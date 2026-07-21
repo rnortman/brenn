@@ -1,0 +1,33 @@
+# Example Containerfile for a Brenn CC subprocess container.
+#
+# Build: podman build -t brenn-cc:latest -f Containerfile.cc-example .
+#
+# This image provides a base environment for running Claude Code inside
+# a container. Tools like CC itself, Rust, uv, and Bun are installed into
+# the persistent home directory (bind-mounted at runtime) rather than baked
+# into the image — so tool updates don't require image rebuilds.
+#
+# Bootstrap a new persistent home directory:
+#   podman run --rm -it -v /path/to/home:/home/user:Z brenn-cc:latest brenn-setup-home
+#
+# Or use brenn-setup-home as a start_hooks.container entry to keep tools
+# current on each new conversation.
+
+FROM fedora:43
+
+# System packages (gcc needed as Rust linker)
+RUN dnf install -y --exclude='nodejs-docs' \
+        git nodejs npm ripgrep openssh-clients curl gcc unzip && \
+    dnf clean all
+
+# Home directory bootstrap script — run once per persistent home_dir:
+#   podman run --rm -it -v /path/to/home:/home/user:Z brenn-cc:latest brenn-setup-home
+COPY brenn-setup-home /usr/local/bin/brenn-setup-home
+
+# Non-root user
+RUN useradd -m -s /bin/bash user
+USER user
+ENV PATH="/home/user/.local/bin:/home/user/.cargo/bin:/home/user/.bun/bin:${PATH}"
+
+WORKDIR /workspace
+ENTRYPOINT []

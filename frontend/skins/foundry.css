@@ -1,0 +1,373 @@
+/* Skin: foundry — "Pixel Foundry".
+ *
+ * Pixel art, 2026: the Sweetie-16 palette hard-committed, flat tile fills with
+ * 3px light borders and hard offset shadows — zero blur anywhere in the system.
+ * Silkscreen (true bitmap) for labels and numerics; Chivo for prose. Pixel type
+ * is earned, never body copy.
+ *
+ * Fills the token contract in surface.css and dresses the shell DOM. Panels are
+ * raised tiles; each of the three slots takes a distinct Sweetie-16 tile color
+ * with a bright accent label, so a bar reads as palette-committed at a glance.
+ */
+
+@font-face {
+    font-family: "Chivo";
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url("fonts/chivo-400.woff2") format("woff2");
+}
+
+/* Only the 400 face is vendored; `strong` bold in prose is browser-synthesized
+ * from it. Declaring a 700 @font-face pointed at the 400 file would suppress
+ * that synthesis and render bold at regular weight. */
+
+@font-face {
+    font-family: "Silkscreen";
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url("fonts/silkscreen-400.woff2") format("woff2");
+}
+
+@font-face {
+    font-family: "Silkscreen";
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url("fonts/silkscreen-700.woff2") format("woff2");
+}
+
+/* Token scope: declared on `body` (not `#surface-root`) so the tokens cascade up
+ * to `body`'s own `background: var(--surface-bg, …)` chrome fill — a custom
+ * property inherits downward only, so producing them on `#surface-root` (a child
+ * of body) would leave the body background resolving the fallback. This is the
+ * chrome-color fix: foundry's #1a1c2c navy now reaches the field between tiles.
+ * Foundry is dark-only — it ships no `[data-theme="light"]` block, so the theme
+ * axis is a no-op here. */
+body[data-skin="foundry"] {
+    --surface-bg: #1a1c2c;
+    --surface-gap: 28px;
+    /* Extra right/bottom room so the last tile's hard offset shadow clears. */
+    --surface-pad: 30px 40px 40px 30px;
+
+    --ink: #1a1c2c;
+    --paper: #f4f4f4;
+    --shadow: #0d0e18;
+    --panel-pad: 22px 26px;
+
+    --text-color: #f4f4f4;
+    --text-font: "Chivo", system-ui, sans-serif;
+    --pixel-font: "Silkscreen", ui-monospace, monospace;
+
+    /* Sweetie-16 accents. */
+    --cyan: #73eff7;
+    --yellow: #ffcd75;
+    --green: #38b764;
+    --red: #b13e53;
+    --slate: #94b0c2;
+}
+
+body {
+    font-size: 16px;
+    line-height: 1.45;
+    image-rendering: pixelated;
+}
+
+/* === Tiles: flat fills, 3px light border, hard offset shadow, zero blur === */
+#surface-root[data-skin="foundry"] > section[data-instance] {
+    background: #29366f;
+    border: 3px solid var(--paper);
+    box-shadow: 8px 8px 0 var(--shadow);
+    padding: var(--panel-pad);
+    gap: 10px;
+}
+
+/* Per-slot Sweetie-16 tile colors — palette committed, not decorative. */
+#surface-root[data-skin="foundry"] > section[data-panel="a"] {
+    background: #29366f;
+}
+
+#surface-root[data-skin="foundry"] > section[data-panel="b"] {
+    background: #333c57;
+}
+
+#surface-root[data-skin="foundry"] > section[data-panel="c"] {
+    background: #3b5dc9;
+}
+
+/* === Panel label: bitmap type === */
+#surface-root[data-skin="foundry"] header[data-panel-label] {
+    font-family: var(--pixel-font);
+    font-size: clamp(0.75rem, 1.2vw, 1.15rem);
+    line-height: 1.4;
+    color: var(--cyan);
+    margin-bottom: 8px;
+}
+
+#surface-root[data-skin="foundry"] > section[data-panel="b"] header[data-panel-label] {
+    color: var(--yellow);
+}
+
+#surface-root[data-skin="foundry"] > section[data-panel="c"] header[data-panel-label] {
+    color: var(--green);
+}
+
+/* === Protobar content dressing === */
+#surface-root[data-skin="foundry"] [data-protobar-message] {
+    font-family: var(--text-font);
+    color: var(--text-color);
+    font-size: clamp(1.1rem, 2.2vw, 1.9rem);
+    line-height: 1.35;
+}
+
+#surface-root[data-skin="foundry"] [data-protobar-message] h1,
+#surface-root[data-skin="foundry"] [data-protobar-message] h2,
+#surface-root[data-skin="foundry"] [data-protobar-message] h3 {
+    font-family: var(--pixel-font);
+    line-height: 1.3;
+    color: var(--paper);
+}
+
+#surface-root[data-skin="foundry"] [data-protobar-message] h1 {
+    font-size: clamp(1.6rem, 3.2vw, 2.6rem);
+    color: var(--yellow);
+}
+
+#surface-root[data-skin="foundry"] [data-protobar-message] h2 {
+    font-size: clamp(1.3rem, 2.4vw, 2rem);
+    color: var(--cyan);
+}
+
+#surface-root[data-skin="foundry"] [data-protobar-message] > * + * {
+    margin-top: 0.55em;
+}
+
+#surface-root[data-skin="foundry"] [data-protobar-message] strong {
+    color: var(--yellow);
+    font-weight: 700;
+}
+
+#surface-root[data-skin="foundry"] [data-protobar-message] ul,
+#surface-root[data-skin="foundry"] [data-protobar-message] ol {
+    padding-left: 1.3em;
+}
+
+#surface-root[data-skin="foundry"] [data-protobar-message] li + li {
+    margin-top: 0.35em;
+}
+
+#surface-root[data-skin="foundry"] [data-protobar-message] code {
+    font-family: var(--pixel-font);
+    color: var(--cyan);
+}
+
+#surface-root[data-skin="foundry"] [data-protobar-message] pre {
+    font-family: var(--pixel-font);
+    background: var(--ink);
+    border: 3px solid var(--paper);
+    box-shadow: 6px 6px 0 var(--shadow);
+    padding: 0.7em 0.9em;
+    overflow-x: auto;
+    color: var(--paper);
+    font-size: 0.8em;
+}
+
+#surface-root[data-skin="foundry"] [data-protobar-message] pre code {
+    color: inherit;
+}
+
+/* === Status line === */
+#surface-root[data-skin="foundry"] [data-protobar-status] {
+    font-family: var(--pixel-font);
+    font-size: 0.75rem;
+    color: var(--slate);
+    margin-top: 0.6rem;
+}
+
+/* === Scrollbar: hard-edged pixel ===
+ * The panel content region (surface.css) scrolls its own overflow. Dress its
+ * scrollbar on-palette: a square Sweetie-16 slate thumb framed by an ink
+ * border on an ink track — zero blur, zero rounding, no native arrow caps
+ * (which otherwise clip the last content line). Covers Firefox (scrollbar-*)
+ * and Chromium (::-webkit-scrollbar).
+ */
+#surface-root[data-skin="foundry"] section[data-instance] > [data-kind] > * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--slate) var(--ink);
+}
+
+#surface-root[data-skin="foundry"] section[data-instance] > [data-kind] > *::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+}
+
+#surface-root[data-skin="foundry"] section[data-instance] > [data-kind] > *::-webkit-scrollbar-track {
+    background: var(--ink);
+}
+
+#surface-root[data-skin="foundry"] section[data-instance] > [data-kind] > *::-webkit-scrollbar-thumb {
+    background: var(--slate);
+    border: 3px solid var(--ink);
+    border-radius: 0;
+}
+
+/* === Connection banner ===
+ * Single global element; unscoped id selector is unambiguous (one skin/page).
+ */
+#brenn-surface-banner {
+    font-family: "Silkscreen", ui-monospace, monospace;
+    font-size: 0.8rem;
+    padding: 0.5rem 0.9rem;
+    background: var(--ink);
+    color: var(--paper);
+    border-bottom: 4px solid #73eff7;
+}
+
+#brenn-surface-banner[data-banner-state="reloading"] {
+    border-bottom-color: #38b764;
+}
+
+#brenn-surface-banner[data-banner-state="fatal"] {
+    background: #b13e53;
+    color: #f4f4f4;
+    border-bottom-color: #f4f4f4;
+}
+
+/* === Error card === */
+#surface-root[data-skin="foundry"] [data-surface-error] {
+    font-family: var(--pixel-font);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    color: #f4f4f4;
+    background: #b13e53;
+    border: 3px solid var(--paper);
+    box-shadow: 6px 6px 0 var(--shadow);
+    padding: 0.8rem 1rem;
+}
+
+/* === Channel-unavailable note === */
+#surface-root[data-skin="foundry"] [data-channel-unavailable] {
+    font-family: var(--pixel-font);
+    font-size: 0.72rem;
+    color: var(--yellow);
+    border-left: 4px solid var(--yellow);
+    padding: 0.35rem 0.6rem;
+    margin-top: 0.6rem;
+}
+
+/* === Meeting component + escalation ladder ===
+ * Palette-swap green→yellow→red by `data-state` (a per-element `--meeting-accent`
+ * the states rebind), a hard frame at takeover+, and a stepped transform shake
+ * for overdue. Zero blur, per the skin's law — every edge hard, every motion a
+ * transform or a step. The `[data-meeting-root]` element is the section's non-header
+ * child.
+ */
+#surface-root[data-skin="foundry"] [data-meeting-root] {
+    font-family: var(--text-font);
+    --meeting-accent: var(--green);
+}
+
+#surface-root[data-skin="foundry"] [data-meeting-root][data-state="idle"] {
+    --meeting-accent: var(--slate);
+}
+
+#surface-root[data-skin="foundry"] [data-meeting-root][data-state="takeover"] {
+    --meeting-accent: var(--yellow);
+}
+
+#surface-root[data-skin="foundry"] [data-meeting-root][data-state="critical"],
+#surface-root[data-skin="foundry"] [data-meeting-root][data-state="overdue"] {
+    --meeting-accent: var(--red);
+}
+
+#surface-root[data-skin="foundry"] [data-meeting-root] [data-meeting-label] {
+    font-family: var(--pixel-font);
+    font-size: clamp(0.75rem, 1.2vw, 1.15rem);
+    line-height: 1.4;
+    color: var(--meeting-accent);
+}
+
+#surface-root[data-skin="foundry"] [data-meeting-root] [data-meeting-title] {
+    font-family: var(--text-font);
+    font-weight: 700;
+    font-size: clamp(1.2rem, 2.6vw, 2.4rem);
+    line-height: 1.2;
+    color: var(--paper);
+}
+
+#surface-root[data-skin="foundry"] [data-meeting-root] [data-meeting-countdown] {
+    font-family: var(--pixel-font);
+    font-size: clamp(2rem, 8vw, 6rem);
+    line-height: 1.3;
+    color: var(--meeting-accent);
+}
+
+#surface-root[data-skin="foundry"] [data-meeting-root] [data-meeting-subline] {
+    font-family: var(--pixel-font);
+    font-size: 0.75rem;
+    color: var(--slate);
+}
+
+/* Escalation frame: a hard palette-swap border at takeover+ (zero blur). */
+#surface-root[data-skin="foundry"] [data-meeting-root][data-state="takeover"],
+#surface-root[data-skin="foundry"] [data-meeting-root][data-state="critical"],
+#surface-root[data-skin="foundry"] [data-meeting-root][data-state="overdue"] {
+    outline: 6px solid var(--meeting-accent);
+    outline-offset: -6px;
+}
+
+/* Overdue: stepped transform shake — hard jumps, no blur. */
+#surface-root[data-skin="foundry"] [data-meeting-root][data-state="overdue"] {
+    animation: foundry-meeting-shake 0.4s steps(2, jump-none) infinite;
+}
+
+/* Reduced motion: drop the shake — the hard escalation outline already carries
+ * the state statically. */
+@media (prefers-reduced-motion: reduce) {
+    #surface-root[data-skin="foundry"] [data-meeting-root][data-state="overdue"] {
+        animation: none;
+    }
+}
+
+@keyframes foundry-meeting-shake {
+    0% { transform: translate(0, 0); }
+    25% { transform: translate(-4px, 1px); }
+    50% { transform: translate(3px, -3px); }
+    75% { transform: translate(-2px, 3px); }
+    100% { transform: translate(0, 0); }
+}
+
+/* Kiosk action buttons — flat tile, hard offset shadow. The actions row layout
+ * lives in base (surface.css); these rules only dress the buttons. */
+#surface-root[data-skin="foundry"] [data-meeting-root] [data-meeting-dismiss],
+#surface-root[data-skin="foundry"] [data-meeting-root] [data-meeting-snooze] {
+    flex: 1 1 0;
+    font-family: var(--pixel-font);
+    font-size: clamp(0.9rem, 2vw, 1.4rem);
+    padding: 0.8em 1em;
+    color: var(--ink);
+    border: 3px solid var(--ink);
+    box-shadow: 6px 6px 0 var(--shadow);
+    cursor: pointer;
+}
+
+#surface-root[data-skin="foundry"] [data-meeting-root] [data-meeting-dismiss] {
+    background: var(--green);
+}
+
+#surface-root[data-skin="foundry"] [data-meeting-root] [data-meeting-snooze] {
+    background: var(--yellow);
+}
+
+#surface-root[data-skin="foundry"] [data-meeting-root] [data-meeting-dismiss]:active,
+#surface-root[data-skin="foundry"] [data-meeting-root] [data-meeting-snooze]:active {
+    transform: translate(6px, 6px);
+    box-shadow: none;
+}
+
+/* Full-bleed takeover tile: the overlaid section owns the whole viewport; drop
+ * its offset shadow so the escalation frame owns the edge. */
+#surface-root[data-skin="foundry"][data-takeover="true"] > section[data-instance] {
+    box-shadow: none;
+}

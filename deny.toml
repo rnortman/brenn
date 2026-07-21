@@ -1,0 +1,61 @@
+# cargo-deny policy for the Brenn repository.
+# Applied to all workspace units (root + standalone WASM workspaces) via `cargo xtask deny`.
+# See design docs/adr/2026/06/13-cargo-deny-check-split/design.md for rationale.
+
+[advisories]
+# Fail on any published RUSTSEC security advisory.
+# No ignore list — the tree is expected to be red on pre-existing advisories
+# until the user evaluates and remediates them (see design §2.3.3).
+version = 2
+ignore = []
+
+[bans]
+# Permissive to start; add banned crates here as needed.
+multiple-versions = "allow"
+
+[licenses]
+version = 2
+unused-allowed-license = "allow"
+
+# Third-party SPDX license identifiers present in the resolved dependency graphs
+# of all workspace units (root workspace + standalone WASM workspaces).
+# Derived mechanically at implementation time (2026-06-14).
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "LGPL-2.1-or-later",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# `private.ignore = true` + `publish = false` in first-party manifests:
+# First-party crates carry `publish = false`, making cargo-deny treat them as
+# private and skip their license check entirely. `private = { ignore = true }`
+# without `publish = false` in the manifests has no effect (verified against
+# cargo-deny 0.19.8: Krate::is_private() gates on publish being Some, not None).
+# graf (git dep) and brenn-mcp (graf's own dep, via crates.io) both declare
+# `license = "Apache-2.0"`, already in the allow list above, so they pass the
+# normal license check; no ignore-sources carve-out is needed.
+[licenses.private]
+ignore = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# crates.io is the only registry in use.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# graf is a git dependency from its public GitHub home. (brenn-mcp, graf's own
+# dependency, arrives via the crates.io registry allowed above.)
+allow-git = [
+    "https://github.com/rnortman/graf.git",
+]

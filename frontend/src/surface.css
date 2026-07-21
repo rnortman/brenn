@@ -1,0 +1,270 @@
+/* Brenn surface shell — base scaffolding stylesheet.
+ *
+ * Scaffolding ONLY: reset, the #surface-root layout grid (one template per
+ * data-layout value), section visibility, and the *structure* (placement, not
+ * dressing) of the connection banner, per-panel label header, error card, and
+ * channel note. All color, typography, borders, shadows, and fonts live in the
+ * per-surface skin pack (skins/<name>.css), loaded alongside this file.
+ *
+ * It styles only the DOM the shell's dom.rs executor produces:
+ *   #surface-root[data-layout][data-skin]     — the shell's DOM root (the grid)
+ *   #brenn-surface-banner[data-banner-state]  — the connection banner (overlay)
+ *   #brenn-surface-staging[hidden]             — the kernel's wrapper holding pen
+ *   section[data-instance]                     — a per-instance layout section
+ *   section[data-panel="a|b|c"]                — an assigned panel (grid slot)
+ *   div[data-instance][data-kind]              — an instance's kernel wrapper
+ *   header[data-panel-label]                   — a panel's label header
+ *   [data-surface-error]                       — a wrapper's error card
+ *   [data-channel-unavailable]                 — a non-fatal channel note
+ *
+ * Token contract the skin fills (each has a neutral fallback so a surface
+ * still renders if a skin somehow fails to load):
+ *   --surface-bg      field background
+ *   --surface-gap     gutter between panels
+ *   --surface-pad     chrome padding around the panel grid
+ *   --panel-pad       interior pad the base applies to escalated brenn-meeting
+ *                     states; must match the skin's section padding
+ */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html,
+body {
+    height: 100%;
+}
+
+body {
+    background: var(--surface-bg, #17191b);
+    color: var(--text-color, #c9cdc9);
+    font-family: var(--text-font, system-ui, sans-serif);
+    overflow: hidden;
+}
+
+/* === Root: the layout grid ===
+ * Fills the viewport. Each data-layout value defines one grid via named areas
+ * a / b / c; assigned sections claim a slot by their data-panel value. The
+ * --surface-ratio custom property (set inline by the shell when a layout doc
+ * carries a ratio) sizes the first region for the two ratio-bearing layouts;
+ * the trailing minmax(0, 1fr) absorbs the gap so the grid never overflows.
+ */
+
+#surface-root {
+    height: 100vh;
+    display: grid;
+    gap: var(--surface-gap, 20px);
+    padding: var(--surface-pad, 24px);
+    box-sizing: border-box;
+    overflow: hidden;
+}
+
+#surface-root[data-layout="single"] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    grid-template-areas: "a";
+}
+
+#surface-root[data-layout="columns-2"] {
+    grid-template-columns:
+        minmax(0, calc(var(--surface-ratio, 0.5) * 100%))
+        minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    grid-template-areas: "a b";
+}
+
+#surface-root[data-layout="columns-3"] {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-rows: minmax(0, 1fr);
+    grid-template-areas: "a b c";
+}
+
+#surface-root[data-layout="main-side"] {
+    grid-template-columns:
+        minmax(0, calc(var(--surface-ratio, 0.6) * 100%))
+        minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+        "a b"
+        "a c";
+}
+
+/* === Per-instance layout sections === */
+
+#surface-root > section[data-instance] {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+}
+
+section[data-panel="a"] {
+    grid-area: a;
+}
+
+section[data-panel="b"] {
+    grid-area: b;
+}
+
+section[data-panel="c"] {
+    grid-area: c;
+}
+
+/* Unassigned instances stay mounted and warm but out of view. */
+#surface-root > section[data-instance]:not([data-panel]) {
+    display: none;
+}
+
+/* === Panel label header (structure only) ===
+ * The shell inserts this as the section's first child when a layout doc names
+ * a label. Skins dress the type; base only reserves it as a block that does
+ * not shrink under the content below it.
+ */
+
+header[data-panel-label] {
+    flex: 0 0 auto;
+}
+
+/* === The kernel's per-instance wrapper ===
+ * The mount/arrange seam: the kernel creates one wrapper per instance and owns
+ * everything inside it (the component's element, or an error card); chrome owns
+ * where it sits. `display: contents` makes it a structural boundary only — it
+ * generates no box, so the component element remains the section's flex child
+ * and a skin styles the component exactly as it did before the seam existed.
+ *
+ * Wrappers wait in the kernel's staging container until chrome first arranges
+ * them: mounted, warm, pumping, and out of view. Staging carries the `hidden`
+ * attribute (dom.rs); this rule is the belt to that suspenders, since a skin
+ * that resets `[hidden]` must not be able to put the holding pen on screen.
+ */
+
+#surface-root > section[data-instance] > [data-kind] {
+    display: contents;
+}
+
+#brenn-surface-staging {
+    display: none;
+}
+
+/* The content below the label fills the remaining panel height and scrolls
+ * its own overflow — the kiosk viewport never scrolls. The section's flex
+ * children are the label header and — through the box-less wrapper — the
+ * instance's component element or error card.
+ */
+#surface-root > section[data-instance] > [data-kind] > * {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+}
+
+/* === Connection banner (overlay) ===
+ * A single element the shell re-styles via data-banner-state. Overlaid at the
+ * top so it never consumes a grid cell; the mockups have no banner and normal
+ * operation keeps it hidden. Skins dress it; base fixes only its placement.
+ */
+
+#brenn-surface-banner {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    text-align: center;
+}
+
+#brenn-surface-banner[hidden] {
+    display: none;
+}
+
+/* === Error card (replaces a component's content) === */
+
+[data-surface-error] {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* === Channel-unavailable note (component stays mounted) === */
+
+[data-channel-unavailable]:empty {
+    display: none;
+}
+
+/* === Protobar content regions ===
+ * Two blocks the protobar component writes: the message subtree (plain text or
+ * a rendered-markdown tree) and a dimmed status line (drops / gap indicators).
+ * Skins own the type; base only handles wrapping and the empty-status collapse.
+ */
+
+[data-protobar-message] {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+[data-protobar-status]:empty {
+    display: none;
+}
+
+/* === Meeting component structure ===
+ * The meeting element is a mount section's non-header child (it inherits
+ * flex/scroll from the section rule above). These rules fix the meeting's own
+ * internal skeleton — the column stack, the actions row, and the empty-countdown
+ * collapse — so every skin dresses the same structure. The [hidden] repair keeps
+ * the flex actions row hidden outside the takeover phases, where the component
+ * toggles the `hidden` attribute; skins add only dressing.
+ *
+ * Anchored on the `data-meeting-root` marker the component stamps on its host,
+ * NOT a `brenn-meeting` type selector: the kernel names the element
+ * `brenn-meeting--<instance>` (per-instance tag), so a bare kind tag matches
+ * nothing.
+ */
+
+[data-meeting-root] {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    height: 100%;
+}
+
+[data-meeting-root] [data-meeting-countdown]:empty {
+    display: none;
+}
+
+[data-meeting-root] [data-meeting-actions] {
+    display: flex;
+    gap: 16px;
+    margin-top: auto;
+}
+
+[data-meeting-root] [data-meeting-actions][hidden] {
+    display: none;
+}
+
+/* Escalated phases draw a strobe/outline border at the meeting element's own
+ * edge (skin dressing). Inset the content by the panel pad so the label,
+ * countdown, subline, and action buttons clear that edge instead of colliding
+ * with it, and center the whole stack in the (fullscreen at takeover) panel so
+ * it reads as a centered alert rather than a top-left column. Ambient/idle have
+ * no edge border and keep the section's own padding + top-left flow so a meeting
+ * panel still aligns with its label header in a multi-panel layout.
+ */
+[data-meeting-root][data-state="takeover"],
+[data-meeting-root][data-state="critical"],
+[data-meeting-root][data-state="overdue"] {
+    padding: var(--panel-pad, 24px);
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+}
+
+/* The centered group keeps the action row full-width (align-items:center would
+ * otherwise shrink it to content) and drops the base bottom-pin so Dismiss/Snooze
+ * join the centered stack instead of being pushed to the panel floor. */
+[data-meeting-root][data-state="takeover"] [data-meeting-actions],
+[data-meeting-root][data-state="critical"] [data-meeting-actions],
+[data-meeting-root][data-state="overdue"] [data-meeting-actions] {
+    align-self: stretch;
+    margin-top: 0;
+}

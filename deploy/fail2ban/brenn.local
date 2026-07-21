@@ -1,0 +1,20 @@
+# Brenn fail2ban jail
+#
+# IMPORTANT: Adjust logpath to match your deployment's security log location.
+# The default below matches ObsConfig's dev default (./logs/).
+# Production deployments typically use /var/log/brenn/security.log.
+
+[brenn]
+enabled = true
+filter = brenn
+logpath = ./logs/security.log
+# Never ban the loopback. Behind a reverse proxy the logged `ip` on a
+# proxy-bypass / misconfigured-proxy reject path is the proxy's own loopback
+# peer (127.0.0.1); banning it on port 443 would self-DoS the whole site. The
+# loopback is also the legitimate identity for direct-bind (trusted_proxy_hops
+# = 0) deployments. It is never a meaningful ban target either way.
+ignoreip = 127.0.0.1/8 ::1
+maxretry = 5
+findtime = 600
+bantime = 3600
+action = iptables-multiport[name=brenn, port="443"]

@@ -1,0 +1,24 @@
+# This crate is intentionally not a workspace member (see design §2.1):
+# it targets wasm32-unknown-unknown and is built via `wit-bindgen-cli` 0.58
+# + plain `cargo build` + `wasm-tools component new` (no cargo-component).
+[workspace]
+
+[package]
+name = "brenn-processor-tool-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Runtime crate for the wit-bindgen 0.58 generator. 0.44 is the latest
+# independently-versioned runtime; there is no 0.58 runtime crate.
+wit-bindgen-rt = "0.44"
+
+[package.metadata.component]
+package = "brenn:processor"
+target = { path = "../../wit/processor.wit" }
+
+[package.metadata.component.dependencies]

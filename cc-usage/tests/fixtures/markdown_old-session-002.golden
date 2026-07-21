@@ -1,0 +1,8 @@
+## Session old-session-002
+Project: my-project
+
+| Role | Agent Type | Agent ID | Model | Input | CW 5m | CW 1h | C Read | Output | Total | Cost USD | Entries | Start Time |
+|------|-----------|----------|-------|------:|------:|------:|-------:|-------:|------:|---------:|--------:|------------|
+| parent | untyped | - | claude-sonnet-4-6 | 500 | 0 | 0 | 0 | 100 | 600 | 0.0030 | 1 | 2026-03-01T08:00:00Z |
+| session_total | - | - | - | 500 | 0 | 0 | 0 | 100 | 600 | 0.0030 | 1 | 2026-03-01T08:00:00Z |
+

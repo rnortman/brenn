@@ -1,0 +1,8 @@
+#!/bin/bash
+# Scrub first: it fails in seconds, `make check` takes minutes.
+set -e
+
+brenn-scrub staged
+make check
+
+echo "All checks passed."

@@ -1,0 +1,829 @@
+# Development configuration for Brenn.
+# Usage: cargo run -- --config brenn.dev.toml serve
+
+[server]
+bind_address = "127.0.0.1:3000"
+static_dir = "frontend/dist"
+surface_dist_dir = "surface/dist"
+secure_cookies = false
+# Required once messaging is configured (the dev-stub surface below): the
+# message source identifier. Matches bind_address for local dev.
+public_url = "http://127.0.0.1:3000"
+
+[database]
+path = "brenn.db"
+
+[logging]
+log_dir = "logs"
+console_level = "debug"
+file_level = "debug"
+
+[claude_defaults]
+mcp_script_path = "noop_mcp.py"
+model = "sonnet"
+
+[integrations.graf]
+command = "graf"
+
+[integrations.pfin]
+command = "pf"
+
+# Surface error reporting: admitted warn/error surface `Log` reports republish
+# onto this durable channel via the trusted in-code system publisher; a
+# component panic on an alert-granted surface additionally pages. The dev
+# instance runs the noop alerter (no `[alerting]` block), so the observable
+# evidence is the durable message on this channel plus the `surface_guest` log
+# lines — the real ntfy/mail alert leg is exercised on staging.
+[observability]
+surface_error_channel = "brenn:surface-errors"
+
+# LLM surface self-description: at boot the server publishes a family of retained
+# help/schema/index documents derived by convention from this prefix, as the
+# reserved `system:surface-help` publisher. Any app (e.g. `dev`) pulls them with
+# `MessageChannelGet` to learn which surfaces/instances/channels exist and how to
+# drive each component kind — reads are ungated (topology only, no secrets);
+# writes are single-writer-enforced at boot. `status_interval_secs` is the
+# heartbeat cadence handed to shells for the (runtime) status snapshot.
+[surface_description]
+prefix = "surface"
+status_interval_secs = 60
+
+[[channel]]
+uuid = "0da727fd-d0f7-414e-98e3-f1fef2ae70ca"
+address = "surface-errors"
+description = "Surface client error reports (trusted republish)"
+
+# Surface self-description channels: the boot-published help/schema/index topology
+# derived from prefix "surface". Each is retained latest-wins (standing_retain_depth
+# = 1) so a non-subscriber MessageChannelGet always returns the current document.
+[[channel]]
+uuid = "59ec3b6b-7a9d-4ede-b692-638ed3834963"
+address = "surface.index"
+description = "Surface topology index (system-published, latest-wins)"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "2f36ae2a-fe98-4a89-8299-7c086b94ddec"
+address = "surface.surface.dev-stub.help"
+description = "Surface help: dev-stub"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "d1fcb93f-d598-4e42-86f2-d7a3a123e38d"
+address = "surface.surface.bar.help"
+description = "Surface help: bar"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "0ac01862-9222-4f53-a8cf-36363303c1e5"
+address = "surface.surface.bar-pixel.help"
+description = "Surface help: bar-pixel"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "cd700d1f-9f28-41bf-972b-f7a1df0dc63a"
+address = "surface.surface.bar-feeder.help"
+description = "Surface help: bar-feeder"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "7d8105bc-e267-4602-a151-ec9e7834d761"
+address = "surface.kind.echo-stub.help"
+description = "Kind help: echo-stub"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "4d56962a-ae1b-4bc4-9636-e0c83d5da770"
+address = "surface.kind.echo-stub.schema"
+description = "Kind schema: echo-stub"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "8efaf001-7f73-4c84-bd0a-d205e88044ab"
+address = "surface.kind.protobar.help"
+description = "Kind help: protobar"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "e51fb93c-744d-4c9b-8737-c6541a621761"
+address = "surface.kind.protobar.schema"
+description = "Kind schema: protobar"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "a6d0f882-4c8f-4d5f-91d5-a4ca6fc5f8e5"
+address = "surface.kind.mode-clock.help"
+description = "Kind help: mode-clock"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "c4aa5cba-de5e-46c2-8dc0-bae5970ca65f"
+address = "surface.kind.mode-clock.schema"
+description = "Kind schema: mode-clock"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "5b5b8634-5ac7-47e3-9225-a0e58829ae3e"
+address = "surface.kind.meeting.help"
+description = "Kind help: meeting"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "1f760261-f036-4420-8400-cdffa84b1f13"
+address = "surface.kind.meeting.schema"
+description = "Kind schema: meeting"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "765d89ad-d9b3-4608-80c9-6f26cdbaf689"
+address = "surface.kind.chrome.help"
+description = "Kind help: chrome"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "c446cdd8-9e9a-4420-a41f-d5c5d21459d2"
+address = "surface.kind.chrome.schema"
+description = "Kind schema: chrome"
+standing_retain_depth = 1
+
+# Surface self-description runtime channels: geometry + status per surface. These
+# receive writes forever (geometry per resize, status per heartbeat), so both
+# retain_depth and standing_retain_depth are bounded (= 1, latest-wins); the owning
+# surface is the single writer (boot-enforced).
+[[channel]]
+uuid = "c89c02ac-8c6b-40f4-ab75-799b7050cadc"
+address = "surface.surface.dev-stub.geometry"
+description = "Surface geometry: dev-stub"
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "3ea19b6b-1946-44de-a3a4-a9526f804773"
+address = "surface.surface.dev-stub.status"
+description = "Surface status: dev-stub"
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "601968c1-d5dc-4620-9ddf-207ffaebc827"
+address = "surface.surface.bar.geometry"
+description = "Surface geometry: bar"
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "271e790b-0e4d-4409-98f0-9987b265634b"
+address = "surface.surface.bar.status"
+description = "Surface status: bar"
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "c8db3fc8-9417-4736-8a35-ddd592f43ee7"
+address = "surface.surface.bar-pixel.geometry"
+description = "Surface geometry: bar-pixel"
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "32dbf7bf-6e08-45c3-bf47-2cee8bcb60e8"
+address = "surface.surface.bar-pixel.status"
+description = "Surface status: bar-pixel"
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "0f613d4d-cd0a-4c4d-9b7c-7aa040c0eb66"
+address = "surface.surface.bar-feeder.geometry"
+description = "Surface geometry: bar-feeder"
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "35e3ba7e-4bc2-4236-b93a-2f21974ac1e9"
+address = "surface.surface.bar-feeder.status"
+description = "Surface status: bar-feeder"
+retain_depth = 1
+standing_retain_depth = 1
+
+# Bar layout channel: latest-wins layout documents for the `bar` / `bar-pixel`
+# surfaces. Durable so a reload/reboot restores the last-chosen layout snapshot
+# (`retain_depth = 1`); `push_depth = 8` bounds the parked backlog. The `dev`
+# app and the `bar-feeder` surface publish layout docs here; both bar surfaces
+# subscribe.
+[[channel]]
+uuid = "81c6ecc1-9694-4f99-8a71-86a38151e9b8"
+address = "bar-layout"
+description = "Bar layout documents (latest-wins)"
+push_depth = 8
+retain_depth = 1
+
+# Bar content channels: one per panel instance. Durable + `retain_depth = 1` so
+# a reloaded panel restores the last-pushed body from the snapshot path; small
+# `push_depth` bounds the parked backlog.
+[[channel]]
+uuid = "95ec41f3-1b8a-4239-a9e1-37af1ea8fa78"
+address = "bar-a"
+description = "Bar panel content channel (slot a / instance p1)"
+push_depth = 8
+retain_depth = 1
+
+[[channel]]
+uuid = "3120b603-6aee-4c24-b2f5-c60717149e73"
+address = "bar-b"
+description = "Bar panel content channel (slot b / instance p2)"
+push_depth = 8
+retain_depth = 1
+
+[[channel]]
+uuid = "af865273-2889-4923-9ac4-0caba3abb393"
+address = "bar-c"
+description = "Bar panel content channel (slot c / instance p3)"
+push_depth = 8
+retain_depth = 1
+
+# Bar mode-clock config channel: the retained (`retain_depth = 1`) config for the
+# `bar` surface's headless `mode-clock` instance. A publisher sends `{mode,
+# schedule}`; retention replays the last config on reconnect so the surface
+# resumes its last-configured dark/light behavior. Only `bar` (bench) subscribes
+# — `bar-pixel` (foundry) is dark-only, so a mode-clock there would be a no-op.
+[[channel]]
+uuid = "15b4d94e-4589-4aa7-bbad-c850b303a713"
+address = "bar-mode"
+description = "Bar mode-clock config (retained, latest-wins)"
+push_depth = 8
+retain_depth = 1
+
+# Bar meeting agenda channel: the personal-assistant agent publishes a full
+# upcoming-meetings snapshot here (latest-wins). Durable + `retain_depth = 1` so
+# a reloaded/reconnected surface replays the last snapshot and recomputes phase
+# locally. Both `bar` (bench) and `bar-pixel` (foundry) subscribe — escalation
+# and takeover are skin-agnostic.
+[[channel]]
+uuid = "2c349f30-5172-4dc9-a6ae-49b2c70ab30c"
+address = "bar-agenda"
+description = "Bar meeting agenda snapshot (retained, latest-wins)"
+push_depth = 8
+retain_depth = 1
+
+# Bar meeting ack channel: the meeting component publishes dismiss/snooze acks
+# here and subscribes to the same channel so every device converges. Durable +
+# `retain_depth = 8` so a reconnecting device replays recent acks and suppresses
+# already-dismissed meetings.
+[[channel]]
+uuid = "2ab4b43f-5adc-4d73-9bd5-c674c70195cf"
+address = "bar-acks"
+description = "Bar meeting dismiss/snooze acks (retained)"
+push_depth = 8
+retain_depth = 8
+
+[[app]]
+slug = "dev"
+name = "Development"
+description = "Brenn development sandbox"
+icon = "🔧"
+working_dir = "."
+grants = ["messaging_publish"]
+
+# The LLM write path into the bar: a `dev`-app conversation `brenn_send`s layout
+# documents to `brenn:bar-layout` and panel content to `brenn:bar-a`/`-b`/`-c`,
+# which the `bar` and `bar-pixel` surfaces render. The `messaging_publish` grant
+# + these `brenn_publish` ACL entries authorize the durable publishes. The dev
+# app also pulls the surface self-description documents (start at
+# `brenn:surface.index` and follow addresses) to discover this topology.
+[[app.acl.brenn_publish]]
+exact = "bar-layout"
+
+[[app.acl.brenn_publish]]
+exact = "bar-a"
+
+[[app.acl.brenn_publish]]
+exact = "bar-b"
+
+[[app.acl.brenn_publish]]
+exact = "bar-c"
+
+[[app]]
+slug = "assistant"
+name = "Personal Assistant"
+description = "Your personal assistant"
+icon = "🤖"
+working_dir = "."
+singleton = true
+compact_reminder_pct = 60
+compact_soft_pct = 75
+compact_red_pct = 80
+compact_hard_pct = 95
+integrations = ["graf"]
+
+[app.mcp_servers.graf]
+command = "graf"
+args = ["mcp"]
+
+[[app]]
+slug = "pfin"
+name = "Personal Finance"
+description = "Transaction import, categorization, and reconciliation"
+icon = "💰"
+working_dir = "."
+integrations = ["pfin"]
+
+[[app.attachment_targets]]
+name = "import"
+label = "Import bank export"
+accept = [".ofx", ".qfx", ".csv"]
+multi = true
+
+[app.attachment_targets.handler]
+type = "command"
+program = "pf"
+args = ["--json", "import", "{ofx}", "--csv", "{csv}"]
+timeout_secs = 60
+cc_instructions = """After a successful import, offer to review pending transactions using the `pending` tool.
+If the import failed due to unmapped accounts, use the map_account tool to create the mapping, then ask the user to retry the import."""
+
+[app.attachment_targets.handler.file_roles]
+ofx = [".ofx", ".qfx"]
+csv = [".csv"]
+
+# Surface dev fixture: echo-stub bound to a single ephemeral channel in an echo
+# loop. Pressing "send" round-trips publish -> bus -> deliver -> rendered text
+# with no external publisher — a self-contained end-to-end check from
+# `make launchdev` alone.
+[[ephemeral_channel]]
+name = "dev-stub"
+retain_depth = 1
+capacity = 64
+
+[[surface]]
+slug = "dev-stub"
+# `alert` is required by the `noise = "alarm"` binding below: a surface whose
+# binding asks for drop alerting must hold the alert plane, checked at boot.
+grants = ["ephemeral_subscribe", "ephemeral_publish", "alert"]
+ephemeral_subscribe_acl = [{ exact = "dev-stub" }]
+ephemeral_publish_acl = [{ exact = "dev-stub" }]
+
+[[surface.component]]
+kind = "echo-stub"
+abi = "dom"
+
+# The page chrome: layout/theme/takeover/banner/toast renderer, driven entirely
+# by port messages. `dev-stub` has no layout channel, so chrome renders the
+# default layout. No takeover grant here, so no takeover plane binding.
+[[surface.component]]
+kind = "chrome"
+instance = "chrome"
+abi = "dom"
+chrome = true
+
+# `push_depth` is the page's port-queue depth. Every surface binding needs one
+# that resolves bounded — the queue is browser memory — and an ephemeral binding
+# has no [[channel]] rung to inherit from, so it is set here.
+[[surface.subscription]]
+channel = "ephemeral:dev-stub"
+instance = "echo-stub"
+port = "messages"
+push_depth = 8
+# The dev topology's ladder exercise: `alarm` = count + backend alert + toast on
+# every observed drop. The echo loop can outrun a depth-8 queue, so overflow here
+# is reachable by hand, and chrome's toast binding below renders the result. Left
+# at the global `silent` default everywhere else — this is the one place the loud
+# half earns its keep.
+noise = "alarm"
+
+# Chrome's control-plane bindings. `local:` channels have no [[channel]] rung, so
+# each carries an explicit page-queue `push_depth`; the retained-ring depth is
+# contract-fixed by the reserved table, not set here.
+[[surface.subscription]]
+channel = "local:brenn/theme"
+instance = "chrome"
+port = "theme"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/link-state"
+instance = "chrome"
+port = "link-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/surface-state"
+instance = "chrome"
+port = "surface-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/toast"
+instance = "chrome"
+port = "toast"
+push_depth = 8
+
+[[surface.output]]
+instance = "echo-stub"
+port = "out"
+channel = "ephemeral:dev-stub"
+
+# The bar: three protobar instances (p1/p2/p3), one per panel, each bound to its
+# own durable content channel. The LLM picks a layout by publishing a layout
+# document to `brenn:bar-layout` (the `[surface.layout]` block below) and pushes
+# panel content to `brenn:bar-a`/`-b`/`-c`. Everything is durable + snapshot-
+# restored, so a reload/reboot brings the bar back exactly as last left. The
+# `subscribe` grant + `subscribe_acl` cover all four channels (three content +
+# the layout channel); the layout subscription inherits the channel's bounded
+# `retain_depth = 1` / `push_depth = 8`. Skin `bench` (1a Bench Instrument).
+[[surface]]
+slug = "bar"
+skin = "bench"
+# `subscribe` covers the content/layout/mode/agenda/ack reads; `publish` +
+# `publish_acl` authorize the meeting component's ack output onto `bar-acks`;
+# `takeover` lets the shell honor the meeting component's fullscreen-overlay
+# request (surface-level grant, mirroring the alert plane).
+grants = ["subscribe", "publish", "takeover"]
+subscribe_acl = [
+    { exact = "bar-a" },
+    { exact = "bar-b" },
+    { exact = "bar-c" },
+    { exact = "bar-layout" },
+    { exact = "bar-mode" },
+    { exact = "bar-agenda" },
+    { exact = "bar-acks" },
+]
+publish_acl = [{ exact = "bar-acks" }]
+
+[[surface.component]]
+kind = "protobar"
+instance = "p1"
+abi = "dom"
+
+[[surface.component]]
+kind = "protobar"
+instance = "p2"
+abi = "dom"
+
+[[surface.component]]
+kind = "protobar"
+instance = "p3"
+abi = "dom"
+
+# Headless theme driver: no layout slot, so it mounts hidden and its only output
+# is a `ThemeBody` on its `theme` port (bound to `local:brenn/theme` below) that
+# chrome turns into the `data-theme` flip on the bench skin.
+[[surface.component]]
+kind = "mode-clock"
+instance = "mode"
+abi = "dom"
+
+# Meeting notice: shows time-to-next-meeting and escalates to a fullscreen
+# takeover. Subscribes to the agenda snapshot and the ack channel, and publishes
+# its own dismiss/snooze acks back onto the ack channel.
+[[surface.component]]
+kind = "meeting"
+instance = "meeting"
+abi = "dom"
+
+# The page chrome: owns layout (from `brenn:bar-layout`), theme, takeover stack,
+# banner, and toasts. `takeover` grant present, so it binds the takeover plane.
+[[surface.component]]
+kind = "chrome"
+instance = "chrome"
+abi = "dom"
+chrome = true
+
+[[surface.subscription]]
+channel = "brenn:bar-a"
+instance = "p1"
+port = "messages"
+
+[[surface.subscription]]
+channel = "brenn:bar-b"
+instance = "p2"
+port = "messages"
+
+[[surface.subscription]]
+channel = "brenn:bar-c"
+instance = "p3"
+port = "messages"
+
+[[surface.subscription]]
+channel = "brenn:bar-mode"
+instance = "mode"
+port = "config"
+
+[[surface.subscription]]
+channel = "brenn:bar-agenda"
+instance = "meeting"
+port = "agenda"
+
+[[surface.subscription]]
+channel = "brenn:bar-acks"
+instance = "meeting"
+port = "acks"
+
+# Chrome's layout binding: the layout channel is now an ordinary durable
+# subscription (inheriting the channel rung's push_depth / retain_depth = 1),
+# replacing the retired special-cased [surface.layout] wiring.
+[[surface.subscription]]
+channel = "brenn:bar-layout"
+instance = "chrome"
+port = "layout"
+
+# Chrome's control-plane bindings (local: — explicit page-queue push_depth each).
+[[surface.subscription]]
+channel = "local:brenn/theme"
+instance = "chrome"
+port = "theme"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/takeover"
+instance = "chrome"
+port = "takeover"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/link-state"
+instance = "chrome"
+port = "link-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/surface-state"
+instance = "chrome"
+port = "surface-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/toast"
+instance = "chrome"
+port = "toast"
+push_depth = 8
+
+[[surface.output]]
+instance = "meeting"
+port = "acks"
+channel = "brenn:bar-acks"
+
+# Meeting's takeover request/release onto the reserved takeover plane chrome
+# consumes. The plane's binding requires the surface's `takeover` grant; the
+# router stamps the publishing instance onto the body so it cannot be spoofed.
+[[surface.output]]
+instance = "meeting"
+port = "takeover"
+channel = "local:brenn/takeover"
+
+# Headless mode-clock's theme output onto the reserved theme plane chrome
+# consumes. `local:` needs no publish grant/ACL (page-local; the server mediates
+# no local traffic); the plane is not kernel-publish-only, so a component may
+# produce it.
+[[surface.output]]
+instance = "mode"
+port = "theme"
+channel = "local:brenn/theme"
+
+# Second bar surface, identical bindings, different skin (`foundry` = 1c Pixel
+# Foundry). Same channels as `bar`, so both render the same content/layout
+# side-by-side — the config-selectable skin swap and multi-surface fan-out onto
+# one channel set, proven at once.
+[[surface]]
+slug = "bar-pixel"
+skin = "foundry"
+# Same meeting wiring as `bar`: `publish`/`publish_acl` for the ack output and
+# `takeover` for the overlay grant. Foundry is dark-only, so no mode-clock here.
+grants = ["subscribe", "publish", "takeover"]
+subscribe_acl = [
+    { exact = "bar-a" },
+    { exact = "bar-b" },
+    { exact = "bar-c" },
+    { exact = "bar-layout" },
+    { exact = "bar-agenda" },
+    { exact = "bar-acks" },
+]
+publish_acl = [{ exact = "bar-acks" }]
+
+[[surface.component]]
+kind = "protobar"
+instance = "p1"
+abi = "dom"
+
+[[surface.component]]
+kind = "protobar"
+instance = "p2"
+abi = "dom"
+
+[[surface.component]]
+kind = "protobar"
+instance = "p3"
+abi = "dom"
+
+[[surface.component]]
+kind = "meeting"
+instance = "meeting"
+abi = "dom"
+
+# The page chrome (foundry skin). Same bindings as `bar`'s chrome.
+[[surface.component]]
+kind = "chrome"
+instance = "chrome"
+abi = "dom"
+chrome = true
+
+[[surface.subscription]]
+channel = "brenn:bar-a"
+instance = "p1"
+port = "messages"
+
+[[surface.subscription]]
+channel = "brenn:bar-b"
+instance = "p2"
+port = "messages"
+
+[[surface.subscription]]
+channel = "brenn:bar-c"
+instance = "p3"
+port = "messages"
+
+[[surface.subscription]]
+channel = "brenn:bar-agenda"
+instance = "meeting"
+port = "agenda"
+
+[[surface.subscription]]
+channel = "brenn:bar-acks"
+instance = "meeting"
+port = "acks"
+
+[[surface.subscription]]
+channel = "brenn:bar-layout"
+instance = "chrome"
+port = "layout"
+
+[[surface.subscription]]
+channel = "local:brenn/theme"
+instance = "chrome"
+port = "theme"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/takeover"
+instance = "chrome"
+port = "takeover"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/link-state"
+instance = "chrome"
+port = "link-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/surface-state"
+instance = "chrome"
+port = "surface-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/toast"
+instance = "chrome"
+port = "toast"
+push_depth = 8
+
+[[surface.output]]
+instance = "meeting"
+port = "acks"
+channel = "brenn:bar-acks"
+
+# Meeting's takeover request/release onto the reserved takeover plane chrome
+# consumes. The plane's binding requires the surface's `takeover` grant; the
+# router stamps the publishing instance onto the body so it cannot be spoofed.
+[[surface.output]]
+instance = "meeting"
+port = "takeover"
+channel = "local:brenn/takeover"
+
+# Bar feeder: the browser-driven publisher for the bar. Four echo-stub instances,
+# each with an output to one of the four bar channels — three content channels
+# plus the layout channel. Type a body, click send, and it publishes durably to
+# that channel: content bodies to `bar-a`/`-b`/`-c`, layout JSON documents to
+# `bar-layout`. Dog-foods the instance model on a second component kind and
+# drives the bar end-to-end from the browser with no LLM / `dev` app in the path.
+#
+# `grants = ["publish"]` (→ `MessagingPublish`) + the covering `publish_acl` +
+# the `[[surface.output]]` blocks are the triple durable publish requires. No
+# `allowed_users` ⇒ any authenticated user may open it and publish durably. Fine
+# for this single-user dev instance; a multi-user config copying this block MUST
+# add `allowed_users` — durable publish persists to disk under only the
+# per-connection bucket (security-posture §6.3).
+[[surface]]
+slug = "bar-feeder"
+grants = ["publish"]
+publish_acl = [
+    { exact = "bar-a" },
+    { exact = "bar-b" },
+    { exact = "bar-c" },
+    { exact = "bar-layout" },
+    { exact = "bar-mode" },
+    { exact = "bar-agenda" },
+    { exact = "bar-acks" },
+]
+
+[[surface.component]]
+kind = "echo-stub"
+instance = "feed-a"
+abi = "dom"
+
+[[surface.component]]
+kind = "echo-stub"
+instance = "feed-b"
+abi = "dom"
+
+[[surface.component]]
+kind = "echo-stub"
+instance = "feed-c"
+abi = "dom"
+
+[[surface.component]]
+kind = "echo-stub"
+instance = "feed-layout"
+abi = "dom"
+
+[[surface.component]]
+kind = "echo-stub"
+instance = "feed-mode"
+abi = "dom"
+
+[[surface.component]]
+kind = "echo-stub"
+instance = "feed-agenda"
+abi = "dom"
+
+[[surface.component]]
+kind = "echo-stub"
+instance = "feed-acks"
+abi = "dom"
+
+# The page chrome. This surface is publisher-only with no layout channel, so
+# chrome renders the default layout; no takeover grant, so no takeover binding.
+[[surface.component]]
+kind = "chrome"
+instance = "chrome"
+abi = "dom"
+chrome = true
+
+[[surface.subscription]]
+channel = "local:brenn/theme"
+instance = "chrome"
+port = "theme"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/link-state"
+instance = "chrome"
+port = "link-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/surface-state"
+instance = "chrome"
+port = "surface-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/toast"
+instance = "chrome"
+port = "toast"
+push_depth = 8
+
+[[surface.output]]
+instance = "feed-a"
+port = "out"
+channel = "brenn:bar-a"
+
+[[surface.output]]
+instance = "feed-b"
+port = "out"
+channel = "brenn:bar-b"
+
+[[surface.output]]
+instance = "feed-c"
+port = "out"
+channel = "brenn:bar-c"
+
+[[surface.output]]
+instance = "feed-layout"
+port = "out"
+channel = "brenn:bar-layout"
+
+[[surface.output]]
+instance = "feed-mode"
+port = "out"
+channel = "brenn:bar-mode"
+
+[[surface.output]]
+instance = "feed-agenda"
+port = "out"
+channel = "brenn:bar-agenda"
+
+[[surface.output]]
+instance = "feed-acks"
+port = "out"
+channel = "brenn:bar-acks"

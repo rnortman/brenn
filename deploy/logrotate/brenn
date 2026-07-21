@@ -1,0 +1,35 @@
+# Brenn log rotation
+#
+# Install: sudo cp deploy/logrotate/brenn /etc/logrotate.d/brenn
+# Adjust paths and user/group to match your deployment.
+#
+# Brenn supports SIGHUP-based log file reopening. logrotate renames the
+# current log, then sends SIGHUP via the PID file. Brenn reopens the log
+# at the original path. No entries are lost (unlike copytruncate).
+
+/var/log/brenn/brenn.log /var/log/brenn/security.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 brenn brenn
+    postrotate
+        [ -f /run/brenn/brenn.pid ] && kill -HUP $(cat /run/brenn/brenn.pid) 2>/dev/null || true
+    endscript
+}
+
+/var/log/brenn/cc-*.ndjson {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 brenn brenn
+    sharedscripts
+    postrotate
+        [ -f /run/brenn/brenn.pid ] && kill -HUP $(cat /run/brenn/brenn.pid) 2>/dev/null || true
+    endscript
+}

@@ -1,0 +1,13 @@
+# cargo-nextest configuration. `make test` runs the suite through nextest via
+# `cargo run -p xtask -- test`, which parses the JUnit report below to record
+# per-binary passes into the incremental test-result cache.
+
+[profile.default]
+# JUnit XML is nextest's stable machine-readable report. The xtask test cache
+# records a binary as passed iff its testsuite reports zero failures/errors.
+# Path is relative to <target-dir>/nextest/<profile-name>/.
+junit = { path = "junit.xml" }
+
+# Test-group definitions for tests needing genuine cross-binary exclusivity
+# (e.g. the single real MQTT broker under BRENN_MQTT_INTEGRATION) go here as
+# [test-groups.<name>] + [[profile.default.overrides]] with max-threads = 1.

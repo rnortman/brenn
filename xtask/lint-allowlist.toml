@@ -1,0 +1,81 @@
+# =============================================================================
+# Standalone Cargo workspace lint allowlist  —  ENFORCED by `cargo xtask guard`
+# (xtask/src/guard.rs). Also: `cargo xtask lint` lints every entry here, plus
+# the root workspace, with the policy from xtask/src/policy.rs.
+#
+# WHY THIS FILE EXISTS
+# Root `cargo clippy` lints ONLY the root workspace. Any Cargo.toml carrying its
+# own [workspace] table (required to opt out for cargo-component / wasm targets)
+# is invisible to it. Three such crates already ship to prod with ZERO lint
+# coverage. This file + `xtask guard` make that impossible to repeat silently:
+# a new standalone [workspace] not listed here FAILS the guard.
+#
+# THE STANDARD (every standalone workspace MUST satisfy ALL of these)
+#   1. It is listed here, with the correct `kind`.
+#   2. `cargo xtask lint` lints it with clippy under `-D warnings`. No dropping
+#      `-D warnings`, no `#[allow]`-the-world. The command is generated from
+#      `kind` by xtask/src/policy.rs — you cannot weaken it from this file.
+#   3. `cargo xtask check` runs in `make check` (Makefile `xtask-check` step,
+#      in the `check:` list), so CI runs the lint.
+#
+# ADDING A NEW STANDALONE WORKSPACE
+#   `cargo xtask guard` FAILS the moment a Cargo.toml with a [workspace] table
+#   appears that is not listed here. To make it pass: add an entry below with
+#   the crate's `kind` (run `cargo xtask lint <dir>` to see which kind it
+#   classifies as). No Makefile edit is needed — the lint is discovery-driven.
+#
+# REMOVING A WORKSPACE: delete its dir AND its entry here.
+# =============================================================================
+
+[workspaces."brenn-wasm/guest"]
+kind = "wasm-sdk"   # brenn-guest SDK rlib; cargo clippy --target wasm32-unknown-unknown -- -D warnings
+
+# WASM component workspaces (Family A: raw bindings, [package.metadata.component])
+[workspaces."brenn-wasm/components/replay"]
+kind = "wasm-component"
+
+[workspaces."brenn-wasm/components/replay-fault-test"]
+kind = "wasm-component"
+
+[workspaces."brenn-wasm/components/replay-generic"]
+kind = "wasm-component"
+
+[workspaces."brenn-wasm/components/processor-exhaust"]
+kind = "wasm-component"
+
+[workspaces."brenn-wasm/components/processor-mem-exhaust"]
+kind = "wasm-component"
+
+[workspaces."brenn-wasm/components/processor-mqtt-test"]
+kind = "wasm-component"
+
+[workspaces."brenn-wasm/components/processor-tool-test"]
+kind = "wasm-component"
+
+# WASM guest workspaces (Family B: brenn-guest dep, no [package.metadata.component])
+[workspaces."brenn-wasm/components/processor-demo"]
+kind = "wasm-guest"
+
+[workspaces."brenn-wasm/components/processor-dual"]
+kind = "wasm-guest"
+
+[workspaces."brenn-wasm/components/processor-log"]
+kind = "wasm-guest"
+
+[workspaces."brenn-wasm/components/processor-multiport"]
+kind = "wasm-guest"
+
+[workspaces."brenn-wasm/components/processor-config"]
+kind = "wasm-guest"
+
+[workspaces."brenn-wasm/components/processor-transplant"]
+kind = "wasm-guest"
+
+[workspaces."brenn-wasm/components/processor-store-rt"]
+kind = "wasm-guest"
+
+[workspaces."brenn-wasm/components/git-forge-parser"]
+kind = "wasm-guest"
+
+[workspaces."brenn-wasm/components/git-sync-consumer"]
+kind = "wasm-guest"

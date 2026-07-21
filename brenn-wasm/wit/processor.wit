@@ -1,0 +1,383 @@
+package brenn:processor@0.1.0;
+
+/// External ABI — out-of-tree components are first-class consumers of this
+/// interface. Evolution is additive-import-only (decisions.md §2 caveats).
+///
+/// The invariant this interface serves:
+///
+///   There is one component model. Any component runs on any host that can
+///   satisfy its imports. Hosting eligibility is an import profile, not a
+///   component kind.
+///
+/// A component importing `store`/`mqtt`/`tools` is backend-only; one importing
+/// DOM capability is surface-only. Same rule, different import profile — not
+/// two kinds of thing. Components see exactly one mechanism: messages on named
+/// ports.
+///
+/// Host linking policy: each interface in `world processor` is linked
+/// per-component only when the operator grants it (`grants` field in
+/// `[[wasm_consumer]]`). Components should import only the interfaces they
+/// actually use (import-GC removes unused imports from built artifacts);
+/// importing an ungranted interface causes a named load-time panic. Version
+/// matching follows wasmtime's semver-compatibility rule: same major.minor for
+/// 0.x, same major for >=1.0.0.
+
+interface types {
+    /// One message in the window: the canonical MessageEnvelope serialized as
+    /// JSON (UTF-8). The host does not parse `body` and does not pre-classify
+    /// `envelope_type`; the guest parses it and fails deserialization if it
+    /// does not understand the envelope.
+    ///
+    /// Envelope-type additivity policy: `envelope_type` is an OPEN string set.
+    /// New values (e.g. `"ephemeral"`) are added additively and appear on the
+    /// wire only together with the feature that can deliver them to guests —
+    /// a guest never observes a value for a delivery class it cannot receive.
+    /// Guests fail deserialization on an unrecognized envelope (the posture
+    /// stated above), so an additive new value is safe for out-of-tree
+    /// consumers by construction.
+    type envelope-json = string;
+
+    /// Messages delivered on one logical input port for this activation.
+    record port-window {
+        /// Logical input port name from host config — never a raw channel address.
+        port: string,
+
+        /// Ordered list, oldest→newest, of MessageEnvelope JSON values for the
+        /// delivering channel. Entries before `new-from` are RETAINED CONTEXT:
+        /// the most-recent up-to-`retain_depth` channel messages preceding the
+        /// new set. These are channel-wide most-recent messages, NOT a
+        /// per-subscriber delivered log — on a component's first window after
+        /// (re)subscription the context MAY include channel messages this
+        /// component was never individually delivered. Treat `new-from` as "the
+        /// most-recent prior channel messages are provided as context here," NOT
+        /// as "I have already processed everything before this index." A guest
+        /// needing exactly-once-seen semantics must track its own high-water by
+        /// `message_id`. Entries from `new-from` onward are this invocation's
+        /// new/unprocessed messages (up to `push_depth`).
+        envelopes: list<envelope-json>,
+
+        /// Index into `envelopes` of the first new/unprocessed message. Equals
+        /// `envelopes` length when the window is pure context with no new messages.
+        /// This is normal for sampled ports (`push_depth = 0`) and for triggering
+        /// ports that had no pending rows in this activation step.
+        new-from: u32,
+
+        /// Count of messages lost to push-overflow (`push_depth` exceeded:
+        /// rolled past the push window before the component consumed them)
+        /// since the previous successful invocation, so the guest can detect
+        /// gaps. BEST-EFFORT / SINCE-BOOT: the underlying counter is volatile
+        /// (in host memory only) and resets to 0 across a host restart, so a
+        /// gap that occurred before a crash is NOT reflected here after the
+        /// restart. `dropped == 0` is therefore not proof of no-gap across a
+        /// host lifetime; treat it as a within-lifetime gap signal only.
+        /// Always 0 for sampled ports (`push_depth = 0`), which never have
+        /// push rows and therefore never experience push-overflow.
+        dropped: u32,
+    }
+
+    /// One activation. Contains one `port-window` per bound input port, in
+    /// the order declared in the consumer's config (`cfg.inputs` order). Every
+    /// bound port appears in every activation; a port with no new messages
+    /// arrives as a pure-context window (`new-from == envelopes` length).
+    /// Guests must not assume `ports` has length 1.
+    record activation { ports: list<port-window> }
+
+    /// Outcome of processing the batch. A guest trap is a distinct,
+    /// host-observed failure (not representable here).
+    variant receive-error {
+        /// Guest could not parse one of the envelope JSON values it was handed.
+        malformed-envelope(string),
+        /// Guest-defined processing failure with a diagnostic message.
+        processing-failed(string),
+    }
+}
+
+interface ports {
+    variant publish-error {
+        /// Port name not bound for this component (attenuation). The guest
+        /// cannot target raw channel addresses — publish is port-name-only.
+        not-permitted,
+        /// Payload failed host validation (e.g. oversize). Diagnostic string.
+        invalid-payload(string),
+        /// Publish budget exhausted: a per-sink token bucket, or a global
+        /// per-activation backstop (message count or total bytes).
+        quota-exceeded,
+    }
+
+    /// Message urgency — identical to RFC 8030 §5.3 ladder. Controls whether
+    /// downstream subscribers are eagerly woken or let the message park until
+    /// their next natural drain. Sender expresses intent; each subscriber's
+    /// `wake_min` policy decides the actual wake behavior.
+    enum urgency { very-low, low, normal, high }
+
+    /// Buffer one message for the bus channel bound to `port`. `payload` is
+    /// the message BODY only (opaque string) — not an envelope; the host
+    /// assigns all envelope fields (message id, sender, publish timestamp,
+    /// channel, envelope_type, urgency). Urgency is taken from the per-port
+    /// configured default (`[[wasm_consumer]] [[output]] urgency`, default
+    /// `normal`). Visibility is deferred: all of an activation's publishes
+    /// flush atomically, in call order, iff receive returns ok; err/trap
+    /// discards them all.
+    ///
+    /// **Provenance / trust note:** Messages emitted via this import appear on
+    /// the bus with `sender = "wasm:<slug>"` and `envelope_type = brenn`.
+    /// External-origin content forwarded through a component (e.g. a webhook body
+    /// republished as a brenn envelope) retains no marker of its external origin.
+    /// Downstream subscribers that make trust decisions based on `envelope_type` or
+    /// `sender` will treat forwarded external content as internally-originated.
+    /// Operators MUST NOT bind a component's output port to a channel whose
+    /// subscribers assume internal-only senders, unless the component is known to
+    /// publish only internal-origin content. The sender of a republished message
+    /// is the component that published it; trust derives from the operator-authored
+    /// wiring and the ACLs it was granted, not from any per-message origin marker.
+    publish: func(port: string, payload: string) -> result<_, publish-error>;
+
+    /// Like `publish`, but with an explicit urgency override. Use when the
+    /// guest has message-specific urgency intent that differs from the port
+    /// default. Existing components compiled without this import keep working
+    /// (additive WIT ABI — no package version bump).
+    publish-with-urgency: func(port: string, payload: string, urgency: urgency)
+        -> result<_, publish-error>;
+}
+
+interface store {
+    /// Opaque handle to an in-flight transaction. The host owns the resource;
+    /// the component receives an index and must commit or rollback before the
+    /// instance returns from its export call. A handle dropped without
+    /// commit/rollback is a contract violation — the host's HostTransaction::drop
+    /// detects the still-active tx via the tx_active flag, attempts a cleanup
+    /// rollback, then returns Err(...) (wasmtime treats a destructor-returned Err
+    /// as a runtime trap). The trap surfaces to the host as Err(wasmtime::Error)
+    /// on the owning receive call, which ProcessorComponent::handle then surfaces
+    /// as a contained Trap (not a panic).
+    resource transaction {
+        /// Read a value for (namespace, key) within this transaction. Returns
+        /// none if the key is absent. Errors are storage-layer failures.
+        get: func(namespace: string, key: list<u8>) -> result<option<list<u8>>, store-error>;
+
+        /// Write or replace a value. Idempotent w.r.t. value equality.
+        put: func(namespace: string, key: list<u8>, value: list<u8>) -> result<_, store-error>;
+
+        /// Delete a key. Absent key is a no-op (not an error).
+        delete: func(namespace: string, key: list<u8>) -> result<_, store-error>;
+
+        /// List keys in namespace in ascending key order, between start (inclusive)
+        /// and end (exclusive). end = none means to-the-end. limit = 0 means
+        /// unlimited. Returns (key, value) pairs.
+        scan: func(
+            namespace: string,
+            start: list<u8>,
+            end: option<list<u8>>,
+            limit: u32,
+        ) -> result<list<tuple<list<u8>, list<u8>>>, store-error>;
+
+        /// Commit the transaction. The handle is consumed (resource dropped).
+        /// On COMMIT failure, host attempts ROLLBACK; if that also fails, the
+        /// host panics (fail-fast). The component sees only store-error on the
+        /// structured failure path.
+        commit: func() -> result<_, store-error>;
+
+        /// Abort the transaction. The handle is consumed.
+        rollback: func();
+    }
+
+    /// Start a new transaction. SQLite BEGIN IMMEDIATE under the hood:
+    /// acquires the write lock now. A second begin from the same component
+    /// instance before commit/rollback returns backend("nested transaction
+    /// not supported"). The contention variant is reserved for later slices.
+    begin: func() -> result<transaction, store-error>;
+
+    /// All store failures the component can observe.
+    variant store-error {
+        /// Another writer holds the lock and the host's wait budget was
+        /// exhausted. Transient. Reserved; not produced in this slice (the
+        /// process-global path guard precludes cross-instance contention).
+        contention,
+        /// Storage subsystem failure or contract violation. String is
+        /// host-side diagnostic, opaque to the component. Covers nested
+        /// begin, SQLite errors, file corruption.
+        backend(string),
+        /// Host-enforced per-store size cap reached. The write was rejected
+        /// atomically; no partial state committed. Distinct from backend(...)
+        /// (disk-full / corruption): this is the host's own quota, recoverable
+        /// by the guest's prune/delete path.
+        quota-exceeded,
+    }
+}
+
+interface log {
+    /// Maps 1:1 onto the host's tracing levels.
+    enum level { trace, debug, info, warn, error }
+
+    /// Emit one diagnostic log line through the host's log pipeline.
+    ///
+    /// Fire-and-forget, best-effort, IMMEDIATE: unlike `ports.publish`, log
+    /// emission is NOT buffered and NOT transactional with the activation
+    /// outcome — lines emitted before a later trap/err are kept (that is the
+    /// point: diagnostics must survive failure). The host attributes every
+    /// line to the emitting component; the guest cannot spoof attribution.
+    /// The message is truncated (UTF-8-safe) and control-escaped by the host.
+    /// Calls beyond the per-activation quota are dropped (host logs the
+    /// suppressed count once after the activation).
+    log: func(level: level, message: string);
+}
+
+interface alert {
+    /// Maps 1:1 onto the host's alert severities.
+    enum severity { info, warning, critical }
+
+    /// Page the operator through the host's alerting pipeline (e.g. mail).
+    ///
+    /// Fire-and-forget, best-effort: delivery is subject to the host's
+    /// process-wide alert rate limiter and queue; an accepted call is not an
+    /// acknowledgment of delivery (which is why there is no result type —
+    /// `ok` would lie). Title and body are truncated and control-escaped;
+    /// the host prefixes the title with the component identity. Calls beyond
+    /// the per-activation quota are dropped (host logs the suppressed count).
+    /// Use for conditions a human should act on; use `log.log` for everything
+    /// else. There is NO implicit log-level→alert escalation: `log.log(error,
+    /// …)` never alerts.
+    alert: func(severity: severity, title: string, body: string);
+}
+
+interface mqtt {
+    /// Failure modes the guest can observe from a synchronous MQTT publish.
+    /// Distinct variants so a guest can tell a transient broker outage
+    /// (`broker`) from a permanent denial (`not-permitted`): the former MAY be
+    /// retried on a later activation, the latter never.
+    variant mqtt-publish-error {
+        /// Grant/ACL denied for the target client — the consumer's
+        /// `mqtt_publish` ACL does not list this client (or the `mqtt` grant is
+        /// absent). Permanent for this config; do not retry.
+        not-permitted,
+        /// The MQTT service is not configured on this server (no `[[mqtt_client]]`
+        /// is declared, so no session exists to publish through). Permanent for
+        /// this config; do not retry. (Kept as a stable WIT variant; its reachable
+        /// meaning narrowed to the service-absent case — a validly-booted server
+        /// with a declared client always has a session, since every ACL-authorized
+        /// client is validated and registered at boot.)
+        no-connector,
+        /// Address parse / wildcard / oversize failure. Diagnostic string.
+        invalid-payload(string),
+        /// Per-activation publish quota hit (shared with `ports.publish`).
+        quota-exceeded,
+        /// Broker disconnect / submit failure / ack drop. Transient — MAY be
+        /// retried on a later activation. The payload is a stable coarse kind
+        /// (e.g. `"not connected"` / `"publish failed"`) suitable for logging
+        /// and retry classification; it is NOT the full host-side error detail
+        /// and MUST NOT be parsed beyond that classification.
+        broker(string),
+        /// Broker accepted the connection but rejected the publish (PUBACK
+        /// reason code != success). Diagnostic string.
+        broker-rejected(string),
+    }
+
+    /// Publish synchronously to an MQTT broker. Unlike `ports.publish`
+    /// (buffered, flushed atomically at activation end), this goes STRAIGHT to
+    /// the broker and returns the broker outcome inline — there is no
+    /// store-and-forward, no queuing, no retry.
+    ///
+    /// **Not transactional with the activation outcome.** Because the send is
+    /// immediate, a message published here has ALREADY reached the broker by the
+    /// time a later trap or err aborts the activation; it is NOT rolled back.
+    /// This is a genuine semantic difference from `ports.publish`, which
+    /// discards its whole buffer on failure. A guest needing all-or-nothing
+    /// semantics across MQTT + bus must NOT mix the two — the MQTT side effect
+    /// is not retractable. (Same immediacy as `log` / `alert`.)
+    ///
+    /// `client` is the `[[mqtt_client]]` slug (mirrors the LLM `MqttSend`
+    /// tool's `<client>` address segment); `topic` is the topic under that
+    /// client and MUST NOT contain wildcards. The consumer's `mqtt_publish` ACL
+    /// gates which clients are reachable. For QoS >= 1 the call awaits the
+    /// PUBACK before returning.
+    mqtt-publish: func(
+        client: string,
+        topic: string,
+        payload: list<u8>,
+        content-type: option<string>,
+        qos: u8,
+        retain: bool,
+    ) -> result<_, mqtt-publish-error>;
+}
+
+interface tools {
+    /// Failure modes a guest can observe from a tool call. Mirrors the host-side
+    /// `ToolError` (the native registry's error type); the fast and async classes
+    /// share this variant because from the caller's viewpoint a tool is one object
+    /// regardless of class.
+    variant tool-error {
+        /// Unknown tool OR a tool this component was not granted — deliberately
+        /// indistinguishable, so a probing guest learns nothing about what exists
+        /// (the same oracle-closure as an out-of-visibility reply target).
+        not-granted,
+        /// ACL clause miss: the args named a resource outside this component's
+        /// grant. Diagnostic string names the offending resource (the caller
+        /// already named it, so it is not an information leak).
+        denied(string),
+        /// Args JSON was malformed, oversize, or failed the tool's own arg
+        /// deserialization. Diagnostic string.
+        invalid-args(string),
+        /// The caller's per-(participant, tool) rate bucket was empty. Fast tools
+        /// fail immediately with this; async tools delay rather than return it.
+        rate-limited,
+        /// `call-fast` on an async tool, or `call-async` on a fast tool. The class
+        /// is the tool's, never the caller's.
+        wrong-class,
+        /// A tool bug the host has already alerted on (e.g. an oversize result, an
+        /// internal execution fault, or a per-activation call-count overflow). The
+        /// string is a stable coarse token, not host-side detail.
+        internal(string),
+    }
+
+    /// Invoke a fast-class tool synchronously and return its JSON result.
+    ///
+    /// Fast tools are bounded, non-blocking host operations (in-memory lookups,
+    /// cheap local reads). The host enforces a per-tool time budget; overrun is a
+    /// *tool bug* that the host alerts on, not a guest fault. `args-json` is the
+    /// tool's argument object serialized as JSON (UTF-8), capped by the host; the
+    /// returned string is the tool's result JSON, also capped. Grant + ACL are
+    /// checked against `args-json` at call time. Calling a fast tool that is
+    /// actually async yields `wrong-class`.
+    call-fast: func(tool: string, args-json: string) -> result<string, tool-error>;
+
+    /// Enqueue an async-class tool call. Returns as soon as the request is
+    /// validated and buffered — the *result* arrives later as a separate bus
+    /// activation on this component's tool-result inbox, correlated by `call-id`.
+    ///
+    /// Grant + ACL + arg-size are checked synchronously here (so caller mistakes
+    /// fail fast with a typed error); on success the request rides the activation's
+    /// transactional flush — it reaches the bus iff this activation returns ok, so
+    /// a trapped activation fires no tool calls. `call-id` is a caller-chosen
+    /// opaque correlation string (echoed verbatim in the result); the caller owns
+    /// its uniqueness and keeps in-flight state in its `store` grant keyed by it.
+    call-async: func(tool: string, args-json: string, call-id: string)
+        -> result<_, tool-error>;
+}
+
+interface config {
+    /// Read one operator-supplied config value. Values are opaque strings;
+    /// the guest parses. The map is fixed for the process lifetime (seeded
+    /// from host TOML at startup; changes require a host restart). Keys
+    /// under the reserved prefix "brenn." are host-injected facts (e.g.
+    /// "brenn.max-skew-secs" on replay components bound to a timestamped
+    /// signature scheme); operator TOML cannot set them.
+    get: func(key: string) -> option<string>;
+}
+
+world processor {
+    use types.{activation, receive-error};
+    import ports;
+    import store;
+    import log;
+    import alert;
+    import config;
+    import mqtt;
+    import tools;
+
+    /// Receive one activation (one or more port-windows of messages). The
+    /// component processes the new portions of each port-window using earlier
+    /// entries as context, and returns one result for the whole activation.
+    /// Published messages (via the ports import) are buffered during execution
+    /// and flushed atomically iff this returns ok; err/trap discards the buffer.
+    export receive: func(a: activation) -> result<_, receive-error>;
+}

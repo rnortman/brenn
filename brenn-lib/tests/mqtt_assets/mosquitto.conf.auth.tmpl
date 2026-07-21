@@ -1,0 +1,17 @@
+listener __PORT__ 127.0.0.1
+protocol mqtt
+cafile   __CA_PEM__
+certfile __SERVER_CRT__
+keyfile  __SERVER_KEY__
+require_certificate false
+# Auth-required broker: anonymous clients are rejected; credentials come from the
+# password_file. The checked-in `passwd` asset holds one user:
+#   brenn-itest / brenn-itest-password
+# Regenerate with:
+#   mosquitto_passwd -c -b passwd brenn-itest brenn-itest-password
+allow_anonymous false
+password_file __PASSWD__
+acl_file __ACL__
+log_dest file __LOG__
+log_type all
+persistence false

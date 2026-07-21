@@ -1,0 +1,165 @@
+package brenn:replay@0.1.0;
+
+interface types {
+    /// Wall-clock instant. Milliseconds since Unix epoch, UTC.
+    /// Host produces; component treats as opaque ordering key.
+    type instant-millis = u64;
+
+    /// One HTTP header. Name is lowercased canonical form. Value is the
+    /// header's UTF-8 representation. (HTTP allows non-UTF-8 header bytes
+    /// in principle; no surveyed webhook provider uses any. The host
+    /// rejects non-UTF-8 header values before reaching the component, so
+    /// the component never sees invalid UTF-8 here.)
+    record header {
+        name: string,
+        value: string,
+    }
+
+    /// Inputs sufficient for any surveyed webhook replay scheme.
+    /// The component owns per-provider extraction (which header(s) it
+    /// reads, whether it parses the body) — that policy lives with the
+    /// per-endpoint replay component, not the host.
+    record check-input {
+        /// All request headers as received, lowercased names. The host
+        /// passes everything; per-provider filtering happens inside the
+        /// component. (A future optional `config` export can let the
+        /// component declare an allowlist so the host pre-filters; this
+        /// is purely additive and not part of iter 1. See design §2.2.1.)
+        headers: list<header>,
+
+        /// Verified raw request body bytes (same bytes that were
+        /// HMAC-verified by the host). The component parses provider
+        /// envelopes itself if it needs to.
+        body: list<u8>,
+
+        /// Host wall-clock at request receipt, for skew-window checks.
+        received-at: instant-millis,
+
+        /// Identity surfaced by the host signature layer (matched HMAC
+        /// key id or bearer token id). Mirrors
+        /// brenn-lib::webhook::signature::VerifiedRequest.key_id.
+        /// Empty string is permitted for schemes with no key id.
+        key-id: string,
+
+        /// Endpoint slug from ResolvedWebhookEndpoint.slug. Lets a
+        /// component namespace its state across endpoints if it serves
+        /// more than one.
+        endpoint-slug: string,
+    }
+
+    /// Generic verdict variants. Names are provider-agnostic; specific
+    /// providers' notions of "stale" / "duplicate" map onto these.
+    variant replay-error {
+        /// received-at vs. provider-asserted send-time exceeds the
+        /// component's skew window (phonebuddy: 24h; Stripe/Slack: 5m).
+        timestamp-out-of-window,
+
+        /// The component recognizes this request as a duplicate of one
+        /// it has already accepted (e.g. nonce reuse, delivery-id seen).
+        duplicate,
+
+        /// Per-key monotonicity violation (e.g. phonebuddy's per-client
+        /// sent_at strict-increase rule). Distinct from duplicate:
+        /// this is an older-than-last-seen, not a same-as-already-seen.
+        monotonicity-violation,
+
+        /// The component has observed enough recent activity from this
+        /// caller that it considers further requests abuse rather than
+        /// ordinary traffic, and is failing closed. Distinct from
+        /// `duplicate` and `monotonicity-violation`: those reject a single
+        /// request as out-of-protocol; this rejects the caller as a whole
+        /// pending decay of the activity window. The host routes this to a
+        /// dedicated fail2ban lane.
+        too-many-requests,
+
+        /// Component could not extract its required fields from the
+        /// provided input (e.g. malformed envelope, missing expected
+        /// header). String carries a component-side diagnostic.
+        /// Distinct from a host-side parse failure: the host already
+        /// verified the body's HMAC, so this implies a producer bug,
+        /// not adversarial input.
+        malformed-input(string),
+    }
+}
+
+interface store {
+    /// Opaque handle to an in-flight transaction. The host owns the resource;
+    /// the component receives an index and must commit or rollback before the
+    /// instance returns from its export call. A handle dropped without
+    /// commit/rollback is a contract violation — the host's HostTransaction::drop
+    /// detects the still-active tx via the tx_active flag, attempts a cleanup
+    /// rollback, then returns Err(...) (wasmtime treats a destructor-returned Err
+    /// as a runtime trap). The trap surfaces to the host as Err(wasmtime::Error)
+    /// on the owning check call, which ReplayComponent::check then collapses to
+    /// a panic per CLAUDE.md fail-fast rules.
+    resource transaction {
+        /// Read a value for (namespace, key) within this transaction. Returns
+        /// none if the key is absent. Errors are storage-layer failures.
+        get: func(namespace: string, key: list<u8>) -> result<option<list<u8>>, store-error>;
+
+        /// Write or replace a value. Idempotent w.r.t. value equality.
+        put: func(namespace: string, key: list<u8>, value: list<u8>) -> result<_, store-error>;
+
+        /// Delete a key. Absent key is a no-op (not an error).
+        delete: func(namespace: string, key: list<u8>) -> result<_, store-error>;
+
+        /// List keys in namespace in ascending key order, between start (inclusive)
+        /// and end (exclusive). end = none means to-the-end. limit = 0 means
+        /// unlimited. Returns (key, value) pairs.
+        scan: func(
+            namespace: string,
+            start: list<u8>,
+            end: option<list<u8>>,
+            limit: u32,
+        ) -> result<list<tuple<list<u8>, list<u8>>>, store-error>;
+
+        /// Commit the transaction. The handle is consumed (resource dropped).
+        /// On COMMIT failure, host attempts ROLLBACK; if that also fails, the
+        /// host panics (fail-fast). The component sees only store-error on the
+        /// structured failure path.
+        commit: func() -> result<_, store-error>;
+
+        /// Abort the transaction. The handle is consumed.
+        rollback: func();
+    }
+
+    /// Start a new transaction. SQLite BEGIN IMMEDIATE under the hood:
+    /// acquires the write lock now. A second begin from the same component
+    /// instance before commit/rollback returns backend("nested transaction
+    /// not supported"). The contention variant is reserved for iter-3+.
+    begin: func() -> result<transaction, store-error>;
+
+    /// All store failures the component can observe.
+    variant store-error {
+        /// Another writer holds the lock and the host's wait budget was
+        /// exhausted. Transient. Reserved; not produced in iter-2 (the
+        /// process-global path guard precludes cross-instance contention).
+        contention,
+        /// Storage subsystem failure or contract violation. String is
+        /// host-side diagnostic, opaque to the component. Covers nested
+        /// begin, SQLite errors, file corruption.
+        backend(string),
+        /// Host-enforced per-store size cap reached. The write was rejected
+        /// atomically; no partial state committed. Distinct from backend(...)
+        /// (disk-full / corruption): this is the host's own quota, recoverable
+        /// by the guest's prune/delete path.
+        quota-exceeded,
+    }
+}
+
+interface config {
+    /// Read one operator-supplied config value. Values are opaque strings;
+    /// the guest parses. The map is fixed for the process lifetime (seeded
+    /// from host TOML at startup; changes require a host restart). Keys
+    /// under the reserved prefix "brenn." are host-injected facts (e.g.
+    /// "brenn.max-skew-secs" on replay components bound to a timestamped
+    /// signature scheme); operator TOML cannot set them.
+    get: func(key: string) -> option<string>;
+}
+
+world replay {
+    use types.{check-input, replay-error};
+    import store;
+    import config;
+    export check: func(input: check-input) -> result<_, replay-error>;
+}

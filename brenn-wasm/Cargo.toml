@@ -1,0 +1,21 @@
+[package]
+name = "brenn-wasm"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+brenn-common = { version = "0.1.0", path = "../brenn-common" }
+wasmtime = { version = "45", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+tracing = "0.1"
+semver = "1.0.28"
+brenn-budget = { version = "0.1.0", path = "../brenn-budget" }
+brenn-activation = { version = "0.1.0", path = "../brenn-activation" }
+
+[dev-dependencies]
+tempfile = "3"
+brenn-cal = { version = "0.1.0", path = "../brenn-cal" }
+tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
+serde_json = "1"
+wat = "1"

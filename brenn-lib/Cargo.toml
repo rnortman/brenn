@@ -1,0 +1,70 @@
+[package]
+name = "brenn-lib"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+# Expose test-only helpers (CountingAlerter, CapturingAlerter, test_runtime_dir_once) to
+# downstream crates for test reuse. Not for production builds.
+testutils = ["dep:tempfile"]
+
+[dependencies]
+brenn-common = { version = "0.1.0", path = "../brenn-common" }
+brenn-envelope = { path = "../brenn-envelope" }
+argon2 = "0.5.3"
+async-trait = "0.1.89"
+base64ct = { version = "1.8.3", features = ["alloc"] }
+chrono = { version = "0.4.44", features = ["serde"] }
+chrono-tz = "0.10.4"
+croner = "3.0.1"
+csv = "1.4.0"
+gethostname = "1.1.0"
+hex = "0.4.3"
+http = "1.4.0"
+indexmap = "2"
+libc = "0.2.183"
+rand = "0.10.0"
+regex = "1.12.3"
+reopen = { version = "1.0.3", features = ["signals"] }
+signal-hook = "0.3"
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls"] }
+rumqttc = { package = "rumqttc-next", version = "0.33.2", default-features = false, features = ["use-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = { version = "1", features = ["std"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "trace"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["sync", "time", "fs", "io-util", "process", "macros", "rt"] }
+toml = "1.0.7"
+tracing = "0.1.44"
+tracing-appender = "0.2.4"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "fmt"] }
+ts-rs = { version = "12.0.1", features = ["serde-compat", "serde-json-impl"] }
+url = "2.5.8"
+uuid = { version = "1.23.0", features = ["v4", "v5", "serde"] }
+web-push-native = { version = "0.4.0", default-features = false }
+p256 = { version = "0.13", features = ["ecdsa"] }
+hmac = "0.13.0"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+bytes = "1.11.1"
+tempfile = { version = "3.27.0", optional = true }
+# Deliberate edge: config's surface-error publish-floor is typed as the wire
+# `LogLevel` the shell is advertised in `Welcome` and compares report levels
+# against, so config parses into the exact delivered type rather than a parallel
+# enum kept in lockstep by hand. `brenn-surface-proto` is a dependency-light leaf
+# (no cycle); this is the only use. Do not grow the edge — server-side wire
+# concerns still belong in the server, not the base library.
+brenn-surface-proto = { version = "0.1.0", path = "../surface/proto" }
+brenn-budget = { version = "0.1.0", path = "../brenn-budget" }
+
+[dev-dependencies]
+rcgen = { version = "0.14.8", default-features = false, features = ["pem", "crypto", "ring"] }
+# base64ct and uuid are already in [dependencies] with the same features; no dev-dep entry needed.
+# tempfile is an optional dep (enabled by the "testutils" feature); also listed here so
+# cfg(test) code (within brenn-lib itself) can use it without enabling the feature.
+tempfile = "3.27.0"
+tokio = { version = "1.50.0", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
+tracing-test = "0.2.6"

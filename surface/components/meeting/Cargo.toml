@@ -1,0 +1,49 @@
+[package]
+name = "brenn-meeting"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Brenn surface meeting component — computes time-to-next-meeting locally from an agenda snapshot and escalates through ambient/takeover/critical/overdue, publishing dismiss/snooze acks"
+
+[lib]
+crate-type = ["cdylib"]
+
+# The DOM-free escalation state machine (logic.rs) is compiled and unit-tested
+# on the host; its dependencies are ungated normal deps. Wasm DOM/timer glue
+# deps belong under the wasm32 target below.
+# The DOM-free state machine (logic.rs) shares the component-support fault
+# helpers, which are host-buildable, so component-support is an ungated normal
+# dep. Wasm DOM/timer glue deps belong under the wasm32 target below.
+[dependencies]
+brenn-envelope = { path = "../../../brenn-envelope" }
+brenn-surface-component-support = { version = "0.1.0", path = "../../component-support" }
+chrono = { version = "0.4.44", default-features = false, features = ["alloc"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.149"
+
+[dev-dependencies]
+brenn-surface-test-fixtures = { path = "../../test-fixtures" }
+
+# Browser-DOM tests for the connect path (component.rs) run under
+# wasm-bindgen-test via `make surface-wasm-test`. wasm32-only, matching the
+# crate's wasm-gated glue.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }
+
+# The DOM/timer glue (component.rs) is browser-only: it renders the panel,
+# dispatches takeover request/release seam events, and publishes acks. These
+# deps never enter the host build (logic.rs and its tests carry no wasm deps).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+brenn-surface-proto = { version = "0.1.0", path = "../../proto" }
+brenn-surface-contract = { version = "0.1.0", path = "../../contract" }
+wasm-bindgen = { workspace = true }
+web-sys = { workspace = true, features = [
+    "Document",
+    "Element",
+    "HtmlElement",
+    "Node",
+    "NodeList",
+    "Text",
+    "Event",
+    "EventTarget",
+] }

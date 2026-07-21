@@ -1,0 +1,26 @@
+# brenn-guest is intentionally NOT a member of the main workspace.
+# It targets wasm32-unknown-unknown exclusively; clippy/check run via
+# `make check-brenn-guest` with --target wasm32-unknown-unknown.
+# See design §2.2.
+[workspace]
+
+[package]
+name = "brenn-guest"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Guest-side SDK for Brenn WASM processor components"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# The whole tree tracks a single wit-bindgen version: the 0.58 macro here
+# for guest crates, `wit-bindgen-cli` 0.58 for raw component crates (via
+# the Makefile wasm_component_rule), and `wit-bindgen-rt` 0.44 in the raw
+# crates' Cargo.tomls. All three are updated together; there is no version
+# split. cargo-component is fully retired — not installed, not invoked.
+wit-bindgen = "0.58"
+brenn-envelope = { path = "../../brenn-envelope" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

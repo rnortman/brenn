@@ -1,0 +1,33 @@
+[package]
+name = "brenn-chrome"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Brenn surface chrome component — the in-tree default chrome: an ordinary contract-v1 dom component that owns layout, takeover, theme, banner, and toast rendering, driven entirely by port messages"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The DOM-free chrome decision core (logic.rs) is compiled and unit-tested on
+# the host; it holds no web-sys handles. Its deps are ungated normal deps.
+[dependencies]
+brenn-surface-proto = { version = "0.1.0", path = "../proto" }
+brenn-surface-contract = { version = "0.1.0", path = "../contract" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.149"
+
+# The DOM glue (component.rs) is browser-only: it drives #surface-root, <body>,
+# and the kernel wrappers from the actions the core emits. These deps never enter
+# the host build.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+brenn-surface-component-support = { version = "0.1.0", path = "../component-support" }
+wasm-bindgen = { workspace = true }
+web-sys = { workspace = true, features = [
+    "Document",
+    "Element",
+    "HtmlElement",
+    "Node",
+    "Event",
+    "EventTarget",
+    "CssStyleDeclaration",
+] }

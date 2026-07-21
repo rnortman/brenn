@@ -1,0 +1,7 @@
+[build]
+# cargo-component 0.21.1 internally overrides this to wasm32-wasip1 regardless
+# of what is set here; the actual artifact lands in target/wasm32-wasip1/.
+# This setting has no effect on the build output but documents the intended
+# target. When cargo-component upgrades to emit wasip2 natively, update both
+# this line and the Makefile cp path.
+target = "wasm32-wasip1"

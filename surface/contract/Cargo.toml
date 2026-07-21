@@ -1,0 +1,20 @@
+[package]
+name = "brenn-surface-contract"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Brenn surface component contract v1 — the DOM-event seam between the surface shell and the component modules it mounts, plus the shell/bootstrap seam"
+
+# The freezable seam, and nothing else: event names, detail shapes, activation
+# shapes, reserved names, and the doctrine that makes them mean something.
+# Depends on `brenn-surface-proto` for the wire types the seam's details carry as
+# JSON strings (`GapReason`), on `brenn-envelope` for the `MessageEnvelope`
+# an activation window carries — the seam hands components the canonical
+# carrier, never a re-typed copy of it — and on `brenn-activation` for the
+# activation shape itself, which the wasmtime host declares from the same
+# crate. All three dependencies run seam → wire/carrier and never back, so those
+# crates stay what they say they are.
+[dependencies]
+brenn-activation = { version = "0.1.0", path = "../../brenn-activation", features = ["serde"] }
+brenn-envelope = { version = "0.1.0", path = "../../brenn-envelope" }
+brenn-surface-proto = { version = "0.1.0", path = "../proto" }

@@ -1,0 +1,21 @@
+# Test-only fixture for the brenn:processor config import.
+# Reads a config key and publishes its value (or "absent" if missing) to prove
+# the WIT config round-trip through ProcessorComponent::handle.
+# Directive-driven for get/get_parsed/require testing.
+# Not listed in brenn-wasm/deployed-components.txt.
+# This crate is intentionally not a workspace member:
+# it targets wasm32-unknown-unknown and must be built with cargo + wasm-tools.
+[workspace]
+
+[package]
+name = "brenn-processor-config"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+brenn-guest = { path = "../../guest" }
+serde_json = "1"

@@ -1,0 +1,8 @@
+topic readwrite brenn/itest/#
+
+# Authenticated user for the auth-broker template. Per mosquitto.conf(5) the
+# general-section rule above applies to anonymous clients only, so an
+# authenticated brenn-itest needs its own section to get topic access. No-op for
+# the anonymous templates (user sections apply only to that username).
+user brenn-itest
+topic readwrite brenn/itest/#

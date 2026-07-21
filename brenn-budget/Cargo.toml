@@ -1,0 +1,14 @@
+[package]
+name = "brenn-budget"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Publish-budget arithmetic and per-activation caps, shared by every host that mints activations"
+
+# Deliberately dependency-free: std only, no serde, no I/O. The three consumers
+# — the wasmtime host (brenn-wasm), the bus config resolver (brenn-lib), and the
+# surface kernel (surface/client, compiled to wasm32) — can each depend on this
+# crate, which is the whole point: brenn-lib and brenn-wasm both pull
+# dependencies the kernel cannot compile, so a constant either lives here or
+# lives twice.
+[dependencies]

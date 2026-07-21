@@ -1,0 +1,27 @@
+# Test-only fault-injection component for brenn-wasm integration tests.
+# Two sentinel ops: LEAK_TX (leaked transaction → host trap) and TRAP (guest panic → host trap).
+# NOT for production use.
+#
+# This crate is intentionally not a workspace member (targets wasm32-unknown-unknown,
+# built via `wit-bindgen-cli` 0.58 + plain `cargo build` + `wasm-tools component new`).
+[workspace]
+
+[package]
+name = "brenn-replay-fault-test"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Runtime crate for the wit-bindgen 0.58 generator. 0.44 is the latest
+# independently-versioned runtime; there is no 0.58 runtime crate.
+wit-bindgen-rt = "0.44"
+
+[package.metadata.component]
+package = "brenn:replay"
+target = { path = "../../wit/replay.wit" }
+
+[package.metadata.component.dependencies]

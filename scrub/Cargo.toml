@@ -1,0 +1,16 @@
+[package]
+name = "scrub"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "gitleaks wrapper: write-time, staged, pushed-range, and full-tree scrub scans"
+
+[[bin]]
+name = "brenn-scrub"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tempfile = "3"
+toml = "1"

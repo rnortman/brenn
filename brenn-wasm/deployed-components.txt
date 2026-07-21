@@ -1,0 +1,18 @@
+# WASM components shipped to deployments.
+#
+# One artifact basename per line; blank lines and lines starting with `#` are
+# ignored. Each listed file is built into brenn-wasm/target/components/ by the
+# Makefile `wasm-components` target, bundled into the release tarball's lib/ by
+# CI, and installed to COMPONENTS_DIR on the target host by the deploy script
+# bundled into the release tarball.
+#
+# Test-only components (e.g. brenn_replay_fault_test.wasm) are deliberately
+# omitted — they must never ship to a deployment.
+#
+# When you add a new deployable WASM component: add its build rule to the
+# Makefile AND add its artifact basename here, or it will not be deployed.
+brenn_processor_demo.wasm
+brenn_replay.wasm
+brenn_replay_generic.wasm
+brenn_git_forge_parser.wasm
+brenn_git_sync_consumer.wasm

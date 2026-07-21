@@ -1,0 +1,71 @@
+[package]
+name = "brenn-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+async-trait = "0.1.89"
+axum = { version = "0.8.8", features = ["ws", "multipart"] }
+axum-helmet = "1.0.1"
+brenn-cc = { version = "0.1.0", path = "../brenn-cc" }
+brenn-common = { version = "0.1.0", path = "../brenn-common" }
+brenn-graf = { version = "0.1.0", path = "../brenn-graf" }
+brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-pfin = { version = "0.1.0", path = "../brenn-pfin" }
+brenn-surface-proto = { version = "0.1.0", path = "../surface/proto" }
+brenn-surface-contract = { version = "0.1.0", path = "../surface/contract" }
+brenn-wasm = { version = "0.1.0", path = "../brenn-wasm" }
+chrono = "0.4.44"
+chrono-tz = "0.10.4"
+clap = { version = "4.6.0", features = ["derive"] }
+futures = "0.3.32"
+helmet-core = "1.0.0"
+hex = "0.4.3"
+hmac = "0.13.0"
+indexmap = "2"
+libc = "0.2.185"
+percent-encoding = "2.3.2"
+pulldown-cmark = { workspace = true, features = ["html"] }
+regex = "1.12.3"
+rusqlite = "0.39.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_yaml = "0.9"
+sha2 = "0.11.0"
+tokio = { version = "1.50.0", features = ["full"] }
+tokio-stream = "0.1.18"
+tower = "0.5.3"
+tower-http = { version = "0.6.8", features = ["catch-panic", "fs", "limit", "set-header"] }
+tower_governor = "0.8.0"
+tracing = "0.1.44"
+ts-rs = { version = "12.0.1", features = ["serde-compat", "serde-json-impl"] }
+# Must stay version-unified with axum's tokio-tungstenite: the surface WS
+# read-error downcast (routes/surface/session.rs) matches on tungstenite::Error
+# by TypeId, which silently stops matching if two tungstenite versions coexist.
+# surface_ws_oversized_frame_is_violation_and_kills pins this end-to-end.
+tungstenite = { version = "0.29.0", default-features = false }
+url = "2.5.8"
+uuid = { version = "1.23.0", features = ["v4"] }
+brenn-budget = { version = "0.1.0", path = "../brenn-budget" }
+
+[dev-dependencies]
+base64ct = { version = "1.8.3", features = ["alloc"] }
+brenn-cal = { version = "0.1.0", path = "../brenn-cal" }
+brenn-cc = { version = "0.1.0", path = "../brenn-cc", features = ["testutils"] }
+brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
+# Native integration tests drive the real surface client against the real
+# router/session. No cycle: the client depends only on the proto + envelope
+# crates, never on brenn-server.
+brenn-surface-kernel = { version = "0.1.0", path = "../surface/kernel" }
+tokio = { version = "1.50.0", features = ["full", "test-util"] }
+http-body-util = "0.1.3"
+reqwest = "0.13.2"
+tempfile = "3.27.0"
+tower = "0.5.3"
+tokio-tungstenite = "0.29.0"
+tracing-subscriber = "0.3.23"
+# "no-env-filter" makes `#[traced_test]` capture unconditionally; without it
+# tracing-test applies a default env filter and `logs_contain` assertions fail.
+tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
+toml = "1.1.2"

@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Every job only reads the tree. Pinned here so a permissive repo-level default
+# cannot silently hand a write-capable token to cached actions, a downloaded
+# tool, or anything `make` executes.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    # This string is the required-check identifier the branch-protection ruleset
+    # keys on. Do not rename it or branch protection silently detaches.
+    name: check (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    # brenn cold-cache compiles four cargo tools, the full workspace, all WASM
+    # components, and three npm trees; 60 bounds a hang without flaking a cold run.
+    timeout-minutes: 60
+    env:
+      # Incremental artifacts bloat rust-cache for no CI benefit.
+      CARGO_INCREMENTAL: "0"
+      # The graf git-dep fetch goes through the git CLI (git-fetch-with-cli); a
+      # bad fetch must hard-fail, not hang on a credential prompt.
+      GIT_TERMINAL_PROMPT: "0"
+      # The xtask test cache is useless on an ephemeral runner; disabling it
+      # removes any stale-skip class entirely.
+      BRENN_TEST_CACHE: "0"
+      BRENN_MQTT_INTEGRATION: "1"
+      # TODO(ci-wasm-tool-pins-drift): these two literals duplicate the
+      # Makefile's wit-bindgen-cli and wasm-tools pins with no derivation; on
+      # drift, CI installs the wrong version and fails later as a bindings
+      # diff, not a version error.
+      WIT_BINDGEN_VERSION: 0.58.0
+      WASM_TOOLS_VERSION: 1.249.0
+      # The Makefile leaves nextest unpinned; pin it here for deterministic cache
+      # keys and deliberate bumps.
+      NEXTEST_VERSION: 0.9.140
+      # BRENN_CHECK_JOBS deliberately unset: public runners have 4 vCPUs and the
+      # Makefile serializes everything that shares state, so default overlap mode
+      # cuts wall time. If OOM/flake appears, set BRENN_CHECK_JOBS: "1".
+    steps:
+      # TODO(fleet-sha-pin-actions): marketplace actions are tag-pinned. Tags are
+      # mutable, so this is looser than the sha256-pinned gitleaks download below;
+      # converging to commit-SHA pins is tracked separately.
+      - uses: actions/checkout@v7
+
+      # rust-toolchain.toml owns the channel, components, and targets; the bare
+      # install restates nothing.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # engines floor is 20; pin the major to decouple from runner-image drift.
+      # No separate jco install: jco is npm ci-installed from surface/package.json
+      # and jco-preflight asserts the installed version against the pin.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The MQTT integration tests spawn their own broker from this binary.
+      # Distro-signed apt is acceptable provenance for a test-only dependency.
+      - name: Install mosquitto
+        run: sudo apt-get update && sudo apt-get install -y mosquitto
+
+      # Extract the wasm-bindgen-cli version from the Cargo.toml crate pin with
+      # the same sed expression the Makefile uses, so the workflow cannot drift
+      # from the crate pin. wasm-bindgen-preflight re-verifies at make time.
+      - name: Resolve wasm-bindgen pin
+        run: |
+          wbg=$(sed -n 's/^wasm-bindgen = "=\(.*\)"/\1/p' Cargo.toml)
+          test -n "$wbg" || { echo "could not extract wasm-bindgen pin from Cargo.toml"; exit 1; }
+          echo "WASM_BINDGEN_VERSION=$wbg" >> "$GITHUB_ENV"
+
+      # A toolchain bump rebuilds the tools (hashFiles on rust-toolchain.toml).
+      # Restore/save are split so the tool build (30+ min cold) is banked even
+      # when make check-ci later fails; a combined cache saves only on job success.
+      - name: Restore cargo build tools
+        id: cargo-tools-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.brenn-ci-tools
+          key: brenn-ci-tools-${{ env.WIT_BINDGEN_VERSION }}-${{ env.WASM_TOOLS_VERSION }}-${{ env.WASM_BINDGEN_VERSION }}-${{ env.NEXTEST_VERSION }}-${{ hashFiles('rust-toolchain.toml') }}
+
+      # cargo install --locked (not sha-pinned prebuilt downloads) keeps
+      # Cargo.toml authoritative for the wasm-bindgen pin.
+      - name: Install cargo build tools
+        run: |
+          root="$HOME/.brenn-ci-tools"
+          export CARGO_INSTALL_ROOT="$root"
+          mkdir -p "$root/bin"
+          export PATH="$root/bin:$PATH"
+          wit-bindgen --version 2>/dev/null | grep -qF "$WIT_BINDGEN_VERSION" \
+            || cargo install --locked wit-bindgen-cli --version "$WIT_BINDGEN_VERSION"
+          wasm-tools --version 2>/dev/null | grep -qF "$WASM_TOOLS_VERSION" \
+            || cargo install --locked wasm-tools --version "$WASM_TOOLS_VERSION"
+          wasm-bindgen --version 2>/dev/null | grep -qF "$WASM_BINDGEN_VERSION" \
+            || cargo install --locked wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION"
+          cargo nextest --version 2>/dev/null | grep -qF "$NEXTEST_VERSION" \
+            || cargo install --locked cargo-nextest --version "$NEXTEST_VERSION"
+          echo "$root/bin" >> "$GITHUB_PATH"
+
+      # Saved before make check-ci so a red gate still banks the tool build;
+      # skipped on an exact restore hit (nothing new to store).
+      - name: Save cargo build tools
+        if: steps.cargo-tools-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.brenn-ci-tools
+          key: ${{ steps.cargo-tools-cache.outputs.cache-primary-key }}
+
+      # check-ci is the Makefile's CI target: check-common minus cargo-deny,
+      # which isn't installed here.
+      - run: make check-ci
+
+  scrub:
+    name: scrub
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # Installed outside the checkout: the tree scan below must see repo content
+      # only, not the scanner's own ~30 MB of binary artifacts.
+      #
+      # The sha256 is the release's published checksum for this asset. Release
+      # assets are mutable, so the version self-check alone proves nothing — a
+      # swapped binary reports whatever version it likes and then writes the
+      # report that decides this job's verdict. The hash is the real gate; the
+      # version check stays as a secondary sanity line.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.0
+          GITLEAKS_SHA256: 79a3ab579b53f71efd634f3aaf7e04a0fa0cf206b7ed434638d1547a2470a66e
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version | grep -qx "${GITLEAKS_VERSION}"
+
+      # --exit-code 0 makes leaks a reporting outcome, so a nonzero exit here
+      # means gitleaks itself malfunctioned.
+      - name: Scan tree
+        run: |
+          "$RUNNER_TEMP/gitleaks" dir . \
+            --config .gitleaks.toml \
+            --report-format json \
+            --report-path "$RUNNER_TEMP/findings.json" \
+            --no-banner \
+            --exit-code 0 \
+            --log-level error
+
+      # `ephemeral-reference` is enforced on diffs only: the existing backlog
+      # is grandfathered and burns down as lines are touched.
+      - name: Report
+        run: |
+          count=$(jq '[.[] | select(.RuleID != "ephemeral-reference")] | length' "$RUNNER_TEMP/findings.json")
+          if [ "$count" -ne 0 ]; then
+            echo "::error::$count scrub finding(s) in tree scan"
+            jq -r '.[] | select(.RuleID != "ephemeral-reference")
+                   | "\(.File):\(.StartLine): [\(.RuleID)] \(.Description)"' "$RUNNER_TEMP/findings.json"
+            exit 1
+          fi
+          echo "clean"

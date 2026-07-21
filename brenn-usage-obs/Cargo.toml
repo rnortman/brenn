@@ -1,0 +1,21 @@
+[package]
+name = "brenn-usage-obs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "brenn-usage-obs"
+path = "src/main.rs"
+
+[dependencies]
+brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+chrono = { version = "0.4.44", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+csv = "1.4.0"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde_json = "1.0.149"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread"] }

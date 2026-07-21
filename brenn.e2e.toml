@@ -1,0 +1,442 @@
+# Hermetic server configuration for the Playwright e2e harness (`make e2e`).
+# Binds a non-dev port and writes all state under target/e2e so a run is fully
+# isolated and `rm -rf target/e2e` gives a fresh DB every time.
+
+[server]
+# Must match E2E_BASE_URL in the Makefile `e2e` target (which polls this port).
+bind_address = "127.0.0.1:3100"
+static_dir = "frontend/dist"
+surface_dist_dir = "surface/dist"
+secure_cookies = false
+public_url = "http://127.0.0.1:3100"
+
+[database]
+path = "target/e2e/brenn.db"
+
+[logging]
+log_dir = "target/e2e/logs"
+console_level = "debug"
+file_level = "debug"
+
+[claude_defaults]
+mcp_script_path = "noop_mcp.py"
+model = "sonnet"
+
+# At least one app is mandatory. This one exists only to satisfy config
+# validation; no conversation is ever started against it in e2e, and it holds
+# no grants.
+[[app]]
+slug = "e2e"
+name = "E2E"
+description = "e2e validation floor"
+icon = "🧪"
+working_dir = "."
+
+# Surface error reporting (parallel to brenn.dev.toml): admitted warn/error
+# surface `Log` reports republish onto this durable channel via the trusted
+# in-code system publisher. The e2e harness runs the noop alerter, so the alert
+# leg is covered by the native integration tests rather than the browser here.
+# Durable park/drain/resume/snapshot transport is now exercised by the bar
+# surfaces' reload-restores-content acceptance run (`bar.spec.ts`).
+[observability]
+surface_error_channel = "brenn:surface-errors"
+
+[[channel]]
+uuid = "a6e15b49-0885-4971-a036-b8d5a9ba693a"
+address = "surface-errors"
+description = "Surface client error reports (trusted republish)"
+
+# Surface self-description channels: the boot-published help/schema/index topology
+# derived from prefix "surface" over the three surfaces and their kinds. Each is
+# retained latest-wins (standing_retain_depth = 1) so a non-subscriber
+# MessageChannelGet always returns the current document.
+
+[[channel]]
+uuid = "4f8c915e-c61f-497e-940d-554a9aa8a266"
+address = "surface.index"
+description = "Surface topology index (system-published, latest-wins)"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "8298c316-1e30-4865-ba92-037937f7f4dc"
+address = "surface.surface.bar.help"
+description = "Surface help: bar"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "d071170c-5804-41d7-9a5f-4c424a471ebe"
+address = "surface.surface.bar-pixel.help"
+description = "Surface help: bar-pixel"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "9d6d95c2-5763-4a5e-a203-5b187d830d99"
+address = "surface.surface.bar-feeder.help"
+description = "Surface help: bar-feeder"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "e01edb29-0c73-475f-bc57-a2ff204d99a1"
+address = "surface.kind.protobar.help"
+description = "Component kind help: protobar"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "d557bf65-99ce-404e-b834-d232548045ba"
+address = "surface.kind.protobar.schema"
+description = "Component kind schema: protobar"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "f95e0ce1-363d-4c6b-89bf-63148106fe73"
+address = "surface.kind.echo-stub.help"
+description = "Component kind help: echo-stub"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "8c0d76ee-abac-422d-a9d4-de3b44bf9857"
+address = "surface.kind.echo-stub.schema"
+description = "Component kind schema: echo-stub"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "5e544eb5-4f75-4835-ae17-2cae2801e660"
+address = "surface.kind.chrome.help"
+description = "Component kind help: chrome"
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "4490b610-206c-4041-87e1-83d611d3a603"
+address = "surface.kind.chrome.schema"
+description = "Component kind schema: chrome"
+standing_retain_depth = 1
+
+# Per-surface runtime telemetry channels. The shell reports geometry on resize and
+# status on the heartbeat, so these receive writes forever: both retain_depth and
+# standing_retain_depth are bounded (= 1, latest-wins); the owning surface is the
+# single writer (boot-enforced).
+
+[[channel]]
+uuid = "d8f95b22-17f4-4fbe-98b0-022daf14d5a8"
+address = "surface.surface.bar.geometry"
+description = "Surface geometry: bar"
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "a6a79c4b-03c7-437c-acfd-876eefa92d19"
+address = "surface.surface.bar.status"
+description = "Surface status: bar"
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "5efc6991-39fe-4d31-af3a-9b550ed6a362"
+address = "surface.surface.bar-pixel.geometry"
+description = "Surface geometry: bar-pixel"
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "b0fb39cd-c6b0-4cc4-8ee5-8622cb0c3178"
+address = "surface.surface.bar-pixel.status"
+description = "Surface status: bar-pixel"
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "befb1315-1bbf-4bbf-b380-196d95161c0a"
+address = "surface.surface.bar-feeder.geometry"
+description = "Surface geometry: bar-feeder"
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "ad89bcfa-9004-47c7-892f-9b51291a78ae"
+address = "surface.surface.bar-feeder.status"
+description = "Surface status: bar-feeder"
+retain_depth = 1
+standing_retain_depth = 1
+
+# Bar channels (parallel to brenn.dev.toml): the durable layout + three panel
+# content channels. Durable + `retain_depth = 1` so `bar.spec.ts` can drive the
+# reload-restores-layout/content acceptance run through the snapshot path;
+# `push_depth = 8` bounds the parked backlog.
+[[channel]]
+uuid = "3c1142e7-5a7f-4781-939a-dfaa0cc8c7a0"
+address = "bar-layout"
+description = "Bar layout documents (latest-wins)"
+push_depth = 8
+retain_depth = 1
+
+[[channel]]
+uuid = "3b2ef031-f286-42e8-a9ac-c66aade0ce0a"
+address = "bar-a"
+description = "Bar panel content channel (slot a / instance p1)"
+push_depth = 8
+retain_depth = 1
+
+[[channel]]
+uuid = "2ccd9df1-08b1-4554-9745-fc3ade11ed98"
+address = "bar-b"
+description = "Bar panel content channel (slot b / instance p2)"
+push_depth = 8
+retain_depth = 1
+
+[[channel]]
+uuid = "0d0f95db-13aa-4214-a461-aa1fbf788351"
+address = "bar-c"
+description = "Bar panel content channel (slot c / instance p3)"
+push_depth = 8
+retain_depth = 1
+
+# The bar (parallel to brenn.dev.toml): three protobar panel instances bound to
+# their own durable content channels, layout driven from `brenn:bar-layout`.
+# `bar.spec.ts` drives the layout/content/reload flows against this surface.
+# Skin `bench` (1a Bench Instrument).
+[[surface]]
+slug = "bar"
+skin = "bench"
+grants = ["subscribe"]
+subscribe_acl = [
+    { exact = "bar-a" },
+    { exact = "bar-b" },
+    { exact = "bar-c" },
+    { exact = "bar-layout" },
+]
+
+[[surface.component]]
+kind = "protobar"
+instance = "p1"
+abi = "dom"
+
+[[surface.component]]
+kind = "protobar"
+instance = "p2"
+abi = "dom"
+
+[[surface.component]]
+kind = "protobar"
+instance = "p3"
+abi = "dom"
+
+# The page chrome: owns layout (from `brenn:bar-layout`), theme, banner, toasts.
+# This surface carries no `takeover` grant, so chrome binds no takeover plane.
+[[surface.component]]
+kind = "chrome"
+instance = "chrome"
+abi = "dom"
+chrome = true
+
+[[surface.subscription]]
+channel = "brenn:bar-a"
+instance = "p1"
+port = "messages"
+
+[[surface.subscription]]
+channel = "brenn:bar-b"
+instance = "p2"
+port = "messages"
+
+[[surface.subscription]]
+channel = "brenn:bar-c"
+instance = "p3"
+port = "messages"
+
+[[surface.subscription]]
+channel = "brenn:bar-layout"
+instance = "chrome"
+port = "layout"
+
+[[surface.subscription]]
+channel = "local:brenn/theme"
+instance = "chrome"
+port = "theme"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/link-state"
+instance = "chrome"
+port = "link-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/surface-state"
+instance = "chrome"
+port = "surface-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/toast"
+instance = "chrome"
+port = "toast"
+push_depth = 8
+
+# Second bar surface, identical bindings, `foundry` skin (1c Pixel Foundry) — the
+# config-selectable skin swap proven against the same channel set.
+[[surface]]
+slug = "bar-pixel"
+skin = "foundry"
+grants = ["subscribe"]
+subscribe_acl = [
+    { exact = "bar-a" },
+    { exact = "bar-b" },
+    { exact = "bar-c" },
+    { exact = "bar-layout" },
+]
+
+[[surface.component]]
+kind = "protobar"
+instance = "p1"
+abi = "dom"
+
+[[surface.component]]
+kind = "protobar"
+instance = "p2"
+abi = "dom"
+
+[[surface.component]]
+kind = "protobar"
+instance = "p3"
+abi = "dom"
+
+# The page chrome (foundry skin). Same bindings as `bar`'s chrome; no takeover.
+[[surface.component]]
+kind = "chrome"
+instance = "chrome"
+abi = "dom"
+chrome = true
+
+[[surface.subscription]]
+channel = "brenn:bar-a"
+instance = "p1"
+port = "messages"
+
+[[surface.subscription]]
+channel = "brenn:bar-b"
+instance = "p2"
+port = "messages"
+
+[[surface.subscription]]
+channel = "brenn:bar-c"
+instance = "p3"
+port = "messages"
+
+[[surface.subscription]]
+channel = "brenn:bar-layout"
+instance = "chrome"
+port = "layout"
+
+[[surface.subscription]]
+channel = "local:brenn/theme"
+instance = "chrome"
+port = "theme"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/link-state"
+instance = "chrome"
+port = "link-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/surface-state"
+instance = "chrome"
+port = "surface-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/toast"
+instance = "chrome"
+port = "toast"
+push_depth = 8
+
+# Bar feeder: browser-driven publisher for the bar — four echo-stub instances,
+# one output each onto the three content channels + the layout channel. The
+# specs type bodies / layout JSON and click send to drive the bar end-to-end.
+#
+# `grants = ["publish"]` + covering `publish_acl` + the `[[surface.output]]`
+# blocks are the durable-publish triple. No `allowed_users` ⇒ any authenticated
+# user may publish durably — harmless on this hermetic loopback harness; a
+# multi-user config copying this block MUST add `allowed_users`.
+[[surface]]
+slug = "bar-feeder"
+grants = ["publish"]
+publish_acl = [
+    { exact = "bar-a" },
+    { exact = "bar-b" },
+    { exact = "bar-c" },
+    { exact = "bar-layout" },
+]
+
+[[surface.component]]
+kind = "echo-stub"
+instance = "feed-a"
+abi = "dom"
+
+[[surface.component]]
+kind = "echo-stub"
+instance = "feed-b"
+abi = "dom"
+
+[[surface.component]]
+kind = "echo-stub"
+instance = "feed-c"
+abi = "dom"
+
+[[surface.component]]
+kind = "echo-stub"
+instance = "feed-layout"
+abi = "dom"
+
+# The page chrome. Publisher-only surface with no layout channel — chrome
+# renders the default layout; no takeover grant, so no takeover binding.
+[[surface.component]]
+kind = "chrome"
+instance = "chrome"
+abi = "dom"
+chrome = true
+
+[[surface.subscription]]
+channel = "local:brenn/theme"
+instance = "chrome"
+port = "theme"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/link-state"
+instance = "chrome"
+port = "link-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/surface-state"
+instance = "chrome"
+port = "surface-state"
+push_depth = 8
+
+[[surface.subscription]]
+channel = "local:brenn/toast"
+instance = "chrome"
+port = "toast"
+push_depth = 8
+
+[[surface.output]]
+instance = "feed-a"
+port = "out"
+channel = "brenn:bar-a"
+
+[[surface.output]]
+instance = "feed-b"
+port = "out"
+channel = "brenn:bar-b"
+
+[[surface.output]]
+instance = "feed-c"
+port = "out"
+channel = "brenn:bar-c"
+
+[[surface.output]]
+instance = "feed-layout"
+port = "out"
+channel = "brenn:bar-layout"

@@ -1,0 +1,13 @@
+[package]
+name = "brenn-surface-test-fixtures"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Canonical wire-shaped JSON fixtures (MessageEnvelope, Pos) shared by the surface client, shell, and protobar test suites"
+
+[dependencies]
+brenn-envelope = { path = "../../brenn-envelope" }
+brenn-surface-proto = { path = "../proto" }
+brenn-surface-contract = { path = "../contract" }
+serde_json = "1.0.149"
+uuid = { version = "1.23.0", features = ["serde"] }

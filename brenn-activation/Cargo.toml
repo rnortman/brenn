@@ -1,0 +1,23 @@
+[package]
+name = "brenn-activation"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The processor.wit activation carrier — one shape, every host"
+
+# Dependency-free and std-only, deliberately: both hosts depend on this crate,
+# and one of them (the surface kernel, via `brenn-surface-contract`) compiles to
+# wasm32. The envelope representation is the generic parameter precisely so this
+# crate needs no opinion about it — the wasmtime host carries envelope JSON
+# strings across the WIT boundary, the surface kernel carries typed
+# `MessageEnvelope`s.
+#
+# One optional dependency: `serde`, off by default. The surface's `dom` profile
+# crosses a JS module boundary per activation, and JSON is the codec that boundary
+# takes — so the carrier needs a derive there and nowhere else. Gated so the
+# wasmtime host keeps the dependency-free crate it has today.
+[dependencies]
+serde = { version = "1.0.228", default-features = false, features = ["derive"], optional = true }
+
+[features]
+serde = ["dep:serde"]

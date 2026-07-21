@@ -1,0 +1,1861 @@
+/* Brenn UI — productivity tool aesthetic.
+ * Left-aligned, linear, squarish. Like a TUI meets a clean web editor.
+ * No chat bubbles, no right-alignment, no rounded message balloons.
+ */
+
+/* === Reset & Base === */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html {
+    height: 100%;
+    /* Do NOT restore height: 100dvh here. On Chrome Android standalone PWA,
+     * 100dvh resolves to ~889.5px while window.innerHeight = 833px (a ~56.5px
+     * discrepancy equal to the gesture-nav-bar band). height:100% anchors to
+     * the layout viewport (= clientHeight = innerHeight = 833), which is the
+     * correct value. See docs/adr/2026/06/06-mobile-chat-input-offscreen/. */
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    background: #1a1a2e;
+    color: #d0d0d8;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* === Header === */
+
+.app-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 1rem;
+    background: #141427;
+    border-bottom: 1px solid #2a2a40;
+    flex-shrink: 0;
+}
+
+.app-header .brand {
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: #e94560;
+    letter-spacing: 0.05em;
+    text-transform: lowercase;
+    text-decoration: none;
+}
+
+.app-header .brand:hover {
+    color: #ff6080;
+}
+
+.app-header .spacer {
+    flex: 1;
+}
+
+.app-header .user {
+    color: #808098;
+    font-size: 0.85rem;
+}
+
+.app-header .logout-form {
+    display: inline;
+}
+
+.app-header .logout-btn {
+    background: transparent;
+    color: #808098;
+    border: 1px solid #2a2a40;
+    padding: 0.35rem 0.75rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    min-height: 44px;
+}
+
+.app-header .logout-btn:hover {
+    color: #e94560;
+    border-color: #e94560;
+}
+
+/* === App Selector (Landing Page) === */
+
+.app-selector {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+}
+
+.app-selector__content {
+    width: 100%;
+    max-width: 480px;
+    margin: 0 auto;
+    padding: 3rem 1.5rem max(3rem, env(safe-area-inset-bottom));
+}
+
+.app-selector h1 {
+    font-size: 1rem;
+    font-weight: 400;
+    color: #808098;
+    margin-bottom: 1.5rem;
+}
+
+.app-selector ul {
+    list-style: none;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.app-selector li a {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 1rem 1.25rem;
+    background: #16213e;
+    border: 1px solid #2a2a40;
+    color: #d0d0d8;
+    text-decoration: none;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.app-selector li a:visited {
+    color: #d0d0d8;
+}
+
+.app-selector li a:hover {
+    border-color: #e94560;
+    color: #fff;
+    background: #1a2744;
+}
+
+.app-selector li a:active {
+    background: #1e2d50;
+}
+
+.app-selector .app-icon {
+    font-size: 1.75rem;
+    line-height: 1;
+    flex-shrink: 0;
+    width: 2.25rem;
+    text-align: center;
+}
+
+.app-selector .app-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 0;
+}
+
+.app-selector .app-name {
+    font-size: 1.05rem;
+    font-weight: 500;
+}
+
+.app-selector .app-desc {
+    font-size: 0.85rem;
+    color: #808098;
+    line-height: 1.4;
+}
+
+.app-selector p {
+    color: #808098;
+    text-align: center;
+}
+
+/* === App Layout === */
+
+brenn-app {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+}
+
+.app-layout {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+}
+
+.app-main {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+}
+
+/* === Top Bar (sidebar toggle + new conversation) === */
+
+.app-topbar {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.25rem 0.5rem;
+    background: #141427;
+    border-bottom: 1px solid #2a2a40;
+    flex-shrink: 0;
+}
+
+.sidebar-toggle,
+.new-conv-btn {
+    background: transparent;
+    border: 1px solid #2a2a40;
+    color: #808098;
+    font-size: 1rem;
+    cursor: pointer;
+    padding: 0.35rem 0.6rem;
+    min-height: 36px;
+    min-width: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.sidebar-toggle:hover,
+.new-conv-btn:hover,
+.files-toggle:hover,
+.tasks-toggle:hover {
+    color: #d0d0d8;
+    border-color: #4a6fa5;
+}
+
+.files-toggle,
+.tasks-toggle {
+    background: transparent;
+    border: 1px solid #2a2a40;
+    color: #808098;
+    font-size: 0.8rem;
+    cursor: pointer;
+    padding: 0.35rem 0.6rem;
+    min-height: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* === Privacy Toggle (multiuser) === */
+
+.privacy-toggle {
+    background: transparent;
+    border: 1px solid #2a2a40;
+    color: #808098;
+    font-size: 0.8rem;
+    cursor: pointer;
+    padding: 0.35rem 0.6rem;
+    min-height: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: auto;
+}
+
+.privacy-toggle:hover {
+    color: #d0d0d8;
+    border-color: #4a6fa5;
+}
+
+.privacy-badge {
+    color: #606078;
+    font-size: 0.8rem;
+    padding: 0.35rem 0.6rem;
+    display: flex;
+    align-items: center;
+    margin-left: auto;
+}
+
+/* === User Menu Dropdown === */
+
+.user-menu-wrapper {
+    position: relative;
+    margin-left: auto;
+}
+
+.user-menu-trigger {
+    background: transparent;
+    border: 1px solid #2a2a40;
+    color: #808098;
+    font-size: 0.8rem;
+    cursor: pointer;
+    padding: 0.35rem 0.6rem;
+    min-height: 36px;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    white-space: nowrap;
+}
+
+.user-menu-trigger:hover {
+    color: #d0d0d8;
+    border-color: #4a6fa5;
+}
+
+.user-menu-dropdown {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 4px);
+    background: #1a1a2e;
+    border: 1px solid #2a2a40;
+    min-width: 200px;
+    z-index: 100;
+    display: flex;
+    flex-direction: column;
+}
+
+.user-menu-item {
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid #2a2a40;
+    color: #808098;
+    font-size: 0.85rem;
+    cursor: pointer;
+    padding: 0.6rem 0.9rem;
+    text-align: left;
+    width: 100%;
+    display: block;
+}
+
+.user-menu-item:last-child {
+    border-bottom: none;
+}
+
+.user-menu-item:hover:not(:disabled) {
+    color: #d0d0d8;
+    background: #22223a;
+}
+
+.user-menu-item:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.user-menu-dropdown .logout-form {
+    display: block;
+}
+
+/* === Sidebar Overlay (mobile) === */
+
+@media (max-width: 768px) {
+    brenn-conversation-list {
+        position: absolute;
+        top: 0;
+        left: 0;
+        height: 100%;
+        z-index: 100;
+        box-shadow: 4px 0 20px rgba(0, 0, 0, 0.5);
+    }
+}
+
+/* === Pane Layout (content area handled by <brenn-pane-layout>) === */
+
+brenn-pane-layout {
+    flex: 1;
+    min-height: 0;
+}
+
+/* Secondary slot wrapper (TwoColumn) — must fill the slot and propagate flex
+   layout so child components (file-picker, file-viewer) size correctly. */
+.secondary-content {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+}
+
+/* Tab bar for switching between todo list and files in the secondary pane. */
+.secondary-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid #2a2a40;
+    background: #161628;
+    flex-shrink: 0;
+}
+
+.secondary-tab {
+    padding: 0.4rem 1rem;
+    font-size: 0.8rem;
+    color: #808098;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+}
+
+.secondary-tab:hover {
+    color: #d0d0d8;
+}
+
+.secondary-tab[aria-selected="true"] {
+    color: #d0d0d8;
+    border-bottom-color: #4a6fa5;
+}
+
+/* Mobile slot wrapper (SinglePane) — all content shares this container. */
+.mobile-slot-content {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+}
+
+/* === Message List === */
+/* All message-list styles are in the component's shadow DOM (message-list.ts).
+   Host layout is defined via :host in the component — nothing needed here. */
+
+/* === Presence Bar === */
+
+.presence-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.4em;
+    padding: 0.25rem 1rem;
+    font-size: 0.8rem;
+    color: #9090a8;
+    background: #141427;
+    border-bottom: 1px solid #2a2a40;
+    flex-shrink: 0;
+}
+
+.presence-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #4caf50;
+    display: inline-block;
+    flex-shrink: 0;
+}
+
+/* === Steal Bar (single-instance enforcement) === */
+
+.steal-bar {
+    display: flex;
+    justify-content: center;
+    padding: 0.5rem;
+    flex-shrink: 0;
+}
+
+.steal-btn {
+    background: #2d2a1a;
+    border: 1px solid #e0a830;
+    color: #f0c674;
+    font-size: 0.9rem;
+    cursor: pointer;
+    padding: 0.5rem 1.2rem;
+    border-radius: 4px;
+}
+
+.steal-btn:hover {
+    background: #3d3520;
+    border-color: #f0c674;
+    color: #fff;
+}
+
+/* === Status Bar (host layout) === */
+
+brenn-status-bar {
+    display: block;
+    flex-shrink: 0;
+    min-height: 1.5rem;
+}
+
+.status {
+    text-align: center;
+    color: #808098;
+    font-size: 0.85rem;
+    padding: 0.25rem;
+}
+
+.status-error {
+    color: #e94560;
+}
+
+.status-disconnected {
+    color: #e94560;
+}
+
+.cost-usage {
+    font-variant-numeric: tabular-nums;
+    opacity: 0.85;
+}
+
+.context-usage {
+    cursor: pointer;
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
+}
+
+.context-usage:hover {
+    text-decoration: underline solid;
+}
+
+.context-yellow {
+    color: #d4a017;
+}
+
+.context-red {
+    color: #e94560;
+}
+
+.perm-mode {
+    font-variant: small-caps;
+    opacity: 0.75;
+}
+
+.perm-mode-warn {
+    color: #e94560;  /* same warn red as .context-red */
+    opacity: 1;
+    font-weight: 600;
+}
+
+/* === Approval Container + Tool Approve === */
+
+brenn-approval-container {
+    display: block;
+}
+
+brenn-approval-container:not([visible]) {
+    display: none;
+}
+
+.approval-card {
+    margin: 0.5rem 1rem;
+    border: 1px solid #e94560;
+    background: #1e1e35;
+    max-width: 80ch;
+}
+
+.approval-header {
+    padding: 0.5rem 1rem;
+    font-weight: 600;
+    color: #e94560;
+    font-size: 0.9rem;
+    border-bottom: 1px solid #2a2a40;
+}
+
+.approval-queue-counter {
+    font-weight: 400;
+    color: #888;
+    font-size: 0.8rem;
+    margin-left: 0.5rem;
+}
+
+.approval-detail {
+    padding: 0.75rem 1rem;
+    overflow-x: auto;
+}
+
+/* Tool-specific formatting classes (set by backend HTML). */
+.tool-code {
+    background: #141427;
+    padding: 0.5rem;
+    border: 1px solid #2a2a40;
+    overflow-x: auto;
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.9rem;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+.tool-file {
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.85rem;
+    color: #4a6fa5;
+    margin-bottom: 0.5rem;
+}
+
+.tool-export-warn {
+    color: #e6a817;
+    font-size: 0.85rem;
+    margin-top: 0.25rem;
+    padding: 0.25rem 0.5rem;
+    border-left: 3px solid #e6a817;
+    background: #2d2a1a;
+}
+
+.tool-diff {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.tool-diff-old pre {
+    background: #2d1a24;
+    border-left: 3px solid #e94560;
+    padding: 0.5rem;
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.85rem;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+.tool-diff-new pre {
+    background: #1a2d24;
+    border-left: 3px solid #2ecc71;
+    padding: 0.5rem;
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.85rem;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+.approval-actions {
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    border-top: 1px solid #2a2a40;
+}
+
+.approval-allow {
+    padding: 0.5rem 1.25rem;
+    background: #2ecc71;
+    color: white;
+    border: none;
+    cursor: pointer;
+    font-size: 0.9rem;
+    min-height: 44px;
+}
+
+.approval-allow:hover {
+    background: #27ae60;
+}
+
+.approval-deny {
+    padding: 0.5rem 1.25rem;
+    background: #e74c3c;
+    color: white;
+    border: none;
+    cursor: pointer;
+    font-size: 0.9rem;
+    min-height: 44px;
+}
+
+.approval-deny:hover {
+    background: #c0392b;
+}
+
+.approval-allow:focus,
+.approval-deny:focus,
+.approval-always-allow:focus,
+.approval-scope-btn:focus,
+.approval-cancel:focus {
+    outline: 2px solid #d0d0d8;
+    outline-offset: 2px;
+}
+
+.approval-always-allow {
+    padding: 0.5rem 1.25rem;
+    background: #3498db;
+    color: white;
+    border: none;
+    cursor: pointer;
+    font-size: 0.9rem;
+    min-height: 44px;
+}
+
+.approval-always-allow:hover {
+    background: #2980b9;
+}
+
+.approval-always-panel {
+    padding: 0.5rem 1rem;
+    border-top: 1px solid #2a2a40;
+}
+
+.approval-pattern-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.approval-pattern-label {
+    font-size: 0.85rem;
+    color: #a0a0b0;
+    white-space: nowrap;
+}
+
+.approval-pattern-input {
+    flex: 1;
+    padding: 0.4rem 0.5rem;
+    background: #141427;
+    color: #d0d0d8;
+    border: 1px solid #3a3a50;
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.85rem;
+}
+
+.approval-pattern-input:focus {
+    border-color: #3498db;
+    outline: none;
+}
+
+.approval-rule-error {
+    color: #e94560;
+    font-size: 0.8rem;
+    margin-bottom: 0.5rem;
+    padding: 0.25rem 0.5rem;
+    background: #2d1a24;
+    border-left: 3px solid #e94560;
+}
+
+.approval-scope-btn {
+    padding: 0.5rem 1.25rem;
+    background: #2ecc71;
+    color: white;
+    border: none;
+    cursor: pointer;
+    font-size: 0.9rem;
+    min-height: 44px;
+}
+
+.approval-scope-btn:hover {
+    background: #27ae60;
+}
+
+.approval-scope-permanent {
+    background: #e67e22;
+}
+
+.approval-scope-permanent:hover {
+    background: #d35400;
+}
+
+.approval-cancel {
+    padding: 0.5rem 1.25rem;
+    background: #555;
+    color: white;
+    border: none;
+    cursor: pointer;
+    font-size: 0.9rem;
+    min-height: 44px;
+}
+
+.approval-cancel:hover {
+    background: #666;
+}
+
+/* --- Deny reason panel --- */
+
+.approval-deny-panel {
+    padding: 0.5rem 1rem;
+    border-top: 1px solid #2a2a40;
+}
+
+.approval-deny-input-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.approval-deny-input {
+    flex: 1;
+    padding: 0.4rem 0.5rem;
+    background: #141427;
+    color: #d0d0d8;
+    border: 1px solid #3a3a50;
+    font-family: inherit;
+    font-size: 0.85rem;
+}
+
+.approval-deny-input:focus {
+    border-color: #e74c3c;
+    outline: none;
+}
+
+.approval-deny-input::placeholder {
+    color: #606078;
+}
+
+.approval-deny-submit-icon {
+    padding: 0.4rem 0.6rem;
+    background: #e74c3c;
+    color: white;
+    border: none;
+    cursor: pointer;
+    font-size: 0.85rem;
+    min-height: 32px;
+    line-height: 1;
+}
+
+.approval-deny-submit-icon:hover {
+    background: #c0392b;
+}
+
+.approval-deny-disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* === Input Bar === */
+
+brenn-input-bar {
+    display: block;
+    flex-shrink: 0;
+    border-top: 1px solid #2a2a40;
+    /* Safe-area rider: currently a no-op (safe-area-inset-bottom = "0px" on all
+     * measured devices). Becomes load-bearing if Chrome's edge-to-edge rollout
+     * makes innerHeight include the gesture band with a nonzero inset. */
+    padding-bottom: env(safe-area-inset-bottom);
+}
+
+.input-form {
+    padding: 0.5rem 0.75rem;
+}
+
+/* File inputs are triggered programmatically; never shown. Kept out of an inline
+ * style= attribute so the page works under CSP style-src 'self' (no
+ * 'unsafe-inline'). */
+.input-form .hidden-file-input {
+    display: none;
+}
+
+.input-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: flex-end;
+}
+
+.input-form textarea {
+    flex: 1;
+    min-width: 0;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid #2a2a40;
+    background: #141427;
+    color: #d0d0d8;
+    font-family: inherit;
+    font-size: 1rem;
+    resize: none;
+    line-height: 1.4;
+    height: auto;
+    max-height: 120px;
+    overflow-y: hidden;
+    box-sizing: border-box;
+}
+
+.input-form textarea:focus {
+    outline: none;
+    border-color: #4a6fa5;
+}
+
+.input-form textarea:disabled {
+    opacity: 0.5;
+}
+
+.input-hint-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 2px 4px;
+}
+
+.input-hint {
+    font-size: 11px;
+    color: #606078;
+    cursor: pointer;
+    user-select: none;
+}
+
+.input-hint:hover {
+    color: #a0a0b0;
+}
+
+.model-picker {
+    font-size: 11px;
+    color: #606078;
+    cursor: pointer;
+    user-select: none;
+}
+
+.model-picker:hover {
+    color: #a0a0b0;
+}
+
+/* Send button: compact arrow icon, always visible */
+.send-btn {
+    padding: 0.25rem 0.5rem;
+    background: transparent;
+    color: #808098;
+    border: 1px solid #2a2a40;
+    font-size: 1.1rem;
+    cursor: pointer;
+    min-height: 32px;
+    min-width: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    align-self: flex-end;
+}
+
+.send-btn:hover {
+    color: #d0d0d8;
+    border-color: #4a6fa5;
+}
+
+.send-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+.send-btn:focus {
+    outline: 2px solid #d0d0d8;
+    outline-offset: 2px;
+}
+
+/* Stop mode: square icon with accent color */
+.send-btn.stop-mode {
+    color: #e07050;
+    border-color: #e07050;
+}
+
+.send-btn.stop-mode:hover {
+    color: #ff8060;
+    border-color: #ff8060;
+}
+
+/* Menu button: replaces attach + camera buttons */
+.menu-anchor {
+    position: relative;
+    align-self: flex-end;
+}
+
+.menu-btn {
+    padding: 0.25rem 0.5rem;
+    background: transparent;
+    color: #808098;
+    border: 1px solid #2a2a40;
+    font-size: 1.2rem;
+    cursor: pointer;
+    min-height: 48px;
+    min-width: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.menu-btn:hover {
+    color: #d0d0d8;
+    border-color: #4a6fa5;
+}
+
+/* Bottom menu popup */
+.bottom-menu-popup {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    margin-bottom: 4px;
+    background: #1a1a2e;
+    border: 1px solid #2a2a40;
+    border-radius: 6px;
+    min-width: 200px;
+    max-height: 70vh;
+    overflow-y: auto;
+    z-index: 200;
+    box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.menu-item {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    width: 100%;
+    min-height: 48px;
+    padding: 0 1rem;
+    background: none;
+    border: none;
+    color: #d0d0d8;
+    font-size: 0.95rem;
+    cursor: pointer;
+    text-align: left;
+}
+
+.menu-item:hover {
+    background: #2a2a40;
+}
+
+.menu-item + .menu-item {
+    border-top: 1px solid #2a2a40;
+}
+
+.menu-item-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.5rem;
+    font-size: 1rem;
+}
+
+/* Camera menu item: hidden on desktop */
+@media (min-width: 601px) {
+    .camera-menu-item { display: none; }
+}
+
+/* Attachment preview strip above textarea */
+.attachment-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    padding: 0.25rem 0;
+    max-height: 120px;
+    overflow-y: auto;
+}
+
+.attachment-chip {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.2rem 0.4rem;
+    background: #1a1a30;
+    border: 1px solid #3a3a50;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    color: #a0a0b8;
+}
+
+.attachment-chip.uploading {
+    opacity: 0.6;
+}
+
+.attachment-chip.error {
+    border-color: #e94560;
+}
+
+.attachment-thumb {
+    max-width: 40px;
+    max-height: 40px;
+    border-radius: 2px;
+}
+
+.attachment-icon {
+    font-size: 1rem;
+}
+
+.attachment-name {
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.attachment-uploading {
+    color: #606078;
+}
+
+.attachment-error {
+    color: #e94560;
+}
+
+.attachment-remove {
+    background: none;
+    border: none;
+    color: #707088;
+    cursor: pointer;
+    font-size: 0.9rem;
+    padding: 0 2px;
+}
+
+.attachment-remove:hover {
+    color: #e94560;
+}
+
+/* Drag-over visual feedback on the input form */
+.input-form.drag-over {
+    border-color: #4a6fa5;
+    background: #1e1e35;
+}
+
+/* === Mobile === */
+
+/* IMPORTANT: Phase-1 patch rules for .app-header and .input-form MUST live in
+ * this @media (max-width:600px) block, not in the @media (max-width:768px) block
+ * at ~line 346. Both breakpoints match on 411px-wide devices; the later source
+ * position of this block is what ensures the Phase-1 rules win the cascade for
+ * properties (like padding/display) the two blocks share. Moving them above line
+ * ~346 would silently lose on any device where the 600px block is also active.
+ * See design-patchfix.md §2 Correction 2. */
+@media (max-width: 600px) {
+    /* .app-header { padding } intentionally omitted: display:none (Phase-1,
+     * below) makes it irrelevant; restore here if ever un-hiding on mobile. */
+
+    .approval-card {
+        margin: 0.5rem;
+        max-width: 100%;
+    }
+
+    /* .input-form { padding: 0.5rem } intentionally omitted: the Phase-1 rule
+     * below (0.25rem 0.5rem) wholly supersedes it. */
+
+    .input-form textarea {
+        max-height: 4rem;
+    }
+
+    /* Phase-1 mobile patch: close static-layout overflow on ≤600px viewports.
+     * See design-patchfix.md §2. */
+
+    /* Hide redundant body-level brand bar; brenn-app expands to fill. */
+    .app-header { display: none; }
+
+    /* Match 48px toggles to the 36px floor already used by row siblings. */
+    .files-toggle,
+    .tasks-toggle,
+    .privacy-toggle { min-height: 36px; }
+
+    /* Reduce topbar vertical padding. */
+    .app-topbar { padding-top: 0.1rem; padding-bottom: 0.1rem; }
+
+    /* Reduce input-form vertical padding (overrides base 0.75rem horizontal;
+     * vertical only is the height lever). */
+    .input-form { padding: 0.25rem 0.5rem; }
+
+}
+
+/* --------------------------------------------------------------------------
+ * pfin — reconcile transaction card (rendered by backend, displayed in
+ * <brenn-tool-approve> approval container).
+ * -------------------------------------------------------------------------- */
+
+.pfin-reconcile {
+    padding: 0.75rem 1rem;
+}
+
+.pfin-reconcile-header {
+    display: flex;
+    gap: 0.75rem;
+    align-items: baseline;
+    margin-bottom: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.pfin-reconcile-op {
+    font-size: 0.8rem;
+    color: #a0a0b0;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+}
+
+.pfin-reconcile-date {
+    color: #a0a0b0;
+    font-size: 0.9rem;
+}
+
+.pfin-reconcile-desc {
+    font-weight: 600;
+    font-size: 0.9rem;
+}
+
+.pfin-splits {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.25rem 0;
+}
+
+.pfin-splits tr + tr {
+    border-top: 1px solid #2a2a40;
+}
+
+.pfin-splits td {
+    padding: 0.35rem 0.5rem;
+}
+
+.pfin-split-account {
+    font-size: 1rem;
+}
+
+.pfin-split-amount {
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.9rem;
+    text-align: right;
+    white-space: nowrap;
+}
+
+.pfin-debit {
+    color: var(--pfin-debit, #e06c75);
+}
+
+.pfin-credit {
+    color: var(--pfin-credit, #98c379);
+}
+
+.pfin-split-memo {
+    color: #a0a0b0;
+    font-size: 0.85rem;
+    font-style: italic;
+}
+
+.pfin-reconcile-ref {
+    color: #707080;
+    font-size: 0.8rem;
+    margin-top: 0.5rem;
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+}
+
+/* -- pfin propose: multi-choice proposal cards -- */
+
+brenn-pfin-propose:focus {
+    outline: none;
+}
+
+.pfin-import-header {
+    background: #1a1a2e;
+    border: 1px solid #2a2a40;
+    border-left: 3px solid #e5c07b;
+    border-radius: 4px;
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.75rem;
+}
+
+.pfin-import-summary {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 1rem;
+}
+
+.pfin-import-payee {
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--fg, #cdd6f4);
+}
+
+.pfin-import-amount {
+    font-weight: 600;
+    font-size: 0.95rem;
+    white-space: nowrap;
+}
+
+.pfin-import-detail {
+    display: flex;
+    gap: 1.5rem;
+    margin-top: 0.25rem;
+    font-size: 0.8rem;
+    color: #707080;
+}
+
+.pfin-proposal-number {
+    display: inline-block;
+    width: 1.5em;
+    text-align: center;
+    opacity: 0.5;
+    font-family: monospace;
+    font-size: 0.85rem;
+}
+
+.pfin-proposal {
+    cursor: pointer;
+    border: 1px solid #2a2a40;
+    border-radius: 6px;
+    margin: 0.35rem 0;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.pfin-proposal:hover {
+    border-color: #4a4a60;
+}
+
+.pfin-proposal-focused {
+    border-color: var(--accent, #61afef);
+    box-shadow: 0 0 0 1px var(--accent, #61afef);
+}
+
+.pfin-proposal-label {
+    padding: 0.4rem 0.75rem 0;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--accent, #61afef);
+}
+
+/* Compact proposal splits (counterparty accounts only) */
+.pfin-proposal-splits {
+    padding: 0.2rem 0.75rem 0.4rem;
+}
+
+.pfin-proposal-split {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    padding: 0.1rem 0;
+    padding-left: 1.5em; /* align with label text past the number badge */
+}
+
+.pfin-proposal-split .pfin-split-account {
+    font-size: 1rem;
+    color: #b0b0c0;
+}
+
+.pfin-proposal-split .pfin-split-amount {
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.95rem;
+    white-space: nowrap;
+}
+
+.pfin-proposal-split .pfin-split-memo {
+    color: #707080;
+    font-size: 0.8rem;
+    font-style: italic;
+}
+
+.pfin-propose-deny {
+    margin-top: 0.5rem;
+}
+
+.pfin-propose-deny-input {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    background: var(--input-bg, #1e1e2e);
+    color: var(--fg, #cdd6f4);
+    border: 1px solid #3a3a50;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    outline: none;
+    box-sizing: border-box;
+}
+
+.pfin-propose-deny-input:focus {
+    border-color: var(--accent, #61afef);
+}
+
+.pfin-propose-deny-input::placeholder {
+    color: #707080;
+}
+
+/* Action bar (Deny button below the proposal cards). Buttons reuse
+   `.pfin-batch-btn` / `.pfin-batch-submit` so the propose component shares
+   one button vocabulary with the rest of pfin. */
+.pfin-propose-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 0.5rem;
+}
+
+/* Action bar inside deny mode: Cancel + Send. */
+.pfin-propose-deny-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+}
+
+/* Tint the Deny entry button red so it reads as destructive without
+   shouting. The double-class selector raises specificity above the bare
+   `.pfin-batch-btn:hover` rule defined later in this file so the colors
+   here win regardless of source order. Everything else (background
+   bump, transition) is inherited from `.pfin-batch-btn`. */
+.pfin-batch-btn.pfin-propose-deny-btn:hover:not(:disabled) {
+    color: #e55;
+    border-color: #e55;
+}
+
+/* ==========================================================================
+   Batch Reconcile — Desktop Table
+   ========================================================================== */
+
+.pfin-batch-table,
+.pfin-batch-assign-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+    margin: 0.5rem 0;
+}
+
+.pfin-batch-table thead th,
+.pfin-batch-assign-table thead th {
+    text-align: left;
+    font-weight: 500;
+    color: #808090;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.25rem 0.5rem;
+    border-bottom: 1px solid #333;
+}
+
+.pfin-batch-th-actions {
+    width: 4rem;
+}
+
+.pfin-batch-row,
+.pfin-batch-assign-row {
+    border-bottom: 1px solid #2a2a3a;
+    transition: background-color 0.15s ease;
+}
+
+.pfin-batch-row:hover,
+.pfin-batch-assign-row:hover {
+    background-color: #1e1e2e;
+}
+
+.pfin-batch-focused {
+    outline: 1px solid var(--accent, #61afef);
+    outline-offset: -1px;
+}
+
+.pfin-batch-row td,
+.pfin-batch-assign-row td {
+    padding: 0.35rem 0.5rem;
+    vertical-align: middle;
+}
+
+/* --- Primary tier: all equal visual weight --- */
+
+.pfin-batch-payee-name {
+    font-weight: 500;
+}
+
+.pfin-batch-date {
+    color: #808090;
+    font-size: 0.85em;
+    margin-left: 0.5em;
+}
+
+.pfin-batch-amount {
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    text-align: right;
+    white-space: nowrap;
+}
+
+/* Import account and memo — same tier as payee/amount. */
+.pfin-batch-import-account {
+    color: #a0a0b0;
+}
+
+.pfin-batch-import-memo {
+    color: #d0d0e0;
+}
+
+/* Transaction description — same tier. */
+.pfin-batch-desc {
+    display: block;
+    margin-bottom: 0.2rem;
+}
+
+/* Counterparty splits — accounts and amounts at same tier. */
+.pfin-batch-splits {
+    margin-top: 0.15rem;
+}
+
+.pfin-batch-split {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5em;
+    line-height: 1.4;
+}
+
+.pfin-batch-split-account {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.pfin-batch-split-amount {
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    white-space: nowrap;
+}
+
+/* --- Secondary tier: smaller, muted --- */
+
+.pfin-batch-split-memo {
+    color: #808090;
+    font-size: 0.85em;
+    font-style: italic;
+}
+
+.pfin-batch-info {
+    color: #808090;
+    font-size: 0.85em;
+    margin-top: 0.25rem;
+    font-style: italic;
+}
+
+/* Accept/reject buttons in each row. */
+.pfin-batch-actions {
+    text-align: center;
+    white-space: nowrap;
+}
+
+.pfin-batch-accept,
+.pfin-batch-reject {
+    background: none;
+    border: 1px solid #444;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    padding: 0.15rem 0.4rem;
+    margin: 0 0.1rem;
+    color: #888;
+    transition: all 0.15s ease;
+}
+
+.pfin-batch-accept:hover {
+    color: #4a9;
+    border-color: #4a9;
+}
+
+.pfin-batch-reject:hover {
+    color: #e55;
+    border-color: #e55;
+}
+
+/* Row states. */
+.pfin-batch-accepted {
+    background-color: rgba(68, 170, 153, 0.1);
+}
+
+.pfin-batch-accepted .pfin-batch-accept {
+    color: #4a9;
+    border-color: #4a9;
+    background-color: rgba(68, 170, 153, 0.15);
+}
+
+.pfin-batch-rejected {
+    background-color: rgba(238, 85, 85, 0.06);
+}
+
+.pfin-batch-rejected .pfin-batch-reject {
+    color: #e55;
+    border-color: #e55;
+    background-color: rgba(238, 85, 85, 0.15);
+}
+
+.pfin-batch-rejected .pfin-batch-payee-name,
+.pfin-batch-rejected .pfin-batch-desc,
+.pfin-batch-rejected .pfin-batch-split-account,
+.pfin-batch-rejected .pfin-batch-amount {
+    opacity: 0.5;
+    text-decoration: line-through;
+}
+
+/* Controls bar below the table. */
+.pfin-batch-controls {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem 0;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.pfin-batch-tally {
+    color: #a0a0b0;
+    font-size: 0.85rem;
+}
+
+.pfin-batch-tally-accept {
+    color: #4a9;
+}
+
+.pfin-batch-tally-reject {
+    color: #e55;
+}
+
+.pfin-batch-buttons {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.pfin-batch-btn {
+    background: #2a2a3a;
+    border: 1px solid #444;
+    border-radius: 4px;
+    color: #d0d0e0;
+    cursor: pointer;
+    font-size: 0.8rem;
+    padding: 0.3rem 0.7rem;
+    transition: all 0.15s ease;
+}
+
+.pfin-batch-btn:hover:not(:disabled) {
+    background: #3a3a4a;
+    border-color: #666;
+}
+
+.pfin-batch-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.pfin-batch-submit {
+    background: var(--accent, #61afef);
+    border-color: var(--accent, #61afef);
+    color: #000;
+    font-weight: 600;
+}
+
+.pfin-batch-submit:hover:not(:disabled) {
+    filter: brightness(1.1);
+}
+
+/* ==========================================================================
+   Batch Reconcile — Mobile Swipe
+   ========================================================================== */
+
+.pfin-batch-swipe-item {
+    position: relative;
+    margin: 0.5rem 0;
+    overflow: hidden;
+    border-radius: 6px;
+    max-height: 200px; /* for collapse animation */
+}
+
+/* Reveal layers sit behind the card. */
+.pfin-batch-reveal {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    font-size: 1.2rem;
+    font-weight: 600;
+    opacity: 0;
+    transition: opacity 0.1s ease;
+}
+
+.pfin-batch-reveal-accept {
+    background-color: rgba(68, 170, 153, 0.3);
+    color: #4a9;
+}
+
+.pfin-batch-reveal-reject {
+    background-color: rgba(238, 85, 85, 0.3);
+    color: #e55;
+}
+
+.pfin-batch-reveal-icon {
+    font-size: 1.5rem;
+    transition: transform 0.15s ease;
+}
+
+.pfin-batch-reveal-label {
+    opacity: 0;
+    transition: opacity 0.15s ease;
+}
+
+/* The card content layer. */
+.pfin-batch-card {
+    position: relative;
+    background: #1e1e2e;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 0.75rem;
+    z-index: 1;
+    cursor: grab;
+    user-select: none;
+    transition: border-color 0.15s ease;
+}
+
+.pfin-batch-card:active {
+    cursor: grabbing;
+}
+
+.pfin-batch-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+}
+
+.pfin-batch-card-header .pfin-batch-payee-name {
+    font-weight: 600;
+}
+
+/* Import detail line (account, memo) within swipe cards. */
+.pfin-batch-import-detail {
+    margin-bottom: 0.2rem;
+}
+
+.pfin-batch-card .pfin-batch-import-detail,
+.pfin-batch-assign-card .pfin-batch-import-detail {
+    display: flex;
+    gap: 0.75em;
+    flex-wrap: wrap;
+}
+
+/* Separator between import section and categorization section. */
+.pfin-batch-card .pfin-batch-desc,
+.pfin-batch-card .pfin-batch-splits {
+    border-top: 1px solid #2a2a3a;
+    padding-top: 0.3rem;
+    margin-top: 0.3rem;
+}
+
+/* No double border when description precedes splits. */
+.pfin-batch-card .pfin-batch-desc + .pfin-batch-splits {
+    border-top: none;
+    padding-top: 0;
+    margin-top: 0;
+}
+
+.pfin-batch-card .pfin-batch-split {
+    flex-wrap: wrap;
+}
+
+.pfin-batch-card .pfin-batch-split-account {
+    color: #d0d0e0;
+}
+
+.pfin-batch-card .pfin-batch-split-memo {
+    width: 100%;
+    padding-left: 1em;
+}
+
+/* Info within swipe cards. */
+.pfin-batch-card .pfin-batch-info {
+    border-top: 1px solid #2a2a3a;
+    padding-top: 0.25rem;
+    margin-top: 0.3rem;
+}
+
+/* Controls below the swipe stack. */
+.pfin-batch-swipe-controls {
+    padding: 0.75rem 0;
+}
+
+.pfin-batch-swipe-tally {
+    color: #a0a0b0;
+    font-size: 0.85rem;
+    margin-bottom: 0.5rem;
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+}
+
+.pfin-batch-swipe-remaining {
+    color: #d0d0e0;
+}
+
+/* ==========================================================================
+   Batch Assign — additions on top of the shared .pfin-batch-* rules.
+   The assign UI deliberately shows less information per row than the
+   reconcile UI, so most styling is inherited; these rules just specialize
+   a few elements (header, account, notes/info).
+   ========================================================================== */
+
+/* Header line above the table/swipe stack: "Assign N imports to @user". */
+.pfin-batch-assign-header {
+    color: #a0a0b0;
+    font-size: 0.9rem;
+    margin: 0.4rem 0 0.3rem;
+}
+
+.pfin-batch-assign-user {
+    color: var(--accent, #61afef);
+    font-weight: 500;
+}
+
+/* Importing account name (subdued, smaller, sits under payee). */
+.pfin-batch-assign-account {
+    color: #a0a0b0;
+    font-size: 0.85em;
+    margin-top: 0.1rem;
+}
+
+/* "+ note: ..." — what will be appended via --notes. */
+.pfin-batch-assign-notes {
+    color: #d0d0e0;
+    font-size: 0.85em;
+    font-style: italic;
+    margin-top: 0.1rem;
+}
+
+/* Optional rationale from the LLM (NOT persisted to pfin). */
+.pfin-batch-assign-info {
+    color: #808090;
+    font-size: 0.85em;
+    font-style: italic;
+    margin-top: 0.1rem;
+}
+
+/* Mobile card variant inherits .pfin-batch-card styling; this hook lets
+   designers specialize density (display/gap/flex-wrap come from the shared
+   .pfin-batch-card .pfin-batch-import-detail rule above). */
+.pfin-batch-assign-card .pfin-batch-import-detail {
+    color: #a0a0b0;
+    font-size: 0.85em;
+    margin-top: 0.2rem;
+}
+
+/* Shared batch CSS variables. */
+:root {
+    --pfin-batch-accept-color: #4a9;
+    --pfin-batch-reject-color: #e55;
+}
+
+/* === Task Selection Chip Bar === */
+
+.chip-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    padding: 0.4rem 0.75rem;
+    background: #161628;
+    border-top: 1px solid #2a2a40;
+    align-items: center;
+}
+
+.task-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    background: #1e2a3e;
+    border: 1px solid #2a3a50;
+    border-radius: 3px;
+    padding: 0.15rem 0.4rem;
+    font-size: 0.8rem;
+    color: #c0c0d0;
+    max-width: 200px;
+}
+
+.chip-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.chip-remove {
+    background: none;
+    border: none;
+    color: #6a6a8a;
+    cursor: pointer;
+    font-size: 0.9rem;
+    padding: 0 0.15rem;
+    line-height: 1;
+    flex-shrink: 0;
+}
+
+.chip-remove:hover {
+    color: #e94560;
+}
+
+.chip-clear {
+    background: none;
+    border: 1px solid #3a3a50;
+    color: #6a6a8a;
+    cursor: pointer;
+    font-size: 0.75rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    margin-left: 0.25rem;
+}
+
+.chip-clear:hover {
+    color: #d0d0d8;
+    border-color: #5a5a78;
+}

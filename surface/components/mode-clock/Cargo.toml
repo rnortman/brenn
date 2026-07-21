@@ -1,0 +1,38 @@
+[package]
+name = "brenn-mode-clock"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Brenn surface mode-clock component — headless clock watcher that drives the runtime dark/light theme axis from a retained config channel (auto schedule / fixed dark / fixed light)"
+
+[lib]
+crate-type = ["cdylib"]
+
+# The DOM-free config/schedule state machine (logic.rs) is compiled and
+# unit-tested on the host; its dependencies are ungated normal deps. Wasm
+# DOM/timer glue deps belong under the wasm32 target below.
+# The DOM-free state machine (logic.rs) shares the contract theme constants and
+# the component-support fault helpers, both host-buildable, so they are ungated
+# normal deps. Wasm DOM/timer glue deps belong under the wasm32 target below.
+[dependencies]
+brenn-surface-proto = { version = "0.1.0", path = "../../proto" }
+brenn-surface-contract = { version = "0.1.0", path = "../../contract" }
+brenn-surface-component-support = { version = "0.1.0", path = "../../component-support" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.149"
+
+[dev-dependencies]
+brenn-surface-test-fixtures = { path = "../../test-fixtures" }
+
+# The DOM/timer glue (component.rs) is browser-only: it dispatches the
+# `brenn-theme` seam event and schedules boundary recomputes. These deps never
+# enter the host build (logic.rs and its tests carry no wasm deps).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+chrono = { version = "0.4.44", default-features = false, features = ["alloc"] }
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+web-sys = { workspace = true, features = [
+    "HtmlElement",
+    "Event",
+    "EventTarget",
+] }

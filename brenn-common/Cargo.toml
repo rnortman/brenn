@@ -1,0 +1,10 @@
+[package]
+name = "brenn-common"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Zero dependencies is this crate's charter: a leaf home for tiny shared items
+# (constants, dependency-free pure functions) needed on both sides of the
+# brenn-wasm / brenn-lib split. Anything that needs a dependency does not belong
+# here. Do not add a [dependencies] section.

@@ -1,0 +1,16 @@
+[package]
+name = "brenn"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Thin binary crate: main() + the compile-time BUILD_ID const only. Every
+# commit bumps BRENN_BUILD_ID, which recompiles this crate; keeping it thin
+# and test-free means the recompile is cheap and the (zero-test) test binary
+# is a cache hit. All server code — and all its tests — live in brenn-server,
+# which does not vary with the build id.
+[dependencies]
+brenn-server = { version = "0.1.0", path = "../brenn-server" }
+brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+clap = { version = "4.6.0", features = ["derive"] }
+tokio = { version = "1.50.0", features = ["full"] }

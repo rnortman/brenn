@@ -1,0 +1,9 @@
+#!/bin/bash
+# Scrub first: it fails in seconds, the project's own checks take minutes.
+set -e
+
+brenn-scrub staged
+
+if [ -f Makefile ] && grep -q '^check:' Makefile; then
+    make check
+fi

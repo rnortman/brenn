@@ -1,0 +1,29 @@
+[package]
+name = "brenn-echo-stub"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Brenn surface echo-stub — minimal dev/test component exercising contract v0 (message rendering, publish, and component-panic plumbing) before protobar exists"
+
+[lib]
+crate-type = ["cdylib"]
+
+# The echo-stub is a browser-only wasm-bindgen component module: all of its DOM
+# behavior is behind cfg(target_arch = "wasm32"). The host build is empty — it
+# carries no host-testable logic (a DOM fixture) — so the default target builds
+# under the workspace host clippy/test sweep with nothing to compile.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+brenn-surface-proto = { version = "0.1.0", path = "../../proto" }
+brenn-surface-contract = { version = "0.1.0", path = "../../contract" }
+brenn-surface-component-support = { version = "0.1.0", path = "../../component-support" }
+wasm-bindgen = { workspace = true }
+web-sys = { workspace = true, features = [
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlInputElement",
+    "Node",
+    "Event",
+    "EventTarget",
+] }
+serde_json = "1.0.149"

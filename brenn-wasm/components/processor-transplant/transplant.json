@@ -1,0 +1,147 @@
+{
+  "_doc": [
+    "The transplant script and its expected transcript — the canonical, shared",
+    "definition both hostings are driven from and checked against.",
+    "",
+    "`config` is the instance's config map. `activations` is the scripted",
+    "sequence of activations, each naming every bound input port's window:",
+    "`envelopes` are (id, body) pairs in window order, `new_from` splits",
+    "retained context from new, `dropped` is the binding's drop-counter delta.",
+    "Each harness expands a pair into the canonical MessageEnvelope JSON using",
+    "the fixed non-identifying fields in `envelope_template`.",
+    "",
+    "`transcript` is the reduced observable of each activation: the flush",
+    "outcome and, in call order, the publishes that actually reached the sink.",
+    "An err or trap activation flushes nothing — that is what discard-on-err",
+    "looks like reduced to observables.",
+    "",
+    "Wire class: every channel here is `brenn:`. That is an owner scoping",
+    "decision, not doctrine — backend WASM consumers cannot bind `ephemeral:`",
+    "channels yet, and closing that gap is its own design and implementation",
+    "effort. The `ephemeral:`-bound variant of this script is that effort's",
+    "standing obligation and extends this criterion with no further",
+    "ratification; nothing about the surface half is class-aware."
+  ],
+  "envelope_template": {
+    "source": "transplant",
+    "channel": "brenn:transplant-in",
+    "sender": "transplant-test",
+    "publish_ts": "2026-01-01T00:00:00Z",
+    "urgency": "normal",
+    "envelope_type": "brenn"
+  },
+  "config": {
+    "greeting": "hello, transplant"
+  },
+  "activations": [
+    {
+      "_why": "First window: one new message, and a bound port whose window is empty. Every bound port appears in every activation.",
+      "ports": [
+        {
+          "port": "in",
+          "envelopes": [
+            { "id": "00000000-0000-0000-0000-000000000001", "body": "alpha" }
+          ],
+          "new_from": 0,
+          "dropped": 0
+        },
+        { "port": "ctx", "envelopes": [], "new_from": 0, "dropped": 0 }
+      ]
+    },
+    {
+      "_why": "Retained context ahead of new-from on the triggering port, and a depth-0 port carrying pure context.",
+      "ports": [
+        {
+          "port": "in",
+          "envelopes": [
+            { "id": "00000000-0000-0000-0000-000000000001", "body": "alpha" },
+            { "id": "00000000-0000-0000-0000-000000000002", "body": "beta" }
+          ],
+          "new_from": 1,
+          "dropped": 0
+        },
+        {
+          "port": "ctx",
+          "envelopes": [
+            { "id": "00000000-0000-0000-0000-000000000010", "body": "gamma" }
+          ],
+          "new_from": 1,
+          "dropped": 0
+        }
+      ]
+    },
+    {
+      "_why": "Err sentinel: the handler buffers publishes and then returns err. The buffer is discarded; the instance lives.",
+      "ports": [
+        {
+          "port": "in",
+          "envelopes": [
+            { "id": "00000000-0000-0000-0000-000000000003", "body": "__err__" }
+          ],
+          "new_from": 0,
+          "dropped": 0
+        },
+        { "port": "ctx", "envelopes": [], "new_from": 0, "dropped": 0 }
+      ]
+    },
+    {
+      "_why": "The instance is still delivering after the err, and a nonzero drop-counter delta reaches the guest.",
+      "ports": [
+        {
+          "port": "in",
+          "envelopes": [
+            { "id": "00000000-0000-0000-0000-000000000004", "body": "delta" }
+          ],
+          "new_from": 0,
+          "dropped": 2
+        },
+        { "port": "ctx", "envelopes": [], "new_from": 0, "dropped": 0 }
+      ]
+    },
+    {
+      "_why": "Trap sentinel: buffer discarded and the instance is terminal.",
+      "ports": [
+        {
+          "port": "in",
+          "envelopes": [
+            { "id": "00000000-0000-0000-0000-000000000005", "body": "__trap__" }
+          ],
+          "new_from": 0,
+          "dropped": 0
+        },
+        { "port": "ctx", "envelopes": [], "new_from": 0, "dropped": 0 }
+      ]
+    }
+  ],
+  "transcript": [
+    {
+      "outcome": "ok",
+      "publishes": [
+        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000001\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"greeting\":\"hello, transplant\",\"absent\":null}",
+        "in:alpha"
+      ]
+    },
+    {
+      "outcome": "ok",
+      "publishes": [
+        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000001\",\"00000000-0000-0000-0000-000000000002\"],\"new_from\":1,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[\"00000000-0000-0000-0000-000000000010\"],\"new_from\":1,\"dropped\":0}],\"greeting\":\"hello, transplant\",\"absent\":null}",
+        "in:beta"
+      ]
+    },
+    {
+      "outcome": "err",
+      "publishes": []
+    },
+    {
+      "outcome": "ok",
+      "publishes": [
+        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000004\"],\"new_from\":0,\"dropped\":2},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"greeting\":\"hello, transplant\",\"absent\":null}",
+        "in:delta"
+      ]
+    },
+    {
+      "outcome": "trap",
+      "publishes": []
+    }
+  ]
+}

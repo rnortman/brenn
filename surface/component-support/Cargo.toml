@@ -1,0 +1,47 @@
+[package]
+name = "brenn-surface-component-support"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Optional in-tree helpers for authoring Brenn surface component modules — panic-hook install, custom-element registration, DOM builders, untrusted-detail readers, and the conformant publish dispatch of contract v0"
+
+# In-tree convenience for component authors, not contract surface: contract v0
+# is exactly brenn-surface-contract, and an out-of-tree component may use
+# this crate but is never required to. Most of the crate is behind cfg(wasm32)
+# with wasm-gated deps; the DOM-free `clamp_timeout_ms` scheduling helper
+# (timeout.rs) is ungated so component state machines can host-test it.
+[dependencies]
+brenn-envelope = { path = "../../brenn-envelope" }
+chrono = { version = "0.4.44", default-features = false, features = ["alloc"] }
+serde_json = "1.0.149"
+
+[dev-dependencies]
+brenn-surface-test-fixtures = { path = "../test-fixtures" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+brenn-surface-proto = { version = "0.1.0", path = "../proto" }
+brenn-surface-contract = { version = "0.1.0", path = "../contract" }
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+web-sys = { workspace = true, features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlInputElement",
+    "Node",
+    "Text",
+    "Event",
+    "EventTarget",
+    "CustomEvent",
+    "CustomEventInit",
+    "console",
+    "Performance",
+] }
+
+# Browser-level unit tests for register_component / the define_component shim,
+# run under wasm-bindgen-test via `make surface-wasm-test`. wasm32-only, matching
+# the crate's wasm-gated body; the host build stays empty.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+uuid = "1.24.0"
+wasm-bindgen-test = { workspace = true }

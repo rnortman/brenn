@@ -1,0 +1,19 @@
+#!/bin/bash
+# Bootstrap a persistent home directory with user-local tools.
+# All installers are idempotent — safe to re-run.
+set -euo pipefail
+
+echo "=== Claude Code ==="
+curl -fsSL https://claude.ai/install.sh | bash
+
+echo "=== uv ==="
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+echo "=== Rust ==="
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+echo "=== Bun ==="
+curl -fsSL https://bun.sh/install | bash
+
+echo ""
+echo "Done. Tools installed to home directory."

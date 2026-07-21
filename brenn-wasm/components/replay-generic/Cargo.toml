@@ -1,0 +1,27 @@
+# Generic body-agnostic replay-protection component.
+# Derives dedup identity from the x-brenn-push-signature header; body is never parsed.
+# Implements brenn:replay@0.1.0 — loadable via the existing replay_protection config.
+#
+# This crate is intentionally not a workspace member (targets wasm32-unknown-unknown,
+# built via `wit-bindgen-cli` 0.58 + plain `cargo build` + `wasm-tools component new`).
+[workspace]
+
+[package]
+name = "brenn-replay-generic"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Runtime crate for the wit-bindgen 0.58 generator. 0.44 is the latest
+# independently-versioned runtime; there is no 0.58 runtime crate.
+wit-bindgen-rt = "0.44"
+
+[package.metadata.component]
+package = "brenn:replay"
+target = { path = "../../wit/replay.wit" }
+
+[package.metadata.component.dependencies]

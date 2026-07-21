@@ -1,0 +1,13 @@
+{
+  "name": "brenn-surface-build",
+  "private": true,
+  "description": "Build-time toolchain for surface processor assets: jco transpiles brenn:processor component-model artifacts into browser-loadable ES modules.",
+  "//type": "The transpiled trees under dist/ are ES modules with no extension of their own to say so; declaring it here stops node from reparsing them as CommonJS first when a test loads one directly.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@bytecodealliance/jco": "1.4.0"
+  }
+}

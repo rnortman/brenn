@@ -1,0 +1,28 @@
+[workspace]
+members = ["brenn", "brenn-server", "brenn-activation", "brenn-budget", "brenn-cal", "brenn-cc", "brenn-cli", "brenn-common", "brenn-envelope", "brenn-graf", "brenn-lib", "brenn-pfin", "brenn-wasm", "cc-usage", "brenn-usage", "brenn-usage-obs", "surface/kernel", "surface/chrome", "surface/component-support", "surface/contract", "surface/components/echo-stub", "surface/components/meeting", "surface/components/mode-clock", "surface/components/protobar", "surface/proto", "surface/test-fixtures", "scrub", "xtask"]
+resolver = "3"
+
+# wasm-bindgen must be exact-pinned: the `wasm-bindgen` crate and the
+# `wasm-bindgen-cli` used to generate JS glue must be the same version.
+[workspace.dependencies]
+wasm-bindgen = "=0.2.125"
+# wasm-bindgen's sibling crates: pinned here so every surface crate agrees on
+# versions compatible with the exact-pinned wasm-bindgen above (features stay
+# per-crate). Adding a component crate reuses these rather than restating them.
+js-sys = "0.3.102"
+web-sys = "0.3.102"
+wasm-bindgen-futures = "0.4.75"
+# Lockstep sibling of the exact-pinned wasm-bindgen above: wasm-bindgen and
+# wasm-bindgen-test release together from the same repo, so this pin moves in
+# step with the wasm-bindgen pin (0.2.125 <-> 0.3.75). A mismatch fails loudly
+# at resolve time. Dev-only: the browser-level surface test harness
+# (`make surface-wasm-test`), never a build or runtime dep.
+wasm-bindgen-test = "=0.3.75"
+# Scripted transport channels for the surface shell's wasm test harness. Present
+# only transitively in Cargo.lock today; named here so the wasm-gated dev-dep
+# resolves to the workspace-agreed version.
+futures-channel = "0.3.32"
+# Shared by the backend (server-side render, `html` feature) and the protobar
+# surface component (events-only, no HTML writer) so the two cannot drift
+# versions. Default features off; each consumer opts into what it needs.
+pulldown-cmark = { version = "0.13.2", default-features = false }

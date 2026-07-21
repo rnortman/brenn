@@ -1,0 +1,480 @@
+/* Skin: bench — "Bench Instrument".
+ *
+ * Tektronix bench-instrument aesthetic: warm charcoal field, modules as milled
+ * recesses (never floating cards), B612 / B612 Mono (the open-license Airbus
+ * cockpit face), amber for state, phosphor green for countdowns. Color carries
+ * meaning, not decoration. Dark is primary; legible at glance distance.
+ *
+ * Fills the token contract in surface.css and dresses the shell DOM: mount
+ * sections, panel-label headers, the connection banner, error cards, and the
+ * protobar markdown subtree.
+ */
+
+@font-face {
+    font-family: "B612";
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url("fonts/b612-400.woff2") format("woff2");
+}
+
+@font-face {
+    font-family: "B612";
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url("fonts/b612-700.woff2") format("woff2");
+}
+
+@font-face {
+    font-family: "B612 Mono";
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url("fonts/b612mono-400.woff2") format("woff2");
+}
+
+@font-face {
+    font-family: "B612 Mono";
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url("fonts/b612mono-700.woff2") format("woff2");
+}
+
+/* Token scope: declared on `body` (not `#surface-root`) so the tokens cascade
+ * up to `body`'s own `background: var(--surface-bg, …)` chrome fill — a custom
+ * property inherits downward only, so a token produced on `#surface-root` (a
+ * child of body) can never reach the body background. Every dressing color below
+ * comes from a token here, so the light block re-scoping the same set flips the
+ * whole skin with no dark literal leaking through. */
+body[data-skin="bench"] {
+    --surface-bg: #17191b;
+    --surface-gap: 24px;
+    --surface-pad: 28px;
+
+    --panel-bg: #131516;
+    --panel-border: #0d0e0f;
+    --inset-line: #262a2c;
+    --panel-inset: inset 0 1px 0 var(--inset-line);
+    --panel-pad: 26px 30px;
+
+    --text-color: #c9cdc9;
+    --heading-color: #e6eae6;
+    --text-font: "B612", system-ui, sans-serif;
+    --mono-font: "B612 Mono", ui-monospace, monospace;
+
+    --label-color: #6b7370;
+    --accent: #ffb02e;
+    --countdown: #7ce38b;
+    --muted: #8d968f;
+
+    --code-bg: #0d0e0f;
+    --code-border: #000;
+
+    --scrollbar-thumb: #2a2f31;
+    --scrollbar-thumb-hover: #363c3e;
+
+    /* Alarm + banner states. */
+    --banner-bg: #0d0e0f;
+    --banner-text: #c9cdc9;
+    --alarm-color: #ff8f6e;
+    --alarm-bg: #1c1210;
+    --alarm-border: #e0553a;
+    --alarm-inset: #3a1e18;
+    --fatal-bg: #2a1414;
+    --channel-note-color: #b0a060;
+
+    /* Meeting escalation ladder. */
+    --meeting-critical-line: #ff5a3c;
+    --meeting-critical-bg: #251310;
+    --meeting-overdue-line: #ff2f2f;
+    --meeting-overdue-bg: #300f0e;
+    --meeting-btn-bg: #1b2224;
+    --meeting-btn-border: #333b3e;
+    --meeting-btn-text: #e6eae6;
+    --meeting-btn-active-bg: #262d30;
+}
+
+/* Light theme (bench only): kitchen-context palette from the mockup — field
+ * #dfdbd2, ink #2b2e2c. Keeps the milled-recess material language (the recess
+ * reads darker than the field with a light top highlight) and darkens the amber
+ * state and phosphor countdown for contrast on the light field. Overrides the
+ * full token set above; foundry ships no light block and stays dark-only. */
+body[data-skin="bench"][data-theme="light"] {
+    --surface-bg: #dfdbd2;
+
+    --panel-bg: #d4d0c6;
+    --panel-border: #b3aea2;
+    --inset-line: #f2efe9;
+
+    --text-color: #2b2e2c;
+    --heading-color: #1b1d1b;
+
+    --label-color: #6e7268;
+    --accent: #b5760a;
+    --countdown: #2f8f45;
+    --muted: #6b7069;
+
+    --code-bg: #cbc7bc;
+    --code-border: #b3aea2;
+
+    --scrollbar-thumb: #b3aea2;
+    --scrollbar-thumb-hover: #9a958a;
+
+    --banner-bg: #cbc7bc;
+    --banner-text: #2b2e2c;
+    --alarm-color: #a3341c;
+    --alarm-bg: #f2ddd6;
+    --alarm-border: #c34a2f;
+    --alarm-inset: #e6ccc3;
+    --fatal-bg: #f2ddd6;
+    --channel-note-color: #7a6320;
+
+    --meeting-critical-line: #c0341a;
+    --meeting-critical-bg: #f4d7cf;
+    --meeting-overdue-line: #b31212;
+    --meeting-overdue-bg: #f0c7c0;
+    --meeting-btn-bg: #cbc7bc;
+    --meeting-btn-border: #b3aea2;
+    --meeting-btn-text: #1b1d1b;
+    --meeting-btn-active-bg: #bdb9ae;
+}
+
+/* Field + base type. */
+body {
+    font-size: 16px;
+    line-height: 1.5;
+}
+
+/* === Modules: milled recesses ===
+ * 1px near-black border + inset top highlight over a slightly darker field —
+ * the panel reads as machined into the surface, never as a floating card.
+ */
+#surface-root[data-skin="bench"] > section[data-instance] {
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    box-shadow: var(--panel-inset);
+    padding: var(--panel-pad);
+    gap: 14px;
+}
+
+/* === Panel label: letter-spaced small-caps === */
+#surface-root[data-skin="bench"] header[data-panel-label] {
+    font-family: var(--text-font);
+    font-size: clamp(0.7rem, 1.1vw, 0.95rem);
+    font-weight: 700;
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    color: var(--label-color);
+    margin-bottom: 4px;
+}
+
+/* === Protobar content dressing === */
+#surface-root[data-skin="bench"] [data-protobar-message] {
+    font-family: var(--text-font);
+    color: var(--text-color);
+    font-size: clamp(1.1rem, 2.2vw, 1.9rem);
+    line-height: 1.35;
+}
+
+#surface-root[data-skin="bench"] [data-protobar-message] h1,
+#surface-root[data-skin="bench"] [data-protobar-message] h2,
+#surface-root[data-skin="bench"] [data-protobar-message] h3 {
+    color: var(--heading-color);
+    font-weight: 700;
+    line-height: 1.1;
+    letter-spacing: 0.01em;
+}
+
+#surface-root[data-skin="bench"] [data-protobar-message] h1 {
+    font-size: clamp(1.8rem, 4vw, 3.2rem);
+    color: var(--accent);
+}
+
+#surface-root[data-skin="bench"] [data-protobar-message] h2 {
+    font-size: clamp(1.5rem, 3vw, 2.4rem);
+}
+
+#surface-root[data-skin="bench"] [data-protobar-message] > * + * {
+    margin-top: 0.6em;
+}
+
+#surface-root[data-skin="bench"] [data-protobar-message] strong {
+    color: var(--accent);
+    font-weight: 700;
+}
+
+#surface-root[data-skin="bench"] [data-protobar-message] ul,
+#surface-root[data-skin="bench"] [data-protobar-message] ol {
+    padding-left: 1.3em;
+}
+
+#surface-root[data-skin="bench"] [data-protobar-message] li + li {
+    margin-top: 0.35em;
+}
+
+#surface-root[data-skin="bench"] [data-protobar-message] code {
+    font-family: var(--mono-font);
+    color: var(--countdown);
+}
+
+#surface-root[data-skin="bench"] [data-protobar-message] pre {
+    font-family: var(--mono-font);
+    background: var(--code-bg);
+    border: 1px solid var(--code-border);
+    box-shadow: var(--panel-inset);
+    padding: 0.6em 0.8em;
+    overflow-x: auto;
+    color: var(--text-color);
+    font-size: 0.85em;
+}
+
+#surface-root[data-skin="bench"] [data-protobar-message] pre code {
+    color: inherit;
+}
+
+/* === Status line === */
+#surface-root[data-skin="bench"] [data-protobar-status] {
+    font-family: var(--mono-font);
+    font-size: 0.8rem;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin-top: 0.5rem;
+}
+
+/* === Scrollbar: subtle recess ===
+ * The panel content region (surface.css) scrolls its own overflow. Dress its
+ * scrollbar so it reads as part of the milled recess — a thin dim thumb on a
+ * transparent track, never the bright native chrome. Covers Firefox
+ * (scrollbar-*) and Chromium (::-webkit-scrollbar; also drops the native arrow
+ * caps that otherwise clip the last content line).
+ */
+#surface-root[data-skin="bench"] section[data-instance] > [data-kind] > * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+#surface-root[data-skin="bench"] section[data-instance] > [data-kind] > *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+#surface-root[data-skin="bench"] section[data-instance] > [data-kind] > *::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+#surface-root[data-skin="bench"] section[data-instance] > [data-kind] > *::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 4px;
+}
+
+#surface-root[data-skin="bench"] section[data-instance] > [data-kind] > *::-webkit-scrollbar-thumb:hover {
+    background: var(--scrollbar-thumb-hover);
+}
+
+/* === Connection banner ===
+ * A single global element (only one skin loads per page, so an unscoped id
+ * selector is unambiguous).
+ */
+#brenn-surface-banner {
+    font-family: "B612", system-ui, sans-serif;
+    padding: 0.5rem 0.9rem;
+    font-size: 0.85rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    background: var(--banner-bg);
+    color: var(--banner-text);
+    border-bottom: 3px solid var(--accent);
+}
+
+#brenn-surface-banner[data-banner-state="reloading"] {
+    border-bottom-color: var(--countdown);
+}
+
+#brenn-surface-banner[data-banner-state="fatal"] {
+    background: var(--fatal-bg);
+    color: var(--alarm-color);
+    border-bottom-color: var(--alarm-border);
+}
+
+/* === Error card === */
+#surface-root[data-skin="bench"] [data-surface-error] {
+    font-family: var(--mono-font);
+    font-size: 0.9rem;
+    color: var(--alarm-color);
+    background: var(--alarm-bg);
+    border: 1px solid var(--alarm-border);
+    box-shadow: inset 0 1px 0 var(--alarm-inset);
+    padding: 0.7rem 0.9rem;
+}
+
+/* === Channel-unavailable note === */
+#surface-root[data-skin="bench"] [data-channel-unavailable] {
+    font-family: var(--mono-font);
+    font-size: 0.8rem;
+    color: var(--channel-note-color);
+    border-left: 3px solid var(--accent);
+    padding: 0.3rem 0.6rem;
+    margin-top: 0.5rem;
+}
+
+/* === Meeting component + escalation ladder ===
+ * The `[data-meeting-root]` element is the section's non-header child (surface.css
+ * gives it flex/scroll); dress it as a milled recess with a big phosphor
+ * countdown. Escalation is keyed on `data-state` on the host, every transition
+ * driven by CSS keyframes — no JS animation: ambient amber accent, takeover
+ * amber edge strobe, critical red, overdue faster/brighter red strobe. Both
+ * themes — every color reads from a token the light block overrides.
+ */
+#surface-root[data-skin="bench"] [data-meeting-root] {
+    font-family: var(--text-font);
+    position: relative;
+}
+
+#surface-root[data-skin="bench"] [data-meeting-root] [data-meeting-label] {
+    font-size: clamp(0.7rem, 1.1vw, 0.95rem);
+    font-weight: 700;
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    color: var(--label-color);
+}
+
+#surface-root[data-skin="bench"] [data-meeting-root] [data-meeting-title] {
+    font-size: clamp(1.2rem, 2.6vw, 2.4rem);
+    font-weight: 700;
+    line-height: 1.1;
+    color: var(--heading-color);
+}
+
+#surface-root[data-skin="bench"] [data-meeting-root] [data-meeting-countdown] {
+    font-family: var(--mono-font);
+    font-weight: 700;
+    font-size: clamp(2.4rem, 9vw, 7rem);
+    line-height: 1;
+    color: var(--countdown);
+}
+
+#surface-root[data-skin="bench"] [data-meeting-root] [data-meeting-subline] {
+    font-family: var(--mono-font);
+    font-size: 0.85rem;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+}
+
+/* Idle: no meetings — dim the whole panel. */
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="idle"] {
+    color: var(--muted);
+}
+
+/* Ambient: amber accent on the title + countdown. */
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="ambient"] [data-meeting-title],
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="ambient"] [data-meeting-countdown] {
+    color: var(--accent);
+}
+
+/* Escalation edge strobe. The pulsing edge lives on a ::before overlay whose
+ * inset border is painted once; only the overlay's opacity animates, which the
+ * compositor handles without repainting the (fullscreen, at takeover) panel each
+ * frame — this runs continuously for up to the overdue cap on kiosk hardware. */
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="takeover"]::before,
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="critical"]::before,
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="overdue"]::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+}
+
+/* Escalated states never scroll: clip the host so the abspos edge strobe tracks
+ * the visible box instead of covering only the top slab and scrolling off with
+ * overflowing content. Specificity beats the section content-scroll rule. */
+#surface-root[data-skin="bench"] > section[data-instance] > [data-kind] > [data-meeting-root][data-state="takeover"],
+#surface-root[data-skin="bench"] > section[data-instance] > [data-kind] > [data-meeting-root][data-state="critical"],
+#surface-root[data-skin="bench"] > section[data-instance] > [data-kind] > [data-meeting-root][data-state="overdue"] {
+    overflow: hidden;
+}
+
+/* Takeover: amber edge strobe. */
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="takeover"] [data-meeting-title],
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="takeover"] [data-meeting-countdown] {
+    color: var(--accent);
+}
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="takeover"]::before {
+    box-shadow: inset 0 0 0 5px var(--accent);
+    animation: bench-meeting-pulse 1.1s ease-in-out infinite;
+}
+
+/* Critical: red field + red strobe. */
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="critical"] {
+    background: var(--meeting-critical-bg);
+}
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="critical"] [data-meeting-title],
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="critical"] [data-meeting-countdown] {
+    color: var(--meeting-critical-line);
+}
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="critical"]::before {
+    box-shadow: inset 0 0 0 6px var(--meeting-critical-line);
+    animation: bench-meeting-pulse 0.9s ease-in-out infinite;
+}
+
+/* Overdue: brighter red, faster strobe. */
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="overdue"] {
+    background: var(--meeting-overdue-bg);
+}
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="overdue"] [data-meeting-title],
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="overdue"] [data-meeting-countdown] {
+    color: var(--meeting-overdue-line);
+}
+#surface-root[data-skin="bench"] [data-meeting-root][data-state="overdue"]::before {
+    box-shadow: inset 0 0 0 9px var(--meeting-overdue-line);
+    animation: bench-meeting-pulse-hard 0.5s steps(2, jump-none) infinite;
+}
+
+@keyframes bench-meeting-pulse {
+    0%, 100% { opacity: 0.35; }
+    50% { opacity: 1; }
+}
+
+@keyframes bench-meeting-pulse-hard {
+    0% { opacity: 0.4; }
+    100% { opacity: 1; }
+}
+
+/* Reduced motion: hold the strobe static — the inset edge (and the red field for
+ * critical/overdue) still reads the escalation without any animation. */
+@media (prefers-reduced-motion: reduce) {
+    #surface-root[data-skin="bench"] [data-meeting-root][data-state="takeover"]::before,
+    #surface-root[data-skin="bench"] [data-meeting-root][data-state="critical"]::before,
+    #surface-root[data-skin="bench"] [data-meeting-root][data-state="overdue"]::before {
+        animation: none;
+        opacity: 1;
+    }
+}
+
+/* Kiosk action buttons — the actions row layout lives in base (surface.css);
+ * these rules only dress the buttons. */
+#surface-root[data-skin="bench"] [data-meeting-root] [data-meeting-dismiss],
+#surface-root[data-skin="bench"] [data-meeting-root] [data-meeting-snooze] {
+    flex: 1 1 0;
+    font-family: var(--text-font);
+    font-size: clamp(1rem, 2.4vw, 1.6rem);
+    font-weight: 700;
+    padding: 0.7em 1em;
+    color: var(--meeting-btn-text);
+    background: var(--meeting-btn-bg);
+    border: 1px solid var(--meeting-btn-border);
+    box-shadow: var(--panel-inset);
+    cursor: pointer;
+}
+
+#surface-root[data-skin="bench"] [data-meeting-root] [data-meeting-dismiss]:active,
+#surface-root[data-skin="bench"] [data-meeting-root] [data-meeting-snooze]:active {
+    background: var(--meeting-btn-active-bg);
+}
+
+/* Takeover chrome: the overlaid section runs full-bleed; drop the milled inset
+ * so the escalation strobe owns the panel edge. */
+#surface-root[data-skin="bench"][data-takeover="true"] > section[data-instance] {
+    box-shadow: none;
+}

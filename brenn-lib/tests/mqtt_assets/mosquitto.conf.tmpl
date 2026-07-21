@@ -1,0 +1,11 @@
+listener __PORT__ 127.0.0.1
+protocol mqtt
+cafile   __CA_PEM__
+certfile __SERVER_CRT__
+keyfile  __SERVER_KEY__
+require_certificate false
+allow_anonymous true
+acl_file __ACL__
+log_dest file __LOG__
+log_type all
+persistence false
