@@ -291,9 +291,16 @@ fn a_reserved_ring_survives_a_welcome_that_restates_its_depth() {
         Millis(3_007),
     );
     register(&mut core, "protobar", Millis(3_008));
-    // The seeded value is in the channel's ring, so it reaches the component as
-    // *context* on its next activation — the port is a view, and the value is one
-    // it has not seen. A publish is what dispatches that view.
+    // The value is in the channel's ring, so registration primes it into the
+    // component's queue and it arrives as new — that is the handoff the plane's
+    // fixed depth exists for.
+    let ready = take_one(&mut core);
+    assert_eq!(
+        split(window(&ready.activation, "in")).1,
+        vec![r#"{"v":1,"state":"connected"}"#],
+        "the ring survived the Welcome and was delivered on attach"
+    );
+    complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
     control(
         &mut core,
         LINK_STATE,
@@ -304,8 +311,8 @@ fn a_reserved_ring_survives_a_welcome_that_restates_its_depth() {
     let (context, new) = split(window(&ready.activation, "in"));
     assert_eq!(new, vec![r#"{"v":1,"state":"reconnecting"}"#]);
     assert!(
-        context.is_empty() || context == vec![r#"{"v":1,"state":"connected"}"#],
-        "depth-1 ring: the seeded value is context if it survived, {context:?}"
+        context.is_empty(),
+        "depth-1 ring: the newer value displaced the old, {context:?}"
     );
 }
 
@@ -533,34 +540,31 @@ fn local_publish_fans_out_to_every_attached_port() {
     assert_eq!(seen, vec!["echo".to_string(), "protobar".to_string()]);
 }
 
-/// The router's ring is the context source for a late-registering instance: a
-/// value published before it existed is in its first window, as context.
-///
-/// TODO(local-replay-on-register): a registration alone does not dispatch, so an
-/// instance that registers after the last publish on a depth-1 plane sees the
-/// retained value only when the *next* message arrives. The design wants the
-/// late-attaching-chrome handoff to be gap-free on attach
-/// (consolidation design §5.3, §6.1); nothing in-tree binds a `local:` channel
-/// yet, so Phase 3 (chrome) is where this first has a consumer and must be
-/// decided — an activation cause is design, not an implementer's call.
+/// The boot race, which is what attach-time priming exists for: a value
+/// published while nobody is listening reaches the instance that attaches
+/// afterwards, **as new**, with no second publish to carry it.
 #[test]
-fn the_local_ring_is_context_for_a_late_registering_instance() {
+fn a_late_registering_instance_is_primed_from_the_local_ring() {
     let mut core = local_core();
     // Publish before anyone is listening — the mode-clock-boots-before-chrome
     // case.
     publish(&mut core, 1, "protobar", "out", "dark", Millis(4));
     register(&mut core, "protobar", Millis(5));
-    // A later publish dispatches the view, and "dark" is in it — displaced from
-    // the depth-1 ring by the newer value, which is retention doing its job.
-    publish(&mut core, 2, "protobar", "out", "light", Millis(6));
+    // Registration alone wakes it: the queue came into existence primed, so the
+    // instance is ready without any further input.
     let ready = take_one(&mut core);
-    assert_eq!(split(window(&ready.activation, "in")).1, vec!["light"]);
+    let (context, new) = split(window(&ready.activation, "in"));
+    assert_eq!(new, vec!["dark"], "the retained value must arrive as new");
+    assert!(
+        context.is_empty(),
+        "a primed envelope is new, never also context: {context:?}"
+    );
 }
 
-/// A ring deeper than 1 hands a late-registering instance the whole retained
-/// window as context, oldest-first, trimmed to depth.
+/// A ring deeper than 1 primes the whole retained window, oldest-first, trimmed
+/// to the binding's own `retain_depth`.
 #[test]
-fn the_local_ring_trims_context_to_its_depth() {
+fn the_local_prime_trims_to_the_rings_depth() {
     // A depth-2 ring on the one plane whose depth a `Welcome` may choose, which
     // makes 2 a legal thing for a `Welcome` to say here at all.
     let mut core = core_wired_to(APP_EVENTS, 2);
@@ -575,13 +579,525 @@ fn the_local_ring_trims_context_to_its_depth() {
         );
     }
     register(&mut core, "protobar", Millis(20));
+    let ready = take_one(&mut core);
+    let (context, new) = split(window(&ready.activation, "in"));
+    // Oldest-first, trimmed to depth: a depth-2 ring holds the last two, and
+    // retention already discarded the rest.
+    assert_eq!(new, vec!["v3", "v4"]);
+    assert!(context.is_empty(), "primed entries are new: {context:?}");
+    complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
+    // The next publish is ordinary delivery; the primed pair is now context, at
+    // the ring's depth.
     publish(&mut core, 9, "protobar", "out", "v5", Millis(21));
     let ready = take_one(&mut core);
     let (context, new) = split(window(&ready.activation, "in"));
-    // Oldest-first, trimmed to depth: a depth-2 ring holds the last two, and the
-    // new message occupies one of them.
     assert_eq!(new, vec!["v5"]);
     assert_eq!(context, vec!["v4"]);
+}
+
+/// The prime is capped at the binding's `push_depth`, and the cap costs no
+/// drops: the excess was never a delivery obligation on this binding, so
+/// reporting it as loss would lie about a counter whose contract is "losses
+/// since your last ack". The deeper history is still readable as context.
+#[test]
+fn the_local_prime_caps_at_push_depth_without_counting_drops() {
+    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
+    core.on_input(Input::Opened, Millis(1));
+    // A binding that reads 4 deep but can only hold 2 new: `retain_depth >
+    // push_depth`, the case the cap exists for.
+    let in_binding = Binding {
+        push_depth: 2,
+        retain_depth: 4,
+        ..local_binding(APP_EVENTS, "protobar", "in")
+    };
+    core.on_input(
+        Input::TextFrame(welcome_frame_local(
+            vec![in_binding],
+            vec![local_output(APP_EVENTS, "protobar", "out")],
+            vec![local_channel(APP_EVENTS, 4)],
+        )),
+        Millis(2),
+    );
+    for i in 0..4 {
+        publish(
+            &mut core,
+            i,
+            "protobar",
+            "out",
+            &format!("v{i}"),
+            Millis(4 + i),
+        );
+    }
+    register(&mut core, "protobar", Millis(20));
+    let ready = take_one(&mut core);
+    let w = window(&ready.activation, "in");
+    let (context, new) = split(w);
+    assert_eq!(new, vec!["v2", "v3"], "primed count equals push_depth");
+    assert_eq!(context, vec!["v0", "v1"], "the excess is context, not loss");
+    assert_eq!(w.dropped, 0, "the cap is not an overflow");
+}
+
+/// `retain_depth` bounds the prime on its own, independently of the queue's
+/// capacity: a binding that asks to read one deep on a deeper ring is primed
+/// with one. The other arm of the cap — a `push_depth` below `retain_depth` —
+/// is `the_local_prime_caps_at_push_depth_without_counting_drops`; both are
+/// load-bearing, and chrome's real bindings (read 1, hold 8) are this one.
+#[test]
+fn a_shallow_binding_is_primed_only_to_its_retain_depth() {
+    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
+    core.on_input(Input::Opened, Millis(1));
+    let in_binding = Binding {
+        push_depth: 8,
+        retain_depth: 1,
+        ..local_binding(APP_EVENTS, "protobar", "in")
+    };
+    core.on_input(
+        Input::TextFrame(welcome_frame_local(
+            vec![in_binding],
+            vec![local_output(APP_EVENTS, "protobar", "out")],
+            vec![local_channel(APP_EVENTS, 4)],
+        )),
+        Millis(2),
+    );
+    for i in 0..4 {
+        publish(
+            &mut core,
+            i,
+            "protobar",
+            "out",
+            &format!("v{i}"),
+            Millis(4 + i),
+        );
+    }
+    register(&mut core, "protobar", Millis(20));
+    let ready = take_one(&mut core);
+    let (context, new) = split(window(&ready.activation, "in"));
+    assert_eq!(
+        new,
+        vec!["v3"],
+        "the ring holds four, the queue would hold eight, and the binding asked for one"
+    );
+    // Context is the ring at the same `retain_depth`, deduped against new, so a
+    // one-deep reader has nothing left over — the deeper history is not its
+    // ambience either.
+    assert!(
+        context.is_empty(),
+        "read one deep, so no context: {context:?}"
+    );
+}
+
+/// The prime fires once per queue, at its creation — never again. `Welcome`
+/// reconciles every registered instance, and a reconnecting page can see many of
+/// them, so re-priming a surviving queue would re-deliver the retained tail on
+/// every reconnect.
+#[test]
+fn a_second_welcome_does_not_re_prime_a_surviving_queue() {
+    let mut core = local_core();
+    publish(&mut core, 1, "protobar", "out", "dark", Millis(4));
+    register(&mut core, "protobar", Millis(5));
+    let ready = take_one(&mut core);
+    assert_eq!(split(window(&ready.activation, "in")).1, vec!["dark"]);
+    complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
+
+    // Blip and reconnect onto the same bindings: the queue survives, so nothing
+    // is primed into it and the instance stays quiet.
+    core.on_input(
+        Input::Disconnected {
+            code: None,
+            reason: String::new(),
+        },
+        Millis(6),
+    );
+    core.on_input(Input::Tick, Millis(3_006));
+    core.on_input(Input::Opened, Millis(3_007));
+    core.on_input(
+        Input::TextFrame(welcome_frame_local(
+            vec![local_binding(THEME, "protobar", "in")],
+            vec![local_output(THEME, "protobar", "out")],
+            vec![local_channel(THEME, 1)],
+        )),
+        Millis(3_008),
+    );
+    assert!(
+        core.take_ready_activation().is_none(),
+        "a surviving queue was re-primed by the reconnect's Welcome"
+    );
+}
+
+/// A binding that appears at a later `Welcome` gets a fresh queue, and a fresh
+/// queue is primed — the operator wired a port onto a plane that already has
+/// state, and the component must learn it without waiting for a republish.
+#[test]
+fn a_binding_added_at_a_later_welcome_is_primed() {
+    let mut core = core_wired_to(APP_EVENTS, 2);
+    register(&mut core, "protobar", Millis(3));
+    publish(&mut core, 1, "protobar", "out", "a1", Millis(4));
+    let ready = take_one(&mut core);
+    complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
+
+    // Reconnect onto a config that adds a second port on the same plane.
+    core.on_input(
+        Input::Disconnected {
+            code: None,
+            reason: String::new(),
+        },
+        Millis(5),
+    );
+    core.on_input(Input::Tick, Millis(3_005));
+    core.on_input(Input::Opened, Millis(3_006));
+    let deep = |port: &str| Binding {
+        retain_depth: 2,
+        ..local_binding(APP_EVENTS, "protobar", port)
+    };
+    core.on_input(
+        Input::TextFrame(welcome_frame_local(
+            vec![deep("in"), deep("watch")],
+            vec![local_output(APP_EVENTS, "protobar", "out")],
+            vec![local_channel(APP_EVENTS, 2)],
+        )),
+        Millis(3_007),
+    );
+    let ready = take_one(&mut core);
+    assert_eq!(
+        split(window(&ready.activation, "watch")).1,
+        vec!["a1"],
+        "the newly bound port is primed from the plane's ring"
+    );
+    assert!(
+        split(window(&ready.activation, "in")).1.is_empty(),
+        "the surviving port is not re-primed"
+    );
+}
+
+/// A port rebound to a different channel is a different queue: the old
+/// channel's envelopes are shed unread and the new channel's retained tail is
+/// primed. Keying the queue by port alone would keep stale envelopes and skip
+/// the prime — the silent-loss shape this whole mechanism removes.
+#[test]
+fn a_port_rebound_to_another_local_channel_sheds_and_re_primes() {
+    const OTHER: &str = "local:app-other";
+    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
+    core.on_input(Input::Opened, Millis(1));
+    let deep = |channel: &str, port: &str| Binding {
+        retain_depth: 2,
+        ..local_binding(channel, "protobar", port)
+    };
+    let welcome = |in_channel: &str| {
+        welcome_frame_local(
+            vec![deep(in_channel, "in")],
+            vec![
+                local_output(APP_EVENTS, "protobar", "out-a"),
+                local_output(OTHER, "protobar", "out-b"),
+            ],
+            vec![local_channel(APP_EVENTS, 2), local_channel(OTHER, 2)],
+        )
+    };
+    core.on_input(Input::TextFrame(welcome(APP_EVENTS)), Millis(2));
+    publish(&mut core, 1, "protobar", "out-a", "a1", Millis(3));
+    publish(&mut core, 2, "protobar", "out-b", "b1", Millis(4));
+    // Primed from the first channel and deliberately left unconsumed, so the
+    // rebind has something to shed.
+    register(&mut core, "protobar", Millis(5));
+
+    core.on_input(
+        Input::Disconnected {
+            code: None,
+            reason: String::new(),
+        },
+        Millis(6),
+    );
+    core.on_input(Input::Tick, Millis(3_006));
+    core.on_input(Input::Opened, Millis(3_007));
+    core.on_input(Input::TextFrame(welcome(OTHER)), Millis(3_008));
+
+    let ready = take_one(&mut core);
+    let (context, new) = split(window(&ready.activation, "in"));
+    assert_eq!(new, vec!["b1"], "the new channel's tail, and only it");
+    assert!(
+        context.is_empty(),
+        "context comes from the new channel's ring too: {context:?}"
+    );
+}
+
+/// A port rebound across channel *classes*, wire to `local:`, is primed like any
+/// other new local queue: the class of the new channel decides, not the class of
+/// the old one. The old channel's unconsumed envelope goes with the queue it sat
+/// in, and no replay is coming to double the prime — the subscription was
+/// released by the same reconcile.
+#[test]
+fn a_wire_port_rebound_to_a_local_channel_is_primed() {
+    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
+    core.on_input(Input::Opened, Millis(1));
+    let welcome = |in_channel: &str| {
+        welcome_frame_local(
+            vec![Binding {
+                channel: in_channel.into(),
+                ..local_binding(APP_EVENTS, "protobar", "in")
+            }],
+            vec![local_output(APP_EVENTS, "protobar", "out")],
+            vec![local_channel(APP_EVENTS, 1)],
+        )
+    };
+    core.on_input(Input::TextFrame(welcome("ephemeral:demo")), Millis(2));
+    register(&mut core, "protobar", Millis(3));
+    core.on_input(
+        Input::TextFrame(subscribe_result("ephemeral:demo", SubscribeOutcome::Ok)),
+        Millis(4),
+    );
+    // Delivered and deliberately left unconsumed, so the rebind has something to
+    // shed.
+    core.on_input(
+        Input::TextFrame(deliver_frame("ephemeral:demo", &sample_envelope("m1"), 1)),
+        Millis(5),
+    );
+    publish(&mut core, 1, "protobar", "out", "a1", Millis(6));
+
+    core.on_input(
+        Input::Disconnected {
+            code: None,
+            reason: String::new(),
+        },
+        Millis(7),
+    );
+    core.on_input(Input::Tick, Millis(3_007));
+    core.on_input(Input::Opened, Millis(3_008));
+    let effects = core.on_input(Input::TextFrame(welcome(APP_EVENTS)), Millis(3_009));
+    assert!(
+        !frames(&effects).iter().any(|f| matches!(
+            f,
+            ClientFrame::Subscribe { channel, .. } if channel == "ephemeral:demo"
+        )),
+        "the released wire subscription was reopened: {effects:?}"
+    );
+
+    let ready = take_one(&mut core);
+    let (context, new) = split(window(&ready.activation, "in"));
+    assert_eq!(new, vec!["a1"], "the local ring's tail, exactly once");
+    assert!(
+        context.is_empty(),
+        "context comes from the new channel's ring too: {context:?}"
+    );
+}
+
+/// The mirror: `local:` to wire. The recreated queue is not primed — a fresh
+/// wire attach is filled by the server's replay, and priming it here would
+/// double every replayed envelope in the first window.
+#[test]
+fn a_local_port_rebound_to_a_wire_channel_is_not_primed() {
+    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
+    core.on_input(Input::Opened, Millis(1));
+    let welcome = |in_channel: &str| {
+        welcome_frame_local(
+            vec![Binding {
+                channel: in_channel.into(),
+                ..local_binding(APP_EVENTS, "protobar", "in")
+            }],
+            vec![local_output(APP_EVENTS, "protobar", "out")],
+            vec![local_channel(APP_EVENTS, 1)],
+        )
+    };
+    core.on_input(Input::TextFrame(welcome(APP_EVENTS)), Millis(2));
+    publish(&mut core, 1, "protobar", "out", "a1", Millis(3));
+    // Primed and left unconsumed, so the rebind has something to shed.
+    register(&mut core, "protobar", Millis(4));
+
+    core.on_input(
+        Input::Disconnected {
+            code: None,
+            reason: String::new(),
+        },
+        Millis(5),
+    );
+    core.on_input(Input::Tick, Millis(3_005));
+    core.on_input(Input::Opened, Millis(3_006));
+    let effects = core.on_input(Input::TextFrame(welcome("ephemeral:demo")), Millis(3_007));
+    assert!(
+        frames(&effects).iter().any(|f| matches!(
+            f,
+            ClientFrame::Subscribe { channel, .. } if channel == "ephemeral:demo"
+        )),
+        "the new wire channel must be subscribed: {effects:?}"
+    );
+    assert!(
+        core.take_ready_activation().is_none(),
+        "the shed local prime surfaced under the wire binding"
+    );
+    assert!(
+        core.registered["protobar"].queues["in"].is_empty(),
+        "the rebound port waits for the server's replay, empty"
+    );
+}
+
+/// A `push_depth = 0` binding has no queue, so there is nothing to prime and
+/// nothing to wake on. That is the whole of "never activates me": the retained
+/// value still reaches it, as context, when a sibling port does the waking.
+#[test]
+fn a_depth_zero_binding_is_not_primed_and_never_wakes() {
+    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
+    core.on_input(Input::Opened, Millis(1));
+    let sampled = Binding {
+        push_depth: 0,
+        retain_depth: 1,
+        ..local_binding(APP_EVENTS, "protobar", "in")
+    };
+    core.on_input(
+        Input::TextFrame(welcome_frame_local(
+            vec![sampled],
+            vec![local_output(APP_EVENTS, "protobar", "out")],
+            vec![local_channel(APP_EVENTS, 1)],
+        )),
+        Millis(2),
+    );
+    publish(&mut core, 1, "protobar", "out", "a1", Millis(3));
+    register(&mut core, "protobar", Millis(4));
+    assert!(
+        core.take_ready_activation().is_none(),
+        "a sampled port was primed into an activation"
+    );
+}
+
+/// The positive half of "never activates me": a sampled port still *reads* its
+/// plane, and it reads it in a window a sibling port's **prime** minted. Priming
+/// is a new activation cause, and a depth-0 port must appear in the window it
+/// produces exactly as it does in one a publish produced — otherwise a component
+/// reading state it must not be woken by boots blind, which is the boot race one
+/// port over.
+#[test]
+fn a_depth_zero_sibling_is_context_only_when_a_prime_does_the_waking() {
+    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
+    core.on_input(Input::Opened, Millis(1));
+    let sampled = Binding {
+        push_depth: 0,
+        retain_depth: 1,
+        ..local_binding(APP_EVENTS, "protobar", "in")
+    };
+    core.on_input(
+        Input::TextFrame(welcome_frame_local(
+            vec![sampled, local_binding(APP_EVENTS, "protobar", "watch")],
+            vec![local_output(APP_EVENTS, "protobar", "out")],
+            vec![local_channel(APP_EVENTS, 1)],
+        )),
+        Millis(2),
+    );
+    publish(&mut core, 1, "protobar", "out", "a1", Millis(3));
+    register(&mut core, "protobar", Millis(4));
+
+    let ready = take_one(&mut core);
+    assert_eq!(
+        split(window(&ready.activation, "watch")).1,
+        vec!["a1"],
+        "the queued sibling is what wakes the instance"
+    );
+    let (context, new) = split(window(&ready.activation, "in"));
+    assert!(new.is_empty(), "a sampled port has no new rows: {new:?}");
+    assert_eq!(
+        context,
+        vec!["a1"],
+        "the sampled port reads the plane's value as context in the primed window"
+    );
+}
+
+/// A binding added while the instance has an activation out is primed then and
+/// delivered after: the prime is queue state, and an in-flight activation's ack
+/// covers only the rows it was dispatched with. Once, not twice, and not lost.
+#[test]
+fn a_binding_added_while_an_activation_is_in_flight_is_primed_once() {
+    let mut core = core_wired_to(APP_EVENTS, 2);
+    register(&mut core, "protobar", Millis(3));
+    publish(&mut core, 1, "protobar", "out", "a1", Millis(4));
+    // Dispatched and deliberately left open across the reconnect.
+    let in_flight = take_one(&mut core);
+
+    core.on_input(
+        Input::Disconnected {
+            code: None,
+            reason: String::new(),
+        },
+        Millis(5),
+    );
+    core.on_input(Input::Tick, Millis(3_005));
+    core.on_input(Input::Opened, Millis(3_006));
+    let deep = |port: &str| Binding {
+        retain_depth: 2,
+        ..local_binding(APP_EVENTS, "protobar", port)
+    };
+    core.on_input(
+        Input::TextFrame(welcome_frame_local(
+            vec![deep("in"), deep("watch")],
+            vec![local_output(APP_EVENTS, "protobar", "out")],
+            vec![local_channel(APP_EVENTS, 2)],
+        )),
+        Millis(3_007),
+    );
+    assert!(
+        core.take_ready_activation().is_none(),
+        "a primed queue must not dispatch over an in-flight activation"
+    );
+
+    complete(
+        &mut core,
+        "protobar",
+        ActivationOutcome::Ok,
+        in_flight.buffer,
+    );
+    let ready = take_one(&mut core);
+    assert_eq!(
+        split(window(&ready.activation, "watch")).1,
+        vec!["a1"],
+        "the prime survives the in-flight activation's completion"
+    );
+    assert!(
+        split(window(&ready.activation, "in")).1.is_empty(),
+        "the surviving port's rows were acked by the activation that carried them"
+    );
+    complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
+    assert!(
+        core.take_ready_activation().is_none(),
+        "the primed envelope was delivered twice"
+    );
+}
+
+/// A trapped instance's queues are recreated at the next `Welcome`, but they
+/// are not primed. A dead instance never activates, so priming it would only
+/// park stale envelopes waiting to surface as new.
+#[test]
+fn a_trapped_instance_is_not_primed_at_the_next_welcome() {
+    let mut core = local_core();
+    register(&mut core, "protobar", Millis(3));
+    publish(&mut core, 1, "protobar", "out", "dark", Millis(4));
+    let ready = take_one(&mut core);
+    complete(
+        &mut core,
+        "protobar",
+        ActivationOutcome::Trap("boom".into()),
+        ready.buffer,
+    );
+
+    core.on_input(
+        Input::Disconnected {
+            code: None,
+            reason: String::new(),
+        },
+        Millis(5),
+    );
+    core.on_input(Input::Tick, Millis(3_005));
+    core.on_input(Input::Opened, Millis(3_006));
+    core.on_input(
+        Input::TextFrame(welcome_frame_local(
+            vec![local_binding(THEME, "protobar", "in")],
+            vec![local_output(THEME, "protobar", "out")],
+            vec![local_channel(THEME, 1)],
+        )),
+        Millis(3_007),
+    );
+    assert!(
+        core.take_ready_activation().is_none(),
+        "a failed instance was primed back into life"
+    );
+    assert!(
+        core.registered["protobar"].queues["in"].is_empty(),
+        "the recreated queue of a failed instance must be empty"
+    );
 }
 
 #[test]
@@ -594,6 +1110,12 @@ fn the_toast_plane_retains_nothing() {
     let mut core = core_bound_to(TOAST, 0);
     control(&mut core, TOAST, r#"{"v":1,"severity":"info"}"#, Millis(4));
     register(&mut core, "protobar", Millis(5));
+    // Nothing retained is nothing to prime: a toast published while chrome was
+    // still instantiating stays lost, deliberately.
+    assert!(
+        core.take_ready_activation().is_none(),
+        "a depth-0 ring primed something"
+    );
     // A second toast dispatches the view; the first is not in its context,
     // because a depth-0 ring retained nothing.
     control(&mut core, TOAST, r#"{"v":1,"severity":"warn"}"#, Millis(6));
@@ -680,13 +1202,20 @@ fn local_rings_and_seqs_survive_a_reconnect() {
     );
 
     register(&mut core, "protobar", Millis(3_008));
-    // The pre-reconnect value survived the blip: it is still the ring's, so it is
-    // context in the window the next publish dispatches.
+    // The pre-reconnect value survived the blip: it is still the ring's, so the
+    // attaching instance is primed from it and wakes on it.
+    let ready = take_one(&mut core);
+    assert_eq!(
+        split(window(&ready.activation, "in")).1,
+        vec!["dark"],
+        "the ring survived the reconnect"
+    );
+    complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
     publish(&mut core, 2, "protobar", "out", "light", Millis(3_009));
     let ready = take_one(&mut core);
     let (context, new) = split(window(&ready.activation, "in"));
     assert_eq!(new, vec!["light"]);
-    assert_eq!(context, vec!["dark"], "the ring survived the reconnect");
+    assert_eq!(context, vec!["dark"]);
 }
 
 #[test]
@@ -774,9 +1303,14 @@ fn deregistering_a_local_only_instance_emits_no_unsubscribe_and_keeps_the_ring()
             .collect::<Vec<_>>(),
         vec!["dark".to_string()]
     );
-    // And a fresh registration is delivered from it as context on its next
-    // activation.
+    // And a fresh registration is a fresh attach: it is primed from the ring and
+    // receives the value again, as new. Wire symmetry — a re-subscribe re-replays
+    // too, and a component with a side-effecting fold owes itself at-most-once
+    // handling by `message_id` on either class.
     register(&mut core, "protobar", Millis(6));
+    let ready = take_one(&mut core);
+    assert_eq!(split(window(&ready.activation, "in")).1, vec!["dark"]);
+    complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
     publish(&mut core, 2, "protobar", "out", "light", Millis(7));
     let ready = take_one(&mut core);
     assert_eq!(split(window(&ready.activation, "in")).1, vec!["light"]);
@@ -1059,25 +1593,13 @@ fn a_reserved_plane_needs_no_declaration_to_be_publishable() {
     assert!(frames(&effects).is_empty());
 }
 
-/// The depth-1 last-value handoff §6.1 rests on: a chrome mounting after the
-/// kernel has already published the current link state must still learn it,
-/// because there is no second copy coming — the kernel publishes transitions, not
-/// a heartbeat.
-///
-/// **What this pins today is the ring, not the handoff.** The retained value
-/// survives for a late registrant to read, but a registration alone does not
-/// dispatch, so the value reaches it only as context on a later activation —
-/// which, on a plane whose whole point is that no later message is coming, is no
-/// handoff at all.
-///
-/// TODO(local-replay-on-register): decide whether registering an instance whose
-/// bound ports have retained context mints an activation. It is an activation
-/// cause, which is design (consolidation design §4.6 names the causes and this is
-/// not among them), not an implementer's call. Nothing in-tree binds a `local:`
-/// channel yet — chrome is Phase 3 — so Phase 3 is where this first has a
-/// consumer and must be answered.
+/// The depth-1 last-value handoff: a chrome mounting after the kernel has
+/// already published the current link state must still learn it, because there
+/// is no second copy coming — the kernel publishes transitions, not a heartbeat.
+/// Retention holds the value and attach-time priming delivers it, so the handoff
+/// is gap-free without a republish.
 #[test]
-fn a_reserved_planes_ring_retains_the_last_value_for_a_late_registrant() {
+fn a_reserved_planes_ring_hands_the_last_value_to_a_late_registrant() {
     let mut core = core_bound_to(LINK_STATE, 1);
     control(
         &mut core,
@@ -1086,7 +1608,7 @@ fn a_reserved_planes_ring_retains_the_last_value_for_a_late_registrant() {
         Millis(3),
     );
     register(&mut core, "protobar", Millis(4));
-    // The value is retained, which is the half that holds.
+    // The value is retained…
     assert_eq!(
         core.local_rings[LINK_STATE]
             .ring
@@ -1096,10 +1618,23 @@ fn a_reserved_planes_ring_retains_the_last_value_for_a_late_registrant() {
         vec![r#"{"v":1,"state":"connected"}"#.to_string()],
         "the ring must hold the state published before the instance registered"
     );
-    // And the half that does not: no activation is minted for it.
+    // …and registration alone dispatches it, as new.
+    let ready = take_one(&mut core);
+    assert_eq!(
+        split(window(&ready.activation, "in")).1,
+        vec![r#"{"v":1,"state":"connected"}"#]
+    );
+}
+
+/// A registration whose bound `local:` rings are all empty mints nothing: the
+/// prime is what wakes an instance, and there is nothing to prime.
+#[test]
+fn registering_against_an_empty_local_ring_dispatches_nothing() {
+    let mut core = core_bound_to(LINK_STATE, 1);
+    register(&mut core, "protobar", Millis(4));
     assert!(
         core.take_ready_activation().is_none(),
-        "registration alone does not dispatch — see TODO(local-replay-on-register)"
+        "an empty ring primes nothing, so nothing is ready"
     );
 }
 
@@ -1132,6 +1667,57 @@ fn a_control_publish_before_the_first_welcome_is_dropped() {
     assert!(
         core.local_rings[LINK_STATE].ring.entries().next().is_none(),
         "the dropped pre-Welcome publish left a value in the ring"
+    );
+}
+
+/// The reachable half of the pre-`Welcome` story: a control publish needs an
+/// identity, so it must follow some `Welcome`, but it need not follow the one
+/// that creates the consuming queue. Published with the link down, retained, and
+/// primed into a queue the *next* `Welcome`'s binding table brings into
+/// existence — the transition reaches a port that did not exist when it
+/// happened.
+#[test]
+fn a_control_publish_between_welcomes_primes_a_queue_created_later() {
+    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
+    core.on_input(Input::Opened, Millis(1));
+    // Nothing bound to the plane yet: the component is registered, but this
+    // binding table gives it no port on it.
+    core.on_input(
+        Input::TextFrame(welcome_frame_local(vec![], vec![], vec![])),
+        Millis(2),
+    );
+    register(&mut core, "protobar", Millis(3));
+
+    core.on_input(
+        Input::Disconnected {
+            code: None,
+            reason: String::new(),
+        },
+        Millis(4),
+    );
+    let effects = control(
+        &mut core,
+        LINK_STATE,
+        r#"{"v":1,"state":"connecting"}"#,
+        Millis(5),
+    );
+    assert!(frames(&effects).is_empty(), "page-local, link or no link");
+
+    core.on_input(Input::Tick, Millis(3_005));
+    core.on_input(Input::Opened, Millis(3_006));
+    core.on_input(
+        Input::TextFrame(welcome_frame_local(
+            vec![local_binding(LINK_STATE, "protobar", "in")],
+            vec![],
+            vec![local_channel(LINK_STATE, 1)],
+        )),
+        Millis(3_007),
+    );
+    let ready = take_one(&mut core);
+    assert_eq!(
+        split(window(&ready.activation, "in")).1,
+        vec![r#"{"v":1,"state":"connecting"}"#],
+        "the queue this Welcome created is primed with what was published before it"
     );
 }
 

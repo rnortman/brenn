@@ -22,6 +22,13 @@
 //! in the same or any later activation retention covers — no gap event, no
 //! replay choreography. Overflow retires the delivery obligation; it never
 //! retires the message body.
+//!
+//! The two structures meet in one direction as well: on a `local:` channel a
+//! queue coming into existence is primed from the channel's ring, capped at the
+//! binding's `push_depth`, so the retained tail arrives as *new* to a consumer
+//! that attached after it was published. Retention is therefore also a delivery
+//! obligation to consumers that did not exist yet — the wire classes get the same
+//! thing from the server's fresh-attach replay.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -194,6 +201,11 @@ impl LocalRing {
 /// coalesce or terminate in the stream.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingQueue {
+    /// The channel this binding resolves to. Part of the queue's identity: a
+    /// queue is a `(port, channel)` pair, not a port, so a port rebound to a
+    /// different channel is a different queue — the old one is dropped with its
+    /// now-stale envelopes and a fresh one attaches to the new channel.
+    channel: String,
     /// New envelopes awaiting an activation, oldest first, bounded by
     /// `push_depth`.
     queue: VecDeque<MessageEnvelope>,
@@ -211,13 +223,19 @@ pub(crate) struct PendingQueue {
 }
 
 impl PendingQueue {
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize, channel: String) -> Self {
         Self {
+            channel,
             queue: VecDeque::new(),
             capacity,
             count: 0,
             last_seen_at_ack: 0,
         }
+    }
+
+    /// The channel this queue's binding resolves to.
+    pub(crate) fn channel(&self) -> &str {
+        &self.channel
     }
 
     pub(crate) fn set_capacity(&mut self, capacity: usize) {
@@ -281,6 +299,11 @@ pub(crate) struct RegisteredInstance {
     /// port name. A depth-0 binding has no entry: it never activates the
     /// instance and never delivers new envelopes — it windows as pure context
     /// when a sibling port does the waking.
+    ///
+    /// Each queue carries the channel it is bound to, so its identity is really
+    /// `(port, channel)`: a reconcile that finds a port pointing at a different
+    /// channel drops the queue and builds a new one rather than keeping the old
+    /// channel's envelopes under the new binding.
     pub queues: HashMap<String, PendingQueue>,
     /// The wire channels this instance holds a subscription reference on, one
     /// entry **per input binding** — so two ports of one instance on one channel

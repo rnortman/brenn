@@ -794,6 +794,33 @@ impl SubKey {
     }
 }
 
+/// One input binding's pending queue as the reconcile resolves it: what the
+/// queue for this port must be after the binding table is applied.
+///
+/// `channel` is half the queue's identity, not decoration — a surviving port
+/// whose channel changed needs a new queue, and the reconcile can only see that
+/// by comparing this against what the existing queue carries.
+struct WantedQueue {
+    /// The binding's `push_depth`, already proven `usize`-representable.
+    capacity: usize,
+    channel: String,
+    /// How deep into the channel's ring this binding reads. Bounds the prime as
+    /// well as the context window.
+    retain_depth: u64,
+}
+
+/// Whether an existing queue survives a reconcile: the wanted set still holds
+/// this port, bound to the same channel.
+///
+/// Both call sites (retain and prime-skip) must use this shared predicate; if
+/// they drift, one direction silently duplicates messages and the other
+/// silently empties queues.
+fn queue_survives(wanted: &HashMap<String, WantedQueue>, port: &str, queue: &PendingQueue) -> bool {
+    wanted
+        .get(port)
+        .is_some_and(|w| w.channel == queue.channel())
+}
+
 /// The `Welcome` handshake fields the core consumes, grouped so `on_welcome`
 /// takes one payload rather than a long positional argument list.
 struct WelcomeParams {
@@ -1565,13 +1592,30 @@ impl ClientCore {
     /// side of the relationship can change. It is idempotent, which is what lets
     /// both call it without either knowing about the other.
     ///
-    /// Queues are per binding, so the binding table defines the set: a binding
-    /// that vanished loses its queue (and the messages in it — nothing can
-    /// deliver them to a port that no longer exists), a new one gains an empty
-    /// queue, and a surviving one keeps its contents and its drop counters with
-    /// its depth retuned. A registered instance whose bindings all vanish simply
+    /// Queues are per binding and keyed by `(port, channel)`, so the binding
+    /// table defines the set: a binding that vanished loses its queue (and the
+    /// messages in it — nothing can deliver them to a port that no longer
+    /// exists), a port rebound to a different channel is treated as removed and
+    /// re-added (its old channel's envelopes are stale under the new binding),
+    /// and a surviving one keeps its contents and its drop counters with its
+    /// depth retuned. A dropped queue takes its drop counters with it, including
+    /// a delta that accrued since the last ack and was never reported: the count
+    /// describes losses on a binding, and that binding is gone. So an overflow
+    /// on a port rebound before its next activation is never surfaced — the
+    /// noise ladder reports at dispatch, and no dispatch of that binding
+    /// follows. Carrying the counters across would mean claiming losses on a
+    /// channel the port was never bound to. A registered instance whose bindings
+    /// all vanish simply
     /// stops being activated; it is not failed and not deregistered — the
     /// operator un-wired it, which is not the component's fault.
+    ///
+    /// A queue coming into existence on a `local:` channel is **primed** from
+    /// that channel's ring — [`Self::local_primes`] — so a component that
+    /// attaches after a publish still receives it as new. That is the whole
+    /// point: a queue's creation is the `local:` analogue of a fresh wire
+    /// attach, where the server's replay lands in the new queue as ordinary
+    /// deliveries. Surviving queues are never re-primed, which is what keeps a
+    /// reconcile at every `Welcome` idempotent.
     ///
     /// Depth-0 bindings get no queue — that is the mechanism of "never activates
     /// me", not an optimization — but they *do* take a subscription reference:
@@ -1588,7 +1632,7 @@ impl ClientCore {
         let mut release: Vec<SubKey> = Vec::new();
         let mut acquire: Vec<SubKey> = Vec::new();
         for instance in &instances {
-            let mut queues: HashMap<String, usize> = HashMap::new();
+            let mut queues: HashMap<String, WantedQueue> = HashMap::new();
             let mut wanted_subs: Vec<String> = Vec::new();
             for b in bindings
                 .subscriptions
@@ -1604,18 +1648,35 @@ impl ClientCore {
                 let capacity = usize::try_from(b.push_depth).expect(
                     "surface client: on_welcome proves every binding's push_depth fits a usize",
                 );
-                queues.insert(b.port.clone(), capacity);
+                queues.insert(
+                    b.port.clone(),
+                    WantedQueue {
+                        capacity,
+                        channel: b.channel.clone(),
+                        retain_depth: b.retain_depth,
+                    },
+                );
             }
+            // The rings are read here, under an immutable borrow, because the
+            // `get_mut` below holds `self.registered` for the rest of the loop
+            // body. Nothing in between can change a ring: `local_primes` is a
+            // pure read.
+            let mut primes = self.local_primes(instance, &queues);
             let reg = self
                 .registered
                 .get_mut(instance)
                 .expect("surface client: instance from this map");
-            reg.queues.retain(|port, _| queues.contains_key(port));
-            for (port, capacity) in queues {
+            reg.queues
+                .retain(|port, queue| queue_survives(&queues, port, queue));
+            for (port, wanted) in queues {
                 match reg.queues.get_mut(&port) {
-                    Some(queue) => queue.set_capacity(capacity),
+                    Some(queue) => queue.set_capacity(wanted.capacity),
                     None => {
-                        reg.queues.insert(port, PendingQueue::new(capacity));
+                        let mut queue = PendingQueue::new(wanted.capacity, wanted.channel);
+                        for envelope in primes.remove(&port).into_iter().flatten() {
+                            queue.push(envelope);
+                        }
+                        reg.queues.insert(port, queue);
                     }
                 }
             }
@@ -1645,6 +1706,70 @@ impl ClientCore {
             effects.extend(self.acquire_channel_ref(sub));
         }
         effects
+    }
+
+    /// The envelopes each about-to-be-created `local:` queue is primed with,
+    /// keyed by port: the channel ring's tail, oldest first, capped at
+    /// `min(retain_depth, push_depth)`.
+    ///
+    /// **Only queues that do not already exist at their wanted channel.** A
+    /// surviving `(port, channel)` queue is skipped, so a reconcile at every
+    /// `Welcome` cannot re-deliver what the component already has, and the ring
+    /// is not even read for it.
+    ///
+    /// **Only `local:` channels.** A fresh wire attach is primed by the server:
+    /// its `SubscribeResult` replay arrives as ordinary `Deliver`s and lands in
+    /// the same queue. The ring dedups a redelivered envelope but the queue does
+    /// not, so priming a wire queue here would double every replayed message in
+    /// the first window's new slice.
+    ///
+    /// **Capped at `push_depth` before pushing, not by the queue's own trim.**
+    /// Trimming counts an eviction as a drop, and "losses since your last ack"
+    /// must not report messages that were never a delivery obligation on this
+    /// binding. Retained entries beyond the cap are still visible as context.
+    ///
+    /// A `failed` instance is skipped: it never activates, so priming its
+    /// recreated queues would only park stale envelopes in a dead instance.
+    fn local_primes(
+        &self,
+        instance: &str,
+        wanted: &HashMap<String, WantedQueue>,
+    ) -> HashMap<String, Vec<MessageEnvelope>> {
+        let reg = self
+            .registered
+            .get(instance)
+            .expect("surface client: instance from this map");
+        let mut primes: HashMap<String, Vec<MessageEnvelope>> = HashMap::new();
+        if reg.failed {
+            return primes;
+        }
+        for (port, w) in wanted {
+            if !is_local_channel(&w.channel) {
+                continue;
+            }
+            if reg
+                .queues
+                .get(port)
+                .is_some_and(|queue| queue_survives(wanted, port, queue))
+            {
+                continue;
+            }
+            let ring = &self
+                .local_rings
+                .get(&w.channel)
+                .expect(
+                    "surface client: every routable local channel has a ring (reserved planes \
+                     seeded at construction, the rest proven by on_welcome)",
+                )
+                .ring;
+            let depth = w.retain_depth.min(w.capacity as u64);
+            let envelopes: Vec<MessageEnvelope> =
+                ring.recent(depth).map(|(e, _)| e.clone()).collect();
+            if !envelopes.is_empty() {
+                primes.insert(port.clone(), envelopes);
+            }
+        }
+        primes
     }
 
     /// Take one reference on a wire subscription, opening it if this is the
@@ -1707,6 +1832,12 @@ impl ClientCore {
     /// Its pending queues go with it (nothing will consume them). Its rings do
     /// not: rings belong to the subscription, not to the entry, and a re-register
     /// reads the same retained history a reconnect would have kept.
+    ///
+    /// A re-registration is therefore a fresh attach: the queues it rebuilds are
+    /// primed from the `local:` rings and replayed into by the wire subscribes,
+    /// so retained messages the instance already folded arrive again as new. That
+    /// is wire symmetry, and the reason a component with side-effecting folds
+    /// owes itself at-most-once handling by `message_id` on any class.
     ///
     /// Deregistering an unregistered instance is a caller bug and panics, exactly
     /// as detaching an unknown port is.
@@ -2633,9 +2764,10 @@ impl ClientCore {
     /// counted by the evicting queue alone.
     ///
     /// A depth-0 binding has no queue and is skipped: it never activates its
-    /// instance and never carries new envelopes. The ring already fed it, as
-    /// context — that is the whole of what depth 0 means. It takes no drop count
-    /// either: ring displacement is retention, not push overflow.
+    /// instance and never carries new envelopes — nor is there anything for the
+    /// attach-time prime to fill. The ring already fed it, as context: that is
+    /// the whole of what depth 0 means. It takes no drop count either: ring
+    /// displacement is retention, not push overflow.
     ///
     /// A `failed` instance is skipped too. Its queues are gone; its rings keep
     /// filling. Delivery stops without disturbing anything the subscription

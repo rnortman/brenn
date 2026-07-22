@@ -64,6 +64,16 @@
 //!   not an error and not "duplicate delivery"; it is what "seen" means. A
 //!   component needing exactly-once-seen tracks its own high-water by
 //!   `message_id`.
+//! - **Attach is a delivery point.** When a port's queue comes into existence —
+//!   the instance's first registration, a re-registration, a binding added or a
+//!   port rebound at a later `Welcome` — the channel's retained tail, capped at
+//!   the binding's `push_depth`, arrives as **new**, not as context. So a message
+//!   published on a `local:` channel before its consumer existed still reaches
+//!   that consumer and still wakes it; a component may rely on `new` alone to
+//!   catch up on attach. Wire channels get the same thing from the server's
+//!   fresh-attach replay. The symmetric cost is that a re-attach re-delivers what
+//!   the component already folded, so a side-effecting fold owes itself
+//!   at-most-once handling by `message_id`.
 //! - **`dropped` is a counter, not a marker in the stream.** It is the delivery
 //!   loss on that binding since the port's previous activation. The lost message
 //!   itself is not gone: it remains visible as retained context in this or any
@@ -73,9 +83,11 @@
 //! - **Err consumes.** The messages an activation was assembled for are acked
 //!   when it is assembled, so returning err (or trapping) does not redeliver
 //!   them; they reappear only as retained context. That is backend parity.
-//! - **A page reload is the one legitimate everything-is-new event.** Cursors,
-//!   rings and registrations die with the page, so everything in the first
-//!   windows after a reload is legitimately new. That is not a bug.
+//! - **Attach events are legitimately everything-is-new.** A page reload is the
+//!   widest of them: cursors, rings and registrations die with the page, so
+//!   everything in the first windows after a reload is new. A fresh attach that
+//!   finds a ring already populated — the priming rule above — is the narrower
+//!   one. Neither is a bug.
 //!
 //! Typed gaps (`EpochChanged`, `HoleExceedsRing`, `BeyondRetained`) survive only
 //! at the websocket/resume layer, where the kernel handles them by re-resuming;

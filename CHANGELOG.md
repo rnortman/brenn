@@ -2,6 +2,14 @@
 
 All notable changes to Brenn are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- **surface:** messages published to a `local:` channel prior to the consumer
+  mounting the channel are now delivered as new instead of only existing as
+  retained context.
+
 ## [0.14.1] — 2026-07-22
 
 ### Fixed

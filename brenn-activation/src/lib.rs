@@ -35,6 +35,14 @@ pub struct Activation<E> {
 /// again is not duplicate delivery; it is what "seen" means. A component needing
 /// exactly-once tracks its own high-water by `message_id`.
 ///
+/// **Attach is a delivery point.** A port whose queue has just come into
+/// existence — a first or repeated registration, a binding added or rebound —
+/// receives the channel's retained tail, capped at its `push_depth`, as **new**.
+/// A message published before its consumer existed therefore still reaches and
+/// still wakes that consumer, and `new` alone suffices to catch up on attach. The
+/// cost of that symmetry is that a re-attach re-delivers what the component
+/// already folded.
+///
 /// This is also why there is no gap vocabulary here: a message dropped from the
 /// port's pending queue on overflow is still visible as context in this or any
 /// later window that retention covers, so recovery is retention, not a marker.

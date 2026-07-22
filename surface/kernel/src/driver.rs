@@ -1961,6 +1961,101 @@ mod tests {
         task.abort();
     }
 
+    /// Registering an instance whose `local:` binding has a populated ring wakes
+    /// it in the same turn — no further frame, no publish, no tick.
+    ///
+    /// This is the half of attach-time priming the core alone cannot show: the
+    /// core makes the instance ready, and the driver's turn structure (feed the
+    /// input, then drain activations) is what turns readiness into an invocation.
+    /// A boot-race handoff on a control plane depends on exactly that, because on
+    /// such a plane there is no next message to carry the value.
+    #[tokio::test(start_paused = true)]
+    async fn registering_against_a_populated_local_ring_activates_in_the_same_turn() {
+        let controls = Controls::new();
+        let (server, _closed) = controls.succeed();
+        let (handle, mut events, driver) = crate::new(client_cfg(), controls.connector());
+        let task = tokio::spawn(driver.run());
+
+        let generous = 1_000_000 * brenn_budget::MILLITOKENS_PER_PUBLISH;
+        let welcome = brenn_surface_test_fixtures::welcome_frame(
+            brenn_surface_test_fixtures::WelcomeParams {
+                subscriptions: vec![Binding {
+                    channel: "local:boot".into(),
+                    instance: "protobar".into(),
+                    port: "in".into(),
+                    push_depth: 8,
+                    retain_depth: 1,
+                    noise: brenn_surface_proto::NoiseLevel::Silent,
+                }],
+                outputs: vec![OutputBinding {
+                    channel: "local:boot".into(),
+                    instance: "protobar".into(),
+                    port: "out".into(),
+                    urgency: Urgency::Normal,
+                    fill_mt: generous,
+                    capacity_mt: generous,
+                }],
+                components: vec!["protobar"],
+                local_channels: vec![brenn_surface_proto::LocalChannel {
+                    channel: "local:boot".into(),
+                    ring_depth: 1,
+                }],
+                ..Default::default()
+            },
+        );
+        server
+            .unbounded_send(TransportEvent::Text(welcome))
+            .unwrap();
+        assert!(matches!(
+            next_event(&mut events).await,
+            Event::Connected { .. }
+        ));
+
+        // Publish while nothing is registered — the component's WASM is still
+        // instantiating, in the case this models.
+        handle
+            .publish("protobar", "out", "takeover".into())
+            .expect("the local output is bound and the gate is open");
+        // The result event proves the publish has already been routed into the
+        // ring, so the registration below is unambiguously the only thing left
+        // that could cause an activation.
+        assert!(matches!(
+            next_event(&mut events).await,
+            Event::PublishResult { .. }
+        ));
+
+        let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&bodies);
+        handle.register_activation(
+            "protobar",
+            Box::new(move |activation, _buffer| {
+                let window = activation
+                    .ports
+                    .iter()
+                    .find(|w| w.port == "in")
+                    .expect("the bound input port is windowed");
+                seen.lock().unwrap().extend(
+                    window.envelopes[window.new_from as usize..]
+                        .iter()
+                        .map(|e| e.body.clone()),
+                );
+                Ok(())
+            }),
+        );
+
+        // Nothing else is fed: no frame, no tick, no publish. If the registration
+        // did not both prime and wake, this hangs.
+        wait_until(|| !bodies.lock().unwrap().is_empty()).await;
+        assert_eq!(
+            bodies.lock().unwrap().as_slice(),
+            ["takeover".to_string()],
+            "the retained value arrives as new on the registration's own turn"
+        );
+
+        drop(handle);
+        task.abort();
+    }
+
     /// A component whose entry republishes onto a `local:` channel one of its own
     /// bindings reads must not hang the driver.
     ///

@@ -790,6 +790,99 @@ fn a_depth_zero_binding_is_context_only_and_never_activates() {
     assert_eq!(sampled.dropped, 0);
 }
 
+/// Wire queues are never primed from their ring at attach: the server's
+/// fresh-attach replay is what fills them, arriving as ordinary `Deliver`s. The
+/// ring dedups a redelivered envelope; the pending queue does not, so a
+/// kernel-side prime here would double every replayed message in the first
+/// window's new slice.
+#[test]
+fn a_re_registered_wire_port_is_replayed_by_the_server_not_primed() {
+    let mut core = active_core_with(vec![Binding {
+        retain_depth: 4,
+        ..sub_binding()
+    }]);
+    register(&mut core, "protobar", Millis(5));
+    core.on_input(
+        Input::TextFrame(subscribe_result("ephemeral:demo", SubscribeOutcome::Ok)),
+        Millis(6),
+    );
+    core.on_input(
+        Input::TextFrame(deliver_frame("ephemeral:demo", &sample_envelope("m1"), 1)),
+        Millis(7),
+    );
+    let ready = take_one(&mut core);
+    complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
+
+    // The ring holds `m1`. Deregistering and re-registering rebuilds the queue —
+    // and the rebuilt queue is empty, because the replay comes from the server.
+    deregister(&mut core, "protobar", Millis(8));
+    register(&mut core, "protobar", Millis(9));
+    assert!(
+        core.take_ready_activation().is_none(),
+        "a wire queue was primed from its ring"
+    );
+    // The server's replay is what wakes it, and it arrives once.
+    core.on_input(
+        Input::TextFrame(subscribe_result("ephemeral:demo", SubscribeOutcome::Ok)),
+        Millis(10),
+    );
+    core.on_input(
+        Input::TextFrame(deliver_frame("ephemeral:demo", &sample_envelope("m1"), 1)),
+        Millis(11),
+    );
+    let ready = take_one(&mut core);
+    assert_eq!(split(window(&ready.activation, "messages")).1, vec!["m1"]);
+}
+
+/// A wire port rebound to a different channel takes the same drop-and-recreate
+/// path a `local:` one does: the old channel's queued envelopes are shed rather
+/// than surfacing under the new binding, and the fresh subscribe's replay fills
+/// the new queue.
+#[test]
+fn a_wire_port_rebound_to_another_channel_sheds_its_old_queue() {
+    let mut core = active_core_with(vec![sub_binding()]);
+    register(&mut core, "protobar", Millis(5));
+    core.on_input(
+        Input::TextFrame(subscribe_result("ephemeral:demo", SubscribeOutcome::Ok)),
+        Millis(6),
+    );
+    // Queued and deliberately left unconsumed, so the rebind has something to
+    // shed.
+    core.on_input(
+        Input::TextFrame(deliver_frame("ephemeral:demo", &sample_envelope("m1"), 1)),
+        Millis(7),
+    );
+
+    // A second `Welcome` points the same port at another channel.
+    core.on_input(
+        Input::Disconnected {
+            code: None,
+            reason: String::new(),
+        },
+        Millis(8),
+    );
+    core.on_input(Input::Tick, Millis(3_008));
+    core.on_input(Input::Opened, Millis(3_009));
+    core.on_input(
+        Input::TextFrame(welcome_frame(
+            vec![Binding {
+                channel: "ephemeral:other".into(),
+                ..sub_binding()
+            }],
+            vec![],
+        )),
+        Millis(3_010),
+    );
+    assert!(
+        core.take_ready_activation().is_none(),
+        "the old channel's envelope surfaced under the new binding"
+    );
+    assert!(
+        core.registered["protobar"].queues["messages"].is_empty(),
+        "the rebound port's queue starts empty, awaiting the new subscribe's replay"
+    );
+}
+
 // ── ReAnchor: the server's single-subscription re-resume ─────────────────
 
 /// The re-anchor is the reconnect path applied to one subscription: unsubscribe,

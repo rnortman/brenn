@@ -1747,6 +1747,17 @@ pub mod brenn {
         /// needing exactly-once-seen semantics must track its own high-water by
         /// `message_id`. Entries from `new-from` onward are this invocation's
         /// new/unprocessed messages (up to `push_depth`).
+        ///
+        /// ATTACH IS A DELIVERY POINT. When a port's queue comes into existence
+        /// — the instance's first attach, a re-attach, or a binding added or
+        /// rebound by a config change — the channel's retained tail, capped at
+        /// `push_depth`, is delivered as NEW, not as context, and it wakes the
+        /// component. A message published while the channel had no consumer
+        /// therefore still reaches the consumer that attaches afterwards, so a
+        /// guest MAY rely on the new set alone to catch up on attach. The
+        /// corollary: a re-attach re-delivers as new what the guest already
+        /// processed, so a guest whose handling is side-effecting MUST make it
+        /// at-most-once by `message_id`.
         pub envelopes: _rt::Vec::<EnvelopeJson>,
         /// Index into `envelopes` of the first new/unprocessed message. Equals
         /// `envelopes` length when the window is pure context with no new messages.

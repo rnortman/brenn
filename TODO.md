@@ -540,30 +540,6 @@ are resolved.
 
 ---
 
-## `local-replay-on-register`
-
-Registering an activation instance does not, on its own, mint an activation, and
-`reconcile_registered` never seeds pending from a `local:` ring. So an instance
-that registers after the last publish on a depth-1 `local:` plane sees the
-retained value only when the *next* message arrives — on a control plane whose
-whole point is that no next message is coming, that is no handoff. The
-consolidation design wants the late-attaching-chrome handoff to be gap-free on
-attach (consolidation design §5.3 "last-value replay", §6.1 "replays the current
-state on attach — no gap at the handoff").
-
-Unobservable in-tree today: zero `local:` bindings exist in any config, and
-chrome — the handoff's only consumer — is Phase 3. Adding an activation cause on
-registration is a design decision (design §4.6 names the activation causes and
-this is not among them), so Phase 3 is where this must be answered.
-
-Done when registration of an instance with retained `local:` context either mints
-a first activation replaying that context, or the design explicitly rules it out.
-
-Code sites (`TODO(local-replay-on-register)`):
-`surface/client/src/core/tests/local.rs` (the two late-registrant tests).
-
----
-
 ## `automation-croner-dst-verify`
 
 The DST-spike behavior of the croner schedule evaluation is asserted by reasoning,
