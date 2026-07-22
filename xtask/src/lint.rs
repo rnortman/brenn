@@ -30,10 +30,9 @@ pub fn lint_root(repo_root: &Path) -> bool {
     lint_matching(repo_root, is_root)
 }
 
-/// Lint only the standalone WASM units. These share `WASM_COMPONENTS_TARGET` (cargo
-/// serializes them via its build-dir lock) and read the same `bindings.rs` files that
-/// `check-wit` regenerates, so they must not run concurrently with either each other
-/// or `check-wit` — the caller keeps them in one serial lane.
+/// Lint only the standalone WASM units. These share `WASM_COMPONENTS_TARGET`, which
+/// cargo serializes via its build-dir lock, and only read the tree (including the
+/// committed `bindings.rs` files), so this lane runs concurrently with the others.
 pub fn lint_wasm(repo_root: &Path) -> bool {
     lint_matching(repo_root, is_wasm)
 }

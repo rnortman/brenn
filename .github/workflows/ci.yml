@@ -45,7 +45,7 @@ jobs:
       NEXTEST_VERSION: 0.9.140
       # BRENN_CHECK_JOBS deliberately unset: public runners have 4 vCPUs and the
       # Makefile serializes everything that shares state, so default overlap mode
-      # cuts wall time. If OOM/flake appears, set BRENN_CHECK_JOBS: "1".
+      # cuts wall time. If OOM appears, set BRENN_CHECK_JOBS: "1".
     steps:
       # TODO(fleet-sha-pin-actions): marketplace actions are tag-pinned. Tags are
       # mutable, so this is looser than the sha256-pinned gitleaks download below;

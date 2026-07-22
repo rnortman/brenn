@@ -41,38 +41,43 @@ fn main() {
         "check" => {
             // guard, lint, and check-wit run across a bounded worker pool
             // (BRENN_CHECK_JOBS; 0/1 = fully serial in this order). Each lane runs to
-            // completion — no early abort — so all failures are reported.
+            // completion — no early abort — so all failures are reported; run_jobs
+            // re-panics with lane attribution if any lane panics.
             //
-            // Lanes are grouped by shared mutable resource so concurrent lanes never
-            // collide:
-            //   - guard: pure discovery, allowlist, and tracked-source reads
-            //     (no cargo, no writes).
-            //   - root clippy: uses the root `target/` dir only.
-            //   - wasm clippy then check-wit: both touch WASM_COMPONENTS_TARGET and the
-            //     component `bindings.rs` files (check-wit regenerates them), so they
-            //     share one serial lane.
+            // Invariant: no check lane — and no `make check` step running concurrently
+            // with `xtask check` — writes anywhere under the repo working tree. The only
+            // writes are cargo target dirs (excluded from discovery walks by component
+            // name) and out-of-repo scratch. Under that invariant every lane is
+            // tree-read-only, so all four run fully concurrently without colliding:
+            //   - guard: discovery, allowlist, and tracked-source reads (no cargo).
+            //   - lint-root: root clippy; uses the root `target/` dir only.
+            //   - lint-wasm: wasm clippy; shares WASM_COMPONENTS_TARGET (cargo serializes
+            //     via its build-dir lock) and reads the committed `bindings.rs` files.
+            //   - check-wit: reads the final artifacts and the committed `bindings.rs`,
+            //     regenerating into out-of-repo scratch for the drift compare — it
+            //     touches no tracked file.
             let jobs = parallel::check_jobs();
-            let lanes: Vec<Box<dyn FnOnce() -> bool + Send>> = vec![
-                {
+            let lanes: Vec<parallel::NamedTask> = vec![
+                ("guard", {
                     let r = repo_root.clone();
                     Box::new(move || {
                         let units_ok = guard::run_guard(&r);
                         let removal_ok = removal_guard::run_removal_guard(&r);
                         units_ok && removal_ok
                     })
-                },
-                {
+                }),
+                ("lint-root", {
                     let r = repo_root.clone();
                     Box::new(move || lint::lint_root(&r))
-                },
-                {
+                }),
+                ("lint-wasm", {
                     let r = repo_root.clone();
-                    Box::new(move || {
-                        let wasm_ok = lint::lint_wasm(&r);
-                        let wit_ok = check_wit::run_check_wit(&r);
-                        wasm_ok && wit_ok
-                    })
-                },
+                    Box::new(move || lint::lint_wasm(&r))
+                }),
+                ("check-wit", {
+                    let r = repo_root.clone();
+                    Box::new(move || check_wit::run_check_wit(&r))
+                }),
             ];
             parallel::run_jobs(jobs, lanes)
         }

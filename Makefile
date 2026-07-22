@@ -144,7 +144,11 @@ xtask-deny:
 # The non-cargo steps touch no cargo lock, but they are NOT all independent of
 # the cargo pipeline:
 #   NONCARGO_PARALLEL_STEPS — test-py + npm-audit consume nothing the cargo lane
-#     produces, so they overlap it freely.
+#     produces, so they overlap it freely. A step qualifies here only if it ALSO
+#     writes nothing under the repo working tree: `xtask check` lanes walk the
+#     tree concurrently, so a parallel step that writes anywhere in the repo
+#     (even a cache like __pycache__/) races the walkers and trips an
+#     intermittent stat panic. See the lane invariant in xtask/src/main.rs.
 #   NONCARGO_AFTER_STEPS — test-ts (vitest) and tsc read the generated .ts files
 #     that the `test` step rewrites. Running them concurrently with `test` races
 #     that rewrite (stale-but-green type-check, or a mid-write parse error), so
@@ -163,7 +167,12 @@ NONCARGO_CHECK_STEPS := $(NONCARGO_PARALLEL_STEPS) $(NONCARGO_AFTER_STEPS)
 # A present-but-non-numeric value is a hard error (validated in check-common
 # with `^[0-9]+$`). The `xtask check` parse accepts the identical digits-only
 # grammar (empty = unset on both sides), so the two consumers never disagree.
-# CI sets BRENN_CHECK_JOBS=1 — it has limited resources and must not parallelize.
+# CI leaves BRENN_CHECK_JOBS unset and runs fully parallel. This is safe because
+# every step that overlaps the tree-walking `xtask check` lanes is tree-read-only
+# (the NONCARGO_PARALLEL_STEPS admission rule above); the cargo steps that DO write
+# the tree (`test` rewriting the generated .ts) run serially in the foreground, and
+# the steps reading those writes are held to NONCARGO_AFTER_STEPS so nothing reads a
+# mid-write .ts. Overlap cuts wall time.
 
 # Shared check steps: everything that runs in CI and locally (no cargo-deny).
 # Quiet mode buffers each step's output to a tmp file and prints it only if that
@@ -528,9 +537,11 @@ surface-wasm-test: wasm-bindgen-preflight
 test: wasm-components surface-transpile
 	cargo run -p xtask -- test
 
-# Run Python unit tests for noop_mcp.py.
+# Run Python unit tests for noop_mcp.py. PYTHONDONTWRITEBYTECODE=1 keeps CPython
+# from creating __pycache__/ and its temp-then-replace .pyc, so this step never
+# writes into the tree while the check lanes walk it.
 test-py:
-	python3 -m unittest noop_mcp_test
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest noop_mcp_test
 
 # Run TypeScript tests (vitest).
 #
