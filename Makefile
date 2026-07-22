@@ -130,7 +130,13 @@ Q := $(if $(V),,-q)
 # step's output is buffered and only printed if that step fails (large dumps are
 # then persisted by the agent harness anyway). Steps stay independently
 # invocable (e.g. `make clippy`) and stream normally when run directly.
-xtask-check:
+# wasm-components: check-wit (a lane of `xtask check`) reads prebuilt component
+# artifacts (brenn-wasm/target/components/*.wasm) but never builds them, so a
+# fresh tree needs them built first. It is a prerequisite (not a concurrent
+# lane) so the build finishes before any lane walks the tree. Without it,
+# xtask-check runs before the later `test` step builds the components and
+# check-wit panics "artifact not found" — the real cause of the first red CI.
+xtask-check: wasm-components
 	cargo run -p xtask -- check
 
 xtask-deny:
