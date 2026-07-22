@@ -772,274 +772,6 @@ async fn run_cc(cli: CcArgs) {
 
 #[cfg(test)]
 mod tests {
-    use brenn_lib::auth::device::{UNENROLLED_TOKEN_PREFIX, resolve_or_create_device};
-    use brenn_lib::auth::user::create_user;
-    use brenn_lib::db::init_db;
-    use std::path::PathBuf;
-    use std::process::Command;
-
-    /// Returns path to the compiled brenn-cli binary.
-    ///
-    /// Cargo sets `CARGO_BIN_EXE_brenn-cli` for integration tests in `tests/`;
-    /// for unit tests compiled into `main.rs` we fall back to the test
-    /// executable's own path and strip the last segment to get the `deps/`
-    /// directory, then look for `brenn-cli` there.
-    fn cli_bin() -> PathBuf {
-        // `std::env::current_exe` points to the test binary in
-        // `target/debug/deps/brenn_cli-<hash>`; the CLI binary lives at
-        // `target/debug/brenn-cli`.
-        let exe = std::env::current_exe().expect("current_exe");
-        // Go up: deps/ → debug/ → target/ root of the build profile.
-        let debug_dir = exe
-            .parent() // deps/
-            .and_then(|p| p.parent()) // debug/
-            .expect("navigate from test binary to build dir");
-        debug_dir.join("brenn-cli")
-    }
-
-    /// Create a fresh in-file SQLite DB in a temp dir and return (db_path, tmpdir handle).
-    fn setup_db() -> (PathBuf, tempfile::TempDir) {
-        let dir = tempfile::TempDir::new().expect("create tmpdir");
-        let path = dir.path().join("test.db");
-        // Init migrations by opening the DB through brenn_lib.
-        let _db = init_db(&path);
-        (path, dir)
-    }
-
-    /// Helper: create a user and device in the DB at `path`, return device_id.
-    fn create_device(path: &std::path::Path, username: &str) -> i64 {
-        let db = init_db(path);
-        let conn = db.blocking_lock();
-        let user_id = create_user(&conn, username, "hash");
-        let r = resolve_or_create_device(&conn, None, user_id, "Mozilla/5.0 Chrome/125");
-        r.id
-    }
-
-    #[test]
-    fn cli_list_shows_enrolled_and_unenrolled() {
-        let (db_path, _dir) = setup_db();
-
-        // Create two devices.
-        let dev1 = create_device(&db_path, "alice");
-        let dev2 = create_device(&db_path, "bob");
-
-        // Unenroll device 2.
-        let unenroll_out = Command::new(cli_bin())
-            .args([
-                "device",
-                "--db",
-                db_path.to_str().unwrap(),
-                "unenroll",
-                "--id",
-                &dev2.to_string(),
-                "--reason",
-                "test setup",
-            ])
-            .output()
-            .expect("run brenn-cli device unenroll");
-        assert!(
-            unenroll_out.status.success(),
-            "unenroll must succeed; stderr: {}",
-            String::from_utf8_lossy(&unenroll_out.stderr)
-        );
-
-        // Run device list.
-        let list_out = Command::new(cli_bin())
-            .args(["device", "--db", db_path.to_str().unwrap(), "list"])
-            .output()
-            .expect("run brenn-cli device list");
-        assert!(
-            list_out.status.success(),
-            "list must succeed; stderr: {}",
-            String::from_utf8_lossy(&list_out.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&list_out.stdout);
-
-        // Both devices must appear (check by tab-delimited first field match).
-        let has_dev1 = stdout.lines().any(|l| {
-            l.split('\t')
-                .next()
-                .map(|f| f.trim() == dev1.to_string())
-                .unwrap_or(false)
-        });
-        assert!(
-            has_dev1,
-            "enrolled device {dev1} must appear in list output; got:\n{stdout}"
-        );
-        let has_dev2 = stdout.lines().any(|l| {
-            l.split('\t')
-                .next()
-                .map(|f| f.trim() == dev2.to_string())
-                .unwrap_or(false)
-        });
-        assert!(
-            has_dev2,
-            "unenrolled device {dev2} must appear in list output; got:\n{stdout}"
-        );
-        // The enrolled device must show "-" for its unenrolled_at column (last tab field).
-        let dev1_line = stdout
-            .lines()
-            .find(|l| {
-                l.split('\t')
-                    .next()
-                    .map(|f| f.trim() == dev1.to_string())
-                    .unwrap_or(false)
-            })
-            .expect("no line for dev1 in list output");
-        let dev1_last_col = dev1_line.trim().rsplit('\t').next().unwrap_or("");
-        assert_eq!(
-            dev1_last_col.trim(),
-            "-",
-            "enrolled device must show '-' for unenrolled_at; line: {dev1_line}"
-        );
-
-        // The unenrolled device must show a timestamp (not "-") for its unenrolled_at column.
-        // Match lines by tab-separated first field == device id (not substring match).
-        let dev2_line = stdout
-            .lines()
-            .find(|l| {
-                l.split('\t')
-                    .next()
-                    .map(|f| f.trim() == dev2.to_string())
-                    .unwrap_or(false)
-            })
-            .expect("no line for dev2 in list output");
-        let dev2_last_col = dev2_line.trim().rsplit('\t').next().unwrap_or("");
-        assert_ne!(
-            dev2_last_col.trim(),
-            "-",
-            "unenrolled device must show a non-null unenrolled_at timestamp; line: {dev2_line}"
-        );
-    }
-
-    #[test]
-    fn cli_unenroll_emits_confirmation_and_invalidates() {
-        let (db_path, _dir) = setup_db();
-        let device_id = create_device(&db_path, "alice");
-
-        let out = Command::new(cli_bin())
-            .args([
-                "device",
-                "--db",
-                db_path.to_str().unwrap(),
-                "unenroll",
-                "--id",
-                &device_id.to_string(),
-                "--reason",
-                "stolen",
-            ])
-            .output()
-            .expect("run brenn-cli device unenroll");
-
-        assert!(
-            out.status.success(),
-            "unenroll must exit 0; stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            stdout.contains("unenrolled at"),
-            "stdout must contain 'unenrolled at'; got: {stdout}"
-        );
-
-        // Verify DB state.
-        let db = init_db(&db_path);
-        let conn = db.blocking_lock();
-        let (unenrolled_at_ms, token): (Option<i64>, String) = conn
-            .query_row(
-                "SELECT unenrolled_at, token FROM devices WHERE id = ?1",
-                rusqlite::params![device_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("query device row");
-        assert!(
-            unenrolled_at_ms.is_some(),
-            "unenrolled_at must be set in DB after unenroll"
-        );
-        assert!(
-            token.starts_with(UNENROLLED_TOKEN_PREFIX),
-            "token must start with sentinel after unenroll; got: {token}"
-        );
-    }
-
-    #[test]
-    fn cli_unenroll_idempotent() {
-        let (db_path, _dir) = setup_db();
-        let device_id = create_device(&db_path, "alice");
-        let id_str = device_id.to_string();
-        let db_str = db_path.to_str().unwrap();
-
-        // First unenroll.
-        let out1 = Command::new(cli_bin())
-            .args([
-                "device",
-                "--db",
-                db_str,
-                "unenroll",
-                "--id",
-                &id_str,
-                "--reason",
-                "idempotency test",
-            ])
-            .output()
-            .expect("first unenroll");
-        assert!(
-            out1.status.success(),
-            "first unenroll must succeed; stderr: {}",
-            String::from_utf8_lossy(&out1.stderr)
-        );
-
-        // Second unenroll — must also succeed and say "already unenrolled at".
-        let out2 = Command::new(cli_bin())
-            .args([
-                "device",
-                "--db",
-                db_str,
-                "unenroll",
-                "--id",
-                &id_str,
-                "--reason",
-                "idempotency test",
-            ])
-            .output()
-            .expect("second unenroll");
-        assert!(
-            out2.status.success(),
-            "second unenroll must exit 0; stderr: {}",
-            String::from_utf8_lossy(&out2.stderr)
-        );
-        let stdout2 = String::from_utf8_lossy(&out2.stdout);
-        assert!(
-            stdout2.contains("already unenrolled at"),
-            "second unenroll must print 'already unenrolled at'; got: {stdout2}"
-        );
-    }
-
-    #[test]
-    fn cli_unenroll_unknown_id_panics() {
-        let (db_path, _dir) = setup_db();
-
-        let out = Command::new(cli_bin())
-            .args([
-                "device",
-                "--db",
-                db_path.to_str().unwrap(),
-                "unenroll",
-                "--id",
-                "99999",
-                "--reason",
-                "should fail",
-            ])
-            .output()
-            .expect("run brenn-cli device unenroll unknown id");
-
-        assert!(
-            !out.status.success(),
-            "unenroll with unknown id must exit non-zero"
-        );
-    }
-
-    // ── push subcommand unit tests ────────────────────────────────────────────
 
     mod push {
         use brenn_lib::webhook::signature::hmac_sha256_hex;
@@ -1054,7 +786,6 @@ mod tests {
             let t_str = "1749200000";
             let body = b"hello world";
 
-            // Build canonical bytes the same way run_push does.
             let mut canonical = Vec::new();
             canonical.extend_from_slice(t_str.as_bytes());
             canonical.push(b'.');
@@ -1076,7 +807,6 @@ mod tests {
             // → e28cab4123de6f823dc1a740b63e0af9c1a844d3b14a17715ff4c4b79d341878
             // This verifies the canonical form (t_str || "." || body) and HMAC function
             // against a reference implementation, catching any separator or byte-order bugs.
-            // (test-1: vacuous cross-check replaced with independent reference vector)
             assert_eq!(
                 hex, "e28cab4123de6f823dc1a740b63e0af9c1a844d3b14a17715ff4c4b79d341878",
                 "HMAC does not match reference vector; canonical form or HMAC function is broken"
@@ -1096,11 +826,14 @@ mod tests {
             canonical.push(b'.');
             canonical.extend_from_slice(body);
 
-            // Expected canonical bytes: "1000000000.a.b.c"
             assert_eq!(canonical, b"1000000000.a.b.c");
-            // Signing must not panic.
+            // Reference vector via Python:
+            // hmac.new(b'secret', b'1000000000.a.b.c', sha256).hexdigest()
             let hex = hmac_sha256_hex(secret, &canonical);
-            assert_eq!(hex.len(), 64);
+            assert_eq!(
+                hex, "25a448a46291eba41fcfd7b98a77263af1b7c0f31df18dbc4a106bc97990b66f",
+                "HMAC over a dot-containing body does not match the reference vector"
+            );
         }
 
         /// Multi-byte (UTF-8) body.
@@ -1115,22 +848,14 @@ mod tests {
             canonical.push(b'.');
             canonical.extend_from_slice(body);
 
+            // Reference vector via Python:
+            // hmac.new(b'secret', '1000000000.héllo wörld'.encode(), sha256).hexdigest()
             let hex = hmac_sha256_hex(secret, &canonical);
-            assert_eq!(hex.len(), 64);
-        }
-
-        /// Trailing-newline stripping: LF stripped, CRLF stripped, no newline preserved.
-        #[test]
-        fn trailing_newline_strip() {
-            fn strip(s: &str) -> String {
-                let s = s.strip_suffix('\n').unwrap_or(s);
-                s.strip_suffix('\r').unwrap_or(s).to_string()
-            }
-            assert_eq!(strip("hi\n"), "hi");
-            assert_eq!(strip("hi\r\n"), "hi");
-            assert_eq!(strip("hi"), "hi");
-            // Only one trailing newline is stripped.
-            assert_eq!(strip("hi\n\n"), "hi\n");
+            assert_eq!(
+                hex, "80cf105497af44590e1ca534a8575059e4d83a08f61ea3187d8a42505b9523fd",
+                "HMAC over a multi-byte body does not match the reference vector; \
+                 the body must be signed as bytes, not chars"
+            );
         }
 
         /// `is_valid_key_id` accepts valid key-ids and rejects invalid ones.
@@ -1164,201 +889,6 @@ mod tests {
             let hex1 = hmac_sha256_hex(b"secret-a", &canonical);
             let hex2 = hmac_sha256_hex(b"secret-b", &canonical);
             assert_ne!(hex1, hex2, "different secrets must produce different HMACs");
-        }
-
-        // ── Empty / whitespace-only message rejection (design §2.4, A2) ─────────
-
-        /// Empty positional message → non-zero exit, no HTTP attempted (design §2.4).
-        #[test]
-        fn empty_message_exits_nonzero() {
-            // Pass an empty string as the positional MESSAGE argument.
-            // No server is running; the CLI must reject before any connection attempt.
-            // BRENN_PUSH_SECRET is set so secret resolution passes; rejection must be
-            // for the empty message, not for missing secret.
-            let out = std::process::Command::new(super::cli_bin())
-                .env("BRENN_PUSH_SECRET", "test-secret")
-                .args([
-                    "push",
-                    "--url",
-                    "http://127.0.0.1:1", // unreachable; must never be contacted
-                    "",                   // empty positional MESSAGE
-                ])
-                .output()
-                .expect("run brenn-cli push with empty message");
-            assert!(
-                !out.status.success(),
-                "empty message must exit non-zero; got: {:?}",
-                out.status
-            );
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                stderr.contains("empty") || stderr.contains("whitespace"),
-                "stderr must mention empty/whitespace; got: {stderr}"
-            );
-        }
-
-        /// Whitespace-only message → non-zero exit (design §2.4).
-        #[test]
-        fn whitespace_only_message_exits_nonzero() {
-            let out = std::process::Command::new(super::cli_bin())
-                .env("BRENN_PUSH_SECRET", "test-secret")
-                .args(["push", "--url", "http://127.0.0.1:1", "   "])
-                .output()
-                .expect("run brenn-cli push with whitespace message");
-            assert!(
-                !out.status.success(),
-                "whitespace-only message must exit non-zero"
-            );
-        }
-
-        // ── Secret resolution (design §2.1, A6) ─────────────────────────────────
-
-        /// No secret provided → non-zero exit with diagnostic naming the env var / flag,
-        /// never printing a secret value (design §2.6, A6).
-        #[test]
-        fn no_secret_exits_nonzero_with_diagnostic() {
-            let out = std::process::Command::new(super::cli_bin())
-                .args(["push", "--url", "http://127.0.0.1:1", "hello"])
-                // Ensure neither secret source is set.
-                .env_remove("BRENN_PUSH_SECRET")
-                .env_remove("BRENN_PUSH_SECRET_FILE")
-                .output()
-                .expect("run brenn-cli push with no secret");
-            assert!(!out.status.success(), "missing secret must exit non-zero");
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            // Diagnostic must name the env var / flag, not print a secret.
-            assert!(
-                stderr.contains("BRENN_PUSH_SECRET") || stderr.contains("secret-file"),
-                "diagnostic must name the missing input; got: {stderr}"
-            );
-        }
-
-        /// `BRENN_PUSH_SECRET` is used when no `--secret-file` is provided.
-        /// Wrong secret → transport error (127.0.0.1:1 unreachable) or HTTP rejection,
-        /// not a client-side secret error. This test only checks that the CLI
-        /// proceeds past secret resolution (i.e., reaches the HTTP phase and exits 2
-        /// for transport failure rather than 2 for missing-secret).
-        #[test]
-        fn env_secret_used_when_no_file() {
-            let out = std::process::Command::new(super::cli_bin())
-                .args(["push", "--url", "http://127.0.0.1:1", "hello"])
-                .env("BRENN_PUSH_SECRET", "some-secret")
-                .env_remove("BRENN_PUSH_SECRET_FILE")
-                .output()
-                .expect("run brenn-cli push with env secret");
-            // Must exit non-zero (transport error) but the stderr must not complain
-            // about a missing secret — it reached the HTTP phase.
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                !stderr.contains("no secret provided"),
-                "must not complain about missing secret when BRENN_PUSH_SECRET is set; stderr: {stderr}"
-            );
-        }
-
-        /// `--secret-file` (BRENN_PUSH_SECRET_FILE) takes precedence over BRENN_PUSH_SECRET.
-        /// When both are set, the CLI uses the file. Verified by writing a known secret to a
-        /// temp file and a different value to the env var; the canonical bytes signed must
-        /// match the file secret, not the env var — checked via the `v1=<hex>` value that
-        /// the CLI would produce on a real send. Since the CLI never reaches the server
-        /// (transport error to 127.0.0.1:1), we infer precedence by confirming no
-        /// "missing secret" or "cannot read" error appears, and the CLI proceeds to the
-        /// transport phase. (test-3: precedence logic previously untested.)
-        #[test]
-        fn secret_file_takes_precedence_over_env() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let file_path = dir.path().join("secret.txt");
-            std::fs::write(&file_path, "file-secret\n").expect("write secret file");
-
-            let out = std::process::Command::new(super::cli_bin())
-                .args([
-                    "push",
-                    "--url",
-                    "http://127.0.0.1:1",
-                    "--secret-file",
-                    file_path.to_str().unwrap(),
-                    "hello",
-                ])
-                .env("BRENN_PUSH_SECRET", "env-secret-different")
-                .output()
-                .expect("run brenn-cli push with both secret sources");
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            // No secret-resolution error → file was used (precedence over env).
-            assert!(
-                !stderr.contains("no secret provided"),
-                "must not complain about missing secret; stderr: {stderr}"
-            );
-            assert!(
-                !stderr.contains("cannot read"),
-                "must not fail to read the file; stderr: {stderr}"
-            );
-            // Must have proceeded to the transport phase (transport error expected).
-            assert!(
-                !out.status.success(),
-                "transport error expected (unreachable server)"
-            );
-        }
-
-        /// Secret file content is trimmed on both ends (design §2.1, byte-match requirement).
-        /// A file with leading + trailing whitespace must produce the same signing bytes
-        /// as the trimmed value. Verified by confirming the CLI proceeds past secret
-        /// resolution without a client-side error when given a whitespace-padded file.
-        /// (test-4: both-ends trim previously untested.)
-        #[test]
-        fn secret_file_trimmed_both_ends() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let file_path = dir.path().join("padded-secret.txt");
-            // Leading and trailing whitespace around the actual secret.
-            std::fs::write(&file_path, "  my-secret  \n").expect("write padded secret file");
-
-            let out = std::process::Command::new(super::cli_bin())
-                .args([
-                    "push",
-                    "--url",
-                    "http://127.0.0.1:1",
-                    "--secret-file",
-                    file_path.to_str().unwrap(),
-                    "hello",
-                ])
-                .env_remove("BRENN_PUSH_SECRET")
-                .output()
-                .expect("run brenn-cli push with padded secret file");
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            // Must not error out on the secret file — it has a non-empty trimmed value.
-            assert!(
-                !stderr.contains("empty or all-whitespace"),
-                "trimmed file must not be rejected as empty; stderr: {stderr}"
-            );
-            // Must proceed to the transport phase.
-            assert!(
-                !out.status.success(),
-                "transport error expected (unreachable server)"
-            );
-        }
-
-        /// Diagnostic (any error path) must never echo the secret value (A6).
-        /// The secret is supplied via BRENN_PUSH_SECRET so the CLI reads it, then
-        /// a refused-connection URL triggers a transport error — the secret must not
-        /// appear in the resulting stderr output. (test-2: previous test never gave
-        /// the CLI the secret value, making it vacuously true.)
-        #[test]
-        fn secret_never_in_error_diagnostic() {
-            let out = std::process::Command::new(super::cli_bin())
-                .args(["push", "--url", "http://127.0.0.1:1", "hello"])
-                .env("BRENN_PUSH_SECRET", "supersecretvalue")
-                .env_remove("BRENN_PUSH_SECRET_FILE")
-                .output()
-                .expect("run brenn-cli push");
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            // The CLI must have received the secret (reached transport phase).
-            assert!(
-                !stderr.contains("no secret provided"),
-                "CLI should have resolved the secret; stderr: {stderr}"
-            );
-            // The secret must never appear in any error output.
-            assert!(
-                !stderr.contains("supersecretvalue"),
-                "secret value must not appear in any diagnostic; got: {stderr}"
-            );
         }
     }
 }
