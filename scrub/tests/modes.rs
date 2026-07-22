@@ -9,36 +9,21 @@
 //! Skipped with a message when the pinned gitleaks is absent, matching
 //! `rules.rs`.
 
+mod common;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use common::gitleaks_available;
+
 const BIN: &str = env!("CARGO_BIN_EXE_brenn-scrub");
-const PINNED_VERSION: &str = "8.30.0";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("scrub crate has a parent directory")
         .to_path_buf()
-}
-
-fn gitleaks_available() -> bool {
-    match Command::new("gitleaks").arg("version").output() {
-        Ok(out) if out.status.success() => {
-            let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if found == PINNED_VERSION {
-                true
-            } else {
-                eprintln!("skipping: gitleaks {found} is not the pinned {PINNED_VERSION}");
-                false
-            }
-        }
-        _ => {
-            eprintln!("skipping: gitleaks not on PATH");
-            false
-        }
-    }
 }
 
 /// A token the built-in rules catch, assembled at runtime so this file never

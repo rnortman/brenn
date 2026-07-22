@@ -389,11 +389,6 @@ fn collect_env_inputs(repo_root: &Path) -> EnvInputs {
     inputs.wasm_fixtures = read_dir_files(&comp_dir, Some("wasm"));
 
     // Checked-in config TOMLs read at runtime by brenn-lib config tests.
-    // TODO(scrub-template-drift-cache-skip): `.gitleaks.toml` and
-    // `scrub/repo-template/gitleaks.toml` are read at runtime by the scrub
-    // template-parity test but are absent from this env key, so drift between
-    // them does not invalidate the scrub::rules cache entry and can pass
-    // unnoticed until that binary is recompiled for another reason.
     for name in ["brenn.dev.toml", "brenn.e2e.toml"] {
         let p = repo_root.join(name);
         inputs

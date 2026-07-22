@@ -1,4 +1,8 @@
 //! Shared harness for the integration tests that drive the real binary.
+//!
+//! Each test binary compiles its own copy of this module and uses only the
+//! helpers it needs, so items unused by one binary are not dead overall.
+#![allow(dead_code)]
 
 use std::io::Write;
 use std::path::Path;
@@ -15,12 +19,12 @@ pub struct Output {
     pub stderr: String,
 }
 
-/// One binary run. Both scrub file-discovery env vars are removed first so no
-/// test ever inherits the operator's live overlay or exemption file (the
-/// harness inherits the parent environment, and the operator's shell exports
-/// both); the caller adds back exactly what the case needs via `extra_env`.
-/// `path_prefix` prepends a directory (e.g. a gitleaks stub) to `PATH`; `cwd`
-/// sets the working directory, which only the non-hook modes read.
+/// One binary run. The scrub overlay env var is removed first so no test ever
+/// inherits the operator's live overlay (the harness inherits the parent
+/// environment, and the operator's shell exports it); the caller adds back
+/// exactly what the case needs via `extra_env`. `path_prefix` prepends a
+/// directory (e.g. a gitleaks stub) to `PATH`; `cwd` sets the working
+/// directory, which only the non-hook modes read.
 pub fn run(
     args: &[&str],
     stdin: &str,
@@ -30,7 +34,6 @@ pub fn run(
 ) -> Output {
     let mut cmd = Command::new(BIN);
     cmd.args(args);
-    cmd.env_remove("BRENN_SCRUB_WRITE_EXEMPT");
     cmd.env_remove("BRENN_SCRUB_DENYLIST");
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -61,9 +64,48 @@ pub fn run(
     }
 }
 
+/// Whether the pinned gitleaks is on PATH, printing a skip reason when not so a
+/// scan-reaching test can `return` early on a machine without it.
+pub fn gitleaks_available() -> bool {
+    match Command::new("gitleaks").arg("version").output() {
+        Ok(out) if out.status.success() => {
+            let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if found == PINNED_VERSION {
+                true
+            } else {
+                eprintln!("skipping: gitleaks {found} is not the pinned {PINNED_VERSION}");
+                false
+            }
+        }
+        _ => {
+            eprintln!("skipping: gitleaks not on PATH");
+            false
+        }
+    }
+}
+
+/// `git init` a fresh temp directory, panicking if git is unavailable.
+pub fn git_init(dir: &Path) {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["init", "-q", "."])
+        .output()
+        .expect("git init");
+    assert!(out.status.success(), "git init failed");
+}
+
+/// A git repo carrying the given `.gitleaks.toml` at its root -- gated, so a
+/// destination inside it is scanned.
+pub fn gated_repo(config: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir");
+    git_init(dir.path());
+    std::fs::write(dir.path().join(".gitleaks.toml"), config).expect("write config");
+    dir
+}
+
 /// A `gitleaks` on PATH reporting the given version and finding nothing, so a
-/// non-exempt write reaches repo/config resolution instead of stopping at the
-/// version probe.
+/// write into a gated repo reaches the scan instead of stopping at the version
+/// probe.
 pub fn stub_gitleaks(version: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("gitleaks");

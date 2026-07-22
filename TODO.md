@@ -13,7 +13,9 @@ drift can pass unnoticed. Pre-existing; unrelated to the write-exemption work.
 Done when those two files feed the env key (or the check moves out of the cached
 path) so the drift check runs on every relevant change.
 
-Code site: xtask/src/test_run.rs, `collect_env_inputs`.
+Code site (`TODO(scrub-template-drift-cache-skip)`): scrub/tests/rules.rs,
+`repo_template_matches_the_tracked_public_config` (the guard the cache skip
+weakens). The fix lands in xtask/src/test_run.rs, `collect_env_inputs`.
 
 
 ## `section-ref-burndown`

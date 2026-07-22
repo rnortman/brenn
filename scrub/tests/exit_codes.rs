@@ -5,12 +5,15 @@
 //! hook mode silently turns "block the write" into "hook errored" and lets
 //! writes through, so the codes are asserted over the real binary.
 //!
-//! Only paths that need no gitleaks are covered here; rule behavior lives in
-//! `rules.rs`.
+//! The hook cases that exercise the size cap and version probe target a gated
+//! temp-repo destination, since only a gated destination reaches those steps;
+//! broader rule behavior lives in `rules.rs`. An ungated destination exits 0
+//! before any scanner runs, and a destination that cannot be resolved exits 2
+//! (block, not the 101 a bare panic would give); both are pinned here too.
 
 mod common;
 
-use common::{Output, PINNED_VERSION, stub_gitleaks};
+use common::{Output, PINNED_VERSION, gated_repo, stub_gitleaks};
 
 /// Mirrors `hook::SIZE_CAP_BYTES`; the crate is a binary, so the constant is
 /// not importable here.
@@ -101,10 +104,15 @@ fn a_stray_tree_flag_is_rejected_rather_than_scanning_nothing() {
     assert!(out.stderr.contains("usage: brenn-scrub"), "{}", out.stderr);
 }
 
-fn write_payload(body: &str) -> String {
+/// The trivial gated-repo config for cases that only need a destination to read
+/// as gated (so it reaches the version probe, size cap, and scan) without
+/// matching any rule.
+const TRIVIAL_CONFIG: &str = "title = \"g\"\n";
+
+fn write_payload(file_path: &std::path::Path, body: &str) -> String {
     serde_json::json!({
         "tool_name": "Write",
-        "tool_input": {"file_path": "/tmp/a.rs", "content": body}
+        "tool_input": {"file_path": file_path, "content": body}
     })
     .to_string()
 }
@@ -116,9 +124,10 @@ fn write_payload(body: &str) -> String {
 #[test]
 fn added_text_over_the_size_cap_is_skipped_with_a_warning() {
     let stub = stub_gitleaks(PINNED_VERSION);
+    let repo = gated_repo(TRIVIAL_CONFIG);
     let out = run_with_path(
         &["hook"],
-        &write_payload(&"x".repeat(SIZE_CAP_BYTES + 1)),
+        &write_payload(&repo.path().join("a.rs"), &"x".repeat(SIZE_CAP_BYTES + 1)),
         Some(stub.path()),
     );
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
@@ -132,9 +141,10 @@ fn added_text_over_the_size_cap_is_skipped_with_a_warning() {
 #[test]
 fn added_text_at_the_size_cap_still_reaches_the_scan() {
     let stub = stub_gitleaks(PINNED_VERSION);
+    let repo = gated_repo(TRIVIAL_CONFIG);
     let out = run_with_path(
         &["hook"],
-        &write_payload(&"x".repeat(SIZE_CAP_BYTES)),
+        &write_payload(&repo.path().join("a.rs"), &"x".repeat(SIZE_CAP_BYTES)),
         Some(stub.path()),
     );
     assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
@@ -146,13 +156,17 @@ fn added_text_at_the_size_cap_still_reaches_the_scan() {
 }
 
 /// The asymmetry is load-bearing: an unpinned engine must never decide a gate,
-/// but must also never block an author mid-edit over a setup problem. Only the
-/// message text was asserted before, so either half could invert unnoticed.
+/// but must also never block an author mid-edit over a setup problem.
 #[test]
 fn an_unpinned_gitleaks_warns_in_hook_mode_but_fails_the_gates() {
     let stub = stub_gitleaks("0.0.1-not-the-pin");
+    let repo = gated_repo(TRIVIAL_CONFIG);
 
-    let out = run_with_path(&["hook"], &write_payload("fn main() {}"), Some(stub.path()));
+    let out = run_with_path(
+        &["hook"],
+        &write_payload(&repo.path().join("a.rs"), "fn main() {}"),
+        Some(stub.path()),
+    );
     assert_eq!(
         out.code,
         Some(0),
@@ -169,4 +183,50 @@ fn an_unpinned_gitleaks_warns_in_hook_mode_but_fails_the_gates() {
         out.stderr
     );
     assert!(out.stderr.contains("version mismatch"), "{}", out.stderr);
+}
+
+/// An ungated destination passes at exit 0 before any scanner runs -- so a
+/// scratch write never depends on gitleaks being installed. No stub is on PATH
+/// here: reaching the version probe at all would be the regression.
+#[test]
+fn an_ungated_destination_passes_before_the_scanner() {
+    let scratch = tempfile::tempdir().expect("temp dir");
+    let out = run(
+        &["hook"],
+        &write_payload(&scratch.path().join("note.rs"), "let x = 1;\n"),
+    );
+    assert_eq!(
+        out.code,
+        Some(0),
+        "an ungated destination must pass; stderr: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("not inside a gated repo"),
+        "the pass must be audited: {}",
+        out.stderr
+    );
+}
+
+/// A destination whose non-existent tail contains `..` resolves to no single
+/// true location, so the hook blocks. Exit 2, not the 101 a bare panic yields:
+/// a resolution failure must land as a block, never a silent pass.
+#[test]
+fn an_unresolvable_destination_blocks_instead_of_exiting_101() {
+    let scratch = tempfile::tempdir().expect("temp dir");
+    let out = run(
+        &["hook"],
+        &write_payload(&scratch.path().join("nope/../evil.rs"), "let x = 1;\n"),
+    );
+    assert_eq!(
+        out.code,
+        Some(2),
+        "a resolution failure must block, not fail open; stderr: {}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("refusing to pass this write unscanned"),
+        "stderr: {}",
+        out.stderr
+    );
 }
