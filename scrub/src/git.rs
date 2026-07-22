@@ -46,7 +46,13 @@ pub fn repo_root(from: &Path) -> PathBuf {
         "not inside a git repository: {}",
         from.display()
     );
-    PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+    // Strip only the trailing newline, not `trim()`: a repo dirname ending in
+    // whitespace is legal, and trimming it would yield a path naming no repo.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let root = stdout
+        .strip_suffix('\n')
+        .expect("git rev-parse --show-toplevel output was not newline-terminated");
+    PathBuf::from(root)
 }
 
 /// The repo root containing `from`, or `None` when `from` is genuinely inside
@@ -59,17 +65,36 @@ pub fn repo_root(from: &Path) -> PathBuf {
 /// `LC_ALL=C` pins the message so the recognition of the not-a-repo case does
 /// not depend on the operator's locale. A failed spawn or non-UTF-8 output is
 /// likewise fatal.
+///
+/// This function's `None` means "pass this write unscanned", so repo identity
+/// must be a pure function of the probe directory. The inherited git discovery
+/// variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CEILING_DIRECTORIES`,
+/// `GIT_COMMON_DIR`, `GIT_INDEX_FILE`) would let a stray `export` in the
+/// session's environment redirect discovery -- reporting the wrong root, or
+/// halting it with a clean "not a git repository" that reads as ungated -- so
+/// they are stripped from the child.
 pub fn try_repo_root(from: &Path) -> Option<PathBuf> {
     let out = Command::new("git")
         .current_dir(from)
         .env("LC_ALL", "C")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .expect("failed to execute git");
     if out.status.success() {
-        let root = String::from_utf8(out.stdout)
+        let stdout = String::from_utf8(out.stdout)
             .unwrap_or_else(|_| panic!("git rev-parse --show-toplevel emitted non-UTF-8 output"));
-        return Some(PathBuf::from(root.trim()));
+        // Strip only the trailing newline, not `trim()`: a repo dirname ending
+        // in whitespace is legal, and trimming it would yield a path naming no
+        // repo whose config probe then reads absent -- a silent fail-open.
+        let root = stdout
+            .strip_suffix('\n')
+            .expect("git rev-parse --show-toplevel output was not newline-terminated");
+        return Some(PathBuf::from(root));
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     if stderr.contains("not a git repository") {

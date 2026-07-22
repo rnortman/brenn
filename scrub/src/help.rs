@@ -33,14 +33,12 @@ stdin: the Claude Code PreToolUse event JSON, delivered by Claude Code itself.
 scans: the added text only, at the target's repo-relative path.
 exits: 0 clean; 2 blocks the write and shows stderr to the agent; 1 when
        gitleaks is missing (non-blocking warning).
-exempt: a write whose resolved destination lies under a path listed in the
-       file named by $BRENN_SCRUB_WRITE_EXEMPT skips this check and exits 0
-       with an audit line naming the destination, the matched root, and that
-       file. Hook mode only -- the commit and push gates never honor it. The
-       file is TOML with one key, `paths = [\"<absolute dir>\", ...]`; setting
-       the variable declares the file required, so a missing or malformed file
-       blocks every write until it is fixed. It is discovered only through the
-       variable, never tracked in a repo.
+gating: the write destination decides the repo, not the current directory. A
+       destination inside a gated repo -- a git repo with a .gitleaks.toml at
+       its root -- is scanned against that repo's config. A destination outside
+       any gated repo (no repo, or a repo without the file) is not this gate's
+       business and exits 0 with an audit line naming the destination; the
+       commit and push gates still scan everything that lands in a gated repo.
 called by: the PreToolUse stanza in .claude/settings.json. Not a human-facing
        command -- there is no supported way to type its input by hand.";
 
@@ -124,12 +122,12 @@ mod tests {
     }
 
     #[test]
-    fn hook_help_documents_the_write_exemption() {
-        assert!(HOOK.contains("$BRENN_SCRUB_WRITE_EXEMPT"));
-        assert!(HOOK.contains("Hook mode only"));
-        assert!(HOOK.contains("paths = ["));
-        // Mechanism only -- the help must not name what the exemption guards.
-        crate::message::neutral::assert_neutral(HOOK, "hook exemption text");
+    fn hook_help_documents_destination_gating() {
+        assert!(HOOK.contains("gated repo"));
+        assert!(HOOK.contains(".gitleaks.toml"));
+        assert!(HOOK.contains("decides the repo"));
+        // Mechanism only -- the help must not name what the gate guards.
+        crate::message::neutral::assert_neutral(HOOK, "hook gating text");
     }
 
     #[test]

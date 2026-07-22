@@ -50,30 +50,20 @@ Then:
 }
 ```
 
-## Write-destination exemptions
+## Destination-based gating
 
-Some write destinations sit outside any gated repo and should skip the
-write-time hook entirely — a deliberately ungated checkout an agent writes into,
-for instance. Name them in a TOML file and point `BRENN_SCRUB_WRITE_EXEMPT` at
-it:
+The write-time `hook` decides which repo a write belongs to from the write
+*destination*, not from the session's working directory. A destination inside a
+gated repo — a git repo with a `.gitleaks.toml` at its root — is scanned against
+that repo's config, at its repo-relative path. A destination outside any gated
+repo (no repo at all, or a repo without the file) is not the gate's concern: it
+exits 0 with an audit line on stderr and is not scanned. The commit and push
+gates still scan everything that lands in a gated repo, so nothing reaches a
+remote unscanned.
 
-```toml
-# Absolute write destinations exempt from the write-time scrub.
-paths = ["/absolute/path/to/checkout"]
-```
-
-A `hook`-mode write whose resolved destination lies under one of those paths
-exits 0 with an audit line on stderr; every other write is scanned as usual.
-This is hook-mode only — `staged`, `range`, and `tree` never honor it, so the
-commit and push gates still see everything.
-
-Setting the variable declares the file required: a missing, unreadable, or
-malformed file (bad TOML, an empty `paths`, a relative or nonexistent entry, an
-entry inside a gated repo, or one broad enough to be a typo) blocks every write
-until it is fixed. Entries must be absolute and must resolve on disk. The file
-is discovered only through the variable — **never commit it to a repo**; keep it
-wherever the site's other private scrub config lives, and export the variable
-from the same place.
+This makes a single hook registration safe from any session: it no-ops on
+writes outside gated repos and scans writes into gated ones against the correct
+config, even when the session is rooted somewhere else entirely.
 
 ## Running it by hand
 

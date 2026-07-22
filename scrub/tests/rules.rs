@@ -14,10 +14,12 @@
 //! this file never contains a literal the gate would flag and never needs to
 //! exempt itself from the rules under test.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const PINNED_VERSION: &str = "8.30.0";
+use common::gitleaks_available;
 
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is <repo>/scrub.
@@ -25,24 +27,6 @@ fn repo_root() -> PathBuf {
         .parent()
         .expect("scrub crate has a parent directory")
         .to_path_buf()
-}
-
-fn gitleaks_available() -> bool {
-    match Command::new("gitleaks").arg("version").output() {
-        Ok(out) if out.status.success() => {
-            let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if found == PINNED_VERSION {
-                true
-            } else {
-                eprintln!("skipping: gitleaks {found} is not the pinned {PINNED_VERSION}");
-                false
-            }
-        }
-        _ => {
-            eprintln!("skipping: gitleaks not on PATH");
-            false
-        }
-    }
 }
 
 /// Rule ids gitleaks reports for a directory of fixtures, scanned with the
@@ -197,6 +181,12 @@ fn builtin_secret_rules_are_still_active() {
 /// cite in-tree docs that consuming repos do not have.
 #[test]
 fn repo_template_matches_the_tracked_public_config() {
+    // TODO(scrub-template-drift-cache-skip): this drift guard can be silently
+    // skipped by the xtask test cache. `collect_env_inputs` in
+    // xtask/src/test_run.rs keys the scrub::rules test binary without the two
+    // gitleaks files this test reads, so drift between `.gitleaks.toml` and
+    // `scrub/repo-template/gitleaks.toml` does not invalidate the cache entry
+    // and passes unnoticed until the binary is recompiled for another reason.
     /// Drop comment lines, blank lines, and `description` (prose, not enforcement).
     fn enforcing_lines(src: &str) -> Vec<&str> {
         src.lines()

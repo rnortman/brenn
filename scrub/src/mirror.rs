@@ -66,25 +66,6 @@ impl Mirror {
     }
 }
 
-/// Express `path` relative to `repo_root`. Paths outside the repo keep their
-/// shape minus the leading separator, so they still mirror to a legal
-/// location instead of escaping.
-pub fn repo_relative(path: &Path, repo_root: &Path) -> PathBuf {
-    if let Ok(rel) = path.strip_prefix(repo_root) {
-        return rel.to_path_buf();
-    }
-    let cleaned: PathBuf = path
-        .components()
-        .filter(|c| matches!(c, Component::Normal(_)))
-        .collect();
-    assert!(
-        !cleaned.as_os_str().is_empty(),
-        "cannot mirror path {}",
-        path.display()
-    );
-    cleaned
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,23 +119,5 @@ mod tests {
             std::fs::read(m.root().join("nested/orig.rs")).unwrap(),
             b"contents"
         );
-    }
-
-    #[test]
-    fn repo_relative_strips_the_repo_root() {
-        assert_eq!(
-            repo_relative(
-                Path::new("/home/u/repo/src/a.rs"),
-                Path::new("/home/u/repo")
-            ),
-            PathBuf::from("src/a.rs")
-        );
-    }
-
-    #[test]
-    fn repo_relative_keeps_outside_paths_inside_the_mirror() {
-        let rel = repo_relative(Path::new("/etc/secret.conf"), Path::new("/home/u/repo"));
-        assert_eq!(rel, PathBuf::from("etc/secret.conf"));
-        assert!(rel.is_relative());
     }
 }

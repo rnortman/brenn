@@ -8,8 +8,8 @@
 //! cannot make them permanently un-green-able.
 
 mod config;
+mod dest;
 mod exclude;
-mod exempt;
 mod git;
 mod gitleaks;
 mod help;
@@ -57,12 +57,6 @@ fn overlay_env() -> Option<String> {
 
 fn resolve_for(repo: &Path) -> config::Resolved {
     config::resolve(repo, overlay_env().as_deref())
-}
-
-/// An empty `BRENN_SCRUB_WRITE_EXEMPT` reaches `exempt::load`, which blocks on
-/// the missing target rather than silently degrading.
-fn exempt_env() -> Option<String> {
-    strict_env(exempt::EXEMPT_ENV, "write-exemption file")
 }
 
 /// Version handling for the gates: any deviation from the pin is fatal, since
@@ -135,17 +129,27 @@ fn size_cap_message(path: &Path, len: usize) -> String {
     )
 }
 
-/// The one line an exempt-matched write prints before exiting 0. Names the
-/// resolved destination, the matched root, and the file the roots came from,
-/// so the opt-out is auditable. Local-only (a passing hook's stderr ships
-/// nowhere), but it carries the same neutrality bar as every emitted string.
-fn exempt_audit_message(dest: &Path, root: &Path, source: &Path) -> String {
+/// The panic text when a resolved destination fails to strip its gated repo's
+/// prefix -- a resolution bug that must block rather than mirror to the wrong
+/// place. Agent-visible, so it carries the same neutrality bar as every other
+/// emitted string.
+fn not_inside_repo_message(dest: &Path, repo: &Path) -> String {
     format!(
-        "brenn-scrub hook: write to {} is exempt from the write-time scrub\n  \
-         (matched {} from {})",
+        "resolved destination {} is not inside gated repo {}",
         dest.display(),
-        root.display(),
-        source.display()
+        repo.display()
+    )
+}
+
+/// The one line an ungated-destination pass prints before exiting 0. Names the
+/// resolved destination so the no-op is auditable. Local-only (a passing hook's
+/// stderr ships nowhere), but it carries the same neutrality bar as every
+/// emitted string.
+fn ungated_dest_message(dest: &Path) -> String {
+    format!(
+        "brenn-scrub hook: {} is not inside a gated repo \
+         (no .gitleaks.toml at the repo root); not scanned",
+        dest.display()
     )
 }
 
@@ -197,26 +201,24 @@ fn mode_hook_inner() -> ExitCode {
         }
     };
 
+    // `cwd` is used only to absolutize a relative `file_path`; repo identity
+    // comes from the destination, never from where the session happens to sit.
     let cwd = payload
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("cannot read cwd"));
 
-    // The exemption is judged on the write destination and runs before every
-    // other step: an exempt destination legitimately has no `.gitleaks.toml`
-    // and needs no scanner, so it must precede repo/config resolution, the
-    // version probe, and the size cap. A load or match panic becomes a block,
-    // per the hook's fail-closed contract.
-    if let Some(exempt) = exempt::load(exempt_env().as_deref())
-        && let Some(root) = exempt.matched_root(&added.file_path, &cwd)
-    {
-        eprintln!(
-            "{}",
-            exempt_audit_message(&added.file_path, root, exempt.source())
-        );
+    // The write destination decides the repo. Resolving it before every other
+    // step means an ungated destination -- no repo, or a repo without the
+    // config -- passes without needing a scanner at all. A resolution panic
+    // (bad tail, dangling symlink, dirty git error) becomes a block, per the
+    // hook's fail-closed contract.
+    let dest = dest::resolve(&added.file_path, &cwd);
+    let Some(repo) = dest::gated_repo_containing(&dest.existing) else {
+        eprintln!("{}", ungated_dest_message(&dest.resolved));
         return ExitCode::from(EXIT_OK);
-    }
+    };
 
     // Missing or unpinned gitleaks must not block an author mid-edit; the
     // gates downstream are hard failures and will catch anything missed here.
@@ -234,13 +236,15 @@ fn mode_hook_inner() -> ExitCode {
         return ExitCode::from(EXIT_OK);
     }
 
-    let repo = git::repo_root(&cwd);
-
+    // The destination resolved inside `repo`, so the strip cannot fail; a
+    // failure would mean a resolution bug and blocks rather than mirroring to
+    // the wrong place.
+    let rel = dest
+        .resolved
+        .strip_prefix(&repo)
+        .unwrap_or_else(|_| panic!("{}", not_inside_repo_message(&dest.resolved, &repo)));
     let mirror = Mirror::new();
-    mirror.write(
-        &mirror::repo_relative(&added.file_path, &repo),
-        added.text.as_bytes(),
-    );
+    mirror.write(rel, added.text.as_bytes());
     let findings = scan_mirror(&resolve_for(&repo), &mirror);
 
     if findings.is_empty() {
@@ -673,12 +677,15 @@ mod tests {
             "size-cap message",
         );
         assert_neutral(
-            &exempt_audit_message(
-                Path::new("src/a.rs"),
-                Path::new("/srv/data/annex"),
-                Path::new("/etc/scrub/exempt.toml"),
+            &ungated_dest_message(Path::new("/srv/data/scratch/a.rs")),
+            "ungated destination audit line",
+        );
+        assert_neutral(
+            &not_inside_repo_message(
+                Path::new("/srv/data/project/src/a.rs"),
+                Path::new("/srv/data/project"),
             ),
-            "exempt audit line",
+            "strip-prefix block message",
         );
     }
 
