@@ -199,7 +199,8 @@ pub(crate) async fn auto_clone_repos(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::process::Command as StdCommand;
+
+    use git_fixture::{git as fixture_git, init_bare_repo, init_repo};
 
     use brenn_lib::config::{AccessLevel, BrennConfig, RepoDeclRaw};
     use brenn_lib::obs::alerting::make_capturing_alerter;
@@ -220,29 +221,12 @@ mod tests {
         let remote = tempfile::tempdir().unwrap();
         // Init with a staging clone, commit, then push to the bare remote.
         let staging = tempfile::tempdir().unwrap();
-        let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = StdCommand::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_AUTHOR_NAME", "Test")
-                .env("GIT_AUTHOR_EMAIL", "test@test")
-                .env("GIT_COMMITTER_NAME", "Test")
-                .env("GIT_COMMITTER_EMAIL", "test@test")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        git(remote.path(), &["init", "--bare", "-b", "main"]);
-        git(staging.path(), &["init", "-b", "main"]);
+        init_bare_repo(remote.path());
+        init_repo(staging.path());
         std::fs::write(staging.path().join("file.txt"), "initial").unwrap();
-        git(staging.path(), &["add", "."]);
-        git(staging.path(), &["commit", "-m", "initial"]);
-        git(
+        fixture_git(staging.path(), &["add", "."]);
+        fixture_git(staging.path(), &["commit", "-m", "initial"]);
+        fixture_git(
             staging.path(),
             &[
                 "remote",
@@ -251,7 +235,7 @@ mod tests {
                 &remote.path().display().to_string(),
             ],
         );
-        git(staging.path(), &["push", "-u", "origin", "main"]);
+        fixture_git(staging.path(), &["push", "-u", "origin", "main"]);
         remote
     }
 
@@ -573,12 +557,7 @@ mod tests {
         prepare_repo_dirs_for_test(repo_dir.path(), "unset-origin-repo");
 
         // git init creates a .git/ but no remote.origin.url.
-        let out = StdCommand::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(repo_dir.path().join("unset-origin-repo"))
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git init failed");
+        init_repo(&repo_dir.path().join("unset-origin-repo"));
 
         let config = minimal_config(
             repo_dir.path(),

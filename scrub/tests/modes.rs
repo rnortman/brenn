@@ -1,10 +1,11 @@
-//! End-to-end behavior of the two modes whose *contract* is consumed by
-//! something other than a human reading stderr: `range`'s warn-only rollout
-//! switch, and `tree`'s captured stdout.
+//! End-to-end behavior of the modes whose *contract* is consumed by something
+//! other than a human reading stderr: `range`'s warn-only rollout switch,
+//! `tree`'s captured stdout, and `staged`'s reliance on the git environment a
+//! hook hands it.
 //!
-//! Both were covered only at the argument-parsing layer, where an inverted or
-//! dropped branch downstream leaves every test green. These drive the real
-//! binary against a real repo instead.
+//! The first two were covered only at the argument-parsing layer, where an
+//! inverted or dropped branch downstream leaves every test green. These drive
+//! the real binary against a real repo instead.
 //!
 //! Skipped with a message when the pinned gitleaks is absent, matching
 //! `rules.rs`.
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use common::gitleaks_available;
+use git_fixture::{git, init_repo};
 
 const BIN: &str = env!("CARGO_BIN_EXE_brenn-scrub");
 
@@ -35,20 +37,6 @@ fn canary() -> String {
     )
 }
 
-fn git(repo: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .current_dir(repo)
-        .args(args)
-        .output()
-        .expect("failed to execute git");
-    assert!(
-        out.status.success(),
-        "git {} failed: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
 fn write_file(repo: &Path, rel: &str, body: &str) {
     let path = repo.join(rel);
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
@@ -59,9 +47,7 @@ fn write_file(repo: &Path, rel: &str, body: &str) {
 fn repo_with(files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp dir");
     let p = dir.path();
-    git(p, &["init", "-q", "-b", "main", "."]);
-    git(p, &["config", "user.email", "a@example.com"]);
-    git(p, &["config", "user.name", "alice"]);
+    init_repo(p);
     std::fs::copy(repo_root().join(".gitleaks.toml"), p.join(".gitleaks.toml"))
         .expect("copy public config");
     for (rel, body) in files {
@@ -79,17 +65,20 @@ struct Output {
 }
 
 fn run_in(repo: &Path, args: &[&str], stdin: &str) -> Output {
-    let mut child = Command::new(BIN)
-        .current_dir(repo)
+    let mut cmd = Command::new(BIN);
+    cmd.current_dir(repo)
         // The overlay is a local convention; these assertions are about the
         // public rules only, so a machine's local overlay must not leak in.
         .env_remove("BRENN_SCRUB_DENYLIST")
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn brenn-scrub");
+        .stderr(Stdio::piped());
+    // The fixture repo is the whole subject here; a `GIT_DIR` from a hook
+    // environment would point the spawned binary — and the `gitleaks` it
+    // spawns — at some other repo entirely.
+    git_fixture::hermetic(&mut cmd);
+    let mut child = cmd.spawn().expect("failed to spawn brenn-scrub");
     child
         .stdin
         .as_mut()
@@ -106,12 +95,7 @@ fn run_in(repo: &Path, args: &[&str], stdin: &str) -> Output {
 
 /// Pre-push stdin for pushing `main` as a ref the remote does not have.
 fn new_ref_line(repo: &Path) -> String {
-    let out = Command::new("git")
-        .current_dir(repo)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .expect("rev-parse");
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let sha = git(repo, &["rev-parse", "HEAD"]).trim().to_string();
     format!("refs/heads/main {sha} refs/heads/main {}\n", "0".repeat(40))
 }
 
@@ -238,6 +222,59 @@ fn an_excluded_prefix_is_neither_scanned_nor_counted() {
             .expect("array")
             .len(),
         1
+    );
+}
+
+/// `staged` runs as a pre-commit hook, and a hook is exactly where git exports
+/// `GIT_DIR` and `GIT_INDEX_FILE`. Scrub must scan the index those name -- that
+/// is how `git commit --only` and linked-worktree commits get scanned at all --
+/// so its production spawns deliberately inherit the environment. Every other
+/// harness here strips `GIT_*`, which would let that inheritance rot unnoticed.
+///
+/// The observable is staged *content*, not the resolved repo root: with
+/// `GIT_DIR` set and no `GIT_WORK_TREE`, git treats the cwd as the work tree,
+/// so the root follows the cwd while the index comes from `GIT_DIR`.
+#[test]
+fn staged_mode_scans_the_index_named_by_the_hook_environment() {
+    if !gitleaks_available() {
+        return;
+    }
+    let fixture = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    write_file(fixture.path(), "src/planted.rs", &canary());
+    git(fixture.path(), &["add", "-A"]);
+
+    // Somewhere else entirely: not a git repo, carrying only the public rules
+    // so config resolution has something to load once the root lands here.
+    let elsewhere = tempfile::tempdir().expect("temp dir");
+    std::fs::copy(
+        repo_root().join(".gitleaks.toml"),
+        elsewhere.path().join(".gitleaks.toml"),
+    )
+    .expect("copy public config");
+
+    // Hermetic first, then one explicit `GIT_DIR`: the contract under test is
+    // that the environment passed to scrub overrides its cwd, and stripping
+    // ambient `GIT_*` first means only this test's variable can decide that.
+    let mut cmd = Command::new(BIN);
+    git_fixture::hermetic(&mut cmd);
+    cmd.current_dir(elsewhere.path())
+        .env_remove("BRENN_SCRUB_DENYLIST")
+        .env("GIT_DIR", fixture.path().join(".git"))
+        .arg("staged")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = cmd.output().expect("failed to spawn brenn-scrub");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("blocked this commit"),
+        "the planted finding must block: {stderr}"
+    );
+    assert!(
+        stderr.contains("src/planted.rs"),
+        "the finding must be attributed to the staged path: {stderr}"
     );
 }
 

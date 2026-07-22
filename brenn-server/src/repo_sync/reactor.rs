@@ -1014,9 +1014,10 @@ mod tests {
     use crate::active_bridge::ActiveBridges;
     use crate::repo_sync::CloneInfo;
     use crate::repo_sync::test_git_fixtures::{
-        head, local_commit, push_sibling_commit, run_git, scratch_remote_and_clone,
+        head, local_commit, push_sibling_commit, scratch_remote_and_clone,
     };
     use brenn_lib::obs::alerting::AlertDispatcher;
+    use git_fixture::{clone_repo, git as fixture_git};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -1275,7 +1276,7 @@ mod tests {
         // error branches — they share the `_ => AdvanceKind::Local` arm.
         let (_remote, clone) = scratch_remote_and_clone();
         // Point origin at a DNS-failing host so fetch classifies as transient.
-        run_git(
+        fixture_git(
             clone.path(),
             &[
                 "remote",
@@ -1786,37 +1787,29 @@ mod tests {
         // Build a sibling clone, reset to the parent of Y, add a new commit
         // (Z), and force-push. Z is now origin/main; Y is unreachable.
         let force_sibling = tempfile::tempdir().unwrap();
-        std::fs::remove_dir_all(force_sibling.path()).unwrap();
-        run_git(
-            std::path::Path::new("/tmp"),
-            &[
-                "clone",
-                &remote.path().display().to_string(),
-                force_sibling.path().to_str().unwrap(),
-            ],
-        );
-        run_git(force_sibling.path(), &["reset", "--hard", "HEAD~1"]);
+        clone_repo(remote.path(), force_sibling.path());
+        fixture_git(force_sibling.path(), &["reset", "--hard", "HEAD~1"]);
         std::fs::write(force_sibling.path().join("rewrite.txt"), "force").unwrap();
-        run_git(force_sibling.path(), &["add", "."]);
-        run_git(
+        fixture_git(force_sibling.path(), &["add", "."]);
+        fixture_git(
             force_sibling.path(),
             &["commit", "-m", "force-pushed replacement"],
         );
-        run_git(force_sibling.path(), &["push", "--force", "origin", "main"]);
+        fixture_git(force_sibling.path(), &["push", "--force", "origin", "main"]);
 
         // Advance the local tracking clone to Z via fetch + hard-reset,
         // simulating an external "git reset --hard origin/main". After this
         // the local clone HEAD == Z; the cursor still says Y (from the DB
         // restored in rebuild_ctx_from_persisted).
-        run_git(clone.path(), &["fetch", "origin"]);
-        run_git(clone.path(), &["reset", "--hard", "origin/main"]);
+        fixture_git(clone.path(), &["fetch", "origin"]);
+        fixture_git(clone.path(), &["reset", "--hard", "origin/main"]);
         // Prune Y's objects from the local store so `collect_oneline(Y..Z)`
         // fails with a "bad object" error rather than traversing a stale pack.
         // This exercises the unreachable-ancestor failure mode, which is the
         // correct path to test here (a fabricated invalid SHA would test a
         // different "bad revision" path instead).
-        run_git(clone.path(), &["reflog", "expire", "--expire=now", "--all"]);
-        run_git(clone.path(), &["gc", "--prune=now", "--quiet"]);
+        fixture_git(clone.path(), &["reflog", "expire", "--expire=now", "--all"]);
+        fixture_git(clone.path(), &["gc", "--prune=now", "--quiet"]);
 
         // Run a cycle. `pull_clone` returns UpToDate (local == remote == Z).
         // `detect_and_notify_advance` sees prev=Y, current=Z, tries
@@ -2315,7 +2308,7 @@ mod tests {
         // Build a real clone, then swap its `origin` URL to a
         // DNS-failing host so `git fetch` classifies as transient.
         let (_remote, clone) = scratch_remote_and_clone();
-        run_git(
+        fixture_git(
             clone.path(),
             &[
                 "remote",

@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Run `git <args>` in `repo`, returning stdout. Inherits the caller's environment.
 pub fn run(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(repo)
@@ -310,16 +311,23 @@ pub fn extract_tree(repo: &Path, sha: &str, dest: &Path) {
 mod tests {
     use super::*;
 
+    use git_fixture::{assert_repo_is, git as fixture_git, init_repo};
+
     /// A git repo with one commit, for the functions that must shell out.
+    ///
+    /// Fixture mutations go through `git_fixture`, never through the
+    /// production `run`: `run` inherits the environment (a contract the
+    /// staged-scan path depends on), so under a git hook it would drive these
+    /// mutations into whatever repo `GIT_DIR` names. The read-only production
+    /// calls under test stay non-hermetic on purpose; `init_repo`'s canary is
+    /// what catches an environment that would redirect them.
     fn repo_with_commit() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
-        run(p, &["init", "-q", "-b", "main", "."]);
-        run(p, &["config", "user.email", "a@example.com"]);
-        run(p, &["config", "user.name", "alice"]);
+        init_repo(p);
         std::fs::write(p.join("f.rs"), "base\n").unwrap();
-        run(p, &["add", "f.rs"]);
-        run(p, &["commit", "-qm", "base"]);
+        fixture_git(p, &["add", "f.rs"]);
+        fixture_git(p, &["commit", "-qm", "base"]);
         dir
     }
 
@@ -409,7 +417,7 @@ diff --git a/src/a.rs b/src/a.rs
         )
         .unwrap();
         std::fs::write(p.join("notes.md"), "doc line\n").unwrap();
-        run(p, &["add", "f.rs", "notes.md"]);
+        fixture_git(p, &["add", "f.rs", "notes.md"]);
 
         let files = staged_files(p);
         assert!(files.contains(&PathBuf::from("f.rs")));
@@ -428,7 +436,7 @@ diff --git a/src/a.rs b/src/a.rs
         let dir = repo_with_commit();
         let p = dir.path();
         std::fs::write(p.join("café.md"), "x\n").unwrap();
-        run(p, &["add", "café.md"]);
+        fixture_git(p, &["add", "café.md"]);
         assert!(staged_files(p).contains(&PathBuf::from("café.md")));
     }
 
@@ -496,17 +504,17 @@ diff --git a/src/a.rs b/src/a.rs
     fn commit_more(repo: &Path, n: usize) -> String {
         for i in 0..n {
             std::fs::write(repo.join(format!("extra{i}.rs")), "x\n").unwrap();
-            run(repo, &["add", "."]);
-            run(repo, &["commit", "-qm", "more"]);
+            fixture_git(repo, &["add", "."]);
+            fixture_git(repo, &["commit", "-qm", "more"]);
         }
-        run(repo, &["rev-parse", "HEAD"]).trim().to_string()
+        fixture_git(repo, &["rev-parse", "HEAD"]).trim().to_string()
     }
 
     #[test]
     fn update_scans_exactly_the_pushed_range() {
         let dir = repo_with_commit();
         let p = dir.path();
-        let remote = run(p, &["rev-parse", "HEAD"]).trim().to_string();
+        let remote = fixture_git(p, &["rev-parse", "HEAD"]).trim().to_string();
         let local = commit_more(p, 2);
 
         let update = RefUpdate::Update {
@@ -522,8 +530,8 @@ diff --git a/src/a.rs b/src/a.rs
     fn update_with_an_unfetched_remote_sha_falls_back_to_merge_base() {
         let dir = repo_with_commit();
         let p = dir.path();
-        let base = run(p, &["rev-parse", "HEAD"]).trim().to_string();
-        run(p, &["checkout", "-q", "-b", "feat"]);
+        let base = fixture_git(p, &["rev-parse", "HEAD"]).trim().to_string();
+        fixture_git(p, &["checkout", "-q", "-b", "feat"]);
         let local = commit_more(p, 1);
 
         let update = RefUpdate::Update {
@@ -538,8 +546,8 @@ diff --git a/src/a.rs b/src/a.rs
     fn new_branch_is_bounded_by_the_merge_base_with_the_default_branch() {
         let dir = repo_with_commit();
         let p = dir.path();
-        let base = run(p, &["rev-parse", "HEAD"]).trim().to_string();
-        run(p, &["checkout", "-q", "-b", "feat"]);
+        let base = fixture_git(p, &["rev-parse", "HEAD"]).trim().to_string();
+        fixture_git(p, &["checkout", "-q", "-b", "feat"]);
         let local = commit_more(p, 2);
 
         let update = RefUpdate::New {
@@ -554,9 +562,12 @@ diff --git a/src/a.rs b/src/a.rs
     fn new_branch_without_a_default_branch_scans_whole_history() {
         let dir = repo_with_commit();
         let p = dir.path();
-        run(p, &["checkout", "-q", "-b", "solo"]);
-        run(p, &["branch", "-q", "-D", "main"]);
-        let local = run(p, &["rev-parse", "HEAD"]).trim().to_string();
+        fixture_git(p, &["checkout", "-q", "-b", "solo"]);
+        // The sharpest fixture in the suite: deleting `main` in the wrong repo
+        // destroys real work. Re-confirm isolation immediately before it.
+        assert_repo_is(p);
+        fixture_git(p, &["branch", "-q", "-D", "main"]);
+        let local = fixture_git(p, &["rev-parse", "HEAD"]).trim().to_string();
 
         let update = RefUpdate::New {
             local: local.clone(),
@@ -571,8 +582,8 @@ diff --git a/src/a.rs b/src/a.rs
         std::fs::create_dir_all(p.join("docs")).unwrap();
         std::fs::write(p.join("docs/a.md"), "x\n").unwrap();
         std::fs::write(p.join("untracked.rs"), "x\n").unwrap();
-        run(p, &["add", "docs/a.md"]);
-        run(p, &["commit", "-qm", "docs"]);
+        fixture_git(p, &["add", "docs/a.md"]);
+        fixture_git(p, &["commit", "-qm", "docs"]);
 
         let all = tracked_files(p, None);
         assert!(all.contains(&PathBuf::from("f.rs")));
@@ -617,8 +628,8 @@ diff --git a/src/a.rs b/src/a.rs
         let dir = repo_with_commit();
         let p = dir.path();
         std::fs::write(p.join("..tree.tar"), "let token = \"scanme\";\n").unwrap();
-        run(p, &["add", "--", "..tree.tar"]);
-        run(p, &["commit", "-qm", "collide"]);
+        fixture_git(p, &["add", "--", "..tree.tar"]);
+        fixture_git(p, &["commit", "-qm", "collide"]);
 
         let dest = tempfile::tempdir().unwrap();
         extract_tree(p, "HEAD", dest.path());

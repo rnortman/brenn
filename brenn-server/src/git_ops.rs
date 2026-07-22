@@ -469,55 +469,7 @@ fn parse_lines(s: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use brenn_lib::config::{AccessLevel, ResolvedMount};
-    use std::process::Command as StdCommand;
-
-    fn git_run(dir: &std::path::Path, args: &[&str]) {
-        let out = StdCommand::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@test")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@test")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    fn git_init(dir: &std::path::Path) {
-        git_run(dir, &["init", "-b", "main"]);
-        // Persist a repo-local identity. Unlike the GIT_AUTHOR_*/GIT_COMMITTER_*
-        // env vars on `git_run` (which only cover these setup commands), this is
-        // read by the production `repo_commit_and_push` subprocess, which
-        // inherits no such env. Without it, commits fail with "Author identity
-        // unknown" in environments lacking a global git identity (e.g. CI).
-        git_run(dir, &["config", "user.name", "Test"]);
-        git_run(dir, &["config", "user.email", "test@test"]);
-        std::fs::write(dir.join("file.txt"), "initial").unwrap();
-        git_run(dir, &["add", "."]);
-        git_run(dir, &["commit", "-m", "initial"]);
-    }
-
-    fn git_add_remote(dir: &std::path::Path) -> tempfile::TempDir {
-        let remote = tempfile::tempdir().unwrap();
-        git_run(remote.path(), &["init", "--bare", "-b", "main"]);
-        git_run(
-            dir,
-            &[
-                "remote",
-                "add",
-                "origin",
-                &remote.path().display().to_string(),
-            ],
-        );
-        git_run(dir, &["push", "-u", "origin", "main"]);
-        remote
-    }
+    use git_fixture::{add_bare_origin, git as fixture_git, seed_repo};
 
     fn test_mount(dir: &std::path::Path) -> ResolvedMount {
         ResolvedMount {
@@ -538,8 +490,8 @@ mod tests {
     #[tokio::test]
     async fn status_clean_repo() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
-        let _remote = git_add_remote(dir.path());
+        seed_repo(dir.path());
+        let _remote = add_bare_origin(dir.path());
         let repo = test_mount(dir.path());
         let working_dir = tempfile::tempdir().unwrap();
 
@@ -560,7 +512,7 @@ mod tests {
     #[tokio::test]
     async fn status_dirty_files() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
+        seed_repo(dir.path());
         let repo = test_mount(dir.path());
         let working_dir = tempfile::tempdir().unwrap();
 
@@ -578,7 +530,7 @@ mod tests {
     #[tokio::test]
     async fn status_untracked_files() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
+        seed_repo(dir.path());
         let repo = test_mount(dir.path());
         let working_dir = tempfile::tempdir().unwrap();
 
@@ -596,13 +548,13 @@ mod tests {
     #[tokio::test]
     async fn status_staged_files() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
+        seed_repo(dir.path());
         let repo = test_mount(dir.path());
         let working_dir = tempfile::tempdir().unwrap();
 
         // Stage a change.
         std::fs::write(dir.path().join("file.txt"), "modified").unwrap();
-        git_run(dir.path(), &["add", "file.txt"]);
+        fixture_git(dir.path(), &["add", "file.txt"]);
 
         let status = repo_status(&repo, working_dir.path()).await;
         assert!(
@@ -615,15 +567,15 @@ mod tests {
     #[tokio::test]
     async fn status_unpushed_commits() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
-        let _remote = git_add_remote(dir.path());
+        seed_repo(dir.path());
+        let _remote = add_bare_origin(dir.path());
         let repo = test_mount(dir.path());
         let working_dir = tempfile::tempdir().unwrap();
 
         // Make a local commit.
         std::fs::write(dir.path().join("local.txt"), "local").unwrap();
-        git_run(dir.path(), &["add", "."]);
-        git_run(dir.path(), &["commit", "-m", "local"]);
+        fixture_git(dir.path(), &["add", "."]);
+        fixture_git(dir.path(), &["commit", "-m", "local"]);
 
         let status = repo_status(&repo, working_dir.path()).await;
         assert_eq!(status.unpushed_count, Some(1));
@@ -632,7 +584,7 @@ mod tests {
     #[tokio::test]
     async fn status_no_upstream() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
+        seed_repo(dir.path());
         // No remote added.
         let repo = test_mount(dir.path());
         let working_dir = tempfile::tempdir().unwrap();
@@ -654,7 +606,7 @@ mod tests {
         // No-upstream case is documented as null-without-error per
         // multi-repo-git design; branch/dirty/staged still populate.
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
+        seed_repo(dir.path());
         let repo = test_mount(dir.path());
         let working_dir = tempfile::tempdir().unwrap();
 
@@ -674,7 +626,6 @@ mod tests {
         // Point at a directory that isn't a git repo at all — every
         // git query should fail and show up in `error`.
         let dir = tempfile::tempdir().unwrap();
-        // No `git_init`. Just an empty dir.
         let repo = test_mount(dir.path());
         let working_dir = tempfile::tempdir().unwrap();
 
@@ -702,8 +653,8 @@ mod tests {
     #[tokio::test]
     async fn commit_and_push_with_changes() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
-        let _remote = git_add_remote(dir.path());
+        seed_repo(dir.path());
+        let _remote = add_bare_origin(dir.path());
         let repo = test_mount(dir.path());
         let working_dir = tempfile::tempdir().unwrap();
 
@@ -718,8 +669,8 @@ mod tests {
     #[tokio::test]
     async fn commit_and_push_nothing_to_commit() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
-        let _remote = git_add_remote(dir.path());
+        seed_repo(dir.path());
+        let _remote = add_bare_origin(dir.path());
         let repo = test_mount(dir.path());
         let working_dir = tempfile::tempdir().unwrap();
 
@@ -735,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn commit_and_push_no_upstream() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
+        seed_repo(dir.path());
         // No remote — commit succeeds, push fails.
         let repo = test_mount(dir.path());
         let working_dir = tempfile::tempdir().unwrap();
@@ -756,7 +707,7 @@ mod tests {
     #[tokio::test]
     async fn run_log() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
+        seed_repo(dir.path());
         let repo = test_mount(dir.path());
         let working_dir = tempfile::tempdir().unwrap();
 
@@ -778,7 +729,7 @@ mod tests {
     #[tokio::test]
     async fn run_bad_command() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
+        seed_repo(dir.path());
         let repo = test_mount(dir.path());
         let working_dir = tempfile::tempdir().unwrap();
 

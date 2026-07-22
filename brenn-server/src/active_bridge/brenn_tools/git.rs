@@ -398,54 +398,18 @@ mod tests {
     use super::super::HandleBrennToolResult;
     use super::super::handle_brenn_tools;
     use super::resolve_mounts;
+    use git_fixture::{add_bare_origin, seed_repo};
     /// Build a scratch bare remote + tracking clone with a writable
     /// origin. The tracking clone is clean and up-to-date with origin;
     /// the caller's test arranges local changes (or not) and then calls
     /// GitRepoCommitAndPush against it. Returns `(remote, clone)`.
-    // This inline `git` closure is structurally similar to
-    // `repo_sync::test_git_fixtures::run_git` but intentionally uses local
-    // `git config` for identity (not env vars), because `GitRepoCommitAndPush`
-    // invokes `git commit` without passing identity env vars.
+    ///
+    /// Commits require a repo-local identity wherever there is no global
+    /// git config; `seed_repo` provides one.
     fn git_commit_and_push_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
-        let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@t")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&out.stderr),
-            );
-        };
-        let remote = tempfile::tempdir().unwrap();
-        git(remote.path(), &["init", "--bare", "-b", "main"]);
-
         let clone = tempfile::tempdir().unwrap();
-        std::fs::remove_dir_all(clone.path()).unwrap();
-        git(
-            std::path::Path::new("/tmp"),
-            &[
-                "clone",
-                &remote.path().display().to_string(),
-                clone.path().to_str().unwrap(),
-            ],
-        );
-        // Set identity on the clone so later commits (which run in the
-        // clone's directory without explicit env) succeed.
-        git(clone.path(), &["config", "user.name", "t"]);
-        git(clone.path(), &["config", "user.email", "t@t"]);
-        // Seed an initial commit so HEAD exists.
-        std::fs::write(clone.path().join("initial.txt"), "i").unwrap();
-        git(clone.path(), &["add", "."]);
-        git(clone.path(), &["commit", "-m", "initial"]);
-        git(clone.path(), &["push", "-u", "origin", "main"]);
-
+        seed_repo(clone.path());
+        let remote = add_bare_origin(clone.path());
         (remote, clone)
     }
 

@@ -21,4 +21,5 @@ wit-component = "0.244"
 wit-parser = "0.244"
 
 [dev-dependencies]
+git-fixture = { path = "../git-fixture" }
 wat = "1"

@@ -118,7 +118,7 @@ pub fn gated_repo_containing(dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use git_fixture::init_repo;
 
     /// A tempdir with a nested `a/b/c`, deep enough to sit clear of the
     /// filesystem root. Returns (guard, canonical deep dir).
@@ -128,15 +128,6 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
         let canonical = std::fs::canonicalize(&deep).unwrap();
         (d, canonical)
-    }
-
-    fn git_init(dir: &Path) {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .args(["init", "-q", "."])
-            .output()
-            .unwrap();
-        assert!(out.status.success());
     }
 
     /// The message a panicking closure produces, for neutrality checks. In hook
@@ -213,7 +204,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let repo = d.path().join("x/y/repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git_init(&repo);
+        init_repo(&repo);
         let canonical = std::fs::canonicalize(&repo).unwrap();
         assert_eq!(gated_repo_containing(&canonical), None);
     }
@@ -227,14 +218,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let repo = d.path().join("x/y/repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git_init(&repo);
+        init_repo(&repo);
         std::fs::write(repo.join(config::PUBLIC_FILENAME), "title = \"g\"\n").unwrap();
-        let add = Command::new("git")
-            .current_dir(&repo)
-            .args(["add", config::PUBLIC_FILENAME])
-            .output()
-            .unwrap();
-        assert!(add.status.success());
+        git_fixture::git(&repo, &["add", config::PUBLIC_FILENAME]);
         let canonical = std::fs::canonicalize(&repo).unwrap();
         assert_eq!(gated_repo_containing(&canonical), Some(canonical));
     }
@@ -246,7 +232,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let repo = d.path().join("x/y/repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git_init(&repo);
+        init_repo(&repo);
         std::fs::write(repo.join(config::PUBLIC_FILENAME), "title = \"g\"\n").unwrap();
         let canonical = std::fs::canonicalize(&repo).unwrap();
         assert_eq!(gated_repo_containing(&canonical), Some(canonical));
@@ -257,7 +243,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let repo = d.path().join("x/y/repo");
         std::fs::create_dir_all(&repo).unwrap();
-        git_init(&repo);
+        init_repo(&repo);
         std::fs::write(repo.join(config::PUBLIC_FILENAME), "title = \"g\"\n").unwrap();
         let canonical = std::fs::canonicalize(&repo).unwrap();
         let file = canonical.join("f.rs");

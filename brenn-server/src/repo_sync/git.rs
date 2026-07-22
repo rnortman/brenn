@@ -663,7 +663,8 @@ pub(super) fn oneline_unavailable(prev: &str, new: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo_sync::test_git_fixtures::{run_git, scratch_remote_and_clone};
+    use crate::repo_sync::test_git_fixtures::scratch_remote_and_clone;
+    use git_fixture::{clone_repo, git as fixture_git, init_repo};
 
     #[test]
     fn pull_outcome_to_json_shapes() {
@@ -777,19 +778,11 @@ mod tests {
         // separately below.
         let (remote, clone) = scratch_remote_and_clone();
         let pusher = tempfile::tempdir().unwrap();
-        std::fs::remove_dir_all(pusher.path()).unwrap();
-        run_git(
-            std::path::Path::new("/tmp"),
-            &[
-                "clone",
-                &remote.path().display().to_string(),
-                pusher.path().to_str().unwrap(),
-            ],
-        );
+        clone_repo(remote.path(), pusher.path());
         std::fs::write(pusher.path().join("a.txt"), "a").unwrap();
-        run_git(pusher.path(), &["add", "."]);
-        run_git(pusher.path(), &["commit", "-m", "add a"]);
-        run_git(pusher.path(), &["push", "origin", "main"]);
+        fixture_git(pusher.path(), &["add", "."]);
+        fixture_git(pusher.path(), &["commit", "-m", "add a"]);
+        fixture_git(pusher.path(), &["push", "origin", "main"]);
 
         let outcome = pull_clone(clone.path()).await;
         assert!(
@@ -809,22 +802,14 @@ mod tests {
         // detection's commit summary.
         let (remote, clone) = scratch_remote_and_clone();
         let pusher = tempfile::tempdir().unwrap();
-        std::fs::remove_dir_all(pusher.path()).unwrap();
-        run_git(
-            std::path::Path::new("/tmp"),
-            &[
-                "clone",
-                &remote.path().display().to_string(),
-                pusher.path().to_str().unwrap(),
-            ],
-        );
+        clone_repo(remote.path(), pusher.path());
         std::fs::write(pusher.path().join("a.txt"), "a").unwrap();
-        run_git(pusher.path(), &["add", "."]);
-        run_git(pusher.path(), &["commit", "-m", "add a"]);
+        fixture_git(pusher.path(), &["add", "."]);
+        fixture_git(pusher.path(), &["commit", "-m", "add a"]);
         std::fs::write(pusher.path().join("b.txt"), "b").unwrap();
-        run_git(pusher.path(), &["add", "."]);
-        run_git(pusher.path(), &["commit", "-m", "add b"]);
-        run_git(pusher.path(), &["push", "origin", "main"]);
+        fixture_git(pusher.path(), &["add", "."]);
+        fixture_git(pusher.path(), &["commit", "-m", "add b"]);
+        fixture_git(pusher.path(), &["push", "origin", "main"]);
 
         // Capture prev before pulling.
         let prev = rev_parse(clone.path(), "HEAD").await.unwrap();
@@ -844,24 +829,16 @@ mod tests {
 
         // Push from a sibling.
         let pusher = tempfile::tempdir().unwrap();
-        std::fs::remove_dir_all(pusher.path()).unwrap();
-        run_git(
-            std::path::Path::new("/tmp"),
-            &[
-                "clone",
-                &remote.path().display().to_string(),
-                pusher.path().to_str().unwrap(),
-            ],
-        );
+        clone_repo(remote.path(), pusher.path());
         std::fs::write(pusher.path().join("upstream.txt"), "up").unwrap();
-        run_git(pusher.path(), &["add", "."]);
-        run_git(pusher.path(), &["commit", "-m", "upstream commit"]);
-        run_git(pusher.path(), &["push", "origin", "main"]);
+        fixture_git(pusher.path(), &["add", "."]);
+        fixture_git(pusher.path(), &["commit", "-m", "upstream commit"]);
+        fixture_git(pusher.path(), &["push", "origin", "main"]);
 
         // Create a diverging commit locally in the clone.
         std::fs::write(clone.path().join("local.txt"), "local").unwrap();
-        run_git(clone.path(), &["add", "."]);
-        run_git(clone.path(), &["commit", "-m", "local divergent"]);
+        fixture_git(clone.path(), &["add", "."]);
+        fixture_git(clone.path(), &["commit", "-m", "local divergent"]);
 
         let outcome = pull_clone(clone.path()).await;
         match outcome {
@@ -879,11 +856,11 @@ mod tests {
     async fn pull_clone_transient_on_unreachable_remote() {
         // Clone against a remote that will fail to resolve.
         let scratch = tempfile::tempdir().unwrap();
-        run_git(scratch.path(), &["init", "-b", "main"]);
+        init_repo(scratch.path());
         std::fs::write(scratch.path().join("x"), "x").unwrap();
-        run_git(scratch.path(), &["add", "."]);
-        run_git(scratch.path(), &["commit", "-m", "initial"]);
-        run_git(
+        fixture_git(scratch.path(), &["add", "."]);
+        fixture_git(scratch.path(), &["commit", "-m", "initial"]);
+        fixture_git(
             scratch.path(),
             &[
                 "remote",
@@ -941,19 +918,11 @@ mod tests {
 
         // Push an upstream change to readme.md (which exists in the clone).
         let pusher = tempfile::tempdir().unwrap();
-        std::fs::remove_dir_all(pusher.path()).unwrap();
-        run_git(
-            std::path::Path::new("/tmp"),
-            &[
-                "clone",
-                &remote.path().display().to_string(),
-                pusher.path().to_str().unwrap(),
-            ],
-        );
+        clone_repo(remote.path(), pusher.path());
         std::fs::write(pusher.path().join("readme.md"), "upstream content").unwrap();
-        run_git(pusher.path(), &["add", "."]);
-        run_git(pusher.path(), &["commit", "-m", "upstream readme"]);
-        run_git(pusher.path(), &["push", "origin", "main"]);
+        fixture_git(pusher.path(), &["add", "."]);
+        fixture_git(pusher.path(), &["commit", "-m", "upstream readme"]);
+        fixture_git(pusher.path(), &["push", "origin", "main"]);
 
         // Dirty the same file locally — unstaged.
         std::fs::write(clone.path().join("readme.md"), "local dirty").unwrap();
@@ -979,21 +948,13 @@ mod tests {
 
         let (remote, clone) = scratch_remote_and_clone();
         let pusher = tempfile::tempdir().unwrap();
-        std::fs::remove_dir_all(pusher.path()).unwrap();
-        run_git(
-            std::path::Path::new("/tmp"),
-            &[
-                "clone",
-                &remote.path().display().to_string(),
-                pusher.path().to_str().unwrap(),
-            ],
-        );
+        clone_repo(remote.path(), pusher.path());
         for i in 0..12 {
             std::fs::write(pusher.path().join(format!("f{i}.txt")), "x").unwrap();
-            run_git(pusher.path(), &["add", "."]);
-            run_git(pusher.path(), &["commit", "-m", &format!("commit {i}")]);
+            fixture_git(pusher.path(), &["add", "."]);
+            fixture_git(pusher.path(), &["commit", "-m", &format!("commit {i}")]);
         }
-        run_git(pusher.path(), &["push", "origin", "main"]);
+        fixture_git(pusher.path(), &["push", "origin", "main"]);
 
         let prev = rev_parse(clone.path(), "HEAD").await.unwrap();
         let outcome = pull_clone(clone.path()).await;

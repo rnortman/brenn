@@ -1,5 +1,5 @@
 [workspace]
-members = ["brenn", "brenn-server", "brenn-activation", "brenn-budget", "brenn-cal", "brenn-cc", "brenn-cli", "brenn-common", "brenn-envelope", "brenn-graf", "brenn-lib", "brenn-pfin", "brenn-wasm", "cc-usage", "brenn-usage", "brenn-usage-obs", "surface/kernel", "surface/chrome", "surface/component-support", "surface/contract", "surface/components/echo-stub", "surface/components/meeting", "surface/components/mode-clock", "surface/components/protobar", "surface/proto", "surface/test-fixtures", "scrub", "xtask"]
+members = ["brenn", "brenn-server", "brenn-activation", "brenn-budget", "brenn-cal", "brenn-cc", "brenn-cli", "brenn-common", "brenn-envelope", "brenn-graf", "brenn-lib", "brenn-pfin", "brenn-wasm", "cc-usage", "brenn-usage", "brenn-usage-obs", "surface/kernel", "surface/chrome", "surface/component-support", "surface/contract", "surface/components/echo-stub", "surface/components/meeting", "surface/components/mode-clock", "surface/components/protobar", "surface/proto", "surface/test-fixtures", "scrub", "xtask", "git-fixture"]
 resolver = "3"
 
 # wasm-bindgen must be exact-pinned: the `wasm-bindgen` crate and the

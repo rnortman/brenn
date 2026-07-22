@@ -58,6 +58,7 @@ brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"]
 # router/session. No cycle: the client depends only on the proto + envelope
 # crates, never on brenn-server.
 brenn-surface-kernel = { version = "0.1.0", path = "../surface/kernel" }
+git-fixture = { version = "0.1.0", path = "../git-fixture" }
 tokio = { version = "1.50.0", features = ["full", "test-util"] }
 http-body-util = "0.1.3"
 reqwest = "0.13.2"

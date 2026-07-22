@@ -15,7 +15,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{Output, gated_repo, git_init, gitleaks_available};
+use common::{Output, gated_repo, gitleaks_available};
 
 /// A fixture token the matching config catches, assembled so the literal never
 /// appears whole in this file.
@@ -50,7 +50,7 @@ fn config_with_md_allowlist(tag: &str) -> String {
 /// destination inside it is ungated.
 fn ungated_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp dir");
-    git_init(dir.path());
+    git_fixture::init_repo(dir.path());
     dir
 }
 

@@ -1,0 +1,9 @@
+[package]
+name = "git-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Dev-only: hermetic git spawning for test fixtures, with a repo-escape canary"
+
+[dependencies]
+tempfile = "3"

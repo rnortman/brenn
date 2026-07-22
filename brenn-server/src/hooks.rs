@@ -348,9 +348,9 @@ async fn run_container_hook(
 mod tests {
     use super::*;
     use brenn_lib::config::{AccessLevel, AppConfig, PathMapper, ResolvedMount, StartHooksConfig};
+    use git_fixture::{add_bare_origin, clone_repo, git as fixture_git, seed_repo};
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::process::Command as StdCommand;
 
     /// Build a minimal AppConfig for testing. `working_dir` is the only
     /// field that matters for hook execution; the rest are inert defaults.
@@ -397,85 +397,6 @@ mod tests {
         }
     }
 
-    /// Run a git command with test credentials. Panics on failure.
-    fn git_run(dir: &Path, args: &[&str]) {
-        let out = StdCommand::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@test")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@test")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// Create a git repo in `dir` with an initial commit.
-    fn git_init(dir: &Path) {
-        let run = |args: &[&str]| {
-            let out = StdCommand::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_AUTHOR_NAME", "Test")
-                .env("GIT_AUTHOR_EMAIL", "test@test")
-                .env("GIT_COMMITTER_NAME", "Test")
-                .env("GIT_COMMITTER_EMAIL", "test@test")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        run(&["init", "-b", "main"]);
-        std::fs::write(dir.join("file.txt"), "initial").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-m", "initial"]);
-    }
-
-    /// Create a "remote" bare repo, push `dir` to it, and set up tracking.
-    /// Returns the path to the bare repo.
-    fn git_add_remote(dir: &Path) -> tempfile::TempDir {
-        let remote = tempfile::tempdir().unwrap();
-        let run_at = |d: &Path, args: &[&str]| {
-            let out = StdCommand::new("git")
-                .args(args)
-                .current_dir(d)
-                .env("GIT_AUTHOR_NAME", "Test")
-                .env("GIT_AUTHOR_EMAIL", "test@test")
-                .env("GIT_COMMITTER_NAME", "Test")
-                .env("GIT_COMMITTER_EMAIL", "test@test")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        run_at(remote.path(), &["init", "--bare", "-b", "main"]);
-        run_at(
-            dir,
-            &[
-                "remote",
-                "add",
-                "origin",
-                &remote.path().display().to_string(),
-            ],
-        );
-        run_at(dir, &["push", "-u", "origin", "main"]);
-        remote
-    }
-
     // -----------------------------------------------------------------------
     // mount auto_pull tests
     // -----------------------------------------------------------------------
@@ -518,8 +439,8 @@ mod tests {
     #[tokio::test]
     async fn auto_pull_dirty_working_tree_already_up_to_date() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
-        let _remote = git_add_remote(dir.path());
+        seed_repo(dir.path());
+        let _remote = add_bare_origin(dir.path());
 
         // Dirty the working tree. Already up-to-date with remote, so
         // git pull --ff-only succeeds (nothing to pull).
@@ -539,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn auto_pull_no_upstream() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
+        seed_repo(dir.path());
         // No remote added — `git fetch origin main` will fail with "no such remote".
 
         let working_dir = tempfile::tempdir().unwrap();
@@ -559,8 +480,8 @@ mod tests {
     #[tokio::test]
     async fn auto_pull_already_up_to_date() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
-        let _remote = git_add_remote(dir.path());
+        seed_repo(dir.path());
+        let _remote = add_bare_origin(dir.path());
 
         let working_dir = tempfile::tempdir().unwrap();
         let mut config = test_app_config(working_dir.path().to_path_buf());
@@ -576,36 +497,16 @@ mod tests {
     #[tokio::test]
     async fn auto_pull_fast_forwards() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
-        let remote = git_add_remote(dir.path());
+        seed_repo(dir.path());
+        let remote = add_bare_origin(dir.path());
 
         // Clone to a second working copy, commit, push — so `dir` is behind.
         let clone_dir = tempfile::tempdir().unwrap();
-        let run = |d: &Path, args: &[&str]| {
-            let out = StdCommand::new("git")
-                .args(args)
-                .current_dir(d)
-                .env("GIT_AUTHOR_NAME", "Test")
-                .env("GIT_AUTHOR_EMAIL", "test@test")
-                .env("GIT_COMMITTER_NAME", "Test")
-                .env("GIT_COMMITTER_EMAIL", "test@test")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        run(
-            clone_dir.path(),
-            &["clone", &remote.path().display().to_string(), "."],
-        );
+        clone_repo(remote.path(), clone_dir.path());
         std::fs::write(clone_dir.path().join("new.txt"), "new content").unwrap();
-        run(clone_dir.path(), &["add", "."]);
-        run(clone_dir.path(), &["commit", "-m", "new commit"]);
-        run(clone_dir.path(), &["push"]);
+        fixture_git(clone_dir.path(), &["add", "."]);
+        fixture_git(clone_dir.path(), &["commit", "-m", "new commit"]);
+        fixture_git(clone_dir.path(), &["push"]);
 
         // Now dir is 1 commit behind origin.
         assert!(!dir.path().join("new.txt").exists());
@@ -628,42 +529,21 @@ mod tests {
     #[tokio::test]
     async fn auto_pull_diverged_returns_warning() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
-        let remote = git_add_remote(dir.path());
-
-        let run = |d: &Path, args: &[&str]| {
-            let out = StdCommand::new("git")
-                .args(args)
-                .current_dir(d)
-                .env("GIT_AUTHOR_NAME", "Test")
-                .env("GIT_AUTHOR_EMAIL", "test@test")
-                .env("GIT_COMMITTER_NAME", "Test")
-                .env("GIT_COMMITTER_EMAIL", "test@test")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
+        seed_repo(dir.path());
+        let remote = add_bare_origin(dir.path());
 
         // Push a commit from a second clone — advance the remote.
         let clone_dir = tempfile::tempdir().unwrap();
-        run(
-            clone_dir.path(),
-            &["clone", &remote.path().display().to_string(), "."],
-        );
+        clone_repo(remote.path(), clone_dir.path());
         std::fs::write(clone_dir.path().join("remote.txt"), "from remote").unwrap();
-        run(clone_dir.path(), &["add", "."]);
-        run(clone_dir.path(), &["commit", "-m", "remote commit"]);
-        run(clone_dir.path(), &["push"]);
+        fixture_git(clone_dir.path(), &["add", "."]);
+        fixture_git(clone_dir.path(), &["commit", "-m", "remote commit"]);
+        fixture_git(clone_dir.path(), &["push"]);
 
         // Make a local commit in dir — now diverged.
         std::fs::write(dir.path().join("local.txt"), "local change").unwrap();
-        run(dir.path(), &["add", "."]);
-        run(dir.path(), &["commit", "-m", "local commit"]);
+        fixture_git(dir.path(), &["add", "."]);
+        fixture_git(dir.path(), &["commit", "-m", "local commit"]);
 
         let working_dir = tempfile::tempdir().unwrap();
         let mut config = test_app_config(working_dir.path().to_path_buf());
@@ -804,8 +684,8 @@ mod tests {
         // auto_pull mount + a hook that creates a marker file.
         // Both succeed — proves ordering is auto_pull first, then hooks.
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
-        let _remote = git_add_remote(dir.path());
+        seed_repo(dir.path());
+        let _remote = add_bare_origin(dir.path());
 
         let working_dir = tempfile::tempdir().unwrap();
         let mut config = test_app_config(working_dir.path().to_path_buf());
@@ -827,8 +707,8 @@ mod tests {
     #[tokio::test]
     async fn mount_auto_pull_succeeds() {
         let repo_dir = tempfile::tempdir().unwrap();
-        git_init(repo_dir.path());
-        let _remote = git_add_remote(repo_dir.path());
+        seed_repo(repo_dir.path());
+        let _remote = add_bare_origin(repo_dir.path());
 
         let mounts = vec![test_mount("testrepo", repo_dir.path().to_path_buf(), true)];
 
@@ -870,19 +750,16 @@ mod tests {
     #[tokio::test]
     async fn mount_auto_pull_fast_forwards() {
         let repo_dir = tempfile::tempdir().unwrap();
-        git_init(repo_dir.path());
-        let remote = git_add_remote(repo_dir.path());
+        seed_repo(repo_dir.path());
+        let remote = add_bare_origin(repo_dir.path());
 
         // Push a commit from a second clone.
         let clone_dir = tempfile::tempdir().unwrap();
-        git_run(
-            clone_dir.path(),
-            &["clone", &remote.path().display().to_string(), "."],
-        );
+        clone_repo(remote.path(), clone_dir.path());
         std::fs::write(clone_dir.path().join("new.txt"), "new content").unwrap();
-        git_run(clone_dir.path(), &["add", "."]);
-        git_run(clone_dir.path(), &["commit", "-m", "new commit"]);
-        git_run(clone_dir.path(), &["push"]);
+        fixture_git(clone_dir.path(), &["add", "."]);
+        fixture_git(clone_dir.path(), &["commit", "-m", "new commit"]);
+        fixture_git(clone_dir.path(), &["push"]);
 
         // Repo should be behind.
         assert!(!repo_dir.path().join("new.txt").exists());
@@ -902,10 +779,10 @@ mod tests {
         // Two mounts, both with auto_pull — both should pull concurrently.
         let repo_a = tempfile::tempdir().unwrap();
         let repo_b = tempfile::tempdir().unwrap();
-        git_init(repo_a.path());
-        git_init(repo_b.path());
-        let _remote_a = git_add_remote(repo_a.path());
-        let _remote_b = git_add_remote(repo_b.path());
+        seed_repo(repo_a.path());
+        seed_repo(repo_b.path());
+        let _remote_a = add_bare_origin(repo_a.path());
+        let _remote_b = add_bare_origin(repo_b.path());
 
         let mounts = vec![
             test_mount("repo-a", repo_a.path().to_path_buf(), true),
@@ -925,20 +802,17 @@ mod tests {
         // at the pull leg. Kept as a smoke test that `AccessLevel::ReadOnly`
         // doesn't re-introduce special-casing by accident.
         let repo_dir = tempfile::tempdir().unwrap();
-        git_init(repo_dir.path());
-        let remote = git_add_remote(repo_dir.path());
+        seed_repo(repo_dir.path());
+        let remote = add_bare_origin(repo_dir.path());
 
         // Push a commit from a second clone so the local repo has
         // something to pull.
         let clone_dir = tempfile::tempdir().unwrap();
-        git_run(
-            clone_dir.path(),
-            &["clone", &remote.path().display().to_string(), "."],
-        );
+        clone_repo(remote.path(), clone_dir.path());
         std::fs::write(clone_dir.path().join("ro-file.txt"), "new content").unwrap();
-        git_run(clone_dir.path(), &["add", "."]);
-        git_run(clone_dir.path(), &["commit", "-m", "remote commit"]);
-        git_run(clone_dir.path(), &["push"]);
+        fixture_git(clone_dir.path(), &["add", "."]);
+        fixture_git(clone_dir.path(), &["commit", "-m", "remote commit"]);
+        fixture_git(clone_dir.path(), &["push"]);
 
         let mut mount = test_mount("ro-repo", repo_dir.path().to_path_buf(), true);
         mount.access = AccessLevel::ReadOnly;
@@ -959,19 +833,16 @@ mod tests {
     async fn mount_auto_pull_integrated_in_run_start_hooks() {
         // Mount auto-pull runs as part of run_start_hooks.
         let repo_dir = tempfile::tempdir().unwrap();
-        git_init(repo_dir.path());
-        let remote = git_add_remote(repo_dir.path());
+        seed_repo(repo_dir.path());
+        let remote = add_bare_origin(repo_dir.path());
 
         // Push a commit from a second clone.
         let clone_dir = tempfile::tempdir().unwrap();
-        git_run(
-            clone_dir.path(),
-            &["clone", &remote.path().display().to_string(), "."],
-        );
+        clone_repo(remote.path(), clone_dir.path());
         std::fs::write(clone_dir.path().join("new.txt"), "new from remote").unwrap();
-        git_run(clone_dir.path(), &["add", "."]);
-        git_run(clone_dir.path(), &["commit", "-m", "remote commit"]);
-        git_run(clone_dir.path(), &["push"]);
+        fixture_git(clone_dir.path(), &["add", "."]);
+        fixture_git(clone_dir.path(), &["commit", "-m", "remote commit"]);
+        fixture_git(clone_dir.path(), &["push"]);
 
         let working_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(working_dir.path()).unwrap();

@@ -1,32 +1,15 @@
 //! Scratch git repo helpers shared across repo-sync integration tests.
 
 use std::path::Path;
-use std::process::Command as StdCommand;
 
-/// Run a git command in `dir`. Panics with a human-readable error on failure.
-pub(crate) fn run_git(dir: &Path, args: &[&str]) {
-    let out = StdCommand::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "Test")
-        .env("GIT_AUTHOR_EMAIL", "test@test")
-        .env("GIT_COMMITTER_NAME", "Test")
-        .env("GIT_COMMITTER_EMAIL", "test@test")
-        .output()
-        .expect("git invocation");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr),
-    );
-}
+use git_fixture::{clone_repo, git, init_bare_repo};
 
 /// Build a scratch bare remote and one clone that tracks it.
 /// Returns `(remote_tempdir, clone_tempdir)`. The clone is ready for
 /// `pull_clone` to return `UpToDate` on the first call.
 pub(crate) fn scratch_remote_and_clone() -> (tempfile::TempDir, tempfile::TempDir) {
     let remote = tempfile::tempdir().unwrap();
-    run_git(remote.path(), &["init", "--bare", "-b", "main"]);
+    init_bare_repo(remote.path());
 
     // Seed the remote via an intermediate clone, then hand back a second
     // fresh clone. Using two separate clones prevents the seed push from
@@ -35,28 +18,14 @@ pub(crate) fn scratch_remote_and_clone() -> (tempfile::TempDir, tempfile::TempDi
     // Deleting it first would free tempfile's name reservation, letting a
     // concurrent test process draw the same path and collide.
     let seed = tempfile::tempdir().unwrap();
-    run_git(
-        Path::new("/tmp"),
-        &[
-            "clone",
-            &remote.path().display().to_string(),
-            seed.path().to_str().unwrap(),
-        ],
-    );
+    clone_repo(remote.path(), seed.path());
     std::fs::write(seed.path().join("readme.md"), "hello").unwrap();
-    run_git(seed.path(), &["add", "."]);
-    run_git(seed.path(), &["commit", "-m", "initial"]);
-    run_git(seed.path(), &["push", "-u", "origin", "main"]);
+    git(seed.path(), &["add", "."]);
+    git(seed.path(), &["commit", "-m", "initial"]);
+    git(seed.path(), &["push", "-u", "origin", "main"]);
 
     let clone = tempfile::tempdir().unwrap();
-    run_git(
-        Path::new("/tmp"),
-        &[
-            "clone",
-            &remote.path().display().to_string(),
-            clone.path().to_str().unwrap(),
-        ],
-    );
+    clone_repo(remote.path(), clone.path());
     (remote, clone)
 }
 
@@ -74,45 +43,24 @@ pub(crate) fn scratch_remote_and_clone_behind_by_one() -> (tempfile::TempDir, te
 /// Returns the pushed commit's SHA.
 pub(crate) fn push_sibling_commit(remote: &Path, message: &str) -> String {
     let sibling = tempfile::tempdir().unwrap();
-    run_git(
-        Path::new("/tmp"),
-        &[
-            "clone",
-            &remote.display().to_string(),
-            sibling.path().to_str().unwrap(),
-        ],
-    );
+    clone_repo(remote, sibling.path());
     let unique = format!("{message}.txt");
     std::fs::write(sibling.path().join(&unique), "x").unwrap();
-    run_git(sibling.path(), &["add", "."]);
-    run_git(sibling.path(), &["commit", "-m", message]);
-    run_git(sibling.path(), &["push", "origin", "main"]);
+    git(sibling.path(), &["add", "."]);
+    git(sibling.path(), &["commit", "-m", message]);
+    git(sibling.path(), &["push", "origin", "main"]);
     head(sibling.path())
 }
 
 pub(crate) fn head(path: &Path) -> String {
-    let out = StdCommand::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(path)
-        .env("GIT_AUTHOR_NAME", "Test")
-        .env("GIT_AUTHOR_EMAIL", "test@test")
-        .env("GIT_COMMITTER_NAME", "Test")
-        .env("GIT_COMMITTER_EMAIL", "test@test")
-        .output()
-        .expect("git rev-parse HEAD: spawn failed");
-    assert!(
-        out.status.success(),
-        "git rev-parse HEAD failed: {}",
-        String::from_utf8_lossy(&out.stderr),
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    git(path, &["rev-parse", "HEAD"]).trim().to_string()
 }
 
 /// Make a local commit in `path` without pushing.
 pub(crate) fn local_commit(path: &Path, filename: &str, message: &str) {
     std::fs::write(path.join(filename), "content").unwrap();
-    run_git(path, &["add", "."]);
-    run_git(path, &["commit", "-m", message]);
+    git(path, &["add", "."]);
+    git(path, &["commit", "-m", message]);
 }
 
 /// Create an orphan branch with a single commit in `path` and return the
@@ -121,12 +69,12 @@ pub(crate) fn local_commit(path: &Path, filename: &str, message: &str) {
 ///
 /// After this call, `path` is left on the newly created orphan branch.
 pub(crate) fn orphan_commit(path: &Path, branch_name: &str, message: &str) -> String {
-    run_git(path, &["checkout", "--orphan", branch_name]);
+    git(path, &["checkout", "--orphan", branch_name]);
     // Clear the index so we don't inherit staged files from the previous branch.
-    run_git(path, &["rm", "-rf", "--cached", "."]);
+    git(path, &["rm", "-rf", "--cached", "."]);
     // Write a unique file so the commit has content.
     std::fs::write(path.join(format!("{branch_name}.txt")), branch_name).unwrap();
-    run_git(path, &["add", "."]);
-    run_git(path, &["commit", "-m", message]);
+    git(path, &["add", "."]);
+    git(path, &["commit", "-m", message]);
     head(path)
 }

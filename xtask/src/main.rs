@@ -1,10 +1,10 @@
 // xtask: policy runner for brenn. Subcommands: lint, guard, check-wit, check, deny, test.
 // Invoked via `cargo run -p xtask -- <subcommand>` or `cargo xtask <subcommand>`.
-// See design §2.
 
 mod check_wit;
 mod deny;
 mod discover;
+mod git_spawn_guard;
 mod guard;
 mod lint;
 mod parallel;
@@ -36,7 +36,11 @@ fn main() {
                 Some(p) => lint::lint_one(&repo_root, std::path::Path::new(&p)),
             }
         }
-        "guard" => guard::run_guard(&repo_root) & removal_guard::run_removal_guard(&repo_root),
+        "guard" => {
+            guard::run_guard(&repo_root)
+                & removal_guard::run_removal_guard(&repo_root)
+                & git_spawn_guard::run_git_spawn_guard(&repo_root)
+        }
         "check-wit" => check_wit::run_check_wit(&repo_root),
         "check" => {
             // guard, lint, and check-wit run across a bounded worker pool
@@ -63,7 +67,8 @@ fn main() {
                     Box::new(move || {
                         let units_ok = guard::run_guard(&r);
                         let removal_ok = removal_guard::run_removal_guard(&r);
-                        units_ok && removal_ok
+                        let spawn_ok = git_spawn_guard::run_git_spawn_guard(&r);
+                        units_ok && removal_ok && spawn_ok
                     })
                 }),
                 ("lint-root", {

@@ -35,6 +35,11 @@ pub fn run(
     let mut cmd = Command::new(BIN);
     cmd.args(args);
     cmd.env_remove("BRENN_SCRUB_DENYLIST");
+    // These cases are "scrub, run against this fixture repo" — production
+    // env-inheritance is not what they test. Without the strip, the spawned
+    // binary (and the `gitleaks` it spawns, which itself runs git) resolves
+    // whatever repo a hook environment names instead of the fixture.
+    git_fixture::hermetic(&mut cmd);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -84,21 +89,11 @@ pub fn gitleaks_available() -> bool {
     }
 }
 
-/// `git init` a fresh temp directory, panicking if git is unavailable.
-pub fn git_init(dir: &Path) {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(["init", "-q", "."])
-        .output()
-        .expect("git init");
-    assert!(out.status.success(), "git init failed");
-}
-
 /// A git repo carrying the given `.gitleaks.toml` at its root -- gated, so a
 /// destination inside it is scanned.
 pub fn gated_repo(config: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp dir");
-    git_init(dir.path());
+    git_fixture::init_repo(dir.path());
     std::fs::write(dir.path().join(".gitleaks.toml"), config).expect("write config");
     dir
 }

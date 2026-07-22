@@ -25,6 +25,20 @@ check_same .claude/hooks/scrub-check.sh scrub/repo-template/claude-hooks/scrub-c
 check_same .claude/hooks/format.sh scrub/repo-template/claude-hooks/format.sh
 check_same .githooks/pre-push scrub/repo-template/githooks/pre-push
 
+# 1b. The pre-commit GIT_* strip, compared as a fragment because pre-commit
+# itself is exempt above. Without this line a commit from a linked worktree
+# runs the project's checks with GIT_DIR/GIT_INDEX_FILE naming the repo being
+# committed to, and every test that spawns git mutates that repo instead of its
+# own fixture tempdir. Dropping it from the template is silent here and breaks
+# every repo that copies the template, so both copies are checked.
+strip_line='for var in $(compgen -v GIT_ || true); do unset "$var"; done'
+check_strip() {
+    grep -Fqx "$strip_line" "$1" || err "$1 does not strip GIT_* before the project's checks -- a commit from a linked worktree would run them with GIT_DIR set, and git-spawning tests would target the real repo instead of their fixtures."
+}
+
+check_strip .githooks/pre-commit
+check_strip scrub/repo-template/githooks/pre-commit
+
 # 2. Hook activation. Skipped in CI, which checks out without hooks by design
 # and is a scanning layer in its own right.
 if [ -z "${CI:-}" ] && [ -e .git ]; then

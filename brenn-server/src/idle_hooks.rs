@@ -336,49 +336,8 @@ async fn invoke_hooks_and_deliver(bridge: &Arc<ActiveBridge>, hooks: &[Arc<dyn I
 mod tests {
     use super::*;
     use brenn_lib::config::{AccessLevel, ResolvedMount};
+    use git_fixture::{add_bare_origin, git as fixture_git, seed_repo};
     use std::path::Path;
-    use std::process::Command as StdCommand;
-
-    fn git_run(dir: &Path, args: &[&str]) {
-        let out = StdCommand::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@test")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@test")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    fn git_init(dir: &Path) {
-        git_run(dir, &["init", "-b", "main"]);
-        std::fs::write(dir.join("file.txt"), "initial").unwrap();
-        git_run(dir, &["add", "."]);
-        git_run(dir, &["commit", "-m", "initial"]);
-    }
-
-    fn git_add_remote(dir: &Path) -> tempfile::TempDir {
-        let remote = tempfile::tempdir().unwrap();
-        git_run(remote.path(), &["init", "--bare", "-b", "main"]);
-        git_run(
-            dir,
-            &[
-                "remote",
-                "add",
-                "origin",
-                &remote.path().display().to_string(),
-            ],
-        );
-        git_run(dir, &["push", "-u", "origin", "main"]);
-        remote
-    }
 
     fn mount_for(dir: &Path, slug: &str) -> ResolvedMount {
         ResolvedMount {
@@ -417,8 +376,8 @@ mod tests {
     #[tokio::test]
     async fn dirty_repo_hook_clean_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
-        let _remote = git_add_remote(dir.path());
+        seed_repo(dir.path());
+        let _remote = add_bare_origin(dir.path());
         let mount = mount_for(dir.path(), "clean");
         let bridge = test_bridge_with_mounts(vec![mount]).await;
 
@@ -434,8 +393,8 @@ mod tests {
     #[tokio::test]
     async fn dirty_repo_hook_uncommitted_returns_some() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
-        let _remote = git_add_remote(dir.path());
+        seed_repo(dir.path());
+        let _remote = add_bare_origin(dir.path());
         std::fs::write(dir.path().join("file.txt"), "modified").unwrap();
         let mount = mount_for(dir.path(), "dirty");
         let bridge = test_bridge_with_mounts(vec![mount]).await;
@@ -452,12 +411,12 @@ mod tests {
     #[tokio::test]
     async fn dirty_repo_hook_unpushed_returns_some() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
-        let _remote = git_add_remote(dir.path());
+        seed_repo(dir.path());
+        let _remote = add_bare_origin(dir.path());
         // Local commit not yet pushed.
         std::fs::write(dir.path().join("local.txt"), "local").unwrap();
-        git_run(dir.path(), &["add", "."]);
-        git_run(dir.path(), &["commit", "-m", "local"]);
+        fixture_git(dir.path(), &["add", "."]);
+        fixture_git(dir.path(), &["commit", "-m", "local"]);
         let mount = mount_for(dir.path(), "tech");
         let bridge = test_bridge_with_mounts(vec![mount]).await;
 
@@ -474,7 +433,7 @@ mod tests {
         // No remote → upstream=None, unpushed_count=None — but no error
         // should be emitted, and the repo should look clean.
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
+        seed_repo(dir.path());
         let mount = mount_for(dir.path(), "noremote");
         let bridge = test_bridge_with_mounts(vec![mount]).await;
 
@@ -489,12 +448,12 @@ mod tests {
     #[tokio::test]
     async fn dirty_repo_hook_mixed_repos() {
         let clean_dir = tempfile::tempdir().unwrap();
-        git_init(clean_dir.path());
-        let _remote_a = git_add_remote(clean_dir.path());
+        seed_repo(clean_dir.path());
+        let _remote_a = add_bare_origin(clean_dir.path());
 
         let dirty_dir = tempfile::tempdir().unwrap();
-        git_init(dirty_dir.path());
-        let _remote_b = git_add_remote(dirty_dir.path());
+        seed_repo(dirty_dir.path());
+        let _remote_b = add_bare_origin(dirty_dir.path());
         std::fs::write(dirty_dir.path().join("new.txt"), "new").unwrap();
 
         let mounts = vec![
@@ -518,8 +477,8 @@ mod tests {
     #[tokio::test]
     async fn dirty_repo_hook_one_shot_cycle() {
         let dir = tempfile::tempdir().unwrap();
-        git_init(dir.path());
-        let _remote = git_add_remote(dir.path());
+        seed_repo(dir.path());
+        let _remote = add_bare_origin(dir.path());
         std::fs::write(dir.path().join("file.txt"), "modified").unwrap();
         let mount = mount_for(dir.path(), "cycle");
         let bridge = test_bridge_with_mounts(vec![mount]).await;
@@ -541,7 +500,7 @@ mod tests {
         );
 
         // Make repo clean.
-        git_run(dir.path(), &["checkout", "--", "file.txt"]);
+        fixture_git(dir.path(), &["checkout", "--", "file.txt"]);
 
         // Third check while clean: None, and reminder_sent cleared.
         let r3 = hook.check(&bridge).await;
