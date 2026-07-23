@@ -873,10 +873,11 @@ impl KernelCore {
             Event::Connected {
                 bindings,
                 alert_granted,
+                takeover_granted,
                 ..
             } => {
                 self.alert_granted = *alert_granted;
-                self.on_connected(bindings, is_element_defined)
+                self.on_connected(bindings, *takeover_granted, is_element_defined)
             }
             // The kernel mounts only `dom` components, and every one of them still
             // rides the condemned per-message dialect — nothing this kernel mounts
@@ -913,6 +914,15 @@ impl KernelCore {
                 // explicitly rather than a wildcard so a future `PublishStatus`
                 // variant fails to compile here, forcing a conscious decision on
                 // whether it warrants distinct handling.
+                // The one non-`Ok` status that reports nothing here: a plane
+                // guard refused the body, and the refusal already produced its
+                // own attributed `OverlayStateRejected` report carrying the
+                // reason. A second, thinner report about the same event doubles
+                // the offender's error-channel traffic and says less. The
+                // buffered publish path, which has no publisher to answer,
+                // already emits exactly that one report — this keeps the two
+                // paths at one report apiece.
+                PublishStatus::Refused => Vec::new(),
                 PublishStatus::RateLimited
                 | PublishStatus::BodyTooLarge { .. }
                 | PublishStatus::UnboundPort
@@ -932,6 +942,14 @@ impl KernelCore {
                     subject: Some(instance.clone()),
                 }],
             },
+            // Attributed to the publisher: the plane belongs to chrome, so a
+            // publish from anyone else is that component's (or its operator's)
+            // fault and draws down its report budget, not the kernel's.
+            Event::OverlayStateRejected { instance, reason } => vec![KernelAction::Report {
+                level: LogLevel::Error,
+                message: format!("refused overlay-state publish from {instance}: {reason}"),
+                subject: Some(instance.clone()),
+            }],
             Event::StragglerDiscarded {
                 channel,
                 seq,
@@ -969,6 +987,7 @@ impl KernelCore {
     fn on_connected(
         &mut self,
         bindings: &proto::SurfaceBindings,
+        takeover_granted: bool,
         is_element_defined: impl Fn(&str, &str) -> bool,
     ) -> Vec<KernelAction> {
         if let Some(stored) = &self.bindings {
@@ -992,6 +1011,7 @@ impl KernelCore {
         // identically; the table has no slot concept.
         self.instances = Vec::with_capacity(bindings.components.len());
         let mut actions = Vec::new();
+        actions.extend(self.dark_overlay_instrument_report(bindings, takeover_granted));
         // instance → kind for the instances that actually mounted (element
         // defined), so a subscription's pump can carry the kind for its terminal
         // error card without re-scanning the component list.
@@ -1109,6 +1129,46 @@ impl KernelCore {
         }
         actions.push(KernelAction::EmitReady);
         actions
+    }
+
+    /// One warn when a surface that can take over the screen has no way to say
+    /// so: chrome publishes its overlay transitions from inside its activation,
+    /// and an unbound output port refuses that publish at buffer time, where the
+    /// answer goes onto the dispatching event's detail and no report is drawn.
+    /// The status document then reads `overlay: null` whether or not an overlay
+    /// is held — a dark instrument that looks exactly like a healthy one, which
+    /// is the failure this plane exists to end. Drawn at connect, so the gap is
+    /// visible before an incident rather than during one.
+    ///
+    /// Only on a takeover-granted surface: nothing else can hold an overlay, and
+    /// the plane requires the grant.
+    fn dark_overlay_instrument_report(
+        &self,
+        bindings: &proto::SurfaceBindings,
+        takeover_granted: bool,
+    ) -> Option<KernelAction> {
+        let chrome = self.chrome_instance.as_deref()?;
+        if !takeover_granted {
+            return None;
+        }
+        let bound = bindings
+            .outputs
+            .iter()
+            .any(|b| b.instance == chrome && b.channel == proto::LOCAL_OVERLAY_STATE_CHANNEL);
+        if bound {
+            return None;
+        }
+        Some(KernelAction::Report {
+            level: LogLevel::Warn,
+            message: format!(
+                "chrome instance {chrome} has no {} output binding: overlay state is \
+                 unreportable and the status document will read no-overlay while one is held",
+                proto::LOCAL_OVERLAY_STATE_CHANNEL
+            ),
+            // The surface's own wiring, not a component's conduct: no instance
+            // did anything wrong, and the operator who reads it owns the config.
+            subject: None,
+        })
     }
 
     /// Whether `instance` is a component this surface configured (from the stored
@@ -3038,6 +3098,11 @@ mod tests {
         // attribution. `RateLimited` is the status a real flood actually earns,
         // and it arrives here (asynchronously, from the server) rather than at the
         // synchronous client-side gate, so this is the path that matters most.
+        //
+        // Every reporting status is listed. `Refused` is the one that reports
+        // nothing here — its plane guard already reported, attributed, with the
+        // reason — and `a_refused_publish_result_draws_no_second_report` pins
+        // that half.
         for status in [
             PublishStatus::RateLimited,
             PublishStatus::BodyTooLarge { len: 32, max: 16 },
@@ -3065,6 +3130,149 @@ mod tests {
                 "the {status:?} report must name the component it is about, not the kernel"
             );
         }
+    }
+
+    #[test]
+    fn a_refused_publish_result_draws_no_second_report() {
+        // `Refused` is the one non-`Ok` status the plane guard already reported,
+        // with the reason and the publisher attached. A generic warn on top of it
+        // says less and doubles what a looping component puts on the error
+        // channel — and the buffered path, which answers no publisher, emits only
+        // the guard's report. One event, one report, whichever path it took.
+        let mut core = KernelCore::new();
+        let actions = core.on_event(
+            &Event::PublishResult {
+                instance: "chrome".to_string(),
+                port: "overlay-state".to_string(),
+                correlation: 3,
+                status: PublishStatus::Refused,
+            },
+            |_, _| false,
+        );
+        assert_eq!(actions, Vec::new(), "the guard's own report is the report");
+    }
+
+    #[test]
+    fn an_overlay_state_rejection_reports_an_error_naming_the_publisher() {
+        // The refusal's only operator-visible trace. Error, so it clears an error
+        // channel's report floor — a downgrade would silence a component (or an
+        // operator binding) claiming to speak for chrome's screen. Attributed to
+        // the publisher, so a looping offender drains its own report budget
+        // rather than the kernel's.
+        let mut core = KernelCore::new();
+        let actions = core.on_event(
+            &Event::OverlayStateRejected {
+                instance: "meeting".to_string(),
+                reason: "only the surface's chrome instance may publish it".to_string(),
+            },
+            |_, _| false,
+        );
+        let [
+            KernelAction::Report {
+                level,
+                message,
+                subject,
+            },
+        ] = actions.as_slice()
+        else {
+            panic!("expected a single Report, got {actions:?}");
+        };
+        assert_eq!(*level, LogLevel::Error);
+        assert_eq!(subject.as_deref(), Some("meeting"));
+        assert!(message.contains("meeting"), "message: {message}");
+        assert!(
+            message.contains("only the surface's chrome instance may publish it"),
+            "the reason must survive into the report: {message}"
+        );
+    }
+
+    // ── the overlay-state instrument's own wiring ─────────────────────────
+
+    /// `connected_event_chrome` with the takeover grant and `outputs`.
+    fn connected_event_takeover(
+        components: Vec<ComponentEntry>,
+        outputs: Vec<proto::OutputBinding>,
+    ) -> Event {
+        let Event::Connected { mut bindings, .. } = connected_event_chrome(components, "chrome")
+        else {
+            unreachable!("connected_event_chrome builds a Connected");
+        };
+        bindings.outputs = outputs;
+        Event::Connected {
+            bindings,
+            participant_id: "surface:deskbar".to_string(),
+            max_body_bytes: 65_536,
+            alert_granted: false,
+            takeover_granted: true,
+            error_report_floor: None,
+            surface_description: SurfaceDescription {
+                status_interval_secs: 60,
+            },
+        }
+    }
+
+    /// The chrome output binding that makes the overlay-state plane reportable.
+    fn overlay_state_output() -> proto::OutputBinding {
+        proto::OutputBinding {
+            channel: proto::LOCAL_OVERLAY_STATE_CHANNEL.to_string(),
+            instance: "chrome".to_string(),
+            port: "overlay-state".to_string(),
+            urgency: Urgency::Normal,
+            fill_mt: 1_000,
+            capacity_mt: 8_000,
+        }
+    }
+
+    /// The overlay-state wiring warns in an action list, if it warned.
+    fn instrument_warn(actions: &[KernelAction]) -> Option<&str> {
+        actions.iter().find_map(|a| match a {
+            KernelAction::Report { message, level, .. }
+                if *level == LogLevel::Warn && message.contains("overlay-state") =>
+            {
+                Some(message.as_str())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_takeover_surface_whose_chrome_cannot_report_overlay_state_warns_at_connect() {
+        // The dark instrument. Chrome's overlay publishes are made from inside its
+        // activation, where an unbound port is answered on the dispatching event's
+        // detail and draws no report of its own — so without this, a surface
+        // deployed before its config caught up reports `overlay: null` forever and
+        // reads exactly like a healthy one.
+        let mut core = KernelCore::new();
+        let actions = core.on_event(
+            &connected_event_takeover(entries(&["chrome", "meeting"]), vec![]),
+            |_, _| true,
+        );
+        let message = instrument_warn(&actions).expect("a warn about the unbound plane");
+        assert!(message.contains("chrome"), "message: {message}");
+    }
+
+    #[test]
+    fn a_wired_or_ungranted_surface_says_nothing_about_overlay_state() {
+        // Bound: the instrument is live, nothing to say.
+        let mut core = KernelCore::new();
+        let wired = core.on_event(
+            &connected_event_takeover(
+                entries(&["chrome", "meeting"]),
+                vec![overlay_state_output()],
+            ),
+            |_, _| true,
+        );
+        assert_eq!(instrument_warn(&wired), None);
+
+        // No takeover grant: nothing can hold an overlay, and the plane requires
+        // the grant — an unbound port there is the correct configuration, not a
+        // gap.
+        let mut core = KernelCore::new();
+        let ungranted = core.on_event(
+            &connected_event_chrome(entries(&["chrome", "meeting"]), "chrome"),
+            |_, _| true,
+        );
+        assert_eq!(instrument_warn(&ungranted), None);
     }
 
     #[test]

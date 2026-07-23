@@ -2,10 +2,31 @@
 
 All notable changes to Brenn are documented here.
 
-## [Unreleased]
+## [0.14.2] — 2026-07-22
+
+### Added
+
+- **surface:** the surface status document now reports overlay state — whether a
+  fullscreen takeover is showing, which component holds it, and since when. A
+  bar stuck fullscreen is now visible to health tooling instead of reporting
+  `health: ok`.
 
 ### Fixed
 
+- **surface:** the deskbar no longer wedges fullscreen when a meeting is
+  rescheduled or replaced while inside its takeover window. Takeover requests and
+  releases published from within a component activation are now stamped with the
+  publishing identity, so a release is always attributable and the fullscreen
+  overlay clears cleanly no matter when the replacement arrives.
+- **surface:** the deskbar no longer logs spurious "dropped takeover release …
+  does not hold the overlay" warnings at theme boundaries, on reconnects, and at
+  other odd times. The chrome layer now processes only newly delivered
+  control-plane messages instead of re-folding the retained last value on every
+  screen update.
+- **surface:** dismissing or snoozing a meeting now applies only to that specific
+  occurrence. Previously a dismissal was keyed by meeting id alone and never
+  aged out, so it silently suppressed every future meeting that reused the same
+  id.
 - **surface:** messages published to a `local:` channel prior to the consumer
   mounting the channel are now delivered as new instead of only existing as
   retained context.

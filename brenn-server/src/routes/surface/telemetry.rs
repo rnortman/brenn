@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use brenn_lib::messaging::config::ResolvedSurface;
 use brenn_lib::messaging::{Messenger, PublishResult, Urgency};
-use brenn_surface_proto::{InstanceReport, InstanceState, StatusCounters};
+use brenn_surface_proto::{InstanceReport, InstanceState, OverlayReport, StatusCounters};
 use serde::Serialize;
 use serde_json::json;
 
@@ -92,6 +92,23 @@ pub fn geometry_body(
     serde_json::to_string(&body).expect("geometry document serializes to JSON")
 }
 
+/// The facts one `ClientFrame::Status` frame reports, borrowed for the length of
+/// the frame's handling.
+///
+/// One bundle rather than a positional list threaded through validation and
+/// document-building: the fields travel together everywhere, several share a
+/// shape (so a transposition would compile), and the set grows with the status
+/// schema — each added field would otherwise churn three signatures and every
+/// call site.
+pub struct StatusReport<'a> {
+    pub instances: &'a [InstanceReport],
+    pub uptime_secs: u64,
+    pub counters: &'a StatusCounters,
+    /// The overlay chrome holds, as the kernel recorded it; `None` when none is
+    /// held.
+    pub overlay: Option<&'a OverlayReport>,
+}
+
 /// Validate a `ClientFrame::Status` report against the surface's configured
 /// instance set. A report naming an instance the surface does not configure, or
 /// naming the same instance more than once, is a protocol violation (the
@@ -109,12 +126,24 @@ pub fn geometry_body(
 /// map's own type rejects duplicate keys, so only membership needs checking, and
 /// membership bounds its size at the configured count. A key may be absent (an
 /// instance that did nothing counts nothing); it may not be unknown.
+///
+/// `overlay`'s `holder` wears the same rule for the same reason: it names a
+/// principal, it reaches the retained document an operator reads, and an
+/// unconfigured one is a shell inventing a component.
 pub fn validate_status(
-    instances: &[InstanceReport],
-    counters: &StatusCounters,
+    report: &StatusReport<'_>,
     configured_instances: &HashMap<String, String>,
 ) -> Result<(), String> {
-    for instance in counters.instances.keys() {
+    let instances = report.instances;
+    if let Some(overlay) = report.overlay
+        && !configured_instances.contains_key(overlay.holder.as_str())
+    {
+        return Err(format!(
+            "Status overlay names unconfigured holder {:?}",
+            overlay.holder
+        ));
+    }
+    for instance in report.counters.instances.keys() {
         if !configured_instances.contains_key(instance.as_str()) {
             return Err(format!(
                 "Status counters name unconfigured instance {instance:?}"
@@ -184,15 +213,12 @@ pub fn derive_health(
 /// server-derived `health`, the reporting `session`, the boot `epoch`, and the
 /// shell-reported instances / uptime / counters. `reason` is `null` for a live
 /// report (the server-written stamps carry the closing reason).
-#[allow(clippy::too_many_arguments)]
 pub fn status_body(
     surface: &str,
     session: &str,
     epoch: uuid::Uuid,
     health: Health,
-    uptime_secs: u64,
-    instances: &[InstanceReport],
-    counters: StatusCounters,
+    report: &StatusReport<'_>,
 ) -> String {
     let body = json!({
         "v": SCHEMA_VERSION,
@@ -202,9 +228,13 @@ pub fn status_body(
         "epoch": epoch,
         "health": health,
         "reason": serde_json::Value::Null,
-        "uptime_secs": uptime_secs,
-        "instances": instances,
-        "counters": counters,
+        "uptime_secs": report.uptime_secs,
+        "instances": report.instances,
+        "counters": report.counters,
+        // Reported, not judged: a held overlay is a takeover doing its job as
+        // often as it is a wedge, so `health` does not read it. The field is
+        // what makes the two distinguishable to whoever does.
+        "overlay": report.overlay,
     });
     serde_json::to_string(&body).expect("status document serializes to JSON")
 }
@@ -234,6 +264,9 @@ pub fn disconnected_body(
         "uptime_secs": serde_json::Value::Null,
         "instances": instances,
         "counters": serde_json::Value::Null,
+        // A surface with no live session holds no overlay, and a server-written
+        // stamp has no page state to report either way.
+        "overlay": serde_json::Value::Null,
     });
     serde_json::to_string(&body).expect("disconnected status document serializes to JSON")
 }
@@ -336,28 +369,44 @@ mod tests {
         }
     }
 
+    /// A status report over the given facts, at a fixed uptime (no test here
+    /// reads it).
+    fn status_report<'a>(
+        instances: &'a [InstanceReport],
+        counters: &'a StatusCounters,
+        overlay: Option<&'a OverlayReport>,
+    ) -> StatusReport<'a> {
+        StatusReport {
+            instances,
+            uptime_secs: 1,
+            counters,
+            overlay,
+        }
+    }
+
     #[test]
     fn status_validation_subset() {
         let configured = configured_map(&[("p1", "protobar"), ("clock", "mode-clock")]);
         let none = StatusCounters::default();
         let ok = vec![report("p1", "protobar", InstanceState::Mounted, 1)];
-        assert!(validate_status(&ok, &none, &configured).is_ok());
+        assert!(validate_status(&status_report(&ok, &none, None), &configured).is_ok());
         // Unconfigured instance.
         let bad = vec![report("ghost", "protobar", InstanceState::Mounted, 1)];
-        assert!(validate_status(&bad, &none, &configured).is_err());
+        assert!(validate_status(&status_report(&bad, &none, None), &configured).is_err());
         // Configured instance, wrong kind.
         let wrong = vec![report("p1", "mode-clock", InstanceState::Mounted, 1)];
-        assert!(validate_status(&wrong, &none, &configured).is_err());
+        assert!(validate_status(&status_report(&wrong, &none, None), &configured).is_err());
         // Over-long reason.
         let mut long = report("p1", "protobar", InstanceState::Failed, 0);
         long.reason = Some("x".repeat(MAX_REASON_BYTES + 1));
-        assert!(validate_status(&[long], &none, &configured).is_err());
+        let long = vec![long];
+        assert!(validate_status(&status_report(&long, &none, None), &configured).is_err());
         // Duplicate instance — a multiset with repeats is not a subset.
         let dup = vec![
             report("p1", "protobar", InstanceState::Mounted, 1),
             report("p1", "protobar", InstanceState::Failed, 0),
         ];
-        assert!(validate_status(&dup, &none, &configured).is_err());
+        assert!(validate_status(&status_report(&dup, &none, None), &configured).is_err());
     }
 
     /// The per-instance counter map wears the configured-instance rule: a key
@@ -369,11 +418,14 @@ mod tests {
         let ok = vec![report("p1", "protobar", InstanceState::Mounted, 1)];
         // Both configured instances, including one the `instances` list omits —
         // the two lists are independent subsets of the same configured set.
-        assert!(validate_status(&ok, &counters_for(&["p1", "clock"]), &configured).is_ok());
+        let both = counters_for(&["p1", "clock"]);
+        assert!(validate_status(&status_report(&ok, &both, None), &configured).is_ok());
         // An instance that counted nothing may simply be absent.
-        assert!(validate_status(&ok, &counters_for(&[]), &configured).is_ok());
+        let empty = counters_for(&[]);
+        assert!(validate_status(&status_report(&ok, &empty, None), &configured).is_ok());
         // A key naming a component the surface does not configure.
-        let err = validate_status(&ok, &counters_for(&["ghost"]), &configured)
+        let ghost = counters_for(&["ghost"]);
+        let err = validate_status(&status_report(&ok, &ghost, None), &configured)
             .expect_err("an unconfigured counter key is a violation");
         assert!(
             err.contains("counters") && err.contains("ghost"),
@@ -413,30 +465,43 @@ mod tests {
         assert_eq!(derive_health(&partial, &expected), Health::Degraded);
     }
 
+    /// The overlay `p1` holds from the epoch, for the document-shape tests.
+    fn held_overlay() -> OverlayReport {
+        OverlayReport {
+            holder: "p1".to_string(),
+            since: chrono::DateTime::UNIX_EPOCH,
+        }
+    }
+
     #[test]
     fn status_body_schema() {
         let epoch = uuid::Uuid::nil();
         let instances = vec![report("p1", "protobar", InstanceState::Mounted, 1)];
+        let overlay = held_overlay();
+        let counters = StatusCounters {
+            deliveries: 10,
+            publishes: 2,
+            errors: 1,
+            instances: [(
+                "p1".to_string(),
+                brenn_surface_proto::InstanceCounters {
+                    publishes: 2,
+                    drops: 5,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
         let s = status_body(
             "bar",
             "sess",
             epoch,
             Health::Degraded,
-            86_400,
-            &instances,
-            StatusCounters {
-                deliveries: 10,
-                publishes: 2,
-                errors: 1,
-                instances: [(
-                    "p1".to_string(),
-                    brenn_surface_proto::InstanceCounters {
-                        publishes: 2,
-                        drops: 5,
-                    },
-                )]
-                .into_iter()
-                .collect(),
+            &StatusReport {
+                instances: &instances,
+                uptime_secs: 86_400,
+                counters: &counters,
+                overlay: Some(&overlay),
             },
         );
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -456,6 +521,55 @@ mod tests {
             v["counters"]["instances"],
             json!({ "p1": { "publishes": 2, "drops": 5 } })
         );
+        // The held overlay reaches the document, holder and start both: this
+        // field is the whole reason a wedged surface is distinguishable from a
+        // healthy one in the retained snapshot.
+        assert_eq!(v["overlay"]["holder"], json!("p1"));
+        assert_eq!(v["overlay"]["since"], json!("1970-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn status_body_reports_no_overlay_as_null() {
+        // The absent case is `null` rather than a missing key: a reader asking
+        // "what holds the overlay?" gets an answer from every live document,
+        // and "nothing" is an answer.
+        let instances = vec![report("p1", "protobar", InstanceState::Mounted, 1)];
+        let none = StatusCounters::default();
+        let s = status_body(
+            "bar",
+            "sess",
+            uuid::Uuid::nil(),
+            Health::Ok,
+            &status_report(&instances, &none, None),
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["overlay"], json!(null));
+    }
+
+    #[test]
+    fn status_overlay_holder_must_be_a_configured_instance() {
+        // Same rule the instance reports wear, for the same reason: the holder
+        // names a principal that reaches the retained document, and the shell is
+        // untrusted even when authenticated.
+        let configured: HashMap<String, String> = [
+            ("p1".to_string(), "protobar".to_string()),
+            ("clock".to_string(), "mode-clock".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let none = StatusCounters::default();
+        let instances = vec![report("p1", "protobar", InstanceState::Mounted, 1)];
+        let held = held_overlay();
+        assert!(
+            validate_status(&status_report(&instances, &none, Some(&held)), &configured).is_ok()
+        );
+        let ghost = OverlayReport {
+            holder: "ghost".to_string(),
+            since: chrono::DateTime::UNIX_EPOCH,
+        };
+        let err = validate_status(&status_report(&instances, &none, Some(&ghost)), &configured)
+            .expect_err("an unconfigured holder is a violation");
+        assert!(err.contains("unconfigured holder"), "unexpected: {err}");
     }
 
     #[test]
@@ -470,6 +584,7 @@ mod tests {
         assert_eq!(v["reason"], json!("server restart"));
         assert_eq!(v["uptime_secs"], json!(null));
         assert_eq!(v["counters"], json!(null));
+        assert_eq!(v["overlay"], json!(null));
         assert_eq!(v["instances"], json!([]));
         assert_eq!(v["epoch"], json!("00000000-0000-0000-0000-000000000000"));
         assert!(v["ts"].is_string());

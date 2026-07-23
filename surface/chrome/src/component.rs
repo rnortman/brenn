@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use brenn_surface_component_support::{
     Activation, PersistentTimer, Publisher, append, boot, claim_initialized, component_log,
-    create_div, document, read_monotonic_ms, register_component,
+    create_div, document, publish, read_monotonic_ms, register_component,
 };
 use brenn_surface_contract::SURFACE_ROOT_ID;
 use brenn_surface_proto::layout::LayoutKind;
@@ -29,7 +29,8 @@ use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::{Document, Element, HtmlElement};
 
 use crate::logic::{
-    BannerState, ChromeAction, ChromeCore, LayoutPlacement, Theme, TimerAction, fold,
+    BannerState, ChromeAction, ChromeCore, LayoutPlacement, PORT_OVERLAY_STATE, Theme, TimerAction,
+    fold_window,
 };
 
 /// This component's kind — its config `kind`, its element-tag stem
@@ -173,14 +174,8 @@ fn on_connected(host: HtmlElement) {
     });
 }
 
-/// Fold every delivered message into the core and apply the actions it returns.
-///
-/// Both the retained context ahead of `new_from` and the new messages are folded:
-/// on attach the depth-1 control-plane rings replay chrome's current state here,
-/// which is exactly how a late-attaching chrome catches up. The core is
-/// idempotent on a re-seen context message (theme/banner dedup, surface-state
-/// equality, layout last-good), and the toast plane retains nothing, so no toast
-/// is ever re-shown from replay.
+/// Fold each window's new messages into the core and apply the actions they
+/// return.
 fn on_activation(activation: &Activation) {
     STATE.with(|s| {
         let mut guard = s.borrow_mut();
@@ -188,10 +183,8 @@ fn on_activation(activation: &Activation) {
             .as_mut()
             .expect("brenn_bind_instance runs before the first activation");
         for window in &activation.ports {
-            for envelope in &window.envelopes {
-                let actions = fold(&mut state.core, &window.port, &envelope.body, now_ms());
-                apply_actions(state, &actions);
-            }
+            let actions = fold_window(&mut state.core, window, now_ms());
+            apply_actions(state, &actions);
         }
     });
 }
@@ -220,6 +213,11 @@ fn apply_actions(state: &mut ChromeState, actions: &[ChromeAction]) {
             ChromeAction::Log { level, message } => {
                 if let Some(host) = state.host.as_ref() {
                     component_log(host, *level, message);
+                }
+            }
+            ChromeAction::PublishOverlayState { body } => {
+                if let Some(host) = state.host.as_ref() {
+                    publish(host, PORT_OVERLAY_STATE, body);
                 }
             }
         }

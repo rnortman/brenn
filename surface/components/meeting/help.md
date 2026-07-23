@@ -35,8 +35,14 @@ The panel publishes dismiss/snooze acks to its `acks` channel and subscribes to
 the same channel so all devices converge; an ack is:
 
 ```json
-{ "v": 1, "meeting_id": "<id>", "action": "dismiss|snooze", "until": "<RFC3339, required for snooze>" }
+{ "v": 1, "meeting_id": "<id>", "start": "<RFC3339>", "action": "dismiss|snooze", "until": "<RFC3339, required for snooze>" }
 ```
+
+`start` is the acked meeting's `start`, copied verbatim from the snapshot, and it
+scopes the ack to that one occurrence: a `meeting_id` reused tomorrow, or the same
+id rescheduled to a different `start`, is not suppressed by today's dismissal. An
+ack with no parseable `start` names no occurrence, so it is dropped with a warning
+and suppresses nothing.
 
 To cancel an alarm from the agent side, drop the meeting from the next snapshot
 (or publish a dismiss ack). At the takeover threshold the panel publishes a

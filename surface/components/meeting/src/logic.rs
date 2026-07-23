@@ -12,6 +12,10 @@
 //! or clock step self-corrects on the next recompute. The agenda channel is a
 //! full snapshot, latest-wins; the ack channel accumulates dismiss/snooze acks
 //! keyed by `meeting_id`, latest-wins per meeting by publish timestamp.
+//!
+//! Acks are scoped to an occurrence: an ack carries the acked meeting's `start`
+//! and suppresses only a meeting whose `start` matches it, so a publisher that
+//! reuses one `meeting_id` across days does not inherit yesterday's dismissal.
 
 use std::collections::BTreeMap;
 
@@ -38,9 +42,9 @@ const DEFAULT_OVERDUE_SECS: i64 = 60;
 /// start with no dismissal — the "overdue forever" cap.
 const RETIRE_AFTER_SECS: i64 = 60 * 60;
 
-/// An ack whose `meeting_id` is absent from the current snapshot is pruned once
-/// it is this stale (judged on the delivered envelope's publish timestamp, so a
-/// reconnect replay of an old ack still counts as stale).
+/// An ack whose `(meeting_id, start)` occurrence is absent from the current
+/// snapshot is pruned once it is this stale (judged on the delivered envelope's
+/// publish timestamp, so a reconnect replay of an old ack still counts as stale).
 const ACK_STALE_SECS: i64 = 24 * 60 * 60;
 
 /// The default snooze duration the Snooze button applies (5 minutes).
@@ -78,12 +82,49 @@ impl DisplayState {
     }
 }
 
+/// The severity the glue logs an [`IngestWarning`] at. Two levels, not proto's
+/// four: `LogLevel` lives in a wasm-only dependency and this module is
+/// host-tested, so the glue maps this across.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarningLevel {
+    /// Expected under a well-behaved publisher; noted, not blamed.
+    Warn,
+    /// A publisher fault the operator should see on the error channel.
+    Error,
+}
+
+/// A body-level warning from a delivery that was otherwise accepted, and the
+/// level it deserves. Level travels with the text because the two sources differ
+/// in kind: an invalid escalation override is a publisher fault, a startless ack
+/// is the designed drop of a pre-occurrence-scoping body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestWarning {
+    pub level: WarningLevel,
+    pub message: String,
+}
+
+impl IngestWarning {
+    fn warn(message: String) -> Self {
+        IngestWarning {
+            level: WarningLevel::Warn,
+            message,
+        }
+    }
+
+    fn error(message: String) -> Self {
+        IngestWarning {
+            level: WarningLevel::Error,
+            message,
+        }
+    }
+}
+
 /// The outcome of an accepted delivery on a known port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestOutcome {
-    /// Body parsed and updated state. `warnings` are per-meeting override faults
-    /// (the meeting was kept with default thresholds) the glue logs as errors.
-    Accepted { warnings: Vec<String> },
+    /// Body parsed and updated state. `warnings` are per-body notes the glue
+    /// logs at each one's own level.
+    Accepted { warnings: Vec<IngestWarning> },
     /// Body violated the convention. State untouched; the report carries what the
     /// DOM glue needs for a `COMPONENT_LOG` error.
     Malformed(FaultReport),
@@ -157,11 +198,22 @@ impl Meeting {
 }
 
 /// A stored ack for one meeting: the latest action seen for its `meeting_id`,
-/// with the publish timestamp that ordered it (and bounds its pruning).
+/// the occurrence it acked, and the publish timestamp that ordered it (and bounds
+/// its pruning).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AckRecord {
     action: AckAction,
+    start: DateTime<Utc>,
     publish_ts: DateTime<Utc>,
+}
+
+/// The occurrence a Dismiss/Snooze button acks: the active meeting's id and its
+/// `start`. Both travel on the wire so an ack binds to one occurrence rather than
+/// to a reusable id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AckTarget {
+    pub meeting_id: String,
+    pub start: DateTime<Utc>,
 }
 
 /// A dismiss/snooze action.
@@ -174,9 +226,13 @@ pub enum AckAction {
 }
 
 impl AckRecord {
-    /// Whether this ack suppresses its meeting at `now`. Dismiss is permanent; a
-    /// snooze suppresses only until its `until`.
-    fn suppresses(&self, now: DateTime<Utc>) -> bool {
+    /// Whether this ack suppresses the occurrence starting at `start` at `now`.
+    /// The occurrence must match: a rescheduled or day-reused id starts clean.
+    /// Dismiss is permanent; a snooze suppresses only until its `until`.
+    fn suppresses(&self, start: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+        if self.start != start {
+            return false;
+        }
         match self.action {
             AckAction::Dismiss => true,
             AckAction::Snooze { until } => now < until,
@@ -201,8 +257,8 @@ pub struct Recompute {
     pub show_buttons: bool,
     /// Whether a fullscreen takeover overlay should be active (takeover+).
     pub want_takeover: bool,
-    /// The active meeting's id — the target for a Dismiss/Snooze button press.
-    pub active_id: Option<String>,
+    /// The active meeting's occurrence — the target for a Dismiss/Snooze press.
+    pub active: Option<AckTarget>,
     /// Seconds until the next recommended recompute.
     pub next_tick_secs: u32,
 }
@@ -236,8 +292,8 @@ struct RawEscalation {
     overdue_secs: i64,
 }
 
-/// Raw ack as serde sees it. `until` is required for `snooze`, absent for
-/// `dismiss`.
+/// Raw ack as serde sees it. `start` is the acked occurrence; `until` is required
+/// for `snooze`, absent for `dismiss`.
 #[derive(Deserialize)]
 struct RawAck {
     #[serde(default)]
@@ -246,7 +302,18 @@ struct RawAck {
     meeting_id: String,
     action: String,
     #[serde(default)]
+    start: Option<String>,
+    #[serde(default)]
     until: Option<String>,
+}
+
+/// What an ack body turned out to be.
+enum AckParse {
+    /// A well-formed occurrence-scoped ack.
+    Ack(AckTarget, AckAction),
+    /// An ack carrying no parseable `start`: it names no occurrence, so it is
+    /// dropped and the reason reported as a warning.
+    Startless(String),
 }
 
 /// Meeting escalation state: the last-good snapshot, the ack map, and a
@@ -291,10 +358,18 @@ impl MeetingState {
             }
         } else {
             match parse_ack(&envelope.body) {
-                Ok((meeting_id, action)) => {
-                    self.store_ack(meeting_id, action, envelope.publish_ts);
+                Ok(AckParse::Ack(target, action)) => {
+                    self.store_ack(&target, action, envelope.publish_ts);
                     IngestOutcome::Accepted { warnings: vec![] }
                 }
+                // Warn, not error: an ack naming no occurrence is what every
+                // body minted before occurrence scoping looks like, and the
+                // acks ring replays those on each attach until they age out.
+                // Reporting the expected as a fault would flood the error
+                // channel the operator watches for real ones.
+                Ok(AckParse::Startless(warning)) => IngestOutcome::Accepted {
+                    warnings: vec![IngestWarning::warn(warning)],
+                },
                 Err(reason) => self.fault(&envelope, reason),
             }
         };
@@ -304,8 +379,8 @@ impl MeetingState {
 
     /// Apply a Dismiss/Snooze locally (immediately, before the ack echoes back),
     /// stamped with `now` as its publish time. Idempotent with the echoed ack.
-    pub fn apply_local_ack(&mut self, meeting_id: &str, action: AckAction, now: DateTime<Utc>) {
-        self.store_ack(meeting_id.to_string(), action, now);
+    pub fn apply_local_ack(&mut self, target: &AckTarget, action: AckAction, now: DateTime<Utc>) {
+        self.store_ack(target, action, now);
         self.prune_acks(now);
     }
 
@@ -316,34 +391,46 @@ impl MeetingState {
     }
 
     /// Store an ack, latest-wins per meeting by publish timestamp — an older
-    /// replayed ack never overwrites a newer decision.
-    fn store_ack(&mut self, meeting_id: String, action: AckAction, publish_ts: DateTime<Utc>) {
-        let record = AckRecord { action, publish_ts };
-        match self.acks.get(&meeting_id) {
+    /// replayed ack never overwrites a newer decision. One record per id is
+    /// enough: ids are unique within a snapshot, so two occurrences of one id
+    /// never coexist as candidates.
+    fn store_ack(&mut self, target: &AckTarget, action: AckAction, publish_ts: DateTime<Utc>) {
+        let record = AckRecord {
+            action,
+            start: target.start,
+            publish_ts,
+        };
+        match self.acks.get(&target.meeting_id) {
             Some(existing) if existing.publish_ts >= publish_ts => {}
             _ => {
-                self.acks.insert(meeting_id, record);
+                self.acks.insert(target.meeting_id.clone(), record);
             }
         }
     }
 
-    /// Drop acks whose `meeting_id` is absent from the current snapshot **and**
-    /// whose publish timestamp is stale (> 24 h before `now`) — the map's bound
-    /// under a chatty publisher. Staleness is judged on the publish timestamp, not
-    /// local receipt, so a reconnect replay of an old ack still counts as stale.
+    /// Drop acks whose occurrence — `(meeting_id, start)` — is absent from the
+    /// current snapshot **and** whose publish timestamp is stale (> 24 h before
+    /// `now`): the map's bound under a chatty publisher, and what stops an ack for
+    /// a daily-reused id from living forever. Staleness is judged on the publish
+    /// timestamp, not local receipt, so a reconnect replay of an old ack still
+    /// counts as stale.
     fn prune_acks(&mut self, now: DateTime<Utc>) {
         let stale_before = now - Duration::seconds(ACK_STALE_SECS);
         self.acks.retain(|id, record| {
-            let known = self.meetings.iter().any(|m| &m.id == id);
-            known || record.publish_ts >= stale_before
+            let current = self
+                .meetings
+                .iter()
+                .any(|m| &m.id == id && m.start == record.start);
+            current || record.publish_ts >= stale_before
         });
     }
 
-    /// Whether a meeting is suppressed at `now` by a dismiss or an active snooze.
-    fn suppressed(&self, id: &str, now: DateTime<Utc>) -> bool {
+    /// Whether a meeting is suppressed at `now` by a dismiss or an active snooze
+    /// of that same occurrence.
+    fn suppressed(&self, meeting: &Meeting, now: DateTime<Utc>) -> bool {
         self.acks
-            .get(id)
-            .is_some_and(|record| record.suppresses(now))
+            .get(&meeting.id)
+            .is_some_and(|record| record.suppresses(meeting.start, now))
     }
 
     /// The active meeting at `now`: the earliest-start candidate not superseded by
@@ -353,7 +440,7 @@ impl MeetingState {
         let candidates: Vec<&Meeting> = self
             .meetings
             .iter()
-            .filter(|m| !self.suppressed(&m.id, now) && !m.past_retire_cap(now))
+            .filter(|m| !self.suppressed(m, now) && !m.past_retire_cap(now))
             .collect();
         candidates
             .iter()
@@ -379,7 +466,7 @@ impl MeetingState {
                 subline: String::new(),
                 show_buttons: false,
                 want_takeover: false,
-                active_id: None,
+                active: None,
                 next_tick_secs: 60,
             };
         };
@@ -400,7 +487,10 @@ impl MeetingState {
             subline: format_subline(secs_to_start),
             show_buttons: escalating,
             want_takeover: escalating,
-            active_id: Some(meeting.id.clone()),
+            active: Some(AckTarget {
+                meeting_id: meeting.id.clone(),
+                start: meeting.start,
+            }),
             // TODO(meeting-tick-visibility): a headless (no-layout-slot) meeting
             // ticks at 1 s for the whole ±1 h window even while hidden. Gating the
             // fast rate on visibility is not a plain glue check: a hidden meeting
@@ -463,7 +553,7 @@ fn parse_ts(field: &str, s: &str) -> Result<DateTime<Utc>, String> {
 
 /// Validate an agenda snapshot into meetings plus per-meeting override warnings
 /// (the meeting is kept with defaults), or a precise whole-snapshot fault reason.
-fn parse_snapshot(body: &str) -> Result<(Vec<Meeting>, Vec<String>), String> {
+fn parse_snapshot(body: &str) -> Result<(Vec<Meeting>, Vec<IngestWarning>), String> {
     let raw: RawSnapshot =
         serde_json::from_str(body).map_err(|e| format!("unparseable agenda: {e}"))?;
     let mut meetings = Vec::with_capacity(raw.meetings.len());
@@ -481,11 +571,11 @@ fn parse_snapshot(body: &str) -> Result<(Vec<Meeting>, Vec<String>), String> {
             Some(raw) => match validate_escalation(&raw) {
                 Some(esc) => esc,
                 None => {
-                    warnings.push(format!(
+                    warnings.push(IngestWarning::error(format!(
                         "meeting {:?} has an invalid escalation override \
                          (takeover_secs={}, critical_secs={}, overdue_secs={}); using defaults",
                         rm.id, raw.takeover_secs, raw.critical_secs, raw.overdue_secs
-                    ));
+                    )));
                     Escalation::default()
                 }
             },
@@ -522,8 +612,12 @@ fn validate_escalation(raw: &RawEscalation) -> Option<Escalation> {
     })
 }
 
-/// Validate an ack into `(meeting_id, action)`, or a precise fault reason.
-fn parse_ack(body: &str) -> Result<(String, AckAction), String> {
+/// Validate an ack into its occurrence and action, or a precise fault reason. An
+/// otherwise well-formed ack whose `start` is missing or unparseable names no
+/// occurrence and cannot be scoped, so it is reported as `Startless` and dropped
+/// rather than faulted — the shape a publisher predating occurrence scoping
+/// emits. A bad id or action is still a fault, judged first.
+fn parse_ack(body: &str) -> Result<AckParse, String> {
     let raw: RawAck = serde_json::from_str(body).map_err(|e| format!("unparseable ack: {e}"))?;
     if raw.meeting_id.is_empty() {
         return Err("ack meeting_id must be non-empty".to_string());
@@ -541,20 +635,47 @@ fn parse_ack(body: &str) -> Result<(String, AckAction), String> {
         }
         other => return Err(format!("unknown ack action {other:?}")),
     };
-    Ok((raw.meeting_id, action))
+    let start = match raw.start.as_deref().map(|s| parse_ts("start", s)) {
+        Some(Ok(start)) => start,
+        Some(Err(reason)) => {
+            return Ok(AckParse::Startless(format!(
+                "ack for meeting {:?} dropped: {reason}",
+                raw.meeting_id
+            )));
+        }
+        None => {
+            return Ok(AckParse::Startless(format!(
+                "ack for meeting {:?} dropped: no start, so it names no occurrence",
+                raw.meeting_id
+            )));
+        }
+    };
+    Ok(AckParse::Ack(
+        AckTarget {
+            meeting_id: raw.meeting_id,
+            start,
+        },
+        action,
+    ))
 }
 
-/// The ack body a Dismiss button publishes for `meeting_id`.
-pub fn dismiss_body(meeting_id: &str) -> String {
-    serde_json::json!({ "v": 1, "meeting_id": meeting_id, "action": "dismiss" }).to_string()
-}
-
-/// The ack body a Snooze button publishes for `meeting_id`, suppressed until
-/// `until`.
-pub fn snooze_body(meeting_id: &str, until: DateTime<Utc>) -> String {
+/// The ack body a Dismiss button publishes for `target`.
+pub fn dismiss_body(target: &AckTarget) -> String {
     serde_json::json!({
         "v": 1,
-        "meeting_id": meeting_id,
+        "meeting_id": target.meeting_id,
+        "start": target.start.to_rfc3339(),
+        "action": "dismiss",
+    })
+    .to_string()
+}
+
+/// The ack body a Snooze button publishes for `target`, suppressed until `until`.
+pub fn snooze_body(target: &AckTarget, until: DateTime<Utc>) -> String {
+    serde_json::json!({
+        "v": 1,
+        "meeting_id": target.meeting_id,
+        "start": target.start.to_rfc3339(),
         "action": "snooze",
         "until": until.to_rfc3339(),
     })
@@ -578,6 +699,19 @@ mod tests {
             "meetings": [{ "id": "m1", "start": start, "title": title }],
         })
         .to_string()
+    }
+
+    /// The occurrence a button press would ack.
+    fn target(meeting_id: &str, start: &str) -> AckTarget {
+        AckTarget {
+            meeting_id: meeting_id.to_string(),
+            start: at(start),
+        }
+    }
+
+    /// The active meeting's id at `now`.
+    fn active_id(state: &MeetingState, now: DateTime<Utc>) -> Option<String> {
+        state.recompute(now).active.map(|t| t.meeting_id)
     }
 
     fn feed_agenda(state: &mut MeetingState, body: &str, now: DateTime<Utc>) -> IngestOutcome {
@@ -607,7 +741,7 @@ mod tests {
         );
         let view = state.recompute(at("2026-07-12T15:00:00Z"));
         assert_eq!(view.state, DisplayState::Idle);
-        assert_eq!(view.active_id, None);
+        assert_eq!(view.active, None);
         assert!(!view.want_takeover);
     }
 
@@ -722,7 +856,8 @@ mod tests {
         match outcome {
             IngestOutcome::Accepted { warnings } => {
                 assert_eq!(warnings.len(), 1);
-                assert!(warnings[0].contains("invalid escalation"));
+                assert!(warnings[0].message.contains("invalid escalation"));
+                assert_eq!(warnings[0].level, WarningLevel::Error);
             }
             other => panic!("expected accepted-with-warning, got {other:?}"),
         }
@@ -764,7 +899,12 @@ mod tests {
         let now = at("2026-07-12T14:59:00Z");
         feed_agenda(&mut state, &snapshot("2026-07-12T15:00:00Z", "Design"), now);
         assert_eq!(state.recompute(now).state, DisplayState::Critical);
-        feed_ack(&mut state, &dismiss_body("m1"), "2026-07-12T14:59:01Z", now);
+        feed_ack(
+            &mut state,
+            &dismiss_body(&target("m1", "2026-07-12T15:00:00Z")),
+            "2026-07-12T14:59:01Z",
+            now,
+        );
         assert_eq!(state.recompute(now).state, DisplayState::Idle);
     }
 
@@ -777,7 +917,7 @@ mod tests {
         let until = at("2026-07-12T15:04:00Z");
         feed_ack(
             &mut state,
-            &snooze_body("m1", until),
+            &snooze_body(&target("m1", "2026-07-12T15:00:00Z"), until),
             "2026-07-12T14:59:01Z",
             now,
         );
@@ -799,7 +939,11 @@ mod tests {
         let mut state = MeetingState::new();
         let now = at("2026-07-12T14:59:00Z");
         feed_agenda(&mut state, &snapshot("2026-07-12T15:00:00Z", "Design"), now);
-        state.apply_local_ack("m1", AckAction::Dismiss, now);
+        state.apply_local_ack(
+            &target("m1", "2026-07-12T15:00:00Z"),
+            AckAction::Dismiss,
+            now,
+        );
         assert_eq!(state.recompute(now).state, DisplayState::Idle);
     }
 
@@ -817,12 +961,12 @@ mod tests {
         // 09:30 — early is overdue but within the 1 h cap; late is far away.
         let t1 = at("2026-07-12T09:30:00Z");
         feed_agenda(&mut state, &body, t1);
-        assert_eq!(state.recompute(t1).active_id.as_deref(), Some("early"));
+        assert_eq!(active_id(&state, t1).as_deref(), Some("early"));
         // 14:58 — late has entered its takeover window; it supersedes the overdue
         // early one. (early is also past its 1 h cap here, but supersession alone
         // suffices.)
         let t2 = at("2026-07-12T14:58:00Z");
-        assert_eq!(state.recompute(t2).active_id.as_deref(), Some("late"));
+        assert_eq!(active_id(&state, t2).as_deref(), Some("late"));
         assert_eq!(state.recompute(t2).state, DisplayState::Takeover);
     }
 
@@ -860,7 +1004,7 @@ mod tests {
         .to_string();
         let now = at("2026-07-12T13:00:00Z");
         feed_agenda(&mut state, &body, now);
-        assert_eq!(state.recompute(now).active_id.as_deref(), Some("a"));
+        assert_eq!(active_id(&state, now).as_deref(), Some("a"));
     }
 
     #[test]
@@ -965,7 +1109,12 @@ mod tests {
         let mut state = MeetingState::new();
         let now = at("2026-07-12T14:59:00Z");
         // Ack arrives first (cross-channel replay order).
-        feed_ack(&mut state, &dismiss_body("m1"), "2026-07-12T14:58:00Z", now);
+        feed_ack(
+            &mut state,
+            &dismiss_body(&target("m1", "2026-07-12T15:00:00Z")),
+            "2026-07-12T14:58:00Z",
+            now,
+        );
         // Then the snapshot naming m1.
         feed_agenda(&mut state, &snapshot("2026-07-12T15:00:00Z", "Design"), now);
         assert_eq!(state.recompute(now).state, DisplayState::Idle);
@@ -977,10 +1126,18 @@ mod tests {
         let now = at("2026-07-12T14:59:00Z");
         feed_agenda(&mut state, &snapshot("2026-07-12T15:00:00Z", "Design"), now);
         // A newer dismiss, then an older snooze replayed — the dismiss must win.
-        feed_ack(&mut state, &dismiss_body("m1"), "2026-07-12T14:59:10Z", now);
         feed_ack(
             &mut state,
-            &snooze_body("m1", at("2026-07-12T15:10:00Z")),
+            &dismiss_body(&target("m1", "2026-07-12T15:00:00Z")),
+            "2026-07-12T14:59:10Z",
+            now,
+        );
+        feed_ack(
+            &mut state,
+            &snooze_body(
+                &target("m1", "2026-07-12T15:00:00Z"),
+                at("2026-07-12T15:10:00Z"),
+            ),
             "2026-07-12T14:59:05Z",
             now,
         );
@@ -994,7 +1151,7 @@ mod tests {
         // A dismiss for a meeting not in any snapshot, published > 24 h ago.
         feed_ack(
             &mut state,
-            &dismiss_body("ghost"),
+            &dismiss_body(&target("ghost", "2026-07-12T10:30:00Z")),
             "2026-07-12T10:00:00Z",
             now,
         );
@@ -1009,10 +1166,245 @@ mod tests {
         let mut state = MeetingState::new();
         let now = at("2026-07-12T15:00:00Z");
         // A dismiss for a not-yet-seen meeting, published just now.
-        feed_ack(&mut state, &dismiss_body("m1"), "2026-07-12T14:59:00Z", now);
+        feed_ack(
+            &mut state,
+            &dismiss_body(&target("m1", "2026-07-12T15:00:30Z")),
+            "2026-07-12T14:59:00Z",
+            now,
+        );
         // The snapshot arrives later — the recent ack still suppresses.
         feed_agenda(&mut state, &snapshot("2026-07-12T15:00:30Z", "M"), now);
         assert_eq!(state.recompute(now).state, DisplayState::Idle);
+    }
+
+    #[test]
+    fn a_reused_id_with_a_new_start_is_not_suppressed_by_the_earlier_dismissal() {
+        let mut state = MeetingState::new();
+        let day1 = at("2026-07-12T14:59:00Z");
+        feed_agenda(
+            &mut state,
+            &snapshot("2026-07-12T15:00:00Z", "Standup"),
+            day1,
+        );
+        feed_ack(
+            &mut state,
+            &dismiss_body(&target("m1", "2026-07-12T15:00:00Z")),
+            "2026-07-12T14:59:01Z",
+            day1,
+        );
+        assert_eq!(state.recompute(day1).state, DisplayState::Idle);
+
+        // Tomorrow's occurrence of the same id, still inside the 24 h window so the
+        // ack is stored — occurrence scoping alone must let the meeting through.
+        let day2 = at("2026-07-13T14:58:00Z");
+        feed_agenda(
+            &mut state,
+            &snapshot("2026-07-13T15:00:00Z", "Standup"),
+            day2,
+        );
+        let view = state.recompute(day2);
+        assert_eq!(view.state, DisplayState::Takeover);
+        assert!(view.want_takeover);
+        assert_eq!(active_id(&state, day2).as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn the_acked_occurrence_stays_suppressed_across_re_delivery() {
+        let mut state = MeetingState::new();
+        let now = at("2026-07-12T14:59:00Z");
+        feed_agenda(&mut state, &snapshot("2026-07-12T15:00:00Z", "Design"), now);
+        let body = dismiss_body(&target("m1", "2026-07-12T15:00:00Z"));
+        feed_ack(&mut state, &body, "2026-07-12T14:59:01Z", now);
+        // The ack channel replays it; the same occurrence stays suppressed.
+        feed_ack(&mut state, &body, "2026-07-12T14:59:01Z", now);
+        feed_agenda(&mut state, &snapshot("2026-07-12T15:00:00Z", "Design"), now);
+        assert_eq!(state.recompute(now).state, DisplayState::Idle);
+    }
+
+    #[test]
+    fn snooze_is_occurrence_scoped_too() {
+        let mut state = MeetingState::new();
+        let now = at("2026-07-12T14:59:00Z");
+        feed_agenda(&mut state, &snapshot("2026-07-12T15:00:00Z", "Design"), now);
+        feed_ack(
+            &mut state,
+            &snooze_body(
+                &target("m1", "2026-07-12T15:00:00Z"),
+                at("2026-07-12T15:30:00Z"),
+            ),
+            "2026-07-12T14:59:01Z",
+            now,
+        );
+        assert_eq!(state.recompute(now).state, DisplayState::Idle);
+        // The meeting is rescheduled inside the snooze window: a new occurrence, so
+        // the snooze does not carry over.
+        feed_agenda(&mut state, &snapshot("2026-07-12T15:20:00Z", "Design"), now);
+        assert_eq!(state.recompute(now).state, DisplayState::Ambient);
+    }
+
+    #[test]
+    fn an_ack_without_a_parseable_start_is_dropped_with_a_warning() {
+        let mut state = MeetingState::new();
+        let now = at("2026-07-12T14:59:00Z");
+        feed_agenda(&mut state, &snapshot("2026-07-12T15:00:00Z", "Design"), now);
+
+        // No start at all — the shape published before occurrence scoping.
+        let body =
+            serde_json::json!({ "v": 1, "meeting_id": "m1", "action": "dismiss" }).to_string();
+        match feed_ack(&mut state, &body, "2026-07-12T14:59:01Z", now) {
+            IngestOutcome::Accepted { warnings } => {
+                assert_eq!(warnings.len(), 1);
+                assert!(
+                    warnings[0].message.contains("no start"),
+                    "{}",
+                    warnings[0].message
+                );
+                // Warn, not error: the expected shape of every pre-scoping ack
+                // the ring still replays, and the error channel stays clean.
+                assert_eq!(warnings[0].level, WarningLevel::Warn);
+            }
+            other => panic!("expected accepted-with-warning, got {other:?}"),
+        }
+        // An unparseable start is dropped the same way.
+        let body = serde_json::json!({
+            "v": 1, "meeting_id": "m1", "start": "soon", "action": "dismiss",
+        })
+        .to_string();
+        match feed_ack(&mut state, &body, "2026-07-12T14:59:02Z", now) {
+            IngestOutcome::Accepted { warnings } => {
+                assert_eq!(warnings.len(), 1);
+                assert!(
+                    warnings[0].message.contains("invalid start"),
+                    "{}",
+                    warnings[0].message
+                );
+                assert_eq!(warnings[0].level, WarningLevel::Warn);
+            }
+            other => panic!("expected accepted-with-warning, got {other:?}"),
+        }
+        // Neither is a publisher fault, and neither suppresses anything.
+        assert_eq!(state.faults(), 0);
+        assert_eq!(state.recompute(now).state, DisplayState::Critical);
+    }
+
+    #[test]
+    fn a_newer_ack_evicts_the_earlier_occurrences_dismissal() {
+        // The load-bearing simplification of occurrence scoping: acks stay keyed
+        // by id, one record each, because two occurrences of one id never coexist
+        // as candidates. The cost, pinned here so it is a decision rather than a
+        // surprise: dismiss 15:00, watch it move to 16:00, dismiss that too, and
+        // the 15:00 dismissal is gone — a move back to 15:00 alarms again.
+        let mut state = MeetingState::new();
+        let now = at("2026-07-12T14:00:00Z");
+        feed_agenda(
+            &mut state,
+            &snapshot("2026-07-12T15:00:00Z", "Standup"),
+            now,
+        );
+        feed_ack(
+            &mut state,
+            &dismiss_body(&target("m1", "2026-07-12T15:00:00Z")),
+            "2026-07-12T14:00:01Z",
+            now,
+        );
+        feed_agenda(
+            &mut state,
+            &snapshot("2026-07-12T16:00:00Z", "Standup"),
+            now,
+        );
+        feed_ack(
+            &mut state,
+            &dismiss_body(&target("m1", "2026-07-12T16:00:00Z")),
+            "2026-07-12T14:00:02Z",
+            now,
+        );
+        assert_eq!(state.recompute(now).state, DisplayState::Idle);
+
+        // Moved back: the record now names 16:00, so the returning 15:00
+        // occurrence is unsuppressed and escalates on its own schedule.
+        let back = at("2026-07-12T14:58:00Z");
+        feed_agenda(
+            &mut state,
+            &snapshot("2026-07-12T15:00:00Z", "Standup"),
+            back,
+        );
+        assert_eq!(state.recompute(back).state, DisplayState::Takeover);
+    }
+
+    #[test]
+    fn an_occurrence_mismatched_ack_ages_out_while_its_id_stays_present() {
+        // Inside 24 h the ack survives snapshots of other occurrences: returning to
+        // the acked occurrence is still suppressed.
+        let mut fresh = MeetingState::new();
+        feed_ack(
+            &mut fresh,
+            &dismiss_body(&target("m1", "2026-07-20T15:00:00Z")),
+            "2026-07-12T10:00:00Z",
+            at("2026-07-12T10:00:00Z"),
+        );
+        feed_agenda(
+            &mut fresh,
+            &snapshot("2026-07-21T15:00:00Z", "Standup"),
+            at("2026-07-12T20:00:00Z"),
+        );
+        feed_agenda(
+            &mut fresh,
+            &snapshot("2026-07-20T15:00:00Z", "Standup"),
+            at("2026-07-12T21:00:00Z"),
+        );
+        assert_eq!(
+            fresh.recompute(at("2026-07-12T21:00:00Z")).state,
+            DisplayState::Idle
+        );
+
+        // Past 24 h, a snapshot carrying only other occurrences of the same id no
+        // longer exempts the ack from the staleness cap.
+        let mut aged = MeetingState::new();
+        feed_ack(
+            &mut aged,
+            &dismiss_body(&target("m1", "2026-07-20T15:00:00Z")),
+            "2026-07-12T10:00:00Z",
+            at("2026-07-12T10:00:00Z"),
+        );
+        feed_agenda(
+            &mut aged,
+            &snapshot("2026-07-21T15:00:00Z", "Standup"),
+            at("2026-07-13T11:00:00Z"),
+        );
+        feed_agenda(
+            &mut aged,
+            &snapshot("2026-07-20T15:00:00Z", "Standup"),
+            at("2026-07-13T12:00:00Z"),
+        );
+        assert_eq!(
+            aged.recompute(at("2026-07-13T12:00:00Z")).state,
+            DisplayState::Ambient
+        );
+    }
+
+    #[test]
+    fn a_matching_occurrence_ack_is_retained_past_the_stale_cap() {
+        let mut state = MeetingState::new();
+        feed_agenda(
+            &mut state,
+            &snapshot("2026-07-20T15:00:00Z", "Standup"),
+            at("2026-07-12T10:00:00Z"),
+        );
+        feed_ack(
+            &mut state,
+            &dismiss_body(&target("m1", "2026-07-20T15:00:00Z")),
+            "2026-07-12T10:00:00Z",
+            at("2026-07-12T10:00:00Z"),
+        );
+        // Two days on, the same occurrence is still in the snapshot: a legitimately
+        // long-lived dismissal survives.
+        let later = at("2026-07-14T10:00:00Z");
+        feed_agenda(
+            &mut state,
+            &snapshot("2026-07-20T15:00:00Z", "Standup"),
+            later,
+        );
+        assert_eq!(state.recompute(later).state, DisplayState::Idle);
     }
 
     #[test]

@@ -450,6 +450,7 @@ dependencies = [
  "brenn-surface-component-support",
  "brenn-surface-contract",
  "brenn-surface-proto",
+ "brenn-surface-test-fixtures",
  "serde",
  "serde_json",
  "wasm-bindgen",

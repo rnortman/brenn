@@ -783,6 +783,9 @@ fn telemetry_on_active_surface_sends_frames() {
                 errors: 0,
                 instances: Default::default(),
             },
+            // Nothing published on the overlay-state plane, so the surface
+            // reports holding no overlay.
+            overlay: None,
         })]
     );
 }

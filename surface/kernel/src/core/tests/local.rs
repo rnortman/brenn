@@ -1449,6 +1449,594 @@ fn a_non_takeover_local_body_is_delivered_byte_for_byte() {
     assert_eq!(delivered, body);
 }
 
+// ── the takeover plane's instance injection, from an activation's buffer ─────
+
+/// A well-formed takeover body naming `instance`.
+fn takeover_body(action: TakeoverAction, instance: &str) -> String {
+    serde_json::to_string(&TakeoverBody {
+        v: CONTROL_PLANE_VERSION,
+        action,
+        instance: instance.into(),
+    })
+    .expect("a TakeoverBody serializes")
+}
+
+/// The bodies a `local:` channel's ring retains, oldest first.
+fn ring_bodies(core: &ClientCore, channel: &str) -> Vec<String> {
+    core.local_rings
+        .get(channel)
+        .expect("the channel's router ring")
+        .ring
+        .entries()
+        .map(|(e, _)| e.body.clone())
+        .collect()
+}
+
+/// A core driven to `Active` with `protobar` reading `local:brenn/theme` on
+/// `in`, and publishing on both `local:brenn/takeover` (port `takeover`) and
+/// `local:brenn/theme` (port `theme-out`).
+///
+/// The ingestion-publishes-takeover shape: a message arrives, the entry
+/// recomputes, and the recompute publishes on the takeover plane from inside
+/// the activation — where the publish is buffered rather than routed inline.
+fn core_ingesting_theme_publishing_takeover() -> ClientCore {
+    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
+    core.on_input(Input::Opened, Millis(1));
+    core.on_input(
+        Input::TextFrame(welcome_frame_local(
+            vec![local_binding(THEME, "protobar", "in")],
+            vec![
+                local_output(TAKEOVER, "protobar", "takeover"),
+                local_output(THEME, "protobar", "theme-out"),
+            ],
+            vec![local_channel(THEME, 1), local_channel(TAKEOVER, 1)],
+        )),
+        Millis(2),
+    );
+    core
+}
+
+/// Take the one ready activation, publish `body` on `port` from inside it, and
+/// return it ok — the buffered publish path, exactly as the driver drives it.
+fn publish_from_activation(
+    core: &mut ClientCore,
+    instance: &str,
+    port: &str,
+    body: &str,
+) -> Vec<Effect> {
+    let ready = take_one(core);
+    assert_eq!(ready.instance, instance, "the expected instance activated");
+    let mut buffer = ready.buffer;
+    buffer
+        .publish(port, body.to_string())
+        .expect("the port is bound for output");
+    complete(core, instance, ActivationOutcome::Ok, buffer)
+}
+
+#[test]
+fn a_buffered_takeover_publish_carries_the_activating_instance() {
+    // The stamp lives at the mint point, which both publish paths funnel
+    // through, so a takeover published from inside an activation entry is
+    // attributable exactly like one published from a gesture.
+    let mut core = core_ingesting_theme_publishing_takeover();
+    register(&mut core, "protobar", Millis(3));
+    publish(&mut core, 1, "protobar", "theme-out", "{}", Millis(4));
+    publish_from_activation(
+        &mut core,
+        "protobar",
+        "takeover",
+        &takeover_body(TakeoverAction::Request, ""),
+    );
+
+    let body = ring_bodies(&core, TAKEOVER)
+        .pop()
+        .expect("a routed takeover message");
+    let parsed: TakeoverBody = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed.instance, "protobar");
+    assert_eq!(parsed.action, TakeoverAction::Request);
+}
+
+#[test]
+fn a_buffered_takeover_publish_naming_another_instance_is_overwritten() {
+    // The forgery guard covers the buffered path too: a component publishing
+    // from inside its own activation names only its port, and the router takes
+    // the identity from its own wiring.
+    let mut core = core_ingesting_theme_publishing_takeover();
+    register(&mut core, "protobar", Millis(3));
+    publish(&mut core, 1, "protobar", "theme-out", "{}", Millis(4));
+    publish_from_activation(
+        &mut core,
+        "protobar",
+        "takeover",
+        &takeover_body(TakeoverAction::Release, "victim"),
+    );
+
+    let body = ring_bodies(&core, TAKEOVER)
+        .pop()
+        .expect("a routed takeover message");
+    let parsed: TakeoverBody = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed.instance, "protobar");
+}
+
+#[test]
+fn a_buffered_non_takeover_publish_is_routed_byte_for_byte() {
+    // The stamp is scoped to the takeover channel at the mint point, not to a
+    // publish path: a body on any other plane flushed from an activation buffer
+    // is routed verbatim, never parsed-and-re-stamped.
+    let mut core = core_ingesting_theme_publishing_takeover();
+    register(&mut core, "protobar", Millis(3));
+    publish(&mut core, 1, "protobar", "theme-out", "{}", Millis(4));
+    let body = r#"{"instance":"victim","arbitrary":"payload"}"#;
+    publish_from_activation(&mut core, "protobar", "theme-out", body);
+
+    assert_eq!(ring_bodies(&core, THEME).pop().unwrap(), body);
+}
+
+#[test]
+fn a_release_published_while_ingesting_a_replacement_is_attributable() {
+    // The wedge, in shape: a component holds the overlay by an earlier stamped
+    // Request; a replacement snapshot arrives; ingesting it flips the component
+    // back to not-wanting-takeover and the Release goes out from inside that
+    // activation. Both messages must name the same instance, or the consumer
+    // holds an overlay whose release it can never attribute.
+    let mut core = core_ingesting_theme_publishing_takeover();
+    register(&mut core, "protobar", Millis(3));
+    // The Request, from a timer tick: no activation in flight, so it routes
+    // inline.
+    publish(
+        &mut core,
+        1,
+        "protobar",
+        "takeover",
+        &takeover_body(TakeoverAction::Request, ""),
+        Millis(4),
+    );
+    let request: TakeoverBody =
+        serde_json::from_str(&ring_bodies(&core, TAKEOVER).pop().unwrap()).unwrap();
+    publish(&mut core, 2, "protobar", "theme-out", "{}", Millis(5));
+    publish_from_activation(
+        &mut core,
+        "protobar",
+        "takeover",
+        &takeover_body(TakeoverAction::Release, ""),
+    );
+    let release: TakeoverBody =
+        serde_json::from_str(&ring_bodies(&core, TAKEOVER).pop().unwrap()).unwrap();
+
+    assert_eq!(request.action, TakeoverAction::Request);
+    assert_eq!(release.action, TakeoverAction::Release);
+    assert_eq!(request.instance, "protobar");
+    assert_eq!(release.instance, request.instance);
+}
+
+#[test]
+fn a_takeover_published_from_a_primed_replay_activation_is_attributable() {
+    // The replay face of the same defect: a fresh page's first activation is
+    // driven by the retained ring primed into its queue at attach, and the
+    // publish its ingestion makes takes the same buffered path. Nothing about
+    // attribution may depend on how the activation was triggered.
+    let mut core = core_ingesting_theme_publishing_takeover();
+    // Published before the instance registers: nothing is queued, the ring
+    // retains it.
+    publish(&mut core, 1, "protobar", "theme-out", "{}", Millis(4));
+    assert!(
+        core.take_ready_activation().is_none(),
+        "an unregistered instance does not activate"
+    );
+    // Attach primes the retained value in as new, which activates the instance
+    // in the same turn.
+    register(&mut core, "protobar", Millis(5));
+    publish_from_activation(
+        &mut core,
+        "protobar",
+        "takeover",
+        &takeover_body(TakeoverAction::Request, ""),
+    );
+
+    let body = ring_bodies(&core, TAKEOVER)
+        .pop()
+        .expect("a routed takeover message");
+    let parsed: TakeoverBody = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed.instance, "protobar");
+}
+
+// ── the overlay-state plane: chrome's report, the kernel's record ────────────
+
+const OVERLAY_STATE: &str = "local:brenn/overlay-state";
+
+/// A `Welcome` declaring `chrome` as the surface's chrome instance, with
+/// `chrome` bound to publish on the overlay-state plane and `meeting` declared
+/// as the instance that can hold an overlay.
+///
+/// Both instances also read and write [`APP_EVENTS`], which is how a test drives
+/// one of them into an activation: chrome's real overlay-state publishes are
+/// made from inside its activation entry, so the buffered path needs an
+/// ingestion to hang off.
+fn welcome_frame_with_chrome() -> String {
+    welcome_frame_chrome_with(vec!["chrome", "meeting"])
+}
+
+/// [`welcome_frame_with_chrome`] declaring exactly `instances` (which must
+/// include `chrome`) — the reconnect fixture, for a `Welcome` that drops the
+/// instance a recorded overlay names.
+fn welcome_frame_chrome_with(instances: Vec<&str>) -> String {
+    let entry = |instance: &str| ComponentEntry {
+        instance: instance.into(),
+        kind: instance.into(),
+        abi: brenn_surface_proto::Abi::Dom,
+        parked_batch_depth: 8,
+        config: Default::default(),
+    };
+    let components: Vec<ComponentEntry> = instances.iter().map(|i| entry(i)).collect();
+    let subscriptions: Vec<Binding> = instances
+        .iter()
+        .map(|i| local_binding(APP_EVENTS, i, "in"))
+        .collect();
+    let outputs: Vec<OutputBinding> = instances
+        .iter()
+        .flat_map(|i| {
+            [
+                local_output(OVERLAY_STATE, i, "overlay-state"),
+                local_output(APP_EVENTS, i, "app-out"),
+            ]
+        })
+        .collect();
+    serde_json::to_string(&ServerFrame::Welcome {
+        surface: "deskbar".into(),
+        participant_id: "surface:deskbar".into(),
+        heartbeat_secs: 20,
+        max_body_bytes: 65_536,
+        alert_granted: false,
+        takeover_granted: true,
+        error_report_floor: None,
+        surface_description: brenn_surface_proto::SurfaceDescription {
+            status_interval_secs: 60,
+        },
+        bindings: SurfaceBindings {
+            components,
+            subscriptions,
+            outputs,
+            local_channels: vec![
+                local_channel(OVERLAY_STATE, 1),
+                local_channel(APP_EVENTS, 1),
+            ],
+            chrome_instance: "chrome".into(),
+        },
+    })
+    .unwrap()
+}
+
+/// A core driven to `Active` on [`welcome_frame_with_chrome`].
+fn core_with_chrome() -> ClientCore {
+    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
+    core.on_input(Input::Opened, Millis(1));
+    core.on_input(Input::TextFrame(welcome_frame_with_chrome()), Millis(2));
+    core
+}
+
+/// An overlay-state body naming `holder`.
+fn overlay_state_body(holder: Option<&str>) -> String {
+    serde_json::to_string(&brenn_surface_proto::OverlayStateBody {
+        v: CONTROL_PLANE_VERSION,
+        holder: holder.map(|h| h.to_string()),
+        since_stamp: 42,
+    })
+    .expect("an OverlayStateBody serializes")
+}
+
+/// The overlay the core reports on a status frame.
+fn reported_overlay(core: &mut ClientCore, now: Millis) -> Option<OverlayReport> {
+    let effects = core.on_input(
+        Input::Command(Command::SendStatus {
+            instances: vec![],
+            uptime_secs: 1,
+            counters: StatusCounters::default(),
+        }),
+        now,
+    );
+    match frames(&effects).as_slice() {
+        [ClientFrame::Status { overlay, .. }] => overlay.clone(),
+        other => panic!("expected one Status frame, got {other:?}"),
+    }
+}
+
+/// The `OverlayStateRejected` reasons an effect list carries, by publisher.
+fn overlay_rejections(effects: &[Effect]) -> Vec<(String, String)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::EmitEvent(Event::OverlayStateRejected { instance, reason }) => {
+                Some((instance.clone(), reason.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_kernel_records_the_overlay_chrome_reports() {
+    // The status document's one page-state field. The kernel cannot infer it
+    // from routed takeover traffic — chrome drops messages the router carried —
+    // so it takes chrome's post-fold word for it, at the mint point.
+    let mut core = core_with_chrome();
+    register(&mut core, "chrome", Millis(3));
+    publish(
+        &mut core,
+        1,
+        "chrome",
+        "overlay-state",
+        &overlay_state_body(Some("meeting")),
+        Millis(4),
+    );
+    let held = reported_overlay(&mut core, Millis(5)).expect("an overlay is held");
+    assert_eq!(held.holder, "meeting");
+    // The hold began when the transition was minted, on the wall clock — the
+    // body's own stamp is page-monotonic and means nothing off the page.
+    assert_eq!(held.since, test_stamp(1).publish_ts);
+
+    // The pop is a report like any other, and clears the record.
+    publish(
+        &mut core,
+        2,
+        "chrome",
+        "overlay-state",
+        &overlay_state_body(None),
+        Millis(6),
+    );
+    assert_eq!(reported_overlay(&mut core, Millis(7)), None);
+}
+
+#[test]
+fn an_overlay_state_publish_from_a_non_chrome_instance_is_refused() {
+    // The spoof guard. `chrome = true` is unique per surface, so a publish from
+    // anyone else is a component (or an operator binding) claiming to speak for
+    // chrome's screen. It is dropped — not retained, not delivered — and
+    // reported, and the kernel's record is untouched.
+    let mut core = core_with_chrome();
+    register(&mut core, "chrome", Millis(3));
+    publish(
+        &mut core,
+        1,
+        "chrome",
+        "overlay-state",
+        &overlay_state_body(Some("meeting")),
+        Millis(4),
+    );
+    let effects = publish(
+        &mut core,
+        2,
+        "meeting",
+        "overlay-state",
+        &overlay_state_body(None),
+        Millis(5),
+    );
+
+    let rejections = overlay_rejections(&effects);
+    assert_eq!(rejections.len(), 1, "one report: {effects:?}");
+    assert_eq!(rejections[0].0, "meeting");
+    assert!(
+        rejections[0].1.contains("chrome instance"),
+        "unexpected reason: {}",
+        rejections[0].1
+    );
+    // The publisher is told its message did not land: a `PublishResult` is the
+    // only word it gets, and `Ok` for a dropped body would be a lie.
+    assert_eq!(publish_statuses(&effects), vec![PublishStatus::Refused]);
+    // Not on the plane, and the recorded overlay still says what chrome said.
+    assert_eq!(ring_bodies(&core, OVERLAY_STATE).len(), 1);
+    assert_eq!(
+        reported_overlay(&mut core, Millis(6))
+            .expect("the recorded overlay survives the refusal")
+            .holder,
+        "meeting"
+    );
+}
+
+#[test]
+fn an_unreportable_overlay_state_body_is_refused() {
+    // Two ways chrome itself could hand the kernel something it cannot stand
+    // behind: a body it cannot parse, and a holder the surface never declared —
+    // which the server treats as a protocol violation and kills the session
+    // over. Both are refused at the mint rather than reported onward.
+    let mut core = core_with_chrome();
+    register(&mut core, "chrome", Millis(3));
+    let garbage = publish(
+        &mut core,
+        1,
+        "chrome",
+        "overlay-state",
+        "not json",
+        Millis(4),
+    );
+    assert_eq!(overlay_rejections(&garbage).len(), 1, "{garbage:?}");
+    assert_eq!(publish_statuses(&garbage), vec![PublishStatus::Refused]);
+
+    let ghost = publish(
+        &mut core,
+        2,
+        "chrome",
+        "overlay-state",
+        &overlay_state_body(Some("ghost")),
+        Millis(5),
+    );
+    let rejections = overlay_rejections(&ghost);
+    assert_eq!(rejections.len(), 1, "{ghost:?}");
+    assert!(
+        rejections[0].1.contains("declared instance"),
+        "unexpected reason: {}",
+        rejections[0].1
+    );
+    assert_eq!(publish_statuses(&ghost), vec![PublishStatus::Refused]);
+    assert!(ring_bodies(&core, OVERLAY_STATE).is_empty());
+    assert_eq!(reported_overlay(&mut core, Millis(6)), None);
+}
+
+#[test]
+fn a_buffered_overlay_state_publish_from_chrome_is_recorded() {
+    // Chrome's *only* real path: it folds an activation window and publishes the
+    // resulting transition from inside that entry, so the guard and the record
+    // both hang off the buffered flush. A guard enforced on the gesture path
+    // alone would leave the buffered path unprotected.
+    let mut core = core_with_chrome();
+    register(&mut core, "chrome", Millis(3));
+    // An ingestion for chrome to fold; its entry publishes the transition.
+    publish(&mut core, 1, "chrome", "app-out", "{}", Millis(4));
+    publish_from_activation(
+        &mut core,
+        "chrome",
+        "overlay-state",
+        &overlay_state_body(Some("meeting")),
+    );
+
+    let held = reported_overlay(&mut core, Millis(5)).expect("an overlay is held");
+    assert_eq!(held.holder, "meeting");
+    assert_eq!(ring_bodies(&core, OVERLAY_STATE).len(), 1);
+}
+
+#[test]
+fn a_buffered_overlay_state_publish_from_a_non_chrome_instance_is_refused() {
+    // The refusal's buffered face, which differs from the gesture path's: the
+    // publisher was answered at buffer time and there is no `PublishResult` to
+    // carry a status, so the violation report is the whole of the signal. It
+    // must survive the flush.
+    let mut core = core_with_chrome();
+    publish(
+        &mut core,
+        1,
+        "chrome",
+        "overlay-state",
+        &overlay_state_body(Some("meeting")),
+        Millis(3),
+    );
+    register(&mut core, "meeting", Millis(4));
+    publish(&mut core, 2, "meeting", "app-out", "{}", Millis(5));
+    let effects = publish_from_activation(
+        &mut core,
+        "meeting",
+        "overlay-state",
+        &overlay_state_body(None),
+    );
+
+    let rejections = overlay_rejections(&effects);
+    assert_eq!(rejections.len(), 1, "one report: {effects:?}");
+    assert_eq!(rejections[0].0, "meeting");
+    assert!(
+        publish_statuses(&effects).is_empty(),
+        "a buffered publish was answered at buffer time: {effects:?}"
+    );
+    // Neither the plane nor the kernel's record moved.
+    assert_eq!(ring_bodies(&core, OVERLAY_STATE).len(), 1);
+    assert_eq!(
+        reported_overlay(&mut core, Millis(6))
+            .expect("the recorded overlay survives the refusal")
+            .holder,
+        "meeting"
+    );
+}
+
+#[test]
+fn a_welcome_that_drops_the_recorded_holder_clears_the_overlay() {
+    // The record is validated against the bindings live when chrome published
+    // it. A reconnect whose `Welcome` no longer declares that instance would
+    // otherwise keep reporting it, and a `Status` naming an unconfigured
+    // instance is a protocol violation the server kills the session over —
+    // reconnect, report, violate, forever.
+    let mut core = core_with_chrome();
+    publish(
+        &mut core,
+        1,
+        "chrome",
+        "overlay-state",
+        &overlay_state_body(Some("meeting")),
+        Millis(3),
+    );
+    assert!(reported_overlay(&mut core, Millis(4)).is_some());
+
+    core.on_input(
+        Input::Disconnected {
+            code: None,
+            reason: String::new(),
+        },
+        Millis(5),
+    );
+    core.on_input(Input::Tick, Millis(3_005));
+    core.on_input(Input::Opened, Millis(3_006));
+    core.on_input(
+        Input::TextFrame(welcome_frame_chrome_with(vec!["chrome"])),
+        Millis(3_007),
+    );
+    assert_eq!(
+        reported_overlay(&mut core, Millis(3_008)),
+        None,
+        "a holder the surface no longer declares is not something to report"
+    );
+}
+
+#[test]
+fn a_welcome_that_keeps_the_recorded_holder_keeps_the_overlay() {
+    // The other half: an ordinary reconnect is exactly when a live wedge most
+    // needs reporting, so a holder the new bindings still declare survives.
+    let mut core = core_with_chrome();
+    publish(
+        &mut core,
+        1,
+        "chrome",
+        "overlay-state",
+        &overlay_state_body(Some("meeting")),
+        Millis(3),
+    );
+    core.on_input(
+        Input::Disconnected {
+            code: None,
+            reason: String::new(),
+        },
+        Millis(4),
+    );
+    core.on_input(Input::Tick, Millis(3_005));
+    core.on_input(Input::Opened, Millis(3_006));
+    core.on_input(Input::TextFrame(welcome_frame_with_chrome()), Millis(3_007));
+    assert_eq!(
+        reported_overlay(&mut core, Millis(3_008))
+            .expect("the overlay survives a reconnect")
+            .holder,
+        "meeting"
+    );
+}
+
+#[test]
+#[should_panic(expected = "the kernel does not publish on local:brenn/takeover")]
+fn the_kernel_may_not_mint_a_takeover_message() {
+    // Unreachable from today's callers — `on_publish_control` asserts the plane
+    // is kernel-publish-only, which takeover is not — so the guard sits at the
+    // mint point, where a future kernel-side publish would arrive. An
+    // unattributable takeover body is exactly what the identity model forbids,
+    // and softening this to a passthrough would reopen it.
+    let mut core = core_wired_to(TAKEOVER, 1);
+    let _ = core.mint_and_route_local(
+        TAKEOVER,
+        LocalOrigin::Kernel,
+        takeover_body(TakeoverAction::Release, ""),
+        test_stamp(1),
+        Urgency::Normal,
+    );
+}
+
+#[test]
+#[should_panic(expected = "the kernel does not publish on local:brenn/overlay-state")]
+fn the_kernel_may_not_mint_an_overlay_state_message() {
+    // The same guard on the telemetry plane: the kernel holds no overlay and
+    // renders none, so a kernel-minted overlay report would be the kernel
+    // inventing telemetry about a component's screen.
+    let mut core = core_with_chrome();
+    let _ = core.mint_and_route_local(
+        OVERLAY_STATE,
+        LocalOrigin::Kernel,
+        overlay_state_body(Some("meeting")),
+        test_stamp(1),
+        Urgency::Normal,
+    );
+}
+
 // ── the kernel's reserved control planes ─────────────────────────────────────
 
 const LINK_STATE: &str = "local:brenn/link-state";

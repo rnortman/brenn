@@ -617,6 +617,10 @@ async fn dispatcher_loop(
             tokio::spawn(async move {
                 match fan_out_handle.await {
                     Ok((fired_wake, delivered_any)) => {
+                        // TODO(dispatcher-completion-kick): a scan that skipped
+                        // this subscriber because its key was in_flight left
+                        // rows behind, and nothing kicks the dispatcher here, so
+                        // those rows wait out the full POLL_INTERVAL.
                         // Normal completion: clean up in_flight.
                         in_flight_supervisor
                             .lock()

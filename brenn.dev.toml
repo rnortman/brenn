@@ -571,6 +571,14 @@ instance = "meeting"
 port = "takeover"
 channel = "local:brenn/takeover"
 
+# Chrome's overlay holdership onto the reserved overlay-state plane. The kernel
+# reads it at the router's mint point into the surface's status report, which is
+# the only place a fullscreen-wedged bar becomes visible to an operator.
+[[surface.output]]
+instance = "chrome"
+port = "overlay-state"
+channel = "local:brenn/overlay-state"
+
 # Headless mode-clock's theme output onto the reserved theme plane chrome
 # consumes. `local:` needs no publish grant/ACL (page-local; the server mediates
 # no local traffic); the plane is not kernel-publish-only, so a component may
@@ -699,6 +707,12 @@ channel = "brenn:bar-acks"
 instance = "meeting"
 port = "takeover"
 channel = "local:brenn/takeover"
+
+# Chrome's overlay holdership, as on `bar`.
+[[surface.output]]
+instance = "chrome"
+port = "overlay-state"
+channel = "local:brenn/overlay-state"
 
 # Bar feeder: the browser-driven publisher for the bar. Four echo-stub instances,
 # each with an output to one of the four bar channels — three content channels

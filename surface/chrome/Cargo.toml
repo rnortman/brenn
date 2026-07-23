@@ -16,6 +16,9 @@ brenn-surface-contract = { version = "0.1.0", path = "../contract" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
 
+[dev-dependencies]
+brenn-surface-test-fixtures = { path = "../test-fixtures" }
+
 # The DOM glue (component.rs) is browser-only: it drives #surface-root, <body>,
 # and the kernel wrappers from the actions the core emits. These deps never enter
 # the host build.

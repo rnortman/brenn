@@ -31,7 +31,10 @@ use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::HtmlElement;
 
 use crate::logic::dismiss_body;
-use crate::logic::{AckAction, IngestOutcome, MeetingState, Recompute, SNOOZE_SECS, snooze_body};
+use crate::logic::{
+    AckAction, AckTarget, IngestOutcome, MeetingState, Recompute, SNOOZE_SECS, WarningLevel,
+    snooze_body,
+};
 
 /// This component's kind — its config `kind`, its element-tag stem
 /// (`brenn-<kind>`), and the `component` field of its panic events.
@@ -142,28 +145,21 @@ fn on_connected(
         subline,
         actions,
     });
-    // The active meeting id from the last render, so a button press targets the
-    // meeting currently on screen.
-    let active_id: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    // The active meeting's occurrence from the last render, so a button press
+    // targets the meeting currently on screen.
+    let active: Rc<RefCell<Option<AckTarget>>> = Rc::new(RefCell::new(None));
 
     let tick = make_ticker(
         host.clone(),
         Rc::clone(&panel),
         Rc::clone(state),
-        Rc::clone(&active_id),
+        Rc::clone(&active),
     );
     // Render the initial idle state before any delivery.
     tick();
 
-    wire_action_button(
-        &dismiss,
-        &host,
-        state,
-        &tick,
-        &active_id,
-        ActionKind::Dismiss,
-    );
-    wire_action_button(&snooze, &host, state, &tick, &active_id, ActionKind::Snooze);
+    wire_action_button(&dismiss, &host, state, &tick, &active, ActionKind::Dismiss);
+    wire_action_button(&snooze, &host, state, &tick, &active, ActionKind::Snooze);
 
     *wiring.borrow_mut() = Some(Wiring { host, tick });
 }
@@ -215,7 +211,11 @@ fn on_activation(
             match outcome {
                 IngestOutcome::Accepted { warnings } => {
                     for warning in warnings {
-                        component_log(&wiring.host, LogLevel::Error, &warning);
+                        let level = match warning.level {
+                            WarningLevel::Warn => LogLevel::Warn,
+                            WarningLevel::Error => LogLevel::Error,
+                        };
+                        component_log(&wiring.host, level, &warning.message);
                     }
                 }
                 IngestOutcome::Malformed(report) => {
@@ -248,27 +248,27 @@ fn wire_action_button(
     host: &HtmlElement,
     state: &Rc<RefCell<MeetingState>>,
     tick: &Ticker,
-    active_id: &Rc<RefCell<Option<String>>>,
+    active: &Rc<RefCell<Option<AckTarget>>>,
     kind: ActionKind,
 ) {
     let host = host.clone();
     let state = Rc::clone(state);
     let tick = Rc::clone(tick);
-    let active_id = Rc::clone(active_id);
+    let active = Rc::clone(active);
     add_listener(button.as_ref(), "click", move |_event| {
-        let Some(id) = active_id.borrow().clone() else {
+        let Some(target) = active.borrow().clone() else {
             return;
         };
         let now = read_now_utc();
         let (body, action) = match kind {
-            ActionKind::Dismiss => (dismiss_body(&id), AckAction::Dismiss),
+            ActionKind::Dismiss => (dismiss_body(&target), AckAction::Dismiss),
             ActionKind::Snooze => {
                 let until = now + chrono::Duration::seconds(SNOOZE_SECS);
-                (snooze_body(&id, until), AckAction::Snooze { until })
+                (snooze_body(&target, until), AckAction::Snooze { until })
             }
         };
         publish(&host, ACKS_PORT, &body);
-        state.borrow_mut().apply_local_ack(&id, action, now);
+        state.borrow_mut().apply_local_ack(&target, action, now);
         tick();
     });
 }
@@ -282,7 +282,7 @@ fn make_ticker(
     host: HtmlElement,
     panel: Rc<Panel>,
     state: Rc<RefCell<MeetingState>>,
-    active_id: Rc<RefCell<Option<String>>>,
+    active: Rc<RefCell<Option<AckTarget>>>,
 ) -> Ticker {
     let timer = Rc::new(PersistentTimer::new());
     // The last takeover state we dispatched, so we emit request/release only on a
@@ -295,7 +295,7 @@ fn make_ticker(
             let now = read_now_utc();
             let view = state.borrow().recompute(now);
             render(&host, &panel, &view);
-            *active_id.borrow_mut() = view.active_id.clone();
+            *active.borrow_mut() = view.active.clone();
 
             let prev = *last_takeover.borrow();
             if view.want_takeover != prev {

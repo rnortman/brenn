@@ -49,8 +49,7 @@ use brenn_common::sanitize_untrusted_str;
 use brenn_surface_proto::{
     AlertSeverity as ProtoAlertSeverity, BatchEntry, ClientFrame, Cursor, DeliverTarget, GapInfo,
     GapReason as ProtoGapReason, InstanceReport, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES,
-    PublishBatchOutcome, PublishOutcome, ServerFrame, StatusCounters, SubscribeOutcome,
-    SurfaceDescription,
+    PublishBatchOutcome, PublishOutcome, ServerFrame, SubscribeOutcome, SurfaceDescription,
 };
 
 use super::cursor::{self, CursorState};
@@ -1360,13 +1359,17 @@ async fn handle_client_frame(
             instances,
             uptime_secs,
             counters,
+            overlay,
         } => {
             handle_status(
                 ctx,
                 &mut buckets.publish,
-                &instances,
-                uptime_secs,
-                counters,
+                &telemetry::StatusReport {
+                    instances: &instances,
+                    uptime_secs,
+                    counters: &counters,
+                    overlay: overlay.as_ref(),
+                },
                 last_status_instances,
             )
             .await
@@ -1415,9 +1418,7 @@ async fn handle_geometry(
 async fn handle_status(
     ctx: &SessionCtx,
     publish_bucket: &mut TokenBucket,
-    instances: &[InstanceReport],
-    uptime_secs: u64,
-    counters: StatusCounters,
+    report: &telemetry::StatusReport<'_>,
     last_status_instances: &mut Vec<InstanceReport>,
 ) -> FrameOutcome {
     let slug = &ctx.runtime.resolved.slug;
@@ -1426,9 +1427,7 @@ async fn handle_status(
     // Configured instance → kind, and the pump count each instance should have,
     // both precomputed once at boot on the description runtime (boot-constant, so
     // not rebuilt per frame). The shell may report only configured instances.
-    if let Err(rule) =
-        telemetry::validate_status(instances, &counters, &description.configured_kinds)
-    {
+    if let Err(rule) = telemetry::validate_status(report, &description.configured_kinds) {
         return FrameOutcome::Violation(format!(
             "surface {slug} user {username}: {}",
             sanitize_client_detail(&rule)
@@ -1437,9 +1436,9 @@ async fn handle_status(
     // Retain the validated report so a teardown terminal snapshot can carry
     // the last-known instances. Recorded even if the publish bucket later denies
     // this frame — the report itself is a truthful, well-formed observation.
-    *last_status_instances = instances.to_vec();
+    *last_status_instances = report.instances.to_vec();
 
-    let health = telemetry::derive_health(instances, &description.expected_pumps);
+    let health = telemetry::derive_health(report.instances, &description.expected_pumps);
     debug_assert!(
         health != Health::Disconnected,
         "live report never disconnected"
@@ -1449,15 +1448,7 @@ async fn handle_status(
         return FrameOutcome::Continue;
     }
     let session = ctx.session_id.simple().to_string();
-    let body = telemetry::status_body(
-        slug,
-        &session,
-        ctx.runtime.bus.epoch(),
-        health,
-        uptime_secs,
-        instances,
-        counters,
-    );
+    let body = telemetry::status_body(slug, &session, ctx.runtime.bus.epoch(), health, report);
     publish_platform_telemetry(ctx, &description.status_channel, &body, "status").await
 }
 

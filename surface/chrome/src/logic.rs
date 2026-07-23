@@ -6,13 +6,18 @@
 //! toast). It holds no web-sys handles, compiles and unit-tests on the host
 //! target, and emits [`ChromeAction`]s the wasm DOM half applies.
 //!
-//! Chrome is a component, not the kernel: it does not fold client connection
-//! events or publish control planes. It *consumes* the planes the kernel
-//! publishes, replaying their retained rings on attach. Every input is an
-//! already-extracted message body (the reserved plane's JSON payload, or the
-//! layout channel's layout doc); the DOM half pulls it from the delivered
-//! envelope and hands it here.
+//! Chrome is a component, not the kernel: it folds no client connection events
+//! and originates no state it merely renders. It *consumes* the planes the
+//! kernel publishes. Every input is an already-extracted message body (the
+//! reserved plane's JSON payload, or the layout channel's layout doc); the DOM
+//! half pulls it from the delivered envelope and hands it here.
+//!
+//! It publishes exactly one plane, `local:brenn/overlay-state`, and only
+//! because overlay holdership is state chrome alone owns: chrome drops takeover
+//! messages the router routes, so no other vantage point on the page can report
+//! which overlay is up.
 
+use brenn_surface_contract::PortWindow;
 use brenn_surface_proto as proto;
 use brenn_surface_proto::layout::{LayoutDoc, LayoutKind, Panel};
 use brenn_surface_proto::{
@@ -142,6 +147,11 @@ pub enum ChromeAction {
     /// Log a breadcrumb (untrusted-input rejection). The DOM half forwards it via
     /// the component-log plane; chrome never panics on a bad plane payload.
     Log { level: LogLevel, message: String },
+    /// Publish chrome's overlay holdership on [`PORT_OVERLAY_STATE`]. `body` is
+    /// the serialized [`proto::OverlayStateBody`] for the transition that just
+    /// folded — emitted on every transition and only on a transition, so the
+    /// plane carries no heartbeat.
+    PublishOverlayState { body: String },
 }
 
 /// The CSS custom-property value for a layout `ratio` fraction (a plain decimal
@@ -402,7 +412,7 @@ impl ChromeCore {
     // instance that leaves the set is never cleaned up. Latent — set membership is
     // fixed within a page lifetime and a config change forces a reload — until
     // dynamic instance add/remove lands.
-    pub fn on_surface_state(&mut self, body: &str) -> Vec<ChromeAction> {
+    pub fn on_surface_state(&mut self, body: &str, now_ms: u64) -> Vec<ChromeAction> {
         let parsed: SurfaceStateBody = match serde_json::from_str(body) {
             Ok(b) => b,
             Err(err) => return vec![self.warn(format!("rejected surface-state payload: {err}"))],
@@ -431,6 +441,7 @@ impl ChromeCore {
             if !alive {
                 self.overlay = None;
                 actions.push(ChromeAction::SetTakeover(false));
+                actions.push(self.overlay_state_action(now_ms));
             }
         }
         actions.extend(self.apply_effective_layout());
@@ -476,7 +487,7 @@ impl ChromeCore {
     /// takeover-capable component exists). `release` from the holder pops; a
     /// release from anyone else is a no-op breadcrumb. An instance the payload
     /// names that is not arrangeable is dropped-and-reported.
-    pub fn on_takeover(&mut self, body: &str) -> Vec<ChromeAction> {
+    pub fn on_takeover(&mut self, body: &str, now_ms: u64) -> Vec<ChromeAction> {
         let parsed: TakeoverBody = match serde_json::from_str(body) {
             Ok(b) => b,
             Err(err) => return vec![self.warn(format!("rejected takeover payload: {err}"))],
@@ -496,13 +507,16 @@ impl ChromeCore {
                 ))],
                 None => {
                     self.overlay = Some(instance.clone());
-                    let mut actions = vec![ChromeAction::SetTakeover(true)];
+                    let mut actions = vec![
+                        ChromeAction::SetTakeover(true),
+                        self.overlay_state_action(now_ms),
+                    ];
                     actions.extend(self.apply_effective_layout());
                     actions
                 }
             },
             TakeoverAction::Release => match self.overlay.as_deref() {
-                Some(current) if current == instance => self.pop_overlay(),
+                Some(current) if current == instance => self.pop_overlay(now_ms),
                 _ => vec![self.warn(format!(
                     "dropped takeover release from {instance}: it does not hold the overlay"
                 ))],
@@ -510,11 +524,14 @@ impl ChromeCore {
         }
     }
 
-    /// Pop the active overlay: clear the flag and re-apply the effective (base or
-    /// default) layout.
-    fn pop_overlay(&mut self) -> Vec<ChromeAction> {
+    /// Pop the active overlay: clear the flag, report the transition, and
+    /// re-apply the effective (base or default) layout.
+    fn pop_overlay(&mut self, now_ms: u64) -> Vec<ChromeAction> {
         self.overlay = None;
-        let mut actions = vec![ChromeAction::SetTakeover(false)];
+        let mut actions = vec![
+            ChromeAction::SetTakeover(false),
+            self.overlay_state_action(now_ms),
+        ];
         actions.extend(self.apply_effective_layout());
         actions
     }
@@ -623,6 +640,23 @@ impl ChromeCore {
             message,
         }
     }
+
+    /// The overlay-state publish for the transition just folded: the post-fold
+    /// [`Self::overlay`] value, stamped with the page-monotonic reading of the
+    /// fold.
+    ///
+    /// Built here rather than in the DOM half so the payload chrome puts on the
+    /// bus is host-tested like every other decision.
+    fn overlay_state_action(&self, now_ms: u64) -> ChromeAction {
+        let body = proto::OverlayStateBody {
+            v: proto::CONTROL_PLANE_VERSION,
+            holder: self.overlay.clone(),
+            since_stamp: now_ms,
+        };
+        ChromeAction::PublishOverlayState {
+            body: serde_json::to_string(&body).expect("an OverlayStateBody serializes to JSON"),
+        }
+    }
 }
 
 /// Chrome's input port names. Config binds each plane to one of these ports on
@@ -634,6 +668,11 @@ pub const PORT_LINK_STATE: &str = "link-state";
 pub const PORT_SURFACE_STATE: &str = "surface-state";
 pub const PORT_TAKEOVER: &str = "takeover";
 pub const PORT_TOAST: &str = "toast";
+
+/// Chrome's one output port: overlay holdership onto
+/// `local:brenn/overlay-state`, where the kernel reads it into the surface's
+/// status report.
+pub const PORT_OVERLAY_STATE: &str = "overlay-state";
 
 /// Route a delivered body to the core method its port names. An unbound or
 /// unknown port is a config/kernel error — chrome only ever receives on ports it
@@ -647,14 +686,28 @@ pub fn fold(core: &mut ChromeCore, port: &str, body: &str, now_ms: u64) -> Vec<C
         PORT_LAYOUT => core.on_layout(body),
         PORT_THEME => core.on_theme(body),
         PORT_LINK_STATE => core.on_link_state(body),
-        PORT_SURFACE_STATE => core.on_surface_state(body),
-        PORT_TAKEOVER => core.on_takeover(body),
+        PORT_SURFACE_STATE => core.on_surface_state(body, now_ms),
+        PORT_TAKEOVER => core.on_takeover(body, now_ms),
         PORT_TOAST => core.on_toast(body, now_ms),
         other => vec![ChromeAction::Log {
             level: LogLevel::Warn,
             message: format!("chrome received on unbound port {other:?}"),
         }],
     }
+}
+
+/// Fold one activation window's **new** envelopes into the core, in order, and
+/// return the actions they produced.
+///
+/// Only the `new_from..` slice is folded; retained context is skipped because
+/// chrome's folds are not idempotent. A component may rely on the new set
+/// alone to catch up on attach.
+pub fn fold_window(core: &mut ChromeCore, window: &PortWindow, now_ms: u64) -> Vec<ChromeAction> {
+    let mut actions = Vec::new();
+    for envelope in window.new_envelopes() {
+        actions.extend(fold(core, &window.port, &envelope.body, now_ms));
+    }
+    actions
 }
 
 // Host-only: native `#[test]`s run in every `make check`. Excluded from the
@@ -664,6 +717,10 @@ mod tests {
     use super::*;
     use brenn_surface_proto::{CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, SurfaceStateInstance};
     use serde_json::json;
+
+    /// The monotonic reading every fold in this suite is given. Fixed: only the
+    /// overlay-state stamp reads it, and no test here asserts on elapsed time.
+    const NOW: u64 = 1_000;
 
     fn core() -> ChromeCore {
         ChromeCore::new("chrome")
@@ -689,11 +746,14 @@ mod tests {
     /// Seed the arrangeable set with mounted p1/p2/p3, discarding the emitted
     /// default-layout action.
     fn seed_three(core: &mut ChromeCore) {
-        core.on_surface_state(&surface_state(&[
-            ("p1", InstanceState::Mounted),
-            ("p2", InstanceState::Mounted),
-            ("p3", InstanceState::Mounted),
-        ]));
+        core.on_surface_state(
+            &surface_state(&[
+                ("p1", InstanceState::Mounted),
+                ("p2", InstanceState::Mounted),
+                ("p3", InstanceState::Mounted),
+            ]),
+            NOW,
+        );
     }
 
     fn layout_kind(actions: &[ChromeAction]) -> Option<LayoutKind> {
@@ -893,10 +953,13 @@ mod tests {
     fn surface_state_synthesizes_default_layout_by_count() {
         let mut c = core();
         // Two mounted instances → columns-2 default.
-        let actions = c.on_surface_state(&surface_state(&[
-            ("p1", InstanceState::Mounted),
-            ("p2", InstanceState::Mounted),
-        ]));
+        let actions = c.on_surface_state(
+            &surface_state(&[
+                ("p1", InstanceState::Mounted),
+                ("p2", InstanceState::Mounted),
+            ]),
+            NOW,
+        );
         assert_eq!(layout_kind(&actions), Some(LayoutKind::Columns2));
     }
 
@@ -904,10 +967,13 @@ mod tests {
     fn chrome_excludes_itself_from_arrangement() {
         let mut c = core();
         // Chrome's own instance in the surface-state must not be placed.
-        let actions = c.on_surface_state(&surface_state(&[
-            ("chrome", InstanceState::Mounted),
-            ("p1", InstanceState::Mounted),
-        ]));
+        let actions = c.on_surface_state(
+            &surface_state(&[
+                ("chrome", InstanceState::Mounted),
+                ("p1", InstanceState::Mounted),
+            ]),
+            NOW,
+        );
         // One placeable instance → single default, and the instances list has
         // only p1.
         match actions.into_iter().find_map(|a| match a {
@@ -928,8 +994,8 @@ mod tests {
     fn unchanged_surface_state_emits_nothing() {
         let mut c = core();
         let body = surface_state(&[("p1", InstanceState::Mounted)]);
-        assert!(!c.on_surface_state(&body).is_empty());
-        assert_eq!(c.on_surface_state(&body), Vec::new());
+        assert!(!c.on_surface_state(&body, NOW).is_empty());
+        assert_eq!(c.on_surface_state(&body, NOW), Vec::new());
     }
 
     // ── Takeover overlay, depth 1 ───────────────────────────────────────────
@@ -953,7 +1019,7 @@ mod tests {
             instance: "p2".to_string(),
         })
         .unwrap();
-        let actions = c.on_takeover(&request);
+        let actions = c.on_takeover(&request, NOW);
         assert_eq!(actions[0], ChromeAction::SetTakeover(true));
         // The overlay is a single-slot fullscreen layout on the requester.
         assert_eq!(layout_kind(&actions), Some(LayoutKind::Single));
@@ -977,7 +1043,7 @@ mod tests {
             instance: "p2".to_string(),
         })
         .unwrap();
-        let actions = c.on_takeover(&release);
+        let actions = c.on_takeover(&release, NOW);
         assert_eq!(actions[0], ChromeAction::SetTakeover(false));
         // Pop re-applies the deferred base (the single p1 doc).
         assert_eq!(layout_kind(&actions), Some(LayoutKind::Single));
@@ -995,8 +1061,8 @@ mod tests {
             })
             .unwrap()
         };
-        c.on_takeover(&req("p1"));
-        let actions = c.on_takeover(&req("p2"));
+        c.on_takeover(&req("p1"), NOW);
+        let actions = c.on_takeover(&req("p2"), NOW);
         assert!(matches!(
             actions.as_slice(),
             [ChromeAction::Log {
@@ -1005,7 +1071,7 @@ mod tests {
             }]
         ));
         // Idempotent re-request from the incumbent is a no-op.
-        assert_eq!(c.on_takeover(&req("p1")), Vec::new());
+        assert_eq!(c.on_takeover(&req("p1"), NOW), Vec::new());
     }
 
     #[test]
@@ -1018,13 +1084,16 @@ mod tests {
             instance: "p2".to_string(),
         })
         .unwrap();
-        c.on_takeover(&req);
+        c.on_takeover(&req, NOW);
         // p2 fails: surface-state now reports it Failed. Overlay must pop.
-        let actions = c.on_surface_state(&surface_state(&[
-            ("p1", InstanceState::Mounted),
-            ("p2", InstanceState::Failed),
-            ("p3", InstanceState::Mounted),
-        ]));
+        let actions = c.on_surface_state(
+            &surface_state(&[
+                ("p1", InstanceState::Mounted),
+                ("p2", InstanceState::Failed),
+                ("p3", InstanceState::Mounted),
+            ]),
+            NOW,
+        );
         assert!(actions.contains(&ChromeAction::SetTakeover(false)));
         assert!(c.overlay.is_none());
     }
@@ -1040,12 +1109,234 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            c.on_takeover(&req).as_slice(),
+            c.on_takeover(&req, NOW).as_slice(),
             [ChromeAction::Log {
                 level: LogLevel::Warn,
                 ..
             }]
         ));
+    }
+
+    // ── The activation-window fold ──────────────────────────────────────────
+
+    /// A takeover body naming `instance`.
+    fn takeover(action: TakeoverAction, instance: &str) -> String {
+        serde_json::to_string(&TakeoverBody {
+            v: CONTROL_PLANE_VERSION,
+            action,
+            instance: instance.to_string(),
+        })
+        .unwrap()
+    }
+
+    /// A window on `port` whose first `context.len()` envelopes are retained
+    /// context and the rest new.
+    fn port_window(port: &str, context: &[String], new: &[String]) -> PortWindow {
+        let envelopes = context
+            .iter()
+            .chain(new.iter())
+            .map(|body| brenn_surface_test_fixtures::sample_envelope(body))
+            .collect();
+        PortWindow {
+            port: port.to_string(),
+            envelopes,
+            new_from: context.len() as u32,
+            dropped: 0,
+        }
+    }
+
+    #[test]
+    fn a_retained_release_in_context_folds_nothing() {
+        // The warn-spam repro. After a completed takeover cycle the depth-1
+        // plane retains the Release, so it rides along as context on every
+        // later activation. Re-folding it warns about a release chrome does not
+        // hold; skipping context is what stops that.
+        let mut c = core();
+        seed_three(&mut c);
+        let window = port_window(
+            PORT_TAKEOVER,
+            &[takeover(TakeoverAction::Release, "p2")],
+            &[],
+        );
+        assert_eq!(fold_window(&mut c, &window, 0), Vec::new());
+    }
+
+    #[test]
+    fn a_retained_request_in_context_does_not_re_push_the_overlay() {
+        // The latent hazard: chrome pops the overlay when its holder dies, but
+        // the holder's Request is still the plane's retained value. Re-folding
+        // it would hand a dead instance a fresh fullscreen overlay.
+        let mut c = core();
+        seed_three(&mut c);
+        c.on_takeover(&takeover(TakeoverAction::Request, "p2"), NOW);
+        c.on_surface_state(
+            &surface_state(&[
+                ("p1", InstanceState::Mounted),
+                ("p2", InstanceState::Failed),
+                ("p3", InstanceState::Mounted),
+            ]),
+            NOW,
+        );
+        assert!(c.overlay.is_none());
+
+        let window = port_window(
+            PORT_TAKEOVER,
+            &[takeover(TakeoverAction::Request, "p2")],
+            &[],
+        );
+        assert_eq!(fold_window(&mut c, &window, 0), Vec::new());
+        assert!(c.overlay.is_none());
+    }
+
+    #[test]
+    fn a_non_takeover_window_skips_its_context_too() {
+        // The rule is per-window, not per-port. These ports — theme equality,
+        // banner equality, layout last-good — are exactly where a "context is
+        // harmless here" regression would hide. A retained *older* theme folded
+        // as context flips the page light and the new value flips it back: one
+        // frame of flicker, no assertion in the takeover suite.
+        let mut c = core();
+        let light = json!({ "v": 1, "theme": "light" }).to_string();
+        let dark = json!({ "v": 1, "theme": "dark" }).to_string();
+        // Chrome starts dark; the window's context is a light value it has
+        // already seen and its new slice restates dark.
+        let window = port_window(PORT_THEME, std::slice::from_ref(&light), &[dark]);
+        assert_eq!(fold_window(&mut c, &window, NOW), Vec::new());
+        assert_eq!(c.theme(), Theme::Dark);
+
+        // And the new slice still reaches the page, on this port as on takeover.
+        let window = port_window(PORT_THEME, &[], &[light]);
+        assert_eq!(
+            fold_window(&mut c, &window, NOW),
+            vec![ChromeAction::SetTheme(Theme::Light)]
+        );
+    }
+
+    #[test]
+    fn a_window_folds_its_new_envelopes_in_order() {
+        // Context is skipped, new is folded whole and in order: the Request
+        // pushes and the Release that follows it pops, both from one window.
+        let mut c = core();
+        seed_three(&mut c);
+        let window = port_window(
+            PORT_TAKEOVER,
+            &[takeover(TakeoverAction::Release, "p3")],
+            &[
+                takeover(TakeoverAction::Request, "p2"),
+                takeover(TakeoverAction::Release, "p2"),
+            ],
+        );
+        let actions = fold_window(&mut c, &window, 0);
+        let takeovers: Vec<bool> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ChromeAction::SetTakeover(on) => Some(*on),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(takeovers, vec![true, false]);
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                ChromeAction::Log {
+                    level: LogLevel::Warn,
+                    ..
+                }
+            )),
+            "the context Release must not be folded: {actions:?}"
+        );
+        assert!(c.overlay.is_none());
+    }
+
+    // ── Overlay-state publishes ─────────────────────────────────────────────
+
+    /// The overlay-state bodies a fold published, parsed.
+    fn overlay_states(actions: &[ChromeAction]) -> Vec<proto::OverlayStateBody> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                ChromeAction::PublishOverlayState { body } => {
+                    Some(serde_json::from_str(body).expect("a published body parses"))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn overlay_push_and_pop_each_publish_one_transition() {
+        // The instrument: chrome is the only party that knows which overlay is
+        // up, so every transition of `overlay` — and nothing else — goes on the
+        // plane the kernel reads.
+        let mut c = core();
+        seed_three(&mut c);
+
+        let pushed = overlay_states(&c.on_takeover(&takeover(TakeoverAction::Request, "p2"), NOW));
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].holder.as_deref(), Some("p2"));
+        assert_eq!(pushed[0].v, CONTROL_PLANE_VERSION);
+        assert_eq!(pushed[0].since_stamp, NOW);
+
+        let popped =
+            overlay_states(&c.on_takeover(&takeover(TakeoverAction::Release, "p2"), NOW + 5));
+        assert_eq!(popped.len(), 1);
+        assert_eq!(popped[0].holder, None);
+        assert_eq!(popped[0].since_stamp, NOW + 5);
+    }
+
+    #[test]
+    fn a_dead_holder_pop_publishes_the_transition() {
+        // The pop chrome makes on its own initiative counts as much as one a
+        // component asked for: the overlay came down, so the report must say so.
+        let mut c = core();
+        seed_three(&mut c);
+        c.on_takeover(&takeover(TakeoverAction::Request, "p2"), NOW);
+        let actions = c.on_surface_state(
+            &surface_state(&[
+                ("p1", InstanceState::Mounted),
+                ("p2", InstanceState::Failed),
+                ("p3", InstanceState::Mounted),
+            ]),
+            NOW + 9,
+        );
+        let published = overlay_states(&actions);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].holder, None);
+        assert_eq!(published[0].since_stamp, NOW + 9);
+    }
+
+    #[test]
+    fn a_non_transition_publishes_nothing() {
+        // No heartbeat: an idempotent re-request, a denied request, a release
+        // from a non-holder, and a surface-state change that leaves the holder
+        // alive all leave `overlay` where it was, so none of them speaks.
+        let mut c = core();
+        seed_three(&mut c);
+        c.on_takeover(&takeover(TakeoverAction::Request, "p2"), NOW);
+
+        for body in [
+            takeover(TakeoverAction::Request, "p2"),
+            takeover(TakeoverAction::Request, "p1"),
+            takeover(TakeoverAction::Release, "p3"),
+        ] {
+            let actions = c.on_takeover(&body, NOW);
+            assert!(
+                overlay_states(&actions).is_empty(),
+                "no transition, no publish: {actions:?}"
+            );
+        }
+        let actions = c.on_surface_state(
+            &surface_state(&[
+                ("p1", InstanceState::Mounted),
+                ("p2", InstanceState::Mounted),
+            ]),
+            NOW,
+        );
+        assert!(
+            overlay_states(&actions).is_empty(),
+            "the holder is still alive: {actions:?}"
+        );
+        assert_eq!(c.overlay.as_deref(), Some("p2"));
     }
 
     // ── Toast queue ─────────────────────────────────────────────────────────

@@ -38,8 +38,8 @@ use brenn_surface_contract::{ERROR_REPORT_INSTANCE, ERROR_REPORT_PORT};
 use brenn_surface_proto::{
     AlertSeverity, BatchEntry, ClientFrame, Cursor, DeliverTarget, GapInfo, GapReason,
     InstanceReport, InstanceState, LogLevel, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES,
-    PublishBatchOutcome, PublishOutcome, ServerFrame, StatusCounters, SubscribeOutcome,
-    max_client_frame_bytes,
+    OverlayReport, PublishBatchOutcome, PublishOutcome, ServerFrame, StatusCounters,
+    SubscribeOutcome, max_client_frame_bytes,
 };
 
 use super::cursor::{self, CursorState};
@@ -5706,10 +5706,34 @@ fn status_frame_with_counters(
     uptime_secs: u64,
     counters: StatusCounters,
 ) -> Message {
+    status_frame_full(instances, uptime_secs, counters, None)
+}
+
+/// [`status_frame`] reporting a held overlay, for the tests whose subject is the
+/// overlay field's trip from the frame to the retained document.
+fn status_frame_with_overlay(instances: &[InstanceReport], holder: &str) -> Message {
+    status_frame_full(
+        instances,
+        0,
+        StatusCounters::default(),
+        Some(OverlayReport {
+            holder: holder.to_string(),
+            since: "2026-07-22T13:10:00Z".parse().expect("an RFC 3339 instant"),
+        }),
+    )
+}
+
+fn status_frame_full(
+    instances: &[InstanceReport],
+    uptime_secs: u64,
+    counters: StatusCounters,
+    overlay: Option<OverlayReport>,
+) -> Message {
     let frame = ClientFrame::Status {
         instances: instances.to_vec(),
         uptime_secs,
         counters,
+        overlay,
     };
     Message::Text(
         serde_json::to_string(&frame)
@@ -5902,6 +5926,80 @@ async fn surface_ws_status_counters_unknown_instance_is_violation() {
                 .collect(),
                 ..StatusCounters::default()
             },
+        ),
+        &flusher,
+        &alerts,
+    )
+    .await;
+}
+
+/// The overlay a shell reports reaches the retained status document end-to-end.
+/// This is the whole point of the field: a fullscreen-wedged surface is
+/// `mounted`, pumping, and error-free, so the document reads `health: ok` — the
+/// holder is the one fact that distinguishes it from a healthy bar, and it is
+/// worthless if the frame's value is dropped anywhere between the frame and the
+/// channel.
+#[tokio::test]
+async fn surface_ws_status_overlay_reaches_the_status_document() {
+    let db = db::init_db_memory();
+    let rig = geometry_status_rig(&db).await;
+    let status_uuid = rig.status_uuid;
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(rig.state).await;
+
+    let ws_url = http_to_ws_url(&base, &format!("/surface/deskbar/ws?build={TEST_BUILD_ID}"));
+    let mut ws = surface_ws_open(&ws_url, &token).await;
+    consume_welcome(&mut ws).await;
+
+    ws.send(status_frame_with_overlay(
+        &[
+            instance_report("protobar", "protobar", InstanceState::Mounted, 1),
+            instance_report("writer", "writer-module", InstanceState::Mounted, 0),
+        ],
+        "writer",
+    ))
+    .await
+    .expect("send Status");
+
+    let rows = wait_for_channel(&db, status_uuid, |r| {
+        r.last().is_some_and(|(_, b)| b.contains("\"overlay\":{"))
+    })
+    .await;
+    let body: serde_json::Value =
+        serde_json::from_str(&rows.last().expect("status row").1).expect("status body is JSON");
+    assert_eq!(body["overlay"]["holder"], "writer");
+    assert_eq!(body["overlay"]["since"], "2026-07-22T13:10:00Z");
+    // Reported, not judged: every instance is mounted and pumping, so a held
+    // overlay leaves health alone.
+    assert_eq!(body["health"], "ok");
+}
+
+/// An overlay naming an instance the surface does not configure is a protocol
+/// violation, not a filtered field: the holder is a principal name reaching the
+/// document an operator reads attribution off, and an untrusted shell inventing
+/// one gets the session killed and the fail2ban-grade log written.
+#[tokio::test]
+async fn surface_ws_status_overlay_unknown_holder_is_violation() {
+    let db = db::init_db_memory();
+    let rig = geometry_status_rig(&db).await;
+    let flusher = rig.flusher.clone();
+    let alerts = rig.alerts.clone();
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(rig.state).await;
+
+    // Every reported *instance* is configured; only the overlay names `ghost`,
+    // so this fails only if the overlay is validated on its own.
+    assert_frame_is_violation(
+        &base,
+        &token,
+        status_frame_with_overlay(
+            &[instance_report(
+                "protobar",
+                "protobar",
+                InstanceState::Mounted,
+                1,
+            )],
+            "ghost",
         ),
         &flusher,
         &alerts,

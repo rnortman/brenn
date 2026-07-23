@@ -690,3 +690,33 @@ Deferred here: this TODO is scoped to the CI workflow only; aligning the fleet
 
 Code site (`TODO(ci-wasm-tool-pins-drift)`): `.github/workflows/ci.yml`
 (the `WIT_BINDGEN_VERSION` / `WASM_TOOLS_VERSION` env vars in the `check` job).
+
+---
+
+## `dispatcher-completion-kick`
+
+When a dispatcher scan skips a subscriber whose key is already `in_flight`, the
+rows it skipped are not re-scanned when that in-flight pass completes: the
+supervisor's normal-completion arm removes the key from `in_flight` but never
+calls `dispatch_kick()`. Skipped rows therefore wait up to `POLL_INTERVAL`
+(60 s) for the next periodic scan. Done when completion re-scans — one
+`dispatch_kick()` in the completion arm, or a "another scan wanted" flag the
+supervisor honors.
+
+Code site (`TODO(dispatcher-completion-kick)`):
+`brenn-lib/src/messaging/dispatcher.rs` (the supervisor task's normal-completion
+arm).
+
+---
+
+## `intercept-noop-shape`
+
+`is_noop_tool_response` expects `{"content":[{"type":"text","text":"__NOOP__"}]}`
+but the live PostToolUse `tool_response` from a `BrennSend` does not match, so
+every send logs "PostToolUse tool_response was not the expected `__NOOP__`"
+while the response really is the noop. Pure log noise, on the hottest path there
+is. Done when the check accepts the shape `noop_mcp.py` actually produces (and
+still rejects a genuinely different response).
+
+Code site (`TODO(intercept-noop-shape)`):
+`brenn-server/src/intercept_helpers.rs` (`warn_if_unexpected_tool_response`).

@@ -69,10 +69,11 @@ use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency, surface_sub_identi
 use brenn_surface_contract::{Activation, ActivationError, PortWindow};
 use brenn_surface_proto::{
     AlertSeverity, BatchEntry, CONTROL_PLANE_VERSION, ClientFrame, Cursor, DeliverTarget, GapInfo,
-    InstanceReport, LOCAL_TAKEOVER_CHANNEL, LOCAL_TOAST_CHANNEL, LogLevel, MAX_ALERT_BODY_BYTES,
-    MAX_ALERT_TITLE_BYTES, NoiseLevel, PublishBatchOutcome, PublishOutcome,
-    RESERVED_LOCAL_CHANNELS, STALE_BUILD_CLOSE_CODE, ServerFrame, StatusCounters, SubscribeOutcome,
-    SurfaceBindings, SurfaceDescription, TakeoverBody, ToastBody, ToastSeverity, ToastSource,
+    InstanceReport, LOCAL_OVERLAY_STATE_CHANNEL, LOCAL_TAKEOVER_CHANNEL, LOCAL_TOAST_CHANNEL,
+    LogLevel, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES, NoiseLevel, OverlayReport,
+    OverlayStateBody, PublishBatchOutcome, PublishOutcome, RESERVED_LOCAL_CHANNELS,
+    STALE_BUILD_CLOSE_CODE, ServerFrame, StatusCounters, SubscribeOutcome, SurfaceBindings,
+    SurfaceDescription, TakeoverBody, ToastBody, ToastSeverity, ToastSource,
     reserved_local_channel,
 };
 use chrono::{DateTime, Utc};
@@ -96,6 +97,44 @@ fn inject_takeover_instance(body: String, instance: &str) -> String {
             serde_json::to_string(&parsed).expect("a TakeoverBody serializes to JSON")
         }
         Err(_) => body,
+    }
+}
+
+/// Who is publishing on a `local:` channel, at the two identity grains a surface
+/// has: a mounted component instance, or the kernel itself.
+///
+/// Carried as a typed origin rather than a preformatted sender string so the
+/// mint point can do more than compose an identity with it — the takeover
+/// plane's anti-spoof stamping needs the instance name, and a sender string has
+/// already thrown that away.
+#[derive(Debug, Clone, Copy)]
+enum LocalOrigin<'a> {
+    Instance(&'a str),
+    Kernel,
+}
+
+/// What the local mint did with one publish, carrying the effects it produced
+/// either way.
+///
+/// The router accepts every publish except on a plane whose guard refuses it
+/// ([`LOCAL_OVERLAY_STATE_CHANNEL`]), so the disposition has to travel back to
+/// the caller: a refused message is neither retained nor delivered, and telling
+/// its publisher `Ok` would report a delivery that did not happen.
+enum LocalMint {
+    /// Minted, retained on the ring, and fanned out to every bound port.
+    Routed(Vec<Effect>),
+    /// Refused at a plane guard before the mint. The effects carry the
+    /// violation report.
+    Refused(Vec<Effect>),
+}
+
+impl LocalMint {
+    /// The effects, whichever way it went — for the callers that have no
+    /// publisher to answer.
+    fn into_effects(self) -> Vec<Effect> {
+        match self {
+            LocalMint::Routed(effects) | LocalMint::Refused(effects) => effects,
+        }
     }
 }
 
@@ -555,6 +594,12 @@ pub enum Event {
     /// Never page death, and never a sibling's problem: a trap has exactly one
     /// subject. The embedder renders the error card and reports the death.
     InstanceFailed { instance: String, reason: String },
+    /// A publish on `local:brenn/overlay-state` was refused: the message was
+    /// dropped and the kernel's recorded overlay is unchanged. `instance` is the
+    /// publisher, `reason` names the rule it broke. The embedder reports it —
+    /// the plane's only legitimate publisher is the surface's own chrome, so
+    /// anything else is a wiring fault an operator has to see.
+    OverlayStateRejected { instance: String, reason: String },
 }
 
 /// The disposition of a publish, carried on [`Event::PublishResult`]. It unifies
@@ -584,6 +629,10 @@ pub enum PublishStatus {
     /// backstop). Client-facing meaning is "it did not land"; the client does
     /// not retry.
     Failed,
+    /// A `local:` plane guard refused the body: the page-local router minted
+    /// nothing, so the message was neither retained nor delivered. The
+    /// violation itself is reported separately, attributed to the publisher.
+    Refused,
 }
 
 /// The three local publish pre-check rejections, in authoritative check order.
@@ -983,6 +1032,17 @@ pub struct ClientCore {
     /// reconnects; deterministic given the seed so the core stays purely
     /// testable. Advanced only by `backoff_delay_ms`.
     jitter_rng: SplitMix64,
+    /// The overlay chrome reported holding on [`LOCAL_OVERLAY_STATE_CHANNEL`],
+    /// or `None` when it reported none — the one field of the status report the
+    /// kernel does not derive from its own instance table.
+    ///
+    /// Read at the router's mint point rather than inferred from routed takeover
+    /// traffic: chrome drops takeover messages the router routes (unknown
+    /// instance, mismatched release), so "what the router carried" and "what
+    /// chrome holds" are different facts, and only the second one is the
+    /// overlay. Page-local like the rings — a reload starts at `None`, which is
+    /// the truth for a fresh page.
+    overlay: Option<OverlayReport>,
 }
 
 impl ClientCore {
@@ -1022,6 +1082,7 @@ impl ClientCore {
             local_epoch: config.local_epoch,
             participant_id: String::new(),
             jitter_rng: SplitMix64::new(config.backoff_jitter_seed),
+            overlay: None,
         };
         let effects = core.begin_connect(now);
         (core, effects)
@@ -1461,6 +1522,24 @@ impl ClientCore {
         self.state = State::Active;
         self.participant_id = participant_id.clone();
         self.bindings = Some(bindings.clone());
+        // The recorded overlay was validated against the *previous* bindings.
+        // A `Welcome` that no longer declares its holder has retired that
+        // instance, and reporting it onward would be a `Status` frame naming an
+        // unconfigured instance — which the server treats as a protocol
+        // violation and kills the session over, so the page would reconnect and
+        // violate again on every status tick. Dropped rather than kept: the
+        // kernel cannot stand behind a holder for a component this surface no
+        // longer has, and chrome republishes on its next transition. A holder
+        // the new bindings still declare survives, because a reconnect is
+        // exactly when a live wedge most needs reporting.
+        if let Some(overlay) = &self.overlay
+            && !bindings
+                .components
+                .iter()
+                .any(|c| c.instance == overlay.holder)
+        {
+            self.overlay = None;
+        }
         // Before `reconcile_attached`, which may force-detach ports on local
         // channels this Welcome dropped, and before any attach resolves — a
         // ring must exist for every declared local channel before a port can
@@ -2238,14 +2317,20 @@ impl ClientCore {
                 // fan-out — synchronously, in call order, with no await between,
                 // which is the single-router property `local:` rests on. It never
                 // touches the wire, so a down link is no reason to delay it.
-                let sender = self.local_sender(instance);
-                effects.extend(self.mint_and_route_local(
-                    &entry.channel,
-                    sender,
-                    entry.body,
-                    stamp,
-                    entry.urgency,
-                ));
+                //
+                // A plane guard's refusal produces its violation report and no
+                // envelope; there is no publisher to answer here, because a
+                // buffered publish got its synchronous answer at buffer time.
+                effects.extend(
+                    self.mint_and_route_local(
+                        &entry.channel,
+                        LocalOrigin::Instance(instance),
+                        entry.body,
+                        stamp,
+                        entry.urgency,
+                    )
+                    .into_effects(),
+                );
             } else {
                 // The stamp is discarded, exactly as it is for a single wire
                 // publish: the server mints the authoritative envelope. The raw
@@ -2563,11 +2648,15 @@ impl ClientCore {
     /// — the single-router property that buys `local:` its freedom from the echo
     /// and dual-position problems.
     ///
-    /// The publish always succeeds: there is no server to reject it, no budget to
-    /// exhaust (nothing leaves the page), and no connection to be down. Fan-out
-    /// pushes into bounded per-port queues, where a slow port's overflow is
-    /// drop-oldest-and-count, the one overflow policy every class runs — a
-    /// per-port concern that never fails the publisher.
+    /// The publish succeeds except where a plane guard refuses the body: there is
+    /// no server to reject it, no budget to exhaust (nothing leaves the page),
+    /// and no connection to be down. Fan-out pushes into bounded per-port queues,
+    /// where a slow port's overflow is drop-oldest-and-count, the one overflow
+    /// policy every class runs — a per-port concern that never fails the
+    /// publisher. The one exception is [`LOCAL_OVERLAY_STATE_CHANNEL`], whose
+    /// guard drops a body the kernel would otherwise have to stand behind; its
+    /// publisher is answered `Refused`, because a `PublishResult` is the
+    /// publisher's only word on whether its message landed.
     ///
     /// Fold-to-latest corollary: on a last-value-semantics plane (a consumer
     /// that folds each message against current state, so only the newest matters)
@@ -2593,24 +2682,23 @@ impl ClientCore {
             // already knows which instance published, from its own port wiring.
             subject_instance: _,
         } = intent;
-        // The takeover plane's payload carries a request/deny/release identity
-        // that the consumer (chrome) trusts; overwrite it with the authenticated
-        // publishing instance so a component cannot forge another's takeover.
-        // Derived from the router's own port wiring, exactly like `sender` — the
-        // component names only its port.
-        let body = if channel == LOCAL_TAKEOVER_CHANNEL {
-            inject_takeover_instance(body, &instance)
-        } else {
-            body
+        let mint = self.mint_and_route_local(
+            &channel,
+            LocalOrigin::Instance(&instance),
+            body,
+            stamp,
+            urgency,
+        );
+        let status = match mint {
+            LocalMint::Routed(_) => PublishStatus::Ok,
+            LocalMint::Refused(_) => PublishStatus::Refused,
         };
-        // Resolved before the ring is borrowed: both read `self`.
-        let sender = self.local_sender(&instance);
-        let mut effects = self.mint_and_route_local(&channel, sender, body, stamp, urgency);
+        let mut effects = mint.into_effects();
         effects.push(Effect::EmitEvent(Event::PublishResult {
             instance,
             port,
             correlation,
-            status: PublishStatus::Ok,
+            status,
         }));
         effects
     }
@@ -2618,8 +2706,8 @@ impl ClientCore {
     /// Publish one of the kernel's own reserved control planes
     /// ([`LOCAL_LINK_STATE_CHANNEL`] and friends): mint, retain, fan out.
     ///
-    /// The kernel grain, not a component's: §7.1 defines exactly two identities
-    /// on a surface, and these messages are the kernel acting on nobody's
+    /// The kernel grain, not a component's: the surface model defines exactly
+    /// two identity grains, and these messages are the kernel acting on nobody's
     /// behalf, so they carry the bare `surface:<slug>` platform identity. There
     /// is no instance to attribute them to and inventing one would fake a
     /// component the config never declared.
@@ -2634,8 +2722,8 @@ impl ClientCore {
     /// to publish under, and an unattributable envelope is precisely what the
     /// identity model exists to prevent. Nothing is lost by it — no chrome can
     /// have mounted that early either (the instance set rides the same
-    /// `Welcome`), and §6.1 gives that window to the kernel's own pre-chrome
-    /// indicator rather than to this plane. The first post-`Welcome` transition
+    /// `Welcome`), and the kernel's own pre-chrome indicator owns that window
+    /// rather than this plane. The first post-`Welcome` transition
     /// publishes, and the depth-1 ring replays it to whatever attaches later.
     fn on_publish_control(
         &mut self,
@@ -2663,28 +2751,130 @@ impl ClientCore {
         if self.participant_id.is_empty() {
             return Vec::new();
         }
-        let sender = self.participant_id.clone();
         // Inert: urgency is wake economics and page-local delivery never parks.
         // Normal is the honest value — the kernel states no preference, and there
         // is no operator knob on a contract-defined plane to resolve one from.
-        self.mint_and_route_local(&channel, sender, body, stamp, Urgency::Normal)
+        self.mint_and_route_local(&channel, LocalOrigin::Kernel, body, stamp, Urgency::Normal)
+            .into_effects()
+    }
+
+    /// Record chrome's overlay holdership from a publish on
+    /// [`LOCAL_OVERLAY_STATE_CHANNEL`], or refuse the publish.
+    ///
+    /// `Some(effect)` means refused: the message is neither retained nor
+    /// delivered, and the effect reports the violation. `None` means recorded,
+    /// and the publish goes on to mint like any other (the plane keeps its
+    /// depth-1 ring so a page-local consumer can read the same value).
+    ///
+    /// Three refusals, all of them "the kernel would otherwise report something
+    /// it cannot stand behind": a publisher that is not this surface's chrome (a
+    /// component cannot speak for chrome's overlay — `chrome = true` is unique
+    /// per surface, so any other publisher is an operator wiring a lie); a body
+    /// that does not parse; and a `holder` naming an instance the surface does
+    /// not declare, which the server would treat as a protocol violation and
+    /// kill the session over.
+    ///
+    /// # Panics
+    ///
+    /// If the kernel itself publishes here. The kernel holds no overlay and
+    /// renders none; a kernel-minted overlay report would be the kernel
+    /// inventing telemetry about a component's state.
+    fn observe_overlay_state(
+        &mut self,
+        origin: LocalOrigin<'_>,
+        body: &str,
+        publish_ts: DateTime<Utc>,
+    ) -> Option<Effect> {
+        let instance = match origin {
+            LocalOrigin::Instance(instance) => instance,
+            LocalOrigin::Kernel => panic!(
+                "surface client: the kernel does not publish on {LOCAL_OVERLAY_STATE_CHANNEL}"
+            ),
+        };
+        let bindings = self
+            .bindings
+            .as_ref()
+            .expect("surface client: a resolved local publish implies bindings");
+        let refuse = |reason: String| {
+            Some(Effect::EmitEvent(Event::OverlayStateRejected {
+                instance: instance.to_string(),
+                reason,
+            }))
+        };
+        if bindings.chrome_instance.is_empty() || bindings.chrome_instance != instance {
+            return refuse("only the surface's chrome instance may publish it".to_string());
+        }
+        let parsed: OverlayStateBody = match serde_json::from_str(body) {
+            Ok(parsed) => parsed,
+            Err(err) => return refuse(format!("unparseable body: {err}")),
+        };
+        if let Some(holder) = &parsed.holder
+            && !bindings.components.iter().any(|c| c.instance == *holder)
+        {
+            return refuse(format!("holder {holder:?} is not a declared instance"));
+        }
+        self.overlay = parsed.holder.map(|holder| OverlayReport {
+            holder,
+            since: publish_ts,
+        });
+        None
     }
 
     /// Mint a `local:` envelope, assign its position, retain it, and fan it out
     /// to every port bound to the channel.
     ///
-    /// The whole of what the router does, shared by its two callers so the
-    /// component grain and the kernel grain cannot drift in position assignment,
-    /// retention, or fan-out. They differ in exactly one value — `sender` — which
-    /// is the difference §7.1 says they have and no other.
+    /// The whole of what the router does, shared by its callers so the component
+    /// grain and the kernel grain cannot drift in position assignment,
+    /// retention, or fan-out. They differ in exactly one value — the identity
+    /// derived from `origin` — and no other.
+    ///
+    /// This is also the single point every `local:` publish passes through, so
+    /// it is where the takeover plane's identity stamping belongs: the gesture
+    /// path and the activation-buffer flush both arrive here, and a stamp
+    /// applied anywhere upstream would cover only one of them.
+    ///
+    /// Returns [`LocalMint::Refused`] when a plane guard rejects the body, so a
+    /// caller with a publisher to answer can say so rather than report a
+    /// delivery that did not happen.
     fn mint_and_route_local(
         &mut self,
         channel: &str,
-        sender: String,
+        origin: LocalOrigin<'_>,
         body: String,
         stamp: MessageStamp,
         urgency: Urgency,
-    ) -> Vec<Effect> {
+    ) -> LocalMint {
+        if channel == LOCAL_OVERLAY_STATE_CHANNEL
+            && let Some(effect) = self.observe_overlay_state(origin, &body, stamp.publish_ts)
+        {
+            return LocalMint::Refused(vec![effect]);
+        }
+        // The takeover plane's payload carries a request/deny/release identity
+        // that the consumer (chrome) trusts; overwrite it with the authenticated
+        // publishing instance so a component cannot forge another's takeover.
+        // Derived from the router's own port wiring, exactly like `sender` — the
+        // component names only its port.
+        let body = if channel == LOCAL_TAKEOVER_CHANNEL {
+            match origin {
+                LocalOrigin::Instance(instance) => inject_takeover_instance(body, instance),
+                // The kernel has no takeover identity to stamp, and an
+                // unattributable takeover message is precisely what the identity
+                // model forbids. A future kernel-emitted takeover (a forced
+                // release on instance failure, say) must carry an explicit
+                // attributed mechanism rather than ride an anonymous body
+                // through the mint.
+                LocalOrigin::Kernel => {
+                    panic!("surface client: the kernel does not publish on {channel}")
+                }
+            }
+        } else {
+            body
+        };
+        // Resolved before the ring is borrowed: both read `self`.
+        let sender = match origin {
+            LocalOrigin::Instance(instance) => self.local_sender(instance),
+            LocalOrigin::Kernel => self.participant_id.clone(),
+        };
         let source = self.participant_id.clone();
         let epoch = self.local_epoch;
         let channel = channel.to_string();
@@ -2742,7 +2932,7 @@ impl ClientCore {
         // `local:` channel has no per-instance subscription to scope a delivery
         // to: the router simply delivers to everyone bound.
         self.deliver_to_registered(&channel, None, &envelope, 0);
-        Vec::new()
+        LocalMint::Routed(Vec::new())
     }
 
     /// Push one delivered envelope, plus its share of any server-reported drops,
@@ -3319,6 +3509,10 @@ impl ClientCore {
             instances,
             uptime_secs,
             counters,
+            // The kernel's own field, not the DOM executor's: overlay state
+            // reaches the core through the router, so the report carries what
+            // the last chrome transition said and nothing the caller supplies.
+            overlay: self.overlay.clone(),
         })]
     }
 

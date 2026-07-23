@@ -33,6 +33,7 @@
 use std::collections::BTreeMap;
 
 use brenn_envelope::{ChannelScheme, DeliveryClass, MessageEnvelope};
+use chrono::{DateTime, Utc};
 
 /// The RFC 8030 urgency ladder, re-exported from the carrier crate.
 ///
@@ -252,7 +253,25 @@ pub enum ClientFrame {
         instances: Vec<InstanceReport>,
         uptime_secs: u64,
         counters: StatusCounters,
+        /// The overlay the surface's chrome holds, or `None` when it holds none.
+        /// Read by the kernel off [`LOCAL_OVERLAY_STATE_CHANNEL`] at the router's
+        /// mint point, so the shell reports what chrome actually folded rather
+        /// than what the router routed. Naming an instance the surface does not
+        /// configure is a protocol violation, like the instance reports.
+        overlay: Option<OverlayReport>,
     },
+}
+
+/// The held-overlay fact a [`ClientFrame::Status`] report carries, and the
+/// `overlay` object of the derived status document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayReport {
+    /// The instance holding the overlay — one of the surface's configured
+    /// instances.
+    pub holder: String,
+    /// When the hold began: the publish time of the chrome transition the kernel
+    /// recorded it from.
+    pub since: DateTime<Utc>,
 }
 
 /// One buffered publish inside a [`ClientFrame::PublishBatch`].
@@ -813,6 +832,11 @@ pub const LOCAL_LINK_STATE_CHANNEL: &str = "local:brenn/link-state";
 pub const LOCAL_SURFACE_STATE_CHANNEL: &str = "local:brenn/surface-state";
 /// The page-local toast stream: kernel → chrome.
 pub const LOCAL_TOAST_CHANNEL: &str = "local:brenn/toast";
+/// The page-local overlay-state plane: chrome → the kernel's status telemetry.
+/// Chrome's post-fold overlay holdership, which no other vantage point can see —
+/// the kernel routes takeover traffic chrome may drop, so routed traffic and
+/// held overlay are different facts.
+pub const LOCAL_OVERLAY_STATE_CHANNEL: &str = "local:brenn/overlay-state";
 
 /// A reserved `local:brenn/*` control channel and the contract-fixed rules that
 /// govern it.
@@ -826,7 +850,7 @@ pub const LOCAL_TOAST_CHANNEL: &str = "local:brenn/toast";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReservedLocalChannel {
     pub address: &'static str,
-    /// Contract-fixed retained-ring depth. The four control planes carry 1
+    /// Contract-fixed retained-ring depth. The control planes carry 1
     /// (last-value replay — what makes a late-attaching chrome's handoff
     /// gap-free); the toast stream carries 0: it is an event stream, not a
     /// control plane, and replaying a stale toast would resurface a past event.
@@ -874,13 +898,21 @@ pub const RESERVED_LOCAL_CHANNELS: &[ReservedLocalChannel] = &[
         kernel_publish_only: true,
         requires_takeover_grant: false,
     },
+    ReservedLocalChannel {
+        address: LOCAL_OVERLAY_STATE_CHANNEL,
+        ring_depth: 1,
+        kernel_publish_only: false,
+        // The plane exists only where takeover exists: a surface without the
+        // grant can never hold an overlay, so it has no overlay state to report.
+        requires_takeover_grant: true,
+    },
 ];
 
 /// The payload version every reserved control plane's body carries as `v`.
 ///
-/// One constant for all five: they are one contract, versioned together per the
-/// self-description discipline. A consumer that does not recognize `v` must not
-/// guess at the rest of the body.
+/// One constant for every plane: they are one contract, versioned together per
+/// the self-description discipline. A consumer that does not recognize `v` must
+/// not guess at the rest of the body.
 // TODO(plane-version-check): every control-plane body carries `v`, but the
 // consumers (chrome's on_theme/on_takeover, and the link-state/surface-state/
 // toast folds) deserialize it and never check it, so a future v2 body is folded
@@ -1006,6 +1038,23 @@ pub struct TakeoverBody {
     /// cannot name another instance as the takeover holder; chrome's `on_takeover`
     /// then trusts this field as the sole request/deny/release identity.
     pub instance: String,
+}
+
+/// The body published on [`LOCAL_OVERLAY_STATE_CHANNEL`]: chrome's overlay
+/// holdership after the fold that changed it.
+///
+/// Published on every transition and only on a transition — there is no
+/// heartbeat, and the plane's depth-1 ring is what hands the current value to
+/// anything attaching later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayStateBody {
+    pub v: u8,
+    /// The instance holding the fullscreen overlay, or `None` when none is held.
+    pub holder: Option<String>,
+    /// The page-monotonic millisecond reading at the transition. Page-local by
+    /// nature (a monotonic clock means nothing off the page), so a consumer that
+    /// needs wall-clock time takes it from the envelope instead.
+    pub since_stamp: u64,
 }
 
 /// The reserved-channel rules for `address`, or `None` when it names no reserved
@@ -1681,6 +1730,10 @@ mod tests {
                     ("mode-clock".to_string(), InstanceCounters::default()),
                 ]),
             },
+            overlay: Some(OverlayReport {
+                holder: "p1".to_string(),
+                since: DateTime::UNIX_EPOCH,
+            }),
         };
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], json!("Status"));
@@ -1702,6 +1755,10 @@ mod tests {
                     "mode-clock": { "publishes": 0, "drops": 0 },
                 },
             })
+        );
+        assert_eq!(
+            v["overlay"],
+            json!({ "holder": "p1", "since": "1970-01-01T00:00:00Z" })
         );
         let s = serde_json::to_string(&f).unwrap();
         let _back: ClientFrame = serde_json::from_str(&s).unwrap();

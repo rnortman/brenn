@@ -79,6 +79,9 @@ pub fn warn_if_unexpected_tool_response(
     tool_name: &str,
     tool_response: &serde_json::Value,
 ) {
+    // TODO(intercept-noop-shape): in production every `BrennSend` trips this
+    // warning while the response *is* `__NOOP__` — the shape check above misses
+    // whatever wrapping the live tool_response carries. Log noise on every send.
     if !is_noop_tool_response(tool_response) {
         warn!(
             tool = tool_name,

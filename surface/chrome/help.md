@@ -25,6 +25,24 @@ A surface with no `layout` binding renders the default layout: the first three
 mounted instances in configured order, laid out by count (1 → single, 2 →
 columns-2, 3+ → columns-3).
 
+## Output (bind this on the chrome instance)
+
+| Port | Channel | Carries |
+|---|---|---|
+| `overlay-state` | `local:brenn/overlay-state` | `{ v, holder, since_stamp }` — which instance holds the fullscreen overlay (needs the surface `takeover` grant) |
+
+Chrome publishes it on every overlay transition and only on a transition:
+`holder` names the instance that took the overlay, or is `null` when the overlay
+popped; `since_stamp` is the page-monotonic millisecond reading of the fold. The
+kernel reads the plane and reports the holder in the surface's status document,
+which is where a fullscreen-wedged surface becomes visible.
+
+Bind it on every surface holding the `takeover` grant. A surface that leaves the
+port unbound still renders identically, but its status document reports no
+overlay whether or not one is held — the instrument is dark, and a wedged bar is
+indistinguishable from a healthy one. The kernel draws one warn at connect when
+a takeover-granted surface's chrome has no `overlay-state` output.
+
 ## The layout doc
 
 A JSON document naming which instance fills each slot of a layout kind:
