@@ -313,17 +313,6 @@ pub async fn insert_wasm_push(
     insert_wasm_push_at(messenger, channel, subscriber, body, envelope_type, ts_ns).await
 }
 
-/// Charge `amount` push-overflow drops to `subscriber` on `channel`'s store.
-/// Used in tests that need to simulate push-overflow without going through the
-/// full publish path. Durable channels only — a ring subscriber's drops are
-/// counted on its cursor, so they come from a real append past its window.
-///
-/// Delegates to `Messenger::inject_drop` (a cfg-gated method) so drop-count
-/// mutation does not leak beyond test builds.
-pub fn inject_drop(messenger: &Messenger, channel: &str, subscriber: &ParticipantId, amount: u64) {
-    messenger.inject_drop(channel, subscriber, amount);
-}
-
 /// Insert a retained-context message on `channel` with **no** push rows — the
 /// message appears only in retained context (as returned by `clamp_and_fetch_context`
 /// / `load_activation_snapshot`). Used to set up sampled-port fixtures where

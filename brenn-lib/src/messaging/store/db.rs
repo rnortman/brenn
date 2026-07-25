@@ -24,10 +24,10 @@ use crate::messaging::config::Depth;
 use crate::messaging::db::{self, PendingPushInsert};
 
 use super::{
-    AppendOutcome, Attached, Committed, DeferralOutcome, DeferredMessage, DeliveryTarget,
-    DropTally, MessageSeq, NewMessage, OverflowEvent, Parked, Priming, ReleaseOutcome, Released,
-    ResumeCursor, RetentionStore, StoreReplay, StoreRetained, TakenMessage, TakenWindow,
-    TargetRecord, TargetResolver,
+    AdvanceOutcome, AppendOutcome, Attached, Committed, DeferralOutcome, DeferredMessage,
+    DeliveryTarget, DropTally, MessageSeq, NewMessage, OverflowEvent, Parked, Priming,
+    ReleaseOutcome, Released, ResumeCursor, RetentionStore, StoreReplay, StoreRetained,
+    SubscriberWindow, TargetRecord, TargetResolver, compose_window, depth_bound,
 };
 
 fn store_retained((seq, envelope): (i64, MessageEnvelope)) -> StoreRetained {
@@ -35,6 +35,16 @@ fn store_retained((seq, envelope): (i64, MessageEnvelope)) -> StoreRetained {
         seq: u64::try_from(seq).expect("messaging: negative retained_seq"),
         message: Arc::new(envelope),
     }
+}
+
+/// A `retained_seq` column value as a store position.
+fn retained_seq(seq: i64) -> MessageSeq {
+    MessageSeq(u64::try_from(seq).expect("messaging: negative retained_seq"))
+}
+
+/// A store position as a `retained_seq` column value.
+fn seq_column(seq: MessageSeq) -> i64 {
+    i64::try_from(seq.0).expect("messaging: retained_seq out of range")
 }
 
 /// Per-subscriber push window: ordered deque of live push_ids (oldest first)
@@ -355,15 +365,6 @@ impl DbStore {
         window.seeded = true;
     }
 
-    /// Test-only: charge `amount` push-overflow drops to `subscriber` without
-    /// driving a real publish through the window. Feature-gated rather than
-    /// `#[cfg(test)]` so downstream test crates reach it through
-    /// `messaging::testutils::inject_drop`.
-    #[cfg(any(test, feature = "testutils"))]
-    pub fn inject_dropped(&self, subscriber: &ParticipantId, amount: u64) {
-        self.charge_drops(subscriber, amount);
-    }
-
     /// Test-only: `true` if no push window has been touched since boot. Used to
     /// assert unbounded subscribers never create window entries.
     #[cfg(test)]
@@ -396,6 +397,25 @@ impl DbStore {
             seq: MessageSeq(u64::try_from(seq).expect("messaging: negative retained_seq")),
             target_records: inserted.push_ids.into_iter().map(TargetRecord).collect(),
         }
+    }
+
+    /// Where this subscriber's unseen messages begin: the lowest retained seq
+    /// among its undelivered claims, or one past everything the channel ever
+    /// assigned when it holds none.
+    ///
+    /// TODO(substrate-durable-cursor): stands in for the persisted cursor row.
+    fn reconstructed_position(
+        &self,
+        conn: &rusqlite::Connection,
+        subscriber: &ParticipantId,
+    ) -> MessageSeq {
+        db::min_owed_retained_seq(conn, subscriber, self.channel_uuid)
+            .map(retained_seq)
+            .unwrap_or_else(|| {
+                MessageSeq(
+                    retained_seq(db::channel_last_retained_seq(conn, self.channel_uuid)).0 + 1,
+                )
+            })
     }
 
     fn assert_owner(&self, lookup: &db::DeferredLookup, sender: &str) {
@@ -434,65 +454,80 @@ impl RetentionStore for DbStore {
         db::channel_has_deliverable_for(&conn, self.channel_uuid, subscriber)
     }
 
-    /// Claims are left pending until the consumer settles them, so a host that
-    /// dies mid-activation redelivers rather than losing the batch — which is
-    /// why the durable take and peek are the same read.
-    async fn take_new(&self, subscriber: &ParticipantId, limit: u64) -> TakenWindow {
-        self.peek_new(subscriber, limit).await
-    }
-
-    /// Hands over the subscriber's undelivered claims, each carrying its claim
-    /// id as the record to settle with. Claims past `limit` are held for the
-    /// next read, not dropped: this charges nothing.
+    /// The retained span this subscriber's position sits in, with the
+    /// new boundary derived from its undelivered claims.
     ///
-    /// The claim read and the drop total are taken under one connection hold,
-    /// so the total names exactly what is missing from the window.
-    async fn peek_new(&self, subscriber: &ParticipantId, limit: u64) -> TakenWindow {
-        if limit == 0 {
-            // A sampled subscriber holds no claims to take (no push row is ever
-            // written for one); pending claims from before a config change are
-            // the caller's residue to retire, not this take's business.
-            return TakenWindow {
-                messages: vec![],
-                dropped: 0,
-                dropped_total: self.dropped.get(subscriber),
-                clamped_leftover: 0,
-            };
-        }
+    /// TODO(substrate-durable-cursor): the position is reconstructed per call
+    /// as the lowest retained seq among the subscriber's undelivered claims,
+    /// because the durable class has no cursor row yet. Both reads happen under
+    /// one connection hold, so the boundary cannot name a message the window
+    /// does not carry. This whole body is replaced by a read of
+    /// `messaging_subscriber_cursors` when that table lands.
+    async fn window(
+        &self,
+        subscriber: &ParticipantId,
+        push_limit: Depth,
+        retain_limit: Depth,
+    ) -> SubscriberWindow {
         let conn = self.db.lock().await;
-        let claims = db::load_pending_pushes_for_channel(&conn, subscriber, self.channel_uuid);
-        let held = claims.len();
-        let messages: Vec<TakenMessage> = claims
+        let next_owed = self.reconstructed_position(&conn, subscriber);
+        let span = match (push_limit, retain_limit) {
+            (Depth::Unbounded, _) | (_, Depth::Unbounded) => Depth::Unbounded,
+            (p, r) => Depth::Bounded(depth_bound(p).max(depth_bound(r))),
+        };
+        let entries = db::load_channel_retained_window_seq(&conn, self.channel_uuid, span)
             .into_iter()
-            .take(usize::try_from(limit).expect("messaging: push depth out of range"))
-            .map(|row| TakenMessage {
-                record: Some(TargetRecord(row.push_id)),
-                envelope: Arc::new(row.envelope),
-            })
+            .map(|(seq, envelope)| (retained_seq(seq), Arc::new(envelope)))
             .collect();
-        TakenWindow {
-            clamped_leftover: held - messages.len(),
-            messages,
-            dropped: 0,
-            dropped_total: self.dropped.get(subscriber),
-        }
+        compose_window(entries, next_owed, push_limit)
     }
 
-    /// Settles exactly the claims named, and only them: a claim the consumer
-    /// did not accept stays pending and is handed over again by the next read.
-    /// Charges nothing — a durable claim that reaches its consumer is delivered,
-    /// not dropped.
+    /// Retire every undelivered claim at or below `through`, and report those
+    /// below `seen_floor` as never served.
     ///
-    /// The subscriber is named for the contract's sake; the claim ids identify
-    /// the rows on their own.
-    async fn settle(&self, _subscriber: &ParticipantId, records: &[TargetRecord]) -> u64 {
-        if records.is_empty() {
-            return 0;
-        }
-        let ids: Vec<i64> = records.iter().map(|record| record.0).collect();
+    /// TODO(substrate-durable-cursor): position advance is a claim retirement
+    /// here rather than a cursor move, so the reported figure is a row count
+    /// instead of the model's seq subtraction. The count is a floor, exact only
+    /// where no claim was retired out from under the subscriber: a seq the
+    /// commit-time push window or a GC eviction already retired holds no claim
+    /// and so is not counted here. Both of those retirements report their own
+    /// overflow when they happen, so the noise ladder sees them; it is the
+    /// subscriber-visible `dropped` figure that under-reports until the cursor
+    /// row lands.
+    async fn advance(
+        &self,
+        subscriber: &ParticipantId,
+        through: MessageSeq,
+        seen_floor: MessageSeq,
+    ) -> AdvanceOutcome {
+        assert!(
+            seen_floor.0 <= through.0.saturating_add(1),
+            "messaging store: {} seen_floor {} is above the window it came from (through {})",
+            self.address,
+            seen_floor.0,
+            through.0
+        );
+        let through = seq_column(through);
+        let floor = seq_column(seen_floor);
         let conn = self.db.lock().await;
-        db::mark_pending_pushes_delivered(&conn, &ids);
-        0
+        let claims = db::owed_push_positions(&conn, subscriber, self.channel_uuid);
+        let passed: Vec<i64> = claims
+            .iter()
+            .filter(|(_, seq)| *seq <= through)
+            .map(|(push_id, _)| *push_id)
+            .collect();
+        // A claim below the window's own floor was never handed over: the
+        // window served the newest and this is what it skipped.
+        let dropped = claims.iter().filter(|(_, seq)| *seq < floor).count() as u64;
+        db::mark_pending_pushes_delivered(&conn, &passed);
+        drop(conn);
+        self.dropped.add(subscriber, dropped);
+        AdvanceOutcome {
+            dropped,
+            // Everything a claim still names is still retained, so nothing here
+            // was already reported by an eviction.
+            noise_charge: dropped,
+        }
     }
 
     /// Requires no connection: safe to call while the caller already holds one.

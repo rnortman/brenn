@@ -289,8 +289,7 @@ async fn guest_async_tool_call_pulls_fixture_and_delivers_advanced_result() {
         ChannelScheme::Brenn,
     )
     .await;
-    let mut last_seen = HashMap::new();
-    drain_step(&harness.cfg, &guest_sub, &mut last_seen).await;
+    drain_step(&harness.cfg, &guest_sub).await;
 
     // The trigger row is acked; a request now sits on the executor's inbox.
     assert!(
@@ -349,7 +348,7 @@ async fn guest_async_tool_call_pulls_fixture_and_delivers_advanced_result() {
 
     // --- Step 3: the result activates the guest on its `tool-results` port; the
     // guest forwards the result envelope to "out".
-    drain_step(&harness.cfg, &guest_sub, &mut last_seen).await;
+    drain_step(&harness.cfg, &guest_sub).await;
     let out_rows = harness.messenger.load_pending_pushes(&out_sub).await;
     assert_eq!(
         out_rows.len(),
@@ -418,7 +417,7 @@ async fn guest_trap_after_call_async_discards_the_buffered_request() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub, &mut HashMap::new()).await;
+    drain_step(&harness.cfg, &guest_sub).await;
 
     // The activation actually ran: the trigger row is acked (drain acks at
     // activation start, before invoking the guest), so an empty guest inbox

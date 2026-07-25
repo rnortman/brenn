@@ -15,7 +15,7 @@ mod cursor;
 mod deferred;
 mod ring;
 
-pub use cursor::{Peek, SubscriberCursor, Take};
+pub use cursor::{Advance, SubscriberCursor, Window, new_boundary, retention_frontier};
 pub use deferred::{Deferred, DeferredId, DeferredSet, NoSuchDeferred, QuotaExceeded, ReleaseTime};
 pub use ring::{Append, GapReason, Replay, ReplayDecision, Resume, Retained, RetainedRing};
 

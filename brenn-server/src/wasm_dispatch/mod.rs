@@ -18,7 +18,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use brenn_lib::messaging::config::{ActivationPacing, WasmInputPort, WasmOutputPort};
-use brenn_lib::messaging::store::{DeferralOutcome, TargetRecord, instant_of, release_time_of};
+use brenn_lib::messaging::store::{DeferralOutcome, MessageSeq, instant_of, release_time_of};
 use brenn_lib::messaging::{Messenger, ParticipantId, Urgency, WasmBatchFailure, WasmPublish};
 use brenn_lib::obs::alerting::{AlertDispatcher, AlertSeverity};
 use brenn_lib::obs::security::{SecurityEventType, log_component_security_event};
@@ -361,42 +361,30 @@ pub(crate) fn spawn_wasm_consumer_task(cfg: WasmConsumerConfig) -> tokio::task::
 async fn run_consumer(cfg: WasmConsumerConfig) {
     let subscriber = ParticipantId::for_wasm(&cfg.slug);
 
-    // Per-channel last-seen drop counter (design §2.5 step 3b: delta tracking).
-    // Seeded at 0 on startup; advances at ack time (before the guest runs) so
-    // a dropped gap is reported exactly once — in the activation that observed it.
-    // Failed/trapped activations are never re-driven; the advance-at-ack contract
-    // means the same gap is never re-reported.
-    // Across a host restart both last_seen and the drop counter reset to 0, so
-    // dropped=0 is reported after a restart even if overflow occurred before the crash
-    // — best-effort, since-boot, per design §2.5.
-    let mut last_seen_drop: HashMap<String, u64> = HashMap::new();
-
-    // Per-component activation pacer (mqtt-wasm-republish-pacing design §2). Every
-    // drain step — startup sweep and each notified wake — is admitted through this
-    // single gate, so external eager wakes, deadline wakes, clamp self-renotify
-    // chains, and the startup sweep are all paced. The bucket starts full, so the
-    // startup sweep and any burst below `burst` never delay.
+    // Per-component activation pacer. Every drain step — startup sweep and
+    // each notified wake — is admitted through this single gate, so the
+    // startup sweep and external eager wakes are all paced. The bucket starts
+    // full, so the startup sweep and any burst below `burst` never delay.
     let mut pacer = ActivationPacer::new(
         cfg.activation_pacing,
         cfg.slug.clone(),
         cfg.alert_dispatcher.clone(),
     );
 
-    // Startup sweep (crash-recovery re-dispatch trigger, design §2.7).
+    // Startup sweep: crash-recovery re-dispatch trigger.
     // Runs before the first `notified.await` so undelivered rows left by a prior crash
     // are re-loaded and re-invoked on restart, not waiting for a new wake.
     pacer.admit().await;
-    drain_step(&cfg, &subscriber, &mut last_seen_drop).await;
+    drain_step(&cfg, &subscriber).await;
 
-    // Serialized drain loop. Notify sources: external eager wakes (`spawn_eager_wake`)
-    // and clamp self-renotify (`drain_step` fires `notify_one` when a port's backlog
-    // exceeded its activation cap). Either sets a one-permit flag; any wakes that arrive
-    // during a drain step coalesce into one pending permit and the next iteration consumes
-    // it. Two drain steps for the same consumer never overlap.
+    // Serialized drain loop, woken by external eager wakes (`spawn_eager_wake`).
+    // A wake sets a one-permit flag; any wakes that arrive during a drain step
+    // coalesce into one pending permit and the next iteration consumes it. Two
+    // drain steps for the same consumer never overlap.
     loop {
         cfg.notify.notified().await;
         pacer.admit().await;
-        drain_step(&cfg, &subscriber, &mut last_seen_drop).await;
+        drain_step(&cfg, &subscriber).await;
     }
 }
 
@@ -411,7 +399,6 @@ async fn run_consumer(cfg: WasmConsumerConfig) {
 pub(in crate::wasm_dispatch) async fn drain_step(
     cfg: &WasmConsumerConfig,
     subscriber: &ParticipantId,
-    last_seen_drop: &mut HashMap<String, u64>,
 ) {
     // Step 1: assemble multi-port snapshot (single scan, T₀ hermetic).
     // Returns None when no triggering input has pending rows → no activation.
@@ -424,8 +411,8 @@ pub(in crate::wasm_dispatch) async fn drain_step(
     };
 
     debug_assert!(
-        snapshots.iter().any(|s| !s.new_rows.is_empty()),
-        "drain_step: snapshot is Some but no port has new_rows — invariant violated"
+        snapshots.iter().any(|s| s.new_len() > 0),
+        "drain_step: snapshot is Some but no port has new messages — invariant violated"
     );
     debug_assert_eq!(
         snapshots.len(),
@@ -435,107 +422,60 @@ pub(in crate::wasm_dispatch) async fn drain_step(
         cfg.inputs.len()
     );
 
-    // Any port whose pending backlog exceeded this activation's cap leaves leftover
-    // rows undelivered. Self-notify so the loop drains them without waiting for the
-    // next external wake. Decided at snapshot time (before the guest runs): leftover
-    // rows are real backlog regardless of the guest outcome. The single-permit Notify
-    // coalesces this with any concurrent external wake into one follow-up drain step,
-    // and every step acks its rows before the guest runs, so the chain is bounded by
-    // real backlog — ceil(backlog / cap) steps absent new publishes.
-    let clamped: Vec<(&str, usize)> = snapshots
-        .iter()
-        .filter(|s| s.clamped_leftover > 0)
-        .map(|s| (s.port.as_str(), s.clamped_leftover))
-        .collect();
-    if !clamped.is_empty() {
-        info!(
-            slug = %cfg.slug,
-            ports = ?clamped,
-            "wasm_dispatch: activation clamped; self-notifying to drain leftover rows"
-        );
-        cfg.notify.notify_one();
+    // Step 2: advance every port's position over the window it just served,
+    // BEFORE the guest executes. At-most-once; a crash between here and the
+    // guest completing means the batch is gone (decided semantics).
+    //
+    // Each channel advances on its own, so the grain is per channel, not per
+    // activation: a crash between two iterations leaves the advanced ports
+    // passed and the rest unseen, and the next activation carries only the
+    // remainder. The guest has not run at this point, so nothing is delivered
+    // twice — a multi-port batch can simply arrive split.
+    //
+    // What the advance passed unserved is this port's `dropped` figure, so the
+    // count the guest reads names exactly what its own window skipped — nothing
+    // arrives an activation late and there is no delta to keep.
+    let mut dropped_per_port: Vec<u64> = Vec::with_capacity(snapshots.len());
+    for (snap, input) in snapshots.iter().zip(&cfg.inputs) {
+        let Some((through, seen_floor)) = snap.advance_span() else {
+            dropped_per_port.push(0);
+            continue;
+        };
+        let outcome = cfg
+            .messenger
+            .advance_subscriber(
+                &snap.channel_address,
+                subscriber,
+                through,
+                seen_floor,
+                input.sub.noise,
+            )
+            .await;
+        dropped_per_port.push(outcome.dropped);
     }
 
-    // Step 2: assemble ProcessorPortWindow per snapshot, computing per-port drop delta.
-    let mut settlements: Vec<(&str, Vec<TargetRecord>)> = Vec::with_capacity(snapshots.len());
-    // Track current drop counter per channel (advance at ack time, step 3).
-    let mut current_drops: Vec<(String, u64)> = Vec::with_capacity(snapshots.len());
-
+    // Step 3: assemble ProcessorPortWindow per snapshot.
     let ports: Vec<ProcessorPortWindow> = snapshots
         .iter()
-        .map(|snap| {
-            let context_envelopes: Vec<String> = snap
-                .context
-                .iter()
-                .map(|env| {
-                    serde_json::to_string(env).unwrap_or_else(|e| {
-                        panic!("wasm_dispatch: serialize context envelope: {e}")
-                    })
-                })
-                .collect();
-            let new_envelopes: Vec<String> = snap
-                .new_rows
+        .zip(&dropped_per_port)
+        .map(|(snap, dropped)| {
+            let envelopes: Vec<String> = snap
+                .entries
                 .iter()
                 .map(|(_, env)| {
                     serde_json::to_string(env)
                         .unwrap_or_else(|e| panic!("wasm_dispatch: serialize MessageEnvelope: {e}"))
                 })
                 .collect();
-            let new_from = context_envelopes.len() as u32;
-
-            // Only a durable port settles: its claims stay pending until named,
-            // and every one of its rows carries the claim id that names it. A
-            // cursor-tracked port's take was its ack, so it settles nothing —
-            // and its records, were any minted, would be ring positions in an
-            // unrelated id domain.
-            settlements.push((
-                snap.channel_address.as_str(),
-                if snap.capabilities.durable {
-                    snap.new_rows
-                        .iter()
-                        .map(|(record, _)| {
-                            record.expect("wasm_dispatch: a durable delivery carries its claim id")
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                },
-            ));
-
-            // Compute `dropped` delta: drop counter read inside load_activation_snapshot
-            // (while the db lock was held) minus last_seen. Using the snapshot value
-            // rather than a live read prevents a concurrent publish from evicting a row
-            // that is present in this snapshot's new_rows while being counted as dropped
-            // (correctness-1). Advance last_seen_drop at ack time (step 3) for EVERY
-            // included channel — defensive uniformity.
-            let current_drop = snap.drop_counter_snapshot;
-            let last_seen = last_seen_drop
-                .get(&snap.channel_address)
-                .copied()
-                .unwrap_or(0);
-            let dropped = current_drop.saturating_sub(last_seen);
-            current_drops.push((snap.channel_address.clone(), current_drop));
-
-            let mut envelopes = context_envelopes;
-            envelopes.extend(new_envelopes);
 
             ProcessorPortWindow {
                 port: snap.port.clone(),
                 envelopes,
-                new_from,
-                dropped,
+                new_from: snap.new_from as u32,
+                dropped: *dropped,
             }
         })
         .collect();
-
-    // A snapshot is only Some when at least one port triggered. Ring-backed rows
-    // carry no push id (they were acked by the snapshot-time cursor take), so
-    // `all_push_ids` is empty for an ephemeral-only consumer — the invariant is
-    // "some port delivered rows", not "some port had push ids".
-    debug_assert!(
-        snapshots.iter().any(|s| !s.new_rows.is_empty()),
-        "drain_step: snapshot Some but no triggering rows on any port"
-    );
 
     // One clock read for both the deferred-view boundary and the guest's `now`,
     // so a component's view of what is still deferred agrees with the clock it is
@@ -588,25 +528,6 @@ pub(in crate::wasm_dispatch) async fn drain_step(
         now: Some(now_ms),
     };
 
-    // Step 3 (ack-at-activation-start): settle every triggering port's delivery
-    // records BEFORE the guest executes. At-most-once; crash between here and guest
-    // completing means the batch is gone (decided semantics).
-    //
-    // Each channel's store settles its own records, so the grain is per channel,
-    // not per activation: a crash between two iterations leaves the settled
-    // ports' rows acked and the rest owed, and the next activation carries only
-    // the remainder. The guest has not run at this point, so nothing is
-    // delivered twice — a multi-port batch can simply arrive split.
-    for (channel_address, records) in &settlements {
-        cfg.messenger
-            .settle_delivered(channel_address, subscriber, records)
-            .await;
-    }
-    // Advance last_seen_drop for EVERY included channel at ack time (defensive uniformity).
-    for (channel_address, current_drop) in &current_drops {
-        last_seen_drop.insert(channel_address.clone(), *current_drop);
-    }
-
     // Step 4: invoke the guest. CPU-bound → spawn_blocking.
     let component = cfg.component.clone();
     let join_result = tokio::task::spawn_blocking(move || component.handle(activation)).await;
@@ -638,7 +559,7 @@ pub(in crate::wasm_dispatch) async fn drain_step(
         }
     };
 
-    // Step 5: disposition (activation-scoped). Push rows already acked above.
+    // Step 5: disposition (activation-scoped). Positions already advanced above.
     match outcome {
         ProcessorOutcome::Ok {
             publishes,
@@ -685,7 +606,7 @@ pub(in crate::wasm_dispatch) async fn drain_step(
                 .inputs
                 .iter()
                 .zip(snapshots.iter())
-                .map(|(inp, snap)| (inp.port.as_str(), snap.new_rows.len()))
+                .map(|(inp, snap)| (inp.port.as_str(), snap.new_len()))
                 .collect();
             info!(
                 slug = %cfg.slug,
@@ -713,7 +634,7 @@ pub(in crate::wasm_dispatch) async fn drain_step(
             debug_assert!(
                 !backing.is_empty(),
                 "drain_step: collect_failure_backing returned empty for Some snapshot \
-                 — invariant violated (snapshot Some ⟹ ≥1 port has new_rows)"
+                 — invariant violated (snapshot Some implies at least one port has new messages)"
             );
             let failures = build_activation_failure_refs(&backing, subscriber, "err", &diag);
             cfg.messenger
@@ -738,7 +659,7 @@ pub(in crate::wasm_dispatch) async fn drain_step(
             debug_assert!(
                 !backing.is_empty(),
                 "drain_step: collect_failure_backing returned empty for Some snapshot \
-                 — invariant violated (snapshot Some ⟹ ≥1 port has new_rows)"
+                 — invariant violated (snapshot Some implies at least one port has new messages)"
             );
             let failures = build_activation_failure_refs(&backing, subscriber, "trap", &diag);
             cfg.messenger
@@ -751,22 +672,21 @@ pub(in crate::wasm_dispatch) async fn drain_step(
 fn format_triggering_summary(snapshots: &[brenn_lib::messaging::PortSnapshot]) -> Vec<String> {
     snapshots
         .iter()
-        .filter(|s| !s.new_rows.is_empty())
+        .filter(|s| s.new_len() > 0)
         .map(|s| {
-            let first = s
-                .new_rows
+            let new = s.new_entries();
+            let first = new
                 .first()
                 .map(|(_, e)| e.message_id.to_string())
                 .unwrap_or_default();
-            let last = s
-                .new_rows
+            let last = new
                 .last()
                 .map(|(_, e)| e.message_id.to_string())
                 .unwrap_or_default();
             format!(
                 "channel={} batch={} first={first} last={last}",
                 s.channel_address,
-                s.new_rows.len()
+                new.len()
             )
         })
         .collect()
@@ -777,10 +697,8 @@ struct PortFailureBacking {
     channel: String,
     first_message_id: String,
     last_message_id: String,
-    /// The `messaging_pending_pushes` rows this port's batch claimed, for the
-    /// quarantine record to retire. Empty for a port whose channel keeps no such
-    /// rows.
-    push_ids: Vec<i64>,
+    /// The retention seqs this port's batch spanned, oldest first.
+    seq_span: (MessageSeq, MessageSeq),
 }
 
 /// Build owned backing + `WasmBatchFailure` slices for all triggering ports in a
@@ -800,7 +718,7 @@ fn build_activation_failure_refs<'a>(
             subscriber,
             first_message_id: &b.first_message_id,
             last_message_id: &b.last_message_id,
-            push_ids: &b.push_ids,
+            seq_span: b.seq_span,
             outcome,
             diagnostic,
         })
@@ -812,40 +730,24 @@ fn collect_failure_backing(
 ) -> Vec<PortFailureBacking> {
     snapshots
         .iter()
-        .filter(|s| !s.new_rows.is_empty())
+        .filter(|s| s.new_len() > 0)
         .map(|s| {
-            let fid = s
-                .new_rows
+            let new = s.new_entries();
+            let fid = new
                 .first()
                 .map(|(_, e)| e.message_id.to_string())
                 .unwrap_or_default();
-            let lid = s
-                .new_rows
+            let lid = new
                 .last()
                 .map(|(_, e)| e.message_id.to_string())
                 .unwrap_or_default();
-            // Quarantine retirement names `messaging_pending_pushes` rows, so
-            // only a durable channel's records belong here: a cursor-tracked
-            // channel's record is a ring position, an unrelated id domain that
-            // would retire whichever claim row happened to share the number.
-            // Its window needs no retirement anyway — the take was its ack.
-            let push_ids: Vec<i64> = if s.capabilities.durable {
-                s.new_rows
-                    .iter()
-                    .map(|(record, _)| {
-                        record
-                            .expect("wasm_dispatch: a durable delivery carries its claim id")
-                            .0
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
             PortFailureBacking {
                 channel: s.channel_address.clone(),
                 first_message_id: fid,
                 last_message_id: lid,
-                push_ids,
+                seq_span: s
+                    .new_seq_span()
+                    .expect("wasm_dispatch: a triggering port has a new span"),
             }
         })
         .collect()

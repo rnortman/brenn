@@ -37,8 +37,7 @@ async fn brenn_message_creates_push_row_and_consumer_invoked_once() {
         Depth::Unbounded,
         Depth::Unbounded,
     );
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // After drain: the row is delivered (no more pending).
     let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
@@ -90,8 +89,7 @@ async fn batching_n_messages_delivered_in_one_invocation() {
         Depth::Unbounded,
         Depth::Unbounded,
     );
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // After one drain step: all rows delivered.
     let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
@@ -124,7 +122,6 @@ async fn retained_context_prefix_in_window() {
         Depth::Unbounded,
         Depth::Bounded(10),
     );
-    let mut last_seen = HashMap::new();
 
     // Insert 2 messages and drain them — they become retained context.
     for i in 0..2usize {
@@ -137,7 +134,7 @@ async fn retained_context_prefix_in_window() {
         )
         .await;
     }
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Verify those 2 rows are now delivered.
     let pending_after_first = messenger.load_pending_pushes(&wasm_sub).await;
@@ -158,7 +155,7 @@ async fn retained_context_prefix_in_window() {
 
     // Drain again — the window should have context prefix from the 2 prior messages.
     // The demo component accepts the window (Ok). Assert the 3rd row is delivered.
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
     let pending_after_second = messenger.load_pending_pushes(&wasm_sub).await;
     assert!(
         pending_after_second.is_empty(),
@@ -202,8 +199,7 @@ async fn crash_recovery_startup_sweep_re_invokes_undelivered_rows() {
         Depth::Unbounded,
         Depth::Unbounded,
     );
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // The row must now be delivered — at-least-once on the Immediate no-deadline case.
     let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
@@ -280,8 +276,7 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
         activation_pacing: unthrottled_pacing(),
     };
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // The push row must be delivered (retired into the quarantine table, not pending).
     let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
@@ -316,7 +311,7 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
     }
 
     // A second drain must find nothing new (no redelivery loop — N=1 terminal).
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
     let rows_second = messenger.load_pending_pushes(&wasm_sub).await;
     assert!(
         rows_second.is_empty(),
@@ -472,8 +467,7 @@ async fn webhook_message_invokes_consumer_with_webhook_envelope_type() {
         Depth::Unbounded,
         Depth::Unbounded,
     );
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // After drain: row delivered.
     let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
@@ -514,9 +508,8 @@ async fn push_depth_zero_wasm_subscription_never_invoked() {
         Depth::Bounded(0),
         Depth::Unbounded,
     );
-    let mut last_seen = HashMap::new();
     // Drain finds nothing and invokes nothing — no panic, no error.
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
     let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
     assert!(
         rows_after.is_empty(),

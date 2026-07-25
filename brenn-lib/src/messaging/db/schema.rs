@@ -230,7 +230,7 @@ pub fn run_messaging_migrations(conn: &Connection) {
             subscriber       TEXT NOT NULL,
             first_message_id TEXT NOT NULL,
             last_message_id  TEXT NOT NULL,
-            batch_push_ids   TEXT NOT NULL,
+            batch_seq_span   TEXT NOT NULL,
             outcome          TEXT NOT NULL CHECK(outcome IN ('err','trap')),
             diagnostic       TEXT NOT NULL,
             failed_at        TEXT NOT NULL,
@@ -241,6 +241,17 @@ pub fn run_messaging_migrations(conn: &Connection) {
         ",
     )
     .expect("failed to run messaging_wasm_consume_failures migration");
+
+    // A quarantined batch is named by the retention seqs it spanned, not by the
+    // claim rows it held. A pre-existing DB carries the claim-id column; rename
+    // it in place, keeping the stale ids as the historical value.
+    if crate::db::column_exists(conn, "messaging_wasm_consume_failures", "batch_push_ids") {
+        conn.execute_batch(
+            "ALTER TABLE messaging_wasm_consume_failures
+                RENAME COLUMN batch_push_ids TO batch_seq_span;",
+        )
+        .expect("failed to rename messaging_wasm_consume_failures.batch_push_ids");
+    }
 
     // The store's durable identity (generation UUID + per-boot incarnation).
     // Created here so a fresh or restored DB carries the row from first boot; the
@@ -934,7 +945,7 @@ mod tests {
             "subscriber",
             "first_message_id",
             "last_message_id",
-            "batch_push_ids",
+            "batch_seq_span",
             "outcome",
             "diagnostic",
             "failed_at",

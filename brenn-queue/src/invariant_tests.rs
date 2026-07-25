@@ -5,7 +5,10 @@
 //! deterministic sequence also means a failure reproduces exactly from the seed
 //! printed in the assertion.
 
-use crate::{DeferredSet, ReplayDecision, Resume, RetainedRing, SubscriberCursor};
+use crate::{
+    Advance, DeferredSet, ReplayDecision, Resume, RetainedRing, SubscriberCursor,
+    retention_frontier,
+};
 
 /// A deterministic source of small numbers.
 struct Lcg(u64);
@@ -92,42 +95,87 @@ fn replay_from_a_covered_resume_is_exactly_what_is_owed() {
     }
 }
 
+/// Serve `cursor` its window and advance over it, as a push consumer does.
+fn serve(
+    cursor: &mut SubscriberCursor,
+    ring: &RetainedRing<u64, u8>,
+    push_limit: u64,
+    retain_limit: u64,
+) -> (Vec<u64>, Advance) {
+    let window = cursor.window(ring, push_limit, retain_limit);
+    // Everything unseen the window carried reached the subscriber, whether as
+    // new or — for a retain limit above the push limit — as context.
+    let unseen_from = cursor.next_owed();
+    let served: Vec<u64> = window
+        .entries
+        .iter()
+        .filter(|e| e.seq >= unseen_from)
+        .map(|e| e.message)
+        .collect();
+    let advance = match window.advance_span() {
+        Some((through, seen_floor)) => cursor.advance(ring, through, seen_floor),
+        None => Advance {
+            dropped: 0,
+            noise_charge: 0,
+        },
+    };
+    (served, advance)
+}
+
+/// Over any interleaving of appends and reads, each published message is either
+/// handed to the subscriber or reported as its drop, exactly once — and the
+/// noise stream partitions the same losses between the eviction that retired
+/// them and the advance that passed them, with no double- or under-report.
 #[test]
-fn every_published_message_is_delivered_or_counted_exactly_once() {
+fn every_published_message_is_delivered_or_reported_exactly_once() {
     for seed in SEEDS {
         let mut rng = Lcg(seed);
         let ring_depth = 1 + rng.below(6);
-        let push_depth = rng.below(5);
+        // A sampled (`push_depth = 0`) subscriber is deliberately outside this
+        // accounting: it is never delivered to and never reported against.
+        let push_depth = 1 + rng.below(4);
+        let retain_depth = rng.below(4);
         let mut ring: RetainedRing<u64, u8> = RetainedRing::new(1, ring_depth);
         let mut cursor = SubscriberCursor::at_head(&ring, push_depth);
 
         let mut published = 0u64;
         let mut delivered: Vec<u64> = Vec::new();
+        let mut dropped = 0u64;
+        let mut evicted_reports = 0u64;
+        let mut noise = 0u64;
 
         for _ in 0..300 {
             if rng.below(3) > 0 {
                 published += 1;
+                let before = retention_frontier(&ring);
                 ring.append(published);
+                evicted_reports += cursor.evicted_since(&ring, before);
             } else {
-                let take = cursor.take(&ring);
-                delivered.extend(take.messages);
+                let (served, advance) = serve(&mut cursor, &ring, push_depth, retain_depth);
+                delivered.extend(served);
+                dropped += advance.dropped;
+                noise += advance.noise_charge;
             }
         }
-        let take = cursor.take(&ring);
-        delivered.extend(take.messages);
+        let (served, advance) = serve(&mut cursor, &ring, push_depth, retain_depth);
+        delivered.extend(served);
+        dropped += advance.dropped;
+        noise += advance.noise_charge;
 
         assert!(
             delivered.windows(2).all(|w| w[0] < w[1]),
             "seed {seed}: deliveries are strictly ascending and never duplicated"
         );
         assert_eq!(
-            delivered.len() as u64 + cursor.dropped_total(),
+            delivered.len() as u64 + dropped,
             published,
-            "seed {seed}: every message is delivered or charged as a drop, never both"
+            "seed {seed}: every message is delivered or reported dropped, never both"
         );
-        if push_depth == 0 {
-            assert!(delivered.is_empty(), "seed {seed}");
-        }
+        assert_eq!(
+            evicted_reports + noise,
+            dropped,
+            "seed {seed}: the noise stream covers each drop exactly once"
+        );
     }
 }
 

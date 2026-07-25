@@ -337,8 +337,7 @@ async fn push_event_matches_and_pulls_fixture_to_outcome() {
         ChannelScheme::Brenn,
     )
     .await;
-    let mut last_seen = HashMap::new();
-    drain_step(&harness.cfg, &guest_sub, &mut last_seen).await;
+    drain_step(&harness.cfg, &guest_sub).await;
 
     // The guest fired exactly one async call for the matched slug.
     let requests = harness.messenger.load_pending_pushes(&executor_sub).await;
@@ -367,7 +366,7 @@ async fn push_event_matches_and_pulls_fixture_to_outcome() {
     executor.drain_step().await;
 
     // Step 3: the result activates the consumer, which publishes the outcome.
-    drain_step(&harness.cfg, &guest_sub, &mut last_seen).await;
+    drain_step(&harness.cfg, &guest_sub).await;
     let outcome = read_latest(&harness.messenger, &harness.outcomes_addr)
         .await
         .expect("outcome event published");
@@ -396,7 +395,7 @@ async fn push_event_no_match_fires_no_call() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub, &mut HashMap::new()).await;
+    drain_step(&harness.cfg, &guest_sub).await;
 
     assert!(
         harness
@@ -414,7 +413,6 @@ async fn call_id_sequence_is_monotonic_across_activations() {
     let slug = "gsc-seq";
     let harness = consumer_harness(slug, empty_registry(), valid_config(), &[SLUG], true).await;
     let guest_sub = harness.guest_sub.clone();
-    let mut last_seen = HashMap::new();
 
     for _ in 0..2 {
         testutils::insert_wasm_push(
@@ -425,7 +423,7 @@ async fn call_id_sequence_is_monotonic_across_activations() {
             ChannelScheme::Brenn,
         )
         .await;
-        drain_step(&harness.cfg, &guest_sub, &mut last_seen).await;
+        drain_step(&harness.cfg, &guest_sub).await;
     }
 
     let requests = harness
@@ -459,7 +457,7 @@ async fn drive_result(harness: &ConsumerHarness, result_body: &str) {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &harness.guest_sub, &mut HashMap::new()).await;
+    drain_step(&harness.cfg, &harness.guest_sub).await;
 }
 
 #[tokio::test]
@@ -550,7 +548,7 @@ async fn missing_remote_config_quarantines() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub, &mut HashMap::new()).await;
+    drain_step(&harness.cfg, &guest_sub).await;
 
     assert_eq!(
         failure_count(&harness.messenger, &guest_sub).await,
@@ -580,7 +578,7 @@ async fn empty_remote_config_quarantines() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub, &mut HashMap::new()).await;
+    drain_step(&harness.cfg, &guest_sub).await;
 
     assert_eq!(
         failure_count(&harness.messenger, &guest_sub).await,
@@ -609,7 +607,7 @@ async fn duplicate_slug_config_quarantines() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub, &mut HashMap::new()).await;
+    drain_step(&harness.cfg, &guest_sub).await;
 
     assert_eq!(
         failure_count(&harness.messenger, &guest_sub).await,
@@ -638,7 +636,7 @@ async fn denied_tool_call_quarantines() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub, &mut HashMap::new()).await;
+    drain_step(&harness.cfg, &guest_sub).await;
 
     assert_eq!(
         failure_count(&harness.messenger, &guest_sub).await,
@@ -677,7 +675,7 @@ async fn unknown_push_event_schema_version_quarantines() {
         ChannelScheme::Brenn,
     )
     .await;
-    drain_step(&harness.cfg, &guest_sub, &mut HashMap::new()).await;
+    drain_step(&harness.cfg, &guest_sub).await;
 
     assert_eq!(
         failure_count(&harness.messenger, &guest_sub).await,

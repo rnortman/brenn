@@ -218,25 +218,51 @@ pub struct PortSnapshot {
     /// The channel's capabilities, so consumers need not re-derive them from
     /// the address.
     pub capabilities: brenn_envelope::ChannelCapabilities,
-    /// The NEW window, oldest first. Empty for sampled ports
-    /// (`push_depth = Bounded(0)`) and for ports that were owed nothing this
-    /// step.
-    ///
-    /// `Some(record)` is a delivery record the consumer must settle (ack or
-    /// quarantine) through the store that issued it; `None` means the take
-    /// itself was the ack.
-    pub new_rows: Vec<(Option<store::TargetRecord>, MessageEnvelope)>,
-    /// Retained context in ASC order (oldest first), deduped against `new_rows`.
-    /// Empty when `retain_depth = Bounded(0)`.
-    pub context: Vec<MessageEnvelope>,
-    /// The subscriber's lifetime drop total on this channel, taken with the
-    /// window so the count cannot name a message the window also carries
-    /// (correctness-1).
-    pub drop_counter_snapshot: u64,
-    /// What the take left behind because of the push-depth cap: an exact count
-    /// of still-owed claims for a store that can count them, and a presence
-    /// flag for one that can only say more remains. 0 means nothing was left.
-    pub clamped_leftover: usize,
+    /// The port's window, oldest first, each entry carrying the retention seq
+    /// its store assigned it: seen context up to `new_from`, then what is new.
+    /// One read, so no message appears twice and no dedupe is needed.
+    pub entries: Vec<(store::MessageSeq, MessageEnvelope)>,
+    /// Index of the first new entry, equal to `entries.len()` when the port was
+    /// owed nothing this step — always the case for a sampled port
+    /// (`push_depth = Bounded(0)`), whose window is all context.
+    pub new_from: usize,
+    /// Whether this port holds a position at all. A sampled port
+    /// (`push_depth = 0`) does not.
+    pub push_enabled: bool,
+}
+
+impl PortSnapshot {
+    /// The `(through, seen_floor)` pair to advance this port's position over,
+    /// or `None` when there is nothing to advance: an empty window, or a
+    /// sampled port, which holds no position to move.
+    pub fn advance_span(&self) -> Option<(store::MessageSeq, store::MessageSeq)> {
+        if !self.push_enabled {
+            return None;
+        }
+        Some((self.entries.last()?.0, self.entries.first()?.0))
+    }
+
+    /// The new messages, oldest first.
+    pub fn new_entries(&self) -> &[(store::MessageSeq, MessageEnvelope)] {
+        &self.entries[self.new_from..]
+    }
+
+    /// The context ahead of the new boundary, oldest first.
+    pub fn context(&self) -> &[(store::MessageSeq, MessageEnvelope)] {
+        &self.entries[..self.new_from]
+    }
+
+    /// How many of this window's messages are new to the subscriber.
+    pub fn new_len(&self) -> usize {
+        self.entries.len() - self.new_from
+    }
+
+    /// The retention seqs the new portion spans, oldest first, or `None` when
+    /// nothing is new.
+    pub fn new_seq_span(&self) -> Option<(store::MessageSeq, store::MessageSeq)> {
+        let new = self.new_entries();
+        Some((new.first()?.0, new.last()?.0))
+    }
 }
 
 /// Parameters for a failed WASM consumer batch disposition.
@@ -247,9 +273,9 @@ pub struct WasmBatchFailure<'a> {
     pub subscriber: &'a ParticipantId,
     pub first_message_id: &'a str,
     pub last_message_id: &'a str,
-    /// The claim rows this batch held, to be retired with the record. Empty when
-    /// the port's channel mints no claims.
-    pub push_ids: &'a [i64],
+    /// The retention seqs this batch spanned, oldest first — the quarantine
+    /// record's handle on what the activation was holding when it failed.
+    pub seq_span: (store::MessageSeq, store::MessageSeq),
     /// `"err"` or `"trap"` (matches the DB CHECK constraint).
     pub outcome: &'a str,
     pub diagnostic: &'a str,
@@ -1335,25 +1361,6 @@ fn retire_push_rows(conn: &rusqlite::Connection, now: &str, ids: &[i64]) {
     }
 }
 
-/// The channel-ambience half of a port window: a store's retained tail, oldest
-/// first, minus whatever the same activation already delivers as NEW.
-///
-/// The read behind it is channel-wide, so the context may include messages this
-/// subscriber was never individually delivered — the documented contract (see
-/// the WIT doc on `new-from`): context is best-effort channel ambience, not a
-/// per-subscriber delivered log. Parked messages are never in it, on either
-/// store: a message joins the retained window when a release pass moves it
-/// there.
-fn context_from_retained(
-    retained: Vec<MessageEnvelope>,
-    new_ids: &std::collections::HashSet<Uuid>,
-) -> Vec<MessageEnvelope> {
-    retained
-        .into_iter()
-        .filter(|e| !new_ids.contains(&e.message_id))
-        .collect()
-}
-
 /// The channel registration that names `subscriber`, or `None` when the
 /// subscriber holds delivery state on this channel under no registration of it.
 ///
@@ -2053,39 +2060,40 @@ impl Messenger {
         self.store_for(&entry).detach(subscriber).await;
     }
 
-    /// Settle delivery records the channel's store handed `subscriber` — the
-    /// consumer's statement that they reached their destination.
+    /// Advance `subscriber`'s position on `channel_address` over a window it
+    /// has been served, and enact the noise for whatever that window skipped.
+    ///
+    /// Returns what the advance passed unserved, so the caller can hand the
+    /// subscriber its own drop figure.
     ///
     /// # Panics
     ///
     /// If `channel_address` resolves to no channel.
-    pub async fn settle_delivered(
+    pub async fn advance_subscriber(
         &self,
         channel_address: &str,
         subscriber: &ParticipantId,
-        records: &[store::TargetRecord],
-    ) {
-        if records.is_empty() {
-            return;
-        }
+        through: store::MessageSeq,
+        seen_floor: store::MessageSeq,
+        noise: config::NoiseLevel,
+    ) -> store::AdvanceOutcome {
         let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
             panic!(
-                "messaging: settle requested for channel {channel_address:?} not in the directory"
+                "messaging: advance requested for channel {channel_address:?} not in the directory"
             )
         });
         let store = self.store_for(&entry);
-        let dropped = store.settle(subscriber, records).await;
-        if dropped > 0 {
-            self.enact_overflow_events(
-                &entry,
-                store.as_ref(),
-                &[store::OverflowEvent {
-                    subscriber: subscriber.clone(),
-                    dropped,
-                    app_slug: None,
-                }],
-            );
-        }
+        let outcome = store.advance(subscriber, through, seen_floor).await;
+        // noise_charge excludes losses already reported by eviction, so
+        // nothing is enacted twice.
+        self.enact_overflow_noise(
+            store.as_ref(),
+            store.address(),
+            subscriber,
+            noise,
+            outcome.noise_charge,
+        );
+        outcome
     }
 
     /// Does `app_slug` hold a dynamic subscription on the non-durable channel
@@ -2831,73 +2839,58 @@ impl Messenger {
         self.retire_activation_residue(subscriber, inputs, &stores)
             .await;
 
-        // Take every port's NEW window first, before any context read: the
-        // windows decide whether this is an activation at all, and a no-op
-        // drain step (the common case after a burst) must not pay for
-        // up-to-K×1000-row context reads (efficiency-1). Taking from a port
-        // that owes nothing is free and changes no state, so the None path
-        // below consumes nothing.
-        let mut windows: Vec<store::TakenWindow> = Vec::with_capacity(inputs.len());
+        // Trigger gate first: a window read carries up to
+        // `max(push_depth, retain_depth)` envelopes per port, and a drain step
+        // that activates nothing — the common case after a burst, since wakes
+        // coalesce — must not pay for K of those. `has_deliverable` answers
+        // "anything unseen and still retained?" from positions alone, and no
+        // port owed anything means no window below could hold anything new.
+        let mut any_deliverable = false;
+        for (input, store) in inputs.iter().zip(&stores) {
+            if input.sub.push_depth.is_push_enabled() && store.has_deliverable(subscriber).await {
+                any_deliverable = true;
+                break;
+            }
+        }
+        if !any_deliverable {
+            return None;
+        }
+
+        // One window read per port builds context and new together. Pure reads:
+        // no position moves here, so the None path below leaves every port
+        // exactly as it found it and the dispatcher advances only once it has
+        // decided to activate.
+        let mut windows: Vec<store::SubscriberWindow> = Vec::with_capacity(inputs.len());
         for (input, store) in inputs.iter().zip(&stores) {
             windows.push(
                 store
-                    .take_new(
+                    .window(
                         subscriber,
-                        input.sub.push_depth.clamped_to(WASM_WINDOW_MAX_NEW),
+                        Depth::Bounded(input.sub.push_depth.clamped_to(WASM_WINDOW_MAX_NEW)),
+                        Depth::Bounded(input.sub.retain_depth.clamped_to(WASM_WINDOW_MAX_RETAIN)),
                     )
                     .await,
             );
         }
-        if windows.iter().all(|w| w.messages.is_empty()) {
+        if windows.iter().all(|w| w.new_entries().is_empty()) {
             return None;
         }
 
         let mut snapshots: Vec<PortSnapshot> = Vec::with_capacity(inputs.len());
-        // Overflow noise is enacted after the per-port loop so the enactment
-        // sink is never entered mid-snapshot.
-        let mut overflows: Vec<(Arc<dyn store::RetentionStore>, config::NoiseLevel, u64)> =
-            Vec::new();
         for ((input, window), store) in inputs.iter().zip(windows).zip(&stores) {
             let sub = &input.sub;
-            if window.dropped > 0 {
-                overflows.push((store.clone(), sub.noise, window.dropped));
-            }
-            let new_rows: Vec<(Option<store::TargetRecord>, MessageEnvelope)> = window
-                .messages
-                .into_iter()
-                .map(|taken| (taken.record, (*taken.envelope).clone()))
-                .collect();
-            let new_ids: std::collections::HashSet<Uuid> =
-                new_rows.iter().map(|(_, e)| e.message_id).collect();
-            let context = if let Depth::Bounded(0) = sub.retain_depth {
-                vec![]
-            } else {
-                let limit = Depth::Bounded(sub.retain_depth.clamped_to(WASM_WINDOW_MAX_RETAIN));
-                let retained = store
-                    .retained_tail(limit)
-                    .await
-                    .into_iter()
-                    .map(|env| (*env).clone())
-                    .collect();
-                context_from_retained(retained, &new_ids)
-            };
             snapshots.push(PortSnapshot {
                 port: input.port.clone(),
                 channel_address: sub.channel_address.clone(),
                 capabilities: store.capabilities(),
-                new_rows,
-                context,
-                drop_counter_snapshot: window.dropped_total,
-                clamped_leftover: window.clamped_leftover,
+                new_from: window.new_from,
+                entries: window
+                    .entries
+                    .into_iter()
+                    .map(|(seq, envelope)| (seq, (*envelope).clone()))
+                    .collect(),
+                push_enabled: sub.push_depth.is_push_enabled(),
             });
-        }
-
-        // What a take charges — the push-depth clamp, on either store — is
-        // enacted here, at the take that charged it. Drops charged at eviction
-        // time were already reported and enacted; the window carries
-        // `dropped = 0` for them.
-        for (store, noise, dropped) in overflows {
-            self.enact_overflow_noise(store.as_ref(), store.address(), subscriber, noise, dropped);
         }
 
         Some(snapshots)
@@ -2978,17 +2971,18 @@ impl Messenger {
         db::mark_pending_pushes_delivered(&conn, push_ids);
     }
 
-    /// Record a failed multi-port WASM activation and retire all push rows, in
-    /// **one transaction** across all failing ports.
+    /// Record a failed multi-port WASM activation in **one transaction** across
+    /// all failing ports.
     ///
     /// Writes one `messaging_wasm_consume_failures` row per entry in `failures`
-    /// (one per triggering port that contributed new rows), then marks all
-    /// accumulated push_ids delivered. The `(subscriber, last_message_id)`
-    /// idempotency key ensures a re-run after a crash is a no-op on duplicate rows.
+    /// (one per triggering port that contributed new messages). The
+    /// `(subscriber, last_message_id)` idempotency key ensures a re-run after a
+    /// crash is a no-op on duplicate rows.
     ///
-    /// `failure.push_ids` is empty for a port on a channel that mints no claim
-    /// rows — a cursor-tracked store's read was its own ack, so the quarantine
-    /// row is written and there is nothing to retire. Panics on any DB error.
+    /// The batch is identified by the retention seqs it spanned, which is a
+    /// fact about the channel rather than about any delivery bookkeeping: the
+    /// subscriber's position moved past the batch before the guest ran, so
+    /// there is nothing left to retire here. Panics on any DB error.
     pub async fn record_wasm_activation_failure(&self, failures: &[WasmBatchFailure<'_>]) {
         assert!(
             !failures.is_empty(),
@@ -3001,15 +2995,11 @@ impl Messenger {
             .unwrap_or_else(|e| panic!("record_wasm_activation_failure: begin tx: {e}"));
 
         for failure in failures {
-            let batch_push_ids = failure
-                .push_ids
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
+            let (first, last) = failure.seq_span;
+            let batch_seq_span = format!("{}-{}", first.0, last.0);
             tx.execute(
                 "INSERT OR IGNORE INTO messaging_wasm_consume_failures \
-                 (channel, subscriber, first_message_id, last_message_id, batch_push_ids, \
+                 (channel, subscriber, first_message_id, last_message_id, batch_seq_span, \
                   outcome, diagnostic, failed_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
@@ -3017,7 +3007,7 @@ impl Messenger {
                     failure.subscriber.as_str(),
                     failure.first_message_id,
                     failure.last_message_id,
-                    batch_push_ids,
+                    batch_seq_span,
                     failure.outcome,
                     failure.diagnostic,
                     &now,
@@ -3029,33 +3019,10 @@ impl Messenger {
                     failure.channel
                 )
             });
-            retire_push_rows(&tx, &now, failure.push_ids);
         }
 
         tx.commit()
             .unwrap_or_else(|e| panic!("record_wasm_activation_failure: commit tx: {e}"));
-    }
-}
-
-#[cfg(any(test, feature = "testutils"))]
-impl Messenger {
-    /// Test-only: charge `amount` push-overflow drops to `subscriber` on
-    /// `channel`'s store, simulating overflow without driving the full publish
-    /// path. The charged total is what an activation window reports as its gap
-    /// signal. Gated on `#[cfg(any(test, feature = "testutils"))]` rather than
-    /// `#[cfg(test)]` only so that `testutils::inject_drop` (used by downstream
-    /// test crates that enable the testutils feature) can call it; in both
-    /// cases the mutation surface stays test-only.
-    pub fn inject_drop(&self, channel: &str, subscriber: &ParticipantId, amount: u64) {
-        let entry = self.directory.resolve(channel).unwrap_or_else(|| {
-            panic!("messaging: inject_drop for channel {channel:?} not in the directory")
-        });
-        assert!(
-            entry.capabilities().durable,
-            "inject_drop is durable-only: a ring subscriber's drops are counted on its cursor, so \
-             append past its push window to produce them ({channel:?})"
-        );
-        self.db_store_for(&entry).inject_dropped(subscriber, amount);
     }
 }
 
@@ -4810,14 +4777,14 @@ mod tests {
             .await
             .expect("the pending row triggers");
         let bodies: Vec<&str> = parked_snapshot[0]
-            .context
+            .entries
             .iter()
-            .map(|e| e.body.as_str())
+            .map(|(_, e)| e.body.as_str())
             .collect();
         assert_eq!(
             bodies,
-            ["later"],
-            "a parked message must not be visible as context"
+            ["later", "new-0"],
+            "a parked message must not be visible in the window at all"
         );
 
         messenger
@@ -4830,14 +4797,14 @@ mod tests {
             .await
             .expect("the pending row still triggers");
         let bodies: Vec<&str> = released_snapshot[0]
-            .context
+            .entries
             .iter()
-            .map(|e| e.body.as_str())
+            .map(|(_, e)| e.body.as_str())
             .collect();
         assert_eq!(
             bodies,
-            ["later", "parked"],
-            "a released message joins the ambience at the position retention gave \
+            ["later", "new-0", "parked"],
+            "a released message joins the window at the position retention gave \
              it — newest-last by retained order, not by its older publish stamp"
         );
     }
@@ -4929,67 +4896,47 @@ mod tests {
         assert_eq!(snapshots.len(), 1, "one port → one snapshot");
         let snap = &snapshots[0];
 
-        // new_rows must be the 2 pending rows (Unbounded → no truncation).
+        // The new portion is the 2 pending rows (Unbounded → no clamp).
         assert_eq!(
-            snap.new_rows.len(),
+            snap.new_len(),
             2,
-            "expected 2 pending new rows, got {}",
-            snap.new_rows.len()
+            "expected 2 new messages, got {}",
+            snap.new_len()
         );
-        let new_ids_in_snap: Vec<Uuid> = snap.new_rows.iter().map(|(_, e)| e.message_id).collect();
-        assert!(new_ids_in_snap.contains(&mid0), "expected mid0 in new_rows");
-        assert!(new_ids_in_snap.contains(&mid1), "expected mid1 in new_rows");
+        let new_ids_in_snap: Vec<Uuid> = snap
+            .new_entries()
+            .iter()
+            .map(|(_, e)| e.message_id)
+            .collect();
+        assert!(new_ids_in_snap.contains(&mid0), "expected mid0 to be new");
+        assert!(new_ids_in_snap.contains(&mid1), "expected mid1 to be new");
 
-        // context must contain ctx-a and ctx-b but NOT mid0 or mid1.
-        let context_ids: Vec<Uuid> = snap.context.iter().map(|e| e.message_id).collect();
-        assert!(
-            context_ids.contains(&mid_ctx_a),
-            "delivered ctx-a must appear in context: {context_ids:?}"
+        // One window read, so a message is either context or new — never both.
+        let context_ids: Vec<Uuid> = snap.context().iter().map(|(_, e)| e.message_id).collect();
+        assert_eq!(
+            context_ids,
+            vec![mid_ctx_a, mid_ctx_b],
+            "the two delivered rows are the context, oldest first"
         );
         assert!(
-            context_ids.contains(&mid_ctx_b),
-            "delivered ctx-b must appear in context: {context_ids:?}"
-        );
-        assert!(
-            !context_ids.contains(&mid0),
-            "pending msg mid0 must be stripped from context: {context_ids:?}"
-        );
-        assert!(
-            !context_ids.contains(&mid1),
-            "pending msg mid1 must be stripped from context: {context_ids:?}"
+            !context_ids.contains(&mid0) && !context_ids.contains(&mid1),
+            "a new message must not also appear as context: {context_ids:?}"
         );
 
-        // context must be in ASC order (oldest first). ctx-a has a smaller
-        // publish_ts_ns than ctx-b, so it must appear first.
-        // A bug that skipped the DESC→ASC reversal would place ctx-b (newer) at
-        // index 0, failing this assertion.
-        assert_eq!(
-            snap.context.len(),
-            2,
-            "context should have exactly the 2 delivered rows"
-        );
-        assert_eq!(
-            snap.context[0].message_id, mid_ctx_a,
-            "context[0] must be the older ctx-a (ASC order)"
-        );
-        assert_eq!(
-            snap.context[1].message_id, mid_ctx_b,
-            "context[1] must be the newer ctx-b (ASC order)"
-        );
-
-        // Backlog (2 rows) is below the Unbounded cap → not clamped.
-        assert_eq!(
-            snap.clamped_leftover, 0,
-            "unclamped port must report clamped_leftover == 0"
-        );
+        // The window is one ascending run: context then new, oldest first. A bug
+        // that skipped the DESC→ASC reversal would place the newer entry first.
+        let seqs: Vec<u64> = snap.entries.iter().map(|(seq, _)| seq.0).collect();
+        let mut ascending = seqs.clone();
+        ascending.sort_unstable();
+        assert_eq!(seqs, ascending, "the window is ascending by retention seq");
     }
 
-    /// `clamped_leftover` is exact: a `Bounded(1)` port with 3 pending rows yields
-    /// `new_rows.len() == 1` and `clamped_leftover == 2`. Acking the delivered row
-    /// and reloading drops the leftover to 1 (the leftover rows are ordinary pending
-    /// rows that stay undelivered until a later drain).
+    /// The push-depth clamp is drop-oldest: a `Bounded(1)` port with 3 owed
+    /// messages is served the newest one, and the advance over that window
+    /// reports the other two as never seen. Nothing is held back for a later
+    /// drain, so the reload finds no activation at all.
     #[tokio::test]
-    async fn load_activation_snapshot_clamped_leftover_exact() {
+    async fn load_activation_snapshot_clamps_to_the_newest_and_reports_the_rest() {
         let slug = "leftover-exact";
         let (messenger, channel, wasm_sub) = super::testutils::build_wasm_messenger(
             slug,
@@ -5032,27 +4979,31 @@ mod tests {
             .expect("expected Some — channel has pending rows");
         assert_eq!(snapshots.len(), 1, "one port → one snapshot");
         let snap = &snapshots[0];
-        assert_eq!(snap.new_rows.len(), 1, "push_depth=1 clamps to 1 new row");
+        assert_eq!(snap.new_len(), 1, "push_depth=1 serves one message");
         assert_eq!(
-            snap.clamped_leftover, 2,
-            "3 pending - 1 delivered = 2 leftover"
+            snap.new_entries()[0].1.body,
+            "row-2",
+            "the window serves the newest, not the oldest"
         );
 
-        // Ack the delivered row, reload: leftover shrinks by exactly one.
-        let delivered = snap.new_rows[0]
-            .0
-            .expect("durable port row carries a claim record");
-        messenger
-            .settle_delivered(&channel.address, &wasm_sub, &[delivered])
+        let (through, seen_floor) = snap.advance_span().expect("the window served a message");
+        let outcome = messenger
+            .advance_subscriber(
+                &channel.address,
+                &wasm_sub,
+                through,
+                seen_floor,
+                config::NoiseLevel::Silent,
+            )
             .await;
+        assert_eq!(outcome.dropped, 2, "the two the clamp skipped");
 
-        let snapshots2 = messenger
-            .load_activation_snapshot(&wasm_sub, &inputs)
-            .await
-            .expect("expected Some — 2 rows still pending");
-        assert_eq!(
-            snapshots2[0].clamped_leftover, 1,
-            "after acking one, 2 pending - 1 delivered = 1 leftover"
+        assert!(
+            messenger
+                .load_activation_snapshot(&wasm_sub, &inputs)
+                .await
+                .is_none(),
+            "nothing is held back for a later drain"
         );
     }
 
@@ -5280,7 +5231,19 @@ mod tests {
             let conn = messenger.db().lock().await;
             db::mark_pending_pushes_delivered(&conn, &[push_id]);
         }
-        messenger.ring_store_for(&ring).take(&ring_sub);
+        {
+            let ring_store = messenger.ring_store_for(&ring);
+            let window = store::RetentionStore::window(
+                ring_store.as_ref(),
+                &ring_sub,
+                Depth::Bounded(4),
+                Depth::Bounded(0),
+            )
+            .await;
+            let (through, seen_floor) = window.advance_span().expect("the ring owed a message");
+            store::RetentionStore::advance(ring_store.as_ref(), &ring_sub, through, seen_floor)
+                .await;
+        }
         router.wakes.lock().unwrap().clear();
         messenger.wake_owed_subscribers().await;
         assert!(
@@ -5518,22 +5481,32 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         let snap = &snapshots[0];
 
-        // push_depth 2, three owed → the newest two, oldest first; m0 is dropped.
-        let new_ids: Vec<Uuid> = snap.new_rows.iter().map(|(_, e)| e.message_id).collect();
+        // push_depth 2, three owed → the newest two, oldest first.
+        let new_ids: Vec<Uuid> = snap
+            .new_entries()
+            .iter()
+            .map(|(_, e)| e.message_id)
+            .collect();
         assert_eq!(new_ids, vec![mids[1], mids[2]]);
-        assert!(
-            snap.new_rows.iter().all(|(id, _)| id.is_none()),
-            "ring rows carry no push id"
-        );
-        assert_eq!(
-            snap.drop_counter_snapshot, 1,
-            "m0 dropped by the push clamp"
-        );
-        // A ring take drains all currently-owed messages, so nothing is left.
-        assert_eq!(snap.clamped_leftover, 0);
-        // The dropped m0 is still retained → channel ambience in context.
-        let context_ids: Vec<Uuid> = snap.context.iter().map(|e| e.message_id).collect();
+        // m0 is below the new boundary but inside the window, so it is served as
+        // context — visible, and therefore not a drop.
+        let context_ids: Vec<Uuid> = snap.context().iter().map(|(_, e)| e.message_id).collect();
         assert_eq!(context_ids, vec![mids[0]]);
+
+        let (through, seen_floor) = snap.advance_span().expect("the window served entries");
+        let outcome = messenger
+            .advance_subscriber(
+                &channel.address,
+                &wasm_sub,
+                through,
+                seen_floor,
+                config::NoiseLevel::Silent,
+            )
+            .await;
+        assert_eq!(
+            outcome.dropped, 0,
+            "every unseen message was served, as new or as context"
+        );
     }
 
     /// Nothing owed → the ring port is non-triggering and the whole snapshot is
@@ -5566,7 +5539,7 @@ mod tests {
             .expect("the late publish is owed");
         assert_eq!(
             snap[0]
-                .new_rows
+                .new_entries()
                 .iter()
                 .map(|(_, e)| e.message_id)
                 .collect::<Vec<_>>(),
@@ -5600,14 +5573,29 @@ mod tests {
             .load_activation_snapshot(&wasm_sub, &inputs)
             .await
             .expect("the surviving two are owed");
-        assert_eq!(snap[0].new_rows.len(), 2, "only the two retained survive");
+        assert_eq!(snap[0].new_len(), 2, "only the two retained survive");
+
+        let (through, seen_floor) = snap[0].advance_span().expect("the window served entries");
+        let outcome = messenger
+            .advance_subscriber(
+                &channel.address,
+                &wasm_sub,
+                through,
+                seen_floor,
+                config::NoiseLevel::Silent,
+            )
+            .await;
         assert_eq!(
-            snap[0].drop_counter_snapshot, 2,
-            "two evicted-before-take messages are accountable drops"
+            outcome.dropped, 2,
+            "two evicted-before-read messages are accountable drops"
+        );
+        assert_eq!(
+            outcome.noise_charge, 0,
+            "the evicting appends already reported them"
         );
     }
 
-    /// Counts alarm invocations for the ring-overflow noise-enactment tests.
+    /// Counts alarm invocations for the noise-enactment tests.
     #[derive(Default)]
     struct CountingAlarmRouter {
         alarms: std::sync::atomic::AtomicU64,
@@ -5624,7 +5612,7 @@ mod tests {
             _message_id: i64,
             _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
-            unreachable!("ring-backed WASM delivery never routes inline through deliver")
+            unreachable!("WASM delivery never routes inline through deliver")
         }
         async fn deliver_ingress(
             &self,
@@ -5632,7 +5620,7 @@ mod tests {
             _subscriber: &ParticipantId,
             _event: &ingress::Event,
         ) -> Result<bool, String> {
-            unreachable!("ring-backed WASM delivery never routes through deliver_ingress")
+            unreachable!("WASM delivery never routes through deliver_ingress")
         }
         fn spawn_eager_wake(&self, _key: &SubscriberEntryKind, _subscriber: &ParticipantId) {}
         fn delivery_shape(&self, key: &SubscriberEntryKind) -> DeliveryShape {
@@ -5708,21 +5696,27 @@ mod tests {
                 &format!("n{i}"),
             ));
         }
+        // A bare trigger port: retain_depth 0, so the two the push clamp skips are
+        // outside the window entirely and the advance reports them.
         let inputs = vec![ring_input_noise(
             &channel,
             Depth::Bounded(1),
-            Depth::Bounded(8),
+            Depth::Bounded(0),
             noise,
         )];
         let snap = messenger
             .load_activation_snapshot(&wasm_sub, &inputs)
             .await
             .expect("three owed, push_depth 1");
-        assert_eq!(snap[0].new_rows.len(), 1, "only the newest delivered");
+        assert_eq!(snap[0].new_len(), 1, "only the newest delivered");
+        let (through, seen_floor) = snap[0].advance_span().expect("the window served entries");
+        let outcome = messenger
+            .advance_subscriber(&channel.address, &wasm_sub, through, seen_floor, noise)
+            .await;
         (
             messenger.drop_counter(&channel.address, &wasm_sub),
             router.alarms.load(std::sync::atomic::Ordering::SeqCst),
-            snap[0].drop_counter_snapshot,
+            outcome.dropped,
         )
     }
 
@@ -5753,6 +5747,128 @@ mod tests {
         let (drop_counter, alarms, _) = ring_overflow_enactment(config::NoiseLevel::Alarm).await;
         assert_eq!(drop_counter, 2, "alarm: counter += dropped count");
         assert_eq!(alarms, 1, "alarm: one alarm fires for the overflowing take");
+    }
+
+    /// A durable-channel messenger whose alarms are counted — the durable twin
+    /// of `build_ring_wasm_messenger_with_alarm`.
+    async fn build_durable_wasm_messenger_with_alarm(
+        slug: &str,
+        channel_name: &str,
+        push_depth: Depth,
+        retain_depth: Depth,
+    ) -> (
+        Arc<Messenger>,
+        Arc<ChannelEntry>,
+        ParticipantId,
+        Arc<CountingAlarmRouter>,
+    ) {
+        let db = crate::db::init_db_memory();
+        let entry = crate::messaging::testutils::wasm_channel_entry(
+            slug,
+            channel_name,
+            push_depth,
+            retain_depth,
+        );
+        {
+            let conn = db.lock().await;
+            db::upsert_channels(&conn, std::slice::from_ref(&*entry));
+        }
+        let router = Arc::new(CountingAlarmRouter::default());
+        let messenger = Messenger::new(
+            db,
+            Arc::new(MessagingDirectory::with_entries(vec![(*entry).clone()])),
+            Arc::from("test"),
+            Arc::new(indexmap::IndexMap::new()),
+            router.clone() as Arc<dyn WakeRouter>,
+            config::MessagingGlobalConfig::default(),
+        );
+        (messenger, entry, ParticipantId::for_wasm(slug), router)
+    }
+
+    /// The durable twin of `ring_overflow_enactment`: three owed messages on a
+    /// `push_depth = 1` durable port, one activation, and the advance's noise
+    /// charge routed into the ladder.
+    async fn durable_overflow_enactment(noise: config::NoiseLevel) -> (u64, u64, u64) {
+        let slug = "durable-noise";
+        let (messenger, channel, wasm_sub, router) = build_durable_wasm_messenger_with_alarm(
+            slug,
+            "durable-noise-ch",
+            Depth::Bounded(1),
+            Depth::Bounded(0),
+        )
+        .await;
+
+        let base_ns = db::utc_to_ns(chrono::Utc::now());
+        for i in 0..3 {
+            super::testutils::insert_wasm_push_at(
+                &messenger,
+                &channel,
+                &wasm_sub,
+                &format!("row-{i}"),
+                ChannelScheme::Brenn,
+                base_ns + i as i64 * 1_000_000,
+            )
+            .await;
+        }
+
+        let inputs = vec![WasmInputPort {
+            port: "in".to_string(),
+            sub: config::ResolvedSubscription {
+                channel_uuid: channel.uuid,
+                channel_address: channel.address.clone(),
+                push_depth: Depth::Bounded(1),
+                retain_depth: Depth::Bounded(0),
+                noise,
+                wake_min: WakeMin::Normal,
+            },
+            amplification_mt: 1000,
+        }];
+        let snap = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs)
+            .await
+            .expect("three owed, push_depth 1");
+        assert_eq!(snap[0].new_len(), 1, "only the newest delivered");
+        let (through, seen_floor) = snap[0].advance_span().expect("the window served entries");
+        let outcome = messenger
+            .advance_subscriber(&channel.address, &wasm_sub, through, seen_floor, noise)
+            .await;
+        (
+            messenger.drop_counter(&channel.address, &wasm_sub),
+            router.alarms.load(std::sync::atomic::Ordering::SeqCst),
+            outcome.dropped,
+        )
+    }
+
+    /// Silent durable overflow: the guest still reads its raw drop figure, and
+    /// the ladder does nothing with it.
+    #[tokio::test]
+    async fn durable_overflow_silent_enacts_nothing() {
+        let (drop_counter, alarms, dropped) =
+            durable_overflow_enactment(config::NoiseLevel::Silent).await;
+        assert_eq!(drop_counter, 0, "silent: no metered counter");
+        assert_eq!(alarms, 0, "silent: no alarm");
+        assert_eq!(dropped, 2, "guest still sees the two the clamp skipped");
+    }
+
+    /// Metered durable overflow: the clamp charges the ladder on the durable
+    /// class exactly as it does on the ring.
+    #[tokio::test]
+    async fn durable_overflow_metered_increments_counter() {
+        let (drop_counter, alarms, _) =
+            durable_overflow_enactment(config::NoiseLevel::Metered).await;
+        assert_eq!(drop_counter, 2, "metered: counter += dropped count");
+        assert_eq!(alarms, 0, "metered: no alarm");
+    }
+
+    /// Alarm durable overflow: counter and one alarm for the batch.
+    #[tokio::test]
+    async fn durable_overflow_alarm_increments_counter_and_fires_alarm() {
+        let (drop_counter, alarms, _) = durable_overflow_enactment(config::NoiseLevel::Alarm).await;
+        assert_eq!(drop_counter, 2, "alarm: counter += dropped count");
+        assert_eq!(
+            alarms, 1,
+            "alarm: one alarm fires for the overflowing batch"
+        );
     }
 
     /// The registered subscriber a ring overflow event names, at the noise rung
@@ -6054,8 +6170,20 @@ mod tests {
         let ctx_env = ring_envelope(&ring.address, ChannelScheme::Ephemeral, "ring-ctx");
         let ctx_mid = ctx_env.message_id;
         messenger.ring_store_for(&ring).append(ctx_env);
-        // Take it so it becomes retained-only context, not owed.
-        messenger.ring_store_for(&ring).take(&wasm_sub);
+        // Serve it so it becomes retained-only context, not owed.
+        {
+            let ring_store = messenger.ring_store_for(&ring);
+            let window = store::RetentionStore::window(
+                ring_store.as_ref(),
+                &wasm_sub,
+                Depth::Bounded(4),
+                Depth::Bounded(0),
+            )
+            .await;
+            let (through, seen_floor) = window.advance_span().expect("one retained message");
+            store::RetentionStore::advance(ring_store.as_ref(), &wasm_sub, through, seen_floor)
+                .await;
+        }
 
         // Durable port: one pending row → the activation trigger.
         let (_pid, dmid) = super::testutils::insert_wasm_push(
@@ -6088,22 +6216,18 @@ mod tests {
             .expect("the durable port triggers the activation");
         assert_eq!(snaps.len(), 2);
         // Ring port: nothing owed, the earlier message is context.
-        assert!(snaps[0].new_rows.is_empty());
+        assert_eq!(snaps[0].new_len(), 0);
         assert_eq!(
             snaps[0]
-                .context
+                .context()
                 .iter()
-                .map(|e| e.message_id)
+                .map(|(_, e)| e.message_id)
                 .collect::<Vec<_>>(),
             vec![ctx_mid]
         );
-        // Durable port: the pending row is a NEW row carrying a push id.
-        assert_eq!(snaps[1].new_rows.len(), 1);
-        assert_eq!(snaps[1].new_rows[0].1.message_id, dmid);
-        assert!(
-            snaps[1].new_rows[0].0.is_some(),
-            "durable rows carry a push id"
-        );
+        // Durable port: the owed message is the new portion.
+        assert_eq!(snaps[1].new_len(), 1);
+        assert_eq!(snaps[1].new_entries()[0].1.message_id, dmid);
     }
 
     // -----------------------------------------------------------------------
@@ -6121,7 +6245,7 @@ mod tests {
             super::testutils::build_wasm_messenger_unbounded(slug, "fail-idem-ch").await;
 
         // Insert 2 push rows on the single channel.
-        let (pid0, mid0) = super::testutils::insert_wasm_push(
+        let (_pid0, mid0) = super::testutils::insert_wasm_push(
             &messenger,
             &channel,
             &wasm_sub,
@@ -6129,7 +6253,7 @@ mod tests {
             ChannelScheme::Brenn,
         )
         .await;
-        let (pid1, mid1) = super::testutils::insert_wasm_push(
+        let (_pid1, mid1) = super::testutils::insert_wasm_push(
             &messenger,
             &channel,
             &wasm_sub,
@@ -6146,12 +6270,12 @@ mod tests {
             subscriber: &wasm_sub,
             first_message_id: &first_msg_id,
             last_message_id: &last_msg_id,
-            push_ids: &[pid0, pid1],
+            seq_span: (store::MessageSeq(1), store::MessageSeq(2)),
             outcome: "trap",
             diagnostic: "unreachable instruction at test",
         };
 
-        // Single-entry call: must write the quarantine row and retire push rows.
+        // Single-entry call: must write the quarantine row.
         messenger.record_wasm_activation_failure(&[failure]).await;
 
         // Verify the quarantine row fields.
@@ -6166,21 +6290,17 @@ mod tests {
             .expect("query wasm_consume_failures count");
         assert_eq!(row_count, 1, "exactly one quarantine row after first call");
 
-        let batch_push_ids_col: String = conn
+        let batch_seq_span_col: String = conn
             .query_row(
-                "SELECT batch_push_ids FROM messaging_wasm_consume_failures \
+                "SELECT batch_seq_span FROM messaging_wasm_consume_failures \
                  WHERE subscriber = ?1 AND last_message_id = ?2",
                 rusqlite::params![wasm_sub.as_str(), &last_msg_id],
                 |r| r.get(0),
             )
-            .expect("query batch_push_ids");
-        assert!(
-            batch_push_ids_col.contains(&pid0.to_string()),
-            "batch_push_ids must contain pid0: {batch_push_ids_col}"
-        );
-        assert!(
-            batch_push_ids_col.contains(&pid1.to_string()),
-            "batch_push_ids must contain pid1: {batch_push_ids_col}"
+            .expect("query batch_seq_span");
+        assert_eq!(
+            batch_seq_span_col, "1-2",
+            "the quarantine row names the seqs the batch spanned"
         );
 
         let (outcome_col, diag_col): (String, String) = conn
@@ -6195,19 +6315,6 @@ mod tests {
         assert!(
             diag_col.contains("unreachable instruction at test"),
             "diagnostic mismatch: {diag_col}"
-        );
-
-        let pending: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM messaging_pending_pushes \
-                 WHERE id IN (?1, ?2) AND delivered_at IS NULL",
-                rusqlite::params![pid0, pid1],
-                |r| r.get(0),
-            )
-            .expect("query pending count");
-        assert_eq!(
-            pending, 0,
-            "both push rows must be delivered after quarantine"
         );
 
         drop(conn); // release lock before idempotency call
@@ -6248,7 +6355,7 @@ mod tests {
             let conn = messenger2.db().lock().await;
             db::upsert_channels(&conn, std::slice::from_ref(&*ch_b));
         }
-        let (pid_a, mid_a) = super::testutils::insert_wasm_push(
+        let (_pid_a, mid_a) = super::testutils::insert_wasm_push(
             &messenger2,
             &ch_a,
             &wasm_sub2,
@@ -6256,7 +6363,7 @@ mod tests {
             ChannelScheme::Brenn,
         )
         .await;
-        let (pid_b, mid_b) = super::testutils::insert_wasm_push(
+        let (_pid_b, mid_b) = super::testutils::insert_wasm_push(
             &messenger2,
             &ch_b,
             &wasm_sub2,
@@ -6272,7 +6379,7 @@ mod tests {
             subscriber: &wasm_sub2,
             first_message_id: &ch_a_mid,
             last_message_id: &ch_a_mid,
-            push_ids: &[pid_a],
+            seq_span: (store::MessageSeq(1), store::MessageSeq(1)),
             outcome: "err",
             diagnostic: "multi-entry-ch-a",
         };
@@ -6281,7 +6388,7 @@ mod tests {
             subscriber: &wasm_sub2,
             first_message_id: &ch_b_mid,
             last_message_id: &ch_b_mid,
-            push_ids: &[pid_b],
+            seq_span: (store::MessageSeq(1), store::MessageSeq(1)),
             outcome: "err",
             diagnostic: "multi-entry-ch-b",
         };

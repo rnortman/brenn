@@ -70,9 +70,10 @@ pub use bus::{
     load_channel_retained_window_seq, load_confirm_pending_pushes, load_envelope_by_uuid,
     load_pending_pushes_for_channel, load_push_window, load_pushes_by_ids,
     load_released_push_window_rows, lookup_message_for_authorship, mark_pending_pushes_delivered,
-    pending_push_exists, pending_pushes_outside_channels, seed_pending_pushes_for_messages,
-    stamp_confirm_pending, unclaim_confirm_pending_pushes, unclaim_pending_pushes,
-    update_message_and_pending_pushes, withdraw_parked_message,
+    min_owed_retained_seq, owed_push_positions, pending_push_exists,
+    pending_pushes_outside_channels, seed_pending_pushes_for_messages, stamp_confirm_pending,
+    unclaim_confirm_pending_pushes, unclaim_pending_pushes, update_message_and_pending_pushes,
+    withdraw_parked_message,
 };
 
 mod deferral;

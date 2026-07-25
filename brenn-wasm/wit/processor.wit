@@ -43,17 +43,27 @@ interface types {
         port: string,
 
         /// Ordered list, oldest→newest, of MessageEnvelope JSON values for the
-        /// delivering channel. Entries before `new-from` are RETAINED CONTEXT:
-        /// the most-recent up-to-`retain_depth` channel messages preceding the
-        /// new set. These are channel-wide most-recent messages, NOT a
+        /// delivering channel: the most-recent up-to-`max(push_depth,
+        /// retain_depth)` messages the channel still retains. Entries from
+        /// `new-from` onward are this invocation's new/unprocessed messages (at
+        /// most `push_depth` of them); everything before `new-from` is RETAINED
+        /// CONTEXT.
+        ///
+        /// Context is whatever else fits in that window, which is NOT bounded by
+        /// `retain_depth` alone: a port with `retain_depth = 0` and a nonzero
+        /// `push_depth` still receives context, back-filled with already-seen
+        /// messages up to the window size. A port asking for more context than
+        /// its push depth gets one window of `retain_depth` entries, not
+        /// `retain_depth` context plus `push_depth` new.
+        ///
+        /// Context entries are channel-wide most-recent messages, NOT a
         /// per-subscriber delivered log — on a component's first window after
         /// (re)subscription the context MAY include channel messages this
         /// component was never individually delivered. Treat `new-from` as "the
         /// most-recent prior channel messages are provided as context here," NOT
         /// as "I have already processed everything before this index." A guest
         /// needing exactly-once-seen semantics must track its own high-water by
-        /// `message_id`. Entries from `new-from` onward are this invocation's
-        /// new/unprocessed messages (up to `push_depth`).
+        /// `message_id`.
         ///
         /// ATTACH IS A DELIVERY POINT. When a port's queue comes into existence
         /// — the instance's first attach, a re-attach, or a binding added or
@@ -70,19 +80,22 @@ interface types {
         /// Index into `envelopes` of the first new/unprocessed message. Equals
         /// `envelopes` length when the window is pure context with no new messages.
         /// This is normal for sampled ports (`push_depth = 0`) and for triggering
-        /// ports that had no pending rows in this activation step.
+        /// ports that had nothing unprocessed in this activation step.
         new-from: u32,
 
         /// Count of messages lost to push-overflow (`push_depth` exceeded:
         /// rolled past the push window before the component consumed them)
         /// since the previous successful invocation, so the guest can detect
-        /// gaps. BEST-EFFORT / SINCE-BOOT: the underlying counter is volatile
+        /// gaps. A backlog larger than `push_depth` is NOT held back for a
+        /// later activation: the window serves the newest `push_depth` and the
+        /// remainder is counted here.
+        /// BEST-EFFORT / SINCE-BOOT: the underlying counter is volatile
         /// (in host memory only) and resets to 0 across a host restart, so a
         /// gap that occurred before a crash is NOT reflected here after the
         /// restart. `dropped == 0` is therefore not proof of no-gap across a
         /// host lifetime; treat it as a within-lifetime gap signal only.
-        /// Always 0 for sampled ports (`push_depth = 0`), which never have
-        /// push rows and therefore never experience push-overflow.
+        /// Always 0 for sampled ports (`push_depth = 0`), which hold no
+        /// delivery position and therefore never experience push-overflow.
         dropped: u32,
     }
 

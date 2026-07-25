@@ -65,8 +65,7 @@ async fn activation_scoped_failure_quarantines_all_ports_and_fires_one_alert() {
         activation_pacing: unthrottled_pacing(),
     };
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg2, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg2, &wasm_sub).await;
 
     // Both push rows must be acked (ack-at-start — neither remains pending).
     let remaining = messenger.load_pending_pushes(&wasm_sub).await;
@@ -182,8 +181,7 @@ async fn multiport_combined_activation_two_triggering_channels() {
     .await;
 
     // Drain — must invoke the guest exactly once.
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Input push rows must be acked.
     let remaining = messenger.load_pending_pushes(&wasm_sub).await;
@@ -304,8 +302,7 @@ async fn multiport_sampled_port_included_as_pure_context() {
     .await;
 
     // Drain — must invoke the guest exactly once.
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // in0 push row must be acked; no push rows existed for in1.
     let remaining = messenger.load_pending_pushes(&wasm_sub).await;
@@ -420,8 +417,7 @@ async fn multiport_sampled_only_no_push_rows_no_activation() {
     );
 
     // Drain: no triggering port has pending rows → no activation → no output.
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Still no push rows (nothing acked, nothing created).
     let push_rows_after = messenger.load_pending_pushes(&wasm_sub).await;
@@ -469,8 +465,7 @@ async fn multiport_triggering_port_without_rows_appears_as_context_window() {
         )
         .await;
     }
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
     // First drain consumed in1 rows as a triggering activation (in1 had rows, in0 didn't).
     // After drain, in1 messages are now retained context. Discard the output of this drain.
     {
@@ -494,7 +489,7 @@ async fn multiport_triggering_port_without_rows_appears_as_context_window() {
     .await;
 
     // Drain again: in0 has a push row (triggering), in1 has retained context only.
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Exactly one summary in the output channel for this drain.
     let out_rows = messenger.load_pending_pushes(&out_sub).await;
@@ -589,8 +584,7 @@ async fn multiport_all_or_nothing_trap_discards_output_from_all_ports() {
     )
     .await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Both push rows must be acked (ack-at-start, at-most-once).
     let remaining = messenger.load_pending_pushes(&wasm_sub).await;
@@ -676,8 +670,7 @@ async fn multiport_err_outcome_quarantines_both_channels() {
     )
     .await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg2, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg2, &wasm_sub).await;
 
     // Both push rows must be acked (ack-at-start).
     let remaining = messenger.load_pending_pushes(&wasm_sub).await;
@@ -729,23 +722,33 @@ async fn multiport_err_outcome_quarantines_both_channels() {
 /// pending on in1 → one activation; in0's window reports `dropped > 0` exactly
 /// once; next activation reports 0 for both.
 ///
-/// Uses `testutils::inject_drop` to simulate overflow without requiring a full
-/// app-level publish path (which needs noise=Metered and an app config).
+/// Overflow is genuine backlog: three messages on a `push_depth=1` port, so the
+/// window serves the newest and the advance reports the two it never served.
 #[tokio::test]
 async fn multiport_drop_reporting_exactly_once() {
     let slug = "mp-drop";
+    // in0 is a bare trigger port at push_depth 1: three owed messages there mean
+    // the window serves the newest and the advance reports the other two.
     let (messenger, in_entries, out_entry, out_sub, wasm_sub, cfg, _alert_handle, _store_db) =
-        build_multiport_setup(slug, &["mp-drop-ch-a", "mp-drop-ch-b"]).await;
+        build_multiport_setup_with_depths(
+            slug,
+            &[
+                ("mp-drop-ch-a", Depth::Bounded(1), Depth::Bounded(0)),
+                ("mp-drop-ch-b", Depth::Unbounded, Depth::Unbounded),
+            ],
+        )
+        .await;
 
-    // Insert one push row on each input channel.
-    testutils::insert_wasm_push(
-        &messenger,
-        &in_entries[0],
-        &wasm_sub,
-        "body-a",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    for i in 0..3 {
+        testutils::insert_wasm_push(
+            &messenger,
+            &in_entries[0],
+            &wasm_sub,
+            &format!("body-a-{i}"),
+            ChannelScheme::Brenn,
+        )
+        .await;
+    }
     testutils::insert_wasm_push(
         &messenger,
         &in_entries[1],
@@ -755,22 +758,8 @@ async fn multiport_drop_reporting_exactly_once() {
     )
     .await;
 
-    // Simulate overflow on in0: inject a drop count of 2.
-    testutils::inject_drop(&messenger, &in_entries[0].address, &wasm_sub, 2);
-    assert_eq!(
-        messenger.dropped_total(&in_entries[0].address, &wasm_sub),
-        2,
-        "in0 drop total must be 2 before drain"
-    );
-    assert_eq!(
-        messenger.dropped_total(&in_entries[1].address, &wasm_sub),
-        0,
-        "in1 drop total must be 0 before drain"
-    );
-
     // Drain: one activation with both ports; in0 reports dropped=2, in1 reports 0.
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Parse the first summary.
     let summary1_body = {
@@ -844,7 +833,7 @@ async fn multiport_drop_reporting_exactly_once() {
     )
     .await;
 
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Parse the second summary (most recently published).
     let summary2_body = {
@@ -877,11 +866,13 @@ async fn multiport_drop_reporting_exactly_once() {
     );
 }
 
-/// §5 test 10 (retain_depth=0 triggering port): the port has push_depth=Unbounded
-/// (triggering) but retain_depth=Bounded(0) — window must have `new_from=0`
-/// (new messages), no context prefix, and no context in the summary.
+/// A bare trigger port (`push_depth = Unbounded`, `retain_depth = 0`) still
+/// receives context: the window is one span of `max(push_depth, retain_depth)`,
+/// so once the port has seen messages they are back-filled ahead of `new_from`.
+/// On its first activation there is nothing seen to back-fill, so `new_from` is
+/// 0; on the next one the message it already processed is context.
 #[tokio::test]
-async fn multiport_retain_depth_zero_triggering_port_no_context() {
+async fn multiport_retain_depth_zero_triggering_port_back_fills_seen_context() {
     let slug = "mp-retain0";
     let (messenger, in_entries, out_entry, out_sub, wasm_sub, cfg, _alert_handle, _store_db) =
         build_multiport_setup_with_depths(
@@ -911,8 +902,7 @@ async fn multiport_retain_depth_zero_triggering_port_no_context() {
     )
     .await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // One summary in output.
     let out_rows = messenger.load_pending_pushes(&out_sub).await;
@@ -936,8 +926,8 @@ async fn multiport_retain_depth_zero_triggering_port_no_context() {
     let arr = summary.as_array().expect("summary must be array");
     assert_eq!(arr.len(), 2, "summary must have 2 entries");
 
-    // in0: retain_depth=0 → new_from=0 (new messages only), len=1 (the new message),
-    // no context prefix.
+    // First activation: nothing has been seen on either port yet, so both
+    // windows are pure new.
     assert_eq!(
         arr[0]["port"].as_str(),
         Some("in0"),
@@ -951,7 +941,7 @@ async fn multiport_retain_depth_zero_triggering_port_no_context() {
     assert_eq!(
         arr[0]["new_from"].as_u64(),
         Some(0),
-        "in0 new_from must be 0 (no context, all messages are new)"
+        "in0 new_from must be 0 (nothing seen yet to back-fill)"
     );
 
     // in1: retain_depth=Unbounded, also just one new message.
@@ -966,9 +956,48 @@ async fn multiport_retain_depth_zero_triggering_port_no_context() {
         Some(0),
         "in1 new_from must be 0"
     );
+
+    // Second activation: the retain-0 port has one seen message now, and the
+    // window back-fills it as context ahead of the new one.
+    testutils::insert_wasm_push(
+        &messenger,
+        &in_entries[0],
+        &wasm_sub,
+        "second-body",
+        ChannelScheme::Brenn,
+    )
+    .await;
+    drain_step(&cfg, &wasm_sub).await;
+
+    let summary2_body = {
+        let conn = messenger.db().lock().await;
+        conn.query_row(
+            "SELECT m.body \
+             FROM messaging_messages m \
+             JOIN messaging_channels c ON c.uuid = m.channel_uuid \
+             WHERE c.address = ?1 \
+             ORDER BY m.publish_ts_ns DESC LIMIT 1",
+            rusqlite::params![out_entry.address.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("second summary must exist")
+    };
+    let summary2: serde_json::Value =
+        serde_json::from_str(&summary2_body).expect("summary2 must be valid JSON");
+    let arr2 = summary2.as_array().expect("summary2 must be array");
+    assert_eq!(
+        arr2[0]["len"].as_u64(),
+        Some(2),
+        "in0 window carries the seen message plus the new one"
+    );
+    assert_eq!(
+        arr2[0]["new_from"].as_u64(),
+        Some(1),
+        "retain_depth=0 does not mean no context: the seen message is back-filled"
+    );
 }
 
-/// §5 test 13 (processor-dual via genuine 2-window activation): set up
+/// Processor-dual via genuine 2-window activation: set up
 /// `processor-dual` with 2 input channels and 2 output channels ("out1", "out2").
 /// A message on each input triggers one activation → dual publishes each new
 /// envelope body to both "out1" and "out2".
@@ -1163,8 +1192,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
     .await;
 
     // Drain: one activation with 2 input windows.
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Both input push rows must be acked.
     let remaining = messenger.load_pending_pushes(&wasm_sub).await;
@@ -1265,8 +1293,7 @@ async fn multiport_config_residue_retired_no_activation() {
     // Drain: both residue rows must be retired; no triggering input has valid rows
     // so the snapshot returns None → no activation → no output.
     let scan_before = messenger.pending_bus_pushes_scan_count();
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
     let scan_after = messenger.pending_bus_pushes_scan_count();
 
     // Exactly one snapshot call must have occurred (test-4: confirms load_activation_snapshot

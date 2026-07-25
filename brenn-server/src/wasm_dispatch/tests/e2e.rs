@@ -34,8 +34,7 @@ async fn end_to_end_demo_webhook_to_brenn_output() {
     .await;
 
     // Drain: demo component extracts inner body and publishes to "out" port.
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Verify the WASM push row is consumed.
     let in_rows_after = messenger.load_pending_pushes(&wasm_sub).await;
@@ -129,8 +128,7 @@ async fn all_or_nothing_trap_after_publish_discards_output() {
     )
     .await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // All input rows must be acked (delivered), but output channel must have no rows.
     let in_rows_after = messenger.load_pending_pushes(&wasm_sub).await;
@@ -268,8 +266,7 @@ async fn err_outcome_acks_push_row_at_activation_start() {
         activation_pacing: unthrottled_pacing(),
     };
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Ack-at-start: the push row must be delivered even though the guest returned Err.
     let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
@@ -280,7 +277,7 @@ async fn err_outcome_acks_push_row_at_activation_start() {
     );
 
     // A second drain must find nothing (no redelivery).
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
     let rows_second = messenger.load_pending_pushes(&wasm_sub).await;
     assert!(
         rows_second.is_empty(),
@@ -323,8 +320,7 @@ async fn call_order_flush_monotonic_timestamps() {
         .await;
     }
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Query the 3 messages on the output channel ordered by publish_ts_ns ASC.
     let ts_list: Vec<i64> = {
@@ -396,8 +392,7 @@ async fn chaining_wake_store_walk_fires_eager_wake_for_downstream_subscriber() {
 
     // Drain: demo publishes to output channel → publish_from_wasm inserts push row
     // with wake=Immediate for the downstream subscriber.
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // The output push row must be present and Immediate-wake.
     let out_pending = messenger.load_pending_pushes(&out_sub).await;
@@ -521,8 +516,7 @@ async fn guest_publish_deferred_parks_with_a_host_stamped_now() {
     .await;
 
     let before = Utc::now();
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     let in_rows_after = messenger.load_pending_pushes(&wasm_sub).await;
     assert!(in_rows_after.is_empty(), "WASM input row must be delivered");
@@ -588,8 +582,7 @@ async fn output_port_deferred_view_reflects_the_guests_own_parked_message() {
         ChannelScheme::Webhook,
     )
     .await;
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Read the parked message's deliver_after so we can assert the guest saw it.
     let parked_da: String = {
@@ -627,7 +620,7 @@ async fn output_port_deferred_view_reflects_the_guests_own_parked_message() {
         ChannelScheme::Webhook,
     )
     .await;
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // The immediate summary the guest published reports its own parked message.
     let summary: String = {
@@ -677,8 +670,7 @@ async fn output_port_defer_cancel_removes_the_guests_own_parked_message() {
         ChannelScheme::Webhook,
     )
     .await;
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     let parked_before: i64 = {
         let conn = messenger.db().lock().await;
@@ -710,7 +702,7 @@ async fn output_port_defer_cancel_removes_the_guests_own_parked_message() {
         ChannelScheme::Webhook,
     )
     .await;
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     let parked_after: i64 = {
         let conn = messenger.db().lock().await;
@@ -757,8 +749,7 @@ async fn output_port_defer_edit_reschedules_the_guests_own_parked_message() {
         ChannelScheme::Webhook,
     )
     .await;
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     let before_ms: i64 = {
         let conn = messenger.db().lock().await;
@@ -797,7 +788,7 @@ async fn output_port_defer_edit_reschedules_the_guests_own_parked_message() {
         ChannelScheme::Webhook,
     )
     .await;
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     let (after_ms, still_parked): (i64, i64) = {
         let conn = messenger.db().lock().await;
@@ -1073,8 +1064,7 @@ async fn a_mixed_class_activation_settles_each_port_in_its_own_domain() {
         "the consumer is owed the ring message before draining"
     );
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     let delivered_at: Option<String> = {
         let conn = messenger.db().lock().await;
@@ -1124,8 +1114,7 @@ async fn drain_step_consumes_a_ring_backed_ephemeral_input() {
 
     // The drain must consume the ring-triggered activation without panicking
     // (an ephemeral-only trigger delivers rows with no push ids).
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     assert!(
         !ring.has_deliverable(&wasm_sub),
@@ -1144,8 +1133,7 @@ async fn ring_backed_trap_quarantines_without_claim_ids() {
 
     append_ring_message(&messenger, &entry, "__trap__".to_string()).await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     assert!(
         !ring.has_deliverable(&wasm_sub),
@@ -1153,9 +1141,9 @@ async fn ring_backed_trap_quarantines_without_claim_ids() {
     );
 
     let conn = messenger.db().lock().await;
-    let (rows, batch_push_ids): (i64, String) = conn
+    let (rows, batch_seq_span): (i64, String) = conn
         .query_row(
-            "SELECT COUNT(*), COALESCE(MIN(batch_push_ids), '') \
+            "SELECT COUNT(*), COALESCE(MIN(batch_seq_span), '') \
              FROM messaging_wasm_consume_failures WHERE channel = ?1",
             rusqlite::params![entry.address.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -1166,7 +1154,7 @@ async fn ring_backed_trap_quarantines_without_claim_ids() {
         "the trapped ring activation wrote one quarantine row"
     );
     assert_eq!(
-        batch_push_ids, "",
-        "a ring-backed batch names no claim rows to retire, got {batch_push_ids:?}"
+        batch_seq_span, "1-1",
+        "the quarantine row names the one retention seq the batch spanned"
     );
 }

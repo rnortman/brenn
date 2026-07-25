@@ -510,8 +510,7 @@ async fn run_pipeline(forge: Forge) -> serde_json::Value {
     );
 
     // --- Step 2: parser activation → normalized push event on git-repo-sync. ---
-    let mut parser_seen = HashMap::new();
-    drain_step(&pipeline.parser_cfg, &pipeline.parser_sub, &mut parser_seen).await;
+    drain_step(&pipeline.parser_cfg, &pipeline.parser_sub).await;
     let event = read_latest(&pipeline.messenger, "brenn:git-repo-sync")
         .await
         .expect("parser must publish a normalized push event");
@@ -522,13 +521,7 @@ async fn run_pipeline(forge: Forge) -> serde_json::Value {
     );
 
     // --- Step 3: consumer push activation → one call-async on the tool bus. ---
-    let mut consumer_seen = HashMap::new();
-    drain_step(
-        &pipeline.consumer_cfg,
-        &pipeline.consumer_sub,
-        &mut consumer_seen,
-    )
-    .await;
+    drain_step(&pipeline.consumer_cfg, &pipeline.consumer_sub).await;
     let requests = pipeline
         .messenger
         .load_pending_pushes(&pipeline.executor_sub)
@@ -543,12 +536,7 @@ async fn run_pipeline(forge: Forge) -> serde_json::Value {
     pipeline.executor.drain_step().await;
 
     // --- Step 5: consumer result activation → outcome event published. ---
-    drain_step(
-        &pipeline.consumer_cfg,
-        &pipeline.consumer_sub,
-        &mut consumer_seen,
-    )
-    .await;
+    drain_step(&pipeline.consumer_cfg, &pipeline.consumer_sub).await;
 
     read_latest(&pipeline.messenger, "brenn:git-repo-sync-outcomes")
         .await

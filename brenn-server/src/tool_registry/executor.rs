@@ -1176,9 +1176,9 @@ mod tests {
             .find(|p| p.port == TOOL_RESULT_INPUT_PORT)
             .expect("the tool-results port is present in the activation");
         assert_eq!(port.channel_address, "brenn:tool-results/sync");
-        assert_eq!(port.new_rows.len(), 1, "the one result row is delivered");
+        assert_eq!(port.new_len(), 1, "the one result message is delivered");
         let body: Value =
-            serde_json::from_str(&port.new_rows[0].1.body).expect("result body is JSON");
+            serde_json::from_str(&port.new_entries()[0].1.body).expect("result body is JSON");
         assert_eq!(body["call_id"], "r1");
         assert_eq!(body["outcome"]["ok"]["echoed"]["repo"], "brenn");
     }
