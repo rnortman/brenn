@@ -160,6 +160,13 @@ async fn consumer_harness(
     } else {
         messenger
     };
+    super::attach_input_ports(
+        &messenger,
+        slug,
+        &ParticipantId::for_wasm(slug),
+        &[(&push_ch, Depth::Unbounded), (&inbox, Depth::Unbounded)],
+    )
+    .await;
 
     let (alert_dispatcher, _alert_handle) = noop_alert_dispatcher();
     let mut tool_grants = BTreeMap::new();

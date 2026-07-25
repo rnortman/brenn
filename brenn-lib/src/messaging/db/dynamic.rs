@@ -38,13 +38,13 @@ pub struct DynamicSubscriptionRow {
 /// integer → `Bounded(n)`. The value is one we wrote ourselves; a malformed
 /// value is a host bug (corrupt DB / writer bug), so panic (CLAUDE.md BETTER
 /// DEAD THAN WRONG).
-fn depth_from_sql(s: &str) -> Depth {
+pub(super) fn depth_from_sql(s: &str) -> Depth {
     if s == "unbounded" {
         Depth::Unbounded
     } else {
-        let n: u64 = s.parse().unwrap_or_else(|e| {
-            panic!("messaging: malformed dynamic-subscription depth {s:?} in DB: {e}")
-        });
+        let n: u64 = s
+            .parse()
+            .unwrap_or_else(|e| panic!("messaging: malformed depth {s:?} in DB: {e}"));
         Depth::Bounded(n)
     }
 }
@@ -403,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "malformed dynamic-subscription depth")]
+    #[should_panic(expected = "malformed depth")]
     fn malformed_depth_panics() {
         let conn = test_conn();
         let uuid = Uuid::new_v4();

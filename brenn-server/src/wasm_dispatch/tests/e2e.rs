@@ -202,6 +202,7 @@ async fn err_outcome_acks_push_row_at_activation_start() {
         wasm_policies_from_entries(std::slice::from_ref(&*entry)),
     ));
     let wasm_sub = ParticipantId::for_wasm(slug);
+    super::attach_input_ports(&messenger, slug, &wasm_sub, &[(&entry, Depth::Unbounded)]).await;
 
     // Insert a webhook envelope. The demo calls publish("out", …); with no output
     // port bound, this returns NotPermitted, causing the guest to return Err.
@@ -979,6 +980,13 @@ async fn build_mixed_class_consumer(
     ));
 
     messenger.attach_ring_subscriber(&ring_entry.uuid, &wasm_sub, u64::MAX, Priming::Head);
+    super::attach_input_ports(
+        &messenger,
+        slug,
+        &wasm_sub,
+        &[(durable.as_ref(), Depth::Unbounded)],
+    )
+    .await;
     let ring = Arc::clone(
         ring_stores
             .get(&ring_entry.uuid)

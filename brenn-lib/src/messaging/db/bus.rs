@@ -1091,43 +1091,6 @@ const OWED_ON_CHANNEL_WHERE: &str = "WHERE pp.target_subscriber = ?1
            AND pp.delivered_at IS NULL
            AND pp.release_after IS NULL";
 
-/// The lowest retention position `subscriber` is still owed on `channel_uuid`,
-/// or `None` when it is owed nothing there.
-///
-/// Panics on an owed, unparked claim whose message holds no retention position,
-/// the same impossible state [`owed_push_positions`] dies on. `MIN` skips NULLs,
-/// so without the count an all-positionless owed set would read as "owed
-/// nothing" — a position at head, an activation that never runs, and a wake that
-/// repeats forever against claims nothing can serve.
-pub fn min_owed_retained_seq(
-    conn: &Connection,
-    subscriber: &ParticipantId,
-    channel_uuid: Uuid,
-) -> Option<i64> {
-    // Cached: one call per input port on every WASM drain step.
-    let mut stmt = conn
-        .prepare_cached(&format!(
-            "SELECT MIN(m.retained_seq), COUNT(*) - COUNT(m.retained_seq)
-             FROM messaging_pending_pushes pp
-             JOIN messaging_messages m ON pp.message_id = m.id
-             {OWED_ON_CHANNEL_WHERE}"
-        ))
-        .expect("prepare min_owed_retained_seq");
-    let (min_seq, positionless) = stmt
-        .query_row(
-            rusqlite::params![subscriber.as_str(), channel_uuid.as_bytes().to_vec()],
-            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .expect("query min_owed_retained_seq");
-    assert!(
-        positionless == 0,
-        "messaging: {positionless} claims for {} on channel {channel_uuid} are owed and unparked \
-         but their messages hold no retention position",
-        subscriber.as_str()
-    );
-    min_seq
-}
-
 /// Every claim `subscriber` is still owed on `channel_uuid` as
 /// `(push_id, retained_seq)`, seq ascending.
 pub fn owed_push_positions(
@@ -1241,40 +1204,15 @@ pub fn pending_pushes_outside_channels(
     .collect()
 }
 
-/// Distinct subscribers on `channel_uuid` holding at least one owed,
-/// deliverable pending push — the durable sibling of a ring channel's set of
-/// cursors that trail the ring head.
-///
-/// "Owed, deliverable" is the same predicate `load_pending_pushes_for_channel`
-/// serves from (`delivered_at IS NULL AND release_after IS NULL`): a row still
-/// parked behind its `release_after` hold is owed to nobody yet, so it does not
-/// list its target here.
-pub fn channel_deliverable_subscribers(
-    conn: &Connection,
-    channel_uuid: Uuid,
-) -> Vec<ParticipantId> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT DISTINCT pp.target_subscriber
-             FROM messaging_pending_pushes pp
-             JOIN messaging_messages m ON pp.message_id = m.id
-             WHERE m.channel_uuid = ?1
-               AND pp.delivered_at IS NULL
-               AND pp.release_after IS NULL",
-        )
-        .expect("prepare channel_deliverable_subscribers");
-    let rows = stmt
-        .query_map(rusqlite::params![channel_uuid.as_bytes().to_vec()], |row| {
-            row.get::<_, String>(0)
-        })
-        .expect("query channel_deliverable_subscribers");
-    rows.map(|r| ParticipantId::from_stored(r.expect("read deliverable subscriber")))
-        .collect()
-}
-
 /// Whether `subscriber` holds any owed, deliverable pending push on
-/// `channel_uuid`. Same predicate as [`channel_deliverable_subscribers`],
-/// scoped to one subscriber.
+/// `channel_uuid`: `delivered_at IS NULL AND release_after IS NULL`, the same
+/// predicate `load_pending_pushes_for_channel` serves from. A row still parked
+/// behind its `release_after` hold is owed to nobody yet.
+///
+/// Test-only. Production answers deliverability through cursor positions
+/// (`cursor_has_deliverable`); this query answers through claim rows. Two
+/// reachable answers to one question is one too many.
+#[cfg(test)]
 pub fn channel_has_deliverable_for(
     conn: &Connection,
     channel_uuid: Uuid,
@@ -1445,6 +1383,49 @@ pub fn channel_last_retained_seq(conn: &Connection, channel_uuid: Uuid) -> i64 {
         |row| row.get::<_, i64>(0),
     )
     .unwrap_or_else(|e| panic!("messaging: channel {channel_uuid} has no row: {e}"))
+}
+
+/// The oldest retention sequence the channel still holds, or `None` when it
+/// holds nothing — the boundary below which every message is gone.
+///
+/// Positions below this frontier name messages already evicted; their losses
+/// were reported at eviction time and must not be charged again.
+pub fn channel_retention_frontier(conn: &Connection, channel_uuid: Uuid) -> Option<i64> {
+    // Cached: an advance that lost something asks on the drain path.
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT MIN(retained_seq) FROM messaging_messages
+             WHERE channel_uuid = ?1 AND retained_seq IS NOT NULL",
+        )
+        .expect("prepare channel_retention_frontier");
+    stmt.query_row(rusqlite::params![channel_uuid.as_bytes().to_vec()], |row| {
+        row.get::<_, Option<i64>>(0)
+    })
+    .expect("query channel_retention_frontier")
+}
+
+/// The oldest retention sequence among the newest `limit` retained messages on
+/// `channel_uuid`, or `None` when the channel retains nothing — where a
+/// retained-primed cursor starts.
+///
+/// Shares the retained-set predicate with [`load_channel_retained_tail`]: a
+/// parked row carries no `retained_seq` and is not part of the tail a fresh
+/// queue is owed.
+pub fn retained_tail_floor_seq(
+    conn: &Connection,
+    channel_uuid: Uuid,
+    limit: crate::messaging::config::Depth,
+) -> Option<i64> {
+    conn.query_row(
+        "SELECT MIN(retained_seq) FROM (
+             SELECT m.retained_seq FROM messaging_messages m
+             WHERE m.channel_uuid = ?1 AND m.retained_seq IS NOT NULL
+             ORDER BY m.retained_seq DESC LIMIT ?2
+         )",
+        rusqlite::params![channel_uuid.as_bytes().to_vec(), depth_limit(limit)],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .expect("query retained_tail_floor_seq")
 }
 
 /// The channel's persisted resume epoch — the identity of its numbering domain,

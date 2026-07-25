@@ -399,23 +399,76 @@ impl DbStore {
         }
     }
 
-    /// Where this subscriber's unseen messages begin: the lowest retained seq
-    /// among its undelivered claims, or one past everything the channel ever
-    /// assigned when it holds none.
+    /// Where this channel's retained set begins, or the seq it will assign next
+    /// when it holds nothing — the boundary below which every message is gone.
+    fn frontier(&self, conn: &rusqlite::Connection) -> u64 {
+        db::channel_retention_frontier(conn, self.channel_uuid)
+            .map(|seq| retained_seq(seq).0)
+            .unwrap_or_else(|| {
+                retained_seq(db::channel_last_retained_seq(conn, self.channel_uuid)).0 + 1
+            })
+    }
+
+    /// Bring `subscriber`'s cursor row into line with this attach: a
+    /// push-enabled subscriber gets one at its primed position (or keeps the
+    /// position it already holds, with the caches retuned), a sampled one loses
+    /// whatever it held.
     ///
-    /// TODO(substrate-durable-cursor): stands in for the persisted cursor row.
-    fn reconstructed_position(
+    /// The sampled branch is the demotion rule: a subscription that lands at
+    /// depth 0 is never delivered to again, and a position left behind would be
+    /// reported against by every eviction pass forever.
+    ///
+    /// Returns the store's own Created/Existing determination — row presence,
+    /// and nothing else. A sampled attach creates no queue and so is always
+    /// `Existing`.
+    fn maintain_cursor(
         &self,
         conn: &rusqlite::Connection,
         subscriber: &ParticipantId,
-    ) -> MessageSeq {
-        db::min_owed_retained_seq(conn, subscriber, self.channel_uuid)
-            .map(retained_seq)
-            .unwrap_or_else(|| {
-                MessageSeq(
-                    retained_seq(db::channel_last_retained_seq(conn, self.channel_uuid)).0 + 1,
-                )
-            })
+        app_slug: &str,
+        push_depth: Depth,
+        priming: Priming,
+    ) -> Attached {
+        if !push_depth.is_push_enabled() {
+            db::delete_subscriber_cursor(conn, self.channel_uuid, subscriber);
+            return Attached::Existing;
+        }
+        let primed = self.primed_position(conn, push_depth, priming);
+        let created = db::ensure_subscriber_cursor(
+            conn,
+            self.channel_uuid,
+            subscriber,
+            app_slug,
+            push_depth,
+            primed,
+        );
+        if created {
+            Attached::Created
+        } else {
+            Attached::Existing
+        }
+    }
+
+    /// Where a cursor coming into existence starts.
+    ///
+    /// `Head` starts one past every sequence the channel ever assigned — owed
+    /// only what publishes next. `Retained` starts at the oldest of the
+    /// `push_depth` newest retained messages, because attach is a delivery point
+    /// for a component queue: a message published before the component existed
+    /// still reaches it. A channel retaining nothing primes at head either way.
+    fn primed_position(
+        &self,
+        conn: &rusqlite::Connection,
+        push_depth: Depth,
+        priming: Priming,
+    ) -> i64 {
+        let head = db::channel_last_retained_seq(conn, self.channel_uuid) + 1;
+        match priming {
+            Priming::Head => head,
+            Priming::Retained => {
+                db::retained_tail_floor_seq(conn, self.channel_uuid, push_depth).unwrap_or(head)
+            }
+        }
     }
 
     fn assert_owner(&self, lookup: &db::DeferredLookup, sender: &str) {
@@ -446,23 +499,26 @@ impl RetentionStore for DbStore {
 
     async fn deliverable_subscribers(&self) -> Vec<ParticipantId> {
         let conn = self.db.lock().await;
-        db::channel_deliverable_subscribers(&conn, self.channel_uuid)
+        db::deliverable_cursor_subscribers(&conn, self.channel_uuid)
     }
 
     async fn has_deliverable(&self, subscriber: &ParticipantId) -> bool {
         let conn = self.db.lock().await;
-        db::channel_has_deliverable_for(&conn, self.channel_uuid, subscriber)
+        db::cursor_has_deliverable(&conn, self.channel_uuid, subscriber)
     }
 
-    /// The retained span this subscriber's position sits in, with the
-    /// new boundary derived from its undelivered claims.
+    /// The retained span this subscriber's cursor sits in, with the new boundary
+    /// cut from the position the cursor row holds.
     ///
-    /// TODO(substrate-durable-cursor): the position is reconstructed per call
-    /// as the lowest retained seq among the subscriber's undelivered claims,
-    /// because the durable class has no cursor row yet. Both reads happen under
-    /// one connection hold, so the boundary cannot name a message the window
-    /// does not carry. This whole body is replaced by a read of
-    /// `messaging_subscriber_cursors` when that table lands.
+    /// Both reads happen under one connection hold, so the boundary cannot name
+    /// a message the window does not carry. A push-enabled `push_limit` retunes
+    /// the row's depth cache, the caller staying its single authority; a sampled
+    /// one is a read the row does not record.
+    ///
+    /// A sampled subscriber holds no cursor and is never delivered to: its
+    /// window is all context, cut at a position above everything the channel
+    /// ever assigned. A push-enabled subscriber with no cursor is a wiring bug
+    /// and panics.
     async fn window(
         &self,
         subscriber: &ParticipantId,
@@ -470,7 +526,36 @@ impl RetentionStore for DbStore {
         retain_limit: Depth,
     ) -> SubscriberWindow {
         let conn = self.db.lock().await;
-        let next_owed = self.reconstructed_position(&conn, subscriber);
+        let next_owed = match db::load_subscriber_cursor(&conn, self.channel_uuid, subscriber) {
+            Some(cursor) => {
+                // A sampled read is a pure channel read: it delivers nothing, so
+                // it does not touch the position it borrowed. Writing its zero
+                // into the row would leave a depth the row's own contract says
+                // cannot exist there, on a subscriber still listed as
+                // deliverable.
+                if push_limit.is_push_enabled() && cursor.push_depth != push_limit {
+                    db::retune_subscriber_cursor_depth(
+                        &conn,
+                        self.channel_uuid,
+                        subscriber,
+                        push_limit,
+                    );
+                }
+                retained_seq(cursor.next_owed_seq)
+            }
+            None => {
+                assert!(
+                    !push_limit.is_push_enabled(),
+                    "messaging store: {} has no cursor for {} — a push-enabled window over a \
+                     queue that was never created",
+                    self.address,
+                    subscriber.as_str()
+                );
+                MessageSeq(
+                    retained_seq(db::channel_last_retained_seq(&conn, self.channel_uuid)).0 + 1,
+                )
+            }
+        };
         let span = match (push_limit, retain_limit) {
             (Depth::Unbounded, _) | (_, Depth::Unbounded) => Depth::Unbounded,
             (p, r) => Depth::Bounded(depth_bound(p).max(depth_bound(r))),
@@ -482,18 +567,16 @@ impl RetentionStore for DbStore {
         compose_window(entries, next_owed, push_limit)
     }
 
-    /// Retire every undelivered claim at or below `through`, and report those
-    /// below `seen_floor` as never served.
+    /// Move the cursor to `through + 1` and report the unseen seqs no window
+    /// served, both figures subtractions between seqs.
     ///
-    /// TODO(substrate-durable-cursor): position advance is a claim retirement
-    /// here rather than a cursor move, so the reported figure is a row count
-    /// instead of the model's seq subtraction. The count is a floor, exact only
-    /// where no claim was retired out from under the subscriber: a seq the
-    /// commit-time push window or a GC eviction already retired holds no claim
-    /// and so is not counted here. Both of those retirements report their own
-    /// overflow when they happen, so the noise ladder sees them; it is the
-    /// subscriber-visible `dropped` figure that under-reports until the cursor
-    /// row lands.
+    /// Panics for a subscriber holding no cursor — sampled or never attached.
+    ///
+    /// TODO(substrate-wake-relocation): the claim retirement below is wake
+    /// bookkeeping, not delivery state. The dispatcher still scans owed claim
+    /// rows to decide who to wake, so a claim left standing past its cursor
+    /// would re-wake the consumer on every tick. It goes when the wake pass
+    /// moves onto live registration and the scan is deleted.
     async fn advance(
         &self,
         subscriber: &ParticipantId,
@@ -507,27 +590,56 @@ impl RetentionStore for DbStore {
             seen_floor.0,
             through.0
         );
-        let through = seq_column(through);
-        let floor = seq_column(seen_floor);
         let conn = self.db.lock().await;
-        let claims = db::owed_push_positions(&conn, subscriber, self.channel_uuid);
-        let passed: Vec<i64> = claims
-            .iter()
-            .filter(|(_, seq)| *seq <= through)
-            .map(|(push_id, _)| *push_id)
-            .collect();
-        // A claim below the window's own floor was never handed over: the
-        // window served the newest and this is what it skipped.
-        let dropped = claims.iter().filter(|(_, seq)| *seq < floor).count() as u64;
-        db::mark_pending_pushes_delivered(&conn, &passed);
-        drop(conn);
-        self.dropped.add(subscriber, dropped);
-        AdvanceOutcome {
+        let cursor = db::load_subscriber_cursor(&conn, self.channel_uuid, subscriber)
+            .unwrap_or_else(|| {
+                panic!(
+                    "messaging store: {} has no cursor for {} to advance",
+                    self.address,
+                    subscriber.as_str()
+                )
+            });
+        let next_owed = retained_seq(cursor.next_owed_seq).0;
+        let dropped = seen_floor.0.saturating_sub(next_owed);
+        let outcome = AdvanceOutcome {
             dropped,
-            // Everything a claim still names is still retained, so nothing here
-            // was already reported by an eviction.
-            noise_charge: dropped,
+            // Losses below the frontier were already charged by eviction; only
+            // the still-retained part is charged here. A consumer that lost
+            // nothing is charged nothing whatever the frontier is, so the read
+            // that finds it stays off the keeping-up path.
+            noise_charge: if dropped == 0 {
+                0
+            } else {
+                seen_floor
+                    .0
+                    .saturating_sub(next_owed.max(self.frontier(&conn)))
+            },
+        };
+        // One transaction: a kill between the move and the retirement would
+        // leave claims standing below a cursor that has passed them, and the
+        // dispatcher would re-wake this consumer for work its position says it
+        // has already done, on every pass, forever.
+        let tx = conn
+            .unchecked_transaction()
+            .expect("messaging store: begin advance tx");
+        if through.0 >= next_owed {
+            db::set_subscriber_cursor_position(
+                &tx,
+                self.channel_uuid,
+                subscriber,
+                seq_column(MessageSeq(through.0 + 1)),
+            );
         }
+        let passed: Vec<i64> = db::owed_push_positions(&tx, subscriber, self.channel_uuid)
+            .into_iter()
+            .filter(|(_, seq)| *seq <= seq_column(through))
+            .map(|(push_id, _)| push_id)
+            .collect();
+        db::mark_pending_pushes_delivered(&tx, &passed);
+        tx.commit().expect("messaging store: commit advance tx");
+        drop(conn);
+        self.dropped.add(subscriber, outcome.dropped);
+        outcome
     }
 
     /// Requires no connection: safe to call while the caller already holds one.
@@ -543,37 +655,43 @@ impl RetentionStore for DbStore {
         self.metered.get(subscriber)
     }
 
+    /// The cursor row is the whole of the determination: it exists, or this
+    /// attach creates it at the primed position. Nothing outside the store gets
+    /// a say, so a queue that survived a restart cannot be re-primed by a caller
+    /// that mis-remembers it, and one that never existed cannot be skipped.
+    ///
+    /// TODO(substrate-wake-relocation): the retained-tail claim seed below is
+    /// wake bookkeeping, as in `advance` — the dispatcher's scan is what wakes a
+    /// freshly primed component, and it reads claim rows. The cursor is already
+    /// primed to the same tail, so the seed decides nothing about delivery.
     async fn attach(
         &self,
         subscriber: &ParticipantId,
         app_slug: &str,
-        push_depth: u64,
+        push_depth: Depth,
         priming: Priming,
-        fresh_queue: bool,
     ) -> Attached {
-        // A surviving queue keeps its pending rows across the restart — no
-        // re-prime. A fresh queue with retained priming seeds the tail as NEW
-        // so the consumer wakes on existing messages, not only the next publish.
-        if !fresh_queue {
-            return Attached::Existing;
-        }
-        if let Priming::Retained = priming {
-            let conn = self.db.lock().await;
-            let tail = db::load_channel_retained_tail(
-                &conn,
-                self.channel_uuid,
-                Depth::Bounded(push_depth),
-            );
+        let conn = self.db.lock().await;
+        // One transaction: a position and the claims that wake it are one
+        // fact, and a kill between them leaves the two disagreeing for good.
+        let tx = conn
+            .unchecked_transaction()
+            .expect("messaging store: begin attach tx");
+        let attached = self.maintain_cursor(&tx, subscriber, app_slug, push_depth, priming);
+        if attached == Attached::Created && priming == Priming::Retained {
+            let tail = db::load_channel_retained_tail(&tx, self.channel_uuid, push_depth);
             if !tail.is_empty() {
                 let ids: Vec<i64> = tail.iter().map(|(id, _)| *id).collect();
-                db::seed_pending_pushes_for_messages(&conn, &ids, subscriber, app_slug);
+                db::seed_pending_pushes_for_messages(&tx, &ids, subscriber, app_slug);
             }
         }
-        Attached::Created
+        tx.commit().expect("messaging store: commit attach tx");
+        attached
     }
 
     async fn detach(&self, subscriber: &ParticipantId) {
         let conn = self.db.lock().await;
+        db::delete_subscriber_cursor(&conn, self.channel_uuid, subscriber);
         db::delete_pushes_for_subscriber(&conn, self.channel_uuid, subscriber);
         self.push_windows
             .lock()

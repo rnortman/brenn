@@ -1,6 +1,12 @@
 //! Cluster 1: Schema DDL for the messaging subsystem.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+use uuid::Uuid;
+
+use crate::messaging::ParticipantId;
+use crate::messaging::config::Depth;
+
+use super::dynamic::depth_from_sql;
 
 /// Messaging migration entry point: create every messaging table in its current
 /// shape.
@@ -10,7 +16,8 @@ use rusqlite::Connection;
 /// `messaging_channels`, `messaging_messages` (+ FTS + triggers),
 /// `messaging_subscriptions`, `messaging_dynamic_subscriptions`,
 /// `messaging_send_budget`, `messaging_pending_pushes`, and
-/// `messaging_wasm_consume_failures`.
+/// `messaging_wasm_consume_failures`. `messaging_subscriber_cursors` comes last,
+/// with its seed ([`create_and_seed_subscriber_cursors`]).
 ///
 /// No structural migrations are currently registered; the marked slot below is
 /// where future column/table migrations are added behind `column_exists` /
@@ -283,6 +290,210 @@ pub fn run_messaging_migrations(conn: &Connection) {
     backfill_retained_seqs(conn);
 
     normalize_released_messages(conn);
+
+    // Last: the seed positions cursors by retention sequence, so every row that
+    // is going to have one must have it by now — including the rows the two
+    // passes above just numbered and released.
+    create_and_seed_subscriber_cursors(conn);
+}
+
+/// Create `messaging_subscriber_cursors` and seed it, both or neither.
+///
+/// The table's own presence is the run-once guard, so the two must commit
+/// together: a table left standing after an aborted seed would read as already
+/// seeded on the next boot and the positions would be lost for good. SQLite runs
+/// DDL inside a transaction, so one transaction covers both, and every abort
+/// path the seed has — its suffix and slug asserts, a mid-seed crash — leaves no
+/// table and re-runs from scratch once the operator has fixed the rows.
+fn create_and_seed_subscriber_cursors(conn: &Connection) {
+    if table_exists(conn, "messaging_subscriber_cursors") {
+        return;
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .expect("begin messaging_subscriber_cursors transaction");
+    // Positions cascade from messaging_channels: a channel row that goes away
+    // takes its numbering domain with it, and a position in a domain that no
+    // longer exists names nothing. The cascade is spelled out because the
+    // schema's other REFERENCES columns do not carry one.
+    tx.execute_batch(
+        "
+        CREATE TABLE messaging_subscriber_cursors (
+            channel_uuid   BLOB NOT NULL REFERENCES messaging_channels(uuid) ON DELETE CASCADE,
+            subscriber     TEXT NOT NULL,
+            app_slug       TEXT NOT NULL,
+            push_depth     TEXT NOT NULL,
+            next_owed_seq  INTEGER NOT NULL,
+            PRIMARY KEY (channel_uuid, subscriber)
+        );
+        ",
+    )
+    .expect("failed to run messaging_subscriber_cursors DDL");
+    seed_subscriber_cursors(&tx);
+    tx.commit()
+        .expect("commit messaging_subscriber_cursors transaction");
+}
+
+/// Whether `table` exists in this database.
+fn table_exists(conn: &Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        rusqlite::params![table],
+        |_| Ok(()),
+    )
+    .optional()
+    .expect("query sqlite_master for table presence")
+    .is_some()
+}
+
+/// The subscriber kinds that hold a server-side position. Surfaces are absent:
+/// their delivery state is the cursor the client echoes back, so a row here
+/// would be a second, competing answer to where one stands.
+const ATTACH_MANAGED_SUBSCRIBER: &str = "(pp.target_subscriber LIKE 'wasm:%'
+       OR pp.target_subscriber LIKE 'conversation:%'
+       OR pp.target_subscriber LIKE 'system:%')";
+
+/// Give every attach-managed subscriber holding delivery claims a cursor at the
+/// position those claims put it in: the oldest sequence it is still owed, or one
+/// past the newest it was delivered when it owes nothing.
+///
+/// Runs once, in the transaction that creates the cursor table. The claims are
+/// the only record of where those subscribers stand, and a first attach that
+/// found no row would either re-deliver a tail the subscriber already consumed
+/// (retained priming) or skip the backlog outright (head priming) — so the
+/// position is carried over here rather than left to be re-primed. A subscriber
+/// that is caught up matters as much as a lagging one: it is the steady state of
+/// a healthy component, and re-priming it hands an at-most-once consumer work it
+/// already did.
+///
+/// TODO(substrate-cursor-registration-seed): a push-enabled subscriber holding no
+/// claim at all — never delivered anything, or its claims already reaped — gets
+/// no row here, because its identity and kind are resolvable only from the
+/// boot-resolved registration set (system components hold no
+/// `messaging_subscriptions` row at all, and a conversation's identity resolves
+/// through its app's allowed user). Seed those at head where that set exists, so
+/// a message published between this migration and such a subscriber's first
+/// attach is ordinary unseen backlog rather than a silent skip.
+///
+/// # Panics
+///
+/// If a subscriber's owed claims are not a suffix of what it was delivered — a
+/// delivered claim above the oldest owed one. Seeding the cursor below that
+/// delivered sequence would resurrect a delivered message as unseen, which an
+/// at-most-once consumer re-executes.
+fn seed_subscriber_cursors(conn: &Connection) {
+    struct ClaimedPosition {
+        channel_uuid: Uuid,
+        subscriber: ParticipantId,
+        app_slug: String,
+        slug_count: i64,
+        min_owed_seq: Option<i64>,
+        max_delivered_seq: Option<i64>,
+        positionless: i64,
+    }
+
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT m.channel_uuid,
+                    pp.target_subscriber,
+                    MIN(pp.target_app_slug),
+                    COUNT(DISTINCT pp.target_app_slug),
+                    MIN(CASE WHEN pp.delivered_at IS NULL THEN m.retained_seq END),
+                    MAX(CASE WHEN pp.delivered_at IS NOT NULL THEN m.retained_seq END),
+                    SUM(CASE WHEN pp.delivered_at IS NULL AND m.retained_seq IS NULL
+                             THEN 1 ELSE 0 END)
+             FROM messaging_pending_pushes pp
+             JOIN messaging_messages m ON pp.message_id = m.id
+             WHERE pp.release_after IS NULL
+               AND m.channel_uuid IS NOT NULL
+               AND {ATTACH_MANAGED_SUBSCRIBER}
+             GROUP BY m.channel_uuid, pp.target_subscriber"
+        ))
+        .expect("prepare cursor seed scan");
+    let claimed: Vec<ClaimedPosition> = stmt
+        .query_map([], |row| {
+            let channel: Vec<u8> = row.get(0)?;
+            Ok(ClaimedPosition {
+                channel_uuid: Uuid::from_slice(&channel)
+                    .expect("messaging: malformed channel uuid in cursor seed"),
+                subscriber: ParticipantId::from_stored(row.get(1)?),
+                app_slug: row.get(2)?,
+                slug_count: row.get(3)?,
+                min_owed_seq: row.get(4)?,
+                max_delivered_seq: row.get(5)?,
+                positionless: row.get(6)?,
+            })
+        })
+        .expect("query cursor seed scan")
+        .map(|r| r.expect("read cursor seed row"))
+        .collect();
+    drop(stmt);
+
+    for pos in claimed {
+        let (channel_uuid, subscriber) = (pos.channel_uuid, &pos.subscriber);
+        assert!(
+            pos.positionless == 0,
+            "messaging: {} claims for {} on channel {channel_uuid} are owed and unparked but \
+             their messages hold no retention position — the cursor would be seeded above them",
+            pos.positionless,
+            subscriber.as_str(),
+        );
+        assert!(
+            pos.slug_count == 1,
+            "messaging: claims for {} on channel {channel_uuid} name {} app slugs; a subscriber \
+             belongs to one",
+            subscriber.as_str(),
+            pos.slug_count,
+        );
+        if let (Some(owed), Some(delivered)) = (pos.min_owed_seq, pos.max_delivered_seq) {
+            assert!(
+                delivered < owed,
+                "messaging: the delivery claims for {} on channel {channel_uuid} are not a \
+                 suffix — sequence {delivered} was delivered above the oldest owed sequence \
+                 {owed}. Seeding a cursor there would resurrect a delivered message as \
+                 unseen; inspect the database rather than starting the server.",
+                subscriber.as_str(),
+            );
+        }
+        // Caught up: the position is one past the newest delivery. A caught-up
+        // subscriber whose delivered claims have all been reaped leaves no trace
+        // to read and is skipped, as the TODO above records.
+        let next_owed = match (pos.min_owed_seq, pos.max_delivered_seq) {
+            (Some(owed), _) => owed,
+            (None, Some(delivered)) => delivered + 1,
+            (None, None) => continue,
+        };
+
+        // The registration's depth, where there is a registration to read.
+        // System components hold none, and a subscriber whose registration is
+        // gone is an orphan whose row the boot reconcile drops; both are
+        // recorded unbounded, which the first window read retunes.
+        let registered_depth: Option<String> = conn
+            .query_row(
+                "SELECT push_depth FROM messaging_subscriptions
+                 WHERE channel_uuid = ?1 AND app_slug = ?2",
+                rusqlite::params![channel_uuid.as_bytes().to_vec(), &pos.app_slug],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("query cursor seed registration depth");
+        let push_depth = match registered_depth.as_deref() {
+            // Sampled: never delivered to, so these claims are residue and the
+            // subscriber holds no position.
+            Some("0") => continue,
+            Some(depth) => depth_from_sql(depth),
+            None => Depth::Unbounded,
+        };
+
+        super::cursors::ensure_subscriber_cursor(
+            conn,
+            channel_uuid,
+            subscriber,
+            &pos.app_slug,
+            push_depth,
+            next_owed,
+        );
+    }
 }
 
 /// Replace the migration's placeholder `resume_epoch` on every channel row with
@@ -552,6 +763,7 @@ mod tests {
             "messaging_subscriptions",
             "messaging_dynamic_subscriptions",
             "messaging_pending_pushes",
+            "messaging_subscriber_cursors",
             "messaging_send_budget",
             "messaging_wasm_consume_failures",
         ] {
@@ -936,6 +1148,21 @@ mod tests {
             !column_exists(&conn, "messaging_pending_pushes", "wake_kind"),
             "messaging_pending_pushes still has legacy column wake_kind"
         );
+
+        // messaging_subscriber_cursors: a position plus the two caches whose
+        // authority lives elsewhere.
+        for col in &[
+            "channel_uuid",
+            "subscriber",
+            "app_slug",
+            "push_depth",
+            "next_owed_seq",
+        ] {
+            assert!(
+                column_exists(&conn, "messaging_subscriber_cursors", col),
+                "messaging_subscriber_cursors missing current column {col}"
+            );
+        }
 
         // messaging_wasm_consume_failures: design's test plan requires this
         // table's columns be pinned so a typo in its DDL fails here rather than

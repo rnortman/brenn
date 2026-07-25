@@ -96,6 +96,7 @@ async fn tool_harness(
         wake_min: None,
     });
 
+    let inbox_ch = inbox.clone();
     let mut all_entries = vec![trigger.clone(), request_ch, inbox];
     all_entries.extend(extra_channels);
     // Fold the executor's spec subscription into the request channel, exactly
@@ -137,6 +138,13 @@ async fn tool_harness(
     } else {
         messenger
     };
+    super::attach_input_ports(
+        &messenger,
+        slug,
+        &ParticipantId::for_wasm(slug),
+        &[(&trigger, Depth::Unbounded), (&inbox_ch, Depth::Unbounded)],
+    )
+    .await;
 
     // A detached noop alert task; dropping its JoinHandle leaves the task running.
     let (alert_dispatcher, _alert_handle) = noop_alert_dispatcher();

@@ -782,48 +782,6 @@ Code site (`TODO(substrate-deferred-view-count-shortcut)`):
 `brenn-server/src/wasm_dispatch/mod.rs` (the `for out in &cfg.outputs`
 deferred-view loop in `drain_step`).
 
-## `substrate-priming-atomic-marker`
-
-Durable WASM-queue priming decides "new vs. surviving" from a `messaging_subscriptions`
-snapshot taken before `rebuild_subscriptions`, but the marker (the rebuilt
-subscription row) and the seed (the primed pending pushes) commit in separate
-autocommit statements in separate db-lock scopes, with reachable panic sites
-between them (the dynamic-mqtt merge, and any SIGKILL/OOM). A boot that dies after
-the rebuild but before the seed completes leaves the row persisted, so the next
-boot classifies the queue as surviving and never primes it — a silent, permanent
-delivery gap against "attach is a delivery point"; a crash mid-seed leaves a
-partial tail with no way to complete it. Fixing it means committing the new-queue
-marker and its seeded pushes atomically (one transaction over rebuild + mirror +
-seed, or a "primed" marker written in the seed's own transaction), which restructures
-the boot sequence — the rebuild runs before the Messenger exists, the seed after.
-This is the durable-priming trait-unification refactor's territory. Done when the
-new-queue marker and its seed cannot be split by a crash.
-
-Code site (`TODO(substrate-priming-atomic-marker)`):
-`brenn-server/src/bootstrap/messaging/mod.rs` (the durable-priming loop that seeds
-pending pushes after the Messenger is built).
-
-## `substrate-priming-kind-qualified-key`
-
-Durable WASM-queue priming compares `(channel_uuid, slug)` against a snapshot of
-`messaging_subscriptions`, which records no subscriber kind (the `app_slug` column
-holds the bare slug for both App- and Wasm-kind rows). Slug disjointness is enforced
-within one boot's config but not across boots, so a config change that removes an
-App subscriber named `worker` on channel U and adds a `[[wasm_consumer]]` `worker`
-subscribing to U leaves `(U, "worker")` in the snapshot from the app row — the
-brand-new WASM queue is misclassified as surviving and skips priming (the same
-silent delivery gap, triggered by an ordinary principal-kind swap rather than a
-crash). The fix is a kind-qualified subscription key (persist the subscriber kind,
-or key the snapshot on the `ParticipantId` string) — but `app_slug` is the join key
-`resolve_push_targets` stamps on push rows, so changing it ripples into the
-wake-recompute join. That is a persisted-subscription-model change owned by the
-durable-priming trait-unification refactor. Done when a new WASM queue cannot alias
-a prior boot's differently-kinded subscription on the same slug.
-
-Code site (`TODO(substrate-priming-kind-qualified-key)`):
-`brenn-server/src/bootstrap/messaging/mod.rs` (the `prior_subscription_keys.contains`
-check in the durable-priming loop).
-
 ## `substrate-ring-drop-total`
 
 `RingStore` keeps an in-memory per-subscriber tally of the drops reported against
@@ -838,20 +796,60 @@ Done when `dropped_total` is off the trait and the tally is deleted.
 Code site (`TODO(substrate-ring-drop-total)`):
 `brenn-lib/src/messaging/store/ring.rs` (the `dropped` field on `RingStore`).
 
-## `substrate-durable-cursor`
+## `substrate-wake-relocation`
 
-`DbStore` answers `window`/`advance` by reconstructing the subscriber's position
-from its undelivered `messaging_pending_pushes` claims: the lowest retained seq
-among them stands in for the stored position, and the advance retires claims
-rather than moving a cursor. The durable class needs a real position of its own —
-a `messaging_subscriber_cursors` row per (channel, subscriber) holding
-`next_owed_seq` — so the two store classes keep position state the same way and
-the claim rows can go. Done when the cursor table exists, `window`/`advance`/
-`deliverable_subscribers` read it, and the reconstruction is deleted.
+`DbStore` delivery state is the cursor row, but the dispatcher still decides who
+to wake by scanning owed `messaging_pending_pushes` rows
+(`load_all_dispatchable_pushes` and its partial index). So the durable store
+still writes a claim per push target at commit, seeds the retained tail at a
+primed attach, and retires claims through `through` at every advance — pure wake
+bookkeeping that decides nothing about delivery, kept only because a claim left
+standing past its cursor re-wakes its consumer on every dispatcher tick. The wake
+decision belongs against the live registration directory at wake time
+(`eager_wake_for` reads only wake economics and message urgency, both available
+there), with the recurring `wake_owed_subscribers` walk — already cursor-driven —
+as the retry. Done when the wake pass reads registration rather than rows, the
+dispatchable scan and its index are gone, and no delivery path writes or retires
+a bus-channel claim.
 
-Code sites (`TODO(substrate-durable-cursor)`):
-`brenn-lib/src/messaging/store/db.rs` (`reconstructed_position`, and the
-`window` / `advance` trait impls that use it);
-`brenn-lib/src/messaging/store/parity_tests.rs`
-(`durable_advance_under_reports_a_loss_gc_already_retired`, the tripwire that
-pins the interim figure the conversion must change).
+Code sites (`TODO(substrate-wake-relocation)`):
+`brenn-lib/src/messaging/store/db.rs` (the claim retirement in `advance` and the
+retained-tail seed in `attach`).
+
+## `substrate-cursor-registration-seed`
+
+The one-shot cursor seed in `seed_subscriber_cursors` carries a subscriber's
+delivery claims over onto a position, which covers every subscriber holding a
+claim — owed or delivered — at the moment the cursor table appeared. A
+push-enabled subscriber holding no claim at all gets no row, because the seed
+runs on a bare connection and cannot tell a conversation from a WASM component
+(system components hold no `messaging_subscriptions` row at all, and a
+conversation's identity resolves through its app's allowed user). Until the boot
+path seeds those at head, a message published between the migration and such a
+subscriber's first attach is skipped rather than delivered: head priming
+positions the cursor at head *at attach time*, so the message is neither served
+nor reported as a drop. Done when the boot path, which holds the resolved
+registration set, seeds a head cursor for every push-enabled attach-managed
+registration that has none.
+
+Code site (`TODO(substrate-cursor-registration-seed)`):
+`brenn-lib/src/messaging/db/schema.rs` (`seed_subscriber_cursors`).
+
+## `substrate-family-cursor-subscribers`
+
+Conversations and the system inbox hold cursor rows — the migration seeds them
+from their delivery claims — but neither family reads or advances one yet: both
+still consume through `messaging_pending_pushes`. Their positions therefore never
+move. A conversation's frozen row is inert (the recurring wake walk passes over
+inline-shaped subscribers), but a `system:` row is ParkedWake-shaped, so from the
+first message published after the migration it is permanently listed as
+deliverable and the walk re-wakes an inbox that is in fact caught up, on every
+dispatcher kick and tick. Churn, not loss — the inbox dequeues nothing and
+returns — and it ends the moment the families read positions instead of rows.
+Not worked around at the wake walk: a kind filter there would go silently wrong
+the other way (a real system backlog never woken) the day the families do attach.
+Done when conversations and the system inbox attach, window, and advance like
+every other cursor subscriber, and their claim paths are gone.
+
+Code site (`TODO(substrate-family-cursor-subscribers)`):
+`brenn-lib/src/messaging/mod.rs` (`wake_owed_subscribers`).

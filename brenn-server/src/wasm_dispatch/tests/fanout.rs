@@ -427,6 +427,7 @@ async fn webhook_message_invokes_consumer_with_webhook_envelope_type() {
         wasm_policies_from_entries(std::slice::from_ref(&*entry)),
     ));
     let wasm_sub = ParticipantId::for_wasm(slug);
+    super::attach_input_ports(&messenger, slug, &wasm_sub, &[(&entry, Depth::Unbounded)]).await;
 
     // The body stored in messaging_messages for a webhook channel is the WebhookEnvelope
     // JSON (that's what `publish_transport_ingress` stores). The MessageEnvelope read

@@ -2016,9 +2016,8 @@ impl Messenger {
     /// Register `subscriber`'s delivery state on the channel at
     /// `channel_address`, delegating to the channel's store.
     ///
-    /// `push_depth` must be pre-clamped by the caller.
-    /// `fresh_queue`: whether this queue is newly created (see
-    /// [`RetentionStore::attach`] for the contract).
+    /// `push_depth` must be pre-clamped by the caller. Whether the queue is new
+    /// is the store's own determination (see [`RetentionStore::attach`]).
     ///
     /// # Panics
     ///
@@ -2028,9 +2027,8 @@ impl Messenger {
         channel_address: &str,
         app_slug: &str,
         subscriber: &ParticipantId,
-        push_depth: u64,
+        push_depth: config::Depth,
         priming: store::Priming,
-        fresh_queue: bool,
     ) -> store::Attached {
         let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
             panic!(
@@ -2039,7 +2037,7 @@ impl Messenger {
             )
         });
         self.store_for(&entry)
-            .attach(subscriber, app_slug, push_depth, priming, fresh_queue)
+            .attach(subscriber, app_slug, push_depth, priming)
             .await
     }
 
@@ -2223,6 +2221,11 @@ impl Messenger {
     ///
     /// Idempotent (`Notify` coalesces) and self-limiting: a subscriber stops
     /// being owed once it drains.
+    ///
+    /// TODO(substrate-family-cursor-subscribers): self-limiting for the families
+    /// that advance a position. The system inbox holds a seeded cursor but still
+    /// consumes through claim rows, so its position never moves and this walk
+    /// wakes it on every pass once any message lands above that position.
     pub async fn wake_owed_subscribers(&self) {
         for entry in self.directory.list() {
             // Skip channels without a ParkedWake subscriber — asking a durable
@@ -4825,7 +4828,7 @@ mod tests {
         // new-1 remain pending (new rows). Explicit ts_ns offsets guarantee distinct
         // timestamps so we can pin the ascending order in context.
         let base_ns = db::utc_to_ns(chrono::Utc::now());
-        let (pid_ctx_a, mid_ctx_a) = super::testutils::insert_wasm_push_at(
+        let (_pid_ctx_a, mid_ctx_a) = super::testutils::insert_wasm_push_at(
             &messenger,
             &channel,
             &wasm_sub,
@@ -4834,7 +4837,7 @@ mod tests {
             base_ns,
         )
         .await;
-        let (pid_ctx_b, mid_ctx_b) = super::testutils::insert_wasm_push_at(
+        let (_pid_ctx_b, mid_ctx_b) = super::testutils::insert_wasm_push_at(
             &messenger,
             &channel,
             &wasm_sub,
@@ -4860,9 +4863,16 @@ mod tests {
         )
         .await;
 
-        // Mark ctx-a and ctx-b delivered — they become retained context only.
+        // Advance past ctx-a and ctx-b — behind the cursor, they are retained
+        // context and nothing more.
         messenger
-            .mark_pushes_delivered(&[pid_ctx_a, pid_ctx_b])
+            .advance_subscriber(
+                &channel.address,
+                &wasm_sub,
+                store::MessageSeq(2),
+                store::MessageSeq(1),
+                config::NoiseLevel::Silent,
+            )
             .await;
 
         // Build an inputs list with one port bound to the channel (Unbounded depths).
@@ -5196,12 +5206,21 @@ mod tests {
         let durable_sub = ParticipantId::for_wasm("durable-waker");
         let ring_sub = ParticipantId::for_wasm("ring-waker");
         messenger.attach_ring_subscriber(&ring.uuid, &ring_sub, 4, store::Priming::Head);
+        messenger
+            .attach_subscriber(
+                &durable.address,
+                "durable-waker",
+                &durable_sub,
+                Depth::Bounded(4),
+                store::Priming::Head,
+            )
+            .await;
 
         // Nothing owed anywhere → no wake.
         messenger.wake_owed_subscribers().await;
         assert!(router.wakes.lock().unwrap().is_empty());
 
-        let (push_id, _) = crate::messaging::testutils::insert_wasm_push(
+        crate::messaging::testutils::insert_wasm_push(
             &messenger,
             &durable,
             &durable_sub,
@@ -5228,8 +5247,22 @@ mod tests {
         );
 
         {
-            let conn = messenger.db().lock().await;
-            db::mark_pending_pushes_delivered(&conn, &[push_id]);
+            let durable_store = messenger.store_for(&durable);
+            let window = store::RetentionStore::window(
+                durable_store.as_ref(),
+                &durable_sub,
+                Depth::Bounded(4),
+                Depth::Bounded(0),
+            )
+            .await;
+            let (through, seen_floor) = window.advance_span().expect("the durable port owed one");
+            store::RetentionStore::advance(
+                durable_store.as_ref(),
+                &durable_sub,
+                through,
+                seen_floor,
+            )
+            .await;
         }
         {
             let ring_store = messenger.ring_store_for(&ring);
@@ -5299,9 +5332,18 @@ mod tests {
         ))
         .clone();
         let (messenger, _router) = wake_walk_messenger(std::slice::from_ref(&channel)).await;
-        // Owed to a subscriber this channel no longer names: what dropping a
-        // component's input binding leaves behind.
+        // A position held by a subscriber this channel no longer names: what
+        // dropping a component's input binding leaves behind.
         let ghost = ParticipantId::for_wasm("ghost");
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "ghost",
+                &ghost,
+                Depth::Bounded(4),
+                store::Priming::Head,
+            )
+            .await;
         crate::messaging::testutils::insert_wasm_push(
             &messenger,
             &channel,
@@ -5335,10 +5377,20 @@ mod tests {
         ))
         .clone();
         let (messenger, _router) = wake_walk_messenger(std::slice::from_ref(&channel)).await;
+        let conversation = ParticipantId::for_conversation(7);
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "waker",
+                &conversation,
+                Depth::Bounded(4),
+                store::Priming::Head,
+            )
+            .await;
         crate::messaging::testutils::insert_wasm_push(
             &messenger,
             &channel,
-            &ParticipantId::for_conversation(7),
+            &conversation,
             "owed",
             ChannelScheme::Brenn,
         )
@@ -5782,7 +5834,12 @@ mod tests {
             router.clone() as Arc<dyn WakeRouter>,
             config::MessagingGlobalConfig::default(),
         );
-        (messenger, entry, ParticipantId::for_wasm(slug), router)
+        let wasm_sub = ParticipantId::for_wasm(slug);
+        crate::messaging::testutils::attach_wasm_port(
+            &messenger, &entry, slug, &wasm_sub, push_depth,
+        )
+        .await;
+        (messenger, entry, wasm_sub, router)
     }
 
     /// The durable twin of `ring_overflow_enactment`: three owed messages on a
@@ -6185,7 +6242,17 @@ mod tests {
                 .await;
         }
 
-        // Durable port: one pending row → the activation trigger.
+        // Durable port: attached at head, then one publish → the activation
+        // trigger.
+        messenger
+            .attach_subscriber(
+                &durable.address,
+                "mixed",
+                &wasm_sub,
+                Depth::Bounded(4),
+                store::Priming::Head,
+            )
+            .await;
         let (_pid, dmid) = super::testutils::insert_wasm_push(
             &messenger,
             &durable,

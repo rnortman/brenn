@@ -28,8 +28,8 @@ pub use budget::{
 
 mod bootstrap;
 pub use bootstrap::{
-    load_channels_by_uuids, load_subscription_keys, mirror_dynamic_subscriptions,
-    prune_dropped_dynamic_subscriptions, rebuild_subscriptions, upsert_channels,
+    load_channels_by_uuids, mirror_dynamic_subscriptions, prune_dropped_dynamic_subscriptions,
+    rebuild_subscriptions, upsert_channels,
 };
 
 mod dynamic;
@@ -56,24 +56,31 @@ pub use ingress::{
 };
 
 mod bus;
-#[cfg(test)]
-pub(crate) use bus::LOAD_ALL_DISPATCHABLE_PUSHES_SQL;
 pub use bus::{
     ChannelPushRow, EditFieldsApplied, EditUpdateResult, InsertedMessage, MessageLookup,
     PendingPushInsert, ReleasedPushRow, TentativePushRow, bus_gc_evict_channel,
-    bus_gc_retire_pushes, cancel_pending_pushes_for_message, channel_deliverable_subscribers,
-    channel_has_deliverable_for, channel_last_retained_seq, channel_resume_epoch,
-    channel_retained_count_after_seq, claim_pending_pushes, confirm_pending_pushes,
-    delete_pending_push_by_id, delete_pushes_for_subscriber, earliest_pending_deadline,
-    insert_message_with_pushes, insert_message_with_pushes_in_tx, list_pending_messages_for_sender,
+    bus_gc_retire_pushes, cancel_pending_pushes_for_message, channel_last_retained_seq,
+    channel_resume_epoch, channel_retained_count_after_seq, channel_retention_frontier,
+    claim_pending_pushes, confirm_pending_pushes, delete_pending_push_by_id,
+    delete_pushes_for_subscriber, earliest_pending_deadline, insert_message_with_pushes,
+    insert_message_with_pushes_in_tx, list_pending_messages_for_sender,
     load_all_dispatchable_pushes, load_channel_messages_after_seq, load_channel_retained_tail,
     load_channel_retained_window_seq, load_confirm_pending_pushes, load_envelope_by_uuid,
     load_pending_pushes_for_channel, load_push_window, load_pushes_by_ids,
     load_released_push_window_rows, lookup_message_for_authorship, mark_pending_pushes_delivered,
-    min_owed_retained_seq, owed_push_positions, pending_push_exists,
-    pending_pushes_outside_channels, seed_pending_pushes_for_messages, stamp_confirm_pending,
+    owed_push_positions, pending_push_exists, pending_pushes_outside_channels,
+    retained_tail_floor_seq, seed_pending_pushes_for_messages, stamp_confirm_pending,
     unclaim_confirm_pending_pushes, unclaim_pending_pushes, update_message_and_pending_pushes,
     withdraw_parked_message,
+};
+#[cfg(test)]
+pub(crate) use bus::{LOAD_ALL_DISPATCHABLE_PUSHES_SQL, channel_has_deliverable_for};
+
+mod cursors;
+pub use cursors::{
+    SubscriberCursorRow, cursor_has_deliverable, delete_subscriber_cursor,
+    deliverable_cursor_subscribers, ensure_subscriber_cursor, load_subscriber_cursor,
+    retune_subscriber_cursor_depth, set_subscriber_cursor_position,
 };
 
 mod deferral;

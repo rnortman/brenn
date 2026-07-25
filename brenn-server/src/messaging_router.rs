@@ -1583,6 +1583,9 @@ mod tests {
         );
 
         let wasm_sub = ParticipantId::for_wasm(slug);
+        // The walk wakes positions that trail retention, so the consumer holds
+        // one — attached at head, before the message below.
+        testutils::attach_wasm_port(&messenger, &entry, slug, &wasm_sub, Depth::Unbounded).await;
 
         // Insert a message + a single Immediate pending-push row targeting the
         // Wasm subscriber, then drive the real publish dispatch path.

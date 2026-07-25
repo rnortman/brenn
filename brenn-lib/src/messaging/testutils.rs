@@ -218,7 +218,8 @@ pub fn local_channel_entry(name: &str, retain_depth: u64) -> ChannelEntry {
 }
 
 /// Build an in-memory `Messenger` with a single WASM-subscriber channel, using a
-/// noop wake router.
+/// noop wake router. The subscriber is attached at head, so every message a test
+/// publishes afterwards is unseen to it.
 ///
 /// Returns `(messenger, channel_entry, wasm_subscriber_id)`.
 ///
@@ -246,7 +247,36 @@ pub async fn build_wasm_messenger(
         MessagingGlobalConfig::default(),
     );
     let wasm_sub = ParticipantId::for_wasm(slug);
+    attach_wasm_port(&messenger, &entry, slug, &wasm_sub, push_depth).await;
     (messenger, entry, wasm_sub)
+}
+
+/// Give a WASM subscriber its position on `entry`, primed at head — what a real
+/// boot does before any message reaches the port. A sampled port is never
+/// delivered to and holds none.
+///
+/// The stored depth is a cache the window read retunes from its own argument, so
+/// a test that reads at a different depth than it attached at gets the depth it
+/// asked for.
+pub async fn attach_wasm_port(
+    messenger: &Messenger,
+    entry: &ChannelEntry,
+    slug: &str,
+    subscriber: &ParticipantId,
+    push_depth: Depth,
+) {
+    if !push_depth.is_push_enabled() {
+        return;
+    }
+    messenger
+        .attach_subscriber(
+            &entry.address,
+            slug,
+            subscriber,
+            push_depth,
+            crate::messaging::store::Priming::Head,
+        )
+        .await;
 }
 
 /// Terse wrapper around [`build_wasm_messenger`] for the common `Unbounded`/`Unbounded` case.

@@ -218,6 +218,7 @@ async fn build_pipeline() -> Pipeline {
         wake_min: None,
     });
 
+    let inbox_ch = inbox.clone();
     let mut all_entries = vec![
         forgejo_wh.clone(),
         github_wh.clone(),
@@ -283,6 +284,16 @@ async fn build_pipeline() -> Pipeline {
 
     // --- Parser guest: two forge input ports → push-events output. ---
     let parser_sub = ParticipantId::for_wasm(PARSER_SLUG);
+    super::attach_input_ports(
+        &messenger,
+        PARSER_SLUG,
+        &parser_sub,
+        &[
+            (&forgejo_wh, Depth::Unbounded),
+            (&github_wh, Depth::Unbounded),
+        ],
+    )
+    .await;
     let (parser_alert, _parser_alert_handle) = noop_alert_dispatcher();
     let mut parser_amp = HashMap::new();
     parser_amp.insert("forgejo".to_string(), 1000u64);
@@ -346,6 +357,13 @@ async fn build_pipeline() -> Pipeline {
 
     // --- Consumer guest: push-events + tool-results inbox → outcomes output. ---
     let consumer_sub = ParticipantId::for_wasm(CONSUMER_SLUG);
+    super::attach_input_ports(
+        &messenger,
+        CONSUMER_SLUG,
+        &consumer_sub,
+        &[(&sync_ch, Depth::Unbounded), (&inbox_ch, Depth::Unbounded)],
+    )
+    .await;
     let (consumer_alert, _consumer_alert_handle) = noop_alert_dispatcher();
     let mut tool_grants: BTreeMap<String, ResolvedToolGrant> = BTreeMap::new();
     tool_grants.insert(

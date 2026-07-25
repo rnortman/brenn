@@ -602,22 +602,31 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     fn metered_drops(&self, subscriber: &ParticipantId) -> u64;
 
     /// Register `subscriber`'s delivery state on this channel, or retune an
-    /// existing one's push depth. Priming seeds owed messages only when the
-    /// queue comes into existence; a re-registration keeps its position and
-    /// returns [`Attached::Existing`].
+    /// existing one's push depth. Priming positions the queue only when it comes
+    /// into existence; a re-registration keeps its position and returns
+    /// [`Attached::Existing`].
     ///
-    /// `fresh_queue`: caller's assertion that this queue did not survive a
-    /// restart. Implementations that track their own cursors may ignore it.
+    /// Created versus Existing is the store's own determination, made from
+    /// whether it already holds a position for this subscriber. No caller
+    /// asserts it: a durable queue survives restarts and a ring one does not,
+    /// and each store knows which of its queues are which.
     ///
-    /// `app_slug`: the subscriber's application name, used by stores that
-    /// record per-target push rows.
+    /// A sampled (`push_depth = 0`) attach creates no queue — there is nothing
+    /// to deliver to and nothing to prime — and removes any position the
+    /// subscriber held before the demotion.
+    ///
+    /// `app_slug`: the subscriber's application name, cached by stores that
+    /// must attribute a lagging position without a second lookup.
+    ///
+    /// `push_depth` is a [`Depth`] because a system subscriber attaches
+    /// unbounded, and a store that caches the depth must record that as what it
+    /// is rather than as a fabricated bound.
     async fn attach(
         &self,
         subscriber: &ParticipantId,
         app_slug: &str,
-        push_depth: u64,
+        push_depth: Depth,
         priming: Priming,
-        fresh_queue: bool,
     ) -> Attached;
 
     /// Tear down `subscriber`'s delivery state on this channel — the inverse of

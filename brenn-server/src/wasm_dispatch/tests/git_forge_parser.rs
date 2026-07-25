@@ -120,6 +120,16 @@ async fn build_parser_setup(
     .with_subscriber_registrations(brenn_lib::messaging::testutils::wasm_registrations(
         wasm_policies_from_entries(&all_entries),
     ));
+    super::attach_input_ports(
+        &messenger,
+        slug,
+        &wasm_sub,
+        &[
+            (&forgejo_entry, Depth::Unbounded),
+            (&github_entry, Depth::Unbounded),
+        ],
+    )
+    .await;
 
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
     let store_db = tempfile::NamedTempFile::new().unwrap();
