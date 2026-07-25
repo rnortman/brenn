@@ -177,6 +177,22 @@ const MULTIPORT_WASM: &str = concat!(
     "/../brenn-wasm/target/components/brenn_processor_multiport.wasm"
 );
 
+/// Give `sub` its position on every channel it reads, primed at head — what boot
+/// does before any message reaches the component. A port's delivery state is a
+/// cursor, so one that was never attached is a wiring error rather than an idle
+/// port.
+pub(super) async fn attach_input_ports(
+    messenger: &brenn_lib::messaging::Messenger,
+    slug: &str,
+    sub: &ParticipantId,
+    ports: &[(&ChannelEntry, Depth)],
+) {
+    for (entry, push_depth) in ports {
+        brenn_lib::messaging::testutils::attach_wasm_port(messenger, entry, slug, sub, *push_depth)
+            .await;
+    }
+}
+
 /// Build a `WasmConsumerConfig` using the demo WASM and a noop alerter.
 /// Returns the config, the alert join handle, and the store tempfile — the
 /// caller must keep the tempfile alive (bind to `_db`) for the component's lifetime.
@@ -276,6 +292,11 @@ pub(super) async fn build_multi_channel_setup(
         wasm_policies_from_entries(&entries),
     ));
     let arc_entries: Vec<Arc<ChannelEntry>> = entries.into_iter().map(Arc::new).collect();
+    let ports: Vec<(&ChannelEntry, Depth)> = arc_entries
+        .iter()
+        .map(|e| (e.as_ref(), Depth::Unbounded))
+        .collect();
+    attach_input_ports(&messenger, slug, &wasm_sub, &ports).await;
 
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
     let store_db = tempfile::NamedTempFile::new().unwrap();
@@ -425,6 +446,12 @@ pub(super) async fn build_multiport_setup_with_depths(
         .map(|e| Arc::new(e.clone()))
         .collect();
     let out_entry = Arc::new(out_entry_raw);
+    let ports: Vec<(&ChannelEntry, Depth)> = in_entries
+        .iter()
+        .zip(input_ports)
+        .map(|(e, (_, push_depth, _))| (e.as_ref(), *push_depth))
+        .collect();
+    attach_input_ports(&messenger, slug, &wasm_sub, &ports).await;
 
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
     let store_db = tempfile::NamedTempFile::new().unwrap();
@@ -625,6 +652,22 @@ pub(super) async fn build_two_channel_setup(
     .with_subscriber_registrations(brenn_lib::messaging::testutils::wasm_registrations(
         wasm_policies_from_entries(&[(*in_entry).clone(), (*out_entry).clone()]),
     ));
+    attach_input_ports(
+        &messenger,
+        slug,
+        &wasm_sub,
+        &[(in_entry.as_ref(), Depth::Unbounded)],
+    )
+    .await;
+    // The downstream reader is a component too: it holds a position on the
+    // output channel.
+    attach_input_ports(
+        &messenger,
+        second_sub_slug,
+        &out_sub,
+        &[(out_entry.as_ref(), Depth::Unbounded)],
+    )
+    .await;
 
     // Build the ProcessorComponent with the "out" port bound.
     let mut output_ports = std::collections::HashMap::new();

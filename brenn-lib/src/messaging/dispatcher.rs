@@ -1944,6 +1944,18 @@ mod tests {
             .collect(),
         ));
 
+        // The walk wakes positions that trail retention, so the component holds
+        // one — attached at head, before the release assigns its seq.
+        messenger
+            .attach_subscriber(
+                &canonical_address("wasm-deliver-after-ch"),
+                wasm_slug,
+                &crate::messaging::ParticipantId::for_wasm(wasm_slug),
+                crate::messaging::config::Depth::Bounded(4),
+                crate::messaging::store::Priming::Head,
+            )
+            .await;
+
         let n = run_deliver_after_pass(&db, &router, &messenger).await;
 
         assert_eq!(

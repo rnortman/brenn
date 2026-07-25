@@ -22,7 +22,9 @@ use brenn_queue::{GapReason, ReplayDecision};
 use crate::db::init_db_memory;
 use crate::messaging::ParticipantId;
 use crate::messaging::config::{Depth, Sink};
-use crate::messaging::db::{bus_gc_evict_channel, upsert_channels, utc_to_ns};
+use crate::messaging::db::{
+    bus_gc_evict_channel, load_subscriber_cursor, upsert_channels, utc_to_ns,
+};
 use crate::messaging::store::{
     AdvanceOutcome, Attached, DbStore, DeferralOutcome, MessageSeq, NewMessage, OverflowEvent,
     Priming, PushRetireParams, ResumeCursor, RetentionStore, RingStore, StoreReplay,
@@ -35,6 +37,8 @@ use crate::messaging::{
 
 /// Retain depth every case uses unless it is testing the cap itself.
 const DEPTH: u64 = 8;
+
+const ATTACH_DEPTH: Depth = Depth::Bounded(DEPTH);
 
 /// Build both stores for one channel at `retain_depth`, so a case body runs
 /// twice without knowing which it holds.
@@ -735,7 +739,7 @@ async fn attach_with_retained_priming_seeds_the_tail_as_owed() {
         }
         let sub = wasm_sub("proc");
         let attached = store
-            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
             .await;
         assert_eq!(attached, Attached::Created, "{}", store.address());
         assert!(store.has_deliverable(&sub).await, "{}", store.address());
@@ -758,33 +762,301 @@ async fn attach_with_head_priming_owes_nothing() {
             store.append(msg).await;
         }
         let sub = wasm_sub("proc");
-        let attached = store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
+        let attached = store
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+            .await;
         assert_eq!(attached, Attached::Created, "{}", store.address());
         assert!(!store.has_deliverable(&sub).await, "{}", store.address());
     }
 }
 
-/// The durable store honors `fresh_queue = false` — a surviving queue keeps
-/// its pending rows and is not re-primed.
+/// A durable queue survives the restart, and the cursor row is what says so: an
+/// attach that finds one is `Existing` and re-primes nothing, however retained
+/// the priming asks for. The subscriber below caught up before the "restart",
+/// so it stays caught up.
 #[tokio::test]
 async fn durable_attach_does_not_reprime_a_surviving_queue() {
     let (store, _db) = durable_store(DEPTH).await;
+    let sub = wasm_sub("proc");
+    RetentionStore::attach(&store, &sub, "proc", ATTACH_DEPTH, Priming::Retained).await;
     for body in ["a", "b"] {
         store.append(message("alice", body)).await;
     }
-    let sub = wasm_sub("proc");
+    serve(&store, &sub, DEPTH, 0).await;
+
     let attached =
-        RetentionStore::attach(&store, &sub, "proc", DEPTH, Priming::Retained, false).await;
+        RetentionStore::attach(&store, &sub, "proc", ATTACH_DEPTH, Priming::Retained).await;
     assert_eq!(attached, Attached::Existing);
     assert!(!store.has_deliverable(&sub).await);
 }
 
+/// Priming positions the new cursor, and the depth it primes at decides how far
+/// back the retained case reaches: two messages for a depth of two, and the
+/// whole retained set for an unbounded one — the system-subscriber shape, where
+/// a bound quietly taken as one would start the queue's life having skipped its
+/// backlog.
+#[tokio::test]
+async fn durable_attach_creates_a_cursor_at_the_primed_position() {
+    for (priming, depth, expected) in [
+        (Priming::Head, Depth::Bounded(2), 4),
+        (Priming::Retained, Depth::Bounded(2), 2),
+        (Priming::Retained, Depth::Unbounded, 1),
+    ] {
+        let (store, db) = durable_store(DEPTH).await;
+        for body in ["a", "b", "c"] {
+            store.append(message("alice", body)).await;
+        }
+        let sub = wasm_sub("proc");
+        RetentionStore::attach(&store, &sub, "proc", depth, priming).await;
+
+        let conn = db.lock().await;
+        let row = load_subscriber_cursor(&conn, store.channel_uuid(), &sub).expect("cursor row");
+        assert_eq!(row.next_owed_seq, expected, "{priming:?} at {depth:?}");
+        assert_eq!(row.app_slug, "proc");
+        assert_eq!(row.push_depth, depth);
+    }
+}
+
+/// Two subscribers of different kinds sharing one app slug hold two positions.
+/// The cursor is keyed by the kind-prefixed participant, not by the
+/// `(channel, app_slug)` pair the rest of the messaging schema keys on, so a
+/// component and an app that happen to be named the same neither inherit each
+/// other's position nor move it.
+#[tokio::test]
+async fn subscribers_of_different_kinds_sharing_a_slug_hold_independent_cursors() {
+    let (store, db) = durable_store(DEPTH).await;
+    for body in ["a", "b", "c"] {
+        store.append(message("alice", body)).await;
+    }
+    let component = wasm_sub("proc");
+    let conversation = ParticipantId::for_conversation(7);
+
+    RetentionStore::attach(
+        &store,
+        &component,
+        "proc",
+        Depth::Bounded(2),
+        Priming::Retained,
+    )
+    .await;
+    let attached =
+        RetentionStore::attach(&store, &conversation, "proc", ATTACH_DEPTH, Priming::Head).await;
+    assert_eq!(
+        attached,
+        Attached::Created,
+        "the component's position is not the conversation's"
+    );
+
+    {
+        let conn = db.lock().await;
+        let channel = store.channel_uuid();
+        assert_eq!(
+            load_subscriber_cursor(&conn, channel, &component)
+                .expect("component cursor")
+                .next_owed_seq,
+            2,
+            "primed over the retained tail at its own depth"
+        );
+        assert_eq!(
+            load_subscriber_cursor(&conn, channel, &conversation)
+                .expect("conversation cursor")
+                .next_owed_seq,
+            4,
+            "primed at head"
+        );
+    }
+
+    let (new, _) = serve(&store, &component, DEPTH, 0).await;
+    assert_eq!(new, vec!["b", "c"]);
+
+    let conn = db.lock().await;
+    assert_eq!(
+        load_subscriber_cursor(&conn, store.channel_uuid(), &conversation)
+            .expect("conversation cursor")
+            .next_owed_seq,
+        4,
+        "the component's advance moved only the component"
+    );
+}
+
+/// An unbounded attach caches unbounded. Collapsing it to a count would put a
+/// bound nobody asked for in the row, and eviction reporting reads that cache in
+/// exactly the window between attach and first read where nothing has retuned it
+/// yet.
+#[tokio::test]
+async fn a_durable_unbounded_attach_caches_unbounded() {
+    let (store, db) = durable_store(DEPTH).await;
+    let sub = wasm_sub("proc");
+    RetentionStore::attach(&store, &sub, "proc", Depth::Unbounded, Priming::Head).await;
+
+    let conn = db.lock().await;
+    let row = load_subscriber_cursor(&conn, store.channel_uuid(), &sub).expect("cursor row");
+    assert_eq!(row.push_depth, Depth::Unbounded);
+}
+
+#[tokio::test]
+async fn durable_reattach_keeps_the_position_and_detach_removes_it() {
+    let (store, db) = durable_store(DEPTH).await;
+    for body in ["a", "b", "c"] {
+        store.append(message("alice", body)).await;
+    }
+    let sub = wasm_sub("proc");
+    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(1), Priming::Retained).await;
+    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(4), Priming::Head).await;
+    {
+        let conn = db.lock().await;
+        let row = load_subscriber_cursor(&conn, store.channel_uuid(), &sub).expect("cursor row");
+        assert_eq!(row.next_owed_seq, 3, "the position it already held");
+        assert_eq!(row.push_depth, Depth::Bounded(4), "the depth cache retunes");
+    }
+
+    store.detach(&sub).await;
+    let conn = db.lock().await;
+    assert!(load_subscriber_cursor(&conn, store.channel_uuid(), &sub).is_none());
+}
+
+/// A sampled attach creates no queue on either class and takes away any the
+/// subscriber held before the demotion, so a caller cannot tell the two stores
+/// apart by what it gets back: `Existing` — there is nothing new — and nothing
+/// deliverable, whatever the channel is carrying.
+#[tokio::test]
+async fn a_sampled_attach_creates_no_queue_on_either_class() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        for body in ["a", "b"] {
+            let msg = message_for(store.as_ref(), "alice", body);
+            store.append(msg).await;
+        }
+
+        let attached = store
+            .attach(&sub, "proc", Depth::Bounded(0), Priming::Retained)
+            .await;
+        assert_eq!(attached, Attached::Existing, "{}", store.address());
+        assert!(!store.has_deliverable(&sub).await, "{}", store.address());
+        assert!(
+            store.deliverable_subscribers().await.is_empty(),
+            "{}",
+            store.address()
+        );
+
+        let attached = store
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
+            .await;
+        assert_eq!(
+            attached,
+            Attached::Created,
+            "the promotion is where the queue begins: {}",
+            store.address()
+        );
+        assert!(store.has_deliverable(&sub).await, "{}", store.address());
+
+        let attached = store
+            .attach(&sub, "proc", Depth::Bounded(0), Priming::Head)
+            .await;
+        assert_eq!(attached, Attached::Existing, "{}", store.address());
+        assert!(
+            !store.has_deliverable(&sub).await,
+            "the demotion took the position with it: {}",
+            store.address()
+        );
+        assert!(
+            store.deliverable_subscribers().await.is_empty(),
+            "{}",
+            store.address()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_sampled_durable_attach_holds_no_cursor() {
+    let (store, db) = durable_store(DEPTH).await;
+    store.append(message("alice", "a")).await;
+    let sub = wasm_sub("proc");
+
+    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(0), Priming::Retained).await;
+    {
+        let conn = db.lock().await;
+        assert!(load_subscriber_cursor(&conn, store.channel_uuid(), &sub).is_none());
+    }
+
+    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(4), Priming::Head).await;
+    {
+        let conn = db.lock().await;
+        assert!(load_subscriber_cursor(&conn, store.channel_uuid(), &sub).is_some());
+    }
+
+    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(0), Priming::Head).await;
+    let conn = db.lock().await;
+    assert!(
+        load_subscriber_cursor(&conn, store.channel_uuid(), &sub).is_none(),
+        "the demotion removes the position"
+    );
+}
+
+/// The window read is where the caller's depth reaches the store: the row's
+/// copy follows the argument, so the next read of the same cursor cannot cut a
+/// window at a depth nobody asked for.
+#[tokio::test]
+async fn a_durable_window_retunes_the_stored_depth() {
+    let (store, db) = durable_store(DEPTH).await;
+    let sub = wasm_sub("proc");
+    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(2), Priming::Head).await;
+
+    RetentionStore::window(&store, &sub, Depth::Bounded(5), Depth::Bounded(0)).await;
+
+    let conn = db.lock().await;
+    let row = load_subscriber_cursor(&conn, store.channel_uuid(), &sub).expect("cursor row");
+    assert_eq!(row.push_depth, Depth::Bounded(5));
+    assert_eq!(row.next_owed_seq, 1, "a read moves nothing");
+}
+
+/// A position retention has outrun owes nothing that can still be served, so it
+/// wakes nobody. Reading the wake question off the channel's high-water instead
+/// of its retained rows would keep naming this subscriber on every tick, with
+/// no window able to satisfy the wake it caused.
+///
+/// Durable-only: the ring answers the same question from an empty ring, which
+/// its own cursor tests pin.
+#[tokio::test]
+async fn a_position_below_an_emptied_retention_is_not_deliverable() {
+    let (store, db) = durable_store_for("proc", DEPTH).await;
+    let sub = wasm_sub("proc");
+    RetentionStore::attach(&store, &sub, "proc", ATTACH_DEPTH, Priming::Head).await;
+    store.append(message("alice", "a")).await;
+    assert!(store.has_deliverable(&sub).await);
+
+    {
+        let conn = db.lock().await;
+        let (evicted, _) = bus_gc_evict_channel(
+            &conn,
+            store.channel_uuid(),
+            store.address(),
+            ChannelScheme::Brenn,
+            0,
+            Sink::Drop,
+            None,
+        );
+        assert_eq!(evicted, 1, "the channel retains nothing now");
+    }
+
+    assert!(!store.has_deliverable(&sub).await);
+    assert!(store.deliverable_subscribers().await.is_empty());
+}
+
 #[tokio::test]
 async fn deliverable_subscribers_and_has_deliverable_agree_across_stores() {
-    let (db_store, db) = durable_store_for("proc", DEPTH).await;
+    let (db_store, _db) = durable_store_for("proc", DEPTH).await;
     let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH));
 
-    let committed = db_store.append(message("alice", "a")).await;
+    RetentionStore::attach(
+        &db_store,
+        &wasm_sub("proc"),
+        "proc",
+        Depth::Bounded(4),
+        Priming::Head,
+    )
+    .await;
+    db_store.append(message("alice", "a")).await;
     ring.attach(&wasm_sub("proc"), 4, Priming::Head);
     RetentionStore::append(&ring, message_for(&ring, "alice", "a")).await;
 
@@ -810,16 +1082,7 @@ async fn deliverable_subscribers_and_has_deliverable_agree_across_stores() {
         );
     }
 
-    {
-        let conn = db.lock().await;
-        let push_ids: Vec<i64> = committed
-            .committed
-            .target_records
-            .iter()
-            .map(|r| r.0)
-            .collect();
-        crate::messaging::db::mark_pending_pushes_delivered(&conn, &push_ids);
-    }
+    serve(&db_store, &wasm_sub("proc"), DEPTH, 0).await;
     serve(&ring, &wasm_sub("proc"), DEPTH, 0).await;
 
     for store in [
@@ -848,7 +1111,7 @@ async fn detach_tears_down_a_subscribers_delivery_state() {
         }
         let sub = wasm_sub("proc");
         store
-            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
             .await;
         assert!(store.has_deliverable(&sub).await, "{}", store.address());
 
@@ -929,7 +1192,7 @@ async fn a_window_serves_the_owed_tail_oldest_first() {
             store.append(msg).await;
         }
         store
-            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
             .await;
 
         let (new, advance) = serve(store.as_ref(), &sub, DEPTH, 0).await;
@@ -951,7 +1214,7 @@ async fn the_push_limit_serves_the_newest_and_reports_the_rest() {
             store.append(msg).await;
         }
         store
-            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
             .await;
 
         let (new, advance) = serve(store.as_ref(), &sub, 2, 0).await;
@@ -989,7 +1252,7 @@ async fn unseen_context_inside_the_window_is_not_a_drop() {
             store.append(msg).await;
         }
         store
-            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
             .await;
 
         let window = store
@@ -1025,7 +1288,7 @@ async fn a_sampled_window_is_all_context() {
             store.append(msg).await;
         }
         store
-            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
             .await;
 
         let window = store
@@ -1054,7 +1317,7 @@ async fn the_window_is_capped_by_the_larger_limit_not_their_sum() {
             store.append(msg).await;
         }
         store
-            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
             .await;
 
         let window = store
@@ -1082,7 +1345,7 @@ async fn an_unbounded_push_limit_serves_every_unseen_entry() {
             store.append(msg).await;
         }
         store
-            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
             .await;
 
         let window = store
@@ -1113,7 +1376,7 @@ async fn an_unbounded_retain_limit_widens_the_window_not_the_new_set() {
             store.append(msg).await;
         }
         store
-            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
             .await;
 
         let window = store
@@ -1149,7 +1412,7 @@ async fn a_sampled_window_offers_no_advance() {
             store.append(msg).await;
         }
         store
-            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
             .await;
 
         let window = store
@@ -1168,16 +1431,37 @@ async fn a_sampled_window_offers_no_advance() {
 }
 
 /// Advancing a sampled subscriber anyway is a wiring bug, not a tolerated
-/// no-op: the cursor-backed store dies rather than move a position the model
-/// says does not exist.
+/// no-op: a sampled attach leaves no position on either class, and the store
+/// dies rather than move one that does not exist.
 #[tokio::test]
-#[should_panic(expected = "advance over a sampled subscriber")]
+#[should_panic(expected = "has no queue for subscriber")]
 async fn advancing_a_sampled_ring_subscriber_panics() {
     let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH));
     let sub = wasm_sub("sampled");
-    ring.attach(&sub, 0, Priming::Head);
+    RetentionStore::attach(&ring, &sub, "sampled", Depth::Bounded(0), Priming::Head).await;
     RetentionStore::append(&ring, message_for(&ring, "alice", "a")).await;
     RetentionStore::advance(&ring, &sub, MessageSeq(1), MessageSeq(1)).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "to advance")]
+async fn advancing_a_sampled_durable_subscriber_panics() {
+    let (store, _db) = durable_store(DEPTH).await;
+    let sub = wasm_sub("sampled");
+    RetentionStore::attach(&store, &sub, "sampled", Depth::Bounded(0), Priming::Head).await;
+    store.append(message("alice", "a")).await;
+    RetentionStore::advance(&store, &sub, MessageSeq(1), MessageSeq(1)).await;
+}
+
+/// The same contract for a subscriber that never attached at all: with no
+/// position to move, the durable store dies rather than retire the claims below
+/// a cursor that was never there.
+#[tokio::test]
+#[should_panic(expected = "to advance")]
+async fn advancing_an_unattached_durable_subscriber_panics() {
+    let (store, _db) = durable_store(DEPTH).await;
+    store.append(message("alice", "a")).await;
+    RetentionStore::advance(&store, &wasm_sub("stranger"), MessageSeq(1), MessageSeq(1)).await;
 }
 
 /// Reading a window owed nothing is empty, not an error, and there is nothing to
@@ -1186,7 +1470,9 @@ async fn advancing_a_sampled_ring_subscriber_panics() {
 async fn an_idle_queue_serves_an_empty_window() {
     for store in stores(DEPTH).await {
         let sub = wasm_sub("proc");
-        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
+        store
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+            .await;
 
         let window = store
             .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
@@ -1202,7 +1488,9 @@ async fn an_idle_queue_serves_an_empty_window() {
 async fn a_window_read_moves_nothing() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
+        store
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+            .await;
         for body in ["a", "b", "c"] {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
@@ -1237,7 +1525,9 @@ async fn a_window_read_moves_nothing() {
 async fn nothing_deliverable_means_nothing_new_in_the_window() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
+        store
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+            .await;
 
         // Idle: attached, nothing published.
         assert!(!store.has_deliverable(&sub).await, "{}", store.address());
@@ -1284,7 +1574,9 @@ async fn nothing_deliverable_means_nothing_new_in_the_window() {
 async fn advancing_over_a_prefix_leaves_the_remainder_owed() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
+        store
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+            .await;
         for body in ["a", "b", "c"] {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
@@ -1312,7 +1604,9 @@ async fn advancing_over_a_prefix_leaves_the_remainder_owed() {
 async fn advancing_nothing_keeps_every_obligation() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
+        store
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+            .await;
         store
             .append(message_for(store.as_ref(), "alice", "a"))
             .await;
@@ -1336,7 +1630,9 @@ async fn advancing_nothing_keeps_every_obligation() {
 async fn advance_is_idempotent() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
+        store
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+            .await;
         for body in ["a", "b"] {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
@@ -1353,20 +1649,36 @@ async fn advance_is_idempotent() {
     }
 }
 
-/// The durable store has no queue registry, so a subscriber it never heard of
-/// simply holds no position and is owed nothing — it still reads the channel's
-/// ambience, which is what makes the window a channel read rather than a queue
-/// read.
+/// A sampled subscriber holds no position on either class, so its window is a
+/// pure channel read: the ambience, none of it new, whether or not the store
+/// ever heard of it.
 #[tokio::test]
-async fn a_durable_window_for_an_unknown_subscriber_is_all_context() {
+async fn a_durable_sampled_window_is_all_context() {
     let (store, _db) = durable_store_for("proc", DEPTH).await;
     store.append(message("alice", "a")).await;
     let window = store
-        .window(&wasm_sub("ghost"), Depth::Bounded(DEPTH), Depth::Bounded(0))
+        .window(&wasm_sub("ghost"), Depth::Bounded(0), Depth::Bounded(DEPTH))
         .await;
     assert!(window.new_entries().is_empty());
     assert_eq!(window_bodies(&window), vec!["a"], "the ambience is served");
     assert_eq!(window.new_from, 1, "and all of it is context");
+}
+
+/// Both classes keep an explicit position per push-enabled subscriber, so a
+/// push window over a queue that was never created is a wiring bug rather than
+/// an empty window.
+#[tokio::test]
+#[should_panic(expected = "a push-enabled window over a queue that was never created")]
+async fn a_durable_window_panics_for_an_unattached_subscriber() {
+    let (store, _db) = durable_store_for("proc", DEPTH).await;
+    store.append(message("alice", "a")).await;
+    RetentionStore::window(
+        &store,
+        &wasm_sub("ghost"),
+        Depth::Bounded(DEPTH),
+        Depth::Bounded(0),
+    )
+    .await;
 }
 
 /// The ring keeps an explicit cursor per subscriber, so reading without one is a
@@ -1415,19 +1727,22 @@ async fn ring_eviction_charges_the_drop_total_without_a_read() {
     );
 }
 
-/// The interim durable shim counts claims, not seqs, so a loss whose claim was
-/// already retired is invisible to the advance that passes it: two messages
-/// evicted out from under a lagging subscriber are reported as zero, where the
-/// ring reports two for the same history.
+/// The durable advance reports a loss whatever retired the claims that named
+/// it: the figure is the distance between the cursor and the window's own
+/// floor, so two messages evicted out from under a lagging subscriber are two
+/// drops, exactly as the ring reports for the same history.
 ///
-/// TODO(substrate-durable-cursor): with the persisted cursor the figure is
-/// `seen_floor - next_owed` and both assertions below become `2` — this case is
-/// the tripwire for that conversion, so change it deliberately or not at all.
+/// The ladder is charged nothing here, and that is the frontier bound doing its
+/// job: everything below the retention frontier was reported by the eviction
+/// that retired it, so the advance that passes it does not enact it a second
+/// time.
 #[tokio::test]
-async fn durable_advance_under_reports_a_loss_gc_already_retired() {
+async fn durable_advance_reports_a_loss_gc_already_retired() {
     let (store, db) = durable_store_for("proc", DEPTH).await;
     let sub = wasm_sub("proc");
-    store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
+    store
+        .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+        .await;
     for body in ["a", "b", "c", "d"] {
         let msg = message_for(&store, "alice", body);
         RetentionStore::append(&store, msg).await;
@@ -1453,10 +1768,61 @@ async fn durable_advance_under_reports_a_loss_gc_already_retired() {
     let (new, advance) = serve(&store, &sub, DEPTH, 0).await;
     assert_eq!(new, vec!["c", "d"], "only what survived is servable");
     assert_eq!(
-        advance.dropped, 0,
-        "the shim counts claims; the two it lost hold none"
+        advance.dropped, 2,
+        "the two seqs no window ever served it, by subtraction"
     );
-    assert_eq!(advance.noise_charge, 0, "and charges the ladder nothing");
+    assert_eq!(
+        advance.noise_charge, 0,
+        "the eviction that retired them reports them; the advance does not re-enact it"
+    );
+}
+
+/// A loss straddling the retention frontier splits between the two reporters:
+/// the part the eviction pass already reported is not charged again, and the
+/// part it never touched — unseen but still retained, clamped away by the push
+/// limit — is. Both terms of the bound are load-bearing here, because the
+/// cursor sits above the frontier rather than at it: charging from the frontier
+/// alone would re-enact what the eviction pass already escalated.
+#[tokio::test]
+async fn durable_advance_charges_only_the_still_retained_half_of_a_loss() {
+    let (store, db) = durable_store_for("proc", DEPTH).await;
+    let sub = wasm_sub("proc");
+    store
+        .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+        .await;
+
+    for body in ["a", "b"] {
+        RetentionStore::append(&store, message_for(&store, "alice", body)).await;
+    }
+    let (new, _) = serve(&store, &sub, DEPTH, 0).await;
+    assert_eq!(new, vec!["a", "b"], "the cursor is at seq 3 now");
+
+    for body in ["c", "d", "e"] {
+        RetentionStore::append(&store, message_for(&store, "alice", body)).await;
+    }
+    {
+        let conn = db.lock().await;
+        let (evicted, _) = bus_gc_evict_channel(
+            &conn,
+            store.channel_uuid(),
+            store.address(),
+            ChannelScheme::Brenn,
+            2,
+            Sink::Drop,
+            None,
+        );
+        assert_eq!(evicted, 3, "the frontier lands above the cursor, at seq 4");
+    }
+
+    // The push limit serves only the newest, so seq 4 is unseen, still
+    // retained, and never served: the advance's own charge.
+    let (new, advance) = serve(&store, &sub, 1, 0).await;
+    assert_eq!(new, vec!["e"]);
+    assert_eq!(advance.dropped, 2, "seqs 3 and 4 were never served");
+    assert_eq!(
+        advance.noise_charge, 1,
+        "seq 3 went with the eviction that reported it; only seq 4 is charged here"
+    );
 }
 
 #[tokio::test]
@@ -1493,7 +1859,7 @@ async fn a_subscriber_attached_mid_park_receives_the_message_at_release() {
         // Attaches after the park, so nothing about it was knowable then.
         let latecomer = wasm_sub("proc");
         store
-            .attach(&latecomer, "proc", DEPTH, Priming::Head, true)
+            .attach(&latecomer, "proc", ATTACH_DEPTH, Priming::Head)
             .await;
 
         store.release_due(release_at).await;
@@ -1520,6 +1886,9 @@ async fn a_subscriber_attached_mid_park_receives_the_message_at_release() {
 async fn a_claim_predating_the_park_is_replaced_at_release() {
     let (store, db) =
         durable_store_at_subscribed(Depth::Bounded(DEPTH), vec![wasm_target("proc", None)]).await;
+    store
+        .attach(&wasm_sub("proc"), "proc", ATTACH_DEPTH, Priming::Head)
+        .await;
     let departed = wasm_sub("gone");
     let params = PushRetireParams {
         app_slug: "gone",
@@ -1636,6 +2005,9 @@ async fn seed_claim(
 async fn a_released_durable_push_makes_its_target_owed() {
     let (store, _db) =
         durable_store_at_subscribed(Depth::Bounded(DEPTH), vec![wasm_target("proc", None)]).await;
+    store
+        .attach(&wasm_sub("proc"), "proc", ATTACH_DEPTH, Priming::Head)
+        .await;
     let release_at = soon();
     store
         .park(message("alice", "later"), release_at)
@@ -1661,7 +2033,7 @@ async fn a_commit_owes_the_message_to_the_channels_registered_subscribers() {
         // the directory subscriber the fixture registered. Neither is told by
         // this caller who to deliver to.
         store
-            .attach(&wasm_sub("proc"), "proc", DEPTH, Priming::Head, true)
+            .attach(&wasm_sub("proc"), "proc", ATTACH_DEPTH, Priming::Head)
             .await;
         store.append(message_for(&*store, "alice", "a")).await;
 
@@ -2474,7 +2846,9 @@ async fn metered_tally_is_written_only_by_the_substrate() {
 async fn detach_forgets_the_drop_tallies() {
     for store in stores(DEPTH).await {
         let sub = wasm_sub("leaver");
-        store.attach(&sub, "leaver", 4, Priming::Head, true).await;
+        store
+            .attach(&sub, "leaver", Depth::Bounded(4), Priming::Head)
+            .await;
         store.record_metered_drops(&sub, 7);
 
         store.detach(&sub).await;

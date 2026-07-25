@@ -1111,6 +1111,16 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
 
     let in0_arc = Arc::new(in0_entry.clone());
     let in1_arc = Arc::new(in1_entry.clone());
+    super::attach_input_ports(
+        &messenger,
+        slug,
+        &wasm_sub,
+        &[
+            (in0_arc.as_ref(), Depth::Unbounded),
+            (in1_arc.as_ref(), Depth::Unbounded),
+        ],
+    )
+    .await;
 
     let mut output_ports = std::collections::HashMap::new();
     output_ports.insert("out1".to_string(), test_out_spec(out1_addr.clone()));

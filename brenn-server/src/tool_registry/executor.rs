@@ -715,6 +715,7 @@ mod tests {
             upsert_channels(&conn, &[tools_ch.clone(), results_ch.clone()]);
         }
 
+        let results_entry = results_ch.clone();
         let directory = Arc::new(MessagingDirectory::with_entries(vec![tools_ch, results_ch]));
         let messenger = Messenger::new(
             db,
@@ -738,6 +739,16 @@ mod tests {
             .with_subscriber_registrations(brenn_lib::messaging::testutils::system_registrations(
                 system_policies,
             ));
+        // The caller reads its inbox through a position, so it holds one from
+        // before any result lands.
+        brenn_lib::messaging::testutils::attach_wasm_port(
+            &messenger,
+            &results_entry,
+            CALLER_SLUG,
+            &ParticipantId::for_wasm(CALLER_SLUG),
+            brenn_lib::messaging::config::Depth::Unbounded,
+        )
+        .await;
 
         Harness {
             messenger,

@@ -508,7 +508,12 @@ impl RingStore {
     ///
     /// Pure read: the cursor does not move and nothing is reported.
     ///
-    /// Panics for a subscriber that is not attached.
+    /// A sampled (`push_limit = 0`) read holds no position: it is served the
+    /// whole span as context, whether or not the subscriber has a cursor from
+    /// some other port, and never retunes one — writing its zero into a cursor
+    /// would leave a depth the model says the cursor cannot hold.
+    ///
+    /// Panics for a push-enabled read by a subscriber that is not attached.
     pub fn window(
         &self,
         subscriber: &ParticipantId,
@@ -517,10 +522,20 @@ impl RingStore {
     ) -> RingWindow {
         let mut state = self.state();
         let RingState { ring, cursors, .. } = &mut *state;
-        let cursor = cursors
-            .get_mut(subscriber)
-            .unwrap_or_else(|| Self::unattached(&self.address, subscriber));
-        cursor.set_push_depth(push_limit);
+        let Some(cursor) = cursors.get_mut(subscriber) else {
+            if push_limit > 0 {
+                Self::unattached(&self.address, subscriber);
+            }
+            let entries: Vec<_> = ring.tail(retain_limit).cloned().collect();
+            return RingWindow {
+                new_from: entries.len(),
+                entries,
+                push_enabled: false,
+            };
+        };
+        if push_limit > 0 {
+            cursor.set_push_depth(push_limit);
+        }
         cursor.window(ring, push_limit, retain_limit)
     }
 
@@ -873,16 +888,30 @@ impl RetentionStore for RingStore {
     }
 
     /// Cursor-tracked: the store self-determines Created vs Existing from
-    /// cursor presence; `app_slug` and `fresh_queue` are unused.
+    /// cursor presence. `app_slug` is unused — a ring cursor is reported against
+    /// under the registration the substrate resolves at the time.
+    ///
+    /// A sampled attach creates no cursor and removes any the subscriber held
+    /// before the demotion: it is never delivered to, so a position kept for it
+    /// would be one every eviction reports against and nothing can ever serve.
+    /// Its drop tallies stay — the demotion ends the queue, not the record
+    /// of what it lost.
+    ///
+    /// The depth collapses to a count here: a ring cursor holds nothing past a
+    /// restart, so an unbounded depth costs it nothing to spell as a bound no
+    /// ring can reach.
     async fn attach(
         &self,
         subscriber: &ParticipantId,
         _app_slug: &str,
-        push_depth: u64,
+        push_depth: Depth,
         priming: Priming,
-        _fresh_queue: bool,
     ) -> Attached {
-        RingStore::attach(self, subscriber, push_depth, priming)
+        if !push_depth.is_push_enabled() {
+            self.state().cursors.remove(subscriber);
+            return Attached::Existing;
+        }
+        RingStore::attach(self, subscriber, super::depth_bound(push_depth), priming)
     }
 
     async fn detach(&self, subscriber: &ParticipantId) {

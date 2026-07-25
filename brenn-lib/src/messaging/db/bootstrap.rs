@@ -13,26 +13,6 @@ use super::super::{
 use super::dynamic::DynamicSubscriptionRow;
 use uuid::Uuid;
 
-/// The `(channel_uuid, app_slug)` keys currently present in
-/// `messaging_subscriptions`. Must be called before [`rebuild_subscriptions`],
-/// which truncates the table.
-pub fn load_subscription_keys(conn: &Connection) -> std::collections::HashSet<(Uuid, String)> {
-    let mut stmt = conn
-        .prepare("SELECT channel_uuid, app_slug FROM messaging_subscriptions")
-        .expect("messaging: prepare load_subscription_keys");
-    let rows = stmt
-        .query_map([], |row| {
-            let uuid_bytes: Vec<u8> = row.get(0)?;
-            let app_slug: String = row.get(1)?;
-            Ok((
-                Uuid::from_slice(&uuid_bytes).expect("subscription channel_uuid"),
-                app_slug,
-            ))
-        })
-        .expect("messaging: query load_subscription_keys");
-    rows.map(|r| r.expect("read subscription key")).collect()
-}
-
 /// Upsert all configured channels into `messaging_channels`. UUIDs not
 /// present in config are kept (so renamed channels keep their history);
 /// operators delete obsolete channels manually if desired.

@@ -523,4 +523,15 @@ mod tests {
         let mut cursor = SubscriberCursor::at_head(&empty(8), 4);
         cursor.advance(&ring, 1, 3);
     }
+
+    /// A sampled cursor is never delivered to, so there is no position for an
+    /// advance to move. Tolerating the call would let a demoted subscriber
+    /// silently keep consuming a queue the model says it does not have.
+    #[test]
+    #[should_panic(expected = "advance over a sampled subscriber")]
+    fn advancing_a_sampled_cursor_panics() {
+        let ring = ring_of(8, &["a", "b"]);
+        let mut cursor = SubscriberCursor::at_head(&empty(8), 0);
+        cursor.advance(&ring, 2, 1);
+    }
 }

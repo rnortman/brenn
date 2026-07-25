@@ -752,14 +752,6 @@ pub(crate) async fn build_messaging(
     // Sync DB state with config: upsert channels, rebuild subscriptions, then
     // fold the durable dynamic subscriptions back into the directory.
 
-    // Snapshot the durable subscription keys before `rebuild_subscriptions`
-    // truncates the table; the durable-priming pass below reads them to tell a
-    // surviving queue from a brand-new one.
-    let prior_subscription_keys = {
-        let conn = db.lock().await;
-        messaging::db::load_subscription_keys(&conn)
-    };
-
     // `dynamic_mqtt_ingress` collects the surviving dynamic `mqtt:` subscriptions
     // whose filter has no static ingress channel, so the caller can rebuild their
     // broker SUBSCRIBE + `IngressRoute` (boot re-activation gap — see
@@ -1012,22 +1004,8 @@ pub(crate) async fn build_messaging(
     )
     .with_ring_stores(ring_stores);
 
-    // A queue is fresh iff its registration did not survive the restart. Ring
-    // registrations never survive; a durable registration survives iff its
-    // `messaging_subscriptions` row was present on the prior boot (the snapshot
-    // taken before `rebuild_subscriptions` truncated the table).
-    //
-    // TODO(substrate-priming-atomic-marker): the durable new-queue marker (the
-    // `rebuild_subscriptions` row) and the seed commit inside `attach` land in
-    // separate autocommit scopes with reachable panics between them; a crash in
-    // the window makes the next boot skip priming (silent delivery gap). Make
-    // marker + seed atomic in the durable-priming refactor.
-    //
-    // TODO(substrate-priming-kind-qualified-key): the snapshot key is kind-blind
-    // (`app_slug` is the bare slug for both App- and Wasm-kind rows), so a prior
-    // boot's App subscriber sharing this slug on this channel aliases here and
-    // suppresses priming of a genuinely new WASM queue. Key on a kind-qualified
-    // subscriber identity in the durable-priming refactor.
+    // Whether a queue is new is the store's determination, made from its own
+    // per-subscriber position.
     let mut primed_any = false;
     for c in &resolved_wasm_consumers {
         let subscriber = brenn_lib::messaging::ParticipantId::for_wasm(&c.slug);
@@ -1035,12 +1013,13 @@ pub(crate) async fn build_messaging(
             &brenn_lib::messaging::SubscriberEntryKind::Wasm(c.slug.clone()),
         );
         for inp in &c.inputs {
-            let push_depth = inp
-                .sub
-                .push_depth
-                .clamped_to(brenn_lib::messaging::WASM_WINDOW_MAX_NEW);
-            let fresh_queue = nondurable_uuids.contains(&inp.sub.channel_uuid)
-                || !prior_subscription_keys.contains(&(inp.sub.channel_uuid, c.slug.clone()));
+            // The same spelling the port's window reads at, so the depth the
+            // cursor row caches is the one the first read would retune it to.
+            let push_depth = brenn_lib::messaging::config::Depth::Bounded(
+                inp.sub
+                    .push_depth
+                    .clamped_to(brenn_lib::messaging::WASM_WINDOW_MAX_NEW),
+            );
             let attached = messenger
                 .attach_subscriber(
                     &inp.sub.channel_address,
@@ -1048,7 +1027,6 @@ pub(crate) async fn build_messaging(
                     &subscriber,
                     push_depth,
                     priming,
-                    fresh_queue,
                 )
                 .await;
             primed_any |= attached == messaging::store::Attached::Created;
