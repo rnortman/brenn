@@ -29,28 +29,22 @@ use uuid::Uuid;
 
 use brenn_envelope::{ChannelCapabilities, ChannelScheme, MessageEnvelope};
 use brenn_queue::{
-    Deferred, DeferredId, DeferredSet, NoSuchDeferred, QuotaExceeded, Replay, ReplayDecision,
-    Resume, RetainedRing, SubscriberCursor, Take,
+    Advance, Deferred, DeferredId, DeferredSet, NoSuchDeferred, QuotaExceeded, Replay,
+    ReplayDecision, Resume, RetainedRing, SubscriberCursor, retention_frontier,
 };
+
+/// One subscriber's activation view over this channel's retained ring.
+pub type RingWindow = brenn_queue::Window<Arc<MessageEnvelope>>;
 
 use crate::messaging::ParticipantId;
 use crate::messaging::config::Depth;
 use crate::messaging::db::ns_to_utc;
 use crate::messaging::store::{
-    AppendOutcome, Attached, Committed, DeferralOutcome, DeferredMessage, DropTally, MessageSeq,
-    NewMessage, OverflowEvent, Parked, Priming, ReleaseOutcome, Released, ResumeCursor,
-    RetentionStore, StoreReplay, TakenMessage, TakenWindow, TargetRecord, instant_of,
+    AdvanceOutcome, AppendOutcome, Attached, Committed, DeferralOutcome, DeferredMessage,
+    DropTally, MessageSeq, NewMessage, OverflowEvent, Parked, Priming, ReleaseOutcome, Released,
+    ResumeCursor, RetentionStore, StoreReplay, SubscriberWindow, depth_bound, instant_of,
     release_time_of,
 };
-
-/// A ring position as the record naming one subscriber's copy of the message
-/// sitting there.
-///
-/// The ring keeps no per-subscriber rows, so the position *is* the handle: a
-/// consumer settles by naming how far it got, and the cursor moves there.
-fn position_record(seq: u64) -> TargetRecord {
-    TargetRecord(i64::try_from(seq).expect("messaging store: ring position out of range"))
-}
 
 /// Maximum retained-ring depth accepted at construction.
 ///
@@ -117,26 +111,29 @@ struct RingState {
 }
 
 impl RingState {
-    /// Append into the ring and charge every attached cursor whose owed
-    /// messages the append pushed out of the window.
+    /// Append into the ring and report every attached cursor the append pushed
+    /// retention past.
     ///
-    /// Accounting the eviction here, under the same lock that performed it, is
+    /// Reporting the eviction here, under the same lock that performed it, is
     /// what makes a drop attributable the moment it happens: a subscriber that
-    /// never runs — wedged, starved, or simply idle — is still charged, and the
-    /// noise ladder escalates against it without waiting for a take that may
-    /// never come.
-    fn append_charging_evictions(
+    /// never runs — wedged, starved, or simply idle — is still reported against,
+    /// and the noise ladder escalates without waiting for a read that may never
+    /// come. Each append reports only the span it itself evicted, so a wedged
+    /// subscriber's loss is never counted twice; the cursors do not move, since
+    /// a cursor left below the frontier *is* the record of what it lost.
+    fn append_reporting_evictions(
         &mut self,
         message: Arc<MessageEnvelope>,
     ) -> (u64, Vec<OverflowEvent>) {
         let RingState { ring, cursors, .. } = self;
+        let frontier = retention_frontier(ring);
         let appended = ring.append(message);
         if appended.evicted == 0 {
             return (appended.seq, Vec::new());
         }
         let mut overflow = Vec::new();
-        for (subscriber, cursor) in cursors.iter_mut() {
-            let dropped = cursor.charge_evicted(ring);
+        for (subscriber, cursor) in cursors.iter() {
+            let dropped = cursor.evicted_since(ring, frontier);
             if dropped > 0 {
                 overflow.push(OverflowEvent {
                     subscriber: subscriber.clone(),
@@ -174,9 +171,14 @@ pub struct RingStore {
     /// either way, transportable only for `ephemeral:`.
     capabilities: ChannelCapabilities,
     /// Drops the noise ladder counted for each subscriber, written by the
-    /// substrate's enactment point. The raw per-subscriber drop total lives on
-    /// the cursor, which is where the drop is accounted.
+    /// substrate's enactment point.
     metered: DropTally,
+    /// TODO(substrate-ring-drop-total): raw per-subscriber drops, accumulated
+    /// from the eviction reports and the advance charges, for the lifetime
+    /// total the trait still exposes. The model stores no drop counters — every
+    /// figure is a seq subtraction — so this dies with `dropped_total` when the
+    /// trait converts to window/advance.
+    dropped: DropTally,
     /// Live fan-out to consumers that read this channel as a stream. `None` on
     /// a confined channel: it never leaves the process, so no receiver is ever
     /// issued for it and none can be.
@@ -275,6 +277,7 @@ impl RingStore {
             address,
             capabilities,
             metered: DropTally::default(),
+            dropped: DropTally::default(),
             live,
             fan_out_gate: Mutex::new(()),
             publishes: AtomicU64::new(0),
@@ -394,7 +397,8 @@ impl RingStore {
         let _gate = self.fan_out_gate();
         let (seq, overflow) = self
             .state()
-            .append_charging_evictions(Arc::clone(&envelope));
+            .append_reporting_evictions(Arc::clone(&envelope));
+        self.tally_dropped(&overflow);
         let retained = RetainedMessage { seq, envelope };
         self.announce(&retained);
         Appended { retained, overflow }
@@ -461,6 +465,7 @@ impl RingStore {
     /// owed them.
     pub fn detach(&self, subscriber: &ParticipantId) {
         self.metered.forget(subscriber);
+        self.dropped.forget(subscriber);
         self.state().cursors.remove(subscriber);
     }
 
@@ -496,30 +501,57 @@ impl RingStore {
         self.cursor(&state, subscriber).has_deliverable(&state.ring)
     }
 
-    /// Take up to this subscriber's push depth of owed messages, oldest first,
-    /// and report how many owed messages were retired undelivered since its
-    /// previous take.
+    /// This subscriber's activation view: the most recent
+    /// `max(push_limit, retain_limit)` retained messages, with the boundary
+    /// where its unseen ones begin. `push_limit` retunes the cursor's stored
+    /// depth first, so the window the caller asked for is the window it gets.
     ///
-    /// The drop count is the noise ladder's input, and it is per subscriber
-    /// precisely so an escalation names the party that fell behind.
+    /// Pure read: the cursor does not move and nothing is reported.
     ///
     /// Panics for a subscriber that is not attached.
-    pub fn take(&self, subscriber: &ParticipantId) -> Take<Arc<MessageEnvelope>> {
+    pub fn window(
+        &self,
+        subscriber: &ParticipantId,
+        push_limit: u64,
+        retain_limit: u64,
+    ) -> RingWindow {
         let mut state = self.state();
         let RingState { ring, cursors, .. } = &mut *state;
-        cursors
+        let cursor = cursors
             .get_mut(subscriber)
-            .unwrap_or_else(|| Self::unattached(&self.address, subscriber))
-            .take(ring)
+            .unwrap_or_else(|| Self::unattached(&self.address, subscriber));
+        cursor.set_push_depth(push_limit);
+        cursor.window(ring, push_limit, retain_limit)
     }
 
-    /// Lifetime drop count for one subscriber, including drops a take has not
-    /// yet reported.
+    /// Move this subscriber's cursor to `through + 1` and report the unseen
+    /// seqs no window ever served it — `seen_floor` being the oldest seq the
+    /// window it is advancing over carried.
     ///
     /// Panics for a subscriber that is not attached.
+    pub fn advance(&self, subscriber: &ParticipantId, through: u64, seen_floor: u64) -> Advance {
+        let mut state = self.state();
+        let RingState { ring, cursors, .. } = &mut *state;
+        let advance = cursors
+            .get_mut(subscriber)
+            .unwrap_or_else(|| Self::unattached(&self.address, subscriber))
+            .advance(ring, through, seen_floor);
+        drop(state);
+        self.dropped.add(subscriber, advance.noise_charge);
+        advance
+    }
+
+    /// Lifetime drop count for one subscriber: every loss reported against it,
+    /// by eviction or by an advance passing seqs no window served.
     pub fn dropped_total(&self, subscriber: &ParticipantId) -> u64 {
-        let state = self.state();
-        self.cursor(&state, subscriber).dropped_total()
+        self.dropped.get(subscriber)
+    }
+
+    /// Accumulate reported drops into the lifetime tally.
+    fn tally_dropped(&self, overflow: &[OverflowEvent]) {
+        for event in overflow {
+            self.dropped.add(&event.subscriber, event.dropped);
+        }
     }
 
     fn cursor<'a>(&self, state: &'a RingState, subscriber: &ParticipantId) -> &'a SubscriberCursor {
@@ -588,11 +620,12 @@ impl RingStore {
         let mut overflow: Vec<OverflowEvent> = Vec::new();
         for entry in due {
             let envelope = Arc::clone(&entry.message);
-            let (seq, evicted) = state.append_charging_evictions(entry.message);
+            let (seq, evicted) = state.append_reporting_evictions(entry.message);
             messages.push(RetainedMessage { seq, envelope });
             merge_overflow(&mut overflow, evicted);
         }
         drop(state);
+        self.tally_dropped(&overflow);
         for retained in &messages {
             self.announce(retained);
         }
@@ -782,116 +815,53 @@ impl RetentionStore for RingStore {
             .is_some_and(|cursor| cursor.has_deliverable(&state.ring))
     }
 
-    /// The cursor is the ack: what this hands over, the subscriber has had, and
-    /// the messages carry no record to settle later. `limit` retunes the
-    /// cursor's push depth first, so the window the caller asked for is the
-    /// window the cursor cuts — and the drops the cut charges are charged
-    /// against that same depth.
+    /// The cursor's own view, repacked to the trait's shape. `push_limit`
+    /// retunes the cursor's stored depth first, so the window the caller asked
+    /// for is the window the cursor cuts.
     ///
     /// Panics for a subscriber with no cursor on this channel.
-    async fn take_new(&self, subscriber: &ParticipantId, limit: u64) -> TakenWindow {
-        let mut state = self.state();
-        let RingState { ring, cursors, .. } = &mut *state;
-        let cursor = cursors
-            .get_mut(subscriber)
-            .unwrap_or_else(|| Self::unattached(&self.address, subscriber));
-        cursor.set_push_depth(limit);
-        if limit == 0 {
-            // A sampled subscriber takes nothing, and a zero-depth take would
-            // charge everything it is owed as dropped.
-            return TakenWindow {
-                messages: vec![],
-                dropped: 0,
-                dropped_total: cursor.dropped_total(),
-                clamped_leftover: 0,
-            };
-        }
-        let take = cursor.take(ring);
-        TakenWindow {
-            messages: take
-                .messages
+    async fn window(
+        &self,
+        subscriber: &ParticipantId,
+        push_limit: Depth,
+        retain_limit: Depth,
+    ) -> SubscriberWindow {
+        let window = RingStore::window(
+            self,
+            subscriber,
+            depth_bound(push_limit),
+            depth_bound(retain_limit),
+        );
+        SubscriberWindow {
+            new_from: window.new_from,
+            push_enabled: window.push_enabled,
+            entries: window
+                .entries
                 .into_iter()
-                .map(|envelope| TakenMessage {
-                    record: None,
-                    envelope,
-                })
+                .map(|entry| (MessageSeq(entry.seq), entry.message))
                 .collect(),
-            dropped: take.dropped,
-            dropped_total: cursor.dropped_total(),
-            clamped_leftover: usize::from(cursor.has_deliverable(ring)),
         }
     }
 
-    /// The cursor stays where it is: each message carries its ring position as
-    /// its record, and only [`RingStore::settle`] moves the cursor past what
-    /// the consumer accepted. `limit` retunes the cursor's push depth first,
-    /// exactly as a take does, so the window read is the window a settle
-    /// accounts against.
-    ///
     /// Panics for a subscriber with no cursor on this channel.
-    async fn peek_new(&self, subscriber: &ParticipantId, limit: u64) -> TakenWindow {
-        let mut state = self.state();
-        let RingState { ring, cursors, .. } = &mut *state;
-        let cursor = cursors
-            .get_mut(subscriber)
-            .unwrap_or_else(|| Self::unattached(&self.address, subscriber));
-        cursor.set_push_depth(limit);
-        if limit == 0 {
-            // A sampled subscriber is owed nothing it could be handed.
-            return TakenWindow {
-                messages: vec![],
-                dropped: 0,
-                dropped_total: cursor.dropped_total(),
-                clamped_leftover: 0,
-            };
-        }
-        let peeked = cursor.peek(ring);
-        TakenWindow {
-            messages: peeked
-                .messages
-                .into_iter()
-                .map(|entry| TakenMessage {
-                    record: Some(position_record(entry.seq)),
-                    envelope: entry.message,
-                })
-                .collect(),
-            dropped: 0,
-            dropped_total: cursor.dropped_total(),
-            clamped_leftover: usize::try_from(peeked.clamped)
-                .expect("messaging store: clamped window out of range"),
+    async fn advance(
+        &self,
+        subscriber: &ParticipantId,
+        through: MessageSeq,
+        seen_floor: MessageSeq,
+    ) -> AdvanceOutcome {
+        let advance = RingStore::advance(self, subscriber, through.0, seen_floor.0);
+        AdvanceOutcome {
+            dropped: advance.dropped,
+            noise_charge: advance.noise_charge,
         }
     }
 
-    /// Moves the cursor to the newest settled position. Everything owed below
-    /// it that the consumer passed over is charged there and then — accepting a
-    /// clamped window is accepting that the older messages are gone — and that
-    /// charge is what this returns. Records above the newest settled one stay
-    /// owed, so a delivery that got partway through redelivers its remainder.
-    ///
-    /// Panics for a subscriber with no cursor on this channel.
-    async fn settle(&self, subscriber: &ParticipantId, records: &[TargetRecord]) -> u64 {
-        let Some(through) = records.iter().map(|r| r.0).max() else {
-            return 0;
-        };
-        let through = u64::try_from(through).expect("messaging store: negative ring position");
-        let delivered = u64::try_from(records.len()).expect("messaging store: settle batch size");
-        let mut state = self.state();
-        let RingState { ring, cursors, .. } = &mut *state;
-        cursors
-            .get_mut(subscriber)
-            .unwrap_or_else(|| Self::unattached(&self.address, subscriber))
-            .settle(ring, through, delivered)
-    }
-
-    /// The cursor's own count, which already covers both ring drop sources (the
-    /// push-depth clamp and eviction of an owed message). Answers `0` for an
-    /// unattached subscriber, where the inherent method panics.
+    /// Every loss reported against this subscriber, by eviction or by an
+    /// advance passing seqs no window served. Answers `0` for a subscriber the
+    /// store has never reported against.
     fn dropped_total(&self, subscriber: &ParticipantId) -> u64 {
-        let state = self.state();
-        state
-            .cursors
-            .get(subscriber)
-            .map_or(0, |cursor| cursor.dropped_total())
+        self.dropped.get(subscriber)
     }
 
     fn record_metered_drops(&self, subscriber: &ParticipantId, count: u64) {
@@ -1071,8 +1041,27 @@ mod tests {
         ParticipantId::for_wasm(slug)
     }
 
-    fn bodies(take: &Take<Arc<MessageEnvelope>>) -> Vec<String> {
-        take.messages.iter().map(|m| m.body.clone()).collect()
+    /// Serve a subscriber its push window and advance over it, as a push
+    /// consumer does: the bodies it was handed as new, and the drops the
+    /// advance reported.
+    fn serve(s: &RingStore, subscriber: &ParticipantId, push_limit: u64) -> (Vec<String>, u64) {
+        let window = s.window(subscriber, push_limit, 0);
+        let bodies = window
+            .new_entries()
+            .iter()
+            .map(|e| e.message.body.clone())
+            .collect();
+        let dropped = match window.advance_span() {
+            Some((through, seen_floor)) => s.advance(subscriber, through, seen_floor).noise_charge,
+            None => 0,
+        };
+        (bodies, dropped)
+    }
+
+    /// The bodies of a subscriber's new window, for a case that does not care
+    /// what the advance reported.
+    fn bodies(s: &RingStore, subscriber: &ParticipantId, push_limit: u64) -> Vec<String> {
+        serve(s, subscriber, push_limit).0
     }
 
     fn publish(store: &RingStore, sender: &str, bodies: &[&str]) {
@@ -1342,10 +1331,10 @@ mod tests {
         let s = store(8);
         publish(&s, "alice", &["old"]);
         assert_eq!(s.attach(&sub("proc"), 4, Priming::Head), Attached::Created);
-        assert!(bodies(&s.take(&sub("proc"))).is_empty());
+        assert!(bodies(&s, &sub("proc"), 4).is_empty());
 
         publish(&s, "alice", &["new"]);
-        assert_eq!(bodies(&s.take(&sub("proc"))), vec!["new"]);
+        assert_eq!(bodies(&s, &sub("proc"), 4), vec!["new"]);
     }
 
     /// Attach is a delivery point: what was published before the queue existed
@@ -1356,9 +1345,9 @@ mod tests {
         publish(&s, "alice", &["a", "b", "c"]);
         s.attach(&sub("proc"), 2, Priming::Retained);
 
-        let take = s.take(&sub("proc"));
-        assert_eq!(bodies(&take), vec!["b", "c"]);
-        assert_eq!(take.dropped, 0);
+        let (new, dropped) = serve(&s, &sub("proc"), 2);
+        assert_eq!(new, vec!["b", "c"]);
+        assert_eq!(dropped, 0);
     }
 
     #[test]
@@ -1366,18 +1355,18 @@ mod tests {
         let s = store(8);
         s.attach(&sub("proc"), 4, Priming::Head);
         publish(&s, "alice", &["a"]);
-        assert_eq!(bodies(&s.take(&sub("proc"))), vec!["a"]);
+        assert_eq!(bodies(&s, &sub("proc"), 4), vec!["a"]);
 
         publish(&s, "alice", &["b", "c"]);
         assert_eq!(
             s.attach(&sub("proc"), 1, Priming::Retained),
             Attached::Existing
         );
-        // Position carried over, so `b` is still owed — and the retuned depth of
-        // 1 clamps the take to the newest, charging the older as a drop.
-        let take = s.take(&sub("proc"));
-        assert_eq!(bodies(&take), vec!["c"]);
-        assert_eq!(take.dropped, 1);
+        // Position carried over, so `b` is still unseen — and the retuned depth
+        // of 1 clamps the window to the newest, reporting the older as a drop.
+        let (new, dropped) = serve(&s, &sub("proc"), 1);
+        assert_eq!(new, vec!["c"]);
+        assert_eq!(dropped, 1);
     }
 
     #[test]
@@ -1387,23 +1376,23 @@ mod tests {
         s.attach(&sub("slow"), 1, Priming::Head);
         publish(&s, "alice", &["a", "b", "c"]);
 
-        let fast = s.take(&sub("fast"));
-        assert_eq!(bodies(&fast), vec!["a", "b", "c"]);
-        assert_eq!(fast.dropped, 0);
+        let (fast, fast_dropped) = serve(&s, &sub("fast"), 8);
+        assert_eq!(fast, vec!["a", "b", "c"]);
+        assert_eq!(fast_dropped, 0);
 
-        let slow = s.take(&sub("slow"));
-        assert_eq!(bodies(&slow), vec!["c"]);
-        assert_eq!(slow.dropped, 2);
+        let (slow, slow_dropped) = serve(&s, &sub("slow"), 1);
+        assert_eq!(slow, vec!["c"]);
+        assert_eq!(slow_dropped, 2);
         assert_eq!(s.dropped_total(&sub("slow")), 2);
         assert_eq!(s.dropped_total(&sub("fast")), 0);
     }
 
-    /// A subscriber whose owed messages the ring overwrites is charged by the
-    /// append that overwrote them, and named in that append's overflow — so the
-    /// loss is escalatable while the subscriber is still absent. The take that
-    /// eventually arrives reports nothing new.
+    /// A subscriber whose unseen messages the ring overwrites is reported
+    /// against by the append that overwrote them, and named in that append's
+    /// overflow — so the loss is escalatable while the subscriber is still
+    /// absent. The window that eventually arrives charges nothing more.
     #[test]
-    fn eviction_of_owed_messages_is_charged_to_the_laggard_at_the_append() {
+    fn eviction_of_unseen_messages_is_reported_at_the_append() {
         let s = store(2);
         s.attach(&sub("proc"), 8, Priming::Head);
         publish(&s, "alice", &["a", "b"]);
@@ -1421,9 +1410,9 @@ mod tests {
         s.append(envelope("alice", "d"));
         assert_eq!(s.dropped_total(&sub("proc")), 2);
 
-        let take = s.take(&sub("proc"));
-        assert_eq!(bodies(&take), vec!["c", "d"]);
-        assert_eq!(take.dropped, 0, "both drops were already reported");
+        let (new, dropped) = serve(&s, &sub("proc"), 8);
+        assert_eq!(new, vec!["c", "d"]);
+        assert_eq!(dropped, 0, "both drops were already reported");
     }
 
     /// The overflow names only the subscribers that were actually owed the
@@ -1434,7 +1423,7 @@ mod tests {
         s.attach(&sub("caught-up"), 8, Priming::Head);
         s.attach(&sub("absent"), 8, Priming::Head);
         publish(&s, "alice", &["a", "b"]);
-        s.take(&sub("caught-up"));
+        serve(&s, &sub("caught-up"), 8);
 
         let evicting = s.append(envelope("alice", "c"));
         assert_eq!(
@@ -1459,7 +1448,7 @@ mod tests {
         // `partial` drains, then falls one message behind; `absent` never reads.
         // The two now lag by different amounts, so the batch must name each with
         // its own count rather than folding both into one entry.
-        s.take(&sub("partial"));
+        serve(&s, &sub("partial"), 8);
         publish(&s, "alice", &["c"]);
         s.park(envelope("alice", "x"), at(1_000)).unwrap();
         s.park(envelope("alice", "y"), at(1_000)).unwrap();
@@ -1493,7 +1482,7 @@ mod tests {
         assert!(!s.has_deliverable(&sub("proc")));
         publish(&s, "alice", &["a"]);
         assert!(s.has_deliverable(&sub("proc")));
-        s.take(&sub("proc"));
+        serve(&s, &sub("proc"), 4);
         assert!(!s.has_deliverable(&sub("proc")));
     }
 
@@ -1510,7 +1499,7 @@ mod tests {
         owed.sort_by_key(|p| p.as_str().to_string());
         assert_eq!(owed, vec![sub("caught-up"), sub("owed")]);
         // One drains; only the other remains owed.
-        s.take(&sub("caught-up"));
+        serve(&s, &sub("caught-up"), 4);
         assert_eq!(s.deliverable_subscribers(), vec![sub("owed")]);
     }
 
@@ -1527,8 +1516,8 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "has no queue for subscriber")]
-    fn take_for_unattached_subscriber_panics() {
-        store(4).take(&sub("proc"));
+    fn a_window_for_an_unattached_subscriber_panics() {
+        store(4).window(&sub("proc"), 4, 0);
     }
 
     // ── Deferral ──────────────────────────────────────────────────────────
@@ -1548,7 +1537,7 @@ mod tests {
         let released = s.release_due(at(2_000));
         assert_eq!(released.messages.len(), 1);
         assert_eq!(released.messages[0].seq, 1);
-        assert_eq!(bodies(&s.take(&sub("proc"))), vec!["later"]);
+        assert_eq!(bodies(&s, &sub("proc"), 4), vec!["later"]);
         assert_eq!(s.next_release(), None);
     }
 

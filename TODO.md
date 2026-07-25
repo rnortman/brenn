@@ -823,3 +823,35 @@ a prior boot's differently-kinded subscription on the same slug.
 Code site (`TODO(substrate-priming-kind-qualified-key)`):
 `brenn-server/src/bootstrap/messaging/mod.rs` (the `prior_subscription_keys.contains`
 check in the durable-priming loop).
+
+## `substrate-ring-drop-total`
+
+`RingStore` keeps an in-memory per-subscriber tally of the drops reported against
+it — eviction reports at append, advance charges at read — solely to answer
+`RetentionStore::dropped_total`. The cursor itself stores no counters: every drop
+figure it produces is a subtraction between two sequence numbers, which cannot
+drift and needs no memory. The tally exists only because the trait still exposes a
+lifetime total, and the store's window/advance conversion is what removes that
+method: the guest-visible `dropped` becomes the figure the advance itself computed.
+Done when `dropped_total` is off the trait and the tally is deleted.
+
+Code site (`TODO(substrate-ring-drop-total)`):
+`brenn-lib/src/messaging/store/ring.rs` (the `dropped` field on `RingStore`).
+
+## `substrate-durable-cursor`
+
+`DbStore` answers `window`/`advance` by reconstructing the subscriber's position
+from its undelivered `messaging_pending_pushes` claims: the lowest retained seq
+among them stands in for the stored position, and the advance retires claims
+rather than moving a cursor. The durable class needs a real position of its own —
+a `messaging_subscriber_cursors` row per (channel, subscriber) holding
+`next_owed_seq` — so the two store classes keep position state the same way and
+the claim rows can go. Done when the cursor table exists, `window`/`advance`/
+`deliverable_subscribers` read it, and the reconstruction is deleted.
+
+Code sites (`TODO(substrate-durable-cursor)`):
+`brenn-lib/src/messaging/store/db.rs` (`reconstructed_position`, and the
+`window` / `advance` trait impls that use it);
+`brenn-lib/src/messaging/store/parity_tests.rs`
+(`durable_advance_under_reports_a_loss_gc_already_retired`, the tripwire that
+pins the interim figure the conversion must change).

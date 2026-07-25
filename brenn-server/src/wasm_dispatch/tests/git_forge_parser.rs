@@ -245,8 +245,7 @@ async fn forgejo_push_emits_event_both_remotes_ssh_first() {
     )
     .await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     let out_rows = messenger.load_pending_pushes(&out_sub).await;
     assert_eq!(out_rows.len(), 1, "exactly one push event published");
@@ -288,8 +287,7 @@ async fn github_push_sets_forge_github() {
     )
     .await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     assert_eq!(messenger.load_pending_pushes(&out_sub).await.len(), 1);
     let event = read_latest(&messenger, &out_entry.address)
@@ -319,8 +317,7 @@ async fn forgejo_port_falls_back_to_gitea_event_header() {
     )
     .await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     assert_eq!(
         messenger.load_pending_pushes(&out_sub).await.len(),
@@ -346,8 +343,7 @@ async fn non_push_event_dropped_no_publish() {
     )
     .await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Input row acked, nothing published.
     assert!(messenger.load_pending_pushes(&wasm_sub).await.is_empty());
@@ -374,8 +370,7 @@ async fn missing_event_header_dropped_no_publish() {
     )
     .await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Input row acked, nothing published — a warn-drop, distinct from a
     // quarantine (which also publishes nothing but records a failure).
@@ -423,8 +418,7 @@ async fn malformed_payload_json_dropped_no_publish() {
     )
     .await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     assert!(
         messenger.load_pending_pushes(&out_sub).await.is_empty(),
@@ -461,8 +455,7 @@ async fn ssh_only_and_clone_only_payloads() {
     )
     .await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     assert_eq!(messenger.load_pending_pushes(&out_sub).await.len(), 1);
     let event = read_latest(&messenger, &out_entry.address)
@@ -491,8 +484,7 @@ async fn duplicate_ssh_clone_deduped() {
     )
     .await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     let event = read_latest(&messenger, &out_entry.address)
         .await
@@ -518,8 +510,7 @@ async fn malformed_envelope_quarantines() {
     )
     .await;
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     // Row acked (at-most-once), nothing published, failure recorded.
     assert!(messenger.load_pending_pushes(&wasm_sub).await.is_empty());

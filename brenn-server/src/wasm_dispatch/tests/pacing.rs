@@ -1,16 +1,16 @@
-//! Activation pacing tests (mqtt-wasm-republish-pacing design §8).
+//! Activation pacing tests.
 //!
 //! These exercise `ActivationPacer` — the per-component activation gate — at the
 //! `admit` level, which is where every drain step (startup sweep + each notified
 //! wake) is paced. The pacer owns everything it touches (its bucket, slug, and
 //! alert sink), so these tests construct it directly — no `WasmConsumerConfig`,
 //! no messenger, no SQLite. That keeps the timing pure (bucket + `sleep`), so
-//! paused-time assertions are deterministic — the caveat design §8 raises about
-//! auto-advance racing a blocking call does not apply on the `admit` path.
+//! paused-time assertions are deterministic — auto-advance cannot race a
+//! blocking call on the `admit` path.
 //!
-//! The one exception is `clamp_chain_drains_fully_and_paced`, which drives the
-//! real consumer task end-to-end (`spawn_wasm_consumer_task`) and therefore does
-//! build a messenger and use real time (see its own comment).
+//! The one exception is `startup_sweep_drains_a_backlog_through_the_real_task`,
+//! which drives the real consumer task end-to-end (`spawn_wasm_consumer_task`)
+//! and therefore does build a messenger and use real time (see its own comment).
 //!
 //! Config-validation tests (`activation_burst`/`activation_min_period_ms` zero
 //! rejection + default resolution) live with the resolve harness in
@@ -271,35 +271,16 @@ async fn second_episode_relogs_but_does_not_realert() {
     );
 }
 
-/// Test 4 (design §8, item 4 — clamp-chain pacing): a backlog larger than
-/// `burst × cap` drains fully, paced, via the self-renotify chain. This is the
-/// one scenario that crosses the pacer with the clamp/self-renotify mechanism
-/// (`drain_step`'s `notify_one`, `mod.rs`) *inside a single oversized backlog* —
-/// pacing kicks in partway through draining one backlog, not merely across
-/// independent external wakes. The admit-level tests above pin pacing in
-/// isolation; the `renotify` family pins the clamp chain in isolation; this pins
-/// the two together.
-///
-/// Unlike the admit-level tests, this drives the real consumer task
-/// (`spawn_wasm_consumer_task`) end-to-end with no external wake — only the
-/// startup sweep + self-renotify chain — so `spawn_blocking` + real SQLite run
-/// and paused time would race the pacer's sleep (design §8). Hence real time
-/// with a small `min_period`, asserting a wall-clock *lower bound*: real sleeps
-/// never shorten, so the elapsed floor is a hard guarantee that pacing engaged,
-/// robust to poll/scheduling slack.
+/// The consumer task end to end: a backlog left by a prior process is dispatched
+/// by the startup sweep alone, with no wake ever sent. This is the one property
+/// no `drain_step` test can see — the sweep, the `notified()` loop, and the pacer
+/// crossing a real activation — so it runs the real task on real time.
 #[tokio::test]
-#[traced_test]
-async fn clamp_chain_drains_fully_and_paced() {
-    const MIN_PERIOD: Duration = Duration::from_millis(100);
-    let slug = "pacing-clamp-chain";
-    // push_depth = Bounded(2) → each activation caps at 2 new rows. 6 rows ⇒
-    // ceil(6/2) = 3 activations. burst = 1 ⇒ the startup sweep is free and the
-    // two follow-up self-renotify activations are each paced by a full
-    // min_period. 6 > burst × cap = 1 × 2, matching design §8 item 4's "backlog
-    // larger than burst × cap".
+async fn startup_sweep_drains_a_backlog_through_the_real_task() {
+    let slug = "pacing-sweep";
     let (messenger, channel, wasm_sub) = testutils::build_wasm_messenger(
         slug,
-        "pacing-clamp-ch",
+        "pacing-sweep-ch",
         Depth::Bounded(2),
         Depth::Bounded(0),
     )
@@ -323,36 +304,17 @@ async fn clamp_chain_drains_fully_and_paced() {
         Depth::Bounded(2),
         Depth::Bounded(0),
     );
+    // A burst of 1: the sweep's own activation is the token, so the gate is
+    // crossed for real rather than configured away.
     cfg.activation_pacing = ActivationPacing {
         burst: 1,
-        min_period: MIN_PERIOD,
+        min_period: Duration::from_millis(50),
     };
 
-    // No external wake is ever sent: only the startup sweep + self-renotify
-    // chain drive the drain, so the clamp chain is what crosses the pacer.
-    let start = std::time::Instant::now();
     let _task = spawn_wasm_consumer_task(cfg);
 
     assert!(
         wait_pending_empty(&messenger, &wasm_sub, Duration::from_secs(5)).await,
-        "clamp self-renotify chain must drain the full backlog even while paced"
-    );
-
-    // Paced, not instant: 3 activations, burst = 1 ⇒ 2 paced sleeps of a full
-    // min_period each, run sequentially before their drain steps ack the last
-    // rows. The pending set cannot empty until the third activation's drain step,
-    // which runs after both sleeps — so elapsed ≥ 2 × min_period, a lower bound
-    // (real sleeps never shorten).
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed >= 2 * MIN_PERIOD,
-        "clamp-chain drain must be paced: elapsed {elapsed:?} < 2 × min_period {:?}",
-        2 * MIN_PERIOD
-    );
-    // And the pacer actually engaged mid-chain (not merely slow for unrelated
-    // reasons): the throttle episode's entry warn must have fired.
-    assert!(
-        logs_contain("activation pacing engaged"),
-        "the clamp self-renotify chain must trip the activation pacer"
+        "the startup sweep alone must dispatch a backlog left by a prior process"
     );
 }

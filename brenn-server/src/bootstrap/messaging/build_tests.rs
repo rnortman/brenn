@@ -2519,13 +2519,13 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         urgency: brenn_lib::messaging::Urgency::Normal,
         envelope_type: brenn_lib::messaging::ChannelScheme::Local,
     });
-    let take = store.take(&subscriber);
+    let window = store.window(&subscriber, 4, 0);
     assert_eq!(
-        take.messages.len(),
+        window.new_len(),
         1,
         "the confined publish is delivered to the WASM consumer's ring cursor"
     );
-    assert_eq!(take.messages[0].body, "ping");
+    assert_eq!(window.new_entries()[0].message.body, "ping");
 
     let conn = db_probe.lock().await;
     let rows: i64 = conn

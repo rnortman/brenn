@@ -1082,6 +1082,88 @@ pub fn load_pending_pushes_for_channel(
     .collect()
 }
 
+/// The `messaging_pending_pushes` predicate for "owed and deliverable to this
+/// subscriber on this channel", matching the one
+/// [`load_pending_pushes_for_channel`] serves from. `?1` is the subscriber,
+/// `?2` the channel uuid.
+const OWED_ON_CHANNEL_WHERE: &str = "WHERE pp.target_subscriber = ?1
+           AND m.channel_uuid = ?2
+           AND pp.delivered_at IS NULL
+           AND pp.release_after IS NULL";
+
+/// The lowest retention position `subscriber` is still owed on `channel_uuid`,
+/// or `None` when it is owed nothing there.
+///
+/// Panics on an owed, unparked claim whose message holds no retention position,
+/// the same impossible state [`owed_push_positions`] dies on. `MIN` skips NULLs,
+/// so without the count an all-positionless owed set would read as "owed
+/// nothing" — a position at head, an activation that never runs, and a wake that
+/// repeats forever against claims nothing can serve.
+pub fn min_owed_retained_seq(
+    conn: &Connection,
+    subscriber: &ParticipantId,
+    channel_uuid: Uuid,
+) -> Option<i64> {
+    // Cached: one call per input port on every WASM drain step.
+    let mut stmt = conn
+        .prepare_cached(&format!(
+            "SELECT MIN(m.retained_seq), COUNT(*) - COUNT(m.retained_seq)
+             FROM messaging_pending_pushes pp
+             JOIN messaging_messages m ON pp.message_id = m.id
+             {OWED_ON_CHANNEL_WHERE}"
+        ))
+        .expect("prepare min_owed_retained_seq");
+    let (min_seq, positionless) = stmt
+        .query_row(
+            rusqlite::params![subscriber.as_str(), channel_uuid.as_bytes().to_vec()],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .expect("query min_owed_retained_seq");
+    assert!(
+        positionless == 0,
+        "messaging: {positionless} claims for {} on channel {channel_uuid} are owed and unparked \
+         but their messages hold no retention position",
+        subscriber.as_str()
+    );
+    min_seq
+}
+
+/// Every claim `subscriber` is still owed on `channel_uuid` as
+/// `(push_id, retained_seq)`, seq ascending.
+pub fn owed_push_positions(
+    conn: &Connection,
+    subscriber: &ParticipantId,
+    channel_uuid: Uuid,
+) -> Vec<(i64, i64)> {
+    // Cached: one call per advanced port on every WASM drain step.
+    let mut stmt = conn
+        .prepare_cached(&format!(
+            "SELECT pp.id, m.retained_seq
+             FROM messaging_pending_pushes pp
+             JOIN messaging_messages m ON pp.message_id = m.id
+             {OWED_ON_CHANNEL_WHERE}
+             ORDER BY m.retained_seq ASC"
+        ))
+        .expect("prepare owed_push_positions");
+    let rows = stmt
+        .query_map(
+            rusqlite::params![subscriber.as_str(), channel_uuid.as_bytes().to_vec()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .expect("query owed_push_positions");
+    rows.map(|r| {
+        let (push_id, retained_seq) = r.expect("read owed push position");
+        let retained_seq = retained_seq.unwrap_or_else(|| {
+            panic!(
+                "messaging: push {push_id} is owed and unparked but its message holds no \
+                 retention position"
+            )
+        });
+        (push_id, retained_seq)
+    })
+    .collect()
+}
+
 /// One owed, deliverable push row on one channel, as
 /// [`load_pending_pushes_for_channel`] hands it over: the claim to settle, the
 /// message's identity, its position in the channel's retention order, and the

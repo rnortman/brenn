@@ -24,8 +24,9 @@ use crate::messaging::ParticipantId;
 use crate::messaging::config::{Depth, Sink};
 use crate::messaging::db::{bus_gc_evict_channel, upsert_channels, utc_to_ns};
 use crate::messaging::store::{
-    Attached, DbStore, DeferralOutcome, NewMessage, OverflowEvent, Priming, PushRetireParams,
-    ResumeCursor, RetentionStore, RingStore, StoreReplay, TargetResolver,
+    AdvanceOutcome, Attached, DbStore, DeferralOutcome, MessageSeq, NewMessage, OverflowEvent,
+    Priming, PushRetireParams, ResumeCursor, RetentionStore, RingStore, StoreReplay,
+    SubscriberWindow, TargetResolver,
 };
 use crate::messaging::testutils::test_channel_entry;
 use crate::messaging::{
@@ -819,7 +820,7 @@ async fn deliverable_subscribers_and_has_deliverable_agree_across_stores() {
             .collect();
         crate::messaging::db::mark_pending_pushes_delivered(&conn, &push_ids);
     }
-    ring.take(&wasm_sub("proc"));
+    serve(&ring, &wasm_sub("proc"), DEPTH, 0).await;
 
     for store in [
         &db_store as &dyn RetentionStore,
@@ -874,21 +875,53 @@ async fn detach_tears_down_a_subscribers_delivery_state() {
     }
 }
 
-// ── Taking the NEW window ───────────────────────────────────────────────────
+// ── The window and the advance ──────────────────────────────────────────────
 
-/// Bodies of a taken window, in the order the store handed them over.
-fn taken_bodies(window: &crate::messaging::store::TakenWindow) -> Vec<String> {
+/// Bodies of a window's new portion, oldest first.
+fn new_bodies(window: &SubscriberWindow) -> Vec<String> {
     window
-        .messages
+        .new_entries()
         .iter()
-        .map(|taken| taken.envelope.body.clone())
+        .map(|(_, envelope)| envelope.body.clone())
         .collect()
 }
 
-/// A retained-primed queue is owed the tail, and the take hands it over oldest
-/// first with nothing left behind.
+/// Bodies of the whole window — context then new — oldest first.
+fn window_bodies(window: &SubscriberWindow) -> Vec<String> {
+    window
+        .entries
+        .iter()
+        .map(|(_, envelope)| envelope.body.clone())
+        .collect()
+}
+
+/// Read the window and advance over it, as a push consumer does: what it was
+/// handed, and what the advance found it had never been handed.
+async fn serve(
+    store: &dyn RetentionStore,
+    sub: &ParticipantId,
+    push_limit: u64,
+    retain_limit: u64,
+) -> (Vec<String>, AdvanceOutcome) {
+    let window = store
+        .window(
+            sub,
+            Depth::Bounded(push_limit),
+            Depth::Bounded(retain_limit),
+        )
+        .await;
+    let new = new_bodies(&window);
+    let advance = match window.advance_span() {
+        Some((through, seen_floor)) => store.advance(sub, through, seen_floor).await,
+        None => AdvanceOutcome::default(),
+    };
+    (new, advance)
+}
+
+/// A retained-primed queue is owed the tail, and the window hands it over oldest
+/// first with nothing reported.
 #[tokio::test]
-async fn take_new_hands_over_the_owed_window_oldest_first() {
+async fn a_window_serves_the_owed_tail_oldest_first() {
     for store in stores(DEPTH).await {
         let sub = wasm_sub("proc");
         for body in ["a", "b", "c"] {
@@ -899,28 +932,18 @@ async fn take_new_hands_over_the_owed_window_oldest_first() {
             .attach(&sub, "proc", DEPTH, Priming::Retained, true)
             .await;
 
-        let window = store.take_new(&sub, DEPTH).await;
-        assert_eq!(
-            taken_bodies(&window),
-            vec!["a", "b", "c"],
-            "{}",
-            store.address()
-        );
-        assert_eq!(window.dropped, 0, "{}", store.address());
-        assert_eq!(
-            window.clamped_leftover,
-            0,
-            "the whole window fit: {}",
-            store.address()
-        );
+        let (new, advance) = serve(store.as_ref(), &sub, DEPTH, 0).await;
+        assert_eq!(new, vec!["a", "b", "c"], "{}", store.address());
+        assert_eq!(advance.dropped, 0, "{}", store.address());
+        assert_eq!(advance.noise_charge, 0, "{}", store.address());
     }
 }
 
-/// The limit caps the window on either store. What each does with the excess is
-/// its own overflow mechanic — held for the next take, or charged as a drop —
-/// and the window says which; the cap itself is the shared contract.
+/// The push limit is a drop-oldest cut on both classes: the window serves the
+/// newest, and the advance over it reports what it skipped. Nothing is held back
+/// for a next read.
 #[tokio::test]
-async fn take_new_caps_the_window_at_the_limit() {
+async fn the_push_limit_serves_the_newest_and_reports_the_rest() {
     for store in stores(DEPTH).await {
         let sub = wasm_sub("proc");
         for body in ["a", "b", "c", "d"] {
@@ -931,185 +954,442 @@ async fn take_new_caps_the_window_at_the_limit() {
             .attach(&sub, "proc", DEPTH, Priming::Retained, true)
             .await;
 
-        let window = store.take_new(&sub, 2).await;
-        assert_eq!(window.messages.len(), 2, "{}", store.address());
+        let (new, advance) = serve(store.as_ref(), &sub, 2, 0).await;
         assert_eq!(
-            window.dropped as usize + window.clamped_leftover,
+            new,
+            vec!["c", "d"],
+            "newest window wins: {}",
+            store.address()
+        );
+        assert_eq!(
+            advance.dropped,
             2,
-            "the two that did not fit are accounted for, either way: {}",
+            "the two the cut skipped: {}",
+            store.address()
+        );
+
+        let (again, _) = serve(store.as_ref(), &sub, 2, 0).await;
+        assert!(
+            again.is_empty(),
+            "nothing was held back for the next read: {}",
             store.address()
         );
     }
 }
 
-/// A sampled subscriber (limit 0) takes nothing and loses nothing: what it was
-/// owed is handed over whole once it asks with a real limit.
+/// `retain_limit` above `push_limit` widens the window without widening what is
+/// new. The extra unseen entries are served as context — delivered, so the
+/// advance charges nothing for them.
 #[tokio::test]
-async fn take_new_with_a_zero_limit_takes_nothing_and_drops_nothing() {
+async fn unseen_context_inside_the_window_is_not_a_drop() {
     for store in stores(DEPTH).await {
         let sub = wasm_sub("proc");
-        let msg = message_for(store.as_ref(), "alice", "a");
-        store.append(msg).await;
+        for body in ["a", "b", "c", "d"] {
+            let msg = message_for(store.as_ref(), "alice", body);
+            store.append(msg).await;
+        }
         store
             .attach(&sub, "proc", DEPTH, Priming::Retained, true)
             .await;
 
-        let window = store.take_new(&sub, 0).await;
-        assert!(window.messages.is_empty(), "{}", store.address());
-        assert_eq!(window.dropped, 0, "{}", store.address());
-        assert_eq!(window.clamped_leftover, 0, "{}", store.address());
-        assert_eq!(window.dropped_total, 0, "{}", store.address());
-
+        let window = store
+            .window(&sub, Depth::Bounded(1), Depth::Bounded(4))
+            .await;
         assert_eq!(
-            taken_bodies(&store.take_new(&sub, DEPTH).await),
-            vec!["a"],
-            "a sampled take retired nothing: {}",
+            window_bodies(&window),
+            vec!["a", "b", "c", "d"],
+            "{}",
+            store.address()
+        );
+        assert_eq!(new_bodies(&window), vec!["d"], "{}", store.address());
+
+        let (through, seen_floor) = window.advance_span().expect("the window served entries");
+        let advance = store.advance(&sub, through, seen_floor).await;
+        assert_eq!(
+            advance.dropped,
+            0,
+            "every unseen entry was served: {}",
             store.address()
         );
     }
 }
 
-/// Taking from a queue owed nothing is an empty window, not an error, and it
-/// reports a zero drop total — nothing has ever been charged.
+/// A sampled subscriber (`push_limit = 0`) is never delivered to: its window is
+/// all context, whatever the channel holds.
 #[tokio::test]
-async fn take_new_on_an_idle_queue_is_empty_and_reports_no_drops() {
+async fn a_sampled_window_is_all_context() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        for body in ["a", "b"] {
+            let msg = message_for(store.as_ref(), "alice", body);
+            store.append(msg).await;
+        }
+        store
+            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .await;
+
+        let window = store
+            .window(&sub, Depth::Bounded(0), Depth::Bounded(4))
+            .await;
+        assert_eq!(
+            window_bodies(&window),
+            vec!["a", "b"],
+            "{}",
+            store.address()
+        );
+        assert!(window.new_entries().is_empty(), "{}", store.address());
+        assert_eq!(window.new_from, 2, "{}", store.address());
+    }
+}
+
+/// The window is one span of `max(push_limit, retain_limit)`, not a context read
+/// glued to a delivery read: a `P = 2`, `R = 4` port over a longer retained
+/// history gets four entries, of which two are new — never `R + P` of them.
+#[tokio::test]
+async fn the_window_is_capped_by_the_larger_limit_not_their_sum() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        for body in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+            let msg = message_for(store.as_ref(), "alice", body);
+            store.append(msg).await;
+        }
+        store
+            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .await;
+
+        let window = store
+            .window(&sub, Depth::Bounded(2), Depth::Bounded(4))
+            .await;
+        assert_eq!(
+            window_bodies(&window),
+            vec!["e", "f", "g", "h"],
+            "the newest max(2, 4): {}",
+            store.address()
+        );
+        assert_eq!(new_bodies(&window), vec!["g", "h"], "{}", store.address());
+    }
+}
+
+/// An unbounded push limit — the system-subscriber shape — makes every unseen
+/// retained message new, and the advance over that window reports nothing: an
+/// unbounded window clamps nothing away.
+#[tokio::test]
+async fn an_unbounded_push_limit_serves_every_unseen_entry() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        for body in ["a", "b", "c", "d", "e"] {
+            let msg = message_for(store.as_ref(), "alice", body);
+            store.append(msg).await;
+        }
+        store
+            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .await;
+
+        let window = store
+            .window(&sub, Depth::Unbounded, Depth::Bounded(0))
+            .await;
+        assert_eq!(
+            new_bodies(&window),
+            vec!["a", "b", "c", "d", "e"],
+            "{}",
+            store.address()
+        );
+
+        let (through, seen_floor) = window.advance_span().expect("the window served entries");
+        let advance = store.advance(&sub, through, seen_floor).await;
+        assert_eq!(advance.dropped, 0, "{}", store.address());
+        assert_eq!(advance.noise_charge, 0, "{}", store.address());
+    }
+}
+
+/// An unbounded retain limit widens the window to the whole retained set without
+/// widening what is new: the push limit alone decides the boundary.
+#[tokio::test]
+async fn an_unbounded_retain_limit_widens_the_window_not_the_new_set() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        for body in ["a", "b", "c", "d", "e"] {
+            let msg = message_for(store.as_ref(), "alice", body);
+            store.append(msg).await;
+        }
+        store
+            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .await;
+
+        let window = store
+            .window(&sub, Depth::Bounded(1), Depth::Unbounded)
+            .await;
+        assert_eq!(
+            window_bodies(&window),
+            vec!["a", "b", "c", "d", "e"],
+            "{}",
+            store.address()
+        );
+        assert_eq!(new_bodies(&window), vec!["e"], "{}", store.address());
+
+        let (through, seen_floor) = window.advance_span().expect("the window served entries");
+        let advance = store.advance(&sub, through, seen_floor).await;
+        assert_eq!(
+            advance.dropped,
+            0,
+            "every unseen entry was served, as context or as new: {}",
+            store.address()
+        );
+    }
+}
+
+/// A sampled subscriber holds no position, so its window offers nothing to
+/// advance over: the generic window→advance pattern cannot move or charge one.
+#[tokio::test]
+async fn a_sampled_window_offers_no_advance() {
+    for store in stores(DEPTH).await {
+        let sub = wasm_sub("proc");
+        for body in ["a", "b"] {
+            let msg = message_for(store.as_ref(), "alice", body);
+            store.append(msg).await;
+        }
+        store
+            .attach(&sub, "proc", DEPTH, Priming::Retained, true)
+            .await;
+
+        let window = store
+            .window(&sub, Depth::Bounded(0), Depth::Bounded(4))
+            .await;
+        assert!(!window.entries.is_empty(), "{}", store.address());
+        assert!(
+            window.advance_span().is_none(),
+            "a sampled window advances nothing: {}",
+            store.address()
+        );
+
+        let (_, advance) = serve(store.as_ref(), &sub, 0, 4).await;
+        assert_eq!(advance, AdvanceOutcome::default(), "{}", store.address());
+    }
+}
+
+/// Advancing a sampled subscriber anyway is a wiring bug, not a tolerated
+/// no-op: the cursor-backed store dies rather than move a position the model
+/// says does not exist.
+#[tokio::test]
+#[should_panic(expected = "advance over a sampled subscriber")]
+async fn advancing_a_sampled_ring_subscriber_panics() {
+    let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH));
+    let sub = wasm_sub("sampled");
+    ring.attach(&sub, 0, Priming::Head);
+    RetentionStore::append(&ring, message_for(&ring, "alice", "a")).await;
+    RetentionStore::advance(&ring, &sub, MessageSeq(1), MessageSeq(1)).await;
+}
+
+/// Reading a window owed nothing is empty, not an error, and there is nothing to
+/// advance over.
+#[tokio::test]
+async fn an_idle_queue_serves_an_empty_window() {
     for store in stores(DEPTH).await {
         let sub = wasm_sub("proc");
         store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
 
-        let window = store.take_new(&sub, DEPTH).await;
-        assert!(window.messages.is_empty(), "{}", store.address());
-        assert_eq!(window.dropped, 0, "{}", store.address());
-        assert_eq!(window.dropped_total, 0, "{}", store.address());
+        let window = store
+            .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
+            .await;
+        assert!(window.entries.is_empty(), "{}", store.address());
+        assert!(window.advance_span().is_none(), "{}", store.address());
     }
 }
 
-/// The durable twin of `ring_take_new_reports_the_drops_its_cut_charged` at the
-/// *total* grain: drops charged before the read (the durable store charges at
-/// the commit that retires the claim, not at the take) reach the guest through
-/// the window's `dropped_total`, which is what becomes its within-lifetime gap
-/// signal.
+/// The read moves nothing: two windows in a row are the same window, and the
+/// subscriber is still owed what it has not advanced over.
 #[tokio::test]
-async fn durable_take_new_reports_the_drop_total_charged_before_it() {
-    let (store, _db) = durable_store_for("slow", 1).await;
-    let sub = wasm_sub("slow");
+async fn a_window_read_moves_nothing() {
+    for store in stores_for_proc(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
+        for body in ["a", "b", "c"] {
+            let msg = message_for(store.as_ref(), "alice", body);
+            store.append(msg).await;
+        }
 
-    for body in ["a", "b", "c"] {
-        store.append(message("alice", body)).await;
+        let first = store
+            .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
+            .await;
+        assert_eq!(
+            new_bodies(&first),
+            vec!["a", "b", "c"],
+            "{}",
+            store.address()
+        );
+        let second = store
+            .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
+            .await;
+        assert_eq!(
+            new_bodies(&second),
+            new_bodies(&first),
+            "{}",
+            store.address()
+        );
+        assert!(store.has_deliverable(&sub).await, "{}", store.address());
     }
-
-    let window = store.take_new(&sub, DEPTH).await;
-    assert_eq!(
-        taken_bodies(&window),
-        vec!["c"],
-        "a depth-1 window leaves only the newest claim live"
-    );
-    assert_eq!(
-        window.dropped_total, 2,
-        "the two retired claims are the subscriber's lifetime drop total"
-    );
-    assert_eq!(
-        window.dropped, 0,
-        "the durable take charges nothing itself — the retirement already did"
-    );
 }
 
-/// The ring's take is the ack: the window carries no record to settle, and a
-/// second take is empty because the cursor advanced past it.
+/// The activation trigger gate is sound on both classes: whenever a store says
+/// a subscriber is owed nothing, the window it would serve carries nothing new.
+/// A `false` hiding new messages would silently prevent an activation.
 #[tokio::test]
-async fn ring_take_new_is_the_ack() {
-    let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH));
-    let sub = wasm_sub("proc");
-    ring.attach(&sub, DEPTH, Priming::Head);
-    RetentionStore::append(&ring, message_for(&ring, "alice", "a")).await;
+async fn nothing_deliverable_means_nothing_new_in_the_window() {
+    for store in stores_for_proc(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
 
-    let window = ring.take_new(&sub, DEPTH).await;
-    assert_eq!(taken_bodies(&window), vec!["a"]);
-    assert!(
-        window.messages.iter().all(|taken| taken.record.is_none()),
-        "a cursor store keeps no record to settle"
-    );
-    assert!(ring.take_new(&sub, DEPTH).await.messages.is_empty());
+        // Idle: attached, nothing published.
+        assert!(!store.has_deliverable(&sub).await, "{}", store.address());
+        let window = store
+            .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(DEPTH))
+            .await;
+        assert!(window.new_entries().is_empty(), "{}", store.address());
+
+        // Owed.
+        for body in ["a", "b"] {
+            let msg = message_for(store.as_ref(), "alice", body);
+            store.append(msg).await;
+        }
+        assert!(store.has_deliverable(&sub).await, "{}", store.address());
+
+        // Caught up: advanced over everything the window served.
+        let window = store
+            .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(DEPTH))
+            .await;
+        let (through, seen_floor) = window.advance_span().expect("the window served entries");
+        store.advance(&sub, through, seen_floor).await;
+        assert!(!store.has_deliverable(&sub).await, "{}", store.address());
+        let window = store
+            .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(DEPTH))
+            .await;
+        assert!(
+            window.new_entries().is_empty(),
+            "caught up but the window still holds new entries: {}",
+            store.address()
+        );
+        assert_eq!(
+            window_bodies(&window),
+            vec!["a", "b"],
+            "the context is still served: {}",
+            store.address()
+        );
+    }
 }
 
-/// The durable take hands over claim records and does *not* settle them: the
-/// window repeats until the consumer acks, which is what makes a host that
-/// dies mid-activation redeliver instead of losing the batch.
+/// A delivery that got partway through advances only over what the far end took,
+/// and the remainder is served again — the property that lets a store serve a
+/// consumer whose delivery can fail halfway.
 #[tokio::test]
-async fn durable_take_new_repeats_until_the_claims_are_settled() {
-    let (store, db) = durable_store_for("proc", DEPTH).await;
-    let sub = wasm_sub("proc");
-    store.append(message("alice", "a")).await;
+async fn advancing_over_a_prefix_leaves_the_remainder_owed() {
+    for store in stores_for_proc(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
+        for body in ["a", "b", "c"] {
+            let msg = message_for(store.as_ref(), "alice", body);
+            store.append(msg).await;
+        }
 
-    let window = store.take_new(&sub, DEPTH).await;
-    assert_eq!(taken_bodies(&window), vec!["a"]);
-    let records: Vec<i64> = window
-        .messages
-        .iter()
-        .map(|taken| taken.record.expect("durable claim record").0)
-        .collect();
+        let window = store
+            .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
+            .await;
+        let accepted = &window.new_entries()[..2];
+        let advance = store.advance(&sub, accepted[1].0, accepted[0].0).await;
+        assert_eq!(advance.dropped, 0, "{}", store.address());
 
-    assert_eq!(
-        taken_bodies(&store.take_new(&sub, DEPTH).await),
-        vec!["a"],
-        "an unsettled claim is still owed"
-    );
-
-    {
-        let conn = db.lock().await;
-        crate::messaging::db::mark_pending_pushes_delivered(&conn, &records);
+        let (new, _) = serve(store.as_ref(), &sub, DEPTH, 0).await;
+        assert_eq!(
+            new,
+            vec!["c"],
+            "only the unaccepted remainder is still owed: {}",
+            store.address()
+        );
     }
-    assert!(store.take_new(&sub, DEPTH).await.messages.is_empty());
+}
+
+/// A delivery that failed outright advances nothing and keeps every obligation.
+#[tokio::test]
+async fn advancing_nothing_keeps_every_obligation() {
+    for store in stores_for_proc(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
+        store
+            .append(message_for(store.as_ref(), "alice", "a"))
+            .await;
+
+        let window = store
+            .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
+            .await;
+        let floor = window.entries[0].0;
+        // Advancing to just below the floor is the "accepted nothing" advance.
+        let advance = store.advance(&sub, MessageSeq(floor.0 - 1), floor).await;
+        assert_eq!(advance.dropped, 0, "{}", store.address());
+
+        let (new, _) = serve(store.as_ref(), &sub, DEPTH, 0).await;
+        assert_eq!(new, vec!["a"], "{}", store.address());
+    }
+}
+
+/// Re-advancing over a window already passed reports nothing a second time: the
+/// figure is a subtraction against a position that has already moved.
+#[tokio::test]
+async fn advance_is_idempotent() {
+    for store in stores_for_proc(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
+        for body in ["a", "b"] {
+            let msg = message_for(store.as_ref(), "alice", body);
+            store.append(msg).await;
+        }
+
+        let window = store
+            .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
+            .await;
+        let (through, seen_floor) = window.advance_span().expect("entries were served");
+        store.advance(&sub, through, seen_floor).await;
+        let again = store.advance(&sub, through, seen_floor).await;
+        assert_eq!(again.dropped, 0, "{}", store.address());
+        assert_eq!(again.noise_charge, 0, "{}", store.address());
+    }
 }
 
 /// The durable store has no queue registry, so a subscriber it never heard of
-/// simply holds no claims.
+/// simply holds no position and is owed nothing — it still reads the channel's
+/// ambience, which is what makes the window a channel read rather than a queue
+/// read.
 #[tokio::test]
-async fn durable_take_new_for_an_unknown_subscriber_is_empty() {
+async fn a_durable_window_for_an_unknown_subscriber_is_all_context() {
     let (store, _db) = durable_store_for("proc", DEPTH).await;
     store.append(message("alice", "a")).await;
-    assert!(
-        store
-            .take_new(&wasm_sub("ghost"), DEPTH)
-            .await
-            .messages
-            .is_empty()
-    );
+    let window = store
+        .window(&wasm_sub("ghost"), Depth::Bounded(DEPTH), Depth::Bounded(0))
+        .await;
+    assert!(window.new_entries().is_empty());
+    assert_eq!(window_bodies(&window), vec!["a"], "the ambience is served");
+    assert_eq!(window.new_from, 1, "and all of it is context");
 }
 
-/// The ring keeps an explicit cursor per subscriber, so taking without one is a
+/// The ring keeps an explicit cursor per subscriber, so reading without one is a
 /// wiring bug rather than an empty window.
 #[tokio::test]
 #[should_panic(expected = "has no queue for subscriber")]
-async fn ring_take_new_panics_for_an_unattached_subscriber() {
+async fn a_ring_window_panics_for_an_unattached_subscriber() {
     let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH));
-    ring.take_new(&wasm_sub("ghost"), DEPTH).await;
+    RetentionStore::window(
+        &ring,
+        &wasm_sub("ghost"),
+        Depth::Bounded(DEPTH),
+        Depth::Bounded(0),
+    )
+    .await;
 }
 
-/// Ring overflow surfaces on the take that finds it: the cut charges what the
-/// limit left behind, and the same count is in the lifetime total.
+/// The ring twin of the durable clamp: an eviction retires a delivery obligation,
+/// so it is reported by the append that retired it. Neither store makes a
+/// subscriber read before its losses are accountable — which is what lets an
+/// absent consumer's overflow escalate at all.
 #[tokio::test]
-async fn ring_take_new_reports_the_drops_its_cut_charged() {
-    let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH));
-    let sub = wasm_sub("proc");
-    ring.attach(&sub, 2, Priming::Head);
-    for body in ["a", "b", "c", "d"] {
-        RetentionStore::append(&ring, message_for(&ring, "alice", body)).await;
-    }
-
-    let window = ring.take_new(&sub, 2).await;
-    assert_eq!(taken_bodies(&window), vec!["c", "d"], "newest window wins");
-    assert_eq!(window.dropped, 2, "the two oldest were charged as dropped");
-    assert_eq!(window.dropped_total, 2);
-}
-
-/// The ring twin of `durable_overflow_charges_the_drop_total_at_retirement`:
-/// an eviction retires a delivery obligation, so it is charged and reported by
-/// the append that retired it. Neither store makes a subscriber read before its
-/// losses are accountable — which is what lets an absent consumer's overflow
-/// escalate at all.
-#[tokio::test]
-async fn ring_eviction_charges_the_drop_total_without_a_take() {
+async fn ring_eviction_charges_the_drop_total_without_a_read() {
     let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(2));
     let sub = wasm_sub("absent");
     ring.attach(&sub, 8, Priming::Head);
@@ -1135,164 +1415,48 @@ async fn ring_eviction_charges_the_drop_total_without_a_take() {
     );
 }
 
-// ── Peeking and settling ────────────────────────────────────────────────────
-
-/// Every record a peeked window handed over, in the order it handed them over.
-fn window_records(
-    window: &crate::messaging::store::TakenWindow,
-) -> Vec<crate::messaging::store::TargetRecord> {
-    window
-        .messages
-        .iter()
-        .map(|taken| taken.record.expect("a peeked message carries its record"))
-        .collect()
-}
-
-/// The read that proves nothing: the window comes over with a record per
-/// message, the subscriber's position does not move, and a second peek answers
-/// the same. A delivery attempt that never gets as far as settling costs the
-/// subscriber nothing.
+/// The interim durable shim counts claims, not seqs, so a loss whose claim was
+/// already retired is invisible to the advance that passes it: two messages
+/// evicted out from under a lagging subscriber are reported as zero, where the
+/// ring reports two for the same history.
+///
+/// TODO(substrate-durable-cursor): with the persisted cursor the figure is
+/// `seen_floor - next_owed` and both assertions below become `2` — this case is
+/// the tripwire for that conversion, so change it deliberately or not at all.
 #[tokio::test]
-async fn peek_new_hands_over_the_owed_window_without_settling_it() {
-    for store in stores_for_proc(DEPTH).await {
-        let sub = wasm_sub("proc");
-        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
-        for body in ["a", "b", "c"] {
-            let msg = message_for(store.as_ref(), "alice", body);
-            store.append(msg).await;
-        }
-
-        let window = store.peek_new(&sub, DEPTH).await;
-        assert_eq!(
-            taken_bodies(&window),
-            vec!["a", "b", "c"],
-            "{}",
-            store.address()
-        );
-        assert_eq!(window.messages.len(), window_records(&window).len());
-        assert_eq!(window.dropped, 0, "{}", store.address());
-        assert_eq!(window.dropped_total, 0, "{}", store.address());
-        assert_eq!(window.clamped_leftover, 0, "{}", store.address());
-
-        assert_eq!(
-            taken_bodies(&store.peek_new(&sub, DEPTH).await),
-            vec!["a", "b", "c"],
-            "the read moved nothing: {}",
-            store.address()
-        );
-        assert!(store.has_deliverable(&sub).await, "{}", store.address());
+async fn durable_advance_under_reports_a_loss_gc_already_retired() {
+    let (store, db) = durable_store_for("proc", DEPTH).await;
+    let sub = wasm_sub("proc");
+    store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
+    for body in ["a", "b", "c", "d"] {
+        let msg = message_for(&store, "alice", body);
+        RetentionStore::append(&store, msg).await;
     }
-}
 
-/// Settling the whole window is what advances the subscriber past it.
-#[tokio::test]
-async fn settling_a_peeked_window_retires_exactly_what_it_names() {
-    for store in stores_for_proc(DEPTH).await {
-        let sub = wasm_sub("proc");
-        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
-        for body in ["a", "b"] {
-            let msg = message_for(store.as_ref(), "alice", body);
-            store.append(msg).await;
-        }
-
-        let window = store.peek_new(&sub, DEPTH).await;
-        let dropped = store.settle(&sub, &window_records(&window)).await;
-        assert_eq!(dropped, 0, "nothing was passed over: {}", store.address());
-        assert!(
-            store.peek_new(&sub, DEPTH).await.messages.is_empty(),
-            "{}",
-            store.address()
-        );
-        assert!(!store.has_deliverable(&sub).await, "{}", store.address());
-    }
-}
-
-/// A delivery that got partway through settles only what the far end took, and
-/// the remainder is handed over again — the property that lets a store serve a
-/// consumer whose delivery can fail halfway.
-#[tokio::test]
-async fn settling_a_prefix_leaves_the_remainder_owed() {
-    for store in stores_for_proc(DEPTH).await {
-        let sub = wasm_sub("proc");
-        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
-        for body in ["a", "b", "c"] {
-            let msg = message_for(store.as_ref(), "alice", body);
-            store.append(msg).await;
-        }
-
-        let window = store.peek_new(&sub, DEPTH).await;
-        let accepted = &window_records(&window)[..2];
-        assert_eq!(store.settle(&sub, accepted).await, 0, "{}", store.address());
-
-        assert_eq!(
-            taken_bodies(&store.peek_new(&sub, DEPTH).await),
-            vec!["c"],
-            "only the unaccepted remainder is still owed: {}",
-            store.address()
-        );
-        assert_eq!(
-            store.dropped_total(&sub),
-            0,
-            "a redelivery is not a loss: {}",
-            store.address()
-        );
-    }
-}
-
-/// A failed delivery settles nothing, and the subscriber keeps every obligation
-/// it had.
-#[tokio::test]
-async fn settling_nothing_keeps_every_obligation() {
-    for store in stores_for_proc(DEPTH).await {
-        let sub = wasm_sub("proc");
-        store.attach(&sub, "proc", DEPTH, Priming::Head, true).await;
-        let msg = message_for(store.as_ref(), "alice", "a");
-        store.append(msg).await;
-
-        store.peek_new(&sub, DEPTH).await;
-        assert_eq!(store.settle(&sub, &[]).await, 0, "{}", store.address());
-        assert_eq!(
-            taken_bodies(&store.peek_new(&sub, DEPTH).await),
-            vec!["a"],
-            "{}",
-            store.address()
-        );
-        assert_eq!(store.dropped_total(&sub), 0, "{}", store.address());
-    }
-}
-
-/// The limit caps a peeked window exactly as it caps a taken one, and the
-/// excess is accounted when the window is settled — charged as dropped by a
-/// store whose position moves past it, held for the next read by one that
-/// keeps a record per message. Either way the caller can tell.
-#[tokio::test]
-async fn settling_a_capped_window_accounts_what_it_left_behind() {
-    for store in stores_subscribed(DEPTH, vec![wasm_target_at("proc", 4, None)]).await {
-        let sub = wasm_sub("proc");
-        store.attach(&sub, "proc", 4, Priming::Head, true).await;
-        for body in ["a", "b", "c", "d"] {
-            let msg = message_for(store.as_ref(), "alice", body);
-            store.append(msg).await;
-        }
-
-        let window = store.peek_new(&sub, 2).await;
-        assert_eq!(window.messages.len(), 2, "{}", store.address());
-        assert_eq!(
-            window.dropped,
-            0,
-            "the read charges nothing: {}",
-            store.address()
-        );
-
-        let dropped = store.settle(&sub, &window_records(&window)).await;
-        let still_owed = store.peek_new(&sub, 2).await.messages.len();
-        assert_eq!(
-            dropped as usize + still_owed,
+    // Retention outruns the subscriber: the two oldest go, and their claims with
+    // them.
+    {
+        let conn = db.lock().await;
+        let (evicted, claims_retired) = bus_gc_evict_channel(
+            &conn,
+            store.channel_uuid(),
+            store.address(),
+            ChannelScheme::Brenn,
             2,
-            "the two that did not fit are accounted for, either way: {}",
-            store.address()
+            Sink::Drop,
+            None,
         );
+        assert_eq!(evicted, 2);
+        assert_eq!(claims_retired, 2, "the lagging subscriber's claims go too");
     }
+
+    let (new, advance) = serve(&store, &sub, DEPTH, 0).await;
+    assert_eq!(new, vec!["c", "d"], "only what survived is servable");
+    assert_eq!(
+        advance.dropped, 0,
+        "the shim counts claims; the two it lost hold none"
+    );
+    assert_eq!(advance.noise_charge, 0, "and charges the ladder nothing");
 }
 
 #[tokio::test]
@@ -1334,9 +1498,9 @@ async fn a_subscriber_attached_mid_park_receives_the_message_at_release() {
 
         store.release_due(release_at).await;
 
-        let window = store.take_new(&latecomer, DEPTH).await;
+        let (new, _) = serve(store.as_ref(), &latecomer, DEPTH, 0).await;
         assert_eq!(
-            taken_bodies(&window),
+            new,
             vec!["later"],
             "attached mid-park and owed the release: {}",
             store.address()
@@ -1417,8 +1581,8 @@ async fn a_claim_predating_the_park_is_replaced_at_release() {
         "a subscriber that is no longer a target keeps no claim"
     );
 
-    let window = store.take_new(&wasm_sub("proc"), DEPTH).await;
-    assert_eq!(taken_bodies(&window), vec!["a"]);
+    let (new, _) = serve(&store, &wasm_sub("proc"), DEPTH, 0).await;
+    assert_eq!(new, vec!["a"]);
 
     assert_eq!(
         store.dropped_total(&departed),

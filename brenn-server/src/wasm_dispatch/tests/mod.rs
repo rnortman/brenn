@@ -26,7 +26,6 @@
 use super::*;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use brenn_lib::db::init_db_memory;
 use brenn_lib::messaging::config::{
@@ -66,14 +65,13 @@ pub(super) fn unthrottled_pacing() -> ActivationPacing {
     }
 }
 
-/// Poll `load_pending_pushes` until it returns empty or the deadline elapses.
-/// Returns `true` if the pending set emptied within the deadline. Shared by the
-/// clamp self-renotify family (`renotify`) and the clamp-chain pacing test
-/// (`pacing`).
+/// Poll until `subscriber` is owed nothing anywhere, or `deadline` elapses.
+/// Returns whether it drained. For the tests that drive the real consumer task
+/// and so cannot observe a drain step directly.
 pub(super) async fn wait_pending_empty(
     messenger: &brenn_lib::messaging::Messenger,
     subscriber: &ParticipantId,
-    deadline: Duration,
+    deadline: std::time::Duration,
 ) -> bool {
     let start = std::time::Instant::now();
     loop {
@@ -83,7 +81,7 @@ pub(super) async fn wait_pending_empty(
         if start.elapsed() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
 

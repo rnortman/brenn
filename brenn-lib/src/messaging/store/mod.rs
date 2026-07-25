@@ -228,35 +228,100 @@ pub fn priming_for_kind(kind: &SubscriberEntryKind) -> Priming {
     }
 }
 
-/// One message handed to a subscriber by [`RetentionStore::take_new`].
+/// One subscriber's activation view: the most recent
+/// `max(push_limit, retain_limit)` retained messages, with the boundary where
+/// its unseen ones begin.
+///
+/// Reading one moves nothing and charges nothing. Everything below `new_from`
+/// is context — messages the subscriber has already seen, or unseen ones the
+/// push limit did not promote to new. Unseen messages served as context were
+/// delivered, so passing them charges nothing; only seqs below the whole
+/// window were never visible, and the advance that passes them reports those.
 #[derive(Debug, Clone)]
-pub struct TakenMessage {
-    /// The store's handle on this subscriber's copy, for the stores that issue
-    /// one. `None` when the take itself settled the message — a cursor-tracked
-    /// store advances past it and has nothing left to name.
-    pub record: Option<TargetRecord>,
-    pub envelope: Arc<MessageEnvelope>,
+pub struct SubscriberWindow {
+    /// Oldest first, each entry carrying the seq its store assigned it.
+    pub entries: Vec<(MessageSeq, Arc<MessageEnvelope>)>,
+    /// Index of the first new entry; equal to `entries.len()` when nothing in
+    /// the window is new.
+    pub new_from: usize,
+    /// Whether the subscriber this window was cut for holds a position at all.
+    /// A sampled subscriber (`push_limit = 0`) does not, so nothing advances
+    /// over its window.
+    pub push_enabled: bool,
 }
 
-/// One subscriber's NEW window, as [`RetentionStore::take_new`] hands it over.
-#[derive(Debug, Clone)]
-pub struct TakenWindow {
-    /// Owed messages, oldest first, capped by the caller's limit.
-    pub messages: Vec<TakenMessage>,
-    /// Owed messages this take charged as dropped — the per-take overflow the
-    /// noise ladder reacts to. Nonzero only for a store whose take is also the
-    /// point where overflow is accounted; a store that accounts its drops when
-    /// they happen reports `0` here and carries them in
-    /// [`RetentionStore::dropped_total`].
+impl SubscriberWindow {
+    /// A window that served nothing.
+    pub fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            new_from: 0,
+            push_enabled: false,
+        }
+    }
+
+    /// The new entries, oldest first.
+    pub fn new_entries(&self) -> &[(MessageSeq, Arc<MessageEnvelope>)] {
+        &self.entries[self.new_from..]
+    }
+
+    /// The `(through, seen_floor)` pair an advance over this window is made
+    /// with, or `None` when there is nothing to advance: a window that served
+    /// nothing, or a sampled subscriber, which holds no position to move.
+    pub fn advance_span(&self) -> Option<(MessageSeq, MessageSeq)> {
+        if !self.push_enabled {
+            return None;
+        }
+        Some((self.entries.last()?.0, self.entries.first()?.0))
+    }
+}
+
+/// What an advance passed over without ever having served it.
+///
+/// Both figures are subtractions between sequence numbers, computed at the
+/// advance and stored nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AdvanceOutcome {
+    /// Unseen seqs the advance stepped past that no window served — the
+    /// subscriber's visible loss since its previous advance, and the figure a
+    /// guest reads as `dropped`.
     pub dropped: u64,
-    /// The subscriber's lifetime drop total, read with the take so the pair
-    /// cannot disagree: the count reflects exactly the messages missing from
-    /// the window handed over.
-    pub dropped_total: u64,
-    /// How much this take left behind because of the cap. Exact for a store
-    /// that can count what it did not hand over; a presence flag (`0` or `1`)
-    /// for one that can only say whether more remains.
-    pub clamped_leftover: usize,
+    /// The portion of `dropped` no eviction pass has already reported. The
+    /// caller routes this into the noise ladder; eviction passes report their
+    /// own, so no span is enacted twice.
+    pub noise_charge: u64,
+}
+
+/// The bound `limit` places on a window read, with `Unbounded` spelled as the
+/// largest count a store can hold.
+pub(crate) fn depth_bound(limit: Depth) -> u64 {
+    match limit {
+        Depth::Bounded(n) => n,
+        Depth::Unbounded => u64::MAX,
+    }
+}
+
+/// Cut the window shape out of a retained span: the newest
+/// `min(unseen, push_limit)` entries are new, the rest is context.
+///
+/// `entries` must already be the most recent `max(push_limit, retain_limit)`
+/// retained messages, oldest first — the part a store answers from its own
+/// retention. The boundary itself comes from [`brenn_queue::new_boundary`], the
+/// one authority for the rule, so both classes cut it identically.
+pub(crate) fn compose_window(
+    entries: Vec<(MessageSeq, Arc<MessageEnvelope>)>,
+    next_owed: MessageSeq,
+    push_limit: Depth,
+) -> SubscriberWindow {
+    SubscriberWindow {
+        new_from: brenn_queue::new_boundary(
+            entries.iter().map(|(seq, _)| seq.0),
+            next_owed.0,
+            depth_bound(push_limit),
+        ),
+        entries,
+        push_enabled: push_limit.is_push_enabled(),
+    }
 }
 
 /// One subscriber's overflow, as the store that dropped the messages reports
@@ -444,82 +509,73 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     /// owed to nobody until they release.
     async fn deliverable_subscribers(&self) -> Vec<ParticipantId>;
 
-    /// Whether `subscriber` is owed deliverable work on this channel.
+    /// Whether `subscriber` is owed deliverable work on this channel: anything
+    /// unseen that retention still holds.
+    ///
+    /// The activation trigger gate, answered from positions alone so a consumer
+    /// that turns out to be owed nothing never pays for a window read. It is
+    /// conservative in the direction that matters: `false` means no window of
+    /// this channel can present the subscriber anything new.
     ///
     /// A subscriber this store has never seen is owed nothing and answers
     /// `false`; it is not an error to ask.
     async fn has_deliverable(&self, subscriber: &ParticipantId) -> bool;
 
-    /// Hand `subscriber` the messages it is owed, oldest first, at most `limit`
-    /// of them — the backend push consumer's read of its queue.
+    /// `subscriber`'s activation view: the most recent
+    /// `max(push_limit, retain_limit)` retained messages, with the new/context
+    /// boundary decided from the subscriber's position.
     ///
-    /// `limit` is the subscriber's resolved push depth, and the caller is its
-    /// single authority: a store holding a copy of the depth retunes it from
-    /// this argument rather than deciding the window itself. `limit = 0` is a
-    /// sampled subscriber — it takes nothing, and the call leaves no trace.
+    /// New is the *newest* `min(unseen, push_limit)` of them — the same
+    /// drop-oldest rule retention itself follows, so a consumer woken late acts
+    /// on the freshest messages. Unseen entries below that boundary are served
+    /// as context and are not lost; unseen seqs below the whole window were
+    /// never visible, and the advance that passes them reports them.
     ///
-    /// The take advances the subscriber past the window it returns. Where that
-    /// is the whole story — a cursor-tracked store — the take *is* the ack and
-    /// the messages carry no record. A store that issues a per-subscriber
-    /// delivery record instead returns the records with them and settles when
-    /// the consumer says so, which is what keeps a durable message from being
-    /// lost to a host that dies mid-activation.
+    /// `push_limit` is the subscriber's resolved push depth and the caller is
+    /// its single authority: a store holding a copy of the depth retunes it
+    /// from this argument rather than deciding the window itself. A sampled
+    /// (`push_limit = 0`) subscriber is never delivered to, so nothing in its
+    /// window is ever new — it still sees `retain_limit` of context.
     ///
-    /// What happens to the excess beyond `limit` is the store's own overflow
-    /// mechanic: held for the next take, or charged as a drop and gone. The
-    /// window reports which, in `clamped_leftover` and `dropped`; the cap
-    /// itself is the part every store owes the caller.
-    ///
-    /// A store that keeps an explicit per-subscriber queue panics when asked
-    /// for a subscriber that has none: taking from a queue that was never
-    /// created is a wiring bug, not an empty window. A store whose delivery
-    /// state is per-message records has no queue to miss and answers with an
-    /// empty window.
-    async fn take_new(&self, subscriber: &ParticipantId, limit: u64) -> TakenWindow;
+    /// Pure read: no position moves and nothing is charged. A store that keeps
+    /// an explicit per-subscriber position panics when asked for a subscriber
+    /// that has none: reading a queue that was never created is a wiring bug,
+    /// not an empty window.
+    async fn window(
+        &self,
+        subscriber: &ParticipantId,
+        push_limit: Depth,
+        retain_limit: Depth,
+    ) -> SubscriberWindow;
 
-    /// Read the same window [`RetentionStore::take_new`] would hand over,
-    /// without settling any of it.
+    /// Advance `subscriber` past everything through `through`, and report the
+    /// unseen seqs no window ever served it.
     ///
-    /// This is the read for a consumer that must prove delivery before its
-    /// queue advances — one that may be asleep, or whose far end can refuse the
-    /// message. It peeks, delivers, and settles exactly what was accepted, so a
-    /// delivery attempt that fails costs nothing. A consumer whose read is its
-    /// own acknowledgement takes instead.
+    /// `seen_floor` is the seq of the oldest entry the window being advanced
+    /// over carried; unseen seqs below it were never visible to this
+    /// subscriber and are its drops, computed as a subtraction and stored
+    /// nowhere. Idempotent for a `through` at or below the current position, so
+    /// a consumer that accepted nothing keeps everything it had and a
+    /// re-advance reports nothing twice.
     ///
-    /// Every message carries the record naming this subscriber's copy of it,
-    /// whatever the store's own bookkeeping is — a per-message delivery record,
-    /// or a position — because the consumer settles by naming what it accepted
-    /// and nothing else.
+    /// This is the consumer's own bookkeeping, not a settlement of debt: a
+    /// consumer that never advances just has an ever-lagging position that
+    /// eviction eventually reports against.
     ///
-    /// `limit`, the sampled (`limit = 0`) rule, and the missing-queue rule are
-    /// exactly [`RetentionStore::take_new`]'s. Nothing is charged: the overflow
-    /// this window leaves behind is charged by the settle that accepts it, so a
-    /// read that is never settled costs the subscriber nothing.
-    async fn peek_new(&self, subscriber: &ParticipantId, limit: u64) -> TakenWindow;
-
-    /// Settle records [`RetentionStore::peek_new`] handed over — the consumer's
-    /// statement that these reached their destination.
-    ///
-    /// The subscriber advances past them: a cursor-tracked store moves to the
-    /// newest settled position, charging as dropped every owed message the
-    /// consumer passed over; a record-issuing store settles exactly the records
-    /// named. Anything above the newest settled record stays owed, so a partial
-    /// delivery redelivers its remainder rather than losing it. Settling nothing
-    /// is a no-op — a delivery attempt that failed outright keeps every
-    /// obligation.
-    ///
-    /// Returns the drops this settle charged, on the same footing as
-    /// [`TakenWindow::dropped`]: the store counts, and the substrate decides
-    /// what the count is worth on the noise ladder.
-    ///
-    /// The records must be ones this store issued for this subscriber. They are
-    /// meaningless to any other store, and a caller reaches them only by having
-    /// been handed them.
-    async fn settle(&self, subscriber: &ParticipantId, records: &[TargetRecord]) -> u64;
+    /// Only a push-enabled subscriber may be advanced. A sampled
+    /// (`push_limit = 0`) subscriber holds no position: its window yields no
+    /// [`SubscriberWindow::advance_span`], and a store that keeps an explicit
+    /// position panics when asked to move one it does not have.
+    async fn advance(
+        &self,
+        subscriber: &ParticipantId,
+        through: MessageSeq,
+        seen_floor: MessageSeq,
+    ) -> AdvanceOutcome;
 
     /// Lifetime count of messages this store dropped out from under
-    /// `subscriber` before it could take them — the within-lifetime gap signal a
-    /// consumer reads to know its stream is incomplete.
+    /// `subscriber` before any window served them — the within-lifetime gap
+    /// signal a consumer reads to know its stream is incomplete.
     ///
     /// This is accounting, not policy: the count rises on every drop whatever
     /// the subscription's noise level, which decides only how loudly the

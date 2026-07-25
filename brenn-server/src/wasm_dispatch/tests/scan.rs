@@ -22,8 +22,7 @@ async fn single_scan_per_drain_step_regardless_of_k() {
 
     // Snapshot the counter immediately before the drain step.
     let before = messenger.pending_bus_pushes_scan_count();
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
     let after = messenger.pending_bus_pushes_scan_count();
 
     assert_eq!(
@@ -56,27 +55,28 @@ async fn order_preserving_partition_delivers_all_rows() {
 
     // Insert 3 rows per channel in interleaved order. Record insertion order
     // per channel (push_id, channel_address) so we can assert partition ordering.
-    let mut expected_order: std::collections::HashMap<String, Vec<i64>> =
+    let mut expected_order: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for i in 0..3usize {
         for channel in &channels {
-            let (push_id, _) = testutils::insert_wasm_push(
+            let body = format!("msg-{i}");
+            testutils::insert_wasm_push(
                 &messenger,
                 channel,
                 &wasm_sub,
-                &format!("msg-{i}"),
+                &body,
                 ChannelScheme::Brenn,
             )
             .await;
             expected_order
                 .entry(channel.address.clone())
                 .or_default()
-                .push(push_id);
+                .push(body);
         }
     }
 
-    // Before drain: assert load_activation_snapshot assembles per-channel new_rows
-    // in ascending push_id order (= scan order = publish_ts_ns ASC, id ASC).
+    // Before drain: assert load_activation_snapshot assembles each channel's new
+    // portion in ascending retention order (= publish_ts_ns ASC, id ASC).
     // This directly pins AC 3 "within a channel" without relying on the demo guest.
     let pre_scan_before = messenger.pending_bus_pushes_scan_count();
     let pre_snapshots = messenger
@@ -90,10 +90,10 @@ async fn order_preserving_partition_delivers_all_rows() {
         "pre-drain load_activation_snapshot must use exactly one scan"
     );
     for snap in &pre_snapshots {
-        let got: Vec<i64> = snap
-            .new_rows
+        let got: Vec<String> = snap
+            .new_entries()
             .iter()
-            .map(|(record, _)| record.expect("durable port row carries a claim record").0)
+            .map(|(_, envelope)| envelope.body.clone())
             .collect();
         let expected = expected_order
             .get(&snap.channel_address)
@@ -101,14 +101,13 @@ async fn order_preserving_partition_delivers_all_rows() {
             .unwrap_or_default();
         assert_eq!(
             got, expected,
-            "channel {} new_rows must be in insertion (scan) order; got={got:?} expected={expected:?}",
+            "channel {} new messages must be in retention order; got={got:?} expected={expected:?}",
             snap.channel_address
         );
     }
 
     let before = messenger.pending_bus_pushes_scan_count();
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
     let after = messenger.pending_bus_pushes_scan_count();
 
     // +1 from the pre-drain load_activation_snapshot call above + 1 from drain = 2 total.
@@ -141,8 +140,7 @@ async fn all_channels_with_pending_rows_are_visited() {
             .await;
     }
 
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
 
     let rows = messenger.load_pending_pushes(&wasm_sub).await;
     assert!(rows.is_empty(), "all channels visited and rows delivered");
@@ -171,8 +169,7 @@ async fn empty_channels_skipped_no_scan_per_empty_channel() {
     .await;
 
     let before = messenger.pending_bus_pushes_scan_count();
-    let mut last_seen = HashMap::new();
-    drain_step(&cfg, &wasm_sub, &mut last_seen).await;
+    drain_step(&cfg, &wasm_sub).await;
     let after = messenger.pending_bus_pushes_scan_count();
 
     // Exactly one scan, regardless of empty channels.
