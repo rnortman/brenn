@@ -441,6 +441,8 @@ fn row_to_drain_push(row: &rusqlite::Row) -> rusqlite::Result<PendingPushRow> {
     };
 
     Ok(PendingPushRow {
+        // An ingress row belongs to no channel, so it holds no retention position.
+        retained_seq: None,
         push_id,
         message_id,
         payload,

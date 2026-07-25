@@ -1096,7 +1096,11 @@ mod tests {
                 dropped: *dropped,
             })
             .collect();
-        let _ = entry(&Activation { ports });
+        let _ = entry(&Activation {
+            ports,
+            deferred: vec![],
+            now: None,
+        });
     }
 
     /// Sink for a listener forwarding a resolved instance, a retargeted tag, and
@@ -1183,6 +1187,8 @@ mod tests {
                 new_from: 0,
                 dropped: 0,
             }],
+            deferred: vec![],
+            now: None,
         }
     }
 

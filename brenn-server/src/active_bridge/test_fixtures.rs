@@ -438,6 +438,7 @@ impl ActiveBridge {
             address: brenn_lib::messaging::canonical_address("test-channel"),
             description: None,
             resolved_channel: brenn_lib::messaging::config::ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: brenn_lib::messaging::config::Depth::Unbounded,
                 retain_depth: brenn_lib::messaging::config::Depth::Unbounded,
                 standing_retain_depth: brenn_lib::messaging::config::Depth::Unbounded,
@@ -467,6 +468,7 @@ impl ActiveBridge {
             address: brenn_lib::messaging::canonical_address("locked-channel"),
             description: None,
             resolved_channel: brenn_lib::messaging::config::ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: brenn_lib::messaging::config::Depth::Unbounded,
                 retain_depth: brenn_lib::messaging::config::Depth::Unbounded,
                 standing_retain_depth: brenn_lib::messaging::config::Depth::Unbounded,
@@ -632,6 +634,7 @@ impl ActiveBridge {
             address: mqtt_address.clone(),
             description: None,
             resolved_channel: brenn_lib::messaging::config::ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: brenn_lib::messaging::config::Depth::Unbounded,
                 retain_depth: brenn_lib::messaging::config::Depth::Unbounded,
                 standing_retain_depth: brenn_lib::messaging::config::Depth::Unbounded,
@@ -800,6 +803,7 @@ impl ActiveBridge {
             address: brenn_lib::messaging::canonical_address("test-channel"),
             description: None,
             resolved_channel: brenn_lib::messaging::config::ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: brenn_lib::messaging::config::Depth::Unbounded,
                 retain_depth: brenn_lib::messaging::config::Depth::Unbounded,
                 standing_retain_depth,
@@ -815,8 +819,15 @@ impl ActiveBridge {
             let conn = db.lock().await;
             brenn_lib::messaging::db::upsert_channels(&conn, std::slice::from_ref(&brenn_entry));
         }
+        // A non-durable channel alongside it, so the runtime subscribe paths have
+        // one of each class to resolve. It carries no DB row (nothing to persist)
+        // and its retention lives in the ring store built below.
+        let ring_entry = brenn_lib::messaging::testutils::ephemeral_channel_entry("test-ring", 8);
+        let ring_stores = Arc::new(brenn_lib::messaging::store::RingStores::build(
+            std::slice::from_ref(&ring_entry),
+        ));
         let dir = Arc::new(brenn_lib::messaging::MessagingDirectory::with_entries(
-            vec![brenn_entry],
+            vec![brenn_entry, ring_entry],
         ));
 
         // Apps: testapp. When `singleton`, a singleton single-user app so
@@ -859,7 +870,8 @@ impl ActiveBridge {
             Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
                 as Arc<dyn brenn_lib::messaging::WakeRouter>,
             brenn_lib::messaging::MessagingGlobalConfig::default(),
-        );
+        )
+        .with_ring_stores(ring_stores);
 
         // MqttService with a registered `home` ingress supervisor. Non-default
         // qos (2) / urgency (High) so qos-/urgency-resolution is observable; the
@@ -954,6 +966,7 @@ impl ActiveBridge {
                 address: brenn_lib::messaging::canonical_address("test-channel"),
                 description: None,
                 resolved_channel: brenn_lib::messaging::config::ResolvedChannel {
+                    send_rate: Default::default(),
                     push_depth: brenn_lib::messaging::config::Depth::Unbounded,
                     retain_depth: brenn_lib::messaging::config::Depth::Unbounded,
                     standing_retain_depth: brenn_lib::messaging::config::Depth::Unbounded,

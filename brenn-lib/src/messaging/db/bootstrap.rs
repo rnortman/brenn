@@ -13,6 +13,26 @@ use super::super::{
 use super::dynamic::DynamicSubscriptionRow;
 use uuid::Uuid;
 
+/// The `(channel_uuid, app_slug)` keys currently present in
+/// `messaging_subscriptions`. Must be called before [`rebuild_subscriptions`],
+/// which truncates the table.
+pub fn load_subscription_keys(conn: &Connection) -> std::collections::HashSet<(Uuid, String)> {
+    let mut stmt = conn
+        .prepare("SELECT channel_uuid, app_slug FROM messaging_subscriptions")
+        .expect("messaging: prepare load_subscription_keys");
+    let rows = stmt
+        .query_map([], |row| {
+            let uuid_bytes: Vec<u8> = row.get(0)?;
+            let app_slug: String = row.get(1)?;
+            Ok((
+                Uuid::from_slice(&uuid_bytes).expect("subscription channel_uuid"),
+                app_slug,
+            ))
+        })
+        .expect("messaging: query load_subscription_keys");
+    rows.map(|r| r.expect("read subscription key")).collect()
+}
+
 /// Upsert all configured channels into `messaging_channels`. UUIDs not
 /// present in config are kept (so renamed channels keep their history);
 /// operators delete obsolete channels manually if desired.
@@ -24,16 +44,19 @@ pub fn upsert_channels(conn: &Connection, entries: &[ChannelEntry]) {
         // First try INSERT OR IGNORE keyed by uuid (PK), then UPDATE
         // address/description if the row already existed.
         let transport_type_str = entry.transport_type.as_str();
+        // The UPDATE below never touches resume_epoch, so an existing channel
+        // keeps the epoch it was born with (the epoch dies only with the row).
         conn.execute(
             "INSERT OR IGNORE INTO messaging_channels \
-             (uuid, address, description, transport_type, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (uuid, address, description, transport_type, created_at, resume_epoch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 uuid_bytes,
                 &entry.address,
                 &entry.description,
                 transport_type_str,
                 &now,
+                Uuid::new_v4().as_bytes().to_vec(),
             ],
         )
         .unwrap_or_else(|e| {
@@ -102,6 +125,7 @@ pub fn load_channels_by_uuids(
         )
         .expect("messaging: prepare load_channels_by_uuids");
     let resolved_channel = ResolvedChannel {
+        send_rate: Default::default(),
         push_depth: defaults.default_push_depth,
         retain_depth: defaults.default_retain_depth,
         standing_retain_depth: defaults.default_standing_retain_depth,
@@ -327,6 +351,7 @@ mod tests {
             description: None,
             transport_type: ChannelScheme::Brenn,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -508,6 +533,7 @@ mod tests {
             description: description.map(str::to_string),
             transport_type: transport,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -596,8 +622,9 @@ mod tests {
         let uuid = Uuid::new_v4();
         conn.execute(
             "INSERT INTO messaging_channels \
-             (uuid, address, description, transport_type, created_at) \
-             VALUES (?1, 'heartbeat', NULL, 'garbage', '2026-06-20T00:00:00Z')",
+             (uuid, address, description, transport_type, created_at, resume_epoch) \
+             VALUES (?1, 'heartbeat', NULL, 'garbage', '2026-06-20T00:00:00Z', \
+                     X'00000000000000000000000000000001')",
             rusqlite::params![uuid.as_bytes().to_vec()],
         )
         .expect("seed corrupt channel row");
@@ -616,8 +643,9 @@ mod tests {
         let uuid = Uuid::new_v4();
         conn.execute(
             "INSERT INTO messaging_channels \
-             (uuid, address, description, transport_type, created_at) \
-             VALUES (?1, 'heartbeat', NULL, 'ingress', '2026-06-20T00:00:00Z')",
+             (uuid, address, description, transport_type, created_at, resume_epoch) \
+             VALUES (?1, 'heartbeat', NULL, 'ingress', '2026-06-20T00:00:00Z', \
+                     X'00000000000000000000000000000001')",
             rusqlite::params![uuid.as_bytes().to_vec()],
         )
         .expect("seed ingress channel row");

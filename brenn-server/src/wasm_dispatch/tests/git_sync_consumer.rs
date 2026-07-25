@@ -233,6 +233,7 @@ async fn consumer_harness(
             },
             inbox_input_port(slug),
         ],
+        outputs: vec![],
         activation_pacing: unthrottled_pacing(),
     };
 

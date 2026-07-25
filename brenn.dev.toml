@@ -350,10 +350,9 @@ csv = [".csv"]
 # loop. Pressing "send" round-trips publish -> bus -> deliver -> rendered text
 # with no external publisher — a self-contained end-to-end check from
 # `make launchdev` alone.
-[[ephemeral_channel]]
-name = "dev-stub"
+[[channel]]
+address = "ephemeral:dev-stub"
 retain_depth = 1
-capacity = 64
 
 [[surface]]
 slug = "dev-stub"

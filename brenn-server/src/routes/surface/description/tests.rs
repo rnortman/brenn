@@ -74,7 +74,8 @@ fn directory_with_channels(bares: &[String], standing: Depth) -> MessagingDirect
         .iter()
         .enumerate()
         .map(|(i, b)| ChannelConfigRaw {
-            uuid: format!("00000000-0000-4000-8000-{i:012x}"),
+            send_rate: None,
+            uuid: Some(format!("00000000-0000-4000-8000-{i:012x}")),
             address: b.clone(),
             description: None,
             push_depth: None,
@@ -116,7 +117,8 @@ fn full_directory(
     let mut uuid = 0u64;
     let mut push = |address: String, retain: Option<Depth>, standing: Depth, uuid: &mut u64| {
         raw.push(ChannelConfigRaw {
-            uuid: format!("00000000-0000-4000-8000-{uuid:012x}"),
+            send_rate: None,
+            uuid: Some(format!("00000000-0000-4000-8000-{uuid:012x}")),
             address,
             description: None,
             push_depth: None,

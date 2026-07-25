@@ -526,6 +526,7 @@ dependencies = [
  "brenn-budget",
  "brenn-common",
  "brenn-envelope",
+ "brenn-queue",
  "brenn-surface-proto",
  "bytes",
  "chrono",
@@ -640,6 +641,10 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
 ]
+
+[[package]]
+name = "brenn-queue"
+version = "0.1.0"
 
 [[package]]
 name = "brenn-server"
@@ -803,6 +808,7 @@ dependencies = [
  "brenn-budget",
  "brenn-cal",
  "brenn-common",
+ "chrono",
  "rusqlite",
  "semver",
  "serde_json",

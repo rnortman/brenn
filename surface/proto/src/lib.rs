@@ -1217,11 +1217,12 @@ pub struct GapInfo {
 #[serde(tag = "kind")]
 pub enum GapReason {
     EpochChanged,
-    HoleExceedsRing,
-    /// Durable resume could not be covered from the retained window: the
-    /// requested `last_seq` predates the channel's oldest retained message, or
-    /// the per-subscriber retain clamp truncated the re-send set. Conservative —
-    /// a false "may have missed" is honest; a false negative is not.
+    /// Resume could not be covered from the retained window: the requested
+    /// `last_seq` predates the oldest retained message, or the per-subscriber
+    /// retain clamp truncated the re-send set. Store-neutral — the same
+    /// condition on a ring-backed channel whose depth dropped the history and on
+    /// a durable channel whose window reaped it. Conservative — a false "may have
+    /// missed" is honest; a false negative is not.
     BeyondRetained,
 }
 
@@ -2148,8 +2149,8 @@ mod tests {
             json!({ "kind": "EpochChanged" })
         );
         assert_eq!(
-            serde_json::to_value(GapReason::HoleExceedsRing).unwrap(),
-            json!({ "kind": "HoleExceedsRing" })
+            serde_json::to_value(GapReason::BeyondRetained).unwrap(),
+            json!({ "kind": "BeyondRetained" })
         );
     }
 

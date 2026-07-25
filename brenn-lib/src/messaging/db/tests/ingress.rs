@@ -22,7 +22,7 @@ fn cleanup_scoping_ingress_only() {
     let ch_uuid = uuid::Uuid::new_v4();
     let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
     conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, created_at) VALUES (?1, 'brenn:ch', '2024-01-01')",
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:ch', '2024-01-01', X'00000000000000000000000000000001')",
         rusqlite::params![ch_uuid_bytes],
     )
     .unwrap();
@@ -246,8 +246,8 @@ fn webhook_row_drains_as_bus_not_ingress() {
     let channel_uuid = crate::messaging::webhook_channel_uuid_from_slug("test-ep");
     let channel_uuid_bytes = channel_uuid.as_bytes().to_vec();
     conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, description, transport_type, created_at) \
-         VALUES (?1, 'webhook:test-ep', NULL, 'webhook', '2024-01-01')",
+        "INSERT INTO messaging_channels (uuid, address, description, transport_type, created_at, resume_epoch) \
+         VALUES (?1, 'webhook:test-ep', NULL, 'webhook', '2024-01-01', X'00000000000000000000000000000001')",
         rusqlite::params![channel_uuid_bytes],
     )
     .unwrap();

@@ -22,12 +22,14 @@ mod types;
 pub use types::PendingPushRow;
 
 mod budget;
-pub use budget::{BudgetDecrement, decrement_send_budget, read_send_budget, reset_send_budget};
+pub use budget::{
+    BudgetDecrement, decrement_send_budget, read_send_budget, refund_send_budget, reset_send_budget,
+};
 
 mod bootstrap;
 pub use bootstrap::{
-    load_channels_by_uuids, mirror_dynamic_subscriptions, prune_dropped_dynamic_subscriptions,
-    rebuild_subscriptions, upsert_channels,
+    load_channels_by_uuids, load_subscription_keys, mirror_dynamic_subscriptions,
+    prune_dropped_dynamic_subscriptions, rebuild_subscriptions, upsert_channels,
 };
 
 mod dynamic;
@@ -57,16 +59,27 @@ mod bus;
 #[cfg(test)]
 pub(crate) use bus::LOAD_ALL_DISPATCHABLE_PUSHES_SQL;
 pub use bus::{
-    EditFieldsApplied, EditUpdateResult, InsertedMessage, MessageLookup, PendingPushInsert,
-    ReleasedPushRow, bus_gc_evict_channel, bus_gc_retire_pushes, cancel_pending_pushes_for_message,
-    channel_max_message_id, channel_min_message_id, claim_pending_pushes, confirm_pending_pushes,
-    delete_pending_push_by_id, earliest_pending_deadline, earliest_pending_release,
+    ChannelPushRow, EditFieldsApplied, EditUpdateResult, InsertedMessage, MessageLookup,
+    PendingPushInsert, ReleasedPushRow, TentativePushRow, bus_gc_evict_channel,
+    bus_gc_retire_pushes, cancel_pending_pushes_for_message, channel_deliverable_subscribers,
+    channel_has_deliverable_for, channel_last_retained_seq, channel_resume_epoch,
+    channel_retained_count_after_seq, claim_pending_pushes, confirm_pending_pushes,
+    delete_pending_push_by_id, delete_pushes_for_subscriber, earliest_pending_deadline,
     insert_message_with_pushes, insert_message_with_pushes_in_tx, list_pending_messages_for_sender,
-    load_all_dispatchable_pushes, load_channel_messages_after, load_confirm_pending_pushes,
-    load_envelope_by_uuid, load_pending_pushes_for_channel, load_push_window, load_pushes_by_ids,
+    load_all_dispatchable_pushes, load_channel_messages_after_seq, load_channel_retained_tail,
+    load_channel_retained_window_seq, load_confirm_pending_pushes, load_envelope_by_uuid,
+    load_pending_pushes_for_channel, load_push_window, load_pushes_by_ids,
     load_released_push_window_rows, lookup_message_for_authorship, mark_pending_pushes_delivered,
-    pending_push_exists, release_due_pushes, stamp_confirm_pending, unclaim_confirm_pending_pushes,
-    unclaim_pending_pushes, update_message_and_pending_pushes,
+    pending_push_exists, pending_pushes_outside_channels, seed_pending_pushes_for_messages,
+    stamp_confirm_pending, unclaim_confirm_pending_pushes, unclaim_pending_pushes,
+    update_message_and_pending_pushes, withdraw_parked_message,
+};
+
+mod deferral;
+pub use deferral::{
+    DeferredLookup, DeferredRow, ReleasedBatch, ReleasedRow, count_deferred, delete_deferred,
+    earliest_channel_release, edit_deferred, list_deferred_for_sender, lookup_deferred,
+    release_due_for_channel,
 };
 
 #[cfg(test)]

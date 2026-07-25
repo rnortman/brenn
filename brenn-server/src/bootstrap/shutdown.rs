@@ -171,7 +171,10 @@ pub(crate) async fn bus_gc_loop(
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(HOURLY_INTERVAL_SECS)).await;
 
-        let channels = directory.list();
+        // Durable channels only: what this loop evicts is database rows, and a
+        // non-durable channel keeps its bounded window in memory, where the ring
+        // itself is the bound.
+        let channels = directory.list_durable();
         let mut total_messages_evicted: usize = 0;
         let mut total_pushes_retired: usize = 0;
 

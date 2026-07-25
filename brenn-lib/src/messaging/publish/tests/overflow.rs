@@ -67,6 +67,7 @@ async fn build_bounded_messenger(
         address: channel_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: sub_depth,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -151,6 +152,80 @@ async fn count_bus_push_rows(messenger: &Arc<Messenger>, conversation_id: i64) -
         |row| row.get(0),
     )
     .unwrap()
+}
+
+/// The publish path and the deliver-after release path enforce one push-depth
+/// bound between them: a window filled by immediate publishes is the window the
+/// release pass adds to, so releasing one more claim overflows it exactly once.
+/// Two independent bounds would let the subscriber hold more than `push_depth`.
+#[tokio::test]
+async fn publish_and_release_paths_enforce_one_push_depth_bound() {
+    let push_depth = 2u64;
+    let (m, channel_addr, _router) = build_bounded_messenger(push_depth, NoiseLevel::Metered).await;
+    let subscriber = crate::messaging::ParticipantId::for_conversation(2);
+
+    // Fill the depth-2 window through the publish path.
+    for i in 0..push_depth {
+        let _ = m
+            .publish(
+                crate::messaging::PublishOrigin::Conversation { id: 1 },
+                "pa-bob",
+                &channel_addr,
+                &format!("live{i}"),
+                Urgency::Low,
+                None,
+                None,
+                None,
+            )
+            .await;
+    }
+    assert_eq!(
+        m.drop_counter(&channel_addr, &subscriber),
+        0,
+        "a full-but-not-over window drops nothing"
+    );
+
+    // A parked message already due, released through the dispatcher path. It
+    // holds no claim: the release mints one for the subscriber attached then,
+    // which is the claim that lands in the window.
+    let channel_uuid = m
+        .directory
+        .resolve(&channel_addr)
+        .expect("channel registered")
+        .uuid;
+    let release_at = Utc::now() - chrono::Duration::seconds(1);
+    {
+        let conn = m.db.lock().await;
+        insert_message_with_pushes(
+            &conn,
+            channel_uuid,
+            "src",
+            "sender",
+            "parked",
+            Urgency::Low,
+            ChannelScheme::Brenn,
+            None,
+            None,
+            Some(release_at),
+            utc_to_ns(Utc::now()),
+            &[],
+        );
+    }
+
+    let db = m.db.clone();
+    let delivery_router: Arc<dyn WakeRouter> = Arc::new(CountingRouter::default());
+    crate::messaging::dispatcher::run_deliver_after_pass(&db, &delivery_router, &m).await;
+
+    assert_eq!(
+        m.drop_counter(&channel_addr, &subscriber),
+        1,
+        "the release lands in the window the publishes filled, overflowing it once"
+    );
+    assert_eq!(
+        count_bus_push_rows(&m, 2).await,
+        push_depth as i64,
+        "the subscriber never holds more than push_depth claims"
+    );
 }
 
 /// push_depth=0 subscriber: no pending_push row is ever created.
@@ -325,11 +400,12 @@ async fn push_overflow_fatal_panics_unreachable_backstop() {
     }
 }
 
-/// A push row for a future deliver_after must not be retired by push-overflow
-/// (design §3 in-flight exclusion). With push_depth=1 and one parked row already
-/// present, a second immediate publish must not touch the parked row.
+/// A parked message cannot be retired by push-overflow, because it holds no
+/// claim to retire: claims are minted at release, for the subscribers attached
+/// then. With push_depth=1 the immediate publish that follows a park therefore
+/// overflows nothing.
 #[tokio::test]
-async fn deliver_after_parked_row_not_retired_on_push_overflow() {
+async fn a_parked_message_holds_no_claim_to_retire_on_push_overflow() {
     let push_depth = 1u64;
     let (m, channel_addr, _router) = build_bounded_messenger(push_depth, NoiseLevel::Silent).await;
 
@@ -347,11 +423,14 @@ async fn deliver_after_parked_row_not_retired_on_push_overflow() {
             None,
         )
         .await;
-    // One push row exists, parked (release_after set).
-    assert_eq!(count_bus_push_rows(&m, 2).await, 1, "parked row must exist");
+    assert_eq!(
+        count_bus_push_rows(&m, 2).await,
+        0,
+        "a parked message is owed to nobody, so it holds no claim"
+    );
 
-    // Second publish: immediate → new row. push_depth=1, but the parked row
-    // is in-flight and must not be retired; total rows = 2.
+    // Second publish: immediate → one claim. push_depth=1 and there is no
+    // parked claim competing for the window, so nothing is retired.
     let _ = m
         .publish(
             crate::messaging::PublishOrigin::Conversation { id: 1 },
@@ -366,8 +445,19 @@ async fn deliver_after_parked_row_not_retired_on_push_overflow() {
         .await;
     assert_eq!(
         count_bus_push_rows(&m, 2).await,
+        1,
+        "the immediate publish's claim is the only one, and nothing is retired"
+    );
+
+    // The parked message's claim is minted at release, past the window the
+    // immediate publish filled — the release pass, not the park, is where it
+    // competes for push depth.
+    m.release_due_messages(future_da + chrono::Duration::seconds(1))
+        .await;
+    assert_eq!(
+        count_bus_push_rows(&m, 2).await,
         2,
-        "parked in-flight row must not be retired by push-overflow (design §3)"
+        "release mints the parked message's claim"
     );
 }
 
@@ -382,7 +472,7 @@ async fn push_window_seeded_from_db_on_first_touch() {
 
     // Insert push_depth pre-existing (non-parked, undelivered) push rows directly
     // into the DB, simulating rows that were there before the process restarted
-    // (the fresh Messenger starts with an empty push_windows map).
+    // (a fresh DbStore starts with an empty push window, seeded lazily on first touch).
     {
         let conn = m.db.lock().await;
         // Look up channel uuid by address (generated inside build_bounded_messenger).
@@ -521,10 +611,13 @@ async fn push_window_seed_truncates_excess_db_rows() {
     // DB row count = 4 (seed truncation is side-effect-free; only one overflow retire).
     assert_eq!(count_bus_push_rows(&m, 2).await, excess as i64);
 
-    // Drop counter is 1 (one overflow retire on the first publish).
     let subscriber = crate::messaging::ParticipantId::for_conversation(2);
-    // NoiseLevel::Silent means drop_counter stays 0 (no metered/alarm).
+    // One overflow retire on the first publish. NoiseLevel::Silent keeps the
+    // metered counter at zero, but the drop itself is accounted either way —
+    // silence is about how loud a drop is, not about whether the consumer's gap
+    // signal reflects it.
     assert_eq!(m.drop_counter(&channel_addr, &subscriber), 0);
+    assert_eq!(m.dropped_total(&channel_addr, &subscriber), 1);
 
     // Second publish: deque was [kept_row, pub1] (size=2=push_depth) after first.
     // This publish overflows → 1 more row retired from DB. DB: 4 + 1 - 1 = 4.
@@ -575,10 +668,10 @@ async fn unbounded_push_depth_no_overflow() {
     assert_eq!(m.drop_counter(&channel_addr, &subscriber), 0);
     // All 10 push rows still exist (unbounded).
     assert_eq!(count_bus_push_rows(&m, 2).await, 10);
-    // Unbounded subscribers must never touch push_windows — the early-return
-    // in record_push_and_check_overflow must fire before any deque entry is created.
+    // Unbounded subscribers must never create a push-window entry.
     assert!(
-        m.push_windows_is_empty(),
+        m.db_store_for_address(&channel_addr)
+            .push_windows_is_empty(),
         "push_windows must remain empty for unbounded subscribers"
     );
 }
@@ -600,6 +693,7 @@ async fn unbounded_push_depth_no_overflow() {
 async fn build_bounded_surface_messenger(
     push_depth: u64,
     wake_min: WakeMin,
+    noise: NoiseLevel,
 ) -> (Arc<Messenger>, String) {
     use crate::access::acl::ChannelMatcher;
 
@@ -627,6 +721,7 @@ async fn build_bounded_surface_messenger(
         address: channel_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: sub_depth,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -641,7 +736,7 @@ async fn build_bounded_surface_messenger(
             },
             push_depth: sub_depth,
             retain_depth: Depth::Unbounded,
-            noise: NoiseLevel::Silent,
+            noise,
             wake_min: None,
         }],
         transport_type: ChannelScheme::Brenn,
@@ -725,7 +820,8 @@ async fn surface_publish(
 /// window under the subscriber's `push_depth`.
 #[tokio::test]
 async fn surface_bounded_push_depth_retires_oldest_on_overflow() {
-    let (m, channel_addr) = build_bounded_surface_messenger(2, WakeMin::Normal).await;
+    let (m, channel_addr) =
+        build_bounded_surface_messenger(2, WakeMin::Normal, NoiseLevel::Silent).await;
     for i in 0..3u32 {
         surface_publish(&m, &channel_addr, &format!("m{i}"), Urgency::Normal).await;
     }
@@ -733,6 +829,40 @@ async fn surface_bounded_push_depth_retires_oldest_on_overflow() {
         count_surface_push_rows(&m).await,
         2,
         "depth-2 Surface window must retire the oldest on the third publish"
+    );
+}
+
+/// A Surface subscriber's overflow on a batch publish is never enacted by
+/// the backend — the window retires, but nothing is metered, however loud
+/// the subscriber's rung.
+#[tokio::test]
+async fn surface_overflow_on_a_batch_publish_is_never_enacted_by_the_backend() {
+    let (m, channel_addr) =
+        build_bounded_surface_messenger(2, WakeMin::Normal, NoiseLevel::Alarm).await;
+    for i in 0..3u32 {
+        let body = format!("m{i}");
+        m.publish_from_wasm(
+            "emitter",
+            &[WasmPublish {
+                channel_address: &channel_addr,
+                body: &body,
+                urgency: Urgency::Normal,
+                reply_to: None,
+                deliver_after: None,
+            }],
+        )
+        .await;
+    }
+
+    assert_eq!(
+        count_surface_push_rows(&m).await,
+        2,
+        "the depth-2 surface window still retires its oldest claim"
+    );
+    assert_eq!(
+        m.drop_counter(&channel_addr, &ParticipantId::for_surface("deskbar")),
+        0,
+        "a surface drop is accounted on the delivery state, never metered by the backend"
     );
 }
 
@@ -744,7 +874,8 @@ async fn surface_bounded_push_depth_retires_oldest_on_overflow() {
 /// a `Low` publish off), both publishes are eager now.
 #[tokio::test]
 async fn surface_push_is_always_eager_regardless_of_urgency() {
-    let (m, channel_addr) = build_bounded_surface_messenger(8, WakeMin::High).await;
+    let (m, channel_addr) =
+        build_bounded_surface_messenger(8, WakeMin::High, NoiseLevel::Silent).await;
     surface_publish(&m, &channel_addr, "loud", Urgency::Normal).await;
     surface_publish(&m, &channel_addr, "quiet", Urgency::Low).await;
 

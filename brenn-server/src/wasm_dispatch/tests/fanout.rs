@@ -276,6 +276,7 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
             },
             amplification_mt: 1000,
         }],
+        outputs: vec![],
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -304,7 +305,7 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
                 |r| r.get(0),
             )
             .unwrap_or(None); // None if row was deleted — also fine
-        // delivered_at IS NOT NULL (mark_pushes_delivered ran) OR row deleted both prove ack.
+        // delivered_at IS NOT NULL (the settle ran) OR row deleted both prove ack.
         // `rows_after.is_empty()` guarantees one of the two; the assertion here
         // additionally verifies the row-exists / delivered_at NOT NULL case specifically.
         assert!(
@@ -395,6 +396,7 @@ async fn webhook_message_invokes_consumer_with_webhook_envelope_type() {
         address: channel_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,

@@ -59,6 +59,7 @@ async fn build_webhook_messenger(
         address: address.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -159,6 +160,7 @@ async fn build_mqtt_messenger(
         address: address.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,

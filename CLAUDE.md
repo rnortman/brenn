@@ -15,6 +15,71 @@ Browser (PWA)  ←→  WebSocket  ←→  Rust/Axum Backend  ←→  Claude Code
 
 Claude Code runs as a child process. Communication is bidirectional NDJSON over stdio. The backend manages sessions, authentication, tool approval routing, and markdown rendering. The browser receives pre-rendered HTML and displays it.
 
+### The message bus
+
+**Your intuitions about message buses are wrong here.** This is not RabbitMQ,
+Kafka, ROS, MQTT, Redis pub/sub, or an actor mailbox. If you find yourself
+reasoning by analogy to any of those, stop and read the [channel documentation](docs/message-bus.md)
+instead of guessing.
+
+#### What a channel is
+
+A channel is a **rolling window over the last N messages**. That's it. It is not
+a conduit, a mailbox, or a work queue. Messages are not *in transit* to anyone.
+
+- **Nothing consumes.** Reading does not remove. There are no acks, no
+  redelivery, no dead-letter queues, no "at-least-once" semantics.
+- **The channel does not know or care about subscribers.** Its contents are
+  identical whether there are zero subscribers or fifty.
+- **No backpressure exists anywhere in the system.** Not as an oversight — as a
+  design decision. A channel cannot be pressured to stop being. Do not add
+  blocking publishes, do not add flow control, do not propose them.
+- **Overflow drops oldest.** Bounded loss is the accepted tradeoff. Correctness
+  comes from sizing N for the outage you intend to survive, not from delivery
+  guarantees.
+- **N is a count but reason about it as duration.** N=100 on a once-a-day channel
+  is three months of history; N=100 on a 200/day channel is twelve hours.
+- Channels are **ephemeral** (in-memory, `ephemeral:`) or **durable** (disk-backed, `brenn:`). That is
+  about surviving restart, not about delivery.
+- Channels are **transportable** or not. This is about whether the messages ever cross the wire.
+  `ephemeral:` and `durable:` are both *transportable*; `local:` is not. `local:` is also
+  *ephemeral*.
+
+#### What a subscription is
+
+Two independent parameters. **Do not conflate them.** Most frameworks fuse them
+into one queue.
+
+- **`push_depth` — what wakes me.** Activation only. `0` means never activate on
+  this channel. `5` means activate on new messages, coalescing pending
+  activations into one and handing over at most the 5 most recent. Coalescing is
+  the correct default for signals, not a degradation path.
+- **`retain_depth` — what I can see.** Visibility only. A private window of size
+  M onto the channel. Does not cause activation.
+
+Every subscriber has its own cursor into the channel that tracks "seen" vs
+"unseen". (Unseen is aka "new".) The channel does not care about these cursors.
+The cursor can get pushed out of the channel if messages arrive faster than the
+subscriber consumes; this is what causes a message drop. Channels do not care
+about drops; that is relevant to each subscriber independently. One subscriber
+can drop while another does not.
+
+#### Other things not to reinvent
+
+- **Time is `deliver_after` on a published message.** All timers, timeouts,
+  retries, debouncing, and scheduled work are built from this. There is no
+  scheduler subsystem — do not add one, do not reach for cron or sleep loops.
+- **State is a retained channel.** `retain_depth=1` on the channel carrying it.
+  There is no separate state store, KV API, or config layer. Do not add one.
+
+#### Design rule for new channels
+
+Ask first: **does message N+1 subsume message N?** Signals (temperature,
+presence, bulb state) — short window, aggressive coalescing. Facts (dishwasher
+finished, email arrived, user command) — long window, generous push depth, and
+where possible pair the fact channel with a state channel so an agent that was
+down can reconcile instead of replay.
+
 ## Non-Negotiable Principles
 
 ### Backend: BETTER DEAD THAN WRONG

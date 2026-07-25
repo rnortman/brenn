@@ -181,7 +181,8 @@ fn validate_resolves_messaging_layer_for_apps_with_messaging_blocks() {
     // No `messaging` block.
 
     let channel = crate::messaging::config::ChannelConfigRaw {
-        uuid: "1f6c6e3a-1d6e-4f7c-9b6a-12cb7e4a8d32".to_string(),
+        send_rate: None,
+        uuid: Some("1f6c6e3a-1d6e-4f7c-9b6a-12cb7e4a8d32".to_string()),
         address: "ch".to_string(),
         description: None,
         push_depth: None,

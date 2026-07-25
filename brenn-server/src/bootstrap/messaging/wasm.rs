@@ -3,8 +3,9 @@ use std::time::Duration;
 use brenn_lib::messaging::MessagingDirectory;
 use brenn_lib::messaging::config::{
     ActivationPacing, DEFAULT_WASM_INPUT_AMPLIFICATION, DEFAULT_WASM_PUBLISH_CAPACITY,
-    DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth, ResolvedSubscription, ResolvedWasmConsumer,
-    WasmConsumerConfigRaw, WasmGrant, WasmInputPort, WasmOutputPort, WasmSinkBudget,
+    DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth, NoiseLevel, ResolvedSubscription,
+    ResolvedWasmConsumer, WasmConsumerConfigRaw, WasmGrant, WasmInputPort, WasmOutputPort,
+    WasmSinkBudget,
 };
 use indexmap::IndexMap;
 
@@ -34,7 +35,8 @@ use super::resolve_publish_millitokens;
 /// - slug containing `:` or `@` (rejected by `ParticipantId::for_wasm` constructor)
 /// - duplicate port name within a consumer (across inputs and outputs)
 /// - empty port name or port name containing non-unreserved chars
-/// - output channel is not a `brenn:` address (this-slice restriction)
+/// - output channel is not a pub/sub scheme (`brenn:`/`ephemeral:`/`local:`) —
+///   `mqtt:`/`webhook:`/`pwa_push:` egress never rides the buffered path
 /// - consumer has no subscriptions but has ≥1 output (dead config)
 /// - duplicate grant entries in `grants` list
 /// - `outputs` non-empty but `ports` not granted (dead config)
@@ -218,6 +220,11 @@ pub(crate) fn resolve_wasm_consumers(
         // Resolve input ports.
         let mut inputs = Vec::with_capacity(consumer.subscriptions.len());
         let mut seen_addresses: HashSet<String> = HashSet::new();
+        // Ring delivery has no runtime ACL gate — ephemeral_subscribe /
+        // local_subscribe coverage must be asserted at boot (below) or the input
+        // is silently dead.
+        let mut ephemeral_inputs: Vec<String> = Vec::new();
+        let mut local_inputs: Vec<String> = Vec::new();
 
         for sub in &consumer.subscriptions {
             validate_port_name(&sub.port, "subscription");
@@ -231,6 +238,24 @@ pub(crate) fn resolve_wasm_consumers(
                     sub.channel,
                 )
             });
+
+            // Non-durable inputs are ring-backed and carry no runtime delivery
+            // ACL gate; their authorization is asserted at boot (below), keyed by
+            // scheme.
+            use brenn_lib::messaging::ChannelScheme;
+            match ChannelScheme::of(&entry.address) {
+                Some(ChannelScheme::Ephemeral) => {
+                    if let Some((_, bare)) = ChannelScheme::split(&entry.address) {
+                        ephemeral_inputs.push(bare.to_string());
+                    }
+                }
+                Some(ChannelScheme::Local) => {
+                    if let Some((_, bare)) = ChannelScheme::split(&entry.address) {
+                        local_inputs.push(bare.to_string());
+                    }
+                }
+                _ => {}
+            }
             assert!(
                 seen_addresses.insert(entry.address.clone()),
                 "[[wasm_consumer]] {slug:?}: duplicate subscription for channel {:?}",
@@ -262,6 +287,19 @@ pub(crate) fn resolve_wasm_consumers(
                 );
             }
             let noise = sub.noise.unwrap_or(ch.noise);
+
+            // `fatal` is the surface-only kill rung; the backend overflow path
+            // has no kill wire, so any subscription resolving to `fatal` is
+            // rejected at boot. The app/mqtt/webhook path rejects `fatal`
+            // separately; the two sites must stay in step.
+            if noise == NoiseLevel::Fatal {
+                panic!(
+                    "[[wasm_consumer]] {slug:?}: subscription on channel {:?} resolves to \
+                     noise = fatal, but fatal is surface-only (the backend overflow path has \
+                     no kill) — set a backend-valid noise level (silent/metered/alarm)",
+                    entry.address,
+                );
+            }
 
             // wake_min is meaningless on a WASM subscription: a parked WASM consumer
             // is cheap to wake, so it is always delivered eagerly (its registration
@@ -343,23 +381,30 @@ pub(crate) fn resolve_wasm_consumers(
                     out.channel,
                 )
             });
-            // The buffered `ports.publish` output path is brenn:-only — and this is
-            // PERMANENT, not a temporary restriction. MQTT egress is
-            // supported, but through the SEPARATE synchronous `mqtt-publish` host fn
-            // (gated by the `mqtt_publish` ACL matcher), never through
-            // `ports.publish` (which buffers + flushes atomically and cannot carry
-            // the immediate broker error MQTT egress requires). Do NOT relax this
-            // assertion to let
-            // mqtt:/webhook: addresses ride the buffered path — that would route MQTT
-            // traffic around the egress enforcement pipeline. webhook: outputs are
-            // simply not supported at all yet.
+            // The buffered `ports.publish` path serves pub/sub schemes only
+            // (brenn:/ephemeral:/local:). Do NOT let mqtt:/webhook:/pwa_push:
+            // ride this path — MQTT egress uses the separate synchronous
+            // `mqtt-publish` host fn, which can surface immediate broker errors;
+            // the buffered path cannot.
+            let out_scheme = brenn_lib::messaging::ChannelScheme::of(&entry.address)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "[[wasm_consumer]] {slug:?}: output.channel {:?} carries no recognized \
+                         scheme prefix",
+                        entry.address,
+                    )
+                });
             assert!(
-                entry
-                    .address
-                    .starts_with(brenn_lib::messaging::BRENN_ADDRESS_PREFIX),
-                "[[wasm_consumer]] {slug:?}: output.channel {:?} must be a brenn: address \
-                 (the buffered ports.publish path is permanently brenn:-only; MQTT egress \
-                 uses the separate mqtt-publish host fn, not ports.publish)",
+                matches!(
+                    out_scheme,
+                    brenn_lib::messaging::ChannelScheme::Brenn
+                        | brenn_lib::messaging::ChannelScheme::Ephemeral
+                        | brenn_lib::messaging::ChannelScheme::Local
+                ),
+                "[[wasm_consumer]] {slug:?}: output.channel {:?} must be a pub/sub address \
+                 (brenn:/ephemeral:/local:); the buffered ports.publish path never carries \
+                 mqtt:/webhook:/pwa_push: egress — MQTT egress uses the separate mqtt-publish \
+                 host fn, not ports.publish",
                 entry.address,
             );
 
@@ -401,40 +446,56 @@ pub(crate) fn resolve_wasm_consumers(
             );
         }
 
-        // 2b. Bound output ports + empty publish_acl ⇒ refuse at resolution. The
-        //      publish gate (`do_publish`) consults `allows_brenn_publish`, which is
-        //      deny-all over an empty `brenn_publish` matcher list, so every guest
-        //      publish to an operator-authored bound port would return NotPermitted at
-        //      runtime. Panic now and force the operator to author an explicit
-        //      publish_acl rather than ship a config that silently denies every publish.
-        //      Narrow scope: fires ONLY with bound output ports — a Ports-granted
-        //      consumer with NO bound outputs + empty publish_acl is a legitimate
-        //      intermediate state and does not panic here.
-        if !outputs.is_empty() && consumer.publish_acl.is_empty() {
+        // 2b. Bound output + empty publish ACL for that scheme ⇒ every publish
+        //      would deny at runtime. Panic now so the operator authors an
+        //      explicit ACL. One check per pub/sub scheme (brenn:/ephemeral:/local:).
+        use brenn_lib::messaging::ChannelScheme;
+        let has_brenn_output = outputs
+            .iter()
+            .any(|o| ChannelScheme::of(&o.channel_address) == Some(ChannelScheme::Brenn));
+        let has_ephemeral_output = outputs
+            .iter()
+            .any(|o| ChannelScheme::of(&o.channel_address) == Some(ChannelScheme::Ephemeral));
+        if has_brenn_output && consumer.publish_acl.is_empty() {
             panic!(
-                "[[wasm_consumer]] {slug:?}: has {} bound output port(s) but publish_acl is empty \
-                 — under deny-by-default the component could never publish to its own bound \
+                "[[wasm_consumer]] {slug:?}: has a bound brenn: output port but publish_acl is \
+                 empty — under deny-by-default the component could never publish to its own bound \
                  channels (every publish would return not-permitted at runtime); add a \
                  publish_acl matcher covering each bound channel (e.g. {{ exact = \"<name>\" }}) \
                  or remove the output bindings",
-                outputs.len(),
+            );
+        }
+        if has_ephemeral_output && consumer.ephemeral_publish_acl.is_empty() {
+            panic!(
+                "[[wasm_consumer]] {slug:?}: has a bound ephemeral: output port but \
+                 ephemeral_publish_acl is empty — under deny-by-default the component could never \
+                 publish to its own bound channels; add an ephemeral_publish_acl matcher covering \
+                 each bound channel (e.g. {{ exact = \"<name>\" }}) or remove the output bindings",
+            );
+        }
+        let has_local_output = outputs
+            .iter()
+            .any(|o| ChannelScheme::of(&o.channel_address) == Some(ChannelScheme::Local));
+        if has_local_output && consumer.local_publish_acl.is_empty() {
+            panic!(
+                "[[wasm_consumer]] {slug:?}: has a bound local: output port but \
+                 local_publish_acl is empty — under deny-by-default the component could never \
+                 publish to its own bound channels; add a local_publish_acl matcher covering \
+                 each bound channel (e.g. {{ exact = \"<name>\" }}) or remove the output bindings",
             );
         }
 
-        // 2c. Non-empty publish_acl but Ports not granted → dead matchers. The
-        //      `build_wasm_policy` mapping derives `MessagingPublish` only from the
-        //      `Ports` grant; without it `allows_brenn_publish` is unconditionally
-        //      false, so the authored matchers can never authorize any publish. The
-        //      operator wrote a publish_acl expecting it to grant publish access;
-        //      silently dropping it is the same runtime-only landmine fail-fast
-        //      rejects. Panic now so the misconfiguration is fixed at boot, not
-        //      discovered as an unexplained NotPermitted after outputs are added.
-        if !consumer.publish_acl.is_empty() && !grants.contains(&WasmGrant::Ports) {
+        // 2c. Non-empty publish ACL but Ports not granted → dead matchers.
+        //      Without the `ports` interface the ACL can never authorize anything.
+        if (!consumer.publish_acl.is_empty()
+            || !consumer.ephemeral_publish_acl.is_empty()
+            || !consumer.local_publish_acl.is_empty())
+            && !grants.contains(&WasmGrant::Ports)
+        {
             panic!(
-                "[[wasm_consumer]] {slug:?}: publish_acl has {} matcher(s) but \"ports\" is not in \
+                "[[wasm_consumer]] {slug:?}: a publish ACL has matcher(s) but \"ports\" is not in \
                  grants — without the ports grant the matchers can never authorize any publish \
-                 (MessagingPublish capability absent); add \"ports\" to grants or remove publish_acl",
-                consumer.publish_acl.len(),
+                 (the ports interface is unlinked); add \"ports\" to grants or remove the ACL",
             );
         }
 
@@ -614,7 +675,11 @@ pub(crate) fn resolve_wasm_consumers(
             grants.iter().copied(),
             brenn_lib::access::raw::WasmAclsRaw {
                 subscribe: &consumer.subscribe_acl,
+                ephemeral_subscribe: &consumer.ephemeral_subscribe_acl,
+                local_subscribe: &consumer.local_subscribe_acl,
                 publish: &consumer.publish_acl,
+                ephemeral_publish: &consumer.ephemeral_publish_acl,
+                local_publish: &consumer.local_publish_acl,
                 mqtt_publish: &consumer.mqtt_publish_acl,
                 mqtt_subscribe: &consumer.mqtt_subscribe_acl,
                 webhook: &consumer.webhook_acl,
@@ -629,6 +694,29 @@ pub(crate) fn resolve_wasm_consumers(
             &format!("wasm consumer {slug:?}"),
             &consumer.tool_grants,
         );
+
+        // Ring delivery has no runtime ACL gate, so an uncovered ephemeral:
+        // subscription would be silently dead. Fail-fast.
+        for bare in &ephemeral_inputs {
+            assert!(
+                policy.allows_ephemeral_delivery(bare),
+                "[[wasm_consumer]] {slug:?}: subscription on ephemeral:{bare} is not covered by \
+                 ephemeral_subscribe_acl — under deny-by-default the component could never receive \
+                 from it (ring delivery is authorized only at boot); add an ephemeral_subscribe_acl \
+                 matcher covering it (e.g. {{ exact = {bare:?} }}) or remove the subscription",
+            );
+        }
+        // Same for confined local: inputs — ring delivery has no runtime gate, so
+        // an uncovered subscription would be silently dead.
+        for bare in &local_inputs {
+            assert!(
+                policy.allows_local_delivery(bare),
+                "[[wasm_consumer]] {slug:?}: subscription on local:{bare} is not covered by \
+                 local_subscribe_acl — under deny-by-default the component could never receive \
+                 from it (ring delivery is authorized only at boot); add a local_subscribe_acl \
+                 matcher covering it (e.g. {{ exact = {bare:?} }}) or remove the subscription",
+            );
+        }
 
         result.push(ResolvedWasmConsumer {
             slug: slug.clone(),

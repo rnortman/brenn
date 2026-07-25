@@ -1,9 +1,9 @@
 mod acl_gate;
-mod dispatch_any;
 mod dispatch_row;
 mod ingress;
 mod overflow;
 mod publish_core;
+mod scheme_parity;
 mod surface;
 mod system;
 mod transport_ingress;
@@ -37,6 +37,8 @@ pub(super) struct CountingRouter {
     // call as_conversation_id() or compare ParticipantId directly rather than
     // baking the conversation-kind assumption into shared mock infrastructure.
     pub(super) deliveries: tokio::sync::Mutex<Vec<(ParticipantId, String)>>,
+    /// `(body, retained_seq)` per row-less fold-0 context feed.
+    pub(super) contexts: tokio::sync::Mutex<Vec<(String, i64)>>,
     pub(super) deliver_returns: AtomicU64,
     pub(super) eager_wakes: AtomicU64,
     pub(super) alarms: AtomicU64,
@@ -50,7 +52,8 @@ impl WakeRouter for CountingRouter {
         subscriber: &ParticipantId,
         envelope: &crate::messaging::MessageEnvelope,
         _push_id: i64,
-        _seq: i64,
+        _message_id: i64,
+        _retained_seq: Option<i64>,
     ) -> Result<bool, String> {
         use crate::messaging::format::format_messaging_event_single;
         self.deliveries
@@ -79,6 +82,17 @@ impl WakeRouter for CountingRouter {
             _ => Err("simulated bridge-died-mid-send".to_string()),
         }
     }
+    async fn deliver_context(
+        &self,
+        _key: &crate::messaging::SubscriberEntryKind,
+        envelope: &Arc<crate::messaging::MessageEnvelope>,
+        retained_seq: i64,
+    ) {
+        self.contexts
+            .lock()
+            .await
+            .push((envelope.body.clone(), retained_seq));
+    }
     fn spawn_eager_wake(
         &self,
         _key: &crate::messaging::SubscriberEntryKind,
@@ -101,6 +115,17 @@ impl WakeRouter for CountingRouter {
 
 pub(super) async fn build_messenger(
     deliver_returns: u64,
+) -> (Arc<Messenger>, Uuid, i64, i64, Arc<CountingRouter>) {
+    build_messenger_with(deliver_returns, vec![], std::collections::HashMap::new()).await
+}
+
+/// [`build_messenger`] with `extra_subscribers` added to the channel and
+/// `surface_policies` installed as Surface-kind registrations — the shape a
+/// fold-0 surface subscriber needs to resolve as a context-feed target.
+pub(super) async fn build_messenger_with(
+    deliver_returns: u64,
+    extra_subscribers: Vec<SubscriberEntry>,
+    surface_policies: std::collections::HashMap<String, crate::access::AppPolicy>,
 ) -> (Arc<Messenger>, Uuid, i64, i64, Arc<CountingRouter>) {
     let db = init_db_memory();
     let conn = db.lock().await;
@@ -135,6 +160,7 @@ pub(super) async fn build_messenger(
         address: canonical_address("pa-alice"),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -143,13 +169,15 @@ pub(super) async fn build_messenger(
             wake_min: WakeMin::Normal,
         },
         // Subscribers populated below: pa-alice is push-enabled (Unbounded).
-        subscribers: vec![SubscriberEntry {
+        subscribers: std::iter::once(SubscriberEntry {
             kind: SubscriberEntryKind::App("pa-alice".to_string()),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             noise: NoiseLevel::Silent,
             wake_min: Some(WakeMin::Normal),
-        }],
+        })
+        .chain(extra_subscribers)
+        .collect(),
         transport_type: ChannelScheme::Brenn,
         mount: None,
     };
@@ -202,7 +230,10 @@ pub(super) async fn build_messenger(
         apps,
         router.clone() as Arc<dyn WakeRouter>,
         MessagingGlobalConfig::default(),
-    );
+    )
+    .with_subscriber_registrations(crate::messaging::testutils::surface_registrations(
+        surface_policies,
+    ));
     (messenger, channel_uuid, 1, 2, router)
 }
 

@@ -184,9 +184,13 @@ fn subset_grants_loads_and_invokes() {
         tool_host: None,
     });
     // An empty activation (no new envelopes) returns Ok from the log fixture.
-    let outcome = comp.handle(ProcessorActivation { ports: vec![] });
+    let outcome = comp.handle(ProcessorActivation {
+        ports: vec![],
+        deferred: vec![],
+        now: None,
+    });
     assert!(
-        matches!(outcome, brenn_wasm::ProcessorOutcome::Ok(_)),
+        matches!(outcome, brenn_wasm::ProcessorOutcome::Ok { .. }),
         "subset-granted component must invoke ok; got {outcome:?}"
     );
 }
@@ -267,9 +271,13 @@ fn degenerate_empty_grants_invoke_succeeds() {
         tool_host: None,
     });
     // Empty activation: no new envelopes → exhaust returns Ok (no spin).
-    let outcome = comp.handle(ProcessorActivation { ports: vec![] });
+    let outcome = comp.handle(ProcessorActivation {
+        ports: vec![],
+        deferred: vec![],
+        now: None,
+    });
     assert!(
-        matches!(outcome, brenn_wasm::ProcessorOutcome::Ok(_)),
+        matches!(outcome, brenn_wasm::ProcessorOutcome::Ok { .. }),
         "zero-grant component with empty activation must invoke ok; got {outcome:?}"
     );
 }

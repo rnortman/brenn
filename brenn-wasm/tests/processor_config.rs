@@ -58,7 +58,11 @@ fn load_config_component(config: HashMap<String, String>) -> ProcessorComponent 
 
 /// Build an empty activation (no port windows — hits the legacy path in the fixture).
 fn empty_activation() -> ProcessorActivation {
-    ProcessorActivation { ports: vec![] }
+    ProcessorActivation {
+        ports: vec![],
+        deferred: vec![],
+        now: None,
+    }
 }
 
 /// Build a directive envelope JSON string.
@@ -79,6 +83,8 @@ fn single_activation(envelope: String) -> ProcessorActivation {
             new_from: 0,
             dropped: 0,
         }],
+        deferred: vec![],
+        now: None,
     }
 }
 
@@ -95,7 +101,7 @@ fn config_present_key_published_as_payload() {
 
     let outcome = comp.handle(empty_activation());
     let publishes = match outcome {
-        ProcessorOutcome::Ok(p) => p,
+        ProcessorOutcome::Ok { publishes: p, .. } => p,
         other => panic!("expected Ok, got: {other:?}"),
     };
     assert_eq!(
@@ -126,7 +132,7 @@ fn config_absent_key_publishes_absent() {
 
     let outcome = comp.handle(empty_activation());
     let publishes = match outcome {
-        ProcessorOutcome::Ok(p) => p,
+        ProcessorOutcome::Ok { publishes: p, .. } => p,
         other => panic!("expected Ok, got: {other:?}"),
     };
     assert_eq!(
@@ -155,7 +161,7 @@ fn config_get_parsed_present_ok() {
         directive_envelope(serde_json::json!({"cmd": "get_parsed", "key": "parsed-key"}));
     let outcome = comp.handle(single_activation(envelope));
     let publishes = match outcome {
-        ProcessorOutcome::Ok(p) => p,
+        ProcessorOutcome::Ok { publishes: p, .. } => p,
         other => panic!("expected Ok, got: {other:?}"),
     };
     assert_eq!(publishes.len(), 1, "expected exactly one publish");
@@ -178,7 +184,7 @@ fn config_get_parsed_absent_key_publishes_absent() {
         directive_envelope(serde_json::json!({"cmd": "get_parsed", "key": "parsed-key"}));
     let outcome = comp.handle(single_activation(envelope));
     let publishes = match outcome {
-        ProcessorOutcome::Ok(p) => p,
+        ProcessorOutcome::Ok { publishes: p, .. } => p,
         other => panic!("expected Ok, got: {other:?}"),
     };
     assert_eq!(publishes.len(), 1, "expected exactly one publish");
@@ -232,7 +238,7 @@ fn config_require_present_ok() {
     let envelope = directive_envelope(serde_json::json!({"cmd": "require", "key": "req-key"}));
     let outcome = comp.handle(single_activation(envelope));
     let publishes = match outcome {
-        ProcessorOutcome::Ok(p) => p,
+        ProcessorOutcome::Ok { publishes: p, .. } => p,
         other => panic!("expected Ok, got: {other:?}"),
     };
     assert_eq!(publishes.len(), 1, "expected exactly one publish");

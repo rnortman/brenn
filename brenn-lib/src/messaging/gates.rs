@@ -37,18 +37,17 @@ pub fn resolve_publish_sender<'a>(
 }
 
 /// Layer-2 policy gate: dispatch on `scheme` to the matching publish-ACL check
-/// against the bare channel `name`. Only the bus-publishable schemes carry a
-/// per-scheme publish ACL; `mqtt:`/`webhook:`/`pwa_push:`/`local:` are not
-/// publishable through this gate (mqtt egress has its own gate; `local:` never
-/// crosses the wire, so no server-side publish reaches it) and deny here.
+/// against the bare channel `name`. The pub/sub schemes each carry a per-scheme
+/// publish ACL (`brenn_publish`, `ephemeral_publish`, `local_publish`);
+/// `mqtt:`/`webhook:`/`pwa_push:` are not publishable through this gate (mqtt
+/// egress has its own gate; webhook/pwa_push are not pub/sub targets) and deny
+/// here.
 pub fn publish_acl_allows(policy: &AppPolicy, scheme: ChannelScheme, name: &str) -> bool {
     match scheme {
         ChannelScheme::Brenn => policy.allows_brenn_publish(name),
         ChannelScheme::Ephemeral => policy.allows_ephemeral_publish(name),
-        ChannelScheme::Mqtt
-        | ChannelScheme::Webhook
-        | ChannelScheme::PwaPush
-        | ChannelScheme::Local => false,
+        ChannelScheme::Local => policy.allows_local_publish(name),
+        ChannelScheme::Mqtt | ChannelScheme::Webhook | ChannelScheme::PwaPush => false,
     }
 }
 

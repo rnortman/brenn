@@ -22,14 +22,15 @@ use brenn_lib::messaging::config::{
     SurfacePrincipalBudgets, SurfaceSendBudget, build_channel_entries,
 };
 use brenn_lib::messaging::db::{
-    PendingPushInsert, insert_message_with_pushes, load_all_dispatchable_pushes,
-    release_due_pushes, upsert_channels, utc_to_ns,
+    PendingPushInsert, insert_message_with_pushes, load_all_dispatchable_pushes, upsert_channels,
+    utc_to_ns,
 };
+use brenn_lib::messaging::store::RingStores;
 use brenn_lib::messaging::testutils::ephemeral_channel_entry;
 use brenn_lib::messaging::{
-    ChannelEntry, ChannelScheme, EphemeralBus, EphemeralPublishResult, MessagingDirectory,
-    MessagingGlobalConfig, Messenger, ParticipantId, PublishResult, SubscriberEntry,
-    SubscriberEntryKind, Urgency, WakeMin, WakeRouter, dispatcher,
+    ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, Messenger,
+    ParticipantId, PublishResult, SubscriberEntry, SubscriberEntryKind, Urgency, WakeMin,
+    WakeRouter, dispatcher,
 };
 use brenn_lib::obs::alerting::{
     AlertDispatcher, AlertSeverity as NativeAlertSeverity, make_capturing_alerter_with_severity,
@@ -53,8 +54,8 @@ use super::registry::{SessionCaps, SurfaceSessionHandle};
 use super::session::ALERT_BURST;
 use super::test_fixtures::{
     COMPONENT, EPH_ADDR, EPH_NAME, PORT, SurfaceTestHarness, TEST_MAX_BODY_BYTES, TEST_ORIGIN,
-    assert_no_alerts, deskbar_context_feed, deskbar_sub, durable_resume,
-    durable_resume_with_confirm, fixture_bus, publish, publish_as, subscribe_harness,
+    assert_no_alerts, deskbar_context_feed, deskbar_sub, durable_resume, durable_resume_at,
+    durable_resume_with_confirm, fixture_stores, publish, publish_as, subscribe_harness,
     surface_harness,
 };
 
@@ -102,8 +103,8 @@ fn deskbar(allowed_users: Vec<String>) -> ResolvedSurface {
         .build()
 }
 
-/// Capturing-alerter test state with the given surface installed over a bus with
-/// no channels. Heartbeat is 1 s (via `AppState::for_test`) so liveness tests run
+/// Capturing-alerter test state with the given surface installed over a registry
+/// with no channels. Heartbeat is 1 s (via `AppState::for_test`) so liveness tests run
 /// fast.
 fn surface_state(db: &db::Db, resolved: ResolvedSurface) -> SurfaceTestHarness {
     surface_harness(db, resolved, vec![])
@@ -134,13 +135,14 @@ fn surface_state_severity(
     let (alert_dispatcher, captured, handle) = make_capturing_alerter_with_severity();
     let mut state = crate::test_support::state::test_state(db);
     state.alert_dispatcher = alert_dispatcher;
-    // Barrier channel on the bus so `drain_barrier` (an ephemeral no-op publish)
-    // resolves for any severity test that uses it.
-    let bus = fixture_bus(vec![ephemeral_channel_entry(BARRIER_EPH_NAME, 0, 16)]);
+    // Barrier channel so `drain_barrier` (an ephemeral no-op publish) resolves
+    // for any severity test that uses it.
+    let entries = vec![ephemeral_channel_entry(BARRIER_EPH_NAME, 0)];
+    let stores = fixture_stores(entries.clone());
+    let messenger = super::test_fixtures::fixture_messenger(db, &entries, &resolved, stores);
     state.surfaces = Arc::new(build_surface_runtimes(
         vec![resolved],
-        bus,
-        None,
+        Some(messenger),
         TEST_MAX_BODY_BYTES,
         None,
         crate::test_support::surface::description_params(),
@@ -335,16 +337,13 @@ fn assert_deliver(
             );
             assert_eq!(target.dropped, dropped);
             // The ephemeral ring position lives in the opaque cursor; parse it to
-            // recover the (bus epoch, ring seq) the delivery carries.
+            // recover the (epoch, ring seq) the delivery carries.
             match cursor::parse(&target.cursor) {
-                Ok(CursorState::Ephemeral {
-                    epoch: got_epoch,
-                    seq: got_seq,
-                }) => {
-                    assert_eq!(got_seq, seq);
-                    assert_eq!(got_epoch, epoch);
+                Ok(state) => {
+                    assert_eq!(state.seq, seq);
+                    assert_eq!(state.epoch, epoch);
                 }
-                other => panic!("expected ephemeral cursor, got {other:?}"),
+                other => panic!("expected a parseable cursor, got {other:?}"),
             }
         }
         other => panic!("expected Deliver, got {other:?}"),
@@ -1054,7 +1053,7 @@ async fn surface_ws_stalled_reader_is_torn_down_by_watchdog() {
     // Broadcast capacity far above the outbound queue so the flood is retained
     // (not broadcast-dropped) and keeps piling deliveries onto the session task
     // even after the writer stalls; retain_depth 0 keeps it a pure live flood.
-    let SurfaceTestHarness { state, bus, .. } = subscribe_harness(&db, 0, 2048);
+    let SurfaceTestHarness { state, stores, .. } = subscribe_harness(&db, 0);
     let registry = state.surface_registry.clone();
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
@@ -1079,9 +1078,9 @@ async fn surface_ws_stalled_reader_is_torn_down_by_watchdog() {
     // socket buffer, guaranteeing the loop blocks on backpressure. Split across
     // three senders to stay under the per-sender publish burst.
     let big = "x".repeat(60_000);
-    publish_as(&bus, "flood-a", EPH_ADDR, EPH_NAME, &big, 200);
-    publish_as(&bus, "flood-b", EPH_ADDR, EPH_NAME, &big, 200);
-    publish_as(&bus, "flood-c", EPH_ADDR, EPH_NAME, &big, 200);
+    publish_as(&stores, "flood-a", EPH_ADDR, &big, 200);
+    publish_as(&stores, "flood-b", EPH_ADDR, &big, 200);
+    publish_as(&stores, "flood-c", EPH_ADDR, &big, 200);
 
     // The slot must release within a generous multiple of the watchdog window
     // (3x heartbeat = 3 s here) despite the client never draining.
@@ -1135,9 +1134,9 @@ async fn surface_ws_ephemeral_sibling_instances_each_get_their_own_subscription(
     );
     // retain_depth 0 keeps each fresh subscribe replay-free, so every Deliver
     // below comes from the one live publish.
-    let SurfaceTestHarness { state, bus, .. } =
-        surface_harness(&db, surface, vec![ephemeral_channel_entry(EPH_NAME, 0, 16)]);
-    let epoch = bus.epoch();
+    let SurfaceTestHarness { state, stores, .. } =
+        surface_harness(&db, surface, vec![ephemeral_channel_entry(EPH_NAME, 0)]);
+    let epoch = stores.epoch();
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -1154,7 +1153,7 @@ async fn surface_ws_ephemeral_sibling_instances_each_get_their_own_subscription(
         );
     }
 
-    publish_eph(&bus, EPH_NAME, EPH_ADDR, "hello-both");
+    publish_eph(&stores, EPH_ADDR, "hello-both");
 
     // One publish reaches both principals, each at its own cursor, in one frame:
     // the write boundary coalesces the sibling subscriptions' copies of a live
@@ -1176,8 +1175,8 @@ async fn surface_ws_ephemeral_sibling_instances_each_get_their_own_subscription(
             );
             for target in targets {
                 assert!(
-                    matches!(cursor::parse(&target.cursor), Ok(CursorState::Ephemeral { epoch: got, .. }) if got == epoch),
-                    "an ephemeral delivery carries the bus epoch: {:?}",
+                    matches!(cursor::parse(&target.cursor), Ok(state) if state.epoch == epoch),
+                    "an ephemeral delivery carries the store epoch: {:?}",
                     target.cursor
                 );
                 assert_eq!(target.seq, 1, "each target's seq comes from its own span");
@@ -1229,8 +1228,8 @@ async fn surface_ws_sibling_without_the_message_at_its_head_stays_out_of_the_fra
         }),
     );
     // retain_depth 0: no replay, so bob's stream starts at his subscribe.
-    let SurfaceTestHarness { state, bus, .. } =
-        surface_harness(&db, surface, vec![ephemeral_channel_entry(EPH_NAME, 0, 16)]);
+    let SurfaceTestHarness { state, stores, .. } =
+        surface_harness(&db, surface, vec![ephemeral_channel_entry(EPH_NAME, 0)]);
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -1240,7 +1239,7 @@ async fn surface_ws_sibling_without_the_message_at_its_head_stays_out_of_the_fra
         .expect("send Subscribe");
     next_subscribe_result(&mut ws, EPH_ADDR, "agenda-alice").await;
 
-    publish_eph(&bus, EPH_NAME, EPH_ADDR, "m1");
+    publish_eph(&stores, EPH_ADDR, "m1");
     // Read M1 out before bob attaches: only alice's subscription existed for it.
     match next_server_frame(&mut ws).await {
         ServerFrame::Deliver {
@@ -1258,7 +1257,7 @@ async fn surface_ws_sibling_without_the_message_at_its_head_stays_out_of_the_fra
         .expect("send Subscribe");
     next_subscribe_result(&mut ws, EPH_ADDR, "agenda-bob").await;
 
-    publish_eph(&bus, EPH_NAME, EPH_ADDR, "m2");
+    publish_eph(&stores, EPH_ADDR, "m2");
     match next_server_frame(&mut ws).await {
         ServerFrame::Deliver {
             envelope, targets, ..
@@ -1295,9 +1294,14 @@ async fn surface_ws_slow_client_drops_are_counted_exactly() {
     // client falls behind, the ring overflows, and the excess is dropped and
     // counted. retain_depth 0 keeps the fresh subscribe replay-free so every
     // Deliver comes from the live flood.
-    let SurfaceTestHarness { state, bus, .. } = subscribe_harness(&db, 0, 2);
+    let SurfaceTestHarness {
+        state,
+        stores,
+        messenger,
+        ..
+    } = subscribe_harness(&db, 0);
     let (token, _) = setup_authenticated_user(&db).await;
-    let epoch = bus.epoch();
+    let epoch = stores.epoch();
     let (base, _sd) = spawn_test_server(state).await;
 
     let ws_url = http_to_ws_url(&base, &format!("/surface/deskbar/ws?build={TEST_BUILD_ID}"));
@@ -1322,9 +1326,9 @@ async fn surface_ws_slow_client_drops_are_counted_exactly() {
     // scheduling; split across three senders to stay under the per-sender burst.
     const FLOOD: u64 = 600;
     let big = "x".repeat(60_000);
-    publish_as(&bus, "flood-a", EPH_ADDR, EPH_NAME, &big, 200);
-    publish_as(&bus, "flood-b", EPH_ADDR, EPH_NAME, &big, 200);
-    publish_as(&bus, "flood-c", EPH_ADDR, EPH_NAME, &big, 200);
+    publish_as(&stores, "flood-a", EPH_ADDR, &big, 200);
+    publish_as(&stores, "flood-b", EPH_ADDR, &big, 200);
+    publish_as(&stores, "flood-c", EPH_ADDR, &big, 200);
 
     // Drain: read every Deliver up to and including the newest seq (always
     // retained in the ring, so always delivered last). Each delivery's `dropped`
@@ -1341,14 +1345,11 @@ async fn surface_ws_slow_client_drops_are_counted_exactly() {
                 let target = sole_target(&targets);
                 let dropped = target.dropped;
                 let seq = match cursor::parse(&target.cursor) {
-                    Ok(CursorState::Ephemeral {
-                        epoch: got_epoch,
-                        seq,
-                    }) => {
-                        assert_eq!(got_epoch, epoch);
-                        seq
+                    Ok(state) => {
+                        assert_eq!(state.epoch, epoch);
+                        state.seq
                     }
-                    other => panic!("expected ephemeral cursor, got {other:?}"),
+                    other => panic!("expected a parseable cursor, got {other:?}"),
                 };
                 assert!(seq > prev, "seqs strictly increase: {prev} then {seq}");
                 assert_eq!(
@@ -1372,17 +1373,18 @@ async fn surface_ws_slow_client_drops_are_counted_exactly() {
         "a capacity-2 ring flooded with {FLOOD} messages must drop some"
     );
     assert_eq!(prev, FLOOD, "the newest message is always delivered last");
-    // Cross-check the wire-reported total against the bus's own drop counter for
+    // Cross-check the wire-reported total against the store's own drop counter for
     // this (channel, participant): they must agree exactly. The participant is
     // the subscribing *instance* — the principal that asked for the stream — so
-    // the bus's own attribution names the component, not the page it rode in on.
+    // the counter's own attribution names the component, not the page it rode in
+    // on.
     assert_eq!(
-        bus.drop_count(EPH_NAME, "surface:deskbar#protobar"),
+        messenger.live_drop_count(EPH_ADDR, "surface:deskbar#protobar"),
         sum_dropped,
-        "summed Deliver.dropped must match the bus drop counter"
+        "summed Deliver.dropped must match the live-stream drop counter"
     );
     assert_eq!(
-        bus.drop_count(EPH_NAME, "surface:deskbar"),
+        messenger.live_drop_count(EPH_ADDR, "surface:deskbar"),
         0,
         "the bare surface grain subscribes nothing here, so it counts nothing"
     );
@@ -1402,10 +1404,15 @@ async fn surface_ws_slow_client_drops_are_counted_exactly() {
 #[tokio::test]
 async fn surface_ws_context_feed_delivers_rows_but_never_reports_drops() {
     let db = db::init_db_memory();
-    let SurfaceTestHarness { state, bus, .. } = surface_harness(
+    let SurfaceTestHarness {
+        state,
+        stores,
+        messenger,
+        ..
+    } = surface_harness(
         &db,
         deskbar_context_feed(),
-        vec![ephemeral_channel_entry(EPH_NAME, 0, 2)],
+        vec![ephemeral_channel_entry(EPH_NAME, 0)],
     );
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
@@ -1428,17 +1435,17 @@ async fn surface_ws_context_feed_delivers_rows_but_never_reports_drops() {
 
     const FLOOD: u64 = 600;
     let big = "x".repeat(60_000);
-    publish_as(&bus, "flood-a", EPH_ADDR, EPH_NAME, &big, 200);
-    publish_as(&bus, "flood-b", EPH_ADDR, EPH_NAME, &big, 200);
-    publish_as(&bus, "flood-c", EPH_ADDR, EPH_NAME, &big, 200);
+    publish_as(&stores, "flood-a", EPH_ADDR, &big, 200);
+    publish_as(&stores, "flood-b", EPH_ADDR, &big, 200);
+    publish_as(&stores, "flood-c", EPH_ADDR, &big, 200);
 
     let mut prev: u64 = 0;
     loop {
         let seq = match next_server_frame(&mut ws).await {
             ServerFrame::Deliver { targets, .. } => {
                 let target = sole_target(&targets);
-                let Ok(CursorState::Ephemeral { seq, .. }) = cursor::parse(&target.cursor) else {
-                    panic!("expected ephemeral cursor, got {:?}", target.cursor)
+                let Ok(CursorState { seq, .. }) = cursor::parse(&target.cursor) else {
+                    panic!("expected a parseable cursor, got {:?}", target.cursor)
                 };
                 assert_eq!(
                     target.dropped, 0,
@@ -1456,10 +1463,10 @@ async fn surface_ws_context_feed_delivers_rows_but_never_reports_drops() {
     }
 
     // The rows themselves flowed, and the loss the wire stayed silent about is
-    // real: the bus counted it against this very subscription.
+    // real: the counter charged it to this very subscription.
     assert_eq!(prev, FLOOD, "the newest message is always delivered last");
     assert!(
-        bus.drop_count(EPH_NAME, "surface:deskbar#protobar") > 0,
+        messenger.live_drop_count(EPH_ADDR, "surface:deskbar#protobar") > 0,
         "a capacity-2 ring flooded with {FLOOD} messages must drop some — the point is that \
          the wire never says so on a context feed"
     );
@@ -1472,12 +1479,12 @@ async fn surface_ws_context_feed_delivers_rows_but_never_reports_drops() {
 #[tokio::test]
 async fn surface_ws_subscribe_fresh_replays_retained_ring() {
     let db = db::init_db_memory();
-    let SurfaceTestHarness { state, bus, .. } = subscribe_harness(&db, 4, 16);
+    let SurfaceTestHarness { state, stores, .. } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
     // Publish two before anyone connects: the retained ring holds them.
-    publish(&bus, "first");
-    publish(&bus, "second");
-    let epoch = bus.epoch();
+    publish(&stores, "first");
+    publish(&stores, "second");
+    let epoch = stores.epoch();
     let (base, _sd) = spawn_test_server(state).await;
 
     let ws_url = http_to_ws_url(&base, &format!("/surface/deskbar/ws?build={TEST_BUILD_ID}"));
@@ -1528,9 +1535,9 @@ async fn surface_ws_subscribe_then_live_publish_delivers() {
     let db = db::init_db_memory();
     // retain_depth 0: no ring, so the subscribe replays nothing and the live
     // publish is the only delivery.
-    let SurfaceTestHarness { state, bus, .. } = subscribe_harness(&db, 0, 16);
+    let SurfaceTestHarness { state, stores, .. } = subscribe_harness(&db, 0);
     let (token, _) = setup_authenticated_user(&db).await;
-    let epoch = bus.epoch();
+    let epoch = stores.epoch();
     let (base, _sd) = spawn_test_server(state).await;
 
     let ws_url = http_to_ws_url(&base, &format!("/surface/deskbar/ws?build={TEST_BUILD_ID}"));
@@ -1551,7 +1558,7 @@ async fn surface_ws_subscribe_then_live_publish_delivers() {
     }
 
     // Publish after the subscription is live: it arrives over the delivery arm.
-    publish(&bus, "live");
+    publish(&stores, "live");
     assert_deliver(
         next_server_frame(&mut ws).await,
         EPH_ADDR,
@@ -1570,7 +1577,7 @@ async fn surface_ws_subscribe_unbound_channel_is_violation() {
         alerts,
         flusher,
         ..
-    } = subscribe_harness(&db, 4, 16);
+    } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -1635,23 +1642,28 @@ async fn subscribe_and_observe_close(base: &str, token: &str, channel: &str) -> 
 async fn surface_ws_no_existence_oracle_unbound_vs_nonexistent() {
     let db = db::init_db_memory();
     let (mut state, alerts, _h) = test_state_with_capturing_alerter(&db);
-    // Both channels exist at the bus layer, so `otherbar-only` is genuinely
-    // "exists on the bus AND in another surface's config, but not in deskbar's
+    // Both channels exist in the registry, so `otherbar-only` is genuinely
+    // "exists as a channel AND in another surface's config, but not in deskbar's
     // map" — the real exists-but-not-yours probe. `pure-fiction` exists nowhere.
-    // Any code path that consulted bus existence to answer differently would
+    // Any code path that consulted channel existence to answer differently would
     // diverge between the two inputs and fail the close-shape assertion below.
-    let bus = fixture_bus(vec![
-        ephemeral_channel_entry(EPH_NAME, 4, 16),
-        ephemeral_channel_entry(OTHERBAR_NAME, 4, 16),
-    ]);
+    let entries = vec![
+        ephemeral_channel_entry(EPH_NAME, 4),
+        ephemeral_channel_entry(OTHERBAR_NAME, 4),
+    ];
+    let messenger = super::test_fixtures::fixture_messenger(
+        &db,
+        &entries,
+        &deskbar_sub(),
+        fixture_stores(entries.clone()),
+    );
     // `deskbar` binds EPH_ADDR; `otherbar` binds OTHERBAR_ADDR. From a deskbar
     // session the latter is a channel absent from deskbar's own
     // `subscription_channels` — indistinguishable, in the single fail-closed
     // lookup, from a channel bound nowhere.
     state.surfaces = Arc::new(build_surface_runtimes(
         vec![deskbar_sub(), otherbar()],
-        bus,
-        None,
+        Some(messenger),
         TEST_MAX_BODY_BYTES,
         None,
         crate::test_support::surface::description_params(),
@@ -1660,9 +1672,9 @@ async fn surface_ws_no_existence_oracle_unbound_vs_nonexistent() {
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
-    // Input 1: bound to a *different* surface (exists in config and on the bus).
+    // Input 1: bound to a *different* surface (exists in config and as a channel).
     let close_bound_elsewhere = subscribe_and_observe_close(&base, &token, OTHERBAR_ADDR).await;
-    // Input 2: bound to no surface at all, and absent from the bus.
+    // Input 2: bound to no surface at all, and absent from the registry.
     let close_nonexistent =
         subscribe_and_observe_close(&base, &token, "ephemeral:pure-fiction").await;
 
@@ -1705,7 +1717,7 @@ async fn surface_ws_subscribe_duplicate_is_violation() {
         alerts,
         flusher,
         ..
-    } = subscribe_harness(&db, 0, 16);
+    } = subscribe_harness(&db, 0);
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -1736,25 +1748,30 @@ async fn surface_ws_subscribe_duplicate_is_violation() {
     assert_single_alert(&flusher, &alerts, "surface_protocol_violation").await;
 }
 
+/// One cursor shape serves both classes, so a durable cursor echoed on a
+/// ring-backed channel is no longer a class mismatch — its epoch is simply one
+/// that ring never assigned, answered as a gap. What *is* a violation is the one
+/// field a ring subscription can never legitimately carry: the below-water
+/// confirm set, which only the durable ack channel mints into.
 #[tokio::test]
-async fn surface_ws_subscribe_class_mismatched_resume_is_violation() {
+async fn surface_ws_subscribe_ring_resume_with_confirmations_is_violation() {
     let db = db::init_db_memory();
     let SurfaceTestHarness {
         state,
         alerts,
         flusher,
+        stores,
         ..
-    } = subscribe_harness(&db, 4, 16);
+    } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
-    // A durable resume token on an ephemeral channel is a class mismatch.
     assert_frame_is_violation(
         &base,
         &token,
         subscribe_frame(
             EPH_ADDR,
-            Some(cursor::mint_durable(Uuid::nil(), 0, 3, vec![])),
+            Some(cursor::mint(0, stores.epoch(), 1, vec![3, 4])),
         ),
         &flusher,
         &alerts,
@@ -1769,13 +1786,13 @@ async fn surface_ws_subscribe_resume_ahead_is_violation() {
         state,
         alerts,
         flusher,
-        bus,
+        stores,
         ..
-    } = subscribe_harness(&db, 4, 16);
+    } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
     // Matching epoch, but a seq far past anything this boot assigned (nothing
     // published, so newest seq is 0): impossible for an honest client.
-    let resume = Some(cursor::mint_ephemeral(bus.epoch(), 999));
+    let resume = Some(cursor::mint(0, stores.epoch(), 999, vec![]));
     let (base, _sd) = spawn_test_server(state).await;
 
     assert_frame_is_violation(
@@ -1795,12 +1812,12 @@ async fn surface_ws_subscribe_resume_ahead_is_violation() {
 #[tokio::test]
 async fn surface_ws_subscribe_resume_exact_replays_tail() {
     let db = db::init_db_memory();
-    let SurfaceTestHarness { state, bus, .. } = subscribe_harness(&db, 4, 16);
+    let SurfaceTestHarness { state, stores, .. } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
-    publish(&bus, "one");
-    publish(&bus, "two");
-    publish(&bus, "three");
-    let epoch = bus.epoch();
+    publish(&stores, "one");
+    publish(&stores, "two");
+    publish(&stores, "three");
+    let epoch = stores.epoch();
     let (base, _sd) = spawn_test_server(state).await;
 
     let ws_url = http_to_ws_url(&base, &format!("/surface/deskbar/ws?build={TEST_BUILD_ID}"));
@@ -1811,7 +1828,7 @@ async fn surface_ws_subscribe_resume_exact_replays_tail() {
     // no gap.
     ws.send(subscribe_frame(
         EPH_ADDR,
-        Some(cursor::mint_ephemeral(epoch, 1)),
+        Some(cursor::mint(0, epoch, 1, vec![])),
     ))
     .await
     .expect("send Subscribe");
@@ -1845,11 +1862,11 @@ async fn surface_ws_subscribe_resume_exact_replays_tail() {
 #[tokio::test]
 async fn surface_ws_subscribe_resume_up_to_date_no_replay() {
     let db = db::init_db_memory();
-    let SurfaceTestHarness { state, bus, .. } = subscribe_harness(&db, 4, 16);
+    let SurfaceTestHarness { state, stores, .. } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
-    publish(&bus, "one");
-    publish(&bus, "two");
-    let epoch = bus.epoch();
+    publish(&stores, "one");
+    publish(&stores, "two");
+    let epoch = stores.epoch();
     let (base, _sd) = spawn_test_server(state).await;
 
     let ws_url = http_to_ws_url(&base, &format!("/surface/deskbar/ws?build={TEST_BUILD_ID}"));
@@ -1860,7 +1877,7 @@ async fn surface_ws_subscribe_resume_up_to_date_no_replay() {
     // no gap.
     ws.send(subscribe_frame(
         EPH_ADDR,
-        Some(cursor::mint_ephemeral(epoch, 2)),
+        Some(cursor::mint(0, epoch, 2, vec![])),
     ))
     .await
     .expect("send Subscribe");
@@ -1880,23 +1897,23 @@ async fn surface_ws_subscribe_resume_hole_exceeds_ring_gaps() {
     let db = db::init_db_memory();
     // retain_depth 1: the ring keeps only the newest message, so a resume from an
     // older seq cannot be healed exactly.
-    let SurfaceTestHarness { state, bus, .. } = subscribe_harness(&db, 1, 16);
+    let SurfaceTestHarness { state, stores, .. } = subscribe_harness(&db, 1);
     let (token, _) = setup_authenticated_user(&db).await;
-    publish(&bus, "one");
-    publish(&bus, "two");
-    publish(&bus, "three");
-    let epoch = bus.epoch();
+    publish(&stores, "one");
+    publish(&stores, "two");
+    publish(&stores, "three");
+    let epoch = stores.epoch();
     let (base, _sd) = spawn_test_server(state).await;
 
     let ws_url = http_to_ws_url(&base, &format!("/surface/deskbar/ws?build={TEST_BUILD_ID}"));
     let mut ws = surface_ws_open(&ws_url, &token).await;
     consume_welcome(&mut ws).await;
 
-    // Resume from seq 1 but the ring only retains seq 3 → Gap(HoleExceedsRing)
+    // Resume from seq 1 but the ring only retains seq 3 → Gap(BeyondRetained)
     // with a full-ring replay.
     ws.send(subscribe_frame(
         EPH_ADDR,
-        Some(cursor::mint_ephemeral(epoch, 1)),
+        Some(cursor::mint(0, epoch, 1, vec![])),
     ))
     .await
     .expect("send Subscribe");
@@ -1909,10 +1926,10 @@ async fn surface_ws_subscribe_resume_hole_exceeds_ring_gaps() {
                 matches!(
                     gap,
                     Some(GapInfo {
-                        reason: GapReason::HoleExceedsRing
+                        reason: GapReason::BeyondRetained
                     })
                 ),
-                "expected HoleExceedsRing, got {gap:?}"
+                "expected BeyondRetained, got {gap:?}"
             );
         }
         other => panic!("expected SubscribeResult, got {other:?}"),
@@ -1930,23 +1947,23 @@ async fn surface_ws_subscribe_resume_hole_exceeds_ring_gaps() {
 #[tokio::test]
 async fn surface_ws_subscribe_resume_wrong_epoch_gaps() {
     let db = db::init_db_memory();
-    let SurfaceTestHarness { state, bus, .. } = subscribe_harness(&db, 4, 16);
+    let SurfaceTestHarness { state, stores, .. } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
-    publish(&bus, "one");
-    publish(&bus, "two");
-    let epoch = bus.epoch();
+    publish(&stores, "one");
+    publish(&stores, "two");
+    let epoch = stores.epoch();
     let (base, _sd) = spawn_test_server(state).await;
 
     let ws_url = http_to_ws_url(&base, &format!("/surface/deskbar/ws?build={TEST_BUILD_ID}"));
     let mut ws = surface_ws_open(&ws_url, &token).await;
     consume_welcome(&mut ws).await;
 
-    // A resume epoch that doesn't match the bus (e.g. a pre-restart token) →
-    // Gap(EpochChanged) with a full-ring replay. Deliveries carry the live bus
+    // A resume epoch that doesn't match the store (e.g. a pre-restart token) →
+    // Gap(EpochChanged) with a full-ring replay. Deliveries carry the live
     // epoch, not the stale resume epoch.
     ws.send(subscribe_frame(
         EPH_ADDR,
-        Some(cursor::mint_ephemeral(Uuid::new_v4(), 1)),
+        Some(cursor::mint(0, Uuid::new_v4(), 1, vec![])),
     ))
     .await
     .expect("send Subscribe");
@@ -2004,7 +2021,7 @@ fn unsubscribe_frame_as(channel: &str, instance: &str) -> Message {
 #[tokio::test]
 async fn surface_ws_unsubscribe_removes_active_subscription() {
     let db = db::init_db_memory();
-    let SurfaceTestHarness { state, alerts, .. } = subscribe_harness(&db, 0, 16);
+    let SurfaceTestHarness { state, alerts, .. } = subscribe_harness(&db, 0);
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -2056,7 +2073,7 @@ async fn surface_ws_unsubscribe_not_subscribed_is_violation() {
         alerts,
         flusher,
         ..
-    } = subscribe_harness(&db, 4, 16);
+    } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -2189,7 +2206,7 @@ fn publish_state(db: &db::Db, publish_burst: u32, publish_per_sec: u32) -> Surfa
     surface_harness(
         db,
         deskbar_pub(publish_burst, publish_per_sec),
-        vec![ephemeral_channel_entry(EPH_NAME, 0, 16)],
+        vec![ephemeral_channel_entry(EPH_NAME, 0)],
     )
 }
 
@@ -2208,7 +2225,8 @@ async fn durable_publish_state(
     // Declare brenn:writer-out in the DB + directory.
     let channel_uuid = Uuid::new_v4();
     let raw = ChannelConfigRaw {
-        uuid: channel_uuid.to_string(),
+        send_rate: None,
+        uuid: Some(channel_uuid.to_string()),
         address: DUR_OUT_NAME.to_string(),
         description: None,
         push_depth: None,
@@ -2239,9 +2257,11 @@ async fn durable_publish_state(
     surface_policies.insert("deskbar".to_string(), deskbar_policy);
     let surfaces = vec![deskbar_pub(publish_burst, 1)];
 
+    let eph = ephemeral_channel_entry(EPH_NAME, 0);
+    let stores = fixture_stores(vec![eph.clone()]);
     let messenger = Messenger::new(
         db.clone(),
-        Arc::new(MessagingDirectory::with_entries(vec![entry])),
+        Arc::new(MessagingDirectory::with_entries(vec![entry, eph])),
         Arc::from(TEST_ORIGIN),
         Arc::new(indexmap::IndexMap::new()),
         Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
@@ -2251,12 +2271,11 @@ async fn durable_publish_state(
     .with_subscriber_registrations(brenn_lib::messaging::testutils::surface_registrations(
         surface_policies,
     ))
-    .with_surface_send_budgets(budget_principals(&surfaces));
+    .with_surface_send_budgets(budget_principals(&surfaces))
+    .with_ring_stores(Arc::clone(&stores));
 
-    let bus = fixture_bus(vec![ephemeral_channel_entry(EPH_NAME, 0, 16)]);
     state.surfaces = Arc::new(build_surface_runtimes(
         surfaces,
-        bus,
         Some(messenger),
         TEST_MAX_BODY_BYTES,
         None,
@@ -2277,7 +2296,8 @@ async fn error_report_publish_state(db: &db::Db) -> (AppState, Uuid) {
 
     let channel_uuid = Uuid::new_v4();
     let raw = ChannelConfigRaw {
-        uuid: channel_uuid.to_string(),
+        send_rate: None,
+        uuid: Some(channel_uuid.to_string()),
         address: "surface-errors".to_string(),
         description: None,
         push_depth: None,
@@ -2308,9 +2328,11 @@ async fn error_report_publish_state(db: &db::Db) -> (AppState, Uuid) {
     surface_policies.insert("deskbar".to_string(), deskbar_policy);
     let surfaces = vec![deskbar_pub(60, 1)];
 
+    let eph = ephemeral_channel_entry(EPH_NAME, 0);
+    let stores = fixture_stores(vec![eph.clone()]);
     let messenger = Messenger::new(
         db.clone(),
-        Arc::new(MessagingDirectory::with_entries(vec![entry])),
+        Arc::new(MessagingDirectory::with_entries(vec![entry, eph])),
         Arc::from(TEST_ORIGIN),
         Arc::new(indexmap::IndexMap::new()),
         Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
@@ -2320,12 +2342,11 @@ async fn error_report_publish_state(db: &db::Db) -> (AppState, Uuid) {
     .with_subscriber_registrations(brenn_lib::messaging::testutils::surface_registrations(
         surface_policies,
     ))
-    .with_surface_send_budgets(budget_principals(&surfaces));
+    .with_surface_send_budgets(budget_principals(&surfaces))
+    .with_ring_stores(Arc::clone(&stores));
 
-    let bus = fixture_bus(vec![ephemeral_channel_entry(EPH_NAME, 0, 16)]);
     state.surfaces = Arc::new(build_surface_runtimes(
         surfaces,
-        bus,
         Some(messenger),
         TEST_MAX_BODY_BYTES,
         Some(("brenn:surface-errors".to_string(), LogLevel::Warn)),
@@ -2519,10 +2540,13 @@ fn publish_result_outcome(frame: ServerFrame, correlation: Option<u64>) -> Publi
 async fn surface_ws_publish_ok_delivers_to_sibling() {
     let db = db::init_db_memory();
     let SurfaceTestHarness {
-        state, alerts, bus, ..
+        state,
+        alerts,
+        stores,
+        ..
     } = publish_state(&db, 60, 1);
     let (token, _) = setup_authenticated_user(&db).await;
-    let epoch = bus.epoch();
+    let epoch = stores.epoch();
     let (base, _sd) = spawn_test_server(state).await;
 
     let ws_url = http_to_ws_url(&base, &format!("/surface/deskbar/ws?build={TEST_BUILD_ID}"));
@@ -2865,6 +2889,7 @@ fn durable_channel_entry(uuid: Uuid, retain_depth: Depth) -> ChannelEntry {
         address: DURABLE_ADDR.to_string(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth,
             standing_retain_depth: retain_depth,
@@ -2876,6 +2901,25 @@ fn durable_channel_entry(uuid: Uuid, retain_depth: Depth) -> ChannelEntry {
         transport_type: ChannelScheme::Brenn,
         mount: None,
     }
+}
+
+/// The below-water channel, carrying the deskbar component subscription the
+/// rig's session opens. The release pass resolves its targets from the
+/// directory, so a delayed-release message reaches this subscriber only if the
+/// channel names it.
+fn below_water_channel_entry(uuid: Uuid, retain_depth: Depth) -> ChannelEntry {
+    let mut entry = durable_channel_entry(uuid, retain_depth);
+    entry.subscribers = vec![SubscriberEntry {
+        kind: brenn_lib::messaging::SubscriberEntryKind::Surface {
+            slug: "deskbar".to_string(),
+            instance: Some(COMPONENT.to_string()),
+        },
+        push_depth: Depth::Unbounded,
+        retain_depth,
+        noise: NoiseLevel::Silent,
+        wake_min: None,
+    }];
+    entry
 }
 
 /// A `deskbar` surface with one durable subscription on `brenn:durable-demo`
@@ -2956,7 +3000,7 @@ async fn durable_rig(
     db: &db::Db,
     resolved: ResolvedSurface,
     channel_entry: ChannelEntry,
-    bus: Arc<EphemeralBus>,
+    nondurable: Vec<ChannelEntry>,
 ) -> (AppState, Arc<Messenger>) {
     {
         let conn = db.lock().await;
@@ -2964,19 +3008,28 @@ async fn durable_rig(
     }
     let router = Arc::new(WakeRouterImpl::new(ActiveBridges::new()));
     register_surface_routes(&router, std::slice::from_ref(&resolved));
+    // Registered as boot does, at every principal grain: a release pass resolves
+    // its targets through the same gate the publish path uses, so an
+    // unregistered subscriber would be minted no claim.
+    let surface_policies =
+        std::collections::HashMap::from([(resolved.slug.clone(), resolved.policy.clone())]);
+    let surfaces = std::slice::from_ref(&resolved);
+    let mut directory_entries = vec![channel_entry];
+    directory_entries.extend(nondurable.iter().cloned());
     let messenger = Messenger::new(
         db.clone(),
-        Arc::new(MessagingDirectory::with_entries(vec![channel_entry])),
+        Arc::new(MessagingDirectory::with_entries(directory_entries)),
         Arc::from(TEST_ORIGIN),
         Arc::new(indexmap::IndexMap::new()),
         router.clone() as Arc<dyn WakeRouter>,
         MessagingGlobalConfig::default(),
-    );
+    )
+    .with_subscriber_registrations(surface_registrations_all_grains(surface_policies, surfaces))
+    .with_ring_stores(fixture_stores(nondurable));
     let mut state = crate::test_support::state::test_state(db);
     state.messenger = Some(messenger.clone());
     state.surfaces = Arc::new(build_surface_runtimes(
         vec![resolved],
-        bus,
         Some(messenger.clone()),
         TEST_MAX_BODY_BYTES,
         None,
@@ -3179,7 +3232,6 @@ async fn durable_pubsub_rig(
     state.messenger = Some(messenger.clone());
     state.surfaces = Arc::new(build_surface_runtimes(
         surfaces,
-        fixture_bus(vec![]),
         Some(messenger.clone()),
         TEST_MAX_BODY_BYTES,
         None,
@@ -3412,7 +3464,7 @@ async fn surface_ws_durable_context_feed_delivers_live_on_a_batch_flush() {
                 assert!(
                     matches!(
                         cursor::parse(&target.cursor),
-                        Ok(CursorState::Durable { high_water: 1, .. })
+                        Ok(CursorState { seq: 1, .. })
                     ),
                     "got {:?}",
                     target.cursor
@@ -3458,7 +3510,7 @@ async fn surface_ws_durable_context_feed_still_replays_the_retained_window_on_re
         &db,
         resolved,
         durable_channel_entry(uuid, Depth::Bounded(2)),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
     let s1 = persist_durable(&messenger, uuid, "r1").await;
@@ -3927,21 +3979,26 @@ async fn surface_ws_durable_publish_parks_then_drains_on_late_subscribe() {
 /// Insert a parked (undelivered) push row targeting `surface:deskbar` on the
 /// durable channel — a publish-while-detached. `eager` sets the `eager_wake` flag
 /// (a non-eager row is not dispatchable and only drains on a nudge/subscribe).
-/// Returns `(push_id, seq = message_id)`.
-async fn park_durable(messenger: &Messenger, uuid: Uuid, body: &str, eager: bool) -> (i64, i64) {
+/// Returns `(push_id, message_id)` — `push_id` is `None` for a delayed release.
+async fn park_durable(
+    messenger: &Messenger,
+    uuid: Uuid,
+    body: &str,
+    eager: bool,
+) -> (Option<i64>, i64) {
     park_durable_at(messenger, uuid, body, eager, None).await
 }
 
 /// Insert a parked push row held until `release_after` — a delayed-release row.
 /// Held rows are excluded from both the parked claim and the dispatchable set
 /// (`release_after IS NULL` on each), so the row reaches the wire only once
-/// [`release_due_pushes`] clears the hold. Returns `(push_id, seq = message_id)`.
+/// a release pass clears the hold. Returns `(push_id, seq = message_id)`.
 async fn park_durable_delayed(
     messenger: &Messenger,
     uuid: Uuid,
     body: &str,
     release_after: chrono::DateTime<Utc>,
-) -> (i64, i64) {
+) -> (Option<i64>, i64) {
     park_durable_at(messenger, uuid, body, true, Some(release_after)).await
 }
 
@@ -3951,7 +4008,7 @@ async fn park_durable_at(
     body: &str,
     eager: bool,
     release_after: Option<chrono::DateTime<Utc>>,
-) -> (i64, i64) {
+) -> (Option<i64>, i64) {
     let conn = messenger.db().lock().await;
     // Targeted at the subscribing *instance*, mirroring what
     // `resolve_push_targets` stamps for these fixtures' bindings: the push window
@@ -3975,11 +4032,27 @@ async fn park_durable_at(
         ChannelScheme::Brenn,
         None,
         None,
-        None,
+        release_after,
         utc_to_ns(Utc::now()),
-        &[push],
+        if release_after.is_some() {
+            &[]
+        } else {
+            std::slice::from_ref(&push)
+        },
     );
-    (msg.push_ids[0], msg.id)
+    (msg.push_ids.first().copied(), msg.id)
+}
+
+/// The undelivered claim on `message_id`. A parked message holds none until its
+/// release mints one, so a delayed-release case asks after releasing.
+async fn claim_id_for(db: &db::Db, message_id: i64) -> i64 {
+    let conn = db.lock().await;
+    conn.query_row(
+        "SELECT id FROM messaging_pending_pushes WHERE message_id = ?1 AND delivered_at IS NULL",
+        rusqlite::params![message_id],
+        |r| r.get(0),
+    )
+    .expect("claim exists")
 }
 
 /// Insert a retained-only message (no push row): present in the retained window
@@ -4073,12 +4146,8 @@ async fn assert_durable_deliver_to(ws: &mut SurfaceWs, instance: &str, body: &st
                 "durable deliveries carry no drop signal in v1"
             );
             match cursor::parse(&target.cursor) {
-                Ok(CursorState::Durable {
-                    high_water: got, ..
-                }) => {
-                    assert_eq!(got, seq, "durable cursor high-water")
-                }
-                other => panic!("expected durable cursor, got {other:?}"),
+                Ok(state) => assert_eq!(state.seq, seq as u64, "durable cursor high-water"),
+                other => panic!("expected a parseable durable cursor, got {other:?}"),
             }
         }
         other => panic!("expected durable Deliver, got {other:?}"),
@@ -4126,18 +4195,9 @@ async fn assert_no_deliver(ws: &mut SurfaceWs) {
 }
 
 /// Publish one ephemeral message onto `addr` as a distinct sender.
-fn publish_eph(bus: &EphemeralBus, name: &str, addr: &str, body: &str) {
+fn publish_eph(stores: &RingStores, addr: &str, body: &str) {
     let participant = ParticipantId::for_surface("eph-pub");
-    let mut policy = AppPolicy::default();
-    policy.grants.insert(AppCapability::EphemeralPublish);
-    policy.acls.ephemeral_publish = vec![ChannelMatcher::Exact(name.to_string())];
-    assert!(
-        matches!(
-            bus.publish(&participant, &policy, addr, body, Urgency::Normal),
-            EphemeralPublishResult::Ok { .. }
-        ),
-        "ephemeral fixture publish must succeed"
-    );
+    super::test_fixtures::commit_eph(stores, addr, &participant, body);
 }
 
 /// Publish-while-detached: three rows park; on attach + `Subscribe` they drain in
@@ -4150,7 +4210,7 @@ async fn surface_ws_durable_parked_rows_drain_in_seq_order_on_subscribe() {
         &db,
         durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Unbounded),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
     let (_p1, s1) = park_durable(&messenger, uuid, "one", true).await;
@@ -4183,7 +4243,7 @@ async fn surface_ws_durable_live_delivery_after_subscribe_no_duplicate() {
         &db,
         durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Unbounded),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
 
@@ -4218,7 +4278,7 @@ async fn surface_ws_durable_quiet_row_flushed_by_live_delivery_nudge() {
         &db,
         durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Unbounded),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
 
@@ -4264,7 +4324,7 @@ async fn surface_ws_durable_resume_exact_continuation() {
         &db,
         durable_surface(uuid, Depth::Bounded(10), WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Bounded(10)),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
     let s1 = persist_durable(&messenger, uuid, "r1").await;
@@ -4303,7 +4363,7 @@ async fn surface_ws_durable_fresh_attach_replays_retained_window() {
         &db,
         durable_surface(uuid, Depth::Bounded(2), WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Bounded(2)),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
     let _s1 = persist_durable(&messenger, uuid, "r1").await;
@@ -4338,7 +4398,7 @@ async fn surface_ws_durable_resume_beyond_window_gaps_and_replays_newest() {
         &db,
         durable_surface(uuid, Depth::Bounded(2), WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Bounded(2)),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
     let s1 = persist_durable(&messenger, uuid, "r1").await;
@@ -4381,7 +4441,7 @@ async fn surface_ws_durable_resume_survives_server_restart() {
         &db,
         durable_surface(uuid, Depth::Bounded(10), WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Bounded(10)),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
     let (_p1, s1) = park_durable(&messenger1, uuid, "a", true).await;
@@ -4408,7 +4468,7 @@ async fn surface_ws_durable_resume_survives_server_restart() {
         &db,
         durable_surface(uuid, Depth::Bounded(10), WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Bounded(10)),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
     let (base2, _sd2) = spawn_test_server(state2).await;
@@ -4438,7 +4498,7 @@ async fn surface_ws_durable_multi_session_fanout_and_backlog_once() {
         &db,
         durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Unbounded),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
     let (_pb, sb) = park_durable(&messenger, uuid, "backlog", true).await;
@@ -4506,8 +4566,9 @@ struct BelowWaterRig {
     db: db::Db,
     messenger: Arc<Messenger>,
     token: String,
-    /// The below-water push row's `(push_id, message_id)`.
-    push_id: i64,
+    /// The below-water message's claim, when one exists at setup. A
+    /// delayed-release message holds none until it is released.
+    push_id: Option<i64>,
     seq: i64,
     /// Tears the test server down at the holder's scope end.
     _sd: crate::test_support::http::TestServer,
@@ -4527,8 +4588,8 @@ async fn below_water_rig_at(
     let (state, messenger) = durable_rig(
         &db,
         durable_surface(uuid, retain_depth, WakeMin::Normal, true, None),
-        durable_channel_entry(uuid, retain_depth),
-        fixture_bus(vec![]),
+        below_water_channel_entry(uuid, retain_depth),
+        vec![],
     )
     .await;
     let (p1, s1) = match release_after {
@@ -4564,8 +4625,9 @@ async fn store_incarnation(db: &db::Db) -> i64 {
 /// entry point, driven on demand with a clock far enough ahead that the release
 /// is deterministic rather than a wall-clock race.
 async fn release_all_due(messenger: &Messenger) {
-    let conn = messenger.db().lock().await;
-    release_due_pushes(&conn, Utc::now() + chrono::Duration::hours(1));
+    messenger
+        .release_due_messages(Utc::now() + chrono::Duration::hours(1))
+        .await;
 }
 
 /// Restart the below-water rig's server on the same store: tear down the old
@@ -4600,8 +4662,8 @@ async fn restart_rig(rig: BelowWaterRig, uuid: Uuid, retain_depth: Depth) -> Bel
     let (state, messenger) = durable_rig(
         &db,
         durable_surface(uuid, retain_depth, WakeMin::Normal, true, None),
-        durable_channel_entry(uuid, retain_depth),
-        fixture_bus(vec![]),
+        below_water_channel_entry(uuid, retain_depth),
+        vec![],
     )
     .await;
     let (base, sd) = spawn_test_server(state).await;
@@ -4616,19 +4678,10 @@ async fn restart_rig(rig: BelowWaterRig, uuid: Uuid, retain_depth: Depth) -> Bel
     }
 }
 
-/// The parsed confirm set of the next durable `Deliver`.
-async fn next_deliver_confirm(ws: &mut SurfaceWs) -> (String, i64, Vec<i64>) {
-    match next_deliver(ws).await {
-        (
-            body,
-            CursorState::Durable {
-                high_water,
-                confirm,
-                ..
-            },
-        ) => (body, high_water, confirm),
-        (body, other) => panic!("expected durable cursor for {body:?}, got {other:?}"),
-    }
+/// The parsed high-water and confirm set of the next durable `Deliver`.
+async fn next_deliver_confirm(ws: &mut SurfaceWs) -> (String, u64, Vec<i64>) {
+    let (body, state) = next_deliver(ws).await;
+    (body, state.seq, state.confirm)
 }
 
 /// A below-water send (a parked row claimed below the resume high-water) is
@@ -4666,7 +4719,7 @@ async fn surface_ws_below_water_delivery_stamps_confirm_and_carries_it() {
     );
     assert_eq!(confirm, vec![s1], "its id enters the confirm set");
     assert_eq!(
-        confirm_pending_flag(&db, p1).await,
+        confirm_pending_flag(&db, p1.expect("the message carries a claim")).await,
         1,
         "the DB row is stamped tentative before the socket write"
     );
@@ -4715,7 +4768,7 @@ async fn surface_ws_below_water_received_is_confirmed_and_not_redelivered() {
     let (replay, _gap) = next_subscribe_result(&mut ws2, DURABLE_ADDR, COMPONENT).await;
     assert_eq!(replay, 0, "a confirmed below-water row is not redelivered");
     assert_eq!(
-        confirm_pending_flag(&db, p1).await,
+        confirm_pending_flag(&db, p1.expect("the message carries a claim")).await,
         0,
         "confirm clears the tentative flag; the row ages out via GC"
     );
@@ -4774,7 +4827,10 @@ async fn surface_ws_below_water_lost_is_redelivered_exactly_once() {
         vec![s1],
         "redelivery is itself below-water and re-stamps"
     );
-    assert_eq!(confirm_pending_flag(&db, p1).await, 1);
+    assert_eq!(
+        confirm_pending_flag(&db, p1.expect("the message carries a claim")).await,
+        1
+    );
     assert_no_deliver(&mut ws2).await;
 }
 
@@ -4828,9 +4884,9 @@ async fn surface_ws_below_water_fresh_attach_redelivers_as_parked() {
     let (body, high_water, confirm) = next_deliver_confirm(&mut ws2).await;
     assert_eq!(body, "d", "the recovered parked row leads the replay");
     assert_eq!(
-        high_water, s1,
+        high_water, s1 as u64,
         "the fresh-attach anchor is 0; delivering the parked row advances it to \
-         the row's own id"
+         the row's own retention position"
     );
     assert_eq!(
         confirm,
@@ -4838,27 +4894,26 @@ async fn surface_ws_below_water_fresh_attach_redelivers_as_parked() {
         "the fresh-attach redelivery is force-stamped so it stays recoverable"
     );
     assert_eq!(
-        confirm_pending_flag(&db, p1).await,
+        confirm_pending_flag(&db, p1.expect("the message carries a claim")).await,
         1,
         "the redelivered parked row is stamped tentative on the DB row"
     );
 }
 
-/// The canonical below-water producer: a delayed-release row released **live
-/// while attached**, reaching the below-water branch from the live-delivery arm
-/// rather than the subscribe replay. The row is held at id 1 while the
-/// subscription resumes at high-water 5, so when the hold clears the live send is
-/// below-water by construction: it stamps, carries the confirm set, and leaves the
-/// high-water put. Echoing that cursor confirms it — no redelivery.
+/// A delayed-release row released **live while attached** enters retention at
+/// release, so it takes the channel's *newest* position — above the high-water a
+/// session resumed at while the row was still held. It is therefore an ordinary
+/// above-water live send: it advances the high-water, carries no confirm set, and
+/// leaves no tentative stamp.
 #[tokio::test]
-async fn surface_ws_below_water_live_release_stamps_and_confirms() {
+async fn surface_ws_late_release_arrives_above_water_live() {
     let uuid = Uuid::new_v4();
     let BelowWaterRig {
         base,
         db,
         messenger,
         token,
-        push_id: p1,
+        push_id: _,
         seq: s1,
         _sd,
     } = below_water_rig_at(
@@ -4868,67 +4923,66 @@ async fn surface_ws_below_water_live_release_stamps_and_confirms() {
     )
     .await;
 
+    // The four unheld rows hold positions 1..4, so the resume anchor is 4.
+    let anchor = durable_resume_at(&db, uuid, 4, vec![]).await;
     let mut ws = open_deskbar(&base, &token).await;
-    ws.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume(&db, 5).await),
-    ))
-    .await
-    .expect("subscribe");
+    ws.send(subscribe_frame(DURABLE_ADDR, Some(anchor)))
+        .await
+        .expect("subscribe");
     let (replay, gap) = next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT).await;
     assert_eq!(
         replay, 0,
-        "the held row is not claimable while released_after stands"
+        "the held row is not claimable while release_after stands"
     );
     assert_eq!(gap, None);
 
-    // The hold clears and the dispatcher fans the row to the attached session:
-    // the live arm's below-water send.
+    // The hold clears and the dispatcher fans the row to the attached session.
     release_all_due(&messenger).await;
+    // The claim exists only now: release mints it for the attached subscriber.
+    let p1 = claim_id_for(&db, s1).await;
     dispatch_pending(&messenger).await;
 
     let (body, high_water, confirm) = next_deliver_confirm(&mut ws).await;
     assert_eq!(body, "d", "the released row arrives live");
     assert_eq!(
         high_water, 5,
-        "a below-water live send leaves the high-water put"
+        "release assigns the newest retention position, so the send is above water"
     );
-    assert_eq!(
-        confirm,
-        vec![s1],
-        "the live send's id enters the confirm set"
+    assert!(
+        confirm.is_empty(),
+        "an above-water send is acked by the high-water, not the confirm set"
     );
     assert_eq!(
         confirm_pending_flag(&db, p1).await,
-        1,
-        "the live path stamps the DB row before the socket write"
+        0,
+        "an above-water send leaves no tentative stamp"
     );
     drop(ws);
 
-    // The page received it and echoes the set: confirmed, never redelivered.
+    // Echoing the advanced high-water: nothing is owed.
     let mut ws2 = open_deskbar(&base, &token).await;
     ws2.send(subscribe_frame(
         DURABLE_ADDR,
-        Some(durable_resume_with_confirm(&db, 5, vec![s1]).await),
+        Some(durable_resume_at(&db, uuid, 5, vec![]).await),
     ))
     .await
     .expect("subscribe ws2");
     let (replay, _gap) = next_subscribe_result(&mut ws2, DURABLE_ADDR, COMPONENT).await;
     assert_eq!(
         replay, 0,
-        "a confirmed live below-water row is not redelivered"
+        "the released row is behind the echoed high-water"
     );
-    assert_eq!(confirm_pending_flag(&db, p1).await, 0);
     assert_no_deliver(&mut ws2).await;
 }
 
 /// Restart survival, timing 1 — **released while attached**, then the socket dies
-/// before the page received the frame and the server restarts. The tentative row
-/// and the incarnation bump are both store state, so the pre-restart cursor
-/// resumes normally and the reconcile (no confirm set echoed → lost) redelivers
-/// the row exactly once across the boundary.
+/// before the page received the frame and the server restarts. The page's cursor
+/// still names the pre-release high-water, and the released row sits one position
+/// above it in retention, so the resume replays it exactly once across the
+/// boundary — the store window, not an ack stamp, is what recovers an above-water
+/// row.
 #[tokio::test]
-async fn surface_ws_below_water_delayed_release_attached_survives_restart_once() {
+async fn surface_ws_late_release_attached_survives_restart_once() {
     let uuid = Uuid::new_v4();
     let rig = below_water_rig_at(
         uuid,
@@ -4936,12 +4990,18 @@ async fn surface_ws_below_water_delayed_release_attached_survives_restart_once()
         Some(Utc::now() + chrono::Duration::hours(1)),
     )
     .await;
-    let (p1, s1) = (rig.push_id, rig.seq);
+    let s1 = rig.seq;
+
+    // Minted before the release and the restart — the four unheld rows hold
+    // positions 1..4 — so it is what a page holding a cursor across a deploy
+    // actually presents: pre-release position, pre-restart incarnation.
+    let pre_restart_cursor = durable_resume_at(&rig.db, uuid, 4, vec![]).await;
+    let pre_restart_incarnation = store_incarnation(&rig.db).await;
 
     let mut ws = open_deskbar(&rig.base, &rig.token).await;
     ws.send(subscribe_frame(
         DURABLE_ADDR,
-        Some(durable_resume(&rig.db, 5).await),
+        Some(durable_resume_at(&rig.db, uuid, 4, vec![]).await),
     ))
     .await
     .expect("subscribe");
@@ -4952,16 +5012,16 @@ async fn surface_ws_below_water_delayed_release_attached_survives_restart_once()
         0
     );
     release_all_due(&rig.messenger).await;
+    // The claim exists only now: release mints it for the attached subscriber.
+    let p1 = claim_id_for(&rig.db, s1).await;
     dispatch_pending(&rig.messenger).await;
-    let (_body, _hw, confirm) = next_deliver_confirm(&mut ws).await;
-    assert_eq!(confirm, vec![s1]);
+    let (_body, hw, _confirm) = next_deliver_confirm(&mut ws).await;
+    assert_eq!(
+        hw, 5,
+        "the released row takes the newest retention position"
+    );
     // The socket dies with the frame in flight — the page never saw it.
     drop(ws);
-
-    // Minted before the restart, so it carries the pre-restart incarnation —
-    // what a page holding a cursor across a deploy actually presents.
-    let pre_restart_cursor = durable_resume(&rig.db, 5).await;
-    let pre_restart_incarnation = store_incarnation(&rig.db).await;
 
     let BelowWaterRig {
         base,
@@ -4972,8 +5032,8 @@ async fn surface_ws_below_water_delayed_release_attached_survives_restart_once()
     } = restart_rig(rig, uuid, Depth::Bounded(10)).await;
     assert_eq!(
         confirm_pending_flag(&db, p1).await,
-        1,
-        "the tentative stamp is store state and survives the restart"
+        0,
+        "an above-water send is never stamped tentative"
     );
     assert!(
         store_incarnation(&db).await > pre_restart_incarnation,
@@ -4987,9 +5047,12 @@ async fn surface_ws_below_water_delayed_release_attached_survives_restart_once()
         .expect("subscribe ws2");
     let (replay, _gap) = next_subscribe_result(&mut ws2, DURABLE_ADDR, COMPONENT).await;
     assert_eq!(replay, 1, "the lost row redelivers across the restart");
-    let (body, _hw, confirm) = next_deliver_confirm(&mut ws2).await;
+    let (body, hw, _confirm) = next_deliver_confirm(&mut ws2).await;
     assert_eq!(body, "d");
-    assert_eq!(confirm, vec![s1], "the redelivery re-stamps");
+    assert_eq!(
+        hw, 5,
+        "the redelivery advances to the released row's position"
+    );
     assert_no_deliver(&mut ws2).await;
 }
 
@@ -4998,7 +5061,7 @@ async fn surface_ws_below_water_delayed_release_attached_survives_restart_once()
 /// changes nothing about it, and the next attach drains it exactly once through
 /// the ordinary parked claim.
 #[tokio::test]
-async fn surface_ws_below_water_delayed_release_detached_survives_restart_once() {
+async fn surface_ws_late_release_detached_survives_restart_once() {
     let uuid = Uuid::new_v4();
     let rig = below_water_rig_at(
         uuid,
@@ -5006,10 +5069,11 @@ async fn surface_ws_below_water_delayed_release_detached_survives_restart_once()
         Some(Utc::now() + chrono::Duration::hours(1)),
     )
     .await;
-    let (p1, s1) = (rig.push_id, rig.seq);
+    let s1 = rig.seq;
 
     // No session attached: the release and dispatch pass find nobody.
     release_all_due(&rig.messenger).await;
+    let p1 = claim_id_for(&rig.db, s1).await;
     dispatch_pending(&rig.messenger).await;
     assert_eq!(
         confirm_pending_flag(&rig.db, p1).await,
@@ -5018,7 +5082,8 @@ async fn surface_ws_below_water_delayed_release_detached_survives_restart_once()
     );
 
     // Minted before the restart: the resumed cursor carries the lower incarnation.
-    let pre_restart_cursor = durable_resume(&rig.db, 5).await;
+    // The four unheld rows hold positions 1..4, so the anchor is 4.
+    let pre_restart_cursor = durable_resume_at(&rig.db, uuid, 4, vec![]).await;
     let pre_restart_incarnation = store_incarnation(&rig.db).await;
 
     let BelowWaterRig {
@@ -5041,8 +5106,11 @@ async fn surface_ws_below_water_delayed_release_detached_survives_restart_once()
     assert_eq!(replay, 1, "the released row drains once at the next attach");
     let (body, high_water, confirm) = next_deliver_confirm(&mut ws).await;
     assert_eq!(body, "d");
-    assert_eq!(high_water, 5, "still below the resumed high-water");
-    assert_eq!(confirm, vec![s1]);
+    assert_eq!(
+        high_water, 5,
+        "the released row entered retention above the resumed high-water"
+    );
+    assert!(confirm.is_empty(), "an above-water send carries no ack set");
     assert_no_deliver(&mut ws).await;
 }
 
@@ -5102,7 +5170,10 @@ async fn surface_ws_below_water_fresh_attach_recovers_at_depth_zero() {
         vec![s1],
         "the fresh-attach redelivery is force-stamped"
     );
-    assert_eq!(confirm_pending_flag(&db, p1).await, 1);
+    assert_eq!(
+        confirm_pending_flag(&db, p1.expect("the message carries a claim")).await,
+        1
+    );
     assert_no_deliver(&mut ws2).await;
 }
 
@@ -5152,7 +5223,7 @@ async fn surface_ws_below_water_stale_confirm_entry_is_ignored() {
     let (replay, _gap) = next_subscribe_result(&mut ws2, DURABLE_ADDR, COMPONENT).await;
     assert_eq!(replay, 0, "the confirmed row is not redelivered");
     assert_eq!(
-        confirm_pending_flag(&db, p1).await,
+        confirm_pending_flag(&db, p1.expect("the message carries a claim")).await,
         0,
         "the stale entry is inert; the real one still confirms"
     );
@@ -5168,14 +5239,14 @@ async fn surface_ws_durable_and_ephemeral_on_one_session() {
     let db = db::init_db_memory();
     let uuid = Uuid::new_v4();
     let eph = "ticker";
-    let bus = fixture_bus(vec![ephemeral_channel_entry(eph, 0, 64)]);
     let (state, messenger) = durable_rig(
         &db,
         durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, Some(eph)),
         durable_channel_entry(uuid, Depth::Unbounded),
-        bus.clone(),
+        vec![ephemeral_channel_entry(eph, 0)],
     )
     .await;
+    let stores = Arc::clone(messenger.ring_stores());
 
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
@@ -5201,27 +5272,23 @@ async fn surface_ws_durable_and_ephemeral_on_one_session() {
     );
 
     // Interleave a durable live delivery and an ephemeral publish; both arrive,
-    // each with its own Pos kind (order between the two classes is unspecified).
+    // each carrying its own store position (order between the two classes is
+    // unspecified, and one cursor shape serves both, so the body names the class).
     let (_p, seq) = park_durable(&messenger, uuid, "dur", true).await;
     dispatch_pending(&messenger).await;
-    publish_eph(&bus, eph, "ephemeral:ticker", "eph");
+    publish_eph(&stores, "ephemeral:ticker", "eph");
 
     let mut saw_durable = false;
     let mut saw_ephemeral = false;
     for _ in 0..2 {
         let (body, state) = next_deliver(&mut ws).await;
-        match state {
-            CursorState::Durable {
-                high_water: got, ..
-            } => {
-                assert_eq!(body, "dur");
-                assert_eq!(got, seq);
+        match body.as_str() {
+            "dur" => {
+                assert_eq!(state.seq, seq as u64);
                 saw_durable = true;
             }
-            CursorState::Ephemeral { .. } => {
-                assert_eq!(body, "eph");
-                saw_ephemeral = true;
-            }
+            "eph" => saw_ephemeral = true,
+            other => panic!("unexpected delivery body {other}"),
         }
     }
     assert!(
@@ -5242,7 +5309,7 @@ async fn surface_ws_durable_floor_denied_retires_without_delivery() {
         &db,
         durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, false, None),
         durable_channel_entry(uuid, Depth::Unbounded),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
     let (p1, _s1) = park_durable(&messenger, uuid, "denied-1", true).await;
@@ -5262,7 +5329,14 @@ async fn surface_ws_durable_floor_denied_retires_without_delivery() {
     // The parked rows were claimed (retired), not left for a later drain.
     let conn = messenger.db().lock().await;
     assert!(
-        brenn_lib::messaging::db::claim_pending_pushes(&conn, &[p1, p2]).is_empty(),
+        brenn_lib::messaging::db::claim_pending_pushes(
+            &conn,
+            &[
+                p1.expect("the message carries a claim"),
+                p2.expect("the message carries a claim")
+            ]
+        )
+        .is_empty(),
         "floor-denied rows are retired (claimed), matching the dispatcher floor"
     );
 }
@@ -5280,7 +5354,7 @@ async fn surface_ws_durable_unsubscribe_then_resubscribe_delivers_fresh_backlog_
         &db,
         durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Unbounded),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
 
@@ -5333,7 +5407,7 @@ async fn surface_ws_durable_drain_skips_already_replayed_seq() {
         &db,
         durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Unbounded),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
 
@@ -5341,6 +5415,7 @@ async fn surface_ws_durable_drain_skips_already_replayed_seq() {
     // session's drain) owning the row, so this session's parked load misses it and
     // it can only reach the wire via the retained window on resume.
     let (p, s) = park_durable(&messenger, uuid, "dup", false).await;
+    let p = p.expect("the message carries a claim");
     {
         let conn = messenger.db().lock().await;
         assert_eq!(
@@ -5358,7 +5433,7 @@ async fn surface_ws_durable_drain_skips_already_replayed_seq() {
     // window re-sends S and records it in this connection's replay_sent.
     ws.send(subscribe_frame(
         DURABLE_ADDR,
-        Some(durable_resume(&db, s - 1).await),
+        Some(durable_resume_at(&db, uuid, s as u64 - 1, vec![]).await),
     ))
     .await
     .expect("subscribe");
@@ -5403,7 +5478,7 @@ async fn surface_ws_durable_live_arm_skips_already_replayed_seq() {
         &db,
         durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Unbounded),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
 
@@ -5411,6 +5486,7 @@ async fn surface_ws_durable_live_arm_skips_already_replayed_seq() {
     // session's parked load misses it and it reaches the wire only via the
     // retained window on resume.
     let (p, s) = park_durable(&messenger, uuid, "dup", true).await;
+    let p = p.expect("the message carries a claim");
     {
         let conn = messenger.db().lock().await;
         assert_eq!(
@@ -5428,7 +5504,7 @@ async fn surface_ws_durable_live_arm_skips_already_replayed_seq() {
     // window re-sends S and records it in this connection's replay_sent.
     ws.send(subscribe_frame(
         DURABLE_ADDR,
-        Some(durable_resume(&db, s - 1).await),
+        Some(durable_resume_at(&db, uuid, s as u64 - 1, vec![]).await),
     ))
     .await
     .expect("subscribe");
@@ -5473,7 +5549,7 @@ async fn surface_ws_durable_resubscribe_replay_skips_already_replayed_seq() {
         &db,
         durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Unbounded),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
 
@@ -5501,7 +5577,7 @@ async fn surface_ws_durable_resubscribe_replay_skips_already_replayed_seq() {
     // is already in replay_sent — an empty replay, no second Deliver.
     ws.send(subscribe_frame(
         DURABLE_ADDR,
-        Some(durable_resume(&db, s - 1).await),
+        Some(durable_resume_at(&db, uuid, s as u64 - 1, vec![]).await),
     ))
     .await
     .expect("re-subscribe");
@@ -5513,34 +5589,40 @@ async fn surface_ws_durable_resubscribe_replay_skips_already_replayed_seq() {
     assert_no_deliver(&mut ws).await;
 }
 
-/// An ephemeral resume token on a durable channel is a class mismatch a correct
-/// client cannot produce — the symmetric case of the durable-resume-on-ephemeral
-/// violation. It is a protocol violation that tears the connection down.
+/// One cursor shape serves both classes, so a cursor minted under some other
+/// channel's numbering domain is no longer a class mismatch the session can
+/// recognize — it is simply an epoch the durable store never minted, which
+/// `replay_from` answers as a fresh attach with an `EpochChanged` gap. The
+/// connection survives.
 #[tokio::test]
-async fn surface_ws_durable_subscribe_ephemeral_resume_is_violation() {
+async fn surface_ws_durable_subscribe_foreign_epoch_resume_gaps() {
     let db = db::init_db_memory();
     let uuid = Uuid::new_v4();
-    let (state, _messenger) = durable_rig(
+    let (state, messenger) = durable_rig(
         &db,
         durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Unbounded),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
+    let (_p, s) = park_durable(&messenger, uuid, "retained", true).await;
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
     let mut ws = open_deskbar(&base, &token).await;
 
     ws.send(subscribe_frame(
         DURABLE_ADDR,
-        Some(cursor::mint_ephemeral(Uuid::new_v4(), 3)),
+        Some(cursor::mint(0, Uuid::new_v4(), 3, vec![])),
     ))
     .await
     .expect("send");
-    assert!(
-        drain_until_closed(&mut ws).await,
-        "ephemeral resume on a durable channel must close the connection"
+    let (replay, gap) = next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT).await;
+    assert_eq!(gap, Some(GapReason::EpochChanged));
+    assert_eq!(
+        replay, 1,
+        "a fresh attach replays the whole retained window"
     );
+    assert_durable_deliver_to(&mut ws, COMPONENT, "retained", s).await;
 }
 
 /// A second Subscribe to an already-active durable channel exercises the
@@ -5553,7 +5635,7 @@ async fn surface_ws_durable_subscribe_duplicate_is_violation() {
         &db,
         durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Unbounded),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
     let (token, _) = setup_authenticated_user(&db).await;
@@ -5607,7 +5689,8 @@ async fn geometry_status_rig(db: &db::Db) -> GeoStatusRig {
     let geometry_uuid = Uuid::new_v4();
     let status_uuid = Uuid::new_v4();
     let bounded = |uuid: Uuid, address: &str| ChannelConfigRaw {
-        uuid: uuid.to_string(),
+        send_rate: None,
+        uuid: Some(uuid.to_string()),
         address: address.to_string(),
         description: None,
         push_depth: None,
@@ -5641,9 +5724,12 @@ async fn geometry_status_rig(db: &db::Db) -> GeoStatusRig {
     surface_policies.insert("deskbar".to_string(), deskbar_policy);
     let surfaces = vec![deskbar_pub(60, 60)];
 
+    let eph = ephemeral_channel_entry(EPH_NAME, 0);
+    let mut directory_entries = entries;
+    directory_entries.push(eph.clone());
     let messenger = Messenger::new(
         db.clone(),
-        Arc::new(MessagingDirectory::with_entries(entries)),
+        Arc::new(MessagingDirectory::with_entries(directory_entries)),
         Arc::from(TEST_ORIGIN),
         Arc::new(indexmap::IndexMap::new()),
         Arc::new(brenn_lib::messaging::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
@@ -5652,12 +5738,11 @@ async fn geometry_status_rig(db: &db::Db) -> GeoStatusRig {
     .with_subscriber_registrations(brenn_lib::messaging::testutils::surface_registrations(
         surface_policies,
     ))
-    .with_surface_send_budgets(budget_principals(&surfaces));
+    .with_surface_send_budgets(budget_principals(&surfaces))
+    .with_ring_stores(fixture_stores(vec![eph]));
 
-    let bus = fixture_bus(vec![ephemeral_channel_entry(EPH_NAME, 0, 16)]);
     state.surfaces = Arc::new(build_surface_runtimes(
         surfaces,
-        bus,
         Some(messenger),
         TEST_MAX_BODY_BYTES,
         None,
@@ -6200,7 +6285,7 @@ async fn surface_ws_confirm_set_past_the_soft_cap_asks_the_client_to_re_anchor()
         &db,
         durable_surface(uuid, Depth::Bounded(10), WakeMin::Normal, true, None),
         durable_channel_entry(uuid, Depth::Bounded(10)),
-        fixture_bus(vec![]),
+        vec![],
     )
     .await;
     // One parked row per below-water send, one more than the soft cap admits.

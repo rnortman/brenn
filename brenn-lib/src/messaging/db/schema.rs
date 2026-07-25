@@ -19,7 +19,8 @@ use rusqlite::Connection;
 /// After the DDL, [`assert_messaging_schema_current`] fails the boot fast if the
 /// DB predates the urgency redesign (pre-2026-06); no migration path exists for
 /// such DBs, so the guard aborts with an actionable message rather than letting a
-/// raw SQLite error kill the dispatcher later.
+/// raw SQLite error kill the dispatcher later. [`normalize_released_messages`]
+/// then converges the one data shape an earlier release path could leave behind.
 pub fn run_messaging_migrations(conn: &Connection) {
     conn.execute_batch(
         "
@@ -28,7 +29,12 @@ pub fn run_messaging_migrations(conn: &Connection) {
             address         TEXT NOT NULL UNIQUE,
             description     TEXT,
             created_at      TEXT NOT NULL,
-            transport_type  TEXT NOT NULL DEFAULT 'brenn'
+            transport_type  TEXT NOT NULL DEFAULT 'brenn',
+            -- Durable resume domain: the epoch is minted with the row and dies
+            -- only with it; last_retained_seq is the per-channel dense-sequence
+            -- allocator and the persisted high-water.
+            resume_epoch        BLOB NOT NULL,
+            last_retained_seq   INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_messaging_channels_address
             ON messaging_channels(address);
@@ -49,6 +55,10 @@ pub fn run_messaging_migrations(conn: &Connection) {
             envelope_type       TEXT NOT NULL DEFAULT 'brenn',
             ingress_source      TEXT,
             ingress_summary     TEXT,
+            -- Dense per-channel retention-order sequence, assigned when the row
+            -- enters retention (append commit, or release for a parked row);
+            -- NULL while parked. Carries retention order, which the rowid cannot.
+            retained_seq        INTEGER,
             -- Non-brenn envelope rows must never have deliver_after or delivery_deadline;
             -- those are bus-only dispatch fields. This constraint makes the
             -- invariant machine-enforced rather than convention-enforced.
@@ -174,7 +184,41 @@ pub fn run_messaging_migrations(conn: &Connection) {
         .expect("failed to add messaging_pending_pushes.confirm_pending column");
     }
 
-    // WASM consumer failure quarantine table (design §3).
+    if !crate::db::column_exists(conn, "messaging_messages", "retained_seq") {
+        conn.execute_batch("ALTER TABLE messaging_messages ADD COLUMN retained_seq INTEGER;")
+            .expect("failed to add messaging_messages.retained_seq column");
+    }
+    if !crate::db::column_exists(conn, "messaging_channels", "last_retained_seq") {
+        conn.execute_batch(
+            "ALTER TABLE messaging_channels
+                ADD COLUMN last_retained_seq INTEGER NOT NULL DEFAULT 0;",
+        )
+        .expect("failed to add messaging_channels.last_retained_seq column");
+    }
+    // SQLite rejects a NOT NULL ADD COLUMN without a default; the empty
+    // placeholder is replaced by backfill_resume_epochs below.
+    if !crate::db::column_exists(conn, "messaging_channels", "resume_epoch") {
+        conn.execute_batch(
+            "ALTER TABLE messaging_channels
+                ADD COLUMN resume_epoch BLOB NOT NULL DEFAULT x'';",
+        )
+        .expect("failed to add messaging_channels.resume_epoch column");
+    }
+    // Outside the ALTER guard: the ALTER commits on its own, so a crash between
+    // it and the backfill would otherwise strand the placeholder forever with no
+    // path left to repair it. Idempotent and cheap — one scan of a table with one
+    // row per channel, matching nothing once the epochs are real.
+    backfill_resume_epochs(conn);
+
+    // Must follow the ALTER that adds retained_seq on a legacy DB.
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_messaging_messages_retained_seq
+            ON messaging_messages(channel_uuid, retained_seq)
+            WHERE retained_seq IS NOT NULL;",
+    )
+    .expect("failed to create idx_messaging_messages_retained_seq");
+
+    // WASM consumer failure quarantine table.
     // One row per failed batch; used as the durable audit/replay surface for
     // per-batch dispositions that did not complete successfully.
     // CREATE IF NOT EXISTS is idempotent — safe on fresh and existing DBs.
@@ -220,6 +264,142 @@ pub fn run_messaging_migrations(conn: &Connection) {
         ",
     )
     .expect("failed to create idx_messaging_pending_pushes_dispatchable");
+
+    // Backfill first: it numbers the rows that were already retained before this
+    // boot, in rowid order. Normalizing afterwards releases the rows that came
+    // due while the process was down, which take their sequences above those —
+    // release order, so retention order is consistent across restarts.
+    backfill_retained_seqs(conn);
+
+    normalize_released_messages(conn);
+}
+
+/// Replace the migration's placeholder `resume_epoch` on every channel row with
+/// a fresh UUID.
+///
+/// Runs once, in the ALTER path that added the column with a `DEFAULT ''`
+/// placeholder. Every channel row is minted its own epoch — including
+/// egress-only `pwa_push:` rows, which are ordinary channel rows here.
+fn backfill_resume_epochs(conn: &Connection) {
+    let uuids: Vec<Vec<u8>> = conn
+        .prepare("SELECT uuid FROM messaging_channels WHERE resume_epoch = x''")
+        .expect("prepare resume_epoch backfill scan")
+        .query_map([], |row| row.get(0))
+        .expect("query resume_epoch backfill scan")
+        .map(|r| r.expect("read channel uuid for resume_epoch backfill"))
+        .collect();
+    for uuid in uuids {
+        conn.execute(
+            "UPDATE messaging_channels SET resume_epoch = ?2 WHERE uuid = ?1",
+            rusqlite::params![uuid, uuid::Uuid::new_v4().as_bytes().to_vec()],
+        )
+        .expect("backfill resume_epoch");
+    }
+}
+
+/// Assign `retained_seq` to every retained (`deliver_after IS NULL`) row that
+/// lacks one, per channel in rowid order.
+///
+/// Idempotent: rows that already carry a seq are untouched. Rows still parked
+/// (`deliver_after IS NOT NULL`) stay unsequenced until release. Ingress rows
+/// (`channel_uuid IS NULL`) are excluded.
+///
+/// Runs at every boot but does work only where a channel has unsequenced
+/// retained rows, so the cost is a per-channel block allocation plus one cached
+/// assignment statement per row — paid once, on the deploy that adds the column.
+fn backfill_retained_seqs(conn: &Connection) {
+    let channels: Vec<Vec<u8>> = conn
+        .prepare(
+            "SELECT DISTINCT channel_uuid FROM messaging_messages
+             WHERE channel_uuid IS NOT NULL
+               AND deliver_after IS NULL
+               AND retained_seq IS NULL",
+        )
+        .expect("prepare retained_seq backfill channel scan")
+        .query_map([], |row| row.get(0))
+        .expect("query retained_seq backfill channel scan")
+        .map(|r| r.expect("read channel uuid for retained_seq backfill"))
+        .collect();
+
+    for channel in channels {
+        let ids: Vec<i64> = conn
+            .prepare(
+                "SELECT id FROM messaging_messages
+                 WHERE channel_uuid = ?1 AND deliver_after IS NULL AND retained_seq IS NULL
+                 ORDER BY id ASC",
+            )
+            .expect("prepare retained_seq backfill row scan")
+            .query_map(rusqlite::params![channel], |row| row.get(0))
+            .expect("query retained_seq backfill row scan")
+            .map(|r| r.expect("read message id for retained_seq backfill"))
+            .collect();
+        let channel_uuid = uuid::Uuid::from_slice(&channel)
+            .expect("messaging: malformed channel uuid in retained_seq backfill");
+        super::bus::assign_retained_seqs(conn, channel_uuid, &ids);
+    }
+}
+
+/// Release the messages that came due with nothing left holding them: clear the
+/// message-row half of the deferral hold and mint each one a retention sequence.
+///
+/// A message is parked while `messaging_messages.deliver_after` is set, and
+/// released when a release pass clears it along with its push rows'
+/// `release_after`. A message whose push rows were all released (or that never
+/// had any) but whose own hold still stands would never appear in a retention
+/// read and would occupy a deferred-cap slot forever.
+///
+/// The predicate is what makes this safe to run at every boot: a message still
+/// holding an undelivered, unreleased push row is genuinely parked and is left
+/// alone, and a future `deliver_after` is left alone.
+///
+/// Sequences are minted per channel in release order (`deliver_after` ascending,
+/// rowid breaking ties), so retention order is consistent regardless of whether
+/// a release occurs during uptime or downtime.
+fn normalize_released_messages(conn: &Connection) {
+    const RELEASABLE: &str = "deliver_after IS NOT NULL
+         AND deliver_after <= ?1
+         AND NOT EXISTS (
+             SELECT 1 FROM messaging_pending_pushes pp
+             WHERE pp.message_id = messaging_messages.id
+               AND pp.delivered_at IS NULL
+               AND pp.release_after IS NOT NULL
+         )";
+    let now = crate::db::format_ts_for_db(chrono::Utc::now());
+
+    // Read the release order before clearing the column that carries it.
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT channel_uuid, id FROM messaging_messages
+             WHERE {RELEASABLE} AND channel_uuid IS NOT NULL
+             ORDER BY deliver_after ASC, id ASC"
+        ))
+        .expect("prepare boot release-order scan");
+    let mut grouped: Vec<(uuid::Uuid, Vec<i64>)> = Vec::new();
+    let rows = stmt
+        .query_map(rusqlite::params![now], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })
+        .expect("query boot release-order scan");
+    for r in rows {
+        let (channel, id) = r.expect("read boot release-order row");
+        let channel_uuid = uuid::Uuid::from_slice(&channel)
+            .expect("messaging: malformed channel uuid on a boot-released row");
+        match grouped.iter_mut().find(|(uuid, _)| *uuid == channel_uuid) {
+            Some((_, ids)) => ids.push(id),
+            None => grouped.push((channel_uuid, vec![id])),
+        }
+    }
+    drop(stmt);
+
+    conn.execute(
+        &format!("UPDATE messaging_messages SET deliver_after = NULL WHERE {RELEASABLE}"),
+        rusqlite::params![now],
+    )
+    .expect("failed to normalize released messaging_messages rows");
+
+    for (channel_uuid, ids) in grouped {
+        super::bus::assign_retained_seqs(conn, channel_uuid, &ids);
+    }
 }
 
 /// Fail fast if the messaging schema predates the urgency redesign (pre-2026-06).
@@ -263,6 +443,92 @@ mod tests {
     // -----------------------------------------------------------------------
     // Smoke test
     // -----------------------------------------------------------------------
+
+    /// The convergence pass clears the message-row hold only where nothing is
+    /// still waiting on it: a due message whose parked push rows were released
+    /// without it, never a message that is genuinely still parked.
+    #[test]
+    fn boot_normalizes_only_the_messages_nothing_still_holds() {
+        use chrono::{Duration, Utc};
+        let db = init_db_memory();
+        let conn = db.blocking_lock();
+        let past = crate::db::format_ts_for_db(Utc::now() - Duration::hours(1));
+        let future = crate::db::format_ts_for_db(Utc::now() + Duration::hours(1));
+        conn.execute_batch(&format!(
+            "INSERT INTO messaging_messages
+                 (id, uuid, source, sender, body, urgency, deliver_after, publish_ts_ns, created_at)
+             VALUES (1, X'01', 's', 'a', 'stale', 'normal', '{past}', 0, '{past}'),
+                    (2, X'02', 's', 'a', 'held', 'normal', '{past}', 0, '{past}'),
+                    (3, X'03', 's', 'a', 'future', 'normal', '{future}', 0, '{past}');
+             INSERT INTO messaging_pending_pushes
+                 (message_id, target_subscriber, target_app_slug, eager_wake, release_after,
+                  created_at)
+             VALUES (2, 'conv:1', 'app', 1, '{past}', '{past}');"
+        ))
+        .expect("seed rows");
+
+        super::normalize_released_messages(&conn);
+
+        let parked: Vec<i64> = conn
+            .prepare(
+                "SELECT id FROM messaging_messages WHERE deliver_after IS NOT NULL ORDER BY id",
+            )
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .map(|r| r.expect("read"))
+            .collect();
+        assert_eq!(
+            parked,
+            vec![2, 3],
+            "only the message whose pushes were released without it is converged"
+        );
+    }
+
+    /// Messages that came due while the process was down are released at boot
+    /// and take their retention sequences in release order, not rowid order —
+    /// the same order a live release pass and the ring both use.
+    #[test]
+    fn boot_release_sequences_in_release_order_not_rowid_order() {
+        use chrono::{Duration, Utc};
+        let db = init_db_memory();
+        let conn = db.blocking_lock();
+        let ch = uuid::Uuid::new_v4();
+        let older = crate::db::format_ts_for_db(Utc::now() - Duration::hours(2));
+        let newer = crate::db::format_ts_for_db(Utc::now() - Duration::hours(1));
+        conn.execute_batch(&format!(
+            "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch)
+             VALUES (X'{ch}', 'brenn:down', 'now', X'{ep}');
+             INSERT INTO messaging_messages
+                 (id, uuid, channel_uuid, source, sender, body, urgency, deliver_after,
+                  publish_ts_ns, created_at)
+             VALUES (1, X'{u1}', X'{ch}', 's', 'a', 'late-release', 'normal', '{newer}', 0, 'now'),
+                    (2, X'{u2}', X'{ch}', 's', 'a', 'early-release', 'normal', '{older}', 0,
+                     'now');",
+            ch = ch.simple(),
+            ep = uuid::Uuid::new_v4().simple(),
+            u1 = uuid::Uuid::new_v4().simple(),
+            u2 = uuid::Uuid::new_v4().simple(),
+        ))
+        .expect("seed rows");
+
+        super::normalize_released_messages(&conn);
+
+        let seq = |id: i64| -> Option<i64> {
+            conn.query_row(
+                "SELECT retained_seq FROM messaging_messages WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .expect("read retained_seq")
+        };
+        assert_eq!(
+            seq(2),
+            Some(1),
+            "the earlier release time is retained first"
+        );
+        assert_eq!(seq(1), Some(2), "the later release time is retained second");
+    }
 
     #[test]
     fn migrations_create_messaging_tables() {
@@ -355,6 +621,201 @@ mod tests {
         assert_eq!(flag_after, 0, "the second pass leaves the row untouched");
     }
 
+    /// The durable-resume migration on a pre-column DB: the three columns are
+    /// added, every retained (`deliver_after IS NULL`) row is assigned
+    /// `retained_seq` per channel in rowid order, `last_retained_seq` records the
+    /// high-water, each channel is minted a distinct real `resume_epoch`, and a
+    /// parked row stays unsequenced until its first release.
+    #[test]
+    fn resume_migration_backfills_seq_epoch_and_high_water() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        // FKs off so hand-written channel/message rows need no full DDL.
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             CREATE TABLE messaging_channels (
+                uuid BLOB PRIMARY KEY, address TEXT NOT NULL UNIQUE, description TEXT,
+                created_at TEXT NOT NULL, transport_type TEXT NOT NULL DEFAULT 'brenn'
+             );
+             CREATE TABLE messaging_messages (
+                id INTEGER PRIMARY KEY, uuid BLOB NOT NULL UNIQUE, channel_uuid BLOB,
+                source TEXT NOT NULL, sender TEXT NOT NULL, body TEXT NOT NULL,
+                urgency TEXT NOT NULL, deliver_after TEXT, publish_ts_ns INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+             );",
+        )
+        .expect("seed pre-migration schema");
+
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let future = crate::db::format_ts_for_db(chrono::Utc::now() + chrono::Duration::hours(1));
+        conn.execute_batch(&format!(
+            "INSERT INTO messaging_channels (uuid, address, created_at)
+             VALUES (X'{a}', 'brenn:a', 'now'), (X'{b}', 'brenn:b', 'now');
+             INSERT INTO messaging_messages
+                 (id, uuid, channel_uuid, source, sender, body, urgency, deliver_after,
+                  publish_ts_ns, created_at)
+             VALUES (1, X'01', X'{a}', 's', 'x', 'm1', 'low', NULL, 0, 'now'),
+                    (2, X'02', X'{a}', 's', 'x', 'm2', 'low', NULL, 0, 'now'),
+                    (3, X'03', X'{a}', 's', 'x', 'p',  'low', '{future}', 0, 'now'),
+                    (4, X'04', X'{b}', 's', 'x', 'n1', 'low', NULL, 0, 'now');",
+            a = a.simple(),
+            b = b.simple(),
+        ))
+        .expect("seed pre-migration rows");
+
+        super::run_messaging_migrations(&conn);
+
+        let seq = |id: i64| -> Option<i64> {
+            conn.query_row(
+                "SELECT retained_seq FROM messaging_messages WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .expect("read retained_seq")
+        };
+        assert_eq!(seq(1), Some(1), "channel A oldest gets seq 1");
+        assert_eq!(seq(2), Some(2), "channel A next gets seq 2");
+        assert_eq!(seq(3), None, "the parked row stays unsequenced");
+        assert_eq!(seq(4), Some(1), "channel B numbers independently from 1");
+
+        let hw = |ch: uuid::Uuid| -> i64 {
+            conn.query_row(
+                "SELECT last_retained_seq FROM messaging_channels WHERE uuid = ?1",
+                rusqlite::params![ch.as_bytes().to_vec()],
+                |r| r.get(0),
+            )
+            .expect("read last_retained_seq")
+        };
+        assert_eq!(hw(a), 2);
+        assert_eq!(hw(b), 1);
+
+        let epoch = |ch: uuid::Uuid| -> Vec<u8> {
+            conn.query_row(
+                "SELECT resume_epoch FROM messaging_channels WHERE uuid = ?1",
+                rusqlite::params![ch.as_bytes().to_vec()],
+                |r| r.get(0),
+            )
+            .expect("read resume_epoch")
+        };
+        let (ea, eb) = (epoch(a), epoch(b));
+        assert!(!ea.is_empty() && !eb.is_empty(), "placeholder was replaced");
+        assert_ne!(ea, eb, "each channel is minted its own epoch");
+        assert!(
+            uuid::Uuid::from_slice(&ea).is_ok(),
+            "the minted epoch is a real UUID"
+        );
+
+        // A second pass over the now-current schema is inert: the backfills run
+        // on every boot and must not renumber or re-mint anything.
+        super::run_messaging_migrations(&conn);
+        assert_eq!(seq(1), Some(1));
+        assert_eq!(seq(2), Some(2));
+        assert_eq!(seq(3), None);
+        assert_eq!(seq(4), Some(1));
+        assert_eq!(hw(a), 2);
+        assert_eq!(hw(b), 1);
+        assert_eq!(epoch(a), ea, "an already-minted epoch is never re-minted");
+    }
+
+    /// The deploy-day path continues past the migration: the first append after
+    /// it must take the sequence above the backfilled high-water, and a resume
+    /// against the migrated store must answer per the resume rules. A block
+    /// allocator that left `last_retained_seq` lagging the seqs it wrote would
+    /// pass the column assertions above and then collide on the unique index
+    /// with the first message published after the upgrade.
+    #[tokio::test]
+    async fn a_migrated_store_appends_and_resumes() {
+        use crate::messaging::store::{ResumeCursor, RetentionStore};
+
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             CREATE TABLE messaging_channels (
+                uuid BLOB PRIMARY KEY, address TEXT NOT NULL UNIQUE, description TEXT,
+                created_at TEXT NOT NULL, transport_type TEXT NOT NULL DEFAULT 'brenn'
+             );
+             CREATE TABLE messaging_messages (
+                id INTEGER PRIMARY KEY, uuid BLOB NOT NULL UNIQUE, channel_uuid BLOB,
+                source TEXT NOT NULL, sender TEXT NOT NULL, body TEXT NOT NULL,
+                urgency TEXT NOT NULL, reply_to_uuid BLOB, delivery_deadline TEXT,
+                deliver_after TEXT, publish_ts_ns INTEGER NOT NULL, created_at TEXT NOT NULL,
+                envelope_type TEXT NOT NULL DEFAULT 'brenn', ingress_source TEXT,
+                ingress_summary TEXT
+             );",
+        )
+        .expect("seed pre-migration schema");
+
+        let a = uuid::Uuid::new_v4();
+        conn.execute_batch(&format!(
+            "INSERT INTO messaging_channels (uuid, address, created_at)
+             VALUES (X'{a}', 'brenn:a', 'now');
+             INSERT INTO messaging_messages
+                 (id, uuid, channel_uuid, source, sender, body, urgency, deliver_after,
+                  publish_ts_ns, created_at)
+             VALUES (1, X'{m1}', X'{a}', 's', 'x', 'm1', 'low', NULL, 0, 'now'),
+                    (2, X'{m2}', X'{a}', 's', 'x', 'm2', 'low', NULL, 0, 'now');",
+            a = a.simple(),
+            m1 = uuid::Uuid::new_v4().simple(),
+            m2 = uuid::Uuid::new_v4().simple(),
+        ))
+        .expect("seed pre-migration rows");
+
+        super::run_messaging_migrations(&conn);
+
+        let db: crate::db::Db = std::sync::Arc::new(tokio::sync::Mutex::new(conn));
+        let store = crate::messaging::store::DbStore::new(
+            db.clone(),
+            a,
+            "brenn:a",
+            crate::messaging::config::Depth::Unbounded,
+            std::sync::Arc::new(crate::messaging::store::TargetResolver::unsubscribed()),
+        );
+
+        // The first post-migration append continues the backfilled numbering.
+        let committed = store
+            .append(crate::messaging::store::NewMessage {
+                source: "s".to_string(),
+                sender: "x".to_string(),
+                body: "m3".to_string(),
+                urgency: crate::messaging::Urgency::Low,
+                envelope_type: crate::messaging::ChannelScheme::Brenn,
+                reply_to_uuid: None,
+                delivery_deadline: None,
+                publish_ts_ns: 0,
+            })
+            .await;
+        assert_eq!(
+            committed.committed.seq.0, 3,
+            "the append takes the next seq"
+        );
+
+        let epoch = store
+            .replay_from(None, crate::messaging::config::Depth::Unbounded)
+            .await
+            .epoch;
+        let cursor = |seq| ResumeCursor { epoch, seq };
+
+        let up_to_date = store
+            .replay_from(Some(cursor(3)), crate::messaging::config::Depth::Unbounded)
+            .await;
+        assert_eq!(
+            up_to_date.decision,
+            brenn_queue::ReplayDecision::UpToDate,
+            "a cursor at the high-water over migrated data is up to date"
+        );
+
+        let trailing = store
+            .replay_from(Some(cursor(1)), crate::messaging::config::Depth::Unbounded)
+            .await;
+        assert_eq!(trailing.decision, brenn_queue::ReplayDecision::Exact);
+        let bodies: Vec<String> = trailing
+            .messages
+            .iter()
+            .map(|m| m.message.body.clone())
+            .collect();
+        assert_eq!(bodies, ["m2", "m3"], "migrated rows replay in seq order");
+    }
+
     // -----------------------------------------------------------------------
     // envelope_type column codec
     // -----------------------------------------------------------------------
@@ -403,6 +864,7 @@ mod tests {
             "envelope_type",
             "ingress_source",
             "ingress_summary",
+            "retained_seq",
         ] {
             assert!(
                 column_exists(&conn, "messaging_messages", col),
@@ -416,11 +878,13 @@ mod tests {
             );
         }
 
-        // messaging_channels: transport_type present.
-        assert!(
-            column_exists(&conn, "messaging_channels", "transport_type"),
-            "messaging_channels missing transport_type"
-        );
+        // messaging_channels: transport_type + durable-resume columns present.
+        for col in &["transport_type", "resume_epoch", "last_retained_seq"] {
+            assert!(
+                column_exists(&conn, "messaging_channels", col),
+                "messaging_channels missing current column {col}"
+            );
+        }
 
         // messaging_subscriptions: depth/wake model present, legacy kind absent.
         for col in &["push_depth", "retain_depth", "noise", "wake_min"] {

@@ -5,8 +5,8 @@ pub type Activation = brenn::processor::types::Activation;
 pub type ReceiveError = brenn::processor::types::ReceiveError;
 #[doc(hidden)]
 #[allow(non_snake_case, unused_unsafe)]
-pub unsafe fn _export_receive_cabi<T_: Guest>(arg0: *mut u8,arg1: usize,) -> *mut u8 { unsafe {#[cfg(target_arch="wasm32")]
-_rt::run_ctors_once();let result12 = {
+pub unsafe fn _export_receive_cabi<T_: Guest>(arg0: *mut u8,arg1: usize,arg2: *mut u8,arg3: usize,arg4: i32,arg5: i64,) -> *mut u8 { unsafe {#[cfg(target_arch="wasm32")]
+_rt::run_ctors_once();let result24 = {
   let base11 = arg0;
   let len11 = arg1;
   let mut result11 = _rt::Vec::with_capacity(len11);
@@ -48,40 +48,92 @@ _rt::run_ctors_once();let result12 = {
     result11.push(e11);
   }
   _rt::cabi_dealloc(base11, len11 * (8+4*::core::mem::size_of::<*const u8>()), ::core::mem::size_of::<*const u8>());
+  let base23 = arg2;
+  let len23 = arg3;
+  let mut result23 = _rt::Vec::with_capacity(len23);
+  for i in 0..len23 {
+    let base = base23.add(i * (4*::core::mem::size_of::<*const u8>()));
+    let e23 = {
+      let l12 = *base.add(0).cast::<*mut u8>();
+      let l13 = *base.add(::core::mem::size_of::<*const u8>()).cast::<usize>();
+      let len14 = l13;
+      let bytes14 = _rt::Vec::from_raw_parts(l12.cast(), len14, len14);
+      let l15 = *base.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>();
+      let l16 = *base.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>();
+      let base22 = l15;
+      let len22 = l16;
+      let mut result22 = _rt::Vec::with_capacity(len22);
+      for i in 0..len22 {
+        let base = base22.add(i * (16+2*::core::mem::size_of::<*const u8>()));
+        let e22 = {
+          let l17 = *base.add(0).cast::<i32>();
+          let l18 = *base.add(::core::mem::size_of::<*const u8>()).cast::<*mut u8>();
+          let l19 = *base.add(2*::core::mem::size_of::<*const u8>()).cast::<usize>();
+          let len20 = l19;
+          let bytes20 = _rt::Vec::from_raw_parts(l18.cast(), len20, len20);
+          let l21 = *base.add(8+2*::core::mem::size_of::<*const u8>()).cast::<i64>();
+
+          brenn::processor::types::DeferredEntry{
+            index: l17 as u32,
+            payload: _rt::string_lift(bytes20),
+            deliver_after: l21 as u64,
+          }
+        };
+        result22.push(e22);
+      }
+      _rt::cabi_dealloc(base22, len22 * (16+2*::core::mem::size_of::<*const u8>()), 8);
+
+      brenn::processor::types::DeferredWindow{
+        port: _rt::string_lift(bytes14),
+        entries: result22,
+      }
+    };
+    result23.push(e23);
+  }
+  _rt::cabi_dealloc(base23, len23 * (4*::core::mem::size_of::<*const u8>()), ::core::mem::size_of::<*const u8>());
   T_::receive(brenn::processor::types::Activation{
     ports: result11,
+    deferred: result23,
+    now: match arg4 {
+      0 => None,
+      1 => {
+        let e = arg5 as u64;
+        Some(e)
+      }
+      _ => _rt::invalid_enum_discriminant(),
+    },
   })
 };
-let ptr13 = (&raw mut _RET_AREA.0).cast::<u8>();
-match result12 {
+let ptr25 = (&raw mut _RET_AREA.0).cast::<u8>();
+match result24 {
   Ok(_) => { {
-    *ptr13.add(0).cast::<u8>() = (0i32) as u8;
+    *ptr25.add(0).cast::<u8>() = (0i32) as u8;
   } },
   Err(e) => { {
-    *ptr13.add(0).cast::<u8>() = (1i32) as u8;
-    use brenn::processor::types::ReceiveError as V16;
+    *ptr25.add(0).cast::<u8>() = (1i32) as u8;
+    use brenn::processor::types::ReceiveError as V28;
     match e {
-      V16::MalformedEnvelope(e) => {
-        *ptr13.add(::core::mem::size_of::<*const u8>()).cast::<u8>() = (0i32) as u8;
-        let vec14 = (e.into_bytes()).into_boxed_slice();
-        let ptr14 = vec14.as_ptr().cast::<u8>();
-        let len14 = vec14.len();
-        ::core::mem::forget(vec14);
-        *ptr13.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>() = len14;
-        *ptr13.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr14.cast_mut();
+      V28::MalformedEnvelope(e) => {
+        *ptr25.add(::core::mem::size_of::<*const u8>()).cast::<u8>() = (0i32) as u8;
+        let vec26 = (e.into_bytes()).into_boxed_slice();
+        let ptr26 = vec26.as_ptr().cast::<u8>();
+        let len26 = vec26.len();
+        ::core::mem::forget(vec26);
+        *ptr25.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>() = len26;
+        *ptr25.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr26.cast_mut();
       },
-      V16::ProcessingFailed(e) => {
-        *ptr13.add(::core::mem::size_of::<*const u8>()).cast::<u8>() = (1i32) as u8;
-        let vec15 = (e.into_bytes()).into_boxed_slice();
-        let ptr15 = vec15.as_ptr().cast::<u8>();
-        let len15 = vec15.len();
-        ::core::mem::forget(vec15);
-        *ptr13.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>() = len15;
-        *ptr13.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr15.cast_mut();
+      V28::ProcessingFailed(e) => {
+        *ptr25.add(::core::mem::size_of::<*const u8>()).cast::<u8>() = (1i32) as u8;
+        let vec27 = (e.into_bytes()).into_boxed_slice();
+        let ptr27 = vec27.as_ptr().cast::<u8>();
+        let len27 = vec27.len();
+        ::core::mem::forget(vec27);
+        *ptr25.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>() = len27;
+        *ptr25.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr27.cast_mut();
       },
     }
   } },
-};ptr13
+};ptr25
 } }
 #[doc(hidden)]
 #[allow(non_snake_case)]
@@ -121,8 +173,8 @@ macro_rules! __export_world_processor_cabi{
   ($ty:ident with_types_in $($path_to_types:tt)*) => (const _: () = {
 
     #[unsafe(export_name = "receive")]
-    unsafe extern "C" fn export_receive(arg0: *mut u8,arg1: usize,) -> *mut u8 {
-      unsafe { $($path_to_types)*::_export_receive_cabi::<$ty>(arg0, arg1) }
+    unsafe extern "C" fn export_receive(arg0: *mut u8,arg1: usize,arg2: *mut u8,arg3: usize,arg4: i32,arg5: i64,) -> *mut u8 {
+      unsafe { $($path_to_types)*::_export_receive_cabi::<$ty>(arg0, arg1, arg2, arg3, arg4, arg5) }
     }
     #[unsafe(export_name = "cabi_post_receive")]
     unsafe extern "C" fn _post_return_receive(arg0: *mut u8,) {
@@ -231,6 +283,54 @@ pub mod brenn {
         }
       }
 
+      /// Failure modes for the deferred-message control ops (`defer-cancel` /
+      /// `defer-edit`). A drain-vs-release race — the named message released
+      /// between the activation's snapshot and the flush — is NOT an error here:
+      /// it is a benign lost race the host logs and counts, and the buffered op
+      /// returns ok at buffer time (the guest already returned before the race is
+      /// resolvable).
+      #[derive(Clone, Copy)]
+      pub enum DeferError {
+        /// `port` is not one of this component's bound output ports.
+        NotPermitted,
+        /// `index` is outside the deferred-window this activation delivered for
+        /// `port`. Snapshot-relative: an index valid against a *different*
+        /// activation's window is still out of range here. This is a guest bug,
+        /// so it fails fail-fast at buffer time.
+        OutOfRange,
+        /// Per-activation control-op budget exhausted (shared with the publish
+        /// call budget).
+        QuotaExceeded,
+        /// A `defer-edit` `deliver-after` is not a representable timestamp. Like
+        /// `publish-deferred`, the host rejects it at buffer time (where the guest
+        /// still holds the error channel) rather than let it collapse host-side.
+        InvalidDeliverAfter,
+      }
+      impl ::core::fmt::Debug for DeferError {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+          match self {
+            DeferError::NotPermitted => {
+              f.debug_tuple("DeferError::NotPermitted").finish()
+            }
+            DeferError::OutOfRange => {
+              f.debug_tuple("DeferError::OutOfRange").finish()
+            }
+            DeferError::QuotaExceeded => {
+              f.debug_tuple("DeferError::QuotaExceeded").finish()
+            }
+            DeferError::InvalidDeliverAfter => {
+              f.debug_tuple("DeferError::InvalidDeliverAfter").finish()
+            }
+          }
+        }
+      }
+      impl ::core::fmt::Display for DeferError {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+          write!(f, "{:?}", self)
+        }
+      }
+
+      impl ::core::error::Error for DeferError {}
       #[allow(unused_unsafe, clippy::all)]
       /// Buffer one message for the bus channel bound to `port`. `payload` is
       /// the message BODY only (opaque string) — not an envelope; the host
@@ -383,6 +483,230 @@ pub mod brenn {
             _ => _rt::invalid_enum_discriminant(),
           };
           result10
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// Buffer one message for the port's channel, held until `deliver-after`
+      /// (epoch milliseconds UTC) before it becomes observable to any subscriber,
+      /// replay, or context read. A `deliver-after` at or before the host's `now`
+      /// (see `activation.now`) publishes immediately, exactly like `publish`.
+      /// Urgency is the port default; use the sender-intent form via a later
+      /// activation if an override is needed.
+      ///
+      /// This is the timer idiom: a component schedules a message to itself (or a
+      /// peer) at a future instant, most commonly to wake itself again. Like
+      /// `publish`, the call is BUFFERED and flushed atomically iff receive
+      /// returns ok — an err/trap schedules nothing. The parked message is bounded
+      /// channel-wide by the channel's retain depth; beyond that the flush drops
+      /// the schedule (host-logged), since a post-activation flush has no error
+      /// channel back to the guest.
+      ///
+      /// Same provenance/trust note as `publish`: the message carries
+      /// `sender = "wasm:<slug>"` with no external-origin marker.
+      #[allow(async_fn_in_trait)]
+      pub fn publish_deferred(port: &str,payload: &str,deliver_after: u64,) -> Result<(),PublishError>{
+        unsafe {
+
+          #[cfg_attr(target_pointer_width="64", repr(align(8)))]
+          #[cfg_attr(target_pointer_width="32", repr(align(4)))]
+          struct RetArea([::core::mem::MaybeUninit::<u8>; 4*::core::mem::size_of::<*const u8>()]);
+          let mut ret_area = RetArea([::core::mem::MaybeUninit::uninit(); 4*::core::mem::size_of::<*const u8>()]);
+          let vec0 = port;
+          let ptr0 = vec0.as_ptr().cast::<u8>();
+          let len0 = vec0.len();
+          let vec1 = payload;
+          let ptr1 = vec1.as_ptr().cast::<u8>();
+          let len1 = vec1.len();
+          let ptr2 = ret_area.0.as_mut_ptr().cast::<u8>();
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/ports@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "publish-deferred"]
+            fn wit_import3(_: *mut u8, _: usize, _: *mut u8, _: usize, _: i64, _: *mut u8, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import3(_: *mut u8, _: usize, _: *mut u8, _: usize, _: i64, _: *mut u8, ) { unreachable!() }
+          wit_import3(ptr0.cast_mut(), len0, ptr1.cast_mut(), len1, _rt::as_i64(&deliver_after), ptr2);
+          let l4 = i32::from(*ptr2.add(0).cast::<u8>());
+          let result10 = match l4 {
+            0 => {
+              let e = ();
+              Ok(e)
+            }
+            1 => {
+              let e = {
+                let l5 = i32::from(*ptr2.add(::core::mem::size_of::<*const u8>()).cast::<u8>());
+                let v9 = match l5 {
+                  0 => {
+                    PublishError::NotPermitted
+                  }
+                  1 => {
+                    let e9 = {
+                      let l6 = *ptr2.add(2*::core::mem::size_of::<*const u8>()).cast::<*mut u8>();
+                      let l7 = *ptr2.add(3*::core::mem::size_of::<*const u8>()).cast::<usize>();
+                      let len8 = l7;
+                      let bytes8 = _rt::Vec::from_raw_parts(l6.cast(), len8, len8);
+
+                      _rt::string_lift(bytes8)
+                    };
+                    PublishError::InvalidPayload(e9)
+                  }
+                  n => {
+                    debug_assert_eq!(n, 2, "invalid enum discriminant");
+                    PublishError::QuotaExceeded
+                  }
+                };
+
+                v9
+              };
+              Err(e)
+            }
+            _ => _rt::invalid_enum_discriminant(),
+          };
+          result10
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// Cancel one of this component's own parked messages, named by its `index`
+      /// into the deferred-window this activation delivered for `port`. Like
+      /// `publish`, the call is BUFFERED and applied atomically iff receive returns
+      /// ok — an err/trap cancels nothing. At flush the host resolves `index` to the
+      /// message identity captured in the snapshot, so a message that released
+      /// between drain and flush cannot be mis-targeted; that case is a benign
+      /// logged no-op, not an error. A cancelled message never becomes observable.
+      #[allow(async_fn_in_trait)]
+      pub fn defer_cancel(port: &str,index: u32,) -> Result<(),DeferError>{
+        unsafe {
+
+          #[repr(align(1))]
+          struct RetArea([::core::mem::MaybeUninit::<u8>; 2]);
+          let mut ret_area = RetArea([::core::mem::MaybeUninit::uninit(); 2]);
+          let vec0 = port;
+          let ptr0 = vec0.as_ptr().cast::<u8>();
+          let len0 = vec0.len();
+          let ptr1 = ret_area.0.as_mut_ptr().cast::<u8>();
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/ports@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "defer-cancel"]
+            fn wit_import2(_: *mut u8, _: usize, _: i32, _: *mut u8, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import2(_: *mut u8, _: usize, _: i32, _: *mut u8, ) { unreachable!() }
+          wit_import2(ptr0.cast_mut(), len0, _rt::as_i32(&index), ptr1);
+          let l3 = i32::from(*ptr1.add(0).cast::<u8>());
+          let result6 = match l3 {
+            0 => {
+              let e = ();
+              Ok(e)
+            }
+            1 => {
+              let e = {
+                let l4 = i32::from(*ptr1.add(1).cast::<u8>());
+                let v5 = match l4 {
+                  0 => {
+                    DeferError::NotPermitted
+                  }
+                  1 => {
+                    DeferError::OutOfRange
+                  }
+                  2 => {
+                    DeferError::QuotaExceeded
+                  }
+                  n => {
+                    debug_assert_eq!(n, 3, "invalid enum discriminant");
+                    DeferError::InvalidDeliverAfter
+                  }
+                };
+
+                v5
+              };
+              Err(e)
+            }
+            _ => _rt::invalid_enum_discriminant(),
+          };
+          result6
+        }
+      }
+      #[allow(unused_unsafe, clippy::all)]
+      /// Edit one of this component's own parked messages, named by its `index` into
+      /// the deferred-window this activation delivered for `port`. `payload` and
+      /// `deliver-after` are each `some` to change, `none` to leave alone. Same
+      /// buffered/atomic/index-resolution semantics as `defer-cancel`: applied at
+      /// flush iff receive returns ok, index resolved against the snapshot, a
+      /// drain-vs-release race a benign logged no-op. A `deliver-after` at or before
+      /// the host's `now` releases the message immediately at flush.
+      #[allow(async_fn_in_trait)]
+      pub fn defer_edit(port: &str,index: u32,payload: Option<&str>,deliver_after: Option<u64>,) -> Result<(),DeferError>{
+        unsafe {
+
+          #[repr(align(1))]
+          struct RetArea([::core::mem::MaybeUninit::<u8>; 2]);
+          let mut ret_area = RetArea([::core::mem::MaybeUninit::uninit(); 2]);
+          let vec0 = port;
+          let ptr0 = vec0.as_ptr().cast::<u8>();
+          let len0 = vec0.len();
+          let (result2_0,result2_1,result2_2,) = match payload {
+            Some(e) => {
+              let vec1 = e;
+              let ptr1 = vec1.as_ptr().cast::<u8>();
+              let len1 = vec1.len();
+
+              (1i32, ptr1.cast_mut(), len1)
+            },
+            None => {
+              (0i32, ::core::ptr::null_mut(), 0usize)
+            },
+          };let (result3_0,result3_1,) = match deliver_after {
+            Some(e) => (1i32, _rt::as_i64(e)),
+            None => {
+              (0i32, 0i64)
+            },
+          };let ptr4 = ret_area.0.as_mut_ptr().cast::<u8>();
+          #[cfg(target_arch = "wasm32")]
+          #[link(wasm_import_module = "brenn:processor/ports@0.1.0")]
+          unsafe extern "C" {
+            #[link_name = "defer-edit"]
+            fn wit_import5(_: *mut u8, _: usize, _: i32, _: i32, _: *mut u8, _: usize, _: i32, _: i64, _: *mut u8, );
+          }
+
+          #[cfg(not(target_arch = "wasm32"))]
+          unsafe extern "C" fn wit_import5(_: *mut u8, _: usize, _: i32, _: i32, _: *mut u8, _: usize, _: i32, _: i64, _: *mut u8, ) { unreachable!() }
+          wit_import5(ptr0.cast_mut(), len0, _rt::as_i32(&index), result2_0, result2_1, result2_2, result3_0, result3_1, ptr4);
+          let l6 = i32::from(*ptr4.add(0).cast::<u8>());
+          let result9 = match l6 {
+            0 => {
+              let e = ();
+              Ok(e)
+            }
+            1 => {
+              let e = {
+                let l7 = i32::from(*ptr4.add(1).cast::<u8>());
+                let v8 = match l7 {
+                  0 => {
+                    DeferError::NotPermitted
+                  }
+                  1 => {
+                    DeferError::OutOfRange
+                  }
+                  2 => {
+                    DeferError::QuotaExceeded
+                  }
+                  n => {
+                    debug_assert_eq!(n, 3, "invalid enum discriminant");
+                    DeferError::InvalidDeliverAfter
+                  }
+                };
+
+                v8
+              };
+              Err(e)
+            }
+            _ => _rt::invalid_enum_discriminant(),
+          };
+          result9
         }
       }
 
@@ -1781,18 +2105,70 @@ pub mod brenn {
           f.debug_struct("PortWindow").field("port", &self.port).field("envelopes", &self.envelopes).field("new-from", &self.new_from).field("dropped", &self.dropped).finish()
         }
       }
+      /// One of this component's own parked (deferred) messages on an output
+      /// port's channel — a message it published via `ports.publish-deferred`
+      /// whose `deliver-after` has not yet arrived, so it is not yet observable to
+      /// any subscriber, replay, or context read.
+      #[derive(Clone)]
+      pub struct DeferredEntry {
+        /// Position of this entry within its `deferred-window.entries` list,
+        /// which is ordered by `deliver-after` ascending. This is the index a
+        /// future `defer-cancel`/`defer-edit` names; it is snapshot-relative and
+        /// only valid against the window it arrived in.
+        pub index: u32,
+        /// The message BODY the component published (not an envelope) — the same
+        /// opaque string it passed to `publish-deferred`.
+        pub payload: _rt::String,
+        /// The scheduled release time, epoch milliseconds UTC.
+        pub deliver_after: u64,
+      }
+      impl ::core::fmt::Debug for DeferredEntry {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+          f.debug_struct("DeferredEntry").field("index", &self.index).field("payload", &self.payload).field("deliver-after", &self.deliver_after).finish()
+        }
+      }
+      /// The component's own parked messages on one output port's channel, a
+      /// snapshot taken at drain, ordered by `deliver-after` ascending. Scoped to
+      /// (this component's sender identity, the port's channel): a component sees
+      /// only messages it itself parked, never a peer's, even on a shared channel.
+      #[derive(Clone)]
+      pub struct DeferredWindow {
+        /// Logical output port name from host config — never a raw channel address.
+        pub port: _rt::String,
+        pub entries: _rt::Vec::<DeferredEntry>,
+      }
+      impl ::core::fmt::Debug for DeferredWindow {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+          f.debug_struct("DeferredWindow").field("port", &self.port).field("entries", &self.entries).finish()
+        }
+      }
       /// One activation. Contains one `port-window` per bound input port, in
       /// the order declared in the consumer's config (`cfg.inputs` order). Every
       /// bound port appears in every activation; a port with no new messages
       /// arrives as a pure-context window (`new-from == envelopes` length).
       /// Guests must not assume `ports` has length 1.
+      ///
+      /// `deferred` carries one `deferred-window` per bound output port, in config
+      /// (`cfg.outputs`) order — the component's own parked messages, so a guest
+      /// can see, and (later) cancel/edit, what it scheduled. Inputs and this
+      /// output-deferred view are separate typed lists: a future in/out port
+      /// appears in both, additively.
+      ///
+      /// `now` is the host's wall clock at drain, epoch milliseconds UTC. It lets
+      /// a guest compute an absolute `deliver-after` for `ports.publish-deferred`
+      /// without holding a clock of its own — clock authority stays with the host.
+      /// It is `none` when the host exposes no UTC wall clock (the surface page
+      /// kernel, whose clock is a monotonic page-load timer, not UTC); a guest
+      /// that needs deferred publish runs only where `now` is `some`.
       #[derive(Clone)]
       pub struct Activation {
         pub ports: _rt::Vec::<PortWindow>,
+        pub deferred: _rt::Vec::<DeferredWindow>,
+        pub now: Option<u64>,
       }
       impl ::core::fmt::Debug for Activation {
         fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-          f.debug_struct("Activation").field("ports", &self.ports).finish()
+          f.debug_struct("Activation").field("ports", &self.ports).field("deferred", &self.deferred).field("now", &self.now).finish()
         }
       }
       /// Outcome of processing the batch. A guest trap is a distinct,
@@ -1844,6 +2220,104 @@ mod _rt {
       panic!("invalid enum discriminant")
     } else {
       unsafe { core::hint::unreachable_unchecked() }
+    }
+  }
+  
+  pub fn as_i64<T: AsI64>(t: T) -> i64 {
+    t.as_i64()
+  }
+
+  pub trait AsI64 {
+    fn as_i64(self) -> i64;
+  }
+
+  impl<'a, T: Copy + AsI64> AsI64 for &'a T {
+    fn as_i64(self) -> i64 {
+      (*self).as_i64()
+    }
+  }
+  
+  impl AsI64 for i64 {
+    #[inline]
+    fn as_i64(self) -> i64 {
+      self as i64
+    }
+  }
+  
+  impl AsI64 for u64 {
+    #[inline]
+    fn as_i64(self) -> i64 {
+      self as i64
+    }
+  }
+  
+  pub fn as_i32<T: AsI32>(t: T) -> i32 {
+    t.as_i32()
+  }
+
+  pub trait AsI32 {
+    fn as_i32(self) -> i32;
+  }
+
+  impl<'a, T: Copy + AsI32> AsI32 for &'a T {
+    fn as_i32(self) -> i32 {
+      (*self).as_i32()
+    }
+  }
+  
+  impl AsI32 for i32 {
+    #[inline]
+    fn as_i32(self) -> i32 {
+      self as i32
+    }
+  }
+  
+  impl AsI32 for u32 {
+    #[inline]
+    fn as_i32(self) -> i32 {
+      self as i32
+    }
+  }
+  
+  impl AsI32 for i16 {
+    #[inline]
+    fn as_i32(self) -> i32 {
+      self as i32
+    }
+  }
+  
+  impl AsI32 for u16 {
+    #[inline]
+    fn as_i32(self) -> i32 {
+      self as i32
+    }
+  }
+  
+  impl AsI32 for i8 {
+    #[inline]
+    fn as_i32(self) -> i32 {
+      self as i32
+    }
+  }
+  
+  impl AsI32 for u8 {
+    #[inline]
+    fn as_i32(self) -> i32 {
+      self as i32
+    }
+  }
+  
+  impl AsI32 for char {
+    #[inline]
+    fn as_i32(self) -> i32 {
+      self as i32
+    }
+  }
+  
+  impl AsI32 for usize {
+    #[inline]
+    fn as_i32(self) -> i32 {
+      self as i32
     }
   }
   
@@ -1942,76 +2416,6 @@ mod _rt {
       }
     }
   }
-  
-  pub fn as_i32<T: AsI32>(t: T) -> i32 {
-    t.as_i32()
-  }
-
-  pub trait AsI32 {
-    fn as_i32(self) -> i32;
-  }
-
-  impl<'a, T: Copy + AsI32> AsI32 for &'a T {
-    fn as_i32(self) -> i32 {
-      (*self).as_i32()
-    }
-  }
-  
-  impl AsI32 for i32 {
-    #[inline]
-    fn as_i32(self) -> i32 {
-      self as i32
-    }
-  }
-  
-  impl AsI32 for u32 {
-    #[inline]
-    fn as_i32(self) -> i32 {
-      self as i32
-    }
-  }
-  
-  impl AsI32 for i16 {
-    #[inline]
-    fn as_i32(self) -> i32 {
-      self as i32
-    }
-  }
-  
-  impl AsI32 for u16 {
-    #[inline]
-    fn as_i32(self) -> i32 {
-      self as i32
-    }
-  }
-  
-  impl AsI32 for i8 {
-    #[inline]
-    fn as_i32(self) -> i32 {
-      self as i32
-    }
-  }
-  
-  impl AsI32 for u8 {
-    #[inline]
-    fn as_i32(self) -> i32 {
-      self as i32
-    }
-  }
-  
-  impl AsI32 for char {
-    #[inline]
-    fn as_i32(self) -> i32 {
-      self as i32
-    }
-  }
-  
-  impl AsI32 for usize {
-    #[inline]
-    fn as_i32(self) -> i32 {
-      self as i32
-    }
-  }
   pub unsafe fn cabi_dealloc(ptr: *mut u8, size: usize, align: usize) {
     if size == 0 {
       return;
@@ -2062,49 +2466,57 @@ pub(crate) use __export_processor_impl as export;
 #[unsafe(link_section = "component-type:wit-bindgen:0.58.0:brenn:processor@0.1.0:processor:encoded world")]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 1956] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xa4\x0e\x01A\x02\x01\
-A\x17\x01B\x09\x01q\x03\x0dnot-permitted\0\0\x0finvalid-payload\x01s\0\x0equota-\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 2324] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x94\x11\x01A\x02\x01\
+A\x17\x01B\x14\x01q\x03\x0dnot-permitted\0\0\x0finvalid-payload\x01s\0\x0equota-\
 exceeded\0\0\x04\0\x0dpublish-error\x03\0\0\x01m\x04\x08very-low\x03low\x06norma\
-l\x04high\x04\0\x07urgency\x03\0\x02\x01j\0\x01\x01\x01@\x02\x04ports\x07payload\
-s\0\x04\x04\0\x07publish\x01\x05\x01@\x03\x04ports\x07payloads\x07urgency\x03\0\x04\
-\x04\0\x14publish-with-urgency\x01\x06\x03\0\x1bbrenn:processor/ports@0.1.0\x05\0\
-\x01B\x1b\x04\0\x0btransaction\x03\x01\x01q\x03\x0acontention\0\0\x07backend\x01\
-s\0\x0equota-exceeded\0\0\x04\0\x0bstore-error\x03\0\x01\x01h\0\x01p}\x01k\x04\x01\
-j\x01\x05\x01\x02\x01@\x03\x04self\x03\x09namespaces\x03key\x04\0\x06\x04\0\x17[\
-method]transaction.get\x01\x07\x01j\0\x01\x02\x01@\x04\x04self\x03\x09namespaces\
-\x03key\x04\x05value\x04\0\x08\x04\0\x17[method]transaction.put\x01\x09\x01@\x03\
-\x04self\x03\x09namespaces\x03key\x04\0\x08\x04\0\x1a[method]transaction.delete\x01\
-\x0a\x01o\x02\x04\x04\x01p\x0b\x01j\x01\x0c\x01\x02\x01@\x05\x04self\x03\x09name\
-spaces\x05start\x04\x03end\x05\x05limity\0\x0d\x04\0\x18[method]transaction.scan\
-\x01\x0e\x01@\x01\x04self\x03\0\x08\x04\0\x1a[method]transaction.commit\x01\x0f\x01\
-@\x01\x04self\x03\x01\0\x04\0\x1c[method]transaction.rollback\x01\x10\x01i\0\x01\
-j\x01\x11\x01\x02\x01@\0\0\x12\x04\0\x05begin\x01\x13\x03\0\x1bbrenn:processor/s\
-tore@0.1.0\x05\x01\x01B\x04\x01m\x05\x05trace\x05debug\x04info\x04warn\x05error\x04\
-\0\x05level\x03\0\0\x01@\x02\x05level\x01\x07messages\x01\0\x04\0\x03log\x01\x02\
-\x03\0\x19brenn:processor/log@0.1.0\x05\x02\x01B\x04\x01m\x03\x04info\x07warning\
-\x08critical\x04\0\x08severity\x03\0\0\x01@\x03\x08severity\x01\x05titles\x04bod\
-ys\x01\0\x04\0\x05alert\x01\x02\x03\0\x1bbrenn:processor/alert@0.1.0\x05\x03\x01\
-B\x03\x01ks\x01@\x01\x03keys\0\0\x04\0\x03get\x01\x01\x03\0\x1cbrenn:processor/c\
-onfig@0.1.0\x05\x04\x01B\x07\x01q\x06\x0dnot-permitted\0\0\x0cno-connector\0\0\x0f\
-invalid-payload\x01s\0\x0equota-exceeded\0\0\x06broker\x01s\0\x0fbroker-rejected\
-\x01s\0\x04\0\x12mqtt-publish-error\x03\0\0\x01p}\x01ks\x01j\0\x01\x01\x01@\x06\x06\
-clients\x05topics\x07payload\x02\x0ccontent-type\x03\x03qos}\x06retain\x7f\0\x04\
-\x04\0\x0cmqtt-publish\x01\x05\x03\0\x1abrenn:processor/mqtt@0.1.0\x05\x05\x01B\x08\
-\x01q\x06\x0bnot-granted\0\0\x06denied\x01s\0\x0cinvalid-args\x01s\0\x0crate-lim\
-ited\0\0\x0bwrong-class\0\0\x08internal\x01s\0\x04\0\x0atool-error\x03\0\0\x01j\x01\
-s\x01\x01\x01@\x02\x04tools\x09args-jsons\0\x02\x04\0\x09call-fast\x01\x03\x01j\0\
-\x01\x01\x01@\x03\x04tools\x09args-jsons\x07call-ids\0\x04\x04\0\x0acall-async\x01\
-\x05\x03\0\x1bbrenn:processor/tools@0.1.0\x05\x06\x01B\x0a\x01s\x04\0\x0denvelop\
-e-json\x03\0\0\x01p\x01\x01r\x04\x04ports\x09envelopes\x02\x08new-fromy\x07dropp\
-edy\x04\0\x0bport-window\x03\0\x03\x01p\x04\x01r\x01\x05ports\x05\x04\0\x0aactiv\
-ation\x03\0\x06\x01q\x02\x12malformed-envelope\x01s\0\x11processing-failed\x01s\0\
-\x04\0\x0dreceive-error\x03\0\x08\x03\0\x1bbrenn:processor/types@0.1.0\x05\x07\x02\
-\x03\0\x07\x0aactivation\x03\0\x0aactivation\x03\0\x08\x02\x03\0\x07\x0dreceive-\
-error\x03\0\x0dreceive-error\x03\0\x0a\x01j\0\x01\x0b\x01@\x01\x01a\x09\0\x0c\x04\
-\0\x07receive\x01\x0d\x04\0\x1fbrenn:processor/processor@0.1.0\x04\0\x0b\x0f\x01\
-\0\x09processor\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\
-\x070.251.0\x10wit-bindgen-rust\x060.58.0";
+l\x04high\x04\0\x07urgency\x03\0\x02\x01q\x04\x0dnot-permitted\0\0\x0cout-of-ran\
+ge\0\0\x0equota-exceeded\0\0\x15invalid-deliver-after\0\0\x04\0\x0bdefer-error\x03\
+\0\x04\x01j\0\x01\x01\x01@\x02\x04ports\x07payloads\0\x06\x04\0\x07publish\x01\x07\
+\x01@\x03\x04ports\x07payloads\x07urgency\x03\0\x06\x04\0\x14publish-with-urgenc\
+y\x01\x08\x01@\x03\x04ports\x07payloads\x0ddeliver-afterw\0\x06\x04\0\x10publish\
+-deferred\x01\x09\x01j\0\x01\x05\x01@\x02\x04ports\x05indexy\0\x0a\x04\0\x0cdefe\
+r-cancel\x01\x0b\x01ks\x01kw\x01@\x04\x04ports\x05indexy\x07payload\x0c\x0ddeliv\
+er-after\x0d\0\x0a\x04\0\x0adefer-edit\x01\x0e\x03\0\x1bbrenn:processor/ports@0.\
+1.0\x05\0\x01B\x1b\x04\0\x0btransaction\x03\x01\x01q\x03\x0acontention\0\0\x07ba\
+ckend\x01s\0\x0equota-exceeded\0\0\x04\0\x0bstore-error\x03\0\x01\x01h\0\x01p}\x01\
+k\x04\x01j\x01\x05\x01\x02\x01@\x03\x04self\x03\x09namespaces\x03key\x04\0\x06\x04\
+\0\x17[method]transaction.get\x01\x07\x01j\0\x01\x02\x01@\x04\x04self\x03\x09nam\
+espaces\x03key\x04\x05value\x04\0\x08\x04\0\x17[method]transaction.put\x01\x09\x01\
+@\x03\x04self\x03\x09namespaces\x03key\x04\0\x08\x04\0\x1a[method]transaction.de\
+lete\x01\x0a\x01o\x02\x04\x04\x01p\x0b\x01j\x01\x0c\x01\x02\x01@\x05\x04self\x03\
+\x09namespaces\x05start\x04\x03end\x05\x05limity\0\x0d\x04\0\x18[method]transact\
+ion.scan\x01\x0e\x01@\x01\x04self\x03\0\x08\x04\0\x1a[method]transaction.commit\x01\
+\x0f\x01@\x01\x04self\x03\x01\0\x04\0\x1c[method]transaction.rollback\x01\x10\x01\
+i\0\x01j\x01\x11\x01\x02\x01@\0\0\x12\x04\0\x05begin\x01\x13\x03\0\x1bbrenn:proc\
+essor/store@0.1.0\x05\x01\x01B\x04\x01m\x05\x05trace\x05debug\x04info\x04warn\x05\
+error\x04\0\x05level\x03\0\0\x01@\x02\x05level\x01\x07messages\x01\0\x04\0\x03lo\
+g\x01\x02\x03\0\x19brenn:processor/log@0.1.0\x05\x02\x01B\x04\x01m\x03\x04info\x07\
+warning\x08critical\x04\0\x08severity\x03\0\0\x01@\x03\x08severity\x01\x05titles\
+\x04bodys\x01\0\x04\0\x05alert\x01\x02\x03\0\x1bbrenn:processor/alert@0.1.0\x05\x03\
+\x01B\x03\x01ks\x01@\x01\x03keys\0\0\x04\0\x03get\x01\x01\x03\0\x1cbrenn:process\
+or/config@0.1.0\x05\x04\x01B\x07\x01q\x06\x0dnot-permitted\0\0\x0cno-connector\0\
+\0\x0finvalid-payload\x01s\0\x0equota-exceeded\0\0\x06broker\x01s\0\x0fbroker-re\
+jected\x01s\0\x04\0\x12mqtt-publish-error\x03\0\0\x01p}\x01ks\x01j\0\x01\x01\x01\
+@\x06\x06clients\x05topics\x07payload\x02\x0ccontent-type\x03\x03qos}\x06retain\x7f\
+\0\x04\x04\0\x0cmqtt-publish\x01\x05\x03\0\x1abrenn:processor/mqtt@0.1.0\x05\x05\
+\x01B\x08\x01q\x06\x0bnot-granted\0\0\x06denied\x01s\0\x0cinvalid-args\x01s\0\x0c\
+rate-limited\0\0\x0bwrong-class\0\0\x08internal\x01s\0\x04\0\x0atool-error\x03\0\
+\0\x01j\x01s\x01\x01\x01@\x02\x04tools\x09args-jsons\0\x02\x04\0\x09call-fast\x01\
+\x03\x01j\0\x01\x01\x01@\x03\x04tools\x09args-jsons\x07call-ids\0\x04\x04\0\x0ac\
+all-async\x01\x05\x03\0\x1bbrenn:processor/tools@0.1.0\x05\x06\x01B\x11\x01s\x04\
+\0\x0denvelope-json\x03\0\0\x01p\x01\x01r\x04\x04ports\x09envelopes\x02\x08new-f\
+romy\x07droppedy\x04\0\x0bport-window\x03\0\x03\x01r\x03\x05indexy\x07payloads\x0d\
+deliver-afterw\x04\0\x0edeferred-entry\x03\0\x05\x01p\x06\x01r\x02\x04ports\x07e\
+ntries\x07\x04\0\x0fdeferred-window\x03\0\x08\x01p\x04\x01p\x09\x01kw\x01r\x03\x05\
+ports\x0a\x08deferred\x0b\x03now\x0c\x04\0\x0aactivation\x03\0\x0d\x01q\x02\x12m\
+alformed-envelope\x01s\0\x11processing-failed\x01s\0\x04\0\x0dreceive-error\x03\0\
+\x0f\x03\0\x1bbrenn:processor/types@0.1.0\x05\x07\x02\x03\0\x07\x0aactivation\x03\
+\0\x0aactivation\x03\0\x08\x02\x03\0\x07\x0dreceive-error\x03\0\x0dreceive-error\
+\x03\0\x0a\x01j\0\x01\x0b\x01@\x01\x01a\x09\0\x0c\x04\0\x07receive\x01\x0d\x04\0\
+\x1fbrenn:processor/processor@0.1.0\x04\0\x0b\x0f\x01\0\x09processor\x03\0\0\0G\x09\
+producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.251.0\x10wit-bindgen-rus\
+t\x060.58.0";
 
 #[inline(never)]
 #[doc(hidden)]

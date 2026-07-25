@@ -193,6 +193,7 @@ async fn tool_harness(
             },
             inbox_input_port(slug),
         ],
+        outputs: vec![],
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -244,6 +245,7 @@ async fn guest_async_tool_call_pulls_fixture_and_delivers_advanced_result() {
         address: out_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,

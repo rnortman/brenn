@@ -16,13 +16,14 @@ pub mod config;
 pub mod db;
 pub mod dispatcher;
 pub mod edit;
-pub mod ephemeral;
 pub mod format;
 pub mod gates;
 pub mod identity;
 pub mod ingress;
+pub mod live;
 pub mod publish;
 pub mod query;
+pub mod store;
 pub mod subscribe;
 pub mod system;
 
@@ -32,28 +33,22 @@ pub mod testutils;
 #[cfg(test)]
 pub(super) mod test_support;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use uuid::Uuid;
 
 use crate::config::{AppConfig, ServerConfig};
 use crate::db::{Db, format_ts_for_db};
 pub use config::{
-    ChannelConfigRaw, DEFAULT_EPHEMERAL_CAPACITY, Depth, EphemeralChannelConfigRaw,
-    EphemeralChannelEntry, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw,
+    ChannelConfigRaw, Depth, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw,
     NoiseLevel, ResolvedChannel, ResolvedMessagingConfig, ResolvedSubscription, Sink,
     WasmConsumerConfigRaw, WasmConsumerSubscriptionRaw, WasmInputPort,
 };
 pub use edit::{CancelResult, EditFields, EditResult};
-pub use ephemeral::{
-    EPHEMERAL_SENDER_BURST, EPHEMERAL_SENDER_REFILL_AMOUNT, EPHEMERAL_SENDER_REFILL_INTERVAL,
-    EphemeralBus, EphemeralDelivery, EphemeralEvent, EphemeralPublishResult, EphemeralReceiver,
-    EphemeralResume, EphemeralSubscribeError, EphemeralSubscription, GapReason, Replay,
-};
 pub use identity::{ParticipantId, SubscriberKind};
 pub use ingress::{
     CollapsedDrain, Event as IngressEvent, IngressOrBus, MAX_DELIVERED_RETENTION_DAYS,
@@ -64,9 +59,13 @@ pub use ingress::{
     cap_oneline, collapse_repo_sync, format_event_batch, is_repo_sync_source,
     repo_sync_staleness_days, set_repo_sync_staleness_days, split_stale_repo_sync,
 };
+pub use live::{
+    EphemeralDelivery, EphemeralEvent, EphemeralReceiver, EphemeralResume, EphemeralSubscribeError,
+    EphemeralSubscription, GapReason, LiveCounters, Replay,
+};
 pub use publish::{
-    AnyPublishResult, PublishOrigin, PublishResult, SurfaceBatchPublish, SurfaceSendDraw,
-    SurfaceSendVerdict, WasmPublish, is_well_formed_address,
+    PublishOrigin, PublishResult, SurfaceBatchPublish, SurfaceSendDraw, SurfaceSendVerdict,
+    WasmPublish, is_well_formed_address,
 };
 pub use query::{MessageQuery, QueryError};
 
@@ -117,9 +116,8 @@ pub fn mqtt_channel_uuid_from_address(address: &str) -> Uuid {
 /// Derive a deterministic UUIDv5 for an `ephemeral:` channel from its bare name.
 ///
 /// Ephemeral channels have no DB row, but a stable UUID keeps their identity
-/// uniform with the durable/webhook/MQTT channel spaces (`EphemeralChannelEntry`
-/// carries it for the `EphemeralBus`). Deterministic across calls, processes,
-/// and restarts so every derivation agrees on the same name.
+/// uniform with the durable/webhook/MQTT channel spaces. Deterministic across
+/// calls, processes, and restarts so every derivation agrees on the same name.
 ///
 /// The namespace seed (`"brenn.ephemeral-channel"`) is deliberately
 /// distinct from the webhook and MQTT seeds so the same string yields a
@@ -131,6 +129,30 @@ pub fn ephemeral_channel_uuid_from_name(name: &str) -> Uuid {
     // channel UUID = UUIDv5(namespace, name)
     let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.ephemeral-channel");
     Uuid::new_v5(&ns, name.as_bytes())
+}
+
+/// Derive a deterministic UUIDv5 for a `local:` channel from its bare name.
+///
+/// Own namespace seed, so `local:foo` and `ephemeral:foo` are distinct
+/// identities — they are distinct channels (a `local:` channel never leaves the
+/// process) and must never collide in the directory.
+pub fn local_channel_uuid_from_name(name: &str) -> Uuid {
+    let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.local-channel");
+    Uuid::new_v5(&ns, name.as_bytes())
+}
+
+/// Deterministic UUID for a non-durable channel, dispatching on its scheme.
+///
+/// # Panics
+///
+/// On a durable or non-pub/sub scheme — those channels carry an operator or
+/// transport-derived UUID instead.
+pub fn nondurable_channel_uuid(scheme: ChannelScheme, name: &str) -> Uuid {
+    match scheme {
+        ChannelScheme::Ephemeral => ephemeral_channel_uuid_from_name(name),
+        ChannelScheme::Local => local_channel_uuid_from_name(name),
+        other => panic!("nondurable_channel_uuid called with durable scheme {other:?}"),
+    }
 }
 
 /// Derive a deterministic UUIDv5 for a tool-substrate channel from its full
@@ -186,33 +208,38 @@ pub const WASM_WINDOW_MAX_NEW: u64 = 1_000;
 
 /// One port's slice of a multi-port activation snapshot.
 ///
-/// Assembled by [`Messenger::load_activation_snapshot`] under one lock hold.
-/// Fields mirror the per-port shape of [`brenn_wasm::ProcessorPortWindow`] at
-/// the messaging layer (pre-serialization).
+/// Coupled to [`brenn_wasm::ProcessorPortWindow`]; changes here must track
+/// changes there.
 pub struct PortSnapshot {
     /// Logical input port name (from config).
     pub port: String,
     /// Canonical channel address (e.g. `brenn:my-input`).
     pub channel_address: String,
-    /// Clamped new rows `(push_id, envelope)` in scan order. Empty for sampled
-    /// ports (`push_depth = Bounded(0)`) and for triggering ports that had no
-    /// pending rows this step.
-    pub new_rows: Vec<(i64, MessageEnvelope)>,
+    /// The channel's capabilities, so consumers need not re-derive them from
+    /// the address.
+    pub capabilities: brenn_envelope::ChannelCapabilities,
+    /// The NEW window, oldest first. Empty for sampled ports
+    /// (`push_depth = Bounded(0)`) and for ports that were owed nothing this
+    /// step.
+    ///
+    /// `Some(record)` is a delivery record the consumer must settle (ack or
+    /// quarantine) through the store that issued it; `None` means the take
+    /// itself was the ack.
+    pub new_rows: Vec<(Option<store::TargetRecord>, MessageEnvelope)>,
     /// Retained context in ASC order (oldest first), deduped against `new_rows`.
     /// Empty when `retain_depth = Bounded(0)`.
     pub context: Vec<MessageEnvelope>,
-    /// Drop counter value read at snapshot time, while the db lock was held.
-    /// Used by `drain_step` for the `dropped` field; reading here keeps the
-    /// counter value in the same T₀ snapshot as the pending rows (correctness-1).
+    /// The subscriber's lifetime drop total on this channel, taken with the
+    /// window so the count cannot name a message the window also carries
+    /// (correctness-1).
     pub drop_counter_snapshot: u64,
-    /// Pending rows scanned for this port but excluded from `new_rows` by the
-    /// push_depth / `WASM_WINDOW_MAX_NEW` clamp. They remain undelivered in
-    /// `messaging_pending_pushes`. 0 means the port was not clamped. Exact at
-    /// snapshot time (T₀, under the db lock).
+    /// What the take left behind because of the push-depth cap: an exact count
+    /// of still-owed claims for a store that can count them, and a presence
+    /// flag for one that can only say more remains. 0 means nothing was left.
     pub clamped_leftover: usize,
 }
 
-/// Parameters for a failed WASM consumer batch disposition (design §3).
+/// Parameters for a failed WASM consumer batch disposition.
 /// Passed to [`Messenger::record_wasm_activation_failure`] to avoid the 7-arg clippy warning.
 #[derive(Clone, Copy)]
 pub struct WasmBatchFailure<'a> {
@@ -220,6 +247,8 @@ pub struct WasmBatchFailure<'a> {
     pub subscriber: &'a ParticipantId,
     pub first_message_id: &'a str,
     pub last_message_id: &'a str,
+    /// The claim rows this batch held, to be retired with the record. Empty when
+    /// the port's channel mints no claims.
     pub push_ids: &'a [i64],
     /// `"err"` or `"trap"` (matches the DB CHECK constraint).
     pub outcome: &'a str,
@@ -279,6 +308,25 @@ pub struct ChannelEntry {
 }
 
 impl ChannelEntry {
+    /// The channel's capability set, derived from its transport scheme.
+    ///
+    /// This is the class-dependent behavior expressed once: `durable` selects
+    /// the retention store, `transportable` gates the wire and egress adapters.
+    /// Call sites consume capabilities, not the scheme discriminant.
+    ///
+    /// # Panics
+    ///
+    /// If the entry's transport is egress-only (`pwa_push:`) — such an address
+    /// never becomes a directory entry.
+    pub fn capabilities(&self) -> brenn_envelope::ChannelCapabilities {
+        self.transport_type.capabilities().unwrap_or_else(|| {
+            panic!(
+                "channel entry {:?} has egress-only transport {:?} — not a pub/sub channel",
+                self.address, self.transport_type,
+            )
+        })
+    }
+
     /// The reap frontier for this channel: the highest row index that must be
     /// retained.
     ///
@@ -589,6 +637,19 @@ impl MessagingDirectory {
                     .cloned()
                     .expect("order references a uuid not present in by_uuid")
             })
+            .collect()
+    }
+
+    /// The durable channels only, in the same order [`Self::list`] gives.
+    ///
+    /// The directory holds every pub/sub channel, durable or not. Callers whose
+    /// work is the database itself — the channel-row upsert, the retention
+    /// reaper, the operator listings that read persisted state — walk this
+    /// instead, because a non-durable channel has no row for them to act on.
+    pub fn list_durable(&self) -> Vec<Arc<ChannelEntry>> {
+        self.list()
+            .into_iter()
+            .filter(|e| e.capabilities().durable)
             .collect()
     }
 
@@ -1004,16 +1065,22 @@ pub trait WakeRouter: Send + Sync + 'static {
     ///   the caller like `Ok(false)`).
     ///
     /// `push_id` is the `messaging_pending_pushes.id` of the row being
-    /// delivered and `seq` is its `messaging_messages.id`. The Conversation arm
-    /// ignores both; the Surface arm mints the wire cursor's high-water from
-    /// `seq` and uses `push_id` for the at-most-once DB claim.
+    /// delivered, `message_id` its `messaging_messages.id`, and `retained_seq`
+    /// the message's position in its channel's retention order (`None` only for
+    /// a row whose message holds no such position — an ingress row).
+    /// Implementations that need durable resume state mint the wire cursor's
+    /// high-water from `retained_seq`, name the row by `message_id` when
+    /// writing below-water ack evidence, and use `push_id` for the at-most-once
+    /// DB claim; implementations that do not need resume state may ignore all
+    /// three.
     async fn deliver(
         &self,
         key: &SubscriberEntryKind,
         subscriber: &ParticipantId,
         envelope: &MessageEnvelope,
         push_id: i64,
-        seq: i64,
+        message_id: i64,
+        retained_seq: Option<i64>,
     ) -> Result<bool, String>;
 
     /// Row-less deliver-if-attached context feed for a depth-0 (fold-0) surface
@@ -1022,8 +1089,9 @@ pub trait WakeRouter: Send + Sync + 'static {
     /// so a durable message reaches an attached session only as a live fan-out at
     /// publish time. A session not attached is owed nothing — its retained
     /// context arrives at the next subscribe/resume. `key` is the surface
-    /// subscriber's `SubscriberEntryKind::Surface`; `envelope` and `seq`
-    /// (`messaging_messages.id`) are the just-committed message.
+    /// subscriber's `SubscriberEntryKind::Surface`; `envelope` and
+    /// `retained_seq` (the message's position in its channel's retention order)
+    /// are the just-committed message.
     ///
     /// Default no-op: only the surface router impl fans out. Test doubles that
     /// never host surface sessions inherit the no-op.
@@ -1031,9 +1099,9 @@ pub trait WakeRouter: Send + Sync + 'static {
         &self,
         key: &SubscriberEntryKind,
         envelope: &Arc<MessageEnvelope>,
-        seq: i64,
+        retained_seq: i64,
     ) {
-        let _ = (key, envelope, seq);
+        let _ = (key, envelope, retained_seq);
     }
 
     /// Cheap precheck for the depth-0 context feed: does any currently-attached
@@ -1090,35 +1158,22 @@ pub trait WakeRouter: Send + Sync + 'static {
 // Messenger
 // ---------------------------------------------------------------------------
 
-/// Key for per-subscriber push-window tracking: `(channel_address, subscriber_id_str)`.
-type PushWindowKey = (String, String);
-
-/// Parameters common to both `record_push_and_check_overflow` and
-/// `record_push_batch_and_check_overflow`. Groups the six shared arguments
-/// to eliminate the `#[allow(clippy::too_many_arguments)]` suppressor and
-/// reduce arg-swap risk between same-typed `&str` parameters.
-pub(crate) struct PushRegistration<'a> {
-    pub(crate) channel: &'a str,
-    pub(crate) channel_uuid: uuid::Uuid,
-    pub(crate) app_slug: &'a str,
-    pub(crate) subscriber: &'a ParticipantId,
-    pub(crate) push_depth: config::Depth,
-    pub(crate) noise: config::NoiseLevel,
-}
-
-/// Per-subscriber push window: ordered deque of live push_ids (oldest first)
-/// plus a `seeded` flag that records whether the deque has been initialised
-/// from the DB on first touch after boot.
+/// What one release sweep across every channel moved into retention.
 ///
-/// `seeded = false` means the key has never been touched in this process;
-/// the deque is empty regardless of what the DB holds. On first touch the
-/// DB is queried once and `seeded` is set to `true`. The seeded/empty state
-/// (`seeded = true`, `ids.is_empty()`) is distinguishable from the never-seeded
-/// state (`seeded = false`), which is necessary because the deque can be
-/// legitimately empty after seed-then-overflow.
-pub(super) struct PushWindow {
-    pub(super) seeded: bool,
-    pub(super) ids: VecDeque<i64>,
+/// `push_ids` carries the durable push rows that became deliverable, for the
+/// caller that registers them into their subscribers' push windows; a ring
+/// channel keeps its subscribers' positions itself and contributes none.
+#[derive(Debug, Default)]
+pub struct ReleaseSweep {
+    /// Total messages released across all channels, both classes.
+    pub released: usize,
+    /// Push rows whose hold the sweep cleared.
+    pub push_ids: Vec<i64>,
+    /// Earliest deferred release still parked anywhere once the sweep is done,
+    /// or `None` when nothing is parked. The sweep already asks every store
+    /// when its next release is due, so it answers that question for the
+    /// dispatcher's sleep target rather than making it walk the stores again.
+    pub next_release: Option<DateTime<Utc>>,
 }
 
 /// The messaging service. Owns the directory, the `WakeRouter`, and the
@@ -1132,51 +1187,80 @@ pub struct Messenger {
     /// reads this directly.
     pub(crate) source: Arc<str>,
     pub(crate) apps: Arc<IndexMap<String, AppConfig>>,
-    /// Unified subscriber registry: one entry per registered non-app subscriber
-    /// (WASM consumer, surface, or system component), keyed by its directory
-    /// [`SubscriberEntryKind`]. Holds each subscriber's resolved access-control
-    /// policy and its declared [`WakeEconomics`]. Replaces the former per-kind
-    /// policy side maps, so both the gated publish path (`publish_from_surface`
-    /// / `publish_from_system`) and the delivery-time ACL gate
-    /// (`subscriber_policy`) resolve every non-app subscriber through one lookup.
-    /// Empty unless populated via `with_subscriber_registrations` at boot.
+    /// Who a channel's messages are owed to, and on what terms: the unified
+    /// subscriber registry (one entry per registered non-app subscriber, holding
+    /// its resolved access-control policy and declared [`WakeEconomics`]) plus
+    /// the target resolution every delivery-record writer runs.
     ///
-    /// App subscribers are not registered here: their policy resolves from
-    /// `apps` (which also carries their non-policy `AppConfig` data), and
-    /// `subscriber_policy` routes `App(slug)` to `app_policy`.
-    pub(crate) subscribers: HashMap<SubscriberEntryKind, SubscriberRegistration>,
+    /// Shared with each durable store, which resolves its own release targets
+    /// through it — so the publish ladder, the batch flush paths, and a release
+    /// pass all answer "who gets this" from one implementation reading one
+    /// registry. Carries no subscriber registrations until
+    /// `with_subscriber_registrations` populates it at boot.
+    pub(crate) targets: Arc<store::TargetResolver>,
     pub(crate) router: Arc<dyn WakeRouter>,
     pub(crate) defaults: MessagingGlobalConfig,
     pub(crate) dispatch_kick_notify: Arc<tokio::sync::Notify>,
-    /// In-memory push-window tracking for bounded-`push_depth` subscribers.
-    ///
-    /// Maps `(channel_address, subscriber_id_str)` → per-subscriber push window.
-    ///
-    /// Each entry holds a `PushWindow { seeded, ids }`. The deque is ordered
-    /// oldest-first; its capacity is the subscriber's `push_depth`. Unbounded
-    /// subscribers are never present. On first touch after boot the DB is
-    /// queried once to seed the deque (`PushWindow::seeded` guards the one-shot).
-    ///
-    /// Mutated only under the `Messenger` async context. The outer `Mutex` is
-    /// a sync mutex (not async) because all publish operations already hold the
-    /// SQLite mutex; the push-window update is a brief in-memory operation.
-    pub(super) push_windows: Mutex<HashMap<PushWindowKey, PushWindow>>,
-    /// Monotonic per-`(channel, subscriber)` overflow drop counter, incremented
-    /// on push-depth-overflow for `metered` and `alarm` noise levels.
-    ///
-    /// Separate from `push_windows`: the deque tracks *which* push-claim ids
-    /// are live; this counter records *how many times* an overflow occurred.
-    pub(crate) drop_counters: Mutex<HashMap<PushWindowKey, u64>>,
     /// Count of `load_activation_snapshot` invocations. Monotonically increasing.
     /// Used in tests to assert exactly one subscriber-wide scan per drain step
     /// (AC 7). Not user-visible surface; test instrumentation only.
     /// Access via the public `pending_bus_pushes_scan_count()` accessor.
     pending_bus_pushes_scan_count: AtomicU64,
-    /// Ephemeral (best-effort, non-persistent) message bus. `Messenger::new`
-    /// installs an empty default bus (zero channels — every ephemeral publish
-    /// returns `UnknownChannel`); boot replaces it via `with_ephemeral_bus`
-    /// once the resolved `[[ephemeral_channel]]` entries are available.
-    ephemeral_bus: Arc<EphemeralBus>,
+    /// Consumer-side counters for the live streams of transportable non-durable
+    /// channels: fan-out lag and delivery-time denials, per `(channel,
+    /// participant)`. Shared with every receiver [`Messenger::attach_live`]
+    /// hands out, which is why it is an `Arc` where the other counters are
+    /// plain fields.
+    live_counters: Arc<live::LiveCounters>,
+    /// Retention stores for the process's non-durable channels, keyed by channel
+    /// UUID. Empty on a `Messenger` with no `ephemeral:`/`local:` channels; boot
+    /// installs the config-resolved set via [`Messenger::with_ring_stores`].
+    ///
+    /// The durable half of the same registry lives in [`Messenger::db_stores`]:
+    /// a durable channel's messages sit in the database, but its store is still
+    /// constructed once per channel and reused.
+    ring_stores: Arc<store::RingStores>,
+    /// Durable channels' retention stores, one per channel UUID, constructed on
+    /// first request and reused for the process lifetime.
+    ///
+    /// Per-channel in-memory delivery state a durable store comes to hold must
+    /// live on a single instance. This lazy cache gives that single-instance
+    /// guarantee without a boot build pass, so a runtime-created durable
+    /// channel (an `mqtt:` topic-filter) is covered on first access like a
+    /// config channel.
+    db_stores: Mutex<HashMap<Uuid, Arc<store::DbStore>>>,
+    /// Dynamic subscription registrations on non-durable channels, keyed by
+    /// `(channel uuid, app slug)` — the in-memory peer of the
+    /// `messaging_dynamic_subscriptions` table.
+    ///
+    /// Registration persistence follows channel durability: a non-durable
+    /// channel's messages die with the process, so a registration outliving them
+    /// would name data that no longer exists. This set is that registration, and
+    /// it is the authority on "does this app hold a dynamic subscription here"
+    /// for non-durable channels, exactly as the durable row is for durable ones.
+    /// Empty after a restart, by construction.
+    nondurable_dynamic_subs: Mutex<HashSet<(Uuid, String)>>,
+    /// `(channel uuid, subscriber)` pairs already reported as stranded by the
+    /// wake walk — owed messages under no registration that could wake them.
+    /// The condition never clears on its own and the walk revisits it every
+    /// pass, so the set holds each pair to a single report.
+    stranded_warned: Mutex<HashSet<(Uuid, String)>>,
+    /// Serializes [`Messenger::subscribe_dynamic`] and
+    /// [`Messenger::unsubscribe_dynamic`] end to end.
+    ///
+    /// Both classify a `(channel, app)` from its registration record and then
+    /// write that record, with `.await` points in between; without this gate two
+    /// concurrent tool calls for the same pair can both classify "not
+    /// registered" and both proceed to the write, where the second collides —
+    /// the durable INSERT on its primary key, the in-memory set on its uniqueness
+    /// assert. Holding one lock across classify-and-write makes each of those
+    /// collisions the host bug its message claims, and makes a duplicated tool
+    /// call answer `AlreadySubscribed…` instead of killing the process.
+    ///
+    /// Runtime subscribe is a rare, human-paced tool call, so one process-wide
+    /// gate costs nothing that per-`(channel, app)` keying would buy. Lock order
+    /// is gate → `db`; nothing acquires them the other way.
+    dynamic_subscribe_gate: tokio::sync::Mutex<()>,
     /// Durable send budgets for surface principals, keyed by the principal's two
     /// grains: `(slug, None)` is the surface's own kernel identity, `(slug,
     /// Some(instance))` is one declared component instance on it. Installed
@@ -1194,6 +1278,37 @@ pub struct Messenger {
     /// (panic). The `std::sync::Mutex` holds no lock across an await.
     pub(crate) surface_send_budgets:
         HashMap<(String, Option<String>), Mutex<crate::token_bucket::TokenBucket>>,
+    /// The unified send-rate gate: one token bucket per `(sender, channel)`,
+    /// created on that pair's first publish at the channel's resolved rate.
+    /// Every publish on every scheme draws from it.
+    ///
+    /// Bounded without eviction: senders are config-resolved principals and
+    /// channels are config-declared, so the key space is a product of two
+    /// operator-authored sets.
+    pub(crate) send_rate_buckets: Mutex<HashMap<(String, Uuid), crate::token_bucket::TokenBucket>>,
+    /// Per-sender count of publishes the send-rate gate refused.
+    pub(crate) publish_rate_limited: Mutex<HashMap<String, u64>>,
+    /// Per-`(sender, denial kind)` count of denied publishes, where the kind is
+    /// a `PublishResult::signal_kind()` tag. Keyed by the config-resolved
+    /// principal, never by the attacker-controlled address, so the key set stays
+    /// bounded.
+    pub(crate) publish_denied: Mutex<HashMap<(String, String), u64>>,
+    /// Per-`(consumer, channel)` count of deferred WASM publishes dropped at flush
+    /// because the channel's deferred set was at its `retain_depth` cap. The flush
+    /// has no error channel back to the guest, so this counter is the only durable
+    /// evidence that a scheduled self-publish never landed — a silently missing
+    /// timer a health check can surface. Keyed by config-resolved principals, so
+    /// the key set stays bounded.
+    pub(crate) dropped_deferred: Mutex<HashMap<(String, String), u64>>,
+
+    /// Per-`(consumer, channel)` count of deferred-control ops (defer-cancel /
+    /// defer-edit) that were no-ops at flush because the target released between
+    /// the activation snapshot and flush — the benign drain-vs-release race. Like
+    /// `dropped_deferred`, the flush has no error channel back to the guest, so
+    /// this counter is the only observable evidence a component's cancels/edits
+    /// chronically lose the race (release times set too close to its own cadence).
+    /// Keyed by config-resolved principals, so the key set stays bounded.
+    pub(crate) deferred_control_races: Mutex<HashMap<(String, String), u64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,103 +1335,96 @@ fn retire_push_rows(conn: &rusqlite::Connection, now: &str, ids: &[i64]) {
     }
 }
 
-/// Output of [`clamp_and_fetch_context`].
-struct ClampedWindow {
-    new_rows: Vec<(i64, MessageEnvelope)>,
-    context: Vec<MessageEnvelope>,
-    /// Pending rows scanned for this port but excluded from `new_rows` by the
-    /// push_depth / `WASM_WINDOW_MAX_NEW` clamp. They remain undelivered in
-    /// `messaging_pending_pushes`. 0 means the port was not clamped.
-    clamped_leftover: usize,
+/// The channel-ambience half of a port window: a store's retained tail, oldest
+/// first, minus whatever the same activation already delivers as NEW.
+///
+/// The read behind it is channel-wide, so the context may include messages this
+/// subscriber was never individually delivered — the documented contract (see
+/// the WIT doc on `new-from`): context is best-effort channel ambience, not a
+/// per-subscriber delivered log. Parked messages are never in it, on either
+/// store: a message joins the retained window when a release pass moves it
+/// there.
+fn context_from_retained(
+    retained: Vec<MessageEnvelope>,
+    new_ids: &std::collections::HashSet<Uuid>,
+) -> Vec<MessageEnvelope> {
+    retained
+        .into_iter()
+        .filter(|e| !new_ids.contains(&e.message_id))
+        .collect()
 }
 
-/// Clamp `raw_rows` to the push-depth limit and fetch retained context for
-/// `channel_uuid` — all under an already-held `&Connection`.
+/// The channel registration that names `subscriber`, or `None` when the
+/// subscriber holds delivery state on this channel under no registration of it.
 ///
-/// Returns a [`ClampedWindow`]:
-/// - `new_rows`: `raw_rows` truncated to `push_depth` (clamped to
-///   `WASM_WINDOW_MAX_NEW`). Empty input → empty output (pure-context window).
-/// - `context`: most-recent `retain_depth` channel messages in ASC order,
-///   deduped against `new_rows`. Empty when `retain_depth = Bounded(0)`
-///   (fast-path: no DB query).
-/// - `clamped_leftover`: count of `raw_rows` dropped by the clamp (exact,
-///   computed here so it stays coupled to the truncation).
+/// Registrations are keyed by subscriber *kind*, so this is a kind comparison,
+/// never an identity-string one. A `Conversation` participant carries no app in
+/// its identity, so it matches an `App(slug)` registration only when the caller
+/// supplies the `app_slug` the delivery record was written under — the store
+/// that wrote the record is the one party that knows it.
 ///
-/// `push_depth` is clamped to `WASM_WINDOW_MAX_NEW`; `retain_depth` is clamped
-/// to `WASM_WINDOW_MAX_RETAIN`.
-///
-/// Panics on any DB error (fail-fast; DB is host infrastructure).
-fn clamp_and_fetch_context(
-    conn: &rusqlite::Connection,
-    channel_uuid: Uuid,
-    raw_rows: Vec<(i64, MessageEnvelope)>,
-    push_depth: Depth,
-    retain_depth: Depth,
-) -> ClampedWindow {
-    // Capture pre-clamp length so leftover is correct on every return path,
-    // including the Bounded(0) retain fast-path below.
-    let raw_len = raw_rows.len();
-
-    // Clamp new-rows portion.
-    let max_new: usize = match push_depth {
-        Depth::Unbounded => WASM_WINDOW_MAX_NEW as usize,
-        Depth::Bounded(n) => n.min(WASM_WINDOW_MAX_NEW) as usize,
+/// The single resolution point from a store-reported `ParticipantId` to the
+/// channel's registration for it.
+fn registered_subscriber<'a>(
+    entry: &'a ChannelEntry,
+    subscriber: &ParticipantId,
+    app_slug: Option<&str>,
+) -> Option<&'a SubscriberEntry> {
+    let matches_kind = |kind: &SubscriberEntryKind| match (kind, subscriber.kind()) {
+        (SubscriberEntryKind::App(registered), SubscriberKind::Conversation(_)) => {
+            app_slug.is_some_and(|named| registered == named)
+        }
+        (SubscriberEntryKind::Wasm(registered), SubscriberKind::Wasm(named)) => {
+            *registered == named
+        }
+        (SubscriberEntryKind::System(registered), SubscriberKind::System(named)) => {
+            *registered == named
+        }
+        (
+            SubscriberEntryKind::Surface { slug, instance },
+            SubscriberKind::Surface {
+                slug: named_slug,
+                instance: named_instance,
+            },
+        ) => *slug == named_slug && *instance == named_instance,
+        _ => false,
     };
-    let new_rows_clamped: Vec<(i64, MessageEnvelope)> =
-        raw_rows.into_iter().take(max_new).collect();
-    let clamped_leftover = raw_len - new_rows_clamped.len();
+    entry.subscribers.iter().find(|sub| matches_kind(&sub.kind))
+}
 
-    // retain_depth = Bounded(0) → skip DB query entirely.
-    if let Depth::Bounded(0) = retain_depth {
-        return ClampedWindow {
-            new_rows: new_rows_clamped,
-            context: vec![],
-            clamped_leftover,
-        };
-    }
-
-    // Build dedup set from clamped new rows.
-    let new_ids: std::collections::HashSet<Uuid> =
-        new_rows_clamped.iter().map(|(_, e)| e.message_id).collect();
-
-    // Retained-context read — most-recent N channel messages, DESC order.
-    // This read is channel-wide: it may include messages the component was never
-    // individually delivered (see the WIT doc on `new-from`). That is the documented
-    // contract — the retained context is best-effort channel ambience, not a
-    // per-subscriber delivered log.
-    let effective_limit: i64 = match retain_depth {
-        Depth::Unbounded => WASM_WINDOW_MAX_RETAIN as i64,
-        Depth::Bounded(n) => n.min(WASM_WINDOW_MAX_RETAIN) as i64,
-    };
-
-    let mut stmt = conn
-        .prepare(&format!(
-            "{base}WHERE m.channel_uuid = ? {tail}",
-            base = query::SELECT_ENVELOPE_BASE,
-            tail = query::SELECT_ENVELOPE_ORDER_LIMIT_TAIL,
-        ))
-        .unwrap_or_else(|e| panic!("clamp_and_fetch_context: prepare recent-read: {e}"));
-
-    let recent_desc: Vec<MessageEnvelope> = stmt
-        .query_map(
-            rusqlite::params![channel_uuid.as_bytes().to_vec(), effective_limit],
-            query::row_to_envelope,
-        )
-        .unwrap_or_else(|e| panic!("clamp_and_fetch_context: query recent-read: {e}"))
-        .map(|r| r.unwrap_or_else(|e| panic!("clamp_and_fetch_context: read row: {e}")))
-        .collect();
-
-    // Reverse DESC→ASC and strip ids already in new_rows_clamped.
-    let context_asc: Vec<MessageEnvelope> = recent_desc
-        .into_iter()
-        .rev()
-        .filter(|e| !new_ids.contains(&e.message_id))
-        .collect();
-
-    ClampedWindow {
-        new_rows: new_rows_clamped,
-        context: context_asc,
-        clamped_leftover,
+/// The noise level to enact for `subscriber`'s overflow on `entry`, or `None`
+/// when the backend must not enact for it.
+///
+/// The registration is the authority: a subscriber's noise rung is resolved
+/// once, at registration, and carried on the channel's subscriber list, so an
+/// overflow reported by a store at any later moment reads the same rung the
+/// delivery path would.
+///
+/// Three `None` cases, all deliberate:
+/// - **Surface-kind** — the loud half of the ladder is kernel-enacted, on the
+///   drop delta the page observes. `fatal` is legal on a surface registration
+///   and would panic the backend sink, so surface events never go there.
+/// - **Conversation-kind with no named app** — an `App(slug)` registration's
+///   delivery participant is a `conversation:` identity, so its rung resolves
+///   only through the app the delivery record was written under. A store that
+///   writes no record names no app, and a conversation holds cursor-tracked
+///   delivery state on no channel today: push-enabled subscribe to a
+///   non-durable channel is refused. The caller panics on one rather than
+///   mis-reporting it, so lifting that refusal cannot quietly bypass the ladder
+///   (`TODO(substrate-nondurable-subscribe)`).
+/// - **No matching registration** — delivery state that outlives its
+///   registration, which the caller reports. The drop is still accounted on the
+///   store; there is simply no resolved rung to be loud at, and inventing one
+///   would be a guess.
+fn overflow_noise_for(
+    entry: &ChannelEntry,
+    subscriber: &ParticipantId,
+    app_slug: Option<&str>,
+) -> Option<config::NoiseLevel> {
+    let registration = registered_subscriber(entry, subscriber, app_slug)?;
+    match registration.kind {
+        SubscriberEntryKind::Surface { .. } => None,
+        _ => Some(registration.noise),
     }
 }
 
@@ -1358,24 +1466,106 @@ impl Messenger {
             crate::messaging::db::bump_incarnation(&conn);
         }
 
-        // Default empty ephemeral bus (zero channels); boot swaps in the
-        // config-resolved bus via `with_ephemeral_bus`.
-        let ephemeral_bus = EphemeralBus::new(Vec::new(), source.clone(), defaults.max_body_bytes);
+        // Default empty store registry (zero non-durable channels); boot swaps in
+        // the config-resolved one via `with_ring_stores`.
+        let ring_stores = Arc::new(store::RingStores::empty());
+        let targets = Arc::new(store::TargetResolver::new(
+            directory.clone(),
+            apps.clone(),
+            HashMap::new(),
+        ));
         Arc::new(Self {
             db,
             directory,
             source,
             apps,
-            subscribers: HashMap::new(),
+            targets,
             router,
             defaults,
             dispatch_kick_notify: Arc::new(tokio::sync::Notify::new()),
-            push_windows: Mutex::new(HashMap::<PushWindowKey, PushWindow>::new()),
-            drop_counters: Mutex::new(HashMap::<PushWindowKey, u64>::new()),
             pending_bus_pushes_scan_count: AtomicU64::new(0),
-            ephemeral_bus,
+            live_counters: Arc::new(live::LiveCounters::default()),
+            ring_stores,
+            db_stores: Mutex::new(HashMap::new()),
+            nondurable_dynamic_subs: Mutex::new(HashSet::new()),
+            stranded_warned: Mutex::new(HashSet::new()),
+            dynamic_subscribe_gate: tokio::sync::Mutex::new(()),
             surface_send_budgets: HashMap::new(),
+            send_rate_buckets: Mutex::new(HashMap::new()),
+            publish_rate_limited: Mutex::new(HashMap::new()),
+            publish_denied: Mutex::new(HashMap::new()),
+            dropped_deferred: Mutex::new(HashMap::new()),
+            deferred_control_races: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Count one deferred WASM publish dropped at flush for `(consumer, channel)`
+    /// because the channel's deferred set was at its `retain_depth` cap.
+    pub(crate) fn record_dropped_deferred(&self, consumer: &str, channel: &str) {
+        *self
+            .dropped_deferred
+            .lock()
+            .expect("messaging: dropped_deferred lock poisoned")
+            .entry((consumer.to_owned(), channel.to_owned()))
+            .or_insert(0) += 1;
+    }
+
+    /// Count of deferred publishes dropped at flush for a `(consumer, channel)`
+    /// pair — a scheduled self-publish that never landed because the deferred set
+    /// was at its cap.
+    pub fn dropped_deferred_count(&self, consumer: &str, channel: &str) -> u64 {
+        *self
+            .dropped_deferred
+            .lock()
+            .expect("messaging: dropped_deferred lock poisoned")
+            .get(&(consumer.to_owned(), channel.to_owned()))
+            .unwrap_or(&0)
+    }
+
+    /// Count one deferred-control op (defer-cancel / defer-edit) that was a no-op
+    /// at flush for `(consumer, channel)` because its target released between the
+    /// activation snapshot and flush.
+    pub fn record_deferred_control_race(&self, consumer: &str, channel: &str) {
+        *self
+            .deferred_control_races
+            .lock()
+            .expect("messaging: deferred_control_races lock poisoned")
+            .entry((consumer.to_owned(), channel.to_owned()))
+            .or_insert(0) += 1;
+    }
+
+    /// Count of deferred-control ops that were no-ops at flush for a
+    /// `(consumer, channel)` pair — cancels/edits that lost the drain-vs-release
+    /// race.
+    pub fn deferred_control_race_count(&self, consumer: &str, channel: &str) -> u64 {
+        *self
+            .deferred_control_races
+            .lock()
+            .expect("messaging: deferred_control_races lock poisoned")
+            .get(&(consumer.to_owned(), channel.to_owned()))
+            .unwrap_or(&0)
+    }
+
+    /// Count of publishes the send-rate gate refused for `sender`, across all
+    /// channels.
+    pub fn publish_rate_limited_count(&self, sender: &str) -> u64 {
+        *self
+            .publish_rate_limited
+            .lock()
+            .expect("messaging: publish_rate_limited lock poisoned")
+            .get(sender)
+            .unwrap_or(&0)
+    }
+
+    /// Count of denied publishes for a `(sender, kind)` pair, where `kind` is a
+    /// `PublishResult::signal_kind()` tag.
+    pub fn publish_denied_count(&self, sender: &str, kind: &str) -> u64 {
+        *self
+            .publish_denied
+            .lock()
+            .expect("messaging: publish_denied lock poisoned")
+            .get(&(sender.to_owned(), kind.to_owned()))
+            .unwrap_or(&0)
     }
 
     /// Install (or extend) subscriber registrations before the `Messenger` is
@@ -1397,14 +1587,16 @@ impl Messenger {
             "with_subscriber_registrations must run before the Messenger Arc is shared \
              (boot-ordering bug)",
         );
-        for (key, reg) in registrations {
-            let prev = inner.subscribers.insert(key.clone(), reg);
-            assert!(
-                prev.is_none(),
-                "with_subscriber_registrations: duplicate registration for {key:?} — \
-                 boot wiring bug",
-            );
-        }
+        // The resolver is shared with every durable store, so it is uniquely
+        // owned only until the first one is built — which is also the last
+        // moment a registration can land without a store already having read
+        // past it.
+        Arc::get_mut(&mut inner.targets)
+            .expect(
+                "with_subscriber_registrations must run before any retention store holds the \
+                 target resolver (boot-ordering bug)",
+            )
+            .register(registrations);
         self
     }
 
@@ -1463,23 +1655,629 @@ impl Messenger {
         self
     }
 
-    /// Install the config-resolved ephemeral bus before the `Messenger` is
+    /// Install the config-resolved non-durable stores before the `Messenger` is
     /// shared, replacing the empty default from `new`. Consumes and returns the
     /// `Arc` because the field is set exactly once at boot, immediately after
     /// `new`, while the `Arc` is still uniquely owned (`Arc::get_mut` therefore
     /// always succeeds). Panics if the `Arc` is already shared — that would be a
     /// boot-ordering bug.
-    pub fn with_ephemeral_bus(mut self: Arc<Self>, bus: Arc<EphemeralBus>) -> Arc<Self> {
+    pub fn with_ring_stores(mut self: Arc<Self>, stores: Arc<store::RingStores>) -> Arc<Self> {
         let inner = Arc::get_mut(&mut self).expect(
-            "with_ephemeral_bus must run before the Messenger Arc is shared (boot-ordering bug)",
+            "with_ring_stores must run before the Messenger Arc is shared (boot-ordering bug)",
         );
-        inner.ephemeral_bus = bus;
+        inner.ring_stores = stores;
         self
     }
 
-    /// The ephemeral message bus handle (best-effort, non-persistent).
-    pub fn ephemeral_bus(&self) -> &Arc<EphemeralBus> {
-        &self.ephemeral_bus
+    /// The non-durable store registry.
+    pub fn ring_stores(&self) -> &Arc<store::RingStores> {
+        &self.ring_stores
+    }
+
+    /// The retention store for a registered channel — where its messages live
+    /// between publish and delivery.
+    ///
+    /// The channel's capabilities pick the implementation, once: a durable
+    /// channel gets its `DbStore` handle over the shared connection, a
+    /// non-durable one gets the process's ring for that channel. Each channel's
+    /// store is constructed once and reused — the durable ones cached lazily in
+    /// [`Messenger::db_stores`], the non-durable ones built at boot. Callers hold
+    /// `Arc<dyn RetentionStore>` and never re-decide the class.
+    ///
+    /// # Panics
+    ///
+    /// If a non-durable entry has no ring. Boot builds one store per non-durable
+    /// channel from the same entries it registers in the directory, so a miss
+    /// means the two halves of the registry disagree about which channels exist.
+    pub fn store_for(&self, entry: &ChannelEntry) -> Arc<dyn store::RetentionStore> {
+        if entry.capabilities().durable {
+            return self.db_store_for(entry);
+        }
+        self.ring_stores
+            .get(&entry.uuid)
+            .unwrap_or_else(|| {
+                panic!(
+                    "messaging: non-durable channel {:?} is in the directory but has no retention \
+                     store — the directory and the store registry disagree",
+                    entry.address
+                )
+            })
+            .clone()
+    }
+
+    /// [`store_for`](Self::store_for) resolved from a channel address.
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel.
+    pub fn store_for_address(&self, channel_address: &str) -> Arc<dyn store::RetentionStore> {
+        let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
+            panic!(
+                "messaging: store requested for channel {channel_address:?} not in the directory"
+            )
+        });
+        self.store_for(&entry)
+    }
+
+    /// The concrete [`DbStore`](store::DbStore) for a durable channel,
+    /// constructed once and cached in [`Messenger::db_stores`] and reused. The
+    /// concrete type (not `Arc<dyn RetentionStore>`) is needed by callers that
+    /// reach the store's inherent push-window overflow methods, which take the
+    /// caller's held SQLite connection and so cannot be async trait methods.
+    ///
+    /// # Panics
+    ///
+    /// If `entry` is a non-durable channel — its store is a `RingStore`.
+    pub(crate) fn db_store_for(&self, entry: &ChannelEntry) -> Arc<store::DbStore> {
+        assert!(
+            entry.capabilities().durable,
+            "db_store_for called for non-durable channel {:?}",
+            entry.address
+        );
+        let mut db_stores = self.db_stores.lock().expect("db_stores poisoned");
+        db_stores
+            .entry(entry.uuid)
+            .or_insert_with(|| {
+                Arc::new(store::DbStore::new(
+                    self.db.clone(),
+                    entry.uuid,
+                    entry.address.clone(),
+                    entry.resolved_channel.retain_depth,
+                    self.targets.clone(),
+                ))
+            })
+            .clone()
+    }
+
+    /// [`db_store_for`](Self::db_store_for) resolved from a channel address.
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel, or resolves to a non-durable
+    /// one.
+    pub(crate) fn db_store_for_address(&self, channel_address: &str) -> Arc<store::DbStore> {
+        let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
+            panic!(
+                "messaging: db store requested for channel {channel_address:?} not in the directory"
+            )
+        });
+        self.db_store_for(&entry)
+    }
+
+    /// One sender's parked (deferred) messages on `channel_address`, soonest
+    /// release first — the substrate half of a WASM output port's deferred view.
+    ///
+    /// Resolves the channel's store (durable or ring-backed, via [`store_for`])
+    /// and reads its sender-scoped deferred surface. Authorization is structural:
+    /// only messages whose recorded sender equals `sender` are returned, so a
+    /// caller passing a component's own `wasm:<slug>` identity can see only that
+    /// component's schedule, even on a channel other components also publish to.
+    /// A message that has matured but not yet been taken by a release pass is out
+    /// of the view (it can no longer be cancelled or edited); `now` is the instant
+    /// that boundary is judged against.
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel — the caller resolved it from
+    /// a bound output port, so an unknown address is a boot-validation gap.
+    pub async fn deferred_view_for_sender(
+        &self,
+        channel_address: &str,
+        sender: &str,
+        now: DateTime<Utc>,
+    ) -> Vec<store::DeferredMessage> {
+        self.store_for_bound_output(channel_address)
+            .deferred_for_sender(sender, now)
+            .await
+    }
+
+    /// Resolves a bound WASM output port's channel address to its retention store.
+    ///
+    /// The caller must have resolved `channel_address` from a bound output port;
+    /// an address not in the directory is a boot-validation gap, not a runtime
+    /// condition.
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel.
+    fn store_for_bound_output(&self, channel_address: &str) -> Arc<dyn store::RetentionStore> {
+        let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
+            panic!(
+                "messaging: deferred operation requested for channel {channel_address:?} not in \
+                 the directory — a bound output port must resolve"
+            )
+        });
+        self.store_for(&entry)
+    }
+
+    /// Cancel one of `sender`'s parked messages on `channel_address`, named by its
+    /// message uuid — the substrate half of a WASM output port's `defer-cancel`.
+    ///
+    /// Resolves the channel's store and applies the cancel on its sender-scoped
+    /// deferred surface. Authorization is structural: the store cancels only a
+    /// message whose recorded sender equals `sender`. Returns [`NotDeferred`] when
+    /// the message already released between the caller's view and this call — a
+    /// benign race, not a failure.
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel (a bound output port must
+    /// resolve).
+    ///
+    /// [`NotDeferred`]: store::DeferralOutcome::NotDeferred
+    pub async fn cancel_deferred_for_sender(
+        &self,
+        channel_address: &str,
+        sender: &str,
+        message_uuid: Uuid,
+        now: DateTime<Utc>,
+    ) -> store::DeferralOutcome {
+        self.store_for_bound_output(channel_address)
+            .cancel_deferred(sender, message_uuid, now)
+            .await
+    }
+
+    /// Edit one of `sender`'s parked messages on `channel_address`, named by its
+    /// message uuid — the substrate half of a WASM output port's `defer-edit`.
+    /// `body` and `release_at` are each `Some` to change, `None` to leave alone.
+    ///
+    /// Same resolution, structural authorization, and race semantics as
+    /// [`cancel_deferred_for_sender`].
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel (a bound output port must
+    /// resolve).
+    pub async fn edit_deferred_for_sender(
+        &self,
+        channel_address: &str,
+        sender: &str,
+        message_uuid: Uuid,
+        body: Option<String>,
+        release_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> store::DeferralOutcome {
+        self.store_for_bound_output(channel_address)
+            .edit_deferred(sender, message_uuid, body, release_at, now)
+            .await
+    }
+
+    /// The ring behind a non-durable channel, for tests that drive its
+    /// synchronous inherent surface (append, take, cursor presence) directly.
+    /// Production code reaches every store the same way, through
+    /// [`store_for`](Self::store_for).
+    ///
+    /// # Panics
+    ///
+    /// If the entry is durable, or if a non-durable entry has no ring — both are
+    /// the registry disagreeing with itself.
+    #[cfg(test)]
+    pub(crate) fn ring_store_for(&self, entry: &ChannelEntry) -> &Arc<store::RingStore> {
+        assert!(
+            !entry.capabilities().durable,
+            "messaging: channel {:?} is durable and has no ring store",
+            entry.address
+        );
+        self.ring_stores.get(&entry.uuid).unwrap_or_else(|| {
+            panic!(
+                "messaging: non-durable channel {:?} is in the directory but has no retention \
+                 store — the directory and the store registry disagree",
+                entry.address
+            )
+        })
+    }
+
+    /// [`enact_overflow_events`](Self::enact_overflow_events) for a caller that
+    /// holds a channel address rather than its directory entry — the shape of a
+    /// publisher outside `brenn-lib` (the surface session's bound-output
+    /// publish), which gets its overflow back from the bus.
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel: a store reported overflow
+    /// for a channel the directory does not know, so the two disagree about
+    /// which channels exist.
+    pub fn enact_overflow_for_channel(
+        &self,
+        channel_address: &str,
+        events: &[store::OverflowEvent],
+    ) {
+        if events.is_empty() {
+            return;
+        }
+        let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
+            panic!(
+                "messaging: overflow reported for channel {channel_address:?} not in the directory"
+            )
+        });
+        let store = self.store_for(&entry);
+        self.enact_overflow_events(&entry, store.as_ref(), events);
+    }
+
+    /// Route a store's overflow events to the single noise-enactment sink, one
+    /// per named subscriber.
+    ///
+    /// The store counted the drops; the resolved subscription decides how loud
+    /// they are. A Surface-kind subscriber is deliberately never routed here:
+    /// its drops stay on its delivery state and reach the page kernel, which is
+    /// the only enactor allowed to see `fatal`.
+    ///
+    /// `store` is the one that reported the events — passed rather than
+    /// re-resolved, because every caller already holds it.
+    fn enact_overflow_events(
+        &self,
+        entry: &ChannelEntry,
+        store: &dyn store::RetentionStore,
+        events: &[store::OverflowEvent],
+    ) {
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            match overflow_noise_for(entry, &event.subscriber, event.app_slug.as_deref()) {
+                Some(noise) => {
+                    self.enact_overflow_noise(
+                        store,
+                        &entry.address,
+                        &event.subscriber,
+                        noise,
+                        event.dropped,
+                    );
+                }
+                // Surface-kind is the designed exemption and says nothing.
+                None if matches!(event.subscriber.kind(), SubscriberKind::Surface { .. }) => {}
+                // A conversation's rung is unresolvable, not merely unregistered:
+                // it lives on an `App(slug)` registration, and the event named
+                // no app to key it by. Reaching here means delivery to an
+                // App-kind subscriber landed from a store that records nothing
+                // per subscriber — silently skipping the ladder for every such
+                // drop, under a log line blaming a missing registration. Die
+                // instead.
+                None if matches!(event.subscriber.kind(), SubscriberKind::Conversation(_)) => {
+                    panic!(
+                        "messaging: channel {} reported overflow for conversation subscriber {} \
+                         under app {:?} — a conversation's noise rung lives on an App \
+                         registration this channel does not carry, so the drop would be \
+                         accounted and never escalated",
+                        entry.address,
+                        event.subscriber.as_str(),
+                        event.app_slug,
+                    )
+                }
+                // Delivery state that outlived its registration: the drop is
+                // accounted but nothing resolves its noise rung, so the ladder
+                // cannot escalate it. Surface it rather than losing it.
+                None => tracing::warn!(
+                    channel = %entry.address,
+                    subscriber = %event.subscriber.as_str(),
+                    dropped = event.dropped,
+                    "overflow reported for a subscriber with no registration on this channel — \
+                     accounted but not escalated",
+                ),
+            }
+        }
+    }
+
+    /// Register `subscriber`'s cursor on a ring-backed channel, or retune an
+    /// existing one's push depth. Returns whether a new cursor was created.
+    ///
+    /// A ring-backed channel holds its subscriber registrations in memory (they
+    /// are meaningless after the restart that empties the ring), so this is the
+    /// non-durable analogue of a `messaging_subscriptions` row: it is the
+    /// consumer's position from which [`Messenger::load_activation_snapshot`]
+    /// draws its ring-backed NEW rows.
+    ///
+    /// `push_depth` bounds how many owed messages one activation takes; the
+    /// caller applies any per-participant clamp (e.g. `WASM_WINDOW_MAX_NEW`)
+    /// before calling. `priming` is honored only when the cursor is created.
+    ///
+    /// # Panics
+    ///
+    /// If `channel_uuid` names no ring-backed channel — the directory and the
+    /// store registry disagree, or the caller passed a durable channel.
+    pub fn attach_ring_subscriber(
+        &self,
+        channel_uuid: &Uuid,
+        subscriber: &ParticipantId,
+        push_depth: u64,
+        priming: store::Priming,
+    ) -> store::Attached {
+        self.ring_store(channel_uuid)
+            .attach(subscriber, push_depth, priming)
+    }
+
+    /// Register `subscriber`'s delivery state on the channel at
+    /// `channel_address`, delegating to the channel's store.
+    ///
+    /// `push_depth` must be pre-clamped by the caller.
+    /// `fresh_queue`: whether this queue is newly created (see
+    /// [`RetentionStore::attach`] for the contract).
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel — a wired input must resolve.
+    pub async fn attach_subscriber(
+        &self,
+        channel_address: &str,
+        app_slug: &str,
+        subscriber: &ParticipantId,
+        push_depth: u64,
+        priming: store::Priming,
+        fresh_queue: bool,
+    ) -> store::Attached {
+        let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
+            panic!(
+                "messaging: attach requested for channel {channel_address:?} not in the \
+                 directory — a wired input must resolve"
+            )
+        });
+        self.store_for(&entry)
+            .attach(subscriber, app_slug, push_depth, priming, fresh_queue)
+            .await
+    }
+
+    /// Tear down `subscriber`'s delivery state on the channel at
+    /// `channel_address` — its position, its in-memory push window, and its drop
+    /// tallies, all of which the store owns. The inverse of
+    /// [`Messenger::attach_subscriber`].
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel.
+    pub async fn detach_subscriber(&self, channel_address: &str, subscriber: &ParticipantId) {
+        let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
+            panic!(
+                "messaging: detach requested for channel {channel_address:?} not in the directory"
+            )
+        });
+        self.store_for(&entry).detach(subscriber).await;
+    }
+
+    /// Settle delivery records the channel's store handed `subscriber` — the
+    /// consumer's statement that they reached their destination.
+    ///
+    /// # Panics
+    ///
+    /// If `channel_address` resolves to no channel.
+    pub async fn settle_delivered(
+        &self,
+        channel_address: &str,
+        subscriber: &ParticipantId,
+        records: &[store::TargetRecord],
+    ) {
+        if records.is_empty() {
+            return;
+        }
+        let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
+            panic!(
+                "messaging: settle requested for channel {channel_address:?} not in the directory"
+            )
+        });
+        let store = self.store_for(&entry);
+        let dropped = store.settle(subscriber, records).await;
+        if dropped > 0 {
+            self.enact_overflow_events(
+                &entry,
+                store.as_ref(),
+                &[store::OverflowEvent {
+                    subscriber: subscriber.clone(),
+                    dropped,
+                    app_slug: None,
+                }],
+            );
+        }
+    }
+
+    /// Does `app_slug` hold a dynamic subscription on the non-durable channel
+    /// `channel_uuid`?
+    pub(crate) fn nondurable_dynamic_sub_exists(
+        &self,
+        channel_uuid: &Uuid,
+        app_slug: &str,
+    ) -> bool {
+        self.nondurable_dynamic_subs
+            .lock()
+            .expect("messaging: nondurable_dynamic_subs lock poisoned")
+            .contains(&(*channel_uuid, app_slug.to_string()))
+    }
+
+    /// Record `app_slug`'s dynamic subscription registration on the non-durable
+    /// channel `channel_uuid`. Panics if one is already recorded: the caller
+    /// classifies the re-subscribe case and writes under one hold of
+    /// [`Messenger::dynamic_subscribe_gate`], so no other subscribe can register
+    /// this pair in between and a collision is a host bug — mirroring the durable
+    /// INSERT's "neither row pre-exists" guarantee.
+    pub(crate) fn register_nondurable_dynamic_sub(&self, channel_uuid: Uuid, app_slug: &str) {
+        let inserted = self
+            .nondurable_dynamic_subs
+            .lock()
+            .expect("messaging: nondurable_dynamic_subs lock poisoned")
+            .insert((channel_uuid, app_slug.to_string()));
+        assert!(
+            inserted,
+            "messaging: app {app_slug:?} already holds a dynamic subscription registration on \
+             non-durable channel {channel_uuid}"
+        );
+    }
+
+    /// Drop `app_slug`'s dynamic subscription registration on the non-durable
+    /// channel `channel_uuid`, reporting whether one was held — the in-memory
+    /// analogue of the durable row delete, and the same authority on "was there
+    /// a dynamic subscription to remove".
+    pub(crate) fn remove_nondurable_dynamic_sub(
+        &self,
+        channel_uuid: &Uuid,
+        app_slug: &str,
+    ) -> bool {
+        self.nondurable_dynamic_subs
+            .lock()
+            .expect("messaging: nondurable_dynamic_subs lock poisoned")
+            .remove(&(*channel_uuid, app_slug.to_string()))
+    }
+
+    /// The ring store for a non-durable channel uuid, panicking if there is
+    /// none — the shared lookup behind the ring-subscriber and snapshot paths.
+    fn ring_store(&self, channel_uuid: &Uuid) -> &Arc<store::RingStore> {
+        self.ring_stores.get(channel_uuid).unwrap_or_else(|| {
+            panic!(
+                "messaging: channel {channel_uuid} has no ring store — it is durable or the \
+                 directory and the store registry disagree"
+            )
+        })
+    }
+
+    /// The earliest deferred release across every channel, or `None` when
+    /// nothing is parked anywhere.
+    pub async fn next_deferred_release(&self) -> Option<DateTime<Utc>> {
+        let mut earliest: Option<DateTime<Utc>> = None;
+        for entry in self.directory.list() {
+            if let Some(due) = self.store_for(&entry).next_release().await {
+                earliest = Some(earliest.map_or(due, |cur: DateTime<Utc>| cur.min(due)));
+            }
+        }
+        earliest
+    }
+
+    /// Release every message due at or before `now`, on every channel, through
+    /// the channel's own store.
+    ///
+    /// The pre-check guard is advisory, not load-bearing: each store's release
+    /// path re-decides what is due under its own lock.
+    ///
+    /// A released message enters retention like any other, so it can push a
+    /// lagging subscriber's owed messages out of the window; that overflow is
+    /// enacted here, on the batch that caused it.
+    ///
+    /// The sweep reports the earliest release still parked after it ran
+    /// ([`ReleaseSweep::next_release`]), asking each store the question once.
+    pub async fn release_due_messages(&self, now: DateTime<Utc>) -> ReleaseSweep {
+        let mut sweep = ReleaseSweep::default();
+        let fold = |due: Option<DateTime<Utc>>, sweep: &mut ReleaseSweep| {
+            if let Some(due) = due {
+                sweep.next_release = Some(sweep.next_release.map_or(due, |cur| cur.min(due)));
+            }
+        };
+        for entry in self.directory.list() {
+            let store = self.store_for(&entry);
+            match store.next_release().await {
+                Some(due) if due <= now => {}
+                other => {
+                    fold(other, &mut sweep);
+                    continue;
+                }
+            }
+            // Who the batch is owed to is the store's own question, decided when
+            // it releases rather than when the message was parked: a subscriber
+            // that attached while a message waited receives it, one whose
+            // subscription went away does not. A store that issues no delivery
+            // records reports none, so the sweep collects whatever came back.
+            let outcome = store.release_due(now).await;
+            for released in &outcome.released {
+                sweep.released += 1;
+                sweep
+                    .push_ids
+                    .extend(released.target_records.iter().map(|record| record.0));
+            }
+            self.enact_overflow_events(&entry, store.as_ref(), &outcome.overflow);
+            let remaining = store.next_release().await;
+            fold(remaining, &mut sweep);
+        }
+        sweep
+    }
+
+    /// Wake every parked-and-woken subscriber currently owed messages, on every
+    /// channel, by asking each channel's own store who is owed.
+    ///
+    /// The dispatcher's one wake source for channel-backed work. Only
+    /// [`DeliveryShape::ParkedWake`] subscribers are woken — the wake *is*
+    /// their delivery trigger. Inline-shaped subscribers are passed over: their
+    /// delivery and fallback wake belong to the dispatch scan.
+    ///
+    /// Idempotent (`Notify` coalesces) and self-limiting: a subscriber stops
+    /// being owed once it drains.
+    pub async fn wake_owed_subscribers(&self) {
+        for entry in self.directory.list() {
+            // Skip channels without a ParkedWake subscriber — asking a durable
+            // store costs a DB round trip, and a non-wakeable channel yields
+            // nothing.
+            let wakeable = entry
+                .subscribers
+                .iter()
+                .any(|sub| self.router.delivery_shape(&sub.kind) == DeliveryShape::ParkedWake);
+            if !wakeable {
+                continue;
+            }
+            let store = self.store_for(&entry);
+            for subscriber in store.deliverable_subscribers().await {
+                // No app named: a conversation is never `ParkedWake`-shaped, so
+                // the App arm has nothing to answer for this walk.
+                let Some(registration) = registered_subscriber(&entry, &subscriber, None) else {
+                    self.warn_stranded_subscriber(&entry, &subscriber);
+                    continue;
+                };
+                if self.router.delivery_shape(&registration.kind) == DeliveryShape::ParkedWake {
+                    self.router
+                        .spawn_eager_wake(&registration.kind, &subscriber);
+                }
+            }
+        }
+    }
+
+    /// Report `subscriber` as owed messages on `entry` under no registration
+    /// that could wake it — at most once per `(channel, subscriber)` pair.
+    ///
+    /// Conversations reach this arm normally and are not reported:
+    /// registrations are keyed by subscriber kind, and an `App(slug)`
+    /// registration never names the conversation that delivers under it.
+    ///
+    /// A `Wasm`/`System` subscriber does name its own registration, so one owed
+    /// without a registration is stranded — nothing will ever take its
+    /// messages. The reachable path is a configuration change: dropping a
+    /// component's input binding leaves its undelivered claims behind, and no
+    /// boot step tears them down. That is an operator-caused, persistent state
+    /// rather than a wiring bug, so it is reported rather than fatal — and
+    /// reported once, because the wake walk revisits it on every dispatcher
+    /// pass and an unbounded repeat would bury the signal it carries.
+    fn warn_stranded_subscriber(&self, entry: &ChannelEntry, subscriber: &ParticipantId) {
+        if !matches!(
+            subscriber.kind(),
+            SubscriberKind::Wasm(_) | SubscriberKind::System(_)
+        ) {
+            return;
+        }
+        let first_report = self
+            .stranded_warned
+            .lock()
+            .expect("messaging: stranded_warned lock poisoned")
+            .insert((entry.uuid, subscriber.as_str().to_string()));
+        if first_report {
+            tracing::warn!(
+                channel = %entry.address,
+                subscriber = %subscriber.as_str(),
+                "owed messages for a parked subscriber with no registration on this channel — \
+                 nothing will wake it (reported once per subscriber per channel)",
+            );
+        }
     }
 
     pub fn directory(&self) -> &Arc<MessagingDirectory> {
@@ -1514,13 +2312,13 @@ impl Messenger {
         &self,
         kind: &SubscriberEntryKind,
     ) -> Option<&SubscriberRegistration> {
-        self.subscribers.get(kind)
+        self.targets.registration(kind)
     }
 
     /// Resolved access-control policy for a directory subscriber, covering
-    /// every subscriber kind: `App(slug)` resolves via `self.apps`; every other
-    /// kind resolves through the unified `subscribers` registry. This is the
-    /// lookup the delivery-time ACL gate calls (design §2.2) so LLM apps, WASM
+    /// every subscriber kind: `App(slug)` resolves via the apps map; every other
+    /// kind resolves through the unified subscriber registry. This is the
+    /// lookup the delivery-time ACL gate calls, so LLM apps, WASM
     /// consumers, surfaces, and system components are enforced uniformly;
     /// `app_policy` alone cannot reach the non-app subscribers (their policies
     /// are not in `apps`). Every resolved subscriber should carry a policy, so a
@@ -1530,33 +2328,25 @@ impl Messenger {
         &self,
         kind: &SubscriberEntryKind,
     ) -> Option<&crate::access::AppPolicy> {
-        match kind {
-            SubscriberEntryKind::App(slug) => self.app_policy(slug),
-            other => self.subscribers.get(other).map(|r| r.policy.as_ref()),
-        }
+        self.targets.policy(kind)
     }
 
     /// Declared [`WakeEconomics`] for a directory subscriber, covering every
     /// subscriber kind: `App(slug)` is `UrgencyGated` iff the app exists (its
-    /// economics are sourced from the authoritative `self.apps` map, not the
-    /// `subscribers` registry — the same App split `subscriber_policy` makes, so
-    /// App policy and economics resolve from one immutable source and cannot
-    /// diverge from a registry clone); every other kind resolves through the
-    /// registry. `None` for a live subscriber indicates a host wiring bug (the
-    /// boot cross-check rejects it); on the delivery path a `None` cannot occur
-    /// because the ACL gate (`subscriber_policy`) has already skipped an
-    /// unresolvable subscriber.
+    /// economics are sourced from the authoritative apps map, not the subscriber
+    /// registry — the same App split `subscriber_policy` makes, so App policy
+    /// and economics resolve from one immutable source and cannot diverge from a
+    /// registry clone); every other kind resolves through the registry. `None`
+    /// for a live subscriber indicates a host wiring bug (the boot cross-check
+    /// rejects it); on the delivery path a `None` cannot occur because the ACL
+    /// gate (`subscriber_policy`) has already skipped an unresolvable
+    /// subscriber.
     ///
     /// This is the single per-participant read that drives eager-wake gating:
     /// `Eager` subscribers are always woken; `UrgencyGated` subscribers consult
     /// `wake_min`. Dispatch never branches on the identity prefix to decide it.
     pub fn subscriber_wake_economics(&self, kind: &SubscriberEntryKind) -> Option<WakeEconomics> {
-        match kind {
-            SubscriberEntryKind::App(slug) => {
-                self.apps.get(slug).map(|_| WakeEconomics::UrgencyGated)
-            }
-            other => self.subscribers.get(other).map(|r| r.wake),
-        }
+        self.targets.wake_economics(kind)
     }
 
     pub fn router(&self) -> &Arc<dyn WakeRouter> {
@@ -1585,308 +2375,84 @@ impl Messenger {
 
     /// Signal the background dispatcher that there may be newly-actionable rows.
     ///
-    /// All publish / edit / release callers use this as the single kick surface
-    /// (design §2.7, R1). The background dispatcher task holds the matching
-    /// `Arc<Notify>`.
+    /// All publish / edit / release callers use this as the single kick surface.
+    /// The background dispatcher task holds the matching `Arc<Notify>`.
     pub fn dispatch_kick(&self) {
         self.dispatch_kick_notify.notify_one();
     }
 
-    /// Read the current drop counter for a `(channel_address, subscriber_id)` pair.
-    /// Returns 0 if no overflow has ever occurred for this pair.
-    /// Used by the telemetry surface (`req §5.2`).
+    /// Read the metered drop count for a `(channel_address, subscriber_id)`
+    /// pair — the drops the noise ladder counted, which is all of them on a
+    /// `metered`/`alarm` subscription and none on a `silent` one. Returns 0 if
+    /// no overflow has ever been metered for this pair. This is the telemetry
+    /// read.
+    ///
+    /// For the raw accounting a consumer reads as its gap signal — every drop,
+    /// whatever the noise level — see [`Messenger::dropped_total`].
+    ///
+    /// # Panics
+    ///
+    /// If `channel` resolves to no channel: the count lives on the channel's
+    /// store, so there is nowhere to read it from.
     pub fn drop_counter(&self, channel: &str, subscriber: &ParticipantId) -> u64 {
-        let key = (channel.to_string(), subscriber.as_str().to_string());
-        let counters = self.drop_counters.lock().expect("drop_counters poisoned");
-        counters.get(&key).copied().unwrap_or(0)
+        self.store_for_address(channel).metered_drops(subscriber)
     }
 
-    /// Register a newly-created push-claim id into the in-memory push window
-    /// for a bounded-`push_depth` subscriber. If the window is full, removes
-    /// and returns the oldest push_id to be retired; also records the overflow
-    /// and fires the configured noise signal. Returns the push_id to retire
-    /// (if any — `None` when the window has capacity or the subscriber is
-    /// unbounded).
+    /// Read a subscriber's lifetime drop total on `channel` — every message the
+    /// channel's store dropped out from under it, whatever the subscription's
+    /// noise level. This is the count the WASM activation window reports as its
+    /// within-lifetime gap signal.
     ///
-    /// On first touch after boot the deque is seeded from the DB (lazy,
-    /// one-shot per key): pre-existing undelivered non-parked push rows are
-    /// loaded so the bound is enforced immediately rather than waiting for the
-    /// GC backstop pass (~45 min post-boot).
+    /// # Panics
     ///
-    /// For released parked rows (`register_released_pushes`), the caller may
-    /// pass an id that is already present in the freshly-seeded deque. In that
-    /// case `push_id` is skipped (the seed already counted it); no double-count.
+    /// If `channel` resolves to no channel.
+    pub fn dropped_total(&self, channel: &str, subscriber: &ParticipantId) -> u64 {
+        self.store_for_address(channel).dropped_total(subscriber)
+    }
+
+    /// Enact the noise ladder for `count` overflow drops `store` charged
+    /// `subscriber`. Single enactment point — every overflow source must funnel
+    /// through here so escalation is store-independent.
     ///
-    /// Must be called *after* the push row has been inserted into the DB and
-    /// its `push_id` is known. The caller is responsible for deleting the
-    /// returned push_id from `messaging_pending_pushes`.
+    /// The drops themselves are already accounted by the store that dropped
+    /// them; what this decides is how loud they are. `metered` and above also
+    /// tally on that store, next to the subscriber's other delivery state — so
+    /// the caller hands over the store it already holds. `channel` is the
+    /// address label for the log and the alarm; nothing is resolved from it.
     ///
-    /// `conn` — the already-held SQLite connection; used for the one-shot seed
-    /// load. Must not be `None` for the first call on a given key.
-    pub(crate) fn record_push_and_check_overflow(
+    /// TODO(drop-counters-export): the metered tallies have no production
+    /// reader — only tests query them. Export them to whatever telemetry
+    /// surface we settle on (blocked on deciding one), then reconsider the
+    /// `Silent` default for `noise` (silent-by-default loss only makes sense
+    /// while the counters are unread; the two decisions are coupled).
+    fn enact_overflow_noise(
         &self,
-        reg: &PushRegistration<'_>,
-        push_id: i64,
-        conn: &rusqlite::Connection,
-    ) -> Option<i64> {
-        let PushRegistration {
-            channel,
-            channel_uuid,
-            app_slug,
-            subscriber,
-            push_depth,
-            noise,
-        } = reg;
-        let channel_uuid = *channel_uuid;
-        let depth = match push_depth {
-            config::Depth::Unbounded => return None, // never tracked, never overflows
-            config::Depth::Bounded(0) => {
-                // Bounded(0) subscribers never get push rows; this code should
-                // not be reached for them — panic if it is (structural bug).
-                panic!(
-                    "record_push_and_check_overflow called for Bounded(0) subscriber \
-                     on channel {channel:?} — Bounded(0) subscribers never get push rows"
-                );
-            }
-            config::Depth::Bounded(n) => *n as usize,
-        };
-
-        let key = (channel.to_string(), subscriber.as_str().to_string());
-        let retired_id = {
-            let mut windows = self.push_windows.lock().expect("push_windows poisoned");
-            let window = windows.entry(key.clone()).or_insert(PushWindow {
-                seeded: false,
-                ids: VecDeque::new(),
-            });
-
-            // Lazy first-touch seed: load pre-existing rows from DB exactly once.
-            // Excludes `push_id` itself so the seed captures rows that existed
-            // before this publish, not the just-inserted new row.
-            if !window.seeded {
-                let existing =
-                    db::load_push_window(conn, channel_uuid, app_slug, subscriber, push_id);
-                for id in existing {
-                    window.ids.push_back(id);
-                }
-                // Truncate to push_depth in case the DB drifted past bound before
-                // this boot (backstop hadn't run). Seed is side-effect-free on the DB.
-                let discarded = window.ids.len().saturating_sub(depth);
-                if discarded > 0 {
-                    tracing::warn!(
-                        channel = channel,
-                        subscriber = subscriber.as_str(),
-                        push_depth = depth,
-                        found_in_db = window.ids.len(),
-                        discarded_from_window = discarded,
-                        "push window seed: DB has more rows than push_depth (backstop hadn't run); \
-                         oldest {discarded} ids discarded from in-memory window (GC backstop will \
-                         clean DB rows within ~1 hour)"
-                    );
-                    while window.ids.len() > depth {
-                        window.ids.pop_front();
-                    }
-                }
-                window.seeded = true;
-            }
-
-            // For released parked rows: if the id is already present (seed counted
-            // it), skip rather than double-count. The membership check is valid here
-            // because we are still under the push_windows lock and the seed just ran
-            // (or already ran), so no concurrent truncation can race this check.
-            // O(n) on `push_depth`, which is always a small bounded integer in
-            // practice — a linear scan is acceptable here.
-            if window.ids.contains(&push_id) {
-                return None; // already counted by seed
-            }
-
-            window.ids.push_back(push_id);
-
-            if window.ids.len() <= depth {
-                return None; // window has capacity — no overflow
-            }
-
-            // Window is full: retire the oldest push-claim.
-            window.ids.pop_front().expect("deque non-empty after push")
-            // `windows` lock released here before acquiring `drop_counters`.
-        };
-
-        // Increment the drop counter for metered/alarm. Lock acquired after
-        // `push_windows` is released to avoid a deadlock with any future caller
-        // that might acquire `drop_counters` first.
-        //
-        // TODO(drop-counters-export): `drop_counters` has no production reader —
-        // only tests query it. Export it to whatever telemetry surface we settle
-        // on (blocked on deciding one), then reconsider the `Silent` default for
-        // `noise` (silent-by-default loss only makes sense while the counters
-        // are unread; the two decisions are coupled).
-        match *noise {
+        store: &dyn store::RetentionStore,
+        channel: &str,
+        subscriber: &ParticipantId,
+        noise: config::NoiseLevel,
+        count: u64,
+    ) {
+        if count == 0 {
+            return;
+        }
+        match noise {
             config::NoiseLevel::Silent => {} // no counter, no alert
             config::NoiseLevel::Metered | config::NoiseLevel::Alarm => {
-                let mut counters = self.drop_counters.lock().expect("drop_counters poisoned");
-                *counters.entry(key).or_insert(0) += 1;
+                store.record_metered_drops(subscriber, count);
             }
             config::NoiseLevel::Fatal => {
-                // Unreachable by construction: `fatal` is the surface-only kill
-                // rung, rejected on every backend subscription where its noise
-                // resolves (`resolve_subscription_params`). Reaching it here is a
-                // bug in that enforcement.
                 panic!(
-                    "record_push_and_check_overflow reached noise = fatal on channel {channel:?} \
+                    "enact_overflow_noise reached noise = fatal on channel {channel:?} \
                      subscriber {} — fatal is surface-only and must never reach the backend \
                      overflow path",
                     subscriber.as_str()
                 );
             }
         }
-        // Fire alert for alarm level (counter already incremented above).
-        if *noise == config::NoiseLevel::Alarm {
+        if noise == config::NoiseLevel::Alarm {
             self.router.alarm(channel, subscriber);
         }
-
-        Some(retired_id)
-    }
-
-    /// Register a batch of just-released parked push ids for a single
-    /// `(channel, subscriber)` key into the in-memory push window.
-    ///
-    /// Unlike calling `record_push_and_check_overflow` once per id, this
-    /// function handles the whole batch atomically under one lock acquisition:
-    /// it seeds the deque exactly once, appends only the ids not already present
-    /// in the freshly-seeded deque, then trims the front to `push_depth` in one
-    /// pass — collecting all retired ids for the caller to delete from DB.
-    ///
-    /// This is necessary because processing multiple released ids for the same
-    /// key one-at-a-time via `record_push_and_check_overflow` causes data loss:
-    /// an id evicted by overflow in iteration N is invisible to the `contains`
-    /// guard in iteration N+1, so it gets re-added and another live id is
-    /// evicted — eventually all N released ids are deleted from the DB.
-    ///
-    /// Returns `Vec<i64>` of retired ids the caller must `delete_pending_push_by_id`.
-    /// Returns empty if the subscriber is `Unbounded` (no tracking).
-    ///
-    /// `push_ids` must all belong to the same `(channel, subscriber)` key.
-    /// The noise / drop-counter / alarm are fired once per *overflow event*
-    /// (i.e. once per retired id), not once per batch.
-    pub(crate) fn record_push_batch_and_check_overflow(
-        &self,
-        reg: &PushRegistration<'_>,
-        push_ids: &[i64],
-        conn: &rusqlite::Connection,
-    ) -> Vec<i64> {
-        let PushRegistration {
-            channel,
-            channel_uuid,
-            app_slug,
-            subscriber,
-            push_depth,
-            noise,
-        } = reg;
-        let channel_uuid = *channel_uuid;
-
-        if push_ids.is_empty() {
-            return vec![];
-        }
-        let depth = match push_depth {
-            config::Depth::Unbounded => return vec![], // never tracked
-            config::Depth::Bounded(0) => panic!(
-                "record_push_batch_and_check_overflow called for Bounded(0) subscriber \
-                 on channel {channel:?} — Bounded(0) subscribers never get push rows"
-            ),
-            config::Depth::Bounded(n) => *n as usize,
-        };
-
-        let key = (channel.to_string(), subscriber.as_str().to_string());
-        let retired_ids: Vec<i64> = {
-            let mut windows = self.push_windows.lock().expect("push_windows poisoned");
-            let window = windows.entry(key.clone()).or_insert(PushWindow {
-                seeded: false,
-                ids: VecDeque::new(),
-            });
-
-            // Seed exactly once: use any id from the batch as the exclusion id.
-            // The seed query already sees all released rows (release_after IS NULL),
-            // so any of these ids would be seen by the seed; excluding one avoids
-            // double-counting that one via the contains-guard below.
-            // We exclude the first id in the batch; the rest are also excluded
-            // if already in the freshly-seeded deque by the contains check below.
-            if !window.seeded {
-                // Pass push_ids[0] as the exclude id — the seed will not include it.
-                // The remaining ids in push_ids may be returned by the seed (if they
-                // were already released before this call — possible when all were
-                // released in the same `release_due_pushes` pass and the seed query
-                // runs after).
-                let existing =
-                    db::load_push_window(conn, channel_uuid, app_slug, subscriber, push_ids[0]);
-                for id in existing {
-                    window.ids.push_back(id);
-                }
-                let discarded = window.ids.len().saturating_sub(depth);
-                if discarded > 0 {
-                    tracing::warn!(
-                        channel = channel,
-                        subscriber = subscriber.as_str(),
-                        push_depth = depth,
-                        found_in_db = window.ids.len(),
-                        discarded_from_window = discarded,
-                        "push window seed: DB has more rows than push_depth (backstop hadn't run); \
-                         oldest {discarded} ids discarded from in-memory window (GC backstop will \
-                         clean DB rows within ~1 hour)"
-                    );
-                    while window.ids.len() > depth {
-                        window.ids.pop_front();
-                    }
-                }
-                window.seeded = true;
-            }
-
-            // Append each id from the batch that is not already in the deque.
-            // After seeding (above), the deque contains the authoritative snapshot
-            // of pre-existing rows. Any batch id present was already counted by seed;
-            // any batch id absent must be added exactly once.
-            // All additions happen before any trimming so that eviction-by-trim does
-            // not cause a later id in the batch to re-add an earlier one (the
-            // correctness-1 bug: per-row calls allow evicted ids to be re-added).
-            for &id in push_ids {
-                if !window.ids.contains(&id) {
-                    window.ids.push_back(id);
-                }
-            }
-
-            // Trim to push_depth in one pass, collecting all retired ids.
-            let mut retired = Vec::new();
-            while window.ids.len() > depth {
-                retired.push(window.ids.pop_front().expect("deque non-empty during trim"));
-            }
-            retired
-        };
-
-        // Fire noise signals once per overflow event, after releasing push_windows.
-        let overflow_count = retired_ids.len();
-        if overflow_count > 0 {
-            match *noise {
-                config::NoiseLevel::Silent => {}
-                config::NoiseLevel::Metered | config::NoiseLevel::Alarm => {
-                    let mut counters = self.drop_counters.lock().expect("drop_counters poisoned");
-                    *counters.entry(key).or_insert(0) += overflow_count as u64;
-                }
-                config::NoiseLevel::Fatal => {
-                    // Unreachable by construction — see the twin in
-                    // `record_push_and_check_overflow`. `fatal` is surface-only.
-                    panic!(
-                        "batch overflow reached noise = fatal on channel {channel:?} subscriber \
-                         {} — fatal is surface-only and must never reach the backend overflow \
-                         path",
-                        subscriber.as_str()
-                    );
-                }
-            }
-            if *noise == config::NoiseLevel::Alarm {
-                // Fire once per batch regardless of how many overflowed.
-                self.router.alarm(channel, subscriber);
-            }
-        }
-
-        retired_ids
     }
 
     /// **System-wide** directory dump — every channel in the process, NOT
@@ -1900,8 +2466,10 @@ impl Messenger {
     /// retained for a possible future operator/admin surface (Open Question 2);
     /// do not re-nominate it for the per-app role.
     pub fn list_channels(&self) -> Vec<ChannelListing> {
+        // Durable channels only: this dump describes persisted channel state, so
+        // the non-durable half of the directory is not its subject.
         self.directory
-            .list()
+            .list_durable()
             .iter()
             .map(|entry| match entry.transport_type {
                 ChannelScheme::Webhook => ChannelListing {
@@ -2012,59 +2580,70 @@ impl Messenger {
             )
         });
 
-        // brenn: / webhook: — keep directory entries the app's ACL covers. mqtt:
-        // directory entries are deliberately skipped here; mqtt: access is sourced
-        // from the ACL matchers below, not the directory.
-        let mut rows: Vec<ChannelListing> = self
-            .directory
-            .list()
-            .iter()
-            .filter_map(|entry| match entry.transport_type {
-                ChannelScheme::Webhook if policy.allows_channel_access(&entry.address) => {
-                    Some(ChannelListing {
-                        protocol: ChannelScheme::Webhook,
-                        address: entry.address.clone(),
-                        description: entry.description.clone(),
-                        access: AccessKind::Existing,
-                        details: entry
-                            .mount
-                            .as_ref()
-                            .map(|m| ChannelDetails::Webhook(WebhookDetails { mount: m.clone() })),
-                    })
-                }
-                ChannelScheme::Mqtt => None,
-                ChannelScheme::Webhook => None,
-                ChannelScheme::Brenn if policy.allows_channel_access(&entry.address) => {
-                    let subscribers: Vec<String> = entry
-                        .subscribers
-                        .iter()
-                        .map(|s| s.kind.slug().to_string())
-                        .collect();
-                    Some(ChannelListing {
-                        protocol: ChannelScheme::Brenn,
-                        address: entry.address.clone(),
-                        description: entry.description.clone(),
-                        access: AccessKind::Existing,
-                        details: Some(ChannelDetails::Brenn(BrennDetails { subscribers })),
-                    })
-                }
-                ChannelScheme::Brenn => None,
-                // `Ephemeral` channels are never persisted, `local:` never
-                // leaves the page (and is declared per-surface, never as a
-                // `[[channel]]` block), and `pwa_push:` is an egress-only
-                // protocol with no channel rows; none ever appears in the
-                // durable messaging directory. One here is a host-wiring
-                // invariant violation — fail fast rather than mislabel it
-                // (BETTER DEAD THAN WRONG).
-                ChannelScheme::Ephemeral | ChannelScheme::Local | ChannelScheme::PwaPush => {
-                    panic!(
-                        "list_accessible_channels: non-durable channel {:?} in messaging directory \
-                         — host-wiring invariant violated",
-                        entry.address
-                    )
-                }
-            })
-            .collect();
+        // brenn: / webhook: / ephemeral: / local: — keep directory entries the
+        // app's ACL covers. mqtt: directory entries are deliberately skipped here;
+        // mqtt: access is sourced from the ACL matchers below, not the directory.
+        let mut rows: Vec<ChannelListing> =
+            self.directory
+                .list()
+                .iter()
+                .filter_map(|entry| match entry.transport_type {
+                    ChannelScheme::Webhook if policy.allows_channel_access(&entry.address) => {
+                        Some(ChannelListing {
+                            protocol: ChannelScheme::Webhook,
+                            address: entry.address.clone(),
+                            description: entry.description.clone(),
+                            access: AccessKind::Existing,
+                            details: entry.mount.as_ref().map(|m| {
+                                ChannelDetails::Webhook(WebhookDetails { mount: m.clone() })
+                            }),
+                        })
+                    }
+                    ChannelScheme::Mqtt => None,
+                    ChannelScheme::Webhook => None,
+                    ChannelScheme::Brenn if policy.allows_channel_access(&entry.address) => {
+                        let subscribers: Vec<String> = entry
+                            .subscribers
+                            .iter()
+                            .map(|s| s.kind.slug().to_string())
+                            .collect();
+                        Some(ChannelListing {
+                            protocol: ChannelScheme::Brenn,
+                            address: entry.address.clone(),
+                            description: entry.description.clone(),
+                            access: AccessKind::Existing,
+                            details: Some(ChannelDetails::Brenn(BrennDetails { subscribers })),
+                        })
+                    }
+                    ChannelScheme::Brenn => None,
+                    // Non-durable channels are listed on the same ACL terms as
+                    // `brenn:` ones — an app that may subscribe to and read a channel
+                    // may see that it exists. They carry no protocol detail shape.
+                    ChannelScheme::Ephemeral | ChannelScheme::Local
+                        if policy.allows_channel_access(&entry.address) =>
+                    {
+                        Some(ChannelListing {
+                            protocol: entry.transport_type,
+                            address: entry.address.clone(),
+                            description: entry.description.clone(),
+                            access: AccessKind::Existing,
+                            details: None,
+                        })
+                    }
+                    ChannelScheme::Ephemeral | ChannelScheme::Local => None,
+                    // `pwa_push:` is an egress-only protocol with no channel rows and
+                    // never appears in the messaging directory. One here is a
+                    // host-wiring invariant violation — fail fast rather than
+                    // mislabel it (BETTER DEAD THAN WRONG).
+                    ChannelScheme::PwaPush => {
+                        panic!(
+                            "list_accessible_channels: egress-only channel {:?} in messaging \
+                         directory — host-wiring invariant violated",
+                            entry.address
+                        )
+                    }
+                })
+                .collect();
 
         // mqtt: — synthesize one Pattern row per ACL matcher (no broker
         // enumeration; design §2.2). Render as the canonical mqtt:<client>:<filter>
@@ -2102,13 +2681,15 @@ impl Messenger {
     /// subscriber's* resolved `push_depth`/`retain_depth`/`noise`/`wake_min`.
     ///
     /// The `dynamic` flag is sourced exactly as `subscribe_dynamic` discriminates
-    /// static-vs-dynamic (design §2.4): an O(1) point-lookup against
-    /// `messaging_dynamic_subscriptions` (`load_dynamic_subscription_for`). A
-    /// durable row present ⇒ `dynamic = true` (runtime, removable); absent ⇒
-    /// `dynamic = false` (static, config-managed). The durable table is the single
-    /// source of truth — no parallel field on `SubscriberEntry` to drift out of
-    /// sync. This is why the method is `async`: it acquires the same `db` lock the
-    /// subscribe path takes, once, for the duration of the per-app point-lookups.
+    /// static-vs-dynamic: an O(1) point-lookup against the channel class's
+    /// registration record — `messaging_dynamic_subscriptions`
+    /// (`load_dynamic_subscription_for`) for a durable channel, the in-memory
+    /// non-durable registration set for a non-durable one. Registration present ⇒
+    /// `dynamic = true` (runtime, removable); absent ⇒ `dynamic = false` (static,
+    /// config-managed). Each record is the single source of truth for its class —
+    /// no parallel field on `SubscriberEntry` to drift out of sync. This is why
+    /// the method is `async`: it acquires the same `db` lock the subscribe path
+    /// takes, once, for the duration of the per-app point-lookups.
     ///
     /// `mqtt:` rows leave the runtime-health fields `None` (the
     /// `MessageSubscriptionList` intercept enriches them via `MqttService`,
@@ -2125,9 +2706,15 @@ impl Messenger {
                 let sub = entry.subscribers.iter().find(
                     |s| matches!(&s.kind, SubscriberEntryKind::App(slug) if slug == app_slug),
                 )?;
-                // Static-vs-dynamic: durable dynamic row present ⇒ dynamic.
-                let dynamic =
-                    db::load_dynamic_subscription_for(&conn, entry.uuid, app_slug).is_some();
+                // Static-vs-dynamic: the channel's registration record present ⇒
+                // dynamic. Each class is asked its own authority — the durable
+                // row for a durable channel, the in-memory registration set for a
+                // non-durable one.
+                let dynamic = if entry.capabilities().durable {
+                    db::load_dynamic_subscription_for(&conn, entry.uuid, app_slug).is_some()
+                } else {
+                    self.nondurable_dynamic_sub_exists(&entry.uuid, app_slug)
+                };
                 let details = match entry.transport_type {
                     ChannelScheme::Webhook => entry
                         .mount
@@ -2160,14 +2747,16 @@ impl Messenger {
                         // Wasm consumers). Matches the struct doc's per-app contract.
                         subscribers: vec![app_slug.to_string()],
                     })),
-                    // `Ephemeral` channels are never persisted, `local:` never
-                    // leaves the page (and is declared per-surface, never as a
-                    // `[[channel]]` block), and `pwa_push:` is an egress-only
-                    // protocol with no channel rows; none ever appears in the
-                    // durable messaging directory. Fail fast per BETTER DEAD THAN WRONG.
-                    ChannelScheme::Ephemeral | ChannelScheme::Local | ChannelScheme::PwaPush => {
+                    // A non-durable channel carries no protocol-specific detail
+                    // shape: its address is the whole story and its retention
+                    // knobs are already on the listing.
+                    ChannelScheme::Ephemeral | ChannelScheme::Local => None,
+                    // `pwa_push:` is an egress-only protocol — nothing subscribes
+                    // to it, so it never carries an `App` subscriber and never
+                    // reaches here. Fail fast per BETTER DEAD THAN WRONG.
+                    ChannelScheme::PwaPush => {
                         panic!(
-                            "list_subscriptions: non-durable channel {:?} in messaging directory \
+                            "list_subscriptions: egress-only channel {:?} carries a subscriber \
                              — host-wiring invariant violated",
                             entry.address
                         )
@@ -2206,24 +2795,22 @@ impl Messenger {
         db::load_pending_pushes_for_drain(&conn, subscriber)
     }
 
-    /// Assemble the full multi-port activation snapshot for `subscriber` under
-    /// **one** db-lock acquisition: pending scan + partition + per-port clamp +
-    /// per-port retained-context read.
+    /// Assemble the full multi-port activation snapshot for `subscriber`: one
+    /// [`PortSnapshot`] per input port, in `inputs` order, or `None` when no
+    /// port was owed anything (no activation).
     ///
-    /// Returns one [`PortSnapshot`] per input port, in `inputs` order, or
-    /// `None` when no triggering input has pending rows (no activation).
+    /// **Per-port snapshot consistency:** a store hands over its window and the
+    /// subscriber's drop total together, under whatever lock it keeps them
+    /// under, so the count can never name a message that is also in the window
+    /// (correctness-1). Ports are read one after another, so two ports' windows
+    /// need not be from the same instant — messages do not move between
+    /// channels, so nothing is double-counted or lost by that.
     ///
-    /// **T₀ hermeticity:** `Messenger` uses one process-wide `Arc<Mutex<Connection>>`;
-    /// holding the guard for the whole assembly means no statement from any other
-    /// task can interleave — equivalent to a single read transaction. **If
-    /// messaging ever grows a second connection (e.g. a read pool), this method
-    /// must gain an explicit read transaction.**
-    ///
-    /// Config-residue reconciliation: rows for a channel that matches no input
-    /// (subscription removed) and rows on an input whose `push_depth` is now
-    /// `Bounded(0)` (port demoted to sampled after a config change) are retired
-    /// (marked delivered) with a `warn!`. Neither case is a bug; leaving them
-    /// pending causes a scan loop, so they are retired here.
+    /// Config-residue reconciliation runs first: pending claims for a channel
+    /// that matches no input (subscription removed) or for an input whose
+    /// `push_depth` is now `0` (port demoted to sampled by a config change) are
+    /// retired with a `warn!`. Neither case is a bug; leaving them pending
+    /// causes a scan loop, so they are retired here.
     ///
     /// Panics on any DB error (fail-fast; the DB is host infrastructure).
     pub async fn load_activation_snapshot(
@@ -2234,153 +2821,155 @@ impl Messenger {
         self.pending_bus_pushes_scan_count
             .fetch_add(1, Ordering::Relaxed);
 
-        let conn = self.db.lock().await;
-
-        // ── Pending scan (absorbed from load_pending_bus_pushes) ───────────
-        let all_pending = db::load_pending_pushes_for_drain(&conn, subscriber);
-        let mut by_channel: std::collections::HashMap<String, Vec<(i64, MessageEnvelope)>> =
-            std::collections::HashMap::new();
-        for (push_id, iob) in all_pending {
-            // An Ingress row on a wasm: subscriber is a host-wiring invariant
-            // violation — panic fail-fast with all context in the payload.
-            let env = match iob {
-                IngressOrBus::Bus(e) => e,
-                IngressOrBus::Ingress(ev) => panic!(
-                    "load_activation_snapshot: Ingress row on wasm: subscriber — \
-                     host-wiring invariant violated; subscriber={} push_id={push_id} \
-                     source={:?}",
-                    subscriber.as_str(),
-                    ev.source,
-                ),
-            };
-            by_channel
-                .entry(env.channel.clone())
-                .or_default()
-                .push((push_id, env));
-        }
-
-        // ── Config-residue reconciliation ───────────────────────────────────
-        // Build a set of channel addresses that are current inputs so we can
-        // detect rows for removed subscriptions (case a).
-        let known_channels: std::collections::HashSet<&str> = inputs
+        // Resolving by address keeps the directory the single authority on
+        // which channel a port names.
+        let stores: Vec<Arc<dyn store::RetentionStore>> = inputs
             .iter()
-            .map(|inp| inp.sub.channel_address.as_str())
+            .map(|input| self.store_for_address(&input.sub.channel_address))
             .collect();
 
-        // Single `now` timestamp for all residue retirements in this snapshot, using
-        // the project-standard `+00:00` form so lex-sort on delivered_at is consistent.
-        let now = format_ts_for_db(Utc::now());
+        self.retire_activation_residue(subscriber, inputs, &stores)
+            .await;
 
-        // Retire rows for channels not in any current input (subscription removed).
-        // This collects keys to avoid borrow issues while iterating.
-        let residue_keys: Vec<String> = by_channel
-            .keys()
-            .filter(|ch| !known_channels.contains(ch.as_str()))
-            .cloned()
-            .collect();
-        for ch in residue_keys {
-            let rows = by_channel.remove(&ch).expect("key came from this map");
-            let count = rows.len();
-            let ids: Vec<i64> = rows.into_iter().map(|(id, _)| id).collect();
-            tracing::warn!(
-                subscriber = %subscriber.as_str(),
-                channel = %ch,
-                count,
-                "load_activation_snapshot: retiring residue rows for removed subscription"
+        // Take every port's NEW window first, before any context read: the
+        // windows decide whether this is an activation at all, and a no-op
+        // drain step (the common case after a burst) must not pay for
+        // up-to-K×1000-row context reads (efficiency-1). Taking from a port
+        // that owes nothing is free and changes no state, so the None path
+        // below consumes nothing.
+        let mut windows: Vec<store::TakenWindow> = Vec::with_capacity(inputs.len());
+        for (input, store) in inputs.iter().zip(&stores) {
+            windows.push(
+                store
+                    .take_new(
+                        subscriber,
+                        input.sub.push_depth.clamped_to(WASM_WINDOW_MAX_NEW),
+                    )
+                    .await,
             );
-            retire_push_rows(&conn, &now, &ids);
         }
-
-        // ── First pass: partition raw rows per port; retire case-b residue ───
-        // Determine triggering-ness and clamp raw rows before the context
-        // queries. This avoids executing up-to-K×1000-row context reads on the
-        // None path (no-op drain steps after a burst), which would hold the
-        // global db mutex for no useful work (efficiency-1).
-        struct PerPortRaw {
-            raw_rows: Vec<(i64, MessageEnvelope)>,
-        }
-        let mut any_triggering = false;
-        let mut per_port_raw: Vec<PerPortRaw> = Vec::with_capacity(inputs.len());
-
-        for input in inputs {
-            let sub = &input.sub;
-            let channel_rows = by_channel.remove(&sub.channel_address);
-
-            // Case b: config residue — push_depth was lowered to Bounded(0) but
-            // pending rows from before the config change remain. Retire them.
-            if let Some(rows) = &channel_rows
-                && let Depth::Bounded(0) = sub.push_depth
-            {
-                let count = rows.len();
-                let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
-                tracing::warn!(
-                    subscriber = %subscriber.as_str(),
-                    channel = %sub.channel_address,
-                    count,
-                    "load_activation_snapshot: retiring residue rows for \
-                     push_depth=0 (sampled) port"
-                );
-                retire_push_rows(&conn, &now, &ids);
-                // Port produces a pure-context window; rows were retired, not triggering.
-                per_port_raw.push(PerPortRaw { raw_rows: vec![] });
-                continue;
-            }
-
-            let raw_rows = channel_rows.unwrap_or_default();
-            if !raw_rows.is_empty() {
-                any_triggering = true;
-            }
-            per_port_raw.push(PerPortRaw { raw_rows });
-        }
-
-        // Early-return before any context queries when nothing is triggering.
-        // Residue retirement above still ran so stale rows don't accumulate.
-        if !any_triggering {
+        if windows.iter().all(|w| w.messages.is_empty()) {
             return None;
         }
 
-        // ── Second pass: context queries + drop counter reads (Some path only) ─
-        // Drop counters are read here, while the db lock is still held, to keep
-        // them in the same T₀ snapshot as the pending rows (correctness-1: a
-        // publish that lands between snapshot-release and a post-lock counter read
-        // could evict a row from this snapshot while reporting its drop as
-        // "dropped" in this activation).
-        let drop_counters_guard = self
-            .drop_counters
-            .lock()
-            .expect("load_activation_snapshot: drop_counters poisoned");
+        let mut snapshots: Vec<PortSnapshot> = Vec::with_capacity(inputs.len());
+        // Overflow noise is enacted after the per-port loop so the enactment
+        // sink is never entered mid-snapshot.
+        let mut overflows: Vec<(Arc<dyn store::RetentionStore>, config::NoiseLevel, u64)> =
+            Vec::new();
+        for ((input, window), store) in inputs.iter().zip(windows).zip(&stores) {
+            let sub = &input.sub;
+            if window.dropped > 0 {
+                overflows.push((store.clone(), sub.noise, window.dropped));
+            }
+            let new_rows: Vec<(Option<store::TargetRecord>, MessageEnvelope)> = window
+                .messages
+                .into_iter()
+                .map(|taken| (taken.record, (*taken.envelope).clone()))
+                .collect();
+            let new_ids: std::collections::HashSet<Uuid> =
+                new_rows.iter().map(|(_, e)| e.message_id).collect();
+            let context = if let Depth::Bounded(0) = sub.retain_depth {
+                vec![]
+            } else {
+                let limit = Depth::Bounded(sub.retain_depth.clamped_to(WASM_WINDOW_MAX_RETAIN));
+                let retained = store
+                    .retained_tail(limit)
+                    .await
+                    .into_iter()
+                    .map(|env| (*env).clone())
+                    .collect();
+                context_from_retained(retained, &new_ids)
+            };
+            snapshots.push(PortSnapshot {
+                port: input.port.clone(),
+                channel_address: sub.channel_address.clone(),
+                capabilities: store.capabilities(),
+                new_rows,
+                context,
+                drop_counter_snapshot: window.dropped_total,
+                clamped_leftover: window.clamped_leftover,
+            });
+        }
 
-        let snapshots: Vec<PortSnapshot> = inputs
-            .iter()
-            .zip(per_port_raw)
-            .map(|(input, pr)| {
-                let sub = &input.sub;
-                let clamped = clamp_and_fetch_context(
-                    &conn,
-                    sub.channel_uuid,
-                    pr.raw_rows,
-                    sub.push_depth,
-                    sub.retain_depth,
-                );
-                let key = (sub.channel_address.clone(), subscriber.as_str().to_string());
-                let drop_counter_snapshot = drop_counters_guard.get(&key).copied().unwrap_or(0);
-                PortSnapshot {
-                    port: input.port.clone(),
-                    channel_address: sub.channel_address.clone(),
-                    new_rows: clamped.new_rows,
-                    context: clamped.context,
-                    drop_counter_snapshot,
-                    clamped_leftover: clamped.clamped_leftover,
-                }
-            })
-            .collect();
-
-        drop(drop_counters_guard);
+        // What a take charges — the push-depth clamp, on either store — is
+        // enacted here, at the take that charged it. Drops charged at eviction
+        // time were already reported and enacted; the window carries
+        // `dropped = 0` for them.
+        for (store, noise, dropped) in overflows {
+            self.enact_overflow_noise(store.as_ref(), store.address(), subscriber, noise, dropped);
+        }
 
         Some(snapshots)
     }
 
+    /// Retire the pending claims no port of this activation will ever read:
+    /// those on channels the consumer no longer subscribes to, and those on a
+    /// port a config change demoted to sampled (`push_depth = 0`, which never
+    /// takes). Both are ordinary config residue; left pending they would keep
+    /// waking the scan forever.
+    ///
+    /// A claim with no channel at all is an ingress row on a `wasm:`
+    /// subscriber, which no config change can produce — a host-wiring invariant
+    /// violation, and a panic.
+    async fn retire_activation_residue(
+        &self,
+        subscriber: &ParticipantId,
+        inputs: &[WasmInputPort],
+        stores: &[Arc<dyn store::RetentionStore>],
+    ) {
+        // Channel identity comes from the resolved store, the same one the take
+        // reads: a claim is residue exactly when no port's store will read it.
+        let bound: std::collections::HashSet<Uuid> =
+            stores.iter().map(|store| store.channel_uuid()).collect();
+        let readable: Vec<Uuid> = inputs
+            .iter()
+            .zip(stores)
+            .filter(|(input, _)| input.sub.push_depth.is_push_enabled())
+            .map(|(_, store)| store.channel_uuid())
+            .collect();
+
+        let conn = self.db.lock().await;
+        let residue = db::pending_pushes_outside_channels(&conn, subscriber, &readable);
+        if residue.is_empty() {
+            return;
+        }
+        let mut by_channel: std::collections::HashMap<Option<Uuid>, Vec<i64>> =
+            std::collections::HashMap::new();
+        for (push_id, channel_uuid) in residue {
+            by_channel.entry(channel_uuid).or_default().push(push_id);
+        }
+        // One `now` for every retirement in this pass, in the project-standard
+        // `+00:00` form so lex-sort on delivered_at stays consistent.
+        let now = format_ts_for_db(Utc::now());
+        for (channel_uuid, ids) in by_channel {
+            let Some(channel_uuid) = channel_uuid else {
+                panic!(
+                    "load_activation_snapshot: ingress row on wasm: subscriber — host-wiring \
+                     invariant violated; subscriber={} push_ids={ids:?}",
+                    subscriber.as_str(),
+                );
+            };
+            let reason = if bound.contains(&channel_uuid) {
+                "push_depth=0 (sampled) port"
+            } else {
+                "removed subscription"
+            };
+            tracing::warn!(
+                subscriber = %subscriber.as_str(),
+                channel = %channel_uuid,
+                count = ids.len(),
+                reason,
+                "load_activation_snapshot: retiring residue rows"
+            );
+            retire_push_rows(&conn, &now, &ids);
+        }
+    }
+
     /// Mark a set of pending-push rows delivered. Idempotent.
+    ///
+    /// Channel-blind: identifies rows by push id alone. Per-channel settling
+    /// goes through [`Messenger::settle_delivered`] instead.
     pub async fn mark_pushes_delivered(&self, push_ids: &[i64]) {
         if push_ids.is_empty() {
             return;
@@ -2390,26 +2979,21 @@ impl Messenger {
     }
 
     /// Record a failed multi-port WASM activation and retire all push rows, in
-    /// **one transaction** across all failing ports (design §2.5).
+    /// **one transaction** across all failing ports.
     ///
     /// Writes one `messaging_wasm_consume_failures` row per entry in `failures`
     /// (one per triggering port that contributed new rows), then marks all
     /// accumulated push_ids delivered. The `(subscriber, last_message_id)`
     /// idempotency key ensures a re-run after a crash is a no-op on duplicate rows.
     ///
-    /// Each `failure.push_ids` must not be empty. Panics on any DB error.
+    /// `failure.push_ids` is empty for a port on a channel that mints no claim
+    /// rows — a cursor-tracked store's read was its own ack, so the quarantine
+    /// row is written and there is nothing to retire. Panics on any DB error.
     pub async fn record_wasm_activation_failure(&self, failures: &[WasmBatchFailure<'_>]) {
         assert!(
             !failures.is_empty(),
             "record_wasm_activation_failure: failures must not be empty"
         );
-        for f in failures {
-            assert!(
-                !f.push_ids.is_empty(),
-                "record_wasm_activation_failure: push_ids must not be empty for channel {}",
-                f.channel
-            );
-        }
         let now = format_ts_for_db(Utc::now());
         let conn = self.db.lock().await;
         let tx = conn
@@ -2453,30 +3037,25 @@ impl Messenger {
     }
 }
 
-#[cfg(test)]
-impl Messenger {
-    /// Test-only: returns `true` if no push windows have been touched since boot.
-    /// Used to assert that unbounded subscribers never create window entries.
-    pub(crate) fn push_windows_is_empty(&self) -> bool {
-        self.push_windows
-            .lock()
-            .expect("push_windows poisoned")
-            .is_empty()
-    }
-}
-
 #[cfg(any(test, feature = "testutils"))]
 impl Messenger {
-    /// Test-only: directly increment the in-memory drop counter for `(channel, subscriber)`
-    /// by `amount`. Used to simulate push-overflow without going through the full publish
-    /// path. Gated on `#[cfg(any(test, feature = "testutils"))]` rather than `#[cfg(test)]`
-    /// only so that `testutils::inject_drop` (used by downstream test crates that enable the
-    /// testutils feature) can call it; in both cases the mutation surface stays test-only
-    /// and `drop_counters` is not widened beyond `pub(crate)` for non-test writes (quality-3).
+    /// Test-only: charge `amount` push-overflow drops to `subscriber` on
+    /// `channel`'s store, simulating overflow without driving the full publish
+    /// path. The charged total is what an activation window reports as its gap
+    /// signal. Gated on `#[cfg(any(test, feature = "testutils"))]` rather than
+    /// `#[cfg(test)]` only so that `testutils::inject_drop` (used by downstream
+    /// test crates that enable the testutils feature) can call it; in both
+    /// cases the mutation surface stays test-only.
     pub fn inject_drop(&self, channel: &str, subscriber: &ParticipantId, amount: u64) {
-        let key = (channel.to_string(), subscriber.as_str().to_string());
-        let mut counters = self.drop_counters.lock().expect("drop_counters poisoned");
-        *counters.entry(key).or_insert(0) += amount;
+        let entry = self.directory.resolve(channel).unwrap_or_else(|| {
+            panic!("messaging: inject_drop for channel {channel:?} not in the directory")
+        });
+        assert!(
+            entry.capabilities().durable,
+            "inject_drop is durable-only: a ring subscriber's drops are counted on its cursor, so \
+             append past its push window to produce them ({channel:?})"
+        );
+        self.db_store_for(&entry).inject_dropped(subscriber, amount);
     }
 }
 
@@ -2980,6 +3559,57 @@ mod tests {
         );
     }
 
+    /// The non-durable arms are an ACL-filtered disclosure decision like every
+    /// other transport's: a channel name carries app and topic structure, so the
+    /// listing shows an `ephemeral:` channel only where the app's own
+    /// `ephemeral_subscribe` matcher covers it. `local:` is the always-deny half
+    /// — `LocalSubscribe` is not authorable on an LLM app, so no policy an LLM
+    /// app can hold reaches a `local:` channel, matcher or no matcher.
+    #[test]
+    fn list_accessible_channels_filters_nondurable_by_acl() {
+        let covered = crate::messaging::testutils::ephemeral_channel_entry("covered", 4);
+        let uncovered = crate::messaging::testutils::ephemeral_channel_entry("uncovered", 4);
+        let confined = crate::messaging::testutils::local_channel_entry("anything", 4);
+
+        let mut policy = crate::access::AppPolicy::default();
+        policy
+            .grants
+            .insert(crate::access::AppCapability::EphemeralSubscribe);
+        policy
+            .grants
+            .insert(crate::access::AppCapability::DynamicSubscribe);
+        policy
+            .acls
+            .ephemeral_subscribe
+            .push(crate::access::acl::ChannelMatcher::Exact(
+                "covered".to_string(),
+            ));
+        // A matcher covering every `local:` name, deliberately without the
+        // transport grant no LLM app can be given: the deny must come from the
+        // grant, not from an absent matcher.
+        policy
+            .acls
+            .local_subscribe
+            .push(crate::access::acl::ChannelMatcher::Prefix(String::new()));
+
+        let messenger =
+            accessible_messenger(vec![covered, uncovered, confined], &[("app-a", policy)]);
+        let listing = messenger.list_accessible_channels("app-a");
+        let addrs: Vec<&str> = listing.iter().map(|c| c.address.as_str()).collect();
+        assert_eq!(
+            addrs,
+            vec!["ephemeral:covered"],
+            "only the ACL-covered ephemeral channel is disclosed"
+        );
+        let row = &listing[0];
+        assert_eq!(row.protocol, ChannelScheme::Ephemeral);
+        assert_eq!(row.access, AccessKind::Existing);
+        assert!(
+            row.details.is_none(),
+            "a non-durable channel carries no protocol detail shape"
+        );
+    }
+
     /// A `webhook:` channel another app created is in app B's accessible list ONLY
     /// when B's `webhook` ACL covers it; absent otherwise — the same ACL-filter
     /// contract as the brenn: arm, but exercising the distinct `ChannelScheme::Webhook`
@@ -3293,12 +3923,10 @@ mod tests {
         );
     }
 
-    /// `Messenger::new` installs an empty default ephemeral bus (zero channels):
-    /// any ephemeral publish reports `UnknownChannel` rather than silently
-    /// succeeding or panicking, until boot replaces the bus via
-    /// `with_ephemeral_bus`. Pins the pre-wiring contract.
+    /// `Messenger::new` installs an empty store registry, so no channel resolves
+    /// to a store until boot replaces it. Pins the pre-wiring contract.
     #[test]
-    fn new_installs_empty_default_ephemeral_bus() {
+    fn new_installs_an_empty_default_registry() {
         use std::sync::Arc;
 
         let messenger = Messenger::new(
@@ -3310,27 +3938,21 @@ mod tests {
             crate::messaging::config::MessagingGlobalConfig::default(),
         );
 
-        let sender = ParticipantId::for_app("someapp", "test-source");
-        let policy = crate::access::AppPolicy::default();
-        let result = messenger.ephemeral_bus().publish(
-            &sender,
-            &policy,
-            "ephemeral:anything",
-            "hi",
-            Urgency::Normal,
-        );
         assert!(
-            matches!(result, EphemeralPublishResult::UnknownChannel(_)),
-            "default empty bus must reject every channel as UnknownChannel, got {result:?}"
+            messenger
+                .ring_stores()
+                .get_by_address("ephemeral:anything")
+                .is_none()
         );
+        assert_eq!(messenger.ring_stores().len(), 0);
     }
 
-    /// `with_ephemeral_bus` must run before the `Messenger` `Arc` is shared:
+    /// `with_ring_stores` must run before the `Messenger` `Arc` is shared:
     /// once a second strong reference exists, `Arc::get_mut` fails and the
     /// builder panics (fail-fast) rather than silently no-op'ing the install.
     #[test]
     #[should_panic(expected = "boot-ordering bug")]
-    fn with_ephemeral_bus_after_arc_shared_panics() {
+    fn with_ring_stores_after_arc_shared_panics() {
         use std::sync::Arc;
 
         let messenger = Messenger::new(
@@ -3343,8 +3965,292 @@ mod tests {
         );
         // Share the Arc so Arc::get_mut can no longer succeed.
         let _shared = Arc::clone(&messenger);
-        let bus = EphemeralBus::new(Vec::new(), Arc::from("test-source"), 1024);
-        let _ = messenger.with_ephemeral_bus(bus);
+        let _ = messenger.with_ring_stores(Arc::new(store::RingStores::empty()));
+    }
+
+    /// One directory, two kinds of store: a channel's capabilities pick the
+    /// implementation, and `list_durable` is the view for callers whose subject
+    /// is the database.
+    #[tokio::test]
+    async fn store_for_picks_the_implementation_from_the_capabilities() {
+        use std::sync::Arc;
+
+        let durable = crate::messaging::testutils::test_channel_entry("heartbeat", vec![]);
+        let ephemeral = crate::messaging::testutils::ephemeral_channel_entry("chatter", 4);
+        let entries = vec![durable.clone(), ephemeral.clone()];
+        let ring_stores = Arc::new(store::RingStores::build(std::slice::from_ref(&ephemeral)));
+
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(entries)),
+            Arc::from("test-source"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            crate::messaging::config::MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(Arc::clone(&ring_stores));
+
+        let durable_store = messenger.store_for(&durable);
+        assert!(durable_store.capabilities().durable);
+        assert_eq!(durable_store.channel_uuid(), durable.uuid);
+
+        let durable_store_again = messenger.store_for(&durable);
+        assert!(
+            Arc::ptr_eq(&durable_store, &durable_store_again),
+            "a durable channel's store is cached, not re-minted per call"
+        );
+
+        // Every entry point onto a durable channel's store lands on the one
+        // instance, so the publish path (`db_store_for`) and the deliver-after
+        // release path (`db_store_for_address`) share one push window rather
+        // than each enforcing the depth bound against its own deque.
+        let by_entry = messenger.db_store_for(&durable);
+        let by_address = messenger.db_store_for_address(&durable.address);
+        assert!(
+            Arc::ptr_eq(&by_entry, &by_address),
+            "resolving a store by address must reach the same instance as by entry"
+        );
+        assert!(
+            std::ptr::eq(
+                Arc::as_ptr(&durable_store) as *const store::DbStore,
+                Arc::as_ptr(&by_entry),
+            ),
+            "the trait-object handle is the same instance the concrete lookups return"
+        );
+
+        let ring_store = messenger.store_for(&ephemeral);
+        assert!(!ring_store.capabilities().durable);
+        assert!(ring_store.capabilities().transportable);
+        assert_eq!(ring_store.address(), "ephemeral:chatter");
+        assert!(
+            std::ptr::eq(
+                Arc::as_ptr(&ring_store) as *const store::RingStore,
+                Arc::as_ptr(ring_stores.get(&ephemeral.uuid).expect("registered")),
+            ),
+            "the store handed out is the registry's, not a fresh ring"
+        );
+
+        let durable_addresses: Vec<String> = messenger
+            .directory()
+            .list_durable()
+            .iter()
+            .map(|e| e.address.clone())
+            .collect();
+        assert_eq!(durable_addresses, vec![durable.address.clone()]);
+        assert_eq!(messenger.directory().list().len(), 2);
+    }
+
+    /// The deferred view a WASM output port draws from: it shows one sender its
+    /// own parked messages, release-ordered, and never a peer's — the structural
+    /// scoping that authorizes a component's view of its output port.
+    #[tokio::test]
+    async fn deferred_view_for_sender_is_sender_scoped_and_release_ordered() {
+        use std::sync::Arc;
+
+        use chrono::Duration;
+
+        use crate::messaging::store::NewMessage;
+
+        let ephemeral = crate::messaging::testutils::ephemeral_channel_entry("timers", 8);
+        let ring_stores = Arc::new(store::RingStores::build(std::slice::from_ref(&ephemeral)));
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![ephemeral.clone()])),
+            Arc::from("node"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            crate::messaging::config::MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(ring_stores);
+
+        let alice = ParticipantId::for_wasm("proc-alice");
+        let bob = ParticipantId::for_wasm("proc-bob");
+        let now = Utc::now();
+        let store = messenger.store_for(&ephemeral);
+
+        let park = |sender: &str, body: &str, offset: i64| {
+            let store = Arc::clone(&store);
+            let msg = NewMessage {
+                source: "node".to_string(),
+                sender: sender.to_string(),
+                body: body.to_string(),
+                urgency: Urgency::Normal,
+                envelope_type: ChannelScheme::Ephemeral,
+                reply_to_uuid: None,
+                delivery_deadline: None,
+                publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
+            };
+            async move {
+                store
+                    .park(msg, now + Duration::seconds(offset))
+                    .await
+                    .expect("under the cap");
+            }
+        };
+
+        // Alice parks two (out of release order); Bob parks one between them.
+        park(alice.as_str(), "alice-late", 60).await;
+        park(alice.as_str(), "alice-soon", 30).await;
+        park(bob.as_str(), "bob-mid", 45).await;
+
+        let alice_view = messenger
+            .deferred_view_for_sender(&ephemeral.address, alice.as_str(), now)
+            .await;
+        let bodies: Vec<&str> = alice_view
+            .iter()
+            .map(|d| d.envelope.body.as_str())
+            .collect();
+        assert_eq!(
+            bodies,
+            vec!["alice-soon", "alice-late"],
+            "alice sees only her own parked messages, soonest release first"
+        );
+
+        let bob_view = messenger
+            .deferred_view_for_sender(&ephemeral.address, bob.as_str(), now)
+            .await;
+        assert_eq!(bob_view.len(), 1);
+        assert_eq!(bob_view[0].envelope.body, "bob-mid");
+    }
+
+    /// The substrate half of a WASM output port's `defer-cancel` / `defer-edit`:
+    /// cancel by uuid erases one sender's parked message (and not a peer's on the
+    /// same channel), edit reschedules it, and a uuid no longer parked reports the
+    /// benign `NotDeferred` race rather than failing.
+    #[tokio::test]
+    async fn cancel_and_edit_deferred_for_sender_target_by_uuid() {
+        use std::sync::Arc;
+
+        use chrono::Duration;
+
+        use crate::messaging::store::{DeferralOutcome, NewMessage};
+
+        let ephemeral = crate::messaging::testutils::ephemeral_channel_entry("timers", 8);
+        let ring_stores = Arc::new(store::RingStores::build(std::slice::from_ref(&ephemeral)));
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![ephemeral.clone()])),
+            Arc::from("node"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            crate::messaging::config::MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(ring_stores);
+
+        let alice = ParticipantId::for_wasm("proc-alice");
+        let bob = ParticipantId::for_wasm("proc-bob");
+        // Ring release times round-trip through epoch-ms, so anchor `now` to
+        // millisecond precision to compare an edited release exactly.
+        let now = DateTime::from_timestamp_millis(Utc::now().timestamp_millis()).unwrap();
+        let store = messenger.store_for(&ephemeral);
+
+        let park = |sender: &str, body: &str, offset: i64| {
+            let store = Arc::clone(&store);
+            let msg = NewMessage {
+                source: "node".to_string(),
+                sender: sender.to_string(),
+                body: body.to_string(),
+                urgency: Urgency::Normal,
+                envelope_type: ChannelScheme::Ephemeral,
+                reply_to_uuid: None,
+                delivery_deadline: None,
+                publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
+            };
+            async move {
+                store
+                    .park(msg, now + Duration::seconds(offset))
+                    .await
+                    .expect("under the cap")
+                    .message_uuid
+            }
+        };
+
+        let alice_uuid = park(alice.as_str(), "alice-soon", 30).await;
+        let bob_uuid = park(bob.as_str(), "bob-mid", 45).await;
+
+        let outcome = messenger
+            .edit_deferred_for_sender(
+                &ephemeral.address,
+                alice.as_str(),
+                alice_uuid,
+                Some("alice-rescheduled".to_string()),
+                Some(now + Duration::seconds(90)),
+                now,
+            )
+            .await;
+        assert_eq!(outcome, DeferralOutcome::Applied);
+        let alice_view = messenger
+            .deferred_view_for_sender(&ephemeral.address, alice.as_str(), now)
+            .await;
+        assert_eq!(alice_view.len(), 1);
+        assert_eq!(alice_view[0].envelope.body, "alice-rescheduled");
+        assert_eq!(alice_view[0].release_at, now + Duration::seconds(90));
+
+        let outcome = messenger
+            .cancel_deferred_for_sender(&ephemeral.address, bob.as_str(), bob_uuid, now)
+            .await;
+        assert_eq!(outcome, DeferralOutcome::Applied);
+        assert!(
+            messenger
+                .deferred_view_for_sender(&ephemeral.address, bob.as_str(), now)
+                .await
+                .is_empty()
+        );
+
+        // Cancelling bob's message again — it is no longer parked — is the benign
+        // race, reported as NotDeferred rather than a failure.
+        let outcome = messenger
+            .cancel_deferred_for_sender(&ephemeral.address, bob.as_str(), bob_uuid, now)
+            .await;
+        assert_eq!(outcome, DeferralOutcome::NotDeferred);
+    }
+
+    /// A non-durable channel in the directory with no store is the two halves of
+    /// the registry disagreeing — a wiring bug, not a state to serve traffic on.
+    #[tokio::test]
+    #[should_panic(expected = "has no retention store")]
+    async fn store_for_panics_on_an_unregistered_nondurable_channel() {
+        use std::sync::Arc;
+
+        let ephemeral = crate::messaging::testutils::ephemeral_channel_entry("orphan", 4);
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![ephemeral.clone()])),
+            Arc::from("test-source"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            crate::messaging::config::MessagingGlobalConfig::default(),
+        );
+        let _ = messenger.store_for(&ephemeral);
+    }
+
+    /// The operator listings read persisted state, so a registered non-durable
+    /// channel is outside their subject rather than a reason to panic.
+    #[tokio::test]
+    async fn listings_skip_the_nondurable_half_of_the_directory() {
+        use std::sync::Arc;
+
+        let durable = crate::messaging::testutils::test_channel_entry("heartbeat", vec![]);
+        let ephemeral = crate::messaging::testutils::ephemeral_channel_entry("chatter", 4);
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![
+                durable.clone(),
+                ephemeral,
+            ])),
+            Arc::from("test-source"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            crate::messaging::config::MessagingGlobalConfig::default(),
+        );
+
+        let listed: Vec<String> = messenger
+            .list_channels()
+            .into_iter()
+            .map(|c| c.address)
+            .collect();
+        assert_eq!(listed, vec![durable.address]);
+        assert!(messenger.list_subscriptions("graf").await.is_empty());
     }
 
     /// `MqttDetails` inside `ChannelDetails` serializes untagged with the
@@ -3829,8 +4735,112 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // load_activation_snapshot unit tests (§5 test 15, first bullet)
+    // load_activation_snapshot unit tests
     // -----------------------------------------------------------------------
+
+    /// A parked message holds no retention position, so it is not part of the
+    /// channel's ambience: it must be absent from a port's context window until
+    /// a release pass moves it into retention, and present once it has — at the
+    /// position retention gave it, which for a late release is **last**, behind
+    /// messages published while it was parked and stamped after it.
+    #[tokio::test]
+    async fn load_activation_snapshot_excludes_parked_messages_from_context() {
+        let (messenger, channel, wasm_sub) =
+            super::testutils::build_wasm_messenger_unbounded("snap-parked", "snap-parked-ch").await;
+
+        let park_ts = db::utc_to_ns(Utc::now());
+        let release_at = Utc::now() + chrono::Duration::seconds(3600);
+        messenger
+            .store_for(&channel)
+            .park(
+                store::NewMessage {
+                    source: "node".to_string(),
+                    sender: "tester".to_string(),
+                    body: "parked".to_string(),
+                    urgency: Urgency::Normal,
+                    envelope_type: ChannelScheme::Brenn,
+                    reply_to_uuid: None,
+                    delivery_deadline: None,
+                    publish_ts_ns: park_ts,
+                },
+                release_at,
+            )
+            .await
+            .expect("an unbounded channel parks without hitting a cap");
+
+        // Published while the parked one waits, and stamped after it: the two
+        // orders — publish time and retention position — disagree about this
+        // pair once the release lands, and context follows retention position.
+        let (pid_later, _) = super::testutils::insert_wasm_push_at(
+            &messenger,
+            &channel,
+            &wasm_sub,
+            "later",
+            ChannelScheme::Brenn,
+            park_ts + 1_000_000,
+        )
+        .await;
+        messenger.mark_pushes_delivered(&[pid_later]).await;
+
+        // One pending row so the port triggers and a snapshot is produced.
+        super::testutils::insert_wasm_push(
+            &messenger,
+            &channel,
+            &wasm_sub,
+            "new-0",
+            ChannelScheme::Brenn,
+        )
+        .await;
+
+        let inputs = vec![WasmInputPort {
+            port: "in".to_string(),
+            sub: config::ResolvedSubscription {
+                channel_uuid: channel.uuid,
+                channel_address: channel.address.clone(),
+                push_depth: config::Depth::Unbounded,
+                retain_depth: config::Depth::Unbounded,
+                noise: config::NoiseLevel::Silent,
+                wake_min: WakeMin::Normal,
+            },
+            amplification_mt: 1000,
+        }];
+
+        let parked_snapshot = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs)
+            .await
+            .expect("the pending row triggers");
+        let bodies: Vec<&str> = parked_snapshot[0]
+            .context
+            .iter()
+            .map(|e| e.body.as_str())
+            .collect();
+        assert_eq!(
+            bodies,
+            ["later"],
+            "a parked message must not be visible as context"
+        );
+
+        messenger
+            .store_for(&channel)
+            .release_due(release_at + chrono::Duration::seconds(1))
+            .await;
+
+        let released_snapshot = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs)
+            .await
+            .expect("the pending row still triggers");
+        let bodies: Vec<&str> = released_snapshot[0]
+            .context
+            .iter()
+            .map(|e| e.body.as_str())
+            .collect();
+        assert_eq!(
+            bodies,
+            ["later", "parked"],
+            "a released message joins the ambience at the position retention gave \
+             it — newest-last by retained order, not by its older publish stamp"
+        );
+    }
 
     /// `load_activation_snapshot` delivers 2 pending new rows and 2 already-delivered
     /// rows as context, with the new-row ids stripped from context and context in ASC
@@ -4029,8 +5039,12 @@ mod tests {
         );
 
         // Ack the delivered row, reload: leftover shrinks by exactly one.
-        let delivered_id = snap.new_rows[0].0;
-        messenger.mark_pushes_delivered(&[delivered_id]).await;
+        let delivered = snap.new_rows[0]
+            .0
+            .expect("durable port row carries a claim record");
+        messenger
+            .settle_delivered(&channel.address, &wasm_sub, &[delivered])
+            .await;
 
         let snapshots2 = messenger
             .load_activation_snapshot(&wasm_sub, &inputs)
@@ -4042,8 +5056,1058 @@ mod tests {
         );
     }
 
+    /// A consumer whose every port is sampled reads nothing, so claims left on
+    /// those ports by an earlier config are residue: retired, no activation.
+    /// The residue query has an empty readable set here, which is the shape
+    /// that would break a naive `NOT IN` list.
+    #[tokio::test]
+    async fn load_activation_snapshot_sampled_only_ports_retire_residue() {
+        let slug = "sampled-only";
+        let (messenger, channel, wasm_sub) = super::testutils::build_wasm_messenger(
+            slug,
+            "sampled-only-ch",
+            config::Depth::Bounded(0),
+            config::Depth::Bounded(0),
+        )
+        .await;
+
+        super::testutils::insert_wasm_push(
+            &messenger,
+            &channel,
+            &wasm_sub,
+            "stale",
+            ChannelScheme::Brenn,
+        )
+        .await;
+
+        let inputs = vec![WasmInputPort {
+            port: "in".to_string(),
+            sub: config::ResolvedSubscription {
+                channel_uuid: channel.uuid,
+                channel_address: channel.address.clone(),
+                push_depth: config::Depth::Bounded(0),
+                retain_depth: config::Depth::Bounded(0),
+                noise: config::NoiseLevel::Silent,
+                wake_min: WakeMin::Normal,
+            },
+            amplification_mt: 1000,
+        }];
+
+        assert!(
+            messenger
+                .load_activation_snapshot(&wasm_sub, &inputs)
+                .await
+                .is_none(),
+            "a sampled port never activates"
+        );
+        assert!(
+            !messenger
+                .store_for(&channel)
+                .has_deliverable(&wasm_sub)
+                .await,
+            "the residue claim was retired, so nothing is owed"
+        );
+    }
+
     // -----------------------------------------------------------------------
-    // record_wasm_activation_failure unit tests (§5 test 15, third bullet)
+    // load_activation_snapshot — ring-backed input ports
+    // -----------------------------------------------------------------------
+
+    /// Build a `Messenger` whose single channel is ring-backed (`ephemeral:` or
+    /// `local:`), with a WASM subscriber id. The cursor is not attached here.
+    fn build_ring_wasm_messenger(
+        slug: &str,
+        channel: ChannelEntry,
+    ) -> (Arc<Messenger>, Arc<ChannelEntry>, ParticipantId) {
+        let ring_stores = Arc::new(store::RingStores::build(std::slice::from_ref(&channel)));
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![channel.clone()])),
+            Arc::from("test"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            config::MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(ring_stores);
+        (messenger, Arc::new(channel), ParticipantId::for_wasm(slug))
+    }
+
+    /// Captures the `SubscriberEntryKind`s a wake targeted, for the ring-wake test.
+    #[derive(Default)]
+    struct RecordingWakeRouter {
+        wakes: std::sync::Mutex<Vec<SubscriberEntryKind>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WakeRouter for RecordingWakeRouter {
+        async fn deliver(
+            &self,
+            _key: &SubscriberEntryKind,
+            _subscriber: &ParticipantId,
+            _envelope: &MessageEnvelope,
+            _push_id: i64,
+            _message_id: i64,
+            _retained_seq: Option<i64>,
+        ) -> Result<bool, String> {
+            unreachable!("ring-backed WASM delivery never routes inline through deliver")
+        }
+        async fn deliver_ingress(
+            &self,
+            _key: &SubscriberEntryKind,
+            _subscriber: &ParticipantId,
+            _event: &ingress::Event,
+        ) -> Result<bool, String> {
+            unreachable!("ring-backed WASM delivery never routes through deliver_ingress")
+        }
+        fn spawn_eager_wake(&self, key: &SubscriberEntryKind, _subscriber: &ParticipantId) {
+            self.wakes.lock().unwrap().push(key.clone());
+        }
+        fn delivery_shape(&self, key: &SubscriberEntryKind) -> DeliveryShape {
+            crate::messaging::default_delivery_shape(key)
+        }
+        fn alarm(&self, _channel: &str, _subscriber: &ParticipantId) {}
+    }
+
+    /// Build a `Messenger` over `channels` with a `RecordingWakeRouter`, wiring
+    /// each channel to the store its class calls for.
+    async fn wake_walk_messenger(
+        channels: &[ChannelEntry],
+    ) -> (Arc<Messenger>, Arc<RecordingWakeRouter>) {
+        let db = crate::db::init_db_memory();
+        let (durable, nondurable): (Vec<ChannelEntry>, Vec<ChannelEntry>) = channels
+            .iter()
+            .cloned()
+            .partition(|c| c.capabilities().durable);
+        if !durable.is_empty() {
+            let conn = db.lock().await;
+            db::upsert_channels(&conn, &durable);
+        }
+        let router = Arc::new(RecordingWakeRouter::default());
+        let messenger = Messenger::new(
+            db,
+            Arc::new(MessagingDirectory::with_entries(channels.to_vec())),
+            Arc::from("test"),
+            Arc::new(indexmap::IndexMap::new()),
+            router.clone() as Arc<dyn WakeRouter>,
+            config::MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(Arc::new(store::RingStores::build(&nondurable)));
+        (messenger, router)
+    }
+
+    /// The wake walk fires an eager wake for a WASM subscriber owed ring
+    /// messages, and only once it is owed — the wake source ring publishes and
+    /// released deferrals depend on (no durable push row exists for them).
+    #[tokio::test]
+    async fn wake_owed_subscribers_wakes_only_owed_ring_subscribers() {
+        let mut channel = crate::messaging::testutils::ephemeral_channel_entry("wake-ch", 8);
+        channel.subscribers = vec![crate::messaging::testutils::wasm_subscriber_entry("waker")];
+        let (messenger, router) = wake_walk_messenger(std::slice::from_ref(&channel)).await;
+        let wasm_sub = ParticipantId::for_wasm("waker");
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+
+        // Nothing owed yet → no wake.
+        messenger.wake_owed_subscribers().await;
+        assert!(router.wakes.lock().unwrap().is_empty());
+
+        // A publish leaves the subscriber owed → woken with its Wasm key.
+        messenger.ring_store_for(&channel).append(ring_envelope(
+            &channel.address,
+            ChannelScheme::Ephemeral,
+            "hi",
+        ));
+        messenger.wake_owed_subscribers().await;
+        assert_eq!(
+            *router.wakes.lock().unwrap(),
+            vec![SubscriberEntryKind::Wasm("waker".to_string())]
+        );
+    }
+
+    /// One walk covers every class in one pass: a WASM subscriber owed a durable
+    /// claim and one owed a ring message are both woken by the same loop, and
+    /// both stop being woken once their work is settled. The durable half also
+    /// pins that the walk asks the store, not the dispatch scan's predicate —
+    /// nothing here ever loads a dispatchable row.
+    #[tokio::test]
+    async fn wake_owed_subscribers_wakes_both_classes_in_one_walk() {
+        let durable = (*crate::messaging::testutils::wasm_channel_entry(
+            "durable-waker",
+            "durable-wake-ch",
+            Depth::Unbounded,
+            Depth::Unbounded,
+        ))
+        .clone();
+        let mut ring = crate::messaging::testutils::local_channel_entry("dual-ring-ch", 8);
+        ring.subscribers = vec![crate::messaging::testutils::wasm_subscriber_entry(
+            "ring-waker",
+        )];
+        let (messenger, router) = wake_walk_messenger(&[durable.clone(), ring.clone()]).await;
+        let durable_sub = ParticipantId::for_wasm("durable-waker");
+        let ring_sub = ParticipantId::for_wasm("ring-waker");
+        messenger.attach_ring_subscriber(&ring.uuid, &ring_sub, 4, store::Priming::Head);
+
+        // Nothing owed anywhere → no wake.
+        messenger.wake_owed_subscribers().await;
+        assert!(router.wakes.lock().unwrap().is_empty());
+
+        let (push_id, _) = crate::messaging::testutils::insert_wasm_push(
+            &messenger,
+            &durable,
+            &durable_sub,
+            "owed",
+            ChannelScheme::Brenn,
+        )
+        .await;
+        messenger.ring_store_for(&ring).append(ring_envelope(
+            &ring.address,
+            ChannelScheme::Local,
+            "owed",
+        ));
+
+        messenger.wake_owed_subscribers().await;
+        let mut woken = router.wakes.lock().unwrap().clone();
+        woken.sort_by_key(|k| format!("{k:?}"));
+        assert_eq!(
+            woken,
+            vec![
+                SubscriberEntryKind::Wasm("durable-waker".to_string()),
+                SubscriberEntryKind::Wasm("ring-waker".to_string()),
+            ],
+            "one pass wakes both classes"
+        );
+
+        {
+            let conn = messenger.db().lock().await;
+            db::mark_pending_pushes_delivered(&conn, &[push_id]);
+        }
+        messenger.ring_store_for(&ring).take(&ring_sub);
+        router.wakes.lock().unwrap().clear();
+        messenger.wake_owed_subscribers().await;
+        assert!(
+            router.wakes.lock().unwrap().is_empty(),
+            "settled work owes nothing, so nothing wakes"
+        );
+    }
+
+    /// Counts `warn` events from the messaging module while it is the calling
+    /// thread's default subscriber.
+    struct MessagingWarnLayer(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MessagingWarnLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            if *meta.level() == tracing::Level::WARN
+                && meta.module_path().is_some_and(|m| m.contains("messaging"))
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Install [`MessagingWarnLayer`] for the rest of the test and return its
+    /// counter plus the guard that restores the previous default on drop.
+    fn capture_messaging_warns() -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subscriber =
+            tracing_subscriber::registry().with(MessagingWarnLayer(Arc::clone(&count)));
+        let guard = tracing::subscriber::set_default(subscriber);
+        (count, guard)
+    }
+
+    /// A WASM subscriber owed claims under no registration is stranded —
+    /// nothing will ever take them — and the walk meets it again every pass, so
+    /// the report is once per `(channel, subscriber)`. An unbounded repeat
+    /// buries the one signal that names the dropped input binding behind it.
+    #[tokio::test]
+    async fn a_stranded_wasm_subscriber_is_reported_once_across_passes() {
+        let channel = (*crate::messaging::testutils::wasm_channel_entry(
+            "waker",
+            "stranded-ch",
+            Depth::Unbounded,
+            Depth::Unbounded,
+        ))
+        .clone();
+        let (messenger, _router) = wake_walk_messenger(std::slice::from_ref(&channel)).await;
+        // Owed to a subscriber this channel no longer names: what dropping a
+        // component's input binding leaves behind.
+        let ghost = ParticipantId::for_wasm("ghost");
+        crate::messaging::testutils::insert_wasm_push(
+            &messenger,
+            &channel,
+            &ghost,
+            "owed",
+            ChannelScheme::Brenn,
+        )
+        .await;
+
+        let (warns, _guard) = capture_messaging_warns();
+        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers().await;
+        assert_eq!(
+            warns.load(Ordering::SeqCst),
+            1,
+            "two passes over one stranded claim report it once"
+        );
+    }
+
+    /// A conversation owed claims reaches the same arm on every normal channel —
+    /// registrations are keyed by subscriber kind, and an `App(slug)`
+    /// registration never names the conversation delivering under it. Reporting
+    /// it would emit a warn per participant per pass for an expected condition.
+    #[tokio::test]
+    async fn an_owed_conversation_is_never_reported_as_stranded() {
+        let channel = (*crate::messaging::testutils::wasm_channel_entry(
+            "waker",
+            "conv-owed-ch",
+            Depth::Unbounded,
+            Depth::Unbounded,
+        ))
+        .clone();
+        let (messenger, _router) = wake_walk_messenger(std::slice::from_ref(&channel)).await;
+        crate::messaging::testutils::insert_wasm_push(
+            &messenger,
+            &channel,
+            &ParticipantId::for_conversation(7),
+            "owed",
+            ChannelScheme::Brenn,
+        )
+        .await;
+
+        let (warns, _guard) = capture_messaging_warns();
+        messenger.wake_owed_subscribers().await;
+        assert_eq!(
+            warns.load(Ordering::SeqCst),
+            0,
+            "a conversation under an App registration is expected, not stranded"
+        );
+    }
+
+    /// An inline-delivered subscriber is passed over by the walk — waking it
+    /// here would be a second wake source.
+    #[tokio::test]
+    async fn wake_owed_subscribers_passes_over_inline_subscribers() {
+        let mut channel = crate::messaging::testutils::test_channel_entry("inline-wake-ch", vec![]);
+        channel.subscribers = vec![SubscriberEntry {
+            kind: SubscriberEntryKind::Surface {
+                slug: "board".to_string(),
+                instance: Some("main".to_string()),
+            },
+            push_depth: Depth::Unbounded,
+            retain_depth: Depth::Unbounded,
+            noise: config::NoiseLevel::Silent,
+            wake_min: None,
+        }];
+        let (messenger, router) = wake_walk_messenger(std::slice::from_ref(&channel)).await;
+        let surface_sub = ParticipantId::for_surface_component("board", "main");
+
+        crate::messaging::testutils::insert_wasm_push(
+            &messenger,
+            &channel,
+            &surface_sub,
+            "owed",
+            ChannelScheme::Brenn,
+        )
+        .await;
+        messenger.wake_owed_subscribers().await;
+        assert!(
+            router.wakes.lock().unwrap().is_empty(),
+            "a surface session is delivered to inline, never woken by the walk"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_subscriber_drops_the_cursor_and_clears_in_memory_state() {
+        let (messenger, channel, wasm_sub) = build_ring_wasm_messenger(
+            "dropme",
+            crate::messaging::testutils::ephemeral_channel_entry("detach-ch", 8),
+        );
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+        messenger.ring_store_for(&channel).append(ring_envelope(
+            &channel.address,
+            ChannelScheme::Ephemeral,
+            "a",
+        ));
+        assert!(messenger.ring_store_for(&channel).is_attached(&wasm_sub));
+
+        // Plant the store's metered drop tally for this subscriber (ring
+        // channels have no push window to plant).
+        messenger
+            .store_for(&channel)
+            .record_metered_drops(&wasm_sub, 3);
+        assert_eq!(messenger.drop_counter(&channel.address, &wasm_sub), 3);
+
+        messenger
+            .detach_subscriber(&channel.address, &wasm_sub)
+            .await;
+
+        assert!(!messenger.ring_store_for(&channel).is_attached(&wasm_sub));
+        assert_eq!(messenger.drop_counter(&channel.address, &wasm_sub), 0);
+    }
+
+    fn ring_envelope(channel: &str, scheme: ChannelScheme, body: &str) -> MessageEnvelope {
+        MessageEnvelope {
+            message_id: Uuid::new_v4(),
+            source: "node".to_string(),
+            channel: channel.to_string(),
+            sender: "test-sender".to_string(),
+            publish_ts: Utc::now(),
+            body: body.to_string(),
+            reply_to: None,
+            delivery_deadline: None,
+            deliver_after: None,
+            urgency: Urgency::Normal,
+            envelope_type: scheme,
+        }
+    }
+
+    fn ring_input(channel: &ChannelEntry, push_depth: Depth, retain_depth: Depth) -> WasmInputPort {
+        WasmInputPort {
+            port: "in".to_string(),
+            sub: config::ResolvedSubscription {
+                channel_uuid: channel.uuid,
+                channel_address: channel.address.clone(),
+                push_depth,
+                retain_depth,
+                noise: config::NoiseLevel::Silent,
+                wake_min: WakeMin::Normal,
+            },
+            amplification_mt: 1000,
+        }
+    }
+
+    /// A ring-backed port draws its NEW rows from the subscriber's cursor. When
+    /// more than push_depth are owed the cursor delivers the newest and charges
+    /// the older as drops (the drop-oldest rule); the dropped-but-still-retained
+    /// message remains channel ambience in context. NEW rows carry no push id.
+    #[tokio::test]
+    async fn load_activation_snapshot_ring_port_takes_newest_and_keeps_dropped_as_context() {
+        let (messenger, channel, wasm_sub) = build_ring_wasm_messenger(
+            "ring-take",
+            crate::messaging::testutils::ephemeral_channel_entry("ring-take-ch", 8),
+        );
+        // Attach at head: only messages published after attach are owed.
+        assert_eq!(
+            messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 2, store::Priming::Head),
+            store::Attached::Created
+        );
+
+        let store = messenger.ring_store_for(&channel);
+        let mids: Vec<Uuid> = (0..3)
+            .map(|i| {
+                let env =
+                    ring_envelope(&channel.address, ChannelScheme::Ephemeral, &format!("m{i}"));
+                let mid = env.message_id;
+                store.append(env);
+                mid
+            })
+            .collect();
+
+        let inputs = vec![ring_input(&channel, Depth::Bounded(2), Depth::Bounded(8))];
+        let snapshots = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs)
+            .await
+            .expect("ring cursor has deliverable messages");
+        assert_eq!(snapshots.len(), 1);
+        let snap = &snapshots[0];
+
+        // push_depth 2, three owed → the newest two, oldest first; m0 is dropped.
+        let new_ids: Vec<Uuid> = snap.new_rows.iter().map(|(_, e)| e.message_id).collect();
+        assert_eq!(new_ids, vec![mids[1], mids[2]]);
+        assert!(
+            snap.new_rows.iter().all(|(id, _)| id.is_none()),
+            "ring rows carry no push id"
+        );
+        assert_eq!(
+            snap.drop_counter_snapshot, 1,
+            "m0 dropped by the push clamp"
+        );
+        // A ring take drains all currently-owed messages, so nothing is left.
+        assert_eq!(snap.clamped_leftover, 0);
+        // The dropped m0 is still retained → channel ambience in context.
+        let context_ids: Vec<Uuid> = snap.context.iter().map(|e| e.message_id).collect();
+        assert_eq!(context_ids, vec![mids[0]]);
+    }
+
+    /// Nothing owed → the ring port is non-triggering and the whole snapshot is
+    /// `None`, without consuming any ring state (a later publish still delivers).
+    #[tokio::test]
+    async fn load_activation_snapshot_ring_none_when_nothing_owed() {
+        let (messenger, channel, wasm_sub) = build_ring_wasm_messenger(
+            "ring-empty",
+            crate::messaging::testutils::local_channel_entry("ring-empty-ch", 8),
+        );
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+
+        let inputs = vec![ring_input(&channel, Depth::Bounded(4), Depth::Bounded(8))];
+        assert!(
+            messenger
+                .load_activation_snapshot(&wasm_sub, &inputs)
+                .await
+                .is_none(),
+            "an attached cursor with nothing owed does not trigger"
+        );
+
+        // A publish after the None call is still delivered — the earlier call
+        // consumed no ring state.
+        let env = ring_envelope(&channel.address, ChannelScheme::Local, "late");
+        let mid = env.message_id;
+        messenger.ring_store_for(&channel).append(env);
+        let snap = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs)
+            .await
+            .expect("the late publish is owed");
+        assert_eq!(
+            snap[0]
+                .new_rows
+                .iter()
+                .map(|(_, e)| e.message_id)
+                .collect::<Vec<_>>(),
+            vec![mid]
+        );
+    }
+
+    /// A cursor that fell behind a bounded ring accounts the evicted messages as
+    /// its own drops; the snapshot reports the cumulative count the caller deltas.
+    #[tokio::test]
+    async fn load_activation_snapshot_ring_reports_cursor_drops() {
+        let (messenger, channel, wasm_sub) = build_ring_wasm_messenger(
+            "ring-drop",
+            crate::messaging::testutils::ephemeral_channel_entry("ring-drop-ch", 2),
+        );
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 8, store::Priming::Head);
+
+        // Four publishes into a depth-2 ring: the oldest two are evicted before
+        // the cursor takes them → two accountable drops.
+        let store = messenger.ring_store_for(&channel);
+        for i in 0..4 {
+            store.append(ring_envelope(
+                &channel.address,
+                ChannelScheme::Ephemeral,
+                &format!("d{i}"),
+            ));
+        }
+
+        let inputs = vec![ring_input(&channel, Depth::Bounded(8), Depth::Bounded(2))];
+        let snap = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs)
+            .await
+            .expect("the surviving two are owed");
+        assert_eq!(snap[0].new_rows.len(), 2, "only the two retained survive");
+        assert_eq!(
+            snap[0].drop_counter_snapshot, 2,
+            "two evicted-before-take messages are accountable drops"
+        );
+    }
+
+    /// Counts alarm invocations for the ring-overflow noise-enactment tests.
+    #[derive(Default)]
+    struct CountingAlarmRouter {
+        alarms: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl WakeRouter for CountingAlarmRouter {
+        async fn deliver(
+            &self,
+            _key: &SubscriberEntryKind,
+            _subscriber: &ParticipantId,
+            _envelope: &MessageEnvelope,
+            _push_id: i64,
+            _message_id: i64,
+            _retained_seq: Option<i64>,
+        ) -> Result<bool, String> {
+            unreachable!("ring-backed WASM delivery never routes inline through deliver")
+        }
+        async fn deliver_ingress(
+            &self,
+            _key: &SubscriberEntryKind,
+            _subscriber: &ParticipantId,
+            _event: &ingress::Event,
+        ) -> Result<bool, String> {
+            unreachable!("ring-backed WASM delivery never routes through deliver_ingress")
+        }
+        fn spawn_eager_wake(&self, _key: &SubscriberEntryKind, _subscriber: &ParticipantId) {}
+        fn delivery_shape(&self, key: &SubscriberEntryKind) -> DeliveryShape {
+            crate::messaging::default_delivery_shape(key)
+        }
+        fn alarm(&self, _channel: &str, _subscriber: &ParticipantId) {
+            self.alarms
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn build_ring_wasm_messenger_with_alarm(
+        slug: &str,
+        channel: ChannelEntry,
+    ) -> (
+        Arc<Messenger>,
+        Arc<ChannelEntry>,
+        ParticipantId,
+        Arc<CountingAlarmRouter>,
+    ) {
+        let router = Arc::new(CountingAlarmRouter::default());
+        let ring_stores = Arc::new(store::RingStores::build(std::slice::from_ref(&channel)));
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![channel.clone()])),
+            Arc::from("test"),
+            Arc::new(indexmap::IndexMap::new()),
+            router.clone() as Arc<dyn WakeRouter>,
+            config::MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(ring_stores);
+        (
+            messenger,
+            Arc::new(channel),
+            ParticipantId::for_wasm(slug),
+            router,
+        )
+    }
+
+    fn ring_input_noise(
+        channel: &ChannelEntry,
+        push_depth: Depth,
+        retain_depth: Depth,
+        noise: config::NoiseLevel,
+    ) -> WasmInputPort {
+        WasmInputPort {
+            port: "in".to_string(),
+            sub: config::ResolvedSubscription {
+                channel_uuid: channel.uuid,
+                channel_address: channel.address.clone(),
+                push_depth,
+                retain_depth,
+                noise,
+                wake_min: WakeMin::Normal,
+            },
+            amplification_mt: 1000,
+        }
+    }
+
+    /// Drive `push_depth`-1 overflow of two owed messages on a ring channel at
+    /// `noise`, returning the resolved drop counter and alarm count.
+    async fn ring_overflow_enactment(noise: config::NoiseLevel) -> (u64, u64, u64) {
+        let (messenger, channel, wasm_sub, router) = build_ring_wasm_messenger_with_alarm(
+            "ring-noise",
+            crate::messaging::testutils::ephemeral_channel_entry("ring-noise-ch", 8),
+        );
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 1, store::Priming::Head);
+        let store = messenger.ring_store_for(&channel);
+        for i in 0..3 {
+            store.append(ring_envelope(
+                &channel.address,
+                ChannelScheme::Ephemeral,
+                &format!("n{i}"),
+            ));
+        }
+        let inputs = vec![ring_input_noise(
+            &channel,
+            Depth::Bounded(1),
+            Depth::Bounded(8),
+            noise,
+        )];
+        let snap = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs)
+            .await
+            .expect("three owed, push_depth 1");
+        assert_eq!(snap[0].new_rows.len(), 1, "only the newest delivered");
+        (
+            messenger.drop_counter(&channel.address, &wasm_sub),
+            router.alarms.load(std::sync::atomic::Ordering::SeqCst),
+            snap[0].drop_counter_snapshot,
+        )
+    }
+
+    /// Silent ring overflow: the cursor still reports its raw drop to the guest,
+    /// but the noise ladder increments no counter and fires no alarm.
+    #[tokio::test]
+    async fn ring_overflow_silent_enacts_nothing() {
+        let (drop_counter, alarms, cursor_drops) =
+            ring_overflow_enactment(config::NoiseLevel::Silent).await;
+        assert_eq!(drop_counter, 0, "silent: no metered counter");
+        assert_eq!(alarms, 0, "silent: no alarm");
+        assert_eq!(cursor_drops, 2, "guest still sees the two raw cursor drops");
+    }
+
+    /// Metered ring overflow: the drop counter increments by the number of
+    /// dropped messages, no alarm.
+    #[tokio::test]
+    async fn ring_overflow_metered_increments_counter() {
+        let (drop_counter, alarms, _) = ring_overflow_enactment(config::NoiseLevel::Metered).await;
+        assert_eq!(drop_counter, 2, "metered: counter += dropped count");
+        assert_eq!(alarms, 0, "metered: no alarm");
+    }
+
+    /// Alarm ring overflow: the counter increments and the router alarm fires
+    /// once for the batch.
+    #[tokio::test]
+    async fn ring_overflow_alarm_increments_counter_and_fires_alarm() {
+        let (drop_counter, alarms, _) = ring_overflow_enactment(config::NoiseLevel::Alarm).await;
+        assert_eq!(drop_counter, 2, "alarm: counter += dropped count");
+        assert_eq!(alarms, 1, "alarm: one alarm fires for the overflowing take");
+    }
+
+    /// The registered subscriber a ring overflow event names, at the noise rung
+    /// its registration resolved to.
+    fn ring_subscriber(kind: SubscriberEntryKind, noise: config::NoiseLevel) -> SubscriberEntry {
+        SubscriberEntry {
+            kind,
+            push_depth: Depth::Bounded(4),
+            retain_depth: Depth::Bounded(8),
+            noise,
+            wake_min: None,
+        }
+    }
+
+    /// One message on its way into `channel`.
+    fn ring_message(channel: &ChannelEntry, body: &str) -> store::NewMessage {
+        store::NewMessage {
+            source: "node".to_string(),
+            sender: "test-sender".to_string(),
+            body: body.to_string(),
+            urgency: Urgency::Normal,
+            envelope_type: channel.transport_type,
+            reply_to_uuid: None,
+            delivery_deadline: None,
+            publish_ts_ns: db::utc_to_ns(Utc::now()),
+        }
+    }
+
+    /// Publish `count` messages into `channel` through the store, enacting
+    /// overflow so the eviction accounting matches a real publish.
+    async fn commit_ring_publishes(messenger: &Messenger, channel: &ChannelEntry, count: usize) {
+        let store = messenger.store_for(channel);
+        for i in 0..count {
+            let outcome = store.append(ring_message(channel, &format!("n{i}"))).await;
+            messenger.enact_overflow_events(channel, store.as_ref(), &outcome.overflow);
+        }
+    }
+
+    /// The canonical overflow producer: a consumer that never activates. Its
+    /// owed messages are overwritten by later publishes, and the noise ladder
+    /// escalates on the publish that overwrote them — no take, no activation, no
+    /// waiting for the consumer to recover.
+    #[tokio::test]
+    async fn ring_eviction_enacts_noise_without_any_activation() {
+        let mut channel = crate::messaging::testutils::local_channel_entry("evict-alarm-ch", 2);
+        channel.subscribers.push(ring_subscriber(
+            SubscriberEntryKind::Wasm("absent".to_string()),
+            config::NoiseLevel::Alarm,
+        ));
+        let (messenger, channel, wasm_sub, router) =
+            build_ring_wasm_messenger_with_alarm("absent", channel);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+
+        // Two fit the depth-2 ring; the third and fourth evict the first two out
+        // from under a subscriber that has never run.
+        commit_ring_publishes(&messenger, &channel, 4).await;
+
+        assert_eq!(
+            messenger.dropped_total(&channel.address, &wasm_sub),
+            2,
+            "both evicted-while-owed messages are accounted"
+        );
+        assert_eq!(
+            messenger.drop_counter(&channel.address, &wasm_sub),
+            2,
+            "alarm meters every drop"
+        );
+        assert_eq!(
+            router.alarms.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one alarm per evicting publish"
+        );
+    }
+
+    /// The same eviction on a `silent` registration: accounted for the guest's
+    /// gap signal, never metered, never alarmed.
+    #[tokio::test]
+    async fn ring_eviction_on_a_silent_subscription_accounts_without_shouting() {
+        let mut channel = crate::messaging::testutils::local_channel_entry("evict-silent-ch", 2);
+        channel.subscribers.push(ring_subscriber(
+            SubscriberEntryKind::Wasm("quiet".to_string()),
+            config::NoiseLevel::Silent,
+        ));
+        let (messenger, channel, wasm_sub, router) =
+            build_ring_wasm_messenger_with_alarm("quiet", channel);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+
+        commit_ring_publishes(&messenger, &channel, 4).await;
+
+        assert_eq!(messenger.dropped_total(&channel.address, &wasm_sub), 2);
+        assert_eq!(messenger.drop_counter(&channel.address, &wasm_sub), 0);
+        assert_eq!(router.alarms.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A Surface-kind subscriber's overflow is never routed to the backend
+    /// enactment sink: `fatal` is legal on a surface registration and is enacted
+    /// by the page kernel, so routing it here would panic the backend on a
+    /// sanctioned config. The drop is still accounted on the store, which is
+    /// what reaches the page.
+    #[tokio::test]
+    async fn surface_kind_ring_overflow_is_never_enacted_by_the_backend() {
+        let mut channel = crate::messaging::testutils::ephemeral_channel_entry("evict-surface", 2);
+        channel.subscribers.push(ring_subscriber(
+            SubscriberEntryKind::Surface {
+                slug: "dash".to_string(),
+                instance: Some("main".to_string()),
+            },
+            config::NoiseLevel::Fatal,
+        ));
+        let (messenger, channel, _unused, router) =
+            build_ring_wasm_messenger_with_alarm("dash", channel);
+        let surface_sub = ParticipantId::for_surface_component("dash", "main");
+        messenger.attach_ring_subscriber(&channel.uuid, &surface_sub, 4, store::Priming::Head);
+
+        commit_ring_publishes(&messenger, &channel, 4).await;
+
+        assert_eq!(
+            messenger.dropped_total(&channel.address, &surface_sub),
+            2,
+            "the drops still reach the page as the store's total"
+        );
+        assert_eq!(router.alarms.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A conversation's noise rung lives on the `App(slug)` registration the
+    /// delivery record was written under, so an event that names no app cannot
+    /// resolve one. Skipping it would silently drop that subscription off the
+    /// noise ladder for every drop it ever takes, so the routing dies instead.
+    #[tokio::test]
+    #[should_panic(expected = "a conversation's noise rung lives on an App")]
+    async fn a_conversation_overflow_event_naming_no_app_dies() {
+        let mut channel = crate::messaging::testutils::local_channel_entry("conv-overflow", 2);
+        channel.subscribers.push(ring_subscriber(
+            SubscriberEntryKind::App("chatty".to_string()),
+            config::NoiseLevel::Metered,
+        ));
+        let (messenger, channel, _unused, _router) =
+            build_ring_wasm_messenger_with_alarm("chatty", channel);
+        let store = messenger.store_for(&channel);
+
+        messenger.enact_overflow_events(
+            &channel,
+            store.as_ref(),
+            &[store::OverflowEvent {
+                subscriber: ParticipantId::for_conversation(1),
+                dropped: 1,
+                app_slug: None,
+            }],
+        );
+    }
+
+    /// Delivery state that outlived its registration: the drop is accounted on
+    /// the store, but no rung resolves for it, so nothing is metered and no
+    /// alarm fires — the event is surfaced in a log, not invented into a rung.
+    #[tokio::test]
+    async fn an_unregistered_subscribers_overflow_is_accounted_but_not_enacted() {
+        let mut channel = crate::messaging::testutils::local_channel_entry("stale-overflow", 2);
+        channel.subscribers.push(ring_subscriber(
+            SubscriberEntryKind::Wasm("known".to_string()),
+            config::NoiseLevel::Alarm,
+        ));
+        let (messenger, channel, _known, router) =
+            build_ring_wasm_messenger_with_alarm("known", channel);
+        let store = messenger.store_for(&channel);
+        let stranger = ParticipantId::for_wasm("gone");
+
+        messenger.enact_overflow_events(
+            &channel,
+            store.as_ref(),
+            &[store::OverflowEvent {
+                subscriber: stranger.clone(),
+                dropped: 3,
+                app_slug: None,
+            }],
+        );
+
+        assert_eq!(
+            messenger.drop_counter(&channel.address, &stranger),
+            0,
+            "an unresolvable rung meters nothing"
+        );
+        assert_eq!(router.alarms.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Park `count` messages on `channel` for `release_at` through its store.
+    async fn park_ring_publishes(
+        messenger: &Messenger,
+        channel: &ChannelEntry,
+        count: usize,
+        release_at: DateTime<Utc>,
+    ) {
+        let store = messenger.store_for(channel);
+        for i in 0..count {
+            store
+                .park(ring_message(channel, &format!("d{i}")), release_at)
+                .await
+                .expect("the deferred set is within the channel's cap");
+        }
+    }
+
+    /// Fill a depth-2 ring with two messages a never-running consumer is owed,
+    /// then release two deferrals over them. Returns
+    /// `(dropped_total, drop_counter, alarms)` for the consumer.
+    ///
+    /// `channel` must already carry the consumer's `alarm` registration.
+    async fn ring_release_overflow_enactment(channel: ChannelEntry) -> (u64, u64, u64) {
+        let (messenger, channel, wasm_sub, router) =
+            build_ring_wasm_messenger_with_alarm("absent", channel);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+
+        commit_ring_publishes(&messenger, &channel, 2).await;
+        let release_at = Utc::now() + chrono::Duration::seconds(1);
+        park_ring_publishes(&messenger, &channel, 2, release_at).await;
+        assert_eq!(
+            messenger.dropped_total(&channel.address, &wasm_sub),
+            0,
+            "a parked message evicts nothing until it is released"
+        );
+
+        let sweep = messenger
+            .release_due_messages(release_at + chrono::Duration::seconds(1))
+            .await;
+        assert_eq!(sweep.released, 2, "both deferrals came due");
+        (
+            messenger.dropped_total(&channel.address, &wasm_sub),
+            messenger.drop_counter(&channel.address, &wasm_sub),
+            router.alarms.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// A release batch is an eviction source like any publish: the messages it
+    /// moves into retention push a never-running consumer's owed window out, and
+    /// the noise ladder escalates on the batch that did it. The confined arm,
+    /// whose batch comes back from the store.
+    #[tokio::test]
+    async fn ring_release_batch_enacts_noise_on_a_confined_channel() {
+        let mut channel = crate::messaging::testutils::local_channel_entry("release-confined", 2);
+        channel.subscribers.push(ring_subscriber(
+            SubscriberEntryKind::Wasm("absent".to_string()),
+            config::NoiseLevel::Alarm,
+        ));
+
+        let (dropped_total, drop_counter, alarms) = ring_release_overflow_enactment(channel).await;
+        assert_eq!(dropped_total, 2, "both owed messages were evicted");
+        assert_eq!(drop_counter, 2, "alarm meters every drop");
+        assert_eq!(alarms, 1, "one alarm for the batch's merged overflow");
+    }
+
+    /// The transportable twin: the batch's overflow comes back through the bus's
+    /// fan-out path rather than the store's, and must reach the same ladder.
+    #[tokio::test]
+    async fn ring_release_batch_enacts_noise_on_a_transportable_channel() {
+        let mut channel = crate::messaging::testutils::ephemeral_channel_entry("release-wire", 2);
+        channel.subscribers.push(ring_subscriber(
+            SubscriberEntryKind::Wasm("absent".to_string()),
+            config::NoiseLevel::Alarm,
+        ));
+
+        let (dropped_total, drop_counter, alarms) = ring_release_overflow_enactment(channel).await;
+        assert_eq!(dropped_total, 2, "both owed messages were evicted");
+        assert_eq!(drop_counter, 2, "alarm meters every drop");
+        assert_eq!(alarms, 1, "one alarm for the batch's merged overflow");
+    }
+
+    /// A mixed durable + ring inputs list: the durable port triggers on its DB
+    /// rows and the ring port contributes pure context (nothing owed), proving the
+    /// per-port routing keeps each store's read independent.
+    #[tokio::test]
+    async fn load_activation_snapshot_mixes_durable_and_ring_ports() {
+        let durable = crate::messaging::testutils::wasm_channel_entry(
+            "mixed",
+            "mixed-durable",
+            Depth::Unbounded,
+            Depth::Unbounded,
+        );
+        let ring = crate::messaging::testutils::ephemeral_channel_entry("mixed-ring", 8);
+        let ring_stores = Arc::new(store::RingStores::build(std::slice::from_ref(&ring)));
+        let db = crate::db::init_db_memory();
+        {
+            let conn = db.lock().await;
+            crate::messaging::db::upsert_channels(&conn, std::slice::from_ref(&*durable));
+        }
+        let messenger = Messenger::new(
+            db,
+            Arc::new(MessagingDirectory::with_entries(vec![
+                (*durable).clone(),
+                ring.clone(),
+            ])),
+            Arc::from("test"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            config::MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(ring_stores);
+        let wasm_sub = ParticipantId::for_wasm("mixed");
+
+        // Ring port: attach + one retained message that is not owed (context only).
+        messenger.attach_ring_subscriber(&ring.uuid, &wasm_sub, 4, store::Priming::Head);
+        let ctx_env = ring_envelope(&ring.address, ChannelScheme::Ephemeral, "ring-ctx");
+        let ctx_mid = ctx_env.message_id;
+        messenger.ring_store_for(&ring).append(ctx_env);
+        // Take it so it becomes retained-only context, not owed.
+        messenger.ring_store_for(&ring).take(&wasm_sub);
+
+        // Durable port: one pending row → the activation trigger.
+        let (_pid, dmid) = super::testutils::insert_wasm_push(
+            &messenger,
+            &durable,
+            &wasm_sub,
+            "durable-new",
+            ChannelScheme::Brenn,
+        )
+        .await;
+
+        let inputs = vec![
+            ring_input(&ring, Depth::Bounded(4), Depth::Bounded(8)),
+            WasmInputPort {
+                port: "durable".to_string(),
+                sub: config::ResolvedSubscription {
+                    channel_uuid: durable.uuid,
+                    channel_address: durable.address.clone(),
+                    push_depth: Depth::Unbounded,
+                    retain_depth: Depth::Unbounded,
+                    noise: config::NoiseLevel::Silent,
+                    wake_min: WakeMin::Normal,
+                },
+                amplification_mt: 1000,
+            },
+        ];
+        let snaps = messenger
+            .load_activation_snapshot(&wasm_sub, &inputs)
+            .await
+            .expect("the durable port triggers the activation");
+        assert_eq!(snaps.len(), 2);
+        // Ring port: nothing owed, the earlier message is context.
+        assert!(snaps[0].new_rows.is_empty());
+        assert_eq!(
+            snaps[0]
+                .context
+                .iter()
+                .map(|e| e.message_id)
+                .collect::<Vec<_>>(),
+            vec![ctx_mid]
+        );
+        // Durable port: the pending row is a NEW row carrying a push id.
+        assert_eq!(snaps[1].new_rows.len(), 1);
+        assert_eq!(snaps[1].new_rows[0].1.message_id, dmid);
+        assert!(
+            snaps[1].new_rows[0].0.is_some(),
+            "durable rows carry a push id"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // record_wasm_activation_failure unit tests
     // -----------------------------------------------------------------------
 
     /// `record_wasm_activation_failure` writes one `messaging_wasm_consume_failures`

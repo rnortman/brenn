@@ -585,11 +585,16 @@ pub fn ensure_pwa_channel(conn: &Connection, address: &PwaPushAddress) -> Uuid {
     // paths, returning the canonical UUID without a second SELECT round-trip.
     let uuid_bytes: Vec<u8> = conn
         .query_row(
-            "INSERT INTO messaging_channels (uuid, address, description, created_at)
-             VALUES (?1, ?2, NULL, ?3)
+            "INSERT INTO messaging_channels (uuid, address, description, created_at, resume_epoch)
+             VALUES (?1, ?2, NULL, ?3, ?4)
              ON CONFLICT(address) DO UPDATE SET address = address
              RETURNING uuid",
-            rusqlite::params![new_uuid_bytes, address_str, now],
+            rusqlite::params![
+                new_uuid_bytes,
+                address_str,
+                now,
+                Uuid::new_v4().as_bytes().to_vec()
+            ],
             |row| row.get(0),
         )
         .expect("pwa_push: ensure_pwa_channel upsert");

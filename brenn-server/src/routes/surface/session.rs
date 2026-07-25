@@ -12,7 +12,7 @@
 //! projection lands) whose live deliveries flow through a `StreamMap` over
 //! `SubscriptionStream`. `Publish` resolves `(instance, port)` to a bound
 //! output and publishes behind the per-connection rate bucket — an ephemeral
-//! output onto the `EphemeralBus`, a durable output through
+//! output onto its channel's ring store, a durable output through
 //! `Messenger::publish_from_surface` (oversized bodies answer `BodyTooLarge`).
 //! `Unsubscribe` removes an active subscription (fire-and-
 //! forget, no ack); unsubscribing a channel with no active subscription is a
@@ -27,9 +27,9 @@ use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
 use brenn_lib::access::AppCapability;
-use brenn_lib::messaging::config::Depth;
+use brenn_lib::messaging::store::ResumeCursor;
 use brenn_lib::messaging::{
-    EphemeralDelivery, EphemeralEvent, EphemeralPublishResult, EphemeralReceiver, EphemeralResume,
+    EphemeralDelivery, EphemeralEvent, EphemeralReceiver, EphemeralResume,
     GapReason as BusGapReason, MessageEnvelope, Messenger, PublishResult, Replay,
     SurfaceBatchPublish, SurfaceSendVerdict, Urgency, db,
 };
@@ -59,6 +59,7 @@ use super::telemetry::{self, Health};
 
 use super::registry::{DurableDelivery, SurfaceSessionGuard};
 use super::{DeliveryClass, OutputPort, SubKey, SurfaceRuntime, sanitize_client_detail};
+use crate::messaging_router::retention_position;
 
 /// Outbound frame queue depth. A slow reader fills this, then the delivery path
 /// blocks (backpressure) rather than dropping control frames.
@@ -287,7 +288,7 @@ async fn session_loop(params: SurfaceSessionParams) {
                     } else {
                         0
                     };
-                    let epoch = ctx.runtime.bus.epoch();
+                    let epoch = ctx.runtime.messenger().ring_epoch();
                     let ring_seq = item.delivery.seq;
                     let mut targets = vec![mint_target(
                         &mut spans,
@@ -325,7 +326,7 @@ async fn session_loop(params: SurfaceSessionParams) {
                         ));
                     }
                     if let FrameOutcome::Disconnect = send_multi_deliver(
-                        &ctx, sub.channel.clone(), item.delivery.envelope.clone(), targets, &mut counters,
+                        &ctx, sub.channel.clone(), item.delivery.envelope.as_ref().clone(), targets, &mut counters,
                     ).await {
                         break;
                     }
@@ -479,7 +480,7 @@ async fn session_loop(params: SurfaceSessionParams) {
     if remaining_sessions == 0 {
         let description = &ctx.runtime.description;
         let session = ctx.session_id.simple().to_string();
-        let epoch = ctx.runtime.bus.epoch();
+        let epoch = ctx.runtime.messenger().ring_epoch();
         let body = telemetry::disconnected_body(
             &slug,
             Some(&session),
@@ -664,8 +665,9 @@ enum FrameOutcome {
 /// registry-shared `shared` set move strictly together through
 /// [`activate`](Self::activate)/[`deactivate`](Self::deactivate) — the two-set
 /// sync discipline lives here and nowhere else, so no handler can update one set
-/// and forget the other. `replay_sent` records, per channel, the message ids the
-/// subscribe replay already put on the wire, so a live row racing the replay is
+/// and forget the other. `replay_sent` records, per channel, the retention
+/// positions the subscribe replay already put on the wire, so a live row racing
+/// the replay is
 /// delivered exactly once; its entries persist for the **connection** lifetime,
 /// not the subscription span, so a re-subscribe merges into the retained set
 /// rather than rebuilding it — closing the duplicate a queued live copy would
@@ -674,7 +676,7 @@ enum FrameOutcome {
 struct DurableSessionState {
     active: HashSet<SubKey>,
     shared: Arc<Mutex<HashSet<SubKey>>>,
-    replay_sent: HashMap<SubKey, HashSet<i64>>,
+    replay_sent: HashMap<SubKey, HashSet<u64>>,
 }
 
 impl DurableSessionState {
@@ -718,10 +720,10 @@ impl DurableSessionState {
         self.active.contains(sub)
     }
 
-    /// Record a replayed message id. Returns `false` when the per-channel set is
-    /// already at [`REPLAY_SENT_MAX`] and this id is new — the caller tears the
-    /// connection down. A repeat id is always accepted (it adds no growth).
-    fn record_replayed(&mut self, sub: &SubKey, seq: i64) -> bool {
+    /// Record a replayed retention position. Returns `false` when the per-channel
+    /// set is already at [`REPLAY_SENT_MAX`] and this position is new — the caller
+    /// tears the connection down. A repeat is always accepted (it adds no growth).
+    fn record_replayed(&mut self, sub: &SubKey, seq: u64) -> bool {
         let set = self.replay_sent.entry(sub.clone()).or_default();
         if set.contains(&seq) {
             return true;
@@ -733,7 +735,7 @@ impl DurableSessionState {
         true
     }
 
-    fn already_replayed(&self, sub: &SubKey, seq: i64) -> bool {
+    fn already_replayed(&self, sub: &SubKey, seq: u64) -> bool {
         self.replay_sent.get(sub).is_some_and(|s| s.contains(&seq))
     }
 }
@@ -794,7 +796,7 @@ enum ConfirmCapAction {
 
 struct WireSpans {
     span_seq: HashMap<SubKey, u64>,
-    durable_high_water: HashMap<SubKey, i64>,
+    durable_high_water: HashMap<SubKey, u64>,
     /// Per-durable-subscription below-water confirm set: the message ids
     /// of below-water rows written to the socket this connection, each carried in
     /// every durable cursor minted for the subscription until the client echoes a
@@ -813,11 +815,18 @@ struct WireSpans {
     /// repeat asks while one is outstanding; cleared by [`WireSpans::clear`],
     /// which every (re)subscribe and teardown runs.
     reanchor_pending: HashSet<SubKey>,
-    /// The store's durable identity `(generation, incarnation)`, read once from
-    /// the DB at the first durable `Subscribe` on the connection and stamped into
-    /// every durable cursor minted thereafter. Constant for the connection's life
-    /// (the store cannot re-boot under a live page), so a single read suffices.
-    store_identity: Option<db::StoreIdentity>,
+    /// The store's boot `incarnation`, read once from the DB at the first durable
+    /// `Subscribe` on the connection and stamped into every cursor minted
+    /// thereafter. Constant for the connection's life (the store cannot re-boot
+    /// under a live page), so a single read suffices. Catches the one staleness
+    /// case the store cursor's epoch cannot: a backup restore that keeps epochs
+    /// but rolls the high-water backwards.
+    incarnation: Option<i64>,
+    /// Per-durable-subscription numbering domain: the channel's `resume_epoch`,
+    /// read from the store at `Subscribe` and stamped into every cursor minted for
+    /// that subscription. Per channel, not per connection — each durable channel
+    /// mints its own epoch with its row.
+    durable_epoch: HashMap<SubKey, Uuid>,
 }
 
 impl WireSpans {
@@ -827,14 +836,23 @@ impl WireSpans {
             durable_high_water: HashMap::new(),
             confirm_set: HashMap::new(),
             reanchor_pending: HashSet::new(),
-            store_identity: None,
+            incarnation: None,
+            durable_epoch: HashMap::new(),
         }
     }
 
-    /// Record the store identity read at a durable `Subscribe`. Idempotent: a
-    /// second durable subscribe on the same connection re-reads the same values.
-    fn set_store_identity(&mut self, identity: db::StoreIdentity) {
-        self.store_identity = Some(identity);
+    /// Record the store's boot incarnation, read at a durable `Subscribe`.
+    /// Idempotent: a second durable subscribe on the same connection re-reads the
+    /// same value.
+    fn set_incarnation(&mut self, incarnation: i64) {
+        self.incarnation = Some(incarnation);
+    }
+
+    /// The store incarnation every cursor on this connection is stamped with.
+    /// Returns `0` before any durable subscribe has read the value — vacuous on a
+    /// ring (whose per-boot epoch already catches cross-boot cursors).
+    fn incarnation(&self) -> i64 {
+        self.incarnation.unwrap_or(0)
     }
 
     /// Reset the span counter for `sub` to 0. Called at every successful
@@ -844,28 +862,30 @@ impl WireSpans {
         self.span_seq.insert(sub.clone(), 0);
     }
 
-    /// Reset the span counter for `sub` to 0 and anchor its durable high-water.
-    /// Called at every successful durable `Subscribe`: a fresh attach anchors at
-    /// 0, a resume anchors at the parsed cursor's high-water.
-    fn start_durable_span(&mut self, sub: &SubKey, anchor_high_water: i64) {
+    /// Reset the span counter for `sub` to 0, anchor its durable high-water at
+    /// `anchor_high_water`, and record the channel's numbering domain `epoch`.
+    fn start_durable_span(&mut self, sub: &SubKey, epoch: Uuid, anchor_high_water: u64) {
         self.span_seq.insert(sub.clone(), 0);
         self.durable_high_water
             .insert(sub.clone(), anchor_high_water);
+        self.durable_epoch.insert(sub.clone(), epoch);
     }
 
     /// Drop all wire state for `sub` (unsubscribe / teardown).
     fn clear(&mut self, sub: &SubKey) {
         self.span_seq.remove(sub);
         self.durable_high_water.remove(sub);
+        self.durable_epoch.remove(sub);
         self.confirm_set.remove(sub);
         self.reanchor_pending.remove(sub);
     }
 
-    /// The subscription's current durable high-water — the value a durable send
-    /// is *below* when its row id is at or under it. Read before [`next_durable`]
-    /// advances it, so a below-water send can be detected and stamped. `None` if
-    /// no durable span was anchored (no durable `Subscribe` yet).
-    fn durable_high_water_of(&self, sub: &SubKey) -> Option<i64> {
+    /// The subscription's current durable high-water — the retention position a
+    /// durable send is *below* when its own position is at or under it. Read
+    /// before [`next_durable`] advances it, so a below-water send can be detected
+    /// and stamped. `None` if no durable span was anchored (no durable
+    /// `Subscribe` yet).
+    fn durable_high_water_of(&self, sub: &SubKey) -> Option<u64> {
         self.durable_high_water.get(sub).copied()
     }
 
@@ -904,41 +924,58 @@ impl WireSpans {
     }
 
     /// The `(span seq, cursor)` for an ephemeral `Deliver` of the row at
-    /// `(epoch, ring_seq)`.
+    /// `(epoch, ring_seq)`. A ring-backed subscription has no below-water ack
+    /// channel, so its cursor's confirm set is always empty.
     fn next_ephemeral(&mut self, sub: &SubKey, epoch: Uuid, ring_seq: u64) -> (u64, Cursor) {
         let seq = self.next_seq(sub);
-        (seq, cursor::mint_ephemeral(epoch, ring_seq))
+        let cursor = cursor::mint(self.incarnation(), epoch, ring_seq, vec![]);
+        (seq, cursor)
     }
 
-    /// The `(span seq, cursor)` for a durable `Deliver` of the row `row_id`. The
-    /// high-water advances to `max(high_water, row_id)` and the cursor is minted
-    /// from the advanced high-water.
-    fn next_durable(&mut self, sub: &SubKey, row_id: i64) -> (u64, Cursor) {
+    /// The `(span seq, cursor)` for a durable `Deliver` of the row at retention
+    /// position `retained_seq`. Advances the high-water to
+    /// `max(high_water, retained_seq)` and mints the cursor from it.
+    fn next_durable(&mut self, sub: &SubKey, retained_seq: u64) -> (u64, Cursor) {
         let seq = self.next_seq(sub);
-        let identity = self.store_identity.expect(
-            "surface session: durable Deliver before the store identity was read at Subscribe",
+        let incarnation = self.incarnation.expect(
+            "surface session: durable Deliver before the store incarnation was read at Subscribe",
         );
+        let epoch = *self
+            .durable_epoch
+            .get(sub)
+            .expect("surface session: durable Deliver on a subscription with no anchored epoch");
         let hw = self.durable_high_water.get_mut(sub).expect(
             "surface session: durable Deliver on a subscription with no anchored high-water",
         );
-        *hw = (*hw).max(row_id);
+        *hw = (*hw).max(retained_seq);
         let hw_value = *hw;
         let confirm: Vec<i64> = self
             .confirm_set
             .get(sub)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default();
-        (
-            seq,
-            cursor::mint_durable(identity.generation, identity.incarnation, hw_value, confirm),
-        )
+        (seq, cursor::mint(incarnation, epoch, hw_value, confirm))
     }
+}
+
+/// One durable row as the session's send path names it: its position in the
+/// channel's retention order (what the wire cursor is minted from and what
+/// at-most-once dedup keys on) and its message identity (what below-water ack
+/// evidence is written against).
+///
+/// `message_id` is `None` for the row-less fold-0 context feed, which owns no
+/// claim to stamp. The two ids travel together in one value so a send site
+/// cannot pass a position where an identity belongs.
+#[derive(Debug, Clone, Copy)]
+struct DurableRowRef {
+    retained_seq: u64,
+    message_id: Option<i64>,
 }
 
 /// Which class of `Deliver` [`send_deliver`] is minting position for.
 enum DeliverKind {
     Ephemeral { epoch: Uuid, ring_seq: u64 },
-    Durable { row_id: i64 },
+    Durable { retained_seq: u64 },
 }
 
 /// Mint the span seq + cursor for one subscription's share of a `Deliver` at the
@@ -956,7 +993,7 @@ fn mint_target(
 ) -> DeliverTarget {
     let (seq, cursor) = match kind {
         DeliverKind::Ephemeral { epoch, ring_seq } => spans.next_ephemeral(sub, epoch, ring_seq),
-        DeliverKind::Durable { row_id } => spans.next_durable(sub, row_id),
+        DeliverKind::Durable { retained_seq } => spans.next_durable(sub, retained_seq),
     };
     DeliverTarget {
         instance: sub.instance.clone(),
@@ -1011,31 +1048,22 @@ async fn send_multi_deliver(
 /// Send a durable `Deliver`, stamping the below-water ack first when the row
 /// needs one.
 ///
-/// A row needs the ack channel when it is at or below the subscription's current
-/// high-water (`row_id <= hw`) *or* when `force_stamp` is set. `force_stamp` is
-/// used by the subscribe replay for a row it just unclaimed from the tentative set:
-/// such a row was below-water on an earlier connection and its fresh redelivery
-/// carries no high-water ack (a fresh attach anchors the high-water at 0), so
-/// without the re-stamp a second lost frame would leave it delivered-but-
-/// unrecoverable. An above-water row that advances the high-water (the common case)
-/// is sent unstamped: the minted cursor's high-water advance *is* its
-/// acknowledgment, and WS frame ordering makes an echoed high-water covering the id
-/// proof of receipt.
-///
-/// Before the socket write a stamped row sets `confirm_pending = 1` on the claimed
-/// push row (a DB write ordered ahead of the send) and enters the id in the confirm
-/// set every durable cursor then carries, giving the next resume's reconcile the
-/// receipt evidence to redeliver a lost row exactly once.
+/// A row is stamped when it is at or below the subscription's current high-water
+/// (`retained_seq <= hw`) or when `force_stamp` is set. `force_stamp` covers a
+/// row just unclaimed from the tentative set: its fresh redelivery carries no
+/// high-water ack (a fresh attach anchors at 0), so without the re-stamp a
+/// second lost frame would leave it unrecoverable. An above-water row is sent
+/// unstamped — the minted cursor's high-water advance is its acknowledgment.
 async fn send_durable_deliver(
     ctx: &SessionCtx,
     spans: &mut WireSpans,
     sub: &SubKey,
     envelope: MessageEnvelope,
-    row_id: i64,
+    row: DurableRowRef,
     force_stamp: bool,
     counters: &mut SessionCounters,
 ) -> FrameOutcome {
-    let cap = stamp_below_water(ctx, spans, sub, row_id, force_stamp).await;
+    let cap = stamp_below_water(ctx, spans, sub, row, force_stamp).await;
     if cap == ConfirmCapAction::Violation {
         return hard_cap_violation(ctx, sub);
     }
@@ -1045,7 +1073,9 @@ async fn send_durable_deliver(
         sub,
         envelope,
         0,
-        DeliverKind::Durable { row_id },
+        DeliverKind::Durable {
+            retained_seq: row.retained_seq,
+        },
         counters,
     )
     .await;
@@ -1067,14 +1097,32 @@ async fn stamp_below_water(
     ctx: &SessionCtx,
     spans: &mut WireSpans,
     sub: &SubKey,
-    row_id: i64,
+    row: DurableRowRef,
     force_stamp: bool,
 ) -> ConfirmCapAction {
     let below_water = force_stamp
         || spans
             .durable_high_water_of(sub)
-            .is_some_and(|hw| row_id <= hw);
+            .is_some_and(|hw| row.retained_seq <= hw);
     if below_water {
+        // Evidence is written against the message row, so a delivery that carries
+        // no message identity cannot be stamped. Only the row-less fold-0 context
+        // feed is in that position: it owns no claim, so there is nothing to
+        // recover and nothing to stamp. It reads as below-water when two publishes
+        // commit in seq order and reach this session's queue out of it — the
+        // earlier feed then sits under a high-water the later one already
+        // advanced, which the cursor already covers. Send it unstamped.
+        // `force_stamp` names a row just unclaimed from the tentative set, which
+        // always carries its identity.
+        let Some(row_id) = row.message_id else {
+            assert!(
+                !force_stamp,
+                "surface {}: forced below-water stamp on {} for a row-less context feed at \
+                 retention position {} — a context feed owns no claim to unclaim",
+                ctx.runtime.resolved.slug, sub.channel, row.retained_seq
+            );
+            return ConfirmCapAction::None;
+        };
         let messenger = ctx.runtime.messenger.as_ref().unwrap_or_else(|| {
             panic!(
                 "surface {}: below-water durable deliver on {} but no Messenger — \
@@ -1083,18 +1131,9 @@ async fn stamp_below_water(
             )
         });
         let participant = sub.participant(&ctx.runtime.resolved.slug);
-        // The stamp is one indexed single-row UPDATE per below-water send, taken
-        // on the same code path for replay and live-drain sends alike. A resume
-        // could in principle batch its below-water stamps under one lock, but the
-        // count is bounded by the subscription's resolved push_depth (which is
-        // never unbounded on a surface binding), so the uniform per-row path is
-        // kept for simplicity over a reconnect-only batch fast path.
-        //
-        // The claim and this stamp are separate lock acquisitions (the claim runs
-        // under the subscribe/drain lock or in the router; the stamp here), so the
-        // hourly GC can evict the claimed row in the gap. A stamp that matches 0
-        // rows is that eviction when the row is gone — an expected transient, not a
-        // bug — and the row is genuinely unrecoverable then (its message aged out
+        // The claim and this stamp are separate lock acquisitions, so the hourly
+        // GC can evict the claimed row in the gap. A stamp that matches 0 rows is
+        // that eviction — the row is genuinely unrecoverable (its message aged out
         // of retention too), so the delivery goes out unstamped. A row still
         // present but unstamped is a real invariant break and panics.
         {
@@ -1139,38 +1178,47 @@ async fn send_durable_live(
     /// One row's deliveries: the envelope, and every subscription it is bound for.
     struct RowGroup {
         channel: String,
-        row_id: i64,
+        row: DurableRowRef,
         envelope: Arc<MessageEnvelope>,
         subs: Vec<SubKey>,
     }
     let mut groups: Vec<RowGroup> = Vec::new();
-    for DurableDelivery { envelope, seq, sub } in batch {
+    for DurableDelivery {
+        envelope,
+        retained_seq,
+        message_id,
+        sub,
+    } in batch
+    {
         if !durable.is_active(&sub) {
             debug!(
                 channel = %sub.channel,
                 instance = ?sub.instance,
-                seq,
+                retained_seq,
                 "durable live delivery for inactive subscription; dropping"
             );
             continue;
         }
-        if durable.already_replayed(&sub, seq) {
+        if durable.already_replayed(&sub, retained_seq) {
             debug!(
                 channel = %sub.channel,
                 instance = ?sub.instance,
-                seq,
+                retained_seq,
                 "durable live delivery already sent by replay; dropping"
             );
             continue;
         }
         match groups
             .iter_mut()
-            .find(|g| g.row_id == seq && g.channel == sub.channel)
+            .find(|g| g.row.retained_seq == retained_seq && g.channel == sub.channel)
         {
             Some(group) => group.subs.push(sub),
             None => groups.push(RowGroup {
                 channel: sub.channel.clone(),
-                row_id: seq,
+                row: DurableRowRef {
+                    retained_seq,
+                    message_id,
+                },
                 envelope,
                 subs: vec![sub],
             }),
@@ -1178,7 +1226,7 @@ async fn send_durable_live(
     }
     for RowGroup {
         channel,
-        row_id,
+        row,
         envelope,
         subs,
     } in groups
@@ -1186,12 +1234,19 @@ async fn send_durable_live(
         let mut targets = Vec::with_capacity(subs.len());
         let mut re_anchor = Vec::new();
         for sub in &subs {
-            match stamp_below_water(ctx, spans, sub, row_id, false).await {
+            match stamp_below_water(ctx, spans, sub, row, false).await {
                 ConfirmCapAction::Violation => return hard_cap_violation(ctx, sub),
                 ConfirmCapAction::ReAnchor => re_anchor.push((*sub).clone()),
                 ConfirmCapAction::None => {}
             }
-            targets.push(mint_target(spans, sub, 0, DeliverKind::Durable { row_id }));
+            targets.push(mint_target(
+                spans,
+                sub,
+                0,
+                DeliverKind::Durable {
+                    retained_seq: row.retained_seq,
+                },
+            ));
         }
         if let FrameOutcome::Disconnect =
             send_multi_deliver(ctx, channel, (*envelope).clone(), targets, counters).await
@@ -1448,7 +1503,13 @@ async fn handle_status(
         return FrameOutcome::Continue;
     }
     let session = ctx.session_id.simple().to_string();
-    let body = telemetry::status_body(slug, &session, ctx.runtime.bus.epoch(), health, report);
+    let body = telemetry::status_body(
+        slug,
+        &session,
+        ctx.runtime.messenger().ring_epoch(),
+        health,
+        report,
+    );
     publish_platform_telemetry(ctx, &description.status_channel, &body, "status").await
 }
 
@@ -1577,48 +1638,23 @@ fn handle_unsubscribe(
     ))
 }
 
-/// The wire class a subscribe expects its echoed resume [`Cursor`] to carry.
-enum ExpectClass {
-    Ephemeral,
-    Durable,
-}
-
-/// Parse an echoed resume cursor for a subscribe of the given class, mapping both
-/// failure shapes to the protocol violation they are: a class mismatch (a durable
-/// cursor on an ephemeral channel, or the reverse) and an unparseable cursor. A
-/// conforming client can produce neither — cursors live only in page memory and
-/// the build gate forces a reload before a stale-format page reconnects — so both
-/// kill the connection and log for fail2ban, the unparseable arm carrying the
-/// parse cause. On `Ok` the returned [`CursorState`] is guaranteed to match
-/// `expect`. One helper owns both violation messages so the two subscribe paths
-/// cannot drift as `CursorState` grows.
+/// Parse an echoed resume [`Cursor`], mapping an unparseable one to the protocol
+/// violation it is. A conforming client cannot produce one — cursors live only in
+/// page memory and the build gate forces a reload before a stale-format page
+/// reconnects — so an unparseable cursor kills the connection and logs for
+/// fail2ban. A cursor minted for a *different* subscription is not unparseable;
+/// it resolves to an epoch mismatch (a gap) at the store.
 fn parse_resume_cursor(
     cursor: &Cursor,
-    expect: ExpectClass,
     slug: &str,
     username: &str,
     channel: &str,
 ) -> Result<CursorState, FrameOutcome> {
-    match cursor::parse(cursor) {
-        Ok(state @ CursorState::Ephemeral { .. }) if matches!(expect, ExpectClass::Ephemeral) => {
-            Ok(state)
-        }
-        Ok(state @ CursorState::Durable { .. }) if matches!(expect, ExpectClass::Durable) => {
-            Ok(state)
-        }
-        Ok(_) => {
-            let (got, want) = match expect {
-                ExpectClass::Ephemeral => ("durable", "ephemeral"),
-                ExpectClass::Durable => ("ephemeral", "durable"),
-            };
-            Err(FrameOutcome::Violation(format!(
-                "surface {slug} user {username}: {got} resume on {want} channel {channel}"
-            )))
-        }
-        Err(detail) => Err(FrameOutcome::Violation(format!(
+    cursor::parse(cursor).map_err(|detail| {
+        FrameOutcome::Violation(format!(
             "surface {slug} user {username}: unparseable resume cursor on {channel}: {detail}"
-        ))),
-    }
+        ))
+    })
 }
 
 /// Handle a `Subscribe` frame.
@@ -1681,8 +1717,8 @@ async fn handle_subscribe(
         // (`SurfaceRuntime::build`), so a client naming a local channel was
         // already killed by the unbound-channel violation above. Broken boot
         // invariant: die naming the real bug rather than falling into the
-        // ephemeral arm, whose `EphemeralBus rejected bound channel` panic would
-        // misdiagnose it as missing boot ACL coverage.
+        // ephemeral arm, whose rejected-bound-channel panic would misdiagnose it
+        // as missing boot ACL coverage.
         DeliveryClass::Local => panic!(
             "broken boot invariant: surface {slug} resolved a local: channel {} into the wire \
              subscription map; page-local channels are never subscribed over the wire",
@@ -1694,27 +1730,32 @@ async fn handle_subscribe(
     let tx = &ctx.tx;
     let resume = match resume {
         None => None,
-        Some(cursor) => {
-            match parse_resume_cursor(
-                &cursor,
-                ExpectClass::Ephemeral,
-                slug,
-                username,
-                &sub.channel,
-            ) {
-                Ok(CursorState::Ephemeral { epoch, seq }) => Some(EphemeralResume { epoch, seq }),
-                Ok(CursorState::Durable { .. }) => {
-                    unreachable!("parse_resume_cursor(Ephemeral) returns only an ephemeral state")
+        Some(cursor) => match parse_resume_cursor(&cursor, slug, username, &sub.channel) {
+            Ok(state) => {
+                // A ring-backed subscription has no below-water ack channel, so
+                // the server never mints a confirm set into its cursors and a
+                // conforming client cannot echo one.
+                if !state.confirm.is_empty() {
+                    return FrameOutcome::Violation(format!(
+                        "surface {slug} user {username}: resume cursor on ring-backed channel {} \
+                         carries {} below-water confirmations",
+                        sub.channel,
+                        state.confirm.len()
+                    ));
                 }
-                Err(outcome) => return outcome,
+                Some(EphemeralResume {
+                    epoch: state.epoch,
+                    seq: state.seq,
+                })
             }
-        }
+            Err(outcome) => return outcome,
+        },
     };
 
-    let subscription = match runtime.bus.subscribe(
+    let subscription = match runtime.messenger().attach_live(
         // The subscribing principal, at the grain it subscribed: an ephemeral
         // subscription opens no push window and keeps no cursor, so nothing here
-        // is keyed by it — but the bus's ACL check and its own attribution
+        // is keyed by it — but the attach's ACL check and its own attribution
         // should name the principal that actually asked, not the page it rode in
         // on.
         sub.participant(slug),
@@ -1728,13 +1769,13 @@ async fn handle_subscribe(
         // invariant, not attacker-reachable (the only client influence — an
         // unbound channel name — was already killed as a violation above).
         Err(err) => panic!(
-            "surface {slug}: EphemeralBus rejected bound channel {}: {err:?} — boot validation \
+            "surface {slug}: live attach rejected bound channel {}: {err:?} — boot validation \
              guarantees every bound channel exists and is policy-covered",
             sub.channel
         ),
     };
 
-    // A matching-epoch resume seq the bus never assigned is impossible for an
+    // A matching-epoch resume seq the store never assigned is impossible for an
     // honest client: escalate to a violation, sending nothing first.
     if let Replay::Gap(BusGapReason::ResumeAhead) = subscription.decision {
         return FrameOutcome::Violation(format!(
@@ -1748,15 +1789,15 @@ async fn handle_subscribe(
         Replay::Gap(BusGapReason::EpochChanged) => Some(GapInfo {
             reason: ProtoGapReason::EpochChanged,
         }),
-        Replay::Gap(BusGapReason::HoleExceedsRing) => Some(GapInfo {
-            reason: ProtoGapReason::HoleExceedsRing,
+        Replay::Gap(BusGapReason::BeyondRetained) => Some(GapInfo {
+            reason: ProtoGapReason::BeyondRetained,
         }),
         Replay::Gap(BusGapReason::ResumeAhead) => {
             unreachable!("ResumeAhead escalated to a violation above")
         }
     };
 
-    let epoch = runtime.bus.epoch();
+    let epoch = runtime.messenger().ring_epoch();
     let replay_count = subscription.replay.len() as u32;
 
     // Reset the span before the SubscribeResult so the replay rows mint seqs
@@ -1786,7 +1827,7 @@ async fn handle_subscribe(
             ctx,
             spans,
             &sub,
-            delivery.envelope.clone(),
+            delivery.envelope.as_ref().clone(),
             0,
             kind,
             counters,
@@ -1802,21 +1843,21 @@ async fn handle_subscribe(
     FrameOutcome::Continue
 }
 
-/// One entry in a durable subscribe's merged replay set: `(seq = message_id,
-/// `Some(push_id)` for a claimed parked row or `None` for a retained re-send,
-/// envelope)`. `push_id` distinguishes rows that must be un-claimed if the
-/// session disconnects mid-replay from retained rows that own no push claim.
-type DurableReplayRow = (i64, Option<i64>, MessageEnvelope);
+/// One entry in a durable subscribe's merged replay set: the row as the send path
+/// names it, plus the claim to release if the session disconnects mid-replay
+/// (`None` for a retained re-send, which owns no claim).
+struct DurableReplayRow {
+    row: DurableRowRef,
+    push_id: Option<i64>,
+    envelope: MessageEnvelope,
+}
 
 /// Handle a `Subscribe` to a durable (`brenn:`) channel.
 ///
-/// Activates the subscription (so the router routes live rows here), then under
-/// one DB lock builds the replay set — claimed parked rows plus, on resume, the
-/// retained window with `id > last_seq` — computes the [`GapReason::BeyondRetained`]
-/// gap, and sends `SubscribeResult` followed by the merged replay in `m.id`
-/// order. Every replayed id is recorded in `replay_sent` so a live row racing the
-/// activation-to-lock window (queued to `durable_rx` *and* present in the retained
-/// re-send) is dropped by the live arm, preserving at-most-once on the wire.
+/// Activates the subscription, reconciles the below-water ack set, claims the
+/// parked backlog, and replays the merged set in retention order. Every replayed
+/// position is recorded in `replay_sent` so a live row racing the
+/// activation-to-claim window is dropped, preserving at-most-once on the wire.
 async fn handle_durable_subscribe(
     ctx: &SessionCtx,
     durable: &mut DurableSessionState,
@@ -1832,30 +1873,12 @@ async fn handle_durable_subscribe(
     // channel are simply not this subscription's to claim.
     let participant = sub.participant(slug);
 
-    // The echoed cursor, parsed to its `(generation, incarnation, high_water)` and
-    // its below-water confirm set. Staleness against the current store
-    // identity is decided under the DB lock below (it reads the store), because a
-    // replaced/wiped/restored store makes a syntactically valid cursor point into a
-    // store that no longer exists.
-    let (resume_durable, echoed_confirm): (Option<(Uuid, i64, i64)>, HashSet<i64>) = match resume {
-        None => (None, HashSet::new()),
-        Some(cursor) => {
-            match parse_resume_cursor(&cursor, ExpectClass::Durable, slug, username, &sub.channel) {
-                Ok(CursorState::Durable {
-                    generation,
-                    incarnation,
-                    high_water,
-                    confirm,
-                }) => (
-                    Some((generation, incarnation, high_water)),
-                    confirm.into_iter().collect(),
-                ),
-                Ok(CursorState::Ephemeral { .. }) => {
-                    unreachable!("parse_resume_cursor(Durable) returns only a durable state")
-                }
-                Err(outcome) => return outcome,
-            }
-        }
+    let echoed = match resume {
+        None => None,
+        Some(cursor) => match parse_resume_cursor(&cursor, slug, username, &sub.channel) {
+            Ok(state) => Some(state),
+            Err(outcome) => return outcome,
+        },
     };
 
     // The resolved subscription carries the channel uuid and the retain clamp.
@@ -1871,100 +1894,138 @@ async fn handle_durable_subscribe(
         )
     });
 
-    // Activate before the drain lock: from here the router claims and queues live
+    // Activate before the store read: from here the router claims and queues live
     // rows; anything it claims is excluded from the parked load by `delivered_at`,
     // and the retained re-send + `replay_sent` close the handoff race.
     durable.activate(&sub);
 
+    // Read the store's boot incarnation (see `WireSpans::incarnation` for the
+    // staleness check it feeds). A stale cursor is conforming, so it is answered
+    // as a fresh attach, never a violation.
+    let incarnation = {
+        let conn = messenger.db().lock().await;
+        db::read_store_identity(&conn).incarnation
+    };
+    spans.set_incarnation(incarnation);
+    let stale = echoed
+        .as_ref()
+        .is_some_and(|state| state.incarnation > incarnation);
+    if let Some(state) = &echoed
+        && stale
+    {
+        warn!(
+            channel = %sub.channel,
+            instance = ?sub.instance,
+            cursor_incarnation = state.incarnation,
+            store_incarnation = incarnation,
+            "surface durable resume: cursor minted under a boot this store never counted; \
+             answering as fresh attach"
+        );
+    }
+    let store_cursor = match (&echoed, stale) {
+        (Some(state), false) => Some(ResumeCursor {
+            epoch: state.epoch,
+            seq: state.seq,
+        }),
+        _ => None,
+    };
+
+    // Taken before the claim lock: `replay_from` takes the store's own lock,
+    // and a row claimed after this read is filtered out of the window below,
+    // so the two orders agree.
+    let replay = messenger
+        .store_for_address(&sub.channel)
+        .replay_from(store_cursor, clamp)
+        .await;
+
+    // An answer that re-anchors on the numbering itself — a foreign epoch, or a
+    // position this store never assigned — says the cursor was minted against
+    // state this store no longer has. Its below-water confirm ids name rows in
+    // that lost numbering, so matching them against this store's tentative rows
+    // could confirm a message the client never received.
+    let renumbered = matches!(
+        replay.decision,
+        Replay::Gap(BusGapReason::EpochChanged) | Replay::Gap(BusGapReason::ResumeAhead)
+    );
+
+    // A resumable cursor keeps its position (rows at or below it are below-water
+    // and carry ack evidence); every other answer anchors at 0 (below every
+    // assigned position — a fresh attach).
+    let (mut gap, anchor) = match replay.decision {
+        Replay::Fresh => (None, 0),
+        Replay::UpToDate | Replay::Exact => (
+            None,
+            store_cursor.map(|cursor| cursor.seq).unwrap_or_default(),
+        ),
+        Replay::Gap(BusGapReason::EpochChanged) => (
+            Some(GapInfo {
+                reason: ProtoGapReason::EpochChanged,
+            }),
+            0,
+        ),
+        Replay::Gap(BusGapReason::BeyondRetained) => (
+            Some(GapInfo {
+                reason: ProtoGapReason::BeyondRetained,
+            }),
+            0,
+        ),
+        // Reachable on a durable channel by an honest client whose store was
+        // restored from backup and re-climbed its high-water past the cursor
+        // before this resume — the incarnation check above catches only cursors
+        // from boots the restore lost. Escalate loudly, answer as a fresh attach,
+        // and never kill: the client conformed. (The ring maps the same decision
+        // to a violation, there being no ring restore.)
+        Replay::Gap(BusGapReason::ResumeAhead) => {
+            warn!(
+                channel = %sub.channel,
+                instance = ?sub.instance,
+                cursor_seq = ?store_cursor.map(|cursor| cursor.seq),
+                store_epoch = %replay.epoch,
+                "surface durable resume: cursor above the channel high-water; the store may \
+                 have been restored from backup"
+            );
+            (
+                Some(GapInfo {
+                    reason: ProtoGapReason::EpochChanged,
+                }),
+                0,
+            )
+        }
+    };
+    if stale {
+        // A stale-store cursor forces the `EpochChanged` gap over whatever the
+        // (fresh-attach) store answer concluded.
+        gap = Some(GapInfo {
+            reason: ProtoGapReason::EpochChanged,
+        });
+    }
+
+    let window = replay.messages;
+
+    let echoed_confirm: HashSet<i64> = match (&echoed, stale || renumbered) {
+        // A fresh attach, a stale-store cursor, or one answered against numbering
+        // this store no longer has carries no valid evidence, so its set is
+        // discarded and every tentative row is unclaimed for redelivery.
+        (Some(state), false) => state.confirm.iter().copied().collect(),
+        _ => HashSet::new(),
+    };
+
     // The subscribe rate is bucketed in `handle_client_frame`, and boot proved the
     // resolved `push_depth`/`retain_depth` of a durable surface binding are both
-    // bounded, so the parked backlog and the retained re-send below are each
+    // bounded, so the parked backlog and the retained re-send are each
     // config-bounded — the load per Subscribe cannot be amplified into a DoS.
     //
-    // Build the replay set + gap under one DB lock. `merged` entries are
-    // `(seq = message_id, Some(push_id) for a claimed parked row | None for a
-    // retained re-send, envelope)`.
-    let (mut merged, gap, effective_anchor, unacked_message_ids): (
-        Vec<DurableReplayRow>,
-        Option<GapInfo>,
-        i64,
-        HashSet<i64>,
-    ) = {
+    // Reconcile the ack set and claim the parked backlog under one DB lock.
+    let (parked, unacked_message_ids): (Vec<DurableReplayRow>, HashSet<i64>) = {
         let conn = messenger.db().lock().await;
-
-        // Read the store identity once and stamp it into the connection's span
-        // state so every durable cursor minted this connection carries it.
-        let store = db::read_store_identity(&conn);
-        spans.set_store_identity(store);
-
-        // Apply the three stale-store arms. Each proves
-        // the cursor was minted against a store that no longer exists — replaced,
-        // wiped, or restored from backup — and is reachable by a conforming
-        // client, so none is a violation: all are answered as a fresh attach
-        // (full retained window from the tail) with an `EpochChanged` gap, the
-        // same shape a stale-epoch ephemeral cursor already gets.
-        let (last_seq, forced_gap): (Option<i64>, Option<GapInfo>) = match resume_durable {
-            None => (None, None),
-            Some((generation, incarnation, high_water)) => {
-                let stale = if generation != store.generation {
-                    // The messaging DB was replaced under a live page.
-                    Some("generation mismatch")
-                } else if incarnation > store.incarnation {
-                    // The DB was restored from backup and the cursor was minted
-                    // under a boot the restored store never counted.
-                    Some("incarnation above store")
-                } else if match db::channel_max_message_id(&conn, channel_uuid) {
-                    Some(max) => high_water > max,
-                    // An empty channel is stale only when the cursor claims to
-                    // have seen a row (`hw >= 1`) that no longer exists; a
-                    // never-delivered anchor (`hw == 0`) is an ordinary resume.
-                    None => high_water > 0,
-                } {
-                    // The DB was restored and reconnected before new rows
-                    // re-climbed the id space (subsumes the emptied-channel case).
-                    Some("high-water above channel max")
-                } else {
-                    None
-                };
-                match stale {
-                    Some(reason) => {
-                        warn!(
-                            channel = %sub.channel,
-                            instance = ?sub.instance,
-                            reason,
-                            cursor_generation = %generation,
-                            cursor_incarnation = incarnation,
-                            cursor_high_water = high_water,
-                            store_generation = %store.generation,
-                            store_incarnation = store.incarnation,
-                            "surface durable resume: stale-store cursor; answering as fresh attach"
-                        );
-                        (
-                            None,
-                            Some(GapInfo {
-                                reason: ProtoGapReason::EpochChanged,
-                            }),
-                        )
-                    }
-                    None => (Some(high_water), None),
-                }
-            }
-        };
 
         // Below-water ack reconcile, before the parked claim. Each
         // tentative (`confirm_pending = 1`) row for this participant is either
         // confirmed (in the echoed set → the client received it → clear the flag,
         // leave it delivered) or unclaimed (absent → never received → clear both
         // flag and `delivered_at` so the parked claim just below redelivers it
-        // exactly once, excluded from the retained window by `parked_ids`). A fresh
-        // attach or a stale-store cursor carries no valid evidence (`last_seq` is
-        // None), so its set is discarded and every tentative row is unclaimed.
-        let empty_confirm = HashSet::new();
-        let effective_confirm = if last_seq.is_some() {
-            &echoed_confirm
-        } else {
-            &empty_confirm
-        };
+        // exactly once, excluded from the store window by the claimed set).
+        //
         // The message ids of tentative rows this reconcile unclaimed for
         // redelivery — a previously below-water row whose receipt the echoed cursor
         // does not testify to. Their parked redelivery below is itself force-stamped
@@ -1979,109 +2040,68 @@ async fn handle_durable_subscribe(
             // predates the send — otherwise the unclaim below clears its evidence and
             // the replay-dedup drops the re-send, destroying recovery state with no
             // new delivery.
-            let (confirmed, unacked): (Vec<_>, Vec<_>) =
-                tentative.into_iter().partition(|(_, message_id)| {
-                    effective_confirm.contains(message_id)
-                        || durable.already_replayed(&sub, *message_id)
-                });
-            let confirmed_ids: Vec<i64> =
-                confirmed.into_iter().map(|(push_id, _)| push_id).collect();
+            let (confirmed, unacked): (Vec<_>, Vec<_>) = tentative.into_iter().partition(|row| {
+                echoed_confirm.contains(&row.message_id)
+                    || row.retained_seq.is_some_and(|seq| {
+                        durable.already_replayed(&sub, retention_position(Some(seq), row.push_id))
+                    })
+            });
+            let confirmed_ids: Vec<i64> = confirmed.into_iter().map(|row| row.push_id).collect();
             let unacked_ids: Vec<i64> = unacked
                 .into_iter()
-                .map(|(push_id, message_id)| {
-                    unacked_message_ids.insert(message_id);
-                    push_id
+                .map(|row| {
+                    unacked_message_ids.insert(row.message_id);
+                    row.push_id
                 })
                 .collect();
             db::confirm_pending_pushes(&conn, &confirmed_ids);
             db::unclaim_confirm_pending_pushes(&conn, &unacked_ids);
         }
 
-        let parked = load_and_claim_parked(&conn, &participant, channel_uuid);
-        let parked_ids: HashSet<i64> = parked
-            .iter()
-            .map(|(_, message_id, _)| *message_id)
-            .collect();
-
-        let (retained, window_gap) = match last_seq {
-            // A fresh attach (no resume token) receives the channel's most recent
-            // rows clamped to `retain_depth`, anchored at the window tail — the
-            // same retained-window read as the resume arm, from message id 0.
-            // Nothing was missed, so no gap is synthesized.
-            None => {
-                let window = db::load_channel_messages_after(&conn, channel_uuid, 0, clamp);
-                let retained: Vec<(i64, MessageEnvelope)> = window
-                    .into_iter()
-                    .filter(|(message_id, _)| !parked_ids.contains(message_id))
-                    .collect();
-                (retained, None)
-            }
-            Some(ls) => {
-                let window = db::load_channel_messages_after(&conn, channel_uuid, ls, clamp);
-                // A full bounded window may have dropped older `id > last_seq`
-                // rows (conservative — a false "may have missed" is honest).
-                let truncated = matches!(clamp, Depth::Bounded(n) if window.len() as u64 == n);
-                // `last_seq` below the oldest retained id ⇒ intervening rows
-                // evicted; an empty channel ⇒ oldest is +∞ ⇒ any resume gaps.
-                let oldest = db::channel_min_message_id(&conn, channel_uuid);
-                let beyond = match oldest {
-                    Some(min_id) => ls < min_id,
-                    None => true,
-                };
-                let gap = (beyond || truncated).then_some(GapInfo {
-                    reason: ProtoGapReason::BeyondRetained,
-                });
-                let retained: Vec<(i64, MessageEnvelope)> = window
-                    .into_iter()
-                    .filter(|(message_id, _)| !parked_ids.contains(message_id))
-                    .collect();
-                if gap.is_some() {
-                    // The gap decision reads moving DB state (GC advances the
-                    // retained window), so record its inputs — otherwise a "may
-                    // have missed data" reported to the client is unreconstructible
-                    // after the window has since moved. Fires at most once per
-                    // Subscribe (rate-bucketed).
-                    debug!(
-                        channel = %sub.channel,
-                        instance = ?sub.instance,
-                        last_seq = ls,
-                        oldest_retained = ?oldest,
-                        truncated,
-                        beyond,
-                        parked = parked_ids.len(),
-                        retained = retained.len(),
-                        "surface durable resume: reporting BeyondRetained gap"
-                    );
-                }
-                (retained, gap)
-            }
-        };
-
-        // A stale-store cursor forces the `EpochChanged` gap over whatever the
-        // (fresh-attach) window arm concluded; otherwise the window's own gap
-        // decision stands.
-        let gap = forced_gap.or(window_gap);
-
-        let merged: Vec<DurableReplayRow> = parked
-            .into_iter()
-            .map(|(push_id, message_id, env)| (message_id, Some(push_id), env))
-            .chain(
-                retained
-                    .into_iter()
-                    .map(|(message_id, env)| (message_id, None, env)),
-            )
-            .collect();
-        (merged, gap, last_seq.unwrap_or(0), unacked_message_ids)
+        let parked: Vec<DurableReplayRow> =
+            load_and_claim_parked(&conn, &participant, channel_uuid)
+                .into_iter()
+                .map(|claim| DurableReplayRow {
+                    row: DurableRowRef {
+                        retained_seq: retention_position(Some(claim.retained_seq), claim.push_id),
+                        message_id: Some(claim.message_id),
+                    },
+                    push_id: Some(claim.push_id),
+                    envelope: claim.envelope,
+                })
+                .collect();
+        (parked, unacked_message_ids)
     };
-    merged.sort_by_key(|(message_id, _, _)| *message_id);
+
+    // A claimed row goes out with its claim, so the store window's copy of it is
+    // dropped rather than sent twice.
+    let claimed_seqs: HashSet<u64> = parked.iter().map(|entry| entry.row.retained_seq).collect();
+    let mut merged: Vec<DurableReplayRow> = parked;
+    merged.extend(
+        window
+            .into_iter()
+            .filter(|retained| !claimed_seqs.contains(&retained.seq))
+            .map(|retained| DurableReplayRow {
+                row: DurableRowRef {
+                    retained_seq: retained.seq,
+                    // A retained re-send owns no claim to stamp — and sits above
+                    // the anchor by construction, so it is never below-water.
+                    message_id: None,
+                },
+                push_id: None,
+                envelope: (*retained.message).clone(),
+            }),
+    );
+    let effective_anchor = anchor;
+    merged.sort_by_key(|entry| entry.row.retained_seq);
 
     // Anchor the durable high-water and reset the span before the
     // SubscribeResult, so the replay rows mint seqs 1..N and the high-water
     // starts at the (non-stale) resume cursor, or 0 on a fresh or stale-store
     // attach.
-    spans.start_durable_span(&sub, effective_anchor);
+    spans.start_durable_span(&sub, replay.epoch, effective_anchor);
 
-    // At-most-once dedup: a row whose seq was already sent on this connection
+    // At-most-once dedup: a row whose position was already sent on this connection
     // (the retained `replay_sent` set) is already delivered — drop the copy and
     // leave any claimed push row claimed (retired), never re-send. This is the
     // same skip the live `durable_rx` arm applies, extended to the replay path
@@ -2089,7 +2109,7 @@ async fn handle_durable_subscribe(
     // cannot re-appear on the wire. Dropped parked rows stay claimed (they are
     // excluded from the unclaim-on-disconnect remainder below), so no later
     // drain resurrects them.
-    merged.retain(|(seq, _push_id, _)| !durable.already_replayed(&sub, *seq));
+    merged.retain(|entry| !durable.already_replayed(&sub, entry.row.retained_seq));
 
     // Floor parity: this gates every session-side durable send — belt-and-
     // suspenders for parked rows, the only floor for the retained re-send.
@@ -2105,7 +2125,7 @@ async fn handle_durable_subscribe(
         gap,
     };
     if let FrameOutcome::Disconnect = send_frame(&ctx.tx, result, counters).await {
-        unclaim_parked(messenger, merged.iter().map(|(_, push_id, _)| *push_id)).await;
+        unclaim_parked(messenger, merged.iter().map(|entry| entry.push_id)).await;
         return FrameOutcome::Disconnect;
     }
 
@@ -2120,33 +2140,32 @@ async fn handle_durable_subscribe(
         return FrameOutcome::Continue;
     }
 
-    for (i, (seq, _push_id, envelope)) in merged.iter().enumerate() {
+    for (i, entry) in merged.iter().enumerate() {
         // A row this reconcile unclaimed from the tentative set is force-stamped on
         // redelivery: it was below-water on an earlier connection and carries no
         // fresh high-water ack here (a fresh attach anchors at 0), so without the
         // re-stamp a second lost frame would leave it delivered-but-unrecoverable.
         // Ordinary rows (first-time parked rows, retained re-sends) keep the
         // high-water ack — their delivery advances the cursor to cover them.
-        let force_stamp = unacked_message_ids.contains(seq);
+        let force_stamp = entry
+            .row
+            .message_id
+            .is_some_and(|id| unacked_message_ids.contains(&id));
         if let FrameOutcome::Disconnect = send_durable_deliver(
             ctx,
             spans,
             &sub,
-            envelope.clone(),
-            *seq,
+            entry.envelope.clone(),
+            entry.row,
             force_stamp,
             counters,
         )
         .await
         {
-            unclaim_parked(
-                messenger,
-                merged[i..].iter().map(|(_, push_id, _)| *push_id),
-            )
-            .await;
+            unclaim_parked(messenger, merged[i..].iter().map(|entry| entry.push_id)).await;
             return FrameOutcome::Disconnect;
         }
-        if !durable.record_replayed(&sub, *seq) {
+        if !durable.record_replayed(&sub, entry.row.retained_seq) {
             // The per-channel replay-dedup set hit REPLAY_SENT_MAX: tear the
             // connection down (normal close, not a violation — reachable by an
             // honest very-long-lived connection). Row `i` was already sent; unclaim
@@ -2157,11 +2176,7 @@ async fn handle_durable_subscribe(
                 cap = REPLAY_SENT_MAX,
                 "surface durable replay-dedup set full; tearing down connection"
             );
-            unclaim_parked(
-                messenger,
-                merged[i + 1..].iter().map(|(_, push_id, _)| *push_id),
-            )
-            .await;
+            unclaim_parked(messenger, merged[i + 1..].iter().map(|entry| entry.push_id)).await;
             return FrameOutcome::Disconnect;
         }
     }
@@ -2189,12 +2204,12 @@ fn load_and_claim_parked(
     conn: &rusqlite::Connection,
     subscriber: &brenn_lib::messaging::ParticipantId,
     channel_uuid: Uuid,
-) -> Vec<(i64, i64, MessageEnvelope)> {
+) -> Vec<db::ChannelPushRow> {
     let rows = db::load_pending_pushes_for_channel(conn, subscriber, channel_uuid);
-    let ids: Vec<i64> = rows.iter().map(|(push_id, _, _)| *push_id).collect();
+    let ids: Vec<i64> = rows.iter().map(|row| row.push_id).collect();
     let won: HashSet<i64> = db::claim_pending_pushes(conn, &ids).into_iter().collect();
     rows.into_iter()
-        .filter(|(push_id, _, _)| won.contains(push_id))
+        .filter(|row| won.contains(&row.push_id))
         .collect()
 }
 
@@ -2238,7 +2253,7 @@ async fn drain_durable_channel(
     });
     // Claims are made under this subscription's own principal, so the drain sees
     // exactly this instance's parked window — never a sibling's.
-    let mut claimed: Vec<(i64, i64, MessageEnvelope)> = {
+    let mut claimed: Vec<db::ChannelPushRow> = {
         let conn = messenger.db().lock().await;
         load_and_claim_parked(
             &conn,
@@ -2246,10 +2261,13 @@ async fn drain_durable_channel(
             channel_uuid,
         )
     };
-    // At-most-once dedup: skip any row whose seq the replay path already put on
-    // this connection's wire (leave it claimed = retired). Without this a row
-    // unclaimed after a replay already sent its seq would drain as a duplicate.
-    claimed.retain(|(_push_id, message_id, _)| !durable.already_replayed(sub, *message_id));
+    // At-most-once dedup: skip any row whose retention position the replay path
+    // already put on this connection's wire (leave it claimed = retired). Without
+    // this a row unclaimed after a replay already sent it would drain as a
+    // duplicate.
+    claimed.retain(|row| {
+        !durable.already_replayed(sub, retention_position(Some(row.retained_seq), row.push_id))
+    });
     if claimed.is_empty() {
         return FrameOutcome::Continue;
     }
@@ -2257,26 +2275,25 @@ async fn drain_durable_channel(
         warn!(%channel, "surface durable drain: delivery floor denied; retiring claimed rows");
         return FrameOutcome::Continue;
     }
-    for (i, (_push_id, message_id, envelope)) in claimed.iter().enumerate() {
+    for (i, row) in claimed.iter().enumerate() {
         // A live drain runs with the subscription's real high-water, so its
-        // below-water detection (`id <= hw` inside `send_durable_deliver`) is
-        // accurate — no force-stamp needed.
+        // below-water detection (`retained_seq <= hw` inside
+        // `send_durable_deliver`) is accurate — no force-stamp needed.
         if let FrameOutcome::Disconnect = send_durable_deliver(
             ctx,
             spans,
             sub,
-            envelope.clone(),
-            *message_id,
+            row.envelope.clone(),
+            DurableRowRef {
+                retained_seq: retention_position(Some(row.retained_seq), row.push_id),
+                message_id: Some(row.message_id),
+            },
             false,
             counters,
         )
         .await
         {
-            unclaim_parked(
-                messenger,
-                claimed[i..].iter().map(|(push_id, _, _)| Some(*push_id)),
-            )
-            .await;
+            unclaim_parked(messenger, claimed[i..].iter().map(|r| Some(r.push_id))).await;
             return FrameOutcome::Disconnect;
         }
     }
@@ -2293,7 +2310,7 @@ async fn drain_durable_channel(
 /// the Nth reject on one connection escalates to a violation and kills).
 /// Otherwise the connection bucket
 /// gates the publish; on grant the message routes by delivery class — an
-/// `Ephemeral` output onto the `EphemeralBus`, a `Durable` (`brenn:`) output
+/// `Ephemeral` output onto its channel's ring store, a `Durable` (`brenn:`) output
 /// through `Messenger::publish_from_surface`. Both classes flow through the same
 /// body-cap and connection-bucket gates; class no longer precedes them.
 ///
@@ -2465,182 +2482,135 @@ async fn handle_publish(
     //    rung it asks for.
     let urgency = urgency.unwrap_or(out.default_urgency);
     let OutputPort { address, class, .. } = out;
-    let outcome = match class {
-        DeliveryClass::Ephemeral => match runtime.bus.publish(
-            &runtime.participant,
-            &runtime.policy,
-            address,
-            body,
-            urgency,
-        ) {
-            EphemeralPublishResult::Ok { .. } => {
-                counters.publish_ok(component);
-                PublishOutcome::Ok
-            }
-            // Bus-level per-sender gate — the second rate-limit gate.
-            EphemeralPublishResult::RateLimited => {
-                counters.publish_rate_limited(component);
-                PublishOutcome::RateLimited
-            }
-            // Reaching this means the transport pre-check (step 2) and the bus
-            // disagree on body size — a boot/config-wiring bug, since both derive
-            // from config.messaging.max_body_bytes. Not panicked (body is
-            // client-controlled input), but it must scream: a bare counter bump
-            // would fold silently into the routine transport-rejection count.
-            EphemeralPublishResult::BodyTooLarge { len, max } => {
-                error!(
-                    len,
-                    max,
-                    transport_max = runtime.max_body_bytes,
-                    "surface Publish: transport and bus body-size caps disagree"
+    // `local:` traffic never crosses the wire: the page-local router is its sole
+    // source of truth, so a `local:` publish must never reach the server. Not
+    // attacker-reachable — `class` comes from the boot-resolved output map, which
+    // excludes `local:` bindings by construction (`SurfaceRuntime::build`), so a
+    // client naming a local output port was already killed by the unbound-port
+    // violation above. Die rather than route page-local traffic onto the bus.
+    assert!(
+        !matches!(class, DeliveryClass::Local),
+        "surface {slug}: output {address} classified Local — local: channels never reach the \
+         server (the output map excludes them); this is a broken boot invariant"
+    );
+    // One publish path for every class the wire can carry: the channel's
+    // capabilities decide where the message lands, inside the pipeline. A bound
+    // output implies a directory channel implies messaging configured implies
+    // `Some(messenger)`, so `None` here is a broken boot invariant, not
+    // attacker-reachable. (`SurfaceRuntime::build` asserts the same
+    // Messenger-present invariant for subscriptions; the output direction is
+    // enforced fail-fast here at first use — see its comment.)
+    let messenger = runtime.messenger.as_ref().unwrap_or_else(|| {
+        panic!(
+            "surface {slug}: output {address} bound but runtime has no Messenger — a bound \
+             output implies a directory channel implies messaging configured implies \
+             Some(messenger)"
+        )
+    });
+    // The reserved error-report port rides the ordinary publish path but has two
+    // distinct postures below: on success an audit emit restoring the
+    // user/session correlation the report body omits, and on the
+    // broken-boot-invariant outcomes an `error!` carrying the report body instead
+    // of the bound-output panic — killing the server over its own diagnostics
+    // channel, on an attacker-sendable frame path, inverts priorities.
+    // A report about a component is published under that component's sub-identity
+    // (resolved at step 1b): attribution lands on the component the report is
+    // about, and a crash-looping component's report flood draws down its own
+    // budget rather than its neighbours'. A kernel self-report carries the bare
+    // surface identity.
+    let outcome = match messenger
+        .publish_from_surface(slug, component, address, body, urgency)
+        .await
+    {
+        PublishResult::Ok { .. } => {
+            counters.publish_ok(component);
+            if is_error_report {
+                // The auth layer attests user/session; the report body does not
+                // carry them (server-attested facts do not belong in a
+                // surface-attributed body). Keyed by the session span +
+                // publish_ts, this restores the correlation.
+                info!(
+                    target: "surface_report",
+                    surface = %slug,
+                    session_id = %ctx.session_id,
+                    user = %username,
+                    "surface error report published"
                 );
-                counters.publish_body_cap_disagreement += 1;
-                PublishOutcome::BodyTooLarge {
-                    len: len as u64,
-                    max: max as u64,
-                }
             }
-            // Boot validation proved every bound output exists and is policy-covered,
-            // so these are broken boot invariants, not attacker-reachable (the only
-            // client influence — an unbound port — was already killed above).
-            other @ (EphemeralPublishResult::AclDenied(_)
-            | EphemeralPublishResult::UnknownChannel(_)
-            | EphemeralPublishResult::MalformedAddress(_)) => panic!(
-                "surface {slug}: EphemeralBus rejected bound output {address}: {other:?} — boot \
-                 validation guarantees every bound output exists and is policy-covered"
-            ),
-            // Dispatch-arm-only variants: never produced by EphemeralBus::publish.
-            other @ (EphemeralPublishResult::MissingSender
-            | EphemeralPublishResult::UnsupportedOption { .. }) => {
-                unreachable!("EphemeralBus::publish never produces {other:?}")
-            }
-        },
-        // Durable (`brenn:`) output: publish through the Messenger. A bound
-        // `brenn:` output implies a directory channel implies messaging
-        // configured implies `Some(messenger)`, so `None` here is a broken boot
-        // invariant, not attacker-reachable. (`SurfaceRuntime::build` asserts the
-        // same Messenger-present invariant for durable *subscriptions*; the output
-        // direction is enforced fail-fast here at first use — see its comment.)
-        DeliveryClass::Durable => {
-            let messenger = runtime.messenger.as_ref().unwrap_or_else(|| {
-                panic!(
-                    "surface {slug}: durable output {address} bound but runtime has no Messenger \
-                     — a bound `brenn:` output implies a directory channel implies messaging \
-                     configured implies Some(messenger)"
-                )
-            });
-            // The reserved error-report port rides the ordinary durable publish
-            // path but has two distinct postures below: on success an audit emit
-            // restoring the user/session correlation the report body omits, and on
-            // the broken-boot-invariant outcomes an `error!` carrying the report
-            // body instead of the bound-output panic — killing the server over its
-            // own diagnostics channel, on an attacker-sendable frame path, inverts
-            // priorities.
-            // A report about a component is published under that component's
-            // sub-identity (resolved at step 1b): attribution lands on the
-            // component the report is about, and a crash-looping component's
-            // report flood draws down its own budget rather than its neighbours'.
-            // A kernel self-report carries the bare surface identity.
-            match messenger
-                .publish_from_surface(slug, component, address, body, urgency)
-                .await
-            {
-                PublishResult::Ok { .. } => {
-                    counters.publish_ok(component);
-                    if is_error_report {
-                        // The auth layer attests user/session; the report body
-                        // does not carry them (server-attested facts do not belong
-                        // in a surface-attributed body). Keyed by the session span
-                        // + publish_ts, this restores the correlation.
-                        info!(
-                            target: "surface_report",
-                            surface = %slug,
-                            session_id = %ctx.session_id,
-                            user = %username,
-                            "surface error report published"
-                        );
-                    }
-                    PublishOutcome::Ok
-                }
-                // Same transport-vs-bus body-cap skew as the ephemeral arm: both
-                // caps derive from config.messaging.max_body_bytes, so a
-                // disagreement is a config-wiring bug. Scream, don't panic (body
-                // is client-controlled input) — surface it as an outcome.
-                PublishResult::BodyTooLarge { len, max } => {
-                    error!(
-                        len,
-                        max,
-                        transport_max = runtime.max_body_bytes,
-                        "surface durable Publish: transport and messenger body-size caps disagree"
-                    );
-                    counters.publish_body_cap_disagreement += 1;
-                    PublishOutcome::BodyTooLarge {
-                        len: len as u64,
-                        max: max as u64,
-                    }
-                }
-                // The output binding, its `brenn_publish` ACL coverage, and the
-                // channel's existence are all boot-validated and boot-static, so a
-                // denial here is a broken boot invariant — not attacker-reachable
-                // (the only client influence, an unbound port, was killed above).
-                // For an ordinary bound output that means panic (a user-visible
-                // publish silently failing is doing the wrong thing). On the
-                // reserved error-report port the same outcomes instead `error!`
-                // the full report body and return `Failed`: this branch handles
-                // attacker-adjacent input on a diagnostics channel, so it fails
-                // loud-and-closed rather than trusting the invariant with the
-                // process's life. The report is preserved in the `error!` line
-                // (and the shell console-logged it before publishing).
-                other @ (PublishResult::MissingSender
-                | PublishResult::AclDenied(_)
-                | PublishResult::UnknownChannel(_)
-                | PublishResult::MalformedAddress(_)) => {
-                    if is_error_report {
-                        error!(
-                            surface = %slug,
-                            session_id = %ctx.session_id,
-                            user = %username,
-                            channel = %address,
-                            outcome = ?other,
-                            // Client-composed content: render via `Debug` so embedded
-                            // newlines / ANSI escapes are escaped rather than forging or
-                            // mangling lines in the operator's primary diagnostic stream.
-                            body = ?body,
-                            "surface error report publish failed on the reserved port; report \
-                             preserved in this log line only"
-                        );
-                        PublishOutcome::Failed
-                    } else {
-                        panic!(
-                            "surface {slug}: publish_from_surface rejected bound durable output \
-                             {address}: {other:?} — boot validation guarantees every bound output \
-                             exists and is policy-covered"
-                        )
-                    }
-                }
-                // The per-surface send budget can deny a durable surface
-                // publish. Client-facing meaning is identical to any rate limit
-                // — slow down — so it maps to the existing RateLimited wire
-                // outcome and counter; the publish gate already emitted the
-                // first-denial warn attributed to the slug.
-                PublishResult::BudgetExhausted => {
-                    counters.publish_rate_limited(component);
-                    PublishOutcome::RateLimited
-                }
+            PublishOutcome::Ok
+        }
+        // Reaching this means the transport pre-check (step 2) and the pipeline
+        // disagree on body size — a config-wiring bug, since both derive from
+        // config.messaging.max_body_bytes. Not panicked (body is client-controlled
+        // input), but it must scream: a bare counter bump would fold silently into
+        // the routine transport-rejection count.
+        PublishResult::BodyTooLarge { len, max } => {
+            error!(
+                len,
+                max,
+                transport_max = runtime.max_body_bytes,
+                "surface Publish: transport and messenger body-size caps disagree"
+            );
+            counters.publish_body_cap_disagreement += 1;
+            PublishOutcome::BodyTooLarge {
+                len: len as u64,
+                max: max as u64,
             }
         }
-        // `local:` traffic never crosses the wire: the page-local router is its
-        // sole source of truth, so a `local:` publish must never reach the
-        // server. Not attacker-reachable — `class` is looked up from the
-        // boot-resolved output map, which excludes `local:` bindings by
-        // construction (`SurfaceRuntime::build`), so a client naming a local
-        // output port was already killed by the unbound-port violation above.
-        // Broken boot invariant: die rather than route page-local traffic onto
-        // the bus.
-        DeliveryClass::Local => panic!(
-            "surface {slug}: output {address} classified Local — local: channels never reach the \
-             server (the output map excludes them); this is a broken boot invariant"
-        ),
+        // The output binding, its publish ACL coverage, and the channel's
+        // existence are all boot-validated and boot-static, so a denial here is a
+        // broken boot invariant — not attacker-reachable (the only client
+        // influence, an unbound port, was killed above). `UnsupportedOption` joins
+        // them: this call passes no option fields at all, so producing one would
+        // mean the pipeline invented one. For an ordinary bound output that means
+        // panic (a user-visible publish silently failing is doing the wrong
+        // thing). On the reserved error-report port the same outcomes instead
+        // `error!` the full report body and return `Failed`: this branch handles
+        // attacker-adjacent input on a diagnostics channel, so it fails
+        // loud-and-closed rather than trusting the invariant with the process's
+        // life. The report is preserved in the `error!` line (and the shell
+        // console-logged it before publishing).
+        // `DeferredQuotaExceeded` joins them for the same reason as
+        // `UnsupportedOption`: it can only arise from a future `deliver_after`,
+        // an option field this call never passes, so producing one means the
+        // pipeline invented it.
+        other @ (PublishResult::MissingSender
+        | PublishResult::AclDenied(_)
+        | PublishResult::UnknownChannel(_)
+        | PublishResult::MalformedAddress(_)
+        | PublishResult::UnsupportedOption { .. }
+        | PublishResult::DeferredQuotaExceeded { .. }) => {
+            if is_error_report {
+                error!(
+                    surface = %slug,
+                    session_id = %ctx.session_id,
+                    user = %username,
+                    channel = %address,
+                    outcome = ?other,
+                    // Client-composed content: render via `Debug` so embedded
+                    // newlines / ANSI escapes are escaped rather than forging or
+                    // mangling lines in the operator's primary diagnostic stream.
+                    body = ?body,
+                    "surface error report publish failed on the reserved port; report preserved \
+                     in this log line only"
+                );
+                PublishOutcome::Failed
+            } else {
+                panic!(
+                    "surface {slug}: publish_from_surface rejected bound output {address}: \
+                     {other:?} — boot validation guarantees every bound output exists and is \
+                     policy-covered"
+                )
+            }
+        }
+        // The per-surface send budget (durable targets) and the per-(sender,
+        // channel) send-rate gate (every target) can both deny. Client-facing
+        // meaning is identical — slow down — so both map to the RateLimited wire
+        // outcome and counter; each gate already emitted its own first-denial warn.
+        PublishResult::BudgetExhausted | PublishResult::RateLimited => {
+            counters.publish_rate_limited(component);
+            PublishOutcome::RateLimited
+        }
     };
     let frame = ServerFrame::PublishResult {
         correlation,
@@ -2859,7 +2829,18 @@ async fn handle_publish_batch(
         .zip(&stamps)
         .filter(|((out, _, _), _)| !matches!(out.class, DeliveryClass::Durable))
     {
-        publish_batch_ephemeral(ctx, instance, out, body, *urgency, *ts, counters);
+        publish_batch_ephemeral(
+            ctx,
+            messenger,
+            instance,
+            EphemeralBatchPublish {
+                out,
+                body,
+                urgency: *urgency,
+                publish_ts_ns: *ts,
+            },
+            counters,
+        );
     }
 
     let frame = ServerFrame::PublishBatchResult {
@@ -2869,37 +2850,52 @@ async fn handle_publish_batch(
     send_frame(&ctx.tx, frame, counters).await
 }
 
+/// One ephemeral entry of an admitted `PublishBatch`, borrowed for the duration
+/// of [`publish_batch_ephemeral`] — the non-durable peer of the durable half's
+/// `SurfaceBatchPublish`.
+struct EphemeralBatchPublish<'a> {
+    out: &'a OutputPort,
+    body: &'a str,
+    urgency: Urgency,
+    publish_ts_ns: i64,
+}
+
 /// Apply one ephemeral entry of an admitted `PublishBatch`.
 ///
-/// Routes through the bus's **prepaid** entry point, which never consults the
+/// Routes through the **prepaid** entry point, which never consults the
 /// per-sender wall-clock gate: the batch already paid, whole, at step 4, and the
 /// client has been promised `Ok` for all of it. A second, independently-keyed
 /// bucket metering per entry after admission could only lose a wide flush's tail
 /// under an answer that said it landed. Ad-hoc (gesture) ephemeral publishes
-/// still route through `EphemeralBus::publish` and its gate — that is where the
+/// still route through the publish ladder and its gate — that is where the
 /// wall-clock tier belongs.
 ///
 /// The prepaid entry point panics rather than returning: every client-reachable
 /// failure was already answered as a violation by the handler's per-entry
 /// resolve, so nothing is left here that a conforming boot can produce.
+///
+/// The append's overflow goes straight to the noise ladder. A ring charges an
+/// eviction as reported at the moment it overwrites an unread position, so a
+/// drop this publish caused is escalated here or nowhere — no later consumer
+/// take carries it.
 fn publish_batch_ephemeral(
     ctx: &SessionCtx,
+    messenger: &Messenger,
     instance: &str,
-    out: &OutputPort,
-    body: &str,
-    urgency: Urgency,
-    publish_ts_ns: i64,
+    publish: EphemeralBatchPublish<'_>,
     counters: &mut SessionCounters,
 ) {
     let runtime = &ctx.runtime;
-    runtime.bus.publish_prepaid(
+    let address = publish.out.address.as_str();
+    let appended = messenger.publish_prepaid(
         &runtime.participant,
         &runtime.policy,
-        out.address.as_str(),
-        body,
-        urgency,
-        brenn_lib::messaging::db::ns_to_utc(publish_ts_ns),
+        address,
+        publish.body,
+        publish.urgency,
+        brenn_lib::messaging::db::ns_to_utc(publish.publish_ts_ns),
     );
+    messenger.enact_overflow_for_channel(address, &appended.overflow);
     counters.publish_ok(Some(instance));
 }
 
@@ -3110,9 +3106,9 @@ pub struct DeliveryItem {
 
 /// A single ephemeral subscription rendered as a stream of wire-ready deliveries.
 ///
-/// Folds the bus event stream so a `Dropped(n)` overflow signal is never yielded
+/// Folds the live event stream so a `Dropped(n)` overflow signal is never yielded
 /// alone: its count accumulates into the `dropped` field of the next delivery.
-/// A bus `Dropped(n)` is emitted only on broadcast lag — which means the ring is
+/// A `Dropped(n)` is emitted only on fan-out lag — which means the ring is
 /// full, so a delivery is immediately available behind it — so the pending count
 /// lives for one poll. If the subscription tears down while a count is pending,
 /// that count dies with it, which is correct: the client no longer holds the
@@ -3123,7 +3119,7 @@ pub struct SubscriptionStream {
     /// yielded. Held so a co-availability check never consumes a delivery it
     /// declines to coalesce.
     head: Option<DeliveryItem>,
-    /// Set once `inner` has yielded its terminating `None` (the bus dropped at
+    /// Set once `inner` has yielded its terminating `None` (the store dropped at
     /// shutdown). `inner` is an `unfold`, which panics if polled after it
     /// returns `None`, so once seen the terminator is remembered and `inner` is
     /// never polled again — `head_now`, which polls off the `StreamMap`'s real
@@ -3189,15 +3185,15 @@ impl Stream for SubscriptionStream {
     }
 }
 
-/// Drive an `EphemeralReceiver` as a stream of raw bus events, ending when the
-/// bus is dropped at shutdown.
+/// Drive an `EphemeralReceiver` as a stream of raw live events, ending when the
+/// store's fan-out closes at shutdown.
 fn receiver_events(receiver: EphemeralReceiver) -> impl Stream<Item = EphemeralEvent> + Send {
     stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|event| (event, receiver))
     })
 }
 
-/// Fold raw bus events into wire-ready `DeliveryItem`s: accumulate `Dropped(n)`
+/// Fold raw live events into wire-ready `DeliveryItem`s: accumulate `Dropped(n)`
 /// counts into a pending total and attach it to the next `Delivery`.
 fn delivery_stream(
     events: impl Stream<Item = EphemeralEvent> + Send + 'static,
@@ -3226,13 +3222,17 @@ fn delivery_stream(
 mod tests {
     use brenn_lib::access::acl::ChannelMatcher;
     use brenn_lib::access::{AppCapability, AppPolicy};
+    use brenn_lib::messaging::config::Depth;
+    use brenn_lib::messaging::store::RingStores;
+    use brenn_lib::messaging::store::ring::RING_FAN_OUT_CAPACITY;
     use brenn_lib::messaging::testutils::ephemeral_channel_entry;
     use brenn_lib::messaging::{
-        EphemeralBus, EphemeralEvent, EphemeralPublishResult, ParticipantId, Urgency,
+        EphemeralEvent, MessagingDirectory, MessagingGlobalConfig, ParticipantId, Urgency,
+        WakeRouter,
     };
 
     use super::super::test_fixtures::{
-        TEST_MAX_BODY_BYTES, TEST_ORIGIN, durable_resume, fixture_bus,
+        TEST_MAX_BODY_BYTES, TEST_ORIGIN, durable_resume, durable_resume_at,
     };
     use super::*;
 
@@ -3241,12 +3241,22 @@ mod tests {
     /// key on (the scheme prefix is stripped before matching).
     const CHANNEL_NAME: &str = "protobar";
 
-    fn bus(retain_depth: u64, capacity: u32) -> Arc<EphemeralBus> {
-        EphemeralBus::new(
-            vec![ephemeral_channel_entry("protobar", retain_depth, capacity)],
+    /// A `Messenger` over one `ephemeral:` channel — everything a live attach
+    /// needs and nothing else.
+    fn ring_messenger(retain_depth: u64, fan_out_capacity: u32) -> Arc<Messenger> {
+        let entry = ephemeral_channel_entry(CHANNEL_NAME, retain_depth);
+        Messenger::new(
+            brenn_lib::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![entry.clone()])),
             Arc::from("test-source"),
-            1024,
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(brenn_lib::messaging::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            MessagingGlobalConfig::default(),
         )
+        .with_ring_stores(Arc::new(RingStores::build_with_fan_out_capacity(
+            &[entry],
+            fan_out_capacity,
+        )))
     }
 
     fn subscriber_policy() -> Arc<AppPolicy> {
@@ -3256,43 +3266,35 @@ mod tests {
         Arc::new(p)
     }
 
-    fn publisher_policy() -> AppPolicy {
-        let mut p = AppPolicy::default();
-        p.grants.insert(AppCapability::EphemeralPublish);
-        p.acls.ephemeral_publish = vec![ChannelMatcher::Exact(CHANNEL_NAME.to_string())];
-        p
-    }
-
-    fn publish_n(bus: &EphemeralBus, n: usize) {
+    fn publish_n(messenger: &Messenger, n: usize) {
         let sender = ParticipantId::for_surface("deskbar");
-        let policy = publisher_policy();
         for _ in 0..n {
-            // Assert success so fixture drift (ACL/scheme mismatch) fails loudly
-            // here instead of hanging every downstream `stream.next().await`.
-            assert!(matches!(
-                bus.publish(&sender, &policy, CHANNEL, "hi", Urgency::Normal),
-                EphemeralPublishResult::Ok { .. }
-            ));
+            crate::routes::surface::test_fixtures::commit_eph(
+                messenger.ring_stores(),
+                CHANNEL,
+                &sender,
+                "hi",
+            );
         }
     }
 
-    fn stream_for(bus: &EphemeralBus) -> SubscriptionStream {
-        let sub = bus
-            .subscribe(
+    fn stream_for(messenger: &Messenger) -> SubscriptionStream {
+        let sub = messenger
+            .attach_live(
                 ParticipantId::for_surface("deskbar"),
                 subscriber_policy(),
                 CHANNEL,
                 None,
             )
-            .expect("subscribe");
+            .expect("attach");
         SubscriptionStream::new(sub.receiver)
     }
 
     #[tokio::test]
     async fn undropped_deliveries_carry_zero_dropped_in_seq_order() {
-        let bus = bus(8, 16);
-        let mut stream = stream_for(&bus);
-        publish_n(&bus, 3);
+        let messenger = ring_messenger(8, RING_FAN_OUT_CAPACITY);
+        let mut stream = stream_for(&messenger);
+        publish_n(&messenger, 3);
 
         for expected_seq in 1..=3 {
             let item = stream.next().await.expect("delivery");
@@ -3303,31 +3305,34 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_count_rides_the_next_delivery() {
-        // capacity 2, flood 5 with no interleaved poll: the receiver lags by 3
-        // (seqs 1..3 overwritten), retaining the 2 newest (4, 5). The fold never
-        // yields the drop alone — it rides the first surviving delivery.
-        let bus = bus(0, 2);
-        let mut stream = stream_for(&bus);
-        publish_n(&bus, 5);
+        // Overrun the broadcast ring by 3 with no interleaved poll: the receiver
+        // lags by 3 (the 3 oldest seqs overwritten). The fold never yields the
+        // drop alone — it rides the first surviving delivery.
+        const CAPACITY: u32 = 4;
+        const OVERSHOOT: u64 = 3;
+        let flood = CAPACITY as usize + OVERSHOOT as usize;
+        let messenger = ring_messenger(0, CAPACITY);
+        let mut stream = stream_for(&messenger);
+        publish_n(&messenger, flood);
 
         let first = stream.next().await.expect("delivery");
-        assert_eq!(first.delivery.seq, 4);
-        assert_eq!(first.dropped, 3);
+        assert_eq!(first.delivery.seq, OVERSHOOT + 1);
+        assert_eq!(first.dropped, OVERSHOOT);
 
         let second = stream.next().await.expect("delivery");
-        assert_eq!(second.delivery.seq, 5);
+        assert_eq!(second.delivery.seq, OVERSHOOT + 2);
         assert_eq!(second.dropped, 0);
     }
 
     #[tokio::test]
     async fn consecutive_drops_accumulate_onto_one_delivery() {
-        // The bus never emits two drops back-to-back (a delivery always sits
-        // behind a lag), so drive the fold directly with synthetic events to pin
-        // the accumulation arithmetic. Reuse a real delivery Arc to avoid
+        // The live stream never emits two drops back-to-back (a delivery always
+        // sits behind a lag), so drive the fold directly with synthetic events to
+        // pin the accumulation arithmetic. Reuse a real delivery Arc to avoid
         // hand-building an envelope.
-        let bus = bus(1, 8);
-        let mut seed = stream_for(&bus);
-        publish_n(&bus, 1);
+        let messenger = ring_messenger(1, RING_FAN_OUT_CAPACITY);
+        let mut seed = stream_for(&messenger);
+        publish_n(&messenger, 1);
         let delivery = seed.next().await.expect("delivery").delivery;
 
         let events = stream::iter(vec![
@@ -3343,16 +3348,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bus_closure_ends_the_stream() {
-        let bus = bus(8, 16);
-        let mut stream = stream_for(&bus);
-        publish_n(&bus, 2);
+    async fn store_teardown_ends_the_stream() {
+        let messenger = ring_messenger(8, RING_FAN_OUT_CAPACITY);
+        let mut stream = stream_for(&messenger);
+        publish_n(&messenger, 2);
 
         assert!(stream.next().await.is_some());
         assert!(stream.next().await.is_some());
 
-        // Dropping the bus closes the broadcast channel: the stream ends.
-        drop(bus);
+        // Dropping the last store handle closes the fan-out: the stream ends.
+        drop(messenger);
         assert!(stream.next().await.is_none());
     }
 
@@ -3389,10 +3394,8 @@ mod tests {
             publish_burst: 60,
             publish_per_sec: 1,
         };
-        let bus = fixture_bus(vec![]);
         let runtime = Arc::new(SurfaceRuntime::build(
             resolved,
-            bus,
             None,
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
@@ -3631,7 +3634,8 @@ mod tests {
         };
 
         let raw = ChannelConfigRaw {
-            uuid: Uuid::new_v4().to_string(),
+            send_rate: None,
+            uuid: Some(Uuid::new_v4().to_string()),
             address: "durable-demo".to_string(),
             description: None,
             push_depth: None,
@@ -3677,10 +3681,8 @@ mod tests {
             )
             .policy(policy)
             .build();
-        let bus = fixture_bus(vec![]);
         let runtime = SurfaceRuntime::build(
             resolved,
-            bus,
             Some(messenger),
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
@@ -3720,7 +3722,8 @@ mod tests {
         };
 
         let raw = ChannelConfigRaw {
-            uuid: Uuid::new_v4().to_string(),
+            send_rate: None,
+            uuid: Some(Uuid::new_v4().to_string()),
             address: "surface-errors".to_string(),
             description: None,
             push_depth: None,
@@ -3772,10 +3775,8 @@ mod tests {
         let resolved = crate::test_support::surface::SurfaceFixture::new("deskbar", "protobar")
             .policy(policy)
             .build();
-        let bus = fixture_bus(vec![]);
         let mut runtime = SurfaceRuntime::build(
             resolved,
-            bus,
             Some(messenger),
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
@@ -3863,7 +3864,7 @@ mod tests {
     /// The same broken-boot-invariant outcome on an *ordinary* bound output still
     /// panics — the backstop is scoped to the reserved port alone.
     #[tokio::test]
-    #[should_panic(expected = "rejected bound durable output")]
+    #[should_panic(expected = "rejected bound output")]
     async fn ordinary_bound_output_acl_denied_still_panics() {
         let db = brenn_lib::db::init_db_memory();
         let (mut ctx, _rx) = report_ctx(&db, false).await;
@@ -4238,16 +4239,17 @@ mod tests {
     }
 
     /// A durable `Deliver` carries a delivery-time span `seq` on the wire and its
-    /// row identity inside the opaque `cursor` (the subscription high-water). The
-    /// tests assert the delivered row by parsing the cursor's high-water, which
-    /// for an in-order delivery is the delivered row's id.
+    /// retention position inside the opaque `cursor` (the subscription
+    /// high-water). The tests assert the delivered row by parsing that position,
+    /// which for an in-order delivery is the delivered row's own.
+    ///
+    /// These fixtures seed one channel per DB, so a message's rowid and its
+    /// retention position coincide and callers can name the row by either.
     fn expect_deliver(frame: ServerFrame, want_id: i64) {
         let target = sole_target(frame);
         match cursor::parse(&target.cursor) {
-            Ok(CursorState::Durable { high_water, .. }) => {
-                assert_eq!(high_water, want_id, "Deliver cursor high-water");
-            }
-            other => panic!("expected a durable cursor for id {want_id}, got {other:?}"),
+            Ok(state) => assert_eq!(state.seq, want_id as u64, "Deliver cursor high-water"),
+            other => panic!("expected a parseable cursor for id {want_id}, got {other:?}"),
         }
     }
 
@@ -4403,30 +4405,21 @@ mod tests {
     #[test]
     fn next_durable_below_high_water_holds_cursor_but_advances_span_seq() {
         let mut spans = WireSpans::new();
-        spans.set_store_identity(db::StoreIdentity {
-            generation: Uuid::nil(),
-            incarnation: 0,
-        });
+        spans.set_incarnation(0);
         let sub = durable_sub();
-        spans.start_durable_span(&sub, 0);
+        spans.start_durable_span(&sub, Uuid::nil(), 0);
 
         let (seq_hi, cursor_hi) = spans.next_durable(&sub, 10);
         assert_eq!(seq_hi, 1, "first durable span seq is 1");
         assert!(
-            matches!(
-                cursor::parse(&cursor_hi),
-                Ok(CursorState::Durable { high_water: 10, .. })
-            ),
+            matches!(cursor::parse(&cursor_hi), Ok(state) if state.seq == 10),
             "cursor high-water tracks the delivered row",
         );
 
         let (seq_lo, cursor_lo) = spans.next_durable(&sub, 7);
         assert_eq!(seq_lo, 2, "span seq is monotone regardless of row order");
         assert!(
-            matches!(
-                cursor::parse(&cursor_lo),
-                Ok(CursorState::Durable { high_water: 10, .. })
-            ),
+            matches!(cursor::parse(&cursor_lo), Ok(state) if state.seq == 10),
             "a below-water row keeps the cursor at the prior high-water",
         );
     }
@@ -4437,12 +4430,9 @@ mod tests {
     #[test]
     fn confirm_set_rides_every_durable_cursor_after_being_recorded() {
         let mut spans = WireSpans::new();
-        spans.set_store_identity(db::StoreIdentity {
-            generation: Uuid::nil(),
-            incarnation: 0,
-        });
+        spans.set_incarnation(0);
         let sub = durable_sub();
-        spans.start_durable_span(&sub, 5);
+        spans.start_durable_span(&sub, Uuid::nil(), 5);
         assert_eq!(spans.durable_high_water_of(&sub), Some(5));
 
         // A below-water row (7 is not below 5, but 3 is): record it, then every
@@ -4451,10 +4441,10 @@ mod tests {
         let (_seq, cursor) = spans.next_durable(&sub, 3);
         assert_eq!(
             cursor::parse(&cursor),
-            Ok(cursor::CursorState::Durable {
-                generation: Uuid::nil(),
+            Ok(cursor::CursorState {
                 incarnation: 0,
-                high_water: 5,
+                epoch: Uuid::nil(),
+                seq: 5,
                 confirm: vec![3],
             }),
             "the confirm set rides the cursor and the high-water stays put",
@@ -4463,11 +4453,7 @@ mod tests {
         let (_seq2, cursor2) = spans.next_durable(&sub, 9);
         assert!(matches!(
             cursor::parse(&cursor2),
-            Ok(cursor::CursorState::Durable {
-                high_water: 9,
-                confirm,
-                ..
-            }) if confirm == vec![3]
+            Ok(cursor::CursorState { seq: 9, confirm, .. }) if confirm == vec![3]
         ));
 
         // Clearing the subscription drops the confirm set with the rest.
@@ -4482,7 +4468,7 @@ mod tests {
     fn parse_resume_cursor_unparseable_is_violation_with_cause() {
         let bogus: Cursor =
             serde_json::from_value(serde_json::Value::String("not-a-cursor".into())).unwrap();
-        match parse_resume_cursor(&bogus, ExpectClass::Durable, "slug", "user", "chan") {
+        match parse_resume_cursor(&bogus, "slug", "user", "chan") {
             Err(FrameOutcome::Violation(detail)) => {
                 assert!(
                     detail.contains("unparseable resume cursor"),
@@ -4616,21 +4602,23 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// A retain clamp that truncates the `id > last_seq` set yields a
+    /// A retain clamp that truncates the resumable suffix yields a
     /// `BeyondRetained` gap alongside the (clamped) replay.
     #[tokio::test]
     async fn durable_subscribe_resume_truncated_window_gaps() {
         let db = brenn_lib::db::init_db_memory();
         let (ctx, mut rx, uuid) = durable_ctx(&db, Depth::Bounded(1)).await;
         let m1 = seed_message(&db, uuid, "one", 100).await;
-        let m2 = seed_message(&db, uuid, "two", 200).await;
+        let _m2 = seed_message(&db, uuid, "two", 200).await;
+        let m3 = seed_message(&db, uuid, "three", 300).await;
 
         let durable_subs = Arc::new(Mutex::new(HashSet::new()));
         let mut durable = DurableSessionState::new(durable_subs.clone());
         let mut counters = SessionCounters::default();
 
-        // Resume from m1 (= oldest, so not "beyond"); the clamp of 1 drops nothing
-        // below m2 here, but a full bounded window is reported conservatively.
+        // Resume from m1: the store answers `Exact` with the two rows above it, and
+        // the binding's clamp of 1 drops m2 — rows this subscription is owed and
+        // will not receive, which is what the gap reports.
         let mut spans = WireSpans::new();
         let outcome = handle_durable_subscribe(
             &ctx,
@@ -4655,15 +4643,14 @@ mod tests {
             }
             other => panic!("expected SubscribeResult, got {other:?}"),
         }
-        expect_deliver(rx.try_recv().expect("m2"), m2);
+        expect_deliver(rx.try_recv().expect("m3"), m3);
         assert!(rx.try_recv().is_err());
     }
 
-    /// A durable cursor whose high-water is 0 on a non-empty channel replays the
-    /// retained window (clamped to `retain_depth`) and reports a `BeyondRetained`
-    /// gap: message ids start at 1, so the oldest retained id is always `> 0` and
-    /// the resume floor of 0 is always "beyond" the retained window. Pins the
-    /// server's replay + gap for a high-water-0 resume anchor.
+    /// A durable cursor anchored at position 0 on a non-empty channel is a
+    /// resumable position — retention positions start at 1, so the whole window is
+    /// its suffix. It replays that window clamped to `retain_depth`, and the
+    /// truncation is what reports `BeyondRetained`.
     #[tokio::test]
     async fn durable_subscribe_snapshot_last_seq_zero_replays_window_with_gap() {
         let db = brenn_lib::db::init_db_memory();
@@ -4681,7 +4668,7 @@ mod tests {
             &mut durable,
             &mut spans,
             durable_sub(),
-            Some(durable_resume(&db, 0).await),
+            Some(durable_resume_at(&db, uuid, 0, vec![]).await),
             &mut counters,
         )
         .await;
@@ -4693,7 +4680,8 @@ mod tests {
             } => {
                 assert_eq!(replay_count, 1, "clamp to retain_depth = 1 keeps newest");
                 assert_eq!(
-                    gap.expect("snapshot always gaps: oldest id > 0").reason,
+                    gap.expect("the clamp drops m1, which the cursor was owed")
+                        .reason,
                     ProtoGapReason::BeyondRetained
                 );
             }
@@ -4703,13 +4691,14 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// A high-water-0 resume anchor on an *empty* channel (fresh install)
-    /// reports the `BeyondRetained` gap with no replayed rows, so a brand-new bar shows no
-    /// false staleness warning.
+    /// A position-0 resume anchor on an *empty* channel (fresh install) is
+    /// `UpToDate`, not a gap: the channel has assigned no position, so 0 is
+    /// exactly its high-water and the client has missed nothing. No rows, no
+    /// gap, so a brand-new bar shows no false staleness warning.
     #[tokio::test]
-    async fn durable_subscribe_snapshot_last_seq_zero_empty_channel_gaps_no_rows() {
+    async fn durable_subscribe_snapshot_last_seq_zero_empty_channel_is_uptodate() {
         let db = brenn_lib::db::init_db_memory();
-        let (ctx, mut rx, _uuid) = durable_ctx(&db, Depth::Bounded(1)).await;
+        let (ctx, mut rx, uuid) = durable_ctx(&db, Depth::Bounded(1)).await;
 
         let durable_subs = Arc::new(Mutex::new(HashSet::new()));
         let mut durable = DurableSessionState::new(durable_subs.clone());
@@ -4721,7 +4710,7 @@ mod tests {
             &mut durable,
             &mut spans,
             durable_sub(),
-            Some(durable_resume(&db, 0).await),
+            Some(durable_resume_at(&db, uuid, 0, vec![]).await),
             &mut counters,
         )
         .await;
@@ -4732,10 +4721,9 @@ mod tests {
                 replay_count, gap, ..
             } => {
                 assert_eq!(replay_count, 0, "empty channel replays nothing");
-                assert_eq!(
-                    gap.expect("empty channel still gaps from resume floor 0")
-                        .reason,
-                    ProtoGapReason::BeyondRetained
+                assert!(
+                    gap.is_none(),
+                    "position 0 is the empty channel's high-water, so nothing was missed"
                 );
             }
             other => panic!("expected SubscribeResult, got {other:?}"),
@@ -4751,13 +4739,14 @@ mod tests {
 
     /// Drive a durable subscribe with `resume` and assert it was answered as a
     /// fresh attach against the retained window plus an `EpochChanged` gap — the
-    /// stale-store answer. Returns the replayed row ids in delivery order.
+    /// stale-store answer. Returns the replayed retention positions in delivery
+    /// order.
     async fn assert_stale_store_fresh_attach(
         ctx: &SessionCtx,
         rx: &mut mpsc::Receiver<ServerFrame>,
         resume: Cursor,
         want_replay: u32,
-    ) -> Vec<i64> {
+    ) -> Vec<u64> {
         let durable_subs = Arc::new(Mutex::new(HashSet::new()));
         let mut durable = DurableSessionState::new(durable_subs);
         let mut counters = SessionCounters::default();
@@ -4789,63 +4778,71 @@ mod tests {
         while let Ok(ServerFrame::Deliver { targets, .. }) = rx.try_recv() {
             for target in targets {
                 match cursor::parse(&target.cursor) {
-                    Ok(CursorState::Durable { high_water, .. }) => ids.push(high_water),
-                    other => panic!("expected durable Deliver, got {other:?}"),
+                    Ok(state) => ids.push(state.seq),
+                    other => panic!("expected a parseable Deliver cursor, got {other:?}"),
                 }
             }
         }
         ids
     }
 
-    /// Arm 1 — a cursor whose generation does not match the store's (the
-    /// messaging DB was replaced under a live page) is answered as a fresh
-    /// attach + `EpochChanged`, never silence, never a violation.
+    /// A cursor bearing an epoch this channel never minted (the messaging DB was
+    /// replaced under a live page, so every channel row — and every epoch — is
+    /// new) is answered as a fresh attach + `EpochChanged`, never silence, never a
+    /// violation. The store answers it from the cursor alone: no wire-layer
+    /// generation field is involved.
     #[tokio::test]
-    async fn durable_resume_generation_mismatch_is_fresh_attach() {
+    async fn durable_resume_foreign_epoch_is_fresh_attach() {
         let db = brenn_lib::db::init_db_memory();
         let (ctx, mut rx, uuid) = durable_ctx(&db, Depth::Bounded(8)).await;
-        let m1 = seed_message(&db, uuid, "one", 100).await;
-        let m2 = seed_message(&db, uuid, "two", 200).await;
-        let id = store_id(&db).await;
+        let _m1 = seed_message(&db, uuid, "one", 100).await;
+        let _m2 = seed_message(&db, uuid, "two", 200).await;
+        let incarnation = store_id(&db).await.incarnation;
 
-        // A cursor pointing at a real row, but minted under a different store
-        // generation than the one now on disk.
-        let stale = cursor::mint_durable(Uuid::new_v4(), id.incarnation, m2, vec![]);
+        // A cursor at a real position, in a numbering domain this store never
+        // assigned.
+        let stale = cursor::mint(incarnation, Uuid::new_v4(), 2, vec![]);
         // retain_depth 8 covers both seeded rows.
         let ids = assert_stale_store_fresh_attach(&ctx, &mut rx, stale, 2).await;
-        assert_eq!(ids, vec![m1, m2], "fresh window replays the retained rows");
+        assert_eq!(ids, vec![1, 2], "fresh window replays the retained rows");
     }
 
-    /// Arm 3 — a cursor whose incarnation is above the store's current one
-    /// (the DB was restored from backup and the cursor was minted under a boot
-    /// the restored store never counted) is answered as a fresh attach.
+    /// A cursor whose incarnation is above the store's current one — the DB was
+    /// restored from backup and the cursor was minted under a boot the restored
+    /// store never counted, so its positions may name different messages now — is
+    /// answered as a fresh attach. The one staleness question the store cursor
+    /// cannot answer, which is why the session keeps it.
     #[tokio::test]
     async fn durable_resume_incarnation_above_store_is_fresh_attach() {
         let db = brenn_lib::db::init_db_memory();
         let (ctx, mut rx, uuid) = durable_ctx(&db, Depth::Bounded(8)).await;
         let m1 = seed_message(&db, uuid, "one", 100).await;
-        let id = store_id(&db).await;
+        let incarnation = store_id(&db).await.incarnation;
+        let epoch = {
+            let conn = db.lock().await;
+            db::channel_resume_epoch(&conn, uuid)
+        };
+        let _ = m1;
 
-        let stale = cursor::mint_durable(id.generation, id.incarnation + 1, m1, vec![]);
+        let stale = cursor::mint(incarnation + 1, epoch, 1, vec![]);
         let ids = assert_stale_store_fresh_attach(&ctx, &mut rx, stale, 1).await;
-        assert_eq!(ids, vec![m1]);
+        assert_eq!(ids, vec![1]);
     }
 
-    /// Arm 2 — a cursor whose high-water exceeds the channel's current max id
-    /// (the DB was restored and reconnected before rows re-climbed the id space)
-    /// is answered as a fresh attach. Same generation and a plausible incarnation,
-    /// so the other two arms pass and this one alone catches it.
+    /// A cursor above the channel's high-water — the store was restored from
+    /// backup and re-climbed its sequence past the cursor before this resume, so
+    /// the incarnation check does not catch it — is escalated as a fresh attach +
+    /// `EpochChanged`. The connection survives: an honest client reaches this.
     #[tokio::test]
-    async fn durable_resume_high_water_above_channel_max_is_fresh_attach() {
+    async fn durable_resume_above_high_water_is_fresh_attach_not_a_kill() {
         let db = brenn_lib::db::init_db_memory();
         let (ctx, mut rx, uuid) = durable_ctx(&db, Depth::Bounded(8)).await;
         let m1 = seed_message(&db, uuid, "one", 100).await;
-        let id = store_id(&db).await;
+        let _ = m1;
 
-        // high-water 1_000_000 is far above any seeded id.
-        let stale = cursor::mint_durable(id.generation, id.incarnation, 1_000_000, vec![]);
-        let ids = assert_stale_store_fresh_attach(&ctx, &mut rx, stale, 1).await;
-        assert_eq!(ids, vec![m1]);
+        let ahead = durable_resume_at(&db, uuid, 1_000_000, vec![]).await;
+        let ids = assert_stale_store_fresh_attach(&ctx, &mut rx, ahead, 1).await;
+        assert_eq!(ids, vec![1]);
     }
 
     /// An ordinary messenger teardown/rebuild on the same DB bumps the incarnation
@@ -4865,7 +4862,7 @@ mod tests {
         // The cursor the live page holds, minted at the current (pre-rebuild)
         // incarnation.
         let id_before = store_id(&db).await;
-        let resume = cursor::mint_durable(id_before.generation, id_before.incarnation, m1, vec![]);
+        let resume = durable_resume(&db, m1).await;
 
         // Simulate a server restart on the same DB: a second Messenger boot bumps
         // the incarnation once, generation unchanged.
@@ -5029,13 +5026,13 @@ mod tests {
         let shared = Arc::new(Mutex::new(HashSet::new()));
         let mut st = DurableSessionState::new(shared);
         st.activate(&sk("a"));
-        for seq in 0..REPLAY_SENT_MAX as i64 {
+        for seq in 0..REPLAY_SENT_MAX as u64 {
             assert!(st.record_replayed(&sk("a"), seq), "id {seq} within cap");
         }
         // A repeat id is accepted (adds no growth).
         assert!(st.record_replayed(&sk("a"), 0));
         // The REPLAY_SENT_MAX + 1-th *distinct* id signals teardown.
-        assert!(!st.record_replayed(&sk("a"), REPLAY_SENT_MAX as i64));
+        assert!(!st.record_replayed(&sk("a"), REPLAY_SENT_MAX as u64));
     }
 
     // ── Subscribe/Unsubscribe rate bucket ─────────────────────────────────
@@ -5060,6 +5057,11 @@ mod tests {
 
     // ── PublishBatch: one activation's flush ────────────────────────────────
 
+    /// The backend consumer registered on `ephemeral:batch-eph` in
+    /// [`batch_ctx`], at `metered` noise: the subscriber a surface publish's ring
+    /// eviction is charged and escalated against.
+    const BATCH_EPH_CONSUMER: &str = "eph-lagger";
+
     /// A [`SessionCtx`] whose runtime declares instance `protobar` with a durable
     /// output (`out` → `brenn:batch-out`) and an ephemeral one (`eph` →
     /// `ephemeral:batch-eph`), backed by a real in-memory `Messenger` with a
@@ -5067,15 +5069,19 @@ mod tests {
     /// what the batch's split-and-apply step exists for.
     async fn batch_ctx(db: &brenn_lib::db::Db) -> (SessionCtx, mpsc::Receiver<ServerFrame>) {
         use brenn_lib::messaging::config::{
-            ChannelConfigRaw, MessagingGlobalConfig, SurfaceSendBudget, build_channel_entries,
+            ChannelConfigRaw, Depth, MessagingGlobalConfig, NoiseLevel, SurfaceSendBudget,
+            build_channel_entries,
         };
+        use brenn_lib::messaging::store::RingStores;
         use brenn_lib::messaging::testutils::{ephemeral_channel_entry, surface_registrations};
         use brenn_lib::messaging::{
-            MessagingDirectory, Messenger, WakeRouter, query::NoopWakeRouter,
+            MessagingDirectory, Messenger, SubscriberEntry, SubscriberEntryKind, WakeRouter,
+            query::NoopWakeRouter,
         };
 
         let raw = ChannelConfigRaw {
-            uuid: Uuid::new_v4().to_string(),
+            send_rate: None,
+            uuid: Some(Uuid::new_v4().to_string()),
             address: "batch-out".to_string(),
             description: None,
             push_depth: None,
@@ -5114,14 +5120,28 @@ mod tests {
         let mut surface_policies = std::collections::HashMap::new();
         surface_policies.insert("deskbar".to_string(), policy.clone());
 
+        // Boot's shape: the ephemeral channel is a member of the one directory,
+        // its store is the registry's, and it carries a backend consumer's
+        // registration — the rung a ring eviction escalates against.
+        let mut eph = ephemeral_channel_entry("batch-eph", 4);
+        eph.subscribers.push(SubscriberEntry {
+            kind: SubscriberEntryKind::Wasm(BATCH_EPH_CONSUMER.to_string()),
+            push_depth: Depth::Bounded(4),
+            retain_depth: Depth::Bounded(4),
+            noise: NoiseLevel::Metered,
+            wake_min: None,
+        });
+        let ring_stores = Arc::new(RingStores::build(std::slice::from_ref(&eph)));
+
         let messenger = Messenger::new(
             db.clone(),
-            Arc::new(MessagingDirectory::with_entries(vec![entry])),
+            Arc::new(MessagingDirectory::with_entries(vec![entry, eph])),
             Arc::from(TEST_ORIGIN),
             Arc::new(indexmap::IndexMap::new()),
             Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
             MessagingGlobalConfig::default(),
         )
+        .with_ring_stores(ring_stores)
         .with_subscriber_registrations(surface_registrations(surface_policies))
         .with_surface_send_budgets([(
             "deskbar".to_string(),
@@ -5136,11 +5156,9 @@ mod tests {
             .output("ephemeral:batch-eph", "protobar", "eph")
             .policy(policy)
             .build();
-        let bus = fixture_bus(vec![ephemeral_channel_entry("batch-eph", 4, 16)]);
         let runtime = SurfaceRuntime::build(
             resolved,
-            bus,
-            Some(messenger),
+            Some(Arc::clone(&messenger)),
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
         );
@@ -5182,8 +5200,8 @@ mod tests {
 
         let mut sub = ctx
             .runtime
-            .bus
-            .subscribe(
+            .messenger()
+            .attach_live(
                 ctx.runtime.participant.clone(),
                 ctx.runtime.policy.clone(),
                 "ephemeral:batch-eph",
@@ -5247,23 +5265,23 @@ mod tests {
         );
     }
 
-    /// **The bus per-sender gate is never consulted on the batch path.** The
-    /// batch paid once, whole, at admission; a second bucket metering per entry
+    /// **The send-rate gate is never consulted on the batch path.** The batch
+    /// paid once, whole, at admission; a second bucket metering per entry
     /// afterwards could only lose a wide flush's tail under an `Ok`. Driven with
-    /// a flush wider than the bus burst — the case that loses entries if the gate
-    /// is in the path at all — and pinned on the bus's own rate-limit counter,
-    /// which is the gate's only fingerprint.
+    /// a flush wider than the default burst — the case that loses entries if the
+    /// gate is in the path at all — and pinned on the messenger's rate-limit
+    /// counter, which is the gate's only fingerprint.
     #[tokio::test]
-    async fn the_bus_per_sender_gate_is_never_consulted_on_the_batch_path() {
-        use brenn_lib::messaging::EPHEMERAL_SENDER_BURST;
+    async fn the_send_rate_gate_is_never_consulted_on_the_batch_path() {
+        use brenn_lib::messaging::config::SendRate;
 
         let db = brenn_lib::db::init_db_memory();
         let (ctx, mut rx) = batch_ctx(&db).await;
         let mut counters = SessionCounters::default();
 
-        // Wider than the bus per-sender burst, and still a conforming flush the
-        // instance's backstop admits whole.
-        let n = EPHEMERAL_SENDER_BURST as usize + 8;
+        // Wider than the default send-rate burst, and still a conforming flush
+        // the instance's backstop admits whole.
+        let n = SendRate::default().burst as usize + 8;
         assert!(
             n <= MAX_PUBLISHES_PER_ACTIVATION,
             "still a conforming flush"
@@ -5284,8 +5302,10 @@ mod tests {
         );
         assert_eq!(
             ctx.runtime
-                .bus
-                .rate_limited_count(ctx.runtime.participant.as_str()),
+                .messenger
+                .as_ref()
+                .expect("batch fixture wires a messenger")
+                .publish_rate_limited_count(ctx.runtime.participant.as_str()),
             0,
             "the gate's counter never moved — it was not in the path"
         );
@@ -5296,6 +5316,59 @@ mod tests {
         assert_eq!(
             counters.publish_rate_limited, 0,
             "nothing was rate-limited below the admission decision"
+        );
+    }
+
+    /// A surface's bound-output publish is an eviction source like any other, and
+    /// the ring books an eviction as reported the moment it happens. The batch
+    /// path must therefore route its overflow to the noise ladder itself: a
+    /// discarded outcome is a drop no consumer take will ever report, so a lagging
+    /// backend consumer would be silently starved by a page.
+    #[tokio::test]
+    async fn publish_batch_enacts_the_ring_overflow_it_causes() {
+        use brenn_lib::messaging::{ParticipantId, store::Priming};
+
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, mut rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+
+        let messenger = ctx
+            .runtime
+            .messenger
+            .as_ref()
+            .expect("batch fixture wires a messenger");
+        let consumer = ParticipantId::for_wasm(BATCH_EPH_CONSUMER);
+        let channel = messenger
+            .directory()
+            .resolve("ephemeral:batch-eph")
+            .expect("the ephemeral channel is a directory member");
+        messenger.attach_ring_subscriber(&channel.uuid, &consumer, 4, Priming::Head);
+
+        // Six into a depth-4 ring: the last two overwrite messages the consumer,
+        // which never runs, is still owed.
+        let flush: Vec<BatchEntry> = (0..6).map(|_| entry("eph", "x")).collect();
+        let outcome = handle_publish_batch(&ctx, "protobar", 9, &flush, &mut counters).await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+        assert!(
+            matches!(
+                rx.try_recv().expect("batch result"),
+                ServerFrame::PublishBatchResult {
+                    outcome: PublishBatchOutcome::Ok,
+                    ..
+                }
+            ),
+            "the flush is answered Ok"
+        );
+
+        assert_eq!(
+            messenger.dropped_total("ephemeral:batch-eph", &consumer),
+            2,
+            "both evicted-while-owed messages are accounted on the store"
+        );
+        assert_eq!(
+            messenger.drop_counter("ephemeral:batch-eph", &consumer),
+            2,
+            "and metered — the ladder saw the drops this publish caused"
         );
     }
 
@@ -5310,8 +5383,8 @@ mod tests {
 
         let mut sub = ctx
             .runtime
-            .bus
-            .subscribe(
+            .messenger()
+            .attach_live(
                 ctx.runtime.participant.clone(),
                 ctx.runtime.policy.clone(),
                 "ephemeral:batch-eph",

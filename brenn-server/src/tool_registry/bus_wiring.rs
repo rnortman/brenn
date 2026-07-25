@@ -47,6 +47,7 @@ pub fn result_inbox_name(slug: &str) -> String {
 /// `inbox_subscription`/`inbox_input_port`) — not by these channel-level values.
 fn tool_resolved_channel(defaults: &MessagingGlobalConfig) -> ResolvedChannel {
     ResolvedChannel {
+        send_rate: Default::default(),
         push_depth: defaults.default_push_depth,
         retain_depth: defaults.default_retain_depth,
         standing_retain_depth: defaults.default_standing_retain_depth,

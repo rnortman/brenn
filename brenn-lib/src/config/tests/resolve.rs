@@ -823,7 +823,11 @@ fn validate_wasm_consumer_slug_colliding_with_app_panics() {
         subscriptions: vec![],
         outputs: vec![],
         subscribe_acl: vec![],
+        ephemeral_subscribe_acl: vec![],
+        local_subscribe_acl: vec![],
         publish_acl: vec![],
+        ephemeral_publish_acl: vec![],
+        local_publish_acl: vec![],
         mqtt_publish_acl: vec![MqttClientMatcherRaw {
             client: "ha".to_string(),
         }],
@@ -1053,6 +1057,8 @@ fn validate_resolves_explicit_grants_and_acl_into_policy() {
                 brenn_subscribe: vec![ChannelMatcherRaw::Prefix("alerts.".to_string())],
                 brenn_publish: vec![ChannelMatcherRaw::Exact("outbox".to_string())],
                 ephemeral_publish: vec![],
+                ephemeral_subscribe: vec![],
+                local_publish: vec![],
                 webhook: vec![WebhookMatcherRaw {
                     endpoint: "github".to_string(),
                 }],

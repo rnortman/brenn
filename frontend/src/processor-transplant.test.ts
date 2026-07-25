@@ -148,6 +148,9 @@ async function runScript(): Promise<TranscriptEntry[]> {
                 newFrom: p.new_from,
                 dropped: p.dropped,
             })),
+            // Output-port deferral is backend scope; a surface-hosted transplant
+            // carries no deferred windows, but the field is required by the ABI.
+            deferred: [],
         };
         try {
             receive(record);

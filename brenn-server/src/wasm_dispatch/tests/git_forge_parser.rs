@@ -51,6 +51,7 @@ async fn build_parser_setup(
         address: addr.to_string(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -78,6 +79,7 @@ async fn build_parser_setup(
         address: out_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -178,6 +180,7 @@ async fn build_parser_setup(
                 amplification_mt: 1000,
             },
         ],
+        outputs: vec![],
         activation_pacing: unthrottled_pacing(),
     };
 

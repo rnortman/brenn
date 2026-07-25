@@ -71,6 +71,25 @@ pub fn decrement_send_budget(
     }
 }
 
+/// Give back a unit drawn for a publish that then committed nothing — the
+/// compensating half of [`decrement_send_budget`], for the refusals that can
+/// only be discovered after the draw.
+///
+/// Clamped at `default_budget`: a refund racing a reset must not mint budget
+/// above the ceiling the reset just set. A missing row (nothing was ever drawn)
+/// updates nothing.
+///
+/// All work happens under the caller's lock — must be invoked while the caller
+/// holds `db.lock().await`.
+pub fn refund_send_budget(conn: &Connection, conversation_id: i64, default_budget: u32) {
+    conn.execute(
+        "UPDATE messaging_send_budget SET remaining = remaining + 1
+         WHERE conversation_id = ?1 AND remaining < ?2",
+        rusqlite::params![conversation_id, default_budget],
+    )
+    .expect("messaging: refund send budget");
+}
+
 /// Read the current send-budget remaining for a conversation. Returns
 /// `None` if no row exists yet. Test/debug helper.
 pub fn read_send_budget(conn: &Connection, conversation_id: i64) -> Option<u32> {

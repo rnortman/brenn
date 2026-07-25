@@ -281,6 +281,24 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
             Some(OUTCOME_ACTION_ERROR),
             Some(format!("body too large: {len} > {max}")),
         ),
+        PublishResult::RateLimited => (
+            OUTCOME_ACTION_ERROR,
+            Some(OUTCOME_ACTION_ERROR),
+            Some("send rate limit exceeded".to_string()),
+        ),
+        // A job's action fields are gated at create/edit time against the same
+        // channel capabilities, so an option the target cannot carry means the
+        // channel changed class under a stored job.
+        PublishResult::UnsupportedOption { field } => (
+            OUTCOME_ACTION_ERROR,
+            Some(OUTCOME_ACTION_ERROR),
+            Some(format!("option `{field}` is not supported on this channel")),
+        ),
+        PublishResult::DeferredQuotaExceeded { cap } => (
+            OUTCOME_ACTION_ERROR,
+            Some(OUTCOME_ACTION_ERROR),
+            Some(format!("deferred-message quota exceeded (cap {cap})")),
+        ),
     };
 
     finish_fire(
@@ -822,7 +840,8 @@ mod tests {
             _: &crate::messaging::ParticipantId,
             _: &MessageEnvelope,
             _push_id: i64,
-            _seq: i64,
+            _message_id: i64,
+            _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             Ok(true)
         }
@@ -877,6 +896,7 @@ mod tests {
             address: canonical_address("test"),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,

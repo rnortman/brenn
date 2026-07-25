@@ -187,7 +187,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::super::build_surface_runtimes;
-    use super::super::test_fixtures::{TEST_MAX_BODY_BYTES, fixture_bus};
+    use super::super::test_fixtures::TEST_MAX_BODY_BYTES;
     use crate::router::build_router;
     use crate::test_support::http::{body_string, setup_authenticated_user};
     use crate::test_support::state::test_state;
@@ -207,10 +207,8 @@ mod tests {
     async fn surface_router(resolved: ResolvedSurface) -> (axum::Router, db::Db, String) {
         let db = db::init_db_memory();
         let mut state = test_state(&db);
-        let bus = fixture_bus(vec![]);
         state.surfaces = Arc::new(build_surface_runtimes(
             vec![resolved],
-            bus,
             None,
             TEST_MAX_BODY_BYTES,
             None,

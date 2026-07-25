@@ -508,6 +508,7 @@ mod processor_bindings {
 
 use processor_bindings::ProcessorPre;
 use processor_bindings::brenn::processor::mqtt::MqttPublishError as MqttPublishWitError;
+use processor_bindings::brenn::processor::ports::DeferError;
 use processor_bindings::brenn::processor::ports::PublishError;
 use processor_bindings::brenn::processor::store::StoreError as ProcessorStoreError;
 use processor_bindings::brenn::processor::tools::ToolError as ToolWitError;
@@ -854,6 +855,33 @@ pub struct ProcessorPublish {
     /// result inbox `brenn:tool-results/<slug>`). `None` for ordinary port
     /// publishes. The host resolves this address to a channel reference at flush.
     pub reply_to: Option<String>,
+    /// Requested release time (epoch milliseconds UTC) for a deferred publish, or
+    /// `None` for an immediate one. A value at or before flush time publishes
+    /// immediately; a future value parks until it. Set only via
+    /// `ports.publish-deferred`.
+    pub deliver_after: Option<u64>,
+}
+
+/// One buffered deferred-message control op from a guest activation.
+///
+/// Named by `(port, index)` where `index` is a position into the deferred-window
+/// this activation delivered for `port`. The host resolves the index to a parked
+/// message identity captured in the activation's snapshot at flush; `brenn-wasm`
+/// itself never sees message identities, so it carries only the port + index the
+/// guest named. Buffered like [`ProcessorPublish`] and applied atomically iff the
+/// guest returns ok.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessorDeferredOp {
+    /// Cancel the parked message at `index` in `port`'s deferred window.
+    Cancel { port: String, index: u32 },
+    /// Edit the parked message at `index` in `port`'s deferred window. `payload`
+    /// and `deliver_after` are each `Some` to change, `None` to leave alone.
+    Edit {
+        port: String,
+        index: u32,
+        payload: Option<String>,
+        deliver_after: Option<u64>,
+    },
 }
 
 /// Logical port label carried on the `ProcessorPublish` synthesized from an async
@@ -936,6 +964,15 @@ fn compute_grant_input_mt(
 /// boundary into the guest.
 pub type ProcessorPortWindow = brenn_activation::PortWindow<String>;
 
+/// One output port's deferred-message view handed to `ProcessorComponent::handle`.
+///
+/// This host carries a parked message's payload as its body text — the same
+/// string the guest passed to `ports.publish-deferred`.
+pub type ProcessorDeferredWindow = brenn_activation::DeferredWindow<String>;
+
+/// One entry in a [`ProcessorDeferredWindow`].
+pub type ProcessorDeferredEntry = brenn_activation::DeferredEntry<String>;
+
 /// Host-side activation handed to `ProcessorComponent::handle`.
 ///
 /// Contains one [`ProcessorPortWindow`] per bound input port, in config (`inputs`)
@@ -947,8 +984,13 @@ pub type ProcessorActivation = brenn_activation::Activation<String>;
 /// Outcome of one `ProcessorComponent::handle` invocation.
 #[derive(Debug)]
 pub enum ProcessorOutcome {
-    /// Guest returned `result::ok`. Vec contains all buffered publishes.
-    Ok(Vec<ProcessorPublish>),
+    /// Guest returned `result::ok`. `publishes` holds every buffered publish;
+    /// `deferred_ops` holds every buffered deferred-message control op
+    /// (`defer-cancel` / `defer-edit`). Both flush together, atomically.
+    Ok {
+        publishes: Vec<ProcessorPublish>,
+        deferred_ops: Vec<ProcessorDeferredOp>,
+    },
     /// Guest returned `result::err` — typed batch rejection.
     Err(ProcessorReceiveError),
     /// Guest panicked, trapped, or exhausted a resource limit.
@@ -1021,6 +1063,16 @@ struct ProcessorData {
     tool_request_buffer: Vec<QueuedToolRequest>,
     /// Count of fast-tool calls this activation; quota enforcement (anti-flood).
     tool_call_count: usize,
+    /// Deferred control ops (`defer-cancel` / `defer-edit`) buffered this
+    /// activation. Flushed by `take_ok_deferred_ops` iff the guest returns ok; a
+    /// trap/err drops the buffer with the store, so a failed activation cancels
+    /// and edits nothing.
+    deferred_op_buffer: Vec<ProcessorDeferredOp>,
+    /// Per-output-port count of deferred-window entries this activation delivered
+    /// — the range a `defer-cancel`/`defer-edit` index is validated against at
+    /// buffer time. Populated in `invoke` before the guest runs; a port absent
+    /// here (unbound, or one that carried no deferred window) admits no index.
+    deferred_index_bounds: HashMap<String, u32>,
 }
 
 impl ProcessorData {
@@ -1045,6 +1097,7 @@ impl ProcessorData {
         port: String,
         payload: String,
         guest_urgency: Option<processor_bindings::brenn::processor::ports::Urgency>,
+        deliver_after: Option<u64>,
     ) -> Result<(), PublishError> {
         // Per-activation total-call budget (successful + failed).
         // Checked first to bound log-flood DoS from repeated unbound-port calls by
@@ -1094,6 +1147,22 @@ impl ProcessorData {
                 self.max_payload_bytes
             )));
         }
+        // deliver_after is guest-supplied epoch-ms UTC. The host schedules it as a
+        // timestamp, whose representable range is far narrower than u64; a value
+        // outside it would otherwise collapse host-side into an immediate publish,
+        // silently turning a deferred publish into a now one. Reject it here, where
+        // the guest still has the error channel, using chrono itself as the range
+        // authority so the bound cannot drift.
+        if let Some(ms) = deliver_after
+            && i64::try_from(ms)
+                .ok()
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                .is_none()
+        {
+            return Err(PublishError::InvalidPayload(format!(
+                "deliver_after {ms} ms is not a representable timestamp"
+            )));
+        }
         // Per-sink token-bucket budget — checked before the global buffer/byte
         // backstops (tightest, most specific gate first; globals remain outer
         // defense-in-depth). A bound port always has a seeded budget entry; a
@@ -1135,6 +1204,7 @@ impl ProcessorData {
             payload,
             urgency,
             reply_to: None,
+            deliver_after,
         });
         // Charge the sink on acceptance. The entry existed and had sufficient budget
         // above; a vanished entry here is a host invariant violation — fail fast.
@@ -1146,13 +1216,80 @@ impl ProcessorData {
         Ok(())
     }
 
+    /// Buffer one deferred-message control op (`defer-cancel` / `defer-edit`).
+    ///
+    /// Validation is fail-fast at buffer time, while the guest still holds the
+    /// error channel: an unbound port is `NotPermitted`, an `index` outside the
+    /// deferred window this activation delivered for the port is `OutOfRange` (a
+    /// guest bug). The actual cancel/edit is applied at flush by the host, which
+    /// resolves `index` against the snapshot's captured identities — so a message
+    /// that releases between drain and flush is a benign no-op there, not an error
+    /// here.
+    fn do_defer(&mut self, op: ProcessorDeferredOp) -> Result<(), DeferError> {
+        let (port, index) = match &op {
+            ProcessorDeferredOp::Cancel { port, index } => (port, *index),
+            ProcessorDeferredOp::Edit { port, index, .. } => (port, *index),
+        };
+        // A `defer-edit` release time is guest-supplied epoch-ms UTC; reject a
+        // non-representable value here, where the guest still holds the error
+        // channel, using chrono as the range authority — a value outside it would
+        // otherwise panic the host at flush (`instant_of`). Mirrors `do_publish`.
+        if let ProcessorDeferredOp::Edit {
+            deliver_after: Some(ms),
+            ..
+        } = &op
+            && i64::try_from(*ms)
+                .ok()
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                .is_none()
+        {
+            return Err(DeferError::InvalidDeliverAfter);
+        }
+        // Per-activation total-call budget, shared with `do_publish` (anti-flood):
+        // a rejected op consumes budget too, so a guest cannot flood the surface
+        // with failing control ops for free.
+        self.publish_call_count += 1;
+        if self.publish_call_count > MAX_PUBLISH_CALLS_PER_ACTIVATION {
+            return Err(DeferError::QuotaExceeded);
+        }
+        // Port must be a bound output port. `port` is guest-controlled: cap and
+        // debug-escape before logging, like `do_publish`.
+        if !self.output_ports.contains_key(port) {
+            warn!(
+                slug = %self.slug,
+                port = %cap_guest_for_log(port),
+                "wasm defer control: not-permitted — unbound port"
+            );
+            return Err(DeferError::NotPermitted);
+        }
+        // Index must be within the deferred window this activation delivered for
+        // the port. An absent port bound is 0 (no deferred entries delivered), so
+        // any index is out of range there.
+        let bound = self.deferred_index_bounds.get(port).copied().unwrap_or(0);
+        if index >= bound {
+            return Err(DeferError::OutOfRange);
+        }
+        // Bound the buffer size (shared per-activation ceiling with publishes and
+        // tool requests): control ops are cheap but not free at flush.
+        if self.deferred_op_buffer.len() >= MAX_PUBLISHES_PER_ACTIVATION {
+            return Err(DeferError::QuotaExceeded);
+        }
+        self.deferred_op_buffer.push(op);
+        Ok(())
+    }
+
+    /// Drain the activation's buffered deferred control ops. Called only on a
+    /// guest `Ok` outcome; on `Err`/`Trap` the buffer drops with the store.
+    fn take_ok_deferred_ops(&mut self) -> Vec<ProcessorDeferredOp> {
+        std::mem::take(&mut self.deferred_op_buffer)
+    }
+
     /// Synchronous MQTT publish (the `mqtt.mqtt-publish` import).
     ///
     /// Unlike `do_publish` (buffered, flushed at activation end), this goes
     /// STRAIGHT to the broker via the injected `mqtt_publish` callback (which
     /// calls the shared `enforce_and_publish` pipeline in the binary crate) and
-    /// returns the broker outcome inline. No store-and-forward (design §2.5,
-    /// §3.1).
+    /// returns the broker outcome inline — no store-and-forward.
     ///
     /// Per-activation flood bound: shares the `publish_call_count` budget with
     /// `do_publish`, checked against `MAX_PUBLISH_CALLS_PER_ACTIVATION`
@@ -1307,7 +1444,7 @@ impl ProcessorData {
 
 impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
     fn publish(&mut self, port: String, payload: String) -> Result<(), PublishError> {
-        self.do_publish(port, payload, None)
+        self.do_publish(port, payload, None, None)
     }
 
     fn publish_with_urgency(
@@ -1316,7 +1453,36 @@ impl processor_bindings::brenn::processor::ports::Host for ProcessorData {
         payload: String,
         urgency: processor_bindings::brenn::processor::ports::Urgency,
     ) -> Result<(), PublishError> {
-        self.do_publish(port, payload, Some(urgency))
+        self.do_publish(port, payload, Some(urgency), None)
+    }
+
+    fn publish_deferred(
+        &mut self,
+        port: String,
+        payload: String,
+        deliver_after: u64,
+    ) -> Result<(), PublishError> {
+        // No clock read here; the host decides park-vs-immediate at flush.
+        self.do_publish(port, payload, None, Some(deliver_after))
+    }
+
+    fn defer_cancel(&mut self, port: String, index: u32) -> Result<(), DeferError> {
+        self.do_defer(ProcessorDeferredOp::Cancel { port, index })
+    }
+
+    fn defer_edit(
+        &mut self,
+        port: String,
+        index: u32,
+        payload: Option<String>,
+        deliver_after: Option<u64>,
+    ) -> Result<(), DeferError> {
+        self.do_defer(ProcessorDeferredOp::Edit {
+            port,
+            index,
+            payload,
+            deliver_after,
+        })
     }
 }
 
@@ -1523,6 +1689,7 @@ impl ProcessorData {
                 payload: req.body_json,
                 urgency: ProcessorUrgency::Normal,
                 reply_to: Some(req.reply_to),
+                deliver_after: None,
             });
         }
         publishes
@@ -2350,6 +2517,8 @@ impl ProcessorComponent {
                 tool_host: self.tool_host.clone(),
                 tool_request_buffer: Vec::new(),
                 tool_call_count: 0,
+                deferred_op_buffer: Vec::new(),
+                deferred_index_bounds: HashMap::new(),
             },
         );
         store.limiter(|d| &mut d.limits);
@@ -2364,7 +2533,7 @@ impl ProcessorComponent {
 
     /// Invoke the component's `receive` export with `activation`.
     ///
-    /// Returns `ProcessorOutcome::Ok(publishes)` on guest ok (publishes are the
+    /// Returns `ProcessorOutcome::Ok { publishes, deferred_ops }` on guest ok (the
     /// buffered messages to flush), `ProcessorOutcome::Err` on a typed guest reject,
     /// and `ProcessorOutcome::Trap` on a guest trap or resource exhaustion — does NOT
     /// panic on a trap (contained, alerted by caller).
@@ -2467,6 +2636,7 @@ impl ProcessorComponent {
         processor_pre: &ProcessorPre<ProcessorData>,
         carry: &mut HashMap<SinkKey, u64>,
     ) -> ProcessorOutcome {
+        let activation_now = activation.now;
         let wit_ports: Vec<_> = activation
             .ports
             .into_iter()
@@ -2483,8 +2653,37 @@ impl ProcessorComponent {
                 },
             )
             .collect();
-        let wit_activation =
-            processor_bindings::brenn::processor::types::Activation { ports: wit_ports };
+        let mut deferred_index_bounds: HashMap<String, u32> =
+            HashMap::with_capacity(activation.deferred.len());
+        let wit_deferred: Vec<_> = activation
+            .deferred
+            .into_iter()
+            .map(
+                |dw| processor_bindings::brenn::processor::types::DeferredWindow {
+                    port: dw.port,
+                    entries: dw
+                        .entries
+                        .into_iter()
+                        .map(
+                            |e| processor_bindings::brenn::processor::types::DeferredEntry {
+                                index: e.index,
+                                payload: e.payload,
+                                deliver_after: e.deliver_after,
+                            },
+                        )
+                        .collect(),
+                },
+            )
+            .inspect(|dw| {
+                deferred_index_bounds.insert(dw.port.clone(), dw.entries.len() as u32);
+            })
+            .collect();
+        store.data_mut().deferred_index_bounds = deferred_index_bounds;
+        let wit_activation = processor_bindings::brenn::processor::types::Activation {
+            ports: wit_ports,
+            deferred: wit_deferred,
+            now: activation_now,
+        };
         let instance = match processor_pre.instantiate(&mut store) {
             Ok(i) => i,
             // Deliberately skips the carry writeback tail below: the guest never ran,
@@ -2495,11 +2694,17 @@ impl ProcessorComponent {
         };
         let outcome = match instance.call_receive(&mut store, &wit_activation) {
             Ok(Ok(())) => {
-                // Both buffers flush together, on Ok only. On Err/Trap this arm is
+                // All buffers flush together, on Ok only. On Err/Trap this arm is
                 // never taken, so the buffers drop with the store below — a trapped
-                // activation therefore fires no port publish AND no tool call.
-                let publishes = store.data_mut().take_ok_publishes();
-                ProcessorOutcome::Ok(publishes)
+                // activation therefore fires no port publish, no tool call, and no
+                // deferred cancel/edit.
+                let data = store.data_mut();
+                let publishes = data.take_ok_publishes();
+                let deferred_ops = data.take_ok_deferred_ops();
+                ProcessorOutcome::Ok {
+                    publishes,
+                    deferred_ops,
+                }
             }
             Ok(Err(re)) => ProcessorOutcome::Err(re),
             Err(e) => ProcessorOutcome::Trap(format!("{e:#}")),
@@ -2743,6 +2948,8 @@ mod processor_store_host_tests {
             tool_host: None,
             tool_request_buffer: Vec::new(),
             tool_call_count: 0,
+            deferred_op_buffer: Vec::new(),
+            deferred_index_bounds: HashMap::new(),
         };
         (db, kv, data)
     }
@@ -2776,6 +2983,8 @@ mod processor_store_host_tests {
             tool_host: None,
             tool_request_buffer: Vec::new(),
             tool_call_count: 0,
+            deferred_op_buffer: Vec::new(),
+            deferred_index_bounds: HashMap::new(),
         }
     }
 
@@ -2790,7 +2999,7 @@ mod processor_store_host_tests {
         let mut data = make_publish_data("brenn:secret", acl);
 
         let err = data
-            .do_publish("out".to_string(), "payload".to_string(), None)
+            .do_publish("out".to_string(), "payload".to_string(), None, None)
             .expect_err("publish to a channel outside the output ACL must be denied");
         assert!(
             matches!(err, PublishError::NotPermitted),
@@ -2821,7 +3030,7 @@ mod processor_store_host_tests {
         let acl: OutputAclFn = Arc::new(|addr: &str| addr == "brenn:allowed");
         let mut data = make_publish_data("brenn:allowed", acl);
 
-        data.do_publish("out".to_string(), "payload".to_string(), None)
+        data.do_publish("out".to_string(), "payload".to_string(), None, None)
             .expect("publish to an in-allowlist channel must succeed");
         assert_eq!(
             data.publish_buffer.len(),
@@ -2839,7 +3048,231 @@ mod processor_store_host_tests {
         assert_eq!(data.publish_call_count, 1);
     }
 
-    // --- do_mqtt_publish host-fn tests (design §2.5, §3.3, §4 "WASM egress") ---
+    /// A `deliver_after` outside the representable timestamp range is rejected at
+    /// buffer time — where the guest still holds the error channel — rather than
+    /// collapsing host-side into an immediate publish.
+    #[test]
+    fn do_publish_rejects_unrepresentable_deliver_after() {
+        let acl: OutputAclFn = Arc::new(|addr: &str| addr == "brenn:allowed");
+        let mut data = make_publish_data("brenn:allowed", acl);
+
+        let err = data
+            .do_publish(
+                "out".to_string(),
+                "payload".to_string(),
+                None,
+                Some(u64::MAX),
+            )
+            .expect_err("an unrepresentable deliver_after must be refused");
+        assert!(
+            matches!(err, PublishError::InvalidPayload(_)),
+            "unrepresentable deliver_after must be invalid-payload, got {err:?}"
+        );
+        assert_eq!(
+            data.publish_buffer.len(),
+            0,
+            "a rejected deferred publish must buffer nothing"
+        );
+        assert_eq!(
+            data.published_bytes, 0,
+            "a rejected deferred publish must count no bytes"
+        );
+
+        // A representable future time buffers normally.
+        data.do_publish(
+            "out".to_string(),
+            "payload".to_string(),
+            None,
+            Some(4_000_000_000_000),
+        )
+        .expect("a representable deliver_after must buffer");
+        assert_eq!(data.publish_buffer.len(), 1);
+        assert_eq!(
+            data.publish_buffer[0].deliver_after,
+            Some(4_000_000_000_000)
+        );
+    }
+
+    // --- defer-control host-fn tests (do_defer / defer-cancel / defer-edit) ---
+
+    /// `make_publish_data` with a deferred-window of `n` entries delivered for
+    /// port `"out"`, so `defer-cancel`/`defer-edit` indices `0..n` are in range.
+    fn make_defer_data(entries: u32) -> ProcessorData {
+        let mut data = make_publish_data("brenn:allowed", Arc::new(|_| true));
+        data.deferred_index_bounds
+            .insert("out".to_string(), entries);
+        data
+    }
+
+    /// A valid `defer-cancel` / `defer-edit` (index within the delivered window,
+    /// bound port) buffers the op; it is not applied here — the host flushes it.
+    #[test]
+    fn do_defer_buffers_valid_ops() {
+        let mut data = make_defer_data(2);
+        data.do_defer(ProcessorDeferredOp::Cancel {
+            port: "out".to_string(),
+            index: 0,
+        })
+        .expect("index 0 is within the 2-entry window");
+        data.do_defer(ProcessorDeferredOp::Edit {
+            port: "out".to_string(),
+            index: 1,
+            payload: Some("new".to_string()),
+            deliver_after: Some(4_000_000_000_000),
+        })
+        .expect("index 1 is within the 2-entry window");
+        assert_eq!(data.deferred_op_buffer.len(), 2);
+        assert_eq!(
+            data.deferred_op_buffer[0],
+            ProcessorDeferredOp::Cancel {
+                port: "out".to_string(),
+                index: 0
+            }
+        );
+        assert_eq!(
+            data.deferred_op_buffer[1],
+            ProcessorDeferredOp::Edit {
+                port: "out".to_string(),
+                index: 1,
+                payload: Some("new".to_string()),
+                deliver_after: Some(4_000_000_000_000),
+            }
+        );
+        assert_eq!(data.take_ok_deferred_ops().len(), 2);
+        assert_eq!(data.deferred_op_buffer.len(), 0, "taken buffer is drained");
+    }
+
+    /// An index at or beyond the delivered window is a guest bug: `OutOfRange`,
+    /// buffering nothing. A port with no delivered window admits no index.
+    #[test]
+    fn do_defer_index_out_of_range_is_rejected_at_buffer_time() {
+        let mut data = make_defer_data(1);
+        let err = data
+            .do_defer(ProcessorDeferredOp::Cancel {
+                port: "out".to_string(),
+                index: 1,
+            })
+            .expect_err("index 1 is out of a 1-entry window");
+        assert!(matches!(err, DeferError::OutOfRange));
+        assert_eq!(data.deferred_op_buffer.len(), 0);
+
+        // A bound port that carried no deferred window this activation admits no
+        // index at all.
+        let mut none = make_publish_data("brenn:allowed", Arc::new(|_| true));
+        let err = none
+            .do_defer(ProcessorDeferredOp::Cancel {
+                port: "out".to_string(),
+                index: 0,
+            })
+            .expect_err("no delivered window ⇒ index 0 is out of range");
+        assert!(matches!(err, DeferError::OutOfRange));
+    }
+
+    /// An unbound port is `NotPermitted`, buffering nothing.
+    #[test]
+    fn do_defer_unbound_port_is_not_permitted() {
+        let mut data = make_defer_data(2);
+        let err = data
+            .do_defer(ProcessorDeferredOp::Cancel {
+                port: "nope".to_string(),
+                index: 0,
+            })
+            .expect_err("an unbound port must be refused");
+        assert!(matches!(err, DeferError::NotPermitted));
+        assert_eq!(data.deferred_op_buffer.len(), 0);
+    }
+
+    /// A `defer-edit` release time outside the representable range is rejected at
+    /// buffer time (`InvalidDeliverAfter`), before it can panic the host at flush.
+    #[test]
+    fn do_defer_edit_rejects_unrepresentable_deliver_after() {
+        let mut data = make_defer_data(1);
+        let err = data
+            .do_defer(ProcessorDeferredOp::Edit {
+                port: "out".to_string(),
+                index: 0,
+                payload: None,
+                deliver_after: Some(u64::MAX),
+            })
+            .expect_err("an unrepresentable deliver_after must be refused");
+        assert!(matches!(err, DeferError::InvalidDeliverAfter));
+        assert_eq!(data.deferred_op_buffer.len(), 0);
+
+        // A representable value buffers.
+        data.do_defer(ProcessorDeferredOp::Edit {
+            port: "out".to_string(),
+            index: 0,
+            payload: None,
+            deliver_after: Some(4_000_000_000_000),
+        })
+        .expect("a representable deliver_after must buffer");
+        assert_eq!(data.deferred_op_buffer.len(), 1);
+    }
+
+    /// The per-activation total-call budget is *shared* with `do_publish`: a
+    /// defer op consumes the same `publish_call_count`, and once the publishes
+    /// have exhausted it the next (otherwise valid) defer op is `QuotaExceeded`,
+    /// buffering nothing. This bounds a guest that mixes publishes and control
+    /// ops to flood the flush surface.
+    #[test]
+    fn do_defer_shares_the_per_activation_call_budget_with_publishes() {
+        let mut data = make_defer_data(1); // index 0 is in range on "out"
+        // Exhaust the shared call budget with unbound-port publishes: each is
+        // rejected (NotPermitted, buffering nothing) but still consumes a call.
+        for _ in 0..MAX_PUBLISH_CALLS_PER_ACTIVATION {
+            let _ = data.do_publish("nope".to_string(), "x".to_string(), None, None);
+        }
+        assert_eq!(data.publish_call_count, MAX_PUBLISH_CALLS_PER_ACTIVATION);
+        assert_eq!(
+            data.publish_buffer.len(),
+            0,
+            "unbound publishes buffer nothing"
+        );
+
+        let err = data
+            .do_defer(ProcessorDeferredOp::Cancel {
+                port: "out".to_string(),
+                index: 0,
+            })
+            .expect_err("the shared call budget is exhausted by the publishes");
+        assert!(matches!(err, DeferError::QuotaExceeded));
+        assert_eq!(
+            data.deferred_op_buffer.len(),
+            0,
+            "a budget-rejected defer op buffers nothing"
+        );
+    }
+
+    /// The defer buffer has its own per-activation ceiling
+    /// (`MAX_PUBLISHES_PER_ACTIVATION`): valid ops buffer up to it, the next is
+    /// `QuotaExceeded`, and the buffer does not grow past the cap.
+    #[test]
+    fn do_defer_buffer_cap_rejects_beyond_the_ceiling() {
+        let mut data = make_defer_data(1); // index 0 stays in range every call
+        for _ in 0..MAX_PUBLISHES_PER_ACTIVATION {
+            data.do_defer(ProcessorDeferredOp::Cancel {
+                port: "out".to_string(),
+                index: 0,
+            })
+            .expect("within the buffer ceiling");
+        }
+        assert_eq!(data.deferred_op_buffer.len(), MAX_PUBLISHES_PER_ACTIVATION);
+
+        let err = data
+            .do_defer(ProcessorDeferredOp::Cancel {
+                port: "out".to_string(),
+                index: 0,
+            })
+            .expect_err("beyond the buffer ceiling");
+        assert!(matches!(err, DeferError::QuotaExceeded));
+        assert_eq!(
+            data.deferred_op_buffer.len(),
+            MAX_PUBLISHES_PER_ACTIVATION,
+            "a rejected op does not grow the buffer past its cap"
+        );
+    }
+
+    // --- do_mqtt_publish host-fn tests ---
 
     /// Build a `ProcessorData` whose MQTT-publish callback returns `outcome`.
     fn make_mqtt_data(outcome: MqttPublishOutcome) -> ProcessorData {
@@ -2867,6 +3300,8 @@ mod processor_store_host_tests {
             tool_host: None,
             tool_request_buffer: Vec::new(),
             tool_call_count: 0,
+            deferred_op_buffer: Vec::new(),
+            deferred_index_bounds: HashMap::new(),
         }
     }
 
@@ -2978,7 +3413,7 @@ mod processor_store_host_tests {
         // Spend half the budget via ports.publish, the rest via mqtt-publish.
         let half = MAX_PUBLISH_CALLS_PER_ACTIVATION / 2;
         for _ in 0..half {
-            data.do_publish("out".to_string(), "p".to_string(), None)
+            data.do_publish("out".to_string(), "p".to_string(), None, None)
                 .expect("under budget");
         }
         for _ in half..MAX_PUBLISH_CALLS_PER_ACTIVATION {
@@ -3213,6 +3648,8 @@ mod processor_store_host_tests {
             tool_host: Some(host),
             tool_request_buffer: Vec::new(),
             tool_call_count: 0,
+            deferred_op_buffer: Vec::new(),
+            deferred_index_bounds: HashMap::new(),
         }
     }
 
@@ -3391,6 +3828,7 @@ mod processor_store_host_tests {
             payload: "port-body".to_string(),
             urgency: ProcessorUrgency::Normal,
             reply_to: None,
+            deliver_after: None,
         });
         data.do_queue_async("git-repo-pull".into(), "{}".into(), "c1")
             .expect("valid async call must buffer");
@@ -3460,7 +3898,7 @@ mod processor_store_host_tests {
 
         for i in 0..MAX_PUBLISH_CALLS_PER_ACTIVATION {
             let err = data
-                .do_publish("out".to_string(), "payload".to_string(), None)
+                .do_publish("out".to_string(), "payload".to_string(), None, None)
                 .expect_err("denied publish must return an error");
             assert!(
                 matches!(err, PublishError::NotPermitted),
@@ -3470,7 +3908,7 @@ mod processor_store_host_tests {
         // Budget now exhausted: the gate that fires first is the call-budget check,
         // so the next call is QuotaExceeded, not NotPermitted.
         let err = data
-            .do_publish("out".to_string(), "payload".to_string(), None)
+            .do_publish("out".to_string(), "payload".to_string(), None, None)
             .expect_err("over-budget publish must return an error");
         assert!(
             matches!(err, PublishError::QuotaExceeded),
@@ -3494,6 +3932,8 @@ mod processor_store_host_tests {
                 new_from,
                 dropped: 0,
             }],
+            deferred: vec![],
+            now: None,
         }
     }
 
@@ -3519,6 +3959,8 @@ mod processor_store_host_tests {
                     dropped: 0,
                 },
             ],
+            deferred: vec![],
+            now: None,
         };
         assert_eq!(compute_grant_input_mt(&amp, &act), 3000 + 2000);
     }
@@ -3563,11 +4005,11 @@ mod processor_store_host_tests {
             .insert(SinkKey::Port("out".to_string()), budget_mt);
 
         for i in 0..(n + 1) {
-            data.do_publish("out".to_string(), "p".to_string(), None)
+            data.do_publish("out".to_string(), "p".to_string(), None, None)
                 .unwrap_or_else(|e| panic!("publish {i} within budget must succeed, got {e:?}"));
         }
         let err = data
-            .do_publish("out".to_string(), "p".to_string(), None)
+            .do_publish("out".to_string(), "p".to_string(), None, None)
             .expect_err("the N+2nd publish must be rejected");
         assert!(matches!(err, PublishError::QuotaExceeded));
         assert_eq!(
@@ -3609,16 +4051,18 @@ mod processor_store_host_tests {
             tool_host: None,
             tool_request_buffer: Vec::new(),
             tool_call_count: 0,
+            deferred_op_buffer: Vec::new(),
+            deferred_index_bounds: HashMap::new(),
         };
         // Drain A.
-        data.do_publish("a".to_string(), "p".to_string(), None)
+        data.do_publish("a".to_string(), "p".to_string(), None, None)
             .expect("A first publish ok");
         assert!(matches!(
-            data.do_publish("a".to_string(), "p".to_string(), None),
+            data.do_publish("a".to_string(), "p".to_string(), None, None),
             Err(PublishError::QuotaExceeded)
         ));
         // B is unaffected.
-        data.do_publish("b".to_string(), "p".to_string(), None)
+        data.do_publish("b".to_string(), "p".to_string(), None, None)
             .expect("B publishes despite A being dry");
         assert_eq!(
             data.publish_suppressed_by_sink
@@ -3858,6 +4302,8 @@ mod processor_config_host_tests {
             tool_host: None,
             tool_request_buffer: Vec::new(),
             tool_call_count: 0,
+            deferred_op_buffer: Vec::new(),
+            deferred_index_bounds: HashMap::new(),
         };
         (db, kv, data)
     }

@@ -76,6 +76,7 @@ async fn build_surface_subscriber_messenger(surface_slug: &str) -> (Arc<Messenge
         address: channel_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -182,6 +183,7 @@ async fn build_app_subscriber_messenger(sub_wake_min: WakeMin) -> (Arc<Messenger
         address: channel_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,

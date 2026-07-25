@@ -1,5 +1,24 @@
 # TODOs
 
+## `substrate-unsubscribe-publish-race`
+
+`unsubscribe_dynamic` (`brenn-lib/src/messaging/subscribe.rs`) tears down a
+subscriber's push rows via `detach_subscriber`, but that delete is not serialized
+against a concurrent publish. A publish that resolved its target list (app still
+subscribed) before the unsubscribe ran can insert its push rows *after* the delete,
+leaving rows naming a fully-unsubscribed subscriber: the dispatcher keeps reporting it
+as owed work (via `channel_deliverable_subscribers`) and may deliver a message after
+the unsubscribe was acknowledged. Closing it means the push insert must pass a "durable
+sub row exists" guard in the same lock scope as the delete — which rides on the
+publish-pipeline reshape that replaces per-publish target resolution with the store's
+attached set, so it lands with that work, not as a standalone patch. Done when a
+publish racing an unsubscribe cannot leave an owed push row for the departed subscriber,
+pinned by a test.
+
+Code site (`TODO(substrate-unsubscribe-publish-race)`):
+`brenn-lib/src/messaging/subscribe.rs` (the `detach_subscriber` teardown step in
+`unsubscribe_dynamic`).
+
 ## `scrub-template-drift-cache-skip`
 
 `repo_template_matches_the_tracked_public_config` (scrub/tests/rules.rs) guards
@@ -720,3 +739,87 @@ still rejects a genuinely different response).
 
 Code site (`TODO(intercept-noop-shape)`):
 `brenn-server/src/intercept_helpers.rs` (`warn_if_unexpected_tool_response`).
+
+---
+
+## `substrate-nondurable-subscribe`
+
+`subscribe_dynamic` accepts a non-durable channel and holds the registration in
+memory, but only pull-only (`push_depth = 0`): a push-enabled subscribe is
+refused, because no delivery path carries ring-backed messages to a
+conversation. App-kind delivery today is push rows read by the dispatcher, and a
+ring has none; the ring cursor's take is destructive, so waking a sleeping
+conversation and delivering only once its bridge is up needs the store's
+peek/take delivery contract. That lands with the dispatcher/delivery collapse.
+Done when a push-enabled dynamic subscribe to a non-durable channel is accepted
+and its messages reach the conversation.
+
+Code site (`TODO(substrate-nondurable-subscribe)`):
+`brenn-lib/src/messaging/subscribe.rs` (`subscribe_dynamic`, step 3b).
+
+## `substrate-deferred-view-count-shortcut`
+
+The WASM drain builds a deferred-window view per bound output port every
+activation. For a durable (`brenn:`) port that is a `DbStore::deferred_for_sender`
+SQL read under the global db mutex, paid even by the common case of a component
+that never parks a message. Short-circuit the empty case cheaply. The naive fix
+(a per-`DbStore` count) does not fit — `DbStore` is a throwaway handle minted per
+call in `Messenger::store_for` — so the count must live on the `Messenger`/registry,
+be seeded at boot, and be kept accurate across every park/cancel/release/quota
+site, including the durable park via `insert_pushes` that does not route through
+`DbStore::park`. A stale count is a correctness bug (a missed deferred view means a
+component cannot see or cancel its own parked message), so this needs a design
+decision about cache ownership and mutation routing. Done when the drain loop skips
+the query for a port with zero deferred messages.
+
+A per-`DbStore` count is now structurally possible — `Messenger::store_for` caches
+one `DbStore` per channel rather than minting a throwaway handle per call — but the
+routing problem above is unchanged: the count must still be seeded at boot and kept
+accurate across every park/cancel/release/quota site, including the durable park via
+`insert_pushes` that does not route through `DbStore::park`.
+
+Code site (`TODO(substrate-deferred-view-count-shortcut)`):
+`brenn-server/src/wasm_dispatch/mod.rs` (the `for out in &cfg.outputs`
+deferred-view loop in `drain_step`).
+
+## `substrate-priming-atomic-marker`
+
+Durable WASM-queue priming decides "new vs. surviving" from a `messaging_subscriptions`
+snapshot taken before `rebuild_subscriptions`, but the marker (the rebuilt
+subscription row) and the seed (the primed pending pushes) commit in separate
+autocommit statements in separate db-lock scopes, with reachable panic sites
+between them (the dynamic-mqtt merge, and any SIGKILL/OOM). A boot that dies after
+the rebuild but before the seed completes leaves the row persisted, so the next
+boot classifies the queue as surviving and never primes it — a silent, permanent
+delivery gap against "attach is a delivery point"; a crash mid-seed leaves a
+partial tail with no way to complete it. Fixing it means committing the new-queue
+marker and its seeded pushes atomically (one transaction over rebuild + mirror +
+seed, or a "primed" marker written in the seed's own transaction), which restructures
+the boot sequence — the rebuild runs before the Messenger exists, the seed after.
+This is the durable-priming trait-unification refactor's territory. Done when the
+new-queue marker and its seed cannot be split by a crash.
+
+Code site (`TODO(substrate-priming-atomic-marker)`):
+`brenn-server/src/bootstrap/messaging/mod.rs` (the durable-priming loop that seeds
+pending pushes after the Messenger is built).
+
+## `substrate-priming-kind-qualified-key`
+
+Durable WASM-queue priming compares `(channel_uuid, slug)` against a snapshot of
+`messaging_subscriptions`, which records no subscriber kind (the `app_slug` column
+holds the bare slug for both App- and Wasm-kind rows). Slug disjointness is enforced
+within one boot's config but not across boots, so a config change that removes an
+App subscriber named `worker` on channel U and adds a `[[wasm_consumer]]` `worker`
+subscribing to U leaves `(U, "worker")` in the snapshot from the app row — the
+brand-new WASM queue is misclassified as surviving and skips priming (the same
+silent delivery gap, triggered by an ordinary principal-kind swap rather than a
+crash). The fix is a kind-qualified subscription key (persist the subscriber kind,
+or key the snapshot on the `ParticipantId` string) — but `app_slug` is the join key
+`resolve_push_targets` stamps on push rows, so changing it ripples into the
+wake-recompute join. That is a persisted-subscription-model change owned by the
+durable-priming trait-unification refactor. Done when a new WASM queue cannot alias
+a prior boot's differently-kinded subscription on the same slug.
+
+Code site (`TODO(substrate-priming-kind-qualified-key)`):
+`brenn-server/src/bootstrap/messaging/mod.rs` (the `prior_subscription_keys.contains`
+check in the durable-priming loop).

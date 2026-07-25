@@ -102,6 +102,67 @@ fn wasm_consumer_resolves_with_non_empty_acl() {
     assert!(c.policy.acls.webhook.is_empty());
 }
 
+/// A WASM consumer subscribing to an `ephemeral:` channel resolves the input
+/// when `ephemeral_subscribe_acl` covers it.
+#[test]
+fn wasm_consumer_resolves_ephemeral_input_with_covering_acl() {
+    use brenn_lib::access::raw::ChannelMatcherRaw;
+    let entry = brenn_lib::messaging::testutils::ephemeral_channel_entry("sensors", 8);
+    let addr = entry.address.clone();
+    let dir = dir_of(vec![entry]);
+    let mut raw = minimal_wasm_consumer_raw("watcher", "/tmp/a.wasm", &addr);
+    raw.ephemeral_subscribe_acl = vec![ChannelMatcherRaw::Exact("sensors".to_string())];
+
+    let resolved = resolve(&[raw], &dir);
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].inputs.len(), 1);
+    assert_eq!(resolved[0].inputs[0].sub.channel_address, addr);
+    assert!(resolved[0].policy.allows_ephemeral_delivery("sensors"));
+}
+
+/// An `ephemeral:` input with no covering `ephemeral_subscribe_acl` is
+/// silently-dead config — ring delivery is authorized only at boot — so it must
+/// fail fast rather than boot into a subscription that could never receive.
+#[test]
+#[should_panic(expected = "not covered by ephemeral_subscribe_acl")]
+fn wasm_consumer_ephemeral_input_without_acl_panics() {
+    let entry = brenn_lib::messaging::testutils::ephemeral_channel_entry("sensors", 8);
+    let addr = entry.address.clone();
+    let dir = dir_of(vec![entry]);
+    let raw = minimal_wasm_consumer_raw("watcher", "/tmp/a.wasm", &addr);
+    resolve(&[raw], &dir);
+}
+
+/// A WASM consumer subscribing to a confined `local:` channel resolves the input
+/// when `local_subscribe_acl` covers it — the mirror of the ephemeral case.
+#[test]
+fn wasm_consumer_resolves_local_input_with_covering_acl() {
+    use brenn_lib::access::raw::ChannelMatcherRaw;
+    let entry = brenn_lib::messaging::testutils::local_channel_entry("scratch", 8);
+    let addr = entry.address.clone();
+    let dir = dir_of(vec![entry]);
+    let mut raw = minimal_wasm_consumer_raw("watcher", "/tmp/a.wasm", &addr);
+    raw.local_subscribe_acl = vec![ChannelMatcherRaw::Exact("scratch".to_string())];
+
+    let resolved = resolve(&[raw], &dir);
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].inputs.len(), 1);
+    assert_eq!(resolved[0].inputs[0].sub.channel_address, addr);
+    assert!(resolved[0].policy.allows_local_delivery("scratch"));
+}
+
+/// A `local:` input with no covering `local_subscribe_acl` is silently-dead
+/// config — ring delivery is authorized only at boot — so it must fail fast.
+#[test]
+#[should_panic(expected = "not covered by local_subscribe_acl")]
+fn wasm_consumer_local_input_without_acl_panics() {
+    let entry = brenn_lib::messaging::testutils::local_channel_entry("scratch", 8);
+    let addr = entry.address.clone();
+    let dir = dir_of(vec![entry]);
+    let raw = minimal_wasm_consumer_raw("watcher", "/tmp/a.wasm", &addr);
+    resolve(&[raw], &dir);
+}
+
 /// A `[[wasm_consumer.tool_grant]]` table resolves into the consumer's
 /// `AppPolicy.tool_grants`, the same map an LLM app carries.
 #[test]
@@ -256,10 +317,44 @@ fn wasm_consumer_explicit_noise_on_pull_only_panics() {
     resolve(&raw, &dir);
 }
 
+/// Explicit `fatal` noise on a WASM subscription is rejected at boot — fatal is
+/// the surface-only kill rung and the backend overflow path has no kill.
+#[test]
+#[should_panic(expected = "fatal is surface-only")]
+fn wasm_consumer_explicit_fatal_noise_panics() {
+    let (dir, chan_addr) = make_dir_with_noise("brenn:fatal-explicit", NoiseLevel::Silent);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "consumer-fatal-x".to_string(),
+        component_path: "/tmp/fx.wasm".into(),
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            push_depth: Some(Depth::Bounded(4)),
+            noise: Some(NoiseLevel::Fatal),
+            ..sub_raw(&chan_addr, "in")
+        }],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+/// `fatal` inherited from the channel (no per-sub override) is rejected at boot
+/// too — the resolved noise is what matters, not where it came from.
+#[test]
+#[should_panic(expected = "fatal is surface-only")]
+fn wasm_consumer_inherited_fatal_noise_panics() {
+    let (dir, chan_addr) = make_dir_with_noise("brenn:fatal-inherited", NoiseLevel::Fatal);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "consumer-fatal-i".to_string(),
+        component_path: "/tmp/fi.wasm".into(),
+        subscriptions: vec![sub_raw(&chan_addr, "in")],
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
 /// Any explicit `wake_min` on a WASM subscription is a config error, even on a
 /// push-enabled sub — WASM consumers are always delivered eagerly, so the knob
 /// does nothing; the error points at `push_depth = 0` as the honest pull-only
-/// alternative (design §5).
+/// alternative.
 #[test]
 #[should_panic(expected = "always delivered eagerly")]
 fn wasm_consumer_explicit_wake_min_panics() {
@@ -426,10 +521,10 @@ fn reserved_tool_results_output_port_panics() {
     resolve(&raw, &dir);
 }
 
-/// Output channel must be a `brenn:` address; non-brenn panics.
+/// Output channel must be a pub/sub scheme; an egress scheme (webhook:) panics.
 #[test]
-#[should_panic(expected = "must be a brenn: address")]
-fn non_brenn_output_channel_panics() {
+#[should_panic(expected = "must be a pub/sub address")]
+fn egress_scheme_output_channel_panics() {
     let wh = ChannelEntry {
         uuid: webhook_channel_uuid_from_slug("wh"),
         transport_type: ChannelScheme::Webhook,
@@ -441,6 +536,120 @@ fn non_brenn_output_channel_panics() {
         component_path: "/tmp/a.wasm".into(),
         subscriptions: vec![sub_raw("brenn:in-ch", "in")],
         outputs: vec![out_raw("out", "webhook:wh")], // must panic
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+/// An `ephemeral:` output resolves when the consumer carries a covering
+/// `ephemeral_publish_acl`.
+#[test]
+fn ephemeral_output_resolves_with_ephemeral_publish_acl() {
+    let in_e = brenn_entry("brenn:in-ch");
+    let eph = ChannelEntry {
+        uuid: uuid::Uuid::new_v4(),
+        transport_type: ChannelScheme::Ephemeral,
+        ..brenn_entry("ephemeral:eph-out")
+    };
+    let dir = dir_of(vec![in_e, eph]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "eph-pub".to_string(),
+        component_path: "/tmp/a.wasm".into(),
+        grants: vec![WasmGrant::Ports],
+        ephemeral_publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
+            "eph-out".to_string(),
+        )],
+        subscriptions: vec![sub_raw("brenn:in-ch", "in")],
+        outputs: vec![out_raw("out", "ephemeral:eph-out")],
+        ..minimal_wasm_consumer()
+    }];
+    let resolved = resolve(&raw, &dir);
+    let c = &resolved[0];
+    assert_eq!(c.outputs[0].channel_address, "ephemeral:eph-out");
+    assert!(
+        c.policy.allows_ephemeral_publish("eph-out"),
+        "the resolved policy must authorize the bound ephemeral output"
+    );
+    assert!(
+        !c.policy.allows_ephemeral_publish("other"),
+        "authorization is scoped to the authored matcher"
+    );
+}
+
+/// A bound `ephemeral:` output with no `ephemeral_publish_acl` panics at boot —
+/// under deny-by-default it could never publish to its own bound channel.
+#[test]
+#[should_panic(expected = "ephemeral_publish_acl is empty")]
+fn ephemeral_output_without_acl_panics() {
+    let eph = ChannelEntry {
+        uuid: uuid::Uuid::new_v4(),
+        transport_type: ChannelScheme::Ephemeral,
+        ..brenn_entry("ephemeral:eph-out")
+    };
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch"), eph]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "eph-noacl".to_string(),
+        component_path: "/tmp/a.wasm".into(),
+        grants: vec![WasmGrant::Ports],
+        subscriptions: vec![sub_raw("brenn:in-ch", "in")],
+        outputs: vec![out_raw("out", "ephemeral:eph-out")], // must panic
+        ..minimal_wasm_consumer()
+    }];
+    resolve(&raw, &dir);
+}
+
+/// A `local:` output resolves when the consumer carries a covering
+/// `local_publish_acl`.
+#[test]
+fn local_output_resolves_with_local_publish_acl() {
+    let in_e = brenn_entry("brenn:in-ch");
+    let loc = ChannelEntry {
+        uuid: uuid::Uuid::new_v4(),
+        transport_type: ChannelScheme::Local,
+        ..brenn_entry("local:loc-out")
+    };
+    let dir = dir_of(vec![in_e, loc]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "loc-pub".to_string(),
+        component_path: "/tmp/a.wasm".into(),
+        grants: vec![WasmGrant::Ports],
+        local_publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
+            "loc-out".to_string(),
+        )],
+        subscriptions: vec![sub_raw("brenn:in-ch", "in")],
+        outputs: vec![out_raw("out", "local:loc-out")],
+        ..minimal_wasm_consumer()
+    }];
+    let resolved = resolve(&raw, &dir);
+    let c = &resolved[0];
+    assert_eq!(c.outputs[0].channel_address, "local:loc-out");
+    assert!(
+        c.policy.allows_local_publish("loc-out"),
+        "the resolved policy must authorize the bound local output"
+    );
+    assert!(
+        !c.policy.allows_local_publish("other"),
+        "authorization is scoped to the authored matcher"
+    );
+}
+
+/// A bound `local:` output with no `local_publish_acl` panics at boot —
+/// under deny-by-default it could never publish to its own bound channel.
+#[test]
+#[should_panic(expected = "local_publish_acl is empty")]
+fn local_output_without_acl_panics() {
+    let loc = ChannelEntry {
+        uuid: uuid::Uuid::new_v4(),
+        transport_type: ChannelScheme::Local,
+        ..brenn_entry("local:loc-out")
+    };
+    let dir = dir_of(vec![brenn_entry("brenn:in-ch"), loc]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "loc-noacl".to_string(),
+        component_path: "/tmp/a.wasm".into(),
+        grants: vec![WasmGrant::Ports],
+        subscriptions: vec![sub_raw("brenn:in-ch", "in")],
+        outputs: vec![out_raw("out", "local:loc-out")], // must panic
         ..minimal_wasm_consumer()
     }];
     resolve(&raw, &dir);
@@ -509,7 +718,7 @@ fn resolved_consumer_carries_port_and_channel_info() {
 /// publish to its own operator-authored bound channels, so resolution refuses
 /// it at startup rather than letting every publish silently deny at runtime.
 #[test]
-#[should_panic(expected = "bound output port(s) but publish_acl is empty")]
+#[should_panic(expected = "bound brenn: output port but publish_acl is empty")]
 fn bound_output_with_empty_publish_acl_panics() {
     let dir = dir_of(vec![
         brenn_entry("brenn:bound-in"),
@@ -556,7 +765,7 @@ fn ports_grant_no_outputs_empty_publish_acl_resolves() {
 /// dead config. Fail-fast at resolution rather than silently dropping the ACL
 /// (which would surface as an unexplained NotPermitted once outputs are added).
 #[test]
-#[should_panic(expected = "publish_acl has 1 matcher(s) but \"ports\" is not in grants")]
+#[should_panic(expected = "a publish ACL has matcher(s) but \"ports\" is not in grants")]
 fn non_empty_publish_acl_without_ports_grant_panics() {
     use brenn_lib::access::raw::ChannelMatcherRaw;
     let (dir, chan_addr) = make_brenn_dir("brenn:dead-acl-ch");

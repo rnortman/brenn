@@ -297,9 +297,9 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         }
     }
 
-    // Observability: log the boot-resolved surfaces and ephemeral
+    // Observability: log the boot-resolved surfaces and non-durable
     // channels. Skipped when empty so a config with no `[[surface]]` /
-    // `[[ephemeral_channel]]` blocks emits no new log line (upholding the
+    // non-durable `[[channel]]` blocks emits no new log line (upholding the
     // bit-for-bit-unchanged guarantee); the emptiness check is also the field read
     // that keeps these `pub(crate)` `MessagingResult` fields off the `dead_code`
     // lint until later consumers use them.
@@ -315,16 +315,16 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
             "boot: resolved [[surface]] blocks",
         );
     }
-    if !messaging_result.ephemeral_channels.is_empty() {
-        let names: Vec<&str> = messaging_result
-            .ephemeral_channels
+    if !messaging_result.nondurable_channels.is_empty() {
+        let addresses: Vec<&str> = messaging_result
+            .nondurable_channels
             .iter()
-            .map(|c| c.name.as_str())
+            .map(|c| c.address.as_str())
             .collect();
         tracing::info!(
-            count = messaging_result.ephemeral_channels.len(),
-            channels = ?names,
-            "boot: resolved [[ephemeral_channel]] blocks",
+            count = messaging_result.nondurable_channels.len(),
+            channels = ?addresses,
+            "boot: resolved non-durable [[channel]] blocks",
         );
     }
 
@@ -378,12 +378,12 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         crate::routes::surface::description::publish_description(messenger, &docs).await;
 
         // Boot disconnected stamps: after the boot-published docs, write a
-        // `disconnected` status snapshot (reason "server restart", the new bus
-        // epoch, empty instances) per configured surface. A durable status
+        // `disconnected` status snapshot (reason "server restart", the new
+        // non-durable incarnation epoch, empty instances) per configured surface. A durable status
         // channel's retained row survives the restart; without this a dead or
         // not-yet-connected wall would read "healthy as of before the restart"
         // until a reader did timestamp math.
-        let epoch = messenger.ephemeral_bus().epoch();
+        let epoch = messenger.ring_epoch();
         crate::routes::surface::telemetry::publish_boot_disconnected_stamps(
             messenger,
             prefix,
@@ -393,10 +393,9 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         .await;
     }
 
-    // Build the per-surface runtime bundle map, keyed by slug. Each runtime
-    // shares the one process `EphemeralBus`. Any non-empty `[[surface]]` list
-    // forces messaging on (`any_messaging` above), so a `Messenger` — and thus a
-    // bus — exists whenever surfaces do; the `expect` cites that gate.
+    // Build the per-surface runtime bundle map, keyed by slug. Any non-empty
+    // `[[surface]]` list forces messaging on (`any_messaging` above), so a
+    // `Messenger` exists whenever surfaces do; the `expect` cites that gate.
     let surface_runtimes = {
         let surfaces = std::mem::take(&mut messaging_result.surfaces);
         if surfaces.is_empty() {
@@ -412,9 +411,8 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
             );
             let messenger = messaging_result.messenger.as_ref().expect(
                 "[[surface]] blocks configured but no Messenger: the any_messaging gate \
-                 forces messaging on whenever surfaces exist, so a bus must be present",
+                 forces messaging on whenever surfaces exist",
             );
-            let bus = messenger.ephemeral_bus().clone();
             // Reserved error-report port + Welcome floor, wired when an error
             // channel is configured. The floor defaults to `warn`.
             let error_report = config
@@ -429,7 +427,6 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
                 });
             crate::routes::surface::build_surface_runtimes(
                 surfaces,
-                bus,
                 Some(messenger.clone()),
                 config.messaging.max_body_bytes,
                 error_report,
@@ -636,16 +633,16 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
             if has_tool_grants {
                 grants.insert(brenn_wasm::Capability::Tools);
             }
-            // Lower the resolved `brenn_publish` ACL to the brenn-lib-free output-ACL
-            // predicate the WASM host calls in `do_publish`. The closure owns the
-            // `brenn:`-prefix convention so `brenn-wasm` never sees a brenn-lib type nor
-            // parses the address: `output_ports` holds the FULL `brenn:<name>` address,
-            // while `allows_brenn_publish` takes the stripped name. A non-`brenn:`
-            // address can never be in a `brenn_publish` ACL, so it denies.
+            // Lower the resolved publish ACLs to the brenn-lib-free output-ACL
+            // predicate. `brenn-wasm` never sees a brenn-lib type; this closure
+            // owns the scheme-prefix convention and dispatches to the right
+            // per-scheme ACL.
             let policy = consumer.policy.clone();
             let output_acl: brenn_wasm::OutputAclFn = std::sync::Arc::new(move |addr: &str| {
-                match addr.strip_prefix(brenn_lib::messaging::BRENN_ADDRESS_PREFIX) {
-                    Some(name) => policy.allows_brenn_publish(name),
+                match brenn_lib::messaging::ChannelScheme::split(addr) {
+                    Some((scheme, name)) => {
+                        brenn_lib::messaging::gates::publish_acl_allows(&policy, scheme, name)
+                    }
                     None => false,
                 }
             });
@@ -919,6 +916,8 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
                     panic!("wasm_dispatch bootstrap: slug {slug:?} not in wasm_consumers")
                 });
             let inputs: Vec<brenn_lib::messaging::config::WasmInputPort> = consumer.inputs.clone();
+            let outputs: Vec<brenn_lib::messaging::config::WasmOutputPort> =
+                consumer.outputs.clone();
             drop(crate::wasm_dispatch::spawn_wasm_consumer_task(
                 crate::wasm_dispatch::WasmConsumerConfig {
                     slug: slug.clone(),
@@ -927,6 +926,7 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
                     messenger: messenger.clone(),
                     alert_dispatcher: state.alert_dispatcher.clone(),
                     inputs,
+                    outputs,
                     activation_pacing: consumer.activation_pacing,
                 },
             ));
@@ -1155,11 +1155,15 @@ pub(crate) fn assert_unique_store_paths(
 /// new subscriber kind silently inherits nothing and strands its messages"
 /// unrepresentable — such an entry cannot get past boot. A missing registration
 /// would fail-close ACL at delivery (silent drop); a missing binding would panic
-/// at dispatch. Named boot failure beats both.
+/// at dispatch. Named boot failure beats both. A third check pairs the two: a
+/// parked subscriber must declare eager wake economics — its wake source
+/// cannot honour urgency gating.
 fn assert_every_subscriber_wired(
     messenger: &brenn_lib::messaging::Messenger,
     router: &crate::messaging_router::WakeRouterImpl,
 ) {
+    use brenn_lib::messaging::{DeliveryShape, WakeEconomics, WakeRouter};
+
     for channel in messenger.directory().list() {
         for sub in &channel.subscribers {
             assert!(
@@ -1176,6 +1180,20 @@ fn assert_every_subscriber_wired(
                 sub.kind,
                 channel.address,
             );
+            // A parked subscriber's wake source cannot honour a per-message
+            // `wake_min` threshold. Every claim an Eager subscriber holds is
+            // eager by construction, so the two are compatible. UrgencyGated
+            // would silently wake for messages its threshold says to hold.
+            if router.delivery_shape(&sub.kind) == DeliveryShape::ParkedWake {
+                assert_eq!(
+                    messenger.subscriber_wake_economics(&sub.kind),
+                    Some(WakeEconomics::Eager),
+                    "boot cross-check: parked-and-woken subscriber {:?} on channel {:?} declares \
+                     urgency-gated wake economics, which its wake source cannot honour",
+                    sub.kind,
+                    channel.address,
+                );
+            }
         }
     }
 }
@@ -1312,6 +1330,27 @@ mod tests {
         fn missing_binding_panics() {
             let messenger = messenger(registered());
             let router = WakeRouterImpl::new(ActiveBridges::new());
+            assert_every_subscriber_wired(&messenger, &router);
+        }
+
+        /// A parked-and-woken subscriber registered as urgency-gated fails the
+        /// cross-check: its wake source cannot honour a `wake_min` threshold.
+        #[test]
+        #[should_panic(expected = "urgency-gated wake economics")]
+        fn urgency_gated_parked_subscriber_panics() {
+            let regs = HashMap::from([(
+                wasm_key(),
+                SubscriberRegistration {
+                    policy: Arc::new(AppPolicy::default()),
+                    wake: brenn_lib::messaging::WakeEconomics::UrgencyGated,
+                },
+            )]);
+            let messenger = messenger(regs);
+            let router = WakeRouterImpl::new(ActiveBridges::new());
+            router.register_delivery_binding(
+                wasm_key(),
+                DeliveryBinding::ParkedNotify(Arc::new(tokio::sync::Notify::new())),
+            );
             assert_every_subscriber_wired(&messenger, &router);
         }
 

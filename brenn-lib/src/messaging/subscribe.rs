@@ -1,24 +1,26 @@
-//! Runtime dynamic-subscribe core (design §2.3).
+//! Runtime dynamic-subscribe core.
 //!
 //! This is the transport-agnostic body of "create a dynamic subscription": it
 //! resolves the subscription's parameters (shared resolver, [`config::resolve_subscription_params`]),
-//! persists the durable row + its `messaging_subscriptions` mirror in one
-//! transaction ([`db::insert_dynamic_subscription`]), and folds the new
-//! subscriber into the in-memory directory (copy-on-write
-//! [`MessagingDirectory::add_subscriber`]).
+//! writes the registration, and folds the new subscriber into the in-memory
+//! directory (copy-on-write [`MessagingDirectory::add_subscriber`]).
+//!
+//! Registration persistence follows channel durability: a durable channel keeps
+//! the row + its `messaging_subscriptions` mirror in one transaction
+//! ([`db::insert_dynamic_subscription`]); a non-durable one keeps an in-memory
+//! record that dies with the ring it names, so a subscription never outlives the
+//! data it subscribes to.
 //!
 //! Scope of *this* layer: for `brenn:`/`webhook:` the channel must already
-//! exist in the directory (design §2.3: never auto-create a channel nobody
-//! publishes to). For `mqtt:`, a not-yet-existing topic-filter channel is
-//! **created** here — validate the filter, derive the canonical address + UUID,
-//! upsert `messaging_channels`, and `add_channel` into the directory (design
-//! §2.3 step 3, the "create the channel entry" half). The transport-specific
-//! *broker activation* (the live MQTT SUBSCRIBE, the configured-client check,
-//! and the router `IngressRoute` add) is **not** done here — it is layered on
-//! top by the per-transport activation increment (design §2.3 steps 1/5/6) and
-//! the `MessageSubscribe` tool (design §2.4). The `qos` parameter is validated
-//! and persisted here (so the later activation step has it), but no broker call
-//! is made.
+//! exist in the directory (never auto-create a channel nobody publishes to).
+//! For `mqtt:`, a not-yet-existing topic-filter channel is **created** here —
+//! validate the filter, derive the canonical address + UUID, upsert
+//! `messaging_channels`, and `add_channel` into the directory. The
+//! transport-specific *broker activation* (the live MQTT SUBSCRIBE, the
+//! configured-client check, and the router `IngressRoute` add) is **not** done
+//! here — it is layered on top by the per-transport activation increment and
+//! the `MessageSubscribe` tool. The `qos` parameter is validated and persisted
+//! here (so the later activation step has it), but no broker call is made.
 //!
 //! Every failure path returns an error (never panics): a misconfigured dynamic
 //! subscribe is LLM/attacker-shaped tool input, not a host bug (CLAUDE.md
@@ -35,7 +37,7 @@ use super::db::{
     upsert_channels,
 };
 use super::{
-    ChannelEntry, ChannelScheme, Depth, Messenger, NoiseLevel, SubscriberEntry,
+    ChannelEntry, ChannelScheme, Depth, Messenger, NoiseLevel, ParticipantId, SubscriberEntry,
     SubscriberEntryKind, WakeMin, mqtt_channel_uuid_from_address,
 };
 use crate::db::format_ts_for_db;
@@ -77,6 +79,12 @@ pub enum RuntimeSubscribeError {
     UnknownChannel { address: String },
     /// `qos` supplied for a non-MQTT (`brenn:`/`webhook:`) address (design §2.3).
     QosOnNonMqtt { address: String },
+    /// A push-enabled (`push_depth > 0`) subscribe to a non-durable
+    /// (`ephemeral:`/`local:`) channel. Ring-backed messages reach a conversation
+    /// through no delivery path yet, so a push-enabled registration would promise
+    /// deliveries that never arrive; pull-only (`push_depth = 0`) is the
+    /// supported shape, read through `MessageChannelGet`.
+    PushOnNonDurableChannel { address: String },
     /// An `mqtt:` address with an invalid topic filter (wildcard placement, empty
     /// topic, etc.). Surfaced here because channel creation validates the filter
     /// before deriving the channel (design §2.3 step 2). Carries the parser's
@@ -133,6 +141,11 @@ impl std::fmt::Display for RuntimeSubscribeError {
                 f,
                 "qos is only valid for mqtt: addresses; channel {address:?} is not MQTT — \
                  omit qos"
+            ),
+            RuntimeSubscribeError::PushOnNonDurableChannel { address } => write!(
+                f,
+                "channel {address:?} is non-durable; push delivery is not available on it — \
+                 subscribe with push_depth = 0 and read the channel with MessageChannelGet"
             ),
             RuntimeSubscribeError::InvalidMqttFilter { address, detail } => {
                 write!(f, "invalid mqtt topic filter in {address:?}: {detail}")
@@ -341,6 +354,7 @@ impl Messenger {
             address: canonical,
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: self.defaults.default_send_rate,
                 push_depth: self.defaults.default_push_depth,
                 retain_depth: self.defaults.default_retain_depth,
                 standing_retain_depth: self.defaults.default_standing_retain_depth,
@@ -380,10 +394,17 @@ impl Messenger {
         address: &str,
         params: DynamicSubscribeParams,
     ) -> Result<SubscribeOutcome, RuntimeSubscribeError> {
+        // 0. Serialize against every other dynamic (un)subscribe. Steps 4 and 5
+        //    are a classify-then-write pair over the same registration record
+        //    with `.await` points between them; two concurrent calls for one
+        //    `(channel, app)` would otherwise both classify "fresh subscribe" and
+        //    the loser would collide on the write.
+        let _gate = self.dynamic_subscribe_gate.lock().await;
+
         // 1. `qos` is MQTT-only — reject it on a non-MQTT address rather than
-        //    silently ignoring a caller mistake (design §2.3). Determine the
-        //    transport from the address prefix (not the directory entry, which may
-        //    not exist yet for a new `mqtt:` filter).
+        //    silently ignoring a caller mistake. Determine the transport from
+        //    the address prefix (not the directory entry, which may not exist
+        //    yet for a new `mqtt:` filter).
         let is_mqtt = matches!(ChannelScheme::of(address), Some(ChannelScheme::Mqtt));
         if params.qos.is_some() && !is_mqtt {
             return Err(RuntimeSubscribeError::QosOnNonMqtt {
@@ -392,13 +413,17 @@ impl Messenger {
         }
 
         // 2. Resolve the target channel, creating it for a not-yet-existing
-        //    `mqtt:` topic-filter address (design §2.3 step 3). `brenn:`/`webhook:`
-        //    never auto-create: a channel nobody publishes to is meaningless, so
-        //    an absent one is a terminal `UnknownChannel` error.
+        //    `mqtt:` topic-filter address. `brenn:`/`webhook:` never auto-create:
+        //    a channel nobody publishes to is meaningless, so an absent one is a
+        //    terminal `UnknownChannel` error.
         let entry = self.resolve_or_create_channel(address, is_mqtt).await?;
+        // 2b. Registration persistence follows channel durability: a durable
+        //     channel keeps its dynamic subscription as a row, a non-durable one
+        //     keeps it in memory, where it expires with the data it names.
+        let durable_channel = entry.capabilities().durable;
         let qos = params.qos;
 
-        // 3. Resolve the requested params via the shared resolver (design §2.2).
+        // 3. Resolve the requested params via the shared resolver.
         //    Done *before* the re-subscribe identity check so an identical /
         //    differing comparison is made against the fully-resolved values
         //    (inheritance applied), not the raw request — matching how the
@@ -426,6 +451,21 @@ impl Messenger {
             wake_min: params.wake_min,
         };
         let resolved = config::resolve_subscription_params(&raw, &rung, singleton, allowed_users)?;
+
+        // 3b. A push-enabled subscription on a non-durable channel would register
+        //     a delivery expectation nothing satisfies: ring-backed messages reach
+        //     a conversation through no path yet. Refuse rather than accept a
+        //     subscription that silently never delivers. Pull-only (`push_depth =
+        //     0`) subscriptions are the supported shape: the app reads the
+        //     channel's retained window with `MessageChannelGet`.
+        // TODO(substrate-nondurable-subscribe): lift this once ring-backed
+        // delivery to App-kind subscribers lands with the dispatcher/delivery
+        // collapse.
+        if !durable_channel && resolved.push_depth.is_push_enabled() {
+            return Err(RuntimeSubscribeError::PushOnNonDurableChannel {
+                address: address.to_string(),
+            });
+        }
 
         // 4. Re-subscribe / existing-subscriber policy + retain-depth cap.
         //    The dynamic-path cap: a runtime dynamic
@@ -457,16 +497,23 @@ impl Messenger {
         //     comparison can be exact.
         //   - neither ⇒ a fresh subscribe (step 5).
         let existing_entry = entry.app_subscriber(app_slug);
-        let durable_row = {
+        // The registration record for this `(channel, app)`, if any, carrying the
+        // stored `qos` the directory entry lacks. Each class answers from its own
+        // authority: the durable table, or the in-memory non-durable registration
+        // set (which carries no `qos` — `qos` is mqtt-only and mqtt is durable).
+        let registration: Option<Option<u8>> = if durable_channel {
             let conn = self.db.lock().await;
-            super::db::load_dynamic_subscription_for(&conn, entry.uuid, app_slug)
+            super::db::load_dynamic_subscription_for(&conn, entry.uuid, app_slug).map(|row| row.qos)
+        } else {
+            self.nondurable_dynamic_sub_exists(&entry.uuid, app_slug)
+                .then_some(None)
         };
         // Static and dormant are checked BEFORE the cap: each is the more actionable
         // error (a static holder can never succeed by lowering its depth, so the cap
         // error would be a lie; a dormant holder must unsubscribe first regardless of
         // depth). The dormant reject re-establishes insert_dynamic_subscription's
         // "neither row pre-exists" guarantee for the step-5 INSERT.
-        match (existing_entry.is_some(), durable_row.is_some()) {
+        match (existing_entry.is_some(), registration.is_some()) {
             (true, false) => {
                 return Err(RuntimeSubscribeError::StaticSubscriptionExists {
                     address: address.to_string(),
@@ -491,13 +538,13 @@ impl Messenger {
                 standing: entry.resolved_channel.standing_retain_depth,
             });
         }
-        if let (Some(existing), Some(existing_row)) = (existing_entry, durable_row) {
+        if let (Some(existing), Some(existing_qos)) = (existing_entry, registration) {
             // Live dynamic re-subscribe: identity-only policy.
             let identical = existing.push_depth == resolved.push_depth
                 && existing.retain_depth == resolved.retain_depth
                 && existing.noise == resolved.noise
                 && existing.wake_min == Some(resolved.wake_min)
-                && existing_row.qos == qos;
+                && existing_qos == qos;
             if identical {
                 return Ok(SubscribeOutcome::AlreadySubscribedIdentical(resolved));
             }
@@ -506,22 +553,27 @@ impl Messenger {
             });
         }
 
-        // 5. Persist the durable row + mirror in one transaction, then fold the
-        //    subscriber into the directory. The DB write is the durable truth; the
-        //    directory swap makes it visible to the publish hot path.
-        let row = DynamicSubscriptionRow {
-            channel_uuid: resolved.channel_uuid,
-            app_slug: app_slug.to_string(),
-            push_depth: resolved.push_depth,
-            retain_depth: resolved.retain_depth,
-            noise: resolved.noise,
-            wake_min: resolved.wake_min,
-            qos,
-            created_at: format_ts_for_db(chrono::Utc::now()),
-        };
-        {
+        // 5. Write the registration, then fold the subscriber into the directory.
+        //    The registration is the truth about "this app subscribed at runtime";
+        //    the directory swap makes it visible to the publish hot path. A
+        //    durable channel writes the row + mirror in one transaction; a
+        //    non-durable one records the in-memory registration, which dies with
+        //    the ring it names.
+        if durable_channel {
+            let row = DynamicSubscriptionRow {
+                channel_uuid: resolved.channel_uuid,
+                app_slug: app_slug.to_string(),
+                push_depth: resolved.push_depth,
+                retain_depth: resolved.retain_depth,
+                noise: resolved.noise,
+                wake_min: resolved.wake_min,
+                qos,
+                created_at: format_ts_for_db(chrono::Utc::now()),
+            };
             let conn = self.db.lock().await;
             insert_dynamic_subscription(&conn, &row);
+        } else {
+            self.register_nondurable_dynamic_sub(resolved.channel_uuid, app_slug);
         }
         let applied = self.directory.add_subscriber(
             &resolved.channel_uuid,
@@ -545,36 +597,43 @@ impl Messenger {
     }
 
     /// Remove `app_slug`'s dynamic subscription on the channel at `address`
-    /// (design §2.3, transport-agnostic core — the inverse of
+    /// (transport-agnostic core — the inverse of
     /// [`Messenger::subscribe_dynamic`]).
     ///
-    /// Steps: delete the durable `messaging_dynamic_subscriptions` row **and**
-    /// its `messaging_subscriptions` mirror in one transaction
-    /// ([`db::delete_dynamic_subscription`]); then fold the subscriber out of the
-    /// in-memory directory (copy-on-write [`MessagingDirectory::remove_subscriber`]).
-    /// The durable delete is the authority on "did a dynamic sub exist": it
-    /// returns `false` for a `(channel, app)` with no durable row — which is both
-    /// the not-subscribed *and* the static-only case (a static sub has no durable
-    /// row). Those two are then discriminated on the in-memory directory entry
+    /// Steps: drop the registration — for a durable channel the
+    /// `messaging_dynamic_subscriptions` row **and** its
+    /// `messaging_subscriptions` mirror in one transaction
+    /// ([`db::delete_dynamic_subscription`]), for a non-durable channel the
+    /// in-memory record; then fold the subscriber out of the in-memory directory
+    /// (copy-on-write [`MessagingDirectory::remove_subscriber`]).
+    /// The registration drop is the authority on "did a dynamic sub exist": it
+    /// returns `false` for a `(channel, app)` holding none — which is both
+    /// the not-subscribed *and* the static-only case (a static sub holds no
+    /// registration). Those two are then discriminated on the in-memory directory entry
     /// into [`RuntimeUnsubscribeError::StaticSubscription`] vs
-    /// [`RuntimeUnsubscribeError::NotSubscribed`] (design §2.3).
+    /// [`RuntimeUnsubscribeError::NotSubscribed`].
     ///
     /// This does **not** perform transport activation — the MQTT broker
     /// UNSUBSCRIBE and last-subscriber route/`IngressSubscription` drop are the
-    /// per-transport activation increment's job (design §2.3 unsubscribe). The
+    /// per-transport activation increment's job. The
     /// returned [`UnsubscribeOutcome::still_subscribed`] tells that layer whether
     /// any other subscriber remains on the filter (so it knows whether to issue
     /// the broker UNSUBSCRIBE).
     ///
     /// Errors (never panics): no dynamic subscription for this app on the channel.
     /// Removing another app's sub, or a static TOML sub, is structurally
-    /// impossible — the delete is keyed on `(channel_uuid, app_slug)` and static
-    /// subs carry no durable dynamic row.
+    /// impossible — the drop is keyed on `(channel_uuid, app_slug)` and static
+    /// subs hold no registration.
     pub async fn unsubscribe_dynamic(
         &self,
         app_slug: &str,
         address: &str,
     ) -> Result<UnsubscribeOutcome, RuntimeUnsubscribeError> {
+        // 0. The same gate `subscribe_dynamic` takes: a removal interleaved with
+        //    a subscribe's classify-then-write would let the subscribe write
+        //    against a registration state it never observed.
+        let _gate = self.dynamic_subscribe_gate.lock().await;
+
         // 1. Resolve the channel UUID from the address. If no channel exists for
         //    this address, the app cannot hold any sub of any kind on it — that is
         //    unambiguously the not-subscribed case, not a host bug. (`address` is
@@ -586,23 +645,26 @@ impl Messenger {
         };
         let channel_uuid = entry.uuid;
 
-        // 2. Delete the durable row + mirror in one transaction. The return value
-        //    is the authority on whether a dynamic sub existed: a static-only or
-        //    not-subscribed `(channel, app)` has no durable dynamic row, so this
-        //    is `false` and no mutation happened. Static subs are config-managed
-        //    and structurally unreachable here (no durable row), so this can never
-        //    remove one (design §2.3 / §2.1).
-        let removed = {
+        // 2. Drop the registration — the durable row + mirror in one transaction
+        //    for a durable channel, the in-memory record for a non-durable one.
+        //    The return value is the authority on whether a dynamic sub existed:
+        //    a static-only or not-subscribed `(channel, app)` holds no
+        //    registration, so this is `false` and no mutation happened. Static
+        //    subs are config-managed and structurally unreachable here (they hold
+        //    no registration), so this can never remove one.
+        let removed = if entry.capabilities().durable {
             let conn = self.db.lock().await;
             delete_dynamic_subscription(&conn, channel_uuid, app_slug)
+        } else {
+            self.remove_nondurable_dynamic_sub(&channel_uuid, app_slug)
         };
         if !removed {
-            // No durable dynamic row for `(channel, app)`. Discriminate the two
-            // cases purely in-memory on the resolved `entry` (design §2.3): a
-            // surviving `App(app_slug)` directory subscriber with no durable
-            // dynamic row is, by the same convention `subscribe_dynamic` uses, a
-            // static (config-managed) sub; no such subscriber means the app holds
-            // no sub of any kind on this channel.
+            // No registration for `(channel, app)`. Discriminate the two cases
+            // purely in-memory on the resolved `entry`: a surviving
+            // `App(app_slug)` directory subscriber with no registration is, by the
+            // same convention `subscribe_dynamic` uses, a static (config-managed)
+            // sub; no such subscriber means the app holds no sub of any kind on
+            // this channel.
             let has_static_sub = entry.app_subscriber(app_slug).is_some();
             return Err(if has_static_sub {
                 RuntimeUnsubscribeError::StaticSubscription {
@@ -654,6 +716,21 @@ impl Messenger {
             ),
         };
 
+        // 4. Tear down delivery state. The directory still holds the channel,
+        //    so `detach_subscriber` resolves.
+        //
+        // TODO(substrate-unsubscribe-publish-race): this push-row teardown is
+        // not serialized against a concurrent publish. A publish that resolved
+        // its targets (app still subscribed) before this ran can insert its push
+        // rows after the delete, leaving rows that name a fully-unsubscribed
+        // subscriber — the dispatcher keeps waking for it and may deliver after
+        // the ack. Closing it means the insert must pass a "sub row exists"
+        // guard in the same lock scope as the delete; that guard rides on the
+        // publish-pipeline reshape that replaces per-publish target resolution
+        // with the store's attached set, so it lands there, not here.
+        let subscriber = ParticipantId::for_app(app_slug, &self.source);
+        self.detach_subscriber(address, &subscriber).await;
+
         Ok(UnsubscribeOutcome {
             channel_uuid,
             still_subscribed,
@@ -668,11 +745,14 @@ mod tests {
     use crate::config::AppConfig;
     use crate::db::init_db_memory;
     use crate::messaging::config::{MessagingGlobalConfig, ResolvedChannel, Sink};
-    use crate::messaging::db::{load_dynamic_subscriptions, upsert_channels};
+    use crate::messaging::db::{
+        PendingPushInsert, channel_has_deliverable_for, insert_message_with_pushes,
+        load_dynamic_subscriptions, upsert_channels,
+    };
     use crate::messaging::test_support::test_app_config;
     use crate::messaging::{
         ChannelDetails, ChannelEntry, ChannelScheme, MessageEnvelope, MessagingDirectory,
-        ParticipantId, WakeRouter,
+        ParticipantId, Urgency, WakeRouter,
     };
     use indexmap::IndexMap;
     use std::sync::Arc;
@@ -689,7 +769,8 @@ mod tests {
             _subscriber: &ParticipantId,
             _envelope: &MessageEnvelope,
             _push_id: i64,
-            _seq: i64,
+            _message_id: i64,
+            _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             Ok(false)
         }
@@ -723,6 +804,7 @@ mod tests {
             description: None,
             transport_type: transport,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Bounded(0),
                 retain_depth: Depth::Bounded(10),
                 standing_retain_depth: Depth::Bounded(10),
@@ -742,10 +824,17 @@ mod tests {
         app_specs: &[(&str, bool, &[&str])],
     ) -> Arc<Messenger> {
         let db = init_db_memory();
+        // Boot's split: durable channels get a DB row, non-durable ones get an
+        // in-memory ring store. Both halves live in the one directory.
+        let (nondurable, durable): (Vec<ChannelEntry>, Vec<ChannelEntry>) = entries
+            .iter()
+            .cloned()
+            .partition(|e| !e.capabilities().durable);
         {
             let conn = db.lock().await;
-            upsert_channels(&conn, &entries);
+            upsert_channels(&conn, &durable);
         }
+        let ring_stores = Arc::new(crate::messaging::store::RingStores::build(&nondurable));
         let directory = Arc::new(MessagingDirectory::with_entries(entries));
         let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
         for (slug, singleton, users) in app_specs {
@@ -762,6 +851,7 @@ mod tests {
             Arc::new(NoopRouter) as Arc<dyn WakeRouter>,
             MessagingGlobalConfig::default(),
         )
+        .with_ring_stores(ring_stores)
     }
 
     fn pull_only(qos: Option<u8>) -> DynamicSubscribeParams {
@@ -799,6 +889,175 @@ mod tests {
                 created_at: crate::db::format_ts_for_db(chrono::Utc::now()),
             },
         );
+    }
+
+    /// A pull-only subscribe to a non-durable channel succeeds: the registration
+    /// is held in memory (no durable row) and the subscriber is folded into the
+    /// directory, so the app can read the channel's retained window.
+    #[tokio::test]
+    async fn subscribe_to_a_nondurable_channel_registers_in_memory() {
+        let ch = channel("ephemeral:chatter", ChannelScheme::Ephemeral);
+        let uuid = ch.uuid;
+        let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
+
+        let outcome = m
+            .subscribe_dynamic("graf", "ephemeral:chatter", pull_only(None))
+            .await
+            .expect("a pull-only subscribe to a non-durable channel succeeds");
+        assert!(outcome.is_created());
+
+        let rows = {
+            let conn = m.db.lock().await;
+            load_dynamic_subscriptions(&conn)
+        };
+        assert!(
+            rows.is_empty(),
+            "a non-durable registration writes no durable row"
+        );
+        assert!(
+            m.nondurable_dynamic_sub_exists(&uuid, "graf"),
+            "the in-memory registration is recorded"
+        );
+        let entry = m.directory.by_uuid(&uuid).expect("channel present");
+        assert!(
+            entry
+                .subscribers
+                .iter()
+                .any(|s| matches!(&s.kind, SubscriberEntryKind::App(slug) if slug == "graf")),
+            "subscriber folded into directory"
+        );
+        // The registration is exactly as removable as a durable one.
+        let removed = m
+            .unsubscribe_dynamic("graf", "ephemeral:chatter")
+            .await
+            .expect("unsubscribe removes the in-memory registration");
+        assert!(!removed.was_dormant);
+        assert!(!removed.still_subscribed);
+        assert!(!m.nondurable_dynamic_sub_exists(&uuid, "graf"));
+        let entry = m.directory.by_uuid(&uuid).expect("channel present");
+        assert!(entry.subscribers.is_empty(), "subscriber folded out");
+    }
+
+    /// What the app sees when it asks what it is subscribed to. The listing walk
+    /// covers non-durable channels, and `dynamic` comes from the in-memory
+    /// registration set — the same authority the subscribe path classifies
+    /// against. Sourcing it from the durable table instead would report a
+    /// removable subscription as config-managed while `MessageUnsubscribe` still
+    /// removed it.
+    #[tokio::test]
+    async fn list_subscriptions_reports_a_nondurable_dynamic_subscription() {
+        let ch = channel("ephemeral:chatter", ChannelScheme::Ephemeral);
+        let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
+        m.subscribe_dynamic("graf", "ephemeral:chatter", pull_only(None))
+            .await
+            .expect("a pull-only subscribe to a non-durable channel succeeds");
+
+        let rows = m.list_subscriptions("graf").await;
+        assert_eq!(rows.len(), 1, "exactly the one subscription: {rows:?}");
+        assert_eq!(rows[0].protocol, ChannelScheme::Ephemeral);
+        assert_eq!(rows[0].address, "ephemeral:chatter");
+        assert!(
+            rows[0].dynamic,
+            "an in-memory registration is a dynamic — removable — subscription"
+        );
+        assert!(
+            rows[0].details.is_none(),
+            "a non-durable channel carries no protocol detail shape"
+        );
+
+        m.unsubscribe_dynamic("graf", "ephemeral:chatter")
+            .await
+            .expect("unsubscribe removes the in-memory registration");
+        assert!(
+            m.list_subscriptions("graf").await.is_empty(),
+            "the removed subscription is gone from the listing too"
+        );
+    }
+
+    /// A second unsubscribe on a non-durable channel reports not-subscribed: the
+    /// in-memory registration is the authority on "was there a dynamic sub",
+    /// exactly as the durable row is for a durable channel.
+    #[tokio::test]
+    async fn unsubscribe_nondurable_without_a_registration_is_not_subscribed() {
+        let ch = channel("ephemeral:chatter", ChannelScheme::Ephemeral);
+        let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
+        let err = m
+            .unsubscribe_dynamic("graf", "ephemeral:chatter")
+            .await
+            .expect_err("nothing to remove");
+        assert!(matches!(err, RuntimeUnsubscribeError::NotSubscribed { .. }));
+    }
+
+    /// A push-enabled subscribe to a non-durable channel is refused: no delivery
+    /// path carries ring-backed messages to a conversation, and a registration
+    /// promising deliveries that never arrive is worse than a refusal. Nothing is
+    /// registered or folded.
+    #[tokio::test]
+    async fn push_enabled_subscribe_to_a_nondurable_channel_is_refused() {
+        let ch = channel("ephemeral:chatter", ChannelScheme::Ephemeral);
+        let uuid = ch.uuid;
+        // A singleton app, so the resolver's push-enabled invariants pass and the
+        // request reaches the non-durable check rather than failing before it.
+        let m = messenger(vec![ch], &[("graf", true, &["u"])]).await;
+
+        let err = m
+            .subscribe_dynamic(
+                "graf",
+                "ephemeral:chatter",
+                DynamicSubscribeParams {
+                    push_depth: Depth::Bounded(3),
+                    retain_depth: Depth::Bounded(5),
+                    noise: None,
+                    wake_min: None,
+                    qos: None,
+                },
+            )
+            .await
+            .expect_err("push delivery is not available on a non-durable channel");
+        assert!(
+            matches!(err, RuntimeSubscribeError::PushOnNonDurableChannel { ref address }
+                if address == "ephemeral:chatter"),
+            "got {err:?}"
+        );
+        assert!(!m.nondurable_dynamic_sub_exists(&uuid, "graf"));
+        let entry = m.directory.by_uuid(&uuid).expect("channel present");
+        assert!(entry.subscribers.is_empty(), "no subscriber was folded");
+    }
+
+    /// Re-subscribe policy is class-blind: identical params on a non-durable
+    /// channel are the idempotent no-op, differing params are the error.
+    #[tokio::test]
+    async fn resubscribe_nondurable_follows_the_identity_policy() {
+        let ch = channel("ephemeral:chatter", ChannelScheme::Ephemeral);
+        let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
+        m.subscribe_dynamic("graf", "ephemeral:chatter", pull_only(None))
+            .await
+            .expect("first subscribe succeeds");
+
+        let outcome = m
+            .subscribe_dynamic("graf", "ephemeral:chatter", pull_only(None))
+            .await
+            .expect("identical re-subscribe is a no-op success");
+        assert!(matches!(
+            outcome,
+            SubscribeOutcome::AlreadySubscribedIdentical(_)
+        ));
+
+        let differing = DynamicSubscribeParams {
+            push_depth: Depth::Bounded(0),
+            retain_depth: Depth::Bounded(7),
+            noise: None,
+            wake_min: None,
+            qos: None,
+        };
+        let err = m
+            .subscribe_dynamic("graf", "ephemeral:chatter", differing)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeSubscribeError::AlreadySubscribedDiffers { .. }
+        ));
     }
 
     /// A pull-only subscribe to an existing `brenn:` channel: resolves params,
@@ -1457,6 +1716,37 @@ mod tests {
             .await
             .expect("subscribe succeeds");
 
+        // Plant delivery state: a pending push owed to this subscriber, so the
+        // channel reports it as owed work before the unsubscribe tears it down.
+        let subscriber = ParticipantId::for_app("graf", &m.source);
+        {
+            let conn = m.db.lock().await;
+            insert_message_with_pushes(
+                &conn,
+                uuid,
+                "src",
+                "someone",
+                "owed",
+                Urgency::Normal,
+                ChannelScheme::Brenn,
+                None,
+                None,
+                None,
+                0,
+                &[PendingPushInsert {
+                    target_subscriber: subscriber.clone(),
+                    target_app_slug: "graf".to_string(),
+                    eager_wake: true,
+                    release_after: None,
+                    delivery_deadline: None,
+                }],
+            );
+            assert!(
+                channel_has_deliverable_for(&conn, uuid, &subscriber),
+                "subscriber is owed the planted push before unsubscribe"
+            );
+        }
+
         let outcome = m
             .unsubscribe_dynamic("graf", "heartbeat")
             .await
@@ -1473,6 +1763,15 @@ mod tests {
             load_dynamic_subscriptions(&conn)
         };
         assert!(rows.is_empty(), "durable row removed");
+
+        // Delivery state torn down: no pending pushes remain for the subscriber.
+        {
+            let conn = m.db.lock().await;
+            assert!(
+                !channel_has_deliverable_for(&conn, uuid, &subscriber),
+                "detach deleted the subscriber's delivery state on unsubscribe"
+            );
+        }
 
         // Directory subscriber folded out.
         let entry = m.directory.resolve("heartbeat").expect("channel present");

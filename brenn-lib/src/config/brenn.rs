@@ -101,16 +101,11 @@ pub struct BrennConfig {
     /// converted to a HashMap keyed by slug via `validate_and_resolve`.
     #[serde(rename = "app")]
     pub apps: Vec<AppConfigRaw>,
-    /// Top-level `[[channel]]` declarations. Each entry registers a
-    /// messaging channel (UUID + URL-safe address). See
-    /// `crate::messaging::config::ChannelConfigRaw`.
+    /// Top-level `[[channel]]` declarations — one table for every pub/sub
+    /// scheme, durable or not. The address's scheme picks the channel's
+    /// capabilities. See `crate::messaging::config::ChannelConfigRaw`.
     #[serde(default, rename = "channel")]
     pub channels: Vec<crate::messaging::config::ChannelConfigRaw>,
-    /// Top-level `[[ephemeral_channel]]` declarations. Each entry registers a
-    /// non-persistent (`ephemeral:`) channel (deterministic UUID + name, no DB
-    /// row). See `crate::messaging::config::EphemeralChannelConfigRaw`.
-    #[serde(default, rename = "ephemeral_channel")]
-    pub ephemeral_channels: Vec<crate::messaging::config::EphemeralChannelConfigRaw>,
     /// Global messaging defaults (`[messaging]`). Defaults to
     /// `MessagingGlobalConfig::default()` when absent.
     #[serde(default)]

@@ -17,13 +17,15 @@ use super::{IngressOrBus, ParticipantId};
 pub struct PendingPushRow {
     pub push_id: i64,
     /// `messaging_messages.id` of the parent message (the FK
-    /// `messaging_pending_pushes.message_id`). This is the globally monotone
-    /// rowid the surface session mints a durable resume cursor's high-water from;
-    /// the Conversation/ingress delivery paths ignore it. Because it is a single
-    /// global counter, not per-channel, the cursor high-waters a surface client
-    /// carries leak aggregate cross-channel publish volume/timing — accepted risk
-    /// under the single-operator model, recorded in `docs/security-posture.md` §6.
+    /// `messaging_pending_pushes.message_id`). Message identity, not position:
+    /// the surface session names a row by it when writing the below-water ack
+    /// evidence; the Conversation/ingress delivery paths ignore it.
     pub message_id: i64,
+    /// The message's position in its channel's retention order
+    /// (`messaging_messages.retained_seq`), dense from 1 per channel. The surface
+    /// session mints a durable resume cursor's high-water from it. `None` for an
+    /// ingress row, which belongs to no channel and holds no retention position.
+    pub retained_seq: Option<i64>,
     pub payload: IngressOrBus,
     pub target_subscriber: ParticipantId,
     /// The app config slug this row was published to (`messaging_pending_pushes.

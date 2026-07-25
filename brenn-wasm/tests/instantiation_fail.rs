@@ -176,7 +176,11 @@ fn instantiation_fail_trap_arm_fires_on_memory_limit() {
     // Drive with a 1-byte memory cap — the fixture's initial memory allocation
     // (first call to memory_growing: current=0, desired=65536 or more) exceeds
     // the limit immediately. The trap fires inside processor_pre.instantiate.
-    let activation = ProcessorActivation { ports: vec![] };
+    let activation = ProcessorActivation {
+        ports: vec![],
+        deferred: vec![],
+        now: None,
+    };
     let outcome = comp.handle_with_memory_limit(activation, 1);
 
     match &outcome {
