@@ -34,6 +34,15 @@ pub struct AclSet {
     /// `ephemeral:` publish allowlist. Same bare-name convention as
     /// `ephemeral_subscribe`.
     pub ephemeral_publish: Vec<ChannelMatcher>,
+    /// `local:` publish allowlist. Same bare-name convention as
+    /// `ephemeral_publish`; scopes which confined channels a principal may
+    /// publish to.
+    pub local_publish: Vec<ChannelMatcher>,
+    /// `local:` subscribe allowlist. Same bare-name convention as
+    /// `ephemeral_subscribe`; scopes which confined channels a principal may
+    /// hold an input on. Only WASM consumers derive it (no LLM-app local
+    /// delivery path in v1), so it resolves empty for LLM apps.
+    pub local_subscribe: Vec<ChannelMatcher>,
     /// Inbound webhook allowlist.
     pub webhook: Vec<WebhookMatcher>,
 }

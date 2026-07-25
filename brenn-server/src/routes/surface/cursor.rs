@@ -2,10 +2,10 @@
 //! and a `Subscribe` echoes.
 //!
 //! [`Cursor`] is opaque to the kernel: the client stores and echoes it verbatim,
-//! never interpreting it. All interpretation lives here, on the server, where the
-//! delivery class genuinely is the question. A durable cursor carries the
-//! subscription's high-water rowid; an ephemeral cursor carries the delivered
-//! row's `(bus epoch, ring seq)`.
+//! never interpreting it. All interpretation lives here, on the server. One
+//! shape serves both ring and durable classes: a store cursor `(epoch, seq)`
+//! wrapped in a session-owned envelope (`incarnation` + below-water ack confirm
+//! set) the store cannot see.
 //!
 //! The wire encoding is a JSON string wrapped into a [`Cursor`] via serde. The
 //! kernel never sees inside it, so the encoding can grow server-side with no wire
@@ -16,52 +16,44 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-/// A parsed cursor's meaning, one variant per wire class.
+/// A parsed cursor's meaning.
+///
+/// `epoch` + `seq` are the store cursor: the numbering domain that assigned the
+/// position and the position itself. Both classes share one shape because a
+/// store answers a resume against these two fields alone.
+///
+/// `incarnation` and `confirm` are the session's envelope around the store
+/// cursor. `incarnation` is the store's boot counter at mint time — it catches
+/// cursors minted under a boot the current store never counted (e.g. after a
+/// backup restore). `confirm` is the below-water ack confirm set: the message
+/// ids delivered below the high-water up to this frame, empty in the common
+/// case.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CursorState {
-    /// A durable subscription's position, anchored to a store incarnation: the
-    /// store's `generation` UUID and `incarnation` counter (the durable epoch),
-    /// plus the `high_water` = max `messaging_messages.id` presented at the resume
-    /// anchor or delivered this connection. The store identity is what lets the
-    /// server catch a cursor minted against a store that was replaced, wiped, or
-    /// restored from backup (the three stale-store arms). `confirm` is the
-    /// below-water ack channel's confirm set: the message ids of the
-    /// below-water rows delivered up to the frame this cursor was minted for,
-    /// empty in the common case (no below-water send).
-    Durable {
-        generation: Uuid,
-        incarnation: i64,
-        high_water: i64,
-        confirm: Vec<i64>,
-    },
-    /// An ephemeral subscription's position: the delivered row's `(bus epoch,
-    /// ring seq)`.
-    Ephemeral { epoch: Uuid, seq: u64 },
+pub struct CursorState {
+    pub incarnation: i64,
+    pub epoch: Uuid,
+    pub seq: u64,
+    pub confirm: Vec<i64>,
 }
 
 /// The internal serde shape of a cursor's inner JSON string. Private: only this
 /// module builds or reads it, and the kernel never sees it.
+///
+/// Field names are terse (`i`, `e`, `s`, `cf`) to match the rest of the wire —
+/// this cursor rides every `Deliver`, and it is opaque, so there is no
+/// readability cost to pay for the bytes.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "c")]
-enum Wire {
-    /// Durable: store generation + incarnation + high-water rowid + confirm set.
-    /// Field names are terse (`g`, `i`, `hw`) to match the rest of the wire —
-    /// this cursor rides every durable `Deliver`, and it is opaque, so there is no
-    /// readability cost to pay for the bytes.
-    D {
-        #[serde(rename = "g")]
-        generation: Uuid,
-        #[serde(rename = "i")]
-        incarnation: i64,
-        hw: i64,
-        /// The below-water ack confirm set. `default`/skip-if-empty so the common
-        /// (empty) case adds no bytes and an older cursor without the field still
-        /// parses.
-        #[serde(rename = "cf", default, skip_serializing_if = "Vec::is_empty")]
-        confirm: Vec<i64>,
-    },
-    /// Ephemeral: bus epoch + ring seq.
-    E { epoch: Uuid, seq: u64 },
+struct Wire {
+    #[serde(rename = "i")]
+    incarnation: i64,
+    #[serde(rename = "e")]
+    epoch: Uuid,
+    #[serde(rename = "s")]
+    seq: u64,
+    /// The below-water ack confirm set. `default`/skip-if-empty so the common
+    /// (empty) case adds no bytes.
+    #[serde(rename = "cf", default, skip_serializing_if = "Vec::is_empty")]
+    confirm: Vec<i64>,
 }
 
 /// Wrap an internal [`Wire`] into an opaque [`Cursor`] via the sanctioned serde
@@ -74,33 +66,24 @@ fn wrap(wire: &Wire) -> Cursor {
         .expect("a JSON string always deserializes into a transparent Cursor newtype")
 }
 
-/// Mint a durable cursor from the store's identity, a subscription's high-water
-/// rowid, and its current below-water confirm set (empty in the common
-/// case).
-pub fn mint_durable(
-    generation: Uuid,
-    incarnation: i64,
-    high_water: i64,
-    confirm: Vec<i64>,
-) -> Cursor {
-    wrap(&Wire::D {
-        generation,
+/// Mint a cursor from the store's boot incarnation, the delivered row's
+/// `(epoch, seq)` store position, and the subscription's current below-water
+/// confirm set (empty in the common case, always empty on a ring-backed
+/// subscription).
+pub fn mint(incarnation: i64, epoch: Uuid, seq: u64, confirm: Vec<i64>) -> Cursor {
+    wrap(&Wire {
         incarnation,
-        hw: high_water,
+        epoch,
+        seq,
         confirm,
     })
-}
-
-/// Mint an ephemeral cursor from the delivered row's bus epoch and ring seq.
-pub fn mint_ephemeral(epoch: Uuid, seq: u64) -> Cursor {
-    wrap(&Wire::E { epoch, seq })
 }
 
 /// Parse an echoed [`Cursor`] back to its [`CursorState`]. `Err(reason)` when the
 /// cursor is unparseable — a conforming client cannot produce one, so the caller
 /// treats it as a protocol violation. The `reason` names *why* (malformed JSON,
-/// unknown tag, wrong field types) so the violation log line that feeds fail2ban
-/// carries a cause, not just a category.
+/// missing fields, wrong field types) so the violation log line that feeds
+/// fail2ban carries a cause, not just a category.
 pub fn parse(cursor: &Cursor) -> Result<CursorState, String> {
     // The sanctioned read: a `Cursor` serializes transparently to a JSON string.
     let inner = match serde_json::to_value(cursor) {
@@ -112,18 +95,17 @@ pub fn parse(cursor: &Cursor) -> Result<CursorState, String> {
         }
     };
     match serde_json::from_str::<Wire>(&inner) {
-        Ok(Wire::D {
-            generation,
+        Ok(Wire {
             incarnation,
-            hw,
+            epoch,
+            seq,
             confirm,
-        }) => Ok(CursorState::Durable {
-            generation,
+        }) => Ok(CursorState {
             incarnation,
-            high_water: hw,
+            epoch,
+            seq,
             confirm,
         }),
-        Ok(Wire::E { epoch, seq }) => Ok(CursorState::Ephemeral { epoch, seq }),
         Err(e) => Err(format!("malformed cursor encoding: {e}")),
     }
 }
@@ -133,31 +115,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn durable_mint_parse_round_trips() {
-        let generation = Uuid::from_u128(0x1234);
-        for (inc, hw, confirm) in [
-            (0i64, 0i64, vec![]),
+    fn mint_parse_round_trips() {
+        let epoch = Uuid::from_u128(0x1234);
+        for (inc, seq, confirm) in [
+            (0i64, 0u64, vec![]),
             (1, 1, vec![]),
             (7, 42, vec![3i64, 5, 41]),
-            (i64::MAX, i64::MAX, vec![i64::MAX]),
+            (i64::MAX, u64::MAX, vec![i64::MAX]),
         ] {
-            let c = mint_durable(generation, inc, hw, confirm.clone());
+            let c = mint(inc, epoch, seq, confirm.clone());
             assert_eq!(
                 parse(&c),
-                Ok(CursorState::Durable {
-                    generation,
+                Ok(CursorState {
                     incarnation: inc,
-                    high_water: hw,
+                    epoch,
+                    seq,
                     confirm,
                 })
             );
         }
     }
 
+    /// One shape for both classes, named concretely: the encoding is the store
+    /// position (`e`, `s`) plus the session envelope (`i`, and `cf` only when the
+    /// confirm set is non-empty). Asserting the key set rather than comparing two
+    /// mints against each other is what makes this fail on a re-split enum, a
+    /// re-introduced class tag, or a renamed field — all of which two mints from
+    /// one `mint` would carry identically.
     #[test]
-    fn empty_confirm_set_adds_no_bytes_and_older_cursor_still_parses() {
-        // The common (empty confirm) case serializes without the field...
-        let c = mint_durable(Uuid::from_u128(0x1234), 3, 7, vec![]);
+    fn ring_and_durable_positions_share_one_encoding() {
+        // The key *set*, not its order — the object's iteration order is serde's
+        // business, the field names are the contract.
+        let shape = |c: &Cursor| match serde_json::to_value(c) {
+            Ok(Value::String(s)) => {
+                let mut keys = serde_json::from_str::<serde_json::Value>(&s)
+                    .expect("inner cursor JSON")
+                    .as_object()
+                    .expect("cursor object")
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                keys.sort();
+                keys
+            }
+            other => panic!("expected string cursor, got {other:?}"),
+        };
+        // A ring-backed subscription has no below-water ack channel, so its
+        // confirm set is always empty.
+        let ring = mint(3, Uuid::from_u128(0xabcd), 9, vec![]);
+        assert_eq!(shape(&ring), vec!["e", "i", "s"]);
+        // A durable one carries the same position fields plus its evidence.
+        let durable = mint(3, Uuid::from_u128(0xbeef), 9, vec![41]);
+        assert_eq!(shape(&durable), vec!["cf", "e", "i", "s"]);
+    }
+
+    #[test]
+    fn empty_confirm_set_adds_no_bytes() {
+        let c = mint(3, Uuid::from_u128(0x1234), 7, vec![]);
         let inner = match serde_json::to_value(&c) {
             Ok(Value::String(s)) => s,
             other => panic!("expected string cursor, got {other:?}"),
@@ -166,29 +180,6 @@ mod tests {
             !inner.contains("cf"),
             "empty confirm set must not be serialized: {inner}"
         );
-        // ...and a cursor minted before the field existed still parses to an empty set.
-        let legacy: Cursor = serde_json::from_value(Value::String(
-            r#"{"c":"D","g":"00000000-0000-0000-0000-000000001234","i":3,"hw":7}"#.into(),
-        ))
-        .unwrap();
-        assert_eq!(
-            parse(&legacy),
-            Ok(CursorState::Durable {
-                generation: Uuid::from_u128(0x1234),
-                incarnation: 3,
-                high_water: 7,
-                confirm: vec![],
-            })
-        );
-    }
-
-    #[test]
-    fn ephemeral_mint_parse_round_trips() {
-        let epoch = Uuid::from_u128(0xabcd);
-        for seq in [0u64, 1, 999, u64::MAX] {
-            let c = mint_ephemeral(epoch, seq);
-            assert_eq!(parse(&c), Ok(CursorState::Ephemeral { epoch, seq }));
-        }
     }
 
     #[test]
@@ -203,7 +194,7 @@ mod tests {
 
     #[test]
     fn cursor_serializes_transparently_as_a_string() {
-        let c = mint_durable(Uuid::from_u128(0x1234), 3, 7, vec![1, 2]);
+        let c = mint(3, Uuid::from_u128(0x1234), 7, vec![1, 2]);
         assert!(matches!(serde_json::to_value(&c), Ok(Value::String(_))));
     }
 }

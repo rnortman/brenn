@@ -4,27 +4,15 @@ use std::time::Duration;
 use brenn_budget::MAX_PUBLISHES_PER_ACTIVATION;
 use brenn_lib::messaging::config::{
     DEFAULT_PARKED_BATCH_DEPTH, DEFAULT_WASM_PUBLISH_CAPACITY, DEFAULT_WASM_PUBLISH_PER_ACTIVATION,
-    Depth, EphemeralChannelEntry, MessagingGlobalConfig, NoiseLevel, ResolvedComponent,
-    ResolvedLocalChannel, ResolvedSubscription, ResolvedSurface, ResolvedSurfaceSubscription,
-    SurfaceBinding, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceOutput, SurfaceOutputRaw,
-    SurfaceSendBudget,
+    Depth, MessagingGlobalConfig, NoiseLevel, ResolvedComponent, ResolvedLocalChannel,
+    ResolvedSubscription, ResolvedSurface, ResolvedSurfaceSubscription, SurfaceBinding,
+    SurfaceComponentRaw, SurfaceConfigRaw, SurfaceOutput, SurfaceOutputRaw, SurfaceSendBudget,
 };
-use brenn_lib::messaging::{
-    ChannelScheme, EPHEMERAL_SENDER_BURST, EPHEMERAL_SENDER_REFILL_AMOUNT,
-    EPHEMERAL_SENDER_REFILL_INTERVAL, MessagingDirectory, Urgency,
-};
+use brenn_lib::messaging::{ChannelEntry, ChannelScheme, MessagingDirectory, Urgency};
 use brenn_surface_proto::Abi;
 use indexmap::IndexMap;
 
 use super::resolve_publish_millitokens;
-
-// The per-surface publish cap compares publish_per_sec (per second) against
-// EPHEMERAL_SENDER_REFILL_AMOUNT (per interval); that comparison is unit-valid
-// only while the bus refill interval is exactly 1s. Pin it at compile time.
-const _: () = assert!(
-    EPHEMERAL_SENDER_REFILL_INTERVAL.as_secs() == 1
-        && EPHEMERAL_SENDER_REFILL_INTERVAL.subsec_nanos() == 0
-);
 
 /// Fold two declared depths of one shared subscription into the depth that
 /// covers both. `Unbounded` dominates — it is "no cap", and a cap that bounds
@@ -144,7 +132,8 @@ fn local_context_depth(channel: &str, retain_depth: Option<Depth>) -> u64 {
 ///    `ephemeral:` — this is the boot-time scheme restriction that makes the
 ///    `WakeRouter::deliver_ingress` `Surface` panic arm structurally unreachable.
 /// 4. A `brenn:` binding channel absent from `directory`; an `ephemeral:` binding
-///    channel absent from `ephemeral_channels`.
+///    channel absent from `ephemeral_channels` (the resolved non-durable
+///    `[[channel]]` entries).
 /// 5. A binding naming an undeclared instance; an empty / non-unreserved port;
 ///    a duplicate `(instance, port)` within subscriptions (or within outputs).
 /// 6. A binding the surface's own resolved policy does not authorize
@@ -156,11 +145,11 @@ fn local_context_depth(channel: &str, retain_depth: Option<Depth>) -> u64 {
 ///
 /// Two adjacent cases deliberately do **not** panic (recorded design
 /// decisions): a declared component with no port bindings (a purely presentational
-/// component is live config), and an `[[ephemeral_channel]]` referenced by no
+/// component is live config), and an `ephemeral:` `[[channel]]` referenced by no
 /// surface binding (ephemeral channels are LLM-app publish targets independently
 /// of any surface).
 /// Resolve a surface binding's page-side port-queue depth for the non-durable
-/// classes: `ephemeral:` inherits binding → its `[[ephemeral_channel]]` rung
+/// classes: `ephemeral:` inherits binding → its `[[channel]]` rung
 /// (already folded over global), and `local:` — with no channel block — collapses
 /// to binding → global. The `channel_default` the caller passes is the resolved
 /// middle rung: the ephemeral channel entry's `push_depth` or the global default.
@@ -393,7 +382,7 @@ fn resolve_output_budget(slug: &str, out: &SurfaceOutputRaw) -> brenn_budget::Si
 /// messages precede `new_from` when the kernel windows this port.
 ///
 /// The ladder is binding → channel → global, class-uniform with `brenn:`: the
-/// binding's own `retain_depth`, else the `[[ephemeral_channel]]` rung the caller
+/// binding's own `retain_depth`, else the `[[channel]]` rung the caller
 /// passes as `channel_default` (itself already resolved channel → global, and
 /// bounded — ephemeral retention is process memory, so the channel build rejects
 /// unbounded and defaults it to 0).
@@ -598,7 +587,7 @@ fn resolve_durable_surface_subscription(
 pub(crate) fn resolve_surfaces(
     raw_surfaces: &[SurfaceConfigRaw],
     directory: &MessagingDirectory,
-    ephemeral_channels: &[EphemeralChannelEntry],
+    ephemeral_channels: &[ChannelEntry],
     globals: &MessagingGlobalConfig,
 ) -> Vec<ResolvedSurface> {
     use brenn_lib::messaging::config::{
@@ -729,20 +718,34 @@ pub(crate) fn resolve_surfaces(
         // Publish token-bucket caps. Floor: both must be >= 1 when present (a
         // surface with publish grants and a zero budget is a config
         // contradiction; a surface that shouldn't publish simply omits the
-        // grants and outputs). Ceiling: neither may exceed the bus per-sender
-        // gate (EPHEMERAL_SENDER_BURST / EPHEMERAL_SENDER_REFILL_AMOUNT), so the
-        // per-connection bucket trips no later than the bus gate for that
-        // connection — the documented "connection bucket trips first" layering.
-        // Equality is safe: equal-sized buckets both start full, so the
-        // connection bucket is never more permissive.
+        // grants and outputs). Ceiling: neither may exceed the global default
+        // send rate, so the per-connection bucket trips no later than the
+        // substrate's per-(sender, channel) gate for that connection — the
+        // documented "connection bucket trips first" layering. Equality is safe:
+        // equal-sized buckets both start full, so the connection bucket is never
+        // more permissive.
+        //
+        // Checked against the global default rather than each channel's
+        // resolved rate: a channel may override *downward*, and a surface
+        // publishing to such a channel trips the substrate gate first. That is
+        // the operator asking for a tighter bound on that channel, not a
+        // layering violation.
         //
         // This is a single-connection guard, not defense in depth. The aggregate
         // across all sessions/users of a surface shares the one surface:<slug>
-        // bus participant and its single per-sender gate — shared-fate: N
-        // sessions can still jointly drain it. The durable publish arm has no
-        // bus-level per-sender gate at all (see security-posture §6.3). Those
-        // aggregate bounds are recorded design decisions, not gaps this check
-        // closes.
+        // participant and its send-rate gate — shared-fate: N sessions can still
+        // jointly drain it. Those aggregate bounds are recorded design
+        // decisions, not gaps this check closes.
+        //
+        // The per-second comparison below is unit-valid only while the refill
+        // interval is one second.
+        let send_rate = globals.default_send_rate;
+        assert_eq!(
+            send_rate.refill_interval_secs, 1,
+            "config: [messaging].default_send_rate.refill_interval_secs must be 1 — the \
+             per-surface publish_per_sec ceiling is compared against `refill` as a per-second \
+             rate",
+        );
         let publish_burst = surface
             .publish_burst
             .unwrap_or(DEFAULT_SURFACE_PUBLISH_BURST);
@@ -760,16 +763,18 @@ pub(crate) fn resolve_surfaces(
              publish grants is a contradiction; omit the grants instead)",
         );
         assert!(
-            publish_burst <= EPHEMERAL_SENDER_BURST,
-            "config: [[surface]] {slug:?}: publish_burst {publish_burst} exceeds the bus \
-             per-sender burst ({EPHEMERAL_SENDER_BURST}); the per-connection bucket must trip \
-             first — see the shared-fate note on the publish budget block",
+            publish_burst <= send_rate.burst,
+            "config: [[surface]] {slug:?}: publish_burst {publish_burst} exceeds the default \
+             send-rate burst ({}); the per-connection bucket must trip first — see the \
+             shared-fate note on the publish budget block",
+            send_rate.burst,
         );
         assert!(
-            publish_per_sec <= EPHEMERAL_SENDER_REFILL_AMOUNT,
-            "config: [[surface]] {slug:?}: publish_per_sec {publish_per_sec} exceeds the bus \
-             per-sender refill ({EPHEMERAL_SENDER_REFILL_AMOUNT}/s); the per-connection bucket \
-             must trip first — see the shared-fate note on the publish budget block",
+            publish_per_sec <= send_rate.refill,
+            "config: [[surface]] {slug:?}: publish_per_sec {publish_per_sec} exceeds the default \
+             send rate ({}/s); the per-connection bucket must trip first — see the shared-fate \
+             note on the publish budget block",
+            send_rate.refill,
         );
 
         // Skin (CSS pack + fonts): default `bench`, validated against the
@@ -827,9 +832,9 @@ pub(crate) fn resolve_surfaces(
             match ChannelScheme::split(channel) {
                 Some((ChannelScheme::Ephemeral, name)) => {
                     assert!(
-                        ephemeral_channels.iter().any(|e| e.name == name),
+                        ephemeral_channels.iter().any(|e| e.address == channel),
                         "config: [[surface]] {slug:?}: {direction} channel {channel:?} names no \
-                         declared [[ephemeral_channel]] (name {name:?} absent)",
+                         declared [[channel]] (ephemeral channel {name:?} absent)",
                     );
                 }
                 Some((ChannelScheme::Brenn, _)) => {
@@ -1019,37 +1024,43 @@ pub(crate) fn resolve_surfaces(
             // Every class resolves the same three page-side facts —
             // (push_depth, retain_depth, noise) — down one class-uniform
             // binding → channel → global ladder. Only the middle rung's *source*
-            // differs (durable `[[channel]]`, ephemeral `[[ephemeral_channel]]`,
+            // differs (durable and ephemeral `[[channel]]` blocks,
             // local none → straight to global), which is a persistence fact, not
             // a component-observable one. `push_depth` puts a bounded page queue
             // in front of the port; `retain_depth` a bounded retained ring behind
             // it; `noise` is resolved and held for the overflow ladder that lands
             // in a later phase — no surface path reads it yet, on any class.
             let (push_depth, retain_depth, noise) = if ephemeral {
-                // The `[[ephemeral_channel]]` block is the middle rung: its
+                // The channel's `[[channel]]` block is the middle rung: its
                 // push_depth/retain_depth/noise are already resolved channel →
                 // global at build time.
-                let name = ChannelScheme::split(&sub.channel).map(|(_, n)| n);
                 let entry = ephemeral_channels
                     .iter()
-                    .find(|e| Some(e.name.as_str()) == name)
+                    .find(|e| e.address == sub.channel)
                     .expect("validate_binding proved the ephemeral channel is declared");
+                let ch = &entry.resolved_channel;
+                let retain_depth = match ch.retain_depth {
+                    Depth::Bounded(n) => n,
+                    Depth::Unbounded => unreachable!(
+                        "config rejects unbounded retain_depth on a non-durable channel"
+                    ),
+                };
                 (
                     resolve_page_queue_depth(
                         slug,
                         context,
                         &sub.channel,
                         sub.push_depth,
-                        entry.push_depth,
+                        ch.push_depth,
                     ),
                     resolve_context_depth(
                         slug,
                         context,
                         &sub.channel,
                         sub.retain_depth,
-                        entry.retain_depth,
+                        retain_depth,
                     ),
-                    sub.noise.unwrap_or(entry.noise),
+                    sub.noise.unwrap_or(ch.noise),
                 )
             } else if local {
                 validate_local_binding("subscription", &sub.channel, false);

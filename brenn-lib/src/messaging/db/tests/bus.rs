@@ -281,7 +281,7 @@ fn fts_search_via_match() {
 }
 
 #[test]
-fn release_due_pushes_clears_and_returns_ids() {
+fn release_due_for_channel_clears_and_returns_ids() {
     let db = init_db_memory();
     let conn = db.blocking_lock();
     ensure_user_and_conv(&conn, 1);
@@ -312,21 +312,44 @@ fn release_due_pushes_clears_and_returns_ids() {
         None,
         Some(release_at),
         utc_to_ns(Utc::now()),
-        &[PendingPushInsert {
-            target_subscriber: ParticipantId::for_conversation(2),
-            target_app_slug: "pa".to_string(),
-            eager_wake: true,
-            release_after: Some(release_at),
-            delivery_deadline: None,
-        }],
+        &[],
     );
     assert!(inserted.id > 0);
     let now = Utc::now();
-    let released = release_due_pushes(&conn, now);
-    assert_eq!(released.len(), 1);
-    // Second call returns nothing.
-    let released = release_due_pushes(&conn, now);
-    assert!(released.is_empty());
+    let targets = [crate::messaging::store::ReleaseTarget {
+        subscriber: ParticipantId::for_conversation(2),
+        app_slug: "pa".to_string(),
+        wake_min: None,
+    }];
+    let released =
+        crate::messaging::db::release_due_for_channel(&conn, channel_uuid, now, &targets);
+    assert_eq!(released.released.len(), 1);
+    assert_eq!(
+        released.released[0].push_ids.len(),
+        1,
+        "release mints a claim for the target attached now"
+    );
+    // Release clears the message grain too, so the row stops claiming it is
+    // parked. A later release pass must not find it due again and dispatch it
+    // a second time.
+    let still_parked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messaging_messages
+             WHERE id = ?1 AND deliver_after IS NOT NULL",
+            rusqlite::params![inserted.id],
+            |row| row.get(0),
+        )
+        .expect("count parked");
+    assert_eq!(
+        still_parked, 0,
+        "a released message must not keep its deliver_after"
+    );
+    assert!(
+        crate::messaging::db::release_due_for_channel(&conn, channel_uuid, now, &[])
+            .released
+            .is_empty(),
+        "a second release pass must not re-release what the first released"
+    );
 }
 
 #[test]
@@ -747,10 +770,10 @@ fn list_pending_excludes_fully_delivered() {
     );
 }
 
-/// Correctness guard for `earliest_pending_deadline` and `earliest_pending_release`:
-/// the MIN(delivery_deadline) / MIN(release_after) queries must return the
-/// chronologically earliest timestamp regardless of whether rows were written by
-/// `format_ts_for_db` (+00:00 form) or an older `to_rfc3339()` (Z form).
+/// Correctness guard for `earliest_pending_deadline`: the MIN(delivery_deadline)
+/// query must return the chronologically earliest timestamp regardless of
+/// whether rows were written by `format_ts_for_db` (+00:00 form) or an older
+/// `to_rfc3339()` (Z form).
 ///
 /// If mixed forms are present, SQLite's lexicographic MIN would pick the wrong row
 /// because "Z" < "+" in ASCII order. This test inserts both forms directly and
@@ -1013,10 +1036,12 @@ fn earliest_pending_deadline_returns_some_when_row_exists() {
     );
 }
 
-/// `earliest_pending_release` returns `Some(release_after)` when a pending
-/// push with `release_after` set exists and has not been delivered.
+/// `earliest_channel_release` returns the parked message's release time.
+///
+/// The release deadline is read off the *message* grain, so it answers for a
+/// message parked with no delivery targets exactly as for one with them.
 #[test]
-fn earliest_pending_release_returns_some_when_pending_row_exists() {
+fn earliest_channel_release_returns_some_when_a_message_is_parked() {
     let db = init_db_memory();
     let conn = db.blocking_lock();
     ensure_user_and_conv(&conn, 1);
@@ -1044,34 +1069,42 @@ fn earliest_pending_release_returns_some_when_pending_row_exists() {
         &[1],
     );
 
-    let result = earliest_pending_release(&conn);
-    assert!(
-        result.is_some(),
-        "must return Some when a pending row with release_after exists"
-    );
-    // The returned value must be close to the inserted release_at (within 1 second
-    // to tolerate timestamp serialisation rounding).
-    let diff = (result.unwrap() - release_at).num_seconds().abs();
+    let result = crate::messaging::db::earliest_channel_release(&conn, channel_uuid);
+    let result = result.expect("a parked message must report a release deadline");
+    // Within a second of the inserted time, tolerating serialisation rounding.
+    let diff = (result - release_at).num_seconds().abs();
     assert!(
         diff <= 1,
         "returned release time {result:?} must match inserted {release_at:?} (diff {diff}s)"
     );
 }
 
-/// `earliest_pending_release` returns `None` when no pending rows have
-/// `release_after` set.
+/// `earliest_channel_release` returns `None` when the channel has nothing
+/// parked, and never answers for another channel's parked message.
 #[test]
-fn earliest_pending_release_returns_none_when_no_rows() {
+fn earliest_channel_release_is_none_for_an_unparked_channel() {
     let db = init_db_memory();
     let conn = db.blocking_lock();
-    let result = earliest_pending_release(&conn);
-    assert!(result.is_none(), "empty table must return None");
+    ensure_user_and_conv(&conn, 1);
+    let (a, b) = upsert_two_channels(&conn);
+    assert!(
+        crate::messaging::db::earliest_channel_release(&conn, a).is_none(),
+        "empty channel must report no release deadline"
+    );
+
+    let release_at = Utc::now() + chrono::Duration::seconds(60);
+    insert_msg(&conn, b, "sender", "body", Some(release_at), &[1]);
+    assert!(
+        crate::messaging::db::earliest_channel_release(&conn, a).is_none(),
+        "one channel's parked message must not become another's deadline"
+    );
+    assert!(crate::messaging::db::earliest_channel_release(&conn, b).is_some());
 }
 
-/// `earliest_pending_release` also returns `None` when all release_after
-/// rows have been delivered.
+/// A released message stops carrying a release deadline: the grain the
+/// deadline is read from is the grain release clears.
 #[test]
-fn earliest_pending_release_returns_none_when_all_delivered() {
+fn earliest_channel_release_is_none_after_release() {
     let db = init_db_memory();
     let conn = db.blocking_lock();
     ensure_user_and_conv(&conn, 1);
@@ -1089,8 +1122,8 @@ fn earliest_pending_release_returns_none_when_all_delivered() {
         }],
     );
 
-    let release_at = Utc::now() + chrono::Duration::seconds(60);
-    let (msg_id, _) = insert_msg(
+    let release_at = Utc::now() - chrono::Duration::seconds(1);
+    insert_msg(
         &conn,
         channel_uuid,
         "sender",
@@ -1098,13 +1131,16 @@ fn earliest_pending_release_returns_none_when_all_delivered() {
         Some(release_at),
         &[1],
     );
-    // Mark delivered.
-    mark_push_delivered(&conn, msg_id, 1);
+    assert_eq!(
+        crate::messaging::db::release_due_for_channel(&conn, channel_uuid, Utc::now(), &[])
+            .released
+            .len(),
+        1
+    );
 
-    let result = earliest_pending_release(&conn);
     assert!(
-        result.is_none(),
-        "delivered rows must not appear in earliest_pending_release"
+        crate::messaging::db::earliest_channel_release(&conn, channel_uuid).is_none(),
+        "a released message must not keep reporting a deadline"
     );
 }
 
@@ -1558,14 +1594,48 @@ fn update_message_and_pending_pushes_panics_on_missing_row() {
 fn insert_bus_msg(conn: &Connection, ch_uuid_bytes: &[u8], publish_ts_ns: i64) -> i64 {
     let msg_uuid = Uuid::new_v4();
     let msg_uuid_bytes = msg_uuid.as_bytes().to_vec();
+    // Allocate a dense per-channel retained_seq exactly as production does;
+    // GC and resume key on retained_seq, not rowid/publish_ts.
+    let seq: i64 = conn
+        .query_row(
+            "UPDATE messaging_channels SET last_retained_seq = last_retained_seq + 1
+             WHERE uuid = ?1 RETURNING last_retained_seq",
+            rusqlite::params![ch_uuid_bytes],
+            |row| row.get(0),
+        )
+        .expect("insert_bus_msg: allocate retained_seq (channel row must exist)");
     conn.execute(
         "INSERT INTO messaging_messages
            (uuid, channel_uuid, source, sender, body, urgency,
-            publish_ts_ns, created_at)
-         VALUES (?1, ?2, 'src', 'sender', '{\"x\":1}', 'low', ?3, '2024-01-01')",
-        rusqlite::params![msg_uuid_bytes, ch_uuid_bytes, publish_ts_ns],
+            publish_ts_ns, created_at, retained_seq)
+         VALUES (?1, ?2, 'src', 'sender', '{\"x\":1}', 'low', ?3, '2024-01-01', ?4)",
+        rusqlite::params![msg_uuid_bytes, ch_uuid_bytes, publish_ts_ns, seq],
     )
     .expect("insert_bus_msg");
+    conn.last_insert_rowid()
+}
+
+/// Helper: insert a parked bus message (a `deliver_after`, `retained_seq` NULL —
+/// no retention position until it releases). `deliver_after` may be future
+/// (strictly parked) or past (due-but-unswept); both stay `retained_seq NULL`
+/// until a release pass. Used to prove GC never reaps a parked row.
+fn insert_parked_bus_msg(
+    conn: &Connection,
+    ch_uuid_bytes: &[u8],
+    publish_ts_ns: i64,
+    deliver_after: &str,
+) -> i64 {
+    let msg_uuid = Uuid::new_v4();
+    let msg_uuid_bytes = msg_uuid.as_bytes().to_vec();
+    conn.execute(
+        "INSERT INTO messaging_messages
+           (uuid, channel_uuid, source, sender, body, urgency,
+            publish_ts_ns, created_at, deliver_after, retained_seq)
+         VALUES (?1, ?2, 'src', 'sender', '{\"x\":1}', 'low', ?3, '2024-01-01',
+                 ?4, NULL)",
+        rusqlite::params![msg_uuid_bytes, ch_uuid_bytes, publish_ts_ns, deliver_after],
+    )
+    .expect("insert_parked_bus_msg");
     conn.last_insert_rowid()
 }
 
@@ -1613,7 +1683,7 @@ fn bus_gc_evict_drop_bounds_channel() {
     let ch_uuid = Uuid::new_v4();
     let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
     conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, created_at) VALUES (?1, 'brenn:ch', '2024-01-01')",
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:ch', '2024-01-01', X'00000000000000000000000000000001')",
         rusqlite::params![ch_uuid_bytes],
     )
     .unwrap();
@@ -1666,7 +1736,7 @@ fn bus_gc_evict_fewer_than_frontier_is_noop() {
     let ch_uuid = Uuid::new_v4();
     let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
     conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, created_at) VALUES (?1, 'brenn:ch2', '2024-01-01')",
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:ch2', '2024-01-01', X'00000000000000000000000000000001')",
         rusqlite::params![ch_uuid_bytes],
     )
     .unwrap();
@@ -1704,7 +1774,7 @@ fn bus_gc_evict_deletes_both_delivered_and_undelivered_push_rows() {
     let ch_uuid = Uuid::new_v4();
     let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
     conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, created_at) VALUES (?1, 'brenn:ch3', '2024-01-01')",
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:ch3', '2024-01-01', X'00000000000000000000000000000001')",
         rusqlite::params![ch_uuid_bytes],
     )
     .unwrap();
@@ -1749,7 +1819,7 @@ fn two_reaper_non_overlap_kind_fence() {
     let ch_uuid = Uuid::new_v4();
     let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
     conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, created_at) VALUES (?1, 'brenn:fence', '2024-01-01')",
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:fence', '2024-01-01', X'00000000000000000000000000000001')",
         rusqlite::params![ch_uuid_bytes],
     )
     .unwrap();
@@ -1850,7 +1920,7 @@ fn bus_gc_retire_pushes_bounds_subscriber() {
     let ch_uuid = Uuid::new_v4();
     let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
     conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, created_at) VALUES (?1, 'brenn:ret', '2024-01-01')",
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:ret', '2024-01-01', X'00000000000000000000000000000001')",
         rusqlite::params![ch_uuid_bytes],
     )
     .unwrap();
@@ -1872,8 +1942,64 @@ fn bus_gc_retire_pushes_bounds_subscriber() {
     assert_eq!(count_bus_messages(&conn, &ch_uuid_bytes), 8);
 }
 
-/// Delivered bus push rows for a bounded subscriber are retired by the backstop
-/// (regression test for the exploration §5/§11 delivered-push-row leak).
+/// The push reaper ranks by retention order. A late-released message has the
+/// oldest publish timestamp and the newest retention position: ranking on
+/// publish order would retire its freshly-released claim in preference to
+/// genuinely older ones, dropping a delivery while keeping the message row.
+#[test]
+fn bus_gc_retire_pushes_ranks_by_retention_order() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+
+    let ch_uuid = Uuid::new_v4();
+    let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
+    conn.execute(
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:rank', '2024-01-01', X'00000000000000000000000000000001')",
+        rusqlite::params![ch_uuid_bytes],
+    )
+    .unwrap();
+
+    let oldest = insert_bus_msg(&conn, &ch_uuid_bytes, 1000);
+    let newest = insert_bus_msg(&conn, &ch_uuid_bytes, 2000);
+    let late = insert_parked_bus_msg(&conn, &ch_uuid_bytes, 500, "2020-01-01T00:00:00+00:00");
+    let oldest_push = insert_bus_push(&conn, oldest, "app-a");
+    let newest_push = insert_bus_push(&conn, newest, "app-a");
+    let targets = [crate::messaging::store::ReleaseTarget {
+        subscriber: ParticipantId::from_stored("conversation:1".to_string()),
+        app_slug: "app-a".to_string(),
+        wake_min: None,
+    }];
+    let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+    let batch = crate::messaging::db::release_due_for_channel(&conn, ch_uuid, now, &targets);
+    assert_eq!(batch.released.len(), 1);
+    let late_push = batch.released[0].push_ids[0];
+    assert_eq!(
+        retained_seq_of(&conn, late),
+        Some(3),
+        "released → newest seq"
+    );
+
+    let retired = bus_gc_retire_pushes(&conn, ch_uuid, "app-a", 2);
+    assert_eq!(retired, 1, "one claim past push_depth=2 is retired");
+
+    let alive = |push_id: i64| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM messaging_pending_pushes WHERE id = ?1",
+            rusqlite::params![push_id],
+            |r| r.get(0),
+        )
+        .expect("count push")
+    };
+    assert_eq!(
+        alive(oldest_push),
+        0,
+        "the lowest-seq claim is the one retired"
+    );
+    assert_eq!(alive(newest_push), 1);
+    assert_eq!(alive(late_push), 1, "the just-released claim is the newest");
+}
+
+/// Delivered bus push rows for a bounded subscriber are retired by the backstop.
 #[test]
 fn bus_gc_retire_pushes_reaps_delivered_push_rows() {
     let db = init_db_memory();
@@ -1882,7 +2008,7 @@ fn bus_gc_retire_pushes_reaps_delivered_push_rows() {
     let ch_uuid = Uuid::new_v4();
     let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
     conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, created_at) VALUES (?1, 'brenn:leak', '2024-01-01')",
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:leak', '2024-01-01', X'00000000000000000000000000000001')",
         rusqlite::params![ch_uuid_bytes],
     )
     .unwrap();
@@ -1919,7 +2045,7 @@ fn bus_gc_retire_pushes_pull_only_noop() {
     let ch_uuid = Uuid::new_v4();
     let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
     conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, created_at) VALUES (?1, 'brenn:po', '2024-01-01')",
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:po', '2024-01-01', X'00000000000000000000000000000001')",
         rusqlite::params![ch_uuid_bytes],
     )
     .unwrap();
@@ -1944,7 +2070,7 @@ fn bus_gc_evict_archive_writes_jsonl_and_removes_body() {
     let ch_uuid = Uuid::new_v4();
     let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
     conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, created_at) VALUES (?1, 'brenn:arc', '2024-01-01')",
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:arc', '2024-01-01', X'00000000000000000000000000000001')",
         rusqlite::params![ch_uuid_bytes],
     )
     .unwrap();
@@ -2030,7 +2156,7 @@ fn bus_gc_evict_zero_frontier_evicts_all() {
     let ch_uuid = Uuid::new_v4();
     let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
     conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, created_at) VALUES (?1, 'brenn:zero', '2024-01-01')",
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:zero', '2024-01-01', X'00000000000000000000000000000001')",
         rusqlite::params![ch_uuid_bytes],
     )
     .unwrap();
@@ -2055,6 +2181,129 @@ fn bus_gc_evict_zero_frontier_evicts_all() {
     assert_eq!(count_bus_messages(&conn, &ch_uuid_bytes), 0);
 }
 
+/// GC evicts oldest-*retention-order* first (lowest `retained_seq`), not
+/// oldest-publish-timestamp: a late-released message is the newest retention
+/// entry despite an old rowid/publish_ts, so it survives eviction that reaps the
+/// genuinely older retained rows. Keying on publish_ts would wrongly evict it.
+#[test]
+fn bus_gc_evicts_lowest_retained_seq_first_late_release_survives() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+
+    let ch_uuid = Uuid::new_v4();
+    let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
+    conn.execute(
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:late', '2024-01-01', X'00000000000000000000000000000001')",
+        rusqlite::params![ch_uuid_bytes],
+    )
+    .unwrap();
+
+    // Three retained messages: seqs 1, 2, 3 at ascending publish_ts.
+    insert_bus_msg(&conn, &ch_uuid_bytes, 1000);
+    insert_bus_msg(&conn, &ch_uuid_bytes, 2000);
+    insert_bus_msg(&conn, &ch_uuid_bytes, 3000);
+    // A parked message with the OLDEST publish_ts, due for release now.
+    let late = insert_parked_bus_msg(&conn, &ch_uuid_bytes, 500, "2020-01-01T00:00:00+00:00");
+
+    // Release: enters retention as seq 4 despite the oldest publish_ts.
+    let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+    let released = crate::messaging::db::release_due_for_channel(&conn, ch_uuid, now, &[]);
+    assert_eq!(
+        released.released.len(),
+        1,
+        "the due parked message releases"
+    );
+    assert_eq!(
+        retained_seq_of(&conn, late),
+        Some(4),
+        "released → newest seq"
+    );
+
+    // frontier=2: keep the top-2 retention entries (seqs 3, 4), evict seqs 1, 2.
+    let (msgs, _) = bus_gc_evict_channel(
+        &conn,
+        ch_uuid,
+        "brenn:late",
+        ChannelScheme::Brenn,
+        2,
+        Sink::Drop,
+        None,
+    );
+    assert_eq!(msgs, 2, "the two lowest-seq retained rows are evicted");
+    assert_eq!(count_bus_messages(&conn, &ch_uuid_bytes), 2);
+    assert_eq!(
+        retained_seq_of(&conn, late),
+        Some(4),
+        "late-released row must survive as the newest retention entry"
+    );
+}
+
+/// A parked row (`retained_seq NULL`) is never evicted by GC, even when its
+/// publish_ts is older than the entire retained window and every retained row is
+/// reaped — and it still releases with a fresh seq afterwards. Guards the new
+/// parked-row exclusion predicate against the pre-existing reapable-parked defect.
+#[test]
+fn bus_gc_never_evicts_parked_row_which_later_releases() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+
+    let ch_uuid = Uuid::new_v4();
+    let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
+    conn.execute(
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:park2', '2024-01-01', X'00000000000000000000000000000001')",
+        rusqlite::params![ch_uuid_bytes],
+    )
+    .unwrap();
+
+    // Two retained messages (seqs 1, 2; high-water 2) plus a parked message with
+    // the oldest publish_ts, due but unswept.
+    insert_bus_msg(&conn, &ch_uuid_bytes, 1000);
+    insert_bus_msg(&conn, &ch_uuid_bytes, 2000);
+    let parked = insert_parked_bus_msg(&conn, &ch_uuid_bytes, 100, "2020-01-01T00:00:00+00:00");
+
+    // frontier=0 evicts every retained row; the parked row must survive.
+    let (msgs, _) = bus_gc_evict_channel(
+        &conn,
+        ch_uuid,
+        "brenn:park2",
+        ChannelScheme::Brenn,
+        0,
+        Sink::Drop,
+        None,
+    );
+    assert_eq!(msgs, 2, "only the two retained rows are evicted");
+    assert_eq!(
+        retained_seq_of(&conn, parked),
+        None,
+        "parked row survives GC"
+    );
+
+    // A second pass has nothing retained left; the parked row still survives.
+    let (msgs2, _) = bus_gc_evict_channel(
+        &conn,
+        ch_uuid,
+        "brenn:park2",
+        ChannelScheme::Brenn,
+        0,
+        Sink::Drop,
+        None,
+    );
+    assert_eq!(msgs2, 0, "no retained rows remain to evict");
+    assert_eq!(
+        retained_seq_of(&conn, parked),
+        None,
+        "still parked after GC"
+    );
+
+    // It releases with a fresh seq (3), continuing the dense high-water past the
+    // evicted 1 and 2.
+    let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+    let released = crate::messaging::db::release_due_for_channel(&conn, ch_uuid, now, &[]);
+    assert_eq!(released.released.len(), 1);
+    assert_eq!(retained_seq_of(&conn, parked), Some(3));
+    assert_eq!(last_retained_seq_of(&conn, ch_uuid), 3);
+}
+
 /// `bus_gc_retire_pushes` retires only rows for the specified app_slug,
 /// not rows belonging to other apps on the same channel.
 #[test]
@@ -2065,7 +2314,7 @@ fn bus_gc_retire_pushes_scoped_to_app_slug() {
     let ch_uuid = Uuid::new_v4();
     let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
     conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, created_at) VALUES (?1, 'brenn:scope', '2024-01-01')",
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:scope', '2024-01-01', X'00000000000000000000000000000001')",
         rusqlite::params![ch_uuid_bytes],
     )
     .unwrap();
@@ -2117,7 +2366,7 @@ fn bus_gc_retire_pushes_excludes_parked_rows() {
     let ch_uuid = Uuid::new_v4();
     let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
     conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, created_at) VALUES (?1, 'brenn:park', '2024-01-01')",
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:park', '2024-01-01', X'00000000000000000000000000000001')",
         rusqlite::params![ch_uuid_bytes],
     )
     .unwrap();
@@ -2800,8 +3049,8 @@ fn unclaim_pending_pushes_reparks() {
 }
 
 /// `load_pending_pushes_for_channel` returns only undelivered, unparked bus
-/// rows for `(subscriber, channel)`, in `publish_ts_ns ASC` order, carrying the
-/// correct `(push_id, message_id, envelope)` triple.
+/// rows for `(subscriber, channel)`, in `publish_ts_ns ASC` order, carrying each
+/// row's claim, message identity, retention position, and payload.
 #[test]
 fn load_pending_pushes_for_channel_scopes_and_orders() {
     let db = init_db_memory();
@@ -2825,75 +3074,20 @@ fn load_pending_pushes_for_channel_scopes_and_orders() {
     let rows = load_pending_pushes_for_channel(&conn, &sub, chan_a);
     assert_eq!(rows.len(), 2, "only the two live A rows for sub");
     // publish_ts_ns ASC → a-early (100) first, a-late (200) second.
-    assert_eq!(rows[0].0, p_a1);
-    assert_eq!(rows[0].1, m_a1, "message_id (seq) matches inserted id");
-    assert_eq!(rows[0].2.body, "a-early");
-    assert_eq!(rows[1].0, p_a2);
-    assert_eq!(rows[1].1, m_a2);
-    assert_eq!(rows[1].2.body, "a-late");
-}
-
-/// `load_channel_messages_after` reads `messaging_messages` directly (not push
-/// rows): it returns messages with `m.id > after_id` on the channel, ordered
-/// ascending, clamped to the newest `clamp` window, excluding other channels.
-#[test]
-fn load_channel_messages_after_window_and_order() {
-    let db = init_db_memory();
-    let conn = db.blocking_lock();
-    let (chan_a, chan_b) = upsert_two_channels(&conn);
-    let sub = ParticipantId::for_surface("deskbar");
-
-    // Interleave inserts across channels so message ids are globally mixed.
-    let (m_a1, _) = insert_one_push(&conn, chan_a, &sub, "a1", 100, None);
-    let (_m_b1, _) = insert_one_push(&conn, chan_b, &sub, "b1", 110, None);
-    let (m_a2, _) = insert_one_push(&conn, chan_a, &sub, "a2", 120, None);
-    let (m_a3, _) = insert_one_push(&conn, chan_a, &sub, "a3", 130, None);
-
-    // Unbounded, after m_a1 → the two later A messages, ascending, no B rows.
-    let after_a1 = load_channel_messages_after(&conn, chan_a, m_a1, Depth::Unbounded);
-    let ids: Vec<i64> = after_a1.iter().map(|(id, _)| *id).collect();
+    assert_eq!(rows[0].push_id, p_a1);
     assert_eq!(
-        ids,
-        vec![m_a2, m_a3],
-        "ascending, id > after, channel-scoped"
+        rows[0].message_id, m_a1,
+        "message identity matches inserted id"
     );
-    assert_eq!(after_a1[0].1.body, "a2");
-    assert_eq!(after_a1[1].1.body, "a3");
-    // Assert several distinct decoded fields (not just body) so a column-index
-    // slip in this query's hand-written SELECT — which sits outside the
-    // `SELECT_ENVELOPE_BASE` golden test — misaligns `row_to_envelope` and fails
-    // here rather than silently corrupting a durable resume replay at runtime.
-    assert_eq!(after_a1[0].1.sender, "sender");
-    assert_eq!(after_a1[0].1.source, "src");
-    assert_eq!(after_a1[0].1.urgency, Urgency::Low);
-
-    // Clamp to newest 1 among {a2, a3} → just a3.
-    let clamped = load_channel_messages_after(&conn, chan_a, m_a1, Depth::Bounded(1));
-    let clamped_ids: Vec<i64> = clamped.iter().map(|(id, _)| *id).collect();
-    assert_eq!(clamped_ids, vec![m_a3], "newest-1 window");
-
-    // after the channel's own max id → empty.
-    let after_max = load_channel_messages_after(&conn, chan_a, m_a3, Depth::Unbounded);
-    assert!(after_max.is_empty(), "nothing after the max id");
-}
-
-/// `channel_min_message_id` returns the oldest surviving message id per channel,
-/// and `None` for a channel with no messages — the durable-resume gap oracle.
-#[test]
-fn channel_min_message_id_reports_oldest_per_channel() {
-    let db = init_db_memory();
-    let conn = db.blocking_lock();
-    let (chan_a, chan_b) = upsert_two_channels(&conn);
-    let sub = ParticipantId::for_surface("deskbar");
-
-    // chan_b has no messages → None.
-    assert_eq!(channel_min_message_id(&conn, chan_b), None);
-
-    let (m_a1, _) = insert_one_push(&conn, chan_a, &sub, "a1", 100, None);
-    let (_m_a2, _) = insert_one_push(&conn, chan_a, &sub, "a2", 110, None);
-    // Oldest of chan_a is its first insert; chan_b still empty.
-    assert_eq!(channel_min_message_id(&conn, chan_a), Some(m_a1));
-    assert_eq!(channel_min_message_id(&conn, chan_b), None);
+    assert_eq!(rows[0].envelope.body, "a-early");
+    assert_eq!(rows[1].push_id, p_a2);
+    assert_eq!(rows[1].message_id, m_a2);
+    assert_eq!(rows[1].envelope.body, "a-late");
+    assert!(
+        rows[0].retained_seq > rows[1].retained_seq,
+        "retention position is assigned at insert, so a-late (inserted first) \
+         holds the lower one even though it sorts second by publish_ts_ns"
+    );
 }
 
 /// The below-water ack channel's DB helpers: a `confirm_pending` stamp
@@ -2913,9 +3107,11 @@ fn confirm_pending_stamp_survives_gc_until_confirmed() {
 
     // Stamp the older tentative and read it back.
     assert_eq!(stamp_confirm_pending(&conn, &sub, m_old), 1);
+    let tentative = load_confirm_pending_pushes(&conn, &sub, chan);
+    assert_eq!(tentative.len(), 1);
     assert_eq!(
-        load_confirm_pending_pushes(&conn, &sub, chan),
-        vec![(p_old, m_old)]
+        (tentative[0].push_id, tentative[0].message_id),
+        (p_old, m_old)
     );
 
     // GC keeping only the newest row would retire the older, but the tentative
@@ -2977,10 +3173,15 @@ fn confirm_pending_row_survives_channel_eviction() {
     );
     assert_eq!(msgs, 1, "only the non-tentative old message is evicted");
     assert_eq!(pushes, 1, "the tentative push row is spared");
+    let surviving = load_confirm_pending_pushes(&conn, &sub, chan);
     assert_eq!(
-        load_confirm_pending_pushes(&conn, &sub, chan),
-        vec![(p_old, m_old)],
+        surviving.len(),
+        1,
         "the recovery evidence survives channel eviction"
+    );
+    assert_eq!(
+        (surviving[0].push_id, surviving[0].message_id),
+        (p_old, m_old)
     );
 
     // Once confirmed, the flag clears and the next eviction reaps it normally.
@@ -3020,5 +3221,276 @@ fn unclaim_confirm_pending_makes_a_row_redeliverable() {
     assert!(load_confirm_pending_pushes(&conn, &sub, chan).is_empty());
     let redeliverable = load_pending_pushes_for_channel(&conn, &sub, chan);
     assert_eq!(redeliverable.len(), 1);
-    assert_eq!(redeliverable[0].1, m, "the unclaimed row redelivers");
+    assert_eq!(
+        redeliverable[0].message_id, m,
+        "the unclaimed row redelivers"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Retention-sequence allocation (durable resume foundation)
+// ---------------------------------------------------------------------------
+
+fn retained_seq_of(conn: &Connection, message_id: i64) -> Option<i64> {
+    conn.query_row(
+        "SELECT retained_seq FROM messaging_messages WHERE id = ?1",
+        rusqlite::params![message_id],
+        |r| r.get(0),
+    )
+    .expect("read retained_seq")
+}
+
+fn last_retained_seq_of(conn: &Connection, channel: Uuid) -> i64 {
+    conn.query_row(
+        "SELECT last_retained_seq FROM messaging_channels WHERE uuid = ?1",
+        rusqlite::params![channel.as_bytes().to_vec()],
+        |r| r.get(0),
+    )
+    .expect("read last_retained_seq")
+}
+
+fn append_msg(conn: &Connection, channel: Uuid, body: &str) -> i64 {
+    insert_message_with_pushes(
+        conn,
+        channel,
+        "src",
+        "sender",
+        body,
+        Urgency::Low,
+        ChannelScheme::Brenn,
+        None,
+        None,
+        None,
+        utc_to_ns(Utc::now()),
+        &[],
+    )
+    .id
+}
+
+fn park_msg(conn: &Connection, channel: Uuid, body: &str, release_at: DateTime<Utc>) -> i64 {
+    insert_message_with_pushes(
+        conn,
+        channel,
+        "src",
+        "sender",
+        body,
+        Urgency::Low,
+        ChannelScheme::Brenn,
+        None,
+        None,
+        Some(release_at),
+        utc_to_ns(Utc::now()),
+        &[],
+    )
+    .id
+}
+
+/// Immediate appends get a dense, per-channel, ascending sequence and bump the
+/// channel's persisted high-water; two channels number independently.
+#[test]
+fn append_assigns_dense_per_channel_retained_seq() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let (a, b) = upsert_two_channels(&conn);
+
+    let a1 = append_msg(&conn, a, "a1");
+    let a2 = append_msg(&conn, a, "a2");
+    let b1 = append_msg(&conn, b, "b1");
+    let a3 = append_msg(&conn, a, "a3");
+
+    assert_eq!(retained_seq_of(&conn, a1), Some(1));
+    assert_eq!(retained_seq_of(&conn, a2), Some(2));
+    assert_eq!(retained_seq_of(&conn, a3), Some(3));
+    assert_eq!(
+        retained_seq_of(&conn, b1),
+        Some(1),
+        "channel B numbers from 1"
+    );
+    assert_eq!(last_retained_seq_of(&conn, a), 3);
+    assert_eq!(last_retained_seq_of(&conn, b), 1);
+}
+
+/// A parked message holds no sequence until it releases; at release it is
+/// assigned the next sequence — above every append made while it was parked, so
+/// a late-released message is the newest retention entry (converging with the
+/// ring).
+#[test]
+fn release_assigns_seq_in_release_order_making_a_late_release_newest() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let (a, _b) = upsert_two_channels(&conn);
+    let past = Utc::now() - chrono::Duration::hours(1);
+
+    let m1 = append_msg(&conn, a, "m1");
+    let p = park_msg(&conn, a, "p", past);
+    let m2 = append_msg(&conn, a, "m2");
+
+    assert_eq!(retained_seq_of(&conn, m1), Some(1));
+    assert_eq!(retained_seq_of(&conn, p), None, "parked holds no seq");
+    assert_eq!(retained_seq_of(&conn, m2), Some(2));
+    assert_eq!(
+        last_retained_seq_of(&conn, a),
+        2,
+        "parking allocates nothing"
+    );
+
+    let released = release_due_for_channel(&conn, a, Utc::now(), &[]);
+    assert_eq!(released.released.len(), 1);
+    assert_eq!(released.released[0].message_id, p);
+
+    assert_eq!(
+        retained_seq_of(&conn, p),
+        Some(3),
+        "the released message is the newest retention entry"
+    );
+    assert_eq!(last_retained_seq_of(&conn, a), 3);
+}
+
+/// A release must mint retention sequences in release order, per channel. A row
+/// cleared without one would sit in no retention read, outside the eviction
+/// universe, and below every resume high-water — retained by nobody's
+/// definition.
+#[test]
+fn a_release_pass_assigns_seqs_in_release_order() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let (a, b) = upsert_two_channels(&conn);
+    let older = Utc::now() - chrono::Duration::hours(2);
+    let newer = Utc::now() - chrono::Duration::hours(1);
+
+    let a1 = append_msg(&conn, a, "a1");
+    // Rowid order is the reverse of release order, so a rowid-ordered sweep
+    // would number these the other way round.
+    let late = park_with_push(&conn, a, "late", newer);
+    let early = park_with_push(&conn, a, "early", older);
+    let b1 = park_with_push(&conn, b, "b1", older);
+
+    let now = Utc::now();
+    let released_a = crate::messaging::db::release_due_for_channel(&conn, a, now, &[]);
+    let released_b = crate::messaging::db::release_due_for_channel(&conn, b, now, &[]);
+    assert_eq!(
+        released_a.released.len() + released_b.released.len(),
+        3,
+        "all three come due"
+    );
+
+    assert_eq!(retained_seq_of(&conn, a1), Some(1));
+    assert_eq!(
+        retained_seq_of(&conn, early),
+        Some(2),
+        "the earlier release time takes the earlier retention position"
+    );
+    assert_eq!(retained_seq_of(&conn, late), Some(3));
+    assert_eq!(last_retained_seq_of(&conn, a), 3);
+    assert_eq!(
+        retained_seq_of(&conn, b1),
+        Some(1),
+        "the other channel numbers independently"
+    );
+    assert_eq!(last_retained_seq_of(&conn, b), 1);
+
+    // A released row is in the retained window, which is what the seq buys.
+    let tail: Vec<String> = load_channel_retained_tail(&conn, a, Depth::Unbounded)
+        .into_iter()
+        .map(|(_, e)| e.body)
+        .collect();
+    assert_eq!(tail, vec!["a1", "early", "late"]);
+}
+
+/// A parked message with one undelivered push claim.
+fn park_with_push(conn: &Connection, channel: Uuid, body: &str, release_at: DateTime<Utc>) -> i64 {
+    insert_message_with_pushes(
+        conn,
+        channel,
+        "src",
+        "sender",
+        body,
+        Urgency::Low,
+        ChannelScheme::Brenn,
+        None,
+        None,
+        Some(release_at),
+        utc_to_ns(Utc::now()),
+        &[PendingPushInsert {
+            target_subscriber: ParticipantId::for_conversation(1),
+            target_app_slug: "target".to_string(),
+            eager_wake: true,
+            release_after: Some(release_at),
+            delivery_deadline: None,
+        }],
+    )
+    .id
+}
+
+/// A parked message that is cancelled before release consumes no sequence, so a
+/// later append is not left with a hole — density is unaffected.
+#[test]
+fn a_cancelled_parked_message_consumes_no_seq() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let (a, _b) = upsert_two_channels(&conn);
+    let future = Utc::now() + chrono::Duration::hours(1);
+
+    let m1 = append_msg(&conn, a, "m1");
+    let p = park_msg(&conn, a, "p", future);
+    conn.execute(
+        "DELETE FROM messaging_messages WHERE id = ?1",
+        rusqlite::params![p],
+    )
+    .expect("cancel parked message");
+    let m2 = append_msg(&conn, a, "m2");
+
+    assert_eq!(retained_seq_of(&conn, m1), Some(1));
+    assert_eq!(
+        retained_seq_of(&conn, m2),
+        Some(2),
+        "no gap from the cancel"
+    );
+    assert_eq!(last_retained_seq_of(&conn, a), 2);
+}
+
+/// The partial unique index is the better-dead-than-wrong backstop: two retained
+/// rows on one channel cannot share a sequence.
+#[test]
+fn the_retained_seq_unique_index_rejects_a_duplicate() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let (a, _b) = upsert_two_channels(&conn);
+    let ab = a.as_bytes().to_vec();
+
+    conn.execute(
+        "INSERT INTO messaging_messages
+            (uuid, channel_uuid, source, sender, body, urgency, publish_ts_ns, created_at, retained_seq)
+         VALUES (?1, ?2, 's', 'a', 'x', 'low', 0, 'now', 7)",
+        rusqlite::params![Uuid::new_v4().as_bytes().to_vec(), ab.clone()],
+    )
+    .expect("first retained_seq row inserts");
+    let dup = conn.execute(
+        "INSERT INTO messaging_messages
+            (uuid, channel_uuid, source, sender, body, urgency, publish_ts_ns, created_at, retained_seq)
+         VALUES (?1, ?2, 's', 'a', 'y', 'low', 0, 'now', 7)",
+        rusqlite::params![Uuid::new_v4().as_bytes().to_vec(), ab.clone()],
+    );
+    match dup {
+        Err(rusqlite::Error::SqliteFailure(e, _)) => assert_eq!(
+            e.code,
+            rusqlite::ErrorCode::ConstraintViolation,
+            "a duplicate (channel, retained_seq) must fail on the unique index, not some \
+             other error"
+        ),
+        other => panic!("expected a constraint violation, got {other:?}"),
+    }
+
+    // The index is *partial*: parked rows carry no sequence, and any number of
+    // them coexist on one channel. A total index would reject the second.
+    for _ in 0..2 {
+        conn.execute(
+            "INSERT INTO messaging_messages
+                (uuid, channel_uuid, source, sender, body, urgency, publish_ts_ns, created_at,
+                 deliver_after, retained_seq)
+             VALUES (?1, ?2, 's', 'a', 'p', 'low', 0, 'now', '2099-01-01T00:00:00+00:00', NULL)",
+            rusqlite::params![Uuid::new_v4().as_bytes().to_vec(), ab.clone()],
+        )
+        .expect("unsequenced rows are not constrained by the partial index");
+    }
 }

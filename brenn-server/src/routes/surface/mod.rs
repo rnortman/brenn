@@ -34,9 +34,7 @@ use brenn_lib::messaging::config::{
 };
 use brenn_lib::messaging::gates::well_formed_name;
 use brenn_lib::messaging::system::SystemParticipantSpec;
-use brenn_lib::messaging::{
-    ChannelScheme, EphemeralBus, MessagingDirectory, Messenger, ParticipantId, Urgency,
-};
+use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Messenger, ParticipantId, Urgency};
 use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
 use brenn_surface_contract::{
     ERROR_REPORT_INSTANCE, ERROR_REPORT_PORT, KERNEL_ARTIFACT, module_artifact,
@@ -172,10 +170,6 @@ pub(crate) fn authorize_surface(
 
 /// Per-surface runtime bundle, precomputed once at boot so the WS hot path does
 /// no re-derivation.
-///
-/// Holds a bus clone (rather than reaching through `state.messenger`) so the
-/// bus-present invariant is encoded once at boot and surface WS tests can build
-/// a runtime over a bare `EphemeralBus` without assembling a full `Messenger`.
 pub struct SurfaceRuntime {
     /// The resolved config block for this surface.
     pub resolved: ResolvedSurface,
@@ -183,12 +177,11 @@ pub struct SurfaceRuntime {
     pub participant: ParticipantId,
     /// Resolved access policy, `Arc`-wrapped once for cheap per-op cloning.
     pub policy: Arc<AppPolicy>,
-    /// The `EphemeralBus` this surface's ephemeral channels flow through.
-    pub bus: Arc<EphemeralBus>,
-    /// The `Messenger` durable (`brenn:`) subscriptions project through — the
-    /// session reaches the directory, DB, and durable queries via it. `Some`
-    /// whenever this surface has any durable subscription (boot invariant);
-    /// `None` only for ephemeral-only test runtimes with no `Messenger`.
+    /// The `Messenger` this surface's messaging projects through — the session
+    /// reaches the directory, the DB, durable queries, and the non-durable
+    /// channels' live streams via it. `Some` whenever this surface has any
+    /// subscription or output (boot invariant); `None` only for test runtimes
+    /// that exercise resolution without touching messaging.
     pub messenger: Option<Arc<Messenger>>,
     /// Subscriptions this surface declares: `(instance, channel)` → the facts
     /// delivery turns on. The gate an inbound `Subscribe` is validated against,
@@ -439,12 +432,28 @@ impl SurfaceRuntime {
             .any(|c| c.instance == instance)
     }
 
-    /// Build the runtime for one resolved surface, sharing the given bus.
+    /// The `Messenger` this surface's messaging projects through.
+    ///
+    /// # Panics
+    ///
+    /// If this runtime has none. Every surface that resolves a subscription or
+    /// an output has one by boot invariant, so a miss is a broken boot, not a
+    /// runtime condition.
+    pub(crate) fn messenger(&self) -> &Arc<Messenger> {
+        self.messenger.as_ref().unwrap_or_else(|| {
+            panic!(
+                "surface {:?} reached messaging with no Messenger — boot wires one whenever a \
+                 surface declares any subscription or output",
+                self.resolved.slug
+            )
+        })
+    }
+
+    /// Build the runtime for one resolved surface.
     ///
     /// `max_body_bytes` is `messaging.max_body_bytes` from config.
     pub fn build(
         resolved: ResolvedSurface,
-        bus: Arc<EphemeralBus>,
         messenger: Option<Arc<Messenger>>,
         max_body_bytes: usize,
         description: SurfaceDescriptionParams,
@@ -584,7 +593,6 @@ impl SurfaceRuntime {
             resolved,
             participant,
             policy,
-            bus,
             messenger,
             subscription_channels,
             output_ports,
@@ -600,13 +608,10 @@ impl SurfaceRuntime {
     }
 }
 
-/// Build the boot-time surface map: slug → runtime.
-///
-/// Every runtime shares the one process `EphemeralBus`. Empty when no
+/// Build the boot-time surface map: slug → runtime. Empty when no
 /// `[[surface]]` blocks are configured.
 pub fn build_surface_runtimes(
     surfaces: Vec<ResolvedSurface>,
-    bus: Arc<EphemeralBus>,
     messenger: Option<Arc<Messenger>>,
     max_body_bytes: usize,
     error_report: Option<(String, LogLevel)>,
@@ -618,7 +623,6 @@ pub fn build_surface_runtimes(
             let slug = resolved.slug.clone();
             let mut runtime = SurfaceRuntime::build(
                 resolved,
-                bus.clone(),
                 messenger.clone(),
                 max_body_bytes,
                 surface_description.clone(),
@@ -1163,9 +1167,7 @@ mod tests {
         ResolvedComponent, ResolvedSurface, SurfaceBinding, SurfaceSendBudget,
     };
 
-    use super::test_fixtures::{
-        TEST_MAX_BODY_BYTES, directory_with, directory_with_standing, fixture_bus,
-    };
+    use super::test_fixtures::{TEST_MAX_BODY_BYTES, directory_with, directory_with_standing};
     use super::*;
 
     /// `wire_noise` is a four-arm hand-written match between two same-named,
@@ -1179,10 +1181,6 @@ mod tests {
         assert_eq!(wire_noise(N::Metered), WireNoiseLevel::Metered);
         assert_eq!(wire_noise(N::Alarm), WireNoiseLevel::Alarm);
         assert_eq!(wire_noise(N::Fatal), WireNoiseLevel::Fatal);
-    }
-
-    fn empty_bus() -> Arc<EphemeralBus> {
-        fixture_bus(vec![])
     }
 
     fn resolved(slug: &str) -> ResolvedSurface {
@@ -1240,7 +1238,6 @@ mod tests {
     fn build_classifies_channels_and_prebuilds_bindings() {
         let rt = SurfaceRuntime::build(
             resolved("deskbar"),
-            empty_bus(),
             None,
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
@@ -1306,7 +1303,6 @@ mod tests {
         resolved.components[1].chrome = true;
         let rt = SurfaceRuntime::build(
             resolved,
-            empty_bus(),
             None,
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
@@ -1353,7 +1349,6 @@ mod tests {
     fn build_advertises_local_bindings_but_keeps_them_out_of_the_wire_maps() {
         let rt = SurfaceRuntime::build(
             resolved_with_local("deskbar"),
-            empty_bus(),
             None,
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
@@ -1410,7 +1405,6 @@ mod tests {
     fn build_advertises_no_local_channels_when_none_are_declared() {
         let rt = SurfaceRuntime::build(
             resolved("deskbar"),
-            empty_bus(),
             None,
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
@@ -1419,11 +1413,9 @@ mod tests {
     }
 
     #[test]
-    fn build_surface_runtimes_keys_by_slug_and_shares_bus() {
-        let bus = empty_bus();
+    fn build_surface_runtimes_keys_by_slug() {
         let map = build_surface_runtimes(
             vec![resolved("deskbar"), resolved("kitchen")],
-            bus.clone(),
             None,
             TEST_MAX_BODY_BYTES,
             None,
@@ -1433,9 +1425,6 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert!(map.contains_key("deskbar"));
         assert!(map.contains_key("kitchen"));
-        // Every runtime shares the one process bus.
-        assert!(Arc::ptr_eq(&map["deskbar"].bus, &bus));
-        assert!(Arc::ptr_eq(&map["kitchen"].bus, &bus));
     }
 
     #[test]
@@ -1445,7 +1434,6 @@ mod tests {
         // surface-free config. Nothing synthesizes a default surface.
         let map = build_surface_runtimes(
             vec![],
-            empty_bus(),
             None,
             TEST_MAX_BODY_BYTES,
             None,
@@ -1460,7 +1448,6 @@ mod tests {
         // `#brenn`/`error-reports` durable output port and advertises the floor.
         let map = build_surface_runtimes(
             vec![resolved("deskbar")],
-            empty_bus(),
             None,
             TEST_MAX_BODY_BYTES,
             Some(("brenn:surface-errors".to_string(), LogLevel::Warn)),
@@ -1487,7 +1474,6 @@ mod tests {
         // Unset error channel: no reserved port, floor `None` (kernel console-only).
         let map = build_surface_runtimes(
             vec![resolved("deskbar")],
-            empty_bus(),
             None,
             TEST_MAX_BODY_BYTES,
             None,
@@ -1952,7 +1938,6 @@ mod tests {
         r.subscriptions[0].channel_address = "mqtt:sensors".to_string();
         SurfaceRuntime::build(
             r,
-            empty_bus(),
             None,
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
@@ -1983,7 +1968,6 @@ mod tests {
         }];
         SurfaceRuntime::build(
             r,
-            empty_bus(),
             None,
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),

@@ -147,6 +147,7 @@ pub(super) fn brenn_channel(address: &str, sub_slug: &str) -> ChannelEntry {
         address: address.to_string(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -230,6 +231,7 @@ pub(super) fn build_cfg(
             },
             amplification_mt: 1000,
         }],
+        outputs: vec![],
         activation_pacing: unthrottled_pacing(),
     };
     (cfg, alert_handle, db)
@@ -320,6 +322,7 @@ pub(super) async fn build_multi_channel_setup(
         messenger: Arc::clone(&messenger),
         alert_dispatcher,
         inputs,
+        outputs: vec![],
         activation_pacing: unthrottled_pacing(),
     };
     (
@@ -381,6 +384,7 @@ pub(super) async fn build_multiport_setup_with_depths(
         address: out_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -474,6 +478,7 @@ pub(super) async fn build_multiport_setup_with_depths(
         messenger: Arc::clone(&messenger),
         alert_dispatcher,
         inputs,
+        outputs: vec![],
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -556,6 +561,7 @@ pub(super) async fn build_two_channel_setup(
         address: in_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -582,6 +588,7 @@ pub(super) async fn build_two_channel_setup(
         address: out_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -661,6 +668,16 @@ pub(super) async fn build_two_channel_setup(
                 wake_min: WakeMin::Normal,
             },
             amplification_mt: 1000,
+        }],
+        outputs: vec![brenn_lib::messaging::config::WasmOutputPort {
+            port: "out".to_string(),
+            channel_uuid: out_uuid,
+            channel_address: out_addr,
+            default_urgency: brenn_lib::messaging::Urgency::Normal,
+            budget: brenn_lib::messaging::config::WasmSinkBudget {
+                fill_mt: 1_000_000,
+                capacity_mt: 1_000_000,
+            },
         }],
         activation_pacing: unthrottled_pacing(),
     };

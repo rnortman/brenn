@@ -89,7 +89,7 @@
 //!   finds a ring already populated — the priming rule above — is the narrower
 //!   one. Neither is a bug.
 //!
-//! Typed gaps (`EpochChanged`, `HoleExceedsRing`, `BeyondRetained`) survive only
+//! Typed gaps (`EpochChanged`, `BeyondRetained`) survive only
 //! at the websocket/resume layer, where the kernel handles them by re-resuming;
 //! the component observes at most a first-window-after-resubscription. `GapReason`
 //! is not part of the component seam.

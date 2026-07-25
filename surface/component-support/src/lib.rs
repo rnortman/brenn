@@ -1009,6 +1009,8 @@ export function define_component(tag, connected) {\n\
                     new_from: 1,
                     dropped: 3,
                 }],
+                deferred: vec![],
+                now: None,
             })
             .expect("the fixture activation serializes")
         }

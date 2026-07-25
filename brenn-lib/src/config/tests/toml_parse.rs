@@ -15,7 +15,7 @@ fn parse_empty_toml_uses_defaults() {
 // invariant. Full validation (validate_and_resolve) needs host-side paths to
 // exist, so it only runs at server startup — but this invariant needs none of
 // those paths: once any messaging is configured (a [[surface]] or
-// [[ephemeral_channel]]), the message-source resolver requires a non-empty
+// [[channel]]), the message-source resolver requires a non-empty
 // server.public_url or boot panics. Asserting it here guards the file against a
 // regression that make check would otherwise miss (only a live server start
 // would catch it — and make e2e is not part of make check).
@@ -26,7 +26,7 @@ fn assert_config_file_messaging_invariant(filename: &str) {
     let contents = std::fs::read_to_string(&path).unwrap();
     let config: BrennConfig =
         toml::from_str(&contents).unwrap_or_else(|e| panic!("{filename} parse failed: {e}"));
-    if !config.surfaces.is_empty() || !config.ephemeral_channels.is_empty() {
+    if !config.surfaces.is_empty() || !config.channels.is_empty() {
         let public_url = config.server.public_url.as_deref().unwrap_or_else(|| {
             panic!("{filename} configures messaging, so server.public_url is required")
         });

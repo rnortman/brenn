@@ -90,7 +90,11 @@ async fn order_preserving_partition_delivers_all_rows() {
         "pre-drain load_activation_snapshot must use exactly one scan"
     );
     for snap in &pre_snapshots {
-        let got: Vec<i64> = snap.new_rows.iter().map(|(id, _)| *id).collect();
+        let got: Vec<i64> = snap
+            .new_rows
+            .iter()
+            .map(|(record, _)| record.expect("durable port row carries a claim record").0)
+            .collect();
         let expected = expected_order
             .get(&snap.channel_address)
             .cloned()

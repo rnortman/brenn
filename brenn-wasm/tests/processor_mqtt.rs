@@ -37,6 +37,8 @@ fn single_activation() -> ProcessorActivation {
             new_from: 0,
             dropped: 0,
         }],
+        deferred: vec![],
+        now: None,
     }
 }
 
@@ -55,6 +57,8 @@ fn trap_after_publish_activation() -> ProcessorActivation {
             new_from: 0,
             dropped: 0,
         }],
+        deferred: vec![],
+        now: None,
     }
 }
 

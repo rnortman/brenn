@@ -980,6 +980,7 @@ mod tests {
             address: addr.to_string(),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,

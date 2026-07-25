@@ -168,6 +168,25 @@ impl AppPolicy {
             && self.webhook_acl_covers(endpoint)
     }
 
+    /// May this app dynamically subscribe to `ephemeral:` `channel`? Requires the
+    /// `DynamicSubscribe` grant, the `EphemeralSubscribe` transport grant, and a
+    /// covering `ephemeral_subscribe` matcher. `channel` is the
+    /// `ephemeral:`-stripped bare channel name.
+    pub fn allows_ephemeral_dynamic_subscribe(&self, channel: &str) -> bool {
+        self.grants.has(AppCapability::DynamicSubscribe) && self.allows_ephemeral_delivery(channel)
+    }
+
+    /// May this app dynamically subscribe to a confined `local:` `channel`?
+    /// Requires the `DynamicSubscribe` grant, the `LocalSubscribe` transport
+    /// grant, and a covering `local_subscribe` matcher. `LocalSubscribe` is not
+    /// authorable on an LLM app, so this denies for every app today; it is
+    /// written as the `local:` arm of the dynamic-subscribe family so the
+    /// enforcement point lives where the other schemes' do rather than as a
+    /// special case at the call site.
+    pub fn allows_local_dynamic_subscribe(&self, channel: &str) -> bool {
+        self.grants.has(AppCapability::DynamicSubscribe) && self.allows_local_delivery(channel)
+    }
+
     /// May this app still *receive a delivery* on MQTT `(client, topic)`?
     ///
     /// The subscription-**holding** decision (design §2.2): the `MqttSubscribe`
@@ -193,29 +212,40 @@ impl AppPolicy {
     /// gating grant is `EphemeralSubscribe`, not `MessagingSubscribe` — the two
     /// delivery classes carry distinct transport grants. `channel` is
     /// the `ephemeral:`-stripped bare channel name (matcher values carry no
-    /// scheme). No dynamic-subscribe analogue in v1.
+    /// scheme). The dynamic-subscribe analogue is
+    /// `allows_ephemeral_dynamic_subscribe`.
     pub fn allows_ephemeral_delivery(&self, channel: &str) -> bool {
         self.grants.has(AppCapability::EphemeralSubscribe)
             && Self::acl_covers(&self.acls.ephemeral_subscribe, channel)
     }
 
+    /// May this app still receive a delivery on a confined `local:` `channel`?
+    /// The `LocalSubscribe` transport grant + a covering `local_subscribe`
+    /// matcher. Same deliberate asymmetry as the ephemeral family: the gating
+    /// grant is `LocalSubscribe`, not `MessagingSubscribe`. `channel` is the
+    /// `local:`-stripped bare channel name (matcher values carry no scheme). No
+    /// dynamic-subscribe analogue.
+    pub fn allows_local_delivery(&self, channel: &str) -> bool {
+        self.grants.has(AppCapability::LocalSubscribe)
+            && Self::acl_covers(&self.acls.local_subscribe, channel)
+    }
+
     /// May this app still receive a delivery on webhook `endpoint`? The `Webhook`
-    /// transport grant + an exact `webhook` matcher, **without** `DynamicSubscribe`
-    /// (design §2.2).
+    /// transport grant + an exact `webhook` matcher, **without** `DynamicSubscribe`.
     pub fn allows_webhook_delivery(&self, endpoint: &str) -> bool {
         self.grants.has(AppCapability::Webhook) && self.webhook_acl_covers(endpoint)
     }
 
-    // --- Publish-side decisions (design §2.1): the send analogue of the
-    //     delivery family. Layer-1 grant AND a covering layer-2 matcher; an empty
-    //     matcher list is deny-by-default (`.any(...)` over an empty `Vec` is
-    //     `false`). These are publish analogues, so they deliberately do NOT carry
-    //     the `_delivery` suffix nor compose into `allows_channel_access`.
+    // --- Publish-side decisions: the send analogue of the delivery family.
+    //     Layer-1 grant AND a covering layer-2 matcher; an empty matcher list is
+    //     deny-by-default (`.any(...)` over an empty `Vec` is `false`). These are
+    //     publish analogues, so they deliberately do NOT carry the `_delivery`
+    //     suffix nor compose into `allows_channel_access`.
 
     /// May this app publish to `brenn:` `channel`? Requires the `MessagingPublish`
     /// grant **and** a covering `brenn_publish` matcher (`Exact`/`Prefix` via
     /// `ChannelMatcher::matches`). `channel` is the `brenn:`-stripped channel name,
-    /// matching how `allows_brenn_delivery` treats it (design §2.1, §2.2).
+    /// matching how `allows_brenn_delivery` treats it.
     pub fn allows_brenn_publish(&self, channel: &str) -> bool {
         self.grants.has(AppCapability::MessagingPublish)
             && Self::acl_covers(&self.acls.brenn_publish, channel)
@@ -231,10 +261,20 @@ impl AppPolicy {
             && Self::acl_covers(&self.acls.ephemeral_publish, channel)
     }
 
+    /// May this app publish to `local:` `channel`? Requires the `LocalPublish`
+    /// grant **and** a covering `local_publish` matcher. `channel` is the
+    /// `local:`-stripped bare channel name (matcher values carry no scheme).
+    /// Publish analogue, so — like `allows_brenn_publish` — it does NOT compose
+    /// into `allows_channel_access`.
+    pub fn allows_local_publish(&self, channel: &str) -> bool {
+        self.grants.has(AppCapability::LocalPublish)
+            && Self::acl_covers(&self.acls.local_publish, channel)
+    }
+
     /// May this app publish to MQTT `client`? Requires the `MqttPublish` grant
     /// **and** a `mqtt_publish` matcher for the client. Client-scoped only — there
     /// is no topic dimension on the publish side (`MqttClientMatcher` carries no
-    /// topic; design §2.1, §2.4).
+    /// topic).
     pub fn allows_mqtt_publish(&self, client: &str) -> bool {
         self.grants.has(AppCapability::MqttPublish)
             && self.acls.mqtt_publish.iter().any(|m| m.client == client)
@@ -285,15 +325,9 @@ impl AppPolicy {
             // separately on the app's pwa_push config. A deliberate policy deny, not
             // a missing case.
             Some((ChannelScheme::PwaPush, _)) => false,
-            // local: is page-local — the surface kernel's router is its sole
-            // source of truth and the traffic never crosses the wire, so the
-            // server mediates no access to it and has none to grant. There is no
-            // bus history to read and nothing server-side to deliver. A
-            // deliberate policy deny, not a missing case: reaching a local:
-            // channel from outside the page takes an explicit bridge component
-            // (subscribe brenn:, republish local:), which is authorized on its
-            // brenn: side by the arm above.
-            Some((ChannelScheme::Local, _)) => false,
+            // `LocalSubscribe` is not LLM-authorable, so an LLM app's read of
+            // a `local:` address always denies.
+            Some((ChannelScheme::Local, channel)) => self.allows_local_delivery(channel),
             // Unclassifiable address — cannot classify, therefore cannot authorize.
             None => false,
         }
@@ -325,9 +359,18 @@ pub enum AppCapability {
     EphemeralPublish,
     /// Hold a subscription to the `ephemeral:` bus. A distinct
     /// transport grant from `MessagingSubscribe`: an operator grants each
-    /// delivery class explicitly. LLM-app-unauthorable in v1 (no ephemeral
-    /// delivery path to a conversation); `build_app_policy` boot-panics on it.
+    /// delivery class explicitly.
     EphemeralSubscribe,
+    /// Publish to a confined `local:` channel. A distinct transport grant from
+    /// `MessagingPublish`/`EphemeralPublish`: each delivery class is gated
+    /// separately. A `local:` channel is process-local and non-transportable,
+    /// but a backend publisher still needs authorization to reach one.
+    LocalPublish,
+    /// Hold a subscription to a confined `local:` channel. A distinct transport
+    /// grant from `MessagingSubscribe`/`EphemeralSubscribe`: each delivery class
+    /// is gated separately. LLM-app-unauthorable in v1 (no local delivery path
+    /// to a conversation).
+    LocalSubscribe,
     // external transports
     /// Publish to MQTT.
     MqttPublish,
@@ -404,6 +447,8 @@ mod tests {
         AppCapability::DynamicSubscribe,
         AppCapability::EphemeralPublish,
         AppCapability::EphemeralSubscribe,
+        AppCapability::LocalPublish,
+        AppCapability::LocalSubscribe,
         AppCapability::MqttPublish,
         AppCapability::MqttSubscribe,
         AppCapability::Webhook,
@@ -426,6 +471,8 @@ mod tests {
             | AppCapability::DynamicSubscribe
             | AppCapability::EphemeralPublish
             | AppCapability::EphemeralSubscribe
+            | AppCapability::LocalPublish
+            | AppCapability::LocalSubscribe
             | AppCapability::MqttPublish
             | AppCapability::MqttSubscribe
             | AppCapability::Webhook
@@ -484,22 +531,22 @@ mod tests {
         // subset). Pin every token so an accidental rename is caught.
         //
         // The WASM-host variants (`wasm_store`/`wasm_log`/`wasm_alert`/
-        // `wasm_config`), `integration`, and `ephemeral_subscribe` are
-        // deliberately *absent* from this table: they are not part of the LLM
-        // `grants` vocabulary. The WASM/integration caps and
-        // `ephemeral_subscribe` have no LLM enforcement point (no ephemeral
-        // delivery path to a conversation in v1, so the grant would be dead
-        // config). They still
+        // `wasm_config`), `integration`, and `local_subscribe` are deliberately
+        // *absent* from this table: they are not part of the LLM
+        // `grants` vocabulary. The WASM/integration caps and `local_subscribe`
+        // have no LLM enforcement point (no confined `local:` path to a
+        // conversation in v1, so the grant would be dead config). They still
         // deserialize (the derive covers the whole enum); the LLM-authorable
         // subset is enforced at the resolution boundary by `build_app_policy`
         // (`access/resolve.rs`), which panics if such a token appears in an LLM
-        // app's `grants`. `ephemeral_publish` *is* LLM-authorable.
-        // This test pins the *positive* token vocabulary only.
+        // app's `grants`.
         let cases = [
             ("messaging_publish", AppCapability::MessagingPublish),
             ("messaging_subscribe", AppCapability::MessagingSubscribe),
             ("dynamic_subscribe", AppCapability::DynamicSubscribe),
             ("ephemeral_publish", AppCapability::EphemeralPublish),
+            ("ephemeral_subscribe", AppCapability::EphemeralSubscribe),
+            ("local_publish", AppCapability::LocalPublish),
             ("mqtt_publish", AppCapability::MqttPublish),
             ("mqtt_subscribe", AppCapability::MqttSubscribe),
             ("webhook", AppCapability::Webhook),
@@ -682,8 +729,77 @@ mod tests {
         assert!(!p.allows_webhook_dynamic_subscribe("github"));
     }
 
-    // --- Delivery-time decisions (design §2.2): subscription-holding
-    //     authorization — transport grant + covering matcher, NO DynamicSubscribe.
+    #[test]
+    fn ephemeral_dynamic_subscribe_grants_and_acl() {
+        let acls = AclSet {
+            ephemeral_subscribe: vec![ChannelMatcher::Prefix("chatter.".to_string())],
+            ..AclSet::default()
+        };
+        // Missing EphemeralSubscribe transport grant — and note the asymmetry:
+        // MessagingSubscribe does not stand in for it.
+        let only_dynamic = policy(
+            &[
+                AppCapability::DynamicSubscribe,
+                AppCapability::MessagingSubscribe,
+            ],
+            acls.clone(),
+        );
+        assert!(!only_dynamic.allows_ephemeral_dynamic_subscribe("chatter.room"));
+        // Missing DynamicSubscribe grant: the app may hold the subscription but
+        // may not create one with the runtime tool.
+        let only_transport = policy(&[AppCapability::EphemeralSubscribe], acls.clone());
+        assert!(!only_transport.allows_ephemeral_dynamic_subscribe("chatter.room"));
+        assert!(only_transport.allows_ephemeral_delivery("chatter.room"));
+        // Both grants + covering matcher ⇒ allowed; uncovered channel ⇒ deny.
+        let both = policy(
+            &[
+                AppCapability::DynamicSubscribe,
+                AppCapability::EphemeralSubscribe,
+            ],
+            acls,
+        );
+        assert!(both.allows_ephemeral_dynamic_subscribe("chatter.room"));
+        assert!(!both.allows_ephemeral_dynamic_subscribe("secrets"));
+        // Empty matcher list denies even with both grants.
+        let no_matcher = policy(
+            &[
+                AppCapability::DynamicSubscribe,
+                AppCapability::EphemeralSubscribe,
+            ],
+            AclSet::default(),
+        );
+        assert!(!no_matcher.allows_ephemeral_dynamic_subscribe("chatter.room"));
+    }
+
+    #[test]
+    fn local_dynamic_subscribe_needs_the_local_transport_grant() {
+        let acls = AclSet {
+            local_subscribe: vec![ChannelMatcher::Prefix(String::new())],
+            ..AclSet::default()
+        };
+        // `LocalSubscribe` is not authorable on an LLM app, so this combination is
+        // unreachable through config today; the decision still requires it, so no
+        // other grant opens the confined class.
+        let without = policy(
+            &[
+                AppCapability::DynamicSubscribe,
+                AppCapability::EphemeralSubscribe,
+            ],
+            acls.clone(),
+        );
+        assert!(!without.allows_local_dynamic_subscribe("ticker"));
+        let with = policy(
+            &[
+                AppCapability::DynamicSubscribe,
+                AppCapability::LocalSubscribe,
+            ],
+            acls,
+        );
+        assert!(with.allows_local_dynamic_subscribe("ticker"));
+    }
+
+    // --- Delivery-time decisions: subscription-holding authorization —
+    //     transport grant + covering matcher, NO DynamicSubscribe.
 
     #[test]
     fn mqtt_delivery_requires_grant_and_matcher_not_dynamic() {
@@ -783,6 +899,31 @@ mod tests {
     }
 
     #[test]
+    fn local_delivery_requires_grant_and_matcher() {
+        let acls = AclSet {
+            local_subscribe: vec![
+                ChannelMatcher::Prefix("timer.".to_string()),
+                ChannelMatcher::Exact("tick".to_string()),
+            ],
+            ..AclSet::default()
+        };
+        let granted = policy(&[AppCapability::LocalSubscribe], acls.clone());
+        assert!(granted.allows_local_delivery("tick"));
+        assert!(granted.allows_local_delivery("timer.fire"));
+        assert!(granted.allows_channel_access("local:tick"));
+        // Deliberate asymmetry: neither the brenn nor the ephemeral subscribe
+        // grant authorizes confined delivery.
+        let wrong_grant = policy(&[AppCapability::EphemeralSubscribe], acls.clone());
+        assert!(!wrong_grant.allows_local_delivery("tick"));
+        assert!(!wrong_grant.allows_channel_access("local:tick"));
+        let no_matcher = policy(&[AppCapability::LocalSubscribe], AclSet::default());
+        assert!(!no_matcher.allows_local_delivery("tick"));
+        let scoped = policy(&[AppCapability::LocalSubscribe], acls);
+        assert!(!scoped.allows_local_delivery("nope"));
+        assert!(!scoped.allows_channel_access("local:nope"));
+    }
+
+    #[test]
     fn ephemeral_publish_requires_grant_and_matcher() {
         let acls = AclSet {
             ephemeral_publish: vec![
@@ -804,6 +945,30 @@ mod tests {
         assert!(!granted.allows_ephemeral_publish("nope"));
         assert!(granted.allows_ephemeral_publish("status.ready"));
         assert!(!granted.allows_ephemeral_publish("status.ready.extra"));
+    }
+
+    #[test]
+    fn local_publish_requires_grant_and_matcher() {
+        let acls = AclSet {
+            local_publish: vec![
+                ChannelMatcher::Prefix("tick".to_string()),
+                ChannelMatcher::Exact("timer.fire".to_string()),
+            ],
+            ..AclSet::default()
+        };
+        // Covering matcher present, but missing the LocalPublish grant ⇒ deny.
+        // A different publish grant must not authorize local publish.
+        let wrong_grant = policy(&[AppCapability::EphemeralPublish], acls.clone());
+        assert!(!wrong_grant.allows_local_publish("tick.a"));
+        // Grant held but empty publish list ⇒ deny-by-default.
+        let no_matcher = policy(&[AppCapability::LocalPublish], AclSet::default());
+        assert!(!no_matcher.allows_local_publish("tick.a"));
+        // Grant + covering matcher ⇒ allow; each arm's happy and deny path.
+        let granted = policy(&[AppCapability::LocalPublish], acls);
+        assert!(granted.allows_local_publish("tick.a"));
+        assert!(!granted.allows_local_publish("nope"));
+        assert!(granted.allows_local_publish("timer.fire"));
+        assert!(!granted.allows_local_publish("timer.fire.extra"));
     }
 
     #[test]

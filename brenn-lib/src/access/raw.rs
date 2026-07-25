@@ -37,13 +37,26 @@ pub struct AppAclRaw {
     /// Matcher values are **bare channel names, no scheme** (`protobar-demo`,
     /// not `ephemeral:protobar-demo`) — same convention as `brenn_publish`, since
     /// `allows_channel_access`/`allows_ephemeral_publish` strip the scheme before
-    /// matching and the ACL list name carries the class. There is
-    /// **no `ephemeral_subscribe` field**: the `ephemeral_subscribe` grant token
-    /// has no LLM-app enforcement point in v1 and boot-panics in `build_app_policy`;
-    /// the serde field and the grant token stay in lockstep so
-    /// neither can exist without the other.
+    /// matching and the ACL list name carries the class.
     #[serde(default)]
     pub ephemeral_publish: Vec<ChannelMatcherRaw>,
+    /// `[[app.acl.ephemeral_subscribe]]` entries: ephemeral channel matchers.
+    ///
+    /// Bare channel names, no scheme — same convention as `ephemeral_publish`.
+    /// Scopes which `ephemeral:` channels this app may hold a subscription on and
+    /// read; combined with the `ephemeral_subscribe` grant by
+    /// `allows_ephemeral_delivery`. There is no `local_subscribe` field: that
+    /// grant token has no LLM-app path and boot-panics in `build_app_policy`, and
+    /// the serde field stays in lockstep with the token so neither can exist
+    /// without the other.
+    #[serde(default)]
+    pub ephemeral_subscribe: Vec<ChannelMatcherRaw>,
+    /// `[[app.acl.local_publish]]` entries: confined (`local:`) channel matchers.
+    ///
+    /// Bare channel names, no scheme — same convention as `ephemeral_publish`.
+    /// Non-empty derives the `LocalPublish` grant in `build_app_policy`.
+    #[serde(default)]
+    pub local_publish: Vec<ChannelMatcherRaw>,
     /// `[[app.acl.webhook]]` entries: endpoint slugs.
     #[serde(default)]
     pub webhook: Vec<WebhookMatcherRaw>,
@@ -94,7 +107,7 @@ pub struct WebhookMatcherRaw {
     pub endpoint: String,
 }
 
-/// Borrowed view of a WASM consumer's five ACL lists, passed as one argument to
+/// Borrowed view of a WASM consumer's ACL lists, passed as one argument to
 /// [`build_wasm_policy`](crate::access::resolve::build_wasm_policy).
 ///
 /// Named fields prevent transposing the two same-typed slices (`subscribe` and
@@ -106,8 +119,16 @@ pub struct WebhookMatcherRaw {
 pub struct WasmAclsRaw<'a> {
     /// `brenn:` subscribe matchers (non-empty derives the `MessagingSubscribe` grant).
     pub subscribe: &'a [ChannelMatcherRaw],
+    /// `ephemeral:` subscribe matchers (non-empty derives the `EphemeralSubscribe` grant).
+    pub ephemeral_subscribe: &'a [ChannelMatcherRaw],
     /// `brenn:` publish matchers.
     pub publish: &'a [ChannelMatcherRaw],
+    /// `ephemeral:` publish matchers (non-empty derives the `EphemeralPublish` grant).
+    pub ephemeral_publish: &'a [ChannelMatcherRaw],
+    /// `local:` publish matchers (non-empty derives the `LocalPublish` grant).
+    pub local_publish: &'a [ChannelMatcherRaw],
+    /// `local:` subscribe matchers (non-empty derives the `LocalSubscribe` grant).
+    pub local_subscribe: &'a [ChannelMatcherRaw],
     /// MQTT publish matchers (client-scoped).
     pub mqtt_publish: &'a [MqttClientMatcherRaw],
     /// MQTT subscribe matchers (non-empty derives the `MqttSubscribe` grant).

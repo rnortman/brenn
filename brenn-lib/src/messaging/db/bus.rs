@@ -36,6 +36,9 @@ pub struct InsertedMessage {
     pub id: i64,
     pub uuid: Uuid,
     pub publish_ts_ns: i64,
+    /// The retention sequence assigned to this message, or `None` when it was
+    /// parked (a parked message holds no retention position until it releases).
+    pub retained_seq: Option<i64>,
     /// Row ids of the `messaging_pending_pushes` rows inserted, in the same
     /// order as the `pending_pushes` slice passed to `insert_message_with_pushes`.
     /// Used by the publish path to populate the in-memory push-window deques.
@@ -107,11 +110,27 @@ pub fn insert_message_with_pushes_in_tx(
     let dd = delivery_deadline.map(format_ts_for_db);
     let da = deliver_after.map(format_ts_for_db);
 
+    // A parked row holds no retention position, and every read that serves an
+    // owed claim needs one. A claim written against it must therefore be held
+    // (`release_after` set) rather than immediately deliverable: an owed,
+    // unparked claim on a positionless message is a row no consumer can be
+    // served, and the reads that meet it panic.
+    assert!(
+        deliver_after.is_none() || pending_pushes.iter().all(|p| p.release_after.is_some()),
+        "messaging: deliverable push claims written for a parked message on channel \
+         {channel_uuid}"
+    );
+    let retained_seq = match deliver_after {
+        None => Some(allocate_retained_seq(tx, channel_uuid)),
+        Some(_) => None,
+    };
+
     tx.execute(
         "INSERT INTO messaging_messages
          (uuid, channel_uuid, source, sender, body, urgency, envelope_type,
-          reply_to_uuid, delivery_deadline, deliver_after, publish_ts_ns, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+          reply_to_uuid, delivery_deadline, deliver_after, publish_ts_ns, created_at,
+          retained_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             uuid_bytes,
             channel_bytes,
@@ -125,6 +144,7 @@ pub fn insert_message_with_pushes_in_tx(
             da,
             publish_ts_ns,
             now,
+            retained_seq,
         ],
     )
     .expect("messaging: insert message");
@@ -158,12 +178,102 @@ pub fn insert_message_with_pushes_in_tx(
         id: message_id,
         uuid,
         publish_ts_ns,
+        retained_seq,
         push_ids,
     }
 }
 
+/// Allocate the next dense retention sequence for a channel.
+///
+/// The channel row's `last_retained_seq` is the allocator and the persisted
+/// high-water: bump it and return the new value. The DB is one mutex-guarded
+/// connection, so allocation is serial by construction; the partial unique index
+/// on `(channel_uuid, retained_seq)` is the better-dead-than-wrong backstop.
+///
+/// Takes a `&Connection` so an in-transaction caller (`&Transaction` derefs) and
+/// an autocommit one share the one allocator statement.
+pub fn allocate_retained_seq(conn: &Connection, channel_uuid: Uuid) -> i64 {
+    allocate_retained_seqs(conn, channel_uuid, 1)
+}
+
+/// Allocate a block of `count` consecutive retention sequences, returning the
+/// highest — the block is `highest - count + 1 ..= highest`.
+///
+/// One statement per block, for callers numbering a known set of messages at
+/// once (the migration backfill). `count` of zero is a caller bug: there is no
+/// sequence to return.
+///
+/// The channel row always exists — `messaging_messages.channel_uuid` is a
+/// foreign key into `messaging_channels`, enforced on every DB this runs on — so
+/// a missing row is a broken invariant and panics rather than inventing a seq.
+pub fn allocate_retained_seqs(conn: &Connection, channel_uuid: Uuid, count: u64) -> i64 {
+    assert!(count > 0, "messaging: allocate_retained_seqs: empty block");
+    let count = i64::try_from(count).expect("messaging: retained seq block out of range");
+    conn.query_row(
+        "UPDATE messaging_channels SET last_retained_seq = last_retained_seq + ?2
+         WHERE uuid = ?1 RETURNING last_retained_seq",
+        rusqlite::params![channel_uuid.as_bytes().to_vec(), count],
+        |row| row.get(0),
+    )
+    .unwrap_or_else(|e| {
+        panic!("messaging: allocate_retained_seqs: channel {channel_uuid} has no row: {e}")
+    })
+}
+
+/// Assign dense retention sequences to `message_ids` on one channel, in the
+/// order given — the caller's order *is* the retention order.
+pub fn assign_retained_seqs(conn: &Connection, channel_uuid: Uuid, message_ids: &[i64]) {
+    if message_ids.is_empty() {
+        return;
+    }
+    // The block ends at the returned high-water, so the first id takes the
+    // lowest sequence in it.
+    let highest = allocate_retained_seqs(conn, channel_uuid, message_ids.len() as u64);
+    let mut seq = highest - message_ids.len() as i64;
+    let mut assign = conn
+        .prepare_cached("UPDATE messaging_messages SET retained_seq = ?2 WHERE id = ?1")
+        .expect("messaging: prepare retained_seq assignment");
+    for &id in message_ids {
+        seq += 1;
+        assign
+            .execute(rusqlite::params![id, seq])
+            .expect("messaging: assign retained_seq");
+    }
+}
+
+/// Seed `messaging_pending_pushes` rows for a newly-created subscriber from a
+/// set of already-retained messages, delivering the channel's retained tail as
+/// NEW when a durable queue comes into existence (attach is a delivery point).
+///
+/// Each row is `eager_wake` so the substrate wakes the subscriber on the seeded
+/// tail, and carries no deadline or release — the messages are already retained
+/// and immediately observable. `message_ids` is oldest-first (the tail order).
+///
+/// The caller is responsible for only ever calling this for a genuinely new
+/// queue (no pre-existing subscription registration): there is no
+/// `(message_id, target_subscriber)` uniqueness constraint, so a second call for
+/// the same subscriber would duplicate rows.
+pub fn seed_pending_pushes_for_messages(
+    conn: &Connection,
+    message_ids: &[i64],
+    subscriber: &ParticipantId,
+    app_slug: &str,
+) {
+    let now = format_ts_for_db(Utc::now());
+    for &message_id in message_ids {
+        conn.execute(
+            "INSERT INTO messaging_pending_pushes
+             (message_id, target_subscriber, target_app_slug, eager_wake,
+              delivery_deadline, release_after, created_at)
+             VALUES (?1, ?2, ?3, 1, NULL, NULL, ?4)",
+            rusqlite::params![message_id, subscriber.as_str(), app_slug, now],
+        )
+        .expect("messaging: seed pending push for new subscriber");
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Bus GC (design §2.5, §2.6)
+// Bus GC
 // ---------------------------------------------------------------------------
 
 /// Evict bus message bodies past the channel's reap frontier,
@@ -225,12 +335,15 @@ pub fn bus_gc_evict_channel(
         .unchecked_transaction()
         .expect("bus_gc_evict_channel: begin transaction");
 
-    // Guard: if the channel has <= frontier rows, nothing is eligible.
-    // Checked inside the transaction for snapshot consistency.
+    // Guard: if the channel has <= frontier retained rows, nothing is eligible.
+    // Checked inside the transaction for snapshot consistency. Parked rows
+    // (`retained_seq IS NULL`) are excluded here and from every eligible-set
+    // predicate below — they have no retention position until release.
     let total_rows: i64 = tx
         .query_row(
             "SELECT COUNT(*) FROM messaging_messages
-             WHERE channel_uuid = ?1 AND envelope_type != 'ingress'",
+             WHERE channel_uuid = ?1 AND envelope_type != 'ingress'
+               AND retained_seq IS NOT NULL",
             rusqlite::params![channel_uuid_bytes],
             |row| row.get(0),
         )
@@ -239,10 +352,11 @@ pub fn bus_gc_evict_channel(
         return (0, 0);
     }
 
-    // Eligible = all rows except the `frontier` most-recent (by publish_ts_ns DESC).
-    // We identify eligible rows as those NOT in the top-frontier set.
-    // This is the same pattern as bus_gc_retire_pushes: avoids timestamp-tie
-    // ambiguity from a cutoff-based approach.
+    // Eligible = all retained rows except the `frontier` most-recent by
+    // `retained_seq` (dense per-channel retention order, unique via the partial
+    // index, so no tiebreaker is needed). Keying on `retained_seq` rather than
+    // publish timestamp makes eviction oldest-retention-first, so a late-released
+    // message (newest retention entry, old publish_ts) is never reaped.
 
     // Step 2 (archive): load eligible bodies and write to JSONL before deleting.
     if sink == Sink::Archive {
@@ -250,14 +364,10 @@ pub fn bus_gc_evict_channel(
         let path = archive_path
             .expect("bus_gc_evict_channel: archive_path is None despite validation (unreachable)");
 
-        // SELECT eligible rows: all bus messages for this channel that are NOT
-        // in the top-`frontier` most-recent set (by publish_ts_ns DESC, id DESC).
-        // The `id DESC` tiebreaker ensures a total order so that the keep-set
-        // is identical across all three sub-query evaluations in this transaction
-        // (archive SELECT, push DELETE, message DELETE). Without a tiebreaker,
-        // two rows sharing `publish_ts_ns` could be assigned to opposite sides of
-        // the frontier by different evaluations, producing archive-but-not-delete
-        // or delete-but-not-archive anomalies.
+        // `retained_seq` is dense and unique per channel (partial unique index),
+        // so it is a total order — the keep-set is identical across all three
+        // sub-query evaluations in this transaction (archive SELECT, push DELETE,
+        // message DELETE) without any tiebreaker.
         let mut stmt = tx
             .prepare(
                 "SELECT m.uuid, m.source, m.sender, m.body, m.urgency,
@@ -267,17 +377,19 @@ pub fn bus_gc_evict_channel(
                  LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
                  WHERE m.channel_uuid = ?1
                    AND m.envelope_type != 'ingress'
+                   AND m.retained_seq IS NOT NULL
                    AND m.id NOT IN (
                        SELECT id FROM messaging_messages
                        WHERE channel_uuid = ?1 AND envelope_type != 'ingress'
-                       ORDER BY publish_ts_ns DESC, id DESC
+                         AND retained_seq IS NOT NULL
+                       ORDER BY retained_seq DESC
                        LIMIT ?2
                    )
                    AND m.id NOT IN (
                        SELECT message_id FROM messaging_pending_pushes
                        WHERE confirm_pending = 1
                    )
-                 ORDER BY m.publish_ts_ns ASC",
+                 ORDER BY m.retained_seq ASC",
             )
             .expect("bus_gc_evict_channel: archive SELECT prepare");
 
@@ -378,16 +490,12 @@ pub fn bus_gc_evict_channel(
 
     // Step 3a: delete push rows for eligible messages FIRST (before message rows),
     // to satisfy the FK constraint on messaging_pending_pushes.message_id.
-    // Eligible = bus messages for this channel NOT in the top-frontier set.
-    // `id DESC` tiebreaker matches the archive SELECT above so the eligible set
-    // is identical across all evaluations.
-    // Tentative (`confirm_pending = 1`) push rows are excluded here exactly as
-    // they are in `bus_gc_retire_pushes`: they carry a below-water delivery's
-    // recovery evidence that the next resume's reconcile depends on, so eviction
-    // must not erase it. Their message row is kept alongside them (the message
-    // DELETE below applies the same exclusion) so the FK stays satisfied and the
-    // row remains recoverable; both rejoin the reapable universe once the flag
-    // clears at reconcile.
+    // Same eligible set as the archive SELECT (retained_seq total order).
+    // Tentative (`confirm_pending = 1`) push rows are excluded: they carry
+    // below-water recovery evidence that the next resume's reconcile depends on.
+    // Their message row is kept alongside them (the message DELETE below applies
+    // the same exclusion) so the FK stays satisfied; both rejoin the reapable
+    // universe once the flag clears at reconcile.
     let push_rows_retired = tx
         .execute(
             "DELETE FROM messaging_pending_pushes
@@ -396,10 +504,12 @@ pub fn bus_gc_evict_channel(
                  SELECT id FROM messaging_messages
                  WHERE channel_uuid = ?1
                    AND envelope_type != 'ingress'
+                   AND retained_seq IS NOT NULL
                    AND id NOT IN (
                        SELECT id FROM messaging_messages
                        WHERE channel_uuid = ?1 AND envelope_type != 'ingress'
-                       ORDER BY publish_ts_ns DESC, id DESC
+                         AND retained_seq IS NOT NULL
+                       ORDER BY retained_seq DESC
                        LIMIT ?2
                    )
              )",
@@ -408,16 +518,19 @@ pub fn bus_gc_evict_channel(
         .expect("bus_gc_evict_channel: DELETE push rows for evicted messages");
 
     // Step 3b: delete eligible message rows (FTS trigger fires on each DELETE).
-    // Same NOT IN predicate — snapshot is stable under the SQLite mutex.
+    // Snapshot is stable under the SQLite mutex. Parked rows (retained_seq NULL)
+    // are excluded — a long-parked message is never reaped before it releases.
     let messages_deleted = tx
         .execute(
             "DELETE FROM messaging_messages
              WHERE channel_uuid = ?1
                AND envelope_type != 'ingress'
+               AND retained_seq IS NOT NULL
                AND id NOT IN (
                    SELECT id FROM messaging_messages
                    WHERE channel_uuid = ?1 AND envelope_type != 'ingress'
-                   ORDER BY publish_ts_ns DESC, id DESC
+                     AND retained_seq IS NOT NULL
+                   ORDER BY retained_seq DESC
                    LIMIT ?2
                )
                AND id NOT IN (
@@ -432,13 +545,12 @@ pub fn bus_gc_evict_channel(
     (messages_deleted, push_rows_retired)
 }
 
-/// Backstop push-claim retirement for bounded-`push_depth` bus subscribers
-/// (design §2.5 step 3).
+/// Backstop push-claim retirement for bounded-`push_depth` bus subscribers.
 ///
 /// For each `(channel_uuid, app_slug)` subscription with a bounded `push_depth`
 /// of `n`, deletes any `messaging_pending_pushes` rows beyond the `n` most-recent
-/// by `publish_ts_ns` (ordered via JOIN to `messaging_messages`). This is the
-/// GC backstop — the primary retirement happens on the publish hot path (§2.4)
+/// by `retained_seq` (ordered via JOIN to `messaging_messages`). This is the
+/// GC backstop — the primary retirement happens on the publish hot path
 /// when the in-memory deque overflows; this catches anything the hot path missed.
 ///
 /// **Scope fence:** only rows with `envelope_type != 'ingress'` are touched
@@ -464,22 +576,17 @@ pub fn bus_gc_retire_pushes(
 
     let channel_uuid_bytes = channel_uuid.as_bytes().to_vec();
 
-    // Identify the push_depth-th most-recent push row for this (channel, subscriber)
-    // by publish_ts_ns. That row and everything older is past the window.
+    // Keep the push_depth most-recent rows by `retained_seq` and delete the
+    // rest. A late-released message has the oldest publish timestamp and the
+    // newest retention position, so ranking on `publish_ts_ns` would retire its
+    // freshly-released claim in preference to genuinely older ones. Every row in
+    // this universe is released (`release_after IS NULL`), so every one carries
+    // a `retained_seq`.
     //
-    // OFFSET = push_depth - 1 (0-indexed) gives the last row to keep (the
-    // push_depth-th most-recent). We capture its publish_ts_ns and delete all
-    // push rows for this (channel, subscriber) with publish_ts_ns <= that value
-    // that rank beyond push_depth in the DESC order.
-    //
-    // Alternative approach: use a NOT IN subquery with LIMIT push_depth to
-    // keep only the push_depth most-recent rows. This avoids ordering ambiguity
-    // (no assumption that pp.id tracks publish_ts_ns).
     // Only count/retire rows with `release_after IS NULL` (non-parked rows).
     // Parked rows (deliver_after pushes awaiting release) are excluded from the
-    // hot-path push-window deque (`publish.rs` `track_in_window = release_after.is_none()`)
-    // and must be equally excluded here so the two reapers operate on the same
-    // row universe (design §3 in-flight exclusion; correctness guarantee from code review).
+    // hot-path push-window deque and must be equally excluded here so the two
+    // reapers operate on the same row universe.
     //
     // Tentative rows (`confirm_pending = 1`) are excluded the same way parked rows
     // are: they are a below-water delivery whose receipt is not yet acknowledged, so
@@ -505,7 +612,7 @@ pub fn bus_gc_retire_pushes(
                      AND m2.channel_uuid = ?2
                      AND m2.envelope_type != 'ingress'
                      AND pp2.release_after IS NULL
-                   ORDER BY m2.publish_ts_ns DESC
+                   ORDER BY m2.retained_seq DESC
                    LIMIT ?3
                )
          )",
@@ -532,13 +639,36 @@ pub fn delete_pending_push_by_id(conn: &Connection, push_id: i64) {
     .expect("delete_pending_push_by_id: DELETE");
 }
 
+/// Delete every `messaging_pending_pushes` row owned by `subscriber` on the
+/// channel `channel_uuid` — undelivered, tentative, and parked alike. Returns
+/// the number of rows removed.
+///
+/// # Panics
+///
+/// Panics on any SQL error.
+pub fn delete_pushes_for_subscriber(
+    conn: &Connection,
+    channel_uuid: Uuid,
+    subscriber: &ParticipantId,
+) -> usize {
+    conn.execute(
+        "DELETE FROM messaging_pending_pushes
+         WHERE target_subscriber = ?1
+           AND message_id IN (
+               SELECT id FROM messaging_messages WHERE channel_uuid = ?2
+           )",
+        rusqlite::params![subscriber.as_str(), channel_uuid.as_bytes().to_vec()],
+    )
+    .expect("delete_pushes_for_subscriber: DELETE")
+}
+
 // ---------------------------------------------------------------------------
 // Push-window seed queries
 // ---------------------------------------------------------------------------
 
 /// Load all undelivered, non-parked push ids for a `(channel, subscriber)`
 /// key, excluding a specific push id. Used to seed the in-memory push window
-/// on first touch after boot (design §2.4 lazy first-touch rebuild — Gap B).
+/// on first touch after boot.
 ///
 /// `exclude_push_id`: the push id that was just inserted for the current
 /// publish; excluded from the seed so the seed reflects pre-existing rows
@@ -603,16 +733,16 @@ pub struct ReleasedPushRow {
 
 /// Build a bare `?`-placeholder string for an IN clause of length `n`.
 ///
-/// Returns `"?,?,?"` for `n=3`. Panics if `n == 0` (callers must guard).
-/// Shared by `load_released_push_window_rows` and `load_pushes_by_ids`.
+/// Returns `"?,?,?"` for `n=3`. Panics if `n == 0` — a caller with an empty
+/// set must shape the clause itself rather than emit an empty `IN ()`.
 fn build_bare_in_placeholders(n: usize) -> String {
     assert!(n > 0, "build_bare_in_placeholders: n must be > 0");
     std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
 }
 
 /// Load the minimal columns needed to register released parked rows into their
-/// push windows. Called by `register_released_pushes` in `deliver_after.rs`
-/// immediately after `release_due_pushes` clears `release_after`.
+/// push windows. Called by `register_released_pushes` immediately after a
+/// release pass clears `release_after`.
 ///
 /// Released parked rows are always `kind='brenn'` (parked rows are created only
 /// on the bus publish path); the channel address is therefore always present.
@@ -818,10 +948,10 @@ pub fn load_confirm_pending_pushes(
     conn: &Connection,
     subscriber: &ParticipantId,
     channel_uuid: Uuid,
-) -> Vec<(i64, i64)> {
+) -> Vec<TentativePushRow> {
     let mut stmt = conn
         .prepare(
-            "SELECT pp.id, pp.message_id
+            "SELECT pp.id, pp.message_id, m.retained_seq
              FROM messaging_pending_pushes pp
              JOIN messaging_messages m ON pp.message_id = m.id
              WHERE pp.target_subscriber = ?1
@@ -832,11 +962,30 @@ pub fn load_confirm_pending_pushes(
     let rows = stmt
         .query_map(
             rusqlite::params![subscriber.as_str(), channel_uuid.as_bytes().to_vec()],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            |row| {
+                Ok(TentativePushRow {
+                    push_id: row.get(0)?,
+                    message_id: row.get(1)?,
+                    retained_seq: row.get(2)?,
+                })
+            },
         )
         .expect("query load_confirm_pending_pushes");
     rows.map(|r| r.expect("read confirm-pending push"))
         .collect()
+}
+
+/// One tentative (delivered, unconfirmed) push row, as
+/// [`load_confirm_pending_pushes`] hands it over.
+///
+/// `retained_seq` is `None` only for a row whose message left retention order —
+/// impossible for a delivered bus row. Callers may treat an absent position as
+/// unresumable rather than matching it against a cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TentativePushRow {
+    pub push_id: i64,
+    pub message_id: i64,
+    pub retained_seq: Option<i64>,
 }
 
 /// Confirm tentative push rows: clear `confirm_pending` back to 0, leaving them
@@ -869,7 +1018,7 @@ pub fn unclaim_confirm_pending_pushes(conn: &Connection, push_ids: &[i64]) {
 /// `load_pending_pushes_for_drain`: same predicate
 /// (`delivered_at IS NULL AND release_after IS NULL`) and ordering, plus a
 /// `m.channel_uuid = ?` filter, bus rows only (inner join on
-/// `messaging_channels`). Returns `(push_id, message_id, envelope)` triples.
+/// `messaging_channels`).
 ///
 /// Ingress rows never reach this path (surfaces bind only `brenn:`/`ephemeral:`
 /// channels, and ingress rows carry no such channel); a stray ingress row would
@@ -879,15 +1028,16 @@ pub fn load_pending_pushes_for_channel(
     conn: &Connection,
     subscriber: &ParticipantId,
     channel_uuid: Uuid,
-) -> Vec<(i64, i64, MessageEnvelope)> {
+) -> Vec<ChannelPushRow> {
+    // Cached: one call per input port on every WASM drain step.
     let mut stmt = conn
-        .prepare(
+        .prepare_cached(
             "SELECT pp.id, pp.target_subscriber, pp.eager_wake,
                     m.uuid, m.source, m.sender, m.body,
                     m.urgency AS msg_urgency,
                     m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
                     c.address, rc.address, m.envelope_type, pp.message_id,
-                    pp.target_app_slug
+                    pp.target_app_slug, m.retained_seq
              FROM messaging_pending_pushes pp
              JOIN messaging_messages m ON pp.message_id = m.id
              JOIN messaging_channels c ON c.uuid = m.channel_uuid
@@ -915,93 +1065,333 @@ pub fn load_pending_pushes_for_channel(
                 row.push_id
             ),
         };
-        (row.push_id, row.message_id, envelope)
+        let retained_seq = row.retained_seq.unwrap_or_else(|| {
+            panic!(
+                "messaging: push {} is owed and unparked but its message {} holds no \
+                 retention position",
+                row.push_id, row.message_id
+            )
+        });
+        ChannelPushRow {
+            push_id: row.push_id,
+            message_id: row.message_id,
+            retained_seq,
+            envelope,
+        }
     })
     .collect()
 }
 
-/// Load the newest `clamp` messages of `channel_uuid` with `m.id > after_id`,
-/// returned in `m.id ASC` order as `(message_id, envelope)` pairs. Used for the
-/// `Resume::Durable` retained re-send: it reads `messaging_messages` directly
-/// (not pending-push rows), so it serves messages whose push rows were already
-/// delivered or GC-retired. `clamp` is the resolved `retain_depth` window;
-/// `Depth::Unbounded` imposes no window.
+/// One owed, deliverable push row on one channel, as
+/// [`load_pending_pushes_for_channel`] hands it over: the claim to settle, the
+/// message's identity, its position in the channel's retention order, and the
+/// payload. Two of the three ids are `i64`, so they travel named rather than
+/// positionally.
+#[derive(Debug, Clone)]
+pub struct ChannelPushRow {
+    /// `messaging_pending_pushes.id` — the claim.
+    pub push_id: i64,
+    /// `messaging_messages.id` — the message's identity, which the below-water
+    /// ack evidence is written against.
+    pub message_id: i64,
+    /// `messaging_messages.retained_seq` — the message's position in this
+    /// channel's retention order, which a resume cursor names.
+    pub retained_seq: i64,
+    pub envelope: MessageEnvelope,
+}
+
+/// Owed, deliverable pending-push rows held for `subscriber` on channels other
+/// than `channels`.
 ///
-/// The window is taken as the newest `clamp` rows (`ORDER BY m.id DESC LIMIT`)
-/// and then reversed to ascending for in-order delivery — the same
-/// newest-window-then-emit shape as `MessageQuery`.
+/// Returns `(push_id, channel_uuid)`, with a `None` channel for a row that
+/// carries no channel at all (an ingress row). Only owed, deliverable rows
+/// are returned; a still-parked claim is never mistaken for residue.
+pub fn pending_pushes_outside_channels(
+    conn: &Connection,
+    subscriber: &ParticipantId,
+    channels: &[Uuid],
+) -> Vec<(i64, Option<Uuid>)> {
+    // No readable channel at all: every owed claim this subscriber holds is
+    // residue, so the exclusion clause is simply absent.
+    let exclusion = if channels.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " AND (m.channel_uuid IS NULL OR m.channel_uuid NOT IN ({}))",
+            build_bare_in_placeholders(channels.len())
+        )
+    };
+    let sql = format!(
+        "SELECT pp.id, m.channel_uuid
+         FROM messaging_pending_pushes pp
+         JOIN messaging_messages m ON pp.message_id = m.id
+         WHERE pp.target_subscriber = ?
+           AND pp.delivered_at IS NULL
+           AND pp.release_after IS NULL{exclusion}
+         ORDER BY pp.id ASC"
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(channels.len() + 1);
+    params.push(Box::new(subscriber.as_str().to_string()));
+    for channel in channels {
+        params.push(Box::new(channel.as_bytes().to_vec()));
+    }
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    // Cached: this runs on every WASM drain step, and the SQL text is stable
+    // per readable-set size.
+    let mut stmt = conn
+        .prepare_cached(&sql)
+        .expect("prepare pending_pushes_outside_channels");
+    let rows = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            let push_id: i64 = row.get(0)?;
+            let channel: Option<Vec<u8>> = row.get(1)?;
+            Ok((push_id, channel))
+        })
+        .expect("query pending_pushes_outside_channels");
+    rows.map(|r| {
+        let (push_id, channel) = r.expect("read residue pending push");
+        let channel = channel.map(|bytes| {
+            Uuid::from_slice(&bytes)
+                .unwrap_or_else(|e| panic!("messaging: residue push {push_id} channel uuid: {e}"))
+        });
+        (push_id, channel)
+    })
+    .collect()
+}
+
+/// Distinct subscribers on `channel_uuid` holding at least one owed,
+/// deliverable pending push — the durable sibling of a ring channel's set of
+/// cursors that trail the ring head.
 ///
-/// Messages with a future `deliver_after` are excluded: the parked loader honours
-/// the same hold (via `pp.release_after`), and re-sending an unreleased message
-/// from the retained window would deliver it before its scheduled release time.
-/// Such rows arrive live through the normal path when the release fires.
-pub fn load_channel_messages_after(
+/// "Owed, deliverable" is the same predicate `load_pending_pushes_for_channel`
+/// serves from (`delivered_at IS NULL AND release_after IS NULL`): a row still
+/// parked behind its `release_after` hold is owed to nobody yet, so it does not
+/// list its target here.
+pub fn channel_deliverable_subscribers(
     conn: &Connection,
     channel_uuid: Uuid,
-    after_id: i64,
-    clamp: crate::messaging::config::Depth,
-) -> Vec<(i64, MessageEnvelope)> {
-    // Column layout matches query::row_to_envelope (0-12); m.id is column 13.
-    let limit: i64 = match clamp {
-        crate::messaging::config::Depth::Unbounded => -1, // SQLite: no limit
-        crate::messaging::config::Depth::Bounded(n) => n as i64,
-    };
-    let now = format_ts_for_db(Utc::now());
+) -> Vec<ParticipantId> {
     let mut stmt = conn
         .prepare(
-            "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency,
-                    m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-                    c.address, rc.address, m.envelope_type, m.id
-             FROM messaging_messages m
-             JOIN messaging_channels c ON c.uuid = m.channel_uuid
-             LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
-             WHERE m.channel_uuid = ?1 AND m.id > ?2
-               AND (m.deliver_after IS NULL OR m.deliver_after <= ?4)
-             ORDER BY m.id DESC LIMIT ?3",
+            "SELECT DISTINCT pp.target_subscriber
+             FROM messaging_pending_pushes pp
+             JOIN messaging_messages m ON pp.message_id = m.id
+             WHERE m.channel_uuid = ?1
+               AND pp.delivered_at IS NULL
+               AND pp.release_after IS NULL",
         )
-        .expect("prepare load_channel_messages_after");
+        .expect("prepare channel_deliverable_subscribers");
     let rows = stmt
-        .query_map(
-            rusqlite::params![channel_uuid.as_bytes().to_vec(), after_id, limit, now],
-            |row| {
-                let envelope = crate::messaging::query::row_to_envelope(row)?;
-                let id: i64 = row.get(13)?;
-                Ok((id, envelope))
-            },
-        )
-        .expect("query load_channel_messages_after");
-    let mut out: Vec<(i64, MessageEnvelope)> = rows
-        .map(|r| r.expect("read channel message after"))
-        .collect();
-    // Query returned newest-first; deliver oldest-first.
+        .query_map(rusqlite::params![channel_uuid.as_bytes().to_vec()], |row| {
+            row.get::<_, String>(0)
+        })
+        .expect("query channel_deliverable_subscribers");
+    rows.map(|r| ParticipantId::from_stored(r.expect("read deliverable subscriber")))
+        .collect()
+}
+
+/// Whether `subscriber` holds any owed, deliverable pending push on
+/// `channel_uuid`. Same predicate as [`channel_deliverable_subscribers`],
+/// scoped to one subscriber.
+pub fn channel_has_deliverable_for(
+    conn: &Connection,
+    channel_uuid: Uuid,
+    subscriber: &ParticipantId,
+) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM messaging_pending_pushes pp
+             JOIN messaging_messages m ON pp.message_id = m.id
+             WHERE m.channel_uuid = ?1
+               AND pp.target_subscriber = ?2
+               AND pp.delivered_at IS NULL
+               AND pp.release_after IS NULL)",
+        rusqlite::params![channel_uuid.as_bytes().to_vec(), subscriber.as_str()],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("query channel_has_deliverable_for")
+        != 0
+}
+
+/// The retained suffix strictly after retention sequence `after_seq`, oldest
+/// first (seq ascending), capped by `clamp` — the `Exact` branch's re-send set.
+///
+/// Keyed on `retained_seq`, the dense per-channel retention order: a parked row
+/// carries no `retained_seq` and is absent, and a late-released row (its seq
+/// assigned at release, above every trailing cursor) is present as the newest,
+/// converging with the ring. Each row is returned with its seq so a consumer
+/// mints its next cursor from this output alone.
+pub fn load_channel_messages_after_seq(
+    conn: &Connection,
+    channel_uuid: Uuid,
+    after_seq: i64,
+    clamp: crate::messaging::config::Depth,
+) -> Vec<(i64, MessageEnvelope)> {
+    let sql = retained_window_sql("AND m.retained_seq > ?2", "?3");
+    let mut stmt = conn
+        .prepare(&sql)
+        .expect("prepare load_channel_messages_after_seq");
+    read_retained_rows(
+        &mut stmt,
+        rusqlite::params![
+            channel_uuid.as_bytes().to_vec(),
+            after_seq,
+            depth_limit(clamp)
+        ],
+    )
+    .into_iter()
+    .map(|row| (row.seq, row.envelope))
+    .collect()
+}
+
+/// The newest `limit` retained messages on `channel_uuid`, oldest first (seq
+/// ascending), each with its retention sequence — the whole retained window as
+/// the resume `Fresh`/`Gap` branches serve it.
+pub fn load_channel_retained_window_seq(
+    conn: &Connection,
+    channel_uuid: Uuid,
+    limit: crate::messaging::config::Depth,
+) -> Vec<(i64, MessageEnvelope)> {
+    let sql = retained_window_sql("", "?2");
+    let mut stmt = conn
+        .prepare(&sql)
+        .expect("prepare load_channel_retained_window_seq");
+    read_retained_rows(
+        &mut stmt,
+        rusqlite::params![channel_uuid.as_bytes().to_vec(), depth_limit(limit)],
+    )
+    .into_iter()
+    .map(|row| (row.seq, row.envelope))
+    .collect()
+}
+
+/// One row of a retained-window read: the message plus both keys callers select
+/// on — its rowid identity and its retention position.
+struct RetainedRow {
+    id: i64,
+    seq: i64,
+    envelope: MessageEnvelope,
+}
+
+/// A retained-window row cap as SQLite spells it (`-1` is no limit).
+fn depth_limit(depth: crate::messaging::config::Depth) -> i64 {
+    match depth {
+        crate::messaging::config::Depth::Unbounded => -1,
+        crate::messaging::config::Depth::Bounded(n) => n as i64,
+    }
+}
+
+/// The one retained-window query body, shared by every retention-order read.
+///
+/// Selects the 13 envelope columns `query::row_to_envelope` decodes (0-12) plus
+/// `m.id` (13) and `m.retained_seq` (14), newest-first, for channel `?1`.
+/// `where_tail` adds predicates after the retained-set predicate; `limit_param`
+/// names the bind holding the row cap. One copy so a change to the retained-set
+/// predicate cannot land on some reads and miss others.
+fn retained_window_sql(where_tail: &str, limit_param: &str) -> String {
+    format!(
+        "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency,
+                m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
+                c.address, rc.address, m.envelope_type, m.id, m.retained_seq
+         FROM messaging_messages m
+         JOIN messaging_channels c ON c.uuid = m.channel_uuid
+         LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
+         WHERE m.channel_uuid = ?1 AND m.retained_seq IS NOT NULL {where_tail}
+         ORDER BY m.retained_seq DESC LIMIT {limit_param}"
+    )
+}
+
+/// Run a [`retained_window_sql`] statement, returning its rows oldest-first (the
+/// query orders newest-first, so the result is reversed).
+fn read_retained_rows(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: &[&dyn rusqlite::ToSql],
+) -> Vec<RetainedRow> {
+    let rows = stmt
+        .query_map(params, |row| {
+            let envelope = crate::messaging::query::row_to_envelope(row)?;
+            Ok(RetainedRow {
+                id: row.get(13)?,
+                seq: row.get(14)?,
+                envelope,
+            })
+        })
+        .expect("query retained-window rows");
+    let mut out: Vec<RetainedRow> = rows.map(|r| r.expect("read retained-window row")).collect();
     out.reverse();
     out
 }
 
-/// Smallest `messaging_messages.id` still retained for `channel_uuid`, or `None`
-/// when the channel holds no messages. GC evicts oldest-first, so this is the
-/// oldest surviving message; the durable-resume gap rule compares a client's
-/// `last_seq` against it to decide whether replay can reach back that far.
-pub fn channel_min_message_id(conn: &Connection, channel_uuid: Uuid) -> Option<i64> {
-    conn.query_row(
-        "SELECT MIN(id) FROM messaging_messages WHERE channel_uuid = ?1",
-        rusqlite::params![channel_uuid.as_bytes().to_vec()],
-        |row| row.get::<_, Option<i64>>(0),
+/// The newest `limit` retained messages on `channel_uuid`, oldest first — the
+/// channel's retained ambience as a `DbStore` serves it, returned as
+/// `(message_id, envelope)` for callers that seed per-message push rows.
+///
+/// Ordered by `retained_seq` — the retention order — so a late-released message
+/// (its seq assigned at release) is the newest tail entry, as it is on the ring.
+/// A parked row carries no `retained_seq` and is absent, whatever the clock
+/// says.
+pub fn load_channel_retained_tail(
+    conn: &Connection,
+    channel_uuid: Uuid,
+    limit: crate::messaging::config::Depth,
+) -> Vec<(i64, MessageEnvelope)> {
+    let sql = retained_window_sql("", "?2");
+    let mut stmt = conn
+        .prepare(&sql)
+        .expect("prepare load_channel_retained_tail");
+    read_retained_rows(
+        &mut stmt,
+        rusqlite::params![channel_uuid.as_bytes().to_vec(), depth_limit(limit)],
     )
-    .expect("messaging: query channel_min_message_id")
+    .into_iter()
+    .map(|row| (row.id, row.envelope))
+    .collect()
 }
 
-/// The current maximum `messaging_messages.id` on a channel, or `None` when the
-/// channel holds no rows. A durable resume cursor whose high-water exceeds this
-/// proves the rowid space regressed under the cursor — a store restored from
-/// backup and reconnected before new rows re-climbed the id space.
-pub fn channel_max_message_id(conn: &Connection, channel_uuid: Uuid) -> Option<i64> {
+/// The highest retention sequence this channel ever assigned — its persisted
+/// resume high-water, carried on the channel row and surviving eviction of every
+/// retained message. `0` means nothing was ever retained.
+///
+/// This is what makes an empty retained window decidable: a cursor at this value
+/// is up to date even when no rows remain, and one below it proves the client
+/// once saw messages the store no longer holds.
+pub fn channel_last_retained_seq(conn: &Connection, channel_uuid: Uuid) -> i64 {
     conn.query_row(
-        "SELECT MAX(id) FROM messaging_messages WHERE channel_uuid = ?1",
+        "SELECT last_retained_seq FROM messaging_channels WHERE uuid = ?1",
         rusqlite::params![channel_uuid.as_bytes().to_vec()],
-        |row| row.get::<_, Option<i64>>(0),
+        |row| row.get::<_, i64>(0),
     )
-    .expect("messaging: query channel_max_message_id")
+    .unwrap_or_else(|e| panic!("messaging: channel {channel_uuid} has no row: {e}"))
+}
+
+/// The channel's persisted resume epoch — the identity of its numbering domain,
+/// minted once with the channel row and dying only with it.
+pub fn channel_resume_epoch(conn: &Connection, channel_uuid: Uuid) -> Uuid {
+    let bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT resume_epoch FROM messaging_channels WHERE uuid = ?1",
+            rusqlite::params![channel_uuid.as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|e| panic!("messaging: channel {channel_uuid} has no row: {e}"));
+    Uuid::from_slice(&bytes)
+        .unwrap_or_else(|e| panic!("messaging: channel {channel_uuid} resume_epoch {bytes:?}: {e}"))
+}
+
+/// How many retained rows the channel still holds above `after_seq`, unclamped.
+pub fn channel_retained_count_after_seq(
+    conn: &Connection,
+    channel_uuid: Uuid,
+    after_seq: i64,
+) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM messaging_messages
+         WHERE channel_uuid = ?1 AND retained_seq IS NOT NULL AND retained_seq > ?2",
+        rusqlite::params![channel_uuid.as_bytes().to_vec(), after_seq],
+        |row| row.get(0),
+    )
+    .expect("messaging: query channel_retained_count_after_seq")
 }
 
 /// Earliest pending `delivery_deadline`, or `None` if no rows are
@@ -1026,65 +1416,6 @@ pub fn earliest_pending_deadline(conn: &Connection) -> Option<DateTime<Utc>> {
     })
 }
 
-/// Earliest pending `release_after` (suppressed-until time), or `None`.
-pub fn earliest_pending_release(conn: &Connection) -> Option<DateTime<Utc>> {
-    let result: Option<String> = conn
-        .query_row(
-            "SELECT MIN(release_after) FROM messaging_pending_pushes
-             WHERE delivered_at IS NULL AND release_after IS NOT NULL",
-            [],
-            |row| row.get(0),
-        )
-        .expect("messaging: query earliest_pending_release");
-    // A non-NULL, non-parseable timestamp is a DB-invariant violation. Panic rather
-    // than silently treating it as "no pending release" (which delays delivery by up
-    // to POLL_INTERVAL with no diagnostic signal).
-    result.map(|s| {
-        parse_rfc3339(&s).unwrap_or_else(|| {
-            panic!("messaging: malformed release_after in messaging_pending_pushes: {s:?}")
-        })
-    })
-}
-
-/// Atomically clear `release_after` for rows where `release_after <= now`,
-/// returning the affected push ids. Used by the deliver-after task.
-pub fn release_due_pushes(conn: &Connection, now: DateTime<Utc>) -> Vec<i64> {
-    let now_str = format_ts_for_db(now);
-    let tx = conn
-        .unchecked_transaction()
-        .expect("begin tx for release_due_pushes");
-    let mut affected: Vec<i64> = Vec::new();
-    {
-        // Collect ids to release first (so we know which to dispatch).
-        let mut stmt = tx
-            .prepare(
-                "SELECT id FROM messaging_pending_pushes
-                 WHERE release_after IS NOT NULL
-                   AND release_after <= ?1
-                   AND delivered_at IS NULL",
-            )
-            .expect("prepare release_due_pushes select");
-        let rows = stmt
-            .query_map(rusqlite::params![now_str], |row| row.get::<_, i64>(0))
-            .expect("query release_due_pushes");
-        for r in rows {
-            affected.push(r.expect("read release_due id"));
-        }
-    }
-    if !affected.is_empty() {
-        tx.execute(
-            "UPDATE messaging_pending_pushes SET release_after = NULL
-             WHERE release_after IS NOT NULL
-               AND release_after <= ?1
-               AND delivered_at IS NULL",
-            rusqlite::params![now_str],
-        )
-        .expect("messaging: clear release_after");
-    }
-    tx.commit().expect("commit release_due_pushes");
-    affected
-}
-
 /// Load a list of pending-push rows by id. Skips delivered rows and rows
 /// not found.
 pub fn load_pushes_by_ids(conn: &Connection, ids: &[i64]) -> Vec<PendingPushRow> {
@@ -1097,7 +1428,7 @@ pub fn load_pushes_by_ids(conn: &Connection, ids: &[i64]) -> Vec<PendingPushRow>
                 m.urgency AS msg_urgency,
                 m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
                 c.address, rc.address, m.envelope_type, pp.message_id,
-                pp.target_app_slug
+                pp.target_app_slug, m.retained_seq
          FROM messaging_pending_pushes pp
          JOIN messaging_messages m ON pp.message_id = m.id
          JOIN messaging_channels c ON c.uuid = m.channel_uuid
@@ -1128,7 +1459,7 @@ pub(crate) const LOAD_ALL_DISPATCHABLE_PUSHES_SQL: &str = "SELECT pp.id, pp.targ
                     c.address, rc.address, m.envelope_type,
                     m.ingress_source, m.ingress_summary,
                     (pp.delivery_deadline IS NOT NULL AND pp.delivery_deadline <= ?1) AS deadline_expired,
-                    pp.message_id, pp.target_app_slug
+                    pp.message_id, pp.target_app_slug, m.retained_seq
              FROM messaging_pending_pushes pp
              JOIN messaging_messages m ON pp.message_id = m.id
              LEFT JOIN messaging_channels c ON c.uuid = m.channel_uuid
@@ -1191,6 +1522,7 @@ pub fn load_all_dispatchable_pushes(
 /// - 16: deadline_expired (0 or 1)
 /// - 17: pp.message_id
 /// - 18: pp.target_app_slug
+/// - 19: m.retained_seq (NULL for ingress and for a still-parked message)
 ///
 /// Handles `brenn`, `webhook`, and `ingress` envelope types, matching the
 /// drain-path decoder. Bus rows produce `IngressOrBus::Bus(MessageEnvelope)`;
@@ -1217,6 +1549,7 @@ fn row_to_dispatchable_push(row: &rusqlite::Row) -> rusqlite::Result<(PendingPus
     // col 15: m.ingress_summary (NULL for bus rows)
     let deadline_expired: bool = row.get::<_, i64>(16)? != 0;
     let message_id: i64 = row.get(17)?;
+    let retained_seq: Option<i64> = row.get(19)?;
 
     // Build IngressOrBus::Bus(MessageEnvelope) from the common row columns.
     // Shared by the `brenn` and `webhook` arms — structurally identical.
@@ -1316,6 +1649,7 @@ fn row_to_dispatchable_push(row: &rusqlite::Row) -> rusqlite::Result<(PendingPus
         PendingPushRow {
             push_id,
             message_id,
+            retained_seq,
             payload,
             target_subscriber,
             target_app_slug,
@@ -1342,7 +1676,8 @@ fn row_to_dispatchable_push(row: &rusqlite::Row) -> rusqlite::Result<(PendingPus
 /// That is acceptable for bus-only paths; the dispatcher uses `row_to_dispatchable_push`
 /// instead.
 ///
-/// Column 14 is `pp.message_id`; column 15 is `pp.target_app_slug`.
+/// Column 14 is `pp.message_id`; column 15 is `pp.target_app_slug`; column 16 is
+/// `m.retained_seq` (NULL while the message is parked).
 fn row_to_pending_push(row: &rusqlite::Row) -> rusqlite::Result<PendingPushRow> {
     let push_id: i64 = row.get(0)?;
     let target_subscriber_str: String = row.get(1)?;
@@ -1365,6 +1700,7 @@ fn row_to_pending_push(row: &rusqlite::Row) -> rusqlite::Result<PendingPushRow> 
     let reply_to: Option<String> = row.get(12)?;
     let envelope_type_str: String = row.get(13)?;
     let message_id: i64 = row.get(14)?;
+    let retained_seq: Option<i64> = row.get(16)?;
 
     let urgency = Urgency::parse(&msg_urgency_str).unwrap_or_else(|| {
         panic!("messaging: message for push {push_id} has invalid urgency {msg_urgency_str:?}")
@@ -1405,6 +1741,7 @@ fn row_to_pending_push(row: &rusqlite::Row) -> rusqlite::Result<PendingPushRow> 
     Ok(PendingPushRow {
         push_id,
         message_id,
+        retained_seq,
         payload: IngressOrBus::Bus(envelope),
         target_subscriber,
         target_app_slug,
@@ -1427,6 +1764,10 @@ pub struct MessageLookup {
     pub undelivered_count: u32,
     /// Pushes with `delivered_at IS NOT NULL` (genuine delivery, not cancel).
     pub delivered_count: u32,
+    /// The message is still parked behind a `deliver_after`. A parked message
+    /// carries no push rows — release mints them for the subscribers attached
+    /// then — so it is pending despite `undelivered_count` being zero.
+    pub parked: bool,
 }
 
 /// Look up a message by UUID for authorship / status checks.
@@ -1436,7 +1777,8 @@ pub fn lookup_message_for_authorship(conn: &Connection, uuid: Uuid) -> Option<Me
     conn.query_row(
         "SELECT m.id, m.sender,
                 COUNT(CASE WHEN pp.id IS NOT NULL AND pp.delivered_at IS NULL THEN 1 END),
-                COUNT(CASE WHEN pp.id IS NOT NULL AND pp.delivered_at IS NOT NULL THEN 1 END)
+                COUNT(CASE WHEN pp.id IS NOT NULL AND pp.delivered_at IS NOT NULL THEN 1 END),
+                m.deliver_after IS NOT NULL
          FROM messaging_messages m
          LEFT JOIN messaging_pending_pushes pp ON pp.message_id = m.id
          WHERE m.uuid = ?1
@@ -1448,6 +1790,7 @@ pub fn lookup_message_for_authorship(conn: &Connection, uuid: Uuid) -> Option<Me
                 sender: row.get(1)?,
                 undelivered_count: row.get::<_, i64>(2)? as u32,
                 delivered_count: row.get::<_, i64>(3)? as u32,
+                parked: row.get(4)?,
             })
         },
     )
@@ -1482,6 +1825,49 @@ pub fn cancel_pending_pushes_for_message(
         )
         .expect("messaging: cancel_pending_pushes_for_message");
     affected as u32
+}
+
+/// Withdraw a parked message: delete the row itself, and any push claims still
+/// attached to it.
+///
+/// Cancelling a parked message must erase it rather than unschedule it. Its
+/// `deliver_after` is the only thing hiding it from retention reads, so a row
+/// left behind would surface as ambience — and be minted claims — at its
+/// release time, delivering exactly what the sender cancelled.
+///
+/// `caller_sender` is re-checked here as defence in depth, as in
+/// [`cancel_pending_pushes_for_message`]. Returns the number of push claims
+/// deleted with it, or `None` when the message is no longer parked (a release
+/// pass took it between the caller's lookup and this call).
+pub fn withdraw_parked_message(
+    conn: &Connection,
+    message_id: i64,
+    caller_sender: &str,
+) -> Option<u32> {
+    let tx = conn
+        .unchecked_transaction()
+        .expect("messaging: begin withdraw_parked_message tx");
+    let claims = tx
+        .execute(
+            "DELETE FROM messaging_pending_pushes
+             WHERE message_id = ?1
+               AND EXISTS (
+                   SELECT 1 FROM messaging_messages
+                   WHERE id = ?1 AND sender = ?2 AND deliver_after IS NOT NULL
+               )",
+            rusqlite::params![message_id, caller_sender],
+        )
+        .expect("messaging: withdraw parked push rows");
+    let removed = tx
+        .execute(
+            "DELETE FROM messaging_messages
+             WHERE id = ?1 AND sender = ?2 AND deliver_after IS NOT NULL",
+            rusqlite::params![message_id, caller_sender],
+        )
+        .expect("messaging: withdraw parked message row");
+    tx.commit()
+        .expect("messaging: commit withdraw_parked_message");
+    (removed > 0).then_some(claims as u32)
 }
 
 /// Resolved fields for an in-place message edit. `None` means "leave column
@@ -1540,22 +1926,22 @@ pub fn update_message_and_pending_pushes(
     // fires under the same lock scope as the UPDATE. The caller's prior
     // lookup_message_for_authorship runs outside this transaction, so a
     // concurrent mutation (however unlikely) would be caught here.
-    let stored_sender: Option<String> = tx
+    let stored: Option<(String, bool)> = tx
         .query_row(
-            "SELECT sender FROM messaging_messages WHERE id = ?1",
+            "SELECT sender, deliver_after IS NOT NULL FROM messaging_messages WHERE id = ?1",
             rusqlite::params![message_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
         .expect("messaging: sender fetch failed");
-    match stored_sender {
+    let parked = match stored {
         None => panic!("messaging: edit row missing — message_id={message_id}"),
-        Some(ref stored) if stored != caller_sender => panic!(
+        Some((ref stored, _)) if stored != caller_sender => panic!(
             "messaging: edit sender mismatch — caller_sender={caller_sender:?} \
              stored={stored:?} message_id={message_id}"
         ),
-        Some(_) => {}
-    }
+        Some((_, parked)) => parked,
+    };
 
     // A3: fail if any push has been delivered. Merged into one query using
     // FILTER (WHERE ...) expressions (SQLite ≥3.30) to halve index seeks.
@@ -1573,7 +1959,9 @@ pub fn update_message_and_pending_pushes(
         tx.rollback().expect("messaging: rollback edit tx");
         return EditUpdateResult::AnyDelivered;
     }
-    if undelivered_count == 0 {
+    // A parked message is editable while holding no claims at all: it is owed to
+    // nobody until release mints them.
+    if undelivered_count == 0 && !parked {
         tx.commit().expect("messaging: commit edit tx (no pushes)");
         return EditUpdateResult::NoPendingPushes;
     }
@@ -1596,6 +1984,15 @@ pub fn update_message_and_pending_pushes(
     if let Some(da) = &fields.deliver_after {
         set_clauses.push("deliver_after = ?");
         params.push(Box::new(da.map(format_ts_for_db)));
+        if da.is_some() {
+            // Parking a message that already entered retention withdraws it from
+            // retention: a parked message holds no position, and release assigns
+            // it a fresh one above every entry made while it waited. Leaving the
+            // old position behind would keep the message replayable during its
+            // park, hand it a second position at release, and expose it to a GC
+            // pass that only ever evicts positioned rows.
+            set_clauses.push("retained_seq = NULL");
+        }
     }
     if let Some(dd) = &fields.delivery_deadline {
         set_clauses.push("delivery_deadline = ?");
@@ -1713,7 +2110,9 @@ pub fn update_message_and_pending_pushes(
 /// Deserialize a `MessageEnvelope` from a row with columns:
 /// 0:uuid, 1:source, 2:sender, 3:body, 4:urgency, 5:delivery_deadline,
 /// 6:deliver_after, 7:publish_ts_ns, 8:channel_address, 9:reply_to, 10:envelope_type.
-fn row_to_message_envelope(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageEnvelope> {
+pub(super) fn row_to_message_envelope(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<MessageEnvelope> {
     let msg_uuid_bytes: Vec<u8> = row.get(0)?;
     let source: String = row.get(1)?;
     let sender: String = row.get(2)?;
@@ -1759,9 +2158,13 @@ fn row_to_message_envelope(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageE
 /// Load pending messages for a sender. Returns `MessageEnvelope`s sorted
 /// ascending by `deliver_after NULLS FIRST, publish_ts_ns ASC`.
 ///
+/// Pending means undelivered: a message with an undelivered push claim, or one
+/// still parked behind a `deliver_after` — a parked message holds no claim
+/// (release mints them for the subscribers attached then) and is the case this
+/// listing exists to make editable.
+///
 /// `channel_uuid_filter`: caller has already resolved the channel address →
-/// UUID. Per design §2.11 an unresolvable address short-circuits before
-/// calling this function.
+/// UUID; an unresolvable address short-circuits before calling this function.
 pub fn list_pending_messages_for_sender(
     conn: &Connection,
     sender: &str,
@@ -1774,8 +2177,9 @@ pub fn list_pending_messages_for_sender(
          FROM messaging_messages m
          JOIN messaging_channels c ON c.uuid = m.channel_uuid
          LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
-         WHERE EXISTS (SELECT 1 FROM messaging_pending_pushes pp
-                       WHERE pp.message_id = m.id AND pp.delivered_at IS NULL)
+         WHERE (m.deliver_after IS NOT NULL
+                OR EXISTS (SELECT 1 FROM messaging_pending_pushes pp
+                           WHERE pp.message_id = m.id AND pp.delivered_at IS NULL))
            AND m.sender = ?
          ",
     );

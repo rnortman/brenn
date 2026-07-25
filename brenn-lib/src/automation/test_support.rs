@@ -70,7 +70,8 @@ impl WakeRouter for FakeWakeRouter {
         _: &crate::messaging::ParticipantId,
         _: &MessageEnvelope,
         _push_id: i64,
-        _seq: i64,
+        _message_id: i64,
+        _retained_seq: Option<i64>,
     ) -> Result<bool, String> {
         Ok(false)
     }

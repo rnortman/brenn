@@ -15,18 +15,24 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use brenn_lib::messaging::config::{ActivationPacing, WasmInputPort};
+use chrono::{DateTime, Utc};
+
+use brenn_lib::messaging::config::{ActivationPacing, WasmInputPort, WasmOutputPort};
+use brenn_lib::messaging::store::{DeferralOutcome, TargetRecord, instant_of, release_time_of};
 use brenn_lib::messaging::{Messenger, ParticipantId, Urgency, WasmBatchFailure, WasmPublish};
 use brenn_lib::obs::alerting::{AlertDispatcher, AlertSeverity};
 use brenn_lib::obs::security::{SecurityEventType, log_component_security_event};
 use brenn_lib::token_bucket::{TokenBucket, TokenBucketOutcome};
+use brenn_wasm::ProcessorDeferredOp;
 use brenn_wasm::{
     GuestAlertSeverity, PROCESSOR_MAX_DIAG_BYTES, ProcessorActivation, ProcessorAlerter,
-    ProcessorComponent, ProcessorOutcome, ProcessorPortWindow, ProcessorUrgency,
+    ProcessorComponent, ProcessorDeferredEntry, ProcessorDeferredWindow, ProcessorOutcome,
+    ProcessorPortWindow, ProcessorUrgency,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 /// Map a `ProcessorUrgency` (from `brenn-wasm`) to the messaging `Urgency` type.
 ///
@@ -41,6 +47,86 @@ fn processor_urgency_to_messaging(u: ProcessorUrgency) -> Urgency {
     }
 }
 
+/// Apply an activation's buffered deferred-message control ops (defer-cancel /
+/// defer-edit).
+///
+/// Each op names a message by `(port, index)`. `index` resolves against
+/// `deferred_ids` — the identities captured in this activation's drain-time
+/// snapshot — so a message released between drain and flush is targeted by the
+/// identity the guest saw, never retargeted by index. The guest host validated
+/// the port binding and the index range at buffer time against the very window
+/// captured here, so an unbound port or an index outside the captured snapshot is
+/// a host invariant violation (the two disagree about the delivered window) and
+/// panics. A [`DeferralOutcome::NotDeferred`] is the benign drain-vs-release race:
+/// logged, not a failure.
+async fn apply_deferred_ops(
+    cfg: &WasmConsumerConfig,
+    sender: &str,
+    deferred_ids: &HashMap<String, Vec<Uuid>>,
+    ops: &[ProcessorDeferredOp],
+    now: DateTime<Utc>,
+) {
+    for op in ops {
+        let (port, index) = match op {
+            ProcessorDeferredOp::Cancel { port, index } => (port, *index),
+            ProcessorDeferredOp::Edit { port, index, .. } => (port, *index),
+        };
+        let out = cfg
+            .outputs
+            .iter()
+            .find(|o| &o.port == port)
+            .unwrap_or_else(|| {
+                panic!(
+                    "wasm_dispatch: deferred op names unbound port {port:?} — the guest host must \
+                 reject an unbound port at buffer time"
+                )
+            });
+        let uuid = *deferred_ids
+            .get(port)
+            .and_then(|ids| ids.get(index as usize))
+            .unwrap_or_else(|| {
+                panic!(
+                    "wasm_dispatch: deferred op index {index} out of range for port {port:?} \
+                     snapshot — the guest host validated it against this same window"
+                )
+            });
+        let outcome = match op {
+            ProcessorDeferredOp::Cancel { .. } => {
+                cfg.messenger
+                    .cancel_deferred_for_sender(&out.channel_address, sender, uuid, now)
+                    .await
+            }
+            ProcessorDeferredOp::Edit {
+                payload,
+                deliver_after,
+                ..
+            } => {
+                let release_at = deliver_after.map(instant_of);
+                cfg.messenger
+                    .edit_deferred_for_sender(
+                        &out.channel_address,
+                        sender,
+                        uuid,
+                        payload.clone(),
+                        release_at,
+                        now,
+                    )
+                    .await
+            }
+        };
+        if outcome == DeferralOutcome::NotDeferred {
+            cfg.messenger
+                .record_deferred_control_race(&cfg.slug, &out.channel_address);
+            info!(
+                slug = %cfg.slug,
+                port = %port,
+                "wasm_dispatch: deferred control op is a no-op — the message released between \
+                 the activation snapshot and flush"
+            );
+        }
+    }
+}
+
 /// Configuration for a single WASM consumer dispatch task.
 pub(crate) struct WasmConsumerConfig {
     pub slug: String,
@@ -50,18 +136,20 @@ pub(crate) struct WasmConsumerConfig {
     pub alert_dispatcher: AlertDispatcher,
     /// Resolved input ports for this consumer (one per subscribed channel).
     pub inputs: Vec<WasmInputPort>,
-    /// Per-component activation pacing (mqtt-wasm-republish-pacing design §2).
-    /// The consumer task builds its `ActivationPacer` (a `TokenBucket` over
-    /// activations) from this and gates every drain step through it.
+    /// Resolved output ports for this consumer (one per bound publish channel).
+    pub outputs: Vec<WasmOutputPort>,
+    /// Per-component activation pacing. The consumer task builds its
+    /// `ActivationPacer` (a `TokenBucket` over activations) from this and gates
+    /// every drain step through it.
     pub activation_pacing: ActivationPacing,
 }
 
-/// Per-consumer activation pacing gate (mqtt-wasm-republish-pacing design §2).
+/// Per-consumer activation pacing gate.
 ///
 /// Wraps a `TokenBucket` over *activations* (capacity = `burst`, one token
 /// refilled per `min_period`) plus episode-based throttle hysteresis owned here —
 /// not the bucket's own per-window signals, which would close and reopen on every
-/// single paced activation under a sustained flood and spam the logs (design §4).
+/// single paced activation under a sustained flood and spam the logs.
 ///
 /// The gate **delays** activations, it never drops them: when the bucket is empty
 /// `admit` sleeps one `min_period` and then proceeds. It is the sole owner of the
@@ -369,8 +457,7 @@ pub(in crate::wasm_dispatch) async fn drain_step(
     }
 
     // Step 2: assemble ProcessorPortWindow per snapshot, computing per-port drop delta.
-    // Collect all push_ids across triggering ports for the combined ack.
-    let mut all_push_ids: Vec<i64> = Vec::new();
+    let mut settlements: Vec<(&str, Vec<TargetRecord>)> = Vec::with_capacity(snapshots.len());
     // Track current drop counter per channel (advance at ack time, step 3).
     let mut current_drops: Vec<(String, u64)> = Vec::with_capacity(snapshots.len());
 
@@ -396,17 +483,31 @@ pub(in crate::wasm_dispatch) async fn drain_step(
                 .collect();
             let new_from = context_envelopes.len() as u32;
 
-            // Accumulate push_ids for the combined ack.
-            for (id, _) in &snap.new_rows {
-                all_push_ids.push(*id);
-            }
+            // Only a durable port settles: its claims stay pending until named,
+            // and every one of its rows carries the claim id that names it. A
+            // cursor-tracked port's take was its ack, so it settles nothing —
+            // and its records, were any minted, would be ring positions in an
+            // unrelated id domain.
+            settlements.push((
+                snap.channel_address.as_str(),
+                if snap.capabilities.durable {
+                    snap.new_rows
+                        .iter()
+                        .map(|(record, _)| {
+                            record.expect("wasm_dispatch: a durable delivery carries its claim id")
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+            ));
 
             // Compute `dropped` delta: drop counter read inside load_activation_snapshot
             // (while the db lock was held) minus last_seen. Using the snapshot value
             // rather than a live read prevents a concurrent publish from evicting a row
             // that is present in this snapshot's new_rows while being counted as dropped
             // (correctness-1). Advance last_seen_drop at ack time (step 3) for EVERY
-            // included channel — defensive uniformity (design §2.4 notes).
+            // included channel — defensive uniformity.
             let current_drop = snap.drop_counter_snapshot;
             let last_seen = last_seen_drop
                 .get(&snap.channel_address)
@@ -427,17 +528,80 @@ pub(in crate::wasm_dispatch) async fn drain_step(
         })
         .collect();
 
+    // A snapshot is only Some when at least one port triggered. Ring-backed rows
+    // carry no push id (they were acked by the snapshot-time cursor take), so
+    // `all_push_ids` is empty for an ephemeral-only consumer — the invariant is
+    // "some port delivered rows", not "some port had push ids".
     debug_assert!(
-        !all_push_ids.is_empty(),
-        "drain_step: all_push_ids empty — snapshot Some but no triggering rows"
+        snapshots.iter().any(|s| !s.new_rows.is_empty()),
+        "drain_step: snapshot Some but no triggering rows on any port"
     );
 
-    let activation = ProcessorActivation { ports };
+    // One clock read for both the deferred-view boundary and the guest's `now`,
+    // so a component's view of what is still deferred agrees with the clock it is
+    // handed to compute new release times against.
+    let now = Utc::now();
+    // A guest has no clock; it computes deliver_after from this value.
+    let now_ms =
+        u64::try_from(now.timestamp_millis()).expect("system clock is before the Unix epoch");
 
-    // Step 3 (ack-at-activation-start): mark all push rows across all triggering ports
-    // delivered BEFORE the guest executes. At-most-once; crash between here and guest
+    // Scoped to this component's `wasm:<slug>` sender identity: a shared output
+    // channel still shows only this component's schedule.
+    let sender = subscriber.as_str();
+    let mut deferred: Vec<ProcessorDeferredWindow> = Vec::with_capacity(cfg.outputs.len());
+    // Per output port, the message identities behind each deferred-window entry,
+    // in the same index order the guest sees. Captured at drain so a
+    // `defer-cancel`/`defer-edit` names the identity the guest actually saw — a
+    // message that releases between here and flush cannot be retargeted by index.
+    let mut deferred_ids: HashMap<String, Vec<Uuid>> = HashMap::with_capacity(cfg.outputs.len());
+    // TODO(substrate-deferred-view-count-shortcut): this queries every bound
+    // output port's deferred view per activation; for a durable port that is a
+    // SQL read under the db mutex, paid even when nothing is parked. Short-circuit
+    // the empty case with a maintained per-channel deferred count.
+    for out in &cfg.outputs {
+        let parked = cfg
+            .messenger
+            .deferred_view_for_sender(&out.channel_address, sender, now)
+            .await;
+        let entries: Vec<ProcessorDeferredEntry> = parked
+            .iter()
+            .enumerate()
+            .map(|(i, dm)| ProcessorDeferredEntry {
+                index: i as u32,
+                payload: dm.envelope.body.clone(),
+                deliver_after: release_time_of(dm.release_at),
+            })
+            .collect();
+        deferred_ids.insert(
+            out.port.clone(),
+            parked.iter().map(|dm| dm.message_uuid()).collect(),
+        );
+        deferred.push(ProcessorDeferredWindow {
+            port: out.port.clone(),
+            entries,
+        });
+    }
+
+    let activation = ProcessorActivation {
+        ports,
+        deferred,
+        now: Some(now_ms),
+    };
+
+    // Step 3 (ack-at-activation-start): settle every triggering port's delivery
+    // records BEFORE the guest executes. At-most-once; crash between here and guest
     // completing means the batch is gone (decided semantics).
-    cfg.messenger.mark_pushes_delivered(&all_push_ids).await;
+    //
+    // Each channel's store settles its own records, so the grain is per channel,
+    // not per activation: a crash between two iterations leaves the settled
+    // ports' rows acked and the rest owed, and the next activation carries only
+    // the remainder. The guest has not run at this point, so nothing is
+    // delivered twice — a multi-port batch can simply arrive split.
+    for (channel_address, records) in &settlements {
+        cfg.messenger
+            .settle_delivered(channel_address, subscriber, records)
+            .await;
+    }
     // Advance last_seen_drop for EVERY included channel at ack time (defensive uniformity).
     for (channel_address, current_drop) in &current_drops {
         last_seen_drop.insert(channel_address.clone(), *current_drop);
@@ -476,8 +640,21 @@ pub(in crate::wasm_dispatch) async fn drain_step(
 
     // Step 5: disposition (activation-scoped). Push rows already acked above.
     match outcome {
-        ProcessorOutcome::Ok(publishes) => {
-            // Flush buffered publishes atomically (all-or-nothing, design §2.3).
+        ProcessorOutcome::Ok {
+            publishes,
+            deferred_ops,
+        } => {
+            // `now` is the same drain-time instant the deferred view was taken
+            // against, keeping the snapshot boundary consistent.
+            apply_deferred_ops(cfg, sender, &deferred_ids, &deferred_ops, now).await;
+            // A defer-edit can move a release time earlier than the dispatcher's
+            // current sleep target (computed before this flush); wake it so an
+            // edited-to-now message releases immediately rather than at the next
+            // unrelated kick or the poll interval. Kicks are cheap and coalesced,
+            // so an unconditional wake whenever any op ran is fine.
+            if !deferred_ops.is_empty() {
+                cfg.messenger.dispatch_kick();
+            }
             if !publishes.is_empty() {
                 let wasm_publishes: Vec<WasmPublish<'_>> = publishes
                     .iter()
@@ -486,6 +663,17 @@ pub(in crate::wasm_dispatch) async fn drain_step(
                         body: &p.payload,
                         urgency: processor_urgency_to_messaging(p.urgency),
                         reply_to: p.reply_to.as_deref(),
+                        // Representability was validated at buffer time
+                        // (`do_publish`), where the guest still held the error
+                        // channel, so a non-representable value here is a host
+                        // invariant violation, not guest input.
+                        deliver_after: p.deliver_after.map(|ms| {
+                            DateTime::<Utc>::from_timestamp_millis(
+                                i64::try_from(ms)
+                                    .expect("deliver_after was range-validated at buffer time"),
+                            )
+                            .expect("deliver_after was range-validated at buffer time")
+                        }),
                     })
                     .collect();
                 cfg.messenger
@@ -589,6 +777,9 @@ struct PortFailureBacking {
     channel: String,
     first_message_id: String,
     last_message_id: String,
+    /// The `messaging_pending_pushes` rows this port's batch claimed, for the
+    /// quarantine record to retire. Empty for a port whose channel keeps no such
+    /// rows.
     push_ids: Vec<i64>,
 }
 
@@ -633,11 +824,28 @@ fn collect_failure_backing(
                 .last()
                 .map(|(_, e)| e.message_id.to_string())
                 .unwrap_or_default();
+            // Quarantine retirement names `messaging_pending_pushes` rows, so
+            // only a durable channel's records belong here: a cursor-tracked
+            // channel's record is a ring position, an unrelated id domain that
+            // would retire whichever claim row happened to share the number.
+            // Its window needs no retirement anyway — the take was its ack.
+            let push_ids: Vec<i64> = if s.capabilities.durable {
+                s.new_rows
+                    .iter()
+                    .map(|(record, _)| {
+                        record
+                            .expect("wasm_dispatch: a durable delivery carries its claim id")
+                            .0
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             PortFailureBacking {
                 channel: s.channel_address.clone(),
                 first_message_id: fid,
                 last_message_id: lid,
-                push_ids: s.new_rows.iter().map(|(id, _)| *id).collect(),
+                push_ids,
             }
         })
         .collect()

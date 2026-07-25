@@ -22,6 +22,50 @@
 pub struct Activation<E> {
     /// One window per bound input port, in config order.
     pub ports: Vec<PortWindow<E>>,
+    /// One deferred-window per bound output port, in config order — the
+    /// component's own parked (deferred) messages on each output channel, a
+    /// snapshot at drain. Separate from `ports`: a future in/out port appears in
+    /// both lists, additively.
+    pub deferred: Vec<DeferredWindow<E>>,
+    /// The host's wall clock at drain, epoch milliseconds UTC. Lets a guest
+    /// compute an absolute future instant (e.g. for a deferred publish) without
+    /// holding a clock of its own. `None` when the host exposes no UTC wall
+    /// clock.
+    pub now: Option<u64>,
+}
+
+/// One output port's view onto its own parked messages: the component's
+/// deferred publishes on that port's channel, ordered by `deliver_after`
+/// ascending, snapshot at drain.
+///
+/// **Scoped to the component.** A window holds only messages this component
+/// itself parked (its `wasm:<slug>` sender identity), never a peer's — the scope
+/// is structural, so a shared output channel still shows each publisher only its
+/// own schedule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DeferredWindow<E> {
+    /// Logical output port name, as declared in config — never a raw channel
+    /// address.
+    pub port: String,
+    /// This component's parked messages on the port's channel, soonest release
+    /// first.
+    pub entries: Vec<DeferredEntry<E>>,
+}
+
+/// One parked message in a [`DeferredWindow`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DeferredEntry<E> {
+    /// Position within the window's `entries` list (which is release-ordered).
+    /// The handle a future cancel/edit names; snapshot-relative, valid only
+    /// against the window it arrived in.
+    pub index: u32,
+    /// The message body the component published, as handed to the deferred
+    /// publish — not an envelope.
+    pub payload: E,
+    /// Scheduled release time, epoch milliseconds UTC.
+    pub deliver_after: u64,
 }
 
 /// One input port's view onto its channel at activation time: retained context
@@ -113,7 +157,24 @@ mod tests {
         };
         let activation = Activation {
             ports: vec![window.clone()],
+            deferred: vec![DeferredWindow {
+                port: "reminders".to_string(),
+                entries: vec![DeferredEntry {
+                    index: 0,
+                    payload: "ping",
+                    deliver_after: 1_700_000_060_000,
+                }],
+            }],
+            now: Some(1_700_000_000_000),
         };
+        assert_eq!(activation.now, Some(1_700_000_000_000));
+
+        let DeferredWindow { port, entries } = &activation.deferred[0];
+        assert_eq!(port, "reminders");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index, 0u32);
+        assert_eq!(entries[0].payload, "ping");
+        assert_eq!(entries[0].deliver_after, 1_700_000_060_000u64);
 
         let PortWindow {
             port,
@@ -140,8 +201,12 @@ mod tests {
         // whole bound set, not just the ports that woke the instance.
         let both = Activation {
             ports: vec![window, context_only],
+            deferred: vec![],
+            now: None,
         };
         assert_eq!(both.ports.len(), 2);
+        assert!(both.deferred.is_empty());
+        assert_eq!(both.now, None);
     }
 
     /// The window/activation accessors: the `new_from` split, the `new_len`
@@ -172,6 +237,8 @@ mod tests {
         // `total_dropped` folds `dropped` across every port, not any other field.
         let activation = Activation {
             ports: vec![with_new, context_only],
+            deferred: vec![],
+            now: None,
         };
         assert_eq!(activation.total_dropped(), 7);
     }

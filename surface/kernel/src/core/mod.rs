@@ -2144,7 +2144,14 @@ impl ClientCore {
         let buffer = self.seed_buffer(&instance, &ports);
         ReadyActivation {
             instance,
-            activation: Activation { ports },
+            // The page kernel has no UTC wall clock (only a monotonic
+            // performance.now() timer), so no honest value to give. Output-port
+            // deferral is backend scope; the surface carries no deferred view.
+            activation: Activation {
+                ports,
+                deferred: vec![],
+                now: None,
+            },
             buffer,
             effects: loud_effects,
         }
@@ -2640,8 +2647,8 @@ impl ClientCore {
 
     /// Route a publish on a `local:` channel: mint the envelope, assign the
     /// position, retain, and fan out — the page-local twin of what the server's
-    /// `EphemeralBus` does for `ephemeral:`, and the reason a `local:` publish
-    /// never touches the wire.
+    /// ring store does for `ephemeral:`, and the reason a `local:` publish never
+    /// touches the wire.
     ///
     /// Seq assignment, ring append, and fan-out are one synchronous step with no
     /// await between them, so the ring and the delivered order can never diverge

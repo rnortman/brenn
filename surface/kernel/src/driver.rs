@@ -1094,7 +1094,11 @@ mod tests {
     /// component cannot return one — so losing it here loses it forever.
     #[test]
     fn invoke_recovers_the_message_from_every_outcome() {
-        let activation = Activation { ports: Vec::new() };
+        let activation = Activation {
+            ports: Vec::new(),
+            deferred: vec![],
+            now: None,
+        };
         let buffer = || PublishBuffer::new(Default::default(), Default::default(), 1024);
 
         let ok: ActivationEntry = Box::new(|_, _| Ok(()));

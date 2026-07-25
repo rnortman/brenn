@@ -17,9 +17,8 @@ use std::borrow::Cow;
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
 use brenn_lib::messaging::{
-    AnyPublishResult, CancelResult, ChannelListing, EditFields, EditResult, EphemeralPublishResult,
-    MessageEnvelope, MessageQuery, PublishOrigin, PublishResult, QueryError, SubscriptionListing,
-    Urgency,
+    CancelResult, ChannelListing, ChannelScheme, EditFields, EditResult, MessageEnvelope,
+    MessageQuery, PublishOrigin, PublishResult, QueryError, SubscriptionListing, Urgency,
 };
 use brenn_lib::obs::security::{DenialKind, SecurityEventType, signal_publish_denial};
 use chrono::{DateTime, Utc};
@@ -68,17 +67,6 @@ struct BrennSendOk<'a> {
     remaining_budget: u32,
 }
 
-/// Success response for `BrennSend` to an `ephemeral:` channel.
-///
-/// Mirrors `BrennSendOk` minus `remaining_budget` — ephemeral channels carry no
-/// per-app send budget. Fields alphabetical: address, message_id, ok.
-#[derive(Serialize)]
-struct EphemeralSendOk<'a> {
-    address: &'a str,
-    message_id: String,
-    ok: bool,
-}
-
 /// Success response for `BrennMessageCancel`.
 ///
 /// Fields alphabetical: cancelled, cancelled_pushes, message_id, ok.
@@ -102,17 +90,26 @@ struct BrennPendingListResponse<'a> {
 
 /// Success response for `MessageSubscribe`.
 ///
-/// Fields alphabetical: address, ok, status. `status` is the activation status
-/// string (`"subscribed"`, `"subscribed_pending_reconnect"`, or
+/// Fields alphabetical: address, note, ok, status. `status` is the activation
+/// status string (`"subscribed"`, `"subscribed_pending_reconnect"`, or
 /// `"already_subscribed"`) so the LLM gets an honest live-vs-deferred-vs-noop
-/// signal (design §3 / §2.4).
+/// signal. `note` carries a channel-class caveat when there is one; omitted
+/// otherwise.
 #[derive(Serialize)]
 struct MessageSubscribeOk<'a> {
-    // alphabetical: address, ok, status
     address: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<&'static str>,
     ok: bool,
     status: &'static str,
 }
+
+/// The caveat carried on a successful subscribe to a non-durable
+/// (`ephemeral:`/`local:`) channel: its registration lives only in memory, so it
+/// is gone after a server restart and the model must re-subscribe when
+/// continuity matters.
+const NONDURABLE_SUBSCRIBE_NOTE: &str = "this channel is non-durable: the subscription does not survive a server restart — \
+     re-subscribe if you need it after one";
 
 /// Success response for `MessageUnsubscribe`.
 ///
@@ -493,7 +490,7 @@ pub async fn try_handle_messaging_tool(
                 };
 
             let result = messenger
-                .publish_any(
+                .publish(
                     PublishOrigin::Conversation {
                         id: bridge.conversation_id,
                     },
@@ -520,149 +517,80 @@ pub async fn try_handle_messaging_tool(
                     true,
                 )
             };
-            // `missing_sender` and `body_too_large` share identical wording across
-            // the durable and ephemeral arms; build each once so the two cannot
-            // drift.
+            // `missing_sender` and `body_too_large` share identical wording once,
+            // so no two arms can drift.
             let missing_sender_msg =
                 || Cow::Borrowed("messaging not configured for this app (sender missing)");
             let body_too_large_msg = |len: usize, max: usize| {
                 Cow::Owned(format!("body too large: {len} bytes (max {max})"))
             };
-            // One byte-identical message for both ephemeral UnknownChannel and
-            // AclDenied — true in both arms, so the LLM-visible string reveals
-            // nothing about which gate fired; the real `kind` lives only in the
-            // server-side security log. The app corrects a typo'd address from its
-            // own operator-configured allowlist, not from a listing tool (there is
-            // no self-service discovery surface for ephemeral publish targets).
-            let ephemeral_channel_denied_msg = |addr: &str| {
-                Cow::Owned(format!(
-                    "channel {addr:?} does not exist or is not in this app's \
-                     ephemeral_publish allowlist"
-                ))
-            };
+            // The log `kind` is derived from the result so it stays in lockstep
+            // with the `publish_denied` counter key.
+            if let Some(kind) = result.signal_kind() {
+                let event = match ChannelScheme::of(to) {
+                    Some(ChannelScheme::Ephemeral) => SecurityEventType::EphemeralPublishDenied,
+                    _ => SecurityEventType::BrennPublishDenied,
+                };
+                signal_publish_denial(
+                    bridge.alert_dispatcher(),
+                    event,
+                    bridge.denial_origin(),
+                    kind,
+                    result.denied_address().unwrap_or(to),
+                );
+            }
             let (outcome_value, is_error) = match result {
-                AnyPublishResult::Durable(durable) => {
-                    // One security signal per denial, mirroring the ephemeral arm:
-                    // the log `kind` is derived from the result enum, address-bearing
-                    // arms echo their carried address, and the rest fall back to the
-                    // original target `to`. `Ok`/`BudgetExhausted` return no
-                    // `signal_kind`, so they emit no signal.
-                    if let Some(kind) = durable.signal_kind() {
-                        signal_publish_denial(
-                            bridge.alert_dispatcher(),
-                            SecurityEventType::BrennPublishDenied,
-                            bridge.denial_origin(),
-                            kind,
-                            durable.denied_address().unwrap_or(to),
-                        );
-                    }
-                    match durable {
-                        PublishResult::Ok {
-                            message_id,
-                            address,
-                            remaining_budget,
-                        } => {
-                            let ok = BrennSendOk {
-                                address: &address,
-                                message_id: message_id.to_string(),
-                                ok: true,
-                                remaining_budget: remaining_budget.expect(
-                                    "Conversation-origin publish returns Some(remaining_budget)",
-                                ),
-                            };
-                            (
-                                serde_json::to_value(&ok)
-                                    .expect("BrennSendOk serialization is infallible"),
-                                false,
-                            )
-                        }
-                        PublishResult::BudgetExhausted => mkerr(Cow::Borrowed(
-                            "budget exhausted: 0 remaining; ask the user to send a chat message to reset",
-                        )),
-                        PublishResult::UnknownChannel(addr) => {
-                            mkerr(Cow::Owned(brenn_channel_denied_msg(&addr)))
-                        }
-                        PublishResult::MalformedAddress(addr) => mkerr(Cow::Owned(format!(
-                            "malformed channel address {addr:?}: must be of the form \
-                             \"brenn:<name>\" (or \"ephemeral:<name>\") with name \
-                             matching ^[A-Za-z0-9._~-]+$"
-                        ))),
-                        PublishResult::MissingSender => mkerr(missing_sender_msg()),
-                        PublishResult::AclDenied(addr) => {
-                            mkerr(Cow::Owned(brenn_channel_denied_msg(&addr)))
-                        }
-                        PublishResult::BodyTooLarge { len, max } => {
-                            mkerr(body_too_large_msg(len, max))
-                        }
-                    }
+                PublishResult::Ok {
+                    message_id,
+                    address,
+                    remaining_budget,
+                } => {
+                    let ok = BrennSendOk {
+                        address: &address,
+                        message_id: message_id.to_string(),
+                        ok: true,
+                        remaining_budget: remaining_budget
+                            .expect("Conversation-origin publish returns Some(remaining_budget)"),
+                    };
+                    (
+                        serde_json::to_value(&ok).expect("BrennSendOk serialization is infallible"),
+                        false,
+                    )
                 }
-                AnyPublishResult::Ephemeral(ephemeral) => {
-                    // One security signal per denial, with the log `kind` field
-                    // derived from the result enum so it stays in lockstep with
-                    // the bus `publish_denied` counter key. Address-bearing arms
-                    // echo their carried address; the rest fall back to the
-                    // original target `to`. `RateLimited` (its own bus counter +
-                    // warn) and `UnsupportedOption` (pure LLM input error) return
-                    // no `signal_kind`, so they emit no signal here.
-                    if let Some(kind) = ephemeral.signal_kind() {
-                        signal_publish_denial(
-                            bridge.alert_dispatcher(),
-                            SecurityEventType::EphemeralPublishDenied,
-                            bridge.denial_origin(),
-                            kind,
-                            ephemeral.denied_address().unwrap_or(to),
-                        );
-                    }
-                    match ephemeral {
-                        EphemeralPublishResult::Ok {
-                            message_id,
-                            address,
-                            ..
-                        } => {
-                            let ok = EphemeralSendOk {
-                                address: &address,
-                                message_id: message_id.to_string(),
-                                ok: true,
-                            };
-                            (
-                                serde_json::to_value(&ok)
-                                    .expect("EphemeralSendOk serialization is infallible"),
-                                false,
-                            )
-                        }
-                        EphemeralPublishResult::UnknownChannel(addr) => {
-                            mkerr(ephemeral_channel_denied_msg(&addr))
-                        }
-                        EphemeralPublishResult::MalformedAddress(addr) => {
-                            mkerr(Cow::Owned(format!(
-                                "malformed channel address {addr:?}: must be of the form \
-                                 \"ephemeral:<name>\" with name matching ^[A-Za-z0-9._~-]+$"
-                            )))
-                        }
-                        EphemeralPublishResult::MissingSender => mkerr(missing_sender_msg()),
-                        EphemeralPublishResult::AclDenied(addr) => {
-                            mkerr(ephemeral_channel_denied_msg(&addr))
-                        }
-                        EphemeralPublishResult::RateLimited => mkerr(Cow::Borrowed(
-                            "rate limited: too many ephemeral publishes; slow down",
-                        )),
-                        EphemeralPublishResult::BodyTooLarge { len, max } => {
-                            mkerr(body_too_large_msg(len, max))
-                        }
-                        EphemeralPublishResult::UnsupportedOption { field } => mkerr(Cow::Owned(
-                            format!("`{field}` is not supported on `ephemeral:` channels"),
-                        )),
-                    }
+                PublishResult::BudgetExhausted => mkerr(Cow::Borrowed(
+                    "budget exhausted: 0 remaining; ask the user to send a chat message to reset",
+                )),
+                // One byte-identical message for UnknownChannel and AclDenied —
+                // true in both cases, so the LLM-visible string reveals nothing
+                // about which gate fired; the real `kind` lives only in the
+                // server-side security log.
+                PublishResult::UnknownChannel(addr) | PublishResult::AclDenied(addr) => {
+                    mkerr(Cow::Owned(brenn_channel_denied_msg(&addr)))
                 }
+                PublishResult::MalformedAddress(addr) => mkerr(Cow::Owned(format!(
+                    "malformed channel address {addr:?}: must be of the form \"brenn:<name>\" \
+                     (or \"ephemeral:<name>\") with name matching ^[A-Za-z0-9._~-]+$"
+                ))),
+                PublishResult::MissingSender => mkerr(missing_sender_msg()),
+                PublishResult::BodyTooLarge { len, max } => mkerr(body_too_large_msg(len, max)),
+                PublishResult::RateLimited => mkerr(Cow::Borrowed(
+                    "rate limited: too many publishes to this channel; slow down",
+                )),
+                PublishResult::UnsupportedOption { field } => mkerr(Cow::Owned(format!(
+                    "`{field}` is not supported on this channel"
+                ))),
+                PublishResult::DeferredQuotaExceeded { cap } => mkerr(Cow::Owned(format!(
+                    "deferred-message quota exceeded: this channel already holds its cap of {cap} \
+                     scheduled messages; retry after some release"
+                ))),
             };
             let output_str = serde_json::to_string(&outcome_value)
                 .expect("outcome_value serialization is infallible");
 
             // Plumb the publish outcome into `format_summary` via a
-            // synthetic field on a cloned `tool_input`. Design §8.1
-            // specifies a status badge ("delivered", "budget exhausted:
-            // 0 remaining", etc.) on the sent-message card; the badge
-            // text comes from this `_outcome` object.
+            // synthetic field on a cloned `tool_input`, so the sent-message
+            // card shows a status badge ("delivered", "budget exhausted:
+            // 0 remaining", etc.); the badge text comes from `_outcome`.
             let mut enriched = tool_input.clone();
             if let serde_json::Value::Object(map) = &mut enriched {
                 map.insert("_outcome".to_string(), outcome_value);
@@ -1572,8 +1500,14 @@ async fn handle_message_subscribe(
                 );
             }
             let status = activation.status_str();
+            // The class caveat is scheme-derived: durability is fixed per scheme,
+            // and the scheme is part of the address.
+            let nondurable = brenn_lib::messaging::ChannelScheme::of(&address)
+                .and_then(|s| s.capabilities())
+                .is_some_and(|caps| !caps.durable);
             let resp = MessageSubscribeOk {
                 address: &address,
+                note: nondurable.then_some(NONDURABLE_SUBSCRIBE_NOTE),
                 ok: true,
                 status,
             };
@@ -1734,7 +1668,13 @@ fn missing_messenger_response() -> MessagingHandled {
 /// server-side security log's `kind` field. Single-sourced so the publish and
 /// edit arms cannot drift and reopen the oracle.
 pub(crate) fn brenn_channel_denied_msg(addr: &str) -> String {
-    format!("channel {addr:?} does not exist or is not in this app's brenn_publish allowlist")
+    // The allowlist named is the one the target's scheme is gated by, so the
+    // teach-string points the model at the config block it must fix.
+    let allowlist = match ChannelScheme::of(addr) {
+        Some(ChannelScheme::Ephemeral) => "ephemeral_publish",
+        _ => "brenn_publish",
+    };
+    format!("channel {addr:?} does not exist or is not in this app's {allowlist} allowlist")
 }
 
 #[cfg(test)]
@@ -2287,6 +2227,7 @@ mod tests {
             address: mqtt_address.clone(),
             description: None,
             resolved_channel: brenn_lib::messaging::config::ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: brenn_lib::messaging::config::Depth::Unbounded,
                 retain_depth: brenn_lib::messaging::config::Depth::Unbounded,
                 standing_retain_depth: brenn_lib::messaging::config::Depth::Unbounded,
@@ -3031,6 +2972,7 @@ mod tests {
             address: format!("webhook:{slug}"),
             description: Some("test endpoint".to_string()),
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -3250,16 +3192,26 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Ephemeral `MessageSend`: the `publish_any`
-    // dispatch routes `ephemeral:` targets to the bus and each outcome maps to
-    // its documented LLM-facing teach-string. The dispatch-layer variant
-    // production is proven in `publish/tests/dispatch_any.rs`; these tests cover
-    // the intercept-layer serialization (`ok` shape + error strings).
+    // Ephemeral `MessageSend`: each outcome maps to its documented LLM-facing
+    // teach-string. Gate-level variant production is proven in
+    // `publish/tests/scheme_parity.rs`; these tests cover the intercept-layer
+    // serialization (`ok` shape + error strings).
     // -----------------------------------------------------------------------
 
-    fn eph_entry(name: &str) -> brenn_lib::messaging::config::EphemeralChannelEntry {
-        brenn_lib::messaging::testutils::ephemeral_channel_entry(name, 8, 16)
+    fn eph_entry(name: &str) -> brenn_lib::messaging::ChannelEntry {
+        let mut entry = brenn_lib::messaging::testutils::ephemeral_channel_entry(name, 8);
+        // A burst small enough that the send-rate gate fires well before the
+        // conversation send budget, so a rate-limit test meters the gate it names.
+        entry.resolved_channel.send_rate = brenn_lib::messaging::config::SendRate {
+            burst: 3,
+            refill_interval_secs: 1,
+            refill: 1,
+        };
+        entry
     }
+
+    /// The burst the intercept fixture's channels admit before rate-limiting.
+    const FIXTURE_BURST: u32 = 3;
 
     /// A `Messenger` with a two-channel ephemeral bus (`protobar` + `locked`).
     /// When `grant` is set, the `testapp` policy holds `EphemeralPublish` scoped
@@ -3273,7 +3225,8 @@ mod tests {
         use std::sync::Arc;
 
         let db = brenn_lib::db::init_db_memory();
-        let dir = brenn_lib::messaging::MessagingDirectory::with_entries(vec![]);
+        let entries = vec![eph_entry("protobar"), eph_entry("locked")];
+        let dir = brenn_lib::messaging::MessagingDirectory::with_entries(entries.clone());
         let mut apps = indexmap::IndexMap::new();
         let mut testapp_cfg =
             crate::test_support::app_config::default_test_app_config("testapp", "testapp");
@@ -3294,14 +3247,13 @@ mod tests {
             Arc::new(apps),
             Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
                 as Arc<dyn brenn_lib::messaging::WakeRouter>,
-            brenn_lib::messaging::MessagingGlobalConfig::default(),
+            brenn_lib::messaging::MessagingGlobalConfig {
+                max_body_bytes,
+                ..Default::default()
+            },
         );
-        let bus = brenn_lib::messaging::EphemeralBus::new(
-            vec![eph_entry("protobar"), eph_entry("locked")],
-            Arc::from("test-source"),
-            max_body_bytes,
-        );
-        messenger.with_ephemeral_bus(bus)
+        let stores = Arc::new(brenn_lib::messaging::store::RingStores::build(&entries));
+        messenger.with_ring_stores(stores)
     }
 
     /// The common fixture: `testapp` holds the grant, generous body limit.
@@ -3310,10 +3262,11 @@ mod tests {
     }
 
     /// `MessageSend` to a granted `ephemeral:` channel returns `ok: true`, a
-    /// valid UUID `message_id`, the canonical `ephemeral:` address, and — unlike
-    /// durable — no `remaining_budget` field (ephemeral has no budget).
+    /// valid UUID `message_id`, the canonical `ephemeral:` address, and the
+    /// conversation's remaining send budget — the same success shape a durable
+    /// send returns, because it is the same publish.
     #[tokio::test]
-    async fn ephemeral_send_success_returns_ok_without_budget() {
+    async fn ephemeral_send_success_returns_the_one_ok_shape() {
         let messenger = ephemeral_intercept_messenger();
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_messenger(messenger).await;
         let req = post_tool_use_req(
@@ -3336,9 +3289,10 @@ mod tests {
                     Some("ephemeral:protobar"),
                     "address should be the canonical ephemeral address: {out}"
                 );
-                assert!(
-                    v.get("remaining_budget").is_none(),
-                    "ephemeral success carries no remaining_budget: {out}"
+                assert_eq!(
+                    v["remaining_budget"],
+                    json!(99),
+                    "the conversation budget is drawn on every scheme: {out}"
                 );
             }
             other => panic!("unexpected result: {other:?}"),
@@ -3346,8 +3300,7 @@ mod tests {
     }
 
     /// `MessageSend` to an `ephemeral:` channel with a durable-only option
-    /// (`reply_to`) is rejected with a teach-string naming the field and the
-    /// `ephemeral:` scheme.
+    /// (`reply_to`) is rejected with a teach-string naming the field.
     #[tokio::test]
     async fn ephemeral_send_reply_to_returns_unsupported_option() {
         let messenger = ephemeral_intercept_messenger();
@@ -3364,8 +3317,8 @@ mod tests {
                 assert_eq!(v["ok"], json!(false), "expected ok: false, got: {out}");
                 let err = v["error"].as_str().unwrap_or("");
                 assert!(
-                    err.contains("reply_to") && err.contains("ephemeral:"),
-                    "error should name reply_to and the ephemeral scheme: {err}"
+                    err.contains("reply_to"),
+                    "error should name the unsupported field: {err}"
                 );
             }
             other => panic!("unexpected result: {other:?}"),
@@ -3481,9 +3434,9 @@ mod tests {
         }
     }
 
-    /// `MessageSend` past the per-sender burst returns `ok: false` with the
-    /// "rate limited" teach-string. The first `EPHEMERAL_SENDER_BURST` sends
-    /// drain the bucket; the next one is rate-limited.
+    /// `MessageSend` past the channel's send-rate burst returns `ok: false` with
+    /// the "rate limited" teach-string. The first burst of sends drains the
+    /// bucket; the next one is rate-limited.
     #[tokio::test]
     async fn ephemeral_send_rate_limited_returns_error() {
         let messenger = ephemeral_intercept_messenger();
@@ -3492,7 +3445,7 @@ mod tests {
             MCP_MESSAGE_SEND_TOOL,
             json!({ "to": "ephemeral:protobar", "body": "hi" }),
         );
-        for _ in 0..brenn_lib::messaging::EPHEMERAL_SENDER_BURST {
+        for _ in 0..FIXTURE_BURST {
             match try_handle_messaging_tool(&bridge, &req).await {
                 Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
                     updated_output: Some(out),
@@ -3920,6 +3873,68 @@ mod tests {
         }
     }
 
+    /// Subscribing to a non-durable channel succeeds and the result carries the
+    /// does-not-survive-restart caveat, so the model knows to re-subscribe after
+    /// a restart when continuity matters.
+    #[tokio::test]
+    async fn message_subscribe_nondurable_channel_carries_the_restart_caveat() {
+        use brenn_lib::access::AppCapability;
+        use brenn_lib::access::acl::ChannelMatcher;
+
+        let mut policy = brenn_lib::access::AppPolicy::default();
+        policy.grants.insert(AppCapability::DynamicSubscribe);
+        policy.grants.insert(AppCapability::EphemeralSubscribe);
+        policy.acls.ephemeral_subscribe = vec![ChannelMatcher::Prefix(String::new())];
+        let bridge =
+            crate::active_bridge::ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy)
+                .await;
+
+        let v = subscribe_result(
+            &bridge,
+            json!({ "address": "ephemeral:test-ring", "push_depth": 0, "retain_depth": 5 }),
+        )
+        .await;
+        assert_eq!(v["ok"], json!(true), "expected ok: {v}");
+        assert_eq!(v["status"], json!("subscribed"));
+        assert!(
+            v["note"]
+                .as_str()
+                .expect("non-durable subscribe carries a note")
+                .contains("does not survive a server restart"),
+            "note states the restart caveat: {v}"
+        );
+    }
+
+    /// A push-enabled subscribe to a non-durable channel is a tool error naming
+    /// the pull-only shape, not a silently-undelivered subscription.
+    #[tokio::test]
+    async fn message_subscribe_nondurable_push_enabled_is_a_tool_error() {
+        use brenn_lib::access::AppCapability;
+        use brenn_lib::access::acl::ChannelMatcher;
+
+        let mut policy = brenn_lib::access::AppPolicy::default();
+        policy.grants.insert(AppCapability::DynamicSubscribe);
+        policy.grants.insert(AppCapability::EphemeralSubscribe);
+        policy.acls.ephemeral_subscribe = vec![ChannelMatcher::Prefix(String::new())];
+        let bridge =
+            crate::active_bridge::ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy)
+                .await;
+
+        let v = subscribe_result(
+            &bridge,
+            json!({ "address": "ephemeral:test-ring", "push_depth": 3, "retain_depth": 5 }),
+        )
+        .await;
+        assert_eq!(v["ok"], json!(false), "expected an error: {v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .expect("error string")
+                .contains("push_depth = 0"),
+            "the error names the supported shape: {v}"
+        );
+    }
+
     /// PreToolUse for MessageSubscribe auto-approves (Allow).
     #[tokio::test]
     async fn message_subscribe_pre_tool_use_auto_approves() {
@@ -3944,6 +3959,10 @@ mod tests {
         assert_eq!(v["ok"], json!(true), "expected ok: {v}");
         assert_eq!(v["status"], json!("subscribed"));
         assert_eq!(v["address"], json!("brenn:test-channel"));
+        assert!(
+            v.get("note").is_none(),
+            "a durable channel carries no class caveat: {v}"
+        );
 
         let entry = bridge
             .messenger()

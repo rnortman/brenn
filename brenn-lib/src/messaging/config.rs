@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    BRENN_ADDRESS_PREFIX, ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntryKind,
-    WakeMin, ephemeral_channel_uuid_from_name, is_unreserved_char, publish,
+    ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntryKind, WakeMin,
+    is_unreserved_char, nondurable_channel_uuid, publish,
 };
 use crate::config::AppConfigRaw;
 
@@ -107,6 +107,25 @@ impl Depth {
             Depth::Bounded(_) | Depth::Unbounded => true,
         }
     }
+
+    /// The tighter of two depths: `Unbounded` yields to any bound, and two
+    /// bounds yield the smaller.
+    pub fn narrowed_by(self, other: Depth) -> Depth {
+        match (self, other) {
+            (Depth::Unbounded, narrower) => narrower,
+            (wider, Depth::Unbounded) => wider,
+            (Depth::Bounded(a), Depth::Bounded(b)) => Depth::Bounded(a.min(b)),
+        }
+    }
+
+    /// Collapses this depth to a concrete count bounded by `max`: `Unbounded`
+    /// becomes `max`, a bounded depth is capped at `max`.
+    pub fn clamped_to(self, max: u64) -> u64 {
+        match self {
+            Depth::Unbounded => max,
+            Depth::Bounded(n) => n.min(max),
+        }
+    }
 }
 
 /// Noise level for push_depth-overflow events (per-subscriber).
@@ -161,90 +180,115 @@ pub enum Sink {
     Archive,
 }
 
+/// Per-`(sender, channel)` send-rate gate: the token bucket every publish draws
+/// one token from, on every scheme.
+///
+/// The grain is one bucket per publishing principal per channel. A sender's
+/// aggregate budget is therefore (this rate × the channels its ACLs let it
+/// publish to), which is bounded because the channel set is operator-declared
+/// config: no publisher can mint a channel to widen its budget.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SendRate {
+    /// Publishes admitted before refill matters.
+    pub burst: u32,
+    /// Seconds between refills.
+    pub refill_interval_secs: u64,
+    /// Tokens returned per interval — the sustained rate.
+    pub refill: u32,
+}
+
+impl Default for SendRate {
+    fn default() -> Self {
+        // Far above any legitimate sustained rate while bounding a runaway
+        // publisher — including an untrusted out-of-tree component.
+        Self {
+            burst: 240,
+            refill_interval_secs: 1,
+            refill: 30,
+        }
+    }
+}
+
+impl SendRate {
+    /// Panics if any field would produce a nonsensical or deny-all bucket.
+    /// `context` names the channel address or global-default key in the panic
+    /// message. Must be called at boot — `bucket()` is built lazily, so an
+    /// invalid rate would panic mid-publish instead.
+    pub fn validate(&self, context: &str) {
+        assert!(
+            self.refill_interval_secs >= 1,
+            "config: {context} send_rate.refill_interval_secs must be >= 1 \
+             (a zero interval has no meaning and divides by zero on refill)",
+        );
+        assert!(
+            self.burst >= 1,
+            "config: {context} send_rate.burst must be >= 1 \
+             (a zero burst admits no publish — a silent deny-all)",
+        );
+        assert!(
+            self.refill >= 1,
+            "config: {context} send_rate.refill must be >= 1 \
+             (a zero refill never replenishes — a burst-then-deny-all)",
+        );
+    }
+
+    /// A fresh bucket enforcing this rate.
+    pub fn bucket(&self) -> crate::token_bucket::TokenBucket {
+        crate::token_bucket::TokenBucket::new(
+            self.burst,
+            std::time::Duration::from_secs(self.refill_interval_secs),
+            self.refill,
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Raw config types
 // ---------------------------------------------------------------------------
 
-/// Top-level `[[channel]]` block.
+/// Top-level `[[channel]]` block — one table for every pub/sub scheme.
+///
+/// The `address`'s scheme selects the channel's capabilities: `brenn:` (or a
+/// bare address, which canonicalizes to `brenn:`) is durable and transportable,
+/// `ephemeral:` is transportable only, `local:` is neither. `mqtt:` and
+/// `webhook:` channels are derived from their own endpoint/client blocks and are
+/// rejected here.
+///
+/// Class-uniform knobs — `push_depth`, `retain_depth`, `noise`, `wake_min` —
+/// are valid on every scheme. `uuid`, `standing_retain_depth`, and `sink` are
+/// durable-only: a non-durable channel has no DB row to name, no reaper
+/// frontier to hold, and nothing to archive.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelConfigRaw {
     /// UUID v4 in canonical hyphenated form. Globally unique across `[[channel]]`.
-    pub uuid: String,
-    /// Channel address (string after `brenn:`). Must match
-    /// `^[A-Za-z0-9._~-]+$` and not contain `:` (the prefix is added by
-    /// the runtime).
+    /// Required on a durable channel (it names the DB row); rejected on a
+    /// non-durable one, whose identity is a deterministic UUIDv5 of its address.
+    pub uuid: Option<String>,
+    /// Channel address, optionally scheme-qualified (`ephemeral:foo`,
+    /// `local:foo`, `brenn:foo`, or bare `foo` ⇒ `brenn:foo`). The part after
+    /// the scheme must match `^[A-Za-z0-9._~-]+$`.
     pub address: String,
     pub description: Option<String>,
     /// Per-channel push depth. `None` ⇒ inherit from global default.
     pub push_depth: Option<Depth>,
-    /// Per-channel retain depth. `None` ⇒ inherit from global default.
+    /// Per-channel retain depth. `None` ⇒ inherit from global default. Must
+    /// resolve bounded on a non-durable channel — its retention is process
+    /// memory.
     pub retain_depth: Option<Depth>,
     /// Subscriber-independent retained buffer depth. `None` ⇒ inherit from
-    /// global default.
+    /// global default. Durable-only.
     pub standing_retain_depth: Option<Depth>,
     /// Noise level for push-overflow on this channel. `None` ⇒ inherit.
     pub noise: Option<NoiseLevel>,
-    /// Eviction sink. `None` ⇒ inherit from global default.
+    /// Eviction sink. `None` ⇒ inherit from global default. Durable-only.
     pub sink: Option<Sink>,
     /// Per-channel wake-min policy. `None` ⇒ inherit from global default.
     pub wake_min: Option<WakeMin>,
-}
-
-/// Top-level `[[ephemeral_channel]]` block.
-///
-/// Declares a non-persistent (`ephemeral:`) channel. The field set carries the
-/// durable `[[channel]]` block's delivery-resolution rungs — `push_depth`,
-/// `retain_depth`, `noise` — so a surface binding resolves `binding → channel →
-/// global` for both wire classes alike, and diverges only where persistence
-/// genuinely differs: no operator `uuid` (deterministic UUIDv5 from the name, no
-/// DB row), no per-subscriber blocks, and an added `capacity` for the
-/// per-subscriber broadcast ring (meaningful only where there is no disk).
-/// Every rung is optional; see the resolved defaults below.
-#[derive(Debug, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct EphemeralChannelConfigRaw {
-    /// Bare channel name (the string after `ephemeral:`). Must be non-empty,
-    /// contain no `:`, and consist of RFC 3986 unreserved chars — same rules as
-    /// a durable `[[channel]]` address.
-    pub name: String,
-    /// Per-channel push depth. `None` ⇒ inherit from global default. The
-    /// channel rung of a surface binding's `binding → channel → global` ladder,
-    /// class-uniform with the durable `[[channel]]` block.
-    pub push_depth: Option<Depth>,
-    /// Retained-ring depth. `None` ⇒ `Bounded(0)` (no retention). `Unbounded`
-    /// is rejected at resolution (ephemeral retention is process memory).
-    pub retain_depth: Option<Depth>,
-    /// Per-channel noise level for push-overflow. `None` ⇒ inherit from global
-    /// default. The channel rung for surface-binding noise resolution, resolved
-    /// but not yet consumed (the surface noise ladder lands in a later phase).
-    pub noise: Option<NoiseLevel>,
-    /// Per-subscriber broadcast-ring capacity. `None` ⇒
-    /// [`DEFAULT_EPHEMERAL_CAPACITY`]. `0` is rejected at resolution.
-    pub capacity: Option<u32>,
-}
-
-/// Default per-subscriber broadcast-ring capacity for an `[[ephemeral_channel]]`
-/// whose `capacity` is omitted. Placeholder; later consumers may re-tune it —
-/// it is a constant, so re-tuning is not a config break.
-pub const DEFAULT_EPHEMERAL_CAPACITY: u32 = 256;
-
-/// Fully resolved `[[ephemeral_channel]]`, carried for later consumers.
-///
-/// `uuid` is deterministic (no DB row); `retain_depth` and `capacity` are the
-/// concrete resolved values (defaults applied, bounds enforced at resolution).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EphemeralChannelEntry {
-    pub uuid: Uuid,
-    pub name: String,
-    /// Channel-rung push depth, resolved channel → global. The middle rung of a
-    /// surface binding's `binding → channel → global` ladder.
-    pub push_depth: Depth,
-    pub retain_depth: u64,
-    /// Channel-rung noise level, resolved channel → global. Held for the
-    /// surface-binding noise ladder that lands in a later phase; no consumer yet.
-    pub noise: NoiseLevel,
-    pub capacity: u32,
+    /// Per-`(sender, channel)` send-rate gate. `None` ⇒ inherit from global
+    /// default. Class-uniform: every scheme is rate-gated.
+    pub send_rate: Option<SendRate>,
 }
 
 /// `[messaging]` section.
@@ -278,6 +322,9 @@ pub struct MessagingGlobalConfig {
     /// `Normal`-urgency message wakes a `Normal` conversation subscriber, matching
     /// old `Immediate` behavior; a `Low`-urgency message parks, matching old `None`).
     pub default_wake_min: WakeMin,
+    /// Global default per-`(sender, channel)` send rate, overridable per
+    /// `[[channel]]`.
+    pub default_send_rate: SendRate,
 }
 
 impl Default for MessagingGlobalConfig {
@@ -294,6 +341,7 @@ impl Default for MessagingGlobalConfig {
             archive_path: None,
             // Migration parity: Normal means old-Immediate still wakes, old-None parks.
             default_wake_min: WakeMin::Normal,
+            default_send_rate: SendRate::default(),
         }
     }
 }
@@ -434,19 +482,49 @@ pub struct WasmConsumerConfigRaw {
     /// convention (authoring-shape asymmetry vs. the LLM `[app.acl.*]` sub-table is
     /// deliberate — both resolve into the same `AppPolicy`). A non-empty
     /// `subscribe_acl` derives the `MessagingSubscribe` transport grant and IS
-    /// enforced at delivery time over `Wasm` subscribers (dynamic-sub-persistence
-    /// design §2.2); an empty list means the consumer holds no subscribe
+    /// enforced at delivery time over `Wasm` subscribers; an empty list means
+    /// the consumer holds no subscribe
     /// authorization (deny-by-default at delivery). This list narrows `brenn:`
     /// subscriptions only; `webhook:` and `mqtt:` subscriptions are narrowed by
     /// `webhook_acl` / `mqtt_subscribe_acl` respectively.
     #[serde(default)]
     pub subscribe_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
+    /// Layer-2 ephemeral subscribe ACL: channel matchers narrowing which
+    /// `ephemeral:` channels this component may hold a (static) subscription to.
+    /// Same flat shape as `subscribe_acl`, scoped to the `ephemeral:` scheme
+    /// (matchers are scheme-stripped names). Non-empty derives the
+    /// `EphemeralSubscribe` transport grant; empty means deny-by-default. A
+    /// ring-backed input's authorization is decided here at boot — ring delivery
+    /// reads the subscriber cursor directly and never re-runs a delivery ACL gate.
+    #[serde(default)]
+    pub ephemeral_subscribe_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
+    /// `local:` (confined) channels this component may hold a (static) input on.
+    /// Same flat shape as `ephemeral_subscribe_acl`, scoped to the `local:`
+    /// scheme (matchers are scheme-stripped names). Non-empty derives the
+    /// `LocalSubscribe` transport grant; empty means deny-by-default. Like the
+    /// ephemeral case, a confined input's authorization is decided here at boot —
+    /// ring delivery reads the subscriber cursor directly and never re-runs a
+    /// delivery ACL gate.
+    #[serde(default)]
+    pub local_subscribe_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// Layer-2 publish ACL: channel matchers narrowing which `brenn:` channels this
-    /// component's output ports may publish to (design §2.5.1). Same flat-`Vec`
-    /// shape as `subscribe_acl`. Enforced at `do_publish` via the `OutputAclFn` →
-    /// `allows_brenn_publish` seam (Phase 3, commit `d7f099b7`).
+    /// component's output ports may publish to. Same flat-`Vec` shape as
+    /// `subscribe_acl`; deny-by-default when empty.
     #[serde(default)]
     pub publish_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
+    /// Layer-2 ephemeral publish ACL: channel matchers narrowing which
+    /// `ephemeral:` channels this component's output ports may publish to. Same
+    /// shape as `publish_acl`, scoped to the `ephemeral:` scheme (matchers are
+    /// scheme-stripped names). Non-empty derives the `EphemeralPublish` capability;
+    /// empty means deny-by-default.
+    #[serde(default)]
+    pub ephemeral_publish_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
+    /// Layer-2 local publish ACL: channel matchers narrowing which `local:`
+    /// (confined) channels this component's output ports may publish to. Same
+    /// shape as `ephemeral_publish_acl`, scoped to the `local:` scheme. Non-empty
+    /// derives the `LocalPublish` capability; empty means deny-by-default.
+    #[serde(default)]
+    pub local_publish_acl: Vec<crate::access::raw::ChannelMatcherRaw>,
     /// Layer-2 MQTT publish ACL: per-client allowlist narrowing which
     /// `[[mqtt_client]]` slugs this component's `mqtt-publish` host call may target
     /// (mqtt-egress-unify design §2.5). Reuses the **same** `client`-keyed
@@ -550,7 +628,11 @@ impl WasmConsumerConfigRaw {
                 .collect(),
             outputs: vec![],
             subscribe_acl: vec![],
+            ephemeral_subscribe_acl: vec![],
+            local_subscribe_acl: vec![],
             publish_acl: vec![],
+            ephemeral_publish_acl: vec![],
+            local_publish_acl: vec![],
             mqtt_publish_acl: vec![],
             mqtt_subscribe_acl: vec![],
             webhook_acl: vec![],
@@ -1032,6 +1114,22 @@ pub struct ResolvedChannel {
     pub sink: Sink,
     /// Channel-level wake-min default (used as subscriber-inheritance template).
     pub wake_min: WakeMin,
+    /// Per-`(sender, this channel)` send-rate gate applied to every publish.
+    pub send_rate: SendRate,
+}
+
+impl Default for ResolvedChannel {
+    fn default() -> Self {
+        Self {
+            push_depth: Depth::Unbounded,
+            retain_depth: Depth::Unbounded,
+            standing_retain_depth: Depth::Unbounded,
+            noise: NoiseLevel::Silent,
+            sink: Sink::Drop,
+            wake_min: WakeMin::Normal,
+            send_rate: SendRate::default(),
+        }
+    }
 }
 
 /// Resolved millitoken budget knobs for one WASM egress sink (output port or MQTT
@@ -1293,9 +1391,9 @@ pub struct SurfaceBinding {
     /// Per binding, not per subscription: two ports of one instance on one
     /// channel share a subscription (whose ring folds by max) but each windows
     /// at its own depth. Resolution is class-uniform binding → channel → global:
-    /// `brenn:` inherits from its `[[channel]]` block, `ephemeral:` from its
-    /// `[[ephemeral_channel]]` block; `local:` channels have no channel block and
-    /// collapse to binding → global.
+    /// `brenn:` and `ephemeral:` inherit from their `[[channel]]` block; `local:`
+    /// channels have no surface-visible channel block and collapse to
+    /// binding → global.
     pub retain_depth: u64,
     /// Resolved push-overflow noise level for this binding, class-uniform
     /// binding → channel → global. Held for the surface-side noise ladder that
@@ -1340,81 +1438,140 @@ pub struct SurfaceOutput {
 /// channel entries (without subscribers — those are filled in after apps
 /// resolve).
 ///
+/// One table, every pub/sub scheme: the address's scheme picks the channel's
+/// capabilities and with them which knobs are meaningful. Durable and
+/// non-durable entries come back in one vec, in declaration order; the caller
+/// partitions them by [`ChannelEntry::capabilities`].
+///
 /// # Panics
 ///
-/// - duplicate UUIDs
-/// - duplicate addresses
-/// - malformed UUID
-/// - address contains `:`
+/// - duplicate UUIDs or duplicate canonical addresses
+/// - malformed or missing UUID on a durable channel; `uuid` present on a
+///   non-durable one
+/// - an `mqtt:`/`webhook:`/`pwa_push:` address (those channels are derived from
+///   their own config blocks, not declared here)
 /// - address fails RFC 3986 unreserved charset (`is_unreserved_char`)
+/// - `standing_retain_depth` or `sink` on a non-durable channel
+/// - `retain_depth` resolving to `Unbounded` on a non-durable channel
 pub fn build_channel_entries(
     raw_channels: &[ChannelConfigRaw],
     defaults: &MessagingGlobalConfig,
 ) -> Vec<ChannelEntry> {
+    // The global default is inherited by every channel that omits a per-channel
+    // override, so it is validated once here, unconditionally.
+    defaults
+        .default_send_rate
+        .validate("[messaging].default_send_rate");
+
     let mut seen_uuids = HashSet::new();
     let mut seen_addresses = HashSet::new();
     let mut entries = Vec::with_capacity(raw_channels.len());
 
     for ch in raw_channels {
-        let uuid = Uuid::parse_str(&ch.uuid).unwrap_or_else(|e| {
-            panic!(
-                "config: [[channel]] uuid {:?} is not a valid UUID: {e}",
-                ch.uuid,
-            )
-        });
+        let (scheme, name) = split_channel_address(&ch.address);
         assert!(
-            seen_uuids.insert(uuid),
-            "config: duplicate [[channel]] uuid {:?}",
-            ch.uuid,
-        );
-        assert!(
-            !ch.address.is_empty(),
-            "config: [[channel]] address must be non-empty (uuid {:?})",
-            ch.uuid,
-        );
-        assert!(
-            !ch.address.contains(':'),
-            "config: [[channel]] address {:?} must not contain ':' \
-             (the brenn: prefix is added by the runtime)",
+            !name.is_empty(),
+            "config: [[channel]] address {:?} must name a channel after its scheme",
             ch.address,
         );
         assert!(
-            ch.address.chars().all(is_unreserved_char),
+            name.chars().all(is_unreserved_char),
             "config: [[channel]] address {:?} must consist of RFC 3986 \
-             unreserved characters only (A-Za-z0-9._~-)",
+             unreserved characters only (A-Za-z0-9._~-) after its scheme",
             ch.address,
         );
         assert!(
-            !crate::tools::is_reserved_channel(&ch.address),
+            !crate::tools::is_reserved_channel(name),
             "config: [[channel]] address {:?} is in a reserved tool namespace \
              (tools/tool-results are owned by the tool substrate)",
             ch.address,
         );
-        let canonical = format!("{}{}", BRENN_ADDRESS_PREFIX, ch.address);
+
+        let capabilities = scheme
+            .capabilities()
+            .expect("split_channel_address admits only pub/sub schemes");
+        let canonical = format!("{}{name}", scheme.prefix());
         assert!(
             seen_addresses.insert(canonical.clone()),
-            "config: duplicate [[channel]] address {:?}",
-            ch.address,
+            "config: duplicate [[channel]] address {canonical:?}",
         );
 
-        // Resolve channel-level depth/noise/sink/wake_min by inheriting from global defaults.
+        let uuid = if capabilities.durable {
+            let raw_uuid = ch.uuid.as_deref().unwrap_or_else(|| {
+                panic!(
+                    "config: [[channel]] {canonical:?} requires a uuid \
+                     (it names the channel's DB row)"
+                )
+            });
+            Uuid::parse_str(raw_uuid).unwrap_or_else(|e| {
+                panic!("config: [[channel]] uuid {raw_uuid:?} is not a valid UUID: {e}")
+            })
+        } else {
+            assert!(
+                ch.uuid.is_none(),
+                "config: [[channel]] {canonical:?} must not set uuid — a non-durable \
+                 channel has no DB row and derives its identity from its address",
+            );
+            nondurable_channel_uuid(scheme, name)
+        };
+        assert!(
+            seen_uuids.insert(uuid),
+            "config: duplicate [[channel]] uuid {uuid} (address {canonical:?})",
+        );
+
+        // Class-uniform: every scheme inherits channel → global for
+        // push_depth, retain_depth, noise, and wake_min.
+        let push_depth = ch.push_depth.unwrap_or(defaults.default_push_depth);
+        let retain_depth = ch.retain_depth.unwrap_or(defaults.default_retain_depth);
+        let noise = ch.noise.unwrap_or(defaults.default_noise);
+        let wake_min = ch.wake_min.unwrap_or(defaults.default_wake_min);
+        let send_rate = ch.send_rate.unwrap_or(defaults.default_send_rate);
+        send_rate.validate(&format!("[[channel]] {canonical:?}"));
+
+        let (standing_retain_depth, sink) = if capabilities.durable {
+            (
+                ch.standing_retain_depth
+                    .unwrap_or(defaults.default_standing_retain_depth),
+                ch.sink.unwrap_or(defaults.default_sink),
+            )
+        } else {
+            assert!(
+                ch.standing_retain_depth.is_none(),
+                "config: [[channel]] {canonical:?} must not set standing_retain_depth — \
+                 it is the durable reaper's frontier; a non-durable channel's retention \
+                 is retain_depth alone",
+            );
+            assert!(
+                ch.sink.is_none(),
+                "config: [[channel]] {canonical:?} must not set sink — a non-durable \
+                 channel evicts from memory and has nothing to archive",
+            );
+            assert!(
+                retain_depth != Depth::Unbounded,
+                "config: [[channel]] {canonical:?} retain_depth must be bounded — \
+                 non-durable retention is process memory; bound it here or lower \
+                 [messaging].default_retain_depth",
+            );
+            // The standing buffer is the retained window itself: there is no
+            // separate subscriber-independent store off-disk.
+            (retain_depth, Sink::Drop)
+        };
+
         let resolved = ResolvedChannel {
-            push_depth: ch.push_depth.unwrap_or(defaults.default_push_depth),
-            retain_depth: ch.retain_depth.unwrap_or(defaults.default_retain_depth),
-            standing_retain_depth: ch
-                .standing_retain_depth
-                .unwrap_or(defaults.default_standing_retain_depth),
-            noise: ch.noise.unwrap_or(defaults.default_noise),
-            sink: ch.sink.unwrap_or(defaults.default_sink),
-            wake_min: ch.wake_min.unwrap_or(defaults.default_wake_min),
+            push_depth,
+            retain_depth,
+            standing_retain_depth,
+            noise,
+            sink,
+            wake_min,
+            send_rate,
         };
 
         // Fail fast if archive sink configured but no archive_path set.
         if resolved.sink == Sink::Archive && defaults.archive_path.is_none() {
             panic!(
-                "config: [[channel]] {:?} has sink = \"archive\" but \
+                "config: [[channel]] {canonical:?} has sink = \"archive\" but \
                  [messaging].archive_path is not set",
-                ch.address,
             );
         }
 
@@ -1424,7 +1581,7 @@ pub fn build_channel_entries(
             description: ch.description.clone(),
             resolved_channel: resolved,
             subscribers: vec![],
-            transport_type: ChannelScheme::Brenn,
+            transport_type: scheme,
             mount: None,
         });
     }
@@ -1432,84 +1589,34 @@ pub fn build_channel_entries(
     entries
 }
 
-/// Validate top-level `[[ephemeral_channel]]` blocks
-/// and build the resolved directory of ephemeral channel entries.
-///
-/// Ephemeral channels have no DB row and no `[[channel]]`-style cross-check
-/// against durable addresses: `ephemeral:foo` and `brenn:foo` are distinct full
-/// addresses by scheme.
+/// Split a `[[channel]]` address into its scheme and bare name, defaulting a
+/// bare address to `brenn:`.
 ///
 /// # Panics
 ///
-/// - empty `name`, `name` contains `:`, or `name` fails the RFC 3986 unreserved
-///   charset (`A-Za-z0-9._~-`) — same rules as a durable `[[channel]]` address
-/// - duplicate `name`
-/// - `retain_depth = "unbounded"` — ephemeral retention is process memory and
-///   must be bounded (deliberately stricter than durable `retain_depth`)
-/// - `capacity = 0` — `tokio::sync::broadcast` rejects capacity 0; fail at
-///   config time, not at first subscribe
-pub fn build_ephemeral_channel_entries(
-    raw: &[EphemeralChannelConfigRaw],
-    globals: &MessagingGlobalConfig,
-) -> Vec<EphemeralChannelEntry> {
-    let mut seen_names = HashSet::new();
-    let mut entries = Vec::with_capacity(raw.len());
-
-    for ch in raw {
-        assert!(
-            !ch.name.is_empty(),
-            "config: [[ephemeral_channel]] name must be non-empty",
-        );
-        assert!(
-            !ch.name.contains(':'),
-            "config: [[ephemeral_channel]] name {:?} must not contain ':' \
-             (the ephemeral: prefix is added by the runtime)",
-            ch.name,
-        );
-        assert!(
-            ch.name.chars().all(is_unreserved_char),
-            "config: [[ephemeral_channel]] name {:?} must consist of RFC 3986 \
-             unreserved characters only (A-Za-z0-9._~-)",
-            ch.name,
-        );
-        assert!(
-            seen_names.insert(ch.name.clone()),
-            "config: duplicate [[ephemeral_channel]] name {:?}",
-            ch.name,
-        );
-
-        // Retention/capacity sanity caps live with the allocation owner:
-        // `EphemeralBus::new` panics above `EPHEMERAL_MAX_RETAIN_DEPTH` /
-        // `EPHEMERAL_MAX_CAPACITY`. Config only enforces the shape invariants
-        // (bounded retention, non-zero capacity) below.
-        let retain_depth = match ch.retain_depth.unwrap_or(Depth::Bounded(0)) {
-            Depth::Bounded(n) => n,
-            Depth::Unbounded => panic!(
-                "config: [[ephemeral_channel]] {:?} retain_depth must be bounded \
-                 — ephemeral retention is process memory; bound it",
-                ch.name,
-            ),
-        };
-
-        let capacity = ch.capacity.unwrap_or(DEFAULT_EPHEMERAL_CAPACITY);
-        assert!(
-            capacity != 0,
-            "config: [[ephemeral_channel]] {:?} capacity must be non-zero \
-             (a zero-capacity broadcast ring is rejected by tokio)",
-            ch.name,
-        );
-
-        entries.push(EphemeralChannelEntry {
-            uuid: ephemeral_channel_uuid_from_name(&ch.name),
-            name: ch.name.clone(),
-            push_depth: ch.push_depth.unwrap_or(globals.default_push_depth),
-            retain_depth,
-            noise: ch.noise.unwrap_or(globals.default_noise),
-            capacity,
-        });
+/// On a scheme that is not declarable in `[[channel]]`: `mqtt:` and `webhook:`
+/// channels are derived from their own config blocks, and `pwa_push:` is an
+/// egress adapter, not a pub/sub channel.
+fn split_channel_address(address: &str) -> (ChannelScheme, &str) {
+    match ChannelScheme::split(address) {
+        Some((
+            scheme @ (ChannelScheme::Brenn | ChannelScheme::Ephemeral | ChannelScheme::Local),
+            name,
+        )) => (scheme, name),
+        Some((scheme, _)) => panic!(
+            "config: [[channel]] address {address:?} uses scheme {:?}, which is not \
+             declarable here — mqtt:/webhook: channels are derived from their own \
+             config blocks and pwa_push: is an egress adapter, not a pub/sub channel",
+            scheme.prefix(),
+        ),
+        None => {
+            assert!(
+                !address.contains(':'),
+                "config: [[channel]] address {address:?} has an unrecognized scheme",
+            );
+            (ChannelScheme::Brenn, address)
+        }
     }
-
-    entries
 }
 
 /// Inheritance rung for subscription-param resolution.
@@ -1589,6 +1696,10 @@ pub enum SubscribeError {
     /// overflow path, so a backend subscription that resolves to it — directly or
     /// by inheriting a `fatal` channel/global default — is rejected. A `fatal`
     /// channel default is legal as long as no backend subscription inherits it.
+    ///
+    /// This variant covers app/mqtt/webhook subscriptions. WASM consumer
+    /// subscriptions reject `fatal` separately at boot; the two sites enforce
+    /// the same rule and must stay in step.
     FatalNoise { channel_address: String },
 }
 
@@ -1665,7 +1776,7 @@ pub fn resolve_subscription_params(
 
     // Noise: check raw presence BEFORE collapsing into inheritance, so an
     // explicitly-set noise on a pull-only sub is an error but an inherited
-    // noise on a pull-only sub is not (design §2.2).
+    // noise on a pull-only sub is not.
     if raw.noise.is_some() && resolved_push_depth == Depth::Bounded(0) {
         return Err(SubscribeError::NoiseOnPullOnly {
             channel_address: raw.channel_address.clone(),
@@ -1674,10 +1785,9 @@ pub fn resolve_subscription_params(
     let resolved_noise = raw.noise.unwrap_or(rung.noise);
 
     // `fatal` is the surface-only kill rung; a backend subscription can never
-    // enact it (the backend overflow path has no kill). Reject it here — the one
-    // place every backend subscription's noise resolves — so a `fatal` that
-    // reaches the overflow path is impossible by construction. Directly-set or
-    // inherited both land on `resolved_noise`, so both are caught.
+    // enact it (the backend overflow path has no kill). Reject it here for
+    // app/mqtt/webhook subscriptions; WASM consumers reject `fatal` separately
+    // at boot — the two sites must stay in step.
     if resolved_noise == NoiseLevel::Fatal {
         return Err(SubscribeError::FatalNoise {
             channel_address: raw.channel_address.clone(),
@@ -2111,7 +2221,8 @@ mod tests {
 
     fn raw_channel(uuid: &str, address: &str) -> ChannelConfigRaw {
         ChannelConfigRaw {
-            uuid: uuid.to_string(),
+            send_rate: None,
+            uuid: Some(uuid.to_string()),
             address: address.to_string(),
             description: None,
             push_depth: None,
@@ -2177,41 +2288,59 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // [[ephemeral_channel]]
+    // Non-durable `[[channel]]` blocks
     // -----------------------------------------------------------------------
 
-    fn raw_ephemeral(name: &str) -> EphemeralChannelConfigRaw {
-        EphemeralChannelConfigRaw {
-            name: name.to_string(),
+    fn raw_nondurable(address: &str) -> ChannelConfigRaw {
+        ChannelConfigRaw {
+            send_rate: None,
+            uuid: None,
+            address: address.to_string(),
+            description: None,
             push_depth: None,
-            retain_depth: None,
+            retain_depth: Some(Depth::Bounded(0)),
+            standing_retain_depth: None,
             noise: None,
-            capacity: None,
+            sink: None,
+            wake_min: None,
         }
     }
 
     #[test]
-    fn ephemeral_channel_parses_full_and_minimal() {
-        // Full form: all fields present.
-        let full: EphemeralChannelConfigRaw =
-            toml::from_str("name = \"protobar-demo\"\nretain_depth = 1\ncapacity = 64\n")
-                .expect("full [[ephemeral_channel]] must parse");
-        assert_eq!(full.name, "protobar-demo");
+    fn channel_parses_bare_and_scheme_qualified() {
+        let full: ChannelConfigRaw = toml::from_str(
+            "address = \"ephemeral:protobar-demo\"\nretain_depth = 1\nnoise = \"metered\"\n",
+        )
+        .expect("scheme-qualified [[channel]] must parse");
+        assert_eq!(full.address, "ephemeral:protobar-demo");
         assert_eq!(full.retain_depth, Some(Depth::Bounded(1)));
-        assert_eq!(full.capacity, Some(64));
+        assert_eq!(full.uuid, None);
 
-        // Minimal form: only name; retain_depth/capacity default via Option.
-        let minimal: EphemeralChannelConfigRaw =
-            toml::from_str("name = \"bare\"\n").expect("minimal [[ephemeral_channel]] must parse");
-        assert_eq!(minimal.name, "bare");
-        assert_eq!(minimal.retain_depth, None);
-        assert_eq!(minimal.capacity, None);
+        let bare: ChannelConfigRaw =
+            toml::from_str("uuid = \"1f6c6e3a-1d6e-4f7c-9b6a-12cb7e4a8d32\"\naddress = \"bare\"\n")
+                .expect("bare [[channel]] must parse");
+        assert_eq!(bare.address, "bare");
+        assert_eq!(bare.retain_depth, None);
+    }
+
+    /// The retired `[[ephemeral_channel]]` table is a boot panic, not a
+    /// silently-ignored block: the config struct no longer carries the field and
+    /// `deny_unknown_fields` rejects it.
+    #[test]
+    fn retired_ephemeral_channel_table_is_rejected() {
+        let result: Result<crate::config::BrennConfig, _> =
+            toml::from_str("[[ephemeral_channel]]\nname = \"dev-stub\"\nretain_depth = 1\n");
+        let err = result.expect_err("[[ephemeral_channel]] must not parse");
+        assert!(
+            err.to_string().contains("ephemeral_channel"),
+            "the rejection must name the retired table, got: {err}",
+        );
     }
 
     #[test]
-    fn ephemeral_channel_rejects_unknown_field() {
-        let result: Result<EphemeralChannelConfigRaw, _> =
-            toml::from_str("name = \"x\"\nbogus = 1\n");
+    fn channel_rejects_unknown_field() {
+        let result: Result<ChannelConfigRaw, _> =
+            toml::from_str("address = \"ephemeral:x\"\nbogus = 1\n");
         assert!(
             result.is_err(),
             "deny_unknown_fields must reject an unknown key"
@@ -2219,96 +2348,227 @@ mod tests {
     }
 
     #[test]
-    fn build_ephemeral_channel_entries_applies_defaults() {
+    fn nondurable_channel_applies_class_uniform_defaults() {
         let defaults = global_defaults();
-        let entries = build_ephemeral_channel_entries(&[raw_ephemeral("bare")], &defaults);
-        assert_eq!(entries.len(), 1);
-        let e = &entries[0];
-        assert_eq!(e.name, "bare");
-        // retain_depth defaults to Bounded(0) = no retention.
-        assert_eq!(e.retain_depth, 0);
-        // push_depth/noise default to the global rung.
-        assert_eq!(e.push_depth, defaults.default_push_depth);
-        assert_eq!(e.noise, defaults.default_noise);
-        // capacity defaults to the named constant.
-        assert_eq!(e.capacity, DEFAULT_EPHEMERAL_CAPACITY);
-        // uuid is the deterministic name-derived value.
-        assert_eq!(e.uuid, ephemeral_channel_uuid_from_name("bare"));
+        let entries = build_channel_entries(
+            &[
+                raw_nondurable("ephemeral:bare"),
+                raw_nondurable("local:bare"),
+            ],
+            &defaults,
+        );
+        assert_eq!(entries.len(), 2);
+        let eph = &entries[0];
+        assert_eq!(eph.address, "ephemeral:bare");
+        assert_eq!(eph.transport_type, ChannelScheme::Ephemeral);
+        assert!(!eph.capabilities().durable);
+        assert!(eph.capabilities().transportable);
+        // push_depth/noise/wake_min inherit the global rung on every scheme.
+        assert_eq!(eph.resolved_channel.push_depth, defaults.default_push_depth);
+        assert_eq!(eph.resolved_channel.noise, defaults.default_noise);
+        assert_eq!(eph.resolved_channel.wake_min, defaults.default_wake_min);
+        // The retained window is the standing buffer: there is no separate
+        // subscriber-independent store off-disk.
+        assert_eq!(
+            eph.resolved_channel.standing_retain_depth,
+            eph.resolved_channel.retain_depth
+        );
+        assert_eq!(eph.resolved_channel.sink, Sink::Drop);
+        assert_eq!(
+            eph.uuid,
+            super::super::ephemeral_channel_uuid_from_name("bare")
+        );
+
+        // `local:` is the same name in a distinct address space with a distinct
+        // identity, and carries neither capability.
+        let local = &entries[1];
+        assert_eq!(local.address, "local:bare");
+        assert!(!local.capabilities().durable);
+        assert!(!local.capabilities().transportable);
+        assert_ne!(local.uuid, eph.uuid);
     }
 
     #[test]
-    fn build_ephemeral_channel_entries_resolves_explicit_values() {
-        let entries = build_ephemeral_channel_entries(
-            &[EphemeralChannelConfigRaw {
-                name: "keep-two".to_string(),
+    fn nondurable_channel_resolves_explicit_values() {
+        let entries = build_channel_entries(
+            &[ChannelConfigRaw {
+                send_rate: None,
+                uuid: None,
+                address: "ephemeral:keep-two".to_string(),
+                description: None,
                 push_depth: Some(Depth::Bounded(4)),
                 retain_depth: Some(Depth::Bounded(2)),
+                standing_retain_depth: None,
                 noise: Some(NoiseLevel::Metered),
-                capacity: Some(16),
+                sink: None,
+                wake_min: None,
             }],
             &global_defaults(),
         );
-        assert_eq!(entries[0].push_depth, Depth::Bounded(4));
-        assert_eq!(entries[0].retain_depth, 2);
-        assert_eq!(entries[0].noise, NoiseLevel::Metered);
-        assert_eq!(entries[0].capacity, 16);
+        assert_eq!(entries[0].resolved_channel.push_depth, Depth::Bounded(4));
+        assert_eq!(entries[0].resolved_channel.retain_depth, Depth::Bounded(2));
+        assert_eq!(entries[0].resolved_channel.noise, NoiseLevel::Metered);
     }
 
     #[test]
-    #[should_panic(expected = "duplicate [[ephemeral_channel]] name")]
-    fn ephemeral_duplicate_name_panics() {
-        build_ephemeral_channel_entries(
-            &[raw_ephemeral("dup"), raw_ephemeral("dup")],
+    #[should_panic(expected = "duplicate [[channel]] address")]
+    fn nondurable_duplicate_address_panics() {
+        build_channel_entries(
+            &[
+                raw_nondurable("ephemeral:dup"),
+                raw_nondurable("ephemeral:dup"),
+            ],
             &global_defaults(),
         );
     }
 
+    /// The same bare name under two schemes is two distinct channels, not a
+    /// duplicate — the scheme is part of the address.
     #[test]
-    #[should_panic(expected = "name must be non-empty")]
-    fn ephemeral_empty_name_panics() {
-        build_ephemeral_channel_entries(&[raw_ephemeral("")], &global_defaults());
+    fn same_name_under_two_schemes_is_two_channels() {
+        let entries = build_channel_entries(
+            &[
+                raw_nondurable("ephemeral:twin"),
+                raw_nondurable("local:twin"),
+                raw_channel("1f6c6e3a-1d6e-4f7c-9b6a-12cb7e4a8d32", "twin"),
+            ],
+            &global_defaults(),
+        );
+        assert_eq!(entries.len(), 3);
     }
 
     #[test]
-    #[should_panic(expected = "must not contain ':'")]
-    fn ephemeral_name_with_colon_panics() {
-        build_ephemeral_channel_entries(&[raw_ephemeral("ephemeral:foo")], &global_defaults());
+    #[should_panic(expected = "must name a channel after its scheme")]
+    fn nondurable_empty_name_panics() {
+        build_channel_entries(&[raw_nondurable("ephemeral:")], &global_defaults());
     }
 
     #[test]
     #[should_panic(expected = "RFC 3986")]
-    fn ephemeral_name_bad_charset_panics() {
-        build_ephemeral_channel_entries(&[raw_ephemeral("has space")], &global_defaults());
+    fn nondurable_name_bad_charset_panics() {
+        build_channel_entries(&[raw_nondurable("ephemeral:has space")], &global_defaults());
     }
 
     #[test]
     #[should_panic(expected = "retain_depth must be bounded")]
-    fn ephemeral_unbounded_retain_panics() {
-        build_ephemeral_channel_entries(
-            &[EphemeralChannelConfigRaw {
-                name: "unbounded".to_string(),
-                push_depth: None,
-                retain_depth: Some(Depth::Unbounded),
-                noise: None,
-                capacity: None,
-            }],
-            &global_defaults(),
-        );
+    fn nondurable_unbounded_retain_panics() {
+        let mut raw = raw_nondurable("ephemeral:unbounded");
+        raw.retain_depth = Some(Depth::Unbounded);
+        build_channel_entries(&[raw], &global_defaults());
+    }
+
+    /// The global default is `Unbounded`, so a non-durable channel that states
+    /// no `retain_depth` inherits it and is rejected — the operator must bound
+    /// process memory explicitly rather than get a silent zero.
+    #[test]
+    #[should_panic(expected = "retain_depth must be bounded")]
+    fn nondurable_inherited_unbounded_retain_panics() {
+        let mut raw = raw_nondurable("ephemeral:inherit");
+        raw.retain_depth = None;
+        build_channel_entries(&[raw], &global_defaults());
     }
 
     #[test]
-    #[should_panic(expected = "capacity must be non-zero")]
-    fn ephemeral_zero_capacity_panics() {
-        build_ephemeral_channel_entries(
-            &[EphemeralChannelConfigRaw {
-                name: "zero".to_string(),
-                push_depth: None,
-                retain_depth: None,
-                noise: None,
-                capacity: Some(0),
-            }],
-            &global_defaults(),
-        );
+    #[should_panic(expected = "requires a uuid")]
+    fn durable_channel_without_uuid_panics() {
+        let mut raw = raw_nondurable("brenn:needs-uuid");
+        raw.retain_depth = None;
+        build_channel_entries(&[raw], &global_defaults());
+    }
+
+    #[test]
+    #[should_panic(expected = "must not set uuid")]
+    fn nondurable_channel_with_uuid_panics() {
+        let mut raw = raw_nondurable("ephemeral:has-uuid");
+        raw.uuid = Some("1f6c6e3a-1d6e-4f7c-9b6a-12cb7e4a8d32".to_string());
+        build_channel_entries(&[raw], &global_defaults());
+    }
+
+    /// A zero refill interval is rejected at boot (it would panic lazily on
+    /// first publish).
+    #[test]
+    #[should_panic(expected = "send_rate.refill_interval_secs must be >= 1")]
+    fn channel_zero_refill_interval_send_rate_panics() {
+        let mut raw = raw_nondurable("ephemeral:zero-interval");
+        raw.retain_depth = Some(Depth::Bounded(4));
+        raw.send_rate = Some(SendRate {
+            burst: 10,
+            refill_interval_secs: 0,
+            refill: 10,
+        });
+        build_channel_entries(&[raw], &global_defaults());
+    }
+
+    /// A zero burst is a silent deny-all — rejected at boot.
+    #[test]
+    #[should_panic(expected = "send_rate.burst must be >= 1")]
+    fn channel_zero_burst_send_rate_panics() {
+        let mut raw = raw_nondurable("ephemeral:zero-burst");
+        raw.retain_depth = Some(Depth::Bounded(4));
+        raw.send_rate = Some(SendRate {
+            burst: 0,
+            refill_interval_secs: 1,
+            refill: 10,
+        });
+        build_channel_entries(&[raw], &global_defaults());
+    }
+
+    /// An invalid `default_send_rate` is caught at boot even with no
+    /// `[[channel]]` blocks.
+    #[test]
+    #[should_panic(expected = "[messaging].default_send_rate send_rate.refill must be >= 1")]
+    fn zero_refill_default_send_rate_panics_without_channels() {
+        let mut defaults = global_defaults();
+        defaults.default_send_rate = SendRate {
+            burst: 10,
+            refill_interval_secs: 1,
+            refill: 0,
+        };
+        build_channel_entries(&[], &defaults);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not set standing_retain_depth")]
+    fn nondurable_channel_with_standing_retain_panics() {
+        let mut raw = raw_nondurable("ephemeral:standing");
+        raw.standing_retain_depth = Some(Depth::Bounded(4));
+        build_channel_entries(&[raw], &global_defaults());
+    }
+
+    #[test]
+    #[should_panic(expected = "must not set sink")]
+    fn nondurable_channel_with_sink_panics() {
+        let mut raw = raw_nondurable("ephemeral:sunk");
+        raw.sink = Some(Sink::Drop);
+        build_channel_entries(&[raw], &global_defaults());
+    }
+
+    #[test]
+    #[should_panic(expected = "not declarable here")]
+    fn webhook_scheme_in_channel_table_panics() {
+        build_channel_entries(&[raw_nondurable("webhook:hook")], &global_defaults());
+    }
+
+    /// The panic names three schemes and each is its own `ChannelScheme::split`
+    /// outcome, so covering one covers none of the others.
+    #[test]
+    #[should_panic(expected = "not declarable here")]
+    fn mqtt_scheme_in_channel_table_panics() {
+        build_channel_entries(&[raw_nondurable("mqtt:topic/sub")], &global_defaults());
+    }
+
+    #[test]
+    #[should_panic(expected = "not declarable here")]
+    fn pwa_push_scheme_in_channel_table_panics() {
+        build_channel_entries(&[raw_nondurable("pwa_push:device")], &global_defaults());
+    }
+
+    /// A misspelled scheme must not register as a `brenn:` channel whose name
+    /// happens to contain a colon.
+    #[test]
+    #[should_panic(expected = "unrecognized scheme")]
+    fn misspelled_scheme_in_channel_table_panics() {
+        build_channel_entries(&[raw_nondurable("ephmeral:room")], &global_defaults());
     }
 
     // -----------------------------------------------------------------------
@@ -2521,13 +2781,29 @@ channel = "brenn:alerts.high"
         build_channel_entries(&[raw_channel("not-a-uuid", "ok")], &global_defaults());
     }
 
+    /// A scheme-qualified `brenn:` address is legal and canonicalizes to the
+    /// same channel a bare address does; a second colon is not part of any
+    /// pub/sub address and fails the charset check.
     #[test]
-    #[should_panic(expected = "must not contain ':'")]
-    fn address_containing_colon_panics() {
+    fn brenn_prefixed_address_canonicalizes() {
+        let entries = build_channel_entries(
+            &[raw_channel(
+                "1f6c6e3a-1d6e-4f7c-9b6a-12cb7e4a8d32",
+                "brenn:explicit",
+            )],
+            &global_defaults(),
+        );
+        assert_eq!(entries[0].address, "brenn:explicit");
+        assert_eq!(entries[0].transport_type, ChannelScheme::Brenn);
+    }
+
+    #[test]
+    #[should_panic(expected = "unreserved characters only")]
+    fn address_containing_nested_colon_panics() {
         build_channel_entries(
             &[raw_channel(
                 "1f6c6e3a-1d6e-4f7c-9b6a-12cb7e4a8d32",
-                "brenn:nested",
+                "brenn:nested:more",
             )],
             &global_defaults(),
         );
@@ -3161,6 +3437,7 @@ channel = "brenn:alerts.high"
             address: "brenn:my-channel".to_string(),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -3212,6 +3489,7 @@ channel = "brenn:alerts.high"
             address: "brenn:alerts".to_string(),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -3271,6 +3549,7 @@ channel = "brenn:alerts.high"
             address: "brenn:alerts".to_string(),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -3317,6 +3596,7 @@ channel = "brenn:alerts.high"
             address: chan_address.clone(),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -3713,6 +3993,7 @@ grants = []
             address: "brenn:ch".to_string(),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -4139,6 +4420,7 @@ grants = []
             address: "brenn:reconstructed".to_string(),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,

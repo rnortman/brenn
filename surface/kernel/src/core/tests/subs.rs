@@ -98,11 +98,7 @@ fn subscribe_result_gap_activates_the_channel_and_reaches_no_component() {
 /// one it was to decide what a component sees.
 #[test]
 fn every_gap_reason_reaches_no_component() {
-    for reason in [
-        GapReason::EpochChanged,
-        GapReason::HoleExceedsRing,
-        GapReason::BeyondRetained,
-    ] {
+    for reason in [GapReason::EpochChanged, GapReason::BeyondRetained] {
         let mut core = active_core_with(vec![sub_binding()]);
         register(&mut core, "protobar", Millis(5));
         let effects = core.on_input(

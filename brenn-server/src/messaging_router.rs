@@ -151,6 +151,24 @@ impl WakeRouterImpl {
     }
 }
 
+/// The retention position a surface delivery names, as `u64`.
+///
+/// Every bus row a surface subscription is owed sits in its channel's retention
+/// order: the store assigns positions from 1 and never re-uses one, so an
+/// absent or negative position means the row was delivered from outside
+/// retention, which no path produces. `push_id` names the claim in the panic
+/// (`0` for the row-less fold-0 context feed, which owns none).
+pub(crate) fn retention_position(retained_seq: Option<i64>, push_id: i64) -> u64 {
+    retained_seq
+        .and_then(|seq| u64::try_from(seq).ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "surface durable delivery (push {push_id}): the row holds no retention \
+                 position {retained_seq:?} — a delivered bus row is always in retention"
+            )
+        })
+}
+
 /// The delivery mechanism for a subscriber, resolved from its [`DeliveryBinding`]
 /// without carrying the lock guard into async delivery.
 enum DeliveryRoute {
@@ -166,11 +184,9 @@ impl WakeRouter for WakeRouterImpl {
         key: &SubscriberEntryKind,
         subscriber: &ParticipantId,
         envelope: &MessageEnvelope,
-        // `push_id` (the claimed pending-push row) and `seq` (`messaging_messages.id`,
-        // the durable row id the surface cursor's high-water is minted from) are
-        // used only by the surface route; the conversation route ignores them.
         push_id: i64,
-        seq: i64,
+        message_id: i64,
+        retained_seq: Option<i64>,
     ) -> Result<bool, String> {
         match self.delivery_route(key) {
             DeliveryRoute::ConversationBridge => {
@@ -224,6 +240,7 @@ impl WakeRouter for WakeRouterImpl {
                     .state
                     .get()
                     .expect("WakeRouter state must be set before any Surface deliver call");
+                let retained_seq = retention_position(retained_seq, push_id);
 
                 // The subscription this row belongs to: the principal the push
                 // row was resolved for, on the row's channel. `key` is the
@@ -279,7 +296,8 @@ impl WakeRouter for WakeRouterImpl {
                 for handle in &subscribed {
                     let delivery = DurableDelivery {
                         envelope: shared_envelope.clone(),
-                        seq,
+                        retained_seq,
+                        message_id: Some(message_id),
                         sub: sub.clone(),
                     };
                     if handle.durable_tx.try_send(delivery).is_ok() {
@@ -296,7 +314,7 @@ impl WakeRouter for WakeRouterImpl {
                     warn!(
                         slug = %slug,
                         channel = %envelope.channel,
-                        seq,
+                        retained_seq,
                         push_id,
                         rejected,
                         accepted,
@@ -325,7 +343,7 @@ impl WakeRouter for WakeRouterImpl {
                     debug!(
                         slug = %slug,
                         channel = %envelope.channel,
-                        seq,
+                        retained_seq,
                         push_id,
                         "surface durable live delivery: all session queues full; \
                          re-parking row for the next drain"
@@ -342,7 +360,7 @@ impl WakeRouter for WakeRouterImpl {
         &self,
         key: &SubscriberEntryKind,
         envelope: &Arc<MessageEnvelope>,
-        seq: i64,
+        retained_seq: i64,
     ) {
         // Row-less deliver-if-attached fan-out for a fold-0 surface subscription
         // (design §6). No push row, no claim: a fold-0 subscription has no push
@@ -381,7 +399,8 @@ impl WakeRouter for WakeRouterImpl {
         for handle in &subscribed {
             let delivery = DurableDelivery {
                 envelope: envelope.clone(),
-                seq,
+                retained_seq: retention_position(Some(retained_seq), 0),
+                message_id: None,
                 sub: sub.clone(),
             };
             if handle.durable_tx.try_send(delivery).is_err() {
@@ -394,7 +413,7 @@ impl WakeRouter for WakeRouterImpl {
                 warn!(
                     slug = %slug,
                     channel = %envelope.channel,
-                    seq,
+                    retained_seq,
                     "surface durable depth-0 context feed: session queue full; row-less \
                      delivery dropped (recovered at the next resume)"
                 );
@@ -610,6 +629,7 @@ mod tests {
                 &env,
                 1,
                 1,
+                Some(1),
             )
             .await;
         assert!(matches!(result, Ok(false)));
@@ -755,6 +775,7 @@ mod tests {
                 &env,
                 1,
                 1,
+                Some(1),
             )
             .await;
         assert!(
@@ -793,7 +814,14 @@ mod tests {
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
         };
         let _ = router
-            .deliver(&key, &ParticipantId::for_wasm("my-consumer"), &env, 1, 1)
+            .deliver(
+                &key,
+                &ParticipantId::for_wasm("my-consumer"),
+                &env,
+                1,
+                1,
+                Some(1),
+            )
             .await;
     }
 
@@ -893,7 +921,8 @@ mod tests {
 
         let bare = channel_addr.strip_prefix("brenn:").expect("brenn: address");
         let raw = ChannelConfigRaw {
-            uuid: Uuid::new_v4().to_string(),
+            send_rate: None,
+            uuid: Some(Uuid::new_v4().to_string()),
             address: bare.to_string(),
             description: None,
             push_depth: None,
@@ -1028,6 +1057,7 @@ mod tests {
                 &surface_envelope(channel),
                 push_id,
                 seq,
+                Some(seq),
             )
             .await;
         assert!(matches!(result, Ok(true)));
@@ -1035,7 +1065,7 @@ mod tests {
         // The claimed row landed on the session's live queue with the wire seq.
         let delivered = rx.try_recv().expect("live delivery enqueued");
         assert_eq!(delivered.envelope.channel, channel);
-        assert_eq!(delivered.seq, seq);
+        assert_eq!(delivered.retained_seq, seq as u64);
         // Per-delivery drain nudge fired.
         tokio::time::timeout(std::time::Duration::from_millis(10), notify.notified())
             .await
@@ -1070,6 +1100,7 @@ mod tests {
                 &surface_envelope(channel),
                 push_id,
                 seq,
+                Some(seq),
             )
             .await;
         assert!(matches!(result, Ok(false)));
@@ -1115,6 +1146,7 @@ mod tests {
                 &surface_envelope(channel),
                 push_id,
                 seq,
+                Some(seq),
             )
             .await;
         assert!(matches!(result, Ok(true)));
@@ -1150,6 +1182,7 @@ mod tests {
                 &surface_envelope(channel),
                 push_id,
                 seq,
+                Some(seq),
             )
             .await;
         assert!(matches!(result, Ok(false)));
@@ -1183,7 +1216,7 @@ mod tests {
 
         let delivered = rx.try_recv().expect("row-less delivery enqueued");
         assert_eq!(delivered.envelope.channel, channel);
-        assert_eq!(delivered.seq, 7);
+        assert_eq!(delivered.retained_seq, 7);
     }
 
     /// `deliver_context` with no attached/subscribed session is a no-op — nothing
@@ -1413,6 +1446,7 @@ mod tests {
                 &surface_envelope("brenn:whatever"),
                 1,
                 1,
+                Some(1),
             )
             .await;
     }
@@ -1606,12 +1640,16 @@ mod tests {
              through the shared dispatch loop"
         );
 
+        // Act: channel-backed rows are not woken by the scan; fire their
+        // wake source explicitly.
+        messenger.wake_owed_subscribers().await;
+
         // Assert: the eager-wake notifier was fired so the off-loop dispatch
         // task is woken promptly. The permit is set by notify_one.
         tokio::time::timeout(std::time::Duration::from_millis(10), notify.notified())
             .await
             .expect(
-                "eager-wake Notify must be fired by dispatch_row for Wasm subscriber; \
+                "eager-wake Notify must be fired by the store walk for a Wasm subscriber; \
                  notified() should resolve immediately after notify_one",
             );
     }

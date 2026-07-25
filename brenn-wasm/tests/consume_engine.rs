@@ -179,6 +179,8 @@ fn single_port_activation(
             new_from,
             dropped: 0,
         }],
+        deferred: vec![],
+        now: None,
     }
 }
 
@@ -217,7 +219,9 @@ fn handle_ok_brenn_envelope_returns_ok_no_publish() {
     // Non-webhook envelopes: demo does not call publish → Ok, empty buffer.
     let comp = load_demo_with_out();
     let activation = single_port_activation("in", vec![envelope_json("brenn:test", "hello")], 0);
-    assert!(matches!(comp.handle(activation), ProcessorOutcome::Ok(v) if v.is_empty()));
+    assert!(
+        matches!(comp.handle(activation), ProcessorOutcome::Ok { publishes, .. } if publishes.is_empty())
+    );
 }
 
 #[test]
@@ -232,7 +236,10 @@ fn handle_ok_with_context_prefix() {
         ],
         2, // new_from=2: first two are context
     );
-    assert!(matches!(comp.handle(activation), ProcessorOutcome::Ok(_)));
+    assert!(matches!(
+        comp.handle(activation),
+        ProcessorOutcome::Ok { .. }
+    ));
 }
 
 #[test]
@@ -244,7 +251,10 @@ fn handle_no_new_envelopes_does_not_fail() {
         vec![envelope_json("brenn:test", "ctx-only")],
         1, // new_from == len → no new
     );
-    assert!(matches!(comp.handle(activation), ProcessorOutcome::Ok(_)));
+    assert!(matches!(
+        comp.handle(activation),
+        ProcessorOutcome::Ok { .. }
+    ));
 }
 
 // ── Webhook publish path ──────────────────────────────────────────────────────
@@ -273,7 +283,7 @@ fn handle_webhook_envelope_publishes_inner_body() {
     let comp = load_demo_with_out();
     let activation = single_port_activation("in", vec![webhook_envelope("hello-from-webhook")], 0);
     match comp.handle(activation) {
-        ProcessorOutcome::Ok(publishes) => {
+        ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(publishes.len(), 1);
             assert_eq!(publishes[0].port, "out");
             assert_eq!(publishes[0].channel_address, "brenn:test-out");
@@ -353,7 +363,7 @@ fn handle_webhook_bound_port_inside_output_acl_publishes() {
     let comp = load_demo_out_with_acl("brenn:secret", acl);
     let activation = single_port_activation("in", vec![webhook_envelope("allowed-payload")], 0);
     match comp.handle(activation) {
-        ProcessorOutcome::Ok(publishes) => {
+        ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(
                 publishes.len(),
                 1,
@@ -484,7 +494,7 @@ fn two_webhook_envelopes_produce_two_buffered_publishes() {
         0,
     );
     match comp.handle(activation) {
-        ProcessorOutcome::Ok(publishes) => {
+        ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(publishes.len(), 2, "expected 2 publishes");
             assert_eq!(publishes[0].channel_address, "brenn:channel-a");
             assert_eq!(publishes[0].payload, "body-1");
@@ -568,7 +578,7 @@ fn per_sink_carryover_accumulates_fractional_amplification() {
     );
     let a2 = single_port_activation("in", vec![webhook_envelope("second")], 0);
     match comp.handle(a2) {
-        ProcessorOutcome::Ok(publishes) => {
+        ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(
                 publishes.len(),
                 1,
@@ -632,7 +642,7 @@ fn per_sink_capacity_clamp_bounds_carryover() {
     for body in ["idle-1", "idle-2"] {
         let idle = single_port_activation("in", vec![webhook_envelope(body)], 1);
         assert!(
-            matches!(comp.handle(idle), ProcessorOutcome::Ok(_)),
+            matches!(comp.handle(idle), ProcessorOutcome::Ok { .. }),
             "an idle activation publishes nothing and only accumulates fill into carry"
         );
     }
@@ -686,7 +696,7 @@ fn multi_port_publishes_routed_independently() {
     let payload = envelope_json("brenn:source", "hello");
     let activation = single_port_activation("in", vec![payload.clone()], 0);
     match comp.handle(activation) {
-        ProcessorOutcome::Ok(publishes) => {
+        ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(
                 publishes.len(),
                 2,
@@ -737,9 +747,11 @@ fn context_envelopes_count_matches_new_from() {
             new_from: 2,
             dropped: 0,
         }],
+        deferred: vec![],
+        now: None,
     };
     match comp.handle(activation) {
-        ProcessorOutcome::Ok(publishes) => {
+        ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(
                 publishes.len(),
                 1,
@@ -787,7 +799,7 @@ fn publish_with_urgency_overrides_port_default() {
         0,
     );
     match comp.handle(activation) {
-        ProcessorOutcome::Ok(publishes) => {
+        ProcessorOutcome::Ok { publishes, .. } => {
             assert_eq!(
                 publishes.len(),
                 1,
@@ -831,7 +843,7 @@ fn publish_with_urgency_all_levels() {
             0,
         );
         match comp.handle(activation) {
-            ProcessorOutcome::Ok(publishes) => {
+            ProcessorOutcome::Ok { publishes, .. } => {
                 assert_eq!(
                     publishes.len(),
                     1,
@@ -864,6 +876,8 @@ fn host_invariant_violation_new_from_exceeds_len_returns_labeled_error() {
             new_from: 2,
             dropped: 0,
         }],
+        deferred: vec![],
+        now: None,
     };
     match comp.handle(activation) {
         ProcessorOutcome::Err(e) => {
@@ -913,7 +927,7 @@ fn full_size_window_does_not_spuriously_trap_demo() {
     let activation = single_port_activation("in", envelopes, 0);
     let outcome = comp.handle(activation);
     assert!(
-        matches!(outcome, ProcessorOutcome::Ok(_)),
+        matches!(outcome, ProcessorOutcome::Ok { .. }),
         "demo component must succeed on a full-size window. got {outcome:?}"
     );
 }
@@ -927,7 +941,10 @@ fn exhaust_component_ok_on_pure_context_window() {
         vec![envelope_json("brenn:test", "ctx")],
         1, // new_from == envelopes.len() → no new entries → Ok
     );
-    assert!(matches!(comp.handle(activation), ProcessorOutcome::Ok(_)));
+    assert!(matches!(
+        comp.handle(activation),
+        ProcessorOutcome::Ok { .. }
+    ));
 }
 
 // ── Memory cap runtime tests ──────────────────────────────────────────────────
@@ -986,7 +1003,10 @@ fn mem_exhaust_component_ok_on_pure_context_window() {
         vec![envelope_json("brenn:test", "ctx")],
         1, // new_from == envelopes.len() → no new entries → Ok
     );
-    assert!(matches!(comp.handle(activation), ProcessorOutcome::Ok(_)));
+    assert!(matches!(
+        comp.handle(activation),
+        ProcessorOutcome::Ok { .. }
+    ));
 }
 
 // ── Memory limits ─────────────────────────────────────────────────────────────
@@ -1031,7 +1051,7 @@ fn store_guest_round_trip_begin_put_commit_get() {
     let activation = single_port_activation("in", vec![], 0);
     let outcome = comp.handle(activation);
     assert!(
-        matches!(outcome, ProcessorOutcome::Ok(_)),
+        matches!(outcome, ProcessorOutcome::Ok { .. }),
         "store round-trip must succeed; got {outcome:?}"
     );
 
@@ -1102,7 +1122,10 @@ fn guest_observes_correct_new_from_and_ordering() {
         ],
         1,
     );
-    assert!(matches!(comp.handle(activation), ProcessorOutcome::Ok(_)));
+    assert!(matches!(
+        comp.handle(activation),
+        ProcessorOutcome::Ok { .. }
+    ));
 }
 
 // ── Quota-exceeded ────────────────────────────────────────────────────────────

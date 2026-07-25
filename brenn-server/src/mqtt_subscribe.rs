@@ -58,8 +58,8 @@ pub enum SubscribeActivation {
     /// transport was NOT re-activated (it is already live). Applies to every
     /// transport.
     AlreadySubscribed,
-    /// `brenn:`/`webhook:` subscribe — no broker activation; the directory write
-    /// is the whole operation.
+    /// `brenn:`/`webhook:`/`ephemeral:`/`local:` subscribe — no broker
+    /// activation; the registration + directory write is the whole operation.
     LocalOnly,
     /// `mqtt:` subscribe; the client was live and the broker SUBSCRIBE went out
     /// now (delivery — including any retained message — starts immediately).
@@ -194,7 +194,7 @@ pub async fn subscribe_dynamic_activated(
 
     let is_mqtt = matches!(ChannelScheme::of(address), Some(ChannelScheme::Mqtt));
     if !is_mqtt {
-        // --- Phase 1: per-app dynamic-subscribe ACL (brenn:/webhook:) ---
+        // --- Phase 1: per-app dynamic-subscribe ACL (non-mqtt schemes) ---
         // Runs before subscribe_dynamic persists anything (same no-side-effect
         // invariant as the mqtt: gate below). Classify by scheme and consult the
         // matching ACL list. An unrecognized/malformed prefix is NOT policy-denied:
@@ -209,13 +209,15 @@ pub async fn subscribe_dynamic_activated(
             Some((ChannelScheme::Webhook, endpoint)) => {
                 policy.allows_webhook_dynamic_subscribe(endpoint)
             }
-            // Ephemeral / PwaPush / Local / unrecognized: do not policy-deny here
-            // — defer to the lib core's address validation, which rejects the
-            // address with its canonical error below. A deliberate defer, not a
-            // missing policy check. (`local:` is page-local and has no
-            // server-side subscription at all, dynamic or otherwise.)
-            Some((ChannelScheme::Ephemeral | ChannelScheme::PwaPush | ChannelScheme::Local, _))
-            | None => true,
+            Some((ChannelScheme::Ephemeral, channel)) => {
+                policy.allows_ephemeral_dynamic_subscribe(channel)
+            }
+            Some((ChannelScheme::Local, channel)) => policy.allows_local_dynamic_subscribe(channel),
+            // PwaPush / unrecognized: do not policy-deny here — defer to the lib
+            // core's address validation, which rejects the address with its
+            // canonical error below. A deliberate defer, not a missing policy
+            // check. (`pwa_push:` is egress-only: nothing subscribes to it.)
+            Some((ChannelScheme::PwaPush, _)) | None => true,
             // Mqtt has its own ACL gate in the `is_mqtt` branch above; the
             // `!is_mqtt` guard makes this arm unreachable. Reaching it means the
             // guard was broken — a host bug, so panic rather than guess a policy.
@@ -1106,6 +1108,65 @@ mod tests {
         assert_eq!(outcome, SubscribeActivation::LocalOnly);
         assert_eq!(dynamic_rows(&bridge).await.len(), 1);
         assert!(has_app_subscriber(&bridge, addr, "testapp"));
+    }
+
+    /// An `ephemeral:` runtime subscribe is gated by the ephemeral arm of the
+    /// Phase-1 ACL: `DynamicSubscribe` + `EphemeralSubscribe` + a covering
+    /// matcher. With the transport grant absent (even holding `MessagingSubscribe`
+    /// and a covering `brenn_subscribe` matcher) it is `PolicyDenied`, and nothing
+    /// reaches the core.
+    #[tokio::test]
+    async fn subscribe_ephemeral_denied_without_ephemeral_subscribe_grant() {
+        let policy = brenn_webhook_policy(
+            true,
+            true,
+            false,
+            vec![brenn_lib::access::acl::ChannelMatcher::Prefix(String::new())],
+            vec![],
+        );
+        let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy).await;
+        let addr = "ephemeral:test-ring";
+
+        let err = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SubscribeActivateError::PolicyDenied {
+                address: addr.to_string()
+            }
+        );
+        assert!(!has_app_subscriber(&bridge, addr, "testapp"));
+    }
+
+    /// A granted `ephemeral:` runtime subscribe is admitted and needs no
+    /// activation: the registration is in-memory (no durable row) and the
+    /// subscriber is folded into the directory.
+    #[tokio::test]
+    async fn subscribe_ephemeral_granted_is_local_only_and_writes_no_row() {
+        use brenn_lib::access::AppCapability;
+        let mut policy = brenn_webhook_policy(true, false, false, vec![], vec![]);
+        policy.grants.insert(AppCapability::EphemeralSubscribe);
+        policy.acls.ephemeral_subscribe = vec![brenn_lib::access::acl::ChannelMatcher::Exact(
+            "test-ring".to_string(),
+        )];
+        let bridge = ActiveBridge::test_new_for_mqtt_subscribe_with_policy(policy).await;
+        let addr = "ephemeral:test-ring";
+
+        let outcome = subscribe_dynamic_activated(&bridge, "testapp", addr, pull_only(None))
+            .await
+            .expect("a covered ephemeral: channel is admitted");
+        assert_eq!(outcome, SubscribeActivation::LocalOnly);
+        assert!(
+            dynamic_rows(&bridge).await.is_empty(),
+            "a non-durable registration writes no durable row"
+        );
+        assert!(has_app_subscriber(&bridge, addr, "testapp"));
+
+        unsubscribe_dynamic_activated(&bridge, "testapp", addr)
+            .await
+            .expect("unsubscribe succeeds");
+        assert!(!has_app_subscriber(&bridge, addr, "testapp"));
     }
 
     /// A `webhook:` runtime subscribe with **no** `Webhook` grant is `PolicyDenied`

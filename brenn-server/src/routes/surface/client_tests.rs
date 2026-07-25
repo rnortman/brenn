@@ -163,15 +163,15 @@ fn deskbar_two_sub() -> ResolvedSurface {
 }
 
 /// Like `subscribe_harness`, but the `deskbar` surface binds both ephemeral
-/// channels (`EPH_ADDR` and `EPH_ADDR_B`) over a bus carrying both, so the test
+/// channels (`EPH_ADDR` and `EPH_ADDR_B`) over a registry carrying both, so the test
 /// can seed each channel's retain ring in-process.
-fn subscribe_state_two(db: &db::Db, retain_depth: u64, capacity: u32) -> SurfaceTestHarness {
+fn subscribe_state_two(db: &db::Db, retain_depth: u64) -> SurfaceTestHarness {
     surface_harness(
         db,
         deskbar_two_sub(),
         vec![
-            ephemeral_channel_entry(EPH_NAME, retain_depth, capacity),
-            ephemeral_channel_entry(EPH_NAME_B, retain_depth, capacity),
+            ephemeral_channel_entry(EPH_NAME, retain_depth),
+            ephemeral_channel_entry(EPH_NAME_B, retain_depth),
         ],
     )
 }
@@ -284,13 +284,14 @@ async fn client_connect_attach_receives_published_message() {
         state,
         alerts,
         flusher,
-        bus,
-    } = subscribe_harness(&db, 4, 16);
+        stores,
+        ..
+    } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
     // Publish before the client connects: the retained ring (depth 4) holds it,
     // so the client's fresh Subscribe replays it deterministically — no
     // subscribe/publish race.
-    publish(&bus, "hello");
+    publish(&stores, "hello");
     let (base, _sd) = spawn_test_server(state).await;
 
     let (client, mut events, driver_task) = spawn_client(&base, &token);
@@ -362,13 +363,14 @@ async fn client_fresh_attach_replays_full_retained_ring() {
         state,
         alerts,
         flusher,
-        bus,
-    } = subscribe_harness(&db, 4, 16);
+        stores,
+        ..
+    } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
 
     let bodies = ["one", "two", "three"];
     for body in bodies {
-        publish(&bus, body);
+        publish(&stores, body);
     }
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -422,11 +424,12 @@ async fn client_reattach_replays_latest_retained_value() {
         state,
         alerts,
         flusher,
-        bus,
-    } = subscribe_harness(&db, 1, 16);
+        stores,
+        ..
+    } = subscribe_harness(&db, 1);
     let (token, _) = setup_authenticated_user(&db).await;
 
-    publish(&bus, "v1");
+    publish(&stores, "v1");
     let (base, _sd) = spawn_test_server(state).await;
 
     let (client, mut events, driver_task) = spawn_client(&base, &token);
@@ -445,10 +448,10 @@ async fn client_reattach_replays_latest_retained_value() {
     // channel's resume token (its last reference is gone).
     client.deregister_activation(COMPONENT);
 
-    // Publish a newer value server-side. Publishing into the in-process bus is
+    // Publish a newer value server-side. Publishing into the in-process store is
     // synchronous, so "v2" is in the (depth-1) ring — displacing "v1" — before
     // the re-registration's Subscribe frame is ever sent.
-    publish(&bus, "v2");
+    publish(&stores, "v2");
 
     // Re-register: a fresh consumer, so the client sends `Subscribe { resume: None }`
     // (not a resume past the old high-water). The server replays the retained
@@ -503,7 +506,7 @@ async fn client_stale_build_reloads_and_does_not_reconnect() {
         alerts,
         flusher,
         ..
-    } = subscribe_harness(&db, 4, 16);
+    } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
     // Front the backend with the relay so its accept counter can prove the client
     // makes exactly one connection — no reconnect after the terminal close.
@@ -561,7 +564,7 @@ async fn client_stale_build_reloads_and_does_not_reconnect() {
 /// to a detached task the accept loop no longer owns — so neither a graceful
 /// `axum::serve` shutdown nor aborting the serve task closes an established
 /// session. Cutting the connection at the TCP layer is the reliable lever, and
-/// keeping a single backend across the blip preserves the bus epoch, which is
+/// keeping a single backend across the blip preserves the store epoch, which is
 /// exactly the in-ring-resume (transport-blip) case, as opposed to a genuine
 /// process restart (new epoch → `Gap { EpochChanged }`).
 ///
@@ -674,7 +677,7 @@ impl Relay {
 /// port's subscription losslessly. The port stays attached across
 /// the blip, so its channel keeps its resume token; on reconnect the client
 /// resubscribes with that token and the backend — the same process, hence the
-/// same bus epoch — replays only the messages published while the client was
+/// same store epoch — replays only the messages published while the client was
 /// down, with no gap and no duplicate.
 #[tokio::test]
 async fn client_reconnects_and_resumes_in_ring() {
@@ -685,13 +688,14 @@ async fn client_reconnects_and_resumes_in_ring() {
         state,
         alerts,
         flusher,
-        bus,
-    } = subscribe_harness(&db, 4, 16);
+        stores,
+        ..
+    } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
 
     // "m1" into the ring, then start the backend and the severable relay in
     // front of it. The client dials the relay's stable front address.
-    publish(&bus, "m1");
+    publish(&stores, "m1");
     let (backend_base, _sd) = spawn_test_server(state).await;
     let relay = Relay::start_for(&backend_base).await;
 
@@ -713,7 +717,7 @@ async fn client_reconnects_and_resumes_in_ring() {
 
     // Publish "m2" while the client is disconnected: it lands in the retain
     // ring (seq 2) and the client cannot have seen it live.
-    publish(&bus, "m2");
+    publish(&stores, "m2");
 
     expect_disconnected(&mut events).await;
 
@@ -762,12 +766,13 @@ async fn client_reconnect_past_ring_gaps() {
         state,
         alerts,
         flusher,
-        bus,
-    } = subscribe_harness(&db, 1, 16);
+        stores,
+        ..
+    } = subscribe_harness(&db, 1);
     let (token, _) = setup_authenticated_user(&db).await;
 
     // "m1" into the ring, then start the backend and the severable relay.
-    publish(&bus, "m1");
+    publish(&stores, "m1");
     let (backend_base, _sd) = spawn_test_server(state).await;
     let relay = Relay::start_for(&backend_base).await;
 
@@ -787,14 +792,14 @@ async fn client_reconnect_past_ring_gaps() {
     // keeps only the newest ("m3", seq 3); "m2" (seq 2) is evicted, so the
     // resume from seq 1 leaves an unhealable hole at seq 2.
     relay.sever();
-    publish(&bus, "m2");
-    publish(&bus, "m3");
+    publish(&stores, "m2");
+    publish(&stores, "m3");
 
     expect_disconnected(&mut events).await;
 
     // The client reconnects to the SAME backend (same epoch) and resubscribes
     // with its resume token (seq 1). The ring no longer contains everything past
-    // seq 1, so the server replies with the full ring plus a HoleExceedsRing gap.
+    // seq 1, so the server replies with the full ring plus a BeyondRetained gap.
     match next_event(&mut events).await {
         Event::Connected { .. } => {}
         other => panic!("expected reconnect Connected, got {other:?}"),
@@ -837,7 +842,7 @@ async fn client_reconnect_past_ring_gaps() {
 /// it simply stops being activated on that channel, and there is no
 /// component-visible binding-removed vocabulary. The surviving binding is
 /// resubscribed (its old-epoch resume token no longer matches the restarted
-/// backend's fresh bus epoch, so the server heals with a resume-layer gap and
+/// backend's fresh store epoch, so the server heals with a resume-layer gap and
 /// replays the retained ring — the instance sees fresh data on the survivor, no
 /// gap named to it, no fatal). Across the whole flow, zero security events are
 /// captured on either backend.
@@ -854,10 +859,11 @@ async fn client_kiosk_restart_drops_binding_without_violation() {
         state: state1,
         alerts: alerts1,
         flusher: flusher1,
-        bus: bus1,
-    } = subscribe_state_two(&db, 1, 16);
-    publish_as(&bus1, "publisher", EPH_ADDR, EPH_NAME, "a1", 1);
-    publish_as(&bus1, "publisher", EPH_ADDR_B, EPH_NAME_B, "b1", 1);
+        stores: stores1,
+        ..
+    } = subscribe_state_two(&db, 1);
+    publish_as(&stores1, "publisher", EPH_ADDR, "a1", 1);
+    publish_as(&stores1, "publisher", EPH_ADDR_B, "b1", 1);
     let (backend1_base, _sd1) = spawn_test_server(state1).await;
     let relay = Relay::start_for(&backend1_base).await;
 
@@ -892,16 +898,17 @@ async fn client_kiosk_restart_drops_binding_without_violation() {
     expect_ports_each_get(&mut activations, &[(PORT, "a1"), (PORT_B, "b1")]).await;
 
     // Backend 2: the config-edited restart — deskbar with only binding A, over a
-    // fresh bus (new epoch). Seed "a2" so the resumed survivor has something to
+    // fresh registry (new epoch). Seed "a2" so the resumed survivor has something to
     // replay. Shares the same `db` as backend 1, so the session cookie stays
     // valid across the restart.
     let SurfaceTestHarness {
         state: state2,
         alerts: alerts2,
         flusher: flusher2,
-        bus: bus2,
-    } = subscribe_harness(&db, 1, 16);
-    publish(&bus2, "a2");
+        stores: stores2,
+        ..
+    } = subscribe_harness(&db, 1);
+    publish(&stores2, "a2");
     let (backend2_base, _sd2) = spawn_test_server(state2).await;
 
     // Restart under the auto-reconnecting client: point the relay at backend 2
@@ -979,14 +986,14 @@ fn deskbar_pub(publish_burst: u32, publish_per_sec: u32) -> ResolvedSurface {
 }
 
 /// Capturing-alerter state whose `deskbar` surface is the publish fixture: one
-/// bound ephemeral output port over a real bus (no retain ring needed — the
+/// bound ephemeral output port over a real store (no retain ring needed — the
 /// client only publishes). `publish_burst` / `publish_per_sec` size the
 /// connection's publish token bucket.
 fn publish_state(db: &db::Db, publish_burst: u32, publish_per_sec: u32) -> SurfaceTestHarness {
     surface_harness(
         db,
         deskbar_pub(publish_burst, publish_per_sec),
-        vec![ephemeral_channel_entry(EPH_NAME, 0, 16)],
+        vec![ephemeral_channel_entry(EPH_NAME, 0)],
     )
 }
 
@@ -1214,11 +1221,12 @@ async fn client_report_path_stays_healthy() {
         state,
         alerts,
         flusher,
-        bus,
-    } = subscribe_harness(&db, 1, 16);
+        stores,
+        ..
+    } = subscribe_harness(&db, 1);
     let (token, _) = setup_authenticated_user(&db).await;
     // Seed the ring so the post-report attach confirms the session is live.
-    publish(&bus, "hello");
+    publish(&stores, "hello");
     let (base, _sd) = spawn_test_server(state).await;
 
     let (client, mut events, driver_task) = spawn_client(&base, &token);

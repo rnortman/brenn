@@ -107,12 +107,77 @@ pub trait Processor {
 /// (`new_from == envelopes.len()`).
 pub struct Activation {
     windows: Vec<PortWindow>,
+    deferred: Vec<DeferredWindow>,
+    now: Option<u64>,
 }
 
 impl Activation {
     /// Iterate over all port windows in config order.
     pub fn port_windows(&self) -> impl Iterator<Item = &PortWindow> {
         self.windows.iter()
+    }
+
+    /// Iterate over all output-port deferred windows in config order. Each
+    /// window holds this component's own parked messages on that output's
+    /// channel, soonest release first.
+    pub fn deferred_windows(&self) -> impl Iterator<Item = &DeferredWindow> {
+        self.deferred.iter()
+    }
+
+    /// The deferred window for one output port by name, if that port is bound.
+    pub fn deferred_for(&self, port: &str) -> Option<&DeferredWindow> {
+        self.deferred.iter().find(|w| w.port == port)
+    }
+
+    /// The host's wall clock at drain, epoch milliseconds UTC. Use it to compute
+    /// an absolute `deliver_after` for [`publish_deferred`] without holding a
+    /// clock. `None` when the host exposes no UTC clock (the surface kernel).
+    pub fn now(&self) -> Option<u64> {
+        self.now
+    }
+}
+
+/// One output port's view onto this component's own parked (deferred) messages,
+/// soonest release first — a snapshot at drain.
+pub struct DeferredWindow {
+    port: String,
+    entries: Vec<DeferredEntry>,
+}
+
+impl DeferredWindow {
+    /// Logical output port name from host config.
+    pub fn port(&self) -> &str {
+        &self.port
+    }
+
+    /// This component's parked messages on the port's channel, release-ordered.
+    pub fn entries(&self) -> &[DeferredEntry] {
+        &self.entries
+    }
+}
+
+/// One parked message in a [`DeferredWindow`].
+pub struct DeferredEntry {
+    index: u32,
+    payload: String,
+    deliver_after: u64,
+}
+
+impl DeferredEntry {
+    /// Position within the window (release-ordered) — the handle a future
+    /// cancel/edit will name. Snapshot-relative to the window it arrived in.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// The message body this component published for deferred delivery.
+    pub fn payload(&self) -> &str {
+        &self.payload
+    }
+
+    /// Scheduled release time, epoch milliseconds UTC.
+    pub fn deliver_after(&self) -> u64 {
+        self.deliver_after
     }
 }
 
@@ -199,7 +264,27 @@ pub fn build_activation(raw: bindings::Activation) -> Result<Activation, Error> 
             new_from,
         });
     }
-    Ok(Activation { windows })
+    let deferred = raw
+        .deferred
+        .into_iter()
+        .map(|dw| DeferredWindow {
+            port: dw.port,
+            entries: dw
+                .entries
+                .into_iter()
+                .map(|e| DeferredEntry {
+                    index: e.index,
+                    payload: e.payload,
+                    deliver_after: e.deliver_after,
+                })
+                .collect(),
+        })
+        .collect();
+    Ok(Activation {
+        windows,
+        deferred,
+        now: raw.now,
+    })
 }
 
 /// Export glue macro: implements the WIT `Guest` trait for a shim that
@@ -300,6 +385,60 @@ pub fn publish_with_urgency(port: &str, payload: &str, urgency: Urgency) -> Resu
     let wit_urgency = urgency_to_wit(urgency);
     bindings::brenn::processor::ports::publish_with_urgency(port, payload, wit_urgency)
         .map_err(|e| publish_error(port, e))
+}
+
+/// Buffer a message on the named output port to become observable only at
+/// `deliver_after` (epoch milliseconds UTC). A `deliver_after` at or before the
+/// activation's `now` publishes immediately. This is the timer idiom: schedule
+/// a message to yourself at a future instant, most often to wake yourself again.
+///
+/// **Requires grant:** `"ports"` in `[[wasm_consumer]]` grants.
+///
+/// Compute `deliver_after` from [`Activation::now`] plus your delay; a guest has
+/// no clock of its own.
+pub fn publish_deferred(port: &str, payload: &str, deliver_after: u64) -> Result<(), Error> {
+    bindings::brenn::processor::ports::publish_deferred(port, payload, deliver_after)
+        .map_err(|e| publish_error(port, e))
+}
+
+/// Map a `DeferError` to a `ProcessingFailed` with a per-port diagnostic.
+fn defer_error(port: &str, e: bindings::brenn::processor::ports::DeferError) -> Error {
+    use bindings::brenn::processor::ports::DeferError;
+    let variant = match e {
+        DeferError::NotPermitted => "not-permitted",
+        DeferError::OutOfRange => "out-of-range",
+        DeferError::QuotaExceeded => "quota-exceeded",
+        DeferError::InvalidDeliverAfter => "invalid-deliver-after",
+    };
+    Error::ProcessingFailed(format!("defer control on {port}: {variant}"))
+}
+
+/// Cancel one of this component's own parked messages on `port`, named by its
+/// `index` into the deferred window this activation delivered
+/// ([`DeferredWindow::entries`]). Buffered and applied atomically iff `receive`
+/// returns `Ok`; a message that released between drain and flush is a benign
+/// no-op, not an error.
+///
+/// **Requires grant:** `"ports"` in `[[wasm_consumer]]` grants.
+pub fn defer_cancel(port: &str, index: u32) -> Result<(), Error> {
+    bindings::brenn::processor::ports::defer_cancel(port, index).map_err(|e| defer_error(port, e))
+}
+
+/// Edit one of this component's own parked messages on `port`, named by its
+/// `index` into the deferred window this activation delivered. `payload` and
+/// `deliver_after` are each `Some` to change, `None` to leave alone. Buffered and
+/// applied atomically iff `receive` returns `Ok`; same index and race semantics
+/// as [`defer_cancel`].
+///
+/// **Requires grant:** `"ports"` in `[[wasm_consumer]]` grants.
+pub fn defer_edit(
+    port: &str,
+    index: u32,
+    payload: Option<&str>,
+    deliver_after: Option<u64>,
+) -> Result<(), Error> {
+    bindings::brenn::processor::ports::defer_edit(port, index, payload, deliver_after)
+        .map_err(|e| defer_error(port, e))
 }
 
 /// Convert `brenn_envelope::Urgency` to WIT urgency exhaustively.

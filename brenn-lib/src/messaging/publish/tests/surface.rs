@@ -73,6 +73,14 @@ fn surface_channel_entry(subscribers: Vec<SubscriberEntry>) -> ChannelEntry {
         address: canonical_address("surface-out-ch"),
         description: None,
         resolved_channel: ResolvedChannel {
+            // Wide enough that the send-rate gate never fires here: these tests
+            // meter the *surface send budget*, whose burst sits above the
+            // default rate, and a rate denial would mask the gate under test.
+            send_rate: crate::messaging::config::SendRate {
+                burst: u32::MAX,
+                refill_interval_secs: 1,
+                refill: u32::MAX,
+            },
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,

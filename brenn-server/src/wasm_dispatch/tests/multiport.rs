@@ -61,6 +61,7 @@ async fn activation_scoped_failure_quarantines_all_ports_and_fires_one_alert() {
         messenger: Arc::clone(&messenger),
         alert_dispatcher,
         inputs: cfg.inputs.clone(),
+        outputs: vec![],
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -76,8 +77,8 @@ async fn activation_scoped_failure_quarantines_all_ports_and_fires_one_alert() {
     );
 
     // Ack-at-start direct-DB check (test-1): delivered_at must be set on BOTH push rows
-    // after drain regardless of Trap outcome. A regression where mark_pushes_delivered
-    // was moved inside record_wasm_activation_failure (post-guest) would pass the
+    // after drain regardless of Trap outcome. A regression where the settle was
+    // moved inside record_wasm_activation_failure (post-guest) would pass the
     // load_pending_pushes check but fail here.
     {
         let conn = messenger.db().lock().await;
@@ -92,7 +93,7 @@ async fn activation_scoped_failure_quarantines_all_ports_and_fires_one_alert() {
             assert!(
                 delivered_at.is_some(),
                 "ack-at-start: push row {push_id} ({label}) must have delivered_at set \
-                 (mark_pushes_delivered must run before guest) — got None"
+                 (the settle must run before guest) — got None"
             );
         }
     }
@@ -653,6 +654,7 @@ async fn multiport_err_outcome_quarantines_both_channels() {
         messenger: Arc::clone(&messenger),
         alert_dispatcher,
         inputs: cfg.inputs.clone(),
+        outputs: vec![],
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -756,14 +758,14 @@ async fn multiport_drop_reporting_exactly_once() {
     // Simulate overflow on in0: inject a drop count of 2.
     testutils::inject_drop(&messenger, &in_entries[0].address, &wasm_sub, 2);
     assert_eq!(
-        messenger.drop_counter(&in_entries[0].address, &wasm_sub),
+        messenger.dropped_total(&in_entries[0].address, &wasm_sub),
         2,
-        "in0 drop counter must be 2 before drain"
+        "in0 drop total must be 2 before drain"
     );
     assert_eq!(
-        messenger.drop_counter(&in_entries[1].address, &wasm_sub),
+        messenger.dropped_total(&in_entries[1].address, &wasm_sub),
         0,
-        "in1 drop counter must be 0 before drain"
+        "in1 drop total must be 0 before drain"
     );
 
     // Drain: one activation with both ports; in0 reports dropped=2, in1 reports 0.
@@ -1009,6 +1011,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
         address: out1_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -1031,6 +1034,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
         address: out2_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -1136,6 +1140,7 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
                 amplification_mt: 1000,
             },
         ],
+        outputs: vec![],
         activation_pacing: unthrottled_pacing(),
     };
 

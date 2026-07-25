@@ -40,6 +40,7 @@ fn fake_pending_row(push_id: i64, urgency: Urgency) -> crate::messaging::db::Pen
     // eager_wake mirrors what insert_pushes would compute with default wake_min=Normal.
     let eager_wake = urgency >= Urgency::Normal;
     crate::messaging::db::PendingPushRow {
+        retained_seq: Some(1),
         push_id,
         message_id: push_id,
         payload: crate::messaging::IngressOrBus::Bus(crate::messaging::MessageEnvelope {
@@ -117,35 +118,66 @@ async fn dispatch_row_ok_true_returns_delivered() {
     assert_eq!(router.eager_wakes.load(Ordering::SeqCst), 0);
 }
 
-/// Wasm + `Immediate` wake: parks and fires one eager wake.
-/// `CountingRouter.deliver_returns` defaults to 0 (Ok(false)/no bridge); if
-/// `deliver` were called the outcome would still be `Parked`, but the
-/// eager-wake count would come from the Ok(false) arm, not the Wasm gate.
-/// We distinguish by checking that `eager_wakes == 1` before any deliver path
-/// could run (the Wasm gate returns early).
+/// Wasm + a bus row: parks without waking. A channel-backed row has a single
+/// external wake source; waking here too would double-fire.
 #[tokio::test]
-async fn dispatch_row_wasm_immediate_parks_and_eager_wakes() {
+async fn dispatch_row_wasm_bus_row_parks_without_waking() {
     let router = Arc::new(CountingRouter::default());
     let mut row = fake_pending_row(11, Urgency::Normal);
     row.target_subscriber = ParticipantId::for_wasm("test-slug");
+    let outcome =
+        dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false, false).await;
+    assert_eq!(outcome, DispatchOutcome::Parked { woke: false });
+    assert_eq!(
+        router.eager_wakes.load(Ordering::SeqCst),
+        0,
+        "a channel-backed Wasm row is woken by the store walk, not here",
+    );
+}
+
+/// Wasm + an ingress row: parks and fires one eager wake. An ingress row
+/// belongs to no channel and therefore to no store, so no walk can find it and
+/// this arm is its only wake source.
+#[tokio::test]
+async fn dispatch_row_wasm_ingress_row_parks_and_eager_wakes() {
+    let router = Arc::new(CountingRouter::default());
+    let mut row = fake_pending_row(11, Urgency::Normal);
+    row.target_subscriber = ParticipantId::for_wasm("test-slug");
+    row.payload = crate::messaging::IngressOrBus::Ingress(crate::messaging::ingress::Event {
+        id: 11,
+        conversation_id: 1,
+        source: "repo_sync".into(),
+        summary: "summary".into(),
+        payload: "payload".into(),
+        created_at: Utc::now(),
+    });
     let outcome =
         dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false, false).await;
     assert_eq!(outcome, DispatchOutcome::Parked { woke: true });
     assert_eq!(
         router.eager_wakes.load(Ordering::SeqCst),
         1,
-        "Immediate-wake Wasm row must fire exactly one eager wake",
+        "a store-less ingress row must fire exactly one eager wake",
     );
 }
 
-/// Wasm + `None` wake: parks and does NOT fire an eager wake. Locks the
-/// `None`-wake branch of the Wasm gate — a regression that accidentally
-/// calls `spawn_eager_wake` for `None`-wake rows would fail here.
+/// Wasm + `None` wake, on the one payload this arm still wakes for: parks and
+/// does NOT fire an eager wake. Locks the `None`-wake branch of the parked gate
+/// — a regression that accidentally calls `spawn_eager_wake` for `None`-wake
+/// rows would fail here.
 #[tokio::test]
 async fn dispatch_row_wasm_none_parks_no_eager_wake() {
     let router = Arc::new(CountingRouter::default());
     let mut row = fake_pending_row(12, Urgency::Low);
     row.target_subscriber = ParticipantId::for_wasm("test-slug");
+    row.payload = crate::messaging::IngressOrBus::Ingress(crate::messaging::ingress::Event {
+        id: 12,
+        conversation_id: 1,
+        source: "repo_sync".into(),
+        summary: "summary".into(),
+        payload: "payload".into(),
+        created_at: Utc::now(),
+    });
     let outcome =
         dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false, false).await;
     assert_eq!(outcome, DispatchOutcome::Parked { woke: false });
@@ -157,9 +189,9 @@ async fn dispatch_row_wasm_none_parks_no_eager_wake() {
 }
 
 /// `None`-wake row + `deadline_expired=true`: the deadline override must trigger
-/// an unconditional eager wake even though `wake_kind == None` (R6 deadline override,
-/// design §2.4). Without this test a regression removing `|| deadline_expired` from
-/// the dispatch_row Ok(false)/Err branches for None-wake rows would pass all other tests.
+/// an unconditional eager wake even though `wake_kind == None`. Without this test
+/// a regression removing `|| deadline_expired` from the dispatch_row Ok(false)/Err
+/// branches for None-wake rows would pass all other tests.
 #[tokio::test]
 async fn dispatch_row_none_wake_deadline_expired_unconditional_wake() {
     let router = Arc::new(CountingRouter::default());

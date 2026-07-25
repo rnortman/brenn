@@ -22,8 +22,8 @@ use crate::access::{AppCapability, AppPolicy, acl::ChannelMatcher};
 use crate::messaging::config::{Depth, NoiseLevel, ResolvedChannel, ResolvedMessagingConfig, Sink};
 use crate::messaging::db::upsert_channels;
 use crate::messaging::{
-    ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, ParticipantId, Urgency,
-    WakeMin, WakeRouter, canonical_address, db,
+    ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, ParticipantId,
+    SubscriberEntry, SubscriberEntryKind, Urgency, WakeMin, WakeRouter, canonical_address, db,
 };
 use chrono::Utc;
 use indexmap::IndexMap;
@@ -313,22 +313,15 @@ async fn publish_with_future_deliver_after_does_not_dispatch_now() {
     assert!(deliveries.is_empty());
 }
 
-/// Deferred publish with qualifying urgency must set eager_wake=1 on the
-/// pending row, even though release_after is set (correctness-2 regression
-/// guard).
+/// A deferred publish holds no claim, and the claim its release mints carries
+/// eager_wake=1 for a qualifying urgency (correctness-2 regression guard).
 ///
-/// The `release_after IS NULL` predicate in `load_all_dispatchable_pushes`
-/// keeps the row invisible until `release_due_pushes` clears `release_after`.
-/// After that point, eager_wake=1 fires dispatch immediately.  If
-/// eager_wake=0 were stored here, the row would be permanently invisible to
-/// the dispatcher after release — silent deferred delivery loss.
-///
-/// This test queries the DB directly (including rows with release_after
-/// set, which `load_pending_pushes_for_drain` deliberately excludes) so
-/// that reintroducing the `&& release_after.is_none()` conjunct trips the
-/// assertion.
+/// eager_wake=0 on that claim would leave it permanently invisible to the
+/// dispatcher after release — silent deferred delivery loss. Resolving the wake
+/// per released message is what keeps the mint honest: the batch carries
+/// whatever urgencies were parked, not one urgency decided at park time.
 #[tokio::test]
-async fn publish_deferred_qualifying_urgency_sets_eager_wake_on_row() {
+async fn released_deferred_claim_carries_eager_wake_for_qualifying_urgency() {
     let (m, _, _, sub_conv, _router) = build_messenger(1).await;
     let result = m
         .publish(
@@ -344,30 +337,205 @@ async fn publish_deferred_qualifying_urgency_sets_eager_wake_on_row() {
         .await;
     assert!(matches!(result, PublishResult::Ok { .. }), "{result:?}");
 
-    // Query the DB directly — include rows with release_after set.
     let sub = ParticipantId::for_conversation(sub_conv);
-    let conn = m.db.lock().await;
-    let eager_wake_values: Vec<bool> = conn
-        .prepare(
-            "SELECT pp.eager_wake FROM messaging_pending_pushes pp \
-             WHERE pp.target_subscriber = ?1 AND pp.delivered_at IS NULL",
-        )
-        .unwrap()
-        .query_map(rusqlite::params![sub.as_str()], |r| r.get::<_, bool>(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-    drop(conn);
+    async fn claim_wakes(m: &crate::messaging::Messenger, sub: &ParticipantId) -> Vec<bool> {
+        let conn = m.db.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT pp.eager_wake FROM messaging_pending_pushes pp \
+                 WHERE pp.target_subscriber = ?1 AND pp.delivered_at IS NULL",
+            )
+            .unwrap();
+        let values: Vec<bool> = stmt
+            .query_map(rusqlite::params![sub.as_str()], |r| r.get::<_, bool>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        values
+    }
+    assert!(
+        claim_wakes(&m, &sub).await.is_empty(),
+        "a parked message is owed to nobody, so it holds no claim"
+    );
+
+    m.release_due_messages(Utc::now() + chrono::Duration::seconds(61))
+        .await;
+    let eager_wake_values = claim_wakes(&m, &sub).await;
 
     assert_eq!(
         eager_wake_values.len(),
         1,
-        "must have exactly one pending row"
+        "release mints exactly one claim for the subscriber attached now"
     );
     assert!(
         eager_wake_values[0],
         "deferred row with qualifying urgency must have eager_wake=1; \
          eager_wake=0 would make the row invisible to dispatcher after release (correctness-2)"
+    );
+}
+
+/// One release pass carries whatever urgencies were parked, so the wake is
+/// resolved per message against the target's threshold — not once for the batch.
+/// A threshold dropped on the way to the release would wake the fixture's
+/// `WakeMin::Normal` subscriber for the low-urgency message too, which is
+/// exactly the cost the threshold exists to prevent.
+#[tokio::test]
+async fn a_released_batch_resolves_each_messages_wake_against_the_threshold() {
+    let (m, _, _, sub_conv, _router) = build_messenger(1).await;
+    let release_at = Utc::now() + chrono::Duration::seconds(60);
+    for (body, urgency) in [("quiet", Urgency::Low), ("loud", Urgency::Normal)] {
+        let result = m
+            .publish(
+                crate::messaging::PublishOrigin::Conversation { id: 1 },
+                "pa-bob",
+                &canonical_address("pa-alice"),
+                body,
+                urgency,
+                None,
+                Some(release_at),
+                None,
+            )
+            .await;
+        assert!(matches!(result, PublishResult::Ok { .. }), "{result:?}");
+    }
+
+    m.release_due_messages(release_at + chrono::Duration::seconds(1))
+        .await;
+
+    let sub = ParticipantId::for_conversation(sub_conv);
+    let wakes: Vec<(String, bool)> = {
+        let conn = m.db.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.body, pp.eager_wake FROM messaging_pending_pushes pp \
+                 JOIN messaging_messages m ON m.id = pp.message_id \
+                 WHERE pp.target_subscriber = ?1 ORDER BY pp.id",
+            )
+            .unwrap();
+        stmt.query_map(rusqlite::params![sub.as_str()], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    };
+    assert_eq!(
+        wakes,
+        vec![("quiet".to_string(), false), ("loud".to_string(), true)],
+        "the below-threshold message waits for a natural wake; the qualifying one wakes"
+    );
+}
+
+/// The fold-0 context feed is gated on the message holding a retention position,
+/// and feeds that position rather than the row id.
+///
+/// Both halves are load-bearing and neither leaves evidence behind — the feed
+/// writes no row. A parked message fed early hands an attached surface a message
+/// before its release instant; a feed carrying the row id mints a wire cursor in
+/// the wrong numbering domain, which the next resume compares against retention
+/// positions. The park consumes a row id and no position, so the two diverge and
+/// the assertion can tell them apart.
+#[tokio::test]
+async fn the_fold0_context_feed_skips_a_parked_message_and_feeds_its_retention_position() {
+    let mut surface_policy = crate::access::AppPolicy::default();
+    surface_policy
+        .grants
+        .insert(crate::access::AppCapability::MessagingSubscribe);
+    surface_policy
+        .acls
+        .brenn_subscribe
+        .push(crate::access::acl::ChannelMatcher::Prefix(String::new()));
+    let (m, _, _, _, router) = super::build_messenger_with(
+        1,
+        vec![SubscriberEntry {
+            kind: SubscriberEntryKind::Surface {
+                slug: "deskbar".to_string(),
+                instance: None,
+            },
+            push_depth: Depth::Bounded(0),
+            retain_depth: Depth::Unbounded,
+            noise: NoiseLevel::Silent,
+            wake_min: None,
+        }],
+        std::collections::HashMap::from([("deskbar".to_string(), surface_policy)]),
+    )
+    .await;
+
+    let publish = async |body: &str, deliver_after| {
+        m.publish(
+            crate::messaging::PublishOrigin::Conversation { id: 1 },
+            "pa-bob",
+            &canonical_address("pa-alice"),
+            body,
+            Urgency::Normal,
+            None,
+            deliver_after,
+            None,
+        )
+        .await
+    };
+
+    // The parked message takes a row id and no retention position.
+    let parked = publish("later", Some(Utc::now() + chrono::Duration::seconds(60))).await;
+    assert!(matches!(parked, PublishResult::Ok { .. }), "{parked:?}");
+    assert!(
+        router.contexts.lock().await.is_empty(),
+        "a parked message is not observable to a depth-0 feed before its release"
+    );
+
+    let live = publish("now", None).await;
+    assert!(matches!(live, PublishResult::Ok { .. }), "{live:?}");
+    assert_eq!(
+        *router.contexts.lock().await,
+        vec![("now".to_string(), 1)],
+        "the feed carries the message's retention position, not its row id (2 here)"
+    );
+}
+
+/// A `deliver_after` that is already past schedules nothing: the message enters
+/// retention now, with claims, like any immediate publish. The park decision is
+/// made once — a message claimed but holding no retention position is a state no
+/// reader can serve.
+#[tokio::test]
+async fn a_past_deliver_after_publishes_immediately_with_a_retention_position() {
+    let (m, _, _, sub_conv, _router) = build_messenger(1).await;
+    let result = m
+        .publish(
+            crate::messaging::PublishOrigin::Conversation { id: 1 },
+            "pa-bob",
+            &canonical_address("pa-alice"),
+            "already due",
+            Urgency::Normal,
+            None,
+            Some(Utc::now() - chrono::Duration::seconds(5)),
+            None,
+        )
+        .await;
+    assert!(matches!(result, PublishResult::Ok { .. }), "{result:?}");
+
+    let (deliver_after, retained_seq): (Option<String>, Option<i64>) = {
+        let conn = m.db.lock().await;
+        conn.query_row(
+            "SELECT deliver_after, retained_seq FROM messaging_messages",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert!(
+        deliver_after.is_none(),
+        "a past release time is no schedule at all, got {deliver_after:?}"
+    );
+    assert!(
+        retained_seq.is_some(),
+        "an unparked message holds the retention position its claims are served against"
+    );
+    assert_eq!(
+        m.load_pending_pushes(&ParticipantId::for_conversation(sub_conv))
+            .await
+            .len(),
+        1,
+        "the subscriber is owed it now"
     );
 }
 
@@ -671,6 +839,7 @@ fn bare_channel(name: &str) -> ChannelEntry {
         address: canonical_address(name),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use brenn_lib::config::{AppConfig, BrennConfig};
 use brenn_lib::messaging;
 use brenn_lib::messaging::config::{
-    Depth, EphemeralChannelEntry, NoiseLevel, ResolvedMessagingConfig, ResolvedSubscription,
-    ResolvedSurface, ResolvedSurfaceSubscription, ResolvedWasmConsumer,
+    Depth, NoiseLevel, ResolvedMessagingConfig, ResolvedSubscription, ResolvedSurface,
+    ResolvedSurfaceSubscription, ResolvedWasmConsumer,
 };
 use brenn_lib::messaging::{
     ChannelEntry, ChannelScheme, MessagingDirectory, webhook_channel_uuid_from_slug,
@@ -235,14 +235,14 @@ pub(crate) struct MessagingResult {
     /// (see [`DynamicMqttIngress`]). Empty when no such rows survived the merge.
     pub(crate) dynamic_mqtt_ingress: Vec<DynamicMqttIngress>,
     /// Fully resolved `[[surface]]` blocks, in declaration order.
-    /// Boot-cross-validated. Carried for later consumers (the `EphemeralBus` / surface WS
+    /// Boot-cross-validated. Carried for later consumers (the surface WS
     /// endpoint); the only reader today is the boot-time observability log in
     /// `bootstrap/mod.rs`. Empty when no `[[surface]]` blocks are configured.
     pub(crate) surfaces: Vec<ResolvedSurface>,
-    /// Resolved `[[ephemeral_channel]]` directory, in declaration
-    /// order. Carried for later consumers' `EphemeralBus`; the only reader today is the boot log.
-    /// Empty when no `[[ephemeral_channel]]` blocks are configured.
-    pub(crate) ephemeral_channels: Vec<EphemeralChannelEntry>,
+    /// Resolved non-durable `[[channel]]` entries (`ephemeral:` and `local:`),
+    /// in declaration order. Carried for the store registry the `Messenger` is
+    /// built with; the only other reader today is the boot log.
+    pub(crate) nondurable_channels: Vec<ChannelEntry>,
     /// Collected system participant specs. The caller registers a parked-notify
     /// delivery binding (and spawns a drain task) for each spec with
     /// subscriptions. Empty when messaging is unconfigured or no system
@@ -396,16 +396,14 @@ pub(crate) fn messaging_configured(
         || !mqtt_ingress_channels.is_empty()
         || !config.wasm_consumers.is_empty()
         || !config.surfaces.is_empty()
-        || !config.ephemeral_channels.is_empty()
 }
 
 /// Build the channel directory, upsert configured channels, rebuild
 /// subscriptions, and construct the messenger + wake router.
 ///
 /// Returns `None` values when `messaging_configured` is false (no `[[channel]]`,
-/// `[[webhook_endpoint]]`, mqtt-ingress, `[[wasm_consumer]]`, `[[surface]]`, or
-/// `[[ephemeral_channel]]` blocks — messaging effectively disabled, no DB rows
-/// touched).
+/// `[[webhook_endpoint]]`, mqtt-ingress, `[[wasm_consumer]]`, or `[[surface]]`
+/// blocks — messaging effectively disabled, no DB rows touched).
 ///
 /// `server_origin` must be the value resolved once at bootstrap entry (via
 /// `resolve_source`) and shared with `build_pwa_push` so both publish paths
@@ -438,7 +436,7 @@ pub(crate) async fn build_messaging(
             wasm_consumers: vec![],
             dynamic_mqtt_ingress: vec![],
             surfaces: vec![],
-            ephemeral_channels: vec![],
+            nondurable_channels: vec![],
             system_participants: vec![],
         };
     }
@@ -459,6 +457,7 @@ pub(crate) async fn build_messaging(
             address: format!("webhook:{}", ep.slug),
             description: ep.description.clone(),
             resolved_channel: messaging::config::ResolvedChannel {
+                send_rate: global_defaults.default_send_rate,
                 push_depth: global_defaults.default_push_depth,
                 retain_depth: global_defaults.default_retain_depth,
                 standing_retain_depth: global_defaults.default_standing_retain_depth,
@@ -491,6 +490,7 @@ pub(crate) async fn build_messaging(
             address: channel.channel_address.clone(),
             description: None,
             resolved_channel: messaging::config::ResolvedChannel {
+                send_rate: global_defaults.default_send_rate,
                 push_depth: global_defaults.default_push_depth,
                 retain_depth: global_defaults.default_retain_depth,
                 standing_retain_depth: global_defaults.default_standing_retain_depth,
@@ -507,9 +507,15 @@ pub(crate) async fn build_messaging(
     // --- Build apps_with_messaging, merging webhook subscriptions ---
     let apps_with_messaging = build_apps_with_messaging(apps, global_defaults);
 
-    // Build channel entries: brenn: channels first, then webhook:, then mqtt:.
-    let mut all_entries =
-        messaging::config::build_channel_entries(&config.channels, global_defaults);
+    // Build channel entries: `[[channel]]` first, then webhook:, then mqtt:.
+    // The `[[channel]]` table declares every pub/sub scheme, so split the
+    // non-durable entries off here — they carry no DB row and are wired to the
+    // in-memory substrate rather than the durable directory.
+    let (nondurable_channels, durable_channels): (Vec<ChannelEntry>, Vec<ChannelEntry>) =
+        messaging::config::build_channel_entries(&config.channels, global_defaults)
+            .into_iter()
+            .partition(|e| !e.capabilities().durable);
+    let mut all_entries = durable_channels;
     all_entries.extend(webhook_channel_entries);
     all_entries.extend(mqtt_channel_entries);
 
@@ -522,13 +528,29 @@ pub(crate) async fn build_messaging(
     // `finalize_directory_with_subscribers` then re-uses `all_entries` to build
     // the final directory with subscribers populated.
     let pre_directory = MessagingDirectory::with_entries(all_entries.clone());
+    // WASM inputs may target non-durable (ephemeral:/local:) channels, so
+    // resolve them against a directory that includes the non-durable set. The
+    // surface pre_directory must stay durable-only (surface binding resolution
+    // takes the ephemeral set as a separate argument).
+    let nondurable_uuids: std::collections::HashSet<uuid::Uuid> =
+        nondurable_channels.iter().map(|e| e.uuid).collect();
+    let wasm_pre_directory = {
+        let mut wasm_dir_entries = all_entries.clone();
+        wasm_dir_entries.extend(nondurable_channels.iter().cloned());
+        MessagingDirectory::with_entries(wasm_dir_entries)
+    };
     let mut resolved_wasm_consumers = resolve_wasm_consumers(
         &config.wasm_consumers,
-        &pre_directory,
+        &wasm_pre_directory,
         &config.wasm.store_size_limit,
         resolved_mqtt_clients,
     );
-    // Strip to slug+subs for `finalize_directory_with_subscribers` (directory only needs these).
+    // Every input registers in the directory, whatever its channel's class: the
+    // registration is where a subscription's resolved parameters (push depth,
+    // retain depth, noise rung) live, and the substrate reads them for a
+    // ring-backed subscriber exactly as for a durable one. Only *persistence* of
+    // the registration follows durability, and that split is made once, at the
+    // `messaging_subscriptions` rebuild below.
     let mut wasm_consumers_for_dir: Vec<(String, Vec<ResolvedSubscription>)> =
         resolved_wasm_consumers
             .iter()
@@ -538,7 +560,7 @@ pub(crate) async fn build_messaging(
             })
             .collect();
 
-    // Resolve `[[ephemeral_channel]]` + `[[surface]]` blocks *before* finalizing
+    // Resolve the `[[surface]]` blocks *before* finalizing
     // the directory: a `brenn:` surface subscription resolves to a
     // `SubscriberEntryKind::Surface` directory entry, so its durable subscriptions
     // must be ready for `finalize_directory_with_subscribers`. `resolve_surfaces`
@@ -547,10 +569,11 @@ pub(crate) async fn build_messaging(
     // resolution needs only channel identity/transport) and the ephemeral-channel
     // set (fail-fast on any dead / mis-scheme / policy-uncovered binding), exactly
     // as `resolve_wasm_consumers` does above.
-    let ephemeral_channels = messaging::config::build_ephemeral_channel_entries(
-        &config.ephemeral_channels,
-        global_defaults,
-    );
+    let ephemeral_channels: Vec<ChannelEntry> = nondurable_channels
+        .iter()
+        .filter(|e| e.transport_type == ChannelScheme::Ephemeral)
+        .cloned()
+        .collect();
     let mut resolved_surfaces = resolve_surfaces(
         &config.surfaces,
         &pre_directory,
@@ -685,6 +708,17 @@ pub(crate) async fn build_messaging(
     ));
     brenn_lib::messaging::system::fold_spec_subscriptions(&mut all_entries, &system_participants);
 
+    // The non-durable channels join the one directory here, after the WASM and
+    // surface resolution passes above. Those passes read `pre_directory`, whose
+    // channel set is the durable one they are wired to today; the participants
+    // that reach a ring-backed channel resolve through the final directory
+    // instead. `local:` entries are included: a backend `local:` channel is a
+    // channel of this process, and surface binding resolution never consults the
+    // `[[channel]]` table for `local:` addresses.
+    all_entries.extend(nondurable_channels.iter().cloned());
+
+    let ring_stores = Arc::new(messaging::store::RingStores::build(&nondurable_channels));
+
     let directory = Arc::new(messaging::config::finalize_directory_with_subscribers(
         all_entries,
         &apps_with_messaging,
@@ -717,7 +751,15 @@ pub(crate) async fn build_messaging(
 
     // Sync DB state with config: upsert channels, rebuild subscriptions, then
     // fold the durable dynamic subscriptions back into the directory.
-    //
+
+    // Snapshot the durable subscription keys before `rebuild_subscriptions`
+    // truncates the table; the durable-priming pass below reads them to tell a
+    // surviving queue from a brand-new one.
+    let prior_subscription_keys = {
+        let conn = db.lock().await;
+        messaging::db::load_subscription_keys(&conn)
+    };
+
     // `dynamic_mqtt_ingress` collects the surviving dynamic `mqtt:` subscriptions
     // whose filter has no static ingress channel, so the caller can rebuild their
     // broker SUBSCRIBE + `IngressRoute` (boot re-activation gap — see
@@ -725,13 +767,33 @@ pub(crate) async fn build_messaging(
     let mut dynamic_mqtt_ingress: Vec<DynamicMqttIngress> = Vec::new();
     {
         let conn = db.lock().await;
-        let entries: Vec<messaging::ChannelEntry> =
-            directory.list().iter().map(|e| (**e).clone()).collect();
+        // Durable channels only: a non-durable channel has no `messaging_channels`
+        // row to upsert, and writing one would outlive the data it names.
+        let entries: Vec<messaging::ChannelEntry> = directory
+            .list_durable()
+            .iter()
+            .map(|e| (**e).clone())
+            .collect();
         messaging::db::upsert_channels(&conn, &entries);
+        // Registration persistence follows channel durability: a ring-backed
+        // subscription is meaningless after the restart that empties the ring,
+        // so it registers in the directory and nowhere else.
+        let wasm_consumers_for_db: Vec<(String, Vec<ResolvedSubscription>)> =
+            wasm_consumers_for_dir
+                .iter()
+                .map(|(slug, subs)| {
+                    let durable = subs
+                        .iter()
+                        .filter(|sub| !nondurable_uuids.contains(&sub.channel_uuid))
+                        .cloned()
+                        .collect();
+                    (slug.clone(), durable)
+                })
+                .collect();
         messaging::db::rebuild_subscriptions(
             &conn,
             &apps_with_messaging,
-            &wasm_consumers_for_dir,
+            &wasm_consumers_for_db,
             &surfaces_for_dir,
         );
         // Boot merge: the directory now holds the static + WASM
@@ -926,13 +988,6 @@ pub(crate) async fn build_messaging(
     subscriber_registrations.extend(brenn_lib::messaging::system::registrations_from_specs(
         &system_participants,
     ));
-    // Build the config-resolved ephemeral bus and attach it to the Messenger,
-    // replacing the empty default installed by `Messenger::new`.
-    let ephemeral_bus = messaging::EphemeralBus::new(
-        ephemeral_channels.clone(),
-        source.clone(),
-        config.messaging.max_body_bytes,
-    );
     let messenger = messaging::Messenger::new(
         db,
         directory,
@@ -955,7 +1010,54 @@ pub(crate) async fn build_messaging(
             .iter()
             .map(|s| (s.slug.clone(), s.principal_send_budgets().collect())),
     )
-    .with_ephemeral_bus(ephemeral_bus);
+    .with_ring_stores(ring_stores);
+
+    // A queue is fresh iff its registration did not survive the restart. Ring
+    // registrations never survive; a durable registration survives iff its
+    // `messaging_subscriptions` row was present on the prior boot (the snapshot
+    // taken before `rebuild_subscriptions` truncated the table).
+    //
+    // TODO(substrate-priming-atomic-marker): the durable new-queue marker (the
+    // `rebuild_subscriptions` row) and the seed commit inside `attach` land in
+    // separate autocommit scopes with reachable panics between them; a crash in
+    // the window makes the next boot skip priming (silent delivery gap). Make
+    // marker + seed atomic in the durable-priming refactor.
+    //
+    // TODO(substrate-priming-kind-qualified-key): the snapshot key is kind-blind
+    // (`app_slug` is the bare slug for both App- and Wasm-kind rows), so a prior
+    // boot's App subscriber sharing this slug on this channel aliases here and
+    // suppresses priming of a genuinely new WASM queue. Key on a kind-qualified
+    // subscriber identity in the durable-priming refactor.
+    let mut primed_any = false;
+    for c in &resolved_wasm_consumers {
+        let subscriber = brenn_lib::messaging::ParticipantId::for_wasm(&c.slug);
+        let priming = messaging::store::priming_for_kind(
+            &brenn_lib::messaging::SubscriberEntryKind::Wasm(c.slug.clone()),
+        );
+        for inp in &c.inputs {
+            let push_depth = inp
+                .sub
+                .push_depth
+                .clamped_to(brenn_lib::messaging::WASM_WINDOW_MAX_NEW);
+            let fresh_queue = nondurable_uuids.contains(&inp.sub.channel_uuid)
+                || !prior_subscription_keys.contains(&(inp.sub.channel_uuid, c.slug.clone()));
+            let attached = messenger
+                .attach_subscriber(
+                    &inp.sub.channel_address,
+                    &c.slug,
+                    &subscriber,
+                    push_depth,
+                    priming,
+                    fresh_queue,
+                )
+                .await;
+            primed_any |= attached == messaging::store::Attached::Created;
+        }
+    }
+    // Kick so primed consumers drain immediately rather than at the next poll.
+    if primed_any {
+        messenger.dispatch_kick();
+    }
 
     MessagingResult {
         messenger: Some(messenger),
@@ -963,7 +1065,7 @@ pub(crate) async fn build_messaging(
         wasm_consumers: resolved_wasm_consumers,
         dynamic_mqtt_ingress,
         surfaces: resolved_surfaces,
-        ephemeral_channels,
+        nondurable_channels,
         system_participants,
     }
 }

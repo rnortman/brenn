@@ -86,12 +86,56 @@ interface types {
         dropped: u32,
     }
 
+    /// One of this component's own parked (deferred) messages on an output
+    /// port's channel — a message it published via `ports.publish-deferred`
+    /// whose `deliver-after` has not yet arrived, so it is not yet observable to
+    /// any subscriber, replay, or context read.
+    record deferred-entry {
+        /// Position of this entry within its `deferred-window.entries` list,
+        /// which is ordered by `deliver-after` ascending. This is the index a
+        /// future `defer-cancel`/`defer-edit` names; it is snapshot-relative and
+        /// only valid against the window it arrived in.
+        index: u32,
+        /// The message BODY the component published (not an envelope) — the same
+        /// opaque string it passed to `publish-deferred`.
+        payload: string,
+        /// The scheduled release time, epoch milliseconds UTC.
+        deliver-after: u64,
+    }
+
+    /// The component's own parked messages on one output port's channel, a
+    /// snapshot taken at drain, ordered by `deliver-after` ascending. Scoped to
+    /// (this component's sender identity, the port's channel): a component sees
+    /// only messages it itself parked, never a peer's, even on a shared channel.
+    record deferred-window {
+        /// Logical output port name from host config — never a raw channel address.
+        port: string,
+        entries: list<deferred-entry>,
+    }
+
     /// One activation. Contains one `port-window` per bound input port, in
     /// the order declared in the consumer's config (`cfg.inputs` order). Every
     /// bound port appears in every activation; a port with no new messages
     /// arrives as a pure-context window (`new-from == envelopes` length).
     /// Guests must not assume `ports` has length 1.
-    record activation { ports: list<port-window> }
+    ///
+    /// `deferred` carries one `deferred-window` per bound output port, in config
+    /// (`cfg.outputs`) order — the component's own parked messages, so a guest
+    /// can see, and (later) cancel/edit, what it scheduled. Inputs and this
+    /// output-deferred view are separate typed lists: a future in/out port
+    /// appears in both, additively.
+    ///
+    /// `now` is the host's wall clock at drain, epoch milliseconds UTC. It lets
+    /// a guest compute an absolute `deliver-after` for `ports.publish-deferred`
+    /// without holding a clock of its own — clock authority stays with the host.
+    /// It is `none` when the host exposes no UTC wall clock (the surface page
+    /// kernel, whose clock is a monotonic page-load timer, not UTC); a guest
+    /// that needs deferred publish runs only where `now` is `some`.
+    record activation {
+        ports: list<port-window>,
+        deferred: list<deferred-window>,
+        now: option<u64>,
+    }
 
     /// Outcome of processing the batch. A guest trap is a distinct,
     /// host-observed failure (not representable here).
@@ -149,6 +193,68 @@ interface ports {
     /// (additive WIT ABI — no package version bump).
     publish-with-urgency: func(port: string, payload: string, urgency: urgency)
         -> result<_, publish-error>;
+
+    /// Buffer one message for the port's channel, held until `deliver-after`
+    /// (epoch milliseconds UTC) before it becomes observable to any subscriber,
+    /// replay, or context read. A `deliver-after` at or before the host's `now`
+    /// (see `activation.now`) publishes immediately, exactly like `publish`.
+    /// Urgency is the port default; use the sender-intent form via a later
+    /// activation if an override is needed.
+    ///
+    /// This is the timer idiom: a component schedules a message to itself (or a
+    /// peer) at a future instant, most commonly to wake itself again. Like
+    /// `publish`, the call is BUFFERED and flushed atomically iff receive
+    /// returns ok — an err/trap schedules nothing. The parked message is bounded
+    /// channel-wide by the channel's retain depth; beyond that the flush drops
+    /// the schedule (host-logged), since a post-activation flush has no error
+    /// channel back to the guest.
+    ///
+    /// Same provenance/trust note as `publish`: the message carries
+    /// `sender = "wasm:<slug>"` with no external-origin marker.
+    publish-deferred: func(port: string, payload: string, deliver-after: u64)
+        -> result<_, publish-error>;
+
+    /// Failure modes for the deferred-message control ops (`defer-cancel` /
+    /// `defer-edit`). A drain-vs-release race — the named message released
+    /// between the activation's snapshot and the flush — is NOT an error here:
+    /// it is a benign lost race the host logs and counts, and the buffered op
+    /// returns ok at buffer time (the guest already returned before the race is
+    /// resolvable).
+    variant defer-error {
+        /// `port` is not one of this component's bound output ports.
+        not-permitted,
+        /// `index` is outside the deferred-window this activation delivered for
+        /// `port`. Snapshot-relative: an index valid against a *different*
+        /// activation's window is still out of range here. This is a guest bug,
+        /// so it fails fail-fast at buffer time.
+        out-of-range,
+        /// Per-activation control-op budget exhausted (shared with the publish
+        /// call budget).
+        quota-exceeded,
+        /// A `defer-edit` `deliver-after` is not a representable timestamp. Like
+        /// `publish-deferred`, the host rejects it at buffer time (where the guest
+        /// still holds the error channel) rather than let it collapse host-side.
+        invalid-deliver-after,
+    }
+
+    /// Cancel one of this component's own parked messages, named by its `index`
+    /// into the deferred-window this activation delivered for `port`. Like
+    /// `publish`, the call is BUFFERED and applied atomically iff receive returns
+    /// ok — an err/trap cancels nothing. At flush the host resolves `index` to the
+    /// message identity captured in the snapshot, so a message that released
+    /// between drain and flush cannot be mis-targeted; that case is a benign
+    /// logged no-op, not an error. A cancelled message never becomes observable.
+    defer-cancel: func(port: string, index: u32) -> result<_, defer-error>;
+
+    /// Edit one of this component's own parked messages, named by its `index` into
+    /// the deferred-window this activation delivered for `port`. `payload` and
+    /// `deliver-after` are each `some` to change, `none` to leave alone. Same
+    /// buffered/atomic/index-resolution semantics as `defer-cancel`: applied at
+    /// flush iff receive returns ok, index resolved against the snapshot, a
+    /// drain-vs-release race a benign logged no-op. A `deliver-after` at or before
+    /// the host's `now` releases the message immediately at flush.
+    defer-edit: func(port: string, index: u32, payload: option<string>,
+        deliver-after: option<u64>) -> result<_, defer-error>;
 }
 
 interface store {

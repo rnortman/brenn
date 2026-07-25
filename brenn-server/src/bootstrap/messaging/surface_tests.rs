@@ -7,11 +7,12 @@ use super::test_fixtures::{
 };
 use super::*;
 use brenn_lib::config::AppConfig;
+use brenn_lib::messaging::Urgency;
+use brenn_lib::messaging::config::SendRate;
 use brenn_lib::messaging::config::{
     DEFAULT_SURFACE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_PER_SEC, ResolvedComponent,
     ResolvedLocalChannel, SurfaceSendBudget,
 };
-use brenn_lib::messaging::{EPHEMERAL_SENDER_BURST, EPHEMERAL_SENDER_REFILL_AMOUNT, Urgency};
 
 /// Global messaging defaults for resolution tests: the stock defaults with a
 /// bounded `default_push_depth`, which is what an operator hosting a surface must
@@ -36,6 +37,7 @@ fn surface_boot_directory() -> messaging::MessagingDirectory {
         address: brenn_lib::messaging::canonical_address("surface-boot"),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -139,6 +141,7 @@ fn system_boot_directory() -> messaging::MessagingDirectory {
         address: brenn_lib::messaging::canonical_address("system-boot"),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -229,20 +232,13 @@ fn validate_static_subscriptions_system_uncovered_panics() {
 
 // --- resolve_surfaces fixtures ---
 
-/// An `EphemeralChannelEntry` whose channel rung is transparent to
+/// An `ephemeral:` `ChannelEntry` whose channel rung is transparent to
 /// `test_globals` — a bounded `push_depth` matching the test global default, so a
 /// binding that states no `push_depth` resolves binding → channel → global to a
 /// legal page-queue depth exactly as `test_globals` intends.
-fn ephem(name: &str) -> brenn_lib::messaging::config::EphemeralChannelEntry {
-    use brenn_lib::messaging::config::{Depth, EphemeralChannelEntry, NoiseLevel};
-    EphemeralChannelEntry {
-        uuid: brenn_lib::messaging::ephemeral_channel_uuid_from_name(name),
-        name: name.to_string(),
-        push_depth: Depth::Bounded(8),
-        retain_depth: 1,
-        noise: NoiseLevel::Silent,
-        capacity: 16,
-    }
+fn ephem(name: &str) -> brenn_lib::messaging::ChannelEntry {
+    use brenn_lib::messaging::config::{Depth, NoiseLevel};
+    ephem_with(name, Depth::Bounded(8), 1, NoiseLevel::Silent)
 }
 
 /// Like [`ephem`] but with an explicit channel-rung `push_depth`, `retain_depth`,
@@ -252,14 +248,24 @@ fn ephem_with(
     push_depth: brenn_lib::messaging::config::Depth,
     retain_depth: u64,
     noise: brenn_lib::messaging::config::NoiseLevel,
-) -> brenn_lib::messaging::config::EphemeralChannelEntry {
-    brenn_lib::messaging::config::EphemeralChannelEntry {
+) -> brenn_lib::messaging::ChannelEntry {
+    use brenn_lib::messaging::config::{Depth, ResolvedChannel, Sink};
+    brenn_lib::messaging::ChannelEntry {
         uuid: brenn_lib::messaging::ephemeral_channel_uuid_from_name(name),
-        name: name.to_string(),
-        push_depth,
-        retain_depth,
-        noise,
-        capacity: 16,
+        address: format!("ephemeral:{name}"),
+        description: None,
+        resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
+            push_depth,
+            retain_depth: Depth::Bounded(retain_depth),
+            standing_retain_depth: Depth::Bounded(retain_depth),
+            noise,
+            sink: Sink::Drop,
+            wake_min: brenn_lib::messaging::WakeMin::Normal,
+        },
+        subscribers: vec![],
+        transport_type: brenn_lib::messaging::ChannelScheme::Ephemeral,
+        mount: None,
     }
 }
 
@@ -327,10 +333,7 @@ fn valid_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
 
 /// A directory holding `brenn:alerts` and an ephemeral set holding
 /// `protobar-demo` — the channels the valid surface binds.
-fn surface_dir_and_ephem() -> (
-    MessagingDirectory,
-    Vec<brenn_lib::messaging::config::EphemeralChannelEntry>,
-) {
+fn surface_dir_and_ephem() -> (MessagingDirectory, Vec<brenn_lib::messaging::ChannelEntry>) {
     let (dir, _addr) = make_brenn_dir("brenn:alerts");
     (dir, vec![ephem("protobar-demo")])
 }
@@ -700,7 +703,7 @@ fn surface_ephemeral_binding_honours_push_depth() {
     assert_eq!(resolved[0].subscriptions[0].push_depth, 3);
 }
 
-/// An unset ephemeral binding inherits the `[[ephemeral_channel]]` rung's
+/// An unset ephemeral binding inherits the `[[channel]]` rung's
 /// `push_depth` — binding → channel → global, class-uniform with `brenn:`. The
 /// `ephem` fixture's channel rung is 8.
 #[test]
@@ -788,7 +791,7 @@ fn surface_ephemeral_binding_retain_depth_resolves() {
 }
 
 /// An ephemeral binding that states no `retain_depth` inherits the
-/// `[[ephemeral_channel]]` rung — binding → channel → global, class-uniform with
+/// `[[channel]]` rung — binding → channel → global, class-uniform with
 /// `brenn:`. The `ephem` fixture's channel rung is 1.
 #[test]
 fn surface_ephemeral_binding_retain_depth_inherits_the_channel_rung() {
@@ -1343,28 +1346,28 @@ fn surface_zero_publish_per_sec_panics() {
 fn surface_at_ceiling_publish_budgets_resolve() {
     let (dir, ephem_chs) = surface_dir_and_ephem();
     let mut raw = valid_surface_raw();
-    raw.publish_burst = Some(EPHEMERAL_SENDER_BURST);
-    raw.publish_per_sec = Some(EPHEMERAL_SENDER_REFILL_AMOUNT);
+    raw.publish_burst = Some(SendRate::default().burst);
+    raw.publish_per_sec = Some(SendRate::default().refill);
     let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
-    assert_eq!(resolved[0].publish_burst, EPHEMERAL_SENDER_BURST);
-    assert_eq!(resolved[0].publish_per_sec, EPHEMERAL_SENDER_REFILL_AMOUNT);
+    assert_eq!(resolved[0].publish_burst, SendRate::default().burst);
+    assert_eq!(resolved[0].publish_per_sec, SendRate::default().refill);
 }
 
 #[test]
-#[should_panic(expected = "exceeds the bus per-sender burst")]
+#[should_panic(expected = "exceeds the default send-rate burst")]
 fn surface_over_ceiling_publish_burst_panics() {
     let (dir, ephem_chs) = surface_dir_and_ephem();
     let mut raw = valid_surface_raw();
-    raw.publish_burst = Some(EPHEMERAL_SENDER_BURST + 1);
+    raw.publish_burst = Some(SendRate::default().burst + 1);
     resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
 }
 
 #[test]
-#[should_panic(expected = "exceeds the bus per-sender refill")]
+#[should_panic(expected = "exceeds the default send rate")]
 fn surface_over_ceiling_publish_per_sec_panics() {
     let (dir, ephem_chs) = surface_dir_and_ephem();
     let mut raw = valid_surface_raw();
-    raw.publish_per_sec = Some(EPHEMERAL_SENDER_REFILL_AMOUNT + 1);
+    raw.publish_per_sec = Some(SendRate::default().refill + 1);
     resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
 }
 
@@ -1668,7 +1671,7 @@ fn surface_wrong_scheme_channel_panics() {
 }
 
 #[test]
-#[should_panic(expected = "names no declared [[ephemeral_channel]]")]
+#[should_panic(expected = "names no declared [[channel]]")]
 fn surface_unknown_ephemeral_channel_panics() {
     let (dir, _ephem_chs) = surface_dir_and_ephem();
     // Empty ephemeral set → the ephemeral:protobar-demo subscription has no
@@ -1838,7 +1841,7 @@ fn surface_leading_hyphen_component_kind_panics() {
     resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
 }
 
-/// An `[[ephemeral_channel]]` no surface binding references is allowed
+/// An `ephemeral:` `[[channel]]` no surface binding references is allowed
 /// (a deliberate staged decision). Pins that no over-eager
 /// "every channel must be read" cross-check is ever added.
 #[test]

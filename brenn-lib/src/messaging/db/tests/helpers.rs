@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 pub(super) fn default_resolved_channel() -> ResolvedChannel {
     ResolvedChannel {
+        send_rate: Default::default(),
         push_depth: Depth::Unbounded,
         retain_depth: Depth::Unbounded,
         standing_retain_depth: Depth::Unbounded,
@@ -35,6 +36,10 @@ pub(super) fn make_directory() -> (MessagingDirectory, Uuid) {
 
 /// Helper: insert a message with N push rows (one per conversation_id provided).
 /// Returns (message internal id, message uuid).
+///
+/// A claim on a scheduled message is held for the same instant the message is:
+/// a claim owed *now* against a message that has not entered retention is a row
+/// no read can serve, whether or not the scheduled instant has passed.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn insert_msg(
     conn: &Connection,
@@ -63,7 +68,7 @@ pub(super) fn insert_msg(
                 target_subscriber: ParticipantId::for_conversation(cid),
                 target_app_slug: "app".to_string(),
                 eager_wake: false,
-                release_after: deliver_after.filter(|da| *da > Utc::now()),
+                release_after: deliver_after,
                 delivery_deadline: None,
             })
             .collect::<Vec<_>>(),

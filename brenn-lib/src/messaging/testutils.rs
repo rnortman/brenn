@@ -13,7 +13,7 @@ use super::{
     ChannelEntry, ChannelScheme, MessagingDirectory, Messenger, ParticipantId, SubscriberEntry,
     SubscriberEntryKind, SubscriberRegistration, Urgency, WakeEconomics, WakeMin, WakeRouter,
     canonical_address,
-    config::{self, Depth, EphemeralChannelEntry, MessagingGlobalConfig, NoiseLevel},
+    config::{self, Depth, MessagingGlobalConfig, NoiseLevel},
     db::{self, PendingPushInsert, insert_message_with_pushes, upsert_channels},
     ephemeral_channel_uuid_from_name,
     query::NoopWakeRouter,
@@ -123,6 +123,7 @@ pub fn wasm_channel_entry(
         address: channel_addr,
         description: None,
         resolved_channel: config::ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -142,6 +143,18 @@ pub fn wasm_channel_entry(
     })
 }
 
+/// A single WASM-subscriber registration for a `ChannelEntry`: unbounded
+/// depths, `noise = Silent`, no per-subscription `wake_min`.
+pub fn wasm_subscriber_entry(slug: &str) -> SubscriberEntry {
+    SubscriberEntry {
+        kind: SubscriberEntryKind::Wasm(slug.to_string()),
+        push_depth: Depth::Unbounded,
+        retain_depth: Depth::Unbounded,
+        noise: config::NoiseLevel::Silent,
+        wake_min: None,
+    }
+}
+
 /// Build a default `brenn:` `ChannelEntry` with the given subscribers.
 ///
 /// Channel-level depths are `Depth::Unbounded`, `noise = Silent`, `sink = Drop`,
@@ -155,6 +168,7 @@ pub fn test_channel_entry(name: &str, subscribers: Vec<SubscriberEntry>) -> Chan
         address: canonical_address(name),
         description: None,
         resolved_channel: config::ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -168,22 +182,38 @@ pub fn test_channel_entry(name: &str, subscribers: Vec<SubscriberEntry>) -> Chan
     }
 }
 
-/// Build an `EphemeralChannelEntry` with the deterministic name-derived uuid.
-pub fn ephemeral_channel_entry(
-    name: &str,
-    retain_depth: u64,
-    capacity: u32,
-) -> EphemeralChannelEntry {
-    EphemeralChannelEntry {
+/// Build an `ephemeral:` `ChannelEntry` with the deterministic name-derived uuid.
+///
+/// The channel rung is transparent to global: an ephemeral binding that states
+/// no push_depth/noise inherits these.
+pub fn ephemeral_channel_entry(name: &str, retain_depth: u64) -> ChannelEntry {
+    ChannelEntry {
         uuid: ephemeral_channel_uuid_from_name(name),
-        name: name.to_string(),
-        // The channel rung transparent to global: an ephemeral binding that
-        // states no push_depth/noise inherits these, matching the pre-rung
-        // behavior where the binding inherited straight from global.
-        push_depth: Depth::Unbounded,
-        retain_depth,
-        noise: NoiseLevel::Silent,
-        capacity,
+        address: format!("ephemeral:{name}"),
+        description: None,
+        resolved_channel: config::ResolvedChannel {
+            send_rate: Default::default(),
+            push_depth: Depth::Unbounded,
+            retain_depth: Depth::Bounded(retain_depth),
+            standing_retain_depth: Depth::Bounded(retain_depth),
+            noise: NoiseLevel::Silent,
+            sink: config::Sink::Drop,
+            wake_min: WakeMin::Normal,
+        },
+        subscribers: vec![],
+        transport_type: ChannelScheme::Ephemeral,
+        mount: None,
+    }
+}
+
+/// Build a `local:` `ChannelEntry` with the deterministic name-derived uuid —
+/// non-durable like `ephemeral:`, and confined on top of it.
+pub fn local_channel_entry(name: &str, retain_depth: u64) -> ChannelEntry {
+    ChannelEntry {
+        uuid: super::local_channel_uuid_from_name(name),
+        address: format!("local:{name}"),
+        transport_type: ChannelScheme::Local,
+        ..ephemeral_channel_entry(name, retain_depth)
     }
 }
 
@@ -283,12 +313,13 @@ pub async fn insert_wasm_push(
     insert_wasm_push_at(messenger, channel, subscriber, body, envelope_type, ts_ns).await
 }
 
-/// Directly increment the in-memory drop counter for `(channel, subscriber)` by
-/// `amount`. Used in tests that need to simulate push-overflow without going through
-/// the full publish path (which requires noise=Metered and an app config).
+/// Charge `amount` push-overflow drops to `subscriber` on `channel`'s store.
+/// Used in tests that need to simulate push-overflow without going through the
+/// full publish path. Durable channels only — a ring subscriber's drops are
+/// counted on its cursor, so they come from a real append past its window.
 ///
-/// Delegates to `Messenger::inject_drop` (a `#[cfg(test)]` method) so drop-counter
-/// mutation is cfg-gated and does not leak beyond test builds (quality-3).
+/// Delegates to `Messenger::inject_drop` (a cfg-gated method) so drop-count
+/// mutation does not leak beyond test builds.
 pub fn inject_drop(messenger: &Messenger, channel: &str, subscriber: &ParticipantId, amount: u64) {
     messenger.inject_drop(channel, subscriber, amount);
 }

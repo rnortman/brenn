@@ -44,21 +44,15 @@ const _: () = assert!(
 /// bounding an attacker.
 pub const SURFACE_SEND_REFILL: Duration = Duration::from_secs(15);
 
-use crate::auth::user::get_user_by_username;
-use crate::conversation::get_or_create_singleton_conversation;
-
 use super::db::{
     self, BudgetDecrement, InsertedMessage, PendingPushInsert, decrement_send_budget,
-    delete_pending_push_by_id, insert_ingress_message, insert_message_with_pushes_in_tx,
+    insert_ingress_message, insert_message_with_pushes_in_tx, refund_send_budget,
 };
 use super::gates::{
     check_body_size, publish_acl_allows, reply_to_visible, resolve_publish_sender, well_formed_name,
 };
-use super::{
-    ChannelScheme, EphemeralPublishResult, Messenger, ParticipantId, SubscriberEntryKind, Urgency,
-    WakeEconomics, WakeMin,
-    config::{Depth, NoiseLevel},
-};
+use super::store::{PushTarget, eager_wake_for};
+use super::{ChannelScheme, Messenger, ParticipantId, SubscriberEntryKind, Urgency, store};
 use crate::access::AppCapability;
 use crate::obs::security::DenialKind;
 
@@ -70,14 +64,13 @@ type ResolvedChannelTargets = (
     Vec<SubscriberEntryKind>,
 );
 
-/// Outcome of `Messenger::publish`. Maps directly to the success / failure
-/// JSON returned to CC by the `MessageSend` PostToolUse intercept.
+/// Outcome of a publish, on any pub/sub scheme. Maps directly to the success /
+/// failure JSON returned to CC by the `MessageSend` PostToolUse intercept.
 ///
-/// The six variants match the design (§6.3 / §3.2). `MalformedAddress`
-/// covers shape errors on either `to` or `reply_to` (missing
-/// `brenn:` prefix, disallowed characters). `UnknownChannel` covers
-/// well-formed addresses that don't resolve to a registered channel,
-/// for either `to` or `reply_to`.
+/// `MalformedAddress` covers shape errors on either `to` or `reply_to` (missing
+/// or unrecognized scheme prefix, disallowed characters). `UnknownChannel`
+/// covers well-formed addresses that don't resolve to a registered channel, for
+/// either `to` or `reply_to`.
 #[derive(Debug)]
 pub enum PublishResult {
     Ok {
@@ -97,14 +90,14 @@ pub enum PublishResult {
     /// disallowed characters, or otherwise malformed. Carries the
     /// offending string.
     MalformedAddress(String),
-    /// Sender app holds no `MessagingPublish` grant (Phase-2 publish/subscribe
-    /// split, design §2.5): the publish path now gates on `MessagingPublish`
-    /// specifically, not the participation `OR`. A `messaging_subscribe`-only app
-    /// is `MissingSender` here. This is a layer-1 (grant) absence — distinct from
-    /// `AclDenied`, which is a layer-2 (ACL scope) denial with the grant held.
+    /// Sender app holds no `MessagingPublish` grant (publish/subscribe split):
+    /// the publish path gates on `MessagingPublish` specifically, not the
+    /// participation `OR`. A `messaging_subscribe`-only app is `MissingSender`
+    /// here. This is a layer-1 (grant) absence — distinct from `AclDenied`,
+    /// which is a layer-2 (ACL scope) denial with the grant held.
     MissingSender,
     /// Sender app holds `MessagingPublish` but the target `brenn:` channel is not
-    /// covered by any `brenn_publish` ACL matcher (layer-2 deny, design §2.2).
+    /// covered by any `brenn_publish` ACL matcher (layer-2 deny).
     /// Distinct from `MissingSender` (layer-1 grant absence) so the LLM-facing
     /// error and automation-outcome class can name the *allowlist*, not the
     /// grant. Carries the offending address (`brenn:<channel>`). Budget is not
@@ -112,16 +105,30 @@ pub enum PublishResult {
     AclDenied(String),
     /// Body length > `max_body_bytes`. Budget is not consumed.
     BodyTooLarge { len: usize, max: usize },
+    /// The per-`(sender, channel)` send-rate gate refused this publish. No
+    /// message was published and no budget was consumed.
+    RateLimited,
+    /// A capability-gated option field was supplied for a channel whose
+    /// capabilities do not carry it — `reply_to` or `delivery_deadline` on a
+    /// non-durable channel.
+    UnsupportedOption { field: &'static str },
+    /// A deferred (`deliver_after`) publish was refused because the channel's
+    /// deferred set is at its channel-wide cap (`retain_depth`). Refusing new
+    /// work rather than silently cancelling already-scheduled work; no message
+    /// was parked and no budget was consumed.
+    DeferredQuotaExceeded { cap: u64 },
 }
 
 impl PublishResult {
     /// Kind tag for every denial that warrants an intercept-level security
-    /// signal, mirroring `EphemeralPublishResult::signal_kind`. A caller that
-    /// signals durable denials derives the log `kind` field from this method.
+    /// signal, and the key of the per-`(sender, kind)` denied-publish counter.
+    /// A caller that signals denials derives the log `kind` field from here.
     ///
-    /// `Ok` and `BudgetExhausted` return `None`: `BudgetExhausted` is a normal
-    /// operational condition with its own LLM-facing recovery path, not a
-    /// policy denial (the analog of ephemeral `RateLimited`).
+    /// `Ok`, `BudgetExhausted`, `RateLimited`, and `UnsupportedOption` return
+    /// `None`. The two limit arms are normal operational conditions with their
+    /// own counters and LLM-facing recovery paths, not policy denials;
+    /// `UnsupportedOption` is a caller input error about the option set, not
+    /// about authorization.
     pub fn signal_kind(&self) -> Option<DenialKind> {
         match self {
             Self::MalformedAddress(_) => Some(DenialKind::MalformedAddress),
@@ -129,7 +136,11 @@ impl PublishResult {
             Self::MissingSender => Some(DenialKind::MissingSender),
             Self::AclDenied(_) => Some(DenialKind::AclDenied),
             Self::BodyTooLarge { .. } => Some(DenialKind::BodyTooLarge),
-            Self::Ok { .. } | Self::BudgetExhausted => None,
+            Self::Ok { .. }
+            | Self::BudgetExhausted
+            | Self::RateLimited
+            | Self::UnsupportedOption { .. }
+            | Self::DeferredQuotaExceeded { .. } => None,
         }
     }
 
@@ -177,16 +188,6 @@ pub enum SurfaceSendVerdict {
     /// The budget refused the draw. The caller answers its client a rate limit —
     /// never a violation and never a kill.
     Denied,
-}
-
-/// Outcome of `Messenger::publish_any`: the union of the durable and ephemeral
-/// pipeline results. The scheme of the target address selects the arm — a
-/// `brenn:` (or any non-`ephemeral:`) address routes to `publish` (`Durable`);
-/// an `ephemeral:` address routes to the `EphemeralBus` (`Ephemeral`).
-#[derive(Debug)]
-pub enum AnyPublishResult {
-    Durable(PublishResult),
-    Ephemeral(EphemeralPublishResult),
 }
 
 /// Identifies the publisher for the send-budget gate.
@@ -262,85 +263,7 @@ enum PublishPrincipal<'a> {
 }
 
 impl Messenger {
-    /// Scheme-dispatching publish entry point above the two pipelines. The
-    /// app-facing surface (LLM `MessageSend` intercept, later automation/WASM)
-    /// calls this; the target address scheme picks the pipeline.
-    ///
-    /// `ephemeral:` addresses route to the `EphemeralBus`; everything else routes
-    /// to `publish` unchanged (including its own handling of unknown schemes as
-    /// `MalformedAddress`). The ephemeral arm rejects the durable-only option
-    /// fields fail-fast rather than silently dropping them, resolves the sender
-    /// slug to its policy (layer-1 grant gate), then calls the bus with the
-    /// resolved principal. `origin` is durable-only (budget bookkeeping) and
-    /// unused on the ephemeral arm.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn publish_any(
-        &self,
-        origin: PublishOrigin,
-        sender_app_slug: &str,
-        addr: &str,
-        body: &str,
-        urgency: super::Urgency,
-        reply_to: Option<&str>,
-        deliver_after: Option<DateTime<Utc>>,
-        delivery_deadline: Option<DateTime<Utc>>,
-    ) -> AnyPublishResult {
-        if !matches!(ChannelScheme::of(addr), Some(ChannelScheme::Ephemeral)) {
-            return AnyPublishResult::Durable(
-                self.publish(
-                    origin,
-                    sender_app_slug,
-                    addr,
-                    body,
-                    urgency,
-                    reply_to,
-                    deliver_after,
-                    delivery_deadline,
-                )
-                .await,
-            );
-        }
-
-        // Ephemeral arm. Durable-only options are unsupported on `ephemeral:`
-        // targets — reject fail-fast rather than silently dropping.
-        if reply_to.is_some() {
-            return AnyPublishResult::Ephemeral(EphemeralPublishResult::UnsupportedOption {
-                field: "reply_to",
-            });
-        }
-        if deliver_after.is_some() {
-            return AnyPublishResult::Ephemeral(EphemeralPublishResult::UnsupportedOption {
-                field: "deliver_after",
-            });
-        }
-        if delivery_deadline.is_some() {
-            return AnyPublishResult::Ephemeral(EphemeralPublishResult::UnsupportedOption {
-                field: "delivery_deadline",
-            });
-        }
-
-        // Layer-1 sender gate: app exists and holds `EphemeralPublish`. Mirrors
-        // the durable split — layer-2 (ACL) lives inside `EphemeralBus::publish`.
-        let app = match resolve_publish_sender(
-            &self.apps,
-            sender_app_slug,
-            AppCapability::EphemeralPublish,
-        ) {
-            Some(a) => a,
-            None => return AnyPublishResult::Ephemeral(EphemeralPublishResult::MissingSender),
-        };
-
-        let sender = ParticipantId::for_app(sender_app_slug, &self.source);
-        AnyPublishResult::Ephemeral(self.ephemeral_bus.publish(
-            &sender,
-            &app.policy,
-            addr,
-            body,
-            urgency,
-        ))
-    }
-
-    /// Publish a message on behalf of a CC subprocess.
+    /// Publish a message on behalf of a CC subprocess, on any pub/sub scheme.
     ///
     /// The `origin` and `sender_app_slug` identify the publisher (used for
     /// budget bookkeeping and sender-config lookup). A `Conversation` origin
@@ -608,10 +531,24 @@ impl Messenger {
         )
     }
 
-    /// Shared durable-publish gate sequence behind `publish`,
-    /// `publish_from_surface`, and `publish_from_system`. The `principal`
-    /// selects the layer-1 authority source (app vs surface vs system); every
-    /// other gate is identical across arms.
+    /// The one publish gate sequence, behind `publish`, `publish_from_surface`,
+    /// and `publish_from_system`, for every pub/sub scheme.
+    ///
+    /// The `principal` selects the layer-1 authority source (app vs surface vs
+    /// system); every other gate is identical across arms. Where behavior
+    /// differs by class it is driven by the resolved channel's
+    /// [`ChannelCapabilities`](brenn_envelope::ChannelCapabilities), never by
+    /// matching on the scheme at a call site: `durable` picks the commit (DB
+    /// rows vs the in-memory ring), admits the durable-only option fields, and
+    /// gates the surface send budget; `transportable` decides whether a commit
+    /// also fans out to attached wire receivers.
+    ///
+    /// Records the per-`(sender, kind)` denied-publish counter for every denial
+    /// arm that carries a [`DenialKind`], so the counter cannot drift from the
+    /// outcome. It does not log denials: it lacks the boundary context to tell
+    /// an attack from a server bug, and the same arms are "impossible, panic"
+    /// for the surface caller. A caller passing an attacker-influenceable
+    /// address owns boundary-appropriate security signaling.
     #[allow(clippy::too_many_arguments)]
     async fn publish_core(
         &self,
@@ -624,8 +561,122 @@ impl Messenger {
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
     ) -> PublishResult {
+        let sender = self.principal_identity(principal);
+        let result = self
+            .publish_gated(
+                origin,
+                principal,
+                &sender,
+                addr,
+                body,
+                urgency,
+                reply_to,
+                deliver_after,
+                delivery_deadline,
+            )
+            .await;
+        self.record_publish_denial(&sender, &result);
+        result
+    }
+
+    /// The stored principal string for a publish, derivable before any policy
+    /// lookup so a denial as early as the address gate is still attributable.
+    fn principal_identity(&self, principal: PublishPrincipal<'_>) -> String {
+        match principal {
+            PublishPrincipal::App { slug } => ParticipantId::for_app(slug, &self.source),
+            PublishPrincipal::Surface {
+                slug,
+                component: Some(instance),
+                ..
+            } => ParticipantId::for_surface_component(slug, instance),
+            PublishPrincipal::Surface {
+                slug,
+                component: None,
+                ..
+            } => ParticipantId::for_surface(slug),
+            PublishPrincipal::System { component } => ParticipantId::for_system(component),
+        }
+        .as_str()
+        .to_owned()
+    }
+
+    /// Draw one token from the per-(sender, channel) send-rate bucket, creating
+    /// it on first use at the channel's resolved rate. Returns `true` when the
+    /// publish is admitted, `false` when the rate limit refused it.
+    ///
+    /// The grain is deliberate: a sender's aggregate allowance is this rate
+    /// times the channels its ACLs cover, and that channel set is
+    /// operator-declared config — no publisher can mint a channel to widen its
+    /// own budget. If dynamic channel creation is ever added, a bus-wide
+    /// per-sender backstop bucket must land with it.
+    ///
+    /// This gate is not surface-specific — it runs on every scheme — so it
+    /// reports a plain admit/deny rather than a [`SurfaceSendVerdict`].
+    fn draw_send_rate(&self, sender: &str, channel: &super::ChannelEntry) -> bool {
+        let outcome = {
+            let mut buckets = self
+                .send_rate_buckets
+                .lock()
+                .expect("messaging: send_rate_buckets lock poisoned");
+            buckets
+                .entry((sender.to_owned(), channel.uuid))
+                .or_insert_with(|| channel.resolved_channel.send_rate.bucket())
+                .try_consume()
+        };
+        match outcome {
+            TokenBucketOutcome::Granted => true,
+            TokenBucketOutcome::GrantedAfterSuppression { suppressed } => {
+                warn!(
+                    sender,
+                    channel = %channel.address,
+                    suppressed,
+                    "send rate limit lifted"
+                );
+                true
+            }
+            TokenBucketOutcome::Denied { first } => {
+                *self
+                    .publish_rate_limited
+                    .lock()
+                    .expect("messaging: publish_rate_limited lock poisoned")
+                    .entry(sender.to_owned())
+                    .or_insert(0) += 1;
+                if first {
+                    warn!(sender, channel = %channel.address, "rate-limiting sender");
+                }
+                false
+            }
+        }
+    }
+
+    /// Count a denied publish under `(sender, kind)`. A no-op for results that
+    /// carry no [`DenialKind`].
+    fn record_publish_denial(&self, sender: &str, result: &PublishResult) {
+        if let Some(kind) = result.signal_kind() {
+            *self
+                .publish_denied
+                .lock()
+                .expect("messaging: publish_denied lock poisoned")
+                .entry((sender.to_owned(), kind.as_str().to_owned()))
+                .or_insert(0) += 1;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_gated(
+        &self,
+        origin: PublishOrigin,
+        principal: PublishPrincipal<'_>,
+        sender: &str,
+        addr: &str,
+        body: &str,
+        urgency: super::Urgency,
+        reply_to: Option<&str>,
+        deliver_after: Option<DateTime<Utc>>,
+        delivery_deadline: Option<DateTime<Utc>>,
+    ) -> PublishResult {
         // 1. Validate address shape, then resolve. Shape errors return
-        //    `MalformedAddress` (per design §3.2 / §6.3); well-formed
+        //    `MalformedAddress`; well-formed
         //    addresses that don't resolve return `UnknownChannel`. The bare
         //    channel name (prefix stripped) is captured here for the layer-2
         //    ACL check below.
@@ -639,6 +690,14 @@ impl Messenger {
         //    operator channels (catalog, error relay) get the same shape gate as
         //    every other principal. `directory.resolve` stays the authoritative
         //    existence check and the layer-2 ACL still gates below.
+        //
+        //    The scheme comes from the address itself: one ladder serves every
+        //    pub/sub scheme, and the scheme is what the shape gate and the
+        //    layer-2 ACL are asked about.
+        let scheme = match ChannelScheme::of(addr) {
+            Some(s) => s,
+            None => return PublishResult::MalformedAddress(addr.to_string()),
+        };
         let reserved_system_target = matches!(principal, PublishPrincipal::System { .. })
             && addr
                 .strip_prefix(ChannelScheme::Brenn.prefix())
@@ -649,7 +708,7 @@ impl Messenger {
                 _ => return PublishResult::MalformedAddress(addr.to_string()),
             }
         } else {
-            match well_formed_name(addr, ChannelScheme::Brenn) {
+            match well_formed_name(addr, scheme) {
                 Some(name) => name,
                 None => return PublishResult::MalformedAddress(addr.to_string()),
             }
@@ -658,43 +717,43 @@ impl Messenger {
             Some(c) => c,
             None => return PublishResult::UnknownChannel(addr.to_string()),
         };
+        let capabilities = channel.capabilities();
 
         // AUTHZ WARNING (security-5): the per-channel sender authorization
-        // (allowlist) below is now LIVE (Phase 2, design §2.2). The automation
-        // fire path (`automation/fire.rs`, `fire_one`) re-checks this same policy
-        // at fire time (design §2.3, Seam B). Automation jobs store `action.to` at
-        // create time and fire later; a policy tightened after job creation would
-        // be stale at fire time unless that re-check is present.
+        // (allowlist) below is live. The automation fire path
+        // (`automation/fire.rs`, `fire_one`) re-checks this same policy at fire
+        // time. Automation jobs store `action.to` at create time and fire later;
+        // a policy tightened after job creation would be stale at fire time
+        // unless that re-check is present.
 
-        // 2. Sender authority + Phase-2 publish authorization (design §2.2, Seam
-        //    A), resolved per principal source. Layer-1: gate on the
-        //    `MessagingPublish` grant specifically — NOT `messaging_enabled()`
-        //    (the participation `OR`). This is the publish/subscribe split
-        //    (design §2.5): a `messaging_subscribe`-only sender is `MissingSender`
+        // 2. Sender authority + publish authorization, resolved per principal
+        //    source. Layer-1: gate on the `MessagingPublish` grant
+        //    specifically — NOT `messaging_enabled()` (the participation `OR`).
+        //    This is the publish/subscribe split: a
+        //    `messaging_subscribe`-only sender is `MissingSender`
         //    here. Yields the policy (for the layer-2 ACL), the stored principal
         //    string, and the optional `Conversation`-origin send budget:
         //    `Some(budget)` for an app (read in the `Conversation` arm of step 5;
         //    falls back to the global default for an app with no `[app.messaging]`
         //    block), `None` for the always-`System` surface arm.
-        let (policy, sender, conversation_send_budget) = match principal {
+        //
+        //    The grant the layer-1 gate demands follows the target's scheme:
+        //    `ephemeral:` traffic is authorized by `EphemeralPublish`, `local:`
+        //    by `LocalPublish`, every other pub/sub scheme by `MessagingPublish`.
+        let grant = match scheme {
+            ChannelScheme::Ephemeral => AppCapability::EphemeralPublish,
+            ChannelScheme::Local => AppCapability::LocalPublish,
+            _ => AppCapability::MessagingPublish,
+        };
+        let (policy, conversation_send_budget) = match principal {
             PublishPrincipal::App { slug } => {
-                let app =
-                    match resolve_publish_sender(&self.apps, slug, AppCapability::MessagingPublish)
-                    {
-                        Some(a) => a,
-                        None => return PublishResult::MissingSender,
-                    };
-                (
-                    &app.policy,
-                    ParticipantId::for_app(slug, &self.source)
-                        .as_str()
-                        .to_owned(),
-                    Some(app.messaging_send_budget()),
-                )
+                let app = match resolve_publish_sender(&self.apps, slug, grant) {
+                    Some(a) => a,
+                    None => return PublishResult::MissingSender,
+                };
+                (&app.policy, Some(app.messaging_send_budget()))
             }
-            PublishPrincipal::Surface {
-                slug, component, ..
-            } => {
+            PublishPrincipal::Surface { slug, .. } => {
                 // Surfaces are not in `self.apps`; their boot-resolved policy
                 // lives in the unified `subscribers` registry, the same
                 // authority the delivery-time gate reads via `subscriber_policy`.
@@ -707,25 +766,19 @@ impl Messenger {
                 // policy blob to hand-maintain, so the instance-grain registrations
                 // boot installs for the delivery gate carry this same policy.
                 let policy = match self
-                    .subscribers
-                    .get(&SubscriberEntryKind::Surface {
+                    .targets
+                    .registration(&SubscriberEntryKind::Surface {
                         slug: slug.to_string(),
                         instance: None,
                     })
                     .map(|r| r.policy.as_ref())
-                    .filter(|p| p.has_grant(AppCapability::MessagingPublish))
+                    .filter(|p| p.has_grant(grant))
                 {
                     Some(p) => p,
                     None => return PublishResult::MissingSender,
                 };
                 (
                     policy,
-                    match component {
-                        Some(instance) => ParticipantId::for_surface_component(slug, instance),
-                        None => ParticipantId::for_surface(slug),
-                    }
-                    .as_str()
-                    .to_owned(),
                     // Surface is always paired with a `System` origin (see
                     // `publish_from_surface`), which never reads the budget below.
                     // `None` makes that pairing structural: a future `Surface` +
@@ -739,29 +792,48 @@ impl Messenger {
                 // policy lives in the unified `subscribers` registry, the same
                 // authority the delivery-time gate reads via `subscriber_policy`.
                 let policy = match self
-                    .subscribers
-                    .get(&SubscriberEntryKind::System(component.to_string()))
+                    .targets
+                    .registration(&SubscriberEntryKind::System(component.to_string()))
                     .map(|r| r.policy.as_ref())
-                    .filter(|p| p.has_grant(AppCapability::MessagingPublish))
+                    .filter(|p| p.has_grant(grant))
                 {
                     Some(p) => p,
                     None => return PublishResult::MissingSender,
                 };
                 (
                     policy,
-                    ParticipantId::for_system(component).as_str().to_owned(),
                     // System is always paired with a `System` origin, which never
                     // reads the budget below — same structural `None` as Surface.
                     None,
                 )
             }
         };
-        // Layer-2: per-channel `brenn_publish` ACL against the bare channel name
-        // captured at gate 1. This is a pure in-memory policy read against the
-        // already-resolved channel and runs BEFORE the budget decrement / DB work,
-        // so an out-of-scope publish consumes no budget and takes no lock.
-        if !publish_acl_allows(policy, ChannelScheme::Brenn, channel_name) {
+        // Layer-2: the target scheme's per-channel publish ACL against the bare
+        // channel name captured at gate 1. This is a pure in-memory policy read
+        // against the already-resolved channel and runs BEFORE the budget
+        // decrement / DB work, so an out-of-scope publish consumes no budget and
+        // takes no lock.
+        if !publish_acl_allows(policy, scheme, channel_name) {
             return PublishResult::AclDenied(addr.to_string());
+        }
+
+        // 2a. Option fields the channel's capabilities do not carry. `reply_to`
+        //     and `delivery_deadline` are durable-only; rejected fail-fast rather
+        //     than silently dropped, still before any budget or rate token.
+        //
+        //     MUST run after the layer-1 grant gate and layer-2 publish ACL:
+        //     otherwise an unauthorized sender attaching one of these options
+        //     would receive the distinct `UnsupportedOption` instead of
+        //     `MissingSender`/`AclDenied`, leaking channel existence.
+        if !capabilities.durable {
+            for (present, field) in [
+                (reply_to.is_some(), "reply_to"),
+                (delivery_deadline.is_some(), "delivery_deadline"),
+            ] {
+                if present {
+                    return PublishResult::UnsupportedOption { field };
+                }
+            }
         }
 
         // 3. Body length.
@@ -771,6 +843,37 @@ impl Messenger {
                 max: e.max,
             };
         }
+
+        // 3a. Resolve reply_to (if any): shape → visibility → resolve. Shape
+        //    errors return `MalformedAddress`. The visibility gate runs BEFORE
+        //    resolution so an out-of-visibility reply_to fails identically
+        //    whether or not the channel exists — closing the success/failure
+        //    existence oracle a plain resolve would open. Visibility is the
+        //    union of the sender's publish allowlist and its delivery scope:
+        //    channels it could name in `to`, plus channels it could legitimately
+        //    learn about as a subscriber (a reply target is a channel the sender
+        //    expects to hear replies on). Out-of-scope → `AclDenied`;
+        //    in-scope-but-unresolved → `UnknownChannel`.
+        //
+        //    Validate-only (spends no token), so it runs ahead of both spending
+        //    gates below: a publish doomed by a malformed or out-of-scope
+        //    reply_to costs no surface-budget and no rate token.
+        let reply_to_uuid = if let Some(rt_addr) = reply_to {
+            let rt_name = match well_formed_name(rt_addr, ChannelScheme::Brenn) {
+                Some(name) => name,
+                None => return PublishResult::MalformedAddress(rt_addr.to_string()),
+            };
+            let visible = reply_to_visible(policy, ChannelScheme::Brenn, rt_name, rt_addr);
+            if !visible {
+                return PublishResult::AclDenied(rt_addr.to_string());
+            }
+            match self.directory.resolve(rt_addr) {
+                Some(c) => Some(c.uuid),
+                None => return PublishResult::UnknownChannel(rt_addr.to_string()),
+            }
+        } else {
+            None
+        };
 
         // 3b. Surface send budget, keyed by principal — the surface's own kernel
         //     identity or one component kind on it. Every durable publish a
@@ -792,17 +895,25 @@ impl Messenger {
         // Platform-origin surface telemetry (geometry/status/stamps) is exempt:
         // it skips only this step and passes every other gate. See
         // `PublishPrincipal::Surface`.
-        if let PublishPrincipal::Surface {
-            slug,
-            component,
-            platform: false,
-        } = principal
+        //
+        // Scoped to durable channels by capability: this bucket bounds what a
+        // surface writes into the server's *persistent* substrate, and its
+        // sustained rate is sized for that (single-digit publishes per minute).
+        // A non-durable channel writes nothing to disk and carries traffic
+        // orders of magnitude faster; it is bounded by the per-(sender, channel)
+        // send-rate gate below, which every scheme runs.
+        if capabilities.durable
+            && let PublishPrincipal::Surface {
+                slug,
+                component,
+                platform: false,
+            } = principal
             && matches!(
                 self.draw_surface_send_budget(
                     SurfaceSendDraw {
                         slug,
                         component,
-                        principal: &sender,
+                        principal: sender,
                         channel: Some(addr),
                         tokens: 1,
                     },
@@ -814,367 +925,180 @@ impl Messenger {
             return PublishResult::BudgetExhausted;
         }
 
-        // 4. Resolve reply_to (if any): shape → visibility → resolve. Shape
-        //    errors return `MalformedAddress`. The visibility gate runs BEFORE
-        //    resolution so an out-of-visibility reply_to fails identically
-        //    whether or not the channel exists — closing the success/failure
-        //    existence oracle a plain resolve would open. Visibility is the
-        //    union of the sender's publish allowlist and its delivery scope:
-        //    channels it could name in `to`, plus channels it could legitimately
-        //    learn about as a subscriber (a reply target is a channel the sender
-        //    expects to hear replies on). Out-of-scope → `AclDenied`;
-        //    in-scope-but-unresolved → `UnknownChannel`.
-        let reply_to_uuid = if let Some(rt_addr) = reply_to {
-            let rt_name = match well_formed_name(rt_addr, ChannelScheme::Brenn) {
-                Some(name) => name,
-                None => return PublishResult::MalformedAddress(rt_addr.to_string()),
-            };
-            let visible = reply_to_visible(policy, ChannelScheme::Brenn, rt_name, rt_addr);
-            if !visible {
-                return PublishResult::AclDenied(rt_addr.to_string());
+        // 3c. Per-(sender, channel) send-rate gate — the one unified rate limit,
+        //     on every scheme. Every validate-only gate (shape, authorization,
+        //     size, reply_to) runs ahead of it, so a publish doomed by any of
+        //     those costs no token. Of the two spending gates, the surface send
+        //     budget (3b) is drawn first: a durable surface publish that is then
+        //     rate-limited here has already spent one surface-budget token. That
+        //     ordering is deliberate — the surface budget only gates durable
+        //     surface writes, the common case is a publish that passes both, and
+        //     a rate token refills far faster than the scarce surface budget.
+        if !self.draw_send_rate(sender, &channel) {
+            return PublishResult::RateLimited;
+        }
+
+        // 4a. A release time at or before now schedules nothing: the message
+        //     enters retention immediately. Deciding that once, here, is what
+        //     keeps the park decision single — every commit path below reads
+        //     this value, so a row carries a release time iff it holds no
+        //     retention position and no claims. Deciding it twice against two
+        //     clock reads is how a message ends up claimed but unpositioned.
+        let deliver_after = deliver_after.filter(|da| *da > Utc::now());
+
+        // 5. Per-conversation send budget. It bounds what a conversation sends,
+        //    not where the bytes land, so every scheme draws on it. The
+        //    `UPDATE ... WHERE remaining > 0` row count is the authoritative
+        //    gate; a `System` origin has no budget and touches no row at all
+        //    (no INSERT, no FK exposure).
+        let remaining_budget = match origin {
+            PublishOrigin::Conversation { id } => {
+                let budget = conversation_send_budget.expect(
+                    "Conversation origin requires a send budget — only App principals \
+                     produce Conversation-origin publishes",
+                );
+                let conn = self.db.lock().await;
+                match decrement_send_budget(&conn, id, budget) {
+                    BudgetDecrement::Ok { remaining } => Some(remaining),
+                    BudgetDecrement::Exhausted => return PublishResult::BudgetExhausted,
+                }
             }
-            match self.directory.resolve(rt_addr) {
-                Some(c) => Some(c.uuid),
-                None => return PublishResult::UnknownChannel(rt_addr.to_string()),
-            }
-        } else {
-            None
+            PublishOrigin::System => None,
         };
 
-        // 5. DB work: budget decrement (creates row if needed) + resolve push
-        //    targets + insert message + insert pending pushes + push-window
-        //    retirement, all in a single lock scope. A single SQLite mutex
-        //    serializes concurrent publishers; the `UPDATE ... WHERE remaining > 0`
-        //    row count is the authoritative gate. The budget decrement applies
-        //    only to a `Conversation` origin; a `System` origin has no send
-        //    budget and skips the row entirely (no INSERT, no FK exposure).
         let publish_ts_ns = db::utc_to_ns(Utc::now());
-        let (message, remaining_budget, context_targets) = {
-            let conn = self.db.lock().await;
-            let remaining = match origin {
-                PublishOrigin::Conversation { id } => {
-                    let budget = conversation_send_budget.expect(
-                        "Conversation origin requires a send budget — only App principals \
-                         produce Conversation-origin publishes",
-                    );
-                    match decrement_send_budget(&conn, id, budget) {
-                        BudgetDecrement::Ok { remaining } => Some(remaining),
-                        BudgetDecrement::Exhausted => return PublishResult::BudgetExhausted,
+
+        // 6. Commit into the channel's retention through its store. One fork for
+        //    every scheme — whether the bytes land in a table or a ring, and
+        //    whether the deferred set is rows or a map, is the store's business
+        //    and no caller's. The deferred cap is the store's too, so a durable
+        //    schedule is refused at the same channel-wide bound a ring one is.
+        let store = self.store_for(&channel);
+        let message = store::NewMessage {
+            source: self.source.as_ref().to_owned(),
+            sender: sender.to_owned(),
+            body: body.to_string(),
+            urgency,
+            envelope_type: scheme,
+            reply_to_uuid,
+            delivery_deadline,
+            publish_ts_ns,
+        };
+        let (message_id, retained_seq) = match deliver_after {
+            Some(release_at) => match store.park(message, release_at).await {
+                Ok(parked) => (parked.message_uuid, None),
+                Err(brenn_queue::QuotaExceeded { cap }) => {
+                    // The cap is only knowable at the park, after the budget
+                    // draw: a sender retrying against a full deferred set must
+                    // not drain its budget without landing a message.
+                    if let PublishOrigin::Conversation { id } = origin {
+                        let budget = conversation_send_budget
+                            .expect("Conversation origin requires a send budget");
+                        let conn = self.db.lock().await;
+                        refund_send_budget(&conn, id, budget);
                     }
+                    return PublishResult::DeferredQuotaExceeded { cap };
                 }
-                PublishOrigin::System => None,
-            };
-            // Resolution must happen under the same lock as the insert to avoid a TOCTOU
-            // window (a channel may gain subscribers between resolution and insert).
-            let push_targets =
-                self.resolve_push_targets(&conn, &channel.address, channel.subscribers.as_slice());
+            },
+            None => {
+                let outcome = store.append(message).await;
+                self.enact_overflow_events(&channel, store.as_ref(), &outcome.overflow);
+                (
+                    outcome.committed.message_uuid,
+                    Some(outcome.committed.seq.0),
+                )
+            }
+        };
+
+        // 7. Durable depth-0 context feed: hand the committed envelope to attached
+        //    fold-0 surface subscriptions as a row-less live delivery. After the
+        //    commit — nothing is owed to a disconnected session.
+        //
+        //    A parked message is not fed: the feed is the wire analogue of
+        //    publish-time delivery for a message that entered retention, and a
+        //    parked message is not observable to any subscriber, replay, query, or
+        //    depth-0 feed before its release. Holding no retention position is
+        //    exactly that state, so the assigned position is the condition — and
+        //    it is what the fed row's wire cursor is minted from. The fold-0
+        //    subscriber is owed nothing now; its retained window covers the
+        //    message at the next attach.
+        //
+        //    The targets are resolved here, under that condition, rather than
+        //    before the commit: a parked publish would only walk the subscriber
+        //    list to discard the answer. The feed is the caller's, not the
+        //    store's — a ring-backed channel's live subscribers are served by the
+        //    store's own fan-out, so a non-durable publish resolves none. The
+        //    delivery records themselves are the store's business: it names its
+        //    own targets at commit.
+        if let Some(retained_seq) = retained_seq
+            && capabilities.durable
+        {
             let context_targets =
                 self.resolve_context_targets(&channel.address, channel.subscribers.as_slice());
-            let tx = conn
-                .unchecked_transaction()
-                .expect("messaging: begin publish tx");
-            let (inserted, plan) = self.insert_pushes(
-                &tx,
-                &channel,
-                &push_targets,
-                ChannelScheme::Brenn,
-                self.source.as_ref(),
-                &sender,
-                body,
-                urgency,
-                publish_ts_ns,
-                reply_to_uuid,
-                deliver_after,
-                delivery_deadline,
-            );
-            tx.commit().expect("messaging: commit publish tx");
-            self.retire_windows(&conn, &plan);
-            (inserted, remaining, context_targets)
-        };
-
-        // Durable depth-0 context feed: hand the committed envelope to attached
-        // fold-0 surface subscriptions as a row-less live delivery (design §6).
-        // After the lock is released — nothing owed to a disconnected session.
-        //
-        // A deferred row (`deliver_after` in the future) is not fed yet: the feed
-        // is the wire analogue of publish-time delivery for immediate rows, and a
-        // deferred message must not be observable before its release (the push
-        // path parks such a row on `release_after`). The fold-0 subscriber is owed
-        // nothing now; its retained window covers the row at the next attach.
-        let feed_due = deliver_after.is_none_or(|da| da <= Utc::now());
-        if feed_due
-            && !context_targets.is_empty()
-            && self
-                .router
-                .any_context_session_attached(&channel.address, &context_targets)
-        {
-            let envelope = context_feed_envelope(
-                message.uuid,
-                self.source.as_ref().to_owned(),
-                channel.address.clone(),
-                sender.clone(),
-                publish_ts_ns,
-                body.to_owned(),
-                reply_to.map(|s| s.to_owned()),
-                delivery_deadline,
-                deliver_after,
-                urgency,
-            );
-            self.fan_out_context_feed(&context_targets, &envelope, message.id)
+            if !context_targets.is_empty()
+                && self
+                    .router
+                    .any_context_session_attached(&channel.address, &context_targets)
+            {
+                let envelope = context_feed_envelope(
+                    message_id,
+                    self.source.as_ref().to_owned(),
+                    channel.address.clone(),
+                    sender.to_owned(),
+                    publish_ts_ns,
+                    body.to_owned(),
+                    reply_to.map(|s| s.to_owned()),
+                    delivery_deadline,
+                    deliver_after,
+                    urgency,
+                );
+                self.fan_out_context_feed(
+                    &context_targets,
+                    &envelope,
+                    i64::try_from(retained_seq)
+                        .expect("messaging: retention position out of range"),
+                )
                 .await;
+            }
         }
 
-        // 7. Kick background tasks if we inserted suppressed or
-        //    deadline-bearing rows.
-        if let Some(da) = deliver_after
-            && da > Utc::now()
-        {
-            self.dispatch_kick();
-        }
-        if delivery_deadline.is_some() {
-            self.dispatch_kick();
-        }
-
-        // 8. Signal the background dispatcher. All dispatch is off-stack (R1).
+        // 8. Signal the background dispatcher. All dispatch is off-stack (R1) —
+        //    a parked message's release, a deadline sweep, and an immediate
+        //    delivery all wake the same loop.
         self.dispatch_kick();
 
         PublishResult::Ok {
-            message_id: message.uuid,
+            message_id,
             address: channel.address.clone(),
             remaining_budget,
         }
     }
 
-    /// Resolve push targets for an outbound publish: per-subscriber, find
-    /// the (singleton-app, allowed_user) → conversation_id mapping that
-    /// the dispatcher will inject into. Also resolves the noise level for
-    /// each subscriber from `SubscriberEntry.noise`.
+    /// Resolve push targets for an outbound publish — the delivery records a
+    /// durable commit writes, one per subscriber owed the message.
     ///
-    /// Accepts a caller-held `&Connection` so resolution and the subsequent
-    /// insert happen under the same lock acquisition — avoiding a TOCTOU window
-    /// where a channel could gain subscribers between resolution and insert.
-    ///
-    /// `channel_address` is the channel's stored address (`mqtt:`/`brenn:`/
-    /// `webhook:`); it backs the **delivery-time ACL gate** (design §2.2,
-    /// "Enforcement point A"). Every `App`/`Wasm` subscriber — regardless of how
-    /// the subscription was created — is re-authorized against its current
-    /// `AppPolicy` via `subscriber_policy` + `allows_channel_access`. A subscriber whose
-    /// policy no longer covers the channel (ACL removed, transport grant gone, or —
-    /// a wiring bug — no policy at all) is **skipped**: it is not pushed and not
-    /// persisted as a pending push, with a `warn` revocation signal. The gate is
-    /// uniform; there is no static/dynamic branch.
+    /// Delegates to the one resolver every target-set answer comes from; the
+    /// caller-held `&Connection` keeps resolution and the insert that follows
+    /// under a single lock acquisition.
     fn resolve_push_targets(
         &self,
         conn: &rusqlite::Connection,
         channel_address: &str,
         subscribers: &[crate::messaging::SubscriberEntry],
-    ) -> Vec<PushTarget> {
-        let mut targets = Vec::with_capacity(subscribers.len());
-        for sub in subscribers {
-            let push_depth = sub.push_depth;
-            // depth-0 subs aren't push targets: no push row is ever created for
-            // them. A fold-0 *surface* subscriber instead gets a row-less
-            // deliver-if-attached context feed via `resolve_context_targets` +
-            // `WakeRouter::deliver_context`, run after this transaction commits.
-            if !push_depth.is_push_enabled() {
-                continue;
-            }
-            // Delivery-time ACL gate (design §2.2 Point A), uniform over App + Wasm,
-            // static + dynamic. A missing policy for a live subscriber is a host
-            // wiring bug — fail closed (deny) rather than panic on the delivery path.
-            let allowed = self
-                .subscriber_policy(&sub.kind)
-                .is_some_and(|p| p.allows_channel_access(channel_address));
-            if !allowed {
-                warn!(
-                    app = %sub.kind.slug(),
-                    channel = %channel_address,
-                    "subscription delivery denied — ACL not satisfied"
-                );
-                continue;
-            }
-            // Declared wake economics for this subscriber, resolved per participant
-            // (App from `self.apps`, others from the registry) — never inferred from
-            // the identity prefix. `Eager` subscribers are woken on every publish;
-            // `UrgencyGated` subscribers consult `wake_min`. A subscriber that just
-            // passed the ACL gate always resolves here (same source), so a `None` is
-            // a host-wiring invariant violation, not a routine outcome — surface it
-            // and skip delivery, exactly like the missing-app/user cases below.
-            // Silently defaulting to `UrgencyGated` here would re-park a live `Eager`
-            // subscriber — the precise stranding this resolution exists to prevent —
-            // and hide the wiring bug behind an ordinary designed-park.
-            let wake = match self.subscriber_wake_economics(&sub.kind) {
-                Some(w) => w,
-                None => {
-                    warn!(
-                        subscriber = ?sub.kind,
-                        channel = %channel_address,
-                        "subscriber passed ACL gate but has no wake-economics \
-                         registration — host wiring bug; skipping delivery"
-                    );
-                    continue;
-                }
-            };
-            // Only `UrgencyGated` targets ever consult a wake threshold; an
-            // `Eager` target carries `None`, making "no eager delivery reads a
-            // wake_min" a type-enforced invariant on the delivery path rather
-            // than a convention. `SubscriberEntry.wake_min` already carries
-            // `Some` iff `UrgencyGated`; forward it unchanged.
-            let push_wake_min = match wake {
-                WakeEconomics::UrgencyGated => sub.wake_min,
-                WakeEconomics::Eager => None,
-            };
-            match &sub.kind {
-                SubscriberEntryKind::App(slug) => {
-                    // These three lookups should always succeed for a subscriber
-                    // that just passed the ACL gate: its policy resolved via
-                    // `subscriber_policy`, so the app is wired. A `None` here is a
-                    // host-wiring invariant violation, NOT a deny-by-default
-                    // outcome — surface it (errhandling-1) so a wiring bug after
-                    // the gate is distinguishable from a successful delivery and
-                    // from a normal ACL revocation.
-                    let app = match self.apps.get(slug) {
-                        Some(a) => a,
-                        None => {
-                            warn!(
-                                app = %slug,
-                                channel = %channel_address,
-                                "subscriber passed ACL gate but app not found in apps map — \
-                                 host wiring bug; skipping delivery"
-                            );
-                            continue;
-                        }
-                    };
-                    let noise = sub.noise;
-                    // Singleton + 1 allowed_user is enforced by config validation.
-                    let username = match app.allowed_users.first() {
-                        Some(u) => u.clone(),
-                        None => {
-                            warn!(
-                                app = %slug,
-                                channel = %channel_address,
-                                "resolved app has no allowed_users — host wiring/config bug; \
-                                 skipping delivery"
-                            );
-                            continue;
-                        }
-                    };
-                    let user = match get_user_by_username(conn, &username) {
-                        Some(u) => u,
-                        None => {
-                            warn!(
-                                app = %slug,
-                                channel = %channel_address,
-                                username = %username,
-                                "allowed_user not found in users table — host wiring bug; \
-                                 skipping delivery"
-                            );
-                            continue;
-                        }
-                    };
-                    let conversation = get_or_create_singleton_conversation(conn, user.id, slug);
-                    targets.push(PushTarget {
-                        subscriber: ParticipantId::for_conversation(conversation.id),
-                        app_slug: slug.clone(),
-                        push_depth,
-                        noise,
-                        wake,
-                        wake_min: push_wake_min,
-                    });
-                }
-                SubscriberEntryKind::Wasm(slug) => {
-                    // WASM consumers do not go through self.apps / singleton-conversation.
-                    // Push target subscriber is the wasm: ParticipantId directly.
-                    // Noise is read from SubscriberEntry.noise — populated by
-                    // finalize_directory_with_subscribers from the resolved
-                    // [[wasm_consumer.subscription]] noise level (design §2.5 #3).
-                    targets.push(PushTarget {
-                        subscriber: ParticipantId::for_wasm(slug),
-                        app_slug: slug.clone(),
-                        push_depth,
-                        noise: sub.noise,
-                        wake,
-                        wake_min: push_wake_min,
-                    });
-                }
-                SubscriberEntryKind::Surface { slug, instance } => {
-                    // Surfaces reach durable dispatch via the surface:
-                    // ParticipantId directly (no self.apps / singleton
-                    // conversation). The push window is keyed on the subscribing
-                    // principal — a component instance's own sub-identity, or the
-                    // bare surface for the kernel's layout subscription — so each
-                    // principal's lag is tracked and bounded independently.
-                    // Eager-wake is derived from wake_min downstream (WakeRouter),
-                    // same as every other kind.
-                    let subscriber = match instance {
-                        Some(instance) => ParticipantId::for_surface_component(slug, instance),
-                        None => ParticipantId::for_surface(slug),
-                    };
-                    targets.push(PushTarget {
-                        app_slug: subscriber.as_surface_subscriber_key().to_owned(),
-                        subscriber,
-                        push_depth,
-                        noise: sub.noise,
-                        wake,
-                        wake_min: push_wake_min,
-                    });
-                }
-                SubscriberEntryKind::System(component) => {
-                    // System-substrate subscribers reach durable dispatch via the
-                    // system: ParticipantId directly (no self.apps / singleton
-                    // conversation), parked-and-woken like the Wasm arm.
-                    targets.push(PushTarget {
-                        subscriber: ParticipantId::for_system(component),
-                        app_slug: component.clone(),
-                        push_depth,
-                        noise: sub.noise,
-                        wake,
-                        wake_min: push_wake_min,
-                    });
-                }
-            }
-        }
-        targets
+    ) -> Vec<store::PushTarget> {
+        self.targets
+            .push_targets(conn, channel_address, subscribers)
     }
 
     /// The fold-0 (depth-0) surface subscribers on a channel — the row-less
-    /// context-feed targets (design §6). A depth-0 subscription creates no push
-    /// row, so `resolve_push_targets` skips it; a surface session nonetheless
-    /// gets a live deliver-if-attached fan-out of durable messages while
-    /// attached. Only surface subscribers take the feed: a depth-0 App/Wasm/
-    /// System subscriber has no wire session to deliver to live.
-    ///
-    /// Runs the same delivery-time ACL gate as `resolve_push_targets` — a
-    /// subscriber whose policy no longer covers the channel is not fed. Returns
-    /// the surface subscriber keys; the caller builds the envelope once and hands
-    /// each to `WakeRouter::deliver_context` after commit.
+    /// context-feed targets, resolved through the same registry and the same
+    /// delivery-time ACL gate as the push targets.
     fn resolve_context_targets(
         &self,
         channel_address: &str,
         subscribers: &[crate::messaging::SubscriberEntry],
     ) -> Vec<SubscriberEntryKind> {
-        let mut out = Vec::new();
-        for sub in subscribers {
-            if sub.push_depth.is_push_enabled() {
-                continue;
-            }
-            if !matches!(sub.kind, SubscriberEntryKind::Surface { .. }) {
-                continue;
-            }
-            let allowed = self
-                .subscriber_policy(&sub.kind)
-                .is_some_and(|p| p.allows_channel_access(channel_address));
-            if !allowed {
-                debug!(
-                    subscriber = ?sub.kind,
-                    channel = %channel_address,
-                    "depth-0 surface context feed denied — ACL not satisfied"
-                );
-                continue;
-            }
-            out.push(sub.kind.clone());
-        }
-        out
+        self.targets.context_targets(channel_address, subscribers)
     }
 
     /// Fan a just-committed durable envelope to fold-0 surface subscribers as a
@@ -1186,14 +1110,16 @@ impl Messenger {
         &self,
         targets: &[SubscriberEntryKind],
         envelope: &super::MessageEnvelope,
-        seq: i64,
+        retained_seq: i64,
     ) {
         // Build the shared envelope once; each `deliver_context` clones only the
         // `Arc` (a refcount bump), never the payload, however many fold-0
         // subscribers the channel carries.
         let shared = Arc::new(envelope.clone());
         for key in targets {
-            self.router.deliver_context(key, &shared, seq).await;
+            self.router
+                .deliver_context(key, &shared, retained_seq)
+                .await;
         }
     }
 }
@@ -1230,24 +1156,6 @@ fn context_feed_envelope(
     }
 }
 
-/// Resolved push-target metadata used inside `publish`.
-struct PushTarget {
-    subscriber: ParticipantId,
-    app_slug: String,
-    push_depth: Depth,
-    /// Noise level for this subscription (used for push-overflow handling).
-    noise: NoiseLevel,
-    /// Declared wake economics for this subscriber. `Eager` ⇒ every push row is
-    /// created eager (`wake_min` ignored); `UrgencyGated` ⇒ `eager_wake` gated by
-    /// `wake_min.wakes(urgency)`.
-    wake: WakeEconomics,
-    /// Wake-min threshold for this subscription. `Some` iff `wake` is
-    /// `UrgencyGated` (the only case that consults it); `None` for `Eager`
-    /// targets, so the delivery path cannot read a threshold for a subscriber
-    /// whose economics never gate on one.
-    wake_min: Option<WakeMin>,
-}
-
 /// Per-target entry in a `RetirementPlan`.
 ///
 /// Carries the push-row id and per-subscriber metadata. Channel address and
@@ -1259,15 +1167,19 @@ struct RetirementPlanEntry {
     app_slug: String,
     subscriber: super::ParticipantId,
     push_depth: super::config::Depth,
-    noise: super::config::NoiseLevel,
 }
 
 /// Retirement plan for one published message: channel identity (shared across all
 /// targets) plus per-target entries. Passed to `retire_windows` after commit.
 struct RetirementPlan {
-    /// Channel address (for push-window keying). Cloned once per message, not per target.
-    channel_address: String,
-    channel_uuid: Uuid,
+    /// The channel the message landed on. Held as the registry the retirement's
+    /// overflow events are routed against — the subscriber's noise rung lives on
+    /// its registration, not on the plan.
+    entry: Arc<super::ChannelEntry>,
+    /// The channel's durable store, resolved once while the `ChannelEntry` is in
+    /// hand. `None` when no target is window-tracked — nothing to retire, so
+    /// nothing to resolve.
+    store: Option<Arc<super::store::DbStore>>,
     entries: Vec<RetirementPlanEntry>,
 }
 
@@ -1282,12 +1194,12 @@ impl Messenger {
     /// - Calling `retire_windows` for each returned plan after the commit.
     ///
     /// `track_in_window` is `false` for parked (`deliver_after` in the future)
-    /// rows — those must not be retired before they are ever delivered (design §3).
+    /// rows — those must not be retired before they are ever delivered.
     #[allow(clippy::too_many_arguments)]
     fn insert_pushes(
         &self,
         tx: &rusqlite::Transaction<'_>,
-        channel: &super::ChannelEntry,
+        channel: &Arc<super::ChannelEntry>,
         push_targets: &[PushTarget],
         envelope_type: ChannelScheme,
         source: &str,
@@ -1300,64 +1212,33 @@ impl Messenger {
         delivery_deadline: Option<DateTime<Utc>>,
     ) -> (InsertedMessage, RetirementPlan) {
         // Build pending-push rows + retirement correlation.
-        // track_in_window is false for parked (future deliver_after) rows —
-        // those must not be retired before they are ever delivered (design §3).
-        let mut push_target_indices: Vec<(usize, bool)> = Vec::with_capacity(push_targets.len());
+        //
+        // A parked message gets none: it is owed to nobody until it releases,
+        // and the release pass mints one claim per subscriber attached then —
+        // so a subscriber that attaches while the message waits receives it,
+        // and one that leaves is not owed it. `deliver_after` is already
+        // normalized against the clock by every caller, so its presence *is*
+        // the park: re-reading the clock here would let a release time that
+        // matured in between mint claims for a row the insert leaves unpositioned.
+        let parked = deliver_after.is_some();
+        let mut push_target_indices: Vec<usize> = Vec::with_capacity(push_targets.len());
         let mut pushes: Vec<PendingPushInsert> = Vec::with_capacity(push_targets.len());
         for (tgt_idx, tgt) in push_targets.iter().enumerate() {
+            if parked {
+                break;
+            }
             if !tgt.push_depth.is_push_enabled() {
                 continue;
             }
-            // Resolve eager_wake from this subscriber's declared wake economics.
-            // `Eager` subscribers (parked WASM/system consumers, attached surface
-            // sessions) are always woken on publish — waking them is cheap, so
-            // urgency never gates delivery. `UrgencyGated` subscribers (LLM
-            // conversations, whose wake spawns a subprocess) are woken only when the
-            // message's urgency meets their `wake_min` threshold; below-threshold
-            // rows park until the subscriber's next natural wake. Gating eager
-            // subscribers on `wake_min` was the stranded-surface-push bug — a
-            // below-threshold publish parked invisibly for a live, attached surface
-            // session.
-            //
-            // The `release_after IS NULL` predicate in `load_all_dispatchable_pushes`
-            // (bus.rs) already excludes still-suppressed deferred rows from the
-            // dispatcher scan, so eager_wake=1 on a deferred row cannot fire
-            // prematurely. After `release_due_pushes` clears `release_after`, the
-            // row becomes visible to the scan and eager_wake=1 rows are dispatched
-            // immediately — this is the correct deferred-deliver-then-wake path.
-            // Setting eager_wake=false here would permanently freeze the row as
-            // parked, making it invisible to the dispatcher forever (correctness-2).
-            let release_after = deliver_after.filter(|da| *da > Utc::now());
-            let eager_wake = match (tgt.wake, tgt.wake_min) {
-                (WakeEconomics::Eager, _) => true,
-                (WakeEconomics::UrgencyGated, Some(wm)) => wm.wakes(urgency),
-                (WakeEconomics::UrgencyGated, None) => unreachable!(
-                    "UrgencyGated push target carries no wake_min — \
-                     resolve_push_targets invariant violated"
-                ),
-            };
-            if !eager_wake {
-                // Reachable only for `UrgencyGated` subscribers — a designed park
-                // (conversation economics), not stranding, but now a traced
-                // decision where the stranded-surface-push failure was silent at
-                // every level.
-                tracing::debug!(
-                    subscriber = %tgt.subscriber.as_str(),
-                    channel = %channel.address,
-                    ?urgency,
-                    wake_min = tgt.wake_min.map(|w| w.as_str()),
-                    "push row created without eager wake — parked pending subscriber's next wake",
-                );
-            }
-            let track_in_window = release_after.is_none();
+            let eager_wake = eager_wake_for(tgt, urgency, &channel.address);
             pushes.push(PendingPushInsert {
                 target_subscriber: tgt.subscriber.clone(),
                 target_app_slug: tgt.app_slug.clone(),
                 eager_wake,
-                release_after,
+                release_after: None,
                 delivery_deadline,
             });
-            push_target_indices.push((tgt_idx, track_in_window));
+            push_target_indices.push(tgt_idx);
         }
 
         let inserted = insert_message_with_pushes_in_tx(
@@ -1383,27 +1264,22 @@ impl Messenger {
             "push_ids and push_target_indices must be in sync"
         );
         let mut entries = Vec::with_capacity(inserted.push_ids.len());
-        for (push_id, &(tgt_idx, track_in_window)) in
-            inserted.push_ids.iter().zip(&push_target_indices)
-        {
-            if !track_in_window {
-                continue;
-            }
+        for (push_id, &tgt_idx) in inserted.push_ids.iter().zip(&push_target_indices) {
             let tgt = &push_targets[tgt_idx];
             entries.push(RetirementPlanEntry {
                 push_id: *push_id,
                 app_slug: tgt.app_slug.clone(),
                 subscriber: tgt.subscriber.clone(),
                 push_depth: tgt.push_depth,
-                noise: tgt.noise,
             });
         }
 
+        let store = (!entries.is_empty()).then(|| self.db_store_for(channel));
         (
             inserted,
             RetirementPlan {
-                channel_address: channel.address.clone(),
-                channel_uuid: channel.uuid,
+                entry: Arc::clone(channel),
+                store,
                 entries,
             },
         )
@@ -1416,22 +1292,37 @@ impl Messenger {
     /// deletes by primary key) — they run in the same lock scope but outside any
     /// explicit transaction.
     fn retire_windows(&self, conn: &rusqlite::Connection, plan: &RetirementPlan) {
-        for entry in &plan.entries {
-            if let Some(retired_id) = self.record_push_and_check_overflow(
-                &super::PushRegistration {
-                    channel: &plan.channel_address,
-                    channel_uuid: plan.channel_uuid,
+        let Some(db_store) = &plan.store else {
+            return; // no window-tracked target on this message
+        };
+        let claims: Vec<super::store::ClaimRetirement<'_>> = plan
+            .entries
+            .iter()
+            .map(|entry| super::store::ClaimRetirement {
+                params: super::store::PushRetireParams {
                     app_slug: &entry.app_slug,
                     subscriber: &entry.subscriber,
                     push_depth: entry.push_depth,
-                    noise: entry.noise,
                 },
-                entry.push_id,
-                conn,
-            ) {
-                delete_pending_push_by_id(conn, retired_id);
-            }
-        }
+                push_id: entry.push_id,
+            })
+            .collect();
+        // A Surface subscriber's drops are the page kernel's to enact — the
+        // backend's fatal rung would panic — so retirements route through the
+        // same kind-aware overflow sink.
+        let events: Vec<super::store::OverflowEvent> = db_store
+            .retire_claims(conn, &claims)
+            .into_iter()
+            .map(|idx| {
+                let entry = &plan.entries[idx];
+                super::store::OverflowEvent {
+                    subscriber: entry.subscriber.clone(),
+                    dropped: 1,
+                    app_slug: Some(entry.app_slug.clone()),
+                }
+            })
+            .collect();
+        self.enact_overflow_events(&plan.entry, db_store.as_ref(), &events);
     }
 }
 
@@ -1587,6 +1478,11 @@ pub struct WasmPublish<'a> {
     /// publishes. Host-resolved to a channel reference at flush; the address must
     /// resolve in the directory (a miss is a host-wiring bug, not attacker input).
     pub reply_to: Option<&'a str>,
+    /// Requested release time for a deferred publish (`ports.publish-deferred`),
+    /// or `None` for an immediate one. A value in the future parks the message
+    /// until it; a past/absent value commits immediately. Mutually exclusive with
+    /// `reply_to` in practice (tool requests never defer).
+    pub deliver_after: Option<DateTime<Utc>>,
 }
 
 impl Messenger {
@@ -1620,13 +1516,24 @@ impl Messenger {
             .as_str()
             .to_owned();
         let source = self.source.as_ref();
+        // One clock read for the whole flush's park-vs-immediate decisions, so
+        // every entry in the batch is judged against the same instant.
+        let flush_now = Utc::now();
 
         let mut all_retirements: Vec<RetirementPlan> = Vec::with_capacity(publishes.len());
-        // Deferred durable depth-0 context feeds (design §6): built under the
-        // lock, fanned out after it is released. Each is one committed envelope +
-        // its seq + the fold-0 surface subscribers on its channel.
+        // Deferred durable depth-0 context feeds: built under the lock, fanned
+        // out after it is released.
         let mut context_feeds: Vec<(super::MessageEnvelope, i64, Vec<SubscriberEntryKind>)> =
             Vec::new();
+        // Non-durable outputs: recorded in call order, committed to their stores
+        // after the durable transaction commits and its lock is released. The
+        // third element is the release time for a deferred entry (`Some` parks,
+        // `None` enters retention immediately).
+        let mut nondurable_pending: Vec<(
+            Arc<super::ChannelEntry>,
+            store::NewMessage,
+            Option<DateTime<Utc>>,
+        )> = Vec::new();
 
         {
             let conn = self.db.lock().await;
@@ -1642,31 +1549,52 @@ impl Messenger {
 
             // Monotonic publish_ts_ns assignment: each message gets
             // max(prev_ts + 1, now) to guarantee strictly increasing timestamps
-            // within the activation (call-order visibility contract, design §2.3).
+            // within the activation (call-order visibility contract).
             let mut prev_ts: Option<i64> = None;
 
             for publish in publishes {
                 let channel_addr = publish.channel_address;
+                let entry = self.directory.resolve(channel_addr).unwrap_or_else(|| {
+                    panic!(
+                        "publish_from_wasm: channel {channel_addr:?} not in directory — \
+                         boot validation should have caught this (slug={consumer_slug})"
+                    )
+                });
+
+                // Non-durable: skip the durable transaction machinery; ring
+                // append is deferred to after the lock.
+                if !entry.capabilities().durable {
+                    let scheme = ChannelScheme::of(channel_addr).unwrap_or_else(|| {
+                        panic!(
+                            "publish_from_wasm: channel {channel_addr:?} carries no scheme prefix \
+                             (slug={consumer_slug})"
+                        )
+                    });
+                    let release = publish.deliver_after.filter(|da| *da > flush_now);
+                    let message = store::NewMessage {
+                        source: source.to_owned(),
+                        sender: sender.clone(),
+                        body: publish.body.to_string(),
+                        urgency: publish.urgency,
+                        envelope_type: scheme,
+                        reply_to_uuid: None,
+                        delivery_deadline: None,
+                        publish_ts_ns: db::utc_to_ns(Utc::now()),
+                    };
+                    nondurable_pending.push((entry, message, release));
+                    continue;
+                }
+
                 let (channel, push_targets, context_targets) =
                     targets_cache.entry(channel_addr).or_insert_with(|| {
-                        let ch = self.directory.resolve(channel_addr).unwrap_or_else(|| {
-                            panic!(
-                                "publish_from_wasm: channel {channel_addr:?} not in directory — \
-                                 boot validation should have caught this (slug={consumer_slug})"
-                            )
-                        });
-                        assert_eq!(
-                            ch.transport_type,
-                            ChannelScheme::Brenn,
-                            "publish_from_wasm: channel {channel_addr:?} has transport_type={tt:?}; \
-                             only Brenn channels are permitted this slice (slug={consumer_slug})",
-                            tt = ch.transport_type,
+                        let targets = self.resolve_push_targets(
+                            &conn,
+                            &entry.address,
+                            entry.subscribers.as_slice(),
                         );
-                        let targets =
-                            self.resolve_push_targets(&conn, &ch.address, ch.subscribers.as_slice());
-                        let context =
-                            self.resolve_context_targets(&ch.address, ch.subscribers.as_slice());
-                        (ch, targets, context)
+                        let context = self
+                            .resolve_context_targets(&entry.address, entry.subscribers.as_slice());
+                        (entry.clone(), targets, context)
                     });
 
                 let now_ns = db::utc_to_ns(Utc::now());
@@ -1692,6 +1620,7 @@ impl Messenger {
                         .uuid
                 });
 
+                let release = publish.deliver_after.filter(|da| *da > flush_now);
                 let (inserted, plan) = self.insert_pushes(
                     &tx,
                     channel,
@@ -1703,10 +1632,13 @@ impl Messenger {
                     publish.urgency,
                     publish_ts_ns,
                     reply_to_uuid,
-                    None, // no deliver_after
+                    release,
                     None, // no delivery_deadline
                 );
-                if !context_targets.is_empty()
+                // A parked message is not observable before release, so it must
+                // not feed context now.
+                if release.is_none()
+                    && !context_targets.is_empty()
                     && self
                         .router
                         .any_context_session_attached(&channel.address, context_targets)
@@ -1724,7 +1656,9 @@ impl Messenger {
                             None,
                             publish.urgency,
                         ),
-                        inserted.id,
+                        inserted.retained_seq.expect(
+                            "publish: an unparked durable message holds a retention position",
+                        ),
                         context_targets.clone(),
                     ));
                 }
@@ -1744,7 +1678,7 @@ impl Messenger {
             for (i, plan) in all_retirements.iter().enumerate() {
                 debug!(
                     consumer_slug = consumer_slug,
-                    channel = plan.channel_address.as_str(),
+                    channel = plan.entry.address.as_str(),
                     publish_index = i,
                     "publish_from_wasm: retiring push windows post-commit"
                 );
@@ -1752,10 +1686,37 @@ impl Messenger {
             }
         }
 
-        // Durable depth-0 context feeds, fanned out after the lock is released
-        // (design §6). Nothing owed to a disconnected session.
+        // Durable depth-0 context feeds, fanned out after the lock is released.
         for (envelope, seq, targets) in &context_feeds {
             self.fan_out_context_feed(targets, envelope, *seq).await;
+        }
+
+        // Non-durable commits, after the durable lock is released. A flush has
+        // no error channel back to the guest, so a deferred-cap overflow is
+        // logged, counted (a dropped schedule is a component that never wakes
+        // again — a health check can read the counter), and the schedule dropped.
+        for (entry, message, release) in nondurable_pending {
+            let store = self.store_for(&entry);
+            match release {
+                Some(release_at) => {
+                    if let Err(brenn_queue::QuotaExceeded { cap }) =
+                        store.park(message, release_at).await
+                    {
+                        self.record_dropped_deferred(consumer_slug, &entry.address);
+                        warn!(
+                            consumer_slug = consumer_slug,
+                            channel = entry.address.as_str(),
+                            cap,
+                            "publish_from_wasm: deferred publish dropped — channel deferred set \
+                             at its retain_depth cap"
+                        );
+                    }
+                }
+                None => {
+                    let outcome = store.append(message).await;
+                    self.enact_overflow_events(&entry, store.as_ref(), &outcome.overflow);
+                }
+            }
         }
 
         self.dispatch_kick();
@@ -1836,8 +1797,8 @@ impl Messenger {
         // does — a component's grants *are* its config-declared bindings, which
         // boot proved covered by the surface's own ACLs.
         let policy = self
-            .subscribers
-            .get(&SubscriberEntryKind::Surface {
+            .targets
+            .registration(&SubscriberEntryKind::Surface {
                 slug: slug.to_string(),
                 instance: None,
             })
@@ -1964,7 +1925,9 @@ impl Messenger {
                             None,
                             publish.urgency,
                         ),
-                        inserted.id,
+                        inserted.retained_seq.expect(
+                            "publish: an unparked durable message holds a retention position",
+                        ),
                         context_targets.clone(),
                     ));
                 }
@@ -1981,8 +1944,7 @@ impl Messenger {
             }
         }
 
-        // Durable depth-0 context feeds, fanned out after the lock is released
-        // (design §6). Nothing owed to a disconnected session.
+        // Durable depth-0 context feeds, fanned out after the lock is released.
         for (envelope, seq, targets) in &context_feeds {
             self.fan_out_context_feed(targets, envelope, *seq).await;
         }

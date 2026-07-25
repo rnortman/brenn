@@ -18,6 +18,30 @@ fn empty_tool_registry() -> std::sync::Arc<crate::tool_registry::ToolRegistry> {
     std::sync::Arc::new(crate::tool_registry::ToolRegistry::new(vec![]))
 }
 
+/// Boot `build_messaging` with the standard no-op periphery. Tests that need
+/// a non-empty app map or real webhooks call `build_messaging` directly.
+async fn boot_messaging(
+    config: &brenn_lib::config::BrennConfig,
+    db: brenn_lib::db::Db,
+) -> MessagingResult {
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+    let webhooks: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IndexMap::new();
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IndexMap::new());
+    build_messaging(
+        config,
+        db,
+        &apps,
+        ActiveBridges::new(),
+        alert_dispatcher,
+        Some(Arc::from("brenn://test")),
+        &webhooks,
+        &[],
+        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
+        &empty_tool_registry(),
+    )
+    .await
+}
+
 /// A webhook-only app (no `[app.messaging]` block, only
 /// `[[app.webhook_subscription]]` entries) must appear in
 /// `apps_with_messaging` with a synthesised `ResolvedMessagingConfig`
@@ -344,6 +368,7 @@ fn webhook_channel_and_directory(
         address: address.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -376,7 +401,8 @@ impl brenn_lib::messaging::WakeRouter for NoopWakeRouter {
         _: &brenn_lib::messaging::ParticipantId,
         _: &brenn_lib::messaging::MessageEnvelope,
         _push_id: i64,
-        _seq: i64,
+        _message_id: i64,
+        _retained_seq: Option<i64>,
     ) -> Result<bool, String> {
         Ok(false)
     }
@@ -692,6 +718,7 @@ async fn build_messaging_reconstructs_runtime_created_mqtt_channel() {
             description: None,
             transport_type: ChannelScheme::Mqtt,
             resolved_channel: brenn_lib::messaging::config::ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -821,6 +848,7 @@ async fn build_messaging_does_not_reconstruct_orphan_channel() {
             description: None,
             transport_type: ChannelScheme::Mqtt,
             resolved_channel: brenn_lib::messaging::config::ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -920,6 +948,7 @@ async fn build_messaging_revokes_then_resumes_dynamic_mqtt_subscription_across_r
             description: None,
             transport_type: ChannelScheme::Mqtt,
             resolved_channel: brenn_lib::messaging::config::ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -1066,7 +1095,8 @@ fn config_with_one_brenn_channel(address: &str) -> (brenn_lib::config::BrennConf
     let uuid = uuid::Uuid::new_v4();
     let config = brenn_lib::config::BrennConfig {
         channels: vec![ChannelConfigRaw {
-            uuid: uuid.to_string(),
+            send_rate: None,
+            uuid: Some(uuid.to_string()),
             address: address.to_string(),
             description: None,
             push_depth: None,
@@ -1226,7 +1256,11 @@ async fn build_messaging_panics_on_static_wasm_sub_without_covering_policy() {
         component_path: "/tmp/deadwasm.wasm".into(),
         grants: vec![],
         subscribe_acl: vec![],
+        ephemeral_subscribe_acl: vec![],
         publish_acl: vec![],
+        ephemeral_publish_acl: vec![],
+        local_subscribe_acl: vec![],
+        local_publish_acl: vec![],
         mqtt_publish_acl: vec![],
         mqtt_subscribe_acl: vec![],
         webhook_acl: vec![],
@@ -1291,7 +1325,11 @@ async fn build_messaging_panics_on_wasm_mqtt_matcher_undeclared_client() {
         component_path: "/tmp/undeclared.wasm".into(),
         grants: vec![WasmGrant::Mqtt],
         subscribe_acl: vec![],
+        ephemeral_subscribe_acl: vec![],
         publish_acl: vec![],
+        ephemeral_publish_acl: vec![],
+        local_subscribe_acl: vec![],
+        local_publish_acl: vec![],
         mqtt_publish_acl: vec![MqttClientMatcherRaw {
             client: "home".to_string(),
         }],
@@ -1360,7 +1398,11 @@ async fn build_messaging_panics_on_wasm_mqtt_publish_acl_without_mqtt_grant() {
         component_path: "/tmp/aclless.wasm".into(),
         grants: vec![],
         subscribe_acl: vec![],
+        ephemeral_subscribe_acl: vec![],
         publish_acl: vec![],
+        ephemeral_publish_acl: vec![],
+        local_subscribe_acl: vec![],
+        local_publish_acl: vec![],
         mqtt_publish_acl: vec![MqttClientMatcherRaw {
             client: "home".to_string(),
         }],
@@ -1428,7 +1470,11 @@ async fn build_messaging_panics_on_static_wasm_sub_channel_outside_subscribe_acl
         // Non-empty ⇒ MessagingSubscribe grant is derived, but the matcher names
         // a different channel, so allows_channel_access("brenn:secret-channel") is false.
         subscribe_acl: vec![ChannelMatcherRaw::Exact("allowed-channel".to_string())],
+        ephemeral_subscribe_acl: vec![],
         publish_acl: vec![],
+        ephemeral_publish_acl: vec![],
+        local_subscribe_acl: vec![],
+        local_publish_acl: vec![],
         mqtt_publish_acl: vec![],
         mqtt_subscribe_acl: vec![],
         webhook_acl: vec![],
@@ -1494,7 +1540,11 @@ async fn build_messaging_accepts_static_wasm_sub_with_covering_subscribe_acl() {
         component_path: "/tmp/covered-wasm.wasm".into(),
         grants: vec![],
         subscribe_acl: vec![ChannelMatcherRaw::Exact(subscribed.to_string())],
+        ephemeral_subscribe_acl: vec![],
         publish_acl: vec![],
+        ephemeral_publish_acl: vec![],
+        local_subscribe_acl: vec![],
+        local_publish_acl: vec![],
         mqtt_publish_acl: vec![],
         mqtt_subscribe_acl: vec![],
         webhook_acl: vec![],
@@ -1598,7 +1648,11 @@ async fn build_messaging_panics_on_wasm_mqtt_subscribe_matcher_undeclared_client
         component_path: "/tmp/undeclared-sub.wasm".into(),
         grants: vec![],
         subscribe_acl: vec![],
+        ephemeral_subscribe_acl: vec![],
         publish_acl: vec![],
+        ephemeral_publish_acl: vec![],
+        local_subscribe_acl: vec![],
+        local_publish_acl: vec![],
         mqtt_publish_acl: vec![],
         mqtt_subscribe_acl: vec![MqttSubMatcherRaw {
             client: "home".to_string(),
@@ -1657,9 +1711,13 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
         component_path: "/tmp/brenn_processor_demo.wasm".into(),
         grants: vec![WasmGrant::Ports],
         subscribe_acl: vec![],
+        ephemeral_subscribe_acl: vec![],
         publish_acl: vec![brenn_lib::access::raw::ChannelMatcherRaw::Exact(
             "wasm-demo-out".to_string(),
         )],
+        ephemeral_publish_acl: vec![],
+        local_subscribe_acl: vec![],
+        local_publish_acl: vec![],
         mqtt_publish_acl: vec![],
         mqtt_subscribe_acl: vec![],
         webhook_acl: vec![brenn_lib::access::raw::WebhookMatcherRaw {
@@ -1744,7 +1802,11 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
         component_path: "/tmp/brenn_processor_demo.wasm".into(),
         grants: vec![],
         subscribe_acl: vec![],
+        ephemeral_subscribe_acl: vec![],
         publish_acl: vec![],
+        ephemeral_publish_acl: vec![],
+        local_subscribe_acl: vec![],
+        local_publish_acl: vec![],
         mqtt_publish_acl: vec![],
         mqtt_subscribe_acl: vec![],
         // Empty webhook_acl ⇒ no Webhook grant ⇒ allows_webhook_delivery is false.
@@ -1825,7 +1887,11 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
         component_path: "/tmp/consume-mqtt.wasm".into(),
         grants: vec![],
         subscribe_acl: vec![],
+        ephemeral_subscribe_acl: vec![],
         publish_acl: vec![],
+        ephemeral_publish_acl: vec![],
+        local_subscribe_acl: vec![],
+        local_publish_acl: vec![],
         mqtt_publish_acl: vec![],
         mqtt_subscribe_acl: vec![MqttSubMatcherRaw {
             client: "home".to_string(),
@@ -1928,7 +1994,11 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
         component_path: "/tmp/consume-mqtt.wasm".into(),
         grants: vec![],
         subscribe_acl: vec![],
+        ephemeral_subscribe_acl: vec![],
         publish_acl: vec![],
+        ephemeral_publish_acl: vec![],
+        local_subscribe_acl: vec![],
+        local_publish_acl: vec![],
         mqtt_publish_acl: vec![],
         // Empty mqtt_subscribe_acl ⇒ no MqttSubscribe grant ⇒ delivery denied.
         mqtt_subscribe_acl: vec![],
@@ -1971,8 +2041,8 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
     .await;
 }
 
-/// A config carrying only `[[surface]]` + `[[ephemeral_channel]]` blocks
-/// (no `[[channel]]`, webhook, mqtt-ingress, or `[[wasm_consumer]]`) must
+/// A config carrying only `[[surface]]` + an `ephemeral:` `[[channel]]`
+/// (no durable channel, webhook, mqtt-ingress, or `[[wasm_consumer]]`) must
 /// still bring messaging up and carry both resolved lists — exercises the
 /// `messaging_configured` gate end-to-end (paired with `run_server`'s
 /// `any_messaging`), which every `resolve_surfaces`-direct test bypasses.
@@ -1982,16 +2052,21 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
     use brenn_lib::access::raw::ChannelMatcherRaw;
     use brenn_lib::config::BrennConfig;
     use brenn_lib::db::init_db_memory;
-    use brenn_lib::messaging::config::{EphemeralChannelConfigRaw, SurfaceConfigRaw, SurfaceGrant};
+    use brenn_lib::messaging::config::{ChannelConfigRaw, SurfaceConfigRaw, SurfaceGrant};
     use indexmap::IndexMap as IM;
 
     let config = BrennConfig {
-        ephemeral_channels: vec![EphemeralChannelConfigRaw {
-            name: "protobar-demo".to_string(),
+        channels: vec![ChannelConfigRaw {
+            send_rate: None,
+            uuid: None,
+            address: "ephemeral:protobar-demo".to_string(),
+            description: None,
             push_depth: None,
-            retain_depth: None,
+            retain_depth: Some(brenn_lib::messaging::config::Depth::Bounded(0)),
+            standing_retain_depth: None,
             noise: None,
-            capacity: None,
+            sink: None,
+            wake_min: None,
         }],
         surfaces: vec![SurfaceConfigRaw {
             grants: vec![SurfaceGrant::EphemeralSubscribe],
@@ -2030,8 +2105,11 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
         result.messenger.is_some(),
         "a surface/ephemeral-only config must bring messaging up"
     );
-    assert_eq!(result.ephemeral_channels.len(), 1);
-    assert_eq!(result.ephemeral_channels[0].name, "protobar-demo");
+    assert_eq!(result.nondurable_channels.len(), 1);
+    assert_eq!(
+        result.nondurable_channels[0].address,
+        "ephemeral:protobar-demo"
+    );
     assert_eq!(result.surfaces.len(), 1);
     assert_eq!(result.surfaces[0].slug, "deskbar");
     assert_eq!(result.surfaces[0].subscriptions.len(), 1);
@@ -2040,32 +2118,701 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
         "ephemeral:protobar-demo"
     );
 
-    // Prove the config-resolved channel is actually wired into the
-    // Messenger's `EphemeralBus` — not just present in the intermediate
-    // `ephemeral_channels` vec. A publish must resolve the channel; the
-    // empty `Messenger::new` default bus would return `UnknownChannel`.
-    use brenn_lib::access::acl::ChannelMatcher;
-    use brenn_lib::access::{AppCapability, AppPolicy};
-    use brenn_lib::messaging::{EphemeralPublishResult, ParticipantId, Urgency};
+    // Prove the config-resolved channel is actually wired into the Messenger's
+    // store registry — not just present in the intermediate
+    // `nondurable_channels` vec. The empty `Messenger::new` default registry
+    // carries no channel at all, so a resolvable store here is the wiring.
+    let messenger = result.messenger.as_ref().unwrap();
+    let store = messenger
+        .ring_stores()
+        .get_by_address("ephemeral:protobar-demo")
+        .expect("config-resolved ephemeral channel must be wired into the Messenger");
+    assert_eq!(store.address(), "ephemeral:protobar-demo");
+    assert_eq!(store.epoch(), messenger.ring_epoch());
+}
 
-    let bus = result.messenger.as_ref().unwrap().ephemeral_bus();
-    let mut policy = AppPolicy::default();
-    policy.grants.insert(AppCapability::EphemeralPublish);
-    policy.acls.ephemeral_publish = vec![ChannelMatcher::Exact("protobar-demo".to_string())];
-    let sender = ParticipantId::for_app("deskbar", "brenn://test");
-    let outcome = bus.publish(
-        &sender,
-        &policy,
-        "ephemeral:protobar-demo",
-        "hi",
-        Urgency::Normal,
+/// Every non-durable `[[channel]]` block joins the one directory and gets one
+/// retention store. A `local:` channel additionally gets no wire fan-out: it is
+/// confined to this process, so its store issues no live handle.
+#[tokio::test]
+async fn build_messaging_registers_nondurable_channels_with_stores() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::config::{ChannelConfigRaw, Depth};
+    use indexmap::IndexMap as IM;
+
+    fn nondurable(address: &str) -> ChannelConfigRaw {
+        ChannelConfigRaw {
+            send_rate: None,
+            uuid: None,
+            address: address.to_string(),
+            description: None,
+            push_depth: None,
+            retain_depth: Some(Depth::Bounded(4)),
+            standing_retain_depth: None,
+            noise: None,
+            sink: None,
+            wake_min: None,
+        }
+    }
+
+    let config = BrennConfig {
+        channels: vec![nondurable("ephemeral:wired"), nondurable("local:inert")],
+        ..BrennConfig::default()
+    };
+
+    let db = init_db_memory();
+    let db_probe = db.clone();
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
+
+    let result = build_messaging(
+        &config,
+        db,
+        &apps,
+        ActiveBridges::new(),
+        alert_dispatcher,
+        Some(Arc::from("brenn://test")),
+        &webhook_endpoints,
+        &[],
+        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
+        &empty_tool_registry(),
+    )
+    .await;
+
+    {
+        let conn = db_probe.lock().await;
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messaging_channels WHERE address LIKE 'ephemeral:%' \
+                 OR address LIKE 'local:%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count non-durable channel rows");
+        assert_eq!(rows, 0, "a non-durable channel is never persisted");
+    }
+
+    let addresses: Vec<&str> = result
+        .nondurable_channels
+        .iter()
+        .map(|e| e.address.as_str())
+        .collect();
+    assert_eq!(addresses, vec!["ephemeral:wired", "local:inert"]);
+
+    let messenger = result.messenger.as_ref().unwrap();
+    assert!(
+        messenger
+            .ring_stores()
+            .get_by_address("ephemeral:wired")
+            .expect("the ephemeral channel has a store")
+            .capabilities()
+            .transportable,
+        "an ephemeral channel carries a live fan-out"
     );
     assert!(
-        matches!(outcome, EphemeralPublishResult::Ok { .. }),
-        "config-resolved ephemeral channel must be wired into the Messenger's \
-             bus; got {outcome:?}"
+        !messenger
+            .ring_stores()
+            .get_by_address("local:inert")
+            .expect("the local channel has a store")
+            .capabilities()
+            .transportable,
+        "a local: channel is confined to this process, so it issues no live handle"
     );
-    assert_eq!(bus.publish_count("protobar-demo"), 1);
+
+    for address in ["ephemeral:wired", "local:inert"] {
+        let entry = messenger
+            .directory()
+            .resolve(address)
+            .unwrap_or_else(|| panic!("{address} must be registered in the one directory"));
+        let store = messenger.store_for(&entry);
+        assert_eq!(store.address(), address);
+        assert!(!store.capabilities().durable);
+        assert_eq!(
+            store.channel_uuid(),
+            entry.uuid,
+            "the directory entry and its store name the same channel"
+        );
+    }
+    for address in ["ephemeral:wired", "local:inert"] {
+        assert_eq!(
+            messenger
+                .ring_stores()
+                .get_by_address(address)
+                .expect("registered")
+                .epoch(),
+            messenger.ring_epoch(),
+            "every non-durable channel of one process shares one incarnation"
+        );
+    }
+
+    // The non-durable channels are directory members, not database rows.
+    let durable: Vec<String> = messenger
+        .directory()
+        .list_durable()
+        .iter()
+        .map(|e| e.address.clone())
+        .collect();
+    assert!(
+        !durable
+            .iter()
+            .any(|a| a.starts_with("ephemeral:") || a.starts_with("local:")),
+        "list_durable is the database's view of the directory, got {durable:?}"
+    );
+}
+
+/// A WASM consumer subscribing to an `ephemeral:` channel registers as an
+/// in-memory ring cursor (not a `messaging_subscriptions` row) and writes no
+/// durable subscription row.
+#[tokio::test]
+async fn build_messaging_wires_wasm_ephemeral_consumer_to_a_ring_cursor() {
+    use brenn_lib::access::raw::ChannelMatcherRaw;
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::ParticipantId;
+    use brenn_lib::messaging::config::{
+        ChannelConfigRaw, Depth, WasmConsumerConfigRaw, WasmConsumerSubscriptionRaw,
+    };
+
+    let channel = ChannelConfigRaw {
+        send_rate: None,
+        uuid: None,
+        address: "ephemeral:sensors".to_string(),
+        description: None,
+        push_depth: Some(Depth::Bounded(4)),
+        retain_depth: Some(Depth::Bounded(8)),
+        standing_retain_depth: None,
+        noise: None,
+        sink: None,
+        wake_min: None,
+    };
+    let consumer = WasmConsumerConfigRaw {
+        slug: "watcher".to_string(),
+        component_path: "/tmp/watcher.wasm".into(),
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            channel: "ephemeral:sensors".to_string(),
+            port: "in".to_string(),
+            push_depth: None,
+            retain_depth: None,
+            noise: None,
+            wake_min: None,
+            amplification: None,
+        }],
+        ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("sensors".to_string())],
+        ..minimal_wasm_consumer()
+    };
+    let config = BrennConfig {
+        channels: vec![channel],
+        wasm_consumers: vec![consumer],
+        ..BrennConfig::default()
+    };
+
+    let db = init_db_memory();
+    let db_probe = db.clone();
+
+    let result = boot_messaging(&config, db).await;
+
+    let messenger = result.messenger.as_ref().unwrap();
+    let uuid = brenn_lib::messaging::ephemeral_channel_uuid_from_name("sensors");
+    let store = messenger
+        .ring_stores()
+        .get(&uuid)
+        .expect("the ephemeral channel has a ring store");
+    assert!(
+        store.is_attached(&ParticipantId::for_wasm("watcher")),
+        "the WASM consumer's ephemeral input is registered as an in-memory ring cursor"
+    );
+
+    let conn = db_probe.lock().await;
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messaging_subscriptions", [], |r| {
+            r.get(0)
+        })
+        .expect("count subscription rows");
+    assert_eq!(
+        rows, 0,
+        "a ring-backed input's registration is the in-memory cursor, not a durable row"
+    );
+}
+
+/// Boot's registration split, both halves in one consumer: every input registers
+/// in the directory whatever its channel's class — that registration is where the
+/// noise rung a ring eviction escalates against is read from — while only the
+/// durable input's registration is *persisted*. Filtering non-durable inputs back
+/// out of the directory would leave every ring eviction unable to resolve a rung;
+/// persisting the ring input would make the next boot treat its queue as
+/// pre-existing and skip priming it.
+#[tokio::test]
+async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_ones() {
+    use brenn_lib::access::raw::ChannelMatcherRaw;
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::SubscriberEntryKind;
+    use brenn_lib::messaging::config::{
+        ChannelConfigRaw, Depth, NoiseLevel, WasmConsumerConfigRaw, WasmConsumerSubscriptionRaw,
+    };
+
+    fn chan(address: &str, uuid: Option<&str>) -> ChannelConfigRaw {
+        ChannelConfigRaw {
+            send_rate: None,
+            uuid: uuid.map(str::to_string),
+            address: address.to_string(),
+            description: None,
+            push_depth: Some(Depth::Bounded(4)),
+            retain_depth: Some(Depth::Bounded(8)),
+            standing_retain_depth: None,
+            noise: None,
+            sink: None,
+            wake_min: None,
+        }
+    }
+    fn sub(channel: &str, port: &str) -> WasmConsumerSubscriptionRaw {
+        WasmConsumerSubscriptionRaw {
+            channel: channel.to_string(),
+            port: port.to_string(),
+            push_depth: None,
+            retain_depth: None,
+            noise: Some(NoiseLevel::Alarm),
+            wake_min: None,
+            amplification: None,
+        }
+    }
+
+    let consumer = WasmConsumerConfigRaw {
+        slug: "watcher".to_string(),
+        component_path: "/tmp/watcher.wasm".into(),
+        subscriptions: vec![sub("brenn:durable-in", "d"), sub("ephemeral:ring-in", "r")],
+        subscribe_acl: vec![ChannelMatcherRaw::Exact("durable-in".to_string())],
+        ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("ring-in".to_string())],
+        ..minimal_wasm_consumer()
+    };
+    let config = BrennConfig {
+        channels: vec![
+            chan(
+                "brenn:durable-in",
+                Some("22222222-2222-4222-8222-222222222222"),
+            ),
+            chan("ephemeral:ring-in", None),
+        ],
+        wasm_consumers: vec![consumer],
+        ..BrennConfig::default()
+    };
+
+    let db = init_db_memory();
+    let db_probe = db.clone();
+    let result = boot_messaging(&config, db).await;
+    let messenger = result.messenger.as_ref().unwrap();
+
+    for address in ["brenn:durable-in", "ephemeral:ring-in"] {
+        let entry = messenger
+            .directory()
+            .resolve(address)
+            .unwrap_or_else(|| panic!("{address} must be in the one directory"));
+        let sub = entry
+            .subscribers
+            .iter()
+            .find(|s| matches!(&s.kind, SubscriberEntryKind::Wasm(slug) if slug == "watcher"))
+            .unwrap_or_else(|| {
+                panic!("{address} must carry the consumer's registration: {entry:?}")
+            });
+        assert_eq!(
+            sub.noise,
+            NoiseLevel::Alarm,
+            "{address}: the registration carries the resolved noise rung"
+        );
+    }
+
+    let durable_uuid = messenger
+        .directory()
+        .resolve("brenn:durable-in")
+        .expect("durable channel present")
+        .uuid;
+    let conn = db_probe.lock().await;
+    let rows: Vec<Vec<u8>> = conn
+        .prepare("SELECT channel_uuid FROM messaging_subscriptions")
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        vec![durable_uuid.as_bytes().to_vec()],
+        "only the durable input's registration is persisted"
+    );
+}
+
+/// The confined-channel mirror of the ephemeral consumer test: a WASM consumer
+/// with a `local:` input attaches an in-memory ring cursor (no durable row), a
+/// confined publish reaches the cursor, and nothing lands in the DB.
+#[tokio::test]
+async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
+    use brenn_lib::access::raw::ChannelMatcherRaw;
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::ParticipantId;
+    use brenn_lib::messaging::config::{
+        ChannelConfigRaw, Depth, WasmConsumerConfigRaw, WasmConsumerSubscriptionRaw,
+    };
+
+    let channel = ChannelConfigRaw {
+        send_rate: None,
+        uuid: None,
+        address: "local:scratch".to_string(),
+        description: None,
+        push_depth: Some(Depth::Bounded(4)),
+        retain_depth: Some(Depth::Bounded(8)),
+        standing_retain_depth: None,
+        noise: None,
+        sink: None,
+        wake_min: None,
+    };
+    let consumer = WasmConsumerConfigRaw {
+        slug: "watcher".to_string(),
+        component_path: "/tmp/watcher.wasm".into(),
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            channel: "local:scratch".to_string(),
+            port: "in".to_string(),
+            push_depth: None,
+            retain_depth: None,
+            noise: None,
+            wake_min: None,
+            amplification: None,
+        }],
+        local_subscribe_acl: vec![ChannelMatcherRaw::Exact("scratch".to_string())],
+        ..minimal_wasm_consumer()
+    };
+    let config = BrennConfig {
+        channels: vec![channel],
+        wasm_consumers: vec![consumer],
+        ..BrennConfig::default()
+    };
+
+    let db = init_db_memory();
+    let db_probe = db.clone();
+
+    let result = boot_messaging(&config, db).await;
+
+    let messenger = result.messenger.as_ref().unwrap();
+    let uuid = brenn_lib::messaging::local_channel_uuid_from_name("scratch");
+    let store = messenger
+        .ring_stores()
+        .get(&uuid)
+        .expect("the local channel has a ring store");
+    let subscriber = ParticipantId::for_wasm("watcher");
+    assert!(
+        store.is_attached(&subscriber),
+        "the WASM consumer's local input is registered as an in-memory ring cursor"
+    );
+
+    store.append(brenn_lib::messaging::MessageEnvelope {
+        message_id: uuid::Uuid::new_v4(),
+        source: "node".to_string(),
+        channel: "local:scratch".to_string(),
+        sender: "test-sender".to_string(),
+        publish_ts: chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+        body: "ping".to_string(),
+        reply_to: None,
+        delivery_deadline: None,
+        deliver_after: None,
+        urgency: brenn_lib::messaging::Urgency::Normal,
+        envelope_type: brenn_lib::messaging::ChannelScheme::Local,
+    });
+    let take = store.take(&subscriber);
+    assert_eq!(
+        take.messages.len(),
+        1,
+        "the confined publish is delivered to the WASM consumer's ring cursor"
+    );
+    assert_eq!(take.messages[0].body, "ping");
+
+    let conn = db_probe.lock().await;
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messaging_subscriptions", [], |r| {
+            r.get(0)
+        })
+        .expect("count subscription rows");
+    assert_eq!(
+        rows, 0,
+        "a confined ring-backed input's registration is the in-memory cursor, not a durable row"
+    );
+    // A confined channel is never a message row either.
+    let msg_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messaging_messages", [], |r| r.get(0))
+        .expect("count message rows");
+    assert_eq!(
+        msg_rows, 0,
+        "a confined local: channel writes no message rows"
+    );
+}
+
+/// A `brenn:<address>` channel config carrying an explicit uuid and push_depth,
+/// plus a WASM consumer "watcher" whose durable input binds it with a covering
+/// `subscribe_acl`. The channel is present in both, so boot 1 (channel only) and
+/// boot 2 (channel + consumer) name the same durable channel.
+fn warm_brenn_priming_configs(
+    address: &str,
+    push_depth: brenn_lib::messaging::config::Depth,
+) -> (
+    brenn_lib::config::BrennConfig,
+    brenn_lib::config::BrennConfig,
+    uuid::Uuid,
+) {
+    use brenn_lib::access::raw::ChannelMatcherRaw;
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::config::{
+        ChannelConfigRaw, WasmConsumerConfigRaw, WasmConsumerSubscriptionRaw,
+    };
+    let uuid = uuid::Uuid::new_v4();
+    let channel = ChannelConfigRaw {
+        send_rate: None,
+        uuid: Some(uuid.to_string()),
+        address: format!("brenn:{address}"),
+        description: None,
+        push_depth: Some(push_depth),
+        retain_depth: Some(brenn_lib::messaging::config::Depth::Bounded(64)),
+        standing_retain_depth: None,
+        noise: None,
+        sink: None,
+        wake_min: None,
+    };
+    let channel_only = BrennConfig {
+        channels: vec![channel.clone()],
+        ..BrennConfig::default()
+    };
+    let consumer = WasmConsumerConfigRaw {
+        slug: "watcher".to_string(),
+        component_path: "/tmp/watcher.wasm".into(),
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            channel: format!("brenn:{address}"),
+            port: "in".to_string(),
+            push_depth: None,
+            retain_depth: None,
+            noise: None,
+            wake_min: None,
+            amplification: None,
+        }],
+        subscribe_acl: vec![ChannelMatcherRaw::Exact(address.to_string())],
+        ..minimal_wasm_consumer()
+    };
+    let with_consumer = BrennConfig {
+        channels: vec![channel],
+        wasm_consumers: vec![consumer],
+        ..BrennConfig::default()
+    };
+    (channel_only, with_consumer, uuid)
+}
+
+/// Insert `n` retained (deliver_after-free) messages onto `channel_uuid` with no
+/// pending pushes — a warm channel tail that pre-dates any subscription.
+async fn warm_channel_with_messages(db: &brenn_lib::db::Db, channel_uuid: uuid::Uuid, n: u32) {
+    let conn = db.lock().await;
+    for i in 0..n {
+        brenn_lib::messaging::db::insert_message_with_pushes(
+            &conn,
+            channel_uuid,
+            "brenn://test",
+            "test-sender",
+            &format!("body-{i}"),
+            brenn_lib::messaging::Urgency::Normal,
+            brenn_lib::messaging::ChannelScheme::Brenn,
+            None,
+            None,
+            None,
+            i as i64 + 1,
+            &[],
+        );
+    }
+}
+
+async fn count_pending_pushes_for(db: &brenn_lib::db::Db, subscriber: &str) -> i64 {
+    let conn = db.lock().await;
+    conn.query_row(
+        "SELECT COUNT(*) FROM messaging_pending_pushes WHERE target_subscriber = ?1",
+        rusqlite::params![subscriber],
+        |r| r.get(0),
+    )
+    .expect("count pending pushes")
+}
+
+/// The bodies of the pending-push rows seeded for `subscriber`, oldest first
+/// (join each push row back to its message, ordered by message id) — pins *which*
+/// messages primed and in what order, not just how many.
+async fn seeded_bodies_for(db: &brenn_lib::db::Db, subscriber: &str) -> Vec<String> {
+    let conn = db.lock().await;
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.body FROM messaging_pending_pushes p \
+             JOIN messaging_messages m ON p.message_id = m.id \
+             WHERE p.target_subscriber = ?1 ORDER BY m.id ASC",
+        )
+        .expect("prepare seeded bodies");
+    let bodies = stmt
+        .query_map(rusqlite::params![subscriber], |r| r.get::<_, String>(0))
+        .expect("query seeded bodies");
+    bodies.map(|r| r.expect("read seeded body")).collect()
+}
+
+/// A newly-created durable WASM queue primes from the channel's retained tail
+/// (attach is a delivery point): the tail, capped by push_depth, is seeded as
+/// pending pushes so the consumer wakes on it as NEW rather than only on the
+/// next publish.
+#[tokio::test]
+async fn build_messaging_primes_a_new_durable_wasm_queue_from_the_retained_tail() {
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::ParticipantId;
+    use brenn_lib::messaging::config::Depth;
+
+    let (channel_only, with_consumer, channel_uuid) =
+        warm_brenn_priming_configs("sensors", Depth::Bounded(4));
+
+    let db = init_db_memory();
+
+    // Boot 1: the channel exists (its row is written) but no consumer yet.
+    boot_messaging(&channel_only, db.clone()).await;
+
+    warm_channel_with_messages(&db, channel_uuid, 6).await;
+
+    // Boot 2: the consumer is added — a brand-new durable queue.
+    boot_messaging(&with_consumer, db.clone()).await;
+
+    let n = count_pending_pushes_for(&db, ParticipantId::for_wasm("watcher").as_str()).await;
+    assert_eq!(
+        n, 4,
+        "a new durable WASM queue primes the retained tail capped by push_depth"
+    );
+    // The tail is the *newest* push_depth messages (body-2..body-5), delivered
+    // oldest-first — not the oldest four, not reversed. A count-only assertion
+    // would pass on a tail-selection or ordering regression; this pins both.
+    let bodies = seeded_bodies_for(&db, ParticipantId::for_wasm("watcher").as_str()).await;
+    assert_eq!(
+        bodies,
+        vec!["body-2", "body-3", "body-4", "body-5"],
+        "priming seeds the newest push_depth messages of the retained tail, oldest first"
+    );
+}
+
+/// A durable WASM queue whose subscription registration survived the prior boot
+/// keeps its carried-over pending rows and does NOT re-prime — priming is a
+/// first-attach event, not a per-boot one.
+#[tokio::test]
+async fn build_messaging_does_not_reprime_a_surviving_durable_wasm_queue() {
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::ParticipantId;
+    use brenn_lib::messaging::config::Depth;
+
+    let (_channel_only, with_consumer, channel_uuid) =
+        warm_brenn_priming_configs("sensors", Depth::Bounded(4));
+
+    let db = init_db_memory();
+
+    // Boot 1: consumer present, channel cold — registration is recorded.
+    boot_messaging(&with_consumer, db.clone()).await;
+
+    // A tail arrives after the queue exists (with no pushes, e.g. it never
+    // reached the live subscriber). A surviving queue must not retroactively
+    // claim it as NEW.
+    warm_channel_with_messages(&db, channel_uuid, 3).await;
+
+    // Boot 2: the same consumer — a surviving registration.
+    boot_messaging(&with_consumer, db.clone()).await;
+
+    let n = count_pending_pushes_for(&db, ParticipantId::for_wasm("watcher").as_str()).await;
+    assert_eq!(
+        n, 0,
+        "a surviving durable WASM queue does not re-prime the retained tail"
+    );
+}
+
+/// Plant `n` retained message rows directly under `channel_uuid`, bypassing the
+/// channel-row foreign key. A non-durable channel never legitimately holds DB
+/// message rows (no `messaging_channels` row backs it), so this fabricates the
+/// only state under which the durable priming loop's non-durable skip guard is
+/// observable: were the guard removed, `load_channel_retained_tail` would find
+/// these rows and seed pushes for the ring-backed queue.
+async fn plant_orphan_message_rows(db: &brenn_lib::db::Db, channel_uuid: uuid::Uuid, n: u32) {
+    let conn = db.lock().await;
+    conn.pragma_update(None, "foreign_keys", "OFF")
+        .expect("fk off");
+    for i in 0..n {
+        conn.execute(
+            "INSERT INTO messaging_messages \
+             (uuid, channel_uuid, source, sender, body, urgency, publish_ts_ns, created_at, envelope_type) \
+             VALUES (?1, ?2, 'node', 'test-sender', ?3, 'normal', ?4, 'now', 'ephemeral')",
+            rusqlite::params![
+                uuid::Uuid::new_v4().as_bytes().to_vec(),
+                channel_uuid.as_bytes().to_vec(),
+                format!("body-{i}"),
+                i as i64 + 1,
+            ],
+        )
+        .expect("plant orphan message row");
+    }
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .expect("fk on");
+}
+
+/// A new WASM queue on a *non-durable* channel is primed via the ring
+/// (`Priming::Retained` at attach), never by seeding durable pending-push rows:
+/// the durable priming loop skips non-durable channels. Even with retained
+/// message rows sitting under the channel's uuid — which absent the skip guard
+/// `load_channel_retained_tail` would seed — no pending pushes are written.
+#[tokio::test]
+async fn build_messaging_does_not_seed_db_pushes_for_a_nondurable_wasm_queue() {
+    use brenn_lib::access::raw::ChannelMatcherRaw;
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::ParticipantId;
+    use brenn_lib::messaging::config::{
+        ChannelConfigRaw, Depth, WasmConsumerConfigRaw, WasmConsumerSubscriptionRaw,
+    };
+
+    let channel = ChannelConfigRaw {
+        send_rate: None,
+        uuid: None,
+        address: "ephemeral:sensors".to_string(),
+        description: None,
+        push_depth: Some(Depth::Bounded(4)),
+        retain_depth: Some(Depth::Bounded(8)),
+        standing_retain_depth: None,
+        noise: None,
+        sink: None,
+        wake_min: None,
+    };
+    let consumer = WasmConsumerConfigRaw {
+        slug: "watcher".to_string(),
+        component_path: "/tmp/watcher.wasm".into(),
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            channel: "ephemeral:sensors".to_string(),
+            port: "in".to_string(),
+            push_depth: None,
+            retain_depth: None,
+            noise: None,
+            wake_min: None,
+            amplification: None,
+        }],
+        ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("sensors".to_string())],
+        ..minimal_wasm_consumer()
+    };
+    let config = BrennConfig {
+        channels: vec![channel],
+        wasm_consumers: vec![consumer],
+        ..BrennConfig::default()
+    };
+
+    let db = init_db_memory();
+
+    let uuid = brenn_lib::messaging::ephemeral_channel_uuid_from_name("sensors");
+    plant_orphan_message_rows(&db, uuid, 6).await;
+
+    boot_messaging(&config, db.clone()).await;
+
+    let n = count_pending_pushes_for(&db, ParticipantId::for_wasm("watcher").as_str()).await;
+    assert_eq!(
+        n, 0,
+        "a non-durable WASM queue is primed via the ring, never by durable pending-push rows"
+    );
 }
 
 /// `messaging_configured` must fire on a config whose only messaging content
@@ -2253,7 +3000,8 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
     use indexmap::IndexMap as IM;
 
     let retained_channel = |uuid: &str, address: &str| ChannelConfigRaw {
-        uuid: uuid.to_string(),
+        send_rate: None,
+        uuid: Some(uuid.to_string()),
         address: address.to_string(),
         description: None,
         push_depth: None,
@@ -2382,7 +3130,8 @@ async fn boot_disconnected_stamp_written_per_surface_and_pullable() {
     use indexmap::IndexMap as IM;
 
     let bounded_channel = |uuid: &str, address: &str| ChannelConfigRaw {
-        uuid: uuid.to_string(),
+        send_rate: None,
+        uuid: Some(uuid.to_string()),
         address: address.to_string(),
         description: None,
         push_depth: None,
@@ -2434,7 +3183,7 @@ async fn boot_disconnected_stamp_written_per_surface_and_pullable() {
     .await;
 
     let messenger = result.messenger.as_ref().expect("messaging must be up");
-    let epoch = messenger.ephemeral_bus().epoch();
+    let epoch = messenger.ring_epoch();
 
     crate::routes::surface::telemetry::publish_boot_disconnected_stamps(
         messenger,

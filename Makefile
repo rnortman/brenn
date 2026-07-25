@@ -334,6 +334,8 @@ clippy:
 # of discovering rot when the real build depends on it. Needs the
 # wasm32-unknown-unknown target (rust-toolchain.toml), not wasm-bindgen-cli.
 # SURFACE_COMPONENT_CRATES is discovered from surface/components/* below.
+# `brenn-queue` rides along: it is a backend crate today, but it exists to be
+# shared with the page-side kernel, so its wasm32 compile is a contract.
 #
 # Two invocations, and the split is load-bearing:
 #   1. --lib across every surface wasm crate. The kernel's protocol-core unit
@@ -348,7 +350,7 @@ clippy:
 #      "wasm32"))`, so --all-targets under the wasm target compiles them out and
 #      never reaches for the native-only dev-deps.
 surface-wasm-check:
-	cargo clippy $(Q) --target wasm32-unknown-unknown -p brenn-surface-kernel -p brenn-surface-component-support $(addprefix -p ,$(SURFACE_COMPONENT_CRATES)) --lib -- -D warnings
+	cargo clippy $(Q) --target wasm32-unknown-unknown -p brenn-queue -p brenn-surface-kernel -p brenn-surface-component-support $(addprefix -p ,$(SURFACE_COMPONENT_CRATES)) --lib -- -D warnings
 	cargo clippy $(Q) --target wasm32-unknown-unknown -p brenn-surface-kernel -p brenn-surface-component-support -p brenn-meeting --all-targets -- -D warnings
 
 # Surface browser bundles: the wasm-bindgen pipeline for the shell and every

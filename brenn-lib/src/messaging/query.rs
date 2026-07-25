@@ -16,21 +16,21 @@ use super::{ChannelEntry, MessageEnvelope, Messenger};
 ///
 /// Column layout matches [`row_to_envelope`]'s documented 0–12 contract exactly; do not
 /// reorder or add columns here without updating that decoder and the byte-identity tests.
-pub(super) const SELECT_ENVELOPE_BASE: &str = "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency, \
+const SELECT_ENVELOPE_BASE: &str = "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency, \
             m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns, \
             c.address, rc.address, m.envelope_type \
      FROM messaging_messages m \
      JOIN messaging_channels c ON c.uuid = m.channel_uuid \
      LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid ";
 
-/// Common ORDER BY + LIMIT tail shared by both read sites.
+/// ORDER BY + LIMIT tail for the history read: newest first, capped.
 ///
-/// Callers append `WHERE m.channel_uuid = ?` (and any filter clauses) before this.
-pub(super) const SELECT_ENVELOPE_ORDER_LIMIT_TAIL: &str =
-    "ORDER BY m.publish_ts_ns DESC, m.id DESC LIMIT ?";
+/// The caller appends `WHERE m.channel_uuid = ?` (and any filter clauses)
+/// before this.
+const SELECT_ENVELOPE_ORDER_LIMIT_TAIL: &str = "ORDER BY m.publish_ts_ns DESC, m.id DESC LIMIT ?";
 
 /// Query parameters as parsed from the MCP tool input. Matches the
-/// `mcp__brenn__MessageQueryChannel` schema (§3.3).
+/// `mcp__brenn__MessageQueryChannel` schema.
 #[derive(Debug, Clone)]
 pub struct MessageQuery {
     /// Channel address (`brenn:<name>`, `mqtt:<client>:<topic>`,
@@ -105,8 +105,58 @@ impl Messenger {
             .ok_or_else(|| QueryError::UnknownChannel(q.channel.clone()))?;
         // Resolve the retain_depth clamp.
         let clamp = resolve_retain_depth_clamp(&entry, &q.calling_app_slug);
-        let conn = self.db.lock().await;
-        run_query(&conn, entry.uuid, q, clamp)
+        // History is queryable on every scheme; non-durable channels serve
+        // from the in-memory retained window instead of the database.
+        if entry.capabilities().durable {
+            let conn = self.db.lock().await;
+            run_query(&conn, entry.uuid, q, clamp)
+        } else {
+            Ok(self.query_retained_window(&entry, q, clamp).await)
+        }
+    }
+
+    /// Query the retained window of a non-durable channel, returning
+    /// newest-first results filtered and clamped to the same contract as the
+    /// durable SQL path: the clamp is a *count* limit on filtered results, not a
+    /// pre-filter window. Filtering happens over the whole retained ring (already
+    /// bounded by the channel's `retain_depth`), then the survivors are truncated
+    /// to `min(q.limit, clamp)` — so a filter that excludes the newest messages
+    /// still returns older matches up to the count. Both paths must agree.
+    ///
+    /// `search` is a case-insensitive substring match (no FTS index on the
+    /// bounded ring).
+    async fn query_retained_window(
+        &self,
+        entry: &ChannelEntry,
+        q: &MessageQuery,
+        retain_depth_clamp: Depth,
+    ) -> Vec<MessageEnvelope> {
+        let retained = self.store_for(entry).retained_tail(Depth::Unbounded).await;
+        let search_lower = q.search.as_ref().map(|s| s.to_lowercase());
+        // Filter on the borrowed `Arc` first; only clone the survivors so a
+        // selective query does not deep-copy the whole window.
+        let mut out: Vec<MessageEnvelope> = retained
+            .iter()
+            .filter(|e| q.before.is_none_or(|b| e.publish_ts < b))
+            .filter(|e| q.after.is_none_or(|a| e.publish_ts > a))
+            .filter(|e| q.sender.as_ref().is_none_or(|s| &e.sender == s))
+            .filter(|e| {
+                search_lower
+                    .as_ref()
+                    .is_none_or(|s| e.body.to_lowercase().contains(s))
+            })
+            .map(|arc| (**arc).clone())
+            .collect();
+        // Must be newest-first. Reverse before the stable sort so
+        // equal-`publish_ts` messages break toward the most recently appended.
+        out.reverse();
+        out.sort_by_key(|e| std::cmp::Reverse(e.publish_ts));
+        let effective_limit = match retain_depth_clamp {
+            Depth::Unbounded => q.limit as usize,
+            Depth::Bounded(n) => (q.limit as u64).min(n) as usize,
+        };
+        out.truncate(effective_limit);
+        out
     }
 }
 
@@ -145,7 +195,12 @@ fn run_query(
     if q.search.is_some() {
         sql.push_str("JOIN messaging_messages_fts fts ON fts.rowid = m.id ");
     }
-    sql.push_str("WHERE m.channel_uuid = ? ");
+    // `retained_seq IS NOT NULL` is the retained-set predicate: a parked
+    // (deferred) message holds no retention position and is observable to no
+    // read — history included — until a release pass moves it into the window.
+    // The non-durable arm reads the store's retained window, which excludes them
+    // the same way.
+    sql.push_str("WHERE m.channel_uuid = ? AND m.retained_seq IS NOT NULL ");
     params.push(Box::new(channel_uuid.as_bytes().to_vec()));
 
     if let Some(before) = q.before {
@@ -256,7 +311,8 @@ impl crate::messaging::WakeRouter for NoopWakeRouter {
         _: &crate::messaging::ParticipantId,
         _: &crate::messaging::MessageEnvelope,
         _push_id: i64,
-        _seq: i64,
+        _message_id: i64,
+        _retained_seq: Option<i64>,
     ) -> Result<bool, String> {
         Ok(false)
     }
@@ -310,6 +366,7 @@ pub mod tests {
             address: address.to_string(),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -611,6 +668,7 @@ pub mod tests {
                 address: canonical_address("news"),
                 description: None,
                 resolved_channel: ResolvedChannel {
+                    send_rate: Default::default(),
                     push_depth: Depth::Unbounded,
                     retain_depth: Depth::Unbounded,
                     standing_retain_depth: Depth::Bounded(2),
@@ -640,6 +698,7 @@ pub mod tests {
             address: canonical_address("news"),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Bounded(2),
@@ -705,6 +764,7 @@ pub mod tests {
                 address: canonical_address("legacy"),
                 description: None,
                 resolved_channel: ResolvedChannel {
+                    send_rate: Default::default(),
                     push_depth: Depth::Unbounded,
                     retain_depth: Depth::Unbounded,
                     standing_retain_depth: Depth::Unbounded,
@@ -734,6 +794,7 @@ pub mod tests {
             address: canonical_address("legacy"),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -801,6 +862,7 @@ pub mod tests {
                     address: canonical_address("sub-clamp"),
                     description: None,
                     resolved_channel: ResolvedChannel {
+                        send_rate: Default::default(),
                         push_depth: Depth::Bounded(0),
                         retain_depth: Depth::Unbounded,
                         standing_retain_depth: standing,
@@ -836,6 +898,7 @@ pub mod tests {
                 address: canonical_address("sub-clamp"),
                 description: None,
                 resolved_channel: ResolvedChannel {
+                    send_rate: Default::default(),
                     push_depth: Depth::Bounded(0),
                     retain_depth: Depth::Unbounded,
                     standing_retain_depth: standing,
@@ -960,6 +1023,7 @@ pub mod tests {
             address: address.to_string(),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: standing,
@@ -1607,6 +1671,7 @@ pub mod tests {
             address: canonical_address("news"),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -1689,5 +1754,503 @@ pub mod tests {
             tail = SELECT_ENVELOPE_ORDER_LIMIT_TAIL,
         );
         assert_eq!(assembled, golden);
+    }
+
+    // ---- Non-durable (ephemeral/local) history query ----
+
+    fn mk_env(
+        channel: &str,
+        scheme: ChannelScheme,
+        sender: &str,
+        body: &str,
+        ns: i64,
+    ) -> MessageEnvelope {
+        MessageEnvelope {
+            message_id: Uuid::new_v4(),
+            source: "src".to_string(),
+            channel: channel.to_string(),
+            sender: sender.to_string(),
+            publish_ts: ns_to_utc(ns),
+            body: body.to_string(),
+            reply_to: None,
+            delivery_deadline: None,
+            deliver_after: None,
+            urgency: Urgency::Normal,
+            envelope_type: scheme,
+        }
+    }
+
+    /// A messenger holding one `ephemeral:` ring channel seeded with
+    /// `messages` (`(sender, body, publish_ts_ns)`). The caller app `"reader"`
+    /// holds a covering ephemeral read ACL.
+    async fn ephemeral_messenger(
+        name: &str,
+        retain_depth: u64,
+        messages: &[(&str, &str, i64)],
+    ) -> std::sync::Arc<Messenger> {
+        use crate::config::AppConfig;
+        use crate::messaging::config::MessagingGlobalConfig;
+        use crate::messaging::store::RingStores;
+        use indexmap::IndexMap;
+        use std::sync::Arc;
+
+        let entry = crate::messaging::testutils::ephemeral_channel_entry(name, retain_depth);
+        let ring_stores = Arc::new(RingStores::build(std::slice::from_ref(&entry)));
+        {
+            let store = ring_stores.get(&entry.uuid).expect("registered");
+            for (sender, body, ns) in messages {
+                store.append(mk_env(
+                    &entry.address,
+                    ChannelScheme::Ephemeral,
+                    sender,
+                    body,
+                    *ns,
+                ));
+            }
+        }
+        let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
+        apps.insert(
+            "reader".to_string(),
+            app_with_access("reader", &entry.address),
+        );
+        Messenger::new(
+            init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![entry])),
+            Arc::from("test-source"),
+            Arc::new(apps),
+            Arc::new(super::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(ring_stores)
+    }
+
+    /// A messenger holding one durable `brenn:` channel seeded with the same
+    /// `(sender, body, publish_ts_ns)` tuples [`ephemeral_messenger`] takes, so a
+    /// case can feed identical messages to both classes and compare query output.
+    async fn durable_messenger(
+        name: &str,
+        messages: &[(&str, &str, i64)],
+    ) -> std::sync::Arc<Messenger> {
+        use crate::config::AppConfig;
+        use indexmap::IndexMap;
+        use std::sync::Arc;
+
+        let address = canonical_address(name);
+        let db = init_db_memory();
+        let uuid = Uuid::new_v4();
+        let entry = ChannelEntry {
+            uuid,
+            address: address.clone(),
+            description: None,
+            resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
+                push_depth: Depth::Unbounded,
+                retain_depth: Depth::Unbounded,
+                standing_retain_depth: Depth::Unbounded,
+                noise: NoiseLevel::Silent,
+                sink: Sink::Drop,
+                wake_min: WakeMin::Normal,
+            },
+            subscribers: vec![],
+            transport_type: ChannelScheme::Brenn,
+            mount: None,
+        };
+        {
+            let conn = db.lock().await;
+            ensure_user_and_conv(&conn, 1);
+            upsert_channels(&conn, std::slice::from_ref(&entry));
+            for (sender, body, ns) in messages {
+                insert(&conn, uuid, body, sender, *ns);
+            }
+        }
+        let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
+        apps.insert("reader".to_string(), app_with_access("reader", &address));
+        Messenger::new(
+            db,
+            Arc::new(MessagingDirectory::with_entries(vec![entry])),
+            Arc::from("test-source"),
+            Arc::new(apps),
+            Arc::new(super::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            MessagingGlobalConfig::default(),
+        )
+    }
+
+    /// The durable SQL path and the non-durable retained-window path answer a
+    /// query identically for the filters both support — the "both paths must
+    /// agree" contract the `query_retained_window` doc claims but nothing else
+    /// pinned. Search is excluded: it is a deliberate divergence (durable FTS
+    /// token match vs ring substring), asserted separately below.
+    #[tokio::test]
+    async fn durable_and_nondurable_query_agree_on_the_retained_window() {
+        let base = utc_to_ns(Utc::now());
+        // Two messages share a timestamp to exercise the equal-`publish_ts`
+        // tiebreak (both paths must break toward the most recently appended).
+        let msgs: &[(&str, &str, i64)] = &[
+            ("alice", "apple", base),
+            ("bob", "banana", base + 1_000_000_000),
+            ("alice", "cherry", base + 1_000_000_000),
+            ("bob", "date", base + 2_000_000_000),
+        ];
+        let dur = durable_messenger("chatter", msgs).await;
+        let eph = ephemeral_messenger("chatter", 8, msgs).await;
+
+        struct Shape {
+            sender: Option<&'static str>,
+            before: Option<i64>,
+            after: Option<i64>,
+            limit: u32,
+        }
+        let shape = |sender, before, after, limit| Shape {
+            sender,
+            before,
+            after,
+            limit,
+        };
+        let shapes = [
+            shape(None, None, None, 100),                       // whole window
+            shape(Some("alice"), None, None, 100),              // sender filter
+            shape(None, Some(base + 2_000_000_000), None, 100), // before
+            shape(None, None, Some(base), 100),                 // after
+            shape(None, None, None, 2),                         // limit clamp
+        ];
+
+        for Shape {
+            sender,
+            before,
+            after,
+            limit,
+        } in shapes
+        {
+            let build = |channel: String| MessageQuery {
+                channel,
+                limit,
+                before: before.map(ns_to_utc),
+                after: after.map(ns_to_utc),
+                sender: sender.map(str::to_string),
+                search: None,
+                calling_app_slug: "reader".to_string(),
+            };
+            let d = dur
+                .query(&build(canonical_address("chatter")))
+                .await
+                .unwrap();
+            let e = eph
+                .query(&build(canonical_address_for("chatter")))
+                .await
+                .unwrap();
+            let db_bodies: Vec<&str> = d.iter().map(|m| m.body.as_str()).collect();
+            let eph_bodies: Vec<&str> = e.iter().map(|m| m.body.as_str()).collect();
+            assert_eq!(
+                db_bodies, eph_bodies,
+                "durable vs non-durable disagree for shape \
+                 sender={sender:?} before={before:?} after={after:?} limit={limit}"
+            );
+        }
+    }
+
+    /// The search divergence made explicit on each side: durable `search` is an
+    /// FTS token MATCH, so a partial token misses; the ring's is a case-
+    /// insensitive substring, so it hits. Documented in `query_retained_window`;
+    /// pinned here so the intended difference is visible in a test.
+    #[tokio::test]
+    async fn durable_search_is_fts_token_the_ring_search_is_substring() {
+        let base = utc_to_ns(Utc::now());
+        let msgs: &[(&str, &str, i64)] = &[("u", "watermelon", base)];
+        let dur = durable_messenger("berry", msgs).await;
+        let eph = ephemeral_messenger("berry", 8, msgs).await;
+
+        let build = |channel: String| MessageQuery {
+            channel,
+            limit: 100,
+            before: None,
+            after: None,
+            sender: None,
+            search: Some("melon".to_string()),
+            calling_app_slug: "reader".to_string(),
+        };
+        // FTS token "melon" does not match the token "watermelon".
+        let d = dur.query(&build(canonical_address("berry"))).await.unwrap();
+        assert!(d.is_empty(), "durable FTS matches whole tokens only");
+        // Substring "melon" is inside "watermelon".
+        let e = eph
+            .query(&build(canonical_address_for("berry")))
+            .await
+            .unwrap();
+        assert_eq!(e.len(), 1, "ring search is a substring match");
+    }
+
+    fn eph_query(sender: Option<&str>, search: Option<&str>) -> MessageQuery {
+        MessageQuery {
+            channel: canonical_address_for("chatter"),
+            limit: 100,
+            before: None,
+            after: None,
+            sender: sender.map(str::to_string),
+            search: search.map(str::to_string),
+            calling_app_slug: "reader".to_string(),
+        }
+    }
+
+    fn canonical_address_for(name: &str) -> String {
+        format!("ephemeral:{name}")
+    }
+
+    #[tokio::test]
+    async fn ephemeral_query_returns_retained_window_newest_first() {
+        let base = utc_to_ns(Utc::now());
+        let m = ephemeral_messenger(
+            "chatter",
+            8,
+            &[
+                ("u", "first", base),
+                ("u", "second", base + 1_000_000_000),
+                ("u", "third", base + 2_000_000_000),
+            ],
+        )
+        .await;
+        let result = m.query(&eph_query(None, None)).await.unwrap();
+        let bodies: Vec<&str> = result.iter().map(|e| e.body.as_str()).collect();
+        assert_eq!(bodies, vec!["third", "second", "first"]);
+        assert_eq!(result[0].channel, "ephemeral:chatter");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_query_filters_by_sender() {
+        let base = utc_to_ns(Utc::now());
+        let m = ephemeral_messenger(
+            "chatter",
+            8,
+            &[
+                ("alice", "from-alice", base),
+                ("bob", "from-bob", base + 1_000_000_000),
+            ],
+        )
+        .await;
+        let result = m.query(&eph_query(Some("alice"), None)).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].body, "from-alice");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_query_search_is_case_insensitive_substring_on_body() {
+        let base = utc_to_ns(Utc::now());
+        let m = ephemeral_messenger(
+            "chatter",
+            8,
+            &[
+                ("u", "the quick brown Fox", base),
+                ("u", "an apple a day", base + 1_000_000_000),
+            ],
+        )
+        .await;
+        let result = m.query(&eph_query(None, Some("fox"))).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].body, "the quick brown Fox");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_query_filters_by_before_and_after() {
+        let base = utc_to_ns(Utc::now());
+        let m = ephemeral_messenger(
+            "chatter",
+            8,
+            &[
+                ("u", "old", base),
+                ("u", "mid", base + 5_000_000_000),
+                ("u", "new", base + 10_000_000_000),
+            ],
+        )
+        .await;
+        let mut q = eph_query(None, None);
+        q.before = Some(ns_to_utc(base + 9_000_000_000));
+        q.after = Some(ns_to_utc(base + 1));
+        let result = m.query(&q).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].body, "mid");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_query_clamped_to_retained_window() {
+        // retain_depth 2 with 4 messages: only the newest two survive.
+        let base = utc_to_ns(Utc::now());
+        let m = ephemeral_messenger(
+            "chatter",
+            2,
+            &[
+                ("u", "m0", base),
+                ("u", "m1", base + 1_000_000_000),
+                ("u", "m2", base + 2_000_000_000),
+                ("u", "m3", base + 3_000_000_000),
+            ],
+        )
+        .await;
+        let result = m.query(&eph_query(None, None)).await.unwrap();
+        let bodies: Vec<&str> = result.iter().map(|e| e.body.as_str()).collect();
+        assert_eq!(bodies, vec!["m3", "m2"]);
+    }
+
+    /// The retain_depth clamp is a *count* limit on filtered results, not a
+    /// pre-filter window — the same contract as the durable SQL path. With a
+    /// clamp (3) smaller than the ring depth (8), a sender filter matching only
+    /// the oldest retained message still returns it: filtering happens over the
+    /// whole ring, then the survivors are truncated to the count.
+    #[tokio::test]
+    async fn ephemeral_query_clamp_is_count_not_window_under_filter() {
+        use crate::config::AppConfig;
+        use crate::messaging::config::MessagingGlobalConfig;
+        use crate::messaging::store::RingStores;
+        use indexmap::IndexMap;
+        use std::sync::Arc;
+
+        // Ring holds 8; the caller (a non-subscriber) clamps to standing = 3.
+        let mut entry = crate::messaging::testutils::ephemeral_channel_entry("chatter", 8);
+        entry.resolved_channel.standing_retain_depth = Depth::Bounded(3);
+        let ring_stores = Arc::new(RingStores::build(std::slice::from_ref(&entry)));
+        let base = utc_to_ns(Utc::now());
+        {
+            let store = ring_stores.get(&entry.uuid).expect("registered");
+            // Only the oldest message is from "old"; it sits outside the newest-3
+            // window a pre-filter clamp would have fetched.
+            for i in 0..8u32 {
+                let sender = if i == 0 { "old" } else { "u" };
+                store.append(mk_env(
+                    &entry.address,
+                    ChannelScheme::Ephemeral,
+                    sender,
+                    &format!("m{i}"),
+                    base + i as i64 * 1_000_000_000,
+                ));
+            }
+        }
+        let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
+        apps.insert(
+            "reader".to_string(),
+            app_with_access("reader", &entry.address),
+        );
+        let m = Messenger::new(
+            init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![entry])),
+            Arc::from("test-source"),
+            Arc::new(apps),
+            Arc::new(super::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(ring_stores);
+
+        let result = m.query(&eph_query(Some("old"), None)).await.unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "the old match survives count-limit clamping"
+        );
+        assert_eq!(result[0].body, "m0");
+    }
+
+    /// The participant×channel matrix row for a conversation on a non-durable
+    /// channel: an LLM app dynamically subscribes to an `ephemeral:` channel and
+    /// then reads it, with its own resolved `retain_depth` clamping the read —
+    /// the same end-to-end shape the `brenn:` path has.
+    #[tokio::test]
+    async fn ephemeral_dynamic_subscribe_then_query_honors_retain_depth() {
+        use crate::messaging::subscribe::DynamicSubscribeParams;
+
+        let base = utc_to_ns(Utc::now());
+        let messages: Vec<(&str, String, i64)> = (0..5)
+            .map(|i| ("u", format!("m{i}"), base + i * 1_000_000_000))
+            .collect();
+        let borrowed: Vec<(&str, &str, i64)> = messages
+            .iter()
+            .map(|(s, b, ns)| (*s, b.as_str(), *ns))
+            .collect();
+        let m = ephemeral_messenger("chatter", 8, &borrowed).await;
+
+        m.subscribe_dynamic(
+            "reader",
+            &canonical_address_for("chatter"),
+            DynamicSubscribeParams {
+                push_depth: Depth::Bounded(0),
+                retain_depth: Depth::Bounded(2),
+                noise: None,
+                wake_min: None,
+                qos: None,
+            },
+        )
+        .await
+        .expect("dynamic subscribe to an ephemeral channel succeeds");
+
+        let result = m.query(&eph_query(None, None)).await.unwrap();
+        assert_eq!(
+            result.len(),
+            2,
+            "the dynamic subscriber's resolved retain_depth clamps its read"
+        );
+        assert_eq!(result[0].body, "m4", "newest first");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_query_empty_window_returns_nothing() {
+        let m = ephemeral_messenger("chatter", 8, &[]).await;
+        let result = m.query(&eph_query(None, None)).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nondurable_query_window_is_scheme_blind_for_local() {
+        // The retained-window read is chosen by capability, not scheme, so a
+        // `local:` channel is served identically once the caller is authorized
+        // for local delivery (LocalSubscribe is not LLM-authorable, so this
+        // stamps the grant directly — an ordinary app query of `local:` denies).
+        use crate::access::acl::ChannelMatcher;
+        use crate::access::{AppCapability, AppPolicy};
+        use crate::config::AppConfig;
+        use crate::messaging::config::MessagingGlobalConfig;
+        use crate::messaging::store::RingStores;
+        use indexmap::IndexMap;
+        use std::sync::Arc;
+
+        let entry = crate::messaging::testutils::local_channel_entry("box", 8);
+        let ring_stores = Arc::new(RingStores::build(std::slice::from_ref(&entry)));
+        let base = utc_to_ns(Utc::now());
+        {
+            let store = ring_stores.get(&entry.uuid).expect("registered");
+            store.append(mk_env(
+                &entry.address,
+                ChannelScheme::Local,
+                "u",
+                "confined",
+                base,
+            ));
+        }
+        let mut policy = AppPolicy::default();
+        policy.grants.insert(AppCapability::LocalSubscribe);
+        policy.acls.local_subscribe = vec![ChannelMatcher::Prefix(String::new())];
+        let mut app = crate::messaging::test_support::test_app_config("reader", None, vec![]);
+        app.policy = policy;
+        let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
+        apps.insert("reader".to_string(), app);
+
+        let messenger = Messenger::new(
+            init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![entry])),
+            Arc::from("test-source"),
+            Arc::new(apps),
+            Arc::new(super::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(ring_stores);
+
+        let q = MessageQuery {
+            channel: "local:box".to_string(),
+            limit: 100,
+            before: None,
+            after: None,
+            sender: None,
+            search: None,
+            calling_app_slug: "reader".to_string(),
+        };
+        let result = messenger.query(&q).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].body, "confined");
+        assert_eq!(result[0].channel, "local:box");
     }
 }

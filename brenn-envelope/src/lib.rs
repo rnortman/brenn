@@ -94,8 +94,8 @@ pub fn surface_sub_identity(participant: &str, instance: &str) -> String {
 /// - **`brenn:` — durable state.** Persisted before delivery, server-assigned
 ///   seq, recoverable via the retained window. **Never push high-frequency data
 ///   over durable channels.**
-/// - **`ephemeral:` — cross-boundary, high-frequency, loss-tolerant.** Flows
-///   through the `EphemeralBus`; server-mediated, so it crosses the wire (the
+/// - **`ephemeral:` — cross-boundary, high-frequency, loss-tolerant.** Retained
+///   in an in-memory ring; server-mediated, so it crosses the wire (the
 ///   shape for backend producer → surface consumer traffic, e.g. token
 ///   streaming).
 /// - **`local:` — page-local.** Never crosses the wire; the surface kernel's
@@ -151,6 +151,42 @@ pub enum DeliveryClass {
     /// Loss-tolerant, page-local, never crosses the wire. Takes the same
     /// drop-oldest-and-count recovery path as [`DeliveryClass::Ephemeral`].
     Local,
+}
+
+/// The two axes on which channels differ at all, carried on a channel's
+/// directory entry and chosen once, at registration, from its address scheme.
+///
+/// Everything else about a channel — bounded drop-oldest retention, replay,
+/// typed gaps, deferral, the noise ladder — is identical across schemes, so it
+/// belongs to the substrate rather than to a per-scheme branch. These two
+/// capabilities are what remains: where retained data lives, and how far a
+/// message may travel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelCapabilities {
+    /// Retained data survives a process restart or crash.
+    pub durable: bool,
+    /// Messages may cross the process (backend) or page (surface) boundary.
+    /// A non-transportable channel is never handed to a wire serializer or an
+    /// egress adapter.
+    pub transportable: bool,
+}
+
+impl ChannelCapabilities {
+    /// Persisted and free to cross the wire — `brenn:`, `mqtt:`, `webhook:`.
+    pub const DURABLE_TRANSPORTABLE: Self = Self {
+        durable: true,
+        transportable: true,
+    };
+    /// In memory only, but free to cross the wire — `ephemeral:`.
+    pub const TRANSPORTABLE: Self = Self {
+        durable: false,
+        transportable: true,
+    };
+    /// In memory only and confined to the instance that hosts it — `local:`.
+    pub const CONFINED: Self = Self {
+        durable: false,
+        transportable: false,
+    };
 }
 
 impl ChannelScheme {
@@ -253,6 +289,26 @@ impl ChannelScheme {
             }
             ChannelScheme::Ephemeral => Some(DeliveryClass::Ephemeral),
             ChannelScheme::Local => Some(DeliveryClass::Local),
+            ChannelScheme::PwaPush => None,
+        }
+    }
+
+    /// The capability set channels of this scheme carry, or `None` for a scheme
+    /// that names no pub/sub channel.
+    ///
+    /// `None` is `pwa_push:`, for the same reason `delivery_class` returns none
+    /// there: it is a send target, not a channel, so it holds no retention and
+    /// answers neither capability question.
+    ///
+    /// Callers must use the returned capabilities rather than re-deriving them
+    /// from the scheme or delivery class at each site.
+    pub fn capabilities(self) -> Option<ChannelCapabilities> {
+        match self {
+            ChannelScheme::Brenn | ChannelScheme::Mqtt | ChannelScheme::Webhook => {
+                Some(ChannelCapabilities::DURABLE_TRANSPORTABLE)
+            }
+            ChannelScheme::Ephemeral => Some(ChannelCapabilities::TRANSPORTABLE),
+            ChannelScheme::Local => Some(ChannelCapabilities::CONFINED),
             ChannelScheme::PwaPush => None,
         }
     }
@@ -644,6 +700,75 @@ mod tests {
                 class.is_none(),
                 scheme == ChannelScheme::PwaPush,
                 "{scheme:?}: pwa_push: is the only classless (egress-only) scheme"
+            );
+        }
+    }
+
+    // ── ChannelCapabilities ───────────────────────────────────────────────
+
+    /// The scheme → capability mapping, pinned per scheme for the same reason
+    /// the delivery-class mapping is: it is the whole of the class-dependent
+    /// behaviour, so it changes only by a visible edit here.
+    #[test]
+    fn capabilities_by_scheme() {
+        assert_eq!(
+            ChannelScheme::Brenn.capabilities(),
+            Some(ChannelCapabilities::DURABLE_TRANSPORTABLE)
+        );
+        assert_eq!(
+            ChannelScheme::Mqtt.capabilities(),
+            Some(ChannelCapabilities::DURABLE_TRANSPORTABLE)
+        );
+        assert_eq!(
+            ChannelScheme::Webhook.capabilities(),
+            Some(ChannelCapabilities::DURABLE_TRANSPORTABLE)
+        );
+        assert_eq!(
+            ChannelScheme::Ephemeral.capabilities(),
+            Some(ChannelCapabilities::TRANSPORTABLE)
+        );
+        assert_eq!(
+            ChannelScheme::Local.capabilities(),
+            Some(ChannelCapabilities::CONFINED)
+        );
+        assert_eq!(ChannelScheme::PwaPush.capabilities(), None);
+    }
+
+    /// `local:` is the only scheme a wire serializer or egress adapter may never
+    /// see, and it is confined by capability rather than by a check at each
+    /// adapter.
+    #[test]
+    fn local_is_the_only_confined_scheme() {
+        for scheme in ChannelScheme::ALL {
+            let Some(caps) = scheme.capabilities() else {
+                continue;
+            };
+            assert_eq!(
+                !caps.transportable,
+                scheme == ChannelScheme::Local,
+                "{scheme:?}: local: is the only non-transportable channel scheme"
+            );
+        }
+    }
+
+    /// Durability and delivery class are two readings of one decision: a
+    /// `Durable`-class scheme is exactly a durable-capability scheme. Pinned so
+    /// the two mappings cannot drift apart while both exist.
+    #[test]
+    fn durability_agrees_with_delivery_class() {
+        for scheme in ChannelScheme::ALL {
+            let (Some(caps), Some(class)) = (scheme.capabilities(), scheme.delivery_class()) else {
+                assert_eq!(
+                    scheme.capabilities().is_none(),
+                    scheme.delivery_class().is_none(),
+                    "{scheme:?}: a scheme answers both questions or neither"
+                );
+                continue;
+            };
+            assert_eq!(
+                caps.durable,
+                class == DeliveryClass::Durable,
+                "{scheme:?}: durability disagrees with delivery class"
             );
         }
     }

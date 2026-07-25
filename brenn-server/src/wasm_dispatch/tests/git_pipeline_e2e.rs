@@ -136,6 +136,7 @@ fn webhook_channel(endpoint_slug: &str) -> ChannelEntry {
         address,
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -339,6 +340,7 @@ async fn build_pipeline() -> Pipeline {
                 amplification_mt: 1000,
             },
         ],
+        outputs: vec![],
         activation_pacing: unthrottled_pacing(),
     };
 
@@ -412,6 +414,7 @@ async fn build_pipeline() -> Pipeline {
             },
             inbox_input_port(CONSUMER_SLUG),
         ],
+        outputs: vec![],
         activation_pacing: unthrottled_pacing(),
     };
 

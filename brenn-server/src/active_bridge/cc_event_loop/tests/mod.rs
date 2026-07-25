@@ -153,6 +153,7 @@ pub(super) async fn bridge_with_messenger_for_drain()
         address: brenn_lib::messaging::canonical_address("test-drain-channel"),
         description: None,
         resolved_channel: brenn_lib::messaging::config::ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: brenn_lib::messaging::config::Depth::Unbounded,
             retain_depth: brenn_lib::messaging::config::Depth::Unbounded,
             standing_retain_depth: brenn_lib::messaging::config::Depth::Unbounded,

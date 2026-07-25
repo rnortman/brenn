@@ -195,15 +195,12 @@ pub fn load_dynamic_subscription_for(
 /// So these are plain `INSERT`s — a PK collision here is a caller/host bug and
 /// panics.
 ///
-/// That check-then-insert re-establishes the guarantee only for callers that are
-/// **not** concurrent for the same `(channel, app)`: the probe and this INSERT are
-/// separate lock acquisitions, so two in-flight `subscribe_dynamic` calls for one
-/// key could both pass the probe and race here, and the loser panics on the PK
-/// collision. This is a pre-existing property (the prior path INSERTed directly).
-/// Intercepts serialize per *conversation* — each bridge's event loop awaits its
-/// approval inline — not per app, so an app with multiple live conversations can
-/// issue two concurrent same-key subscribes and reach this race. It is an accepted
-/// pre-existing residual, out of this change's scope; the loser panics.
+/// The probe and this INSERT are separate `db` lock acquisitions, so the
+/// guarantee rests on `subscribe_dynamic` holding its dynamic-subscribe gate
+/// across both: intercepts serialize per *conversation*, not per app, so an app
+/// with several live conversations can issue two same-key subscribes at once and
+/// without that gate both would pass the probe and the loser would panic here on
+/// attacker-shaped input.
 pub fn insert_dynamic_subscription(conn: &Connection, row: &DynamicSubscriptionRow) {
     let tx = conn
         .unchecked_transaction()
@@ -307,6 +304,7 @@ mod tests {
             description: None,
             transport_type: envelope,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,

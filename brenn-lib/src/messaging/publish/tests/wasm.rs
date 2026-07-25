@@ -245,6 +245,7 @@ async fn build_wasm_messenger(
         address: channel_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -327,6 +328,7 @@ async fn build_wasm_and_app_messenger(
         address: channel_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -574,6 +576,7 @@ async fn build_wasm_output_messenger(
         address: channel_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -637,12 +640,14 @@ async fn publish_from_wasm_two_publishes_correct_fields() {
             body: "msg-a",
             urgency: Urgency::Normal,
             reply_to: None,
+            deliver_after: None,
         },
         WasmPublish {
             channel_address: &channel_addr,
             body: "msg-b",
             urgency: Urgency::Normal,
             reply_to: None,
+            deliver_after: None,
         },
     ];
     m.publish_from_wasm(consumer_slug, &publishes).await;
@@ -694,6 +699,288 @@ async fn publish_from_wasm_two_publishes_correct_fields() {
     assert_eq!(rows_raw[1].4, "msg-b");
 }
 
+/// Build a Messenger with a durable `brenn:` output channel and a non-durable
+/// `ephemeral:` output channel, wired with ring stores and bus.
+async fn build_wasm_mixed_output_messenger(
+    consumer_slug: &str,
+) -> (Arc<Messenger>, String, String) {
+    use crate::messaging::store::RingStores;
+    use crate::messaging::testutils::ephemeral_channel_entry;
+
+    let db = init_db_memory();
+    let subscriber_slug = "wasm-output-receiver";
+    let durable_addr = canonical_address("wasm-output-ch");
+    let durable = ChannelEntry {
+        uuid: Uuid::new_v4(),
+        address: durable_addr.clone(),
+        description: None,
+        resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
+            push_depth: Depth::Unbounded,
+            retain_depth: Depth::Unbounded,
+            standing_retain_depth: Depth::Unbounded,
+            noise: NoiseLevel::Silent,
+            sink: Sink::Drop,
+            wake_min: WakeMin::Normal,
+        },
+        subscribers: vec![SubscriberEntry {
+            kind: SubscriberEntryKind::Wasm(subscriber_slug.to_string()),
+            push_depth: Depth::Unbounded,
+            retain_depth: Depth::Unbounded,
+            noise: NoiseLevel::Silent,
+            wake_min: None,
+        }],
+        transport_type: ChannelScheme::Brenn,
+        mount: None,
+    };
+    let ephemeral = ephemeral_channel_entry("wasm-eph-out", 8);
+    let ephemeral_addr = ephemeral.address.clone();
+    {
+        let conn = db.lock().await;
+        upsert_channels(&conn, std::slice::from_ref(&durable));
+    }
+    let nondurable = [ephemeral.clone()];
+    let directory = Arc::new(MessagingDirectory::with_entries(vec![durable, ephemeral]));
+    let mut apps_raw: IndexMap<String, crate::config::AppConfig> = IndexMap::new();
+    apps_raw.insert(
+        consumer_slug.to_string(),
+        test_app_config(
+            consumer_slug,
+            Some(ResolvedMessagingConfig {
+                send_budget: 0,
+                subscriptions: vec![],
+            }),
+            vec![],
+        ),
+    );
+    let stores = Arc::new(RingStores::build(&nondurable));
+    let messenger = Messenger::new(
+        db,
+        directory,
+        Arc::from("test"),
+        Arc::new(apps_raw),
+        Arc::new(CountingRouter::default()) as Arc<dyn WakeRouter>,
+        MessagingGlobalConfig::default(),
+    )
+    .with_subscriber_registrations(crate::messaging::testutils::wasm_registrations(
+        wasm_delivery_policies(&[subscriber_slug]),
+    ))
+    .with_ring_stores(stores);
+    (messenger, durable_addr, ephemeral_addr)
+}
+
+/// A WASM output port bound to an `ephemeral:` channel publishes through the
+/// unified commit: the message lands in the channel's ring store (no DB row) and
+/// is fanned out to attached wire receivers.
+#[tokio::test]
+async fn publish_from_wasm_ephemeral_output_lands_in_the_ring() {
+    let consumer_slug = "wasm-eph-flusher";
+    let (m, _durable, ephemeral_addr) = build_wasm_mixed_output_messenger(consumer_slug).await;
+
+    m.publish_from_wasm(
+        consumer_slug,
+        &[WasmPublish {
+            channel_address: &ephemeral_addr,
+            body: "eph-body",
+            urgency: Urgency::Normal,
+            reply_to: None,
+            deliver_after: None,
+        }],
+    )
+    .await;
+
+    let store = m
+        .ring_stores()
+        .get_by_address("ephemeral:wasm-eph-out")
+        .expect("registered ring channel")
+        .clone();
+    let retained = store.retained_tail(10);
+    assert_eq!(retained.len(), 1, "ephemeral publish must land in the ring");
+    assert_eq!(retained[0].envelope.body, "eph-body");
+    assert_eq!(
+        retained[0].envelope.sender,
+        format!("wasm:{consumer_slug}"),
+        "sender must be wasm:<slug>"
+    );
+    assert_eq!(
+        retained[0].envelope.envelope_type,
+        ChannelScheme::Ephemeral,
+        "envelope_type follows the target scheme"
+    );
+
+    // Nothing durable was written.
+    let conn = m.db().lock().await;
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messaging_messages", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "an ephemeral output writes no DB row");
+}
+
+/// A single flush mixing a durable and an ephemeral output commits both halves:
+/// the durable one as a push row, the ephemeral one into the ring.
+#[tokio::test]
+async fn publish_from_wasm_mixed_batch_commits_both_halves() {
+    let consumer_slug = "wasm-mixed-flusher";
+    let (m, durable_addr, ephemeral_addr) = build_wasm_mixed_output_messenger(consumer_slug).await;
+    let receiver_sub = ParticipantId::for_wasm("wasm-output-receiver");
+
+    m.publish_from_wasm(
+        consumer_slug,
+        &[
+            WasmPublish {
+                channel_address: &durable_addr,
+                body: "durable-body",
+                urgency: Urgency::Normal,
+                reply_to: None,
+                deliver_after: None,
+            },
+            WasmPublish {
+                channel_address: &ephemeral_addr,
+                body: "eph-body",
+                urgency: Urgency::Normal,
+                reply_to: None,
+                deliver_after: None,
+            },
+        ],
+    )
+    .await;
+
+    // Durable half: one push row for the Wasm subscriber, one DB message row.
+    let rows = m.load_pending_pushes(&receiver_sub).await;
+    assert_eq!(rows.len(), 1, "the durable output lands as one push row");
+    {
+        let conn = m.db().lock().await;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messaging_messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "only the durable output writes a DB row");
+    }
+
+    // Ephemeral half: one ring entry, no DB row.
+    let store = m
+        .ring_stores()
+        .get_by_address("ephemeral:wasm-eph-out")
+        .expect("registered ring channel")
+        .clone();
+    let retained = store.retained_tail(10);
+    assert_eq!(retained.len(), 1, "the ephemeral output lands in the ring");
+    assert_eq!(retained[0].envelope.body, "eph-body");
+}
+
+/// A WASM ephemeral output with a future `deliver_after` parks in the channel's
+/// ring: it is not observable in the retained tail until the store releases it at
+/// its due time.
+#[tokio::test]
+async fn publish_from_wasm_ephemeral_deferred_parks_then_releases() {
+    let consumer_slug = "wasm-eph-defer";
+    let (m, _durable, ephemeral_addr) = build_wasm_mixed_output_messenger(consumer_slug).await;
+    let release_at = chrono::Utc::now() + chrono::Duration::seconds(60);
+
+    m.publish_from_wasm(
+        consumer_slug,
+        &[WasmPublish {
+            channel_address: &ephemeral_addr,
+            body: "later",
+            urgency: Urgency::Normal,
+            reply_to: None,
+            deliver_after: Some(release_at),
+        }],
+    )
+    .await;
+
+    let store = m
+        .ring_stores()
+        .get_by_address("ephemeral:wasm-eph-out")
+        .expect("registered ring channel")
+        .clone();
+    // Parked: nothing retained yet, but a release deadline exists.
+    assert!(
+        store.retained_tail(10).is_empty(),
+        "a deferred publish is not observable before release"
+    );
+    assert!(
+        store.next_release().is_some(),
+        "the parked message has a deadline"
+    );
+
+    // Released at its due time: it lands in the ring.
+    let released = store.release_due(release_at);
+    assert_eq!(
+        released.messages.len(),
+        1,
+        "the message releases at its due time"
+    );
+    let retained = store.retained_tail(10);
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].envelope.body, "later");
+}
+
+/// A WASM ephemeral output whose `deliver_after` is already in the past commits
+/// immediately — the past instant is treated exactly like no deferral.
+#[tokio::test]
+async fn publish_from_wasm_ephemeral_past_deliver_after_is_immediate() {
+    let consumer_slug = "wasm-eph-past";
+    let (m, _durable, ephemeral_addr) = build_wasm_mixed_output_messenger(consumer_slug).await;
+
+    m.publish_from_wasm(
+        consumer_slug,
+        &[WasmPublish {
+            channel_address: &ephemeral_addr,
+            body: "now",
+            urgency: Urgency::Normal,
+            reply_to: None,
+            deliver_after: Some(chrono::Utc::now() - chrono::Duration::seconds(60)),
+        }],
+    )
+    .await;
+
+    let store = m
+        .ring_stores()
+        .get_by_address("ephemeral:wasm-eph-out")
+        .expect("registered ring channel")
+        .clone();
+    let retained = store.retained_tail(10);
+    assert_eq!(
+        retained.len(),
+        1,
+        "a past deliver_after publishes immediately"
+    );
+    assert!(store.next_release().is_none(), "nothing is parked");
+}
+
+/// A WASM durable output with a future `deliver_after` parks the durable row:
+/// the message row carries `deliver_after`, so a retention read (which filters
+/// `deliver_after IS NULL`) does not surface it before release.
+#[tokio::test]
+async fn publish_from_wasm_durable_deferred_parks_the_row() {
+    let consumer_slug = "wasm-dur-defer";
+    let (m, durable_addr, _ephemeral) = build_wasm_mixed_output_messenger(consumer_slug).await;
+    let release_at = chrono::Utc::now() + chrono::Duration::seconds(60);
+
+    m.publish_from_wasm(
+        consumer_slug,
+        &[WasmPublish {
+            channel_address: &durable_addr,
+            body: "durable-later",
+            urgency: Urgency::Normal,
+            reply_to: None,
+            deliver_after: Some(release_at),
+        }],
+    )
+    .await;
+
+    let conn = m.db().lock().await;
+    // The row exists and is parked: its deliver_after is set (not NULL).
+    let parked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messaging_messages WHERE deliver_after IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(parked, 1, "a deferred durable output parks its message row");
+}
+
 /// `publish_from_wasm` with an empty slice is a no-op (no rows, no panic).
 #[tokio::test]
 async fn publish_from_wasm_empty_slice_noop() {
@@ -730,6 +1017,7 @@ async fn build_mixed_wake_min_messenger(
         address: channel_addr.clone(),
         description: None,
         resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             standing_retain_depth: Depth::Unbounded,
@@ -938,6 +1226,7 @@ async fn publish_from_wasm_unknown_channel_panics() {
         body: "x",
         urgency: Urgency::Normal,
         reply_to: None,
+        deliver_after: None,
     };
     m.publish_from_wasm(consumer_slug, &[bad_publish]).await;
 }
@@ -962,6 +1251,7 @@ async fn publish_from_wasm_reply_to_resolves_to_channel_uuid() {
         body: "req",
         urgency: Urgency::Normal,
         reply_to: Some(&channel_addr),
+        deliver_after: None,
     }];
     m.publish_from_wasm(consumer_slug, &publishes).await;
 
@@ -992,6 +1282,7 @@ async fn publish_from_wasm_unknown_reply_to_panics() {
         body: "req",
         urgency: Urgency::Normal,
         reply_to: Some("brenn:tool-results/nonexistent"),
+        deliver_after: None,
     }];
     m.publish_from_wasm(consumer_slug, &publishes).await;
 }

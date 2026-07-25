@@ -5,13 +5,13 @@
 //! eager-wake a sleeping bridge, or route to the WASM off-loop task.
 //!
 //! `spawn_dispatcher_task` / `dispatcher_loop` is the single background task
-//! that replaces `deliver_after_loop` + `deadline_loop` (design §2.3, §2.7).
-//! It folds:
-//!   - Deliver-after release scanning (`release_due_pushes`, `register_released_pushes`)
+//! that owns all time-sensitive dispatch. It folds:
+//!   - Deferred release across every channel's store (`Messenger::release_due_messages`,
+//!     `register_released_pushes`)
 //!   - Deadline scanning
 //!   - Immediate/dispatchable-row global scan (`load_all_dispatchable_pushes`)
-//!   - Per-bridge fan-out (D-a) for head-of-line isolation
-//!   - In-flight dedup (R5, D-d) via `Mutex<HashSet<String>>` keyed by subscriber
+//!   - Per-bridge fan-out for head-of-line isolation
+//!   - In-flight dedup via `Mutex<HashSet<String>>` keyed by subscriber
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -25,7 +25,7 @@ use super::WakeRouter;
 use super::config::Depth;
 use super::db::{
     self, ReleasedPushRow, delete_pending_push_by_id, earliest_pending_deadline,
-    earliest_pending_release, load_released_push_window_rows, release_due_pushes,
+    load_released_push_window_rows,
 };
 use super::ingress::IngressOrBus;
 use super::publish::DispatchOutcome;
@@ -60,13 +60,14 @@ const PAST_DEADLINE_DEBOUNCE: Duration = Duration::from_secs(5);
 ///   (ingress). `Ok(true)` ⇒ `Delivered` (or `DeliveredNoRemark` when the
 ///   binding marks its own delivery); no bridge / bridge-died-mid-send →
 ///   eager-wake if `Immediate` or `deadline_expired`, then `Parked`.
-/// - `ParkedWake` → route to the off-loop parked task via `spawn_eager_wake`;
-///   `router.deliver()` is never called (WASM/system subscribers).
+/// - `ParkedWake` → `router.deliver()` is never called (WASM/system
+///   subscribers). A channel-backed row must not be woken here (it has a
+///   single external wake source); only a channel-less ingress row fires
+///   `spawn_eager_wake`.
 ///
 /// `deadline_expired`: when `true`, the `wake_kind`-gated eager-wake
 /// check is overridden — a past-deadline row always triggers an eager wake
-/// on the no-bridge / error branches regardless of `wake_kind` (R6 deadline
-/// override, design §2.4).
+/// on the no-bridge / error branches regardless of `wake_kind`.
 ///
 /// `wake_gated`: when `true`, an eager wake is suppressed for `eager_wake` rows
 /// (the caller's wake cooldown is active). Delivery is never gated — only the
@@ -89,12 +90,13 @@ pub async fn dispatch_row(
     let key = registration_key(&row.target_subscriber, &row.target_app_slug);
 
     // ParkedWake: never call router.deliver() for these targets (it panics by
-    // design). Route to the off-loop dispatch task via spawn_eager_wake and
-    // mirror the no-bridge eager-wake condition — only `Immediate` rows (or
-    // deadline-expired rows) wake here.
+    // design). Bus rows must not be woken here — each has a single external
+    // wake source; waking again would double-fire. Only an ingress row (no
+    // channel, no store) fires its eager wake here.
     let marks_own_delivery = match router.delivery_shape(&key) {
         DeliveryShape::ParkedWake => {
-            let should_wake = (row.eager_wake && !wake_gated) || deadline_expired;
+            let should_wake =
+                !row.payload.is_bus() && ((row.eager_wake && !wake_gated) || deadline_expired);
             if should_wake {
                 router.spawn_eager_wake(&key, &row.target_subscriber);
             }
@@ -115,6 +117,7 @@ pub async fn dispatch_row(
                     envelope,
                     row.push_id,
                     row.message_id,
+                    row.retained_seq,
                 )
                 .await
         }
@@ -346,27 +349,26 @@ async fn dispatcher_loop(
     // gets its fan-out and per-row dispatch_row, so a live durable/bridge delivery
     // is never delayed by the cooldown. Armed on a fresh wake, cleared when a
     // delivery proves the subscriber live, and left untouched (to expire via
-    // elapsed()) on a gated pass. Only Conversation groups are ever gated —
-    // surface/wasm wakes are free notify_one calls, and for wasm the notify is the
-    // delivery trigger, so gating them would reintroduce delivery latency.
+    // elapsed()) on a gated pass. Only Conversation groups are ever gated — a
+    // surface wake is a free notify_one, and a parked subscriber's channel-backed
+    // wake does not come from a fan-out task at all.
     let recently_woken: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let mut fired_wakes = false;
+    // Earliest deferred release across every channel's store. Seeded by one
+    // walk here and thereafter reported by each release sweep, so a pass asks
+    // each store when its next release is due exactly once. A park that lands
+    // after the sweep kicks the loop, so a stale value never delays a release.
+    let mut next_release = messenger.next_deferred_release().await;
     loop {
-        // Compute sleep target: min(earliest_pending_release, earliest_pending_deadline).
-        let (next_release, next_deadline) = {
+        // Compute sleep target: the earliest deferred release, and the durable
+        // delivery deadline (a durable-only publish option, so it has no
+        // per-store question to ask).
+        let next_deadline = {
             let conn = db.lock().await;
-            (
-                earliest_pending_release(&conn),
-                earliest_pending_deadline(&conn),
-            )
+            earliest_pending_deadline(&conn)
         };
-        let next_due = match (next_release, next_deadline) {
-            (Some(r), Some(d)) => Some(r.min(d)),
-            (Some(r), None) => Some(r),
-            (None, Some(d)) => Some(d),
-            (None, None) => None,
-        };
+        let next_due = [next_deadline, next_release].into_iter().flatten().min();
         let sleep_dur = match next_due {
             Some(dt) => {
                 let now = Utc::now();
@@ -383,7 +385,7 @@ async fn dispatcher_loop(
         // Wait for kick, timer expiry, or the debounce (if wakes fired last pass).
         if fired_wakes {
             // Debounce: the spawned wakes take seconds to land; without this the
-            // loop would immediately re-query past-deadline rows and spin (review F4).
+            // loop would immediately re-query past-deadline rows and spin.
             // The kick still wins if a publish or drain changes state during the debounce.
             tokio::select! {
                 _ = tokio::time::sleep(PAST_DEADLINE_DEBOUNCE) => {}
@@ -397,19 +399,28 @@ async fn dispatcher_loop(
             }
         }
 
-        // Release any rows whose deliver_after has passed.
+        // Release every message whose deliver_after has passed, on every channel,
+        // through the channel's own store.
         let now = Utc::now();
-        let released_ids = {
-            let conn = db.lock().await;
-            release_due_pushes(&conn, now)
-        };
-        if !released_ids.is_empty() {
+        let sweep = messenger.release_due_messages(now).await;
+        next_release = sweep.next_release;
+        if sweep.released > 0 {
+            tracing::debug!(
+                released = sweep.released,
+                "dispatcher released parked messages"
+            );
+        }
+        if !sweep.push_ids.is_empty() {
             // Register released rows into their push windows (push-depth enforcement,
             // Gap B). Overflow-retired ids are deleted from DB and excluded from dispatch.
-            register_released_pushes(&messenger, &db, &released_ids).await;
+            register_released_pushes(&messenger, &db, &sweep.push_ids).await;
         }
 
-        // Load all currently-dispatchable rows (global scan, design §2.3 D-b).
+        // Before the scan's early-continue, so a publish on any class (which
+        // kicks this loop) reaches its consumer at once.
+        messenger.wake_owed_subscribers().await;
+
+        // Load all currently-dispatchable rows.
         // Predicate: delivered_at IS NULL AND release_after IS NULL AND
         //   (wake_kind='immediate' OR (delivery_deadline IS NOT NULL AND deadline <= now))
         let due_rows = {
@@ -489,9 +500,9 @@ async fn dispatcher_loop(
             // `UrgencyGated` subscriber woken within POLL_INTERVAL. This gates only
             // the wake (a CC spawn) — the group is never skipped, so every row's
             // dispatch_row delivery attempt still runs. Only `UrgencyGated` groups
-            // are gated: `Eager` (surface/wasm/system) wakes are free notify_one
-            // calls, and for parked consumers the notify is the delivery trigger, so
-            // gating it would delay delivery. The gate reads the subscriber's
+            // are gated: an `Eager` surface wake is a free notify_one, and a parked
+            // consumer's channel-backed wake is the store walk's, not this task's.
+            // The gate reads the subscriber's
             // declared wake economics per participant (via the registry), not its
             // identity prefix. Deadline-expired rows still wake unconditionally (the
             // override lives per-row inside dispatch_row).
@@ -692,16 +703,16 @@ async fn dispatcher_loop(
 }
 
 // ---------------------------------------------------------------------------
-// register_released_pushes (moved from deliver_after.rs, design §2.7)
+// register_released_pushes
 // ---------------------------------------------------------------------------
 
 /// Register a set of just-released parked push ids into the push windows of
 /// their respective bounded-`push_depth` subscribers.
 ///
-/// Called after `release_due_pushes` clears `release_after` on a batch of
+/// Called after a release sweep clears `release_after` on a batch of
 /// rows. Each released row now counts as a live undelivered push for its
 /// subscriber; this function ensures the in-memory window is updated so the
-/// hot-path bound is enforced correctly (design §2.4 Gap B).
+/// hot-path bound is enforced correctly.
 ///
 /// Uses `record_push_batch_and_check_overflow` (not `record_push_and_check_overflow`)
 /// so that multiple released ids for the same `(channel, subscriber)` key are
@@ -791,18 +802,16 @@ pub(crate) async fn register_released_pushes(
     let conn = db.lock().await;
     for (gkey, push_ids) in &groups {
         let (channel_addr, app_slug, subscriber_str) = gkey;
-        let &(push_depth, noise, channel_uuid) = group_meta
+        let &(push_depth, noise, _channel_uuid) = group_meta
             .get(gkey)
             .expect("group_meta populated alongside groups");
         let subscriber = super::ParticipantId::from_stored(subscriber_str.clone());
-        let retired_ids = messenger.record_push_batch_and_check_overflow(
-            &super::PushRegistration {
-                channel: channel_addr,
-                channel_uuid,
+        let db_store = messenger.db_store_for_address(channel_addr);
+        let retired_ids = db_store.record_push_batch_and_check_overflow(
+            &super::store::PushRetireParams {
                 app_slug,
                 subscriber: &subscriber,
                 push_depth,
-                noise,
             },
             push_ids,
             &conn,
@@ -813,9 +822,16 @@ pub(crate) async fn register_released_pushes(
                 subscriber = subscriber.as_str(),
                 "push-depth overflow on deliver-after release: retiring oldest push IDs"
             );
-        }
-        for retired_id in retired_ids {
-            delete_pending_push_by_id(&conn, retired_id);
+            for retired_id in &retired_ids {
+                delete_pending_push_by_id(&conn, *retired_id);
+            }
+            messenger.enact_overflow_noise(
+                db_store.as_ref(),
+                channel_addr,
+                &subscriber,
+                noise,
+                retired_ids.len() as u64,
+            );
         }
     }
 }
@@ -835,10 +851,7 @@ pub async fn run_deliver_after_pass(
     messenger: &Arc<Messenger>,
 ) -> usize {
     let now = Utc::now();
-    let released_ids = {
-        let conn = db.lock().await;
-        release_due_pushes(&conn, now)
-    };
+    let released_ids = messenger.release_due_messages(now).await.push_ids;
     if released_ids.is_empty() {
         return 0;
     }
@@ -946,7 +959,8 @@ mod tests {
             _subscriber: &crate::messaging::ParticipantId,
             _envelope: &crate::messaging::MessageEnvelope,
             _push_id: i64,
-            _seq: i64,
+            _message_id: i64,
+            _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             self.deliver_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.active.load(Ordering::SeqCst) == 1)
@@ -989,7 +1003,8 @@ mod tests {
             _subscriber: &crate::messaging::ParticipantId,
             _envelope: &crate::messaging::MessageEnvelope,
             _push_id: i64,
-            _seq: i64,
+            _message_id: i64,
+            _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             Ok(false)
         }
@@ -1025,6 +1040,7 @@ mod tests {
             address: canonical_address("test"),
             description: None,
             resolved_channel: crate::messaging::config::ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: crate::messaging::config::Depth::Unbounded,
                 retain_depth: crate::messaging::config::Depth::Unbounded,
                 standing_retain_depth: crate::messaging::config::Depth::Unbounded,
@@ -1093,6 +1109,25 @@ mod tests {
         channel_uuid: uuid::Uuid,
         push_depth: crate::messaging::config::Depth,
     ) -> Arc<Messenger> {
+        make_messenger_with_router(
+            db,
+            dir,
+            channel_uuid,
+            push_depth,
+            Arc::new(FakeRouter::default()),
+        )
+    }
+
+    /// `make_messenger_with_depth` with the `WakeRouter` supplied, for tests
+    /// that assert on wakes the `Messenger` itself fires (the store walk) rather
+    /// than on wakes driven through a router handed to a dispatcher pass.
+    fn make_messenger_with_router(
+        db: &Db,
+        dir: MessagingDirectory,
+        channel_uuid: uuid::Uuid,
+        push_depth: crate::messaging::config::Depth,
+        router: Arc<dyn super::super::WakeRouter>,
+    ) -> Arc<Messenger> {
         use crate::messaging::MessagingGlobalConfig;
         use crate::messaging::config::{NoiseLevel, ResolvedMessagingConfig, ResolvedSubscription};
         use crate::messaging::test_support::test_app_config;
@@ -1116,7 +1151,6 @@ mod tests {
         let mut apps: IndexMap<String, crate::config::AppConfig> = IndexMap::new();
         apps.insert("target".to_string(), app);
 
-        let router: Arc<dyn super::super::WakeRouter> = Arc::new(FakeRouter::default());
         Messenger::new(
             db.clone(),
             Arc::new(dir),
@@ -1218,6 +1252,7 @@ mod tests {
             address: canonical_address("test"),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Bounded(push_depth),
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -1269,6 +1304,7 @@ mod tests {
             address: canonical_address("test"),
             description: None,
             resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Bounded(push_depth),
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -1295,6 +1331,17 @@ mod tests {
 
     /// Noise-parameterized variant of `make_bounded_messenger`. The supplied
     /// router is used so callers can inspect alarm counts.
+    /// The subscriber a release pass resolves for the `target` app: its singleton
+    /// conversation, which is what `resolve_push_targets` names when it mints a
+    /// claim. Tests that read the window or the drop counter must ask for the
+    /// same identity the release wrote.
+    async fn target_conversation_subscriber(db: &Db) -> crate::messaging::ParticipantId {
+        let conn = db.lock().await;
+        crate::messaging::ParticipantId::for_conversation(
+            crate::conversation::get_or_create_singleton_conversation(&conn, 1, "target").id,
+        )
+    }
+
     fn make_bounded_messenger_with_noise(
         db: &Db,
         dir: MessagingDirectory,
@@ -1357,7 +1404,6 @@ mod tests {
         ensure_user_and_conv(&conn, 1);
         ensure_user_and_conv(&conn, 2);
         let (dir, channel_uuid) = make_bounded_directory_and_channel(&conn, push_depth);
-        let subscriber = crate::messaging::ParticipantId::for_conversation(2);
         let channel_addr = canonical_address("test");
 
         // Insert one parked row (past deadline → releases immediately).
@@ -1374,15 +1420,10 @@ mod tests {
             None,
             Some(release_at),
             utc_to_ns(Utc::now()),
-            &[PendingPushInsert {
-                target_subscriber: subscriber.clone(),
-                target_app_slug: "target".to_string(),
-                eager_wake: false,
-                release_after: Some(release_at),
-                delivery_deadline: None,
-            }],
+            &[],
         );
         drop(conn);
+        let subscriber = target_conversation_subscriber(&db).await;
 
         let messenger = make_bounded_messenger(&db, dir, channel_uuid, push_depth);
         let fake = Arc::new(FakeRouter::default());
@@ -1405,15 +1446,13 @@ mod tests {
         // Now register a new distinct id. With push_depth=1 and window=[parked_push_id],
         // the new id must overflow → return Some(parked_push_id).
         let new_id = parked_push_id + 1_000_000;
+        let db_store = messenger.db_store_for_address(&channel_addr);
         let conn = db.lock().await;
-        let retired = messenger.record_push_and_check_overflow(
-            &crate::messaging::PushRegistration {
-                channel: &channel_addr,
-                channel_uuid,
+        let retired = db_store.record_push_and_check_overflow(
+            &crate::messaging::store::PushRetireParams {
                 app_slug: "target",
                 subscriber: &subscriber,
                 push_depth: crate::messaging::config::Depth::Bounded(push_depth),
-                noise: crate::messaging::config::NoiseLevel::Silent,
             },
             new_id,
             &conn,
@@ -1533,22 +1572,20 @@ mod tests {
 
             // First call: seeded=false → seed loads parked_push_id, sets seeded=true.
             // id already present → returns None.
-            let reg = crate::messaging::PushRegistration {
-                channel: &channel_addr,
-                channel_uuid,
+            let db_store = messenger.db_store_for_address(&channel_addr);
+            let params = crate::messaging::store::PushRetireParams {
                 app_slug: "target",
                 subscriber: &subscriber,
                 push_depth: crate::messaging::config::Depth::Bounded(push_depth),
-                noise: crate::messaging::config::NoiseLevel::Silent,
             };
-            let r1 = messenger.record_push_and_check_overflow(&reg, parked_push_id, &conn);
+            let r1 = db_store.record_push_and_check_overflow(&params, parked_push_id, &conn);
             assert!(
                 r1.is_none(),
                 "first registration of released id should not overflow (already in seeded deque)"
             );
 
             // Second call with same id: seeded=true, id still present → skip.
-            let r2 = messenger.record_push_and_check_overflow(&reg, parked_push_id, &conn);
+            let r2 = db_store.record_push_and_check_overflow(&params, parked_push_id, &conn);
             assert!(
                 r2.is_none(),
                 "second registration of same id must be a no-op (no double-count)"
@@ -1558,7 +1595,7 @@ mod tests {
             // Depth=2 → push distinct_id → count=2 ≤ depth → no overflow.
             // If double-counted: deque = [parked, parked] (count=2) → 3rd push → overflow.
             let distinct_id = parked_push_id + 1_000_000; // guaranteed distinct
-            let r3 = messenger.record_push_and_check_overflow(&reg, distinct_id, &conn);
+            let r3 = db_store.record_push_and_check_overflow(&params, distinct_id, &conn);
             assert!(
                 r3.is_none(),
                 "third registration with distinct id must not overflow (deque count=2 ≤ depth=2); \
@@ -1583,7 +1620,6 @@ mod tests {
         )
         .unwrap();
         let (dir, channel_uuid) = make_bounded_directory_and_channel(&conn, push_depth);
-        let subscriber = crate::messaging::ParticipantId::for_conversation(2);
         let channel_addr = canonical_address("test");
 
         let release_at = Utc::now() - chrono::Duration::seconds(1);
@@ -1599,13 +1635,7 @@ mod tests {
             None,
             Some(release_at),
             utc_to_ns(Utc::now()),
-            &[PendingPushInsert {
-                target_subscriber: subscriber.clone(),
-                target_app_slug: "target".to_string(),
-                eager_wake: false,
-                release_after: Some(release_at),
-                delivery_deadline: None,
-            }],
+            &[],
         );
         drop(conn);
 
@@ -1670,7 +1700,6 @@ mod tests {
         ensure_user_and_conv(&conn, 1);
         ensure_user_and_conv(&conn, 2);
         let (dir, channel_uuid) = make_bounded_directory_and_channel(&conn, push_depth);
-        let subscriber = crate::messaging::ParticipantId::for_conversation(2);
         let release_at = Utc::now() - chrono::Duration::seconds(1);
 
         let n_parked = push_depth + 2;
@@ -1687,13 +1716,7 @@ mod tests {
                 None,
                 Some(release_at),
                 utc_to_ns(Utc::now()) + i as i64,
-                &[PendingPushInsert {
-                    target_subscriber: subscriber.clone(),
-                    target_app_slug: "target".to_string(),
-                    eager_wake: false,
-                    release_after: Some(release_at),
-                    delivery_deadline: None,
-                }],
+                &[],
             );
         }
         drop(conn);
@@ -1737,7 +1760,6 @@ mod tests {
         ensure_user_and_conv(&conn, 2);
         let (dir, channel_uuid) =
             make_bounded_directory_and_channel_with_noise(&conn, push_depth, NoiseLevel::Metered);
-        let subscriber = crate::messaging::ParticipantId::for_conversation(2);
         let channel_addr = canonical_address("test");
 
         // Insert push_depth+1 past-due parked rows → releasing all will cause 1 overflow.
@@ -1755,16 +1777,11 @@ mod tests {
                 None,
                 Some(release_at),
                 utc_to_ns(Utc::now()) + i as i64,
-                &[PendingPushInsert {
-                    target_subscriber: subscriber.clone(),
-                    target_app_slug: "target".to_string(),
-                    eager_wake: false,
-                    release_after: Some(release_at),
-                    delivery_deadline: None,
-                }],
+                &[],
             );
         }
         drop(conn);
+        let subscriber = target_conversation_subscriber(&db).await;
 
         let alarm_router = Arc::new(AlarmCountingRouter::default());
         let messenger = make_bounded_messenger_with_noise(
@@ -1805,7 +1822,6 @@ mod tests {
         ensure_user_and_conv(&conn, 2);
         let (dir, channel_uuid) =
             make_bounded_directory_and_channel_with_noise(&conn, push_depth, NoiseLevel::Alarm);
-        let subscriber = crate::messaging::ParticipantId::for_conversation(2);
         let channel_addr = canonical_address("test");
 
         let release_at = Utc::now() - chrono::Duration::seconds(1);
@@ -1822,16 +1838,11 @@ mod tests {
                 None,
                 Some(release_at),
                 utc_to_ns(Utc::now()) + i as i64,
-                &[PendingPushInsert {
-                    target_subscriber: subscriber.clone(),
-                    target_app_slug: "target".to_string(),
-                    eager_wake: false,
-                    release_after: Some(release_at),
-                    delivery_deadline: None,
-                }],
+                &[],
             );
         }
         drop(conn);
+        let subscriber = target_conversation_subscriber(&db).await;
 
         let alarm_router = Arc::new(AlarmCountingRouter::default());
         let messenger = make_bounded_messenger_with_noise(
@@ -1863,19 +1874,19 @@ mod tests {
     #[tokio::test]
     async fn run_deliver_after_pass_wasm_subscriber_parks_not_delivered() {
         use crate::messaging::config::{Depth, NoiseLevel};
-        use crate::messaging::{ParticipantId, SubscriberEntry, SubscriberEntryKind};
+        use crate::messaging::{SubscriberEntry, SubscriberEntryKind};
 
         let wasm_slug = "test-wasm-consumer";
         let db = init_db_memory();
         let conn = db.lock().await;
 
         let channel_uuid = Uuid::new_v4();
-        let wasm_sub = ParticipantId::for_wasm(wasm_slug);
         let entry = ChannelEntry {
             uuid: channel_uuid,
             address: canonical_address("wasm-deliver-after-ch"),
             description: None,
             resolved_channel: crate::messaging::config::ResolvedChannel {
+                send_rate: Default::default(),
                 push_depth: Depth::Unbounded,
                 retain_depth: Depth::Unbounded,
                 standing_retain_depth: Depth::Unbounded,
@@ -1909,19 +1920,29 @@ mod tests {
             None,
             Some(release_at),
             utc_to_ns(Utc::now()),
-            &[PendingPushInsert {
-                target_subscriber: wasm_sub.clone(),
-                target_app_slug: wasm_slug.to_string(),
-                eager_wake: true,
-                release_after: Some(release_at),
-                delivery_deadline: None,
-            }],
+            &[],
         );
         drop(conn);
 
-        let messenger = make_messenger(&db, dir, channel_uuid);
         let fake = Arc::new(FakeRouter::default());
         let router: Arc<dyn super::super::WakeRouter> = fake.clone();
+        let messenger = make_messenger_with_router(
+            &db,
+            dir,
+            channel_uuid,
+            crate::messaging::config::Depth::Unbounded,
+            router.clone(),
+        )
+        .with_subscriber_registrations(crate::messaging::testutils::wasm_registrations(
+            [(
+                wasm_slug.to_string(),
+                crate::messaging::test_support::brenn_delivery_policy(
+                    crate::access::acl::ChannelMatcher::Prefix(String::new()),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        ));
 
         let n = run_deliver_after_pass(&db, &router, &messenger).await;
 
@@ -1931,8 +1952,15 @@ mod tests {
         );
         assert_eq!(
             fake.eager_wakes.load(Ordering::SeqCst),
+            0,
+            "the scan does not wake a channel-backed parked row — the store walk does",
+        );
+
+        messenger.wake_owed_subscribers().await;
+        assert_eq!(
+            fake.eager_wakes.load(Ordering::SeqCst),
             1,
-            "Immediate-wake Wasm row must fire exactly one eager wake on deliver-after release",
+            "the store walk must fire exactly one eager wake for the released row",
         );
     }
 
@@ -2123,7 +2151,8 @@ mod tests {
             _subscriber: &crate::messaging::ParticipantId,
             _envelope: &crate::messaging::MessageEnvelope,
             _push_id: i64,
-            _seq: i64,
+            _message_id: i64,
+            _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             Err("simulated flush failure (D1 acceptance test)".to_string())
         }
@@ -2336,7 +2365,8 @@ mod tests {
             _subscriber: &crate::messaging::ParticipantId,
             _envelope: &crate::messaging::MessageEnvelope,
             _push_id: i64,
-            _seq: i64,
+            _message_id: i64,
+            _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             self.deliver_calls.fetch_add(1, Ordering::SeqCst);
             // Block until a permit is available (simulates slow CC flush).
@@ -2964,6 +2994,7 @@ mod tests {
 
     fn bus_row(push_id: i64, subscriber: ParticipantId, channel: &str) -> db::PendingPushRow {
         db::PendingPushRow {
+            retained_seq: Some(1),
             push_id,
             message_id: push_id,
             payload: IngressOrBus::Bus(MessageEnvelope {
@@ -3284,6 +3315,7 @@ mod tests {
         // Deny-everything messenger; an ingress row must still pass (not gated).
         let messenger = make_messenger_with_policy(&db, dir, crate::access::AppPolicy::default());
         let row = db::PendingPushRow {
+            retained_seq: Some(1),
             push_id: 1,
             message_id: 1,
             payload: IngressOrBus::Ingress(Event {

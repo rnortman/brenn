@@ -1,0 +1,13 @@
+[package]
+name = "brenn-queue"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Bounded retained rings, subscriber cursors, and deferred sets — the mechanical core both message-bus hosts share"
+
+# Dependency-free and std-only, deliberately: the backend links this crate from
+# the messaging substrate, and the surface kernel compiles to wasm32, where a
+# wall clock is not available. Every time value here is a caller-supplied
+# parameter (epoch-millisecond `u64`), and the epoch identity is a generic
+# parameter, so this crate needs no clock, no uuid, and no runtime.
+[dependencies]

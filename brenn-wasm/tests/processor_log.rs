@@ -70,6 +70,8 @@ fn single_activation(envelope: String) -> ProcessorActivation {
             new_from: 0,
             dropped: 0,
         }],
+        deferred: vec![],
+        now: None,
     }
 }
 
@@ -81,6 +83,8 @@ fn multi_activation(envelopes: Vec<String>) -> ProcessorActivation {
             new_from: 0,
             dropped: 0,
         }],
+        deferred: vec![],
+        now: None,
     }
 }
 
@@ -107,7 +111,7 @@ fn log_happy_path_each_level() {
         }));
         let outcome = comp.handle(single_activation(envelope));
         assert!(
-            matches!(outcome, ProcessorOutcome::Ok(_)),
+            matches!(outcome, ProcessorOutcome::Ok { .. }),
             "log level {level_str}: expected Ok, got {outcome:?}"
         );
         // The captured log output must contain both the level, the target, the slug, and the
@@ -151,7 +155,7 @@ fn alert_happy_path_each_severity() {
         }));
         let outcome = comp.handle(single_activation(envelope));
         assert!(
-            matches!(outcome, ProcessorOutcome::Ok(_)),
+            matches!(outcome, ProcessorOutcome::Ok { .. }),
             "alert severity {severity_str}: expected Ok, got {outcome:?}"
         );
     }
@@ -203,7 +207,7 @@ fn log_sanitization_escapes_control_chars() {
         "message": "line1\nline2\x1b[31mred slug=evil rest"
     }));
     let outcome = comp.handle(single_activation(envelope));
-    assert!(matches!(outcome, ProcessorOutcome::Ok(_)));
+    assert!(matches!(outcome, ProcessorOutcome::Ok { .. }));
 
     // The raw newline and ESC must not appear verbatim — they are escape_debug'd.
     // logs_contain checks the formatted string representation, which will have \n
@@ -241,7 +245,7 @@ fn alert_sanitization_truncates_and_escapes() {
         "body": "normal body"
     }));
     let outcome = comp.handle(single_activation(envelope));
-    assert!(matches!(outcome, ProcessorOutcome::Ok(_)));
+    assert!(matches!(outcome, ProcessorOutcome::Ok { .. }));
 
     let calls = alerter.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
@@ -269,7 +273,7 @@ fn alert_hostile_title_bounded_at_cap() {
         "body": "normal body"
     }));
     let outcome = comp.handle(single_activation(envelope));
-    assert!(matches!(outcome, ProcessorOutcome::Ok(_)));
+    assert!(matches!(outcome, ProcessorOutcome::Ok { .. }));
 
     let calls = alerter.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
@@ -309,7 +313,7 @@ fn log_oversized_message_truncated() {
     }));
     let outcome = comp.handle(single_activation(envelope));
     assert!(
-        matches!(outcome, ProcessorOutcome::Ok(_)),
+        matches!(outcome, ProcessorOutcome::Ok { .. }),
         "oversized message must not cause an error"
     );
     // The sanitized message is 4095 'a's (escape_debug leaves ASCII unchanged) plus the
@@ -347,7 +351,7 @@ fn log_quota_suppresses_excess() {
     }));
     let outcome = comp.handle(single_activation(envelope));
     assert!(
-        matches!(outcome, ProcessorOutcome::Ok(_)),
+        matches!(outcome, ProcessorOutcome::Ok { .. }),
         "log quota exhaustion must not fail the activation"
     );
 
@@ -402,7 +406,7 @@ fn alert_quota_suppresses_excess() {
     }));
     let outcome = comp.handle(single_activation(envelope));
     assert!(
-        matches!(outcome, ProcessorOutcome::Ok(_)),
+        matches!(outcome, ProcessorOutcome::Ok { .. }),
         "alert quota exhaustion must not fail the activation"
     );
 

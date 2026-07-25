@@ -82,21 +82,18 @@ pub fn build_app_policy(
                 "app {app_slug:?}: grant {cap:?} is not authorable on an LLM app's `grants` \
                  (surface takeover is authored as `SurfaceGrant` on a `[[surface]]`)",
             ),
-            // `ephemeral_subscribe` is not authorable on an LLM app: no delivery
-            // path carries ephemeral traffic to a conversation in v1, so the grant
-            // has no enforcement point — dead config, and dead config is a lie we
-            // fail fast on. Relaxing this is one line plus a delivery
-            // path. `ephemeral_publish` *is* authorable (LLM apps may publish
-            // ephemeral channels; a demo publisher depends on
-            // it) — it falls into the OK arm below.
-            AppCapability::EphemeralSubscribe => panic!(
+            // No delivery path carries confined `local:` traffic to a
+            // conversation in v1, so the grant would be dead config.
+            AppCapability::LocalSubscribe => panic!(
                 "app {app_slug:?}: grant {cap:?} is not authorable on an LLM app's `grants` \
-                 (no ephemeral delivery path to a conversation in v1)",
+                 (no local delivery path to a conversation in v1)",
             ),
             AppCapability::MessagingPublish
             | AppCapability::MessagingSubscribe
             | AppCapability::DynamicSubscribe
+            | AppCapability::EphemeralSubscribe
             | AppCapability::EphemeralPublish
+            | AppCapability::LocalPublish
             | AppCapability::MqttPublish
             | AppCapability::MqttSubscribe
             | AppCapability::Webhook
@@ -151,19 +148,25 @@ pub fn build_app_policy(
             .iter()
             .map(|m| resolve_channel(&owner, "brenn_publish", m))
             .collect(),
-        // Ephemeral ACL lists. The `ephemeral_subscribe` grant
-        // token boot-panics for LLM apps above and there is no
-        // `ephemeral_subscribe` raw field (dead-config lockstep), so
-        // the resolved `ephemeral_subscribe` list is always empty for an LLM app.
-        // `ephemeral_publish` resolves from its raw field exactly like
+        // Ephemeral ACL lists resolve from their raw fields exactly like
         // `brenn_publish` — same `resolve_channel` validation, bare-name matcher
         // values.
-        ephemeral_subscribe: Vec::new(),
+        ephemeral_subscribe: acl
+            .ephemeral_subscribe
+            .iter()
+            .map(|m| resolve_channel(&owner, "ephemeral_subscribe", m))
+            .collect(),
         ephemeral_publish: acl
             .ephemeral_publish
             .iter()
             .map(|m| resolve_channel(&owner, "ephemeral_publish", m))
             .collect(),
+        local_publish: acl
+            .local_publish
+            .iter()
+            .map(|m| resolve_channel(&owner, "local_publish", m))
+            .collect(),
+        local_subscribe: Vec::new(),
         webhook: acl
             .webhook
             .iter()
@@ -259,7 +262,11 @@ pub fn build_wasm_policy(
 
     let crate::access::raw::WasmAclsRaw {
         subscribe: subscribe_acl,
+        ephemeral_subscribe: ephemeral_subscribe_acl,
         publish: publish_acl,
+        ephemeral_publish: ephemeral_publish_acl,
+        local_publish: local_publish_acl,
+        local_subscribe: local_subscribe_acl,
         mqtt_publish: mqtt_publish_acl,
         mqtt_subscribe: mqtt_subscribe_acl,
         webhook: webhook_acl,
@@ -296,8 +303,8 @@ pub fn build_wasm_policy(
     // `MessagingPublish`), there is no "subscribe" WIT interface and therefore no
     // `WasmGrant` that maps to `MessagingSubscribe`: a WASM consumer's input
     // subscriptions are declared statically in config, not exercised through a host
-    // function. The delivery-time ACL gate (`allows_brenn_delivery`,
-    // dynamic-sub-persistence design §2.2) requires *both* the `MessagingSubscribe`
+    // function. The delivery-time ACL gate (`allows_brenn_delivery`) requires
+    // *both* the `MessagingSubscribe`
     // grant *and* a covering `brenn_subscribe` matcher; without deriving the grant
     // here, every operator-blessed `[[wasm_consumer.subscription]]` would be denied
     // at delivery (no `WasmGrant` could ever satisfy the gate). The presence of a
@@ -321,6 +328,24 @@ pub fn build_wasm_policy(
     if !webhook_acl.is_empty() {
         grant_set.insert(AppCapability::Webhook);
     }
+    // Same derivation for ephemeral publish: ACL presence is the authorization
+    // signal. Empty ⇒ no grant ⇒ deny-by-default.
+    if !ephemeral_publish_acl.is_empty() {
+        grant_set.insert(AppCapability::EphemeralPublish);
+    }
+    if !local_publish_acl.is_empty() {
+        grant_set.insert(AppCapability::LocalPublish);
+    }
+    // No `WasmGrant` maps to `EphemeralSubscribe` (inputs are static config,
+    // not host calls); the non-empty ACL is the authorization signal.
+    if !ephemeral_subscribe_acl.is_empty() {
+        grant_set.insert(AppCapability::EphemeralSubscribe);
+    }
+    // No `WasmGrant` maps to `LocalSubscribe`; the non-empty ACL is the
+    // authorization signal.
+    if !local_subscribe_acl.is_empty() {
+        grant_set.insert(AppCapability::LocalSubscribe);
+    }
 
     let owner = format!("wasm consumer {slug:?}");
     let acls = AclSet {
@@ -328,9 +353,25 @@ pub fn build_wasm_policy(
             .iter()
             .map(|m| resolve_channel(&owner, "subscribe_acl", m))
             .collect(),
+        ephemeral_subscribe: ephemeral_subscribe_acl
+            .iter()
+            .map(|m| resolve_channel(&owner, "ephemeral_subscribe_acl", m))
+            .collect(),
         brenn_publish: publish_acl
             .iter()
             .map(|m| resolve_channel(&owner, "publish_acl", m))
+            .collect(),
+        ephemeral_publish: ephemeral_publish_acl
+            .iter()
+            .map(|m| resolve_channel(&owner, "ephemeral_publish_acl", m))
+            .collect(),
+        local_publish: local_publish_acl
+            .iter()
+            .map(|m| resolve_channel(&owner, "local_publish_acl", m))
+            .collect(),
+        local_subscribe: local_subscribe_acl
+            .iter()
+            .map(|m| resolve_channel(&owner, "local_subscribe_acl", m))
             .collect(),
         // MQTT publish ACL: the same `client`-keyed `MqttClientMatcher` the LLM
         // side resolves into. Charset-validate the client slug here; the
@@ -392,7 +433,6 @@ pub fn build_wasm_policy(
                 }
             })
             .collect(),
-        ..AclSet::default()
     };
 
     AppPolicy {
@@ -600,6 +640,8 @@ mod tests {
             ],
             brenn_publish: vec![ChannelMatcherRaw::Exact("outbox".to_string())],
             ephemeral_publish: vec![ChannelMatcherRaw::Exact("protobar-demo".to_string())],
+            ephemeral_subscribe: vec![ChannelMatcherRaw::Prefix("chatter.".to_string())],
+            local_publish: vec![],
             webhook: vec![WebhookMatcherRaw {
                 endpoint: "github".to_string(),
             }],
@@ -640,6 +682,10 @@ mod tests {
             vec![ChannelMatcher::Exact("outbox".to_string())]
         );
         assert_eq!(
+            policy.acls.ephemeral_subscribe,
+            vec![ChannelMatcher::Prefix("chatter.".to_string())]
+        );
+        assert_eq!(
             policy.acls.webhook,
             vec![WebhookMatcher {
                 endpoint: "github".to_string(),
@@ -650,6 +696,9 @@ mod tests {
         assert!(policy.allows_mqtt_dynamic_subscribe("home", "sensors/kitchen/temp"));
         assert!(policy.allows_brenn_dynamic_subscribe("alerts.high"));
         assert!(policy.allows_webhook_dynamic_subscribe("github"));
+        // The ephemeral matcher resolved, but the transport grant is absent, so
+        // the ephemeral dynamic-subscribe decision still denies.
+        assert!(!policy.allows_ephemeral_dynamic_subscribe("chatter.room"));
 
         // ...and the right DENY decisions, so a regression that flips a decision
         // to always-allow (or ignores the client/filter scope) is caught at the
@@ -706,13 +755,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not authorable on an LLM app")]
-    fn ephemeral_subscribe_grant_token_in_llm_grants_panics() {
-        // `ephemeral_subscribe` deserializes from an LLM `grants` list but has no
-        // enforcement point (no ephemeral delivery path to a conversation in v1) —
-        // dead config, rejected at the resolution boundary.
+    fn ephemeral_subscribe_grant_token_in_llm_grants_is_authorable() {
+        // An LLM app may hold a subscription on an `ephemeral:` channel and read
+        // its retained window, so the grant has an enforcement point and resolves
+        // like any other. Paired with its matcher list, it authorizes access.
         let grants = vec![AppCapability::EphemeralSubscribe];
-        build_app_policy("home", &grants, &AppAclRaw::default(), &clients(&[]));
+        let acl = AppAclRaw {
+            ephemeral_subscribe: vec![ChannelMatcherRaw::Exact("chatter".to_string())],
+            ..Default::default()
+        };
+        let policy = build_app_policy("home", &grants, &acl, &clients(&[]));
+        assert!(policy.has_grant(AppCapability::EphemeralSubscribe));
+        assert!(policy.allows_ephemeral_delivery("chatter"));
+        assert!(policy.allows_channel_access("ephemeral:chatter"));
+        assert!(!policy.allows_channel_access("ephemeral:other"));
     }
 
     #[test]
@@ -899,6 +955,103 @@ mod tests {
         assert!(policy.allows_ephemeral_publish("bar.high"));
         // Unlisted channel ⇒ deny-by-default.
         assert!(!policy.allows_ephemeral_publish("other"));
+    }
+
+    #[test]
+    fn local_publish_acl_resolves_and_authorizes() {
+        let grants = vec![AppCapability::LocalPublish];
+        let acl = AppAclRaw {
+            local_publish: vec![
+                ChannelMatcherRaw::Exact("tick".to_string()),
+                ChannelMatcherRaw::Prefix("timer.".to_string()),
+            ],
+            ..AppAclRaw::default()
+        };
+        let policy = build_app_policy("home", &grants, &acl, &clients(&[]));
+        assert_eq!(
+            policy.acls.local_publish,
+            vec![
+                ChannelMatcher::Exact("tick".to_string()),
+                ChannelMatcher::Prefix("timer.".to_string()),
+            ]
+        );
+        assert!(policy.allows_local_publish("tick"));
+        assert!(policy.allows_local_publish("timer.fire"));
+        assert!(!policy.allows_local_publish("other"));
+    }
+
+    #[test]
+    fn wasm_local_publish_acl_derives_grant_and_resolves() {
+        let local_acl = [ChannelMatcherRaw::Exact("tick".to_string())];
+        let policy = build_wasm_policy(
+            "ticker",
+            [WasmGrant::Ports],
+            WasmAclsRaw {
+                local_publish: &local_acl,
+                ..Default::default()
+            },
+        );
+        assert!(policy.has_grant(AppCapability::LocalPublish));
+        assert!(policy.allows_local_publish("tick"));
+        assert!(!policy.allows_local_publish("other"));
+    }
+
+    #[test]
+    fn wasm_ephemeral_subscribe_acl_derives_grant_and_resolves() {
+        let eph_acl = [ChannelMatcherRaw::Exact("sensors".to_string())];
+        let policy = build_wasm_policy(
+            "watcher",
+            [],
+            WasmAclsRaw {
+                ephemeral_subscribe: &eph_acl,
+                ..Default::default()
+            },
+        );
+        assert!(policy.has_grant(AppCapability::EphemeralSubscribe));
+        assert!(policy.allows_ephemeral_delivery("sensors"));
+        assert!(!policy.allows_ephemeral_delivery("other"));
+    }
+
+    #[test]
+    fn wasm_empty_ephemeral_subscribe_acl_holds_no_grant() {
+        let policy = build_wasm_policy("watcher", [], WasmAclsRaw::default());
+        assert!(!policy.has_grant(AppCapability::EphemeralSubscribe));
+        assert!(policy.acls.ephemeral_subscribe.is_empty());
+        assert!(!policy.allows_ephemeral_delivery("sensors"));
+    }
+
+    #[test]
+    fn wasm_local_subscribe_acl_derives_grant_and_resolves() {
+        let loc_acl = [ChannelMatcherRaw::Exact("tick".to_string())];
+        let policy = build_wasm_policy(
+            "ticker",
+            [],
+            WasmAclsRaw {
+                local_subscribe: &loc_acl,
+                ..Default::default()
+            },
+        );
+        assert!(policy.has_grant(AppCapability::LocalSubscribe));
+        assert!(policy.allows_local_delivery("tick"));
+        assert!(!policy.allows_local_delivery("other"));
+        assert!(policy.allows_channel_access("local:tick"));
+        assert!(!policy.allows_channel_access("local:other"));
+    }
+
+    #[test]
+    fn wasm_empty_local_subscribe_acl_holds_no_grant() {
+        let policy = build_wasm_policy("watcher", [], WasmAclsRaw::default());
+        assert!(!policy.has_grant(AppCapability::LocalSubscribe));
+        assert!(policy.acls.local_subscribe.is_empty());
+        assert!(!policy.allows_local_delivery("tick"));
+        assert!(!policy.allows_channel_access("local:tick"));
+    }
+
+    #[test]
+    #[should_panic(expected = "not authorable on an LLM app")]
+    fn local_subscribe_grant_token_in_llm_grants_panics() {
+        let grants = vec![AppCapability::LocalSubscribe];
+        build_app_policy("home", &grants, &AppAclRaw::default(), &clients(&[]));
     }
 
     #[test]

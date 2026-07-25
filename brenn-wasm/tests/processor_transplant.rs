@@ -72,14 +72,18 @@ fn activation(template: &serde_json::Value, spec: &serde_json::Value) -> Process
             dropped: port["dropped"].as_u64().expect("dropped"),
         })
         .collect();
-    ProcessorActivation { ports }
+    ProcessorActivation {
+        ports,
+        deferred: vec![],
+        now: None,
+    }
 }
 
 /// Reduce one activation's outcome to the canonical transcript entry: the flush
 /// outcome plus, in call order, the publishes that actually reached the sink.
 fn transcript_entry(outcome: ProcessorOutcome) -> serde_json::Value {
     match outcome {
-        ProcessorOutcome::Ok(publishes) => {
+        ProcessorOutcome::Ok { publishes, .. } => {
             let payloads: Vec<serde_json::Value> = publishes
                 .iter()
                 .map(|p| {
