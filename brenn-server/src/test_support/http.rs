@@ -68,29 +68,18 @@ pub(crate) fn inject_extensions(mut req: Request<Body>, user_id: i64, ip: IpAddr
     req
 }
 
-/// A running test server: signalling graceful shutdown and awaiting the serve
-/// task's termination.
-///
-/// Dropping the handle signals shutdown but does not wait for it. A caller that
-/// needs the server's resources (the `Db`) provably released — rather than
-/// released at some unsynchronized later point — must call [`Self::shutdown`].
+/// A running test server. Dropping the handle drops `_shutdown_tx`, which
+/// signals graceful shutdown; the serve task then winds down asynchronously and
+/// nothing awaits it, so a dropped handle does not prove the server has stopped
+/// touching shared state.
 pub(crate) struct TestServer {
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
-    serve: tokio::task::JoinHandle<()>,
-}
-
-impl TestServer {
-    /// Signal graceful shutdown and await the serve task, so every connection
-    /// task it owns has run to completion when this returns.
-    pub(crate) async fn shutdown(self) {
-        drop(self.shutdown_tx);
-        self.serve.await.expect("serve task must not panic");
-    }
+    _shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    _serve: tokio::task::JoinHandle<()>,
 }
 
 /// Spin up a real server on a random port. Returns the base URL and a
 /// [`TestServer`]. The server runs in a background task and stops when the
-/// returned handle is dropped or [`TestServer::shutdown`] is awaited.
+/// returned handle is dropped.
 pub(crate) async fn spawn_test_server(state: AppState) -> (String, TestServer) {
     use crate::router::build_router;
     let app =
@@ -108,7 +97,13 @@ pub(crate) async fn spawn_test_server(state: AppState) -> (String, TestServer) {
             .unwrap();
     });
 
-    (format!("http://{addr}"), TestServer { shutdown_tx, serve })
+    (
+        format!("http://{addr}"),
+        TestServer {
+            _shutdown_tx: shutdown_tx,
+            _serve: serve,
+        },
+    )
 }
 
 /// Make an HTTP request with WebSocket upgrade headers to trigger the WS handler.

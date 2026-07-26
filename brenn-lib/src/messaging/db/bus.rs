@@ -317,16 +317,9 @@ pub struct BusGcEviction {
 /// frontier *is* the record of what it lost.
 ///
 /// Both subtractions in the accounting — this one and the advance's — rest on
-/// retention being dense, and one thing still perforates it: step 3 spares a
-/// message whose delivery is tentative (`confirm_pending = 1`), so a spared
-/// message older than the deleted ones holds the new frontier down at its own
-/// seq and the pass reports less than it removed. The gap it hides is charged by
-/// a later advance only when that advance's window starts above the spared
-/// message; a window wide enough to still serve it reports nothing for the gap.
-/// This costs noise-ladder accuracy, not delivery — every position and every
-/// message body is exactly where it would otherwise be — and it lasts as long
-/// as the tentative hold does. The carve-out belongs to the surface delivery
-/// lifecycle; density, and with it exactness, returns when that goes.
+/// retention being dense, and nothing perforates it: every message the pass's
+/// span covers is deleted, so the new frontier is exactly where the pass left
+/// retention.
 ///
 /// # Panics
 ///
@@ -422,10 +415,6 @@ pub fn bus_gc_evict_channel(
                          AND retained_seq IS NOT NULL
                        ORDER BY retained_seq DESC
                        LIMIT ?2
-                   )
-                   AND m.id NOT IN (
-                       SELECT message_id FROM messaging_pending_pushes
-                       WHERE confirm_pending = 1
                    )
                  ORDER BY m.retained_seq ASC",
             )
@@ -529,16 +518,10 @@ pub fn bus_gc_evict_channel(
     // Step 3a: delete push rows for eligible messages FIRST (before message rows),
     // to satisfy the FK constraint on messaging_pending_pushes.message_id.
     // Same eligible set as the archive SELECT (retained_seq total order).
-    // Tentative (`confirm_pending = 1`) push rows are excluded: they carry
-    // below-water recovery evidence that the next resume's reconcile depends on.
-    // Their message row is kept alongside them (the message DELETE below applies
-    // the same exclusion) so the FK stays satisfied; both rejoin the reapable
-    // universe once the flag clears at reconcile.
     let push_rows_retired = tx
         .execute(
             "DELETE FROM messaging_pending_pushes
-             WHERE confirm_pending = 0
-               AND message_id IN (
+             WHERE message_id IN (
                  SELECT id FROM messaging_messages
                  WHERE channel_uuid = ?1
                    AND envelope_type != 'ingress'
@@ -570,10 +553,6 @@ pub fn bus_gc_evict_channel(
                      AND retained_seq IS NOT NULL
                    ORDER BY retained_seq DESC
                    LIMIT ?2
-               )
-               AND id NOT IN (
-                   SELECT message_id FROM messaging_pending_pushes
-                   WHERE confirm_pending = 1
                )",
             rusqlite::params![channel_uuid_bytes, frontier as i64],
         )
@@ -654,12 +633,6 @@ pub fn bus_gc_retire_pushes(
     // Parked rows (deliver_after pushes awaiting release) are excluded from the
     // hot-path push-window deque and must be equally excluded here so the two
     // reapers operate on the same row universe.
-    //
-    // Tentative rows (`confirm_pending = 1`) are excluded the same way parked rows
-    // are: they are a below-water delivery whose receipt is not yet acknowledged, so
-    // retirement must not erase the recovery evidence the reconcile at the next
-    // resume depends on. They clear back to 0 (confirmed) or NULL delivered_at
-    // (unclaimed) at reconcile, rejoining the reapable universe then.
     conn.execute(
         "DELETE FROM messaging_pending_pushes
          WHERE id IN (
@@ -670,7 +643,6 @@ pub fn bus_gc_retire_pushes(
                AND m.channel_uuid = ?2
                AND m.envelope_type != 'ingress'
                AND pp.release_after IS NULL
-               AND pp.confirm_pending = 0
                AND pp.id NOT IN (
                    SELECT pp2.id
                    FROM messaging_pending_pushes pp2
@@ -873,50 +845,30 @@ pub fn load_released_push_window_rows(conn: &Connection, ids: &[i64]) -> Vec<Rel
 // Pending-push queries
 // ---------------------------------------------------------------------------
 
-/// Mark pending-push rows delivered. Idempotent.
-///
-/// A thin wrapper over [`claim_pending_pushes`] that discards the won ids: mark
-/// and claim share the exact `delivered_at = now WHERE delivered_at IS NULL`
-/// predicate, so the claim protocol's core statement has a single
-/// implementation. The single `Mutex<Connection>` makes the claim atomic, so
-/// the dispatcher's batch re-mark after a Surface `Ok(true)` is an idempotent
-/// no-op against a row the session drain already claimed.
-pub fn mark_pending_pushes_delivered(conn: &Connection, push_ids: &[i64]) {
-    let _ = claim_pending_pushes(conn, push_ids);
-}
-
 /// Maximum ids bound into a single `IN (…)` batch. SQLite's compiled
 /// `SQLITE_MAX_VARIABLE_NUMBER` is 32766 on modern builds; staying well under it
-/// (claim also binds `now`) means an arbitrarily large parked backlog is claimed
-/// across several statements instead of tripping a `prepare` error — the backlog
-/// is bounded only by `push_depth`, which may be `Unbounded`.
+/// (the mark also binds `now`) means an arbitrarily large batch is retired
+/// across several statements instead of tripping a `prepare` error.
 const MAX_IN_CLAUSE_IDS: usize = 30000;
 
-/// Atomically claim pending-push rows for delivery, returning the ids actually
-/// claimed by this call. A row is claimed by stamping `delivered_at = now` while
-/// it is still `delivered_at IS NULL`; the single `Mutex<Connection>` makes the
-/// claim atomic across the two surface-delivery actors (the dispatcher fan-out
-/// task and the session drain). An id already claimed by the other actor is
-/// simply absent from the returned set — the caller then skips sending it.
-///
-/// Returns the claimed ids (a subset of `push_ids`). Idempotent double-claim of
-/// the same id returns it at most once (to the first claimer). The id list is
-/// batched under `MAX_IN_CLAUSE_IDS` so a large backlog never overflows the
-/// SQLite bind-variable limit.
-pub fn claim_pending_pushes(conn: &Connection, push_ids: &[i64]) -> Vec<i64> {
+/// Mark pending-push rows delivered — `delivered_at = now` where it is still
+/// `NULL`, so a row already marked keeps its first timestamp. Idempotent. The id
+/// list is batched under [`MAX_IN_CLAUSE_IDS`] so a large backlog never overflows
+/// the SQLite bind-variable limit.
+pub fn mark_pending_pushes_delivered(conn: &Connection, push_ids: &[i64]) {
     if push_ids.is_empty() {
-        return vec![];
+        return;
     }
     let now = format_ts_for_db(Utc::now());
-    let mut claimed = Vec::new();
     for chunk in push_ids.chunks(MAX_IN_CLAUSE_IDS) {
         let sql = format!(
             "UPDATE messaging_pending_pushes SET delivered_at = ?1
-             WHERE id IN ({}) AND delivered_at IS NULL
-             RETURNING id",
+             WHERE id IN ({}) AND delivered_at IS NULL",
             build_bare_in_placeholders(chunk.len()),
         );
-        let mut stmt = conn.prepare(&sql).expect("prepare claim_pending_pushes");
+        let mut stmt = conn
+            .prepare(&sql)
+            .expect("prepare mark_pending_pushes_delivered");
         // Params: now (?1) followed by the id list bound to the IN placeholders.
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(chunk.len() + 1);
         params.push(Box::new(now.clone()));
@@ -924,160 +876,9 @@ pub fn claim_pending_pushes(conn: &Connection, push_ids: &[i64]) -> Vec<i64> {
             params.push(Box::new(*id));
         }
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| &**p as _).collect();
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(param_refs), |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("query claim_pending_pushes");
-        for r in rows {
-            claimed.push(r.expect("read claimed push id"));
-        }
+        stmt.execute(rusqlite::params_from_iter(param_refs))
+            .expect("exec mark_pending_pushes_delivered");
     }
-    claimed
-}
-
-/// Release a prior claim on pending-push rows by clearing `delivered_at`. Used
-/// only by a claimer that failed to hand off any copy of the row (all target
-/// session queues full or closed), so the row re-parks and is redelivered on
-/// the next drain. Clears unconditionally over the given ids, batched under
-/// `MAX_IN_CLAUSE_IDS`.
-pub fn unclaim_pending_pushes(conn: &Connection, push_ids: &[i64]) {
-    update_pushes_by_ids(
-        conn,
-        "delivered_at = NULL",
-        push_ids,
-        "unclaim_pending_pushes",
-    );
-}
-
-/// Apply `SET <set_clause>` to `messaging_pending_pushes` rows matched by id,
-/// batched under `MAX_IN_CLAUSE_IDS`. The shared skeleton behind every
-/// SET-by-ids operation; `ctx` names the caller in the prepare/exec expects.
-fn update_pushes_by_ids(conn: &Connection, set_clause: &str, push_ids: &[i64], ctx: &str) {
-    if push_ids.is_empty() {
-        return;
-    }
-    for chunk in push_ids.chunks(MAX_IN_CLAUSE_IDS) {
-        let sql = format!(
-            "UPDATE messaging_pending_pushes SET {set_clause} WHERE id IN ({})",
-            build_bare_in_placeholders(chunk.len()),
-        );
-        let mut stmt = conn
-            .prepare(&sql)
-            .unwrap_or_else(|e| panic!("prepare {ctx}: {e}"));
-        stmt.execute(rusqlite::params_from_iter(chunk.iter()))
-            .unwrap_or_else(|e| panic!("exec {ctx}: {e}"));
-    }
-}
-
-/// Stamp `confirm_pending = 1` on the claimed push row for `(subscriber,
-/// message_id)` — the below-water ack channel's tentative mark.
-/// Ordered before the socket write of a below-water durable row so a dead socket
-/// after the write leaves recovery evidence the next resume's reconcile reads.
-/// Scoped to a claimed row (`delivered_at IS NOT NULL`): only a row already on
-/// its way to the wire is tentative, and `(subscriber, message_id)` identifies it
-/// uniquely (one push row per subscriber per message). Returns the rows stamped.
-pub fn stamp_confirm_pending(
-    conn: &Connection,
-    subscriber: &ParticipantId,
-    message_id: i64,
-) -> usize {
-    conn.execute(
-        "UPDATE messaging_pending_pushes SET confirm_pending = 1
-         WHERE target_subscriber = ?1 AND message_id = ?2 AND delivered_at IS NOT NULL",
-        rusqlite::params![subscriber.as_str(), message_id],
-    )
-    .expect("stamp_confirm_pending: UPDATE")
-}
-
-/// Whether a push row still exists for `(subscriber, message_id)`. Used to tell a
-/// concurrently GC-evicted below-water row (row gone — an expected transient) from
-/// a genuine invariant break (row present but unclaimed) when a stamp matched no
-/// rows.
-pub fn pending_push_exists(conn: &Connection, subscriber: &ParticipantId, message_id: i64) -> bool {
-    conn.query_row(
-        "SELECT 1 FROM messaging_pending_pushes
-         WHERE target_subscriber = ?1 AND message_id = ?2
-         LIMIT 1",
-        rusqlite::params![subscriber.as_str(), message_id],
-        |_| Ok(()),
-    )
-    .optional()
-    .expect("pending_push_exists: query")
-    .is_some()
-}
-
-/// Load the tentative (`confirm_pending = 1`) push rows for `(subscriber,
-/// channel)`, returning `(push_id, message_id)` pairs. The reconcile at a durable
-/// `Subscribe` reads these and, per the echoed cursor's confirm set, either
-/// confirms (clears the flag) or unclaims each.
-pub fn load_confirm_pending_pushes(
-    conn: &Connection,
-    subscriber: &ParticipantId,
-    channel_uuid: Uuid,
-) -> Vec<TentativePushRow> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT pp.id, pp.message_id, m.retained_seq
-             FROM messaging_pending_pushes pp
-             JOIN messaging_messages m ON pp.message_id = m.id
-             WHERE pp.target_subscriber = ?1
-               AND m.channel_uuid = ?2
-               AND pp.confirm_pending = 1",
-        )
-        .expect("prepare load_confirm_pending_pushes");
-    let rows = stmt
-        .query_map(
-            rusqlite::params![subscriber.as_str(), channel_uuid.as_bytes().to_vec()],
-            |row| {
-                Ok(TentativePushRow {
-                    push_id: row.get(0)?,
-                    message_id: row.get(1)?,
-                    retained_seq: row.get(2)?,
-                })
-            },
-        )
-        .expect("query load_confirm_pending_pushes");
-    rows.map(|r| r.expect("read confirm-pending push"))
-        .collect()
-}
-
-/// One tentative (delivered, unconfirmed) push row, as
-/// [`load_confirm_pending_pushes`] hands it over.
-///
-/// `retained_seq` is `None` only for a row whose message left retention order —
-/// impossible for a delivered bus row. Callers may treat an absent position as
-/// unresumable rather than matching it against a cursor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TentativePushRow {
-    pub push_id: i64,
-    pub message_id: i64,
-    pub retained_seq: Option<i64>,
-}
-
-/// Confirm tentative push rows: clear `confirm_pending` back to 0, leaving them
-/// delivered. Their receipt was proven by the client echoing a cursor whose
-/// confirm set names them, so they age out via GC as any delivered row.
-pub fn confirm_pending_pushes(conn: &Connection, push_ids: &[i64]) {
-    update_pushes_by_ids(
-        conn,
-        "confirm_pending = 0",
-        push_ids,
-        "confirm_pending_pushes",
-    );
-}
-
-/// Unclaim tentative push rows never acknowledged: clear both `confirm_pending`
-/// and `delivered_at` so the same subscribe's parked claim redelivers them
-/// exactly once. A below-water redelivery re-stamps and re-enters
-/// the set; the recursion terminates at the first cursor the client echoes.
-pub fn unclaim_confirm_pending_pushes(conn: &Connection, push_ids: &[i64]) {
-    update_pushes_by_ids(
-        conn,
-        "delivered_at = NULL, confirm_pending = 0",
-        push_ids,
-        "unclaim_confirm_pending_pushes",
-    );
 }
 
 /// Load undelivered, unparked bus pending-push rows for `(subscriber, channel)`

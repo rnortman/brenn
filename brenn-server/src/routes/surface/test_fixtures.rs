@@ -309,16 +309,6 @@ pub(crate) fn publish(stores: &RingStores, body: &str) {
 /// the store's real incarnation, so it is not caught as stale when echoed back to
 /// a live durable subscribe.
 pub(crate) async fn durable_resume(db: &db::Db, message_id: i64) -> brenn_surface_proto::Cursor {
-    durable_resume_with_confirm(db, message_id, vec![]).await
-}
-
-/// Like [`durable_resume`] but carrying a below-water confirm set — the ack
-/// evidence a page echoes for a below-water row it received.
-pub(crate) async fn durable_resume_with_confirm(
-    db: &db::Db,
-    message_id: i64,
-    confirm: Vec<i64>,
-) -> brenn_surface_proto::Cursor {
     let (channel_uuid, seq) = {
         let conn = db.lock().await;
         conn.query_row(
@@ -332,7 +322,7 @@ pub(crate) async fn durable_resume_with_confirm(
         )
         .unwrap_or_else(|e| panic!("no retained message {message_id} to resume from: {e}"))
     };
-    durable_resume_at(db, channel_uuid, seq as u64, confirm).await
+    durable_resume_at(db, channel_uuid, seq as u64).await
 }
 
 /// Mint a resume cursor naming an arbitrary position in a channel's retention
@@ -342,7 +332,6 @@ pub(crate) async fn durable_resume_at(
     db: &db::Db,
     channel_uuid: uuid::Uuid,
     seq: u64,
-    confirm: Vec<i64>,
 ) -> brenn_surface_proto::Cursor {
     let (incarnation, epoch) = {
         let conn = db.lock().await;
@@ -351,7 +340,7 @@ pub(crate) async fn durable_resume_at(
             brenn_lib::messaging::db::channel_resume_epoch(&conn, channel_uuid),
         )
     };
-    super::cursor::mint(incarnation, epoch, seq, confirm)
+    super::cursor::mint(incarnation, epoch, seq)
 }
 
 /// Drain the capturing alerter's channel, then assert no security event was

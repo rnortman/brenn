@@ -492,6 +492,123 @@ async fn the_fold0_context_feed_skips_a_parked_message_and_feeds_its_retention_p
     );
 }
 
+/// A surface policy authorizing delivery on any `brenn:` channel, and the
+/// `Surface` subscriber it covers.
+fn surface_subscriber(
+    push_depth: Depth,
+) -> (
+    SubscriberEntry,
+    std::collections::HashMap<String, AppPolicy>,
+) {
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::MessagingSubscribe);
+    policy
+        .acls
+        .brenn_subscribe
+        .push(ChannelMatcher::Prefix(String::new()));
+    (
+        SubscriberEntry {
+            kind: SubscriberEntryKind::Surface {
+                slug: "deskbar".to_string(),
+                instance: None,
+            },
+            push_depth,
+            retain_depth: Depth::Unbounded,
+            noise: NoiseLevel::Silent,
+            wake_min: None,
+        },
+        std::collections::HashMap::from([("deskbar".to_string(), policy)]),
+    )
+}
+
+/// A push-enabled surface subscriber is served the committed envelope at the
+/// commit, row-lessly, exactly as a fold-0 one is — a surface holds no position,
+/// so nothing that walks positions can name it and the fan-out is its whole
+/// delivery trigger. It goes through `deliver` rather than `deliver_context`:
+/// its session can resume the suffix it misses, which the fold-0 feed cannot.
+#[tokio::test]
+async fn a_push_enabled_surface_subscriber_is_fanned_out_at_commit() {
+    let (subscriber, policies) = surface_subscriber(Depth::Bounded(8));
+    let (m, _, _, _, router) = super::build_messenger_with(1, vec![subscriber], policies).await;
+
+    let published = m
+        .publish(
+            crate::messaging::PublishOrigin::Conversation { id: 1 },
+            "pa-bob",
+            &canonical_address("pa-alice"),
+            "now",
+            Urgency::Normal,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(published, PublishResult::Ok { .. }),
+        "{published:?}"
+    );
+
+    let deliveries = router.deliveries.lock().await;
+    let surface: Vec<_> = deliveries
+        .iter()
+        .filter(|(sub, _)| sub.as_str().starts_with("surface:"))
+        .collect();
+    assert_eq!(
+        surface.len(),
+        1,
+        "one fan-out to the surface: {deliveries:?}"
+    );
+    assert!(surface[0].1.contains("now"));
+    assert!(
+        router.contexts.lock().await.is_empty(),
+        "a push-enabled subscription is not a fold-0 context feed"
+    );
+}
+
+/// A parked message reaches a surface when it enters retention, which is at the
+/// release sweep — not at the publish that scheduled it, and not never. The
+/// release is the parked message's commit, so it is also its fan-out.
+#[tokio::test]
+async fn a_released_message_is_fanned_out_to_surfaces_by_the_release_sweep() {
+    let (subscriber, policies) = surface_subscriber(Depth::Bounded(8));
+    let (m, _, _, _, router) = super::build_messenger_with(1, vec![subscriber], policies).await;
+
+    let release_at = Utc::now() + chrono::Duration::seconds(60);
+    let parked = m
+        .publish(
+            crate::messaging::PublishOrigin::Conversation { id: 1 },
+            "pa-bob",
+            &canonical_address("pa-alice"),
+            "later",
+            Urgency::Normal,
+            None,
+            Some(release_at),
+            None,
+        )
+        .await;
+    assert!(matches!(parked, PublishResult::Ok { .. }), "{parked:?}");
+    assert!(
+        router.deliveries.lock().await.is_empty(),
+        "a parked message is observable to nobody before its release"
+    );
+
+    let sweep = m
+        .release_due_messages(release_at + chrono::Duration::seconds(1))
+        .await;
+    assert_eq!(sweep.released, 1);
+    let deliveries = router.deliveries.lock().await;
+    let surface: Vec<_> = deliveries
+        .iter()
+        .filter(|(sub, _)| sub.as_str().starts_with("surface:"))
+        .collect();
+    assert_eq!(
+        surface.len(),
+        1,
+        "the release fans out once: {deliveries:?}"
+    );
+    assert!(surface[0].1.contains("later"));
+}
+
 /// A `deliver_after` that is already past schedules nothing: the message enters
 /// retention now, with claims, like any immediate publish. The park decision is
 /// made once — a message claimed but holding no retention position is a state no

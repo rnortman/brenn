@@ -399,8 +399,6 @@ mod tests {
             _key: &crate::messaging::SubscriberEntryKind,
             subscriber: &crate::messaging::ParticipantId,
             _: &crate::messaging::MessageEnvelope,
-            _push_id: i64,
-            _message_id: i64,
             _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             self.deliveries.lock().await.push(subscriber.clone());

@@ -40,7 +40,7 @@ pub use db::DbStore;
 pub(crate) use db::{ClaimRetirement, PushRetireParams};
 pub use registry::RingStores;
 pub use ring::RingStore;
-pub use targets::{PushTarget, TargetResolver, eager_wake_for};
+pub use targets::{PushTarget, SurfaceFeedTarget, TargetResolver, eager_wake_for};
 
 /// A message on its way into a channel, before the store has given it an
 /// identity or a position.
@@ -264,6 +264,14 @@ pub struct DeliverableSubscriber {
     /// retention still holds. Never `None` — a subscriber with nothing unseen is
     /// not deliverable and does not appear here at all.
     pub max_unseen_urgency: Urgency,
+    /// The earliest `delivery_deadline` among those same unseen messages, or
+    /// `None` when none of them carries one.
+    ///
+    /// A deadline says "wake for this by T even if urgency alone would not", so
+    /// the wake pass needs it from the same snapshot as the urgency. It leaves
+    /// the set the moment the position passes the message carrying it, which is
+    /// what stops a served deadline from waking anyone again.
+    pub earliest_unseen_deadline: Option<DateTime<Utc>>,
 }
 
 /// The bound `limit` places on a window read, with `Unbounded` spelled as the

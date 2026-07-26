@@ -430,8 +430,6 @@ async fn chaining_wake_store_walk_fires_eager_wake_for_downstream_subscriber() {
             _: &brenn_lib::messaging::SubscriberEntryKind,
             _: &ParticipantId,
             _: &brenn_lib::messaging::MessageEnvelope,
-            _push_id: i64,
-            _message_id: i64,
             _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             Ok(false)
@@ -476,7 +474,7 @@ async fn chaining_wake_store_walk_fires_eager_wake_for_downstream_subscriber() {
         Arc::clone(&capturing_router) as Arc<dyn WakeRouter>,
         brenn_lib::messaging::config::MessagingGlobalConfig::default(),
     );
-    walker.wake_owed_subscribers().await;
+    walker.wake_owed_subscribers(Utc::now()).await;
 
     let woken = capturing_router.woken.lock().unwrap();
     assert!(

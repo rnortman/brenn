@@ -527,6 +527,10 @@ impl RingStore {
                     max_unseen_urgency: *loudest_from
                         .get(first_unseen)
                         .expect("ring: a deliverable cursor trails a retained message"),
+                    // A non-durable channel refuses a message carrying a
+                    // delivery deadline at commit, so no unseen suffix here can
+                    // hold one.
+                    earliest_unseen_deadline: None,
                 }
             })
             .collect()

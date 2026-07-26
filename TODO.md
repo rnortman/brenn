@@ -126,24 +126,6 @@ Code sites (`TODO(buffered-publish-routing-test)`):
 
 ---
 
-## `confirm-set-hard-cap-e2e`
-
-The confirm-set-specific Violation wiring (`add_confirm` →
-`ConfirmCapAction::Violation` → session kill) has unit coverage on `add_confirm`
-only; no ws test drives a real client past the hard cap and asserts the session
-is killed and logged. A first attempt over the parked-replay path hung: the
-replay path does not appear to enforce the hard cap (it keeps sending
-heartbeats), so the kill fires only on live sends — and whether replay *should*
-enforce the cap wants a design answer before a correct e2e test is written.
-
-Done when a ws test drives a live-send client past the hard cap, asserts the
-session closes, and the replay-vs-live enforcement question is settled.
-
-Code site (`TODO(confirm-set-hard-cap-e2e)`):
-`brenn-server/src/routes/surface/session.rs`, `CONFIRM_SET_HARD_CAP`.
-
----
-
 ## `surface-wasm-test-in-ci`
 
 `make check` now *type-checks* the browser-side wasm test suites
@@ -798,6 +780,38 @@ as the retry. Done when the wake pass reads registration rather than rows, the
 dispatchable scan and its index are gone, and no delivery path writes or retires
 a bus-channel claim.
 
+Surfaces are the one family whose delivery the scan still duplicates rather than
+drives: the publish and release paths fan the envelope out to their attached
+sessions directly (`Messenger::fan_out_surface_feed`), and the scan's later
+`deliver` for the same claim is dropped by the session's cursor comparison. The
+surface arm of commit-time `push_targets` dies with the scan.
+
+One allocation rides on that: `WakeRouter::deliver` takes `&MessageEnvelope`
+because the scan hands it a borrow, so its `SurfaceSessions` arm deep-clones the
+body into a fresh `Arc` even though `fan_out_surface_feed` already holds one.
+Once the fan-out is `deliver`'s only surface caller, the seam can carry the
+`Arc` and that copy goes with the scan.
+
 Code sites (`TODO(substrate-wake-relocation)`):
 `brenn-lib/src/messaging/store/db.rs` (the claim retirement in `advance` and the
 retained-tail seed in `attach`).
+
+## `surface-reanchor-frame`
+
+`ServerFrame::ReAnchor` has a kernel handler and a test battery but no sender
+anywhere in-tree. It was built for a server that carried per-subscription
+below-water bookkeeping needing a reconcile; that bookkeeping is gone, and a
+surface's delivery state is now the cursor the client echoes at subscribe, which
+subscribe-time replay already heals. What is undecided is whether the wire keeps
+an explicit cursor-confirm / re-anchor frame at all — cheap resume hygiene that
+lets the server retire a stale server-side cursor without waiting for a
+reconnect — or relies purely on subscribe-time replay. It touches the PWA
+client, so it is a session-layer call, not a substrate one. Until it is
+answered, this is unreachable protocol surface whose handler and tests cost
+maintenance against a path no server can trigger. Done when either a server path
+sends the frame or the variant, its handler, and its tests are deleted (no compat
+concern — the frontend redeploys with the backend).
+
+Code sites (`TODO(surface-reanchor-frame)`):
+`surface/proto/src/lib.rs` (the `ServerFrame::ReAnchor` variant),
+`surface/kernel/src/core/mod.rs` (`on_re_anchor`).

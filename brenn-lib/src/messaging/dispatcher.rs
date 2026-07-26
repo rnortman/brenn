@@ -45,7 +45,7 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const PAST_DEADLINE_DEBOUNCE: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
-// dispatch_row — the single dispatch primitive (design §2.4, R12)
+// dispatch_row — the single dispatch primitive
 // ---------------------------------------------------------------------------
 
 /// Dispatch an already-durably-parked pending-push row to the appropriate
@@ -57,8 +57,7 @@ const PAST_DEADLINE_DEBOUNCE: Duration = Duration::from_secs(5);
 /// The row's registration key ([`registration_key`]) selects the subscriber's
 /// [`DeliveryShape`] from the router's binding:
 /// - `Inline` → inject via `router.deliver()` (bus) or `router.deliver_ingress()`
-///   (ingress). `Ok(true)` ⇒ `Delivered` (or `DeliveredNoRemark` when the
-///   binding marks its own delivery); no bridge / bridge-died-mid-send →
+///   (ingress). `Ok(true)` ⇒ `Delivered`; no bridge / bridge-died-mid-send →
 ///   eager-wake if `Immediate` or `deadline_expired`, then `Parked`.
 /// - `ParkedWake` → `router.deliver()` is never called (WASM/system
 ///   subscribers). A channel-backed row must not be woken here (it has a
@@ -93,17 +92,14 @@ pub async fn dispatch_row(
     // design). Bus rows must not be woken here — each has a single external
     // wake source; waking again would double-fire. Only an ingress row (no
     // channel, no store) fires its eager wake here.
-    let marks_own_delivery = match router.delivery_shape(&key) {
-        DeliveryShape::ParkedWake => {
-            let should_wake =
-                !row.payload.is_bus() && ((row.eager_wake && !wake_gated) || deadline_expired);
-            if should_wake {
-                router.spawn_eager_wake(&key, &row.target_subscriber);
-            }
-            return DispatchOutcome::Parked { woke: should_wake };
+    if let DeliveryShape::ParkedWake = router.delivery_shape(&key) {
+        let should_wake =
+            !row.payload.is_bus() && ((row.eager_wake && !wake_gated) || deadline_expired);
+        if should_wake {
+            router.spawn_eager_wake(&key, &row.target_subscriber);
         }
-        DeliveryShape::Inline { marks_own_delivery } => marks_own_delivery,
-    };
+        return DispatchOutcome::Parked { woke: should_wake };
+    }
 
     // Dispatch based on payload kind: bus envelopes go through deliver(),
     // ingress events through deliver_ingress(). Both methods return the
@@ -111,14 +107,7 @@ pub async fn dispatch_row(
     let result = match &row.payload {
         IngressOrBus::Bus(envelope) => {
             router
-                .deliver(
-                    &key,
-                    &row.target_subscriber,
-                    envelope,
-                    row.push_id,
-                    row.message_id,
-                    row.retained_seq,
-                )
+                .deliver(&key, &row.target_subscriber, envelope, row.retained_seq)
                 .await
         }
         IngressOrBus::Ingress(event) => {
@@ -129,12 +118,6 @@ pub async fn dispatch_row(
     };
 
     match result {
-        // A binding that marks its own delivery (a surface session's atomic
-        // claim is the mark) must not be re-marked by the dispatcher batch: a
-        // concurrent session may unclaim a row it owns to re-park it, and a
-        // batch re-mark would race that unclaim and permanently retire an
-        // undelivered row.
-        Ok(true) if marks_own_delivery => DispatchOutcome::DeliveredNoRemark,
         Ok(true) => DispatchOutcome::Delivered(row.push_id),
         Ok(false) => {
             // No active bridge. Eager-wake if this row demands it and the wake
@@ -354,15 +337,23 @@ async fn dispatcher_loop(
     // each store when its next release is due exactly once. A park that lands
     // after the sweep kicks the loop, so a stale value never delays a release.
     let mut next_release = messenger.next_deferred_release().await;
+    // Earliest delivery deadline no position has passed, as of the last wake
+    // pass. `None` until the first pass runs, which is covered by the claim-row
+    // source below.
+    let mut next_cursor_deadline: Option<chrono::DateTime<Utc>> = None;
     loop {
-        // Compute sleep target: the earliest deferred release, and the durable
-        // delivery deadline (a durable-only publish option, so it has no
-        // per-store question to ask).
-        let next_deadline = {
+        // Interim, dies with the dispatchable-row scan
+        // (`TODO(substrate-wake-relocation)`): the claim-row deadline is read
+        // alongside the wake pass's, because the families still served by that
+        // scan hold no position for the pass to see.
+        let claim_deadline = {
             let conn = db.lock().await;
             earliest_pending_deadline(&conn)
         };
-        let next_due = [next_deadline, next_release].into_iter().flatten().min();
+        let next_due = [claim_deadline, next_cursor_deadline, next_release]
+            .into_iter()
+            .flatten()
+            .min();
         let sleep_dur = match next_due {
             Some(dt) => {
                 let now = Utc::now();
@@ -412,7 +403,11 @@ async fn dispatcher_loop(
 
         // Before the scan's early-continue, so a publish on any class (which
         // kicks this loop) reaches its consumer at once.
-        messenger.wake_owed_subscribers().await;
+        let wake = messenger.wake_owed_subscribers(now).await;
+        next_cursor_deadline = wake.next_deadline;
+        if wake.fired_deadline_wake {
+            fired_wakes = true;
+        }
 
         // Load all currently-dispatchable rows.
         // Predicate: delivered_at IS NULL AND release_after IS NULL AND
@@ -509,15 +504,15 @@ async fn dispatcher_loop(
             let fan_out_handle = tokio::spawn(async move {
                 let mut delivered_ids: Vec<i64> = Vec::new();
                 // `fired_wake`: any row actually fired an eager wake.
-                // `delivered_any`: any row was delivered (Delivered /
-                // DeliveredNoRemark) — floor-denied retirements do not count, as
-                // they prove nothing about subscriber liveness.
+                // `delivered_any`: any row was delivered — floor-denied
+                // retirements do not count, as they prove nothing about
+                // subscriber liveness.
                 let mut fired_wake = false;
                 let mut delivered_any = false;
 
-                // Delivery floor (design §2.2 Point B): resolve the group's
-                // subscriber kind once (slug recovery is invariant across the
-                // group — efficiency-1/2). `None` means fail-closed deny for the
+                // Delivery floor: resolve the group's subscriber kind once
+                // (slug recovery is invariant across the group). `None` means
+                // fail-closed deny for the
                 // whole group (DB error or wiring bug); the reason is already
                 // logged by `resolve_subscriber_kind`. Retire every row so none
                 // redeliver.
@@ -530,8 +525,8 @@ async fn dispatcher_loop(
                 .await;
 
                 for (row, deadline_expired) in &rows {
-                    // Delivery floor (design §2.2 Point B): re-validate the
-                    // subscriber's current ACL before delivering any parked bus row.
+                    // Delivery floor: re-validate the subscriber's current ACL
+                    // before delivering any parked bus row.
                     // A revoked ACL (or a denied group) drops the row — mark it
                     // delivered/retired (in the same batch) so it does not
                     // redeliver, and skip dispatch. Ingress rows are never gated
@@ -542,7 +537,7 @@ async fn dispatcher_loop(
                     if !floor_decision(&messenger_clone, group_kind.as_ref(), row) {
                         // Surface the channel address so an operator can tell
                         // which ACL revocation backed up this subscriber's
-                        // deliveries (quality-1). Group-level denies (group_kind
+                        // deliveries. Group-level denies (group_kind
                         // None) are already logged with their distinct reason.
                         let channel = if row.payload.is_bus() {
                             row.payload.unwrap_bus_ref().channel.as_str()
@@ -563,12 +558,6 @@ async fn dispatcher_loop(
                     {
                         DispatchOutcome::Delivered(id) => {
                             delivered_ids.push(id);
-                            delivered_any = true;
-                        }
-                        // Surface row already marked by the router's claim —
-                        // must not be re-marked here (would race a session
-                        // unclaim); leave it out of `delivered_ids`.
-                        DispatchOutcome::DeliveredNoRemark => {
                             delivered_any = true;
                         }
                         DispatchOutcome::Parked { woke } => {
@@ -930,8 +919,6 @@ mod tests {
             _key: &crate::messaging::SubscriberEntryKind,
             _subscriber: &crate::messaging::ParticipantId,
             _envelope: &crate::messaging::MessageEnvelope,
-            _push_id: i64,
-            _message_id: i64,
             _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             self.deliver_calls.fetch_add(1, Ordering::SeqCst);
@@ -974,8 +961,6 @@ mod tests {
             _key: &crate::messaging::SubscriberEntryKind,
             _subscriber: &crate::messaging::ParticipantId,
             _envelope: &crate::messaging::MessageEnvelope,
-            _push_id: i64,
-            _message_id: i64,
             _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             Ok(false)
@@ -1940,7 +1925,7 @@ mod tests {
             "the scan does not wake a channel-backed parked row — the store walk does",
         );
 
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             fake.eager_wakes.load(Ordering::SeqCst),
             1,
@@ -2134,8 +2119,6 @@ mod tests {
             _key: &crate::messaging::SubscriberEntryKind,
             _subscriber: &crate::messaging::ParticipantId,
             _envelope: &crate::messaging::MessageEnvelope,
-            _push_id: i64,
-            _message_id: i64,
             _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             Err("simulated flush failure (D1 acceptance test)".to_string())
@@ -2348,8 +2331,6 @@ mod tests {
             _key: &crate::messaging::SubscriberEntryKind,
             _subscriber: &crate::messaging::ParticipantId,
             _envelope: &crate::messaging::MessageEnvelope,
-            _push_id: i64,
-            _message_id: i64,
             _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             self.deliver_calls.fetch_add(1, Ordering::SeqCst);
@@ -2888,7 +2869,6 @@ mod tests {
         for (row, deadline_expired) in &due_rows {
             match dispatch_row(router.as_ref(), row, *deadline_expired, false).await {
                 DispatchOutcome::Delivered(id) => delivered_ids.push(id),
-                DispatchOutcome::DeliveredNoRemark => {}
                 DispatchOutcome::Parked { .. } => {}
             }
         }

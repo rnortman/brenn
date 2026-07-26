@@ -400,8 +400,6 @@ impl brenn_lib::messaging::WakeRouter for NoopWakeRouter {
         _: &brenn_lib::messaging::SubscriberEntryKind,
         _: &brenn_lib::messaging::ParticipantId,
         _: &brenn_lib::messaging::MessageEnvelope,
-        _push_id: i64,
-        _message_id: i64,
         _retained_seq: Option<i64>,
     ) -> Result<bool, String> {
         Ok(false)
