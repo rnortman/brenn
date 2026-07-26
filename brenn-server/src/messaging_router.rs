@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use brenn_lib::messaging::store::SurfaceFeedTarget;
 use brenn_lib::messaging::{
     DeliveryShape, MessageEnvelope, ParticipantId, SubscriberEntryKind, WakeRouter,
 };
@@ -151,18 +152,17 @@ impl WakeRouterImpl {
 
 /// The retention position a surface delivery names, as `u64`.
 ///
-/// Every bus row a surface subscription is owed sits in its channel's retention
-/// order: the store assigns positions from 1 and never re-uses one, so an
-/// absent or negative position means the row was delivered from outside
-/// retention, which no path produces. `push_id` names the claim in the panic
-/// (`0` for the row-less fold-0 context feed, which owns none).
-pub(crate) fn retention_position(retained_seq: Option<i64>, push_id: i64) -> u64 {
+/// Every message a surface subscription is delivered sits in its channel's
+/// retention order: the store assigns positions from 1 and never re-uses one, so
+/// an absent or negative position means the message was delivered from outside
+/// retention, which no path produces.
+fn retention_position(retained_seq: Option<i64>) -> u64 {
     retained_seq
         .and_then(|seq| u64::try_from(seq).ok())
         .unwrap_or_else(|| {
             panic!(
-                "surface durable delivery (push {push_id}): the row holds no retention \
-                 position {retained_seq:?} — a delivered bus row is always in retention"
+                "surface durable delivery: the message holds no retention position \
+                 {retained_seq:?} — a delivered bus message is always in retention"
             )
         })
 }
@@ -182,8 +182,6 @@ impl WakeRouter for WakeRouterImpl {
         key: &SubscriberEntryKind,
         subscriber: &ParticipantId,
         envelope: &MessageEnvelope,
-        push_id: i64,
-        message_id: i64,
         retained_seq: Option<i64>,
     ) -> Result<bool, String> {
         match self.delivery_route(key) {
@@ -219,20 +217,20 @@ impl WakeRouter for WakeRouterImpl {
                      reach the shared dispatch loop deliver path"
                 );
             }
-            // Claim-based at-most-once fan-out to attached, subscribed sessions.
-            // The dispatcher fan-out (this arm) and each session's drain race for
-            // the same rows; whoever atomically claims a push row sends it, the
-            // other skips. `try_send` (not awaited): a hung session must not stall
-            // the shared fan-out task, so partial acceptance is accepted — a slow
-            // session's interior misses heal only where its own high-water has not
-            // passed them (at-most-once; the planned Ack upgrade tightens this).
+            // Row-less fan-out to attached, subscribed sessions. A surface holds
+            // no server-side delivery state: the client's echoed cursor is the
+            // whole of it, so this arm hands the envelope over and arbitrates
+            // nothing. The session drops a copy its cursor already covers, and a
+            // session that missed one — queue full, or the frame lost — resumes
+            // past its cursor and is served the suffix. `try_send` (not awaited):
+            // a hung session must not stall the shared fan-out task.
             DeliveryRoute::SurfaceSessions => {
                 let slug = key.slug();
                 let state = self
                     .state
                     .get()
                     .expect("WakeRouter state must be set before any Surface deliver call");
-                let retained_seq = retention_position(retained_seq, push_id);
+                let retained_seq = retention_position(retained_seq);
 
                 // The subscription this row belongs to: the principal the push
                 // row was resolved for, on the row's channel. `key` is the
@@ -263,22 +261,7 @@ impl WakeRouter for WakeRouterImpl {
                     return Ok(false);
                 }
 
-                let messenger = state.messenger.as_ref().expect(
-                    "WakeRouter Surface deliver: a Surface subscriber implies messaging is \
-                     configured (boot invariant)",
-                );
-
-                // 3. Claim the row. Empty → a session drain already owns it and
-                //    will send it; report delivered without re-sending.
-                let claimed = {
-                    let conn = messenger.db().lock().await;
-                    brenn_lib::messaging::db::claim_pending_pushes(&conn, &[push_id])
-                };
-                if claimed.is_empty() {
-                    return Ok(true);
-                }
-
-                // 4. Fan out the claimed row to every subscribed session. One
+                // 3. Fan out to every subscribed session. One
                 //    `Arc<MessageEnvelope>` is built here and every session clones
                 //    the refcount — the shared dispatch task never deep-clones the
                 //    body per session.
@@ -289,7 +272,6 @@ impl WakeRouter for WakeRouterImpl {
                     let delivery = DurableDelivery {
                         envelope: shared_envelope.clone(),
                         retained_seq,
-                        message_id: Some(message_id),
                         sub: sub.clone(),
                     };
                     if handle.durable_tx.try_send(delivery).is_ok() {
@@ -298,52 +280,32 @@ impl WakeRouter for WakeRouterImpl {
                         rejected += 1;
                     }
                 }
-                // Partial acceptance: sessions that were backpressured while others
-                // took the row have a permanent interior gap (resume heals only
-                // rows above a session's own high-water). Surface it — this is a
-                // knowingly-lost message class, otherwise undiagnosable.
-                if rejected > 0 && accepted > 0 {
-                    warn!(
-                        slug = %slug,
-                        channel = %envelope.channel,
-                        retained_seq,
-                        push_id,
-                        rejected,
-                        accepted,
-                        "surface durable live delivery: some session queues full; those \
-                         sessions may permanently miss this row"
-                    );
-                }
-
-                // 5. Per-delivery drain nudge on every subscribed session: flushes
-                //    below-`wake_min` parked rows on a healthy attached session
-                //    (dispatch_row only eager-wakes on Ok(false)/Err) and recovers
-                //    a queue-full session. Fires before the accept decision below
-                //    (step 6) because that decision returns out of the arm. A
-                //    spurious pass over an empty parked set is one indexed query
-                //    per active channel.
-                for handle in &subscribed {
-                    handle.drain_notify.notify_one();
-                }
-
-                // 6. ≥1 accepted → delivered. Zero (every queue full/closed) →
-                //    unclaim so the row re-parks and the sessions catch up by
-                //    draining.
-                if accepted >= 1 {
-                    Ok(true)
-                } else {
+                if rejected > 0 {
                     debug!(
                         slug = %slug,
                         channel = %envelope.channel,
                         retained_seq,
-                        push_id,
-                        "surface durable live delivery: all session queues full; \
-                         re-parking row for the next drain"
+                        rejected,
+                        accepted,
+                        "surface durable live delivery: some session queues full; those \
+                         sessions are served the suffix by the drain nudge below"
                     );
-                    let conn = messenger.db().lock().await;
-                    brenn_lib::messaging::db::unclaim_pending_pushes(&conn, &[push_id]);
-                    Ok(false)
                 }
+
+                // 4. Per-delivery drain nudge on every subscribed session: serves
+                //    the suffix above each session's cursor, which is what recovers
+                //    a queue-full session and flushes anything a below-`wake_min`
+                //    publish left unwoken (dispatch_row only eager-wakes on
+                //    Ok(false)/Err). A spurious pass over a caught-up cursor is one
+                //    indexed retention read per active channel.
+                for handle in &subscribed {
+                    handle.drain_notify.notify_one();
+                }
+
+                // 5. ≥1 accepted → this wake landed somewhere. Zero (every queue
+                //    full/closed) → report undelivered so the dispatcher wakes
+                //    again; the sessions catch up from their cursors either way.
+                Ok(accepted >= 1)
             }
         }
     }
@@ -354,9 +316,9 @@ impl WakeRouter for WakeRouterImpl {
         envelope: &Arc<MessageEnvelope>,
         retained_seq: i64,
     ) {
-        // Row-less deliver-if-attached fan-out for a fold-0 surface subscription
-        // (design §6). No push row, no claim: a fold-0 subscription has no push
-        // window, so the message reaches an attached session only here, live.
+        // Row-less deliver-if-attached fan-out for a fold-0 surface subscription.
+        // No push row: a fold-0 subscription has no push window, so the message
+        // reaches an attached session only here, live.
         let SubscriberEntryKind::Surface { slug, .. } = key else {
             // `resolve_context_targets` filters to Surface subscribers, so any
             // other kind here is a caller-side wiring bug.
@@ -391,8 +353,7 @@ impl WakeRouter for WakeRouterImpl {
         for handle in &subscribed {
             let delivery = DurableDelivery {
                 envelope: envelope.clone(),
-                retained_seq: retention_position(Some(retained_seq), 0),
-                message_id: None,
+                retained_seq: retention_position(Some(retained_seq)),
                 sub: sub.clone(),
             };
             if handle.durable_tx.try_send(delivery).is_err() {
@@ -413,12 +374,13 @@ impl WakeRouter for WakeRouterImpl {
         }
     }
 
-    fn any_context_session_attached(&self, channel: &str, targets: &[SubscriberEntryKind]) -> bool {
+    fn any_surface_session_subscribed(&self, channel: &str, targets: &[SurfaceFeedTarget]) -> bool {
         let Some(state) = self.state.get() else {
             // No state wired yet — no session can be attached.
             return false;
         };
-        targets.iter().any(|key| {
+        targets.iter().any(|target| {
+            let key = &target.kind;
             let SubscriberEntryKind::Surface { slug, .. } = key else {
                 return false;
             };
@@ -570,12 +532,9 @@ impl WakeRouter for WakeRouterImpl {
     fn delivery_shape(&self, key: &SubscriberEntryKind) -> DeliveryShape {
         let map = self.bindings.read().expect("bindings RwLock poisoned");
         match map.get(key) {
-            Some(DeliveryBinding::ConversationBridge) => DeliveryShape::Inline {
-                marks_own_delivery: false,
-            },
-            Some(DeliveryBinding::SurfaceSessions) => DeliveryShape::Inline {
-                marks_own_delivery: true,
-            },
+            Some(DeliveryBinding::ConversationBridge) | Some(DeliveryBinding::SurfaceSessions) => {
+                DeliveryShape::Inline
+            }
             Some(DeliveryBinding::ParkedNotify(_)) => DeliveryShape::ParkedWake,
             None => panic!(
                 "delivery_shape: no delivery binding registered for {key:?} — \
@@ -631,6 +590,16 @@ mod tests {
         }
     }
 
+    /// The push-enabled feed target for [`surface_key`], as the publish path
+    /// resolves it.
+    fn surface_feed_target() -> SurfaceFeedTarget {
+        SurfaceFeedTarget {
+            kind: surface_key(),
+            subscriber: ParticipantId::for_surface_component("deskbar", "protobar"),
+            push_enabled: true,
+        }
+    }
+
     /// `deliver` returns `Ok(false)` when the target conversation has
     /// no active bridge (the dispatcher maps this to "park" /
     /// eager-wake instead of error). No render work is performed because
@@ -660,8 +629,6 @@ mod tests {
                 &conv_key(),
                 &ParticipantId::for_conversation(42),
                 &env,
-                1,
-                1,
                 Some(1),
             )
             .await;
@@ -858,8 +825,6 @@ mod tests {
                 &conv_key(),
                 &ParticipantId::for_conversation(conversation_id),
                 &env,
-                1,
-                1,
                 Some(1),
             )
             .await;
@@ -943,14 +908,7 @@ mod tests {
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
         };
         let _ = router
-            .deliver(
-                &key,
-                &ParticipantId::for_wasm("my-consumer"),
-                &env,
-                1,
-                1,
-                Some(1),
-            )
+            .deliver(&key, &ParticipantId::for_wasm("my-consumer"), &env, Some(1))
             .await;
     }
 
@@ -1161,11 +1119,24 @@ mod tests {
         (guard, durable_rx, drain_notify)
     }
 
+    /// Whether the pending-push row is still owed (undelivered). The surface
+    /// delivery path must never touch it: the row is the dispatcher's wake
+    /// bookkeeping, not the session's delivery state.
+    async fn push_is_owed(db: &brenn_lib::db::Db, push_id: i64) -> bool {
+        let conn = db.lock().await;
+        conn.query_row(
+            "SELECT delivered_at IS NULL FROM messaging_pending_pushes WHERE id = ?1",
+            rusqlite::params![push_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .expect("the seeded push row")
+    }
+
     /// `deliver` for a `surface:` subscriber with an attached, subscribed session
-    /// claims the push row and hands it to that session's live queue, returning
-    /// `Ok(true)`.
+    /// hands the envelope to that session's live queue and returns `Ok(true)`,
+    /// writing nothing: the session's own cursor is its delivery state.
     #[tokio::test]
-    async fn deliver_surface_fans_out_and_claims() {
+    async fn deliver_surface_fans_out_without_claiming() {
         let db = brenn_lib::db::init_db_memory();
         let channel = "brenn:durable-demo";
         let (messenger, participant, push_id, seq) =
@@ -1184,14 +1155,12 @@ mod tests {
                 &surface_key(),
                 &participant,
                 &surface_envelope(channel),
-                push_id,
-                seq,
                 Some(seq),
             )
             .await;
         assert!(matches!(result, Ok(true)));
 
-        // The claimed row landed on the session's live queue with the wire seq.
+        // The row landed on the session's live queue with the wire seq.
         let delivered = rx.try_recv().expect("live delivery enqueued");
         assert_eq!(delivered.envelope.channel, channel);
         assert_eq!(delivered.retained_seq, seq as u64);
@@ -1200,13 +1169,14 @@ mod tests {
             .await
             .expect("drain nudge fired");
 
-        // The push row is claimed (a re-claim finds nothing).
-        let conn = db.lock().await;
-        assert!(brenn_lib::messaging::db::claim_pending_pushes(&conn, &[push_id]).is_empty());
+        assert!(
+            push_is_owed(&db, push_id).await,
+            "the fan-out marks nothing — the dispatcher retires its own row"
+        );
     }
 
     /// `deliver` for a `surface:` subscriber with no attached/subscribed session
-    /// parks (`Ok(false)`) and leaves the row unclaimed for a later attach+drain.
+    /// parks (`Ok(false)`) so the dispatcher wakes again for a later attach.
     #[tokio::test]
     async fn deliver_surface_no_session_parks() {
         let db = brenn_lib::db::init_db_memory();
@@ -1227,37 +1197,25 @@ mod tests {
                 &surface_key(),
                 &participant,
                 &surface_envelope(channel),
-                push_id,
-                seq,
                 Some(seq),
             )
             .await;
         assert!(matches!(result, Ok(false)));
-
-        // Row stays unclaimed (claimable).
-        let conn = db.lock().await;
-        assert_eq!(
-            brenn_lib::messaging::db::claim_pending_pushes(&conn, &[push_id]),
-            vec![push_id]
-        );
+        assert!(push_is_owed(&db, push_id).await);
     }
 
-    /// A row already claimed by a session drain → `deliver` returns `Ok(true)`
-    /// without re-sending (the claimer owns the send).
+    /// A row the dispatcher already retired still fans out: the wake bookkeeping
+    /// no longer arbitrates who sends, so a session subscribed now is served the
+    /// envelope and drops it only if its own cursor already covers it.
     #[tokio::test]
-    async fn deliver_surface_already_claimed_skips_send() {
+    async fn deliver_surface_fans_out_over_an_already_retired_row() {
         let db = brenn_lib::db::init_db_memory();
         let channel = "brenn:durable-demo";
         let (messenger, participant, push_id, seq) =
             surface_push_fixture(&db, "deskbar", channel).await;
-
-        // Pre-claim the row, as a session drain would.
         {
             let conn = messenger.db().lock().await;
-            assert_eq!(
-                brenn_lib::messaging::db::claim_pending_pushes(&conn, &[push_id]),
-                vec![push_id]
-            );
+            brenn_lib::messaging::db::mark_pending_pushes_delivered(&conn, &[push_id]);
         }
 
         let mut state = AppState::for_test(db.clone(), None);
@@ -1273,22 +1231,21 @@ mod tests {
                 &surface_key(),
                 &participant,
                 &surface_envelope(channel),
-                push_id,
-                seq,
                 Some(seq),
             )
             .await;
         assert!(matches!(result, Ok(true)));
-        // Nothing was sent — the drain owns the row.
-        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            rx.try_recv().expect("live delivery enqueued").retained_seq,
+            seq as u64
+        );
     }
 
     /// When every subscribed session's live queue is unusable (here: receiver
-    /// dropped, so `try_send` fails), `deliver` unclaims the row and returns
-    /// `Ok(false)` so it re-parks for a later drain — the "slow session, queue
-    /// full" recovery path.
+    /// dropped, so `try_send` fails), `deliver` reports `Ok(false)` and writes
+    /// nothing — the sessions catch up from their own cursors.
     #[tokio::test]
-    async fn deliver_surface_all_queues_full_unclaims_and_parks() {
+    async fn deliver_surface_all_queues_full_parks() {
         let db = brenn_lib::db::init_db_memory();
         let channel = "brenn:durable-demo";
         let (messenger, participant, push_id, seq) =
@@ -1309,19 +1266,11 @@ mod tests {
                 &surface_key(),
                 &participant,
                 &surface_envelope(channel),
-                push_id,
-                seq,
                 Some(seq),
             )
             .await;
         assert!(matches!(result, Ok(false)));
-
-        // The row was unclaimed (re-parked): a fresh claim finds it again.
-        let conn = db.lock().await;
-        assert_eq!(
-            brenn_lib::messaging::db::claim_pending_pushes(&conn, &[push_id]),
-            vec![push_id]
-        );
+        assert!(push_is_owed(&db, push_id).await);
     }
 
     /// `deliver_context` (the durable depth-0 row-less feed) fans an envelope to
@@ -1367,11 +1316,11 @@ mod tests {
             .await;
     }
 
-    /// `any_context_session_attached` — the publish-time build-skip precheck —
+    /// `any_surface_session_subscribed` — the publish-time build-skip precheck —
     /// answers true for a subscribed attached session and false with none. The
     /// false branch is the cost saver: no envelope is built when no page is open.
     #[tokio::test]
-    async fn any_context_session_attached_true_with_subscriber_false_without() {
+    async fn any_surface_session_subscribed_true_with_subscriber_false_without() {
         let db = brenn_lib::db::init_db_memory();
         let channel = "brenn:durable-demo";
         let state = AppState::for_test(db.clone(), None);
@@ -1379,17 +1328,17 @@ mod tests {
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.set_state(state.clone());
         assert!(
-            !router.any_context_session_attached(channel, &[surface_key()]),
+            !router.any_surface_session_subscribed(channel, &[surface_feed_target()]),
             "no session open — nothing to feed, skip the build"
         );
 
         let (_guard, _rx, _notify) = register_surface_session(&state, "deskbar", channel);
         assert!(
-            router.any_context_session_attached(channel, &[surface_key()]),
+            router.any_surface_session_subscribed(channel, &[surface_feed_target()]),
             "the subscribed attached session is a feed target"
         );
         assert!(
-            !router.any_context_session_attached("brenn:other-channel", &[surface_key()]),
+            !router.any_surface_session_subscribed("brenn:other-channel", &[surface_feed_target()]),
             "subscribed to a different channel — not a target here"
         );
     }
@@ -1518,15 +1467,11 @@ mod tests {
         );
         assert!(matches!(
             router.delivery_shape(&conv_key()),
-            DeliveryShape::Inline {
-                marks_own_delivery: false
-            }
+            DeliveryShape::Inline
         ));
         assert!(matches!(
             router.delivery_shape(&surface_key()),
-            DeliveryShape::Inline {
-                marks_own_delivery: true
-            }
+            DeliveryShape::Inline
         ));
         assert!(matches!(
             router.delivery_shape(&parked_key),
@@ -1573,8 +1518,6 @@ mod tests {
                 &key,
                 &ParticipantId::for_system("tool-executor"),
                 &surface_envelope("brenn:whatever"),
-                1,
-                1,
                 Some(1),
             )
             .await;
@@ -1774,7 +1717,7 @@ mod tests {
 
         // Act: channel-backed rows are not woken by the scan; fire their
         // wake source explicitly.
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
 
         // Assert: the eager-wake notifier was fired so the off-loop dispatch
         // task is woken promptly. The permit is set by notify_one.

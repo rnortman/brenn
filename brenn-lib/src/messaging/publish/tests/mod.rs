@@ -51,8 +51,6 @@ impl WakeRouter for CountingRouter {
         _key: &crate::messaging::SubscriberEntryKind,
         subscriber: &ParticipantId,
         envelope: &crate::messaging::MessageEnvelope,
-        _push_id: i64,
-        _message_id: i64,
         _retained_seq: Option<i64>,
     ) -> Result<bool, String> {
         use crate::messaging::format::format_messaging_event_single;

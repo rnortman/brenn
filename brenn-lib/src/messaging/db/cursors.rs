@@ -208,19 +208,23 @@ pub fn retune_subscriber_cursor_depth(
 }
 
 /// Every subscriber on `channel_uuid` whose position trails a message retention
-/// still holds, each with the loudest urgency in its unseen suffix.
+/// still holds, each with the loudest urgency in its unseen suffix and the
+/// earliest delivery deadline that suffix carries.
 ///
 /// A position above everything retained is caught up; one below a frontier that
 /// has evicted past it is owed nothing that can still be served, and neither
 /// lists here. A sampled subscriber holds no row and so never appears.
 ///
-/// The urgency is a `MAX` over the same join that decides deliverability, so the
-/// wake pass gets "is there work" and "is it loud enough" from one read of one
-/// consistent snapshot. The rank mapping mirrors [`Urgency::rank`]; a row whose
-/// urgency string matches no level ranks above every known level, so a single
-/// unmatched row among matched ones carries the `MAX` and is a hard error rather
-/// than a quiet downgrade of the group to the loudest level this mapping does
-/// know.
+/// Both figures are aggregates over the same join that decides deliverability,
+/// so the wake pass gets "is there work", "is it loud enough", and "is anything
+/// past its deadline" from one read of one consistent snapshot. The rank mapping
+/// mirrors [`Urgency::rank`]; a row whose urgency string matches no level ranks
+/// above every known level, so a single unmatched row among matched ones carries
+/// the `MAX` and is a hard error rather than a quiet downgrade of the group to
+/// the loudest level this mapping does know.
+///
+/// `MIN` over the deadline column is a string comparison, which orders correctly
+/// because every writer stores the one fixed-width UTC form.
 pub fn deliverable_cursor_subscribers(
     conn: &Connection,
     channel_uuid: Uuid,
@@ -233,7 +237,7 @@ pub fn deliverable_cursor_subscribers(
                         WHEN 'normal'   THEN 2
                         WHEN 'high'     THEN 3
                         ELSE 9999
-                    END)
+                    END), MIN(m.delivery_deadline)
              FROM messaging_subscriber_cursors c
              JOIN messaging_messages m ON m.channel_uuid = c.channel_uuid
              WHERE c.channel_uuid = ?1
@@ -248,11 +252,12 @@ pub fn deliverable_cursor_subscribers(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })
         .expect("query deliverable_cursor_subscribers");
     rows.map(|r| {
-        let (subscriber, app_slug, rank) = r.expect("read deliverable cursor subscriber");
+        let (subscriber, app_slug, rank, deadline) = r.expect("read deliverable cursor subscriber");
         let urgency = usize::try_from(rank)
             .ok()
             .and_then(|rank| Urgency::ALL.get(rank).copied())
@@ -262,10 +267,21 @@ pub fn deliverable_cursor_subscribers(
                      an urgency outside the known levels"
                 )
             });
+        // A stored deadline that will not parse would sleep the dispatcher past
+        // the wake it names — a silent delivery delay, so it fails loudly.
+        let earliest_unseen_deadline = deadline.map(|raw| {
+            super::parse_rfc3339(&raw).unwrap_or_else(|| {
+                panic!(
+                    "messaging: unseen message on channel {channel_uuid} for {subscriber} carries \
+                     a malformed delivery_deadline {raw:?}"
+                )
+            })
+        });
         DeliverableSubscriber {
             subscriber: ParticipantId::from_stored(subscriber),
             app_slug: Some(app_slug),
             max_unseen_urgency: urgency,
+            earliest_unseen_deadline,
         }
     })
     .collect()

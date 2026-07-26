@@ -10,7 +10,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::session::CONFIRM_SET_SOFT_CAP;
 use crate::test_support::TEST_BUILD_ID;
 use axum::http::StatusCode;
 use brenn_lib::access::acl::ChannelMatcher;
@@ -54,21 +53,9 @@ use super::registry::{SessionCaps, SurfaceSessionHandle};
 use super::session::ALERT_BURST;
 use super::test_fixtures::{
     COMPONENT, EPH_ADDR, EPH_NAME, PORT, SurfaceTestHarness, TEST_MAX_BODY_BYTES, TEST_ORIGIN,
-    assert_no_alerts, deskbar_context_feed, deskbar_sub, durable_resume, durable_resume_at,
-    durable_resume_with_confirm, fixture_stores, publish, publish_as, subscribe_harness,
-    surface_harness,
+    assert_no_alerts, deskbar_context_feed, deskbar_sub, durable_resume, fixture_stores, publish,
+    publish_as, subscribe_harness, surface_harness,
 };
-
-/// Read the `confirm_pending` flag on a pending-push row.
-async fn confirm_pending_flag(db: &db::Db, push_id: i64) -> i64 {
-    let conn = db.lock().await;
-    conn.query_row(
-        "SELECT confirm_pending FROM messaging_pending_pushes WHERE id = ?1",
-        rusqlite::params![push_id],
-        |r| r.get(0),
-    )
-    .expect("push row exists")
-}
 use super::{MAX_SESSIONS_PER_SURFACE, MAX_SESSIONS_PER_USER_PER_SURFACE, build_surface_runtimes};
 use crate::active_bridge::ActiveBridges;
 use crate::messaging_router::WakeRouterImpl;
@@ -1748,37 +1735,6 @@ async fn surface_ws_subscribe_duplicate_is_violation() {
     assert_single_alert(&flusher, &alerts, "surface_protocol_violation").await;
 }
 
-/// One cursor shape serves both classes, so a durable cursor echoed on a
-/// ring-backed channel is no longer a class mismatch — its epoch is simply one
-/// that ring never assigned, answered as a gap. What *is* a violation is the one
-/// field a ring subscription can never legitimately carry: the below-water
-/// confirm set, which only the durable ack channel mints into.
-#[tokio::test]
-async fn surface_ws_subscribe_ring_resume_with_confirmations_is_violation() {
-    let db = db::init_db_memory();
-    let SurfaceTestHarness {
-        state,
-        alerts,
-        flusher,
-        stores,
-        ..
-    } = subscribe_harness(&db, 4);
-    let (token, _) = setup_authenticated_user(&db).await;
-    let (base, _sd) = spawn_test_server(state).await;
-
-    assert_frame_is_violation(
-        &base,
-        &token,
-        subscribe_frame(
-            EPH_ADDR,
-            Some(cursor::mint(0, stores.epoch(), 1, vec![3, 4])),
-        ),
-        &flusher,
-        &alerts,
-    )
-    .await;
-}
-
 #[tokio::test]
 async fn surface_ws_subscribe_resume_ahead_is_violation() {
     let db = db::init_db_memory();
@@ -1792,7 +1748,7 @@ async fn surface_ws_subscribe_resume_ahead_is_violation() {
     let (token, _) = setup_authenticated_user(&db).await;
     // Matching epoch, but a seq far past anything this boot assigned (nothing
     // published, so newest seq is 0): impossible for an honest client.
-    let resume = Some(cursor::mint(0, stores.epoch(), 999, vec![]));
+    let resume = Some(cursor::mint(0, stores.epoch(), 999));
     let (base, _sd) = spawn_test_server(state).await;
 
     assert_frame_is_violation(
@@ -1826,12 +1782,9 @@ async fn surface_ws_subscribe_resume_exact_replays_tail() {
 
     // Resume from seq 1: seqs 2 and 3 are owed and within the ring → Replay::Exact,
     // no gap.
-    ws.send(subscribe_frame(
-        EPH_ADDR,
-        Some(cursor::mint(0, epoch, 1, vec![])),
-    ))
-    .await
-    .expect("send Subscribe");
+    ws.send(subscribe_frame(EPH_ADDR, Some(cursor::mint(0, epoch, 1))))
+        .await
+        .expect("send Subscribe");
     match next_server_frame(&mut ws).await {
         ServerFrame::SubscribeResult {
             replay_count, gap, ..
@@ -1875,12 +1828,9 @@ async fn surface_ws_subscribe_resume_up_to_date_no_replay() {
 
     // Resume from the newest seq: caught up → Replay::UpToDate, nothing replayed,
     // no gap.
-    ws.send(subscribe_frame(
-        EPH_ADDR,
-        Some(cursor::mint(0, epoch, 2, vec![])),
-    ))
-    .await
-    .expect("send Subscribe");
+    ws.send(subscribe_frame(EPH_ADDR, Some(cursor::mint(0, epoch, 2))))
+        .await
+        .expect("send Subscribe");
     match next_server_frame(&mut ws).await {
         ServerFrame::SubscribeResult {
             replay_count, gap, ..
@@ -1911,12 +1861,9 @@ async fn surface_ws_subscribe_resume_hole_exceeds_ring_gaps() {
 
     // Resume from seq 1 but the ring only retains seq 3 → Gap(BeyondRetained)
     // with a full-ring replay.
-    ws.send(subscribe_frame(
-        EPH_ADDR,
-        Some(cursor::mint(0, epoch, 1, vec![])),
-    ))
-    .await
-    .expect("send Subscribe");
+    ws.send(subscribe_frame(EPH_ADDR, Some(cursor::mint(0, epoch, 1))))
+        .await
+        .expect("send Subscribe");
     match next_server_frame(&mut ws).await {
         ServerFrame::SubscribeResult {
             replay_count, gap, ..
@@ -1963,7 +1910,7 @@ async fn surface_ws_subscribe_resume_wrong_epoch_gaps() {
     // epoch, not the stale resume epoch.
     ws.send(subscribe_frame(
         EPH_ADDR,
-        Some(cursor::mint(0, Uuid::new_v4(), 1, vec![])),
+        Some(cursor::mint(0, Uuid::new_v4(), 1)),
     ))
     .await
     .expect("send Subscribe");
@@ -2903,25 +2850,6 @@ fn durable_channel_entry(uuid: Uuid, retain_depth: Depth) -> ChannelEntry {
     }
 }
 
-/// The below-water channel, carrying the deskbar component subscription the
-/// rig's session opens. The release pass resolves its targets from the
-/// directory, so a delayed-release message reaches this subscriber only if the
-/// channel names it.
-fn below_water_channel_entry(uuid: Uuid, retain_depth: Depth) -> ChannelEntry {
-    let mut entry = durable_channel_entry(uuid, retain_depth);
-    entry.subscribers = vec![SubscriberEntry {
-        kind: brenn_lib::messaging::SubscriberEntryKind::Surface {
-            slug: "deskbar".to_string(),
-            instance: Some(COMPONENT.to_string()),
-        },
-        push_depth: Depth::Unbounded,
-        retain_depth,
-        noise: NoiseLevel::Silent,
-        wake_min: None,
-    }];
-    entry
-}
-
 /// A `deskbar` surface with one durable subscription on `brenn:durable-demo`
 /// (retain/wake as given) and, optionally, a second ephemeral subscription. When
 /// `allow_delivery` the policy authorizes brenn delivery on the channel; when
@@ -3010,7 +2938,7 @@ async fn durable_rig(
     register_surface_routes(&router, std::slice::from_ref(&resolved));
     // Registered as boot does, at every principal grain: a release pass resolves
     // its targets through the same gate the publish path uses, so an
-    // unregistered subscriber would be minted no claim.
+    // unregistered subscriber would be resolved as no target at all.
     let surface_policies =
         std::collections::HashMap::from([(resolved.slug.clone(), resolved.policy.clone())]);
     let surfaces = std::slice::from_ref(&resolved);
@@ -3365,7 +3293,7 @@ async fn surface_ws_durable_context_feed_delivers_live_with_no_push_row() {
     assert_durable_deliver_to(&mut ws, COMPONENT, "hello-durable", 1).await;
 
     // A dispatcher pass finds no push row and delivers nothing again — the feed
-    // is not backed by a claimable row, so there is nothing to duplicate.
+    // is not backed by a wake row, so there is nothing to duplicate.
     dispatch_pending(&messenger).await;
     assert_no_deliver(&mut ws).await;
 
@@ -3639,29 +3567,28 @@ async fn surface_ws_durable_sibling_instances_each_get_their_own_subscription() 
         "durable publish is Ok"
     );
 
-    // One publish, two push rows, two deliveries — one per principal, from its
-    // own window, coalesced into one frame at the write boundary. Target order
-    // within the frame is unspecified, so collect and sort.
+    // One publish, two deliveries — one per principal, from its own window.
+    // Sibling targets coalesce into one frame when they are co-available at the
+    // write boundary, which is an encoding choice and not a wire guarantee: each
+    // principal is resolved separately, so the two can also land as two frames.
+    // What is pinned is the delivery set, so collect across frames and sort.
     dispatch_pending(&messenger).await;
     let mut got: Vec<String> = Vec::new();
-    match next_server_frame(&mut ws).await {
-        ServerFrame::Deliver {
-            channel,
-            envelope,
-            targets,
-        } => {
-            assert_eq!(channel, DURABLE_ADDR);
-            assert_eq!(envelope.body, "hello-both");
-            assert_eq!(
-                targets.len(),
-                2,
-                "the row's sibling deliveries coalesce into one frame: {targets:?}"
-            );
-            for target in targets {
-                got.push(target.instance.clone());
+    while got.len() < 2 {
+        match next_server_frame(&mut ws).await {
+            ServerFrame::Deliver {
+                channel,
+                envelope,
+                targets,
+            } => {
+                assert_eq!(channel, DURABLE_ADDR);
+                assert_eq!(envelope.body, "hello-both");
+                for target in targets {
+                    got.push(target.instance.clone());
+                }
             }
+            other => panic!("expected Deliver, got {other:?}"),
         }
-        other => panic!("expected Deliver, got {other:?}"),
     }
     got.sort();
     assert_eq!(
@@ -3670,18 +3597,18 @@ async fn surface_ws_durable_sibling_instances_each_get_their_own_subscription() 
         "each instance is delivered under its own name — one publish, two \
          independent subscriptions, two windows"
     );
+    assert_no_deliver(&mut ws).await;
 }
 
 /// The router's fan-out filter keys on the whole subscription, and that is
 /// load-bearing rather than defense-in-depth.
 ///
-/// The filter (`h.is_subscribed(&sub)`) runs *before* `claim_pending_pushes`
-/// stamps `delivered_at`, and a fan-out that accepts on any session returns
-/// `Ok(true)` — the row does not re-park. So the session's own `is_active` drop
-/// does not neutralise a misroute; it **consumes** the row. Under a
-/// channel-keyed filter: alice is subscribed nowhere, bob is active on session
-/// S, alice's row matches S on the channel, is claimed, is sent to S, and S
-/// discards it — alice's row marked delivered and never seen by anyone.
+/// A fan-out that any session accepts reports `Ok(true)`, and the dispatcher
+/// retires the row on that report — so the session's own `is_active` drop does
+/// not neutralise a misroute; it **consumes** the row. Under a channel-keyed
+/// filter: alice is subscribed nowhere, bob is active on session S, alice's row
+/// matches S on the channel, is sent to S, and S discards it — alice's row
+/// retired and never woken for again.
 ///
 /// Constructible on one session precisely because the mutation's damage is to
 /// the *unsubscribed* principal's row, not to what the subscribed one receives.
@@ -3805,9 +3732,9 @@ async fn surface_ws_a_row_for_an_unsubscribed_instance_parks_rather_than_being_c
     assert_no_deliver(&mut ws).await;
 
     // (b) Alice's row is still pending. This is the assertion the mutation
-    //     inverts: channel-keyed, her row is claimed and marked delivered by a
-    //     session that then discards it — silent per-instance loss, and she can
-    //     never be sent it again.
+    //     inverts: channel-keyed, her row is retired by a session that then
+    //     discards it — silent per-instance loss, and she can never be sent it
+    //     again.
     let pending_for = |key: &str| {
         let key = key.to_string();
         let messenger = messenger.clone();
@@ -3830,7 +3757,7 @@ async fn surface_ws_a_row_for_an_unsubscribed_instance_parks_rather_than_being_c
     assert_eq!(
         pending_for("deskbar#agenda-bob").await,
         0,
-        "the subscribed instance's row was claimed and delivered"
+        "the subscribed instance's row was dispatched and retired"
     );
 }
 
@@ -3989,19 +3916,6 @@ async fn park_durable(
     park_durable_at(messenger, uuid, body, eager, None).await
 }
 
-/// Insert a parked push row held until `release_after` — a delayed-release row.
-/// Held rows are excluded from both the parked claim and the dispatchable set
-/// (`release_after IS NULL` on each), so the row reaches the wire only once
-/// a release pass clears the hold. Returns `(push_id, seq = message_id)`.
-async fn park_durable_delayed(
-    messenger: &Messenger,
-    uuid: Uuid,
-    body: &str,
-    release_after: chrono::DateTime<Utc>,
-) -> (Option<i64>, i64) {
-    park_durable_at(messenger, uuid, body, true, Some(release_after)).await
-}
-
 async fn park_durable_at(
     messenger: &Messenger,
     uuid: Uuid,
@@ -4011,9 +3925,9 @@ async fn park_durable_at(
 ) -> (Option<i64>, i64) {
     let conn = messenger.db().lock().await;
     // Targeted at the subscribing *instance*, mirroring what
-    // `resolve_push_targets` stamps for these fixtures' bindings: the push window
+    // `resolve_push_targets` stamps for these fixtures' bindings: the wake row
     // belongs to the principal, so a row seeded at the bare surface grain would
-    // be nobody's and claim-drain nothing.
+    // be nobody's and wake nothing.
     let subscriber = ParticipantId::for_surface_component("deskbar", COMPONENT);
     let push = PendingPushInsert {
         target_app_slug: subscriber.as_surface_subscriber_key().to_string(),
@@ -4041,18 +3955,6 @@ async fn park_durable_at(
         },
     );
     (msg.push_ids.first().copied(), msg.id)
-}
-
-/// The undelivered claim on `message_id`. A parked message holds none until its
-/// release mints one, so a delayed-release case asks after releasing.
-async fn claim_id_for(db: &db::Db, message_id: i64) -> i64 {
-    let conn = db.lock().await;
-    conn.query_row(
-        "SELECT id FROM messaging_pending_pushes WHERE message_id = ?1 AND delivered_at IS NULL",
-        rusqlite::params![message_id],
-        |r| r.get(0),
-    )
-    .expect("claim exists")
 }
 
 /// Insert a retained-only message (no push row): present in the retained window
@@ -4084,9 +3986,18 @@ async fn dispatch_pending(messenger: &Messenger) {
         let conn = messenger.db().lock().await;
         load_all_dispatchable_pushes(&conn, Utc::now())
     };
+    let mut delivered = Vec::new();
     for (row, expired) in &rows {
-        dispatcher::dispatch_row(messenger.router().as_ref(), row, *expired, false).await;
+        if let brenn_lib::messaging::publish::DispatchOutcome::Delivered(id) =
+            dispatcher::dispatch_row(messenger.router().as_ref(), row, *expired, false).await
+        {
+            delivered.push(id);
+        }
     }
+    // The production loop retires what it delivered in one batch; a fixture that
+    // skipped it would leave every dispatched row owed and re-woken forever.
+    let conn = messenger.db().lock().await;
+    brenn_lib::messaging::db::mark_pending_pushes_delivered(&conn, &delivered);
 }
 
 /// Open a `deskbar` WS session and consume its `Welcome`.
@@ -4143,7 +4054,7 @@ async fn assert_durable_deliver_to(ws: &mut SurfaceWs, instance: &str, body: &st
             assert_eq!(target.instance, instance, "delivery instance");
             assert_eq!(
                 target.dropped, 0,
-                "durable deliveries carry no drop signal in v1"
+                "retention covered this subscription's span, so nothing was lost"
             );
             match cursor::parse(&target.cursor) {
                 Ok(state) => assert_eq!(state.seq, seq as u64, "durable cursor high-water"),
@@ -4172,7 +4083,8 @@ async fn next_deliver(ws: &mut SurfaceWs) -> (String, CursorState) {
 
 /// Assert no `Deliver` frame arrives within a short window (idle `Heartbeat`s and
 /// keep-alive pings are allowed through). Used to prove at-most-once — that a
-/// claimed/duplicate row never reaches the wire twice.
+/// position already at or below the subscription's high-water never reaches the
+/// wire twice.
 async fn assert_no_deliver(ws: &mut SurfaceWs) {
     let deadline = Instant::now() + Duration::from_millis(500);
     loop {
@@ -4233,8 +4145,9 @@ async fn surface_ws_durable_parked_rows_drain_in_seq_order_on_subscribe() {
 }
 
 /// Live delivery after subscribe: a dispatched row reaches the attached session
-/// as a `Pos::Durable` `Deliver`; a second dispatch pass finds the row claimed
-/// and the drain nudge finds nothing, so no duplicate reaches the wire.
+/// as a `Pos::Durable` `Deliver`; a second dispatch pass finds the row already
+/// retired and the drain nudge finds nothing above the high-water, so no
+/// duplicate reaches the wire.
 #[tokio::test]
 async fn surface_ws_durable_live_delivery_after_subscribe_no_duplicate() {
     let db = db::init_db_memory();
@@ -4261,17 +4174,19 @@ async fn surface_ws_durable_live_delivery_after_subscribe_no_duplicate() {
     dispatch_pending(&messenger).await;
     assert_durable_deliver_to(&mut ws, COMPONENT, "live", seq).await;
 
-    // Idempotence: re-dispatch cannot re-deliver the claimed row.
+    // Idempotence: re-dispatch cannot re-deliver a position the high-water covers.
     dispatch_pending(&messenger).await;
     assert_no_deliver(&mut ws).await;
 }
 
 /// A quiet parked row (non-eager, so never dispatchable and never eager-woken)
-/// stays put until a louder live delivery fires the per-delivery drain nudge
-/// (SD5 step 6), which flushes it. Both rows reach the wire (order between the
-/// live loud row and the drained quiet row is the accepted SD5 inversion).
+/// stays put until a louder live delivery arrives. That louder row sits two
+/// positions above the session's high-water, so its live copy is dropped and the
+/// subscription is served its whole suffix from retention instead — the gap-heal
+/// arm. Both rows reach the wire, in seq order, exactly once: the quiet one the
+/// live path skipped, then the loud one that exposed it.
 #[tokio::test]
-async fn surface_ws_durable_quiet_row_flushed_by_live_delivery_nudge() {
+async fn surface_ws_durable_live_copy_above_the_high_water_heals_the_interior_gap() {
     let db = db::init_db_memory();
     let uuid = Uuid::new_v4();
     let (state, messenger) = durable_rig(
@@ -4297,20 +4212,229 @@ async fn surface_ws_durable_quiet_row_flushed_by_live_delivery_nudge() {
     );
 
     // Park a quiet row after subscribe: nothing nudges the session, so it waits.
-    park_durable(&messenger, uuid, "quiet", false).await;
+    let (_, quiet_seq) = park_durable(&messenger, uuid, "quiet", false).await;
     assert_no_deliver(&mut ws).await;
 
-    // A louder eager row is dispatchable → live-delivered AND nudges the drain,
-    // which flushes the quiet backlog.
-    park_durable(&messenger, uuid, "loud", true).await;
+    // A louder eager row is dispatchable → fanned out live. Its position is
+    // high_water + 2, so the live copy is dropped and retention serves both.
+    let (_, loud_seq) = park_durable(&messenger, uuid, "loud", true).await;
     dispatch_pending(&messenger).await;
-    let mut bodies = std::collections::HashSet::new();
-    bodies.insert(next_deliver(&mut ws).await.0);
-    bodies.insert(next_deliver(&mut ws).await.0);
-    assert!(
-        bodies.contains("loud") && bodies.contains("quiet"),
-        "both the live loud row and the nudged quiet row must arrive, got {bodies:?}"
+    assert_durable_deliver_to(&mut ws, COMPONENT, "quiet", quiet_seq).await;
+    assert_durable_deliver_to(&mut ws, COMPONENT, "loud", loud_seq).await;
+    assert_no_deliver(&mut ws).await;
+}
+
+/// A drain whose suffix is longer than the subscription's `retain_depth` clamp
+/// serves only the newest window, and says so: the positions between the
+/// high-water and that window are lost to this subscription and ride the first
+/// delivery's `dropped`. Silence there would be unrecoverable — the drain
+/// advances the high-water past the hole, so no later Subscribe can report it.
+#[tokio::test]
+async fn surface_ws_durable_drain_reports_the_span_the_clamp_left_behind() {
+    let db = db::init_db_memory();
+    let uuid = Uuid::new_v4();
+    let (state, messenger) = durable_rig(
+        &db,
+        // One position per drain: a suffix of three cannot fit.
+        durable_surface(uuid, Depth::Bounded(1), WakeMin::Normal, true, None),
+        durable_channel_entry(uuid, Depth::Unbounded),
+        vec![],
+    )
+    .await;
+
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(state).await;
+    let mut ws = open_deskbar(&base, &token).await;
+
+    ws.send(subscribe_frame(DURABLE_ADDR, None))
+        .await
+        .expect("subscribe");
+    assert_eq!(
+        next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT)
+            .await
+            .0,
+        0,
+        "nothing retained before subscribe"
     );
+
+    // Two retained rows with no wake row: nothing nudges the session, so the
+    // high-water stays at 0 while retention climbs.
+    persist_durable(&messenger, uuid, "lost-1").await;
+    persist_durable(&messenger, uuid, "lost-2").await;
+    assert_no_deliver(&mut ws).await;
+
+    // A dispatchable third row: its live copy is above the contiguous next
+    // position, so the drain runs — and finds a suffix the clamp cannot cover.
+    let (_, newest) = park_durable(&messenger, uuid, "newest", true).await;
+    dispatch_pending(&messenger).await;
+    match next_server_frame(&mut ws).await {
+        ServerFrame::Deliver {
+            channel,
+            envelope,
+            targets,
+        } => {
+            assert_eq!(channel, DURABLE_ADDR);
+            assert_eq!(
+                envelope.body, "newest",
+                "the clamp serves the newest window"
+            );
+            let target = sole_target(&targets);
+            assert_eq!(
+                target.dropped, 2,
+                "the two positions the clamped window skipped are reported as lost"
+            );
+            match cursor::parse(&target.cursor) {
+                Ok(state) => assert_eq!(state.seq, newest as u64),
+                other => panic!("expected a parseable durable cursor, got {other:?}"),
+            }
+        }
+        other => panic!("expected durable Deliver, got {other:?}"),
+    }
+    assert_no_deliver(&mut ws).await;
+}
+
+/// Two sibling subscriptions in one live batch are each decided against **their
+/// own** high-water, not the batch's or the channel's. One sits at the position
+/// below the arriving row and takes it live; the other is two behind and is
+/// served its whole suffix from retention instead. A decision made against the
+/// wrong sibling's high-water would either strand the laggard's interior span or
+/// put the caught-up instance's row on the other's ports.
+#[tokio::test]
+async fn surface_ws_durable_siblings_are_decided_against_their_own_high_waters() {
+    let db = db::init_db_memory();
+    let uuid = Uuid::new_v4();
+    let mut channel_entry = durable_channel_entry(uuid, Depth::Unbounded);
+    channel_entry.subscribers = ["agenda-behind", "agenda-current"]
+        .into_iter()
+        .map(|instance| SubscriberEntry {
+            kind: SubscriberEntryKind::Surface {
+                slug: "deskbar".to_string(),
+                instance: Some(instance.to_string()),
+            },
+            push_depth: Depth::Unbounded,
+            retain_depth: Depth::Unbounded,
+            noise: NoiseLevel::Silent,
+            wake_min: None,
+        })
+        .collect();
+
+    let mut resolved = durable_pubsub_surface(uuid);
+    resolved
+        .components
+        .extend(
+            ["agenda-behind", "agenda-current"].map(|instance| ResolvedComponent {
+                instance: instance.to_string(),
+                kind: "agenda".to_string(),
+                abi: brenn_surface_proto::Abi::Dom,
+                send_budget: SurfaceSendBudget::default(),
+                parked_batch_depth: 8,
+                config: Default::default(),
+                chrome: false,
+            }),
+        );
+    resolved.subscriptions = ["agenda-behind", "agenda-current"]
+        .into_iter()
+        .map(|instance| SurfaceBinding {
+            channel_address: DURABLE_ADDR.to_string(),
+            instance: instance.to_string(),
+            port: PORT.to_string(),
+            push_depth: 8,
+            retain_depth: 0,
+            noise: NoiseLevel::Silent,
+        })
+        .collect();
+    resolved.durable_subscriptions = ["agenda-behind", "agenda-current"]
+        .into_iter()
+        .map(|instance| ResolvedSurfaceSubscription {
+            instance: instance.to_string(),
+            subscription: ResolvedSubscription {
+                channel_uuid: uuid,
+                channel_address: DURABLE_ADDR.to_string(),
+                push_depth: Depth::Unbounded,
+                retain_depth: Depth::Unbounded,
+                noise: NoiseLevel::Silent,
+                wake_min: WakeMin::Normal,
+            },
+        })
+        .collect();
+
+    let surface_policies =
+        std::collections::HashMap::from([("deskbar".to_string(), resolved.policy.clone())]);
+    let (state, messenger) =
+        durable_pubsub_rig(&db, resolved, channel_entry, surface_policies).await;
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(state).await;
+    let mut ws = open_deskbar(&base, &token).await;
+
+    // The laggard subscribes before anything is retained, so its high-water stays
+    // at 0 through the two rows that follow (no wake row, so no nudge).
+    ws.send(subscribe_frame_as(DURABLE_ADDR, "agenda-behind", None))
+        .await
+        .expect("subscribe behind");
+    assert_eq!(
+        next_subscribe_result(&mut ws, DURABLE_ADDR, "agenda-behind")
+            .await
+            .0,
+        0
+    );
+    persist_durable(&messenger, uuid, "one").await;
+    persist_durable(&messenger, uuid, "two").await;
+
+    // The caught-up instance subscribes after: its replay carries both rows, so
+    // it starts one position below what comes next.
+    ws.send(subscribe_frame_as(DURABLE_ADDR, "agenda-current", None))
+        .await
+        .expect("subscribe current");
+    assert_eq!(
+        next_subscribe_result(&mut ws, DURABLE_ADDR, "agenda-current")
+            .await
+            .0,
+        2
+    );
+    assert_durable_deliver_to(&mut ws, "agenda-current", "one", 1).await;
+    assert_durable_deliver_to(&mut ws, "agenda-current", "two", 2).await;
+
+    ws.send(publish_frame("writer", "durable", "three", Some(9)))
+        .await
+        .expect("send durable Publish");
+    assert!(
+        matches!(
+            publish_result_outcome(next_server_frame(&mut ws).await, Some(9)),
+            PublishOutcome::Ok
+        ),
+        "durable publish is Ok"
+    );
+    dispatch_pending(&messenger).await;
+
+    let mut behind: Vec<String> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    while behind.len() + current.len() < 4 {
+        match next_server_frame(&mut ws).await {
+            ServerFrame::Deliver {
+                envelope, targets, ..
+            } => {
+                for target in targets {
+                    match target.instance.as_str() {
+                        "agenda-behind" => behind.push(envelope.body.clone()),
+                        "agenda-current" => current.push(envelope.body.clone()),
+                        other => panic!("delivery to an unsubscribed instance {other}"),
+                    }
+                }
+            }
+            other => panic!("expected Deliver, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        behind,
+        vec!["one", "two", "three"],
+        "the laggard is served its whole suffix in seq order, exactly once"
+    );
+    assert_eq!(
+        current,
+        vec!["three"],
+        "the caught-up sibling takes the live copy and nothing else"
+    );
+    assert_no_deliver(&mut ws).await;
 }
 
 /// `Resume::Durable` exact continuation: with the retained window covering, a
@@ -4461,7 +4585,9 @@ async fn surface_ws_durable_resume_survives_server_restart() {
         assert_durable_deliver_to(&mut ws, COMPONENT, "a", s1).await;
         assert_durable_deliver_to(&mut ws, COMPONENT, "b", s2).await;
     }
-    drop(sd1); // graceful-shutdown server 1
+    // Signals server 1's shutdown; the task winds down on its own and nothing
+    // awaits it. Server 2 binds its own port, so the two never contend.
+    drop(sd1);
 
     // Server 2 over the SAME db: resume from s1 replays the persisted retained row.
     let (state2, _messenger2) = durable_rig(
@@ -4485,10 +4611,9 @@ async fn surface_ws_durable_resume_survives_server_restart() {
     assert_durable_deliver_to(&mut ws2, COMPONENT, "b", s2).await;
 }
 
-/// Multi-session fan-out: a live row reaches both attached sessions; the parked
-/// backlog push row is claimed once (only the first subscriber drains it as a
-/// parked claim), but the second session's fresh attach still replays the row
-/// from the retained window — fresh attach is the retained window, not a
+/// Multi-session fan-out: a live row reaches both attached sessions, and a
+/// session that attaches after the backlog was parked still replays it from the
+/// retained window — a fresh attach is answered from retention, not from any
 /// per-subscriber delivered log.
 #[tokio::test]
 async fn surface_ws_durable_multi_session_fanout_and_backlog_once() {
@@ -4508,7 +4633,7 @@ async fn surface_ws_durable_multi_session_fanout_and_backlog_once() {
     let mut ws1 = open_deskbar(&base, &token).await;
     let mut ws2 = open_deskbar(&base, &token).await;
 
-    // ws1 subscribes first → claims and drains the backlog.
+    // ws1 subscribes first → its replay drains the backlog.
     ws1.send(subscribe_frame(DURABLE_ADDR, None))
         .await
         .expect("subscribe ws1");
@@ -4520,9 +4645,8 @@ async fn surface_ws_durable_multi_session_fanout_and_backlog_once() {
     );
     assert_durable_deliver_to(&mut ws1, COMPONENT, "backlog", sb).await;
 
-    // ws2 subscribes after → the parked row is already claimed, so it drains no
-    // parked backlog, but a fresh attach replays the retained window, which still
-    // holds the row.
+    // ws2 subscribes after → a fresh attach replays the retained window, which
+    // holds the row whether or not another session was served it.
     ws2.send(subscribe_frame(DURABLE_ADDR, None))
         .await
         .expect("subscribe ws2");
@@ -4542,692 +4666,120 @@ async fn surface_ws_durable_multi_session_fanout_and_backlog_once() {
     assert_durable_deliver_to(&mut ws2, COMPONENT, "live", sl).await;
 }
 
-// ===========================================================================
-// The below-water ack channel. A parked row claimed at resume below the
-// echoed high-water is a below-water send: it is stamped `confirm_pending`, its
-// id enters the cursor's confirm set, and the next reconnect's reconcile either
-// confirms it (echoed set names it → not redelivered) or redelivers it exactly
-// once (absent → lost). Rig: one parked row at id 1 plus retained rows 2..5, so a
-// resume at high-water 5 claims the id-1 parked row strictly below the cursor.
-// ===========================================================================
-
-/// Build the below-water rig and return `(base, db, messenger, token, parked
-/// push_id, parked message_id)`. The parked row is at message id 1; ids 2..5 are
-/// retained-only, lifting the channel max to 5 so a resume at high-water 5 is not
-/// caught by the stale-store above-max arm.
-async fn below_water_rig(uuid: Uuid) -> BelowWaterRig {
-    below_water_rig_at(uuid, Depth::Bounded(10), None).await
-}
-
-/// The below-water rig's parts. Named rather than a bare tuple because the
-/// variants below take three parameters and the positional form stopped reading.
-struct BelowWaterRig {
-    base: String,
-    db: db::Db,
-    messenger: Arc<Messenger>,
-    token: String,
-    /// The below-water message's claim, when one exists at setup. A
-    /// delayed-release message holds none until it is released.
-    push_id: Option<i64>,
-    seq: i64,
-    /// Tears the test server down at the holder's scope end.
-    _sd: crate::test_support::http::TestServer,
-}
-
-/// `below_water_rig` generalized on the two axes the design's matrix varies:
-/// `retain_depth` (0 is the permanent-loss corner — the fresh-attach window
-/// carries nothing, so the parked claim is the only recovery path) and
-/// `release_after` (`Some` makes row 1 a *delayed-release* row, held out of both
-/// the parked claim and the dispatchable set until [`release_all_due`]).
-async fn below_water_rig_at(
-    uuid: Uuid,
-    retain_depth: Depth,
-    release_after: Option<chrono::DateTime<Utc>>,
-) -> BelowWaterRig {
+/// The live fan-out and the drain nudge it fires both reach for the same
+/// position, and the client sees it once: the subscription's high-water is the
+/// only delivery state, so the second path finds the position already written
+/// and sends nothing. Neither path arbitrates with the other; the comparison at
+/// send time settles it.
+#[tokio::test]
+async fn surface_ws_durable_live_fanout_and_its_drain_nudge_deliver_once() {
     let db = db::init_db_memory();
+    let uuid = Uuid::new_v4();
     let (state, messenger) = durable_rig(
         &db,
-        durable_surface(uuid, retain_depth, WakeMin::Normal, true, None),
-        below_water_channel_entry(uuid, retain_depth),
+        durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
+        durable_channel_entry(uuid, Depth::Unbounded),
         vec![],
     )
     .await;
-    let (p1, s1) = match release_after {
-        Some(at) => park_durable_delayed(&messenger, uuid, "d", at).await,
-        None => park_durable(&messenger, uuid, "d", true).await,
-    };
-    for body in ["m2", "m3", "m4", "m5"] {
-        persist_durable(&messenger, uuid, body).await;
-    }
-    assert_eq!(s1, 1, "parked row anchors below the retained tail");
 
     let (token, _) = setup_authenticated_user(&db).await;
-    let (base, sd) = spawn_test_server(state).await;
-    BelowWaterRig {
-        base,
-        db,
-        messenger,
-        token,
-        push_id: p1,
-        seq: s1,
-        _sd: sd,
-    }
-}
-
-/// The store's current incarnation, so a test can prove a cursor it minted
-/// earlier really does carry a lower one than the post-restart store.
-async fn store_incarnation(db: &db::Db) -> i64 {
-    let conn = db.lock().await;
-    brenn_lib::messaging::db::read_store_identity(&conn).incarnation
-}
-
-/// Clear every outstanding `release_after` hold — the deliver-after task's own
-/// entry point, driven on demand with a clock far enough ahead that the release
-/// is deterministic rather than a wall-clock race.
-async fn release_all_due(messenger: &Messenger) {
-    messenger
-        .release_due_messages(Utc::now() + chrono::Duration::hours(1))
-        .await;
-}
-
-/// Restart the below-water rig's server on the same store: tear down the old
-/// server and its messenger/dispatcher, then build a whole fresh rig — new
-/// `Messenger`, new dispatcher, new wake router, new test server — over the same
-/// `Db`. Every scrap of pre-restart in-memory state (ack channel, drop counters,
-/// wake routes) is gone, so a session attached to the returned base is served
-/// only by post-restart state plus what genuinely persisted in the store.
-///
-/// The boot also bumps the store incarnation (generation unchanged), which every
-/// session opened after it reads at its first durable `Subscribe`. A cursor
-/// minted before the restart carries a *lower* incarnation, so it resumes
-/// normally rather than tripping a stale-store arm — callers must mint the
-/// cursor they resume with *before* calling this, since minting reads the
-/// store's identity live and would otherwise pick up the bumped value.
-async fn restart_rig(rig: BelowWaterRig, uuid: Uuid, retain_depth: Depth) -> BelowWaterRig {
-    let BelowWaterRig {
-        db,
-        token,
-        push_id,
-        seq,
-        _sd,
-        messenger,
-        ..
-    } = rig;
-    // Await the old server's termination and retire its messenger before the
-    // fresh `Messenger::new`, so it boots against a `Db` no live task can be
-    // holding — the same uniquely-owned-at-boot precondition a real boot
-    // enjoys — and against no surviving in-memory dispatcher or ack state.
-    _sd.shutdown().await;
-    drop(messenger);
-    let (state, messenger) = durable_rig(
-        &db,
-        durable_surface(uuid, retain_depth, WakeMin::Normal, true, None),
-        below_water_channel_entry(uuid, retain_depth),
-        vec![],
-    )
-    .await;
-    let (base, sd) = spawn_test_server(state).await;
-    BelowWaterRig {
-        base,
-        db,
-        messenger,
-        token,
-        push_id,
-        seq,
-        _sd: sd,
-    }
-}
-
-/// The parsed high-water and confirm set of the next durable `Deliver`.
-async fn next_deliver_confirm(ws: &mut SurfaceWs) -> (String, u64, Vec<i64>) {
-    let (body, state) = next_deliver(ws).await;
-    (body, state.seq, state.confirm)
-}
-
-/// A below-water send (a parked row claimed below the resume high-water) is
-/// stamped `confirm_pending` on the DB row and carries its id in the delivered
-/// cursor's confirm set, while the cursor's high-water stays put.
-#[tokio::test]
-async fn surface_ws_below_water_delivery_stamps_confirm_and_carries_it() {
-    let uuid = Uuid::new_v4();
-    let BelowWaterRig {
-        base,
-        db,
-        token,
-        push_id: p1,
-        seq: s1,
-        _sd,
-        ..
-    } = below_water_rig(uuid).await;
+    let (base, _sd) = spawn_test_server(state).await;
     let mut ws = open_deskbar(&base, &token).await;
-
-    ws.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume(&db, 5).await),
-    ))
-    .await
-    .expect("subscribe");
-    let (replay, gap) = next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(replay, 1, "only the below-water parked row replays");
-    assert_eq!(gap, None);
-
-    let (body, high_water, confirm) = next_deliver_confirm(&mut ws).await;
-    assert_eq!(body, "d");
-    assert_eq!(
-        high_water, 5,
-        "a below-water send leaves the high-water put"
-    );
-    assert_eq!(confirm, vec![s1], "its id enters the confirm set");
-    assert_eq!(
-        confirm_pending_flag(&db, p1.expect("the message carries a claim")).await,
-        1,
-        "the DB row is stamped tentative before the socket write"
-    );
-}
-
-/// received + reconnect: the reconnect echoes a cursor whose confirm set names the
-/// below-water row, so the reconcile confirms it and it is not redelivered.
-#[tokio::test]
-async fn surface_ws_below_water_received_is_confirmed_and_not_redelivered() {
-    let uuid = Uuid::new_v4();
-    let BelowWaterRig {
-        base,
-        db,
-        token,
-        push_id: p1,
-        seq: s1,
-        _sd,
-        ..
-    } = below_water_rig(uuid).await;
-
-    let mut ws1 = open_deskbar(&base, &token).await;
-    ws1.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume(&db, 5).await),
-    ))
-    .await
-    .expect("subscribe ws1");
-    assert_eq!(
-        next_subscribe_result(&mut ws1, DURABLE_ADDR, COMPONENT)
-            .await
-            .0,
-        1
-    );
-    let (_body, _hw, confirm) = next_deliver_confirm(&mut ws1).await;
-    assert_eq!(confirm, vec![s1]);
-    drop(ws1);
-
-    // Reconnect echoing the confirm set: the row was received.
-    let mut ws2 = open_deskbar(&base, &token).await;
-    ws2.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume_with_confirm(&db, 5, vec![s1]).await),
-    ))
-    .await
-    .expect("subscribe ws2");
-    let (replay, _gap) = next_subscribe_result(&mut ws2, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(replay, 0, "a confirmed below-water row is not redelivered");
-    assert_eq!(
-        confirm_pending_flag(&db, p1.expect("the message carries a claim")).await,
-        0,
-        "confirm clears the tentative flag; the row ages out via GC"
-    );
-    assert_no_deliver(&mut ws2).await;
-}
-
-/// lost + reconnect: the reconnect echoes a cursor whose confirm set omits the
-/// below-water row, so the reconcile unclaims it and the parked claim redelivers
-/// it exactly once.
-#[tokio::test]
-async fn surface_ws_below_water_lost_is_redelivered_exactly_once() {
-    let uuid = Uuid::new_v4();
-    let BelowWaterRig {
-        base,
-        db,
-        token,
-        push_id: p1,
-        seq: s1,
-        _sd,
-        ..
-    } = below_water_rig(uuid).await;
-
-    let mut ws1 = open_deskbar(&base, &token).await;
-    ws1.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume(&db, 5).await),
-    ))
-    .await
-    .expect("subscribe ws1");
-    assert_eq!(
-        next_subscribe_result(&mut ws1, DURABLE_ADDR, COMPONENT)
-            .await
-            .0,
-        1
-    );
-    let _ = next_deliver_confirm(&mut ws1).await;
-    drop(ws1);
-
-    // Reconnect echoing no confirm set: the row was lost.
-    let mut ws2 = open_deskbar(&base, &token).await;
-    ws2.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume(&db, 5).await),
-    ))
-    .await
-    .expect("subscribe ws2");
-    let (replay, _gap) = next_subscribe_result(&mut ws2, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(
-        replay, 1,
-        "a lost below-water row redelivers via the parked claim"
-    );
-    let (body, _hw, confirm) = next_deliver_confirm(&mut ws2).await;
-    assert_eq!(body, "d");
-    assert_eq!(
-        confirm,
-        vec![s1],
-        "redelivery is itself below-water and re-stamps"
-    );
-    assert_eq!(
-        confirm_pending_flag(&db, p1.expect("the message carries a claim")).await,
-        1
-    );
-    assert_no_deliver(&mut ws2).await;
-}
-
-/// fresh attach: no cursor means no evidence, so every tentative row is unclaimed
-/// and redelivered through the parked claim — recovering the row even where the
-/// retained window would otherwise not carry it. The redelivery is itself stamped
-/// tentative even though the fresh-attach high-water is 0, so a second dead socket
-/// during the redelivery is still recoverable (a parked row's recovery channel is
-/// the confirm set, never the window).
-#[tokio::test]
-async fn surface_ws_below_water_fresh_attach_redelivers_as_parked() {
-    let uuid = Uuid::new_v4();
-    let BelowWaterRig {
-        base,
-        db,
-        token,
-        push_id: p1,
-        seq: s1,
-        _sd,
-        ..
-    } = below_water_rig(uuid).await;
-
-    let mut ws1 = open_deskbar(&base, &token).await;
-    ws1.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume(&db, 5).await),
-    ))
-    .await
-    .expect("subscribe ws1");
-    assert_eq!(
-        next_subscribe_result(&mut ws1, DURABLE_ADDR, COMPONENT)
-            .await
-            .0,
-        1
-    );
-    let _ = next_deliver_confirm(&mut ws1).await;
-    drop(ws1);
-
-    // Fresh attach: the retained window (ids 2..5, clamp 10) plus the unclaimed
-    // parked row (id 1) — five rows, the parked one recovered.
-    let mut ws2 = open_deskbar(&base, &token).await;
-    ws2.send(subscribe_frame(DURABLE_ADDR, None))
-        .await
-        .expect("subscribe ws2");
-    let (replay, _gap) = next_subscribe_result(&mut ws2, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(
-        replay, 5,
-        "fresh attach recovers the tentative row plus the window"
-    );
-    // The parked row (id 1) sorts first among the merged replay.
-    let (body, high_water, confirm) = next_deliver_confirm(&mut ws2).await;
-    assert_eq!(body, "d", "the recovered parked row leads the replay");
-    assert_eq!(
-        high_water, s1 as u64,
-        "the fresh-attach anchor is 0; delivering the parked row advances it to \
-         the row's own retention position"
-    );
-    assert_eq!(
-        confirm,
-        vec![s1],
-        "the fresh-attach redelivery is force-stamped so it stays recoverable"
-    );
-    assert_eq!(
-        confirm_pending_flag(&db, p1.expect("the message carries a claim")).await,
-        1,
-        "the redelivered parked row is stamped tentative on the DB row"
-    );
-}
-
-/// A delayed-release row released **live while attached** enters retention at
-/// release, so it takes the channel's *newest* position — above the high-water a
-/// session resumed at while the row was still held. It is therefore an ordinary
-/// above-water live send: it advances the high-water, carries no confirm set, and
-/// leaves no tentative stamp.
-#[tokio::test]
-async fn surface_ws_late_release_arrives_above_water_live() {
-    let uuid = Uuid::new_v4();
-    let BelowWaterRig {
-        base,
-        db,
-        messenger,
-        token,
-        push_id: _,
-        seq: s1,
-        _sd,
-    } = below_water_rig_at(
-        uuid,
-        Depth::Bounded(10),
-        Some(Utc::now() + chrono::Duration::hours(1)),
-    )
-    .await;
-
-    // The four unheld rows hold positions 1..4, so the resume anchor is 4.
-    let anchor = durable_resume_at(&db, uuid, 4, vec![]).await;
-    let mut ws = open_deskbar(&base, &token).await;
-    ws.send(subscribe_frame(DURABLE_ADDR, Some(anchor)))
+    ws.send(subscribe_frame(DURABLE_ADDR, None))
         .await
         .expect("subscribe");
-    let (replay, gap) = next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(
-        replay, 0,
-        "the held row is not claimable while release_after stands"
-    );
-    assert_eq!(gap, None);
-
-    // The hold clears and the dispatcher fans the row to the attached session.
-    release_all_due(&messenger).await;
-    // The claim exists only now: release mints it for the attached subscriber.
-    let p1 = claim_id_for(&db, s1).await;
-    dispatch_pending(&messenger).await;
-
-    let (body, high_water, confirm) = next_deliver_confirm(&mut ws).await;
-    assert_eq!(body, "d", "the released row arrives live");
-    assert_eq!(
-        high_water, 5,
-        "release assigns the newest retention position, so the send is above water"
-    );
-    assert!(
-        confirm.is_empty(),
-        "an above-water send is acked by the high-water, not the confirm set"
-    );
-    assert_eq!(
-        confirm_pending_flag(&db, p1).await,
-        0,
-        "an above-water send leaves no tentative stamp"
-    );
-    drop(ws);
-
-    // Echoing the advanced high-water: nothing is owed.
-    let mut ws2 = open_deskbar(&base, &token).await;
-    ws2.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume_at(&db, uuid, 5, vec![]).await),
-    ))
-    .await
-    .expect("subscribe ws2");
-    let (replay, _gap) = next_subscribe_result(&mut ws2, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(
-        replay, 0,
-        "the released row is behind the echoed high-water"
-    );
-    assert_no_deliver(&mut ws2).await;
-}
-
-/// Restart survival, timing 1 — **released while attached**, then the socket dies
-/// before the page received the frame and the server restarts. The page's cursor
-/// still names the pre-release high-water, and the released row sits one position
-/// above it in retention, so the resume replays it exactly once across the
-/// boundary — the store window, not an ack stamp, is what recovers an above-water
-/// row.
-#[tokio::test]
-async fn surface_ws_late_release_attached_survives_restart_once() {
-    let uuid = Uuid::new_v4();
-    let rig = below_water_rig_at(
-        uuid,
-        Depth::Bounded(10),
-        Some(Utc::now() + chrono::Duration::hours(1)),
-    )
-    .await;
-    let s1 = rig.seq;
-
-    // Minted before the release and the restart — the four unheld rows hold
-    // positions 1..4 — so it is what a page holding a cursor across a deploy
-    // actually presents: pre-release position, pre-restart incarnation.
-    let pre_restart_cursor = durable_resume_at(&rig.db, uuid, 4, vec![]).await;
-    let pre_restart_incarnation = store_incarnation(&rig.db).await;
-
-    let mut ws = open_deskbar(&rig.base, &rig.token).await;
-    ws.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume_at(&rig.db, uuid, 4, vec![]).await),
-    ))
-    .await
-    .expect("subscribe");
     assert_eq!(
         next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT)
             .await
             .0,
         0
     );
-    release_all_due(&rig.messenger).await;
-    // The claim exists only now: release mints it for the attached subscriber.
-    let p1 = claim_id_for(&rig.db, s1).await;
-    dispatch_pending(&rig.messenger).await;
-    let (_body, hw, _confirm) = next_deliver_confirm(&mut ws).await;
-    assert_eq!(
-        hw, 5,
-        "the released row takes the newest retention position"
-    );
-    // The socket dies with the frame in flight — the page never saw it.
-    drop(ws);
 
-    let BelowWaterRig {
-        base,
-        db,
-        token,
-        _sd,
-        ..
-    } = restart_rig(rig, uuid, Depth::Bounded(10)).await;
-    assert_eq!(
-        confirm_pending_flag(&db, p1).await,
-        0,
-        "an above-water send is never stamped tentative"
-    );
-    assert!(
-        store_incarnation(&db).await > pre_restart_incarnation,
-        "the restart bumped the incarnation, so the held cursor is genuinely the lower one"
-    );
-
-    // Resume with the pre-restart cursor: lower incarnation, so not stale.
-    let mut ws2 = open_deskbar(&base, &token).await;
-    ws2.send(subscribe_frame(DURABLE_ADDR, Some(pre_restart_cursor)))
-        .await
-        .expect("subscribe ws2");
-    let (replay, _gap) = next_subscribe_result(&mut ws2, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(replay, 1, "the lost row redelivers across the restart");
-    let (body, hw, _confirm) = next_deliver_confirm(&mut ws2).await;
-    assert_eq!(body, "d");
-    assert_eq!(
-        hw, 5,
-        "the redelivery advances to the released row's position"
-    );
-    assert_no_deliver(&mut ws2).await;
-}
-
-/// Restart survival, timing 2 — **released while detached**. Nothing is owed to a
-/// dead session, so the release leaves the row parked and unclaimed; the restart
-/// changes nothing about it, and the next attach drains it exactly once through
-/// the ordinary parked claim.
-#[tokio::test]
-async fn surface_ws_late_release_detached_survives_restart_once() {
-    let uuid = Uuid::new_v4();
-    let rig = below_water_rig_at(
-        uuid,
-        Depth::Bounded(10),
-        Some(Utc::now() + chrono::Duration::hours(1)),
-    )
-    .await;
-    let s1 = rig.seq;
-
-    // No session attached: the release and dispatch pass find nobody.
-    release_all_due(&rig.messenger).await;
-    let p1 = claim_id_for(&rig.db, s1).await;
-    dispatch_pending(&rig.messenger).await;
-    assert_eq!(
-        confirm_pending_flag(&rig.db, p1).await,
-        0,
-        "a row released with nobody attached is never sent, so never stamped"
-    );
-
-    // Minted before the restart: the resumed cursor carries the lower incarnation.
-    // The four unheld rows hold positions 1..4, so the anchor is 4.
-    let pre_restart_cursor = durable_resume_at(&rig.db, uuid, 4, vec![]).await;
-    let pre_restart_incarnation = store_incarnation(&rig.db).await;
-
-    let BelowWaterRig {
-        base,
-        db,
-        token,
-        _sd,
-        ..
-    } = restart_rig(rig, uuid, Depth::Bounded(10)).await;
-    assert!(
-        store_incarnation(&db).await > pre_restart_incarnation,
-        "the restart bumped the incarnation, so the held cursor is genuinely the lower one"
-    );
-
-    let mut ws = open_deskbar(&base, &token).await;
-    ws.send(subscribe_frame(DURABLE_ADDR, Some(pre_restart_cursor)))
-        .await
-        .expect("subscribe");
-    let (replay, _gap) = next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(replay, 1, "the released row drains once at the next attach");
-    let (body, high_water, confirm) = next_deliver_confirm(&mut ws).await;
-    assert_eq!(body, "d");
-    assert_eq!(
-        high_water, 5,
-        "the released row entered retention above the resumed high-water"
-    );
-    assert!(confirm.is_empty(), "an above-water send carries no ack set");
+    // One eager row: the router fans it out and nudges the drain, which re-reads
+    // retention above the high-water the fan-out just advanced.
+    let (_p, s) = park_durable(&messenger, uuid, "once", true).await;
+    dispatch_pending(&messenger).await;
+    assert_durable_deliver_to(&mut ws, COMPONENT, "once", s).await;
     assert_no_deliver(&mut ws).await;
 }
 
-/// The permanent-loss corner at **every depth resolved to 0**: the retained window
-/// carries nothing at all, so the parked claim is the row's only recovery path. A
-/// fresh attach has no cursor and therefore no evidence, unclaims the tentative
-/// row, and redelivers it — proving recovery does not depend on the window
-/// carrying the message.
+/// A row published while the session held no subscription is served by the next
+/// resume, from the cursor the session echoes — the surface's whole delivery
+/// state — and the fan-out that arrives afterwards is dropped as the duplicate
+/// it is.
 #[tokio::test]
-async fn surface_ws_below_water_fresh_attach_recovers_at_depth_zero() {
+async fn surface_ws_durable_row_missed_while_detached_is_served_on_resume() {
+    let db = db::init_db_memory();
     let uuid = Uuid::new_v4();
-    let BelowWaterRig {
-        base,
-        db,
-        token,
-        push_id: p1,
-        seq: s1,
-        _sd,
-        ..
-    } = below_water_rig_at(uuid, Depth::Bounded(0), None).await;
+    let (state, messenger) = durable_rig(
+        &db,
+        durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
+        durable_channel_entry(uuid, Depth::Unbounded),
+        vec![],
+    )
+    .await;
+    let (_p1, s1) = park_durable(&messenger, uuid, "first", true).await;
 
-    let mut ws1 = open_deskbar(&base, &token).await;
-    ws1.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume(&db, 5).await),
-    ))
-    .await
-    .expect("subscribe ws1");
-    assert_eq!(
-        next_subscribe_result(&mut ws1, DURABLE_ADDR, COMPONENT)
-            .await
-            .0,
-        1,
-        "the parked claim is id-agnostic: it delivers at depth 0 too"
-    );
-    let (_body, _hw, confirm) = next_deliver_confirm(&mut ws1).await;
-    assert_eq!(confirm, vec![s1]);
-    // Lost: the socket dies before the page stored the cursor.
-    drop(ws1);
-
-    let mut ws2 = open_deskbar(&base, &token).await;
-    ws2.send(subscribe_frame(DURABLE_ADDR, None))
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(state).await;
+    let mut ws = open_deskbar(&base, &token).await;
+    ws.send(subscribe_frame(DURABLE_ADDR, None))
         .await
-        .expect("subscribe ws2");
-    let (replay, _gap) = next_subscribe_result(&mut ws2, DURABLE_ADDR, COMPONENT).await;
+        .expect("subscribe");
     assert_eq!(
-        replay, 1,
-        "at depth 0 the window carries nothing; the recovered row is the whole replay"
-    );
-    let (body, _hw, confirm) = next_deliver_confirm(&mut ws2).await;
-    assert_eq!(
-        body, "d",
-        "the tentative row recovers through the parked claim"
-    );
-    assert_eq!(
-        confirm,
-        vec![s1],
-        "the fresh-attach redelivery is force-stamped"
-    );
-    assert_eq!(
-        confirm_pending_flag(&db, p1.expect("the message carries a claim")).await,
-        1
-    );
-    assert_no_deliver(&mut ws2).await;
-}
-
-/// A stale confirm-set entry — an id the echoed cursor names but that matches no
-/// tentative row (e.g. an already-confirmed row under a newer cursor the client
-/// never saw, or a bogus id) — is harmless: the reconcile's partition simply finds
-/// no matching tentative row, and the genuine below-water row is still confirmed.
-#[tokio::test]
-async fn surface_ws_below_water_stale_confirm_entry_is_ignored() {
-    let uuid = Uuid::new_v4();
-    let BelowWaterRig {
-        base,
-        db,
-        token,
-        push_id: p1,
-        seq: s1,
-        _sd,
-        ..
-    } = below_water_rig(uuid).await;
-
-    let mut ws1 = open_deskbar(&base, &token).await;
-    ws1.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume(&db, 5).await),
-    ))
-    .await
-    .expect("subscribe ws1");
-    assert_eq!(
-        next_subscribe_result(&mut ws1, DURABLE_ADDR, COMPONENT)
+        next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT)
             .await
             .0,
         1
     );
-    let _ = next_deliver_confirm(&mut ws1).await;
-    drop(ws1);
+    assert_durable_deliver_to(&mut ws, COMPONENT, "first", s1).await;
 
-    // Reconnect echoing the real below-water id plus a stale one (9999) that names
-    // no tentative row: the reconcile confirms s1 and ignores 9999 — no panic, no
-    // redelivery.
-    let mut ws2 = open_deskbar(&base, &token).await;
-    ws2.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume_with_confirm(&db, 5, vec![s1, 9999]).await),
+    // Published with no wake dispatched: nothing reaches the session live.
+    let (p2, s2) = park_durable(&messenger, uuid, "missed", true).await;
+
+    // Unsubscribe then resume at the first row's position. Frames are handled in
+    // order, so the answered re-subscribe is itself the proof the unsubscribe
+    // landed — a duplicate Subscribe would have been a violation.
+    ws.send(Message::Text(
+        serde_json::to_string(&ClientFrame::Unsubscribe {
+            channel: DURABLE_ADDR.to_string(),
+            instance: COMPONENT.to_string(),
+        })
+        .expect("serialize")
+        .into(),
     ))
     .await
-    .expect("subscribe ws2");
-    let (replay, _gap) = next_subscribe_result(&mut ws2, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(replay, 0, "the confirmed row is not redelivered");
-    assert_eq!(
-        confirm_pending_flag(&db, p1.expect("the message carries a claim")).await,
-        0,
-        "the stale entry is inert; the real one still confirms"
+    .expect("unsubscribe");
+    ws.send(subscribe_frame(
+        DURABLE_ADDR,
+        Some(durable_resume(&db, s1).await),
+    ))
+    .await
+    .expect("re-subscribe");
+    let (replay, gap) = next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT).await;
+    assert_eq!(replay, 1, "the resume serves only what the cursor lacks");
+    assert!(gap.is_none(), "an exact suffix reports no gap");
+    assert_durable_deliver_to(&mut ws, COMPONENT, "missed", s2).await;
+
+    // The wake finally fires; its copy is at the high-water the resume set, so
+    // the session drops it rather than writing the position twice.
+    dispatch_pending(&messenger).await;
+    assert_no_deliver(&mut ws).await;
+
+    // The wake row is the dispatcher's; the session never touched it.
+    let conn = messenger.db().lock().await;
+    let retired: bool = conn
+        .query_row(
+            "SELECT delivered_at IS NOT NULL FROM messaging_pending_pushes WHERE id = ?1",
+            rusqlite::params![p2.expect("the message carries a wake row")],
+            |row| row.get(0),
+        )
+        .expect("the parked push row");
+    assert!(
+        retired,
+        "the dispatcher retires its own wake row on the fan-out's report"
     );
-    assert_no_deliver(&mut ws2).await;
 }
 
 /// One session holding an ephemeral and a durable subscription concurrently
@@ -5298,11 +4850,12 @@ async fn surface_ws_durable_and_ephemeral_on_one_session() {
 }
 
 /// Session-side delivery-floor parity: when the surface policy does not authorize
-/// brenn delivery on the channel, a durable subscribe claims (retires) the parked
-/// backlog without delivering — `replay_count = 0`, no `Deliver` — the same
-/// retire-without-deliver the dispatcher floor applies to App/Wasm subscribers.
+/// brenn delivery on the channel, a durable subscribe is a silent wire —
+/// `replay_count = 0`, no `Deliver` — and it touches no wake row. A surface holds
+/// no server-side delivery state, so a denied floor leaves the rows exactly where
+/// the dispatcher left them.
 #[tokio::test]
-async fn surface_ws_durable_floor_denied_retires_without_delivery() {
+async fn surface_ws_durable_floor_denied_delivers_nothing_and_marks_no_row() {
     let db = db::init_db_memory();
     let uuid = Uuid::new_v4();
     let (state, messenger) = durable_rig(
@@ -5326,26 +4879,25 @@ async fn surface_ws_durable_floor_denied_retires_without_delivery() {
     assert_eq!(replay, 0, "the floor denies → empty replay");
     assert_no_deliver(&mut ws).await;
 
-    // The parked rows were claimed (retired), not left for a later drain.
+    // The session wrote nothing: a denied floor is a silent wire, and the wake
+    // rows stay the dispatcher's to retire.
     let conn = messenger.db().lock().await;
-    assert!(
-        brenn_lib::messaging::db::claim_pending_pushes(
-            &conn,
-            &[
-                p1.expect("the message carries a claim"),
-                p2.expect("the message carries a claim")
-            ]
-        )
-        .is_empty(),
-        "floor-denied rows are retired (claimed), matching the dispatcher floor"
-    );
+    for push_id in [p1, p2] {
+        let owed: bool = conn
+            .query_row(
+                "SELECT delivered_at IS NULL FROM messaging_pending_pushes WHERE id = ?1",
+                rusqlite::params![push_id.expect("the message carries a wake row")],
+                |row| row.get(0),
+            )
+            .expect("the parked push row");
+        assert!(owed, "a floor-denied subscribe marks no wake row");
+    }
 }
 
 /// Unsubscribe then re-subscribe a durable channel: the fresh subscription drains
 /// a newly parked backlog exactly once and never re-delivers a stale row. The
-/// exact queued-copy dedup race the retained `replay_sent` set closes is covered
-/// deterministically by the `DurableSessionState` unit tests; this pins the
-/// end-to-end lifecycle over the wire.
+/// re-subscribe re-anchors from the client's echoed cursor, which is what makes
+/// the second span start above everything the first one wrote.
 #[tokio::test]
 async fn surface_ws_durable_unsubscribe_then_resubscribe_delivers_fresh_backlog_once() {
     let db = db::init_db_memory();
@@ -5394,201 +4946,6 @@ async fn surface_ws_durable_unsubscribe_then_resubscribe_delivers_fresh_backlog_
     assert_no_deliver(&mut ws).await;
 }
 
-/// The session-side `already_replayed` dedup covers the drain pass, not just the
-/// live arm: a seq the replay already put on the wire is never re-sent by a later
-/// drain, even after the push row is unclaimed and re-claimed. Without the
-/// drain-path check, the retained re-send plus a re-claim would duplicate the seq
-/// on the wire — the at-most-once violation the dedup exists to prevent.
-#[tokio::test]
-async fn surface_ws_durable_drain_skips_already_replayed_seq() {
-    let db = db::init_db_memory();
-    let uuid = Uuid::new_v4();
-    let (state, messenger) = durable_rig(
-        &db,
-        durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
-        durable_channel_entry(uuid, Depth::Unbounded),
-        vec![],
-    )
-    .await;
-
-    // A parked (non-eager) row; pre-claim it to simulate another actor (a second
-    // session's drain) owning the row, so this session's parked load misses it and
-    // it can only reach the wire via the retained window on resume.
-    let (p, s) = park_durable(&messenger, uuid, "dup", false).await;
-    let p = p.expect("the message carries a claim");
-    {
-        let conn = messenger.db().lock().await;
-        assert_eq!(
-            brenn_lib::messaging::db::claim_pending_pushes(&conn, &[p]),
-            vec![p],
-            "pre-claim the row so the resume replays it from the retained window"
-        );
-    }
-
-    let (token, _) = setup_authenticated_user(&db).await;
-    let (base, _sd) = spawn_test_server(state).await;
-    let mut ws = open_deskbar(&base, &token).await;
-
-    // Resume below S: the parked load misses the claimed row, but the retained
-    // window re-sends S and records it in this connection's replay_sent.
-    ws.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume_at(&db, uuid, s as u64 - 1, vec![]).await),
-    ))
-    .await
-    .expect("subscribe");
-    let (replay, _gap) = next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(replay, 1, "the retained window re-sends S once");
-    assert_durable_deliver_to(&mut ws, COMPONENT, "dup", s).await;
-
-    // The other actor "disconnects": its claim is released, re-parking the row.
-    {
-        let conn = messenger.db().lock().await;
-        brenn_lib::messaging::db::unclaim_pending_pushes(&conn, &[p]);
-    }
-
-    // A louder live row nudges this session's drain (SD5 step 6). The drain
-    // re-claims the re-parked row, but its seq is already in replay_sent, so it is
-    // retired without a second Deliver — only the live row reaches the wire.
-    let (_p2, s2) = park_durable(&messenger, uuid, "live", true).await;
-    dispatch_pending(&messenger).await;
-    assert_durable_deliver_to(&mut ws, COMPONENT, "live", s2).await;
-    assert_no_deliver(&mut ws).await;
-
-    // The de-duped row is retired (claimed) by the drain, not re-delivered.
-    let conn = messenger.db().lock().await;
-    assert!(
-        brenn_lib::messaging::db::claim_pending_pushes(&conn, &[p]).is_empty(),
-        "the already-replayed row is retired by the drain, not left parked"
-    );
-}
-
-/// The session-side `already_replayed` dedup covers the **live arm**
-/// (`durable_rx`), not just the drain: a seq the subscribe replay already put on
-/// the wire is dropped when the router later `try_send`s the same seq straight
-/// into `durable_rx` as a live delivery. Removing the live-arm skip
-/// (`session.rs`, the `durable_rx` arm) fails this test — the router's live copy
-/// of the already-replayed row would reach the wire a second time, the
-/// at-most-once violation delta item 1's original fix exists to prevent.
-#[tokio::test]
-async fn surface_ws_durable_live_arm_skips_already_replayed_seq() {
-    let db = db::init_db_memory();
-    let uuid = Uuid::new_v4();
-    let (state, messenger) = durable_rig(
-        &db,
-        durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
-        durable_channel_entry(uuid, Depth::Unbounded),
-        vec![],
-    )
-    .await;
-
-    // An eager row, pre-claimed to simulate another actor owning it, so this
-    // session's parked load misses it and it reaches the wire only via the
-    // retained window on resume.
-    let (p, s) = park_durable(&messenger, uuid, "dup", true).await;
-    let p = p.expect("the message carries a claim");
-    {
-        let conn = messenger.db().lock().await;
-        assert_eq!(
-            brenn_lib::messaging::db::claim_pending_pushes(&conn, &[p]),
-            vec![p],
-            "pre-claim the row so the resume replays it from the retained window"
-        );
-    }
-
-    let (token, _) = setup_authenticated_user(&db).await;
-    let (base, _sd) = spawn_test_server(state).await;
-    let mut ws = open_deskbar(&base, &token).await;
-
-    // Resume below S: the parked load misses the claimed row, but the retained
-    // window re-sends S and records it in this connection's replay_sent.
-    ws.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume_at(&db, uuid, s as u64 - 1, vec![]).await),
-    ))
-    .await
-    .expect("subscribe");
-    let (replay, _gap) = next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(replay, 1, "the retained window re-sends S once");
-    assert_durable_deliver_to(&mut ws, COMPONENT, "dup", s).await;
-
-    // The other actor "disconnects": its claim is released, re-parking the eager
-    // row so the dispatcher picks it up as a live delivery.
-    {
-        let conn = messenger.db().lock().await;
-        brenn_lib::messaging::db::unclaim_pending_pushes(&conn, &[p]);
-    }
-
-    // The dispatcher claims the re-parked eager row and the router `try_send`s its
-    // live copy straight into `durable_rx`. Its seq is already in replay_sent, so
-    // the live arm drops it — no second Deliver reaches the wire. (The router's
-    // synchronous claim, not a later drain, retires the row, so this exercises the
-    // live arm and not the drain-path check.)
-    dispatch_pending(&messenger).await;
-    assert_no_deliver(&mut ws).await;
-
-    // The live-delivered row is retired (claimed) by the router, not re-parked.
-    let conn = messenger.db().lock().await;
-    assert!(
-        brenn_lib::messaging::db::claim_pending_pushes(&conn, &[p]).is_empty(),
-        "the already-replayed row is retired by the router claim, not left parked"
-    );
-}
-
-/// The retained `replay_sent` set gates the subscribe **merged-replay** path
-/// across an unsubscribe/re-subscribe cycle: a seq delivered under the first
-/// subscription is excluded from the second subscription's retained re-send.
-/// Removing the merged-replay retain (`handle_durable_subscribe`) fails this
-/// test — the retained window would re-deliver S on the re-subscribe, the
-/// duplicate the connection-lifetime `replay_sent` set closes (delta item 1).
-#[tokio::test]
-async fn surface_ws_durable_resubscribe_replay_skips_already_replayed_seq() {
-    let db = db::init_db_memory();
-    let uuid = Uuid::new_v4();
-    let (state, messenger) = durable_rig(
-        &db,
-        durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
-        durable_channel_entry(uuid, Depth::Unbounded),
-        vec![],
-    )
-    .await;
-
-    let (_p, s) = park_durable(&messenger, uuid, "dup", true).await;
-
-    let (token, _) = setup_authenticated_user(&db).await;
-    let (base, _sd) = spawn_test_server(state).await;
-    let mut ws = open_deskbar(&base, &token).await;
-
-    // First subscribe drains the parked row and records S in replay_sent.
-    ws.send(subscribe_frame(DURABLE_ADDR, None))
-        .await
-        .expect("subscribe");
-    let (replay, _) = next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(replay, 1, "parked S drains on the first subscribe");
-    assert_durable_deliver_to(&mut ws, COMPONENT, "dup", s).await;
-
-    // Unsubscribe retains replay_sent for the connection lifetime.
-    ws.send(unsubscribe_frame(DURABLE_ADDR))
-        .await
-        .expect("unsubscribe");
-
-    // Re-subscribe below S: the retained window loads S (S's push row is claimed,
-    // so the parked set is empty), but the merged-replay retain drops it because S
-    // is already in replay_sent — an empty replay, no second Deliver.
-    ws.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume_at(&db, uuid, s as u64 - 1, vec![]).await),
-    ))
-    .await
-    .expect("re-subscribe");
-    let (replay, _) = next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(
-        replay, 0,
-        "the already-replayed seq is excluded from the re-send"
-    );
-    assert_no_deliver(&mut ws).await;
-}
-
 /// One cursor shape serves both classes, so a cursor minted under some other
 /// channel's numbering domain is no longer a class mismatch the session can
 /// recognize — it is simply an epoch the durable store never minted, which
@@ -5612,7 +4969,7 @@ async fn surface_ws_durable_subscribe_foreign_epoch_resume_gaps() {
 
     ws.send(subscribe_frame(
         DURABLE_ADDR,
-        Some(cursor::mint(0, Uuid::new_v4(), 3, vec![])),
+        Some(cursor::mint(0, Uuid::new_v4(), 3)),
     ))
     .await
     .expect("send");
@@ -6264,77 +5621,4 @@ async fn surface_ws_non_last_session_close_writes_no_terminal_snapshot() {
     assert_eq!(sender, "surface:deskbar");
     let v: serde_json::Value = serde_json::from_str(body).expect("terminal body is JSON");
     assert_eq!(v["reason"], serde_json::json!("session closed"));
-}
-
-// ===========================================================================
-// The confirm-set cap. The set only shrinks at a resume's reconcile, so on a
-// connection that never reconnects it — and every cursor carrying it — grows
-// with the below-water sends since the last reconcile. Past the soft cap the
-// server asks the kernel to re-anchor the subscription, whose resubscribe runs
-// the reconcile without waiting for a reconnect.
-// ===========================================================================
-
-/// A resume claiming more below-water rows than the soft cap allows puts a
-/// `ReAnchor` on the wire for that subscription — exactly one, naming it — and
-/// keeps delivering: the cap is a trigger, not a gate.
-#[tokio::test]
-async fn surface_ws_confirm_set_past_the_soft_cap_asks_the_client_to_re_anchor() {
-    let uuid = Uuid::new_v4();
-    let db = db::init_db_memory();
-    let (state, messenger) = durable_rig(
-        &db,
-        durable_surface(uuid, Depth::Bounded(10), WakeMin::Normal, true, None),
-        durable_channel_entry(uuid, Depth::Bounded(10)),
-        vec![],
-    )
-    .await;
-    // One parked row per below-water send, one more than the soft cap admits.
-    let below_water = CONFIRM_SET_SOFT_CAP + 1;
-    for i in 0..below_water {
-        park_durable(&messenger, uuid, &format!("d{i}"), true).await;
-    }
-    // Lift the channel max above the resume high-water, so the resume is not
-    // caught by the stale-store above-max arm.
-    for i in 0..4 {
-        persist_durable(&messenger, uuid, &format!("tail{i}")).await;
-    }
-    let high_water = (below_water + 4) as i64;
-
-    let (token, _) = setup_authenticated_user(&db).await;
-    let (base, _sd) = spawn_test_server(state).await;
-    let mut ws = open_deskbar(&base, &token).await;
-    ws.send(subscribe_frame(
-        DURABLE_ADDR,
-        Some(durable_resume(&db, high_water).await),
-    ))
-    .await
-    .expect("subscribe");
-    let (replay, _gap) = next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT).await;
-    assert_eq!(
-        replay as usize, below_water,
-        "every parked row is claimed below the resume high-water"
-    );
-
-    let mut delivered = 0usize;
-    let mut re_anchors = 0usize;
-    for _ in 0..below_water + 1 {
-        match next_server_frame(&mut ws).await {
-            ServerFrame::Deliver { .. } => delivered += 1,
-            ServerFrame::ReAnchor { channel, instance } => {
-                re_anchors += 1;
-                assert_eq!(channel, DURABLE_ADDR, "the ask names the subscription");
-                assert_eq!(instance, COMPONENT);
-                assert_eq!(
-                    delivered, below_water,
-                    "the ask rides behind the delivery that triggered it"
-                );
-            }
-            other => panic!("expected Deliver or ReAnchor, got {other:?}"),
-        }
-    }
-    assert_eq!(
-        delivered, below_water,
-        "the cap is a trigger, not a gate: every row is still delivered"
-    );
-    assert_eq!(re_anchors, 1, "exactly one ask while it is outstanding");
 }

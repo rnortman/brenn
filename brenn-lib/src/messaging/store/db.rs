@@ -822,10 +822,9 @@ impl RetentionStore for DbStore {
 
         // A trailing cursor is an exact suffix iff every sequence assigned above
         // it is still retained and the whole run fits the window cap. Counting
-        // rather than testing the window's oldest edge is what makes this exact:
-        // sequences are dense at assignment but eviction can leave a hole behind
-        // a row a tentative push protects, and an edge test would read such a
-        // window as a contiguous suffix and serve it as `Exact`.
+        // rather than testing the window's oldest edge is what keeps this exact
+        // whatever eviction leaves behind: an edge test would read a window with
+        // an interior hole as a contiguous suffix and serve it as `Exact`.
         let after = i64::try_from(cursor.seq).expect("messaging: resume seq out of range");
         let owed = last_seq - cursor.seq;
         let present = u64::try_from(db::channel_retained_count_after_seq(

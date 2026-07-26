@@ -3727,6 +3727,9 @@ impl ClientCore {
     /// for, and doing nothing is correct in each. A subscription this kernel
     /// never held has no such explanation: a correct server only asks about
     /// subscriptions it acknowledged, so it is fatal.
+    ///
+    /// TODO(surface-reanchor-frame): no server path sends `ReAnchor`, so this
+    /// handler and its tests are reachable only from the test harness.
     fn on_re_anchor(&mut self, sub: SubKey, now: Millis) -> Vec<Effect> {
         let Some(cs) = self.channels.get_mut(&sub) else {
             return self.go_fatal(format!(

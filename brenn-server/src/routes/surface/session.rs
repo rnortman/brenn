@@ -18,7 +18,7 @@
 //! forget, no ack); unsubscribing a channel with no active subscription is a
 //! violation.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -59,7 +59,6 @@ use super::telemetry::{self, Health};
 
 use super::registry::{DurableDelivery, SurfaceSessionGuard};
 use super::{DeliveryClass, OutputPort, SubKey, SurfaceRuntime, sanitize_client_detail};
-use crate::messaging_router::retention_position;
 
 /// Outbound frame queue depth. A slow reader fills this, then the delivery path
 /// blocks (backpressure) rather than dropping control frames.
@@ -93,23 +92,6 @@ const SUBSCRIBE_REFILL: Duration = Duration::from_secs(1);
 /// the same cap, so it produces ~0; the outcome frames give even a
 /// buggy-but-honest component feedback to stop before this trips.
 const BODY_TOO_LARGE_VIOLATION_THRESHOLD: u64 = 8;
-
-/// Hard cap on the per-channel `replay_sent` id set held for the connection
-/// lifetime. A new id enters only when it is both published after a previous
-/// replay's window and then replay-sent — so growth needs both re-subscribe churn
-/// (bucket-bounded above) and new publishes; a client that stays subscribed adds
-/// nothing after its initial replay, and each replay adds at most the resolved
-/// `retain_depth`. The set is therefore not a config-derived constant over an
-/// unbounded connection lifetime — a churning client on a busy channel accretes
-/// ids — so the bound is enforced, not argued: past it the connection is torn
-/// down (normal close, not a protocol violation — it is reachable by an honest
-/// very-long-lived connection, and teardown is always safe: the client
-/// reconnects, resumes, and starts a fresh set). 65 536 ids ≈ 512 KiB per
-/// channel. Pruning below the DB-retained window was rejected as unsound: a live
-/// copy still queued in `durable_tx` is process memory independent of DB
-/// retention GC, so pruning a still-queued id re-opens the duplicate this cap and
-/// the retained set together close.
-const REPLAY_SENT_MAX: usize = 65_536;
 
 /// Everything the upgrade callback hands to the session task.
 pub(crate) struct SurfaceSessionParams {
@@ -349,8 +331,21 @@ async fn session_loop(params: SurfaceSessionParams) {
                     break;
                 }
             }
-            // Eager-wake nudge: drain every active durable channel's parked rows.
+            // Eager-wake nudge: serve every active durable channel its suffix.
+            // The router queues its live copy before firing the nudge, so anything
+            // already in hand goes out first — as the frame the fan-out composed,
+            // not as a retention read that would beat it to the position.
             _ = drain_notify.notified() => {
+                let mut batch = Vec::new();
+                while let Ok(next) = durable_rx.try_recv() {
+                    batch.push(next);
+                }
+                if !batch.is_empty()
+                    && let FrameOutcome::Disconnect =
+                        send_durable_live(&ctx, &durable, &mut spans, batch, &mut counters).await
+                {
+                    break;
+                }
                 if let FrameOutcome::Disconnect =
                     drain_all_durable(&ctx, &durable, &mut spans, &mut counters).await
                 {
@@ -665,18 +660,15 @@ enum FrameOutcome {
 /// registry-shared `shared` set move strictly together through
 /// [`activate`](Self::activate)/[`deactivate`](Self::deactivate) — the two-set
 /// sync discipline lives here and nowhere else, so no handler can update one set
-/// and forget the other. `replay_sent` records, per channel, the retention
-/// positions the subscribe replay already put on the wire, so a live row racing
-/// the replay is
-/// delivered exactly once; its entries persist for the **connection** lifetime,
-/// not the subscription span, so a re-subscribe merges into the retained set
-/// rather than rebuilding it — closing the duplicate a queued live copy would
-/// otherwise be across an unsubscribe/re-subscribe cycle. Each per-channel set is
-/// hard-capped at [`REPLAY_SENT_MAX`]; see that constant for the bound argument.
+/// and forget the other.
+///
+/// Duplicate suppression is not held here: a subscription's durable high-water
+/// ([`WireSpans::durable_high_water_of`]) is the only record of what this
+/// connection has sent, so a second copy of a position — the replay racing the
+/// live fan-out — is at or below it and dropped.
 struct DurableSessionState {
     active: HashSet<SubKey>,
     shared: Arc<Mutex<HashSet<SubKey>>>,
-    replay_sent: HashMap<SubKey, HashSet<u64>>,
 }
 
 impl DurableSessionState {
@@ -684,26 +676,21 @@ impl DurableSessionState {
         Self {
             active: HashSet::new(),
             shared,
-            replay_sent: HashMap::new(),
         }
     }
 
     /// Insert the subscription into both the local and registry-shared active
-    /// sets and ensure a `replay_sent` entry exists. Inserting into `shared` is
-    /// what makes the router start claiming and queuing live rows, so callers
-    /// activate before the drain lock. An existing `replay_sent` entry from an
-    /// earlier subscription span is retained (merged into), never cleared.
+    /// sets. Inserting into `shared` is what makes the router start queuing live
+    /// rows, so callers activate before the store read.
     fn activate(&mut self, sub: &SubKey) {
         self.shared
             .lock()
             .expect("durable_subs poisoned")
             .insert(sub.clone());
         self.active.insert(sub.clone());
-        self.replay_sent.entry(sub.clone()).or_default();
     }
 
-    /// Remove the subscription from both active sets, **retaining** its
-    /// `replay_sent` entry for the connection lifetime. Returns whether it was
+    /// Remove the subscription from both active sets. Returns whether it was
     /// active — the Unsubscribe-of-non-active violation check.
     fn deactivate(&mut self, sub: &SubKey) -> bool {
         let was_active = self.active.remove(sub);
@@ -718,25 +705,6 @@ impl DurableSessionState {
 
     fn is_active(&self, sub: &SubKey) -> bool {
         self.active.contains(sub)
-    }
-
-    /// Record a replayed retention position. Returns `false` when the per-channel
-    /// set is already at [`REPLAY_SENT_MAX`] and this position is new — the caller
-    /// tears the connection down. A repeat is always accepted (it adds no growth).
-    fn record_replayed(&mut self, sub: &SubKey, seq: u64) -> bool {
-        let set = self.replay_sent.entry(sub.clone()).or_default();
-        if set.contains(&seq) {
-            return true;
-        }
-        if set.len() >= REPLAY_SENT_MAX {
-            return false;
-        }
-        set.insert(seq);
-        true
-    }
-
-    fn already_replayed(&self, sub: &SubKey, seq: u64) -> bool {
-        self.replay_sent.get(sub).is_some_and(|s| s.contains(&seq))
     }
 }
 
@@ -756,65 +724,9 @@ impl DurableSessionState {
 /// row below the high-water leaves it unmoved and repeats the unmoved cursor —
 /// no duplicate replay next reconnect — while its wire seq is still the next
 /// monotone span seq.
-/// Confirm-set depth past which the server asks the kernel to re-anchor the
-/// subscription, so the reconcile that empties the set runs without waiting for
-/// a reconnect. A trigger, not a gate: deliveries continue and the set keeps
-/// absorbing entries while the ask is outstanding.
-///
-/// A constant, not config: no operator could state what a per-subscription
-/// confirm-set depth means. Tune it here.
-pub(super) const CONFIRM_SET_SOFT_CAP: usize = 64;
-
-/// Confirm-set depth at which a client is judged to have ignored the re-anchor
-/// ask. A conforming kernel resubscribes promptly, so reaching this is a
-/// non-conforming client and takes the ordinary violation posture: kill + log.
-///
-/// Never silent truncation — dropping entries would silently convert delivered
-/// rows into presumed-lost ones at the next reconcile.
-///
-/// TODO(confirm-set-hard-cap-e2e): the confirm-set-specific Violation wiring
-/// (`add_confirm` → `ConfirmCapAction::Violation` → session kill) has only unit
-/// coverage on `add_confirm`; no ws test drives a client past the hard cap and
-/// asserts the kill. The parked-replay path does not appear to enforce the hard
-/// cap (it keeps the connection alive), so a correct e2e test needs a live-send
-/// scenario — and whether replay should enforce the cap at all wants a design
-/// answer before the test is written.
-const CONFIRM_SET_HARD_CAP: usize = 256;
-
-const _: () = assert!(CONFIRM_SET_SOFT_CAP < CONFIRM_SET_HARD_CAP);
-
-/// What recording a confirm-set entry obliges the caller to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfirmCapAction {
-    /// Set is within the soft cap, or an ask is already outstanding.
-    None,
-    /// Set passed the soft cap with no ask outstanding: send one `ReAnchor`.
-    ReAnchor,
-    /// Set reached the hard cap: the client ignored the ask. Violation.
-    Violation,
-}
-
 struct WireSpans {
     span_seq: HashMap<SubKey, u64>,
     durable_high_water: HashMap<SubKey, u64>,
-    /// Per-durable-subscription below-water confirm set: the message ids
-    /// of below-water rows written to the socket this connection, each carried in
-    /// every durable cursor minted for the subscription until the client echoes a
-    /// cursor confirming it at the next resume. Entries are only added within a
-    /// connection (the confirm signal arrives via an echoed cursor at the *next*
-    /// resume), so on a single never-reconnecting connection the set grows with the
-    /// number of below-water sends since the last reconcile — bounded by the
-    /// resolved `push_depth` at any moment a resume clears it. Past
-    /// [`CONFIRM_SET_SOFT_CAP`] the server asks the kernel to re-anchor the
-    /// subscription ([`ServerFrame::ReAnchor`]), whose resubscribe runs the
-    /// reconcile and empties the set; at [`CONFIRM_SET_HARD_CAP`] a client that
-    /// ignored the ask is non-conforming and the session is killed. See
-    /// [`WireSpans::add_confirm`].
-    confirm_set: HashMap<SubKey, BTreeSet<i64>>,
-    /// Subscriptions with a `ReAnchor` sent and no resubscribe yet. Suppresses
-    /// repeat asks while one is outstanding; cleared by [`WireSpans::clear`],
-    /// which every (re)subscribe and teardown runs.
-    reanchor_pending: HashSet<SubKey>,
     /// The store's boot `incarnation`, read once from the DB at the first durable
     /// `Subscribe` on the connection and stamped into every cursor minted
     /// thereafter. Constant for the connection's life (the store cannot re-boot
@@ -834,8 +746,6 @@ impl WireSpans {
         Self {
             span_seq: HashMap::new(),
             durable_high_water: HashMap::new(),
-            confirm_set: HashMap::new(),
-            reanchor_pending: HashSet::new(),
             incarnation: None,
             durable_epoch: HashMap::new(),
         }
@@ -876,40 +786,21 @@ impl WireSpans {
         self.span_seq.remove(sub);
         self.durable_high_water.remove(sub);
         self.durable_epoch.remove(sub);
-        self.confirm_set.remove(sub);
-        self.reanchor_pending.remove(sub);
     }
 
-    /// The subscription's current durable high-water — the retention position a
-    /// durable send is *below* when its own position is at or under it. Read
-    /// before [`next_durable`] advances it, so a below-water send can be detected
-    /// and stamped. `None` if no durable span was anchored (no durable
-    /// `Subscribe` yet).
+    /// The subscription's current durable high-water — the newest retention
+    /// position written to this socket for it. A durable send at or below it is a
+    /// second copy of a position the client already has (the replay racing the
+    /// live fan-out) and is dropped. `None` if no durable span was anchored (no
+    /// durable `Subscribe` yet).
     fn durable_high_water_of(&self, sub: &SubKey) -> Option<u64> {
         self.durable_high_water.get(sub).copied()
     }
 
-    /// Record `message_id` in the subscription's below-water confirm set, so
-    /// every durable cursor minted thereafter carries it as ack evidence, and
-    /// report what the resulting depth obliges the caller to do.
-    ///
-    /// The set only shrinks at a resume's reconcile, so on a connection that
-    /// never reconnects it — and every cursor carrying it — grows with the
-    /// below-water sends since the last reconcile. The caps bound that: past the
-    /// soft cap the caller asks for a re-anchor (one ask per outstanding
-    /// re-anchor, [`Self::reanchor_pending`]); at the hard cap the ask was
-    /// ignored and the client is non-conforming.
-    fn add_confirm(&mut self, sub: &SubKey, message_id: i64) -> ConfirmCapAction {
-        let set = self.confirm_set.entry(sub.clone()).or_default();
-        set.insert(message_id);
-        let len = set.len();
-        if len >= CONFIRM_SET_HARD_CAP {
-            return ConfirmCapAction::Violation;
-        }
-        if len > CONFIRM_SET_SOFT_CAP && self.reanchor_pending.insert(sub.clone()) {
-            return ConfirmCapAction::ReAnchor;
-        }
-        ConfirmCapAction::None
+    /// The numbering domain the subscription's positions are minted in. `None`
+    /// if no durable span was anchored.
+    fn durable_epoch_of(&self, sub: &SubKey) -> Option<Uuid> {
+        self.durable_epoch.get(sub).copied()
     }
 
     /// The next span seq for `sub`. Panics if no span was started — every
@@ -924,11 +815,10 @@ impl WireSpans {
     }
 
     /// The `(span seq, cursor)` for an ephemeral `Deliver` of the row at
-    /// `(epoch, ring_seq)`. A ring-backed subscription has no below-water ack
-    /// channel, so its cursor's confirm set is always empty.
+    /// `(epoch, ring_seq)`.
     fn next_ephemeral(&mut self, sub: &SubKey, epoch: Uuid, ring_seq: u64) -> (u64, Cursor) {
         let seq = self.next_seq(sub);
-        let cursor = cursor::mint(self.incarnation(), epoch, ring_seq, vec![]);
+        let cursor = cursor::mint(self.incarnation(), epoch, ring_seq);
         (seq, cursor)
     }
 
@@ -949,27 +839,8 @@ impl WireSpans {
         );
         *hw = (*hw).max(retained_seq);
         let hw_value = *hw;
-        let confirm: Vec<i64> = self
-            .confirm_set
-            .get(sub)
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_default();
-        (seq, cursor::mint(incarnation, epoch, hw_value, confirm))
+        (seq, cursor::mint(incarnation, epoch, hw_value))
     }
-}
-
-/// One durable row as the session's send path names it: its position in the
-/// channel's retention order (what the wire cursor is minted from and what
-/// at-most-once dedup keys on) and its message identity (what below-water ack
-/// evidence is written against).
-///
-/// `message_id` is `None` for the row-less fold-0 context feed, which owns no
-/// claim to stamp. The two ids travel together in one value so a send site
-/// cannot pass a position where an identity belongs.
-#[derive(Debug, Clone, Copy)]
-struct DurableRowRef {
-    retained_seq: u64,
-    message_id: Option<i64>,
 }
 
 /// Which class of `Deliver` [`send_deliver`] is minting position for.
@@ -1045,129 +916,25 @@ async fn send_multi_deliver(
     send_frame(&ctx.tx, frame, counters).await
 }
 
-/// Send a durable `Deliver`, stamping the below-water ack first when the row
-/// needs one.
-///
-/// A row is stamped when it is at or below the subscription's current high-water
-/// (`retained_seq <= hw`) or when `force_stamp` is set. `force_stamp` covers a
-/// row just unclaimed from the tentative set: its fresh redelivery carries no
-/// high-water ack (a fresh attach anchors at 0), so without the re-stamp a
-/// second lost frame would leave it unrecoverable. An above-water row is sent
-/// unstamped — the minted cursor's high-water advance is its acknowledgment.
-async fn send_durable_deliver(
-    ctx: &SessionCtx,
-    spans: &mut WireSpans,
-    sub: &SubKey,
-    envelope: MessageEnvelope,
-    row: DurableRowRef,
-    force_stamp: bool,
-    counters: &mut SessionCounters,
-) -> FrameOutcome {
-    let cap = stamp_below_water(ctx, spans, sub, row, force_stamp).await;
-    if cap == ConfirmCapAction::Violation {
-        return hard_cap_violation(ctx, sub);
-    }
-    let outcome = send_deliver(
-        ctx,
-        spans,
-        sub,
-        envelope,
-        0,
-        DeliverKind::Durable {
-            retained_seq: row.retained_seq,
-        },
-        counters,
-    )
-    .await;
-    // The ask rides behind the delivery it was triggered by: the delivery is
-    // owed regardless (the cap is a trigger, not a gate), and the kernel's
-    // re-anchor is correct whatever it just accepted.
-    if matches!(outcome, FrameOutcome::Continue) && cap == ConfirmCapAction::ReAnchor {
-        return send_re_anchor(ctx, sub, counters).await;
-    }
-    outcome
-}
-
-/// Stamp the below-water ack for one subscription's durable row when it needs
-/// one — the DB write ordered ahead of the row's socket write. See
-/// [`send_durable_deliver`] for the full rules. Returns what the stamped id's
-/// confirm-set depth obliges the caller to do ([`WireSpans::add_confirm`]); a
-/// send that stamps nothing obliges nothing.
-async fn stamp_below_water(
-    ctx: &SessionCtx,
-    spans: &mut WireSpans,
-    sub: &SubKey,
-    row: DurableRowRef,
-    force_stamp: bool,
-) -> ConfirmCapAction {
-    let below_water = force_stamp
-        || spans
-            .durable_high_water_of(sub)
-            .is_some_and(|hw| row.retained_seq <= hw);
-    if below_water {
-        // Evidence is written against the message row, so a delivery that carries
-        // no message identity cannot be stamped. Only the row-less fold-0 context
-        // feed is in that position: it owns no claim, so there is nothing to
-        // recover and nothing to stamp. It reads as below-water when two publishes
-        // commit in seq order and reach this session's queue out of it — the
-        // earlier feed then sits under a high-water the later one already
-        // advanced, which the cursor already covers. Send it unstamped.
-        // `force_stamp` names a row just unclaimed from the tentative set, which
-        // always carries its identity.
-        let Some(row_id) = row.message_id else {
-            assert!(
-                !force_stamp,
-                "surface {}: forced below-water stamp on {} for a row-less context feed at \
-                 retention position {} — a context feed owns no claim to unclaim",
-                ctx.runtime.resolved.slug, sub.channel, row.retained_seq
-            );
-            return ConfirmCapAction::None;
-        };
-        let messenger = ctx.runtime.messenger.as_ref().unwrap_or_else(|| {
-            panic!(
-                "surface {}: below-water durable deliver on {} but no Messenger — \
-                 boot invariant violated",
-                ctx.runtime.resolved.slug, sub.channel
-            )
-        });
-        let participant = sub.participant(&ctx.runtime.resolved.slug);
-        // The claim and this stamp are separate lock acquisitions, so the hourly
-        // GC can evict the claimed row in the gap. A stamp that matches 0 rows is
-        // that eviction — the row is genuinely unrecoverable (its message aged out
-        // of retention too), so the delivery goes out unstamped. A row still
-        // present but unstamped is a real invariant break and panics.
-        {
-            let conn = messenger.db().lock().await;
-            let stamped = db::stamp_confirm_pending(&conn, &participant, row_id);
-            if stamped == 1 {
-                return spans.add_confirm(sub, row_id);
-            } else if db::pending_push_exists(&conn, &participant, row_id) {
-                panic!(
-                    "surface {}: below-water durable deliver on {} stamped {stamped} claimed rows \
-                     for message {row_id} (participant {participant:?}); the push row is present \
-                     but was not claimed — the ack channel's recovery evidence was not written",
-                    ctx.runtime.resolved.slug, sub.channel
-                );
-            } else {
-                warn!(
-                    channel = %sub.channel,
-                    instance = ?sub.instance,
-                    message_id = row_id,
-                    "surface durable below-water deliver: push row GC-evicted before the \
-                     tentative stamp; delivering unstamped (row already past retention)"
-                );
-            }
-        }
-    }
-    ConfirmCapAction::None
-}
-
 /// Send one turn's worth of live durable router deliveries, coalescing the rows
 /// of one message across this connection's sibling subscriptions into one frame.
 ///
-/// Groups by (channel, row id) in first-appearance order, which preserves each
-/// subscription's own delivery order: a subscription appears in at most one group
-/// per row, and the router never queues a row twice for it.
+/// Groups by (channel, retention position) in first-appearance order, which
+/// preserves each subscription's own delivery order: a subscription appears in at
+/// most one group per position.
+///
+/// The subscription's high-water decides each copy, at send time, because a
+/// send inside this batch moves it:
+///
+/// - at or below it — a second copy of a position this connection already wrote
+///   (the fan-out racing the subscribe replay or a drain). Dropped: the client's
+///   cursor already covers it.
+/// - exactly one above it — the contiguous next position. Sent.
+/// - further above it — something below this position never reached the wire
+///   (a quiet row nobody woke for, a frame this session's queue was too full to
+///   take). Sending it alone would strand the interior span under a high-water
+///   that had moved past it, so the live copy is dropped and the subscription is
+///   served its whole suffix from retention instead.
 async fn send_durable_live(
     ctx: &SessionCtx,
     durable: &DurableSessionState,
@@ -1178,7 +945,7 @@ async fn send_durable_live(
     /// One row's deliveries: the envelope, and every subscription it is bound for.
     struct RowGroup {
         channel: String,
-        row: DurableRowRef,
+        retained_seq: u64,
         envelope: Arc<MessageEnvelope>,
         subs: Vec<SubKey>,
     }
@@ -1186,7 +953,6 @@ async fn send_durable_live(
     for DurableDelivery {
         envelope,
         retained_seq,
-        message_id,
         sub,
     } in batch
     {
@@ -1199,26 +965,14 @@ async fn send_durable_live(
             );
             continue;
         }
-        if durable.already_replayed(&sub, retained_seq) {
-            debug!(
-                channel = %sub.channel,
-                instance = ?sub.instance,
-                retained_seq,
-                "durable live delivery already sent by replay; dropping"
-            );
-            continue;
-        }
         match groups
             .iter_mut()
-            .find(|g| g.row.retained_seq == retained_seq && g.channel == sub.channel)
+            .find(|g| g.retained_seq == retained_seq && g.channel == sub.channel)
         {
             Some(group) => group.subs.push(sub),
             None => groups.push(RowGroup {
                 channel: sub.channel.clone(),
-                row: DurableRowRef {
-                    retained_seq,
-                    message_id,
-                },
+                retained_seq,
                 envelope,
                 subs: vec![sub],
             }),
@@ -1226,78 +980,60 @@ async fn send_durable_live(
     }
     for RowGroup {
         channel,
-        row,
+        retained_seq,
         envelope,
         subs,
     } in groups
     {
         let mut targets = Vec::with_capacity(subs.len());
-        let mut re_anchor = Vec::new();
+        let mut behind = Vec::new();
         for sub in &subs {
-            match stamp_below_water(ctx, spans, sub, row, false).await {
-                ConfirmCapAction::Violation => return hard_cap_violation(ctx, sub),
-                ConfirmCapAction::ReAnchor => re_anchor.push((*sub).clone()),
-                ConfirmCapAction::None => {}
+            let hw = spans.durable_high_water_of(sub).expect(
+                "surface session: live durable delivery for a subscription with no anchored \
+                 high-water — activation anchors one",
+            );
+            if retained_seq <= hw {
+                debug!(
+                    channel = %sub.channel,
+                    instance = ?sub.instance,
+                    retained_seq,
+                    high_water = hw,
+                    "durable live delivery at or below the subscription high-water; dropping \
+                     the duplicate"
+                );
+            } else if retained_seq == hw + 1 {
+                targets.push(mint_target(
+                    spans,
+                    sub,
+                    0,
+                    DeliverKind::Durable { retained_seq },
+                ));
+            } else {
+                debug!(
+                    channel = %sub.channel,
+                    instance = ?sub.instance,
+                    retained_seq,
+                    high_water = hw,
+                    "durable live delivery above the contiguous next position; serving the \
+                     subscription its suffix from retention instead"
+                );
+                behind.push(sub.clone());
             }
-            targets.push(mint_target(
-                spans,
-                sub,
-                0,
-                DeliverKind::Durable {
-                    retained_seq: row.retained_seq,
-                },
-            ));
         }
-        if let FrameOutcome::Disconnect =
-            send_multi_deliver(ctx, channel, (*envelope).clone(), targets, counters).await
+        if !targets.is_empty()
+            && let FrameOutcome::Disconnect =
+                send_multi_deliver(ctx, channel, (*envelope).clone(), targets, counters).await
         {
             return FrameOutcome::Disconnect;
         }
-        // The asks ride behind the delivery that triggered them: the delivery is
-        // owed regardless (the cap is a trigger, not a gate), and the kernel's
-        // re-anchor is correct whatever it just accepted.
-        for sub in re_anchor {
-            if let FrameOutcome::Disconnect = send_re_anchor(ctx, &sub, counters).await {
+        for sub in &behind {
+            if let FrameOutcome::Disconnect = drain_durable_channel(ctx, spans, sub, counters).await
+            {
                 return FrameOutcome::Disconnect;
             }
         }
     }
     FrameOutcome::Continue
-}
-
-/// Ask the kernel to re-anchor one subscription, so the resume reconcile that
-/// empties its confirm set runs without waiting for a reconnect.
-async fn send_re_anchor(
-    ctx: &SessionCtx,
-    sub: &SubKey,
-    counters: &mut SessionCounters,
-) -> FrameOutcome {
-    debug!(
-        channel = %sub.channel,
-        instance = ?sub.instance,
-        "surface durable confirm set past the soft cap; asking the client to re-anchor"
-    );
-    send_frame(
-        &ctx.tx,
-        ServerFrame::ReAnchor {
-            channel: sub.channel.clone(),
-            instance: sub.instance.clone(),
-        },
-        counters,
-    )
-    .await
-}
-
-/// The confirm set reached the hard cap: the client was asked to re-anchor and
-/// did not. A conforming kernel resubscribes promptly, so this is a
-/// non-conforming client under the ordinary violation posture.
-fn hard_cap_violation(ctx: &SessionCtx, sub: &SubKey) -> FrameOutcome {
-    FrameOutcome::Violation(format!(
-        "surface {}: confirm set for {} (instance {:?}) reached the hard cap of \
-         {CONFIRM_SET_HARD_CAP} — the client ignored the ReAnchor sent past \
-         {CONFIRM_SET_SOFT_CAP}",
-        ctx.runtime.resolved.slug, sub.channel, sub.instance
-    ))
 }
 
 /// The per-connection rate buckets, grouped so frame handlers take one bundle
@@ -1604,11 +1340,11 @@ fn charge_subscribe_token(
 /// `Deliver` frames for the removed channel may still sit in the outbound queue
 /// (ephemeral) or the durable live queue and arrive after this; the client
 /// contract (proto crate docs) is to discard them. A durable removal clears the
-/// channel from both active sets (so the router stops fanning out to it) but
-/// **retains** its `replay_sent` set: a row still queued from this span that a
-/// re-subscribe would otherwise re-deliver is dropped by the select loop's
-/// `replay_sent` skip, which now spans subscription cycles. Any already-claimed
-/// rows still queued stand (the client revoked interest — not a loss bug).
+/// channel from both active sets, which stops the router fanning out to it, and
+/// clears the subscription's span — so a live copy still queued from this span
+/// is dropped rather than delivered. A re-subscribe re-anchors from the client's
+/// echoed cursor and is served from retention, so nothing carries across the
+/// cycle server-side.
 fn handle_unsubscribe(
     ctx: &SessionCtx,
     subscriptions: &mut StreamMap<SubKey, SubscriptionStream>,
@@ -1731,23 +1467,10 @@ async fn handle_subscribe(
     let resume = match resume {
         None => None,
         Some(cursor) => match parse_resume_cursor(&cursor, slug, username, &sub.channel) {
-            Ok(state) => {
-                // A ring-backed subscription has no below-water ack channel, so
-                // the server never mints a confirm set into its cursors and a
-                // conforming client cannot echo one.
-                if !state.confirm.is_empty() {
-                    return FrameOutcome::Violation(format!(
-                        "surface {slug} user {username}: resume cursor on ring-backed channel {} \
-                         carries {} below-water confirmations",
-                        sub.channel,
-                        state.confirm.len()
-                    ));
-                }
-                Some(EphemeralResume {
-                    epoch: state.epoch,
-                    seq: state.seq,
-                })
-            }
+            Ok(state) => Some(EphemeralResume {
+                epoch: state.epoch,
+                seq: state.seq,
+            }),
             Err(outcome) => return outcome,
         },
     };
@@ -1843,21 +1566,13 @@ async fn handle_subscribe(
     FrameOutcome::Continue
 }
 
-/// One entry in a durable subscribe's merged replay set: the row as the send path
-/// names it, plus the claim to release if the session disconnects mid-replay
-/// (`None` for a retained re-send, which owns no claim).
-struct DurableReplayRow {
-    row: DurableRowRef,
-    push_id: Option<i64>,
-    envelope: MessageEnvelope,
-}
-
 /// Handle a `Subscribe` to a durable (`brenn:`) channel.
 ///
-/// Activates the subscription, reconciles the below-water ack set, claims the
-/// parked backlog, and replays the merged set in retention order. Every replayed
-/// position is recorded in `replay_sent` so a live row racing the
-/// activation-to-claim window is dropped, preserving at-most-once on the wire.
+/// Activates the subscription, anchors its high-water at the echoed cursor (0 on
+/// a fresh attach), and replays what retention holds above it. The echoed cursor
+/// is the subscription's whole delivery state, so a live row racing the
+/// activation is either above the anchor — and delivered once, by whichever path
+/// reaches the socket first — or at or below it, and dropped as a duplicate.
 async fn handle_durable_subscribe(
     ctx: &SessionCtx,
     durable: &mut DurableSessionState,
@@ -1868,10 +1583,6 @@ async fn handle_durable_subscribe(
 ) -> FrameOutcome {
     let slug = &ctx.runtime.resolved.slug;
     let username = &ctx.username;
-    // The principal whose push window this subscription drains. Every parked-row
-    // claim below is made under it, so a sibling instance's rows on the same
-    // channel are simply not this subscription's to claim.
-    let participant = sub.participant(slug);
 
     let echoed = match resume {
         None => None,
@@ -1884,7 +1595,6 @@ async fn handle_durable_subscribe(
     // The resolved subscription carries the channel uuid and the retain clamp.
     // Boot classified this (instance, channel) Durable, so it must be present.
     let resolved = ctx.runtime.durable_subscription(&sub);
-    let channel_uuid = resolved.channel_uuid;
     let clamp = resolved.retain_depth;
     let messenger = ctx.runtime.messenger.as_ref().unwrap_or_else(|| {
         panic!(
@@ -1894,9 +1604,9 @@ async fn handle_durable_subscribe(
         )
     });
 
-    // Activate before the store read: from here the router claims and queues live
-    // rows; anything it claims is excluded from the parked load by `delivered_at`,
-    // and the retained re-send + `replay_sent` close the handoff race.
+    // Activate before the store read: from here the router queues live rows. A row
+    // the replay below also serves arrives at the live arm at or below the
+    // high-water this subscribe anchors, so the handoff race closes on the cursor.
     durable.activate(&sub);
 
     // Read the store's boot incarnation (see `WireSpans::incarnation` for the
@@ -1930,27 +1640,18 @@ async fn handle_durable_subscribe(
         _ => None,
     };
 
-    // Taken before the claim lock: `replay_from` takes the store's own lock,
-    // and a row claimed after this read is filtered out of the window below,
-    // so the two orders agree.
+    // The subscription's whole delivery state: the client's own cursor, answered
+    // from retention. The subscribe rate is bucketed in `handle_client_frame` and
+    // boot proved a durable surface binding's `retain_depth` is bounded, so the
+    // replay per Subscribe is config-bounded and cannot be amplified into a DoS.
     let replay = messenger
         .store_for_address(&sub.channel)
         .replay_from(store_cursor, clamp)
         .await;
 
-    // An answer that re-anchors on the numbering itself — a foreign epoch, or a
-    // position this store never assigned — says the cursor was minted against
-    // state this store no longer has. Its below-water confirm ids name rows in
-    // that lost numbering, so matching them against this store's tentative rows
-    // could confirm a message the client never received.
-    let renumbered = matches!(
-        replay.decision,
-        Replay::Gap(BusGapReason::EpochChanged) | Replay::Gap(BusGapReason::ResumeAhead)
-    );
-
-    // A resumable cursor keeps its position (rows at or below it are below-water
-    // and carry ack evidence); every other answer anchors at 0 (below every
-    // assigned position — a fresh attach).
+    // A resumable cursor keeps its position — everything at or below it the client
+    // already holds; every other answer anchors at 0 (below every assigned
+    // position — a fresh attach).
     let (mut gap, anchor) = match replay.decision {
         Replay::Fresh => (None, 0),
         Replay::UpToDate | Replay::Exact => (
@@ -2000,122 +1701,17 @@ async fn handle_durable_subscribe(
         });
     }
 
-    let window = replay.messages;
-
-    let echoed_confirm: HashSet<i64> = match (&echoed, stale || renumbered) {
-        // A fresh attach, a stale-store cursor, or one answered against numbering
-        // this store no longer has carries no valid evidence, so its set is
-        // discarded and every tentative row is unclaimed for redelivery.
-        (Some(state), false) => state.confirm.iter().copied().collect(),
-        _ => HashSet::new(),
-    };
-
-    // The subscribe rate is bucketed in `handle_client_frame`, and boot proved the
-    // resolved `push_depth`/`retain_depth` of a durable surface binding are both
-    // bounded, so the parked backlog and the retained re-send are each
-    // config-bounded — the load per Subscribe cannot be amplified into a DoS.
-    //
-    // Reconcile the ack set and claim the parked backlog under one DB lock.
-    let (parked, unacked_message_ids): (Vec<DurableReplayRow>, HashSet<i64>) = {
-        let conn = messenger.db().lock().await;
-
-        // Below-water ack reconcile, before the parked claim. Each
-        // tentative (`confirm_pending = 1`) row for this participant is either
-        // confirmed (in the echoed set → the client received it → clear the flag,
-        // leave it delivered) or unclaimed (absent → never received → clear both
-        // flag and `delivered_at` so the parked claim just below redelivers it
-        // exactly once, excluded from the store window by the claimed set).
-        //
-        // The message ids of tentative rows this reconcile unclaimed for
-        // redelivery — a previously below-water row whose receipt the echoed cursor
-        // does not testify to. Their parked redelivery below is itself force-stamped
-        // (they carry no fresh high-water ack — a fresh attach anchors at 0), so a
-        // second lost frame is still recoverable.
-        let mut unacked_message_ids: HashSet<i64> = HashSet::new();
-        let tentative = db::load_confirm_pending_pushes(&conn, &participant, channel_uuid);
-        if !tentative.is_empty() {
-            // A row already sent on *this* connection is delivered: a same-connection
-            // re-subscribe means the socket is still up, and WS/TCP delivered every
-            // earlier frame in order. Treat it as confirmed even if the echoed cursor
-            // predates the send — otherwise the unclaim below clears its evidence and
-            // the replay-dedup drops the re-send, destroying recovery state with no
-            // new delivery.
-            let (confirmed, unacked): (Vec<_>, Vec<_>) = tentative.into_iter().partition(|row| {
-                echoed_confirm.contains(&row.message_id)
-                    || row.retained_seq.is_some_and(|seq| {
-                        durable.already_replayed(&sub, retention_position(Some(seq), row.push_id))
-                    })
-            });
-            let confirmed_ids: Vec<i64> = confirmed.into_iter().map(|row| row.push_id).collect();
-            let unacked_ids: Vec<i64> = unacked
-                .into_iter()
-                .map(|row| {
-                    unacked_message_ids.insert(row.message_id);
-                    row.push_id
-                })
-                .collect();
-            db::confirm_pending_pushes(&conn, &confirmed_ids);
-            db::unclaim_confirm_pending_pushes(&conn, &unacked_ids);
-        }
-
-        let parked: Vec<DurableReplayRow> =
-            load_and_claim_parked(&conn, &participant, channel_uuid)
-                .into_iter()
-                .map(|claim| DurableReplayRow {
-                    row: DurableRowRef {
-                        retained_seq: retention_position(Some(claim.retained_seq), claim.push_id),
-                        message_id: Some(claim.message_id),
-                    },
-                    push_id: Some(claim.push_id),
-                    envelope: claim.envelope,
-                })
-                .collect();
-        (parked, unacked_message_ids)
-    };
-
-    // A claimed row goes out with its claim, so the store window's copy of it is
-    // dropped rather than sent twice.
-    let claimed_seqs: HashSet<u64> = parked.iter().map(|entry| entry.row.retained_seq).collect();
-    let mut merged: Vec<DurableReplayRow> = parked;
-    merged.extend(
-        window
-            .into_iter()
-            .filter(|retained| !claimed_seqs.contains(&retained.seq))
-            .map(|retained| DurableReplayRow {
-                row: DurableRowRef {
-                    retained_seq: retained.seq,
-                    // A retained re-send owns no claim to stamp — and sits above
-                    // the anchor by construction, so it is never below-water.
-                    message_id: None,
-                },
-                push_id: None,
-                envelope: (*retained.message).clone(),
-            }),
-    );
-    let effective_anchor = anchor;
-    merged.sort_by_key(|entry| entry.row.retained_seq);
-
     // Anchor the durable high-water and reset the span before the
     // SubscribeResult, so the replay rows mint seqs 1..N and the high-water
     // starts at the (non-stale) resume cursor, or 0 on a fresh or stale-store
     // attach.
-    spans.start_durable_span(&sub, replay.epoch, effective_anchor);
+    spans.start_durable_span(&sub, replay.epoch, anchor);
 
-    // At-most-once dedup: a row whose position was already sent on this connection
-    // (the retained `replay_sent` set) is already delivered — drop the copy and
-    // leave any claimed push row claimed (retired), never re-send. This is the
-    // same skip the live `durable_rx` arm applies, extended to the replay path
-    // so a row unclaimed and re-claimed across a session/subscription cycle
-    // cannot re-appear on the wire. Dropped parked rows stay claimed (they are
-    // excluded from the unclaim-on-disconnect remainder below), so no later
-    // drain resurrects them.
-    merged.retain(|entry| !durable.already_replayed(&sub, entry.row.retained_seq));
-
-    // Floor parity: this gates every session-side durable send — belt-and-
-    // suspenders for parked rows, the only floor for the retained re-send.
-    // Policies are boot-static, so a deny is fail-closed hygiene, not a feature.
+    // Floor parity: this gates every session-side durable send. Policies are
+    // boot-static, so a deny is fail-closed hygiene, not a feature.
     let floor_ok = ctx.runtime.policy.allows_channel_access(&sub.channel);
-    let replay_count = if floor_ok { merged.len() as u32 } else { 0 };
+    let window = replay.messages;
+    let replay_count = if floor_ok { window.len() as u32 } else { 0 };
 
     let result = ServerFrame::SubscribeResult {
         channel: sub.channel.clone(),
@@ -2125,58 +1721,32 @@ async fn handle_durable_subscribe(
         gap,
     };
     if let FrameOutcome::Disconnect = send_frame(&ctx.tx, result, counters).await {
-        unclaim_parked(messenger, merged.iter().map(|entry| entry.push_id)).await;
         return FrameOutcome::Disconnect;
     }
 
     if !floor_ok {
-        // Rows stay claimed (retired), matching the dispatcher floor's retire
-        // semantics; the wire sees an empty replay.
         warn!(
             channel = %sub.channel,
             instance = ?sub.instance,
-            "surface durable subscribe: delivery floor denied; retiring claimed rows"
+            "surface durable subscribe: delivery floor denied; sending no replay"
         );
         return FrameOutcome::Continue;
     }
 
-    for (i, entry) in merged.iter().enumerate() {
-        // A row this reconcile unclaimed from the tentative set is force-stamped on
-        // redelivery: it was below-water on an earlier connection and carries no
-        // fresh high-water ack here (a fresh attach anchors at 0), so without the
-        // re-stamp a second lost frame would leave it delivered-but-unrecoverable.
-        // Ordinary rows (first-time parked rows, retained re-sends) keep the
-        // high-water ack — their delivery advances the cursor to cover them.
-        let force_stamp = entry
-            .row
-            .message_id
-            .is_some_and(|id| unacked_message_ids.contains(&id));
-        if let FrameOutcome::Disconnect = send_durable_deliver(
+    for retained in window {
+        if let FrameOutcome::Disconnect = send_deliver(
             ctx,
             spans,
             &sub,
-            entry.envelope.clone(),
-            entry.row,
-            force_stamp,
+            (*retained.message).clone(),
+            0,
+            DeliverKind::Durable {
+                retained_seq: retained.seq,
+            },
             counters,
         )
         .await
         {
-            unclaim_parked(messenger, merged[i..].iter().map(|entry| entry.push_id)).await;
-            return FrameOutcome::Disconnect;
-        }
-        if !durable.record_replayed(&sub, entry.row.retained_seq) {
-            // The per-channel replay-dedup set hit REPLAY_SENT_MAX: tear the
-            // connection down (normal close, not a violation — reachable by an
-            // honest very-long-lived connection). Row `i` was already sent; unclaim
-            // the still-unsent remainder so a later drain re-sends it.
-            warn!(
-                channel = %sub.channel,
-                instance = ?sub.instance,
-                cap = REPLAY_SENT_MAX,
-                "surface durable replay-dedup set full; tearing down connection"
-            );
-            unclaim_parked(messenger, merged[i + 1..].iter().map(|entry| entry.push_id)).await;
             return FrameOutcome::Disconnect;
         }
     }
@@ -2184,36 +1754,7 @@ async fn handle_durable_subscribe(
     FrameOutcome::Continue
 }
 
-/// Un-claim the parked push rows among `push_ids` (the `Some` values) so they
-/// re-park for a later drain. Used only by a claimer that disconnected before
-/// handing off the rows it claimed.
-async fn unclaim_parked(messenger: &Messenger, push_ids: impl Iterator<Item = Option<i64>>) {
-    let remainder: Vec<i64> = push_ids.flatten().collect();
-    if !remainder.is_empty() {
-        let conn = messenger.db().lock().await;
-        db::unclaim_pending_pushes(&conn, &remainder);
-    }
-}
-
-/// Load the parked backlog for `(subscriber, channel)` and atomically claim it,
-/// returning only the `(push_id, message_id, envelope)` rows this caller won.
-/// Both durable send paths — the subscribe replay and the drain pass — share it
-/// so the claim semantics the at-most-once guarantee depends on stay identical.
-/// The caller holds the DB lock (`conn`) so load and claim are one atomic scope.
-fn load_and_claim_parked(
-    conn: &rusqlite::Connection,
-    subscriber: &brenn_lib::messaging::ParticipantId,
-    channel_uuid: Uuid,
-) -> Vec<db::ChannelPushRow> {
-    let rows = db::load_pending_pushes_for_channel(conn, subscriber, channel_uuid);
-    let ids: Vec<i64> = rows.iter().map(|row| row.push_id).collect();
-    let won: HashSet<i64> = db::claim_pending_pushes(conn, &ids).into_iter().collect();
-    rows.into_iter()
-        .filter(|row| won.contains(&row.push_id))
-        .collect()
-}
-
-/// Drain every active durable channel's parked backlog — the eager-wake nudge
+/// Drain every active durable channel's unseen suffix — the eager-wake nudge
 /// path. Stops and reports `Disconnect` if any send finds the writer gone.
 async fn drain_all_durable(
     ctx: &SessionCtx,
@@ -2221,27 +1762,25 @@ async fn drain_all_durable(
     spans: &mut WireSpans,
     counters: &mut SessionCounters,
 ) -> FrameOutcome {
-    for sub in &durable.active {
-        let uuid = ctx.runtime.durable_subscription(sub).channel_uuid;
-        if let FrameOutcome::Disconnect =
-            drain_durable_channel(ctx, durable, spans, sub, uuid, counters).await
-        {
+    let subs: Vec<SubKey> = durable.active.iter().cloned().collect();
+    for sub in &subs {
+        if let FrameOutcome::Disconnect = drain_durable_channel(ctx, spans, sub, counters).await {
             return FrameOutcome::Disconnect;
         }
     }
     FrameOutcome::Continue
 }
 
-/// Claim and send one durable channel's parked backlog in seq order. Rows are
-/// claimed under the same lock they are loaded, so the router fan-out and this
-/// drain never double-send. The delivery floor gates the send; a deny retires
-/// (leaves claimed) without delivering.
+/// Send one durable subscription's unseen suffix in seq order: everything the
+/// channel retains above the high-water this connection has written. That
+/// high-water is the subscription's whole delivery state, so a drain racing the
+/// live fan-out re-reads what the fan-out already advanced past and finds
+/// nothing. A span retention no longer holds is reported as `dropped` on the
+/// first delivery that follows it. The delivery floor gates the send.
 async fn drain_durable_channel(
     ctx: &SessionCtx,
-    durable: &DurableSessionState,
     spans: &mut WireSpans,
     sub: &SubKey,
-    channel_uuid: Uuid,
     counters: &mut SessionCounters,
 ) -> FrameOutcome {
     let channel = sub.channel.as_str();
@@ -2251,49 +1790,79 @@ async fn drain_durable_channel(
             ctx.runtime.resolved.slug
         )
     });
-    // Claims are made under this subscription's own principal, so the drain sees
-    // exactly this instance's parked window — never a sibling's.
-    let mut claimed: Vec<db::ChannelPushRow> = {
-        let conn = messenger.db().lock().await;
-        load_and_claim_parked(
-            &conn,
-            &sub.participant(&ctx.runtime.resolved.slug),
-            channel_uuid,
-        )
+    // An active durable subscription always has an anchored span and epoch — the
+    // Subscribe that activated it anchored both before returning.
+    let cursor = ResumeCursor {
+        epoch: spans.durable_epoch_of(sub).expect(
+            "surface session: durable drain on a subscription with no anchored epoch — \
+             activation anchors one",
+        ),
+        seq: spans.durable_high_water_of(sub).expect(
+            "surface session: durable drain on a subscription with no anchored high-water — \
+             activation anchors one",
+        ),
     };
-    // At-most-once dedup: skip any row whose retention position the replay path
-    // already put on this connection's wire (leave it claimed = retired). Without
-    // this a row unclaimed after a replay already sent it would drain as a
-    // duplicate.
-    claimed.retain(|row| {
-        !durable.already_replayed(sub, retention_position(Some(row.retained_seq), row.push_id))
-    });
-    if claimed.is_empty() {
+    let clamp = ctx.runtime.durable_subscription(sub).retain_depth;
+    let replay = messenger
+        .store_for_address(channel)
+        .replay_from(Some(cursor), clamp)
+        .await;
+    // A `Gap` answer means retention no longer covers the whole span above the
+    // high-water — evicted, or longer than the subscription's clamp — and its
+    // window is the channel's newest rows rather than a suffix of the cursor.
+    // Sending it whole would re-send positions already written and, worse, move
+    // the high-water past the interior span with no signal, which no later
+    // Subscribe could then report. So the window is cut to the suffix and the
+    // seqs between the high-water and its oldest entry ride the first delivery's
+    // `dropped`, which is the wire's own field for exactly this loss.
+    let (window, lost) = match replay.decision {
+        Replay::Gap(reason) => {
+            let suffix: Vec<_> = replay
+                .messages
+                .into_iter()
+                .filter(|retained| retained.seq > cursor.seq)
+                .collect();
+            let lost = suffix
+                .first()
+                .map_or(0, |retained| retained.seq - cursor.seq - 1);
+            warn!(
+                %channel,
+                instance = ?sub.instance,
+                ?reason,
+                high_water = cursor.seq,
+                dropped = lost,
+                serving = suffix.len(),
+                "surface durable drain: retention no longer covers the span above the \
+                 high-water; the subscription loses the interior span"
+            );
+            (suffix, lost)
+        }
+        _ => (replay.messages, 0),
+    };
+    if window.is_empty() {
         return FrameOutcome::Continue;
     }
     if !ctx.runtime.policy.allows_channel_access(channel) {
-        warn!(%channel, "surface durable drain: delivery floor denied; retiring claimed rows");
+        warn!(%channel, "surface durable drain: delivery floor denied; sending nothing");
         return FrameOutcome::Continue;
     }
-    for (i, row) in claimed.iter().enumerate() {
-        // A live drain runs with the subscription's real high-water, so its
-        // below-water detection (`retained_seq <= hw` inside
-        // `send_durable_deliver`) is accurate — no force-stamp needed.
-        if let FrameOutcome::Disconnect = send_durable_deliver(
+    // The loss belongs to the subscription, not to a message: it rides the first
+    // delivery that follows it and is not repeated on the rest.
+    let mut dropped = lost;
+    for retained in window {
+        if let FrameOutcome::Disconnect = send_deliver(
             ctx,
             spans,
             sub,
-            row.envelope.clone(),
-            DurableRowRef {
-                retained_seq: retention_position(Some(row.retained_seq), row.push_id),
-                message_id: Some(row.message_id),
+            (*retained.message).clone(),
+            std::mem::take(&mut dropped),
+            DeliverKind::Durable {
+                retained_seq: retained.seq,
             },
-            false,
             counters,
         )
         .await
         {
-            unclaim_parked(messenger, claimed[i..].iter().map(|r| Some(r.push_id))).await;
             return FrameOutcome::Disconnect;
         }
     }
@@ -3624,6 +3193,17 @@ mod tests {
         db: &brenn_lib::db::Db,
         retain_depth: Depth,
     ) -> (SessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
+        durable_ctx_for(db, retain_depth, &[DURABLE_INSTANCE]).await
+    }
+
+    /// [`durable_ctx`] whose surface declares one durable subscription per named
+    /// instance — sibling principals on the one channel and the one session, each
+    /// with its own subscription state.
+    async fn durable_ctx_for(
+        db: &brenn_lib::db::Db,
+        retain_depth: Depth,
+        instances: &[&str],
+    ) -> (SessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
         use brenn_lib::access::acl::ChannelMatcher;
         use brenn_lib::messaging::config::{
             ChannelConfigRaw, MessagingGlobalConfig, NoiseLevel, ResolvedSubscription,
@@ -3666,10 +3246,12 @@ mod tests {
         policy.grants.insert(AppCapability::MessagingSubscribe);
         policy.acls.brenn_subscribe = vec![ChannelMatcher::Exact("durable-demo".to_string())];
 
-        let resolved = crate::test_support::surface::SurfaceFixture::new("deskbar", "protobar")
+        let mut fixture = crate::test_support::surface::SurfaceFixture::new("deskbar", "protobar")
             .subscribe(DURABLE_ADDR, "protobar", "messages")
-            .durable_subscribe(
-                DURABLE_INSTANCE,
+            .policy(policy);
+        for instance in instances {
+            fixture = fixture.durable_subscribe(
+                instance,
                 ResolvedSubscription {
                     channel_uuid,
                     channel_address: DURABLE_ADDR.to_string(),
@@ -3678,9 +3260,9 @@ mod tests {
                     noise: NoiseLevel::Silent,
                     wake_min: WakeMin::Normal,
                 },
-            )
-            .policy(policy)
-            .build();
+            );
+        }
+        let resolved = fixture.build();
         let runtime = SurfaceRuntime::build(
             resolved,
             Some(messenger),
@@ -4276,128 +3858,6 @@ mod tests {
         sole_target(frame).seq
     }
 
-    /// Under the soft cap the confirm set asks for nothing: the set is doing its
-    /// job and the cursors carrying it are small.
-    #[test]
-    fn confirm_set_under_the_soft_cap_asks_for_nothing() {
-        let mut spans = WireSpans::new();
-        let sub = durable_sub();
-        for id in 0..CONFIRM_SET_SOFT_CAP {
-            assert_eq!(
-                spans.add_confirm(&sub, id as i64),
-                ConfirmCapAction::None,
-                "entry {id} is within the soft cap",
-            );
-        }
-    }
-
-    /// Past the soft cap the server asks once and only once: the ask is
-    /// outstanding until the resubscribe, and deliveries continue meanwhile —
-    /// the cap is a trigger, not a gate, so the set keeps absorbing entries.
-    #[test]
-    fn confirm_set_past_the_soft_cap_asks_exactly_once_while_pending() {
-        let mut spans = WireSpans::new();
-        let sub = durable_sub();
-        for id in 0..CONFIRM_SET_SOFT_CAP {
-            spans.add_confirm(&sub, id as i64);
-        }
-        assert_eq!(
-            spans.add_confirm(&sub, CONFIRM_SET_SOFT_CAP as i64),
-            ConfirmCapAction::ReAnchor,
-            "the entry past the soft cap triggers the ask",
-        );
-        for id in CONFIRM_SET_SOFT_CAP + 1..CONFIRM_SET_HARD_CAP - 1 {
-            assert_eq!(
-                spans.add_confirm(&sub, id as i64),
-                ConfirmCapAction::None,
-                "entry {id} must not repeat the ask while one is outstanding",
-            );
-        }
-        assert_eq!(
-            spans.confirm_set[&sub].len(),
-            CONFIRM_SET_HARD_CAP - 1,
-            "entries keep being absorbed while the ask is outstanding",
-        );
-    }
-
-    /// A re-anchor's resubscribe clears the set and the pending flag together, so
-    /// a subscription that re-anchors is asked again the next time it needs to be
-    /// — the trigger re-arms rather than firing once per connection.
-    #[test]
-    fn re_anchor_resubscribe_empties_the_set_and_re_arms_the_ask() {
-        let mut spans = WireSpans::new();
-        let sub = durable_sub();
-        for id in 0..=CONFIRM_SET_SOFT_CAP {
-            spans.add_confirm(&sub, id as i64);
-        }
-        assert!(spans.reanchor_pending.contains(&sub));
-
-        // The kernel re-anchored: the resubscribe's clear is the reconcile.
-        spans.clear(&sub);
-        assert!(!spans.confirm_set.contains_key(&sub), "set emptied");
-        assert!(
-            !spans.reanchor_pending.contains(&sub),
-            "ask no longer pending"
-        );
-
-        for id in 0..CONFIRM_SET_SOFT_CAP {
-            assert_eq!(spans.add_confirm(&sub, id as i64), ConfirmCapAction::None);
-        }
-        assert_eq!(
-            spans.add_confirm(&sub, CONFIRM_SET_SOFT_CAP as i64),
-            ConfirmCapAction::ReAnchor,
-            "the trigger re-arms after a reconcile",
-        );
-    }
-
-    /// A client that ignores the ask until the hard cap is non-conforming. The set
-    /// is never truncated to make room — truncating would silently convert
-    /// delivered rows into presumed-lost ones at the next reconcile.
-    #[test]
-    fn confirm_set_at_the_hard_cap_is_a_violation_and_never_truncates() {
-        let mut spans = WireSpans::new();
-        let sub = durable_sub();
-        for id in 0..CONFIRM_SET_HARD_CAP - 1 {
-            assert_ne!(
-                spans.add_confirm(&sub, id as i64),
-                ConfirmCapAction::Violation,
-                "entry {id} is below the hard cap",
-            );
-        }
-        assert_eq!(
-            spans.add_confirm(&sub, (CONFIRM_SET_HARD_CAP - 1) as i64),
-            ConfirmCapAction::Violation,
-            "the entry reaching the hard cap is a violation",
-        );
-        assert_eq!(
-            spans.confirm_set[&sub].len(),
-            CONFIRM_SET_HARD_CAP,
-            "every recorded id survives; the set is never truncated",
-        );
-    }
-
-    /// The caps are per subscription: one subscription's depth never triggers
-    /// another's ask, exactly as the set itself is per-subscription state.
-    #[test]
-    fn confirm_caps_are_per_subscription() {
-        let mut spans = WireSpans::new();
-        let a = durable_sub();
-        let b = SubKey {
-            instance: "other".to_string(),
-            channel: DURABLE_ADDR.to_string(),
-        };
-        for id in 0..=CONFIRM_SET_SOFT_CAP {
-            spans.add_confirm(&a, id as i64);
-        }
-        assert!(spans.reanchor_pending.contains(&a));
-        assert_eq!(
-            spans.add_confirm(&b, 0),
-            ConfirmCapAction::None,
-            "a sibling's full set says nothing about this one",
-        );
-        assert!(!spans.reanchor_pending.contains(&b));
-    }
-
     /// A durable row released below the current high-water advances the wire span
     /// seq but neither regresses the minted cursor nor moves the high-water — so
     /// the next reconnect resumes from the true high-water, not a below-water
@@ -4424,41 +3884,146 @@ mod tests {
         );
     }
 
-    /// The below-water confirm set rides every durable cursor once a
-    /// message id is recorded, and `durable_high_water_of` reads the pre-advance
-    /// high-water a below-water send is detected against.
-    #[test]
-    fn confirm_set_rides_every_durable_cursor_after_being_recorded() {
+    /// One live batch, three decisions, each made against the subscription's own
+    /// high-water: the caught-up sibling takes the contiguous position live, the
+    /// lagging one has its live copy dropped and is served its whole suffix from
+    /// retention, and a position already written is dropped as the duplicate it
+    /// is. Driven directly, so no drain nudge can heal a decision the arm got
+    /// wrong.
+    #[tokio::test]
+    async fn a_live_batch_decides_each_sibling_against_its_own_high_water() {
+        const BEHIND: &str = "protobar";
+        const CURRENT: &str = "agenda";
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, mut rx, uuid) = durable_ctx_for(&db, Depth::Bounded(8), &[BEHIND, CURRENT]).await;
+        let behind = SubKey {
+            instance: BEHIND.to_string(),
+            channel: DURABLE_ADDR.to_string(),
+        };
+        let current = SubKey {
+            instance: CURRENT.to_string(),
+            channel: DURABLE_ADDR.to_string(),
+        };
+
+        let durable_subs = Arc::new(Mutex::new(HashSet::new()));
+        let mut durable = DurableSessionState::new(durable_subs);
+        let mut counters = SessionCounters::default();
         let mut spans = WireSpans::new();
-        spans.set_incarnation(0);
-        let sub = durable_sub();
-        spans.start_durable_span(&sub, Uuid::nil(), 5);
-        assert_eq!(spans.durable_high_water_of(&sub), Some(5));
 
-        // A below-water row (7 is not below 5, but 3 is): record it, then every
-        // cursor minted thereafter carries it.
-        spans.add_confirm(&sub, 3);
-        let (_seq, cursor) = spans.next_durable(&sub, 3);
-        assert_eq!(
-            cursor::parse(&cursor),
-            Ok(cursor::CursorState {
-                incarnation: 0,
-                epoch: Uuid::nil(),
-                seq: 5,
-                confirm: vec![3],
-            }),
-            "the confirm set rides the cursor and the high-water stays put",
+        // The laggard subscribes to an empty channel: its high-water anchors at 0
+        // and nothing moves it.
+        handle_durable_subscribe(
+            &ctx,
+            &mut durable,
+            &mut spans,
+            behind.clone(),
+            None,
+            &mut counters,
+        )
+        .await;
+        let _ = rx.try_recv().expect("the laggard's SubscribeResult");
+
+        let m1 = seed_message(&db, uuid, "one", 100).await;
+        let m2 = seed_message(&db, uuid, "two", 200).await;
+        // The sibling subscribes after: its replay carries both rows, so its
+        // high-water sits one below what comes next.
+        handle_durable_subscribe(
+            &ctx,
+            &mut durable,
+            &mut spans,
+            current.clone(),
+            None,
+            &mut counters,
+        )
+        .await;
+        let _ = rx.try_recv().expect("the sibling's SubscribeResult");
+        expect_deliver(rx.try_recv().expect("replay of one"), m1);
+        expect_deliver(rx.try_recv().expect("replay of two"), m2);
+
+        let m3 = seed_message(&db, uuid, "three", 300).await;
+        let envelope = |body: &str| {
+            Arc::new(MessageEnvelope {
+                message_id: Uuid::new_v4(),
+                source: "test".into(),
+                channel: DURABLE_ADDR.to_string(),
+                sender: "sender".into(),
+                publish_ts: Utc::now(),
+                body: body.to_string(),
+                reply_to: None,
+                delivery_deadline: None,
+                deliver_after: None,
+                urgency: Urgency::Normal,
+                envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
+            })
+        };
+        let outcome = send_durable_live(
+            &ctx,
+            &durable,
+            &mut spans,
+            vec![
+                DurableDelivery {
+                    envelope: envelope("three"),
+                    retained_seq: m3 as u64,
+                    sub: behind.clone(),
+                },
+                DurableDelivery {
+                    envelope: envelope("three"),
+                    retained_seq: m3 as u64,
+                    sub: current.clone(),
+                },
+                DurableDelivery {
+                    envelope: envelope("one"),
+                    retained_seq: m1 as u64,
+                    sub: current.clone(),
+                },
+            ],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+
+        // The contiguous sibling takes the live copy, under its own name.
+        match rx.try_recv().expect("the live copy") {
+            ServerFrame::Deliver {
+                envelope, targets, ..
+            } => {
+                assert_eq!(envelope.body, "three");
+                assert_eq!(
+                    targets.len(),
+                    1,
+                    "only the caught-up sibling is a live target"
+                );
+                assert_eq!(targets[0].instance, CURRENT);
+                assert!(
+                    matches!(cursor::parse(&targets[0].cursor), Ok(state) if state.seq == m3 as u64)
+                );
+            }
+            other => panic!("expected a Deliver, got {other:?}"),
+        }
+        // The laggard is served every position above its own high-water, in order.
+        for (want_body, want_seq) in [("one", m1), ("two", m2), ("three", m3)] {
+            match rx.try_recv().expect("the laggard's suffix") {
+                ServerFrame::Deliver {
+                    envelope, targets, ..
+                } => {
+                    assert_eq!(envelope.body, want_body);
+                    assert_eq!(targets.len(), 1);
+                    assert_eq!(targets[0].instance, BEHIND);
+                    assert_eq!(
+                        targets[0].dropped, 0,
+                        "retention covered the whole suffix, so nothing was lost"
+                    );
+                    assert!(
+                        matches!(cursor::parse(&targets[0].cursor), Ok(state) if state.seq == want_seq as u64)
+                    );
+                }
+                other => panic!("expected a Deliver, got {other:?}"),
+            }
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "the below-water copy is dropped as a duplicate, not re-sent"
         );
-        // A later above-water send still carries the accumulated set.
-        let (_seq2, cursor2) = spans.next_durable(&sub, 9);
-        assert!(matches!(
-            cursor::parse(&cursor2),
-            Ok(cursor::CursorState { seq: 9, confirm, .. }) if confirm == vec![3]
-        ));
-
-        // Clearing the subscription drops the confirm set with the rest.
-        spans.clear(&sub);
-        assert_eq!(spans.durable_high_water_of(&sub), None);
     }
 
     /// An unparseable resume cursor is a protocol violation whose detail names the
@@ -4512,10 +4077,12 @@ mod tests {
         assert!(s2 > s1, "durable span seq strictly increases across replay");
     }
 
-    /// A fresh durable subscribe drains the parked backlog in seq order behind a
-    /// `SubscribeResult{Ok}`, activates the shared/local sets, and claims the rows.
+    /// A fresh durable subscribe replays the retained window in seq order behind
+    /// a `SubscribeResult{Ok}` and activates the shared/local sets. It writes
+    /// nothing: the client's cursor, minted onto each `Deliver`, is the whole of
+    /// the subscription's delivery state.
     #[tokio::test]
-    async fn durable_subscribe_fresh_drains_parked_backlog() {
+    async fn durable_subscribe_fresh_replays_the_retained_window() {
         let db = brenn_lib::db::init_db_memory();
         let (ctx, mut rx, uuid) = durable_ctx(&db, Depth::Bounded(8)).await;
         let (p1, m1) = seed_parked(&db, uuid, "one", 100).await;
@@ -4557,9 +4124,18 @@ mod tests {
         // Activation is visible to the router (shared set) and the local mirror.
         assert!(durable.is_active(&durable_sub()));
         assert!(durable_subs.lock().unwrap().contains(&durable_sub()));
-        // Both rows are claimed (a re-claim finds nothing).
+        // Neither wake row was touched — the replay reads retention, not rows.
         let conn = db.lock().await;
-        assert!(brenn_lib::messaging::db::claim_pending_pushes(&conn, &[p1, p2]).is_empty());
+        for push_id in [p1, p2] {
+            let owed: bool = conn
+                .query_row(
+                    "SELECT delivered_at IS NULL FROM messaging_pending_pushes WHERE id = ?1",
+                    rusqlite::params![push_id],
+                    |row| row.get(0),
+                )
+                .expect("the seeded push row");
+            assert!(owed, "the subscribe replay marks no wake row");
+        }
     }
 
     /// `Resume::Durable` replays the retained window (`id > last_seq`) with no gap
@@ -4668,7 +4244,7 @@ mod tests {
             &mut durable,
             &mut spans,
             durable_sub(),
-            Some(durable_resume_at(&db, uuid, 0, vec![]).await),
+            Some(durable_resume_at(&db, uuid, 0).await),
             &mut counters,
         )
         .await;
@@ -4710,7 +4286,7 @@ mod tests {
             &mut durable,
             &mut spans,
             durable_sub(),
-            Some(durable_resume_at(&db, uuid, 0, vec![]).await),
+            Some(durable_resume_at(&db, uuid, 0).await),
             &mut counters,
         )
         .await;
@@ -4801,7 +4377,7 @@ mod tests {
 
         // A cursor at a real position, in a numbering domain this store never
         // assigned.
-        let stale = cursor::mint(incarnation, Uuid::new_v4(), 2, vec![]);
+        let stale = cursor::mint(incarnation, Uuid::new_v4(), 2);
         // retain_depth 8 covers both seeded rows.
         let ids = assert_stale_store_fresh_attach(&ctx, &mut rx, stale, 2).await;
         assert_eq!(ids, vec![1, 2], "fresh window replays the retained rows");
@@ -4824,7 +4400,7 @@ mod tests {
         };
         let _ = m1;
 
-        let stale = cursor::mint(incarnation + 1, epoch, 1, vec![]);
+        let stale = cursor::mint(incarnation + 1, epoch, 1);
         let ids = assert_stale_store_fresh_attach(&ctx, &mut rx, stale, 1).await;
         assert_eq!(ids, vec![1]);
     }
@@ -4840,7 +4416,7 @@ mod tests {
         let m1 = seed_message(&db, uuid, "one", 100).await;
         let _ = m1;
 
-        let ahead = durable_resume_at(&db, uuid, 1_000_000, vec![]).await;
+        let ahead = durable_resume_at(&db, uuid, 1_000_000).await;
         let ids = assert_stale_store_fresh_attach(&ctx, &mut rx, ahead, 1).await;
         assert_eq!(ids, vec![1]);
     }
@@ -4974,65 +4550,6 @@ mod tests {
             2,
             "two principals, two entries"
         );
-    }
-
-    /// The replay-dedup set is per subscription: a seq alice already received
-    /// must not suppress bob's copy of the same message. They are separate
-    /// principals with separate windows — the row is delivered once to each.
-    #[test]
-    fn durable_session_state_replay_dedup_is_per_instance() {
-        let shared = Arc::new(Mutex::new(HashSet::new()));
-        let mut st = DurableSessionState::new(shared);
-        st.activate(&sk("agenda-alice"));
-        st.activate(&sk("agenda-bob"));
-
-        assert!(st.record_replayed(&sk("agenda-alice"), 42));
-        assert!(st.already_replayed(&sk("agenda-alice"), 42));
-        assert!(
-            !st.already_replayed(&sk("agenda-bob"), 42),
-            "alice's replay must not suppress bob's copy of seq 42"
-        );
-    }
-
-    /// `replay_sent` survives an unsubscribe/re-subscribe cycle: a queued live
-    /// copy of an already-replayed id is still skipped after a fresh re-subscribe,
-    /// closing the stale-queue duplicate.
-    #[test]
-    fn durable_session_state_retains_replay_sent_across_deactivate() {
-        let shared = Arc::new(Mutex::new(HashSet::new()));
-        let mut st = DurableSessionState::new(shared);
-        st.activate(&sk("a"));
-        assert!(st.record_replayed(&sk("a"), 42));
-        assert!(st.already_replayed(&sk("a"), 42));
-
-        st.deactivate(&sk("a"));
-        assert!(
-            st.already_replayed(&sk("a"), 42),
-            "replay_sent retained across unsubscribe"
-        );
-
-        st.activate(&sk("a"));
-        assert!(
-            st.already_replayed(&sk("a"), 42),
-            "still retained after re-subscribe"
-        );
-    }
-
-    /// `record_replayed` hard-caps each per-channel set at `REPLAY_SENT_MAX`: ids
-    /// within the cap are admitted, a repeat is always accepted (no growth), and
-    /// the cap-plus-one-th distinct id signals connection teardown (returns false).
-    #[test]
-    fn durable_session_state_record_replayed_caps_at_max() {
-        let shared = Arc::new(Mutex::new(HashSet::new()));
-        let mut st = DurableSessionState::new(shared);
-        st.activate(&sk("a"));
-        for seq in 0..REPLAY_SENT_MAX as u64 {
-            assert!(st.record_replayed(&sk("a"), seq), "id {seq} within cap");
-        }
-        // A repeat id is accepted (adds no growth).
-        assert!(st.record_replayed(&sk("a"), 0));
-        // The REPLAY_SENT_MAX + 1-th *distinct* id signals teardown.
-        assert!(!st.record_replayed(&sk("a"), REPLAY_SENT_MAX as u64));
     }
 
     // ── Subscribe/Unsubscribe rate bucket ─────────────────────────────────

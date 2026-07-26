@@ -26,8 +26,9 @@ pub const DURABLE_QUEUE_FRAMES: usize = 256;
 
 /// One live durable row handed from the `WakeRouter` fan-out to a subscribed
 /// session's task via its bounded `durable_tx`. The channel is
-/// `envelope.channel`; the router's claim of the pending-push row *is* the
-/// mark-delivered, so the session carries no `push_id`. The envelope is an `Arc`
+/// `envelope.channel`. A session that misses one — queue full, or gone between
+/// the fan-out and the send — resumes past it from its own cursor, so the
+/// hand-off owes nothing and carries no delivery state. The envelope is an `Arc`
 /// so the fan-out shares one allocation across every subscribed session instead
 /// of cloning the body per session.
 #[derive(Clone)]
@@ -35,16 +36,12 @@ pub struct DurableDelivery {
     pub envelope: Arc<MessageEnvelope>,
     /// The message's position in its channel's retention order — what the
     /// session mints the wire cursor's high-water from, and the key its
-    /// at-most-once replay dedup runs on.
+    /// duplicate suppression runs on.
     pub retained_seq: u64,
-    /// The message's `messaging_messages.id`, which below-water ack evidence is
-    /// written against. `None` for the row-less fold-0 context feed: it owns no
-    /// claim to stamp, and a just-published row is never below-water.
-    pub message_id: Option<i64>,
-    /// The subscription this row is targeted at — the principal the push row
-    /// named, paired with the row's channel. The session routes the resulting
-    /// `Deliver` under it, so a row bound for one instance never surfaces on a
-    /// sibling's ports.
+    /// The subscription this row is targeted at — the principal the delivery was
+    /// resolved for, paired with the row's channel. The session routes the
+    /// resulting `Deliver` under it, so a row bound for one instance never
+    /// surfaces on a sibling's ports.
     pub sub: SubKey,
 }
 

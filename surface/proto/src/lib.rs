@@ -583,11 +583,11 @@ pub enum ServerFrame {
     /// Re-anchor one subscription: unsubscribe it and subscribe it again with
     /// the cursor the kernel currently holds for it.
     ///
-    /// The server's ask, not a report of anything. The server carries
-    /// per-subscription resume bookkeeping whose reconcile only runs when a
-    /// subscription re-attaches; on a connection that never reconnects that
-    /// bookkeeping — and the cursors carrying it — grow without bound. This
-    /// frame lets the server run the reconcile without waiting for a reconnect.
+    /// The server's ask, not a report of anything: it makes one subscription
+    /// re-resume on a connection that would otherwise never reconnect.
+    ///
+    /// TODO(surface-reanchor-frame): no server path sends this frame, so the
+    /// handler and its tests exercise a path nothing can trigger today.
     ///
     /// Class-blind: the kernel re-resumes whatever subscription is named,
     /// echoing the opaque cursor it holds. It reads no class and no cursor

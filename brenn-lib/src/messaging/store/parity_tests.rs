@@ -1193,6 +1193,77 @@ async fn the_owed_walk_ranks_every_urgency_level() {
     }
 }
 
+/// The owed walk reports the earliest delivery deadline a position has not
+/// passed, which is what lets a wake pass serve a message by T without any
+/// per-subscriber copy of T: the figure is read from the unseen suffix, so it
+/// vanishes for a subscriber that has passed the message and stays for one that
+/// has not. Durable-only — a non-durable channel refuses a deadline at commit.
+#[tokio::test]
+async fn the_owed_walk_reports_the_earliest_unseen_deadline() {
+    let (store, _db) = durable_store_for("proc", DEPTH).await;
+    let sub = wasm_sub("proc");
+    store
+        .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+        .await;
+
+    let mut early = message_for(&store, "alice", "by soon");
+    early.delivery_deadline = Some(soon());
+    RetentionStore::append(&store, early).await;
+    let mut late = message_for(&store, "alice", "by later");
+    late.delivery_deadline = Some(soon() + chrono::Duration::minutes(5));
+    RetentionStore::append(&store, late).await;
+    RetentionStore::append(&store, message_for(&store, "alice", "whenever")).await;
+
+    let owed = RetentionStore::deliverable_subscribers(&store).await;
+    assert_eq!(
+        owed.iter()
+            .map(|o| o.earliest_unseen_deadline)
+            .collect::<Vec<_>>(),
+        vec![Some(soon())],
+        "the earliest of the two deadlines in the unseen suffix"
+    );
+
+    // Passing the first message leaves the later deadline as the next one owed.
+    RetentionStore::advance(&store, &sub, MessageSeq(1), MessageSeq(1)).await;
+    let owed = RetentionStore::deliverable_subscribers(&store).await;
+    assert_eq!(
+        owed.iter()
+            .map(|o| o.earliest_unseen_deadline)
+            .collect::<Vec<_>>(),
+        vec![Some(soon() + chrono::Duration::minutes(5))]
+    );
+
+    // Past both, only the deadline-less message is left: nothing to wake for by
+    // any time in particular.
+    RetentionStore::advance(&store, &sub, MessageSeq(2), MessageSeq(2)).await;
+    let owed = RetentionStore::deliverable_subscribers(&store).await;
+    assert_eq!(
+        owed.iter()
+            .map(|o| o.earliest_unseen_deadline)
+            .collect::<Vec<_>>(),
+        vec![None]
+    );
+}
+
+/// A ring position never carries a deadline to report: the ring refuses a
+/// message that names one, so the walk's deadline arm is durable-only by
+/// construction rather than by the ring choosing not to answer.
+#[tokio::test]
+async fn a_ring_position_reports_no_deadline() {
+    let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH));
+    let sub = wasm_sub("proc");
+    ring.attach(&sub, "proc", DEPTH, Priming::Head);
+    RetentionStore::append(&ring, message_for(&ring, "alice", "one")).await;
+    assert_eq!(
+        RetentionStore::deliverable_subscribers(&ring)
+            .await
+            .iter()
+            .map(|o| o.earliest_unseen_deadline)
+            .collect::<Vec<_>>(),
+        vec![None]
+    );
+}
+
 /// The ring answers the same question from a table of suffix maxima indexed by
 /// where the position lands in what is *still retained*, so the cases that
 /// matter are the ends of that table: a position retention has already outrun
@@ -2156,91 +2227,29 @@ async fn durable_advance_charges_only_the_still_retained_half_of_a_loss() {
     );
 }
 
-/// The one thing that perforates retention today: a message spared by a
-/// tentative delivery hold, older than the ones the same pass deletes. It keeps
-/// the frontier at its own seq, so the pass's frontier pair understates what it
-/// removed, and a window wide enough to still serve the spared message starts
-/// its advance below the gap — so neither reporter charges the seqs in between.
-///
-/// Positions and bodies are untouched by this: what is served is exactly what
-/// survives, and the cursor moves exactly over it. Only the ladder's figure is
-/// short. Pinned so the accounting is a known quantity while the hold exists;
-/// deleting the tentative lifecycle restores density and makes both subtractions
-/// exact again, and this row goes with it.
-#[tokio::test]
-async fn a_tentative_hold_below_an_evicted_span_shortens_the_report() {
-    let (store, db) = durable_store_for("proc", DEPTH).await;
-    let sub = wasm_sub("proc");
-    store
-        .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-        .await;
-    for body in ["a", "b", "c", "d"] {
-        RetentionStore::append(&store, message_for(&store, "alice", body)).await;
-    }
-
-    // Hold the oldest message's delivery below water, as an unconfirmed surface
-    // delivery does. Whose row carries the flag does not matter to eviction —
-    // the flag alone spares the message.
-    {
-        let conn = db.lock().await;
-        conn.execute(
-            "UPDATE messaging_pending_pushes SET confirm_pending = 1
-             WHERE message_id = (SELECT id FROM messaging_messages
-                                 ORDER BY retained_seq ASC LIMIT 1)",
-            [],
-        )
-        .expect("hold the oldest delivery");
-    }
-
-    let eviction = {
-        let conn = db.lock().await;
-        bus_gc_evict_channel(
-            &conn,
-            store.channel_uuid(),
-            store.address(),
-            ChannelScheme::Brenn,
-            1,
-            Sink::Drop,
-            None,
-        )
-    };
-    assert_eq!(
-        eviction.messages_evicted, 2,
-        "seqs 2 and 3 go; the held seq 1 stays, out of retention order"
-    );
-    assert!(
-        eviction.overflow.is_empty(),
-        "the held message keeps the frontier at seq 1, so the pair spans nothing"
-    );
-
-    let (new, advance) = serve(&store, &sub, DEPTH, 0).await;
-    assert_eq!(
-        new,
-        vec!["a", "d"],
-        "the held message is still retained, so the window still serves it"
-    );
-    assert_eq!(
-        advance.dropped, 0,
-        "the window's floor is the held seq, so the subtraction sees no gap"
-    );
-    assert_eq!(advance.noise_charge, 0, "and the ladder is charged nothing");
-}
-
+/// A parked message is not in retention, so it moves nobody's position: an
+/// attached subscriber is owed nothing until the release puts the message in
+/// front of it. Both classes — a park that leaked into the owed walk would wake
+/// a subscriber for a message no window can serve.
 #[tokio::test]
 async fn a_parked_message_owes_no_subscriber_until_release() {
-    for store in stores(DEPTH).await {
+    for store in stores_for_proc(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+            .await;
         store
             .park(message_for(&*store, "alice", "later"), soon())
             .await
             .expect("within cap");
         assert!(
             store.deliverable_subscribers().await.is_empty(),
-            "parked message must owe no one: {}",
+            "a parked message owes no one: {}",
             store.address()
         );
         assert!(
-            !store.has_deliverable(&wasm_sub("proc")).await,
-            "{}",
+            !store.has_deliverable(&sub).await,
+            "and its subscriber has nothing deliverable: {}",
             store.address()
         );
     }
@@ -3141,60 +3150,50 @@ async fn durable_replay_from_is_exact_on_an_unbounded_retain_depth() {
     assert_eq!(up_to_date.decision, ReplayDecision::UpToDate);
 }
 
-/// Eviction keeps any message a tentative (`confirm_pending`) push protects, so
-/// the surviving retained set is not always a contiguous suffix: an old
-/// protected row can outlive the band above it. A cursor sitting at that row is
-/// owed the evicted band, and answering `Exact` would report perfect continuity
-/// while silently dropping it.
+/// The retained set is a contiguous suffix by construction — eviction deletes
+/// in retention order and spares nothing — so `replay_from`'s counting test has
+/// no in-tree way to disagree with an edge test. It is the defense against a
+/// hole arriving anyway (an operator restore, a manual delete): a cursor below
+/// an interior hole is owed seqs that are gone, and answering `Exact` would
+/// report perfect continuity while silently dropping them.
 #[tokio::test]
-async fn durable_replay_reports_a_gap_when_eviction_left_a_hole() {
+async fn durable_replay_reports_a_gap_when_an_interior_seq_is_missing() {
     let (store, db) = durable_store_for("proc", DEPTH).await;
     let cursor = cursor_of(&store).await;
 
-    let protected = store
-        .append(message("s1", "m1"))
-        .await
-        .committed
-        .target_records[0]
-        .0;
-    let seqs = append_all(&store, &["m2", "m3", "m4"]).await;
+    let seqs = append_all(&store, &["m1", "m2", "m3", "m4"]).await;
 
     {
         let conn = db.lock().await;
-        // The claim on seq 1 goes tentative, which pins its message row through
-        // eviction; the frontier of 1 makes everything but seq 4 eligible.
+        // Delete the interior seqs directly, leaving seq 1 below the hole and
+        // seq 4 above it — the shape no eviction pass can produce.
         conn.execute(
-            "UPDATE messaging_pending_pushes SET confirm_pending = 1 WHERE id = ?1",
-            rusqlite::params![protected],
+            "DELETE FROM messaging_pending_pushes WHERE message_id IN
+                 (SELECT id FROM messaging_messages WHERE retained_seq IN (?1, ?2))",
+            rusqlite::params![seqs[1] as i64, seqs[2] as i64],
         )
-        .expect("stamp the claim tentative");
-        let eviction = bus_gc_evict_channel(
-            &conn,
-            store.channel_uuid(),
-            store.address(),
-            ChannelScheme::Brenn,
-            1,
-            Sink::Drop,
-            None,
-        );
-        assert_eq!(
-            eviction.messages_evicted, 2,
-            "seqs 2 and 3 are evicted; 1 is protected, 4 kept"
-        );
+        .expect("clear the rows referencing them");
+        conn.execute(
+            "DELETE FROM messaging_messages WHERE retained_seq IN (?1, ?2)",
+            rusqlite::params![seqs[1] as i64, seqs[2] as i64],
+        )
+        .expect("punch the hole");
     }
 
-    // Cursor at the protected row: seqs 2 and 3 are gone, so it is not an exact
-    // suffix even though the surviving window reaches back past the cursor.
-    let holed = store.replay_from(Some(cursor(1)), Depth::Unbounded).await;
+    // Cursor at seq 1: seqs 2 and 3 are gone, so it is not an exact suffix even
+    // though the surviving window reaches back past the cursor.
+    let holed = store
+        .replay_from(Some(cursor(seqs[0])), Depth::Unbounded)
+        .await;
     assert_eq!(
         holed.decision,
         ReplayDecision::Gap(GapReason::BeyondRetained),
-        "an evicted band behind a protected row is a gap, not an exact suffix"
+        "a missing interior seq is a gap, not an exact suffix"
     );
 
     // A cursor above the hole is still an exact suffix.
     let clean = store
-        .replay_from(Some(cursor(seqs[1])), Depth::Unbounded)
+        .replay_from(Some(cursor(seqs[2])), Depth::Unbounded)
         .await;
     assert_eq!(clean.decision, ReplayDecision::Exact);
     assert_eq!(replay_bodies(&clean), ["m4"]);

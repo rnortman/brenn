@@ -1025,22 +1025,19 @@ pub fn registration_key(target: &ParticipantId, target_app_slug: &str) -> Subscr
 /// deliver path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryShape {
-    /// Deliver inline through `deliver`/`deliver_ingress`. `marks_own_delivery`
-    /// is `true` when the binding's own atomic claim already marks the row
-    /// delivered (surface sessions), so the dispatcher must not re-mark it (a
-    /// batch re-mark would race a session unclaim); `false` when the dispatcher
-    /// owns the delivered-mark (conversation bridges).
-    Inline { marks_own_delivery: bool },
+    /// Deliver inline through `deliver`/`deliver_ingress`. The dispatcher owns
+    /// the delivered-mark: no inline binding keeps delivery state of its own in
+    /// the row.
+    Inline,
     /// Never delivered inline: route to the off-loop parked task via
     /// `spawn_eager_wake` and leave the row parked (WASM/system subscribers).
     ParkedWake,
 }
 
 /// The default [`DeliveryShape`] for a subscriber kind, mirroring the
-/// kind→binding choices bootstrap makes by hand: `App` subscribers deliver
-/// inline through their conversation bridge (the dispatcher owns the mark);
-/// `Surface` subscribers deliver inline but mark their own delivery via the
-/// session claim; `Wasm`/`System` subscribers are parked-and-woken.
+/// kind→binding choices bootstrap makes by hand: `App` and `Surface`
+/// subscribers deliver inline; `Wasm`/`System` subscribers are
+/// parked-and-woken.
 ///
 /// Bootstrap is authoritative: it registers each real binding directly (see
 /// the delivery-binding registration in `brenn-server`), and the live dispatch
@@ -1049,12 +1046,7 @@ pub enum DeliveryShape {
 /// full binding map; keep it in step with bootstrap's choices by hand.
 pub fn default_delivery_shape(key: &SubscriberEntryKind) -> DeliveryShape {
     match key {
-        SubscriberEntryKind::App(_) => DeliveryShape::Inline {
-            marks_own_delivery: false,
-        },
-        SubscriberEntryKind::Surface { .. } => DeliveryShape::Inline {
-            marks_own_delivery: true,
-        },
+        SubscriberEntryKind::App(_) | SubscriberEntryKind::Surface { .. } => DeliveryShape::Inline,
         SubscriberEntryKind::Wasm(_) | SubscriberEntryKind::System(_) => DeliveryShape::ParkedWake,
     }
 }
@@ -1091,31 +1083,25 @@ pub trait WakeRouter: Send + Sync + 'static {
     /// - `Err(_)` if the bridge was active but the send failed (treated by
     ///   the caller like `Ok(false)`).
     ///
-    /// `push_id` is the `messaging_pending_pushes.id` of the row being
-    /// delivered, `message_id` its `messaging_messages.id`, and `retained_seq`
-    /// the message's position in its channel's retention order (`None` only for
-    /// a row whose message holds no such position — an ingress row).
-    /// Implementations that need durable resume state mint the wire cursor's
-    /// high-water from `retained_seq`, name the row by `message_id` when
-    /// writing below-water ack evidence, and use `push_id` for the at-most-once
-    /// DB claim; implementations that do not need resume state may ignore all
-    /// three.
+    /// `retained_seq` is the message's position in its channel's retention order
+    /// (`None` only for a row whose message holds no such position — an ingress
+    /// row). Implementations that carry a client-side resume cursor mint its
+    /// high-water from `retained_seq`; implementations that keep no resume state
+    /// may ignore it. Nothing about the wake's own bookkeeping crosses this
+    /// boundary: the dispatcher retires its row itself.
     async fn deliver(
         &self,
         key: &SubscriberEntryKind,
         subscriber: &ParticipantId,
         envelope: &MessageEnvelope,
-        push_id: i64,
-        message_id: i64,
         retained_seq: Option<i64>,
     ) -> Result<bool, String>;
 
     /// Row-less deliver-if-attached context feed for a depth-0 (fold-0) surface
-    /// subscription. Unlike `deliver`, this creates and claims no
-    /// `messaging_pending_pushes` row: a fold-0 subscription has no push window,
-    /// so a durable message reaches an attached session only as a live fan-out at
-    /// publish time. A session not attached is owed nothing — its retained
-    /// context arrives at the next subscribe/resume. `key` is the surface
+    /// subscription. A fold-0 subscription is live-or-nothing: it holds no
+    /// resume position, so a durable message reaches an attached session only as
+    /// a live fan-out at publish time. A session not attached is owed nothing —
+    /// its retained context arrives at the next subscribe. `key` is the surface
     /// subscriber's `SubscriberEntryKind::Surface`; `envelope` and
     /// `retained_seq` (the message's position in its channel's retention order)
     /// are the just-committed message.
@@ -1131,15 +1117,20 @@ pub trait WakeRouter: Send + Sync + 'static {
         let _ = (key, envelope, retained_seq);
     }
 
-    /// Cheap precheck for the depth-0 context feed: does any currently-attached
-    /// session hold a fold-0 subscription on `channel` for one of `targets`? A
-    /// `false` answer lets the publish path skip building the owned,
-    /// body-copying context-feed envelope entirely when no page is open — a
-    /// deliver-if-attached feed owes a disconnected session nothing (design §6).
+    /// Cheap precheck for the surface live feed: does any currently-attached
+    /// session hold a subscription on `channel` for one of `targets`? A `false`
+    /// answer lets the publish path skip building the owned, body-copying feed
+    /// envelope entirely when no page is open — a deliver-if-attached fan-out
+    /// owes a disconnected session nothing, and a push-enabled one resumes past
+    /// its own cursor when it comes back.
     ///
     /// Default `true`: a router that hosts no surface sessions never reaches the
     /// build guard with non-empty targets, so the default costs it nothing.
-    fn any_context_session_attached(&self, channel: &str, targets: &[SubscriberEntryKind]) -> bool {
+    fn any_surface_session_subscribed(
+        &self,
+        channel: &str,
+        targets: &[store::targets::SurfaceFeedTarget],
+    ) -> bool {
         let _ = (channel, targets);
         true
     }
@@ -1216,6 +1207,21 @@ pub struct ReleaseSweep {
     /// when its next release is due, so it answers that question for the
     /// dispatcher's sleep target rather than making it walk the stores again.
     pub next_release: Option<DateTime<Utc>>,
+}
+
+/// What one wake pass ([`Messenger::wake_owed_subscribers`]) learned about
+/// delivery deadlines while deciding who to wake.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WakeSweep {
+    /// Whether any subscriber was woken because a deadline had come due.
+    /// Callers should debounce on it: a forced wake takes seconds to land, and
+    /// the deadline stays due until the subscriber drains past it.
+    pub fired_deadline_wake: bool,
+    /// The earliest deadline still ahead of the pass, across every lagging
+    /// position on every channel, or `None` when nothing unseen carries one.
+    /// Deadlines already due are absent — the pass just fired for them, and a
+    /// sleep target in the past would spin.
+    pub next_deadline: Option<DateTime<Utc>>,
 }
 
 /// The messaging service. Owns the directory, the `WakeRouter`, and the
@@ -2249,6 +2255,30 @@ impl Messenger {
                     .extend(released.target_records.iter().map(|record| record.0));
             }
             self.enact_overflow_events(&entry, &outcome.overflow);
+            // A released message enters retention here, which is where a surface
+            // is served: it holds no position for anything to walk, so the
+            // release is its live fan-out, exactly as the commit is for an
+            // unparked publish. Resolved once per releasing channel, after the
+            // store's own lock is gone.
+            if entry.capabilities().durable && !outcome.released.is_empty() {
+                let feed_targets =
+                    self.resolve_surface_feed_targets(&entry.address, entry.subscribers.as_slice());
+                if !feed_targets.is_empty()
+                    && self
+                        .router
+                        .any_surface_session_subscribed(&entry.address, &feed_targets)
+                {
+                    for released in &outcome.released {
+                        self.fan_out_surface_feed(
+                            &feed_targets,
+                            Arc::clone(&released.envelope),
+                            i64::try_from(released.seq.0)
+                                .expect("messaging: retention position out of range"),
+                        )
+                        .await;
+                    }
+                }
+            }
             let remaining = store.next_release().await;
             fold(remaining, &mut sweep);
         }
@@ -2276,9 +2306,18 @@ impl Messenger {
     /// a crash between commit and wake leaves a trailing position, and a
     /// trailing position is exactly what this walk looks for.
     ///
+    /// A message's `delivery_deadline` is the second wake source here: at `now`
+    /// past T, every subscriber whose position has not passed that message is
+    /// woken whatever its urgency economics say, and whatever the inline cooldown
+    /// says. The deadline leaves the pass's view the moment the position passes
+    /// the message, so nothing re-fires for a deadline already served, and no
+    /// per-subscriber copy of T is stored anywhere — the message row that has
+    /// always carried it is the only record.
+    ///
     /// Idempotent (`Notify` coalesces) and self-limiting: a subscriber stops
     /// being owed once it drains.
-    pub async fn wake_owed_subscribers(&self) {
+    pub async fn wake_owed_subscribers(&self, now: DateTime<Utc>) -> WakeSweep {
+        let mut sweep = WakeSweep::default();
         for entry in self.directory.list() {
             // Skip channels no subscriber holds a position on — asking a durable
             // store costs a DB round trip, and only a push-enabled subscriber
@@ -2310,7 +2349,7 @@ impl Messenger {
                     // one that does not is a host-wiring bug, and skipping it
                     // would wedge a subscriber nothing else wakes with no signal
                     // that it happened.
-                    DeliveryShape::Inline { .. } => self
+                    DeliveryShape::Inline => self
                         .targets
                         .wake_economics(&registration.kind)
                         .unwrap_or_else(|| {
@@ -2334,23 +2373,47 @@ impl Messenger {
                     self.warn_acl_denied(&entry, slug);
                     continue;
                 }
-                if !store::targets::wakes_at(
-                    economics,
-                    registration.wake_min,
-                    owed.max_unseen_urgency,
-                ) {
-                    continue;
-                }
-                if economics == WakeEconomics::UrgencyGated
-                    && !self.inline_wake_due(&owed.subscriber)
-                {
-                    continue;
+                // A deadline that has come due overrides both gates below: the
+                // point of `delivery_deadline` is that a message too quiet to
+                // wake anyone still gets in front of its subscriber by T.
+                let deadline_due = match owed.earliest_unseen_deadline {
+                    Some(deadline) if deadline <= now => true,
+                    Some(deadline) => {
+                        sweep.next_deadline = Some(
+                            sweep
+                                .next_deadline
+                                .map_or(deadline, |cur| cur.min(deadline)),
+                        );
+                        false
+                    }
+                    None => false,
+                };
+                if !deadline_due {
+                    if !store::targets::wakes_at(
+                        economics,
+                        registration.wake_min,
+                        owed.max_unseen_urgency,
+                    ) {
+                        continue;
+                    }
+                    if economics == WakeEconomics::UrgencyGated
+                        && !self.inline_wake_due(&owed.subscriber)
+                    {
+                        continue;
+                    }
+                } else {
+                    // The forced wake spawns like any other, so it arms the
+                    // cooldown a gated wake would have armed — what it does not
+                    // do is wait for one.
+                    self.arm_inline_wake(owed.subscriber.as_str());
+                    sweep.fired_deadline_wake = true;
                 }
                 self.router
                     .wake_owed(&registration.kind, &owed.subscriber)
                     .await;
             }
         }
+        sweep
     }
 
     /// Whether an urgency-gated wake for `subscriber_key` is still inside the
@@ -5321,8 +5384,6 @@ mod tests {
             _key: &SubscriberEntryKind,
             _subscriber: &ParticipantId,
             _envelope: &MessageEnvelope,
-            _push_id: i64,
-            _message_id: i64,
             _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             unreachable!("ring-backed WASM delivery never routes inline through deliver")
@@ -5392,7 +5453,7 @@ mod tests {
         messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
 
         // Nothing owed yet → no wake.
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert!(router.wakes.lock().unwrap().is_empty());
 
         // A publish leaves the subscriber owed → woken with its Wasm key.
@@ -5401,7 +5462,7 @@ mod tests {
             ChannelScheme::Ephemeral,
             "hi",
         ));
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             *router.wakes.lock().unwrap(),
             vec![SubscriberEntryKind::Wasm("waker".to_string())]
@@ -5441,7 +5502,7 @@ mod tests {
             .await;
 
         // Nothing owed anywhere → no wake.
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert!(router.wakes.lock().unwrap().is_empty());
 
         crate::messaging::testutils::insert_wasm_push(
@@ -5458,7 +5519,7 @@ mod tests {
             "owed",
         ));
 
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         let mut woken = router.wakes.lock().unwrap().clone();
         woken.sort_by_key(|k| format!("{k:?}"));
         assert_eq!(
@@ -5502,7 +5563,7 @@ mod tests {
                 .await;
         }
         router.wakes.lock().unwrap().clear();
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert!(
             router.wakes.lock().unwrap().is_empty(),
             "settled work owes nothing, so nothing wakes"
@@ -5578,8 +5639,8 @@ mod tests {
         .await;
 
         let (warns, _guard) = capture_messaging_warns();
-        messenger.wake_owed_subscribers().await;
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             warns.load(Ordering::SeqCst),
             1,
@@ -5621,7 +5682,7 @@ mod tests {
         .await;
 
         let (warns, _guard) = capture_messaging_warns();
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             warns.load(Ordering::SeqCst),
             0,
@@ -5656,7 +5717,7 @@ mod tests {
             ChannelScheme::Brenn,
         )
         .await;
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert!(
             router.wakes.lock().unwrap().is_empty(),
             "a surface session holds no position, so the walk never names it"
@@ -5708,6 +5769,433 @@ mod tests {
             .await;
     }
 
+    /// Commit one `Normal` message onto `entry`'s store that must be in front of
+    /// its subscriber by `deadline`.
+    async fn publish_by(
+        messenger: &Messenger,
+        entry: &ChannelEntry,
+        body: &str,
+        deadline: DateTime<Utc>,
+    ) {
+        messenger
+            .store_for(entry)
+            .append(store::NewMessage {
+                source: "test".to_string(),
+                sender: "alice".to_string(),
+                body: body.to_string(),
+                urgency: Urgency::Normal,
+                envelope_type: ChannelScheme::Brenn,
+                reply_to_uuid: None,
+                delivery_deadline: Some(deadline),
+                publish_ts_ns: crate::messaging::db::utc_to_ns(Utc::now()),
+            })
+            .await;
+    }
+
+    /// A deadline that has come due wakes a subscriber the urgency economics
+    /// would have left alone — that override is the whole point of naming one.
+    /// The pass reports the forced wake so the dispatcher can debounce it: the
+    /// deadline stays due until the subscriber drains past the message.
+    #[tokio::test]
+    async fn a_due_deadline_wakes_below_the_urgency_threshold() {
+        let channel = conversation_wake_channel("assistant", "deadline-ch", WakeMin::High);
+        let (messenger, router) =
+            wake_walk_messenger_with_apps(std::slice::from_ref(&channel), wake_apps("assistant"))
+                .await;
+        let conversation = ParticipantId::for_conversation(31);
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "assistant",
+                &conversation,
+                Depth::Bounded(8),
+                store::Priming::Head,
+            )
+            .await;
+
+        let deadline = Utc::now() - chrono::Duration::seconds(1);
+        publish_by(&messenger, &channel, "quiet but due", deadline).await;
+        let sweep = messenger.wake_owed_subscribers(Utc::now()).await;
+        assert_eq!(
+            *router.wakes.lock().unwrap(),
+            vec![SubscriberEntryKind::App("assistant".to_string())],
+            "a Normal message under wake_min High still wakes once its deadline passes"
+        );
+        assert!(
+            sweep.fired_deadline_wake,
+            "the pass reports the forced wake so the loop debounces it"
+        );
+        assert_eq!(
+            sweep.next_deadline, None,
+            "a deadline already due is not a sleep target"
+        );
+    }
+
+    /// The cooldown that holds an urgency-gated wake to one per tick does not
+    /// hold a deadline: the subscriber has until T, and a suppressed retry could
+    /// spend it. The forced wake still arms the cooldown, so a wake the urgency
+    /// economics ask for coalesces into the one the deadline just fired.
+    #[tokio::test]
+    async fn a_due_deadline_overrides_the_inline_cooldown() {
+        let channel = conversation_wake_channel("assistant", "deadline-retry-ch", WakeMin::High);
+        let (messenger, router) =
+            wake_walk_messenger_with_apps(std::slice::from_ref(&channel), wake_apps("assistant"))
+                .await;
+        let conversation = ParticipantId::for_conversation(32);
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "assistant",
+                &conversation,
+                Depth::Bounded(8),
+                store::Priming::Head,
+            )
+            .await;
+
+        let deadline = Utc::now() - chrono::Duration::seconds(1);
+        publish_by(&messenger, &channel, "quiet but due", deadline).await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
+        assert_eq!(
+            router.wakes.lock().unwrap().len(),
+            2,
+            "the position still trails the deadline, so the retry is not suppressed"
+        );
+
+        // The other half of the rule: the forced wake armed the cooldown, so an
+        // urgency-driven wake in the same window coalesces into it instead of
+        // spawning a second subprocess. Serve the deadline message first, so
+        // what follows is decided by the economics rather than by the deadline.
+        messenger
+            .store_for(&channel)
+            .advance(&conversation, store::MessageSeq(1), store::MessageSeq(1))
+            .await;
+        publish_at(&messenger, &channel, "loud", Urgency::High).await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
+        assert_eq!(
+            router.wakes.lock().unwrap().len(),
+            2,
+            "a message above wake_min still coalesces into the wake the deadline just fired"
+        );
+
+        // And the cooldown is the only thing holding it: cleared, the same pass
+        // wakes.
+        messenger.clear_inline_wake(conversation.as_str());
+        messenger.wake_owed_subscribers(Utc::now()).await;
+        assert_eq!(
+            router.wakes.lock().unwrap().len(),
+            3,
+            "with the cooldown spent the loud message wakes on its own economics"
+        );
+    }
+
+    /// A deadline still ahead wakes nobody and becomes the dispatcher's sleep
+    /// target — the timer source that replaces the per-subscriber copy of T.
+    #[tokio::test]
+    async fn a_deadline_still_ahead_is_the_sleep_target() {
+        let channel = conversation_wake_channel("assistant", "deadline-ahead-ch", WakeMin::High);
+        let (messenger, router) =
+            wake_walk_messenger_with_apps(std::slice::from_ref(&channel), wake_apps("assistant"))
+                .await;
+        let conversation = ParticipantId::for_conversation(33);
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "assistant",
+                &conversation,
+                Depth::Bounded(8),
+                store::Priming::Head,
+            )
+            .await;
+
+        // Whole seconds: the durable store persists deadlines at that grain.
+        let deadline =
+            DateTime::from_timestamp((Utc::now() + chrono::Duration::minutes(5)).timestamp(), 0)
+                .expect("representable");
+        publish_by(&messenger, &channel, "quiet, due later", deadline).await;
+        let sweep = messenger.wake_owed_subscribers(Utc::now()).await;
+        assert!(
+            router.wakes.lock().unwrap().is_empty(),
+            "below wake_min and not yet due wakes nobody"
+        );
+        assert_eq!(
+            sweep.next_deadline,
+            Some(deadline),
+            "the pass hands the dispatcher the time it must be awake by"
+        );
+        assert!(!sweep.fired_deadline_wake);
+    }
+
+    /// A deadline the position has passed leaves the pass's view entirely: no
+    /// wake, and no sleep target. Nothing stores "this one was handled" — the
+    /// position moving past the message is the whole record.
+    #[tokio::test]
+    async fn a_served_deadline_wakes_nobody() {
+        let channel = conversation_wake_channel("assistant", "deadline-served-ch", WakeMin::High);
+        let (messenger, router) =
+            wake_walk_messenger_with_apps(std::slice::from_ref(&channel), wake_apps("assistant"))
+                .await;
+        let conversation = ParticipantId::for_conversation(34);
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "assistant",
+                &conversation,
+                Depth::Bounded(8),
+                store::Priming::Head,
+            )
+            .await;
+
+        let deadline = Utc::now() - chrono::Duration::seconds(1);
+        publish_by(&messenger, &channel, "quiet but due", deadline).await;
+        messenger
+            .store_for(&channel)
+            .advance(&conversation, store::MessageSeq(1), store::MessageSeq(1))
+            .await;
+
+        let sweep = messenger.wake_owed_subscribers(Utc::now()).await;
+        assert!(
+            router.wakes.lock().unwrap().is_empty(),
+            "the conversation has seen the message, so its deadline is spent"
+        );
+        assert_eq!(sweep.next_deadline, None);
+        assert!(!sweep.fired_deadline_wake);
+    }
+
+    /// A deadline on a parked message is not owed to anyone until the message is
+    /// released: it enters retention then, with a fresh seq above the position,
+    /// and the pass that follows the release is the one that finds it due. A
+    /// deadline that expired while the message was parked is due the moment it
+    /// lands, which is the same rule read from the same row.
+    #[tokio::test]
+    async fn a_parked_message_owes_its_deadline_from_release() {
+        let channel = conversation_wake_channel("assistant", "deadline-parked-ch", WakeMin::High);
+        let (messenger, router) =
+            wake_walk_messenger_with_apps(std::slice::from_ref(&channel), wake_apps("assistant"))
+                .await;
+        let conversation = ParticipantId::for_conversation(35);
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "assistant",
+                &conversation,
+                Depth::Bounded(8),
+                store::Priming::Head,
+            )
+            .await;
+
+        let now = Utc::now();
+        let deadline = now - chrono::Duration::seconds(1);
+        messenger
+            .store_for(&channel)
+            .park(
+                store::NewMessage {
+                    source: "test".to_string(),
+                    sender: "alice".to_string(),
+                    body: "quiet, and late".to_string(),
+                    urgency: Urgency::Normal,
+                    envelope_type: ChannelScheme::Brenn,
+                    reply_to_uuid: None,
+                    delivery_deadline: Some(deadline),
+                    publish_ts_ns: crate::messaging::db::utc_to_ns(now),
+                },
+                now - chrono::Duration::seconds(30),
+            )
+            .await
+            .expect("park within quota");
+
+        let sweep = messenger.wake_owed_subscribers(now).await;
+        assert!(
+            router.wakes.lock().unwrap().is_empty(),
+            "a parked message is owed to nobody, deadline or not"
+        );
+        assert!(!sweep.fired_deadline_wake);
+
+        messenger.release_due_messages(now).await;
+        let sweep = messenger.wake_owed_subscribers(now).await;
+        assert_eq!(
+            *router.wakes.lock().unwrap(),
+            vec![SubscriberEntryKind::App("assistant".to_string())],
+            "release puts it in the unseen suffix, where its expired deadline forces the wake"
+        );
+        assert!(sweep.fired_deadline_wake);
+    }
+
+    /// A channel + messenger + attached conversation carrying one quiet message
+    /// due at `deadline`, with the dispatcher loop running over it. Nothing here
+    /// writes a wake row — the conversation's registration resolves no owner —
+    /// so the pass's own report is the loop's only deadline source, which is what
+    /// makes these two cases pin it.
+    async fn deadline_loop_rig(
+        name: &str,
+        conversation_id: i64,
+        deadline: DateTime<Utc>,
+    ) -> (
+        Arc<RecordingWakeRouter>,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let channel = conversation_wake_channel("assistant", name, WakeMin::High);
+        let (messenger, router) =
+            wake_walk_messenger_with_apps(std::slice::from_ref(&channel), wake_apps("assistant"))
+                .await;
+        let conversation = ParticipantId::for_conversation(conversation_id);
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "assistant",
+                &conversation,
+                Depth::Bounded(8),
+                store::Priming::Head,
+            )
+            .await;
+        publish_by(&messenger, &channel, "quiet but scheduled", deadline).await;
+
+        let db = messenger.db().clone();
+        let kick = Arc::new(tokio::sync::Notify::new());
+        let handle = dispatcher::spawn_dispatcher_task(
+            db,
+            router.clone() as Arc<dyn WakeRouter>,
+            kick.clone(),
+            messenger,
+        );
+        (router, kick, handle)
+    }
+
+    /// The loop sleeps to the deadline the pass reported, not to its poll
+    /// interval: a message too quiet to wake anyone is still put in front of its
+    /// subscriber at T, with no kick in between. Without the pass's
+    /// `next_deadline` folded into the sleep target the wake would be up to a
+    /// poll interval late.
+    #[tokio::test]
+    async fn the_loop_wakes_at_the_deadline_the_pass_reported() {
+        // Whole seconds: the durable store persists deadlines at that grain, so
+        // this lands between one and two seconds out.
+        let deadline =
+            DateTime::from_timestamp((Utc::now() + chrono::Duration::seconds(2)).timestamp(), 0)
+                .expect("representable");
+        let (router, kick, handle) = deadline_loop_rig("deadline-loop-ch", 36, deadline).await;
+
+        // The publish's own kick makes the first pass run and report the deadline.
+        kick.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            router.wakes.lock().unwrap().is_empty(),
+            "below wake_min and not yet due: nothing wakes early"
+        );
+
+        // No further kick: only the deadline can bring the loop back.
+        for _ in 0..60 {
+            if !router.wakes.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            *router.wakes.lock().unwrap(),
+            vec![SubscriberEntryKind::App("assistant".to_string())],
+            "the loop must come back at T on its own"
+        );
+        handle.abort();
+    }
+
+    /// A deadline stays due until its subscriber drains past it, so the pass that
+    /// forces a wake reports it and the loop retries on the debounce rather than
+    /// on its poll interval: paced, not spinning, and not a minute apart. Losing
+    /// the report leaves the retry a whole poll interval away — a forced wake
+    /// that failed to land would sit out the deadline it exists to keep.
+    #[tokio::test]
+    async fn a_due_deadline_paces_the_loop_by_the_debounce() {
+        let deadline = Utc::now() - chrono::Duration::seconds(1);
+        let (router, kick, handle) =
+            deadline_loop_rig("deadline-retry-loop-ch", 37, deadline).await;
+
+        kick.notify_one();
+        for _ in 0..100 {
+            if !router.wakes.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            router.wakes.lock().unwrap().len(),
+            1,
+            "the due deadline forces one wake"
+        );
+
+        // The subscriber never drains, so the deadline stays due. A loop that
+        // took the past-due target as its sleep target would fire dozens here.
+        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+        assert_eq!(
+            router.wakes.lock().unwrap().len(),
+            1,
+            "a due deadline does not spin the loop"
+        );
+
+        // …and the retry lands on the debounce, well inside the poll interval.
+        for _ in 0..70 {
+            if router.wakes.lock().unwrap().len() > 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            router.wakes.lock().unwrap().len(),
+            2,
+            "the debounce the pass armed brings the loop back long before its poll interval"
+        );
+        handle.abort();
+    }
+
+    /// The wake decision made at wake time agrees with the rule the commit path
+    /// applies to the one message it commits, over the whole (threshold, urgency)
+    /// matrix. Both ask [`store::targets::wakes_at`]; this is the pin that the
+    /// walk really routes its answer through it rather than approximating it for
+    /// a backlog.
+    #[tokio::test]
+    async fn the_walk_wakes_exactly_where_the_commit_rule_would_have() {
+        for wake_min in [
+            WakeMin::VeryLow,
+            WakeMin::Low,
+            WakeMin::Normal,
+            WakeMin::High,
+        ] {
+            for urgency in Urgency::ALL {
+                let channel = conversation_wake_channel(
+                    "assistant",
+                    &format!("matrix-{}-{urgency:?}", wake_min.as_str()),
+                    wake_min,
+                );
+                let (messenger, router) = wake_walk_messenger_with_apps(
+                    std::slice::from_ref(&channel),
+                    wake_apps("assistant"),
+                )
+                .await;
+                let conversation = ParticipantId::for_conversation(41);
+                messenger
+                    .attach_subscriber(
+                        &channel.address,
+                        "assistant",
+                        &conversation,
+                        Depth::Bounded(8),
+                        store::Priming::Head,
+                    )
+                    .await;
+
+                publish_at(&messenger, &channel, "one", urgency).await;
+                messenger.wake_owed_subscribers(Utc::now()).await;
+                let expected =
+                    store::targets::wakes_at(WakeEconomics::UrgencyGated, Some(wake_min), urgency);
+                assert_eq!(
+                    !router.wakes.lock().unwrap().is_empty(),
+                    expected,
+                    "wake_min {} at {urgency:?}",
+                    wake_min.as_str()
+                );
+            }
+        }
+    }
+
     /// The wake economics are applied to the loudest message a conversation has
     /// not seen, at wake time: a backlog entirely below `wake_min` wakes nobody
     /// and waits for the conversation's next natural drain, and one loud message
@@ -5730,14 +6218,14 @@ mod tests {
             .await;
 
         publish_at(&messenger, &channel, "chatter", Urgency::Normal).await;
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert!(
             router.wakes.lock().unwrap().is_empty(),
             "a below-threshold backlog costs no subprocess spawn"
         );
 
         publish_at(&messenger, &channel, "the house is on fire", Urgency::High).await;
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             *router.wakes.lock().unwrap(),
             vec![SubscriberEntryKind::App("assistant".to_string())],
@@ -5767,9 +6255,9 @@ mod tests {
             .await;
 
         publish_at(&messenger, &channel, "first", Urgency::Normal).await;
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         publish_at(&messenger, &channel, "second", Urgency::Normal).await;
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             router.wakes.lock().unwrap().len(),
             1,
@@ -5781,7 +6269,7 @@ mod tests {
         // wakes the still-trailing position again. That retry is the walk's whole
         // job behind a lost wake or a failed spawn.
         messenger.clear_inline_wake(conversation.as_str());
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             router.wakes.lock().unwrap().len(),
             2,
@@ -5832,7 +6320,7 @@ mod tests {
             ChannelScheme::Ephemeral,
             "hi",
         ));
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             *router.wakes.lock().unwrap(),
             vec![SubscriberEntryKind::App("assistant".to_string())],
@@ -5868,8 +6356,8 @@ mod tests {
 
         publish_at(&messenger, &channel, "unservable", Urgency::Normal).await;
         let (warns, _guard) = capture_messaging_warns();
-        messenger.wake_owed_subscribers().await;
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert!(
             router.wakes.lock().unwrap().is_empty(),
             "a subscriber the delivery gate will deny is not worth a spawn"
@@ -5903,7 +6391,7 @@ mod tests {
             .await;
 
         publish_at(&messenger, &channel, "unwakeable", Urgency::Normal).await;
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
     }
 
     /// A parked subscriber is woken by anything it is owed, whatever the
@@ -5925,7 +6413,7 @@ mod tests {
             ChannelScheme::Ephemeral,
             "quiet",
         ));
-        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             *router.wakes.lock().unwrap(),
             vec![SubscriberEntryKind::Wasm("waker".to_string())]
@@ -6186,8 +6674,6 @@ mod tests {
             _key: &SubscriberEntryKind,
             _subscriber: &ParticipantId,
             _envelope: &MessageEnvelope,
-            _push_id: i64,
-            _message_id: i64,
             _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             unreachable!("WASM delivery never routes inline through deliver")

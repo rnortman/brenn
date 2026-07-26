@@ -47,6 +47,22 @@ pub struct PushTarget {
     pub wake_min: Option<WakeMin>,
 }
 
+/// One surface subscriber a just-retained message is fanned out to live.
+///
+/// Surfaces hold no cursor, so no walk over positions can name them: the
+/// envelope is handed to their attached sessions at the moment it enters
+/// retention, and a session that misses it resumes past its own wire cursor.
+#[derive(Debug, Clone)]
+pub struct SurfaceFeedTarget {
+    /// The registration key, which carries the subscribing principal's instance.
+    pub kind: SubscriberEntryKind,
+    /// The subscribing principal as a participant identity.
+    pub subscriber: ParticipantId,
+    /// `true` for a push-enabled subscription, whose session can resume the
+    /// suffix it missed; `false` for fold-0, which is live-or-nothing.
+    pub push_enabled: bool,
+}
+
 /// The participant registry plus the channel directory: everything needed to
 /// answer "who is this channel's message owed to, and on what terms".
 pub struct TargetResolver {
@@ -373,30 +389,30 @@ impl TargetResolver {
         targets
     }
 
-    /// The fold-0 (depth-0) surface subscribers on a channel — the row-less
-    /// context-feed targets. A depth-0 subscription creates no push row, so
-    /// [`Self::push_targets`] skips it; a surface session nonetheless gets a live
-    /// deliver-if-attached fan-out of durable messages while attached. Only
-    /// surface subscribers take the feed: a depth-0 App/Wasm/System subscriber
-    /// has no wire session to deliver to live.
+    /// The surface subscribers on a channel that a just-retained message is
+    /// fanned out to live, at whatever depth they subscribe.
+    ///
+    /// A surface holds no server-side delivery state: the client's echoed cursor
+    /// is the whole of it, so both depths take the same row-less
+    /// deliver-if-attached fan-out and differ only in what a *detached* session
+    /// can recover afterwards — a push-enabled subscription resumes its suffix
+    /// from retention, a fold-0 one gets whatever its retained window still
+    /// carries at the next subscribe. Only surface subscribers take the feed: an
+    /// App/Wasm/System subscriber holds a position and is served from it.
     ///
     /// Runs the same delivery-time ACL gate as [`Self::push_targets`] — a
-    /// subscriber whose policy no longer covers the channel is not fed. Returns
-    /// the surface subscriber keys; the caller builds the envelope once and hands
-    /// each to `WakeRouter::deliver_context` after commit.
-    pub fn context_targets(
+    /// subscriber whose policy no longer covers the channel is not fed. The
+    /// caller builds the envelope once and hands each target to the router.
+    pub fn surface_feed_targets(
         &self,
         channel_address: &str,
         subscribers: &[SubscriberEntry],
-    ) -> Vec<SubscriberEntryKind> {
+    ) -> Vec<SurfaceFeedTarget> {
         let mut out = Vec::new();
         for sub in subscribers {
-            if sub.push_depth.is_push_enabled() {
+            let SubscriberEntryKind::Surface { slug, instance } = &sub.kind else {
                 continue;
-            }
-            if !matches!(sub.kind, SubscriberEntryKind::Surface { .. }) {
-                continue;
-            }
+            };
             let allowed = self
                 .policy(&sub.kind)
                 .is_some_and(|p| p.allows_channel_access(channel_address));
@@ -404,11 +420,21 @@ impl TargetResolver {
                 debug!(
                     subscriber = ?sub.kind,
                     channel = %channel_address,
-                    "depth-0 surface context feed denied — ACL not satisfied"
+                    "surface live feed denied — ACL not satisfied"
                 );
                 continue;
             }
-            out.push(sub.kind.clone());
+            // The subscribing principal: a component instance's own sub-identity,
+            // or the bare surface for the kernel's layout subscription.
+            let subscriber = match instance {
+                Some(instance) => ParticipantId::for_surface_component(slug, instance),
+                None => ParticipantId::for_surface(slug),
+            };
+            out.push(SurfaceFeedTarget {
+                kind: sub.kind.clone(),
+                subscriber,
+                push_enabled: sub.push_depth.is_push_enabled(),
+            });
         }
         out
     }

@@ -124,13 +124,12 @@ async fn resolve_push_targets_surface_missing_policy_skips() {
     assert!(targets.is_empty());
 }
 
-/// A depth-0 `Surface` subscriber is not a push target but **is** a row-less
-/// context-feed target (design §6): `resolve_push_targets` skips it (no row),
-/// while `resolve_context_targets` returns its key for the deliver-if-attached
-/// feed. A push-enabled surface subscriber is the opposite — a push target, not
-/// a context target.
+/// Every `Surface` subscriber is a live-feed target at whatever depth it
+/// subscribes — a surface holds no position, so the fan-out at commit is what
+/// serves it. A depth-0 one is not additionally a push target; a push-enabled
+/// one is, and its feed entry says so.
 #[tokio::test]
-async fn resolve_context_targets_returns_fold_zero_surface_subscribers() {
+async fn surface_feed_targets_cover_both_depths() {
     use crate::access::acl::ChannelMatcher;
     let db = init_db_memory();
     let channel = canonical_address("surface-boot");
@@ -171,16 +170,19 @@ async fn resolve_context_targets_returns_fold_zero_surface_subscribers() {
             .resolve_push_targets(&conn, &channel, std::slice::from_ref(&fold_zero))
             .is_empty()
     );
-    let context = messenger.resolve_context_targets(&channel, std::slice::from_ref(&fold_zero));
+    let feed = messenger.resolve_surface_feed_targets(&channel, std::slice::from_ref(&fold_zero));
+    assert_eq!(feed.len(), 1);
     assert_eq!(
-        context,
-        vec![SubscriberEntryKind::Surface {
+        feed[0].kind,
+        SubscriberEntryKind::Surface {
             slug: "deskbar".to_string(),
             instance: Some("protobar".to_string()),
-        }]
+        }
     );
+    assert_eq!(feed[0].subscriber.as_str(), "surface:deskbar#protobar");
+    assert!(!feed[0].push_enabled, "depth-0 is live-or-nothing");
 
-    // push-enabled: a push target, not a context target.
+    // push-enabled: a push target, and a feed target that can resume.
     let push_enabled = SubscriberEntry {
         push_depth: Depth::Bounded(8),
         ..fold_zero.clone()
@@ -191,18 +193,17 @@ async fn resolve_context_targets_returns_fold_zero_surface_subscribers() {
             .len(),
         1
     );
-    assert!(
-        messenger
-            .resolve_context_targets(&channel, std::slice::from_ref(&push_enabled))
-            .is_empty()
-    );
+    let feed =
+        messenger.resolve_surface_feed_targets(&channel, std::slice::from_ref(&push_enabled));
+    assert_eq!(feed.len(), 1);
+    assert!(feed[0].push_enabled);
 }
 
-/// A depth-0 `Surface` subscriber whose policy no longer covers the channel is
-/// not a context target — the feed runs the same delivery-time ACL gate as the
-/// push path.
+/// A `Surface` subscriber whose policy no longer covers the channel is not a
+/// feed target — the fan-out runs the same delivery-time ACL gate as the push
+/// path.
 #[tokio::test]
-async fn resolve_context_targets_skips_a_revoked_surface_subscriber() {
+async fn surface_feed_targets_skip_a_revoked_surface_subscriber() {
     let db = init_db_memory();
     // No surface policy registered → the ACL gate denies (fail-closed).
     let messenger = Messenger::new(
@@ -225,7 +226,7 @@ async fn resolve_context_targets_skips_a_revoked_surface_subscriber() {
     };
     assert!(
         messenger
-            .resolve_context_targets(&canonical_address("surface-boot"), &[sub])
+            .resolve_surface_feed_targets(&canonical_address("surface-boot"), &[sub])
             .is_empty()
     );
 }

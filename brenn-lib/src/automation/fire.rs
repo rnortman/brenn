@@ -839,8 +839,6 @@ mod tests {
             _key: &crate::messaging::SubscriberEntryKind,
             _: &crate::messaging::ParticipantId,
             _: &MessageEnvelope,
-            _push_id: i64,
-            _message_id: i64,
             _retained_seq: Option<i64>,
         ) -> Result<bool, String> {
             Ok(true)

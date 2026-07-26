@@ -51,17 +51,17 @@ use super::db::{
 use super::gates::{
     check_body_size, publish_acl_allows, reply_to_visible, resolve_publish_sender, well_formed_name,
 };
-use super::store::{PushTarget, eager_wake_for};
+use super::store::{PushTarget, SurfaceFeedTarget, eager_wake_for};
 use super::{ChannelScheme, Messenger, ParticipantId, SubscriberEntryKind, Urgency, store};
 use crate::access::AppCapability;
 use crate::obs::security::DenialKind;
 
 /// Per-channel memoized resolution for a batch flush: the channel entry, its
-/// push targets, and its fold-0 surface context-feed targets (design §6).
+/// push targets, and its live surface-feed targets.
 type ResolvedChannelTargets = (
     Arc<super::ChannelEntry>,
     Vec<PushTarget>,
-    Vec<SubscriberEntryKind>,
+    Vec<SurfaceFeedTarget>,
 );
 
 /// Outcome of a publish, on any pub/sub scheme. Maps directly to the success /
@@ -1010,37 +1010,34 @@ impl Messenger {
             }
         };
 
-        // 7. Durable depth-0 context feed: hand the committed envelope to attached
-        //    fold-0 surface subscriptions as a row-less live delivery. After the
+        // 7. Durable surface feed: hand the committed envelope to attached
+        //    surface subscriptions as a row-less live delivery. After the
         //    commit — nothing is owed to a disconnected session.
         //
         //    A parked message is not fed: the feed is the wire analogue of
         //    publish-time delivery for a message that entered retention, and a
         //    parked message is not observable to any subscriber, replay, query, or
-        //    depth-0 feed before its release. Holding no retention position is
-        //    exactly that state, so the assigned position is the condition — and
-        //    it is what the fed row's wire cursor is minted from. The fold-0
-        //    subscriber is owed nothing now; its retained window covers the
-        //    message at the next attach.
+        //    feed before its release. Holding no retention position is exactly
+        //    that state, so the assigned position is the condition — and it is
+        //    what the fed row's wire cursor is minted from. The release sweep
+        //    fans out what it moves into retention.
         //
         //    The targets are resolved here, under that condition, rather than
         //    before the commit: a parked publish would only walk the subscriber
         //    list to discard the answer. The feed is the caller's, not the
         //    store's — a ring-backed channel's live subscribers are served by the
-        //    store's own fan-out, so a non-durable publish resolves none. The
-        //    delivery records themselves are the store's business: it names its
-        //    own targets at commit.
+        //    store's own fan-out, so a non-durable publish resolves none.
         if let Some(retained_seq) = retained_seq
             && capabilities.durable
         {
-            let context_targets =
-                self.resolve_context_targets(&channel.address, channel.subscribers.as_slice());
-            if !context_targets.is_empty()
+            let feed_targets =
+                self.resolve_surface_feed_targets(&channel.address, channel.subscribers.as_slice());
+            if !feed_targets.is_empty()
                 && self
                     .router
-                    .any_context_session_attached(&channel.address, &context_targets)
+                    .any_surface_session_subscribed(&channel.address, &feed_targets)
             {
-                let envelope = context_feed_envelope(
+                let envelope = Arc::new(surface_feed_envelope(
                     message_id,
                     self.source.as_ref().to_owned(),
                     channel.address.clone(),
@@ -1051,10 +1048,10 @@ impl Messenger {
                     delivery_deadline,
                     deliver_after,
                     urgency,
-                );
-                self.fan_out_context_feed(
-                    &context_targets,
-                    &envelope,
+                ));
+                self.fan_out_surface_feed(
+                    &feed_targets,
+                    envelope,
                     i64::try_from(retained_seq)
                         .expect("messaging: retention position out of range"),
                 )
@@ -1090,46 +1087,75 @@ impl Messenger {
             .push_targets(conn, channel_address, subscribers)
     }
 
-    /// The fold-0 (depth-0) surface subscribers on a channel — the row-less
-    /// context-feed targets, resolved through the same registry and the same
+    /// The surface subscribers on a channel that a retained message is fanned
+    /// out to live, resolved through the same registry and the same
     /// delivery-time ACL gate as the push targets.
-    fn resolve_context_targets(
+    pub(crate) fn resolve_surface_feed_targets(
         &self,
         channel_address: &str,
         subscribers: &[crate::messaging::SubscriberEntry],
-    ) -> Vec<SubscriberEntryKind> {
-        self.targets.context_targets(channel_address, subscribers)
+    ) -> Vec<SurfaceFeedTarget> {
+        self.targets
+            .surface_feed_targets(channel_address, subscribers)
     }
 
-    /// Fan a just-committed durable envelope to fold-0 surface subscribers as a
-    /// row-less live feed (design §6). Called after the publish transaction
-    /// commits and its lock is released — `deliver_context` touches no DB and
-    /// only enqueues onto attached sessions, so nothing owed to a disconnected
-    /// one. A no-op when there are no context targets.
-    async fn fan_out_context_feed(
+    /// Hand a message that has just entered retention to every attached,
+    /// subscribed surface session, as a row-less live fan-out.
+    ///
+    /// This is the whole of a surface's delivery trigger. A surface holds no
+    /// position, so nothing that walks positions can name it; what reaches an
+    /// attached session reaches it here, and what a detached (or queue-full)
+    /// session missed it recovers from its own wire cursor at the next resume.
+    ///
+    /// Runs after the commit transaction's lock is released: the router touches
+    /// no DB and only enqueues onto attached sessions.
+    pub(crate) async fn fan_out_surface_feed(
         &self,
-        targets: &[SubscriberEntryKind],
-        envelope: &super::MessageEnvelope,
+        targets: &[SurfaceFeedTarget],
+        envelope: Arc<super::MessageEnvelope>,
         retained_seq: i64,
     ) {
-        // Build the shared envelope once; each `deliver_context` clones only the
-        // `Arc` (a refcount bump), never the payload, however many fold-0
-        // subscribers the channel carries.
-        let shared = Arc::new(envelope.clone());
-        for key in targets {
-            self.router
-                .deliver_context(key, &shared, retained_seq)
-                .await;
+        for target in targets {
+            if !target.push_enabled {
+                self.router
+                    .deliver_context(&target.kind, &envelope, retained_seq)
+                    .await;
+                continue;
+            }
+            match self
+                .router
+                .deliver(
+                    &target.kind,
+                    &target.subscriber,
+                    envelope.as_ref(),
+                    Some(retained_seq),
+                )
+                .await
+            {
+                // Delivered, or nothing attached and subscribed. A surface is
+                // owed nothing while away; the suffix above its cursor is what
+                // it resumes to.
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        subscriber = %target.subscriber.as_str(),
+                        channel = %envelope.channel,
+                        retained_seq,
+                        error = %e,
+                        "surface live fan-out failed; sessions recover at their next resume"
+                    );
+                }
+            }
         }
     }
 }
 
-/// Build the row-less durable depth-0 context-feed envelope for a just-committed
-/// message (design §6). Single definition of the envelope shape shared by the
+/// Build the row-less envelope a just-committed durable message is fanned out
+/// to surface sessions as. Single definition of the envelope shape shared by the
 /// ad-hoc publish and both batch flush paths, so a new envelope field is wired
 /// in one place rather than three.
 #[allow(clippy::too_many_arguments)]
-fn context_feed_envelope(
+fn surface_feed_envelope(
     message_id: Uuid,
     source: String,
     channel: String,
@@ -1521,9 +1547,9 @@ impl Messenger {
         let flush_now = Utc::now();
 
         let mut all_retirements: Vec<RetirementPlan> = Vec::with_capacity(publishes.len());
-        // Deferred durable depth-0 context feeds: built under the lock, fanned
-        // out after it is released.
-        let mut context_feeds: Vec<(super::MessageEnvelope, i64, Vec<SubscriberEntryKind>)> =
+        // Deferred durable surface feeds: built under the lock, fanned out
+        // after it is released.
+        let mut surface_feeds: Vec<(Arc<super::MessageEnvelope>, i64, Vec<SurfaceFeedTarget>)> =
             Vec::new();
         // Non-durable outputs: recorded in call order, committed to their stores
         // after the durable transaction commits and its lock is released. The
@@ -1585,16 +1611,18 @@ impl Messenger {
                     continue;
                 }
 
-                let (channel, push_targets, context_targets) =
+                let (channel, push_targets, feed_targets) =
                     targets_cache.entry(channel_addr).or_insert_with(|| {
                         let targets = self.resolve_push_targets(
                             &conn,
                             &entry.address,
                             entry.subscribers.as_slice(),
                         );
-                        let context = self
-                            .resolve_context_targets(&entry.address, entry.subscribers.as_slice());
-                        (entry.clone(), targets, context)
+                        let feed = self.resolve_surface_feed_targets(
+                            &entry.address,
+                            entry.subscribers.as_slice(),
+                        );
+                        (entry.clone(), targets, feed)
                     });
 
                 let now_ns = db::utc_to_ns(Utc::now());
@@ -1636,15 +1664,15 @@ impl Messenger {
                     None, // no delivery_deadline
                 );
                 // A parked message is not observable before release, so it must
-                // not feed context now.
+                // not be fed now.
                 if release.is_none()
-                    && !context_targets.is_empty()
+                    && !feed_targets.is_empty()
                     && self
                         .router
-                        .any_context_session_attached(&channel.address, context_targets)
+                        .any_surface_session_subscribed(&channel.address, feed_targets)
                 {
-                    context_feeds.push((
-                        context_feed_envelope(
+                    surface_feeds.push((
+                        Arc::new(surface_feed_envelope(
                             inserted.uuid,
                             source.to_owned(),
                             channel.address.clone(),
@@ -1655,11 +1683,11 @@ impl Messenger {
                             None,
                             None,
                             publish.urgency,
-                        ),
+                        )),
                         inserted.retained_seq.expect(
                             "publish: an unparked durable message holds a retention position",
                         ),
-                        context_targets.clone(),
+                        feed_targets.clone(),
                     ));
                 }
                 all_retirements.push(plan);
@@ -1686,9 +1714,9 @@ impl Messenger {
             }
         }
 
-        // Durable depth-0 context feeds, fanned out after the lock is released.
-        for (envelope, seq, targets) in &context_feeds {
-            self.fan_out_context_feed(targets, envelope, *seq).await;
+        // Durable surface feeds, fanned out after the lock is released.
+        for (envelope, seq, targets) in surface_feeds {
+            self.fan_out_surface_feed(&targets, envelope, seq).await;
         }
 
         // Non-durable commits, after the durable lock is released. A flush has
@@ -1825,9 +1853,9 @@ impl Messenger {
         );
 
         let mut all_retirements: Vec<RetirementPlan> = Vec::with_capacity(publishes.len());
-        // Deferred durable depth-0 context feeds (design §6): built under the
-        // lock, fanned out after release. See `publish_from_wasm`.
-        let mut context_feeds: Vec<(super::MessageEnvelope, i64, Vec<SubscriberEntryKind>)> =
+        // Deferred durable surface feeds: built under the lock, fanned out
+        // after release. See `publish_from_wasm`.
+        let mut surface_feeds: Vec<(Arc<super::MessageEnvelope>, i64, Vec<SurfaceFeedTarget>)> =
             Vec::new();
 
         {
@@ -1844,7 +1872,7 @@ impl Messenger {
 
             for publish in publishes {
                 let addr = publish.channel_address;
-                let (channel, push_targets, context_targets) =
+                let (channel, push_targets, feed_targets) =
                     targets_cache.entry(addr).or_insert_with(|| {
                         let name =
                             well_formed_name(addr, ChannelScheme::Brenn).unwrap_or_else(|| {
@@ -1872,9 +1900,9 @@ impl Messenger {
                             &ch.address,
                             ch.subscribers.as_slice(),
                         );
-                        let context =
-                            self.resolve_context_targets(&ch.address, ch.subscribers.as_slice());
-                        (ch, targets, context)
+                        let feed = self
+                            .resolve_surface_feed_targets(&ch.address, ch.subscribers.as_slice());
+                        (ch, targets, feed)
                     });
 
                 // The caller answered the client a violation for an over-cap body
@@ -1907,13 +1935,13 @@ impl Messenger {
                     None, // no deliver_after — an activation flush is immediate
                     None, // no delivery_deadline
                 );
-                if !context_targets.is_empty()
+                if !feed_targets.is_empty()
                     && self
                         .router
-                        .any_context_session_attached(&channel.address, context_targets)
+                        .any_surface_session_subscribed(&channel.address, feed_targets)
                 {
-                    context_feeds.push((
-                        context_feed_envelope(
+                    surface_feeds.push((
+                        Arc::new(surface_feed_envelope(
                             inserted.uuid,
                             source.to_owned(),
                             channel.address.clone(),
@@ -1924,11 +1952,11 @@ impl Messenger {
                             None,
                             None,
                             publish.urgency,
-                        ),
+                        )),
                         inserted.retained_seq.expect(
                             "publish: an unparked durable message holds a retention position",
                         ),
-                        context_targets.clone(),
+                        feed_targets.clone(),
                     ));
                 }
                 all_retirements.push(plan);
@@ -1944,9 +1972,9 @@ impl Messenger {
             }
         }
 
-        // Durable depth-0 context feeds, fanned out after the lock is released.
-        for (envelope, seq, targets) in &context_feeds {
-            self.fan_out_context_feed(targets, envelope, *seq).await;
+        // Durable surface feeds, fanned out after the lock is released.
+        for (envelope, seq, targets) in surface_feeds {
+            self.fan_out_surface_feed(&targets, envelope, seq).await;
         }
 
         self.dispatch_kick();
@@ -1969,13 +1997,6 @@ pub fn is_well_formed_address(addr: &str) -> bool {
 pub enum DispatchOutcome {
     /// The bridge accepted the send. Caller must mark this push delivered.
     Delivered(i64),
-    /// The row was delivered (or is owned by another actor that will deliver
-    /// it) and is already marked delivered — the caller must **not** re-mark
-    /// it. Used by the Surface arm, where the atomic push-row claim *is* the
-    /// mark: a concurrent session can unclaim a row it owns (re-parking it for
-    /// a later drain), and a dispatcher re-mark would race that unclaim and
-    /// silently retire an undelivered row.
-    DeliveredNoRemark,
     /// The push remains undelivered. Drain-on-wake (or the deadline /
     /// deliver-after scanners) will pick it up. `woke` reports whether this
     /// dispatch actually fired an eager wake — the truthful signal the
