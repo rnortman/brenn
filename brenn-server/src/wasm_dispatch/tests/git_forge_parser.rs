@@ -130,6 +130,15 @@ async fn build_parser_setup(
         ],
     )
     .await;
+    // The output channel's reader holds a position too, or a case that reads back
+    // what the component published would be owed nothing.
+    super::attach_input_ports(
+        &messenger,
+        &out_sub_slug,
+        &out_sub,
+        &[(&out_entry_raw, Depth::Unbounded)],
+    )
+    .await;
 
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
     let store_db = tempfile::NamedTempFile::new().unwrap();
@@ -246,18 +255,11 @@ async fn forgejo_push_emits_event_both_remotes_ssh_first() {
         Some("https://forge/rn/brenn.git"),
     );
     let body = webhook_body(&[("x-forgejo-event", "push")], &payload, "git-forgejo");
-    testutils::insert_wasm_push(
-        &messenger,
-        &forgejo_in,
-        &wasm_sub,
-        &body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
     drain_step(&cfg, &wasm_sub).await;
 
-    let out_rows = messenger.load_pending_pushes(&out_sub).await;
+    let out_rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
     assert_eq!(out_rows.len(), 1, "exactly one push event published");
     let event = read_latest(&messenger, &out_entry.address)
         .await
@@ -288,18 +290,16 @@ async fn github_push_sets_forge_github() {
 
     let payload = forgejo_payload(Some("git@github.com:rn/brenn.git"), None);
     let body = webhook_body(&[("x-github-event", "push")], &payload, "git-github");
-    testutils::insert_wasm_push(
-        &messenger,
-        &github_in,
-        &wasm_sub,
-        &body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &github_in, &body, ChannelScheme::Webhook).await;
 
     drain_step(&cfg, &wasm_sub).await;
 
-    assert_eq!(messenger.load_pending_pushes(&out_sub).await.len(), 1);
+    assert_eq!(
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub)
+            .await
+            .len(),
+        1
+    );
     let event = read_latest(&messenger, &out_entry.address)
         .await
         .expect("event present");
@@ -318,19 +318,14 @@ async fn forgejo_port_falls_back_to_gitea_event_header() {
     // Only the legacy X-Gitea-Event header is present.
     let payload = forgejo_payload(Some("ssh://git@forge/rn/pfin.git"), None);
     let body = webhook_body(&[("x-gitea-event", "push")], &payload, "git-forgejo");
-    testutils::insert_wasm_push(
-        &messenger,
-        &forgejo_in,
-        &wasm_sub,
-        &body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
     drain_step(&cfg, &wasm_sub).await;
 
     assert_eq!(
-        messenger.load_pending_pushes(&out_sub).await.len(),
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub)
+            .await
+            .len(),
         1,
         "gitea-event fallback must yield a push event"
     );
@@ -344,21 +339,20 @@ async fn non_push_event_dropped_no_publish() {
 
     let payload = forgejo_payload(Some("ssh://git@forge/rn/brenn.git"), None);
     let body = webhook_body(&[("x-forgejo-event", "issues")], &payload, "git-forgejo");
-    testutils::insert_wasm_push(
-        &messenger,
-        &forgejo_in,
-        &wasm_sub,
-        &body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
     drain_step(&cfg, &wasm_sub).await;
 
     // Input row acked, nothing published.
-    assert!(messenger.load_pending_pushes(&wasm_sub).await.is_empty());
     assert!(
-        messenger.load_pending_pushes(&out_sub).await.is_empty(),
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub)
+            .await
+            .is_empty()
+    );
+    assert!(
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub)
+            .await
+            .is_empty(),
         "non-push event must not publish"
     );
 }
@@ -371,25 +365,22 @@ async fn missing_event_header_dropped_no_publish() {
 
     let payload = forgejo_payload(Some("ssh://git@forge/rn/brenn.git"), None);
     let body = webhook_body(&[("x-some-other", "value")], &payload, "git-forgejo");
-    testutils::insert_wasm_push(
-        &messenger,
-        &forgejo_in,
-        &wasm_sub,
-        &body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
     drain_step(&cfg, &wasm_sub).await;
 
     // Input row acked, nothing published — a warn-drop, distinct from a
     // quarantine (which also publishes nothing but records a failure).
     assert!(
-        messenger.load_pending_pushes(&wasm_sub).await.is_empty(),
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub)
+            .await
+            .is_empty(),
         "missing event header must ack its input row"
     );
     assert!(
-        messenger.load_pending_pushes(&out_sub).await.is_empty(),
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub)
+            .await
+            .is_empty(),
         "missing event header must not publish"
     );
     let failures: i64 = {
@@ -419,19 +410,14 @@ async fn malformed_payload_json_dropped_no_publish() {
         "not json at all",
         "git-forgejo",
     );
-    testutils::insert_wasm_push(
-        &messenger,
-        &forgejo_in,
-        &wasm_sub,
-        &body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
     drain_step(&cfg, &wasm_sub).await;
 
     assert!(
-        messenger.load_pending_pushes(&out_sub).await.is_empty(),
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub)
+            .await
+            .is_empty(),
         "malformed payload must not publish"
     );
     // A malformed forge payload is a warn-log drop, not quarantine.
@@ -456,18 +442,16 @@ async fn ssh_only_and_clone_only_payloads() {
     // clone-only.
     let payload = forgejo_payload(None, Some("https://forge/rn/graf.git"));
     let body = webhook_body(&[("x-forgejo-event", "push")], &payload, "git-forgejo");
-    testutils::insert_wasm_push(
-        &messenger,
-        &forgejo_in,
-        &wasm_sub,
-        &body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
     drain_step(&cfg, &wasm_sub).await;
 
-    assert_eq!(messenger.load_pending_pushes(&out_sub).await.len(), 1);
+    assert_eq!(
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub)
+            .await
+            .len(),
+        1
+    );
     let event = read_latest(&messenger, &out_entry.address)
         .await
         .expect("event present");
@@ -485,14 +469,7 @@ async fn duplicate_ssh_clone_deduped() {
     let same = "ssh://git@forge/rn/brenn.git";
     let payload = forgejo_payload(Some(same), Some(same));
     let body = webhook_body(&[("x-forgejo-event", "push")], &payload, "git-forgejo");
-    testutils::insert_wasm_push(
-        &messenger,
-        &forgejo_in,
-        &wasm_sub,
-        &body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &forgejo_in, &body, ChannelScheme::Webhook).await;
 
     drain_step(&cfg, &wasm_sub).await;
 
@@ -511,10 +488,9 @@ async fn malformed_envelope_quarantines() {
         build_parser_setup(slug).await;
 
     // Body is not a valid WebhookEnvelope at all → receive-error (quarantine).
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &forgejo_in,
-        &wasm_sub,
         "{\"garbage\":true}",
         ChannelScheme::Webhook,
     )
@@ -523,8 +499,16 @@ async fn malformed_envelope_quarantines() {
     drain_step(&cfg, &wasm_sub).await;
 
     // Row acked (at-most-once), nothing published, failure recorded.
-    assert!(messenger.load_pending_pushes(&wasm_sub).await.is_empty());
-    assert!(messenger.load_pending_pushes(&out_sub).await.is_empty());
+    assert!(
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub)
+            .await
+            .is_empty()
+    );
+    assert!(
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub)
+            .await
+            .is_empty()
+    );
     let failures: i64 = {
         let conn = messenger.db().lock().await;
         conn.query_row(

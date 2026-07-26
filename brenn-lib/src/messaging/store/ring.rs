@@ -951,7 +951,6 @@ impl RetentionStore for RingStore {
             committed: Committed {
                 message_uuid,
                 seq: MessageSeq(appended.retained.seq),
-                target_records: vec![],
             },
             overflow: appended.overflow,
         }
@@ -1005,7 +1004,6 @@ impl RetentionStore for RingStore {
                 .map(|m| Released {
                     seq: MessageSeq(m.seq),
                     envelope: m.envelope,
-                    target_records: vec![],
                 })
                 .collect(),
             overflow: batch.overflow,

@@ -42,92 +42,13 @@ fn wasm_delivery_policies(
 }
 
 // -----------------------------------------------------------------------
-// Push-target resolution (§2.5 #3 / design §6 "Push-target resolution")
+// Surface-feed target resolution
 // -----------------------------------------------------------------------
-
-/// `resolve_push_targets` builds a real push target for a `Surface` subscriber
-/// whose surface policy authorizes delivery: the target's subscriber is the
-/// `surface:<slug>` ParticipantId, keyed on the surface slug (mirroring the Wasm
-/// arm), and the subscription's `push_depth` carries through. No config path
-/// constructed a Surface directory entry before surface projection, so the entry
-/// is hand-built and the covering policy installed via `with_surface_policies`.
-#[tokio::test]
-async fn resolve_push_targets_surface_builds_target() {
-    use crate::access::acl::ChannelMatcher;
-    let db = init_db_memory();
-    let channel = canonical_address("surface-boot");
-    let mut surface_policies = std::collections::HashMap::new();
-    surface_policies.insert(
-        "deskbar".to_string(),
-        crate::messaging::test_support::brenn_delivery_policy(
-            ChannelMatcher::Prefix(String::new()),
-        ),
-    );
-    let messenger = Messenger::new(
-        db.clone(),
-        Arc::new(MessagingDirectory::with_entries(vec![])),
-        Arc::from("test"),
-        Arc::new(IndexMap::new()),
-        Arc::new(CountingRouter::default()) as Arc<dyn WakeRouter>,
-        MessagingGlobalConfig::default(),
-    )
-    .with_subscriber_registrations(crate::messaging::testutils::surface_registrations(
-        surface_policies,
-    ));
-    let sub = SubscriberEntry {
-        kind: SubscriberEntryKind::Surface {
-            slug: "deskbar".to_string(),
-            instance: None,
-        },
-        push_depth: Depth::Bounded(8),
-        retain_depth: Depth::Unbounded,
-        noise: NoiseLevel::Silent,
-        wake_min: None,
-    };
-    let conn = db.lock().await;
-    let targets = messenger.resolve_push_targets(&conn, &channel, &[sub]);
-    assert_eq!(targets.len(), 1);
-    assert_eq!(
-        targets[0].subscriber.as_str(),
-        crate::messaging::ParticipantId::for_surface("deskbar").as_str()
-    );
-    assert_eq!(targets[0].app_slug, "deskbar");
-    assert_eq!(targets[0].push_depth, Depth::Bounded(8));
-}
-
-/// A `Surface` subscriber with no resolved surface policy (a host-wiring bug, or
-/// a revoked ACL) is skipped fail-closed at the delivery-time ACL gate — no
-/// target, no panic, matching the App/Wasm deny behavior.
-#[tokio::test]
-async fn resolve_push_targets_surface_missing_policy_skips() {
-    let db = init_db_memory();
-    let messenger = Messenger::new(
-        db.clone(),
-        Arc::new(MessagingDirectory::with_entries(vec![])),
-        Arc::from("test"),
-        Arc::new(IndexMap::new()),
-        Arc::new(CountingRouter::default()) as Arc<dyn WakeRouter>,
-        MessagingGlobalConfig::default(),
-    );
-    let sub = SubscriberEntry {
-        kind: SubscriberEntryKind::Surface {
-            slug: "deskbar".to_string(),
-            instance: None,
-        },
-        push_depth: Depth::Unbounded,
-        retain_depth: Depth::Unbounded,
-        noise: NoiseLevel::Silent,
-        wake_min: None,
-    };
-    let conn = db.lock().await;
-    let targets = messenger.resolve_push_targets(&conn, &canonical_address("surface-boot"), &[sub]);
-    assert!(targets.is_empty());
-}
 
 /// Every `Surface` subscriber is a live-feed target at whatever depth it
 /// subscribes — a surface holds no position, so the fan-out at commit is what
-/// serves it. A depth-0 one is not additionally a push target; a push-enabled
-/// one is, and its feed entry says so.
+/// serves it. Depth is a property of the target, not a filter: it decides only
+/// what a *detached* session can recover afterwards.
 #[tokio::test]
 async fn surface_feed_targets_cover_both_depths() {
     use crate::access::acl::ChannelMatcher;
@@ -163,13 +84,7 @@ async fn surface_feed_targets_cover_both_depths() {
         noise: NoiseLevel::Silent,
         wake_min: None,
     };
-    let conn = db.lock().await;
-    // depth-0: no push target, one context target.
-    assert!(
-        messenger
-            .resolve_push_targets(&conn, &channel, std::slice::from_ref(&fold_zero))
-            .is_empty()
-    );
+    // depth-0: a feed target that is live-or-nothing.
     let feed = messenger.resolve_surface_feed_targets(&channel, std::slice::from_ref(&fold_zero));
     assert_eq!(feed.len(), 1);
     assert_eq!(
@@ -182,17 +97,11 @@ async fn surface_feed_targets_cover_both_depths() {
     assert_eq!(feed[0].subscriber.as_str(), "surface:deskbar#protobar");
     assert!(!feed[0].push_enabled, "depth-0 is live-or-nothing");
 
-    // push-enabled: a push target, and a feed target that can resume.
+    // push-enabled: a feed target that can resume.
     let push_enabled = SubscriberEntry {
         push_depth: Depth::Bounded(8),
         ..fold_zero.clone()
     };
-    assert_eq!(
-        messenger
-            .resolve_push_targets(&conn, &channel, std::slice::from_ref(&push_enabled))
-            .len(),
-        1
-    );
     let feed =
         messenger.resolve_surface_feed_targets(&channel, std::slice::from_ref(&push_enabled));
     assert_eq!(feed.len(), 1);
@@ -200,8 +109,7 @@ async fn surface_feed_targets_cover_both_depths() {
 }
 
 /// A `Surface` subscriber whose policy no longer covers the channel is not a
-/// feed target — the fan-out runs the same delivery-time ACL gate as the push
-/// path.
+/// feed target — the fan-out runs the delivery-time ACL gate.
 #[tokio::test]
 async fn surface_feed_targets_skip_a_revoked_surface_subscriber() {
     let db = init_db_memory();
@@ -307,6 +215,17 @@ async fn build_wasm_messenger(
     .with_subscriber_registrations(crate::messaging::testutils::wasm_registrations(
         wasm_delivery_policies(&[wasm_slug]),
     ));
+    // A subscriber holds a position or it is owed nothing; a sampled attach is
+    // where the demotion rule removes one.
+    messenger
+        .attach_subscriber(
+            &canonical_address("wasm-test-channel"),
+            wasm_slug,
+            &crate::messaging::ParticipantId::for_wasm(wasm_slug),
+            push_depth,
+            crate::messaging::store::Priming::Head,
+        )
+        .await;
     (messenger, channel_uuid, router)
 }
 
@@ -420,17 +339,29 @@ async fn build_wasm_and_app_messenger(
     .with_subscriber_registrations(crate::messaging::testutils::wasm_registrations(
         wasm_delivery_policies(&[wasm_slug]),
     ));
+    // A subscriber holds a position or it is owed nothing: boot attaches both
+    // kinds, and so does this fixture.
+    messenger.attach_conversation_subscribers().await;
+    messenger
+        .attach_subscriber(
+            &channel_addr,
+            wasm_slug,
+            &crate::messaging::ParticipantId::for_wasm(wasm_slug),
+            Depth::Unbounded,
+            crate::messaging::store::Priming::Head,
+        )
+        .await;
     (messenger, channel_uuid, router)
 }
 
-/// Publishing one `brenn:` message to a channel with BOTH a Wasm and App subscriber
-/// must create pending-push rows for both subscribers.
+/// Publishing one `brenn:` message to a channel with BOTH a Wasm and App
+/// subscriber leaves both of their positions trailing retention.
 ///
-/// This is the §6 fan-out AC: "WASM push row created AND conversation push row
-/// created/delivered." A regression in `resolve_push_targets` that accidentally
-/// skips the `App` arm when a `Wasm` arm is present would fail this test.
+/// A commit is target-blind, so the fan-out is the *reads*: a regression that
+/// wrote one subscriber's position past the commit — or failed to give one a
+/// position at all — would fail here.
 #[tokio::test]
-async fn wasm_and_app_subscriber_both_get_push_rows() {
+async fn wasm_and_app_subscriber_are_both_owed_the_message() {
     let wasm_slug = "fanout-wasm-consumer";
     let app_slug = "fanout-app";
     let sender_app_slug = "sender-app-fanout";
@@ -453,24 +384,30 @@ async fn wasm_and_app_subscriber_both_get_push_rows() {
         "publish must succeed, got {result:?}"
     );
 
-    // Wasm subscriber must have a pending-push row.
-    let wasm_sub = ParticipantId::for_wasm(wasm_slug);
-    let wasm_rows = m.load_pending_pushes(&wasm_sub).await;
+    // What each is owed, not merely that it is owed something: a commit that
+    // positioned one of them against the wrong message would satisfy a
+    // has-something probe.
+    let wasm_owed =
+        crate::messaging::testutils::owed_everywhere(&m, &ParticipantId::for_wasm(wasm_slug)).await;
     assert_eq!(
-        wasm_rows.len(),
-        1,
-        "Wasm subscriber must get exactly one push row"
+        wasm_owed
+            .iter()
+            .map(|(_, e)| e.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["hello-fanout"],
+        "the Wasm subscriber must be owed the message just published"
     );
-
-    // App subscriber: get_or_create_singleton_conversation was called internally;
-    // find the created conversation id (it is conversation id 2 — user 1 already
-    // has conversation 1 for sender-app; app_slug gets conversation 2).
-    let app_sub = ParticipantId::for_conversation(2);
-    let app_rows = m.load_pending_pushes(&app_sub).await;
+    // The App subscriber's conversation is the one the boot attach minted: user 1
+    // already holds conversation 1 for the sender app, so the app gets id 2.
+    let app_owed =
+        crate::messaging::testutils::owed_everywhere(&m, &ParticipantId::for_conversation(2)).await;
     assert_eq!(
-        app_rows.len(),
-        1,
-        "App subscriber conversation must get exactly one push row"
+        app_owed
+            .iter()
+            .map(|(_, e)| e.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["hello-fanout"],
+        "the App subscriber's conversation must be owed the same message"
     );
 
     // Publish is off-stack (R1) — no inline eager-wake or deliver calls.
@@ -482,11 +419,11 @@ async fn wasm_and_app_subscriber_both_get_push_rows() {
     let _ = chan_uuid;
 }
 
-/// A `Wasm(slug)` subscriber with `push_depth > 0` resolves to a pending-push
-/// row keyed on `for_wasm(slug)` — not touching `self.apps` or
+/// A `Wasm(slug)` subscriber with `push_depth > 0` is owed the commit through its
+/// own position, keyed on `for_wasm(slug)` — not touching `self.apps` or
 /// `get_or_create_singleton_conversation`.
 #[tokio::test]
-async fn wasm_subscriber_gets_pending_push_row() {
+async fn wasm_subscriber_is_owed_the_published_message() {
     let slug = "demo-consumer";
     let (m, _chan_uuid, router) = build_wasm_messenger(slug, Depth::Unbounded).await;
     let result = m
@@ -512,20 +449,24 @@ async fn wasm_subscriber_gets_pending_push_row() {
         0,
         "publish must not call spawn_eager_wake inline — dispatch is off-stack (R1)"
     );
-    // A pending-push row must exist for the wasm: subscriber.
-    let wasm_sub = ParticipantId::for_wasm(slug);
-    let rows = m.load_pending_pushes(&wasm_sub).await;
+    let owed =
+        crate::messaging::testutils::owed_everywhere(&m, &ParticipantId::for_wasm(slug)).await;
     assert_eq!(
-        rows.len(),
-        1,
-        "exactly one pending-push row for the WASM subscriber"
+        owed.iter()
+            .map(|(_, e)| e.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["hello"],
+        "the WASM subscriber must be owed the message just published"
     );
 }
 
-/// A `Wasm(slug)` subscriber with `push_depth=0` must never produce a
-/// pending-push row (`push_depth=0`-never-a-target guard, design §2.5 #3).
+/// A sampled (`push_depth=0`) `Wasm(slug)` subscriber wakes nobody on a commit:
+/// the channel is visibility-only for it. Its owing nothing follows from the
+/// attach — a sampled subscription writes no position — so what the publish
+/// itself is on trial for here is the wake, and the nothing-owed assertion is
+/// the standing property that makes the missing wake correct rather than a bug.
 #[tokio::test]
-async fn wasm_subscriber_push_depth_zero_yields_no_target() {
+async fn wasm_subscriber_push_depth_zero_is_owed_nothing() {
     let slug = "no-push";
     let (m, _chan_uuid, router) = build_wasm_messenger(slug, Depth::Bounded(0)).await;
     let result = m
@@ -545,17 +486,17 @@ async fn wasm_subscriber_push_depth_zero_yields_no_target() {
         "publish should succeed, got {result:?}"
     );
 
-    // push_depth=0 → no target → no eager wake and no pending row.
+    // Sampled → no position → no eager wake and nothing owed.
     assert_eq!(
         router.eager_wakes.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "push_depth=0 WASM subscription must produce no spawn_eager_wake"
     );
-    let wasm_sub = ParticipantId::for_wasm(slug);
-    let rows = m.load_pending_pushes(&wasm_sub).await;
     assert!(
-        rows.is_empty(),
-        "push_depth=0 must produce no pending-push row"
+        !m.store_for_address("brenn:wasm-test-channel")
+            .has_deliverable(&ParticipantId::for_wasm(slug))
+            .await,
+        "a sampled subscriber is owed nothing"
     );
 }
 
@@ -624,6 +565,18 @@ async fn build_wasm_output_messenger(
     .with_subscriber_registrations(crate::messaging::testutils::wasm_registrations(
         wasm_delivery_policies(&[subscriber_slug]),
     ));
+    // The receiver holds a position from here on, as boot would give it: without
+    // one it is owed nothing whatever the flush commits, and a case asking what
+    // the flush left it owed would read empty for the wrong reason.
+    messenger
+        .attach_subscriber(
+            &channel_addr,
+            subscriber_slug,
+            &ParticipantId::for_wasm(subscriber_slug),
+            Depth::Unbounded,
+            crate::messaging::store::Priming::Head,
+        )
+        .await;
     (messenger, channel_addr, router)
 }
 
@@ -633,7 +586,6 @@ async fn build_wasm_output_messenger(
 async fn publish_from_wasm_two_publishes_correct_fields() {
     let consumer_slug = "wasm-flusher";
     let (m, channel_addr, _router) = build_wasm_output_messenger(consumer_slug).await;
-    let receiver_sub = ParticipantId::for_wasm("wasm-output-receiver");
 
     let publishes = vec![
         WasmPublish {
@@ -652,9 +604,6 @@ async fn publish_from_wasm_two_publishes_correct_fields() {
         },
     ];
     m.publish_from_wasm(consumer_slug, &publishes).await;
-
-    let rows = m.load_pending_pushes(&receiver_sub).await;
-    assert_eq!(rows.len(), 2, "both publishes must land as push rows");
 
     // Load message rows from the DB to check field values.
     let conn = m.db().lock().await;
@@ -698,6 +647,23 @@ async fn publish_from_wasm_two_publishes_correct_fields() {
     // Bodies in call order.
     assert_eq!(rows_raw[0].4, "msg-a");
     assert_eq!(rows_raw[1].4, "msg-b");
+    drop(stmt);
+    drop(conn);
+
+    // And both reach the channel's subscriber: the rows above pin the commit,
+    // this pins that the commit left the receiver owed them, in order.
+    let owed = crate::messaging::testutils::owed_everywhere(
+        &m,
+        &ParticipantId::for_wasm("wasm-output-receiver"),
+    )
+    .await;
+    assert_eq!(
+        owed.iter()
+            .map(|(_, e)| e.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["msg-a", "msg-b"],
+        "the subscriber is owed both publishes, oldest first"
+    );
 }
 
 /// Build a Messenger with a durable `brenn:` output channel and a non-durable
@@ -767,6 +733,17 @@ async fn build_wasm_mixed_output_messenger(
         wasm_delivery_policies(&[subscriber_slug]),
     ))
     .with_ring_stores(stores);
+    // As above: the durable half's subscriber is positioned, so what the flush
+    // leaves it owed is a question with a meaningful answer.
+    messenger
+        .attach_subscriber(
+            &durable_addr,
+            subscriber_slug,
+            &ParticipantId::for_wasm(subscriber_slug),
+            Depth::Unbounded,
+            crate::messaging::store::Priming::Head,
+        )
+        .await;
     (messenger, durable_addr, ephemeral_addr)
 }
 
@@ -818,12 +795,12 @@ async fn publish_from_wasm_ephemeral_output_lands_in_the_ring() {
 }
 
 /// A single flush mixing a durable and an ephemeral output commits both halves:
-/// the durable one as a push row, the ephemeral one into the ring.
+/// the durable one into the channel's retention, where its subscriber is left
+/// owed it, the ephemeral one into the ring.
 #[tokio::test]
 async fn publish_from_wasm_mixed_batch_commits_both_halves() {
     let consumer_slug = "wasm-mixed-flusher";
     let (m, durable_addr, ephemeral_addr) = build_wasm_mixed_output_messenger(consumer_slug).await;
-    let receiver_sub = ParticipantId::for_wasm("wasm-output-receiver");
 
     m.publish_from_wasm(
         consumer_slug,
@@ -846,9 +823,7 @@ async fn publish_from_wasm_mixed_batch_commits_both_halves() {
     )
     .await;
 
-    // Durable half: one push row for the Wasm subscriber, one DB message row.
-    let rows = m.load_pending_pushes(&receiver_sub).await;
-    assert_eq!(rows.len(), 1, "the durable output lands as one push row");
+    // Durable half: one DB message row, and the channel's subscriber owed it.
     {
         let conn = m.db().lock().await;
         let count: i64 = conn
@@ -856,6 +831,18 @@ async fn publish_from_wasm_mixed_batch_commits_both_halves() {
             .unwrap();
         assert_eq!(count, 1, "only the durable output writes a DB row");
     }
+    let owed = crate::messaging::testutils::owed_everywhere(
+        &m,
+        &ParticipantId::for_wasm("wasm-output-receiver"),
+    )
+    .await;
+    assert_eq!(
+        owed.iter()
+            .map(|(_, e)| e.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["durable-body"],
+        "the durable half leaves its subscriber owed that message and no other"
+    );
 
     // Ephemeral half: one ring entry, no DB row.
     let store = m
@@ -987,234 +974,19 @@ async fn publish_from_wasm_durable_deferred_parks_the_row() {
 async fn publish_from_wasm_empty_slice_noop() {
     let consumer_slug = "wasm-noop";
     let (m, _, _router) = build_wasm_output_messenger(consumer_slug).await;
-    let receiver_sub = ParticipantId::for_wasm("wasm-output-receiver");
 
     m.publish_from_wasm(consumer_slug, &[]).await;
 
-    let rows = m.load_pending_pushes(&receiver_sub).await;
-    assert!(rows.is_empty(), "no rows on empty publish slice");
+    let conn = m.db().lock().await;
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messaging_messages", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0, "no rows on empty publish slice");
 }
 
 // -----------------------------------------------------------------------
 // wake_min × eager_wake integration (urgency-redesign §2.3)
 // -----------------------------------------------------------------------
-
-/// Build a Messenger where one WASM and one App subscriber share a channel,
-/// but with different `wake_min` policies. Returns (messenger, channel_uuid, router).
-async fn build_mixed_wake_min_messenger(
-    // The WASM subscriber is `Eager`, so its directory entry carries no
-    // threshold; the parameter is retained for call-site symmetry only.
-    _wasm_wake_min: WakeMin,
-    app_wake_min: WakeMin,
-) -> (Arc<Messenger>, Uuid, Arc<CountingRouter>) {
-    let db = init_db_memory();
-    let channel_uuid = Uuid::new_v4();
-    let channel_addr = canonical_address("wake-min-fanout-ch");
-    let sender_slug = "wake-min-sender";
-    let app_slug = "wake-min-app";
-    let wasm_slug = "wake-min-wasm";
-    let entry = ChannelEntry {
-        uuid: channel_uuid,
-        address: channel_addr.clone(),
-        description: None,
-        resolved_channel: ResolvedChannel {
-            send_rate: Default::default(),
-            push_depth: Depth::Unbounded,
-            retain_depth: Depth::Unbounded,
-            standing_retain_depth: Depth::Unbounded,
-            noise: NoiseLevel::Silent,
-            sink: Sink::Drop,
-            wake_min: WakeMin::Normal,
-        },
-        subscribers: vec![
-            SubscriberEntry {
-                kind: SubscriberEntryKind::Wasm(wasm_slug.to_string()),
-                push_depth: Depth::Unbounded,
-                retain_depth: Depth::Unbounded,
-                noise: NoiseLevel::Silent,
-                wake_min: None,
-            },
-            SubscriberEntry {
-                kind: SubscriberEntryKind::App(app_slug.to_string()),
-                push_depth: Depth::Unbounded,
-                retain_depth: Depth::Unbounded,
-                noise: NoiseLevel::Silent,
-                wake_min: Some(app_wake_min),
-            },
-        ],
-        transport_type: ChannelScheme::Brenn,
-        mount: None,
-    };
-    {
-        let conn = db.lock().await;
-        upsert_channels(&conn, std::slice::from_ref(&entry));
-        conn.execute(
-            "INSERT INTO users (id, username, password_hash, created_at) \
-             VALUES (1, 'test-user', 'h', '2024-01-01')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            &format!(
-                "INSERT INTO conversations \
-                 (id, user_id, status, app_slug, created_at, updated_at) \
-                 VALUES (1, 1, 'active', '{sender_slug}', '2024-01-01', '2024-01-01')"
-            ),
-            [],
-        )
-        .unwrap();
-    }
-    let directory = Arc::new(MessagingDirectory::with_entries(vec![entry]));
-    let router = Arc::new(CountingRouter::default());
-    let mut apps_raw: IndexMap<String, crate::config::AppConfig> = IndexMap::new();
-    apps_raw.insert(
-        sender_slug.to_string(),
-        test_app_config(
-            sender_slug,
-            Some(ResolvedMessagingConfig {
-                send_budget: 100,
-                subscriptions: vec![],
-            }),
-            vec!["test-user".to_string()],
-        ),
-    );
-    apps_raw.insert(
-        app_slug.to_string(),
-        test_app_config(
-            app_slug,
-            Some(ResolvedMessagingConfig {
-                send_budget: 100,
-                subscriptions: vec![ResolvedSubscription {
-                    channel_uuid,
-                    channel_address: channel_addr.clone(),
-                    push_depth: Depth::Unbounded,
-                    retain_depth: Depth::Unbounded,
-                    noise: NoiseLevel::Silent,
-                    wake_min: app_wake_min,
-                }],
-            }),
-            vec!["test-user".to_string()],
-        ),
-    );
-    let messenger = Messenger::new(
-        db,
-        directory,
-        Arc::from("test"),
-        Arc::new(apps_raw),
-        router.clone() as Arc<dyn WakeRouter>,
-        MessagingGlobalConfig::default(),
-    )
-    .with_subscriber_registrations(crate::messaging::testutils::wasm_registrations(
-        wasm_delivery_policies(&[wasm_slug]),
-    ));
-    (messenger, channel_uuid, router)
-}
-
-/// Mixed-subscriber matrix: one `Normal` message, two subscribers with different
-/// wake economics. The WASM subscriber is `Eager` (always woken); the App
-/// subscriber is `UrgencyGated` with `wake_min=High` (parks on a Normal message,
-/// since Normal < High). Proves `eager_wake` is computed per participant.
-///
-/// Expected: wasm row eager_wake=true (Eager), app row eager_wake=false (gated).
-#[tokio::test]
-async fn insert_pushes_mixed_wake_min_computes_eager_wake_per_subscriber() {
-    // wasm: Eager → always eager_wake=true (its wake_min is ignored)
-    // app:  UrgencyGated, wake_min=High → Normal >= High is false → eager_wake=false
-    let (m, _chan_uuid, _router) =
-        build_mixed_wake_min_messenger(WakeMin::Low, WakeMin::High).await;
-
-    let result = m
-        .publish(
-            crate::messaging::PublishOrigin::Conversation { id: 1 },
-            "wake-min-sender",
-            "brenn:wake-min-fanout-ch",
-            "test body",
-            Urgency::Normal,
-            None,
-            None,
-            None,
-        )
-        .await;
-    assert!(matches!(result, PublishResult::Ok { .. }), "{result:?}");
-
-    // Load pending rows for each subscriber and verify eager_wake.
-    // Query eager_wake directly from DB for both subscribers.
-    let conn = m.db.lock().await;
-    let wasm_rows: Vec<bool> = conn
-        .prepare(
-            "SELECT pp.eager_wake FROM messaging_pending_pushes pp \
-             WHERE pp.target_subscriber = 'wasm:wake-min-wasm' AND pp.delivered_at IS NULL",
-        )
-        .unwrap()
-        .query_map([], |r| r.get::<_, bool>(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-    let app_rows: Vec<bool> = conn
-        .prepare(
-            "SELECT pp.eager_wake FROM messaging_pending_pushes pp \
-             WHERE pp.target_app_slug = 'wake-min-app' AND pp.delivered_at IS NULL",
-        )
-        .unwrap()
-        .query_map([], |r| r.get::<_, bool>(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-    drop(conn);
-    assert_eq!(wasm_rows.len(), 1, "wasm subscriber must have one push row");
-    assert!(
-        wasm_rows[0],
-        "wasm (wake_min=Low) must have eager_wake=true for Normal-urgency message"
-    );
-    assert_eq!(app_rows.len(), 1, "app subscriber must have one push row");
-    assert!(
-        !app_rows[0],
-        "app (wake_min=High) must have eager_wake=false for Normal-urgency message"
-    );
-}
-
-/// A WASM subscriber is `Eager`: its push row is created eager regardless of the
-/// subscription's `wake_min` (waking a parked consumer is cheap, and the notify
-/// is itself the delivery trigger). Even with `wake_min=Never` on the entry and
-/// the lowest urgency, the row is eager — parking it would strand the consumer's
-/// delivery until an unrelated drain, the same class of bug as 5.2.
-#[tokio::test]
-async fn insert_pushes_wasm_is_eager_ignoring_wake_min() {
-    let (m, _chan_uuid, _router) =
-        build_mixed_wake_min_messenger(WakeMin::Never, WakeMin::Never).await;
-
-    let result = m
-        .publish(
-            crate::messaging::PublishOrigin::Conversation { id: 1 },
-            "wake-min-sender",
-            "brenn:wake-min-fanout-ch",
-            "test body",
-            Urgency::VeryLow,
-            None,
-            None,
-            None,
-        )
-        .await;
-    assert!(matches!(result, PublishResult::Ok { .. }), "{result:?}");
-
-    let conn = m.db.lock().await;
-    let wasm_eager_wake: Vec<bool> = conn
-        .prepare(
-            "SELECT pp.eager_wake FROM messaging_pending_pushes pp \
-             WHERE pp.target_subscriber = 'wasm:wake-min-wasm' AND pp.delivered_at IS NULL",
-        )
-        .unwrap()
-        .query_map([], |r| r.get::<_, bool>(0))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-    drop(conn);
-    assert_eq!(wasm_eager_wake.len(), 1);
-    assert!(
-        wasm_eager_wake[0],
-        "an Eager WASM subscriber wakes on every publish — wake_min=Never is ignored"
-    );
-}
 
 /// `publish_from_wasm` panics if the channel address is not in the directory.
 #[tokio::test]

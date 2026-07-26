@@ -308,9 +308,8 @@ impl crate::messaging::WakeRouter for NoopWakeRouter {
     async fn deliver(
         &self,
         _key: &crate::messaging::SubscriberEntryKind,
-        _: &crate::messaging::ParticipantId,
-        _: &crate::messaging::MessageEnvelope,
-        _retained_seq: Option<i64>,
+        _envelope: &std::sync::Arc<crate::messaging::MessageEnvelope>,
+        _retained_seq: i64,
     ) -> Result<bool, String> {
         Ok(false)
     }
@@ -338,7 +337,7 @@ impl crate::messaging::WakeRouter for NoopWakeRouter {
         crate::messaging::default_delivery_shape(key)
     }
 
-    fn alarm(&self, _channel: &str, _subscriber: &crate::messaging::ParticipantId) {}
+    fn alarm(&self, _channel: &str, _subscriber: &crate::messaging::ParticipantId, _count: u64) {}
 }
 
 #[cfg(test)]
@@ -347,7 +346,7 @@ pub mod tests {
     use crate::db::init_db_memory;
     use crate::messaging::canonical_address;
     use crate::messaging::config::{Depth, NoiseLevel, ResolvedChannel, Sink};
-    use crate::messaging::db::{insert_message_with_pushes, upsert_channels};
+    use crate::messaging::db::{insert_message, upsert_channels};
     use crate::messaging::{ChannelEntry, ChannelScheme};
     use crate::messaging::{
         MessagingDirectory, MessagingGlobalConfig, SubscriberEntry, SubscriberEntryKind, Urgency,
@@ -381,7 +380,7 @@ pub mod tests {
     }
 
     fn insert(conn: &Connection, channel: Uuid, body: &str, sender: &str, ns: i64) {
-        insert_message_with_pushes(
+        insert_message(
             conn,
             channel,
             "src",
@@ -393,7 +392,6 @@ pub mod tests {
             None,
             None,
             ns,
-            &[],
         );
     }
 

@@ -1,61 +1,50 @@
-//! F26: `dispatch_row` Err / Ok(false) / Ok(true) / deadline-override arm tests
-//! (design §"Tests: fanned into `publish/tests/` by family":
-//! `publish/tests/dispatch_row.rs`).
+//! `dispatch_row` Err / Ok(false) / Ok(true) arm tests.
 //!
-//! These lock the F3 fix (Immediate row + bridge-died-mid-send →
-//! `spawn_eager_wake` instead of silent park) and the R6 deadline override.
-//! Each constructs a `PendingPushRow` via the single-family `fake_pending_row`
-//! helper and calls `dispatcher::dispatch_row` against a `CountingRouter`
-//! configured to return the relevant arm.
+//! These lock the eager-wake-on-failed-send behaviour (an eager row whose bridge
+//! died mid-send fires `spawn_eager_wake` instead of parking silently) and the
+//! wake gate. Each constructs a `PendingPushRow` via the single-family
+//! `fake_ingress_row` helper and calls `dispatcher::dispatch_row` against a
+//! `CountingRouter` configured to return the relevant arm.
 //!
 //! Production items (`DispatchOutcome`, `Messenger`) are reached via
 //! `use super::super::*;` (directly from `publish/mod.rs`); the cross-family
 //! shared `CountingRouter` fixture is declared `pub(super)` in `tests/mod.rs`
-//! and pulled in by the named `use super::{…};` below. `fake_pending_row` is
-//! used only by this family, so per design §"Tests: fanned…" it lives here
-//! rather than in the harness.
+//! and pulled in by the named `use super::{…};` below. `fake_ingress_row` is
+//! used only by this family, so it lives here rather than in the harness.
 
 use super::super::*;
 use super::CountingRouter;
 use crate::messaging::dispatcher;
-use crate::messaging::{ParticipantId, Urgency, WakeRouter, canonical_address};
+use crate::messaging::{ParticipantId, Urgency, WakeRouter};
 use chrono::Utc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use uuid::Uuid;
 
 // -----------------------------------------------------------------------
-// F26: dispatch_row Err arm (F3 fix)
-//
-// The Err arm is the F3 fix (Immediate row + bridge-died-mid-send →
-// spawn_eager_wake instead of silent park). Without these tests, a
-// regression that re-broke F3 would pass every other test in the
-// suite. We construct a `PendingPushRow` directly and call
-// `dispatch_row` against a `CountingRouter` configured to return
-// `Err`, asserting both the outcome (Parked) and that the eager
-// wake fired iff `wake_kind == Immediate`.
+// The Err arm: an eager row whose bridge died mid-send must wake rather than
+// park silently. Without these tests, a regression that re-broke it would pass
+// every other test in the suite. We construct a `PendingPushRow` directly and
+// call `dispatch_row` against a `CountingRouter` configured to return `Err`,
+// asserting both the outcome (Parked) and that the eager wake fired iff the row
+// asks for one.
 // -----------------------------------------------------------------------
 
-fn fake_pending_row(push_id: i64, urgency: Urgency) -> crate::messaging::db::PendingPushRow {
-    // eager_wake mirrors what insert_pushes would compute with default wake_min=Normal.
+/// One channel-less ingress row — the only kind `dispatch_row` still sees, since
+/// what a subscriber is owed on a channel is its cursor position.
+fn fake_ingress_row(push_id: i64, urgency: Urgency) -> crate::messaging::db::PendingPushRow {
+    // eager_wake mirrors what the ingress insert computes: eager at Normal and up.
     let eager_wake = urgency >= Urgency::Normal;
     crate::messaging::db::PendingPushRow {
-        retained_seq: Some(1),
         push_id,
         message_id: push_id,
-        payload: crate::messaging::IngressOrBus::Bus(crate::messaging::MessageEnvelope {
-            message_id: Uuid::new_v4(),
-            source: "src".into(),
-            channel: canonical_address("test"),
-            sender: "sender".into(),
-            publish_ts: Utc::now(),
-            body: "body".into(),
-            reply_to: None,
-            delivery_deadline: None,
-            deliver_after: None,
-            urgency,
-            envelope_type: crate::messaging::ChannelScheme::Brenn,
-        }),
+        event: crate::messaging::ingress::Event {
+            id: push_id,
+            conversation_id: 99,
+            source: "repo_sync".into(),
+            summary: "summary".into(),
+            payload: "payload".into(),
+            created_at: Utc::now(),
+        },
         target_subscriber: ParticipantId::for_conversation(99),
         target_app_slug: "test-app".to_string(),
         eager_wake,
@@ -63,45 +52,42 @@ fn fake_pending_row(push_id: i64, urgency: Urgency) -> crate::messaging::db::Pen
 }
 
 #[tokio::test]
-async fn dispatch_row_immediate_err_fires_eager_wake() {
+async fn dispatch_row_eager_err_fires_eager_wake() {
     let router = Arc::new(CountingRouter::default());
-    // Simulate bridge-died-mid-send: deliver returns Err.
+    // Simulate bridge-died-mid-send: the send returns Err.
     router.deliver_returns.store(2, Ordering::SeqCst);
-    let row = fake_pending_row(7, Urgency::Normal);
-    let outcome =
-        dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false, false).await;
+    let row = fake_ingress_row(7, Urgency::Normal);
+    let outcome = dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false).await;
     assert_eq!(outcome, DispatchOutcome::Parked { woke: true });
     assert_eq!(
         router.eager_wakes.load(Ordering::SeqCst),
         1,
-        "Immediate-wake row must eager-wake on Err (F3 contract)"
+        "an eager row must eager-wake on Err"
     );
 }
 
 #[tokio::test]
-async fn dispatch_row_none_wake_err_does_not_eager_wake() {
+async fn dispatch_row_quiet_err_does_not_eager_wake() {
     let router = Arc::new(CountingRouter::default());
     router.deliver_returns.store(2, Ordering::SeqCst);
-    let row = fake_pending_row(8, Urgency::Low);
-    let outcome =
-        dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false, false).await;
+    let row = fake_ingress_row(8, Urgency::Low);
+    let outcome = dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false).await;
     assert_eq!(outcome, DispatchOutcome::Parked { woke: false });
     assert_eq!(
         router.eager_wakes.load(Ordering::SeqCst),
         0,
-        "None-wake rows must not eager-wake — only Immediate gets the F3 fix",
+        "a row that asks for no wake must not eager-wake",
     );
 }
 
 /// Sanity check the `Ok(false)` arm against the same fixture so the
 /// Err vs. Ok(false) eager-wake parity is locked.
 #[tokio::test]
-async fn dispatch_row_immediate_ok_false_fires_eager_wake() {
+async fn dispatch_row_eager_ok_false_fires_eager_wake() {
     let router = Arc::new(CountingRouter::default());
     // deliver_returns = 0 → Ok(false).
-    let row = fake_pending_row(9, Urgency::Normal);
-    let outcome =
-        dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false, false).await;
+    let row = fake_ingress_row(9, Urgency::Normal);
+    let outcome = dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false).await;
     assert_eq!(outcome, DispatchOutcome::Parked { woke: true });
     assert_eq!(router.eager_wakes.load(Ordering::SeqCst), 1);
 }
@@ -111,48 +97,20 @@ async fn dispatch_row_immediate_ok_false_fires_eager_wake() {
 async fn dispatch_row_ok_true_returns_delivered() {
     let router = Arc::new(CountingRouter::default());
     router.deliver_returns.store(1, Ordering::SeqCst);
-    let row = fake_pending_row(10, Urgency::Normal);
-    let outcome =
-        dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false, false).await;
+    let row = fake_ingress_row(10, Urgency::Normal);
+    let outcome = dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false).await;
     assert_eq!(outcome, DispatchOutcome::Delivered(10));
     assert_eq!(router.eager_wakes.load(Ordering::SeqCst), 0);
 }
 
-/// Wasm + a bus row: parks without waking. A channel-backed row has a single
-/// external wake source; waking here too would double-fire.
+/// A parked-shaped (`wasm:`) target: the row's own eager wake is the whole of the
+/// dispatch — the inline delivery path is never called for it.
 #[tokio::test]
-async fn dispatch_row_wasm_bus_row_parks_without_waking() {
+async fn dispatch_row_parked_target_wakes_without_delivering() {
     let router = Arc::new(CountingRouter::default());
-    let mut row = fake_pending_row(11, Urgency::Normal);
+    let mut row = fake_ingress_row(11, Urgency::Normal);
     row.target_subscriber = ParticipantId::for_wasm("test-slug");
-    let outcome =
-        dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false, false).await;
-    assert_eq!(outcome, DispatchOutcome::Parked { woke: false });
-    assert_eq!(
-        router.eager_wakes.load(Ordering::SeqCst),
-        0,
-        "a channel-backed Wasm row is woken by the store walk, not here",
-    );
-}
-
-/// Wasm + an ingress row: parks and fires one eager wake. An ingress row
-/// belongs to no channel and therefore to no store, so no walk can find it and
-/// this arm is its only wake source.
-#[tokio::test]
-async fn dispatch_row_wasm_ingress_row_parks_and_eager_wakes() {
-    let router = Arc::new(CountingRouter::default());
-    let mut row = fake_pending_row(11, Urgency::Normal);
-    row.target_subscriber = ParticipantId::for_wasm("test-slug");
-    row.payload = crate::messaging::IngressOrBus::Ingress(crate::messaging::ingress::Event {
-        id: 11,
-        conversation_id: 1,
-        source: "repo_sync".into(),
-        summary: "summary".into(),
-        payload: "payload".into(),
-        created_at: Utc::now(),
-    });
-    let outcome =
-        dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false, false).await;
+    let outcome = dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false).await;
     assert_eq!(outcome, DispatchOutcome::Parked { woke: true });
     assert_eq!(
         router.eager_wakes.load(Ordering::SeqCst),
@@ -161,72 +119,26 @@ async fn dispatch_row_wasm_ingress_row_parks_and_eager_wakes() {
     );
 }
 
-/// Wasm + `None` wake, on the one payload this arm still wakes for: parks and
-/// does NOT fire an eager wake. Locks the `None`-wake branch of the parked gate
-/// — a regression that accidentally calls `spawn_eager_wake` for `None`-wake
-/// rows would fail here.
+/// A parked-shaped target on a row that asks for no wake: parks and fires
+/// nothing. Locks the quiet branch of the parked gate — a regression that
+/// accidentally calls `spawn_eager_wake` for it would fail here.
 #[tokio::test]
-async fn dispatch_row_wasm_none_parks_no_eager_wake() {
+async fn dispatch_row_parked_target_quiet_row_wakes_nobody() {
     let router = Arc::new(CountingRouter::default());
-    let mut row = fake_pending_row(12, Urgency::Low);
+    let mut row = fake_ingress_row(12, Urgency::Low);
     row.target_subscriber = ParticipantId::for_wasm("test-slug");
-    row.payload = crate::messaging::IngressOrBus::Ingress(crate::messaging::ingress::Event {
-        id: 12,
-        conversation_id: 1,
-        source: "repo_sync".into(),
-        summary: "summary".into(),
-        payload: "payload".into(),
-        created_at: Utc::now(),
-    });
-    let outcome =
-        dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false, false).await;
+    let outcome = dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false).await;
     assert_eq!(outcome, DispatchOutcome::Parked { woke: false });
     assert_eq!(
         router.eager_wakes.load(Ordering::SeqCst),
         0,
-        "None-wake Wasm row must NOT fire an eager wake",
-    );
-}
-
-/// `None`-wake row + `deadline_expired=true`: the deadline override must trigger
-/// an unconditional eager wake even though `wake_kind == None`. Without this test
-/// a regression removing `|| deadline_expired` from the dispatch_row Ok(false)/Err
-/// branches for None-wake rows would pass all other tests.
-#[tokio::test]
-async fn dispatch_row_none_wake_deadline_expired_unconditional_wake() {
-    let router = Arc::new(CountingRouter::default());
-    // deliver_returns = 0 → Ok(false) (no active bridge).
-    let row = fake_pending_row(20, Urgency::Low);
-    let outcome =
-        dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, true, false).await;
-    assert_eq!(outcome, DispatchOutcome::Parked { woke: true });
-    assert_eq!(
-        router.eager_wakes.load(Ordering::SeqCst),
-        1,
-        "None-wake row with deadline_expired=true must unconditionally eager-wake (R6 deadline override)"
-    );
-}
-
-/// `None`-wake row + `deadline_expired=true` + Err from deliver: same unconditional
-/// wake on the Err arm (symmetry with the Ok(false) arm above).
-#[tokio::test]
-async fn dispatch_row_none_wake_deadline_expired_unconditional_wake_on_err() {
-    let router = Arc::new(CountingRouter::default());
-    router.deliver_returns.store(2, Ordering::SeqCst); // Err arm
-    let row = fake_pending_row(21, Urgency::Low);
-    let outcome =
-        dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, true, false).await;
-    assert_eq!(outcome, DispatchOutcome::Parked { woke: true });
-    assert_eq!(
-        router.eager_wakes.load(Ordering::SeqCst),
-        1,
-        "None-wake + deadline_expired + Err must still eager-wake unconditionally"
+        "a quiet row on a parked target must NOT fire an eager wake",
     );
 }
 
 // -----------------------------------------------------------------------
 // Wake gate: `wake_gated=true` suppresses the eager wake but never the
-// delivery attempt; `deadline_expired` still overrides the gate.
+// delivery attempt.
 // -----------------------------------------------------------------------
 
 /// Eager row + `wake_gated=true` + no active bridge (Ok(false)): the gate
@@ -235,9 +147,8 @@ async fn dispatch_row_none_wake_deadline_expired_unconditional_wake_on_err() {
 async fn dispatch_row_wake_gated_suppresses_eager_wake() {
     let router = Arc::new(CountingRouter::default());
     // deliver_returns = 0 → Ok(false) (no active bridge).
-    let row = fake_pending_row(30, Urgency::Normal);
-    let outcome =
-        dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false, true).await;
+    let row = fake_ingress_row(30, Urgency::Normal);
+    let outcome = dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, true).await;
     assert_eq!(outcome, DispatchOutcome::Parked { woke: false });
     assert_eq!(
         router.eager_wakes.load(Ordering::SeqCst),
@@ -246,36 +157,34 @@ async fn dispatch_row_wake_gated_suppresses_eager_wake() {
     );
 }
 
-/// Eager Wasm row + `wake_gated=true`: the Wasm gate honours `wake_gated` too —
-/// no eager wake fires. Covers the wasm-gate branch of the gate.
+/// Eager row on a parked-shaped target + `wake_gated=true`: the parked gate
+/// honours `wake_gated` too — no eager wake fires.
 #[tokio::test]
-async fn dispatch_row_wake_gated_suppresses_wasm_wake() {
+async fn dispatch_row_wake_gated_suppresses_a_parked_targets_wake() {
     let router = Arc::new(CountingRouter::default());
-    let mut row = fake_pending_row(31, Urgency::Normal);
+    let mut row = fake_ingress_row(31, Urgency::Normal);
     row.target_subscriber = ParticipantId::for_wasm("test-slug");
-    let outcome =
-        dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, false, true).await;
+    let outcome = dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, true).await;
     assert_eq!(outcome, DispatchOutcome::Parked { woke: false });
     assert_eq!(
         router.eager_wakes.load(Ordering::SeqCst),
         0,
-        "wake_gated must suppress the eager wake on the Wasm gate branch",
+        "wake_gated must suppress the eager wake on the parked-gate branch",
     );
 }
 
-/// Eager row + `wake_gated=true` + `deadline_expired=true`: the deadline override
-/// beats the gate — the wake fires (`Parked { woke: true }`, `eager_wakes == 1`).
+/// The gate is never a delivery gate: a gated eager row still reaches the bridge,
+/// and a live one is delivered.
 #[tokio::test]
-async fn dispatch_row_wake_gated_deadline_beats_gate() {
+async fn dispatch_row_wake_gated_still_delivers() {
     let router = Arc::new(CountingRouter::default());
-    // deliver_returns = 0 → Ok(false).
-    let row = fake_pending_row(32, Urgency::Normal);
-    let outcome =
-        dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, true, true).await;
-    assert_eq!(outcome, DispatchOutcome::Parked { woke: true });
+    router.deliver_returns.store(1, Ordering::SeqCst);
+    let row = fake_ingress_row(32, Urgency::Normal);
+    let outcome = dispatcher::dispatch_row(router.as_ref() as &dyn WakeRouter, &row, true).await;
+    assert_eq!(outcome, DispatchOutcome::Delivered(32));
     assert_eq!(
         router.eager_wakes.load(Ordering::SeqCst),
-        1,
-        "deadline_expired must force the eager wake even when wake_gated is true",
+        0,
+        "a delivered row needs no wake",
     );
 }

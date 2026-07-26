@@ -173,20 +173,16 @@ pub fn load_dynamic_subscription_for(
 /// `messaging_subscriptions`, both in **one transaction** (design §2.1 "Runtime
 /// mirror write").
 ///
-/// The mirror write is not optional and not deferrable to the next boot: the
-/// urgency-recompute join in `update_message_and_pending_pushes` (`bus.rs`) reads
-/// `messaging_subscriptions` to resolve `push_depth` for pending push rows. A
-/// just-created **push-enabled** dynamic sub that is absent from the mirror until
-/// reboot would be invisible to that join — a message-urgency edit before any
-/// restart would compute `eager_wake` against a missing row and silently fail to
-/// wake a subscriber it should (CLAUDE.md BETTER DEAD THAN WRONG). Writing the mirror in
-/// the same transaction as the durable row keeps the two consistent. Pull-only
-/// (`push_depth=0`) subs never participate in `eager_wake` (the join's
-/// `push_depth>0` guard excludes them), so for those the mirror row is harmless
-/// redundancy — but writing it unconditionally keeps one code path.
+/// The mirror write is not optional and not deferrable to the next boot:
+/// `messaging_subscriptions` is the flat record of every live subscription
+/// whatever its origin, and a just-created dynamic sub absent from it until the
+/// next restart would leave the two tables telling different stories about the
+/// same subscriber. Sharing the durable row's transaction is what makes that
+/// disagreement unreachable rather than merely unlikely. The write is
+/// unconditional across depths so there is one code path, not two.
 ///
 /// The MQTT-only `qos` lives only in the durable table; `messaging_subscriptions`
-/// has no `qos` column and the recompute join does not need it. Both writes share
+/// has no `qos` column and no reader of it needs one. Both writes share
 /// the `(channel_uuid, app_slug)` PK; the caller guarantees neither row
 /// pre-exists. `subscribe_dynamic` re-establishes that guarantee before reaching
 /// here: it returns early on an existing directory subscriber (re-subscribe is

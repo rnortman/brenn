@@ -252,7 +252,7 @@ mod tests {
     use crate::messaging::config::{
         Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel, Sink,
     };
-    use crate::messaging::db::{insert_message_with_pushes, upsert_channels, utc_to_ns};
+    use crate::messaging::db::{insert_message, upsert_channels, utc_to_ns};
     use crate::messaging::query::NoopWakeRouter;
     use crate::messaging::test_support::{brenn_delivery_policy, test_app_config};
     use crate::messaging::{
@@ -264,9 +264,20 @@ mod tests {
     const USER: &str = "u";
 
     fn channel(name: &str, push_depth: Depth) -> ChannelEntry {
+        transport_channel(&canonical_address(name), ChannelScheme::Brenn, push_depth)
+    }
+
+    /// The same subscriber shape on a channel of any scheme — what the delivery
+    /// gate dispatches on is the address, so a test of that dispatch needs to
+    /// name one of each.
+    fn transport_channel(
+        address: &str,
+        transport_type: ChannelScheme,
+        push_depth: Depth,
+    ) -> ChannelEntry {
         ChannelEntry {
             uuid: Uuid::new_v4(),
-            address: canonical_address(name),
+            address: address.to_string(),
             description: None,
             resolved_channel: ResolvedChannel {
                 send_rate: Default::default(),
@@ -284,7 +295,7 @@ mod tests {
                 noise: NoiseLevel::Silent,
                 wake_min: Some(WakeMin::Normal),
             }],
-            transport_type: ChannelScheme::Brenn,
+            transport_type,
             mount: None,
         }
     }
@@ -294,6 +305,19 @@ mod tests {
     /// conversation through. The conversation itself is not created here: the
     /// attach mints it, which is half of what these rows are about.
     async fn messenger(entries: Vec<ChannelEntry>) -> Arc<Messenger> {
+        messenger_with_policy(
+            entries,
+            brenn_delivery_policy(crate::access::acl::ChannelMatcher::Prefix(String::new())),
+        )
+        .await
+    }
+
+    /// The same, with the app's policy chosen by the caller — the delivery gate
+    /// reads it, so a case about the gate has to be able to say what it holds.
+    async fn messenger_with_policy(
+        entries: Vec<ChannelEntry>,
+        policy: crate::access::AppPolicy,
+    ) -> Arc<Messenger> {
         let db = init_db_memory();
         {
             let conn = db.lock().await;
@@ -302,8 +326,7 @@ mod tests {
         }
         let mut app: AppConfig = test_app_config(APP, None, vec![USER.to_string()]);
         app.singleton = true;
-        app.policy =
-            brenn_delivery_policy(crate::access::acl::ChannelMatcher::Prefix(String::new()));
+        app.policy = policy;
         let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
         apps.insert(APP.to_string(), app);
         Messenger::new(
@@ -318,7 +341,7 @@ mod tests {
 
     async fn publish(m: &Messenger, channel_uuid: Uuid, body: &str) {
         let conn = m.db.lock().await;
-        insert_message_with_pushes(
+        insert_message(
             &conn,
             channel_uuid,
             "test-source",
@@ -330,7 +353,6 @@ mod tests {
             None,
             None,
             utc_to_ns(chrono::Utc::now()),
-            &[],
         );
     }
 
@@ -490,6 +512,25 @@ mod tests {
         );
     }
 
+    /// The same store and directory, under an app whose policy covers nothing —
+    /// the operator revoking the app's access to the channel, with every position
+    /// left exactly where it was.
+    fn revoked_messenger(m: &Messenger) -> Arc<Messenger> {
+        let mut app: AppConfig = test_app_config(APP, None, vec![USER.to_string()]);
+        app.singleton = true;
+        app.policy = crate::access::AppPolicy::default();
+        let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
+        apps.insert(APP.to_string(), app);
+        Messenger::new(
+            m.db.clone(),
+            Arc::clone(m.directory()),
+            Arc::from("test-source"),
+            Arc::new(apps),
+            Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
+            MessagingGlobalConfig::default(),
+        )
+    }
+
     /// A revoked ACL stops delivery from that channel — the same delivery-time
     /// gate the commit path applies, now applied where the read happens.
     #[tokio::test]
@@ -505,24 +546,118 @@ mod tests {
             1
         );
 
-        let revoked = {
-            let mut app: AppConfig = test_app_config(APP, None, vec![USER.to_string()]);
-            app.singleton = true;
-            app.policy = crate::access::AppPolicy::default();
-            let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
-            apps.insert(APP.to_string(), app);
-            Messenger::new(
-                m.db.clone(),
-                Arc::clone(m.directory()),
-                Arc::from("test-source"),
-                Arc::new(apps),
-                Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
-                MessagingGlobalConfig::default(),
-            )
-        };
+        let revoked = revoked_messenger(&m);
         assert!(
             revoked.conversation_delivery(conversation).await.is_empty(),
             "a subscriber whose policy no longer covers the channel is not served from it"
+        );
+    }
+
+    /// The gate is two lookups composed — the app has a policy, and that policy
+    /// covers this address — and the second one dispatches on the address's
+    /// scheme: `mqtt:` against the app's mqtt matchers, `webhook:` against its
+    /// webhook ones. One covered and one uncovered channel of each scheme pin
+    /// that dispatch at the delivery point, where routing an address to the wrong
+    /// per-transport check either leaks a channel the operator did not grant or
+    /// silently starves one they did.
+    #[tokio::test]
+    async fn the_delivery_gate_checks_each_transport_against_its_own_acl() {
+        use crate::access::acl::{MqttSubMatcher, WebhookMatcher};
+        use crate::access::{AppCapability, AppPolicy};
+
+        let covered_mqtt = transport_channel(
+            "mqtt:home:sensors/kitchen/temp",
+            ChannelScheme::Mqtt,
+            Depth::Bounded(5),
+        );
+        let uncovered_mqtt = transport_channel(
+            "mqtt:office:sensors/kitchen/temp",
+            ChannelScheme::Mqtt,
+            Depth::Bounded(5),
+        );
+        let covered_hook =
+            transport_channel("webhook:github", ChannelScheme::Webhook, Depth::Bounded(5));
+        let uncovered_hook =
+            transport_channel("webhook:gitlab", ChannelScheme::Webhook, Depth::Bounded(5));
+        let uuids = [
+            covered_mqtt.uuid,
+            uncovered_mqtt.uuid,
+            covered_hook.uuid,
+            uncovered_hook.uuid,
+        ];
+
+        let mut policy = AppPolicy::default();
+        policy.grants.insert(AppCapability::MqttSubscribe);
+        policy.grants.insert(AppCapability::Webhook);
+        policy.acls.mqtt_subscribe.push(MqttSubMatcher {
+            client: "home".to_string(),
+            topic_filter: "sensors/+/temp".to_string(),
+        });
+        policy.acls.webhook.push(WebhookMatcher {
+            endpoint: "github".to_string(),
+        });
+
+        let m = messenger_with_policy(
+            vec![covered_mqtt, uncovered_mqtt, covered_hook, uncovered_hook],
+            policy,
+        )
+        .await;
+        m.attach_conversation_subscribers().await;
+        let conversation = conversation_of(&m).await;
+
+        // Every channel is subscribed and positioned; only the ACL differs.
+        publish(&m, uuids[0], "mqtt-covered").await;
+        publish(&m, uuids[1], "mqtt-uncovered").await;
+        publish(&m, uuids[2], "webhook-covered").await;
+        publish(&m, uuids[3], "webhook-uncovered").await;
+
+        let delivery = m.conversation_delivery(conversation).await;
+        assert_eq!(
+            delivery
+                .messages
+                .iter()
+                .map(|e| e.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mqtt-covered", "webhook-covered"],
+            "each address is decided by its own transport's matchers"
+        );
+    }
+
+    /// The other half of the same rule: the denial skips the channel and moves
+    /// nothing, so restoring the ACL serves everything published in between,
+    /// bounded by retention. Authorization is a read-time fact — the position
+    /// moves only by its owner's advance.
+    ///
+    /// This is the half a regression destroys invisibly: a denial that skipped
+    /// *and* advanced passes `a_revoked_acl_stops_delivery` unchanged and eats
+    /// the backlog silently.
+    #[tokio::test]
+    async fn a_restored_acl_serves_the_backlog_the_denial_held() {
+        let ch = channel("chat", Depth::Bounded(5));
+        let uuid = ch.uuid;
+        let m = messenger(vec![ch]).await;
+        m.attach_conversation_subscribers().await;
+        let conversation = conversation_of(&m).await;
+        publish(&m, uuid, "before-revocation").await;
+
+        let revoked = revoked_messenger(&m);
+        publish(&m, uuid, "during-revocation").await;
+        assert!(
+            revoked.conversation_delivery(conversation).await.is_empty(),
+            "nothing is served while the policy does not cover the channel"
+        );
+
+        // `m` is the same app with its coverage back: both messages are still
+        // ahead of the position the denial declined to move.
+        let delivery = m.conversation_delivery(conversation).await;
+        assert_eq!(
+            delivery
+                .messages
+                .iter()
+                .map(|e| e.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before-revocation", "during-revocation"],
+            "a restored ACL is a window over the history the subscriber missed"
         );
     }
 }

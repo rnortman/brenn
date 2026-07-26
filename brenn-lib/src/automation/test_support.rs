@@ -67,9 +67,8 @@ impl WakeRouter for FakeWakeRouter {
     async fn deliver(
         &self,
         _key: &crate::messaging::SubscriberEntryKind,
-        _: &crate::messaging::ParticipantId,
-        _: &MessageEnvelope,
-        _retained_seq: Option<i64>,
+        _envelope: &std::sync::Arc<MessageEnvelope>,
+        _retained_seq: i64,
     ) -> Result<bool, String> {
         Ok(false)
     }
@@ -93,7 +92,7 @@ impl WakeRouter for FakeWakeRouter {
     ) -> crate::messaging::DeliveryShape {
         crate::messaging::default_delivery_shape(key)
     }
-    fn alarm(&self, _channel: &str, _subscriber: &crate::messaging::ParticipantId) {}
+    fn alarm(&self, _channel: &str, _subscriber: &crate::messaging::ParticipantId, _count: u64) {}
 }
 
 /// Build a minimal `AppConfig` for test engines.
@@ -105,8 +104,8 @@ pub(super) fn default_app_cfg(slug: &str, singleton: bool) -> AppConfig {
 }
 
 /// Like `default_app_cfg` but with an explicit subscription list. Use when the
-/// test directory has a push-enabled subscriber entry for this app — the
-/// `resolve_push_targets` invariant requires a matching `ResolvedSubscription`.
+/// test directory has a push-enabled subscriber entry for this app, so the app's
+/// own config and the directory agree about what it subscribes to.
 pub(super) fn default_app_cfg_with_subscriptions(
     slug: &str,
     singleton: bool,
@@ -203,9 +202,9 @@ pub(super) fn make_engine_full(
     global_cfg: AutomationGlobalConfig,
     singleton: bool,
 ) -> Arc<AutomationEngine> {
-    // Build subscriptions for "test-app" from the directory so the
-    // resolve_push_targets invariant holds: every push-enabled channel subscriber
-    // must have a matching ResolvedSubscription on the app.
+    // Build subscriptions for "test-app" from the directory so the app's config
+    // and the directory agree: every push-enabled channel subscriber has a
+    // matching ResolvedSubscription on the app.
     let subscriptions: Vec<crate::messaging::config::ResolvedSubscription> = directory
         .list()
         .iter()

@@ -895,22 +895,16 @@ async fn maybe_inject_pending(ctx: &RepoSyncCtx, conversation_id: i64, source: &
     // Fetch pending repo_sync rows (the just-committed one plus any
     // stragglers from earlier cycles that failed to inject). The rows
     // are already persisted — we did NOT just enqueue here.
-    // Load from the unified ingress store via load_pending_pushes_for_drain,
+    // Load from the unified ingress store via load_pending_ingress_for_drain,
     // filtering to repo_sync:* ingress events.
-    // `Event.id` is the push_id (set by row_to_drain_push) — used for marking delivered.
+    // `Event.id` is the push_id — used for marking delivered.
     let repo_sync_pending: Vec<brenn_lib::messaging::IngressEvent> = {
         let conn = ctx.db.lock().await;
         let subscriber = brenn_lib::messaging::ParticipantId::for_conversation(conversation_id);
-        brenn_lib::messaging::db::load_pending_pushes_for_drain(&conn, &subscriber)
+        brenn_lib::messaging::db::load_pending_ingress_for_drain(&conn, &subscriber)
             .into_iter()
-            .filter_map(|(_push_id, payload)| match payload {
-                brenn_lib::messaging::IngressOrBus::Ingress(ev)
-                    if brenn_lib::messaging::is_repo_sync_source(&ev.source) =>
-                {
-                    Some(ev)
-                }
-                _ => None,
-            })
+            .map(|(_push_id, ev)| ev)
+            .filter(|ev| brenn_lib::messaging::is_repo_sync_source(&ev.source))
             .collect()
     };
     span.record("pending_count", repo_sync_pending.len());
@@ -1103,16 +1097,10 @@ mod tests {
     ) -> Vec<brenn_lib::messaging::IngressEvent> {
         let conn = db.lock().await;
         let subscriber = brenn_lib::messaging::ParticipantId::for_conversation(conv_id);
-        brenn_lib::messaging::db::load_pending_pushes_for_drain(&conn, &subscriber)
+        brenn_lib::messaging::db::load_pending_ingress_for_drain(&conn, &subscriber)
             .into_iter()
-            .filter_map(|(_push_id, payload)| match payload {
-                brenn_lib::messaging::IngressOrBus::Ingress(ev)
-                    if brenn_lib::messaging::is_repo_sync_source(&ev.source) =>
-                {
-                    Some(ev)
-                }
-                _ => None,
-            })
+            .map(|(_push_id, ev)| ev)
+            .filter(|ev| brenn_lib::messaging::is_repo_sync_source(&ev.source))
             .collect()
     }
 

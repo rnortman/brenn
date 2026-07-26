@@ -6,10 +6,9 @@ use uuid::Uuid;
 
 use crate::db::format_ts_for_db;
 use crate::messaging::ingress::Event as IngressEvent;
-use crate::messaging::{IngressOrBus, MessageEnvelope, ParticipantId, Urgency};
+use crate::messaging::{ParticipantId, Urgency};
 
-use super::shared::{ns_to_utc, parse_rfc3339};
-use super::types::PendingPushRow;
+use super::shared::ns_to_utc;
 
 /// Insert a `kind='ingress'` message row plus exactly one pending-push row
 /// keyed to `subscriber`, without wrapping in a new transaction. Callers
@@ -273,222 +272,75 @@ pub fn mark_stale_undelivered_ingress_repo_sync(conn: &Connection, staleness_day
     stale_count + orphan_count
 }
 
-/// The drain read, up to its row-kind filter: undelivered, unparked pending-push
-/// rows for one subscriber, oldest publish first.
-const DRAIN_PUSHES_SQL: &str = "SELECT pp.id, pp.target_subscriber, pp.eager_wake,
-            m.uuid, m.source, m.sender, m.body,
-            m.urgency AS msg_urgency,
-            m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-            c.address, rc.address,
-            m.envelope_type, m.ingress_source, m.ingress_summary,
-            pp.message_id, pp.target_app_slug
-     FROM messaging_pending_pushes pp
-     JOIN messaging_messages m ON pp.message_id = m.id
-     LEFT JOIN messaging_channels c ON c.uuid = m.channel_uuid
-     LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
-     WHERE pp.target_subscriber = ?1
-       AND pp.delivered_at IS NULL
-       AND pp.release_after IS NULL";
-
-const DRAIN_PUSHES_ORDER_SQL: &str = " ORDER BY m.publish_ts_ns ASC, m.id ASC";
-
-/// Run the drain read, optionally narrowed to the channel-less ingress
-/// row-kind. Narrowing in SQL rather than in Rust is what keeps a caller that
-/// wants only ingress from loading — and discarding — every bus body the
-/// subscriber is owed.
-fn load_drain_pushes(
-    conn: &Connection,
-    subscriber: &ParticipantId,
-    only_ingress: bool,
-) -> Vec<(i64, IngressOrBus)> {
-    let mut sql = String::from(DRAIN_PUSHES_SQL);
-    if only_ingress {
-        sql.push_str(" AND m.envelope_type = '");
-        sql.push_str(super::EnvelopeTypeColumn::Ingress.as_str());
-        sql.push('\'');
-    }
-    sql.push_str(DRAIN_PUSHES_ORDER_SQL);
-    let mut stmt = conn.prepare(&sql).expect("prepare drain push read");
-    let rows = stmt
-        .query_map(rusqlite::params![subscriber.as_str()], row_to_drain_push)
-        .expect("query drain push read");
-    rows.map(|r| {
-        let row = r.expect("read pending push");
-        (row.push_id, row.payload)
-    })
-    .collect()
-}
-
-/// Load all undelivered, unparked pending-push rows for `subscriber`,
-/// in `publish_ts_ns ASC, id ASC` order. Rows of `kind='brenn'` produce
-/// `Bus(MessageEnvelope)`, `kind='ingress'` rows produce an
-/// `Ingress(Event)`. The drain caller partitions these into two slices for
-/// `render_combined_drain`.
-pub fn load_pending_pushes_for_drain(
-    conn: &Connection,
-    subscriber: &ParticipantId,
-) -> Vec<(i64, IngressOrBus)> {
-    load_drain_pushes(conn, subscriber, false)
-}
-
-/// The same read, narrowed to the channel-less ingress row-kind: what a
-/// participant is owed on a *channel* is its position, read through its window,
-/// so a drain that already reads its windows wants only these rows here.
+/// SQL for the drain read. Shared with its plan-assertion test so the test can
+/// never drift from the production query.
 ///
-/// A bus row reaching the decoder would mean the row-kind predicate and the
-/// decoder disagree — a host bug, not a row to skip.
+/// The `pp` conjuncts match `idx_messaging_pending_pushes_ingress_undelivered`'s
+/// partial predicate, so the planner can qualify that index rather than scanning
+/// the table for one subscriber's rows.
+pub(crate) const LOAD_PENDING_INGRESS_FOR_DRAIN_SQL: &str = "SELECT pp.id, m.body, m.publish_ts_ns,
+                    m.ingress_source, m.ingress_summary, m.envelope_type
+             FROM messaging_pending_pushes pp
+             JOIN messaging_messages m ON pp.message_id = m.id
+             WHERE pp.target_subscriber = ?1
+               AND pp.delivered_at IS NULL
+               AND m.channel_uuid IS NULL
+             ORDER BY m.publish_ts_ns ASC, m.id ASC";
+
+/// Undelivered, channel-less ingress rows for one subscriber, oldest publish
+/// first.
+///
+/// What a participant is owed on a *channel* is its cursor position, read
+/// through its window, so the drain reads only the channel-less rows here.
+/// `m.channel_uuid IS NULL` is the row-kind fence; a row inside it whose
+/// `envelope_type` is not `ingress` means the fence and the decoder disagree —
+/// a host bug, not a row to skip.
 pub fn load_pending_ingress_for_drain(
     conn: &Connection,
     subscriber: &ParticipantId,
 ) -> Vec<(i64, IngressEvent)> {
-    load_drain_pushes(conn, subscriber, true)
-        .into_iter()
-        .map(|(id, payload)| match payload {
-            IngressOrBus::Ingress(event) => (id, event),
-            IngressOrBus::Bus(envelope) => panic!(
-                "messaging: push {id} on channel {} decoded as a bus message under an \
-                 ingress-only predicate",
-                envelope.channel
-            ),
+    let mut stmt = conn
+        .prepare(LOAD_PENDING_INGRESS_FOR_DRAIN_SQL)
+        .expect("prepare ingress drain read");
+    let rows = stmt
+        .query_map(rusqlite::params![subscriber.as_str()], |row| {
+            let push_id: i64 = row.get(0)?;
+            let payload: String = row.get(1)?;
+            let publish_ts_ns: i64 = row.get(2)?;
+            let source: Option<String> = row.get(3)?;
+            let summary: Option<String> = row.get(4)?;
+            let envelope_type: String = row.get(5)?;
+            assert!(
+                matches!(
+                    super::EnvelopeTypeColumn::parse(&envelope_type),
+                    Some(super::EnvelopeTypeColumn::Ingress)
+                ),
+                "messaging: push {push_id} carries no channel but is envelope_type \
+                 {envelope_type:?} — host wrote every row"
+            );
+            Ok((
+                push_id,
+                IngressEvent {
+                    id: push_id,
+                    // Not used at drain time; the key is target_subscriber.
+                    conversation_id: crate::messaging::ingress::SYNTHETIC_EVENT_ID,
+                    source: source.unwrap_or_else(|| {
+                        panic!(
+                            "messaging: push {push_id} is envelope_type='ingress' but \
+                             ingress_source IS NULL"
+                        )
+                    }),
+                    summary: summary.unwrap_or_else(|| {
+                        panic!(
+                            "messaging: push {push_id} is envelope_type='ingress' but \
+                             ingress_summary IS NULL"
+                        )
+                    }),
+                    payload,
+                    created_at: ns_to_utc(publish_ts_ns),
+                },
+            ))
         })
-        .collect()
-}
-
-/// Row decoder for the drain query (columns 0-15, `LEFT JOIN` channel).
-///
-/// Column layout:
-/// - 0: pp.id  1: pp.target_subscriber  2: pp.eager_wake (0 or 1)
-/// - 3: m.uuid  4: m.source  5: m.sender  6: m.body  7: m.urgency (msg)
-/// - 8: m.delivery_deadline  9: m.deliver_after  10: m.publish_ts_ns
-/// - 11: c.address (NULL for ingress — read only in brenn arm)
-/// - 12: rc.address
-/// - 13: m.envelope_type
-/// - 14: m.ingress_source (NULL for brenn rows)
-/// - 15: m.ingress_summary (NULL for brenn rows)
-/// - 16: pp.message_id
-/// - 17: pp.target_app_slug
-///
-/// `source` (col 4) and `sender` (col 5) are only read in the `brenn` arm;
-/// they are NULL / irrelevant for ingress rows and deferring their reads
-/// eliminates per-row heap allocations on the ingress-drain path.
-fn row_to_drain_push(row: &rusqlite::Row) -> rusqlite::Result<PendingPushRow> {
-    let push_id: i64 = row.get(0)?;
-    let target_subscriber_str: String = row.get(1)?;
-    let target_subscriber = ParticipantId::from_stored(target_subscriber_str);
-    let target_app_slug: String = row.get(17)?;
-    let eager_wake: bool = row.get::<_, i64>(2)? != 0;
-    let msg_uuid_bytes: Vec<u8> = row.get(3)?;
-    // cols 4 (source) and 5 (sender) deferred — read only in the brenn arm below.
-    let body: String = row.get(6)?;
-    let msg_urgency_str: String = row.get(7)?;
-    let delivery_deadline_s: Option<String> = row.get(8)?;
-    let deliver_after_s: Option<String> = row.get(9)?;
-    let publish_ts_ns: i64 = row.get(10)?;
-    // col 11: c.address (NULL for ingress rows — must NOT be read before envelope_type branch)
-    // col 12: rc.address
-    // col 13: m.envelope_type
-    let envelope_type: String = row.get(13)?;
-    // col 14: m.ingress_source (NULL for brenn rows)
-    // col 15: m.ingress_summary (NULL for brenn rows)
-    let message_id: i64 = row.get(16)?;
-
-    // Build a Bus(MessageEnvelope) from the common row columns. Used for both
-    // `brenn` and `webhook` arms, which are structurally identical — only the
-    // panic message on a NULL c.address differs.
-    let build_bus_envelope = |et: super::super::ChannelScheme,
-                              body: String|
-     -> rusqlite::Result<IngressOrBus> {
-        let urgency = Urgency::parse(&msg_urgency_str).unwrap_or_else(|| {
-            panic!("messaging: message for push {push_id} has invalid urgency {msg_urgency_str:?}")
-        });
-        let message_uuid = Uuid::from_slice(&msg_uuid_bytes).unwrap_or_else(|e| {
-            panic!("messaging: message uuid for push {push_id} is malformed: {e}")
-        });
-        let delivery_deadline = delivery_deadline_s.map(|s| {
-            parse_rfc3339(&s).unwrap_or_else(|| panic!("messaging: invalid rfc3339 in db: {s:?}"))
-        });
-        let deliver_after = deliver_after_s.map(|s| {
-            parse_rfc3339(&s).unwrap_or_else(|| panic!("messaging: invalid rfc3339 in db: {s:?}"))
-        });
-        let publish_ts = ns_to_utc(publish_ts_ns);
-        let source: String = row.get(4)?;
-        let sender: String = row.get(5)?;
-        let channel_address: String = row.get(11).unwrap_or_else(|e| {
-            panic!(
-                "messaging: push {push_id} is envelope_type={:?} but \
-                     c.address is NULL (missing channel FK): {e}",
-                et.as_str()
-            )
-        });
-        let reply_to: Option<String> = row.get(12)?;
-        Ok(IngressOrBus::Bus(MessageEnvelope {
-            message_id: message_uuid,
-            source,
-            channel: channel_address,
-            sender,
-            publish_ts,
-            body,
-            reply_to,
-            delivery_deadline,
-            deliver_after,
-            urgency,
-            envelope_type: et,
-        }))
-    };
-
-    use super::super::ChannelScheme;
-    use super::EnvelopeTypeColumn;
-    let payload = match EnvelopeTypeColumn::parse(&envelope_type) {
-        // `brenn`, `webhook`, and `mqtt` rows are real bus messages: non-NULL
-        // channel_uuid, transport-typed JSON body. Route through
-        // Bus(MessageEnvelope) so they render via the standard envelope renderer,
-        // not the [Event] card.
-        Some(EnvelopeTypeColumn::Bus(
-            scheme @ (ChannelScheme::Brenn | ChannelScheme::Webhook | ChannelScheme::Mqtt),
-        )) => build_bus_envelope(scheme, body)?,
-        Some(EnvelopeTypeColumn::Ingress) => {
-            let ingress_source: Option<String> = row.get(14)?;
-            let ingress_summary: Option<String> = row.get(15)?;
-            let ingress_source = ingress_source.unwrap_or_else(|| {
-                panic!("messaging: push {push_id} is envelope_type='ingress' but ingress_source IS NULL")
-            });
-            let ingress_summary = ingress_summary.unwrap_or_else(|| {
-                panic!("messaging: push {push_id} is envelope_type='ingress' but ingress_summary IS NULL")
-            });
-            let created_at = ns_to_utc(publish_ts_ns);
-            IngressOrBus::Ingress(IngressEvent {
-                id: push_id,
-                conversation_id: crate::messaging::ingress::SYNTHETIC_EVENT_ID, // not used at drain time; key is target_subscriber
-                source: ingress_source,
-                summary: ingress_summary,
-                payload: body,
-                created_at,
-            })
-        }
-        // `ephemeral`/`local`/`pwa_push` are never persisted to
-        // `messaging_messages`, and any other value is corruption. `local` rows
-        // are doubly impossible: that traffic never leaves the page, so it
-        // never reaches a DB write. The host wrote every row — panic.
-        Some(EnvelopeTypeColumn::Bus(
-            ChannelScheme::Ephemeral | ChannelScheme::Local | ChannelScheme::PwaPush,
-        ))
-        | None => {
-            panic!(
-                "messaging: push {push_id} has non-persistable envelope_type {envelope_type:?} \
-             (ephemeral/local/pwa_push are never written; anything else is unrecognized) — \
-             host wrote every row; this is a host-internal bug"
-            )
-        }
-    };
-
-    Ok(PendingPushRow {
-        // An ingress row belongs to no channel, so it holds no retention position.
-        retained_seq: None,
-        push_id,
-        message_id,
-        payload,
-        target_subscriber,
-        target_app_slug,
-        eager_wake,
-    })
+        .expect("query ingress drain read");
+    rows.map(|r| r.expect("read pending ingress row")).collect()
 }

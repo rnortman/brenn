@@ -178,17 +178,16 @@ pub(super) fn noise_to_sql(n: NoiseLevel) -> &'static str {
 /// messaging configs and from WASM consumer subscriptions. Done at every server
 /// start.
 ///
-/// WASM consumer subscriptions are included so that the wake-recompute UPDATE in
-/// `update_message_and_pending_pushes` (bus.rs) correctly resolves push_depth for
-/// wasm push rows when a message's wake is edited — without them the join misses
-/// wasm rows and downgrades their wake_kind to 'none' (correctness-2 fix).
-/// `surfaces` supplies `(surface_slug, durable_subscriptions)`; each becomes a
+/// Every push-enabled subscriber kind lands here, not just apps: the table is a
+/// flat record of subscriptions with no kind column, so a reader of it sees one
+/// shape whatever the subscriber is. `surfaces` supplies
+/// `(surface_slug, durable_subscriptions)`; each becomes a
 /// `messaging_subscriptions` row keyed on `app_slug =
 /// SubscriberEntryKind::subscriber_key()` — the surface slug for a
 /// kernel-grain subscription (the layout channel), `<slug>#<instance>` for a
-/// component instance's. That is the same key `resolve_push_targets` stamps on
-/// the instance's push rows, so the wake-recompute join resolves push_depth for
-/// surface push rows exactly as it does for app/wasm rows.
+/// component instance's. That is the same key the subscriber is known by
+/// everywhere else, so the row joins to its subscriber without a translation
+/// step.
 ///
 /// The `(channel_uuid, app_slug)` PK never collides: `resolve_surfaces` folds a
 /// principal's repeated bindings of one channel into a single subscription, so
@@ -264,13 +263,14 @@ pub fn rebuild_subscriptions(
 /// dynamic row whose `(channel, app)` already had a static row was dropped at
 /// merge time, design §2.1 "Mirror collision policy").
 ///
-/// The mirror is what the urgency-recompute join in
-/// `update_message_and_pending_pushes` (`bus.rs`) reads to resolve `push_depth`
-/// for pending push rows; without dynamic subscribers here, a push-enabled
-/// dynamic sub would be invisible to that join and silently fail to wake — a
-/// push-delivery correctness bug (CLAUDE.md BETTER DEAD THAN WRONG). The MQTT-only `qos`
-/// is intentionally not mirrored: `messaging_subscriptions` has no `qos` column
-/// and the recompute join does not need it (the durable truth keeps `qos`).
+/// The mirror is what makes `messaging_subscriptions` a complete record of every
+/// live subscription: a dynamic sub is recorded there on the same terms as a
+/// static one, so a reader of that table needs no second source to learn a
+/// subscriber's resolved params. Its one reader today is the cursor-seed
+/// migration (`db/schema.rs`), which resolves a subscriber's recorded
+/// `push_depth` from it. The MQTT-only `qos` is intentionally not mirrored:
+/// `messaging_subscriptions` has no `qos` column and no reader of it needs one
+/// (the durable truth keeps `qos`).
 pub fn mirror_dynamic_subscriptions(conn: &Connection, rows: &[DynamicSubscriptionRow]) {
     for row in rows {
         conn.execute(

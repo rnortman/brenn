@@ -324,7 +324,7 @@ mod tests {
     }
 
     /// Build a `Messenger` over a set of `mqtt:` channel entries, with an apps
-    /// map so `resolve_push_targets` can find subscribers.
+    /// map so each subscriber's policy and owner resolve.
     fn messenger_with_channels(
         db: brenn_lib::db::Db,
         entries: Vec<ChannelEntry>,
@@ -343,10 +343,10 @@ mod tests {
             let mut app_cfg =
                 crate::test_support::app_config::default_test_app_config(app_slug, app_slug);
             app_cfg.allowed_users = allowed_users;
-            // Delivery-time ACL gate (design §2.2 Point A): the subscriber's policy
-            // must cover each subscribed `mqtt:` channel (grant + matcher), else
-            // `resolve_push_targets` denies it. Stamp a covering policy derived from
-            // the subscription addresses.
+            // Delivery-time ACL gate: the subscriber's policy must cover each
+            // subscribed `mqtt:` channel (grant + matcher), else the wake pass
+            // skips the app without advancing its position. Stamp a covering
+            // policy derived from the subscription addresses.
             app_cfg.policy = crate::test_support::app_config::delivery_policy_for_addresses(
                 subs.iter().map(|(_, a)| a.as_str()),
             );
@@ -584,56 +584,16 @@ mod tests {
             )
             .await;
 
-        let (push_count, envelope_type) =
-            crate::test_support::wasm::wasm_push_rows(&db, "consume-demo").await;
+        let (retained, envelope_type) =
+            crate::test_support::wasm::retained_on_channel(&db, addr).await;
         assert_eq!(
-            push_count, 1,
-            "the covered WASM consumer must receive exactly one push row"
+            retained, 1,
+            "the inbound message must commit onto the subscribed channel"
         );
         assert_eq!(
             envelope_type.as_deref(),
             Some("mqtt"),
-            "the WASM consumer's push row must carry the MqttEnvelope"
-        );
-    }
-
-    /// End-to-end MQTT receive denial: with no covering `mqtt_subscribe_acl`, the
-    /// delivery-time ACL gate denies the WASM consumer — no push row lands and a
-    /// denial warn is emitted (the post-boot runtime half of the fail-fast posture).
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn deliver_inbound_denies_uncovered_wasm_subscriber() {
-        let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
-        let addr = "mqtt:homeassistant:home/+/state";
-        state.messenger = Some(messenger_with_wasm_channels(
-            db.clone(),
-            vec![mqtt_channel_entry_wasm(addr, "consume-demo")],
-            "consume-demo",
-            vec![],
-        ));
-        let router = MqttEventRouterImpl::new();
-        router.set_state(
-            state,
-            vec![route("homeassistant", "home/+/state", Urgency::Normal)],
-        );
-
-        router
-            .deliver_inbound(
-                "homeassistant",
-                "home/kitchen/state",
-                InboundPayload::Text("22.5".to_string()),
-                1,
-            )
-            .await;
-
-        let (push_count, _) = crate::test_support::wasm::wasm_push_rows(&db, "consume-demo").await;
-        assert_eq!(
-            push_count, 0,
-            "an uncovered WASM consumer must receive no push row"
-        );
-        assert!(
-            logs_contain("subscription delivery denied"),
-            "the delivery gate must emit a denial warn for the uncovered subscriber"
+            "the committed message must carry the MqttEnvelope"
         );
     }
 
@@ -1004,20 +964,19 @@ mod tests {
             )
             .await;
 
-        let push_count: i64 = {
+        let retained: i64 = {
             let conn = db.lock().await;
             conn.query_row(
-                "SELECT COUNT(*) FROM messaging_pending_pushes pp \
-                 JOIN messaging_messages m ON pp.message_id = m.id \
-                 WHERE m.envelope_type = 'mqtt'",
+                "SELECT COUNT(*) FROM messaging_messages \
+                 WHERE envelope_type = 'mqtt' AND retained_seq IS NOT NULL",
                 [],
                 |r| r.get(0),
             )
             .expect("query must succeed")
         };
         assert_eq!(
-            push_count, 1,
-            "exactly one pending-push row for the subscriber, even with send_budget=0"
+            retained, 1,
+            "exactly one committed message, even with send_budget=0"
         );
 
         // The client's configured urgency must reach the stored message row.

@@ -359,7 +359,7 @@ async fn publish_wide_cap_fires_on_hung_endpoint() {
 ///
 /// We record the baseline BEGIN/COMMIT count immediately before `send()` and
 /// assert the delta is exactly 1, not the absolute value. This accounts for
-/// the one implicit `BEGIN` issued by `insert_message_with_pushes` in the
+/// the one implicit `BEGIN` issued by `insert_message` in the
 /// pre-fanout phase (step 7), which is a separate DB operation.
 ///
 /// **Runtime/task invariant:** Two code-change vectors silently break the counters
@@ -429,13 +429,13 @@ async fn outcome_batch_acquires_db_lock_once() {
         .await;
 
     // The batch write (step 10) must issue exactly one BEGIN/COMMIT pair.
-    // Other BEGINs in send() (e.g. insert_message_with_pushes) are accounted
+    // Other BEGINs in send() (e.g. insert_message) are accounted
     // for in the delta.
     let delta_begin = read_begin_count() - begin_before;
     let delta_commit = read_commit_count() - commit_before;
 
     // send() issues exactly two BEGIN/COMMIT pairs: one from
-    // insert_message_with_pushes (pre-fanout, step 7) and one from our
+    // insert_message (pre-fanout, step 7) and one from our
     // batch write (post-fanout, step 10). We assert the total delta is 2
     // (not 1) to confirm no extra transactions were introduced.
     assert_eq!(

@@ -17,7 +17,7 @@
 //! it lives in the harness rather than here.
 
 use super::super::*;
-use super::{CountingRouter, build_messenger, test_app_config};
+use super::{CountingRouter, build_messenger, owed_on_gate_channel, test_app_config};
 use crate::access::{AppCapability, AppPolicy, acl::ChannelMatcher};
 use crate::messaging::config::{Depth, NoiseLevel, ResolvedChannel, ResolvedMessagingConfig, Sink};
 use crate::messaging::db::upsert_channels;
@@ -250,10 +250,12 @@ async fn publish_inserts_pending_row_no_inline_dispatch() {
         0,
         "publish must not call spawn_eager_wake inline — dispatch is off-stack (R1)"
     );
-    // Pending row exists for the subscriber.
-    let sub = ParticipantId::for_conversation(sub_conv);
-    let rows = m.load_pending_pushes(&sub).await;
-    assert_eq!(rows.len(), 1, "push row must exist");
+    // The subscriber's position now trails retention — the whole of what a
+    // commit leaves behind.
+    assert!(
+        owed_on_gate_channel(&m, &ParticipantId::for_conversation(sub_conv)).await,
+        "the subscriber must be owed the committed message"
+    );
 }
 
 #[tokio::test]
@@ -311,119 +313,6 @@ async fn publish_with_future_deliver_after_does_not_dispatch_now() {
     assert!(matches!(result, PublishResult::Ok { .. }));
     let deliveries = router.deliveries.lock().await;
     assert!(deliveries.is_empty());
-}
-
-/// A deferred publish holds no claim, and the claim its release mints carries
-/// eager_wake=1 for a qualifying urgency (correctness-2 regression guard).
-///
-/// eager_wake=0 on that claim would leave it permanently invisible to the
-/// dispatcher after release — silent deferred delivery loss. Resolving the wake
-/// per released message is what keeps the mint honest: the batch carries
-/// whatever urgencies were parked, not one urgency decided at park time.
-#[tokio::test]
-async fn released_deferred_claim_carries_eager_wake_for_qualifying_urgency() {
-    let (m, _, _, sub_conv, _router) = build_messenger(1).await;
-    let result = m
-        .publish(
-            crate::messaging::PublishOrigin::Conversation { id: 1 },
-            "pa-bob",
-            &canonical_address("pa-alice"),
-            "hi",
-            Urgency::Normal, // meets WakeMin::Normal threshold
-            None,
-            Some(Utc::now() + chrono::Duration::seconds(60)),
-            None,
-        )
-        .await;
-    assert!(matches!(result, PublishResult::Ok { .. }), "{result:?}");
-
-    let sub = ParticipantId::for_conversation(sub_conv);
-    async fn claim_wakes(m: &crate::messaging::Messenger, sub: &ParticipantId) -> Vec<bool> {
-        let conn = m.db.lock().await;
-        let mut stmt = conn
-            .prepare(
-                "SELECT pp.eager_wake FROM messaging_pending_pushes pp \
-                 WHERE pp.target_subscriber = ?1 AND pp.delivered_at IS NULL",
-            )
-            .unwrap();
-        let values: Vec<bool> = stmt
-            .query_map(rusqlite::params![sub.as_str()], |r| r.get::<_, bool>(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        values
-    }
-    assert!(
-        claim_wakes(&m, &sub).await.is_empty(),
-        "a parked message is owed to nobody, so it holds no claim"
-    );
-
-    m.release_due_messages(Utc::now() + chrono::Duration::seconds(61))
-        .await;
-    let eager_wake_values = claim_wakes(&m, &sub).await;
-
-    assert_eq!(
-        eager_wake_values.len(),
-        1,
-        "release mints exactly one claim for the subscriber attached now"
-    );
-    assert!(
-        eager_wake_values[0],
-        "deferred row with qualifying urgency must have eager_wake=1; \
-         eager_wake=0 would make the row invisible to dispatcher after release (correctness-2)"
-    );
-}
-
-/// One release pass carries whatever urgencies were parked, so the wake is
-/// resolved per message against the target's threshold — not once for the batch.
-/// A threshold dropped on the way to the release would wake the fixture's
-/// `WakeMin::Normal` subscriber for the low-urgency message too, which is
-/// exactly the cost the threshold exists to prevent.
-#[tokio::test]
-async fn a_released_batch_resolves_each_messages_wake_against_the_threshold() {
-    let (m, _, _, sub_conv, _router) = build_messenger(1).await;
-    let release_at = Utc::now() + chrono::Duration::seconds(60);
-    for (body, urgency) in [("quiet", Urgency::Low), ("loud", Urgency::Normal)] {
-        let result = m
-            .publish(
-                crate::messaging::PublishOrigin::Conversation { id: 1 },
-                "pa-bob",
-                &canonical_address("pa-alice"),
-                body,
-                urgency,
-                None,
-                Some(release_at),
-                None,
-            )
-            .await;
-        assert!(matches!(result, PublishResult::Ok { .. }), "{result:?}");
-    }
-
-    m.release_due_messages(release_at + chrono::Duration::seconds(1))
-        .await;
-
-    let sub = ParticipantId::for_conversation(sub_conv);
-    let wakes: Vec<(String, bool)> = {
-        let conn = m.db.lock().await;
-        let mut stmt = conn
-            .prepare(
-                "SELECT m.body, pp.eager_wake FROM messaging_pending_pushes pp \
-                 JOIN messaging_messages m ON m.id = pp.message_id \
-                 WHERE pp.target_subscriber = ?1 ORDER BY pp.id",
-            )
-            .unwrap();
-        stmt.query_map(rusqlite::params![sub.as_str()], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect()
-    };
-    assert_eq!(
-        wakes,
-        vec![("quiet".to_string(), false), ("loud".to_string(), true)],
-        "the below-threshold message waits for a natural wake; the qualifying one wakes"
-    );
 }
 
 /// The fold-0 context feed is gated on the message holding a retention position,
@@ -645,13 +534,10 @@ async fn a_past_deliver_after_publishes_immediately_with_a_retention_position() 
     );
     assert!(
         retained_seq.is_some(),
-        "an unparked message holds the retention position its claims are served against"
+        "an unparked message holds the retention position every read keys on"
     );
-    assert_eq!(
-        m.load_pending_pushes(&ParticipantId::for_conversation(sub_conv))
-            .await
-            .len(),
-        1,
+    assert!(
+        owed_on_gate_channel(&m, &ParticipantId::for_conversation(sub_conv)).await,
         "the subscriber is owed it now"
     );
 }

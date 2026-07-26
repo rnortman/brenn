@@ -15,22 +15,12 @@ async fn activation_scoped_failure_quarantines_all_ports_and_fires_one_alert() {
 
     // channel[0] gets a trap row; channel[1] gets a normal row.
     // Both arrive in the same activation (multi-port snapshot).
-    let (trap_push_id, _) = testutils::insert_wasm_push(
-        &messenger,
-        &channels[0],
-        &wasm_sub,
-        "__trap__",
-        ChannelScheme::Brenn,
-    )
-    .await;
-    let (ok_push_id, _) = testutils::insert_wasm_push(
-        &messenger,
-        &channels[1],
-        &wasm_sub,
-        "ok-body",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    let _ =
+        testutils::insert_bus_message(&messenger, &channels[0], "__trap__", ChannelScheme::Brenn)
+            .await;
+    let _ =
+        testutils::insert_bus_message(&messenger, &channels[1], "ok-body", ChannelScheme::Brenn)
+            .await;
 
     // Override with a capturing alerter to assert alert count.
     use brenn_lib::obs::alerting::make_capturing_alerter_with_severity;
@@ -67,35 +57,15 @@ async fn activation_scoped_failure_quarantines_all_ports_and_fires_one_alert() {
 
     drain_step(&cfg2, &wasm_sub).await;
 
-    // Both push rows must be acked (ack-at-start — neither remains pending).
-    let remaining = messenger.load_pending_pushes(&wasm_sub).await;
+    // Ack-at-start: both ports' positions moved past their message before the guest
+    // ran, whatever the outcome. A regression that moved the advance inside
+    // `record_wasm_activation_failure` (post-guest) would leave the trapping port's
+    // message owed and be caught here.
+    let remaining = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         remaining.is_empty(),
-        "both push rows must be acked after drain; remaining={remaining:?} \
-         trap_push_id={trap_push_id} ok_push_id={ok_push_id}"
+        "both ports must be advanced past after drain; remaining={remaining:?}"
     );
-
-    // Ack-at-start direct-DB check (test-1): delivered_at must be set on BOTH push rows
-    // after drain regardless of Trap outcome. A regression where the settle was
-    // moved inside record_wasm_activation_failure (post-guest) would pass the
-    // load_pending_pushes check but fail here.
-    {
-        let conn = messenger.db().lock().await;
-        for (push_id, label) in [(trap_push_id, "trap"), (ok_push_id, "ok")] {
-            let delivered_at: Option<String> = conn
-                .query_row(
-                    "SELECT delivered_at FROM messaging_pending_pushes WHERE id = ?1",
-                    rusqlite::params![push_id],
-                    |r| r.get(0),
-                )
-                .unwrap_or(None);
-            assert!(
-                delivered_at.is_some(),
-                "ack-at-start: push row {push_id} ({label}) must have delivered_at set \
-                 (the settle must run before guest) — got None"
-            );
-        }
-    }
 
     // channel[0]'s row must appear in the failures table (trap triggered quarantine).
     let trap_failure_count: i64 = {
@@ -163,35 +133,21 @@ async fn multiport_combined_activation_two_triggering_channels() {
         build_multiport_setup(slug, &["mp-comb-ch-a", "mp-comb-ch-b"]).await;
 
     // Insert one row on each input channel.
-    testutils::insert_wasm_push(
-        &messenger,
-        &in_entries[0],
-        &wasm_sub,
-        "body-a",
-        ChannelScheme::Brenn,
-    )
-    .await;
-    testutils::insert_wasm_push(
-        &messenger,
-        &in_entries[1],
-        &wasm_sub,
-        "body-b",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &in_entries[0], "body-a", ChannelScheme::Brenn).await;
+    testutils::insert_bus_message(&messenger, &in_entries[1], "body-b", ChannelScheme::Brenn).await;
 
     // Drain — must invoke the guest exactly once.
     drain_step(&cfg, &wasm_sub).await;
 
     // Input push rows must be acked.
-    let remaining = messenger.load_pending_pushes(&wasm_sub).await;
+    let remaining = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         remaining.is_empty(),
         "all input push rows must be delivered after drain"
     );
 
     // Exactly one summary message in the output channel.
-    let out_rows = messenger.load_pending_pushes(&out_sub).await;
+    let out_rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
     assert_eq!(
         out_rows.len(),
         1,
@@ -292,10 +248,9 @@ async fn multiport_sampled_port_included_as_pure_context() {
     .await;
 
     // Insert one triggering push row on in0.
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &in_entries[0],
-        &wasm_sub,
         "trigger-msg",
         ChannelScheme::Brenn,
     )
@@ -305,14 +260,14 @@ async fn multiport_sampled_port_included_as_pure_context() {
     drain_step(&cfg, &wasm_sub).await;
 
     // in0 push row must be acked; no push rows existed for in1.
-    let remaining = messenger.load_pending_pushes(&wasm_sub).await;
+    let remaining = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         remaining.is_empty(),
         "all push rows must be delivered after drain"
     );
 
     // Exactly one summary message in the output channel.
-    let out_rows = messenger.load_pending_pushes(&out_sub).await;
+    let out_rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
     assert_eq!(
         out_rows.len(),
         1,
@@ -410,7 +365,8 @@ async fn multiport_sampled_only_no_push_rows_no_activation() {
     .await;
 
     // Do NOT insert any push row on the triggering channel.
-    let push_rows_before = messenger.load_pending_pushes(&wasm_sub).await;
+    let push_rows_before =
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         push_rows_before.is_empty(),
         "no push rows before drain (only retained-only messages exist)"
@@ -420,14 +376,15 @@ async fn multiport_sampled_only_no_push_rows_no_activation() {
     drain_step(&cfg, &wasm_sub).await;
 
     // Still no push rows (nothing acked, nothing created).
-    let push_rows_after = messenger.load_pending_pushes(&wasm_sub).await;
+    let push_rows_after =
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         push_rows_after.is_empty(),
         "still no push rows after drain — sampled-only traffic must not activate"
     );
 
     // No summary message in the output channel (no invocation occurred).
-    let out_rows = messenger.load_pending_pushes(&out_sub).await;
+    let out_rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
     assert!(
         out_rows.is_empty(),
         "no output message must be produced when only sampled messages exist"
@@ -456,33 +413,25 @@ async fn multiport_triggering_port_without_rows_appears_as_context_window() {
 
     // Insert 2 push rows on in1 and drain them — they become retained context.
     for i in 0..2usize {
-        testutils::insert_wasm_push(
+        testutils::insert_bus_message(
             &messenger,
             &in_entries[1],
-            &wasm_sub,
             &format!("in1-ctx-{i}"),
             ChannelScheme::Brenn,
         )
         .await;
     }
     drain_step(&cfg, &wasm_sub).await;
-    // First drain consumed in1 rows as a triggering activation (in1 had rows, in0 didn't).
-    // After drain, in1 messages are now retained context. Discard the output of this drain.
-    {
-        let conn = messenger.db().lock().await;
-        conn.execute(
-            "UPDATE messaging_pending_pushes SET delivered_at = datetime('now') \
-             WHERE delivered_at IS NULL",
-            [],
-        )
-        .expect("mark all output pushes delivered");
-    }
+    // First drain consumed in1's messages as a triggering activation (in1 had them,
+    // in0 did not). They are retained context now. Move the output reader's
+    // position past this drain's summary so the assertion below sees only the next
+    // one.
+    brenn_lib::messaging::testutils::consume_owed(&messenger, &out_entry.address, &out_sub).await;
 
     // Now insert a push row on in0 only — in1 has no new push rows.
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &in_entries[0],
-        &wasm_sub,
         "in0-new-msg",
         ChannelScheme::Brenn,
     )
@@ -492,7 +441,7 @@ async fn multiport_triggering_port_without_rows_appears_as_context_window() {
     drain_step(&cfg, &wasm_sub).await;
 
     // Exactly one summary in the output channel for this drain.
-    let out_rows = messenger.load_pending_pushes(&out_sub).await;
+    let out_rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
     assert_eq!(
         out_rows.len(),
         1,
@@ -566,35 +515,28 @@ async fn multiport_all_or_nothing_trap_discards_output_from_all_ports() {
         build_multiport_setup(slug, &["mp-aon-ch-a", "mp-aon-ch-b"]).await;
 
     // in0: normal message — the fixture would publish a summary on Ok.
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &in_entries[0],
-        &wasm_sub,
         "normal-body",
         ChannelScheme::Brenn,
     )
     .await;
     // in1: trap sentinel — causes the fixture to trap, discarding any buffered publish.
-    testutils::insert_wasm_push(
-        &messenger,
-        &in_entries[1],
-        &wasm_sub,
-        "__trap__",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &in_entries[1], "__trap__", ChannelScheme::Brenn)
+        .await;
 
     drain_step(&cfg, &wasm_sub).await;
 
     // Both push rows must be acked (ack-at-start, at-most-once).
-    let remaining = messenger.load_pending_pushes(&wasm_sub).await;
+    let remaining = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         remaining.is_empty(),
         "both push rows must be acked after trap drain"
     );
 
     // No output: trap discards the buffered summary publish.
-    let out_rows = messenger.load_pending_pushes(&out_sub).await;
+    let out_rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
     assert!(
         out_rows.is_empty(),
         "no output must be published when trap fires; out_entry={}",
@@ -653,30 +595,24 @@ async fn multiport_err_outcome_quarantines_both_channels() {
     };
 
     // in0: normal body; in1: __err__ sentinel → Err returned.
-    let (push_a, _) = testutils::insert_wasm_push(
+    let _ = testutils::insert_bus_message(
         &messenger,
         &in_entries[0],
-        &wasm_sub,
         "normal-body",
         ChannelScheme::Brenn,
     )
     .await;
-    let (push_b, _) = testutils::insert_wasm_push(
-        &messenger,
-        &in_entries[1],
-        &wasm_sub,
-        "__err__",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    let _ =
+        testutils::insert_bus_message(&messenger, &in_entries[1], "__err__", ChannelScheme::Brenn)
+            .await;
 
     drain_step(&cfg2, &wasm_sub).await;
 
     // Both push rows must be acked (ack-at-start).
-    let remaining = messenger.load_pending_pushes(&wasm_sub).await;
+    let remaining = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         remaining.is_empty(),
-        "both push rows must be acked after Err; push_a={push_a} push_b={push_b}"
+        "both ports must be advanced past after an Err outcome"
     );
 
     // Both channels must have failure records (activation-scoped quarantine under Err).
@@ -698,7 +634,7 @@ async fn multiport_err_outcome_quarantines_both_channels() {
     }
 
     // No output published.
-    let out_rows = messenger.load_pending_pushes(&out_sub).await;
+    let out_rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
     assert!(
         out_rows.is_empty(),
         "no output must be published when Err fires; out_entry={}",
@@ -740,23 +676,15 @@ async fn multiport_drop_reporting_exactly_once() {
         .await;
 
     for i in 0..3 {
-        testutils::insert_wasm_push(
+        testutils::insert_bus_message(
             &messenger,
             &in_entries[0],
-            &wasm_sub,
             &format!("body-a-{i}"),
             ChannelScheme::Brenn,
         )
         .await;
     }
-    testutils::insert_wasm_push(
-        &messenger,
-        &in_entries[1],
-        &wasm_sub,
-        "body-b",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &in_entries[1], "body-b", ChannelScheme::Brenn).await;
 
     // Drain: one activation with both ports; in0 reports dropped=2, in1 reports 0.
     drain_step(&cfg, &wasm_sub).await;
@@ -803,35 +731,15 @@ async fn multiport_drop_reporting_exactly_once() {
     );
 
     // Mark out_sub's pending rows delivered so we can detect new output in the second
-    // drain. Scoped to out_sub only to avoid accidentally clearing wasm_sub input rows
-    // (test-5: a blanket UPDATE would mask partial-ack bugs on the input side).
-    {
-        let conn = messenger.db().lock().await;
-        conn.execute(
-            "UPDATE messaging_pending_pushes SET delivered_at = datetime('now') \
-             WHERE target_subscriber = ?1 AND delivered_at IS NULL",
-            rusqlite::params![out_sub.as_str()],
-        )
-        .expect("mark out_sub pending delivered");
-    }
+    // drain. Scoped to the output reader's own position, so an input-side
+    // partial-advance bug is not masked (test-5).
+    brenn_lib::messaging::testutils::consume_owed(&messenger, &out_entry.address, &out_sub).await;
 
     // Second drain: insert new rows on both channels; no new overflow.
-    testutils::insert_wasm_push(
-        &messenger,
-        &in_entries[0],
-        &wasm_sub,
-        "body-a2",
-        ChannelScheme::Brenn,
-    )
-    .await;
-    testutils::insert_wasm_push(
-        &messenger,
-        &in_entries[1],
-        &wasm_sub,
-        "body-b2",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &in_entries[0], "body-a2", ChannelScheme::Brenn)
+        .await;
+    testutils::insert_bus_message(&messenger, &in_entries[1], "body-b2", ChannelScheme::Brenn)
+        .await;
 
     drain_step(&cfg, &wasm_sub).await;
 
@@ -885,18 +793,16 @@ async fn multiport_retain_depth_zero_triggering_port_back_fills_seen_context() {
         .await;
 
     // Insert push rows on both channels.
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &in_entries[0],
-        &wasm_sub,
         "no-retain-body",
         ChannelScheme::Brenn,
     )
     .await;
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &in_entries[1],
-        &wasm_sub,
         "normal-body",
         ChannelScheme::Brenn,
     )
@@ -905,7 +811,7 @@ async fn multiport_retain_depth_zero_triggering_port_back_fills_seen_context() {
     drain_step(&cfg, &wasm_sub).await;
 
     // One summary in output.
-    let out_rows = messenger.load_pending_pushes(&out_sub).await;
+    let out_rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
     assert_eq!(out_rows.len(), 1, "exactly one summary");
 
     let summary_body = {
@@ -959,10 +865,9 @@ async fn multiport_retain_depth_zero_triggering_port_back_fills_seen_context() {
 
     // Second activation: the retain-0 port has one seen message now, and the
     // window back-fills it as context ahead of the new one.
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &in_entries[0],
-        &wasm_sub,
         "second-body",
         ChannelScheme::Brenn,
     )
@@ -1092,8 +997,9 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
         let conn = db.lock().await;
         upsert_channels(&conn, &all_entries);
     }
-    // Delivery-time ACL gate (design §2.2 Point A): the out1/out2 WASM subscribers
-    // must hold a covering policy or `resolve_push_targets` denies them.
+    // The out1/out2 WASM subscribers are registered with a policy covering each
+    // channel they subscribe to, which is the shape boot builds: every live
+    // subscriber resolves a policy and its wake economics from its registration.
     let wasm_policies = wasm_policies_from_entries(&all_entries);
     let directory = Arc::new(MessagingDirectory::with_entries(all_entries));
     let router = Arc::new(NoopWakeRouter);
@@ -1119,6 +1025,22 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
             (in0_arc.as_ref(), Depth::Unbounded),
             (in1_arc.as_ref(), Depth::Unbounded),
         ],
+    )
+    .await;
+    // Each output channel's reader holds a position too, or the case that reads
+    // back what the component published would be owed nothing.
+    super::attach_input_ports(
+        &messenger,
+        &out1_sub_slug,
+        &out1_sub,
+        &[(&out1_entry, Depth::Unbounded)],
+    )
+    .await;
+    super::attach_input_ports(
+        &messenger,
+        &out2_sub_slug,
+        &out2_sub,
+        &[(&out2_entry, Depth::Unbounded)],
     )
     .await;
 
@@ -1184,28 +1106,14 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
     };
 
     // Insert one message on each input channel.
-    testutils::insert_wasm_push(
-        &messenger,
-        &in0_arc,
-        &wasm_sub,
-        "msg-a",
-        ChannelScheme::Brenn,
-    )
-    .await;
-    testutils::insert_wasm_push(
-        &messenger,
-        &in1_arc,
-        &wasm_sub,
-        "msg-b",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &in0_arc, "msg-a", ChannelScheme::Brenn).await;
+    testutils::insert_bus_message(&messenger, &in1_arc, "msg-b", ChannelScheme::Brenn).await;
 
     // Drain: one activation with 2 input windows.
     drain_step(&cfg, &wasm_sub).await;
 
     // Both input push rows must be acked.
-    let remaining = messenger.load_pending_pushes(&wasm_sub).await;
+    let remaining = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         remaining.is_empty(),
         "all input push rows must be acked after drain"
@@ -1213,8 +1121,8 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
 
     // processor-dual publishes each new envelope to both out1 and out2.
     // 2 input windows × 1 new envelope each = 2 publishes to out1, 2 to out2.
-    let out1_rows = messenger.load_pending_pushes(&out1_sub).await;
-    let out2_rows = messenger.load_pending_pushes(&out2_sub).await;
+    let out1_rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out1_sub).await;
+    let out2_rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out2_sub).await;
     assert_eq!(
         out1_rows.len(),
         2,
@@ -1224,116 +1132,5 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
         out2_rows.len(),
         2,
         "out2 must have 2 pending pushes (one per input envelope)"
-    );
-}
-
-/// §5 test 14 (config-residue reconciliation): insert a pending push row for
-/// (a) a channel not in cfg.inputs (subscription removed) and (b) a channel
-/// whose input has push_depth=Bounded(0) (push_depth lowered, old rows remain).
-///
-/// After drain: both rows are retired (delivered_at set), no guest was invoked,
-/// no failure record created. The triggering input in cfg.inputs is empty so
-/// the snapshot returns None and the drain produces no output.
-#[tokio::test]
-async fn multiport_config_residue_retired_no_activation() {
-    let slug = "mp-residue";
-
-    // Build a multiport setup with one triggering input (in0) and one sampled
-    // input (in1, push_depth=0). We'll inject residue rows directly into the DB.
-    let (messenger, in_entries, _out_entry, _out_sub, wasm_sub, cfg, _alert_handle, _store_db) =
-        build_multiport_setup_with_depths(
-            slug,
-            &[
-                ("mp-res-ch-trigger", Depth::Unbounded, Depth::Unbounded),
-                ("mp-res-ch-sampled", Depth::Bounded(0), Depth::Unbounded),
-            ],
-        )
-        .await;
-
-    // Case (a): insert a push row for a channel that is NOT in cfg.inputs.
-    // Build a ghost channel entry using upsert_channels (proper schema insert),
-    // then insert a push row for the wasm subscriber on it.
-    let ghost_entry =
-        (*testutils::wasm_channel_entry(slug, "mp-res-ghost", Depth::Unbounded, Depth::Unbounded))
-            .clone();
-    {
-        let conn = messenger.db().lock().await;
-        brenn_lib::messaging::db::upsert_channels(&conn, std::slice::from_ref(&ghost_entry));
-        brenn_lib::messaging::db::insert_message_with_pushes(
-            &conn,
-            ghost_entry.uuid,
-            "test",
-            "test-sender",
-            "ghost-body",
-            brenn_lib::messaging::Urgency::Normal,
-            ChannelScheme::Brenn,
-            None,
-            None,
-            None,
-            brenn_lib::messaging::db::utc_to_ns(chrono::Utc::now()),
-            &[brenn_lib::messaging::db::PendingPushInsert {
-                target_subscriber: wasm_sub.clone(),
-                target_app_slug: String::new(),
-                eager_wake: true,
-                release_after: None,
-                delivery_deadline: None,
-            }],
-        );
-    }
-
-    // Case (b): insert a push row for the sampled channel (push_depth=Bounded(0)).
-    // This simulates old rows from before the push_depth was lowered to 0.
-    testutils::insert_wasm_push(
-        &messenger,
-        &in_entries[1],
-        &wasm_sub,
-        "residue-sampled-body",
-        ChannelScheme::Brenn,
-    )
-    .await;
-
-    // Verify we have 2 pending rows (ghost + sampled residue).
-    let rows_before = messenger.load_pending_pushes(&wasm_sub).await;
-    assert_eq!(
-        rows_before.len(),
-        2,
-        "must have 2 pending residue rows before drain"
-    );
-
-    // Drain: both residue rows must be retired; no triggering input has valid rows
-    // so the snapshot returns None → no activation → no output.
-    let scan_before = messenger.pending_bus_pushes_scan_count();
-    drain_step(&cfg, &wasm_sub).await;
-    let scan_after = messenger.pending_bus_pushes_scan_count();
-
-    // Exactly one snapshot call must have occurred (test-4: confirms load_activation_snapshot
-    // was called once and returned None, i.e. the guest was NOT invoked).
-    assert_eq!(
-        scan_after - scan_before,
-        1,
-        "exactly one load_activation_snapshot call per drain_step; delta={}",
-        scan_after - scan_before,
-    );
-
-    // All residue rows must now be retired (delivered_at set).
-    let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
-    assert!(
-        rows_after.is_empty(),
-        "both residue rows must be retired after drain; remaining={rows_after:?}"
-    );
-
-    // No failure records must exist for these rows — residue retirement is not a failure.
-    let failure_count: i64 = {
-        let conn = messenger.db().lock().await;
-        conn.query_row(
-            "SELECT COUNT(*) FROM messaging_wasm_consume_failures WHERE subscriber = ?1",
-            rusqlite::params![wasm_sub.as_str()],
-            |row| row.get(0),
-        )
-        .expect("query failure count")
-    };
-    assert_eq!(
-        failure_count, 0,
-        "residue retirement must not create failure records"
     );
 }

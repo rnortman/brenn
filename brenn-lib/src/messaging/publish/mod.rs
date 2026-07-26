@@ -45,24 +45,20 @@ const _: () = assert!(
 pub const SURFACE_SEND_REFILL: Duration = Duration::from_secs(15);
 
 use super::db::{
-    self, BudgetDecrement, InsertedMessage, PendingPushInsert, decrement_send_budget,
-    insert_ingress_message, insert_message_with_pushes_in_tx, refund_send_budget,
+    self, BudgetDecrement, InsertedMessage, decrement_send_budget, insert_ingress_message,
+    insert_message_in_tx, refund_send_budget,
 };
 use super::gates::{
     check_body_size, publish_acl_allows, reply_to_visible, resolve_publish_sender, well_formed_name,
 };
-use super::store::{PushTarget, SurfaceFeedTarget, eager_wake_for};
+use super::store::SurfaceFeedTarget;
 use super::{ChannelScheme, Messenger, ParticipantId, SubscriberEntryKind, Urgency, store};
 use crate::access::AppCapability;
 use crate::obs::security::DenialKind;
 
-/// Per-channel memoized resolution for a batch flush: the channel entry, its
-/// push targets, and its live surface-feed targets.
-type ResolvedChannelTargets = (
-    Arc<super::ChannelEntry>,
-    Vec<PushTarget>,
-    Vec<SurfaceFeedTarget>,
-);
+/// Per-channel memoized resolution for a batch flush: the channel entry and its
+/// live surface-feed targets.
+type ResolvedChannelTargets = (Arc<super::ChannelEntry>, Vec<SurfaceFeedTarget>);
 
 /// Outcome of a publish, on any pub/sub scheme. Maps directly to the success /
 /// failure JSON returned to CC by the `MessageSend` PostToolUse intercept.
@@ -942,8 +938,8 @@ impl Messenger {
         //     enters retention immediately. Deciding that once, here, is what
         //     keeps the park decision single — every commit path below reads
         //     this value, so a row carries a release time iff it holds no
-        //     retention position and no claims. Deciding it twice against two
-        //     clock reads is how a message ends up claimed but unpositioned.
+        //     retention position. Deciding it twice against two clock reads is
+        //     how a message ends up visible on one test and parked on the other.
         let deliver_after = deliver_after.filter(|da| *da > Utc::now());
 
         // 5. Per-conversation send budget. It bounds what a conversation sends,
@@ -1071,22 +1067,6 @@ impl Messenger {
         }
     }
 
-    /// Resolve push targets for an outbound publish — the delivery records a
-    /// durable commit writes, one per subscriber owed the message.
-    ///
-    /// Delegates to the one resolver every target-set answer comes from; the
-    /// caller-held `&Connection` keeps resolution and the insert that follows
-    /// under a single lock acquisition.
-    fn resolve_push_targets(
-        &self,
-        conn: &rusqlite::Connection,
-        channel_address: &str,
-        subscribers: &[crate::messaging::SubscriberEntry],
-    ) -> Vec<store::PushTarget> {
-        self.targets
-            .push_targets(conn, channel_address, subscribers)
-    }
-
     /// The surface subscribers on a channel that a retained message is fanned
     /// out to live, resolved through the same registry and the same
     /// delivery-time ACL gate as the push targets.
@@ -1124,12 +1104,7 @@ impl Messenger {
             }
             match self
                 .router
-                .deliver(
-                    &target.kind,
-                    &target.subscriber,
-                    envelope.as_ref(),
-                    Some(retained_seq),
-                )
+                .deliver(&target.kind, &envelope, retained_seq)
                 .await
             {
                 // Delivered, or nothing attached and subscribed. A surface is
@@ -1147,6 +1122,69 @@ impl Messenger {
                 }
             }
         }
+    }
+
+    /// Commit `body` onto `channel_address` and run the surface live fan-out over
+    /// it — the two halves of a durable commit, without the sender-side gates a
+    /// real principal would pass. Returns the message uuid and its retention
+    /// position.
+    ///
+    /// Test-only. A surface holds no server-side position, so the fan-out at the
+    /// commit is the whole of its delivery trigger: a case that writes a message
+    /// row directly reaches no session at all. This is the one seam that lets a
+    /// fixture stand in for a publishing principal it has no reason to build.
+    #[cfg(any(test, feature = "testutils"))]
+    pub async fn commit_and_feed_surfaces(
+        &self,
+        channel_address: &str,
+        body: &str,
+        urgency: Urgency,
+    ) -> (Uuid, i64) {
+        let channel = self.directory.resolve(channel_address).unwrap_or_else(|| {
+            panic!("commit_and_feed_surfaces: {channel_address} not registered")
+        });
+        let publish_ts_ns = db::utc_to_ns(Utc::now());
+        let inserted = {
+            let conn = self.db.lock().await;
+            let tx = conn
+                .unchecked_transaction()
+                .expect("commit_and_feed_surfaces: begin tx");
+            let inserted = self.insert_message(
+                &tx,
+                &channel,
+                ChannelScheme::Brenn,
+                self.source.as_ref(),
+                "sender",
+                body,
+                urgency,
+                publish_ts_ns,
+                None,
+                None,
+                None,
+            );
+            tx.commit().expect("commit_and_feed_surfaces: commit tx");
+            inserted
+        };
+        let retained_seq = inserted
+            .retained_seq
+            .expect("an unparked durable message holds a retention position");
+        let feed_targets =
+            self.resolve_surface_feed_targets(&channel.address, channel.subscribers.as_slice());
+        let envelope = Arc::new(surface_feed_envelope(
+            inserted.uuid,
+            self.source.as_ref().to_owned(),
+            channel.address.clone(),
+            "sender".to_owned(),
+            publish_ts_ns,
+            body.to_owned(),
+            None,
+            None,
+            None,
+            urgency,
+        ));
+        self.fan_out_surface_feed(&feed_targets, envelope, retained_seq)
+            .await;
+        (inserted.uuid, retained_seq)
     }
 }
 
@@ -1182,51 +1220,20 @@ fn surface_feed_envelope(
     }
 }
 
-/// Per-target entry in a `RetirementPlan`.
-///
-/// Carries the push-row id and per-subscriber metadata. Channel address and
-/// uuid are stored once per plan (in `RetirementPlan`) rather than once per
-/// entry, reducing allocations under the global DB lock from N×M to M (where
-/// N = subscriber count, M = message count per flush).
-struct RetirementPlanEntry {
-    push_id: i64,
-    app_slug: String,
-    subscriber: super::ParticipantId,
-    push_depth: super::config::Depth,
-}
-
-/// Retirement plan for one published message: channel identity (shared across all
-/// targets) plus per-target entries. Passed to `retire_windows` after commit.
-struct RetirementPlan {
-    /// The channel the message landed on. Held as the registry the retirement's
-    /// overflow events are routed against — the subscriber's noise rung lives on
-    /// its registration, not on the plan.
-    entry: Arc<super::ChannelEntry>,
-    /// The channel's durable store, resolved once while the `ChannelEntry` is in
-    /// hand. `None` when no target is window-tracked — nothing to retire, so
-    /// nothing to resolve.
-    store: Option<Arc<super::store::DbStore>>,
-    entries: Vec<RetirementPlanEntry>,
-}
-
 impl Messenger {
-    /// Insert one message + its pending-push rows under a caller-owned
-    /// transaction. Returns the `InsertedMessage` and the retirement plan
-    /// for the push-window overflow step (`retire_windows`).
+    /// Insert one message row under a caller-owned transaction.
     ///
-    /// The caller is responsible for:
-    /// - Holding the DB lock (`conn` / the transaction).
-    /// - Committing the transaction after all `insert_pushes` calls for the batch.
-    /// - Calling `retire_windows` for each returned plan after the commit.
+    /// Target-blind, like the durable store's own `append`: the row is written
+    /// once and nothing per-subscriber is, because who reads it is decided by
+    /// each subscriber's own position at its own read.
     ///
-    /// `track_in_window` is `false` for parked (`deliver_after` in the future)
-    /// rows — those must not be retired before they are ever delivered.
+    /// The caller holds the DB lock (`conn` / the transaction) and commits it
+    /// after all `insert_message` calls for the batch.
     #[allow(clippy::too_many_arguments)]
-    fn insert_pushes(
+    fn insert_message(
         &self,
         tx: &rusqlite::Transaction<'_>,
         channel: &Arc<super::ChannelEntry>,
-        push_targets: &[PushTarget],
         envelope_type: ChannelScheme,
         source: &str,
         sender: &str,
@@ -1236,38 +1243,8 @@ impl Messenger {
         reply_to_uuid: Option<Uuid>,
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
-    ) -> (InsertedMessage, RetirementPlan) {
-        // Build pending-push rows + retirement correlation.
-        //
-        // A parked message gets none: it is owed to nobody until it releases,
-        // and the release pass mints one claim per subscriber attached then —
-        // so a subscriber that attaches while the message waits receives it,
-        // and one that leaves is not owed it. `deliver_after` is already
-        // normalized against the clock by every caller, so its presence *is*
-        // the park: re-reading the clock here would let a release time that
-        // matured in between mint claims for a row the insert leaves unpositioned.
-        let parked = deliver_after.is_some();
-        let mut push_target_indices: Vec<usize> = Vec::with_capacity(push_targets.len());
-        let mut pushes: Vec<PendingPushInsert> = Vec::with_capacity(push_targets.len());
-        for (tgt_idx, tgt) in push_targets.iter().enumerate() {
-            if parked {
-                break;
-            }
-            if !tgt.push_depth.is_push_enabled() {
-                continue;
-            }
-            let eager_wake = eager_wake_for(tgt, urgency, &channel.address);
-            pushes.push(PendingPushInsert {
-                target_subscriber: tgt.subscriber.clone(),
-                target_app_slug: tgt.app_slug.clone(),
-                eager_wake,
-                release_after: None,
-                delivery_deadline,
-            });
-            push_target_indices.push(tgt_idx);
-        }
-
-        let inserted = insert_message_with_pushes_in_tx(
+    ) -> InsertedMessage {
+        insert_message_in_tx(
             tx,
             channel.uuid,
             source,
@@ -1279,76 +1256,7 @@ impl Messenger {
             delivery_deadline,
             deliver_after,
             publish_ts_ns,
-            &pushes,
-        );
-
-        // Build the retirement plan. Channel address + uuid are stored once per
-        // message; per-target entries hold only the push_id and subscriber metadata.
-        debug_assert_eq!(
-            inserted.push_ids.len(),
-            push_target_indices.len(),
-            "push_ids and push_target_indices must be in sync"
-        );
-        let mut entries = Vec::with_capacity(inserted.push_ids.len());
-        for (push_id, &tgt_idx) in inserted.push_ids.iter().zip(&push_target_indices) {
-            let tgt = &push_targets[tgt_idx];
-            entries.push(RetirementPlanEntry {
-                push_id: *push_id,
-                app_slug: tgt.app_slug.clone(),
-                subscriber: tgt.subscriber.clone(),
-                push_depth: tgt.push_depth,
-            });
-        }
-
-        let store = (!entries.is_empty()).then(|| self.db_store_for(channel));
-        (
-            inserted,
-            RetirementPlan {
-                entry: Arc::clone(channel),
-                store,
-                entries,
-            },
         )
-    }
-
-    /// Apply push-window overflow retirement for one message's plan.
-    ///
-    /// Must be called after the enclosing transaction has been committed, while
-    /// still holding the DB lock (`conn`). The DELETEs are autocommit (point
-    /// deletes by primary key) — they run in the same lock scope but outside any
-    /// explicit transaction.
-    fn retire_windows(&self, conn: &rusqlite::Connection, plan: &RetirementPlan) {
-        let Some(db_store) = &plan.store else {
-            return; // no window-tracked target on this message
-        };
-        let claims: Vec<super::store::ClaimRetirement<'_>> = plan
-            .entries
-            .iter()
-            .map(|entry| super::store::ClaimRetirement {
-                params: super::store::PushRetireParams {
-                    app_slug: &entry.app_slug,
-                    subscriber: &entry.subscriber,
-                    push_depth: entry.push_depth,
-                },
-                push_id: entry.push_id,
-            })
-            .collect();
-        // A Surface subscriber's drops are the page kernel's to enact — the
-        // backend's fatal rung would panic — so retirements route through the
-        // same kind-aware overflow sink.
-        let events: Vec<super::store::OverflowEvent> = db_store
-            .retire_claims(conn, &claims)
-            .into_iter()
-            .map(|idx| {
-                let entry = &plan.entries[idx];
-                super::store::OverflowEvent {
-                    subscriber: entry.subscriber.clone(),
-                    dropped: 1,
-                    app_slug: Some(entry.app_slug.clone()),
-                }
-            })
-            .collect();
-        self.enact_overflow_events(&plan.entry, &events);
     }
 }
 
@@ -1428,7 +1336,7 @@ impl Messenger {
 
         // Accept-side validation: deserialize the body JSON into the channel's
         // transport-typed struct to verify the host built a structurally valid
-        // envelope. A deserialize failure is a host-internal bug — panic (§2.4).
+        // envelope. A deserialize failure is a host-internal bug — panic.
         match channel.transport_type {
             ChannelScheme::Webhook => {
                 serde_json::from_str::<super::WebhookEnvelope>(body).unwrap_or_else(|e| {
@@ -1457,21 +1365,17 @@ impl Messenger {
             }
         }
 
-        // DB work: resolve push targets + insert message + pending pushes +
-        // push-window retirement, all under one lock (step 6). No budget
+        // DB work: insert the message row under one lock (step 6). No budget
         // decrement, no sender gate, no body-length gate. No deliver_after /
         // delivery_deadline for transport ingress — both are None (always immediate).
         {
             let conn = self.db.lock().await;
-            let push_targets =
-                self.resolve_push_targets(&conn, &channel.address, channel.subscribers.as_slice());
             let tx = conn
                 .unchecked_transaction()
                 .expect("messaging: begin transport ingress tx");
-            let (_, plan) = self.insert_pushes(
+            self.insert_message(
                 &tx,
                 &channel,
-                &push_targets,
                 channel.transport_type,
                 source,
                 sender,
@@ -1483,7 +1387,6 @@ impl Messenger {
                 None, // no delivery_deadline
             );
             tx.commit().expect("messaging: commit transport ingress tx");
-            self.retire_windows(&conn, &plan);
         }
 
         // Signal the background dispatcher. All dispatch is off-stack (R1).
@@ -1518,15 +1421,13 @@ impl Messenger {
     /// (all enforced at the WASM ports import). Panics on any DB error or
     /// unresolvable channel address (boot-validated; a miss is a host-internal bug).
     ///
-    /// All messages in the batch are inserted in one transaction, committed
-    /// together, then push-window retirement runs. A panic mid-flush unwinds
-    /// through the `Transaction` Drop guard, rolling back — none of the batch
-    /// is visible (all-or-nothing, design §2.3). In-memory window state is
-    /// mutated only in `retire_windows` (post-commit), so a pre-commit panic
-    /// leaves it consistent with the rolled-back DB.
+    /// All messages in the batch are inserted in one transaction and committed
+    /// together. A panic mid-flush unwinds through the `Transaction` Drop
+    /// guard, rolling back — none of the batch is visible: a flush lands
+    /// whole or not at all.
     ///
     /// Each publish carries its own urgency: port-configured default (for `publish`)
-    /// or guest-supplied (for `publish-with-urgency`). Design §2.6.
+    /// or guest-supplied (for `publish-with-urgency`).
     pub async fn publish_from_wasm(&self, consumer_slug: &str, publishes: &[WasmPublish<'_>]) {
         if publishes.is_empty() {
             return;
@@ -1546,7 +1447,6 @@ impl Messenger {
         // every entry in the batch is judged against the same instant.
         let flush_now = Utc::now();
 
-        let mut all_retirements: Vec<RetirementPlan> = Vec::with_capacity(publishes.len());
         // Deferred durable surface feeds: built under the lock, fanned out
         // after it is released.
         let mut surface_feeds: Vec<(Arc<super::MessageEnvelope>, i64, Vec<SurfaceFeedTarget>)> =
@@ -1567,10 +1467,9 @@ impl Messenger {
                 .unchecked_transaction()
                 .expect("publish_from_wasm: begin tx");
 
-            // Per-flush memoization of resolve_push_targets: the directory is immutable
-            // and the lock is held throughout, so targets cannot change mid-flush. The
-            // dominant case is all publishes targeting one channel — this eliminates
-            // 256× redundant `get_or_create_singleton_conversation` DB queries for that case.
+            // Per-flush memoization of the surface-feed resolution: the directory is
+            // immutable and the lock is held throughout, so targets cannot change
+            // mid-flush. The dominant case is all publishes targeting one channel.
             let mut targets_cache: HashMap<&str, ResolvedChannelTargets> = HashMap::new();
 
             // Monotonic publish_ts_ns assignment: each message gets
@@ -1611,18 +1510,13 @@ impl Messenger {
                     continue;
                 }
 
-                let (channel, push_targets, feed_targets) =
+                let (channel, feed_targets) =
                     targets_cache.entry(channel_addr).or_insert_with(|| {
-                        let targets = self.resolve_push_targets(
-                            &conn,
-                            &entry.address,
-                            entry.subscribers.as_slice(),
-                        );
                         let feed = self.resolve_surface_feed_targets(
                             &entry.address,
                             entry.subscribers.as_slice(),
                         );
-                        (entry.clone(), targets, feed)
+                        (entry.clone(), feed)
                     });
 
                 let now_ns = db::utc_to_ns(Utc::now());
@@ -1649,10 +1543,9 @@ impl Messenger {
                 });
 
                 let release = publish.deliver_after.filter(|da| *da > flush_now);
-                let (inserted, plan) = self.insert_pushes(
+                let inserted = self.insert_message(
                     &tx,
                     channel,
-                    push_targets,
                     ChannelScheme::Brenn,
                     source,
                     &sender,
@@ -1690,28 +1583,14 @@ impl Messenger {
                         feed_targets.clone(),
                     ));
                 }
-                all_retirements.push(plan);
             }
 
             tx.commit().expect("publish_from_wasm: commit tx");
             debug!(
                 consumer_slug = consumer_slug,
                 publish_count = publishes.len(),
-                "publish_from_wasm: batch committed; retiring push windows"
+                "publish_from_wasm: batch committed"
             );
-
-            // retire_windows runs post-commit (in-memory deque + autocommit DELETEs).
-            // A panic here would leave in-memory window state partially updated vs DB;
-            // the preceding log line records slug + channel for on-call triage.
-            for (i, plan) in all_retirements.iter().enumerate() {
-                debug!(
-                    consumer_slug = consumer_slug,
-                    channel = plan.entry.address.as_str(),
-                    publish_index = i,
-                    "publish_from_wasm: retiring push windows post-commit"
-                );
-                self.retire_windows(&conn, plan);
-            }
         }
 
         // Durable surface feeds, fanned out after the lock is released.
@@ -1783,9 +1662,7 @@ impl Messenger {
     /// buffered and released together by the kernel's flush-on-ok rule, so a
     /// partially-applied batch would publish a state no component ever asked to
     /// exist. A panic mid-batch unwinds through the `Transaction` drop guard and
-    /// rolls the whole thing back; in-memory window state is touched only in
-    /// `retire_windows`, post-commit, so it stays consistent with the rolled-back
-    /// DB.
+    /// rolls the whole thing back.
     ///
     /// **The send budget is not drawn here** — the caller draws once for the whole
     /// batch via [`Messenger::draw_surface_send_budget_for_batch`] before calling,
@@ -1852,7 +1729,6 @@ impl Messenger {
             "publish_batch_from_surface: applying activation flush"
         );
 
-        let mut all_retirements: Vec<RetirementPlan> = Vec::with_capacity(publishes.len());
         // Deferred durable surface feeds: built under the lock, fanned out
         // after release. See `publish_from_wasm`.
         let mut surface_feeds: Vec<(Arc<super::MessageEnvelope>, i64, Vec<SurfaceFeedTarget>)> =
@@ -1864,7 +1740,7 @@ impl Messenger {
                 .unchecked_transaction()
                 .expect("publish_batch_from_surface: begin tx");
 
-            // Per-batch memoization of resolve_push_targets, as in
+            // Per-batch memoization of the surface-feed resolution, as in
             // `publish_from_wasm`: the directory is immutable and the lock is held
             // throughout, so targets cannot change mid-batch, and the dominant
             // case is a batch fanning one port.
@@ -1872,38 +1748,31 @@ impl Messenger {
 
             for publish in publishes {
                 let addr = publish.channel_address;
-                let (channel, push_targets, feed_targets) =
-                    targets_cache.entry(addr).or_insert_with(|| {
-                        let name =
-                            well_formed_name(addr, ChannelScheme::Brenn).unwrap_or_else(|| {
-                                panic!(
-                                    "publish_batch_from_surface: bound output {addr:?} of surface \
+                let (channel, feed_targets) = targets_cache.entry(addr).or_insert_with(|| {
+                    let name = well_formed_name(addr, ChannelScheme::Brenn).unwrap_or_else(|| {
+                        panic!(
+                            "publish_batch_from_surface: bound output {addr:?} of surface \
                                      {slug:?} is not a well-formed brenn: address — boot resolved \
                                      it, so this is a broken boot invariant"
-                                )
-                            });
-                        assert!(
-                            publish_acl_allows(policy, ChannelScheme::Brenn, name),
-                            "publish_batch_from_surface: surface {slug:?} has no brenn_publish ACL \
+                        )
+                    });
+                    assert!(
+                        publish_acl_allows(policy, ChannelScheme::Brenn, name),
+                        "publish_batch_from_surface: surface {slug:?} has no brenn_publish ACL \
                              covering bound output {addr:?} — boot validation proves every bound \
                              output is policy-covered, so this is a broken boot invariant"
-                        );
-                        let ch = self.directory.resolve(addr).unwrap_or_else(|| {
-                            panic!(
-                                "publish_batch_from_surface: bound output {addr:?} of surface \
+                    );
+                    let ch = self.directory.resolve(addr).unwrap_or_else(|| {
+                        panic!(
+                            "publish_batch_from_surface: bound output {addr:?} of surface \
                                  {slug:?} is not in the directory — boot validation proves every \
                                  bound output exists, so this is a broken boot invariant"
-                            )
-                        });
-                        let targets = self.resolve_push_targets(
-                            &conn,
-                            &ch.address,
-                            ch.subscribers.as_slice(),
-                        );
-                        let feed = self
-                            .resolve_surface_feed_targets(&ch.address, ch.subscribers.as_slice());
-                        (ch, targets, feed)
+                        )
                     });
+                    let feed =
+                        self.resolve_surface_feed_targets(&ch.address, ch.subscribers.as_slice());
+                    (ch, feed)
+                });
 
                 // The caller answered the client a violation for an over-cap body
                 // before reaching here (the kernel's own buffer-time gate already
@@ -1921,10 +1790,9 @@ impl Messenger {
                     );
                 }
 
-                let (inserted, plan) = self.insert_pushes(
+                let inserted = self.insert_message(
                     &tx,
                     channel,
-                    push_targets,
                     ChannelScheme::Brenn,
                     source,
                     &sender,
@@ -1959,17 +1827,9 @@ impl Messenger {
                         feed_targets.clone(),
                     ));
                 }
-                all_retirements.push(plan);
             }
 
             tx.commit().expect("publish_batch_from_surface: commit tx");
-
-            // Post-commit: in-memory deque + autocommit DELETEs. The log line
-            // above records surface + principal + count for triage if a panic
-            // here leaves window state partially updated against the DB.
-            for plan in &all_retirements {
-                self.retire_windows(&conn, plan);
-            }
         }
 
         // Durable surface feeds, fanned out after the lock is released.

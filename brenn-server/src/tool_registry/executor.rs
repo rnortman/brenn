@@ -541,14 +541,12 @@ mod tests {
     use brenn_lib::access::{AppCapability, AppPolicy, GrantSet};
     use brenn_lib::db::init_db_memory;
     use brenn_lib::messaging::config::MessagingGlobalConfig;
-    use brenn_lib::messaging::db::{
-        PendingPushInsert, insert_message_with_pushes, upsert_channels, utc_to_ns,
-    };
+    use brenn_lib::messaging::db::{insert_message, upsert_channels, utc_to_ns};
     use brenn_lib::messaging::query::NoopWakeRouter;
     use brenn_lib::messaging::testutils::test_channel_entry;
     use brenn_lib::messaging::{
-        ChannelScheme, IngressOrBus, MessagingDirectory, SubscriberEntry, SubscriberEntryKind,
-        WakeMin, WakeRouter, config::Depth, config::NoiseLevel,
+        ChannelScheme, MessagingDirectory, SubscriberEntry, SubscriberEntryKind, WakeMin,
+        WakeRouter, config::Depth, config::NoiseLevel,
     };
     use brenn_lib::obs::alerting::{make_capturing_alerter, noop_alert_dispatcher};
     use brenn_lib::tools::AclClause;
@@ -771,18 +769,12 @@ mod tests {
         }
     }
 
-    /// Insert one request pending-push row for the executor on `tools/apull`,
-    /// with `reply_to` set to the `tool-results/sync` inbox.
-    async fn insert_request(h: &Harness, body: &str, reply_to_uuid: Option<uuid::Uuid>) -> i64 {
+    /// Commit one request onto `tools/apull` with `reply_to` set to the
+    /// `tool-results/sync` inbox. The executor's attached position is what makes
+    /// it owed; a commit writes nothing per subscriber.
+    async fn insert_request(h: &Harness, body: &str, reply_to_uuid: Option<uuid::Uuid>) {
         let conn = h.messenger.db().lock().await;
-        let push = PendingPushInsert {
-            target_subscriber: ParticipantId::for_system(TOOL_EXECUTOR_COMPONENT),
-            target_app_slug: TOOL_EXECUTOR_COMPONENT.to_string(),
-            eager_wake: true,
-            release_after: None,
-            delivery_deadline: None,
-        };
-        let msg = insert_message_with_pushes(
+        insert_message(
             &conn,
             h.tools_uuid,
             "test",
@@ -794,9 +786,7 @@ mod tests {
             None,
             None,
             utc_to_ns(Utc::now()),
-            &[push],
         );
-        msg.push_ids[0]
     }
 
     fn request_body(call_id: &str, repo: &str) -> String {
@@ -847,21 +837,19 @@ mod tests {
 
     /// The one result row on the caller's inbox, decoded as JSON.
     async fn read_result(h: &Harness) -> Value {
-        let rows = h
-            .messenger
-            .load_pending_pushes(&ParticipantId::for_wasm(CALLER_SLUG))
-            .await;
+        let rows = brenn_lib::messaging::testutils::owed_everywhere(
+            &h.messenger,
+            &ParticipantId::for_wasm(CALLER_SLUG),
+        )
+        .await;
         assert_eq!(rows.len(), 1, "exactly one result row on the caller inbox");
-        match &rows[0].1 {
-            IngressOrBus::Bus(env) => serde_json::from_str(&env.body).expect("result body is JSON"),
-            other => panic!("expected a bus result row, got {other:?}"),
-        }
+        serde_json::from_str(&rows[0].1.body).expect("result body is JSON")
     }
 
     #[tokio::test]
     async fn drains_executes_and_delivers_result_and_acks_request() {
         let h = harness().await;
-        let push_id = insert_request(&h, &request_body("c1", "brenn"), Some(h.results_uuid)).await;
+        insert_request(&h, &request_body("c1", "brenn"), Some(h.results_uuid)).await;
         let (alert, _hg) = noop_alert_dispatcher();
         let exec = executor(
             &h,
@@ -873,15 +861,15 @@ mod tests {
         drain_and_join(&exec).await;
 
         // Request row acked (ack-at-dequeue).
-        let remaining = h
-            .messenger
-            .load_pending_pushes(&ParticipantId::for_system(TOOL_EXECUTOR_COMPONENT))
-            .await;
+        let remaining = brenn_lib::messaging::testutils::owed_everywhere(
+            &h.messenger,
+            &ParticipantId::for_system(TOOL_EXECUTOR_COMPONENT),
+        )
+        .await;
         assert!(
             remaining.is_empty(),
-            "request row must be acked, got {remaining:?}"
+            "the executor's position must be advanced past the request, got {remaining:?}"
         );
-        let _ = push_id;
 
         // Result delivered to the caller inbox with the ok outcome + echoed args.
         let result = read_result(&h).await;
@@ -981,10 +969,11 @@ mod tests {
         )
         .await;
         // Nothing landed on any inbox; the drop is silent-but-logged.
-        let rows = h
-            .messenger
-            .load_pending_pushes(&ParticipantId::for_wasm(CALLER_SLUG))
-            .await;
+        let rows = brenn_lib::messaging::testutils::owed_everywhere(
+            &h.messenger,
+            &ParticipantId::for_wasm(CALLER_SLUG),
+        )
+        .await;
         assert!(rows.is_empty(), "no result row for a dropped reply target");
     }
 
@@ -1013,10 +1002,11 @@ mod tests {
             "max_concurrency = 1 must serialize the two executions",
         );
         // Both results delivered.
-        let rows = h
-            .messenger
-            .load_pending_pushes(&ParticipantId::for_wasm(CALLER_SLUG))
-            .await;
+        let rows = brenn_lib::messaging::testutils::owed_everywhere(
+            &h.messenger,
+            &ParticipantId::for_wasm(CALLER_SLUG),
+        )
+        .await;
         assert_eq!(rows.len(), 2, "both results delivered to the caller inbox");
     }
 
@@ -1065,10 +1055,11 @@ mod tests {
             probe
         };
         // No result row anywhere.
-        let rows = h
-            .messenger
-            .load_pending_pushes(&ParticipantId::for_wasm(CALLER_SLUG))
-            .await;
+        let rows = brenn_lib::messaging::testutils::owed_everywhere(
+            &h.messenger,
+            &ParticipantId::for_wasm(CALLER_SLUG),
+        )
+        .await;
         assert!(rows.is_empty(), "no result row when reply_to is absent");
         // The side effect still ran despite the missing reply target.
         assert!(
@@ -1206,35 +1197,5 @@ mod tests {
             serde_json::from_str(&port.new_entries()[0].1.body).expect("result body is JSON");
         assert_eq!(body["call_id"], "r1");
         assert_eq!(body["outcome"]["ok"]["echoed"]["repo"], "brenn");
-    }
-
-    #[tokio::test]
-    async fn result_row_is_retired_when_inbox_port_absent_from_inputs() {
-        // The mirror of the property above: if the inbox channel is *not* a
-        // current input, the row is residue and is retired (marked delivered) with
-        // no activation. This pins why folding `inbox_input_port` into the
-        // consumer's `inputs` is load-bearing — without it every result is eaten.
-        let h = harness().await;
-        let (alert, _hg) = noop_alert_dispatcher();
-        publish_result(
-            &h.messenger,
-            "brenn:tool-results/sync",
-            &build_result_body("apull", "r2", &Ok(json!({})), &alert),
-        )
-        .await;
-
-        let caller = ParticipantId::for_wasm(CALLER_SLUG);
-        // No inputs ⇒ the inbox channel matches no port ⇒ the row is retired.
-        let snapshot = h.messenger.load_activation_snapshot(&caller, &[]).await;
-        assert!(
-            snapshot.is_none(),
-            "with no matching input port the result row must not activate",
-        );
-        // Retired means acked: a second drain sees nothing pending.
-        let remaining = h.messenger.load_pending_pushes(&caller).await;
-        assert!(
-            remaining.is_empty(),
-            "the residue row must be retired (marked delivered), got {remaining:?}",
-        );
     }
 }

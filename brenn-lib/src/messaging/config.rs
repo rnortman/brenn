@@ -1283,8 +1283,9 @@ pub struct ResolvedSurface {
     /// channel)** pair the surface's `brenn:` bindings name. Ephemeral and `local:`
     /// bindings never appear here (they carry no durable knobs and open no push
     /// window). These become `SubscriberEntryKind::Surface` directory entries so
-    /// the durable dispatch path (`resolve_push_targets`, `floor_decision`)
-    /// treats each principal exactly like an App/Wasm subscriber.
+    /// the durable path resolves each principal exactly like an App/Wasm
+    /// subscriber — `TargetResolver::surface_feed_targets` finds it on the
+    /// channel and gates it on the same ACLs.
     pub durable_subscriptions: Vec<ResolvedSurfaceSubscription>,
     /// Every distinct `local:` channel this surface's bindings name, with the
     /// ring depth resolved from them. Deduped, in first-binding order. Carried
@@ -1319,9 +1320,9 @@ impl ResolvedSurface {
     /// This is the single authority for that set. Subscriber registrations,
     /// delivery-binding routes, and send budgets must each cover exactly it, and
     /// a site that enumerates it by hand can drift: a missing registration makes
-    /// `floor_decision` fail closed, a missing route parks rows silently, and a
-    /// missing budget panics the publish gate. Adding a grain here lands on
-    /// every site at once.
+    /// surface target resolution fail closed, a missing route silently strands
+    /// the principal's traffic, and a missing budget panics the publish gate.
+    /// Adding a grain here lands on every site at once.
     pub fn principals(&self) -> impl Iterator<Item = Option<String>> + '_ {
         std::iter::once(None).chain(self.instance_ids().map(Some))
     }
@@ -1966,10 +1967,11 @@ pub fn finalize_directory_with_subscribers(
         for sub in subs {
             // A surface subscription resolved against a channel the directory
             // does not hold means the two build paths disagree about what
-            // exists. Skipping would drop the principal's subscriber entry:
-            // `resolve_push_targets` would never target it, no push rows would
-            // be written, and the instance would receive nothing forever with no
-            // signal at boot or runtime. Host-state corruption — panic.
+            // exists. Skipping would drop the principal's subscriber entry, and
+            // the entry is what every delivery decision reads: no live fan-out
+            // would name the instance and no wake pass would give it a position,
+            // so it would receive nothing forever with no signal at boot or
+            // runtime. Host-state corruption — panic.
             let entry = by_uuid
                 .get_mut(&sub.subscription.channel_uuid)
                 .unwrap_or_else(|| {
@@ -2031,8 +2033,8 @@ pub fn finalize_directory_with_subscribers(
 ///
 /// Returns a [`DynamicMergeOutcome`] partitioning the input rows: `kept` are the
 /// rows folded into the directory (the boot path mirrors these into
-/// `messaging_subscriptions` so the urgency-recompute join in `bus.rs` sees
-/// dynamic subscribers); `dropped` are the `(channel_uuid, app_slug)` keys the
+/// `messaging_subscriptions`, so a dynamic subscriber appears there on the same
+/// terms as a static one); `dropped` are the `(channel_uuid, app_slug)` keys the
 /// boot path prunes from `messaging_dynamic_subscriptions` so the same conflict
 /// does not recur next boot (design §2.1 "Boot merge" / "Mirror collision
 /// policy"); `revoked` are the rows no longer authorized by the current config —
@@ -2158,7 +2160,8 @@ pub fn merge_dynamic_subscriptions<'p>(
 /// (`revoked`).
 ///
 /// The boot path uses `kept` to mirror the surviving dynamic subscriptions into
-/// `messaging_subscriptions` (so the urgency-recompute join sees them) and
+/// `messaging_subscriptions` (so a dynamic subscriber is recorded there on the
+/// same terms as a static one) and
 /// `dropped` to prune the now-overridden rows from
 /// `messaging_dynamic_subscriptions` (so the conflict does not recur next boot).
 /// `revoked` rows are folded into **neither** — they are not added to the

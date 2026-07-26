@@ -759,10 +759,7 @@ mod tests {
     use crate::config::AppConfig;
     use crate::db::init_db_memory;
     use crate::messaging::config::{MessagingGlobalConfig, ResolvedChannel, Sink};
-    use crate::messaging::db::{
-        PendingPushInsert, channel_has_deliverable_for, insert_message_with_pushes,
-        load_dynamic_subscriptions, upsert_channels,
-    };
+    use crate::messaging::db::{insert_message, load_dynamic_subscriptions, upsert_channels};
     use crate::messaging::test_support::test_app_config;
     use crate::messaging::{
         ChannelDetails, ChannelEntry, ChannelScheme, MessageEnvelope, MessagingDirectory,
@@ -780,9 +777,8 @@ mod tests {
         async fn deliver(
             &self,
             _key: &crate::messaging::SubscriberEntryKind,
-            _subscriber: &ParticipantId,
-            _envelope: &MessageEnvelope,
-            _retained_seq: Option<i64>,
+            _envelope: &std::sync::Arc<MessageEnvelope>,
+            _retained_seq: i64,
         ) -> Result<bool, String> {
             Ok(false)
         }
@@ -806,7 +802,16 @@ mod tests {
         ) -> crate::messaging::DeliveryShape {
             crate::messaging::default_delivery_shape(key)
         }
-        fn alarm(&self, _channel: &str, _subscriber: &ParticipantId) {}
+        fn alarm(&self, _channel: &str, _subscriber: &ParticipantId, _count: u64) {}
+    }
+
+    /// Whether `subscriber` is owed anything on the channel `uuid` names.
+    async fn owed_on(m: &Messenger, uuid: Uuid, subscriber: &ParticipantId) -> bool {
+        let entry = m
+            .directory()
+            .by_uuid(&uuid)
+            .expect("the channel is in the directory");
+        m.store_for(&entry).has_deliverable(subscriber).await
     }
 
     fn channel(address: &str, transport: ChannelScheme) -> ChannelEntry {
@@ -1754,11 +1759,11 @@ mod tests {
             );
         }
 
-        // Plant delivery state: a pending push owed to this subscriber, so the
-        // channel reports it as owed work before the unsubscribe tears it down.
+        // Publish something the position now trails, so the channel reports the
+        // subscriber as owed work before the unsubscribe tears it down.
         {
             let conn = m.db.lock().await;
-            insert_message_with_pushes(
+            insert_message(
                 &conn,
                 uuid,
                 "src",
@@ -1770,19 +1775,12 @@ mod tests {
                 None,
                 None,
                 0,
-                &[PendingPushInsert {
-                    target_subscriber: subscriber.clone(),
-                    target_app_slug: "graf".to_string(),
-                    eager_wake: true,
-                    release_after: None,
-                    delivery_deadline: None,
-                }],
-            );
-            assert!(
-                channel_has_deliverable_for(&conn, uuid, &subscriber),
-                "subscriber is owed the planted push before unsubscribe"
             );
         }
+        assert!(
+            owed_on(&m, uuid, &subscriber).await,
+            "subscriber is owed the published message before unsubscribe"
+        );
 
         let outcome = m
             .unsubscribe_dynamic("graf", "heartbeat")
@@ -1801,19 +1799,19 @@ mod tests {
         };
         assert!(rows.is_empty(), "durable row removed");
 
-        // Delivery state torn down: the conversation's position and the pushes
-        // owed to it are both gone.
+        // Delivery state torn down: the conversation's position is gone, so the
+        // channel owes it nothing.
         {
             let conn = m.db.lock().await;
             assert!(
                 crate::messaging::db::load_subscriber_cursor(&conn, uuid, &subscriber).is_none(),
                 "unsubscribe deleted the conversation's position"
             );
-            assert!(
-                !channel_has_deliverable_for(&conn, uuid, &subscriber),
-                "detach deleted the subscriber's delivery state on unsubscribe"
-            );
         }
+        assert!(
+            !owed_on(&m, uuid, &subscriber).await,
+            "a subscriber with no position is owed nothing"
+        );
 
         // Directory subscriber folded out.
         let entry = m.directory.resolve("heartbeat").expect("channel present");

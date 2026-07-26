@@ -16,8 +16,7 @@ async fn single_scan_per_drain_step_regardless_of_k() {
 
     // Insert one pending row on each channel.
     for channel in &channels {
-        testutils::insert_wasm_push(&messenger, channel, &wasm_sub, "row", ChannelScheme::Brenn)
-            .await;
+        testutils::insert_bus_message(&messenger, channel, "row", ChannelScheme::Brenn).await;
     }
 
     // Snapshot the counter immediately before the drain step.
@@ -34,7 +33,7 @@ async fn single_scan_per_drain_step_regardless_of_k() {
     );
 
     // All rows must be delivered (correctness check).
-    let rows = messenger.load_pending_pushes(&wasm_sub).await;
+    let rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(rows.is_empty(), "all rows must be delivered after drain");
 }
 
@@ -60,14 +59,7 @@ async fn order_preserving_partition_delivers_all_rows() {
     for i in 0..3usize {
         for channel in &channels {
             let body = format!("msg-{i}");
-            testutils::insert_wasm_push(
-                &messenger,
-                channel,
-                &wasm_sub,
-                &body,
-                ChannelScheme::Brenn,
-            )
-            .await;
+            testutils::insert_bus_message(&messenger, channel, &body, ChannelScheme::Brenn).await;
             expected_order
                 .entry(channel.address.clone())
                 .or_default()
@@ -113,7 +105,7 @@ async fn order_preserving_partition_delivers_all_rows() {
     // +1 from the pre-drain load_activation_snapshot call above + 1 from drain = 2 total.
     assert_eq!(after - before, 1, "drain itself must use exactly one scan");
 
-    let rows = messenger.load_pending_pushes(&wasm_sub).await;
+    let rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         rows.is_empty(),
         "all rows across channels must be delivered"
@@ -136,13 +128,12 @@ async fn all_channels_with_pending_rows_are_visited() {
         build_multi_channel_setup(slug, &["vis-ch-a", "vis-ch-b", "vis-ch-c"]).await;
 
     for channel in &channels {
-        testutils::insert_wasm_push(&messenger, channel, &wasm_sub, "body", ChannelScheme::Brenn)
-            .await;
+        testutils::insert_bus_message(&messenger, channel, "body", ChannelScheme::Brenn).await;
     }
 
     drain_step(&cfg, &wasm_sub).await;
 
-    let rows = messenger.load_pending_pushes(&wasm_sub).await;
+    let rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(rows.is_empty(), "all channels visited and rows delivered");
 }
 
@@ -159,14 +150,7 @@ async fn empty_channels_skipped_no_scan_per_empty_channel() {
         build_multi_channel_setup(slug, &["empty-ch-a", "empty-ch-b", "empty-ch-c"]).await;
 
     // Insert a row only on the first channel.
-    testutils::insert_wasm_push(
-        &messenger,
-        &channels[0],
-        &wasm_sub,
-        "only-row",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &channels[0], "only-row", ChannelScheme::Brenn).await;
 
     let before = messenger.pending_bus_pushes_scan_count();
     drain_step(&cfg, &wasm_sub).await;
@@ -176,6 +160,6 @@ async fn empty_channels_skipped_no_scan_per_empty_channel() {
     assert_eq!(after - before, 1, "single scan even with empty channels");
 
     // The row is delivered; empty channels leave no spurious failure records.
-    let rows = messenger.load_pending_pushes(&wasm_sub).await;
+    let rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(rows.is_empty(), "pending row must be delivered");
 }

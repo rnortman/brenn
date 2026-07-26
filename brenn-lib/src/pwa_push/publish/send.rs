@@ -11,7 +11,7 @@
 //!   4. Resolve targets (ACL + subscription lookup).
 //!   5. Plaintext size precheck (3993-byte cap, worst-case user_id width).
 //!   6. Budget decrement.
-//!   7. Persist message row (ensure_pwa_channel + insert_message_with_pushes).
+//!   7. Persist message row (ensure_pwa_channel + insert_message).
 //!   8. Release DB lock.
 //!   9. Encrypt + POST per subscription.
 //!  10. Record outcomes (201/410/404/other), update/delete rows.
@@ -22,9 +22,7 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use crate::auth::user::get_user_by_username_nocase;
-use crate::messaging::db::{
-    BudgetDecrement, decrement_send_budget, insert_message_with_pushes, utc_to_ns,
-};
+use crate::messaging::db::{BudgetDecrement, decrement_send_budget, insert_message, utc_to_ns};
 use crate::messaging::{ParticipantId, Urgency as MessagingUrgency};
 use crate::pwa_push::db::{
     DeviceSubscriptionLookup, SubscriptionRow, delete_subscription_by_id, ensure_pwa_channel,
@@ -281,7 +279,7 @@ impl PwaPushService {
             let conn = self.db.lock().await;
             let channel_uuid = ensure_pwa_channel(&conn, &canonical_addr);
             let publish_ts_ns = utc_to_ns(Utc::now());
-            let inserted = insert_message_with_pushes(
+            let inserted = insert_message(
                 &conn,
                 channel_uuid,
                 // source: use the server's own identifier (same as brenn: path)
@@ -294,7 +292,6 @@ impl PwaPushService {
                 None, // no delivery_deadline
                 None, // no deliver_after
                 publish_ts_ns,
-                &[], // no messaging_pending_pushes rows for pwa_push
             );
             inserted.uuid
         };

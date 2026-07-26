@@ -24,27 +24,21 @@ async fn end_to_end_demo_webhook_to_brenn_output() {
         endpoint_slug: "e2e-in".into(),
     };
     let wh_body = serde_json::to_string(&wh_env).unwrap();
-    testutils::insert_wasm_push(
-        &messenger,
-        &in_entry,
-        &wasm_sub,
-        &wh_body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &in_entry, &wh_body, ChannelScheme::Webhook).await;
 
     // Drain: demo component extracts inner body and publishes to "out" port.
     drain_step(&cfg, &wasm_sub).await;
 
     // Verify the WASM push row is consumed.
-    let in_rows_after = messenger.load_pending_pushes(&wasm_sub).await;
+    let in_rows_after =
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         in_rows_after.is_empty(),
         "WASM input push row must be delivered"
     );
 
     // Verify the output row on the brenn: channel.
-    let out_rows = messenger.load_pending_pushes(&out_sub).await;
+    let out_rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
     assert_eq!(
         out_rows.len(),
         1,
@@ -109,20 +103,12 @@ async fn all_or_nothing_trap_after_publish_discards_output() {
         endpoint_slug: "e2e-in".into(),
     };
     let wh_body = serde_json::to_string(&wh_env).unwrap();
-    testutils::insert_wasm_push(
-        &messenger,
-        &in_entry,
-        &wasm_sub,
-        &wh_body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &in_entry, &wh_body, ChannelScheme::Webhook).await;
     // The sentinel causes trap. Because both rows arrive in the same activation
     // window, the trap discards the buffered publish from the first envelope.
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &in_entry,
-        &wasm_sub,
         "__trap__", // MessageEnvelope.body == "__trap__" → guest traps
         ChannelScheme::Brenn,
     )
@@ -131,13 +117,14 @@ async fn all_or_nothing_trap_after_publish_discards_output() {
     drain_step(&cfg, &wasm_sub).await;
 
     // All input rows must be acked (delivered), but output channel must have no rows.
-    let in_rows_after = messenger.load_pending_pushes(&wasm_sub).await;
+    let in_rows_after =
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         in_rows_after.is_empty(),
         "WASM input rows must be acked despite trap"
     );
 
-    let out_rows = messenger.load_pending_pushes(&out_sub).await;
+    let out_rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
     assert!(
         out_rows.is_empty(),
         "no rows must be published to output channel when trap discards buffer; \
@@ -215,14 +202,8 @@ async fn err_outcome_acks_push_row_at_activation_start() {
         endpoint_slug: channel_slug.into(),
     };
     let wh_body = serde_json::to_string(&wh_env).unwrap();
-    let (push_id, _) = testutils::insert_wasm_push(
-        &messenger,
-        &entry,
-        &wasm_sub,
-        &wh_body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    let _ =
+        testutils::insert_bus_message(&messenger, &entry, &wh_body, ChannelScheme::Webhook).await;
 
     // Build component with no output ports → publish("out", …) → NotPermitted → Err.
     let _db = tempfile::NamedTempFile::new().unwrap();
@@ -269,17 +250,17 @@ async fn err_outcome_acks_push_row_at_activation_start() {
 
     drain_step(&cfg, &wasm_sub).await;
 
-    // Ack-at-start: the push row must be delivered even though the guest returned Err.
-    let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
+    // Ack-at-start: the position moved past the batch even though the guest
+    // returned Err — the advance runs before the guest (at-most-once).
+    let rows_after = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         rows_after.is_empty(),
-        "push row must be acked (delivered) even after Err outcome — \
-         ack happens before guest runs (at-most-once); push_id={push_id}"
+        "the batch must be advanced past even after an Err outcome"
     );
 
     // A second drain must find nothing (no redelivery).
     drain_step(&cfg, &wasm_sub).await;
-    let rows_second = messenger.load_pending_pushes(&wasm_sub).await;
+    let rows_second = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         rows_second.is_empty(),
         "no redelivery after Err — at-most-once semantics"
@@ -311,14 +292,8 @@ async fn call_order_flush_monotonic_timestamps() {
             endpoint_slug: "e2e-in".into(),
         };
         let wh_body = serde_json::to_string(&wh_env).unwrap();
-        testutils::insert_wasm_push(
-            &messenger,
-            &in_entry,
-            &wasm_sub,
-            &wh_body,
-            ChannelScheme::Webhook,
-        )
-        .await;
+        testutils::insert_bus_message(&messenger, &in_entry, &wh_body, ChannelScheme::Webhook)
+            .await;
     }
 
     drain_step(&cfg, &wasm_sub).await;
@@ -382,43 +357,22 @@ async fn chaining_wake_store_walk_fires_eager_wake_for_downstream_subscriber() {
         endpoint_slug: "e2e-in".into(),
     };
     let wh_body = serde_json::to_string(&wh_env).unwrap();
-    testutils::insert_wasm_push(
-        &messenger,
-        &in_entry,
-        &wasm_sub,
-        &wh_body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &in_entry, &wh_body, ChannelScheme::Webhook).await;
 
     // Drain: demo publishes to output channel → publish_from_wasm inserts push row
     // with wake=Immediate for the downstream subscriber.
     drain_step(&cfg, &wasm_sub).await;
 
-    // The output push row must be present and Immediate-wake.
-    let out_pending = messenger.load_pending_pushes(&out_sub).await;
+    // The downstream subscriber's position now trails the published output.
+    let out_pending = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
     assert_eq!(
         out_pending.len(),
         1,
-        "exactly one pending push for downstream subscriber after drain"
-    );
-    let out_push_id = out_pending[0].0;
-
-    // Load the push row for dispatch_row.
-    let push_row = {
-        let conn = messenger.db().lock().await;
-        brenn_lib::messaging::db::load_pushes_by_ids(&conn, &[out_push_id])
-            .into_iter()
-            .next()
-            .expect("output push row must exist")
-    };
-    assert!(
-        push_row.eager_wake,
-        "output push row must have eager_wake=true for eager-wake routing"
+        "exactly one message owed to the downstream subscriber after drain"
     );
 
-    // Build a capturing wake router and call dispatch_row directly —
-    // simulating the one step the background dispatcher task would run.
+    // Build a capturing wake router and run the wake pass — the one step the
+    // background dispatcher task would run for a trailing position.
     use std::sync::Mutex;
     struct CapturingWakeRouter {
         woken: Mutex<Vec<String>>,
@@ -428,9 +382,8 @@ async fn chaining_wake_store_walk_fires_eager_wake_for_downstream_subscriber() {
         async fn deliver(
             &self,
             _: &brenn_lib::messaging::SubscriberEntryKind,
-            _: &ParticipantId,
-            _: &brenn_lib::messaging::MessageEnvelope,
-            _retained_seq: Option<i64>,
+            _envelope: &std::sync::Arc<brenn_lib::messaging::MessageEnvelope>,
+            _retained_seq: i64,
         ) -> Result<bool, String> {
             Ok(false)
         }
@@ -458,7 +411,7 @@ async fn chaining_wake_store_walk_fires_eager_wake_for_downstream_subscriber() {
         ) -> brenn_lib::messaging::DeliveryShape {
             brenn_lib::messaging::default_delivery_shape(key)
         }
-        fn alarm(&self, _: &str, _: &ParticipantId) {}
+        fn alarm(&self, _: &str, _: &ParticipantId, _: u64) {}
     }
 
     // Drive the wake through a Messenger whose router captures wakes (the
@@ -505,19 +458,13 @@ async fn guest_publish_deferred_parks_with_a_host_stamped_now() {
         endpoint_slug: "e2e-in".into(),
     };
     let wh_body = serde_json::to_string(&wh_env).unwrap();
-    testutils::insert_wasm_push(
-        &messenger,
-        &in_entry,
-        &wasm_sub,
-        &wh_body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &in_entry, &wh_body, ChannelScheme::Webhook).await;
 
     let before = Utc::now();
     drain_step(&cfg, &wasm_sub).await;
 
-    let in_rows_after = messenger.load_pending_pushes(&wasm_sub).await;
+    let in_rows_after =
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(in_rows_after.is_empty(), "WASM input row must be delivered");
 
     {
@@ -545,7 +492,7 @@ async fn guest_publish_deferred_parks_with_a_host_stamped_now() {
         );
     }
 
-    let out_rows = messenger.load_pending_pushes(&out_sub).await;
+    let out_rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &out_sub).await;
     assert!(
         out_rows.is_empty(),
         "a parked deferred publish delivers nothing before its release time",
@@ -573,10 +520,9 @@ async fn output_port_deferred_view_reflects_the_guests_own_parked_message() {
         body: "__defer__".into(),
         endpoint_slug: "e2e-in".into(),
     };
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &in_entry,
-        &wasm_sub,
         &serde_json::to_string(&defer_env).unwrap(),
         ChannelScheme::Webhook,
     )
@@ -611,10 +557,9 @@ async fn output_port_deferred_view_reflects_the_guests_own_parked_message() {
         body: "__viewcount__".into(),
         endpoint_slug: "e2e-in".into(),
     };
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &in_entry,
-        &wasm_sub,
         &serde_json::to_string(&view_env).unwrap(),
         ChannelScheme::Webhook,
     )
@@ -661,10 +606,9 @@ async fn output_port_defer_cancel_removes_the_guests_own_parked_message() {
         body: "__defer__".into(),
         endpoint_slug: "e2e-in".into(),
     };
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &in_entry,
-        &wasm_sub,
         &serde_json::to_string(&defer_env).unwrap(),
         ChannelScheme::Webhook,
     )
@@ -693,10 +637,9 @@ async fn output_port_defer_cancel_removes_the_guests_own_parked_message() {
         body: "__cancel__".into(),
         endpoint_slug: "e2e-in".into(),
     };
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &in_entry,
-        &wasm_sub,
         &serde_json::to_string(&cancel_env).unwrap(),
         ChannelScheme::Webhook,
     )
@@ -740,10 +683,9 @@ async fn output_port_defer_edit_reschedules_the_guests_own_parked_message() {
         body: "__defer__".into(),
         endpoint_slug: "e2e-in".into(),
     };
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &in_entry,
-        &wasm_sub,
         &serde_json::to_string(&defer_env).unwrap(),
         ChannelScheme::Webhook,
     )
@@ -779,10 +721,9 @@ async fn output_port_defer_edit_reschedules_the_guests_own_parked_message() {
         body: "__reschedule__".into(),
         endpoint_slug: "e2e-in".into(),
     };
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &messenger,
         &in_entry,
-        &wasm_sub,
         &serde_json::to_string(&edit_env).unwrap(),
         ChannelScheme::Webhook,
     )
@@ -1056,14 +997,9 @@ async fn a_mixed_class_activation_settles_each_port_in_its_own_domain() {
     let (messenger, durable, ring_entry, ring, wasm_sub, cfg, _alert_handle) =
         build_mixed_class_consumer("e2e-mixed").await;
 
-    let (durable_push_id, _) = testutils::insert_wasm_push(
-        &messenger,
-        &durable,
-        &wasm_sub,
-        "durable-body",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    let _ =
+        testutils::insert_bus_message(&messenger, &durable, "durable-body", ChannelScheme::Brenn)
+            .await;
     append_ring_message(&messenger, &ring_entry, "ring-body".to_string()).await;
     assert!(
         ring.has_deliverable(&wasm_sub),
@@ -1072,18 +1008,11 @@ async fn a_mixed_class_activation_settles_each_port_in_its_own_domain() {
 
     drain_step(&cfg, &wasm_sub).await;
 
-    let delivered_at: Option<String> = {
-        let conn = messenger.db().lock().await;
-        conn.query_row(
-            "SELECT delivered_at FROM messaging_pending_pushes WHERE id = ?1",
-            rusqlite::params![durable_push_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(None)
-    };
     assert!(
-        delivered_at.is_some(),
-        "the durable claim must be settled in the claim domain"
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub)
+            .await
+            .is_empty(),
+        "the durable port's position advanced past its one message"
     );
 
     assert!(

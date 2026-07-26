@@ -3754,56 +3754,17 @@ mod tests {
         );
     }
 
-    /// Insert one message on `channel_uuid` with a pending push targeting
-    /// `surface:deskbar`. Returns `(push_id, message_id)`.
-    async fn seed_parked(
-        db: &brenn_lib::db::Db,
-        channel_uuid: Uuid,
-        body: &str,
-        ts_ns: i64,
-    ) -> (i64, i64) {
-        use brenn_lib::messaging::db::{PendingPushInsert, insert_message_with_pushes};
-        use brenn_lib::messaging::{ChannelScheme, ParticipantId, Urgency};
-        let conn = db.lock().await;
-        // Targeted at the subscribing instance, as `resolve_push_targets` would:
-        // the push window is the principal's, not the surface's.
-        let subscriber = ParticipantId::for_surface_component("deskbar", DURABLE_INSTANCE);
-        let push = PendingPushInsert {
-            target_app_slug: subscriber.as_surface_subscriber_key().to_string(),
-            target_subscriber: subscriber,
-            eager_wake: true,
-            release_after: None,
-            delivery_deadline: None,
-        };
-        let msg = insert_message_with_pushes(
-            &conn,
-            channel_uuid,
-            "test",
-            "sender",
-            body,
-            Urgency::Normal,
-            ChannelScheme::Brenn,
-            None,
-            None,
-            None,
-            ts_ns,
-            &[push],
-        );
-        (msg.push_ids[0], msg.id)
-    }
-
-    /// Insert one message on `channel_uuid` with no pending push (an
-    /// already-delivered / retained-only row). Returns the message id.
+    /// Insert one message on `channel_uuid`. Returns the message id.
     async fn seed_message(
         db: &brenn_lib::db::Db,
         channel_uuid: Uuid,
         body: &str,
         ts_ns: i64,
     ) -> i64 {
-        use brenn_lib::messaging::db::insert_message_with_pushes;
+        use brenn_lib::messaging::db::insert_message;
         use brenn_lib::messaging::{ChannelScheme, Urgency};
         let conn = db.lock().await;
-        insert_message_with_pushes(
+        insert_message(
             &conn,
             channel_uuid,
             "test",
@@ -3815,7 +3776,6 @@ mod tests {
             None,
             None,
             ts_ns,
-            &[],
         )
         .id
     }
@@ -4052,8 +4012,8 @@ mod tests {
     async fn durable_deliver_span_seq_starts_at_one_and_is_monotone() {
         let db = brenn_lib::db::init_db_memory();
         let (ctx, mut rx, uuid) = durable_ctx(&db, Depth::Bounded(8)).await;
-        let _ = seed_parked(&db, uuid, "one", 100).await;
-        let _ = seed_parked(&db, uuid, "two", 200).await;
+        let _ = seed_message(&db, uuid, "one", 100).await;
+        let _ = seed_message(&db, uuid, "two", 200).await;
 
         let durable_subs = Arc::new(Mutex::new(HashSet::new()));
         let mut durable = DurableSessionState::new(durable_subs.clone());
@@ -4085,8 +4045,8 @@ mod tests {
     async fn durable_subscribe_fresh_replays_the_retained_window() {
         let db = brenn_lib::db::init_db_memory();
         let (ctx, mut rx, uuid) = durable_ctx(&db, Depth::Bounded(8)).await;
-        let (p1, m1) = seed_parked(&db, uuid, "one", 100).await;
-        let (p2, m2) = seed_parked(&db, uuid, "two", 200).await;
+        let m1 = seed_message(&db, uuid, "one", 100).await;
+        let m2 = seed_message(&db, uuid, "two", 200).await;
 
         let durable_subs = Arc::new(Mutex::new(HashSet::new()));
         let mut durable = DurableSessionState::new(durable_subs.clone());
@@ -4124,18 +4084,14 @@ mod tests {
         // Activation is visible to the router (shared set) and the local mirror.
         assert!(durable.is_active(&durable_sub()));
         assert!(durable_subs.lock().unwrap().contains(&durable_sub()));
-        // Neither wake row was touched — the replay reads retention, not rows.
+        // The replay reads retention and writes nothing at all.
         let conn = db.lock().await;
-        for push_id in [p1, p2] {
-            let owed: bool = conn
-                .query_row(
-                    "SELECT delivered_at IS NULL FROM messaging_pending_pushes WHERE id = ?1",
-                    rusqlite::params![push_id],
-                    |row| row.get(0),
-                )
-                .expect("the seeded push row");
-            assert!(owed, "the subscribe replay marks no wake row");
-        }
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messaging_pending_pushes", [], |row| {
+                row.get(0)
+            })
+            .expect("count pending pushes");
+        assert_eq!(rows, 0, "a durable subscribe writes no row");
     }
 
     /// `Resume::Durable` replays the retained window (`id > last_seq`) with no gap

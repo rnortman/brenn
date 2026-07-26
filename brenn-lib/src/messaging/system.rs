@@ -291,9 +291,7 @@ mod tests {
     use crate::access::{AppCapability, GrantSet};
     use crate::db::init_db_memory;
     use crate::messaging::config::MessagingGlobalConfig;
-    use crate::messaging::db::{
-        PendingPushInsert, insert_message_with_pushes, upsert_channels, utc_to_ns,
-    };
+    use crate::messaging::db::{insert_message, upsert_channels, utc_to_ns};
     use crate::messaging::query::NoopWakeRouter;
     use crate::messaging::testutils::test_channel_entry;
     use crate::messaging::{ChannelScheme, MessagingDirectory, Urgency, WakeRouter};
@@ -380,16 +378,9 @@ mod tests {
         SystemInbox::new(COMPONENT, h.messenger.clone(), Arc::new(Notify::new()))
     }
 
-    async fn insert_on(h: &Harness, channel_uuid: uuid::Uuid, body: &str) -> i64 {
+    async fn insert_on(h: &Harness, channel_uuid: uuid::Uuid, body: &str) {
         let conn = h.messenger.db().lock().await;
-        let push = PendingPushInsert {
-            target_subscriber: ParticipantId::for_system(COMPONENT),
-            target_app_slug: COMPONENT.to_string(),
-            eager_wake: true,
-            release_after: None,
-            delivery_deadline: None,
-        };
-        let msg = insert_message_with_pushes(
+        insert_message(
             &conn,
             channel_uuid,
             "test",
@@ -401,12 +392,10 @@ mod tests {
             None,
             None,
             utc_to_ns(Utc::now()),
-            &[push],
         );
-        msg.push_ids[0]
     }
 
-    async fn insert_row(h: &Harness, body: &str) -> i64 {
+    async fn insert_row(h: &Harness, body: &str) {
         insert_on(h, h.reqs_uuid, body).await
     }
 

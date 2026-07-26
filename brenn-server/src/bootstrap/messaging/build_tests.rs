@@ -149,10 +149,9 @@ fn mqtt_only_app_included_in_apps_with_messaging() {
     // is now decided by the app's `AppPolicy`, not this synthesised config.)
 }
 
-/// The merged apps map must expose an `[[app.mqtt_subscription]]` on the
-/// app's `.messaging` so `resolve_push_targets` finds the matching
-/// `ResolvedSubscription` when an MQTT envelope is published to the channel
-/// — without it, `resolve_push_targets` would panic.
+/// The merged apps map must expose an `[[app.mqtt_subscription]]` on the app's
+/// `.messaging`, so the map the Messenger holds names the same subscription the
+/// directory placed on the channel.
 #[test]
 fn merged_apps_map_contains_mqtt_subscription() {
     let slug = "pa-alice";
@@ -180,7 +179,7 @@ fn merged_apps_map_contains_mqtt_subscription() {
         .find(|s| s.channel_address == address)
         .expect(
             "merged apps map must contain the mqtt subscription for the app; \
-                 without the fix, resolve_push_targets would panic",
+                 without the merge the app's own config omits it",
         );
     assert!(
         mqtt_sub.push_depth.is_push_enabled(),
@@ -203,7 +202,7 @@ fn app_with_no_messaging_excluded() {
 
 /// Regression: `merge_apps_for_messenger` (production code, called by
 /// `build_messaging`) must write the webhook-derived `ResolvedSubscription`
-/// onto each app's `.messaging` field so `resolve_push_targets` can find it.
+/// onto each app's `.messaging` field.
 ///
 /// Shape (a): webhook-only app (phonebuddy target shape — no [app.messaging]).
 ///
@@ -234,7 +233,7 @@ fn merged_apps_map_contains_webhook_subscription_webhook_only_shape() {
     let merged = merge_apps_for_messenger(&apps, &apps_with_messaging);
 
     // The merged map must expose the webhook subscription on the app's
-    // `.messaging` — this is what `resolve_push_targets` reads.
+    // `.messaging` — the operator's config never mentions it.
     let merged_app = merged.get(slug).expect("app must be in merged map");
     let merged_msg = merged_app
         .messaging
@@ -246,11 +245,10 @@ fn merged_apps_map_contains_webhook_subscription_webhook_only_shape() {
         .find(|s| s.channel_address == format!("webhook:{endpoint_slug}"));
     let webhook_sub = webhook_sub.expect(
         "merged apps map must contain the webhook subscription for the app; \
-             without the fix, resolve_push_targets would panic",
+             without the merge the app's own config omits it",
     );
-    // push_depth must be push-enabled — the panic in resolve_push_targets is
-    // gated behind is_push_enabled(), so a Bounded(0) sub would silently skip
-    // rather than panic, masking the fix.
+    // Push-enabled depth is the point of a webhook subscription: a Bounded(0) sub
+    // would be pull-only, and the app would never be woken by an inbound webhook.
     assert!(
         webhook_sub.push_depth.is_push_enabled(),
         "merged webhook subscription must have push-enabled depth (Unbounded)"
@@ -322,11 +320,10 @@ fn merged_apps_map_contains_webhook_subscription_brenn_plus_webhook_shape() {
         .find(|s| s.channel_address == format!("webhook:{endpoint_slug}"));
     let webhook_sub = webhook_sub.expect(
         "merged apps map must contain the webhook subscription for the app; \
-             without the fix, resolve_push_targets would panic",
+             without the merge the app's own config omits it",
     );
-    // push_depth must be push-enabled — the panic in resolve_push_targets is
-    // gated behind is_push_enabled(), so a Bounded(0) sub would silently skip
-    // rather than panic, masking the fix.
+    // Push-enabled depth is the point of a webhook subscription: a Bounded(0) sub
+    // would be pull-only, and the app would never be woken by an inbound webhook.
     assert!(
         webhook_sub.push_depth.is_push_enabled(),
         "merged webhook subscription must have push-enabled depth (Unbounded)"
@@ -338,264 +335,6 @@ fn merged_apps_map_contains_webhook_subscription_brenn_plus_webhook_shape() {
         2,
         "merged config must have exactly 2 subscriptions (brenn + webhook)"
     );
-}
-
-// -------------------------------------------------------------------------
-// End-to-end regression: drive resolve_push_targets through a real Messenger
-// constructed the way build_messaging constructs it, for a webhook subscriber.
-//
-// These tests exercise the ACTUAL fix site: the apps map argument to
-// Messenger::new. They fail against pre-fix code (apps.clone() unmerged).
-// -------------------------------------------------------------------------
-
-/// Build a webhook channel entry and directory for `endpoint_slug`.
-fn webhook_channel_and_directory(
-    slug: &str,
-    endpoint_slug: &str,
-) -> (
-    brenn_lib::messaging::ChannelEntry,
-    Arc<brenn_lib::messaging::MessagingDirectory>,
-) {
-    use brenn_lib::messaging::config::{Depth, NoiseLevel, ResolvedChannel, Sink};
-    use brenn_lib::messaging::{
-        ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntry, SubscriberEntryKind,
-    };
-
-    let uuid = brenn_lib::messaging::webhook_channel_uuid_from_slug(endpoint_slug);
-    let address = format!("webhook:{endpoint_slug}");
-    let entry = ChannelEntry {
-        uuid,
-        address: address.clone(),
-        description: None,
-        resolved_channel: ResolvedChannel {
-            send_rate: Default::default(),
-            push_depth: Depth::Unbounded,
-            retain_depth: Depth::Unbounded,
-            standing_retain_depth: Depth::Unbounded,
-            noise: NoiseLevel::Silent,
-            sink: Sink::Drop,
-            wake_min: brenn_lib::messaging::WakeMin::Normal,
-        },
-        subscribers: vec![SubscriberEntry {
-            kind: SubscriberEntryKind::App(slug.to_string()),
-            push_depth: Depth::Unbounded,
-            retain_depth: Depth::Unbounded,
-            noise: NoiseLevel::Silent,
-            wake_min: Some(brenn_lib::messaging::WakeMin::Normal),
-        }],
-        transport_type: ChannelScheme::Webhook,
-        mount: None,
-    };
-    let directory = Arc::new(MessagingDirectory::with_entries(vec![entry.clone()]));
-    (entry, directory)
-}
-
-/// Noop wake router for tests that don't care about delivery.
-struct NoopWakeRouter;
-
-#[async_trait::async_trait]
-impl brenn_lib::messaging::WakeRouter for NoopWakeRouter {
-    async fn deliver(
-        &self,
-        _: &brenn_lib::messaging::SubscriberEntryKind,
-        _: &brenn_lib::messaging::ParticipantId,
-        _: &brenn_lib::messaging::MessageEnvelope,
-        _retained_seq: Option<i64>,
-    ) -> Result<bool, String> {
-        Ok(false)
-    }
-    async fn deliver_ingress(
-        &self,
-        _: &brenn_lib::messaging::SubscriberEntryKind,
-        _: &brenn_lib::messaging::ParticipantId,
-        _: &brenn_lib::messaging::ingress::Event,
-    ) -> Result<bool, String> {
-        Ok(false)
-    }
-    fn spawn_eager_wake(
-        &self,
-        _: &brenn_lib::messaging::SubscriberEntryKind,
-        _: &brenn_lib::messaging::ParticipantId,
-    ) {
-    }
-    fn delivery_shape(
-        &self,
-        key: &brenn_lib::messaging::SubscriberEntryKind,
-    ) -> brenn_lib::messaging::DeliveryShape {
-        brenn_lib::messaging::default_delivery_shape(key)
-    }
-    fn alarm(&self, _: &str, _: &brenn_lib::messaging::ParticipantId) {}
-}
-
-/// Regression (end-to-end, webhook-only shape): `publish_transport_ingress`
-/// must complete without panicking when the Messenger is constructed with the
-/// merged apps map (post-fix). This tests the actual fix site — the apps
-/// argument to `Messenger::new` — and would fail if `build_messaging` were
-/// reverted to pass `apps.clone()` (unmerged).
-///
-/// The test drives `resolve_push_targets` through a Messenger built exactly
-/// as `build_messaging` builds it (via `merge_apps_for_messenger`). A user +
-/// singleton conversation is seeded in the in-memory DB so
-/// `get_or_create_singleton_conversation` succeeds and returns a push target.
-#[tokio::test]
-async fn resolve_push_targets_no_panic_with_merged_apps_webhook_only() {
-    use brenn_lib::db::init_db_memory;
-    use brenn_lib::messaging::{Messenger, WebhookEnvelope};
-
-    let slug = "phonebuddy";
-    let endpoint_slug = "pb-events";
-
-    let app = minimal_app_config(
-        slug,
-        None, // no [app.messaging] — webhook-only shape
-        vec![ResolvedWebhookSubscription {
-            endpoint_slug: endpoint_slug.to_string(),
-            wake_min: brenn_lib::messaging::WakeMin::Normal,
-        }],
-    );
-    let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
-    apps.insert(slug.to_string(), app);
-
-    let global = MessagingGlobalConfig::default();
-    let apps_with_messaging = build_apps_with_messaging(&apps, &global);
-
-    // Production merge — this is the fix site.
-    let merged = Arc::new(merge_apps_for_messenger(&apps, &apps_with_messaging));
-
-    let (channel_entry, directory) = webhook_channel_and_directory(slug, endpoint_slug);
-
-    // Seed DB: user "alice" + singleton conversation for "phonebuddy".
-    let db = init_db_memory();
-    {
-        let conn = db.lock().await;
-        conn.execute(
-            "INSERT INTO users (id, username, password_hash, created_at) \
-                 VALUES (1, 'alice', 'h', '2024-01-01')",
-            [],
-        )
-        .unwrap();
-        brenn_lib::messaging::db::upsert_channels(&conn, std::slice::from_ref(&channel_entry));
-    }
-
-    let messenger = Messenger::new(
-        db,
-        directory,
-        Arc::from("brenn://test"),
-        merged,
-        Arc::new(NoopWakeRouter),
-        MessagingGlobalConfig::default(),
-    );
-
-    // Build a minimal valid WebhookEnvelope body.
-    let envelope = WebhookEnvelope {
-        headers: vec![],
-        key_id: "test-key".to_string(),
-        client_ip: "127.0.0.1".to_string(),
-        received_at: chrono::Utc::now(),
-        body: "{}".to_string(),
-        endpoint_slug: endpoint_slug.to_string(),
-    };
-    let body = serde_json::to_string(&envelope).unwrap();
-
-    // publish_transport_ingress calls resolve_push_targets internally.
-    // If the apps map is not merged it panics; with the fix it must complete.
-    messenger
-        .publish_transport_ingress(
-            Arc::new(channel_entry),
-            &format!("webhook:{endpoint_slug}"),
-            "test-key",
-            &body,
-            brenn_lib::messaging::Urgency::Normal,
-        )
-        .await;
-    // Reaching this line proves no panic occurred — the fix is in effect.
-}
-
-/// Regression (end-to-end, brenn+webhook shape): same guarantee for the
-/// prod pa-alice shape (existing brenn: messaging config + webhook sub).
-#[tokio::test]
-async fn resolve_push_targets_no_panic_with_merged_apps_brenn_plus_webhook() {
-    use brenn_lib::db::init_db_memory;
-    use brenn_lib::messaging::config::{Depth, NoiseLevel, ResolvedSubscription};
-    use brenn_lib::messaging::{Messenger, WebhookEnvelope};
-
-    let slug = "pa-alice";
-    let endpoint_slug = "push-alice";
-    let brenn_channel_uuid = uuid::Uuid::new_v4();
-
-    let existing_brenn_sub = ResolvedSubscription {
-        channel_uuid: brenn_channel_uuid,
-        channel_address: "brenn:some-channel".to_string(),
-        push_depth: Depth::Unbounded,
-        retain_depth: Depth::Unbounded,
-        noise: NoiseLevel::Silent,
-        wake_min: brenn_lib::messaging::WakeMin::Normal,
-    };
-
-    let app = minimal_app_config(
-        slug,
-        Some(brenn_lib::messaging::config::ResolvedMessagingConfig {
-            send_budget: 100,
-            subscriptions: vec![existing_brenn_sub],
-        }),
-        vec![ResolvedWebhookSubscription {
-            endpoint_slug: endpoint_slug.to_string(),
-            wake_min: brenn_lib::messaging::WakeMin::Normal,
-        }],
-    );
-    let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
-    apps.insert(slug.to_string(), app);
-
-    let global = MessagingGlobalConfig::default();
-    let apps_with_messaging = build_apps_with_messaging(&apps, &global);
-
-    // Production merge — this is the fix site.
-    let merged = Arc::new(merge_apps_for_messenger(&apps, &apps_with_messaging));
-
-    let (channel_entry, directory) = webhook_channel_and_directory(slug, endpoint_slug);
-
-    // Seed DB: user "alice" + singleton conversation.
-    let db = init_db_memory();
-    {
-        let conn = db.lock().await;
-        conn.execute(
-            "INSERT INTO users (id, username, password_hash, created_at) \
-                 VALUES (1, 'alice', 'h', '2024-01-01')",
-            [],
-        )
-        .unwrap();
-        brenn_lib::messaging::db::upsert_channels(&conn, std::slice::from_ref(&channel_entry));
-    }
-
-    let messenger = Messenger::new(
-        db,
-        directory,
-        Arc::from("brenn://test"),
-        merged,
-        Arc::new(NoopWakeRouter),
-        MessagingGlobalConfig::default(),
-    );
-
-    let envelope = WebhookEnvelope {
-        headers: vec![],
-        key_id: "test-key".to_string(),
-        client_ip: "127.0.0.1".to_string(),
-        received_at: chrono::Utc::now(),
-        body: "{}".to_string(),
-        endpoint_slug: endpoint_slug.to_string(),
-    };
-    let body = serde_json::to_string(&envelope).unwrap();
-
-    messenger
-        .publish_transport_ingress(
-            Arc::new(channel_entry),
-            &format!("webhook:{endpoint_slug}"),
-            "test-key",
-            &body,
-            brenn_lib::messaging::Urgency::Normal,
-        )
-        .await;
-    // Reaching this line proves no panic occurred — the fix is in effect.
 }
 
 /// An ingress channel produces an `mqtt:<client>:<topic>` `ChannelEntry` in
@@ -2607,7 +2346,7 @@ fn warm_brenn_priming_configs(
 async fn warm_channel_with_messages(db: &brenn_lib::db::Db, channel_uuid: uuid::Uuid, n: u32) {
     let conn = db.lock().await;
     for i in 0..n {
-        brenn_lib::messaging::db::insert_message_with_pushes(
+        brenn_lib::messaging::db::insert_message(
             &conn,
             channel_uuid,
             "brenn://test",
@@ -2619,37 +2358,8 @@ async fn warm_channel_with_messages(db: &brenn_lib::db::Db, channel_uuid: uuid::
             None,
             None,
             i as i64 + 1,
-            &[],
         );
     }
-}
-
-async fn count_pending_pushes_for(db: &brenn_lib::db::Db, subscriber: &str) -> i64 {
-    let conn = db.lock().await;
-    conn.query_row(
-        "SELECT COUNT(*) FROM messaging_pending_pushes WHERE target_subscriber = ?1",
-        rusqlite::params![subscriber],
-        |r| r.get(0),
-    )
-    .expect("count pending pushes")
-}
-
-/// The bodies of the pending-push rows seeded for `subscriber`, oldest first
-/// (join each push row back to its message, ordered by message id) — pins *which*
-/// messages primed and in what order, not just how many.
-async fn seeded_bodies_for(db: &brenn_lib::db::Db, subscriber: &str) -> Vec<String> {
-    let conn = db.lock().await;
-    let mut stmt = conn
-        .prepare(
-            "SELECT m.body FROM messaging_pending_pushes p \
-             JOIN messaging_messages m ON p.message_id = m.id \
-             WHERE p.target_subscriber = ?1 ORDER BY m.id ASC",
-        )
-        .expect("prepare seeded bodies");
-    let bodies = stmt
-        .query_map(rusqlite::params![subscriber], |r| r.get::<_, String>(0))
-        .expect("query seeded bodies");
-    bodies.map(|r| r.expect("read seeded body")).collect()
 }
 
 /// A newly-created durable WASM queue primes from the channel's retained tail
@@ -2673,21 +2383,28 @@ async fn build_messaging_primes_a_new_durable_wasm_queue_from_the_retained_tail(
     warm_channel_with_messages(&db, channel_uuid, 6).await;
 
     // Boot 2: the consumer is added — a brand-new durable queue.
-    boot_messaging(&with_consumer, db.clone()).await;
+    let booted = boot_messaging(&with_consumer, db.clone()).await;
+    let messenger = booted
+        .messenger
+        .expect("boot with a consumer wires a messenger");
 
-    let n = count_pending_pushes_for(&db, ParticipantId::for_wasm("watcher").as_str()).await;
+    // The primed position is the whole of the priming: it starts at the oldest of
+    // the newest `push_depth` retained messages, so the tail is what the
+    // consumer's first window serves as new. Reading it back pins both the
+    // tail selection (newest four, not oldest) and the order (oldest-first) —
+    // a count alone would pass on a regression in either.
+    let owed: Vec<String> = brenn_lib::messaging::testutils::owed_everywhere(
+        &messenger,
+        &ParticipantId::for_wasm("watcher"),
+    )
+    .await
+    .into_iter()
+    .map(|(_, envelope)| envelope.body.clone())
+    .collect();
     assert_eq!(
-        n, 4,
-        "a new durable WASM queue primes the retained tail capped by push_depth"
-    );
-    // The tail is the *newest* push_depth messages (body-2..body-5), delivered
-    // oldest-first — not the oldest four, not reversed. A count-only assertion
-    // would pass on a tail-selection or ordering regression; this pins both.
-    let bodies = seeded_bodies_for(&db, ParticipantId::for_wasm("watcher").as_str()).await;
-    assert_eq!(
-        bodies,
+        owed,
         vec!["body-2", "body-3", "body-4", "body-5"],
-        "priming seeds the newest push_depth messages of the retained tail, oldest first"
+        "a new durable WASM queue primes at the newest push_depth retained messages, oldest first"
     );
 }
 
@@ -2708,18 +2425,30 @@ async fn build_messaging_does_not_reprime_a_surviving_durable_wasm_queue() {
     // Boot 1: consumer present, channel cold — registration is recorded.
     boot_messaging(&with_consumer, db.clone()).await;
 
-    // A tail arrives after the queue exists (with no pushes, e.g. it never
-    // reached the live subscriber). A surviving queue must not retroactively
-    // claim it as NEW.
-    warm_channel_with_messages(&db, channel_uuid, 3).await;
+    // Six messages arrive after the queue exists — more than the depth-4 cap, which
+    // is what makes re-priming observable: a surviving position stays at head-of-boot-1
+    // and is owed all six, while a re-prime would jump to the newest four.
+    warm_channel_with_messages(&db, channel_uuid, 6).await;
 
     // Boot 2: the same consumer — a surviving registration.
-    boot_messaging(&with_consumer, db.clone()).await;
+    let booted = boot_messaging(&with_consumer, db.clone()).await;
+    let messenger = booted
+        .messenger
+        .expect("boot with a consumer wires a messenger");
 
-    let n = count_pending_pushes_for(&db, ParticipantId::for_wasm("watcher").as_str()).await;
+    let owed: Vec<String> = brenn_lib::messaging::testutils::owed_everywhere(
+        &messenger,
+        &ParticipantId::for_wasm("watcher"),
+    )
+    .await
+    .into_iter()
+    .map(|(_, envelope)| envelope.body.clone())
+    .collect();
     assert_eq!(
-        n, 0,
-        "a surviving durable WASM queue does not re-prime the retained tail"
+        owed,
+        vec!["body-0", "body-1", "body-2", "body-3", "body-4", "body-5"],
+        "a surviving durable WASM queue keeps its position — it is owed everything \
+         published since, not re-primed to the newest push_depth"
     );
 }
 
@@ -2806,10 +2535,19 @@ async fn build_messaging_does_not_seed_db_pushes_for_a_nondurable_wasm_queue() {
 
     boot_messaging(&config, db.clone()).await;
 
-    let n = count_pending_pushes_for(&db, ParticipantId::for_wasm("watcher").as_str()).await;
+    // A non-durable queue is primed through the ring, so the durable side holds no
+    // position for it at all — the guard's observable effect.
+    let conn = db.lock().await;
+    let cursors: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messaging_subscriber_cursors WHERE subscriber = ?1",
+            rusqlite::params![ParticipantId::for_wasm("watcher").as_str()],
+            |row| row.get(0),
+        )
+        .expect("count durable cursor rows");
     assert_eq!(
-        n, 0,
-        "a non-durable WASM queue is primed via the ring, never by durable pending-push rows"
+        cursors, 0,
+        "a non-durable WASM queue is primed via the ring, never by a durable cursor row"
     );
 }
 

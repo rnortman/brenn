@@ -27,10 +27,9 @@ async fn a_clamped_activation_clears_the_whole_backlog() {
     .await;
 
     for i in 0..3 {
-        testutils::insert_wasm_push(
+        testutils::insert_bus_message(
             &messenger,
             &channel,
-            &wasm_sub,
             &format!("row-{i}"),
             ChannelScheme::Brenn,
         )
@@ -47,7 +46,9 @@ async fn a_clamped_activation_clears_the_whole_backlog() {
     drain_step(&cfg, &wasm_sub).await;
 
     assert!(
-        messenger.load_pending_pushes(&wasm_sub).await.is_empty(),
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub)
+            .await
+            .is_empty(),
         "one activation passes the whole backlog: what did not fit was reported, not held"
     );
     let permit = tokio::time::timeout(Duration::from_millis(100), cfg.notify.notified()).await;
@@ -73,11 +74,10 @@ async fn a_trapping_clamped_activation_leaves_nothing_owed() {
     .await;
 
     for i in 0..6 {
-        testutils::insert_wasm_push(
+        // The demo guest traps on the `__trap__` sentinel body.
+        testutils::insert_bus_message(
             &messenger,
             &channel,
-            &wasm_sub,
-            // The demo guest traps on this sentinel body.
             &format!("__trap__{i}"),
             ChannelScheme::Brenn,
         )
@@ -94,7 +94,9 @@ async fn a_trapping_clamped_activation_leaves_nothing_owed() {
     drain_step(&cfg, &wasm_sub).await;
 
     assert!(
-        messenger.load_pending_pushes(&wasm_sub).await.is_empty(),
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub)
+            .await
+            .is_empty(),
         "a trapped batch is passed, not redelivered"
     );
 }

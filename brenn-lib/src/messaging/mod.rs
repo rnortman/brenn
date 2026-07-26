@@ -52,7 +52,7 @@ pub use config::{
 pub use edit::{CancelResult, EditFields, EditResult};
 pub use identity::{ParticipantId, SubscriberKind};
 pub use ingress::{
-    CollapsedDrain, Event as IngressEvent, IngressOrBus, MAX_DELIVERED_RETENTION_DAYS,
+    CollapsedDrain, Event as IngressEvent, MAX_DELIVERED_RETENTION_DAYS,
     MAX_REPO_SYNC_STALENESS_DAYS, ONELINE_CAP, REPO_SYNC_KIND_CONFLICT, REPO_SYNC_KIND_LOCAL,
     REPO_SYNC_KIND_PULLED, REPO_SYNC_KIND_SUMMARY, REPO_SYNC_SOURCE_CONFLICT,
     REPO_SYNC_SOURCE_LOCAL, REPO_SYNC_SOURCE_PREFIX, REPO_SYNC_SOURCE_PULLED,
@@ -201,10 +201,9 @@ pub const WASM_WINDOW_MAX_RETAIN: u64 = 1_000;
 
 /// Maximum number of new (unprocessed) messages in the new-portion of a WASM
 /// consumer window when `push_depth = Unbounded`. Mirrors `WASM_WINDOW_MAX_RETAIN`:
-/// the §4 window-size bound ("bounded at push_depth + retain_depth") requires
-/// clamping both sides when either is `Unbounded`. With a bounded `push_depth`
-/// the push-window overflow invariant already keeps undelivered rows ≤ push_depth,
-/// so the clamp is only reached for `Unbounded` consumers (correctness-3 / security-3 fix).
+/// the window-size bound requires clamping both sides when either is
+/// `Unbounded`. A bounded `push_depth` already caps the new portion at
+/// `push_depth`, so the clamp is only reached for `Unbounded` consumers.
 pub const WASM_WINDOW_MAX_NEW: u64 = 1_000;
 
 /// One port's slice of a multi-port activation snapshot.
@@ -444,9 +443,9 @@ pub enum SubscriberEntryKind {
     /// [`SubscriberKind::Surface`], whose bare `surface:<slug>` grain is a live
     /// publisher participant.
     ///
-    /// Constructed by `finalize_directory_with_subscribers`; the durable
-    /// dispatch path (`resolve_push_targets`, `floor_decision`) treats either
-    /// grain exactly like an App/Wasm subscriber. Policy resolves via
+    /// Constructed by `finalize_directory_with_subscribers`; the durable path
+    /// (`TargetResolver::surface_feed_targets`) treats either grain exactly like
+    /// an App/Wasm subscriber. Policy resolves via
     /// `Messenger::surface_policies` **at the surface grain for both** — a
     /// component's grants are its config-declared bindings, which boot already
     /// proved the surface's own ACLs cover, so the instance grain finer-grains
@@ -567,14 +566,13 @@ pub struct SubscriberEntry {
     /// Single authoritative source for both `App` and `Wasm` subscribers.
     /// Populated once at startup by `finalize_directory_with_subscribers` from
     /// the same `ResolvedSubscription.noise` value; immutable thereafter.
-    /// Both `resolve_push_targets` and `register_released_pushes` read this
-    /// field directly — no secondary lookup into `messenger.apps` is required.
     pub noise: config::NoiseLevel,
     /// Resolved wake-min policy for this subscription — `Some` iff the subscriber
     /// is `UrgencyGated`.
     ///
     /// Populated once at startup by `finalize_directory_with_subscribers` from
-    /// `ResolvedSubscription.wake_min`. Read by `resolve_push_targets`.
+    /// `ResolvedSubscription.wake_min`. Read by the wake pass, which compares it
+    /// against the loudest message the subscriber has not seen.
     ///
     /// Only `UrgencyGated` economics consult a wake threshold, so only those
     /// subscribers carry `Some`; every `Eager` kind (`Wasm`/`Surface`/`System`)
@@ -1034,6 +1032,23 @@ pub enum DeliveryShape {
     ParkedWake,
 }
 
+/// What serving one wake cost, as the [`WakeRouter`] answers it.
+///
+/// The wake cooldown exists to bound subprocess spawns, so it applies to a wake
+/// that spawns one and to nothing else. A subscriber the router found already
+/// live is served in place; that costs no spawn and proves the subscriber is up,
+/// which is exactly the two conditions under which the cooldown has nothing to
+/// pace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeServed {
+    /// A wake was fired at a subscriber that was not running — the shape whose
+    /// cost the cooldown bounds.
+    Spawned,
+    /// The subscriber was already live and was served from its position on the
+    /// spot; no wake was fired.
+    Live,
+}
+
 /// The default [`DeliveryShape`] for a subscriber kind, mirroring the
 /// kind→binding choices bootstrap makes by hand: `App` and `Surface`
 /// subscribers deliver inline; `Wasm`/`System` subscribers are
@@ -1068,33 +1083,23 @@ pub fn default_delivery_shape(key: &SubscriberEntryKind) -> DeliveryShape {
 /// behavior from the identity prefix.
 #[async_trait::async_trait]
 pub trait WakeRouter: Send + Sync + 'static {
-    /// Inject an envelope into the target subscriber's active bridge, if
-    /// any. The implementation renders the envelope to HTML *only after*
-    /// confirming a bridge is present — so sleeping targets pay no render
-    /// cost and a malformed-envelope panic is confined to the per-bridge
-    /// path, not the shared dispatch loop.
+    /// Hand a just-retained envelope to a push-enabled surface subscription's
+    /// attached sessions, live.
     ///
-    /// Routes through `send_system_message` in the binary crate so live
-    /// delivery and drain delivery emit the same `SystemMessageBroadcast`
-    /// wire shape.
+    /// - `Ok(true)` when at least one session accepted it.
+    /// - `Ok(false)` when no session of that subscription is attached — nothing
+    ///   is owed to one that is away; it resumes past its own cursor.
+    /// - `Err(_)` when a session was attached but the hand-off failed.
     ///
-    /// - `Ok(true)` on send success.
-    /// - `Ok(false)` if no bridge is active.
-    /// - `Err(_)` if the bridge was active but the send failed (treated by
-    ///   the caller like `Ok(false)`).
-    ///
-    /// `retained_seq` is the message's position in its channel's retention order
-    /// (`None` only for a row whose message holds no such position — an ingress
-    /// row). Implementations that carry a client-side resume cursor mint its
-    /// high-water from `retained_seq`; implementations that keep no resume state
-    /// may ignore it. Nothing about the wake's own bookkeeping crosses this
-    /// boundary: the dispatcher retires its row itself.
+    /// `retained_seq` is the message's position in its channel's retention order,
+    /// which is what the client's resume cursor is minted from. The envelope
+    /// arrives as an `Arc` the caller already holds, so a fan-out over several
+    /// sessions and several subscriptions copies the body no times.
     async fn deliver(
         &self,
         key: &SubscriberEntryKind,
-        subscriber: &ParticipantId,
-        envelope: &MessageEnvelope,
-        retained_seq: Option<i64>,
+        envelope: &Arc<MessageEnvelope>,
+        retained_seq: i64,
     ) -> Result<bool, String>;
 
     /// Row-less deliver-if-attached context feed for a depth-0 (fold-0) surface
@@ -1166,11 +1171,15 @@ pub trait WakeRouter: Send + Sync + 'static {
     /// spawn-shaped wake would find it running and do nothing. One that is not
     /// gets the ordinary eager wake.
     ///
+    /// The return value tells the walk which of the two it was, so the wake
+    /// cooldown — which exists to bound spawns — paces only the spawn.
+    ///
     /// Default: the eager wake alone, which is the whole of the answer for a
     /// parked subscriber (its notify is the delivery trigger) and for a surface
     /// slug (the nudge is what makes its sessions drain).
-    async fn wake_owed(&self, key: &SubscriberEntryKind, subscriber: &ParticipantId) {
+    async fn wake_owed(&self, key: &SubscriberEntryKind, subscriber: &ParticipantId) -> WakeServed {
         self.spawn_eager_wake(key, subscriber);
+        WakeServed::Spawned
     }
 
     /// The [`DeliveryShape`] of the subscriber registered under `key`, derived
@@ -1178,13 +1187,15 @@ pub trait WakeRouter: Send + Sync + 'static {
     /// inline-deliver vs. parked-wake path and whether to re-mark delivery.
     fn delivery_shape(&self, key: &SubscriberEntryKind) -> DeliveryShape;
 
-    /// Fire a push-overflow alarm for the given channel + subscriber. Called
-    /// when `noise = Alarm` and a push-depth-overflow occurs on the publish
-    /// path. The implementation should call `AlertDispatcher::alert` with
+    /// Fire a push-overflow alarm for the given channel + subscriber, naming the
+    /// span the subscriber lost: `count` messages passed out of retention (or
+    /// out of its window) with its position still behind them. Called when
+    /// `noise = Alarm` and an overflow is reported against a position. The
+    /// implementation should call `AlertDispatcher::alert` with
     /// `AlertSeverity::Warning`; the rate-limiter on `AlertDispatcher` prevents
     /// flooding. The metric counter is incremented separately before this is
     /// called; `alarm` handles only the alerting side.
-    fn alarm(&self, channel: &str, subscriber: &ParticipantId);
+    fn alarm(&self, channel: &str, subscriber: &ParticipantId, count: u64);
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,16 +1203,10 @@ pub trait WakeRouter: Send + Sync + 'static {
 // ---------------------------------------------------------------------------
 
 /// What one release sweep across every channel moved into retention.
-///
-/// `push_ids` carries the durable push rows that became deliverable, for the
-/// caller that registers them into their subscribers' push windows; a ring
-/// channel keeps its subscribers' positions itself and contributes none.
 #[derive(Debug, Default)]
 pub struct ReleaseSweep {
     /// Total messages released across all channels, both classes.
     pub released: usize,
-    /// Push rows whose hold the sweep cleared.
-    pub push_ids: Vec<i64>,
     /// Earliest deferred release still parked anywhere once the sweep is done,
     /// or `None` when nothing is parked. The sweep already asks every store
     /// when its next release is due, so it answers that question for the
@@ -1389,30 +1394,6 @@ pub struct Messenger {
     metered_drops: Mutex<HashMap<(String, String), u64>>,
 }
 
-// ---------------------------------------------------------------------------
-// Sync helper for per-port window assembly (used inside load_activation_snapshot)
-// ---------------------------------------------------------------------------
-
-/// Mark a batch of pending-push rows delivered using `prepare_cached` so the
-/// statement is compiled once per connection regardless of call count.
-///
-/// Works on any `&Connection` deref target — a `MutexGuard<Connection>`,
-/// a `rusqlite::Transaction`, or a bare `&Connection` all satisfy this.
-///
-/// Panics on DB error (fail-fast; DB is host infrastructure).
-fn retire_push_rows(conn: &rusqlite::Connection, now: &str, ids: &[i64]) {
-    let mut stmt = conn
-        .prepare_cached(
-            "UPDATE messaging_pending_pushes SET delivered_at = ?1 \
-             WHERE id = ?2 AND delivered_at IS NULL",
-        )
-        .expect("retire_push_rows: prepare_cached");
-    for &id in ids {
-        stmt.execute(rusqlite::params![now, id])
-            .unwrap_or_else(|e| panic!("retire_push_rows: retire push {id}: {e}"));
-    }
-}
-
 /// The channel registration that names `subscriber`, or `None` when the
 /// subscriber holds delivery state on this channel under no registration of it.
 ///
@@ -1527,11 +1508,7 @@ impl Messenger {
         // Default empty store registry (zero non-durable channels); boot swaps in
         // the config-resolved one via `with_ring_stores`.
         let ring_stores = Arc::new(store::RingStores::empty());
-        let targets = Arc::new(store::TargetResolver::new(
-            directory.clone(),
-            apps.clone(),
-            HashMap::new(),
-        ));
+        let targets = Arc::new(store::TargetResolver::new(apps.clone(), HashMap::new()));
         Arc::new(Self {
             db,
             directory,
@@ -1752,7 +1729,18 @@ impl Messenger {
     /// means the two halves of the registry disagree about which channels exist.
     pub fn store_for(&self, entry: &ChannelEntry) -> Arc<dyn store::RetentionStore> {
         if entry.capabilities().durable {
-            return self.db_store_for(entry);
+            let mut db_stores = self.db_stores.lock().expect("db_stores poisoned");
+            return db_stores
+                .entry(entry.uuid)
+                .or_insert_with(|| {
+                    Arc::new(store::DbStore::new(
+                        self.db.clone(),
+                        entry.uuid,
+                        entry.address.clone(),
+                        entry.resolved_channel.retain_depth,
+                    ))
+                })
+                .clone();
         }
         self.ring_stores
             .get(&entry.uuid)
@@ -1778,51 +1766,6 @@ impl Messenger {
             )
         });
         self.store_for(&entry)
-    }
-
-    /// The concrete [`DbStore`](store::DbStore) for a durable channel,
-    /// constructed once and cached in [`Messenger::db_stores`] and reused. The
-    /// concrete type (not `Arc<dyn RetentionStore>`) is needed by callers that
-    /// reach the store's inherent push-window overflow methods, which take the
-    /// caller's held SQLite connection and so cannot be async trait methods.
-    ///
-    /// # Panics
-    ///
-    /// If `entry` is a non-durable channel — its store is a `RingStore`.
-    pub(crate) fn db_store_for(&self, entry: &ChannelEntry) -> Arc<store::DbStore> {
-        assert!(
-            entry.capabilities().durable,
-            "db_store_for called for non-durable channel {:?}",
-            entry.address
-        );
-        let mut db_stores = self.db_stores.lock().expect("db_stores poisoned");
-        db_stores
-            .entry(entry.uuid)
-            .or_insert_with(|| {
-                Arc::new(store::DbStore::new(
-                    self.db.clone(),
-                    entry.uuid,
-                    entry.address.clone(),
-                    entry.resolved_channel.retain_depth,
-                    self.targets.clone(),
-                ))
-            })
-            .clone()
-    }
-
-    /// [`db_store_for`](Self::db_store_for) resolved from a channel address.
-    ///
-    /// # Panics
-    ///
-    /// If `channel_address` resolves to no channel, or resolves to a non-durable
-    /// one.
-    pub(crate) fn db_store_for_address(&self, channel_address: &str) -> Arc<store::DbStore> {
-        let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
-            panic!(
-                "messaging: db store requested for channel {channel_address:?} not in the directory"
-            )
-        });
-        self.db_store_for(&entry)
     }
 
     /// One sender's parked (deferred) messages on `channel_address`, soonest
@@ -2091,9 +2034,9 @@ impl Messenger {
     }
 
     /// Tear down `subscriber`'s delivery state on the channel at
-    /// `channel_address` — its position and its in-memory push window, which the
-    /// store owns, plus the metered tally the noise ladder kept for it. The
-    /// inverse of [`Messenger::attach_subscriber`].
+    /// `channel_address` — its position, which the store owns, plus the metered
+    /// tally the noise ladder kept for it. The inverse of
+    /// [`Messenger::attach_subscriber`].
     ///
     /// The wake cooldown is deliberately left alone: it bounds spawn cost per
     /// subscriber across every channel, so leaving one channel says nothing
@@ -2242,18 +2185,13 @@ impl Messenger {
                     continue;
                 }
             }
-            // Who the batch is owed to is the store's own question, decided when
-            // it releases rather than when the message was parked: a subscriber
-            // that attached while a message waited receives it, one whose
-            // subscription went away does not. A store that issues no delivery
-            // records reports none, so the sweep collects whatever came back.
+            // Release is target-blind: it moves the message into retention, and
+            // every subscriber reads it from its own position. A subscriber that
+            // attached while the message waited therefore receives it and one
+            // whose subscription went away does not, with nobody resolving a
+            // subscriber set here.
             let outcome = store.release_due(now).await;
-            for released in &outcome.released {
-                sweep.released += 1;
-                sweep
-                    .push_ids
-                    .extend(released.target_records.iter().map(|record| record.0));
-            }
+            sweep.released += outcome.released.len();
             self.enact_overflow_events(&entry, &outcome.overflow);
             // A released message enters retention here, which is where a surface
             // is served: it holds no position for anything to walk, so the
@@ -2404,13 +2342,25 @@ impl Messenger {
                 } else {
                     // The forced wake spawns like any other, so it arms the
                     // cooldown a gated wake would have armed — what it does not
-                    // do is wait for one.
+                    // do is wait for one. A live serve clears it again below,
+                    // for the same reason a live serve never arms it.
                     self.arm_inline_wake(owed.subscriber.as_str());
                     sweep.fired_deadline_wake = true;
                 }
-                self.router
+                // A subscriber the router found already live was served in
+                // place, without a spawn — so the cooldown, which is there to
+                // bound spawns, has nothing to pace and would only withhold the
+                // next message from a bridge that is sitting right there. Same
+                // reasoning the ingress supervisor applies when a delivery
+                // proves its subscriber live (`dispatcher.rs`).
+                if self
+                    .router
                     .wake_owed(&registration.kind, &owed.subscriber)
-                    .await;
+                    .await
+                    == WakeServed::Live
+                {
+                    self.clear_inline_wake(owed.subscriber.as_str());
+                }
             }
         }
         sweep
@@ -2483,8 +2433,8 @@ impl Messenger {
     /// A `Wasm`/`System` subscriber does name its own registration, so one owed
     /// without a registration is stranded — nothing will ever take its
     /// messages. The reachable path is a configuration change: dropping a
-    /// component's input binding leaves its undelivered claims behind, and no
-    /// boot step tears them down. That is an operator-caused, persistent state
+    /// component's input binding leaves its cursor position behind, and no
+    /// boot step tears it down. That is an operator-caused, persistent state
     /// rather than a wiring bug, so it is reported rather than fatal — and
     /// reported once, because the wake walk revisits it on every dispatcher
     /// pass and an unbounded repeat would bury the signal it carries.
@@ -2601,9 +2551,8 @@ impl Messenger {
     /// and economics resolve from one immutable source and cannot diverge from a
     /// registry clone); every other kind resolves through the registry. `None`
     /// for a live subscriber indicates a host wiring bug (the boot cross-check
-    /// rejects it); on the delivery path a `None` cannot occur because the ACL
-    /// gate (`subscriber_policy`) has already skipped an unresolvable
-    /// subscriber.
+    /// rejects it); the wake pass panics on a `None` for an inline subscriber
+    /// rather than passing over one nothing else would wake.
     ///
     /// This is the single per-participant read that drives eager-wake gating:
     /// `Eager` subscribers are always woken; `UrgencyGated` subscribers consult
@@ -2725,7 +2674,7 @@ impl Messenger {
             }
         }
         if noise == config::NoiseLevel::Alarm {
-            self.router.alarm(channel, subscriber);
+            self.router.alarm(channel, subscriber, count);
         }
     }
 
@@ -3056,26 +3005,13 @@ impl Messenger {
             .collect()
     }
 
-    /// Load undelivered, non-suppressed pending pushes for a subscriber.
-    /// Called by the binary crate's drain logic on wake.
-    ///
-    /// Returns tagged `IngressOrBus` payloads. The drain caller partitions
-    /// these into events and envelopes for `render_combined_drain`.
-    pub async fn load_pending_pushes(
-        &self,
-        subscriber: &ParticipantId,
-    ) -> Vec<(i64, IngressOrBus)> {
-        let conn = self.db.lock().await;
-        db::load_pending_pushes_for_drain(&conn, subscriber)
-    }
-
     /// Undelivered direct-to-participant ingress events for a subscriber, with
     /// the row id each is retired by.
     ///
     /// Ingress deliveries are channel-less rows a participant is handed once;
     /// what a subscriber is owed on a *channel* is its position, read through
-    /// [`Messenger::conversation_delivery`] and its siblings. This read serves
-    /// only the former.
+    /// [`Messenger::conversation_delivery`] and its siblings. Only the former
+    /// still ride `messaging_pending_pushes` at all.
     pub async fn load_pending_ingress(
         &self,
         subscriber: &ParticipantId,
@@ -3095,11 +3031,10 @@ impl Messenger {
     /// need not be from the same instant — messages do not move between
     /// channels, so nothing is double-counted or lost by that.
     ///
-    /// Config-residue reconciliation runs first: pending claims for a channel
-    /// that matches no input (subscription removed) or for an input whose
-    /// `push_depth` is now `0` (port demoted to sampled by a config change) are
-    /// retired with a `warn!`. Neither case is a bug; leaving them pending
-    /// causes a scan loop, so they are retired here.
+    /// A config change leaves no residue to reconcile: a channel that matches no
+    /// input, or an input a config change demoted to sampled, is simply a
+    /// position nothing reads — `detach` and the sampled-attach demotion rule
+    /// remove it, and nothing else was ever written per message.
     ///
     /// Panics on any DB error (fail-fast; the DB is host infrastructure).
     pub async fn load_activation_snapshot(
@@ -3116,9 +3051,6 @@ impl Messenger {
             .iter()
             .map(|input| self.store_for_address(&input.sub.channel_address))
             .collect();
-
-        self.retire_activation_residue(subscriber, inputs, &stores)
-            .await;
 
         // Trigger gate first: a window read carries up to
         // `max(push_depth, retain_depth)` envelopes per port, and a drain step
@@ -3177,73 +3109,7 @@ impl Messenger {
         Some(snapshots)
     }
 
-    /// Retire the pending claims no port of this activation will ever read:
-    /// those on channels the consumer no longer subscribes to, and those on a
-    /// port a config change demoted to sampled (`push_depth = 0`, which never
-    /// takes). Both are ordinary config residue; left pending they would keep
-    /// waking the scan forever.
-    ///
-    /// A claim with no channel at all is an ingress row on a `wasm:`
-    /// subscriber, which no config change can produce — a host-wiring invariant
-    /// violation, and a panic.
-    async fn retire_activation_residue(
-        &self,
-        subscriber: &ParticipantId,
-        inputs: &[WasmInputPort],
-        stores: &[Arc<dyn store::RetentionStore>],
-    ) {
-        // Channel identity comes from the resolved store, the same one the take
-        // reads: a claim is residue exactly when no port's store will read it.
-        let bound: std::collections::HashSet<Uuid> =
-            stores.iter().map(|store| store.channel_uuid()).collect();
-        let readable: Vec<Uuid> = inputs
-            .iter()
-            .zip(stores)
-            .filter(|(input, _)| input.sub.push_depth.is_push_enabled())
-            .map(|(_, store)| store.channel_uuid())
-            .collect();
-
-        let conn = self.db.lock().await;
-        let residue = db::pending_pushes_outside_channels(&conn, subscriber, &readable);
-        if residue.is_empty() {
-            return;
-        }
-        let mut by_channel: std::collections::HashMap<Option<Uuid>, Vec<i64>> =
-            std::collections::HashMap::new();
-        for (push_id, channel_uuid) in residue {
-            by_channel.entry(channel_uuid).or_default().push(push_id);
-        }
-        // One `now` for every retirement in this pass, in the project-standard
-        // `+00:00` form so lex-sort on delivered_at stays consistent.
-        let now = format_ts_for_db(Utc::now());
-        for (channel_uuid, ids) in by_channel {
-            let Some(channel_uuid) = channel_uuid else {
-                panic!(
-                    "load_activation_snapshot: ingress row on wasm: subscriber — host-wiring \
-                     invariant violated; subscriber={} push_ids={ids:?}",
-                    subscriber.as_str(),
-                );
-            };
-            let reason = if bound.contains(&channel_uuid) {
-                "push_depth=0 (sampled) port"
-            } else {
-                "removed subscription"
-            };
-            tracing::warn!(
-                subscriber = %subscriber.as_str(),
-                channel = %channel_uuid,
-                count = ids.len(),
-                reason,
-                "load_activation_snapshot: retiring residue rows"
-            );
-            retire_push_rows(&conn, &now, &ids);
-        }
-    }
-
-    /// Mark a set of pending-push rows delivered. Idempotent.
-    ///
-    /// Channel-blind: identifies rows by push id alone. Per-channel settling
-    /// goes through [`Messenger::settle_delivered`] instead.
+    /// Mark a set of ingress rows delivered. Idempotent.
     pub async fn mark_pushes_delivered(&self, push_ids: &[i64]) {
         if push_ids.is_empty() {
             return;
@@ -4249,21 +4115,11 @@ mod tests {
         );
 
         // Every entry point onto a durable channel's store lands on the one
-        // instance, so the publish path (`db_store_for`) and the deliver-after
-        // release path (`db_store_for_address`) share one push window rather
-        // than each enforcing the depth bound against its own deque.
-        let by_entry = messenger.db_store_for(&durable);
-        let by_address = messenger.db_store_for_address(&durable.address);
+        // instance, whether the caller names the channel by entry or by address.
+        let by_address = messenger.store_for_address(&durable.address);
         assert!(
-            Arc::ptr_eq(&by_entry, &by_address),
+            Arc::ptr_eq(&durable_store, &by_address),
             "resolving a store by address must reach the same instance as by entry"
-        );
-        assert!(
-            std::ptr::eq(
-                Arc::as_ptr(&durable_store) as *const store::DbStore,
-                Arc::as_ptr(&by_entry),
-            ),
-            "the trait-object handle is the same instance the concrete lookups return"
         );
 
         let ring_store = messenger.store_for(&ephemeral);
@@ -5019,26 +4875,18 @@ mod tests {
         // Published while the parked one waits, and stamped after it: the two
         // orders — publish time and retention position — disagree about this
         // pair once the release lands, and context follows retention position.
-        let (pid_later, _) = super::testutils::insert_wasm_push_at(
+        let _ = super::testutils::insert_bus_message_at(
             &messenger,
             &channel,
-            &wasm_sub,
             "later",
             ChannelScheme::Brenn,
             park_ts + 1_000_000,
         )
         .await;
-        messenger.mark_pushes_delivered(&[pid_later]).await;
 
-        // One pending row so the port triggers and a snapshot is produced.
-        super::testutils::insert_wasm_push(
-            &messenger,
-            &channel,
-            &wasm_sub,
-            "new-0",
-            ChannelScheme::Brenn,
-        )
-        .await;
+        // One more message so the port triggers and a snapshot is produced.
+        super::testutils::insert_bus_message(&messenger, &channel, "new-0", ChannelScheme::Brenn)
+            .await;
 
         let inputs = vec![WasmInputPort {
             port: "in".to_string(),
@@ -5106,36 +4954,32 @@ mod tests {
         // new-1 remain pending (new rows). Explicit ts_ns offsets guarantee distinct
         // timestamps so we can pin the ascending order in context.
         let base_ns = db::utc_to_ns(chrono::Utc::now());
-        let (_pid_ctx_a, mid_ctx_a) = super::testutils::insert_wasm_push_at(
+        let mid_ctx_a = super::testutils::insert_bus_message_at(
             &messenger,
             &channel,
-            &wasm_sub,
             "ctx-a",
             ChannelScheme::Brenn,
             base_ns,
         )
         .await;
-        let (_pid_ctx_b, mid_ctx_b) = super::testutils::insert_wasm_push_at(
+        let mid_ctx_b = super::testutils::insert_bus_message_at(
             &messenger,
             &channel,
-            &wasm_sub,
             "ctx-b",
             ChannelScheme::Brenn,
             base_ns + 1_000_000,
         )
         .await;
-        let (_pid0, mid0) = super::testutils::insert_wasm_push(
+        let mid0 = super::testutils::insert_bus_message(
             &messenger,
             &channel,
-            &wasm_sub,
             "new-0",
             ChannelScheme::Brenn,
         )
         .await;
-        let (_pid1, mid1) = super::testutils::insert_wasm_push(
+        let mid1 = super::testutils::insert_bus_message(
             &messenger,
             &channel,
-            &wasm_sub,
             "new-1",
             ChannelScheme::Brenn,
         )
@@ -5237,10 +5081,9 @@ mod tests {
         // 3 pending rows on a push_depth=1 port → 1 delivered, 2 clamped leftover.
         let base_ns = db::utc_to_ns(chrono::Utc::now());
         for i in 0..3 {
-            super::testutils::insert_wasm_push_at(
+            super::testutils::insert_bus_message_at(
                 &messenger,
                 &channel,
-                &wasm_sub,
                 &format!("row-{i}"),
                 ChannelScheme::Brenn,
                 base_ns + i as i64 * 1_000_000,
@@ -5295,12 +5138,12 @@ mod tests {
         );
     }
 
-    /// A consumer whose every port is sampled reads nothing, so claims left on
-    /// those ports by an earlier config are residue: retired, no activation.
-    /// The residue query has an empty readable set here, which is the shape
-    /// that would break a naive `NOT IN` list.
+    /// A consumer whose every port is sampled reads nothing, so it never
+    /// activates and is owed nothing — a sampled port holds no position for a
+    /// retained message to be measured against. The all-sampled shape is the
+    /// edge case: the snapshot has an empty readable port set to fold over.
     #[tokio::test]
-    async fn load_activation_snapshot_sampled_only_ports_retire_residue() {
+    async fn load_activation_snapshot_sampled_only_ports_never_activate() {
         let slug = "sampled-only";
         let (messenger, channel, wasm_sub) = super::testutils::build_wasm_messenger(
             slug,
@@ -5310,14 +5153,8 @@ mod tests {
         )
         .await;
 
-        super::testutils::insert_wasm_push(
-            &messenger,
-            &channel,
-            &wasm_sub,
-            "stale",
-            ChannelScheme::Brenn,
-        )
-        .await;
+        super::testutils::insert_bus_message(&messenger, &channel, "stale", ChannelScheme::Brenn)
+            .await;
 
         let inputs = vec![WasmInputPort {
             port: "in".to_string(),
@@ -5344,7 +5181,7 @@ mod tests {
                 .store_for(&channel)
                 .has_deliverable(&wasm_sub)
                 .await,
-            "the residue claim was retired, so nothing is owed"
+            "a sampled port holds no position, so nothing is owed on it"
         );
     }
 
@@ -5375,6 +5212,11 @@ mod tests {
     #[derive(Default)]
     struct RecordingWakeRouter {
         wakes: std::sync::Mutex<Vec<SubscriberEntryKind>>,
+        /// Answer every wake with [`WakeServed::Live`] — the shape the real
+        /// router takes when it finds the subscriber's bridge already running
+        /// and serves it in place. Off by default: a spawn is the ordinary
+        /// answer, and only the live answer changes what the cooldown does.
+        serve_live: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -5382,9 +5224,8 @@ mod tests {
         async fn deliver(
             &self,
             _key: &SubscriberEntryKind,
-            _subscriber: &ParticipantId,
-            _envelope: &MessageEnvelope,
-            _retained_seq: Option<i64>,
+            _envelope: &std::sync::Arc<MessageEnvelope>,
+            _retained_seq: i64,
         ) -> Result<bool, String> {
             unreachable!("ring-backed WASM delivery never routes inline through deliver")
         }
@@ -5399,10 +5240,24 @@ mod tests {
         fn spawn_eager_wake(&self, key: &SubscriberEntryKind, _subscriber: &ParticipantId) {
             self.wakes.lock().unwrap().push(key.clone());
         }
+        async fn wake_owed(
+            &self,
+            key: &SubscriberEntryKind,
+            subscriber: &ParticipantId,
+        ) -> WakeServed {
+            if self.serve_live.load(Ordering::SeqCst) {
+                // Served in place, so no wake fires; the walk still named this
+                // subscriber, which is what the recording is for.
+                self.wakes.lock().unwrap().push(key.clone());
+                return WakeServed::Live;
+            }
+            self.spawn_eager_wake(key, subscriber);
+            WakeServed::Spawned
+        }
         fn delivery_shape(&self, key: &SubscriberEntryKind) -> DeliveryShape {
             crate::messaging::default_delivery_shape(key)
         }
-        fn alarm(&self, _channel: &str, _subscriber: &ParticipantId) {}
+        fn alarm(&self, _channel: &str, _subscriber: &ParticipantId, _count: u64) {}
     }
 
     /// Build a `Messenger` over `channels` with a `RecordingWakeRouter`, wiring
@@ -5505,10 +5360,9 @@ mod tests {
         messenger.wake_owed_subscribers(Utc::now()).await;
         assert!(router.wakes.lock().unwrap().is_empty());
 
-        crate::messaging::testutils::insert_wasm_push(
+        crate::messaging::testutils::insert_bus_message(
             &messenger,
             &durable,
-            &durable_sub,
             "owed",
             ChannelScheme::Brenn,
         )
@@ -5603,8 +5457,9 @@ mod tests {
         (count, guard)
     }
 
-    /// A WASM subscriber owed claims under no registration is stranded —
-    /// nothing will ever take them — and the walk meets it again every pass, so
+    /// A WASM subscriber whose position is owed messages under no registration
+    /// is stranded — nothing will ever take them — and the walk meets it again
+    /// every pass, so
     /// the report is once per `(channel, subscriber)`. An unbounded repeat
     /// buries the one signal that names the dropped input binding behind it.
     #[tokio::test]
@@ -5629,10 +5484,9 @@ mod tests {
                 store::Priming::Head,
             )
             .await;
-        crate::messaging::testutils::insert_wasm_push(
+        crate::messaging::testutils::insert_bus_message(
             &messenger,
             &channel,
-            &ghost,
             "owed",
             ChannelScheme::Brenn,
         )
@@ -5644,11 +5498,11 @@ mod tests {
         assert_eq!(
             warns.load(Ordering::SeqCst),
             1,
-            "two passes over one stranded claim report it once"
+            "two passes over one stranded position report it once"
         );
     }
 
-    /// A conversation owed claims reaches the same arm on every normal channel —
+    /// A conversation owed messages reaches the same arm on every normal channel —
     /// registrations are keyed by subscriber kind, and an `App(slug)`
     /// registration never names the conversation delivering under it. Reporting
     /// it would emit a warn per participant per pass for an expected condition.
@@ -5672,10 +5526,9 @@ mod tests {
                 store::Priming::Head,
             )
             .await;
-        crate::messaging::testutils::insert_wasm_push(
+        crate::messaging::testutils::insert_bus_message(
             &messenger,
             &channel,
-            &conversation,
             "owed",
             ChannelScheme::Brenn,
         )
@@ -5707,12 +5560,10 @@ mod tests {
             wake_min: None,
         }];
         let (messenger, router) = wake_walk_messenger(std::slice::from_ref(&channel)).await;
-        let surface_sub = ParticipantId::for_surface_component("board", "main");
 
-        crate::messaging::testutils::insert_wasm_push(
+        crate::messaging::testutils::insert_bus_message(
             &messenger,
             &channel,
-            &surface_sub,
             "owed",
             ChannelScheme::Brenn,
         )
@@ -5886,6 +5737,56 @@ mod tests {
             router.wakes.lock().unwrap().len(),
             3,
             "with the cooldown spent the loud message wakes on its own economics"
+        );
+    }
+
+    /// A subscriber the router found already live was served in place, at no
+    /// spawn cost — so the cooldown, which exists to bound spawns, must not hold
+    /// the next message back. Both halves of the rule run here against one
+    /// fixture shape, because the only difference between them is the router's
+    /// answer: report `Live` and the second message goes through on the next
+    /// pass; report `Spawned` and it coalesces into the first wake, a whole poll
+    /// interval away.
+    ///
+    /// Neither half advances the position, so what the second pass sees is
+    /// decided by the cooldown alone.
+    #[tokio::test]
+    async fn a_live_serve_leaves_the_next_message_unpaced() {
+        async fn two_passes(name: &str, conversation_id: i64, serve_live: bool) -> usize {
+            let channel = conversation_wake_channel("assistant", name, WakeMin::Normal);
+            let (messenger, router) = wake_walk_messenger_with_apps(
+                std::slice::from_ref(&channel),
+                wake_apps("assistant"),
+            )
+            .await;
+            router.serve_live.store(serve_live, Ordering::SeqCst);
+            let conversation = ParticipantId::for_conversation(conversation_id);
+            messenger
+                .attach_subscriber(
+                    &channel.address,
+                    "assistant",
+                    &conversation,
+                    Depth::Bounded(8),
+                    store::Priming::Head,
+                )
+                .await;
+
+            publish_at(&messenger, &channel, "first", Urgency::Normal).await;
+            messenger.wake_owed_subscribers(Utc::now()).await;
+            publish_at(&messenger, &channel, "second", Urgency::Normal).await;
+            messenger.wake_owed_subscribers(Utc::now()).await;
+            router.wakes.lock().unwrap().len()
+        }
+
+        assert_eq!(
+            two_passes("live-serve-ch", 38, true).await,
+            2,
+            "a live serve spawns nothing, so the next message is served on the next pass"
+        );
+        assert_eq!(
+            two_passes("spawned-serve-ch", 39, false).await,
+            1,
+            "a spawned wake is paced: the second message coalesces into it"
         );
     }
 
@@ -6481,6 +6382,20 @@ mod tests {
         );
     }
 
+    /// `Fatal` is a surface rung: the kernel enacts it on its own queues and the
+    /// backend never resolves one for a bus subscription. The arm that says so is
+    /// a panic rather than a fall-through to `Metered`, and this is what executes
+    /// it — remove the arm, or let it drop through, and nothing else notices.
+    #[tokio::test]
+    #[should_panic(expected = "reached noise = fatal")]
+    async fn the_fatal_rung_panics_rather_than_metering_a_surface_only_level() {
+        let channel = crate::messaging::testutils::ephemeral_channel_entry("fatal-ch", 8);
+        let (messenger, channel, wasm_sub) = build_ring_wasm_messenger("burner", channel);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+
+        messenger.enact_overflow_noise(&channel.address, &wasm_sub, config::NoiseLevel::Fatal, 1);
+    }
+
     fn ring_envelope(channel: &str, scheme: ChannelScheme, body: &str) -> MessageEnvelope {
         MessageEnvelope {
             message_id: Uuid::new_v4(),
@@ -6672,9 +6587,8 @@ mod tests {
         async fn deliver(
             &self,
             _key: &SubscriberEntryKind,
-            _subscriber: &ParticipantId,
-            _envelope: &MessageEnvelope,
-            _retained_seq: Option<i64>,
+            _envelope: &std::sync::Arc<MessageEnvelope>,
+            _retained_seq: i64,
         ) -> Result<bool, String> {
             unreachable!("WASM delivery never routes inline through deliver")
         }
@@ -6690,7 +6604,7 @@ mod tests {
         fn delivery_shape(&self, key: &SubscriberEntryKind) -> DeliveryShape {
             crate::messaging::default_delivery_shape(key)
         }
-        fn alarm(&self, _channel: &str, _subscriber: &ParticipantId) {
+        fn alarm(&self, _channel: &str, _subscriber: &ParticipantId, _count: u64) {
             self.alarms
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -6869,10 +6783,9 @@ mod tests {
 
         let base_ns = db::utc_to_ns(chrono::Utc::now());
         for i in 0..3 {
-            super::testutils::insert_wasm_push_at(
+            super::testutils::insert_bus_message_at(
                 &messenger,
                 &channel,
-                &wasm_sub,
                 &format!("row-{i}"),
                 ChannelScheme::Brenn,
                 base_ns + i as i64 * 1_000_000,
@@ -7394,10 +7307,9 @@ mod tests {
                 store::Priming::Head,
             )
             .await;
-        let (_pid, dmid) = super::testutils::insert_wasm_push(
+        let dmid = super::testutils::insert_bus_message(
             &messenger,
             &durable,
-            &wasm_sub,
             "durable-new",
             ChannelScheme::Brenn,
         )
@@ -7453,18 +7365,16 @@ mod tests {
             super::testutils::build_wasm_messenger_unbounded(slug, "fail-idem-ch").await;
 
         // Insert 2 push rows on the single channel.
-        let (_pid0, mid0) = super::testutils::insert_wasm_push(
+        let mid0 = super::testutils::insert_bus_message(
             &messenger,
             &channel,
-            &wasm_sub,
             "body-a",
             ChannelScheme::Brenn,
         )
         .await;
-        let (_pid1, mid1) = super::testutils::insert_wasm_push(
+        let mid1 = super::testutils::insert_bus_message(
             &messenger,
             &channel,
-            &wasm_sub,
             "body-b",
             ChannelScheme::Brenn,
         )
@@ -7563,18 +7473,16 @@ mod tests {
             let conn = messenger2.db().lock().await;
             db::upsert_channels(&conn, std::slice::from_ref(&*ch_b));
         }
-        let (_pid_a, mid_a) = super::testutils::insert_wasm_push(
+        let mid_a = super::testutils::insert_bus_message(
             &messenger2,
             &ch_a,
-            &wasm_sub2,
             "port-a-msg",
             ChannelScheme::Brenn,
         )
         .await;
-        let (_pid_b, mid_b) = super::testutils::insert_wasm_push(
+        let mid_b = super::testutils::insert_bus_message(
             &messenger2,
             &ch_b,
-            &wasm_sub2,
             "port-b-msg",
             ChannelScheme::Brenn,
         )

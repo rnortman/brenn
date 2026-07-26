@@ -85,8 +85,9 @@ async fn tool_harness(
             .clone();
     let request_ch = request_channel_entry("git-repo-pull", &defaults);
     // The inbox: the bus-wiring entry (stable v5 uuid, matches `inbox_input_port`)
-    // plus the consumer's own Wasm subscriber, so `wasm_policies_from_entries`
-    // grants it delivery of its results and `resolve_push_targets` can push to it.
+    // plus the consumer's own Wasm subscriber, which is what gives the consumer a
+    // position on its own result inbox (and what `wasm_policies_from_entries`
+    // derives its covering policy from).
     let mut inbox = result_inbox_entry(slug, &defaults);
     inbox.subscribers.push(SubscriberEntry {
         kind: SubscriberEntryKind::Wasm(slug.to_string()),
@@ -288,12 +289,25 @@ async fn guest_async_tool_call_pulls_fixture_and_delivers_advanced_result() {
     let guest_sub = harness.guest_sub.clone();
     let executor_sub = harness.executor_sub.clone();
     let out_sub = ParticipantId::for_wasm(&out_reader_slug);
+    // The output channel's reader holds a position too, or the assertion below
+    // would read an empty window rather than the guest's forwarded result.
+    let out_entry = harness
+        .messenger
+        .directory()
+        .resolve(&out_addr)
+        .expect("the out channel is registered");
+    super::attach_input_ports(
+        &harness.messenger,
+        &out_reader_slug,
+        &out_sub,
+        &[(out_entry.as_ref(), Depth::Unbounded)],
+    )
+    .await;
 
     // --- Step 1: deliver a trigger; the guest fires `call-async`, flushed on Ok.
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &harness.messenger,
         &harness.trigger,
-        &guest_sub,
         "go",
         ChannelScheme::Brenn,
     )
@@ -302,14 +316,13 @@ async fn guest_async_tool_call_pulls_fixture_and_delivers_advanced_result() {
 
     // The trigger row is acked; a request now sits on the executor's inbox.
     assert!(
-        harness
-            .messenger
-            .load_pending_pushes(&guest_sub)
+        brenn_lib::messaging::testutils::owed_everywhere(&harness.messenger, &guest_sub)
             .await
             .is_empty(),
         "trigger row must be acked after the guest activation"
     );
-    let requests = harness.messenger.load_pending_pushes(&executor_sub).await;
+    let requests =
+        brenn_lib::messaging::testutils::owed_everywhere(&harness.messenger, &executor_sub).await;
     assert_eq!(
         requests.len(),
         1,
@@ -336,18 +349,15 @@ async fn guest_async_tool_call_pulls_fixture_and_delivers_advanced_result() {
 
     // The result is delivered to the consumer's inbox with an Advanced outcome,
     // correlated by the guest's `call-1`.
-    let inbox_rows = harness.messenger.load_pending_pushes(&guest_sub).await;
+    let inbox_rows =
+        brenn_lib::messaging::testutils::owed_everywhere(&harness.messenger, &guest_sub).await;
     assert_eq!(
         inbox_rows.len(),
         1,
         "exactly one result row on the consumer inbox"
     );
-    let result: serde_json::Value = match &inbox_rows[0].1 {
-        brenn_lib::messaging::IngressOrBus::Bus(env) => {
-            serde_json::from_str(&env.body).expect("result body is JSON")
-        }
-        other => panic!("expected a bus result row, got {other:?}"),
-    };
+    let result: serde_json::Value =
+        serde_json::from_str(&inbox_rows[0].1.body).expect("result body is JSON");
     assert_eq!(result["call_id"], "call-1");
     assert_eq!(result["tool"], "git-repo-pull");
     assert_eq!(
@@ -358,7 +368,8 @@ async fn guest_async_tool_call_pulls_fixture_and_delivers_advanced_result() {
     // --- Step 3: the result activates the guest on its `tool-results` port; the
     // guest forwards the result envelope to "out".
     drain_step(&harness.cfg, &guest_sub).await;
-    let out_rows = harness.messenger.load_pending_pushes(&out_sub).await;
+    let out_rows =
+        brenn_lib::messaging::testutils::owed_everywhere(&harness.messenger, &out_sub).await;
     assert_eq!(
         out_rows.len(),
         1,
@@ -366,12 +377,8 @@ async fn guest_async_tool_call_pulls_fixture_and_delivers_advanced_result() {
     );
     // The forwarded "out" body is the verbatim inbox envelope-json; its `body`
     // field is the v1 result the guest received.
-    let forwarded_envelope: serde_json::Value = match &out_rows[0].1 {
-        brenn_lib::messaging::IngressOrBus::Bus(env) => {
-            serde_json::from_str(&env.body).expect("out body is an envelope JSON")
-        }
-        other => panic!("expected a bus row on out, got {other:?}"),
-    };
+    let forwarded_envelope: serde_json::Value =
+        serde_json::from_str(&out_rows[0].1.body).expect("out body is an envelope JSON");
     let forwarded_result: serde_json::Value = serde_json::from_str(
         forwarded_envelope["body"]
             .as_str()
@@ -418,10 +425,9 @@ async fn guest_trap_after_call_async_discards_the_buffered_request() {
 
     // The trigger body carries the marker: the guest buffers the async call, then
     // returns Err — the activation fails and the flush must drop the request.
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &harness.messenger,
         &harness.trigger,
-        &guest_sub,
         "TRAP_AFTER_CALL",
         ChannelScheme::Brenn,
     )
@@ -433,9 +439,7 @@ async fn guest_trap_after_call_async_discards_the_buffered_request() {
     // means the drain assembled and fired the activation rather than the trigger
     // wiring silently regressing to a no-op.
     assert!(
-        harness
-            .messenger
-            .load_pending_pushes(&guest_sub)
+        brenn_lib::messaging::testutils::owed_everywhere(&harness.messenger, &guest_sub)
             .await
             .is_empty(),
         "the trigger row must be acked, proving the guest activation fired"
@@ -466,7 +470,8 @@ async fn guest_trap_after_call_async_discards_the_buffered_request() {
 
     // No request reached the executor's inbox: the trapped activation fired no
     // tool call, so the transactional flush discarded the buffered request.
-    let requests = harness.messenger.load_pending_pushes(&executor_sub).await;
+    let requests =
+        brenn_lib::messaging::testutils::owed_everywhere(&harness.messenger, &executor_sub).await;
     assert!(
         requests.is_empty(),
         "a trapped activation must flush no tool request; got {} on the executor inbox",

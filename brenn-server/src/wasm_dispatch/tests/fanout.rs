@@ -15,19 +15,13 @@ async fn brenn_message_creates_push_row_and_consumer_invoked_once() {
     // `body` here is the raw message body stored in messaging_messages.body.
     // `drain_channel` reads it back as MessageEnvelope.body and serializes the
     // full MessageEnvelope to JSON for the guest — the guest sees a valid envelope.
-    let (push_id, _) = testutils::insert_wasm_push(
-        &messenger,
-        &channel,
-        &wasm_sub,
-        "hello",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    let _ =
+        testutils::insert_bus_message(&messenger, &channel, "hello", ChannelScheme::Brenn).await;
 
-    // Before drain: the push row is pending.
-    let rows_before = messenger.load_pending_pushes(&wasm_sub).await;
-    assert_eq!(rows_before.len(), 1, "one pending push before drain");
-    assert_eq!(rows_before[0].0, push_id);
+    // Before drain: the consumer's position trails the message.
+    let owed_before = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
+    assert_eq!(owed_before.len(), 1, "one message owed before drain");
+    assert_eq!(owed_before[0].0, channel.address);
 
     // Run the drain step.
     let (cfg, _handle, _db) = build_cfg(
@@ -40,7 +34,7 @@ async fn brenn_message_creates_push_row_and_consumer_invoked_once() {
     drain_step(&cfg, &wasm_sub).await;
 
     // After drain: the row is delivered (no more pending).
-    let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
+    let rows_after = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         rows_after.is_empty(),
         "pending row must be delivered after drain"
@@ -58,23 +52,15 @@ async fn batching_n_messages_delivered_in_one_invocation() {
         testutils::build_wasm_messenger(slug, "batch-ch", Depth::Unbounded, Depth::Unbounded).await;
 
     let n = 3usize;
-    let mut push_ids = Vec::new();
     for i in 0..n {
         // Raw body string — MessageEnvelope is assembled from DB fields by the host.
         let body = format!("msg-{i}");
-        let (pid, _) = testutils::insert_wasm_push(
-            &messenger,
-            &channel,
-            &wasm_sub,
-            &body,
-            ChannelScheme::Brenn,
-        )
-        .await;
-        push_ids.push(pid);
+        let _ =
+            testutils::insert_bus_message(&messenger, &channel, &body, ChannelScheme::Brenn).await;
     }
 
-    // Before drain: all 3 rows pending.
-    let rows_before = messenger.load_pending_pushes(&wasm_sub).await;
+    // Before drain: all 3 messages owed.
+    let rows_before = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert_eq!(
         rows_before.len(),
         n,
@@ -92,7 +78,7 @@ async fn batching_n_messages_delivered_in_one_invocation() {
     drain_step(&cfg, &wasm_sub).await;
 
     // After one drain step: all rows delivered.
-    let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
+    let rows_after = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         rows_after.is_empty(),
         "all {n} rows must be delivered after one drain step"
@@ -125,10 +111,9 @@ async fn retained_context_prefix_in_window() {
 
     // Insert 2 messages and drain them — they become retained context.
     for i in 0..2usize {
-        testutils::insert_wasm_push(
+        testutils::insert_bus_message(
             &messenger,
             &channel,
-            &wasm_sub,
             &format!("ctx-{i}"),
             ChannelScheme::Brenn,
         )
@@ -137,26 +122,21 @@ async fn retained_context_prefix_in_window() {
     drain_step(&cfg, &wasm_sub).await;
 
     // Verify those 2 rows are now delivered.
-    let pending_after_first = messenger.load_pending_pushes(&wasm_sub).await;
+    let pending_after_first =
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         pending_after_first.is_empty(),
         "first 2 rows must be delivered"
     );
 
     // Insert a 3rd message.
-    testutils::insert_wasm_push(
-        &messenger,
-        &channel,
-        &wasm_sub,
-        "new-1",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    testutils::insert_bus_message(&messenger, &channel, "new-1", ChannelScheme::Brenn).await;
 
     // Drain again — the window should have context prefix from the 2 prior messages.
     // The demo component accepts the window (Ok). Assert the 3rd row is delivered.
     drain_step(&cfg, &wasm_sub).await;
-    let pending_after_second = messenger.load_pending_pushes(&wasm_sub).await;
+    let pending_after_second =
+        brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         pending_after_second.is_empty(),
         "3rd row must be delivered after second drain"
@@ -176,19 +156,14 @@ async fn crash_recovery_startup_sweep_re_invokes_undelivered_rows() {
         testutils::build_wasm_messenger(slug, "crash-ch", Depth::Unbounded, Depth::Unbounded).await;
 
     // Simulate a crash: insert a pending row without running any drain step.
-    let (push_id, _) = testutils::insert_wasm_push(
-        &messenger,
-        &channel,
-        &wasm_sub,
-        "undelivered",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    let _ =
+        testutils::insert_bus_message(&messenger, &channel, "undelivered", ChannelScheme::Brenn)
+            .await;
 
-    // Verify the row is pending (as it would be after a crash restart).
-    let rows = messenger.load_pending_pushes(&wasm_sub).await;
-    assert_eq!(rows.len(), 1, "one undelivered row before startup sweep");
-    assert_eq!(rows[0].0, push_id);
+    // Verify the message is owed (as it would be after a crash restart).
+    let rows = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
+    assert_eq!(rows.len(), 1, "one unconsumed message before startup sweep");
+    assert_eq!(rows[0].0, channel.address);
 
     // Startup sweep: drain_all_channels runs once (before any wake — simulates
     // the task body's unconditional first drain in run_consumer).
@@ -202,7 +177,7 @@ async fn crash_recovery_startup_sweep_re_invokes_undelivered_rows() {
     drain_step(&cfg, &wasm_sub).await;
 
     // The row must now be delivered — at-least-once on the Immediate no-deadline case.
-    let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
+    let rows_after = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         rows_after.is_empty(),
         "startup sweep must deliver the undelivered row (crash recovery AC)"
@@ -224,14 +199,8 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
     // `insert_wasm_push` stores this as the raw message body; drain_channel reads it
     // back as MessageEnvelope.body = "__trap__", serializes the full envelope to JSON,
     // and passes it to the guest — which then checks `obj["body"] == "__trap__"`.
-    let (push_id, _) = testutils::insert_wasm_push(
-        &messenger,
-        &channel,
-        &wasm_sub,
-        "__trap__",
-        ChannelScheme::Brenn,
-    )
-    .await;
+    let _ =
+        testutils::insert_bus_message(&messenger, &channel, "__trap__", ChannelScheme::Brenn).await;
 
     // Use a severity-capturing alerter to verify both count and content.
     let (alert_dispatcher, captured_alerts, alert_handle) = make_capturing_alerter_with_severity();
@@ -278,41 +247,18 @@ async fn always_trap_consumer_quarantines_batch_and_alerts() {
 
     drain_step(&cfg, &wasm_sub).await;
 
-    // The push row must be delivered (retired into the quarantine table, not pending).
-    let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
+    // Ack-at-start: the position moved past the batch BEFORE the guest ran, not
+    // only on a successful outcome. A regression to advance-on-Ok-only would leave
+    // the message owed and be caught here, on the Trap path.
+    let rows_after = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         rows_after.is_empty(),
-        "trap batch push row must be retired (quarantined), not pending. push_id={push_id}"
+        "ack-at-start: the trapping batch must be advanced past even on Trap"
     );
-
-    // Ack-at-start invariant (design §2.5): the push row must have delivered_at set
-    // BEFORE the guest ran — not only after a successful outcome. Assert directly on
-    // the DB row so a regression to ack-on-Ok-only is caught on the Trap path.
-    // `rows_after.is_empty()` (above) already proved the row is not pending
-    // (delivered_at IS NOT NULL), but an explicit delivered_at IS NOT NULL check
-    // pins the specific ack-at-start ordering contract against the Trap arm.
-    {
-        let conn = messenger.db().lock().await;
-        let delivered_at: Option<String> = conn
-            .query_row(
-                "SELECT delivered_at FROM messaging_pending_pushes WHERE id = ?1",
-                rusqlite::params![push_id],
-                |r| r.get(0),
-            )
-            .unwrap_or(None); // None if row was deleted — also fine
-        // delivered_at IS NOT NULL (the settle ran) OR row deleted both prove ack.
-        // `rows_after.is_empty()` guarantees one of the two; the assertion here
-        // additionally verifies the row-exists / delivered_at NOT NULL case specifically.
-        assert!(
-            delivered_at.is_some(),
-            "ack-at-start: push row {push_id} must have delivered_at set (even on Trap) \
-                 — got None (row deleted or delivered_at NULL). ack-at-start regressed?"
-        );
-    }
 
     // A second drain must find nothing new (no redelivery loop — N=1 terminal).
     drain_step(&cfg, &wasm_sub).await;
-    let rows_second = messenger.load_pending_pushes(&wasm_sub).await;
+    let rows_second = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         rows_second.is_empty(),
         "no redelivery loop after quarantine"
@@ -444,21 +390,15 @@ async fn webhook_message_invokes_consumer_with_webhook_envelope_type() {
     };
     let wh_body = serde_json::to_string(&wh_env).unwrap();
 
-    let (push_id, _) = testutils::insert_wasm_push(
-        &messenger,
-        &entry,
-        &wasm_sub,
-        &wh_body,
-        ChannelScheme::Webhook,
-    )
-    .await;
+    let _ =
+        testutils::insert_bus_message(&messenger, &entry, &wh_body, ChannelScheme::Webhook).await;
 
     // Before drain: one pending row.
-    let rows_before = messenger.load_pending_pushes(&wasm_sub).await;
+    let rows_before = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert_eq!(
         rows_before.len(),
         1,
-        "one webhook push row before drain; push_id={push_id}"
+        "one webhook message owed before drain"
     );
 
     let (cfg, _handle, _db) = build_cfg(
@@ -471,7 +411,7 @@ async fn webhook_message_invokes_consumer_with_webhook_envelope_type() {
     drain_step(&cfg, &wasm_sub).await;
 
     // After drain: row delivered.
-    let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
+    let rows_after = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
         rows_after.is_empty(),
         "webhook push row must be delivered after drain"
@@ -480,26 +420,23 @@ async fn webhook_message_invokes_consumer_with_webhook_envelope_type() {
 
 // ── push_depth=0 subscription → never invoked ────────────────────────────
 
-/// With push_depth=Bounded(0), no pending push rows are created for the Wasm
-/// subscriber, so drain_all_channels finds nothing to invoke.
-/// (This test verifies the guard in resolve_push_targets; covered also in
-/// publish.rs but repeated here at the dispatch level.)
+/// A `push_depth=Bounded(0)` Wasm subscriber is owed nothing however much the
+/// channel retains, so `drain_all_channels` finds nothing to invoke. Covered also
+/// in publish.rs, but repeated here at the dispatch level.
 #[tokio::test]
 async fn push_depth_zero_wasm_subscription_never_invoked() {
-    // Use build_wasm_setup with push_depth=Bounded(0) so the channel is configured
-    // correctly (the SubscriberEntry has push_depth=0). Then insert_wasm_push bypasses
-    // resolve_push_targets entirely — so we verify the drain step finds nothing by
-    // simply not inserting any push row.
+    // build_wasm_messenger configures the channel with a push_depth=0
+    // SubscriberEntry, which is the whole of the setup: a sampled subscriber holds
+    // no position, so there is nothing for the drain to read.
     let slug = "consumer-no-push";
     let (messenger, channel, wasm_sub) =
         testutils::build_wasm_messenger(slug, "nopush-ch", Depth::Bounded(0), Depth::Unbounded)
             .await;
 
-    // Do NOT insert any push row — with push_depth=0 none would be created by publish().
-    let rows_before = messenger.load_pending_pushes(&wasm_sub).await;
+    let owed_before = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
     assert!(
-        rows_before.is_empty(),
-        "no rows before drain with push_depth=0"
+        owed_before.is_empty(),
+        "a push_depth=0 subscriber is owed nothing before the drain"
     );
 
     let (cfg, _handle, _db) = build_cfg(
@@ -511,9 +448,6 @@ async fn push_depth_zero_wasm_subscription_never_invoked() {
     );
     // Drain finds nothing and invokes nothing — no panic, no error.
     drain_step(&cfg, &wasm_sub).await;
-    let rows_after = messenger.load_pending_pushes(&wasm_sub).await;
-    assert!(
-        rows_after.is_empty(),
-        "still no rows after drain with push_depth=0"
-    );
+    let owed_after = brenn_lib::messaging::testutils::owed_everywhere(&messenger, &wasm_sub).await;
+    assert!(owed_after.is_empty(), "and is owed nothing after it");
 }

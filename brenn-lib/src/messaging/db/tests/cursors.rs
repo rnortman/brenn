@@ -1,5 +1,6 @@
-//! Subscriber cursor rows: the accessors, and the one-shot seed that carries
-//! standing delivery claims over onto positions.
+//! Subscriber cursor rows: the accessors, the one-shot seed that carries
+//! standing delivery claims over onto positions, and the delete that clears the
+//! claims out behind it.
 
 use rusqlite::Connection;
 use uuid::Uuid;
@@ -479,4 +480,141 @@ fn the_seed_does_not_run_again_on_a_later_boot() {
         Some(4),
         "a later boot leaves the position where the consumer left it"
     );
+}
+
+// ── The bus-claim delete ────────────────────────────────────────────────────
+
+/// Counts `warn` events from the messaging module while it is the calling
+/// thread's default subscriber, and returns the guard that restores the previous
+/// default on drop.
+fn capture_messaging_warns() -> (
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tracing::subscriber::DefaultGuard,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    struct WarnLayer(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            if *meta.level() == tracing::Level::WARN
+                && meta.module_path().is_some_and(|m| m.contains("messaging"))
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(WarnLayer(Arc::clone(&count)));
+    let guard = tracing::subscriber::set_default(subscriber);
+    (count, guard)
+}
+
+/// Channel-backed claim rows in `messaging_pending_pushes`.
+fn bus_claims(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM messaging_pending_pushes AS pp
+         WHERE EXISTS (SELECT 1 FROM messaging_messages m
+                       WHERE m.id = pp.message_id AND m.channel_uuid IS NOT NULL)",
+        [],
+        |row| row.get(0),
+    )
+    .expect("count channel-backed claims")
+}
+
+/// Both sides of the delete's predicate, on one fixture: the migration takes the
+/// channel-backed claims — the cursor seed has already read them, and nothing
+/// else ever will — and leaves the channel-less ingress rows, which are still
+/// live delivery records.
+///
+/// The predicate is what separates the two, and it runs unguarded on every boot,
+/// so an inversion would wipe every pending ingress delivery in the database at
+/// the next restart. Both counts are asserted here rather than one, because
+/// either half alone passes under an inverted predicate.
+#[test]
+fn the_migration_takes_the_bus_claims_and_leaves_the_ingress_rows() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let channel = seed_channel(&conn, "brenn:delete", 2);
+    register(&conn, channel, "proc", "4");
+    claim(&conn, channel, 1, "wasm:proc", "proc", false);
+    claim(&conn, channel, 2, "wasm:proc", "proc", true);
+    conn.execute(
+        "INSERT INTO messaging_messages
+             (uuid, source, sender, body, urgency, publish_ts_ns, created_at, envelope_type)
+         VALUES (?1, 'src', 'sender', 'ingress', 'normal', 0, 'now', 'ingress')",
+        rusqlite::params![Uuid::new_v4().as_bytes().to_vec()],
+    )
+    .expect("insert ingress message");
+    let ingress_id: i64 = conn
+        .query_row(
+            "SELECT id FROM messaging_messages WHERE channel_uuid IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("look up ingress message");
+    conn.execute(
+        "INSERT INTO messaging_pending_pushes
+             (message_id, target_subscriber, target_app_slug, eager_wake, created_at)
+         VALUES (?1, 'conversation:3', 'repo-sync', 1, 'now')",
+        rusqlite::params![ingress_id],
+    )
+    .expect("insert ingress claim");
+
+    let (warns, guard) = capture_messaging_warns();
+    migrate_from_before_cursors(&conn);
+
+    // The seed ran off those claims before they went: the position they encoded
+    // is the point of deleting them rather than the cost of it.
+    assert_eq!(
+        cursor(&conn, channel, "wasm:proc").map(|c| c.2),
+        Some(2),
+        "the seed positioned the subscriber at its oldest owed sequence"
+    );
+    assert_eq!(bus_claims(&conn), 0, "the channel-backed claims are gone");
+    let ingress_claims: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messaging_pending_pushes WHERE message_id = ?1",
+            rusqlite::params![ingress_id],
+            |row| row.get(0),
+        )
+        .expect("count ingress claims");
+    assert_eq!(ingress_claims, 1, "the ingress delivery record survives");
+
+    // The migration boot is the one legitimate hit, and it is reported: an
+    // operator seeing this line on any later boot is seeing a path that started
+    // minting channel-backed claims again.
+    assert_eq!(
+        warns.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the delete reports the rows it took"
+    );
+
+    // And the backstop stays quiet when it finds nothing — while still leaving
+    // the ingress row where it is, which is the half every later boot repeats.
+    run_messaging_migrations(&conn);
+    assert_eq!(
+        warns.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a boot with no channel-backed claims reports nothing"
+    );
+    let ingress_claims_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messaging_pending_pushes WHERE message_id = ?1",
+            rusqlite::params![ingress_id],
+            |row| row.get(0),
+        )
+        .expect("count ingress claims");
+    assert_eq!(
+        ingress_claims_after, 1,
+        "and the second boot does not touch it either"
+    );
+    drop(guard);
 }

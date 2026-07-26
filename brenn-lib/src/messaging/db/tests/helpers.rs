@@ -1,4 +1,3 @@
-use crate::db::format_ts_for_db;
 use crate::messaging::config::{Depth, NoiseLevel, ResolvedChannel, Sink};
 use crate::messaging::db::*;
 use crate::messaging::{
@@ -34,23 +33,19 @@ pub(super) fn make_directory() -> (MessagingDirectory, Uuid) {
     (dir, uuid)
 }
 
-/// Helper: insert a message with N push rows (one per conversation_id provided).
-/// Returns (message internal id, message uuid).
+/// Helper: insert one message row. Returns (message internal id, message uuid).
 ///
-/// A claim on a scheduled message is held for the same instant the message is:
-/// a claim owed *now* against a message that has not entered retention is a row
-/// no read can serve, whether or not the scheduled instant has passed.
-#[allow(clippy::too_many_arguments)]
+/// `deliver_after` parks it: a parked message holds no retention position, which
+/// is the whole of what hides it from every read.
 pub(super) fn insert_msg(
     conn: &Connection,
     channel_uuid: Uuid,
     sender: &str,
     body: &str,
     deliver_after: Option<DateTime<Utc>>,
-    conv_ids: &[i64],
 ) -> (i64, Uuid) {
     let ns = utc_to_ns(Utc::now());
-    let inserted = insert_message_with_pushes(
+    let inserted = insert_message(
         conn,
         channel_uuid,
         "src",
@@ -62,27 +57,6 @@ pub(super) fn insert_msg(
         None,
         deliver_after,
         ns,
-        &conv_ids
-            .iter()
-            .map(|&cid| PendingPushInsert {
-                target_subscriber: ParticipantId::for_conversation(cid),
-                target_app_slug: "app".to_string(),
-                eager_wake: false,
-                release_after: deliver_after,
-                delivery_deadline: None,
-            })
-            .collect::<Vec<_>>(),
     );
     (inserted.id, inserted.uuid)
-}
-
-pub(super) fn mark_push_delivered(conn: &Connection, message_id: i64, conv_id: i64) {
-    let now = format_ts_for_db(Utc::now());
-    let subscriber = ParticipantId::for_conversation(conv_id);
-    conn.execute(
-        "UPDATE messaging_pending_pushes SET delivered_at = ?1
-         WHERE message_id = ?2 AND target_subscriber = ?3 AND delivered_at IS NULL",
-        rusqlite::params![now, message_id, subscriber.as_str()],
-    )
-    .unwrap();
 }

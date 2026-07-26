@@ -69,13 +69,12 @@ struct BrennSendOk<'a> {
 
 /// Success response for `BrennMessageCancel`.
 ///
-/// Fields alphabetical: cancelled, cancelled_pushes, message_id, ok.
-/// `message_id` is `String` (from `Uuid::to_string()`). `cancelled_pushes` is `u32`.
+/// Fields alphabetical: cancelled, message_id, ok.
+/// `message_id` is `String` (from `Uuid::to_string()`).
 #[derive(Serialize)]
 struct BrennMessageCancelOk {
-    // alphabetical: cancelled, cancelled_pushes, message_id, ok
+    // alphabetical: cancelled, message_id, ok
     cancelled: bool,
-    cancelled_pushes: u32,
     message_id: String,
     ok: bool,
 }
@@ -850,13 +849,9 @@ pub async fn try_handle_messaging_tool(
             };
             let result = messenger.cancel(&bridge.app_slug, message_uuid).await;
             let (output_str, is_error) = match result {
-                CancelResult::Ok {
-                    message_id,
-                    cancelled_pushes,
-                } => {
+                CancelResult::Ok { message_id } => {
                     let ok = BrennMessageCancelOk {
                         cancelled: true,
-                        cancelled_pushes,
                         message_id: message_id.to_string(),
                         ok: true,
                     };
@@ -869,7 +864,10 @@ pub async fn try_handle_messaging_tool(
                 CancelResult::UnknownMessage => {
                     let err = ToolErr {
                         ok: false,
-                        error: Cow::Owned(format!("unknown message {message_uuid}")),
+                        error: Cow::Owned(format!(
+                            "{} {message_uuid}",
+                            brenn_lib::integration::UNKNOWN_MESSAGE_ERR
+                        )),
                     };
                     (
                         serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
@@ -889,23 +887,11 @@ pub async fn try_handle_messaging_tool(
                     )
                 }
                 CancelResult::AlreadyDelivered => {
+                    // The tool description quotes this same constant, so what the
+                    // model was told to expect is what it gets.
                     let err = ToolErr {
                         ok: false,
-                        error: Cow::Borrowed(
-                            "all pending pushes for this message have already been delivered",
-                        ),
-                    };
-                    (
-                        serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
-                        true,
-                    )
-                }
-                CancelResult::NoPendingPushes => {
-                    let err = ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(
-                            "no pending pushes for this message (already cancelled or zero-target broadcast)",
-                        ),
+                        error: Cow::Borrowed(brenn_lib::integration::CANCEL_ALREADY_PUBLISHED_ERR),
                     };
                     (
                         serde_json::to_string(&err).expect("ToolErr serialization is infallible"),
@@ -1146,22 +1132,11 @@ pub async fn try_handle_messaging_tool(
                     .expect("ToolErr serialization is infallible"),
                     true,
                 ),
+                // As with cancel: the tool description quotes this constant.
                 EditResult::AlreadyDelivered => (
                     serde_json::to_string(&ToolErr {
                         ok: false,
-                        error: Cow::Borrowed(
-                            "at least one push for this message has already been delivered; edit not allowed",
-                        ),
-                    })
-                    .expect("ToolErr serialization is infallible"),
-                    true,
-                ),
-                EditResult::NoPendingPushes => (
-                    serde_json::to_string(&ToolErr {
-                        ok: false,
-                        error: Cow::Borrowed(
-                            "no pending pushes for this message (already cancelled or zero-target broadcast)",
-                        ),
+                        error: Cow::Borrowed(brenn_lib::integration::EDIT_ALREADY_PUBLISHED_ERR),
                     })
                     .expect("ToolErr serialization is infallible"),
                     true,
@@ -3498,8 +3473,18 @@ mod tests {
         }
     }
 
-    /// Seed-then-cancel: publish a message, extract `message_id`, cancel it.
-    /// Exercises `CancelResult::Ok` arm and `BrennMessageCancelOk` serialization.
+    /// An RFC3339 instant far enough ahead that no release pass in a test's
+    /// lifetime takes the message: what keeps it parked, and so cancellable and
+    /// editable.
+    fn far_future() -> String {
+        (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
+    }
+
+    /// Seed-then-cancel: schedule a message, extract `message_id`, cancel it.
+    /// Exercises the `CancelResult::Ok` arm and `BrennMessageCancelOk`
+    /// serialization. The message is scheduled, not published outright: a message
+    /// that has entered retention is past recall, so only a parked one is
+    /// cancellable.
     #[tokio::test]
     async fn cancel_success_returns_ok() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_combined_services().await;
@@ -3507,7 +3492,11 @@ mod tests {
         // Publish a message to get a real message_id.
         let send_req = post_tool_use_req(
             MCP_MESSAGE_SEND_TOOL,
-            json!({ "to": "brenn:test-channel", "body": "cancel me" }),
+            json!({
+                "to": "brenn:test-channel",
+                "body": "cancel me",
+                "deliver_after": far_future(),
+            }),
         );
         let message_id = match try_handle_messaging_tool(&bridge, &send_req).await {
             Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
@@ -3539,11 +3528,6 @@ mod tests {
                     Some(message_id.as_str()),
                     "cancelled message_id should match: {out}"
                 );
-                assert_eq!(
-                    v["cancelled_pushes"],
-                    json!(1u32),
-                    "cancelled_pushes should be 1 (one pending push row, not yet delivered): {out}"
-                );
             }
             other => panic!("cancel: unexpected result: {other:?}"),
         }
@@ -3558,7 +3542,11 @@ mod tests {
         // Publish a message to get a real message_id.
         let send_req = post_tool_use_req(
             MCP_MESSAGE_SEND_TOOL,
-            json!({ "to": "brenn:test-channel", "body": "original body" }),
+            json!({
+                "to": "brenn:test-channel",
+                "body": "original body",
+                "deliver_after": far_future(),
+            }),
         );
         let message_id = match try_handle_messaging_tool(&bridge, &send_req).await {
             Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
@@ -3597,6 +3585,81 @@ mod tests {
         }
     }
 
+    /// Publish `body` to the test channel with no `deliver_after`, so it enters
+    /// retention at once, and return its `message_id` — a message past recall,
+    /// which is now what cancel and edit meet in the ordinary case.
+    async fn publish_retained(bridge: &crate::active_bridge::ActiveBridge, body: &str) -> String {
+        let send_req = post_tool_use_req(
+            MCP_MESSAGE_SEND_TOOL,
+            json!({ "to": "brenn:test-channel", "body": body }),
+        );
+        match try_handle_messaging_tool(bridge, &send_req).await {
+            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
+                updated_output: Some(out),
+            })) => {
+                let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(v["ok"], json!(true), "publish should succeed: {out}");
+                v["message_id"].as_str().expect("message_id").to_string()
+            }
+            other => panic!("publish: unexpected result: {other:?}"),
+        }
+    }
+
+    /// Cancelling a message that has entered retention is refused, with the exact
+    /// text `BrennMessageCancel`'s description quotes. This is the common outcome
+    /// now, not a rare one, and the text is the model's only cue that the refusal
+    /// is a rule rather than a failure — so the arm is pinned against the shared
+    /// constant, not against a copy of the words.
+    #[tokio::test]
+    async fn cancel_of_a_retained_message_returns_the_documented_error() {
+        let bridge = crate::active_bridge::ActiveBridge::test_new_with_combined_services().await;
+        let message_id = publish_retained(&bridge, "already out").await;
+
+        let cancel_req =
+            post_tool_use_req(MCP_MESSAGE_CANCEL_TOOL, json!({ "message_id": message_id }));
+        match try_handle_messaging_tool(&bridge, &cancel_req).await {
+            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
+                updated_output: Some(out),
+            })) => {
+                let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(v["ok"], json!(false), "expected a refusal: {out}");
+                assert_eq!(
+                    v["error"].as_str(),
+                    Some(brenn_lib::integration::CANCEL_ALREADY_PUBLISHED_ERR),
+                    "the emitted text must be the one the tool description quotes: {out}"
+                );
+            }
+            other => panic!("cancel: unexpected result: {other:?}"),
+        }
+    }
+
+    /// The same for edit, whose refusal text differs only in the last word — and
+    /// so is the one most likely to be reworded into disagreement with its doc.
+    #[tokio::test]
+    async fn edit_of_a_retained_message_returns_the_documented_error() {
+        let bridge = crate::active_bridge::ActiveBridge::test_new_with_combined_services().await;
+        let message_id = publish_retained(&bridge, "already out").await;
+
+        let edit_req = post_tool_use_req(
+            MCP_MESSAGE_EDIT_TOOL,
+            json!({ "message_id": message_id, "body": "too late" }),
+        );
+        match try_handle_messaging_tool(&bridge, &edit_req).await {
+            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
+                updated_output: Some(out),
+            })) => {
+                let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(v["ok"], json!(false), "expected a refusal: {out}");
+                assert_eq!(
+                    v["error"].as_str(),
+                    Some(brenn_lib::integration::EDIT_ALREADY_PUBLISHED_ERR),
+                    "the emitted text must be the one the tool description quotes: {out}"
+                );
+            }
+            other => panic!("edit: unexpected result: {other:?}"),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Wire-shape regression guards for C2 typed structs
     // -----------------------------------------------------------------------
@@ -3628,7 +3691,6 @@ mod tests {
             ok: true,
             cancelled: true,
             message_id: "00000000-0000-0000-0000-000000000002".to_string(),
-            cancelled_pushes: 3,
         };
         let produced =
             serde_json::to_string(&ok).expect("BrennMessageCancelOk serialization is infallible");
@@ -3636,7 +3698,6 @@ mod tests {
             "ok": true,
             "cancelled": true,
             "message_id": "00000000-0000-0000-0000-000000000002",
-            "cancelled_pushes": 3_u32,
         })
         .to_string();
         assert_eq!(produced, reference);

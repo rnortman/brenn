@@ -147,7 +147,7 @@ pub(super) async fn bridge_with_messenger_for_drain()
 
     // Single ChannelEntry binding shared between the DB upsert and the in-memory
     // MessagingDirectory — UUID mismatch between them would cause
-    // load_pending_pushes_for_drain to silently return zero rows (FK JOIN miss).
+    // load_pending_ingress_for_drain to silently return zero rows (FK JOIN miss).
     let channel_entry = brenn_lib::messaging::ChannelEntry {
         uuid: DRAIN_TEST_CHANNEL_UUID,
         address: brenn_lib::messaging::canonical_address("test-drain-channel"),
@@ -241,7 +241,7 @@ fn drain_test_app_config(allowed_user: &str) -> brenn_lib::config::AppConfig {
 
 /// Fixed channel UUID used by `bridge_with_messenger_for_drain` and
 /// `seed_pending_push`. Both must use the same value to satisfy the FK
-/// JOIN in `load_pending_pushes_for_drain`.
+/// JOIN in `load_pending_ingress_for_drain`.
 const DRAIN_TEST_CHANNEL_UUID: uuid::Uuid = uuid::Uuid::from_bytes([
     0x00, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
 ]);
@@ -250,16 +250,16 @@ const DRAIN_TEST_CHANNEL_UUID: uuid::Uuid = uuid::Uuid::from_bytes([
 /// for `conversation_id` against `DRAIN_TEST_CHANNEL_UUID`.
 ///
 /// Uses `Urgency::Normal` (eager wake) and no deadline/deliver_after.
-/// Tests verify delivered state via `load_pending_pushes_for_drain` returning
+/// Tests verify delivered state via `load_pending_ingress_for_drain` returning
 /// empty or non-empty — the push row ID is not needed by callers.
 ///
 /// Requires `bridge_with_messenger_for_drain` to have already upserted a
 /// `messaging_channels` row with `DRAIN_TEST_CHANNEL_UUID`. A mismatch
-/// produces an FK violation panic from `insert_message_with_pushes`.
+/// produces an FK violation panic from `insert_message`.
 pub(super) async fn seed_pending_push(bridge: &ActiveBridge, body: &str) {
     let conn = bridge.db.lock().await;
     let now_ns = brenn_lib::messaging::db::utc_to_ns(chrono::Utc::now());
-    brenn_lib::messaging::db::insert_message_with_pushes(
+    brenn_lib::messaging::db::insert_message(
         &conn,
         DRAIN_TEST_CHANNEL_UUID,
         "test-drain-source",
@@ -271,27 +271,23 @@ pub(super) async fn seed_pending_push(bridge: &ActiveBridge, body: &str) {
         None,
         None,
         now_ns,
-        &[brenn_lib::messaging::db::PendingPushInsert {
-            target_subscriber: brenn_lib::messaging::ParticipantId::for_conversation(
-                bridge.conversation_id,
-            ),
-            target_app_slug: bridge.app_slug.clone(),
-            eager_wake: true,
-            release_after: None,
-            delivery_deadline: None,
-        }],
     );
-    // Verify the push row was inserted: a FK violation (channel not seeded) causes
-    // insert_message_with_pushes to panic with a raw SQLite error. If it somehow
-    // succeeded but the row is not visible (e.g. wrong conversation_id), catch that
-    // here with a clear diagnostic rather than a confusing assertion failure later.
-    let pushes = brenn_lib::messaging::db::load_pending_pushes_for_drain(
-        &conn,
-        &brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id),
-    );
+    // Verify the message entered retention: a FK violation (channel not seeded)
+    // makes insert_message panic with a raw SQLite error. If it somehow succeeded
+    // but landed unpositioned, catch that here with a clear diagnostic rather than
+    // a confusing assertion failure later. What the conversation is *owed* is its
+    // cursor position, which the caller's `attach_conversation_subscribers` set.
+    let retained: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messaging_messages \
+             WHERE channel_uuid = ?1 AND retained_seq IS NOT NULL",
+            rusqlite::params![DRAIN_TEST_CHANNEL_UUID.as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .expect("count retained messages on the drain channel");
     assert!(
-        !pushes.is_empty(),
-        "seed_pending_push: inserted row is not visible via load_pending_pushes_for_drain — \
-             check DRAIN_TEST_CHANNEL_UUID matches the upserted messaging_channels row"
+        retained > 0,
+        "seed_pending_push: the message did not enter retention — check \
+         DRAIN_TEST_CHANNEL_UUID matches the upserted messaging_channels row"
     );
 }

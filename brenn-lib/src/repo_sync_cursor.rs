@@ -138,8 +138,8 @@ pub fn load_all(conn: &Connection) -> HashMap<String, String> {
 mod tests {
     use super::*;
     use crate::db::init_db_memory;
-    use crate::messaging::db::load_pending_pushes_for_drain;
-    use crate::messaging::{IngressOrBus, ParticipantId};
+    use crate::messaging::ParticipantId;
+    use crate::messaging::db::load_pending_ingress_for_drain;
 
     fn seed_conversation(conn: &Connection, conv_id: i64) {
         conn.execute(
@@ -158,10 +158,7 @@ mod tests {
 
     fn pending_count(conn: &Connection, conv_id: i64) -> usize {
         let subscriber = ParticipantId::for_conversation(conv_id);
-        load_pending_pushes_for_drain(conn, &subscriber)
-            .into_iter()
-            .filter(|(_, p)| matches!(p, IngressOrBus::Ingress(_)))
-            .count()
+        load_pending_ingress_for_drain(conn, &subscriber).len()
     }
 
     #[test]

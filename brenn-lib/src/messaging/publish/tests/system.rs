@@ -48,10 +48,10 @@ fn system_receiver_policy() -> AppPolicy {
 }
 
 /// Build a `Messenger` with one `brenn:` channel carrying a single
-/// `System(RECEIVER)` subscriber (so a system publish fans out an inspectable
-/// pending row that also exercises the `resolve_push_targets` System arm), the
-/// given publisher policy installed for `PUBLISHER`, and a configurable body
-/// cap. `apps` is empty — system components are not apps.
+/// `System(RECEIVER)` subscriber, so a system publish has a subscriber holding a
+/// position for the test to inspect. The given publisher policy is installed for
+/// `PUBLISHER`, with a configurable body cap. `apps` is empty — system
+/// components are not apps.
 async fn build_system_publish_messenger(
     publisher_policy: AppPolicy,
     max_body_bytes: usize,
@@ -103,14 +103,25 @@ async fn build_system_publish_messenger(
     .with_subscriber_registrations(crate::messaging::testutils::system_registrations(
         system_policies,
     ));
+    // A subscriber holds a position or it is owed nothing: the System receiver
+    // attaches exactly as boot does.
+    messenger
+        .attach_subscriber(
+            &channel_addr,
+            RECEIVER,
+            &ParticipantId::for_system(RECEIVER),
+            Depth::Unbounded,
+            crate::messaging::store::Priming::Head,
+        )
+        .await;
     (messenger, channel_addr)
 }
 
 /// Happy path: a granted, in-ACL system publish inserts a durable row stamped
-/// with the `system:<component>` sender, fans out to the `System` subscriber,
-/// and returns `Ok` with **no** remaining budget (System origin has no send
-/// budget). Proves the publish-side System arm, the `resolve_push_targets`
-/// System arm, and the `subscriber_policy` System arm together.
+/// with the `system:<component>` sender, reaches the `System` subscriber's
+/// position, and returns `Ok` with **no** remaining budget (System origin has no
+/// send budget). Proves the publish-side System arm and the `subscriber_policy`
+/// System arm together.
 #[tokio::test]
 async fn publish_from_system_ok_stamps_system_sender_and_fans_out() {
     let (m, addr) = build_system_publish_messenger(
@@ -133,12 +144,13 @@ async fn publish_from_system_ok_stamps_system_sender_and_fans_out() {
         "system publish is System origin: Ok with no budget, got {result:?}"
     );
 
-    // The row fanned out to the System subscriber (resolve_push_targets +
-    // subscriber_policy System arms).
-    let rows = m
-        .load_pending_pushes(&ParticipantId::for_system(RECEIVER))
-        .await;
-    assert_eq!(rows.len(), 1, "one pending push for the system subscriber");
+    // The message reached retention where the System subscriber's position sees it.
+    assert!(
+        m.store_for_address(&addr)
+            .has_deliverable(&ParticipantId::for_system(RECEIVER))
+            .await,
+        "the system subscriber must be owed the published message"
+    );
 
     // The stored sender is the backend-derived system principal.
     let conn = m.db().lock().await;

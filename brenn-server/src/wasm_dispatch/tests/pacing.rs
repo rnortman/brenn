@@ -287,10 +287,9 @@ async fn startup_sweep_drains_a_backlog_through_the_real_task() {
     .await;
 
     for i in 0..6 {
-        testutils::insert_wasm_push(
+        testutils::insert_bus_message(
             &messenger,
             &channel,
-            &wasm_sub,
             &format!("row-{i}"),
             ChannelScheme::Brenn,
         )

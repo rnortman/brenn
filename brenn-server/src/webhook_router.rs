@@ -413,7 +413,7 @@ mod tests {
         }
         let directory = Arc::new(MessagingDirectory::with_entries(vec![entry]));
 
-        // Build apps map so resolve_push_targets can find the subscriber.
+        // Build apps map so the subscriber's policy and owner resolve.
         let mut app_cfg =
             crate::test_support::app_config::default_test_app_config(app_slug, app_slug);
         app_cfg.allowed_users = allowed_users;
@@ -523,61 +523,18 @@ mod tests {
             .await
             .expect("delivery should succeed");
 
-        // The WASM consumer's push row is keyed on the `wasm:<slug>` participant,
-        // and it carries the webhook envelope (envelope_type='webhook').
-        let (push_count, envelope_type) =
-            crate::test_support::wasm::wasm_push_rows(&db, "consume-demo").await;
+        // The message commits onto the subscribed channel carrying the webhook
+        // envelope (envelope_type='webhook'), where the consumer's position reads it.
+        let (retained, envelope_type) =
+            crate::test_support::wasm::retained_on_channel(&db, "webhook:push-alice").await;
         assert_eq!(
-            push_count, 1,
-            "the covered WASM consumer must receive exactly one push row"
+            retained, 1,
+            "the inbound message must commit onto the subscribed channel"
         );
         assert_eq!(
             envelope_type.as_deref(),
             Some("webhook"),
-            "the WASM consumer's push row must carry the webhook envelope"
-        );
-    }
-
-    /// End-to-end webhook receive denial: with no covering `webhook_acl`, the
-    /// delivery-time ACL gate denies the WASM consumer — no push row lands and a
-    /// denial warn is emitted. Deny-by-default at the runtime gate (the boot half
-    /// of the fail-fast posture panics; this is the post-boot runtime half).
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn deliver_inbound_denies_uncovered_wasm_subscriber() {
-        let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
-        state.messenger = Some(messenger_with_webhook_channel_and_wasm_subscriber(
-            db.clone(),
-            "push-alice",
-            "consume-demo",
-            false,
-        ));
-        state.webhook = Some(test_webhook_svc("push-alice", "myapp"));
-        let router = WebhookEventRouterImpl::new();
-        router.set_state(state);
-
-        router
-            .deliver_inbound(
-                "push-alice",
-                &WebhookOwner::App(Arc::from("myapp")),
-                "primary",
-                test_headers(),
-                test_ip(),
-                SystemTime::now(),
-                "hello".to_string(),
-                Urgency::Normal,
-            )
-            .await
-            .expect("delivery itself succeeds; the subscriber is denied, not the ingress");
-
-        let (push_count, _) = crate::test_support::wasm::wasm_push_rows(&db, "consume-demo").await;
-        assert_eq!(
-            push_count, 0,
-            "an uncovered WASM consumer must receive no push row"
-        );
-        assert!(
-            logs_contain("subscription delivery denied"),
-            "the delivery gate must emit a denial warn for the uncovered subscriber"
+            "the committed message must carry the webhook envelope"
         );
     }
 
@@ -649,10 +606,11 @@ mod tests {
             .await
             .expect("delivery should succeed for a present wasm owner");
 
-        let (push_count, _) = crate::test_support::wasm::wasm_push_rows(&db, "consume-demo").await;
+        let (retained, _) =
+            crate::test_support::wasm::retained_on_channel(&db, "webhook:push-alice").await;
         assert_eq!(
-            push_count, 1,
-            "the owning WASM consumer must receive exactly one push row"
+            retained, 1,
+            "the inbound message must commit onto the owning consumer's channel"
         );
     }
 
@@ -792,22 +750,18 @@ mod tests {
             .await
             .expect("delivery should succeed");
 
-        // Verify a pending-push row exists for the webhook channel message.
-        let push_count: i64 = {
+        // Verify the webhook channel message committed into retention.
+        let retained: i64 = {
             let conn = db.lock().await;
             conn.query_row(
-                "SELECT COUNT(*) FROM messaging_pending_pushes pp \
-                 JOIN messaging_messages m ON pp.message_id = m.id \
-                 WHERE m.envelope_type = 'webhook'",
+                "SELECT COUNT(*) FROM messaging_messages \
+                 WHERE envelope_type = 'webhook' AND retained_seq IS NOT NULL",
                 [],
                 |r| r.get(0),
             )
             .expect("query must succeed")
         };
-        assert_eq!(
-            push_count, 1,
-            "exactly one pending-push row for the subscriber"
-        );
+        assert_eq!(retained, 1, "exactly one committed message");
     }
 
     /// Credential-header redaction: the scheme-named credential header value
