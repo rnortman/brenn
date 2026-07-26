@@ -3101,9 +3101,6 @@ impl ClientCore {
                 envelope,
                 targets,
             } => self.on_deliver_frame(channel, envelope, targets, now),
-            ServerFrame::ReAnchor { channel, instance } => {
-                self.on_re_anchor(SubKey { instance, channel }, now)
-            }
             ServerFrame::PublishResult {
                 correlation,
                 outcome,
@@ -3708,50 +3705,6 @@ impl ClientCore {
             // the deferred Unsubscribe. Unsubscribed: nothing.
             WireState::Pending | WireState::Unsubscribed => Vec::new(),
         }
-    }
-
-    /// The server asked for one subscription to be re-anchored: unsubscribe it
-    /// and subscribe it again presenting the cursor this kernel holds.
-    ///
-    /// This is the reconnect path applied to a single subscription, disturbing
-    /// no other principal. The stored cursor is echoed verbatim — the kernel
-    /// never interprets it, here as anywhere — and the span high-water resets,
-    /// the server restarting the span counter at 1 for the new subscription.
-    /// Class-blind: nothing here reads the channel's wire class.
-    ///
-    /// Only an `Active` subscription is re-anchored. A `Pending` one already has
-    /// a fresh span opening (that subscribe *is* the re-anchor); an
-    /// `Unsubscribed` one is either torn down with the `Unsubscribe` crossing
-    /// this frame in flight or awaiting reconcile's resubscribe at the next
-    /// `Welcome`. All are benign crosses with a re-subscribe already accounted
-    /// for, and doing nothing is correct in each. A subscription this kernel
-    /// never held has no such explanation: a correct server only asks about
-    /// subscriptions it acknowledged, so it is fatal.
-    ///
-    /// TODO(surface-reanchor-frame): no server path sends `ReAnchor`, so this
-    /// handler and its tests are reachable only from the test harness.
-    fn on_re_anchor(&mut self, sub: SubKey, now: Millis) -> Vec<Effect> {
-        let Some(cs) = self.channels.get_mut(&sub) else {
-            return self.go_fatal(format!(
-                "ReAnchor for a subscription never held: {} (instance {:?})",
-                sub.channel, sub.instance
-            ));
-        };
-        if cs.wire != WireState::Active {
-            return vec![Effect::SetWakeup(Some(self.arm_liveness(now)))];
-        }
-        let resume = cs.prepare_subscribe();
-        let mut effects = vec![Effect::SetWakeup(Some(self.arm_liveness(now)))];
-        effects.push(Effect::SendFrame(ClientFrame::Unsubscribe {
-            channel: sub.channel.clone(),
-            instance: sub.instance.clone(),
-        }));
-        effects.push(Effect::SendFrame(ClientFrame::Subscribe {
-            channel: sub.channel,
-            instance: sub.instance,
-            resume,
-        }));
-        effects
     }
 
     /// A `SubscribeResult` arrived. It must be for a `Pending` channel (the

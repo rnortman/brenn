@@ -1,7 +1,8 @@
 //! Shared scaffolding for WASM-subscriber receive tests across the MQTT and
 //! webhook router suites: a single-`Wasm`-subscriber channel entry, a `Messenger`
-//! carrying that subscriber's policy, and the retained-message query both suites
-//! assert on. Keeping these in one place means a schema change or a new transport
+//! carrying that subscriber's policy, the retained-message query both suites
+//! assert on, and the activation read that answers what the consumer is actually
+//! served. Keeping these in one place means a schema change or a new transport
 //! edits one builder, not several near-identical copies.
 
 use std::sync::Arc;
@@ -9,9 +10,12 @@ use std::sync::Arc;
 use brenn_lib::access::AppPolicy;
 use brenn_lib::db::Db;
 use brenn_lib::messaging::{
-    ChannelEntry, ChannelScheme, MessagingDirectory, Messenger, SubscriberEntry,
-    SubscriberEntryKind, WakeMin, WakeRouter,
-    config::{Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel, Sink},
+    ChannelEntry, ChannelScheme, MessageEnvelope, MessagingDirectory, Messenger, ParticipantId,
+    SubscriberEntry, SubscriberEntryKind, WakeMin, WakeRouter,
+    config::{
+        Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel, ResolvedSubscription, Sink,
+        WasmInputPort,
+    },
     db::upsert_channels,
     query::NoopWakeRouter,
 };
@@ -82,6 +86,68 @@ pub(crate) fn messenger_with_wasm_policy(
     .with_subscriber_registrations(brenn_lib::messaging::testutils::wasm_registrations(
         wasm_policies,
     ))
+}
+
+/// Give the WASM consumer a position on `entry`, primed at head, and return the
+/// `wasm:<slug>` identity that holds it.
+///
+/// A push-enabled read against a channel the subscriber holds no position on
+/// panics, so a receive test that asks what its consumer was served has to
+/// attach first — which is what boot does for every configured input port.
+pub(crate) async fn attach_wasm_consumer(
+    messenger: &Messenger,
+    entry: &ChannelEntry,
+    wasm_slug: &str,
+) -> ParticipantId {
+    let subscriber = ParticipantId::for_wasm(wasm_slug);
+    brenn_lib::messaging::testutils::attach_wasm_port(
+        messenger,
+        entry,
+        wasm_slug,
+        &subscriber,
+        Depth::Unbounded,
+    )
+    .await;
+    subscriber
+}
+
+/// What the production activation read would hand the guest for a WASM consumer
+/// with one input port bound to `entry`: the new messages of that port's window,
+/// oldest first.
+///
+/// The read is what enforces the delivery-time ACL gate, so this is the only
+/// honest way to ask whether a subscriber is being served — a retention query
+/// answers where the message is, not who may see it. Pure read: it moves no
+/// position, so a case may ask twice.
+pub(crate) async fn activation_new_messages(
+    messenger: &Messenger,
+    entry: &ChannelEntry,
+    wasm_slug: &str,
+) -> Vec<MessageEnvelope> {
+    let subscriber = ParticipantId::for_wasm(wasm_slug);
+    let inputs = vec![WasmInputPort {
+        port: "in".to_string(),
+        sub: ResolvedSubscription {
+            channel_uuid: entry.uuid,
+            channel_address: entry.address.clone(),
+            push_depth: Depth::Unbounded,
+            retain_depth: Depth::Bounded(0),
+            noise: NoiseLevel::Silent,
+            wake_min: WakeMin::Normal,
+        },
+        amplification_mt: 1_000,
+    }];
+    messenger
+        .load_activation_snapshot(&subscriber, &inputs)
+        .await
+        .map(|snapshots| {
+            snapshots
+                .iter()
+                .flat_map(|snapshot| snapshot.new_entries())
+                .map(|(_, envelope)| envelope.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `(retained_count, envelope_type)` for the messages a transport ingress

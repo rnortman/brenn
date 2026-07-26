@@ -1859,8 +1859,8 @@ pub enum DispatchOutcome {
     Delivered(i64),
     /// The push remains undelivered. Drain-on-wake (or the deadline /
     /// deliver-after scanners) will pick it up. `woke` reports whether this
-    /// dispatch actually fired an eager wake — the truthful signal the
-    /// dispatcher supervisor arms its wake cooldown from (no decoupled mirror).
+    /// dispatch actually fired an eager wake, for the dispatcher's own
+    /// debug log.
     Parked { woke: bool },
 }
 

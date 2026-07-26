@@ -597,6 +597,123 @@ mod tests {
         );
     }
 
+    /// End-to-end MQTT receive denial: with no covering `mqtt_subscribe_acl`, the
+    /// delivery-time ACL gate at the activation read serves the WASM consumer an
+    /// empty window and emits a denial warn (the post-boot runtime half of the
+    /// fail-fast posture; the boot half panics).
+    ///
+    /// The commit is target-blind, so the message still reaches retention — what
+    /// the gate decides is who may be served from it.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn deliver_inbound_denies_uncovered_wasm_subscriber() {
+        let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+        let addr = "mqtt:homeassistant:home/+/state";
+        let messenger = messenger_with_wasm_channels(
+            db.clone(),
+            vec![mqtt_channel_entry_wasm(addr, "consume-demo")],
+            "consume-demo",
+            vec![],
+        );
+        let entry = messenger
+            .directory()
+            .resolve(addr)
+            .expect("the mqtt channel must be in the directory");
+        crate::test_support::wasm::attach_wasm_consumer(&messenger, &entry, "consume-demo").await;
+        state.messenger = Some(Arc::clone(&messenger));
+        let router = MqttEventRouterImpl::new();
+        router.set_state(
+            state,
+            vec![route("homeassistant", "home/+/state", Urgency::Normal)],
+        );
+
+        router
+            .deliver_inbound(
+                "homeassistant",
+                "home/kitchen/state",
+                InboundPayload::Text("22.5".to_string()),
+                1,
+            )
+            .await;
+
+        let served =
+            crate::test_support::wasm::activation_new_messages(&messenger, &entry, "consume-demo")
+                .await;
+        assert!(
+            served.is_empty(),
+            "an uncovered WASM consumer must be served nothing, got {served:?}"
+        );
+        assert!(
+            logs_contain("subscription delivery denied"),
+            "the delivery gate must emit a denial warn for the uncovered subscriber"
+        );
+    }
+
+    /// The restore half: the denied read never advanced the consumer's position,
+    /// so a policy covering the channel again serves the backlog that accumulated
+    /// under the revocation. Same database, same position — only the policy
+    /// differs.
+    #[tokio::test]
+    async fn a_restored_mqtt_subscribe_acl_serves_the_denied_backlog() {
+        let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+        let addr = "mqtt:homeassistant:home/+/state";
+        let denied = messenger_with_wasm_channels(
+            db.clone(),
+            vec![mqtt_channel_entry_wasm(addr, "consume-demo")],
+            "consume-demo",
+            vec![],
+        );
+        let entry = denied
+            .directory()
+            .resolve(addr)
+            .expect("the mqtt channel must be in the directory");
+        crate::test_support::wasm::attach_wasm_consumer(&denied, &entry, "consume-demo").await;
+        state.messenger = Some(Arc::clone(&denied));
+        let router = MqttEventRouterImpl::new();
+        router.set_state(
+            state,
+            vec![route("homeassistant", "home/+/state", Urgency::Normal)],
+        );
+
+        for reading in ["22.5", "23.0"] {
+            router
+                .deliver_inbound(
+                    "homeassistant",
+                    "home/kitchen/state",
+                    InboundPayload::Text(reading.to_string()),
+                    1,
+                )
+                .await;
+        }
+        assert!(
+            crate::test_support::wasm::activation_new_messages(&denied, &entry, "consume-demo")
+                .await
+                .is_empty(),
+            "nothing may be served while the ACL is revoked"
+        );
+
+        let restored = messenger_with_wasm_channels(
+            db.clone(),
+            vec![mqtt_channel_entry_wasm(addr, "consume-demo")],
+            "consume-demo",
+            vec![brenn_lib::access::raw::MqttSubMatcherRaw {
+                client: "homeassistant".to_string(),
+                topic_filter: "home/+/state".to_string(),
+            }],
+        );
+        crate::test_support::wasm::attach_wasm_consumer(&restored, &entry, "consume-demo").await;
+
+        let served =
+            crate::test_support::wasm::activation_new_messages(&restored, &entry, "consume-demo")
+                .await;
+        assert_eq!(
+            served.len(),
+            2,
+            "both messages published under the revocation must be served once it is restored, \
+             got {served:?}"
+        );
+    }
+
     /// One inbound topic matching two distinct-channel filters on the same client
     /// fans out to both channels: two stored messages, one per channel.
     #[tokio::test]

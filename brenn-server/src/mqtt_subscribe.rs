@@ -2,8 +2,8 @@
 //!
 //! The transport-agnostic *core* of a dynamic subscribe lives in `brenn-lib`
 //! ([`Messenger::subscribe_dynamic`]): it resolves params, persists the durable
-//! row + `messaging_subscriptions` mirror, creates a not-yet-existing `mqtt:`
-//! channel, and folds the subscriber into the in-memory directory. That core is
+//! row, creates a not-yet-existing `mqtt:` channel, and folds the subscriber
+//! into the in-memory directory. That core is
 //! transport-blind and makes **no broker call**.
 //!
 //! For `mqtt:` addresses there is one more transport-specific step — *activation*

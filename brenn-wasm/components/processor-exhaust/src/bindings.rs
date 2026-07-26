@@ -2104,11 +2104,16 @@ pub mod brenn {
         /// gaps. A backlog larger than `push_depth` is NOT held back for a
         /// later activation: the window serves the newest `push_depth` and the
         /// remainder is counted here.
-        /// BEST-EFFORT / SINCE-BOOT: the underlying counter is volatile
-        /// (in host memory only) and resets to 0 across a host restart, so a
-        /// gap that occurred before a crash is NOT reflected here after the
-        /// restart. `dropped == 0` is therefore not proof of no-gap across a
-        /// host lifetime; treat it as a within-lifetime gap signal only.
+        /// This is not a stored counter: it is the distance between the
+        /// position the port held and the oldest message this window served,
+        /// computed when the port's position advances over the window. How far
+        /// back it can reach therefore depends on where that position lives.
+        /// DURABLE CHANNELS (`brenn:`): the position is persisted, so a gap
+        /// that straddles a host restart IS reflected in the first `dropped`
+        /// reported after it. NON-DURABLE CHANNELS (`ephemeral:`, `local:`):
+        /// channel and position both die with the host process, so `dropped`
+        /// covers the current process lifetime only — there, `dropped == 0` is
+        /// not proof of no-gap across a host lifetime.
         /// Always 0 for sampled ports (`push_depth = 0`), which hold no
         /// delivery position and therefore never experience push-overflow.
         pub dropped: u32,

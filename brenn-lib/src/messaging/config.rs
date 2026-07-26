@@ -2012,8 +2012,7 @@ pub fn finalize_directory_with_subscribers(
 /// (design §2.1 boot merge).
 ///
 /// Runs *after* [`finalize_directory_with_subscribers`] has populated the
-/// directory with the static (TOML) and WASM subscribers, and after the static
-/// `messaging_subscriptions` mirror has been rebuilt. Each row in `rows` (loaded
+/// directory with the static (TOML) and WASM subscribers. Each row in `rows` (loaded
 /// from `messaging_dynamic_subscriptions`, the durable truth that boot does NOT
 /// truncate) is folded onto its channel as an `App(app_slug)` subscriber via the
 /// directory's copy-on-write [`MessagingDirectory::add_subscriber`] — the same
@@ -2032,9 +2031,8 @@ pub fn finalize_directory_with_subscribers(
 /// to re-apply.
 ///
 /// Returns a [`DynamicMergeOutcome`] partitioning the input rows: `kept` are the
-/// rows folded into the directory (the boot path mirrors these into
-/// `messaging_subscriptions`, so a dynamic subscriber appears there on the same
-/// terms as a static one); `dropped` are the `(channel_uuid, app_slug)` keys the
+/// rows folded into the directory, which is the whole of what surviving them
+/// means — the boot path writes nothing for them; `dropped` are the `(channel_uuid, app_slug)` keys the
 /// boot path prunes from `messaging_dynamic_subscriptions` so the same conflict
 /// does not recur next boot (design §2.1 "Boot merge" / "Mirror collision
 /// policy"); `revoked` are the rows no longer authorized by the current config —
@@ -2159,9 +2157,7 @@ pub fn merge_dynamic_subscriptions<'p>(
 /// folded into the directory (`kept`), dropped (`dropped`), or revoked
 /// (`revoked`).
 ///
-/// The boot path uses `kept` to mirror the surviving dynamic subscriptions into
-/// `messaging_subscriptions` (so a dynamic subscriber is recorded there on the
-/// same terms as a static one) and
+/// The boot path folds `kept` into the directory and nowhere else, and uses
 /// `dropped` to prune the now-overridden rows from
 /// `messaging_dynamic_subscriptions` (so the conflict does not recur next boot).
 /// `revoked` rows are folded into **neither** — they are not added to the

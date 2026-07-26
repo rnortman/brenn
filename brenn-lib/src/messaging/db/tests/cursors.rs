@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::db::init_db_memory;
 use crate::messaging::ParticipantId;
 use crate::messaging::config::Depth;
+use crate::messaging::db::schema::table_exists;
 use crate::messaging::db::{
     delete_subscriber_cursor, ensure_subscriber_cursor, load_subscriber_cursor,
     run_messaging_migrations,
@@ -72,8 +73,25 @@ fn claim(conn: &Connection, channel: Uuid, seq: i64, subscriber: &str, slug: &st
     .expect("insert claim");
 }
 
-/// A registration row, which is where the seed reads a depth from.
+/// A row in the flat `messaging_subscriptions` mirror, which is where the seed
+/// reads a depth from.
+///
+/// The mirror belongs to the binary these tests migrate *from*: this binary
+/// neither creates nor writes it, and drops it once the seed has read it. So the
+/// table is raised here, as part of building the pre-migration database by hand.
 fn register(conn: &Connection, channel: Uuid, slug: &str, push_depth: &str) {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS messaging_subscriptions (
+            channel_uuid   BLOB NOT NULL REFERENCES messaging_channels(uuid),
+            app_slug       TEXT NOT NULL,
+            push_depth     TEXT NOT NULL,
+            retain_depth   TEXT NOT NULL,
+            noise          TEXT NOT NULL,
+            wake_min       TEXT NOT NULL,
+            PRIMARY KEY (channel_uuid, app_slug)
+        );",
+    )
+    .expect("raise the legacy subscription mirror");
     conn.execute(
         "INSERT INTO messaging_subscriptions
              (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min)
@@ -236,6 +254,69 @@ fn the_seed_positions_owed_subscribers_at_their_oldest_owed_sequence() {
         cursor(&conn, channel, "surface:deskbar#agenda"),
         None,
         "a surface holds no server-side position"
+    );
+    assert!(
+        !table_exists(&conn, "messaging_subscriptions"),
+        "the mirror the seed read is dropped by the same migration"
+    );
+}
+
+/// A database created by this binary comes out of its first boot with no flat
+/// subscription mirror, and the drop that guarantees that is a no-op rather than
+/// an error on the path where the table was never there.
+///
+/// (Restoring the DDL alone changes nothing observable — the drop runs at the end
+/// of the same call either way — so this pins the end state, not the DDL.)
+#[test]
+fn a_fresh_database_never_carries_the_subscription_mirror() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    assert!(!table_exists(&conn, "messaging_subscriptions"));
+}
+
+/// The seed reads depths out of a mirror this binary neither creates nor writes,
+/// so it must tolerate the table's absence rather than fail the boot on it. With
+/// no mirror to read, a claimed subscriber is seeded unbounded — the same arm an
+/// unregistered kind already takes — and its first window read retunes it.
+#[test]
+fn the_seed_survives_a_database_with_no_mirror_to_read() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let channel = seed_channel(&conn, "brenn:no-mirror", 2);
+    claim(&conn, channel, 2, "wasm:proc", "proc", true);
+    assert!(
+        !table_exists(&conn, "messaging_subscriptions"),
+        "no registration was planted, so there is no mirror"
+    );
+
+    migrate_from_before_cursors(&conn);
+
+    assert_eq!(
+        cursor(&conn, channel, "wasm:proc"),
+        Some(("proc".to_string(), Depth::Unbounded, 2)),
+        "the claim alone positions the subscriber; the depth waits for its first read"
+    );
+}
+
+/// The drop is idempotent and outside the seed's run-once guard, so a database
+/// that already ran the cursor migration under an interim build — cursor table
+/// present, mirror still on disk — loses the orphan on its next boot rather than
+/// carrying it forever behind a guard that will never fire again.
+#[test]
+fn an_already_migrated_database_loses_the_orphaned_mirror_on_its_next_boot() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let channel = seed_channel(&conn, "brenn:orphan", 1);
+    // `register` raises the mirror; the cursor table is already there, so the
+    // seed will not run and would leave the mirror standing.
+    register(&conn, channel, "proc", "4");
+    assert!(table_exists(&conn, "messaging_subscriptions"));
+
+    run_messaging_migrations(&conn);
+
+    assert!(
+        !table_exists(&conn, "messaging_subscriptions"),
+        "the orphan goes on the next boot"
     );
 }
 
@@ -423,16 +504,10 @@ fn an_aborted_seed_leaves_no_table_for_the_next_boot_to_skip() {
         migrate_from_before_cursors(&conn);
     }));
     assert!(aborted.is_err(), "the non-suffix claim set aborts the seed");
-    let table_present: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master
-                           WHERE type = 'table' AND name = 'messaging_subscriber_cursors')",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .expect("query sqlite_master")
-        != 0;
-    assert!(!table_present, "the aborted seed took the table with it");
+    assert!(
+        !table_exists(&conn, "messaging_subscriber_cursors"),
+        "the aborted seed took the table with it"
+    );
 
     // The operator retires the stray delivered claim the abort named, and the
     // next boot seeds from the claims that are still there.

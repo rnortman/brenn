@@ -842,6 +842,7 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         tools: tool_registry_core,
         tool_server_origin,
         wake_locks: Default::default(),
+        spawn_backoff: Default::default(),
         server_shutting_down: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         repo_sync_sender: repo_sync_result.sender,
         messenger: messaging_result.messenger.clone(),
@@ -858,6 +859,8 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         replay_locks,
         #[cfg(test)]
         test_wake_bridge: Default::default(),
+        #[cfg(test)]
+        wake_spawns: Default::default(),
     };
 
     // Attach the AppState to the WakeRouter, then spawn the background

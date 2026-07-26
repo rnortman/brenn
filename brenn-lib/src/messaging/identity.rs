@@ -294,8 +294,8 @@ impl ParticipantId {
     }
 
     /// The subscriber key this surface identity stores in
-    /// `messaging_subscriptions.app_slug` / `messaging_pending_pushes
-    /// .target_app_slug`: everything after the `surface:` prefix, so
+    /// `messaging_pending_pushes.target_app_slug`: everything after the
+    /// `surface:` prefix, so
     /// `surface:kitchen` keys `"kitchen"` and `surface:kitchen#agenda-alice`
     /// keys `"kitchen#agenda-alice"`.
     ///

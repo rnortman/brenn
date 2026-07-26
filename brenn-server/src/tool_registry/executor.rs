@@ -657,20 +657,6 @@ mod tests {
         }
     }
 
-    /// `MessagingPublish` + a `brenn_publish` prefix matcher policy.
-    fn publish_policy(prefix: &str) -> AppPolicy {
-        let mut grants = GrantSet::default();
-        grants.insert(AppCapability::MessagingPublish);
-        let mut acls = brenn_lib::access::acl::AclSet::default();
-        acls.brenn_publish
-            .push(ChannelMatcher::Prefix(prefix.to_string()));
-        AppPolicy {
-            grants,
-            acls,
-            tool_grants: BTreeMap::new(),
-        }
-    }
-
     /// `MessagingSubscribe` + a `brenn_subscribe` prefix matcher policy (delivery).
     fn subscribe_policy(prefix: &str) -> AppPolicy {
         let mut grants = GrantSet::default();
@@ -728,10 +714,14 @@ mod tests {
         );
         let mut wasm_policies = HashMap::new();
         wasm_policies.insert(CALLER_SLUG.to_string(), subscribe_policy("tool-results/"));
+        // The production policy, not a hand-rolled one: the executor's delivery
+        // read is gated on the same subscribe ACL boot builds for it, so a
+        // fixture policy that omitted the `tools/` half would be denied its own
+        // request channel.
         let mut system_policies = HashMap::new();
         system_policies.insert(
             TOOL_EXECUTOR_COMPONENT.to_string(),
-            publish_policy("tool-results/"),
+            crate::tool_registry::bus_wiring::tool_executor_system_policy(),
         );
         let messenger = messenger
             .with_subscriber_registrations(brenn_lib::messaging::testutils::wasm_registrations(

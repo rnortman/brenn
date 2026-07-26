@@ -538,6 +538,125 @@ mod tests {
         );
     }
 
+    /// End-to-end webhook receive denial: with no covering `webhook_acl`, the
+    /// delivery-time ACL gate at the activation read serves the WASM consumer an
+    /// empty window and emits a denial warn. Deny-by-default at the runtime gate
+    /// (the boot half of the fail-fast posture panics; this is the post-boot
+    /// runtime half).
+    ///
+    /// The message still commits — a commit is target-blind — so the assertion
+    /// that matters is what the consumer is *served*, not what retention holds.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn deliver_inbound_denies_uncovered_wasm_subscriber() {
+        let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+        let messenger = messenger_with_webhook_channel_and_wasm_subscriber(
+            db.clone(),
+            "push-alice",
+            "consume-demo",
+            false,
+        );
+        let entry = messenger
+            .directory()
+            .resolve("webhook:push-alice")
+            .expect("the webhook channel must be in the directory");
+        crate::test_support::wasm::attach_wasm_consumer(&messenger, &entry, "consume-demo").await;
+        state.messenger = Some(Arc::clone(&messenger));
+        state.webhook = Some(test_webhook_svc("push-alice", "myapp"));
+        let router = WebhookEventRouterImpl::new();
+        router.set_state(state);
+
+        router
+            .deliver_inbound(
+                "push-alice",
+                &WebhookOwner::App(Arc::from("myapp")),
+                "primary",
+                test_headers(),
+                test_ip(),
+                SystemTime::now(),
+                "hello".to_string(),
+                Urgency::Normal,
+            )
+            .await
+            .expect("delivery itself succeeds; the subscriber is denied, not the ingress");
+
+        let served =
+            crate::test_support::wasm::activation_new_messages(&messenger, &entry, "consume-demo")
+                .await;
+        assert!(
+            served.is_empty(),
+            "an uncovered WASM consumer must be served nothing, got {served:?}"
+        );
+        assert!(
+            logs_contain("subscription delivery denied"),
+            "the delivery gate must emit a denial warn for the uncovered subscriber"
+        );
+    }
+
+    /// The restore half: the denial skipped the read without advancing the
+    /// consumer's position, so a policy that covers the channel again serves the
+    /// backlog that accumulated under the revocation rather than stepping past
+    /// it. Same database, same position — only the policy differs.
+    #[tokio::test]
+    async fn a_restored_webhook_acl_serves_the_denied_backlog() {
+        let (mut state, db, _) = test_state_with_user_and_app("myapp", vec!["alice".to_string()]);
+        let denied = messenger_with_webhook_channel_and_wasm_subscriber(
+            db.clone(),
+            "push-alice",
+            "consume-demo",
+            false,
+        );
+        let entry = denied
+            .directory()
+            .resolve("webhook:push-alice")
+            .expect("the webhook channel must be in the directory");
+        crate::test_support::wasm::attach_wasm_consumer(&denied, &entry, "consume-demo").await;
+        state.messenger = Some(Arc::clone(&denied));
+        state.webhook = Some(test_webhook_svc("push-alice", "myapp"));
+        let router = WebhookEventRouterImpl::new();
+        router.set_state(state);
+
+        for body in ["first", "second"] {
+            router
+                .deliver_inbound(
+                    "push-alice",
+                    &WebhookOwner::App(Arc::from("myapp")),
+                    "primary",
+                    test_headers(),
+                    test_ip(),
+                    SystemTime::now(),
+                    body.to_string(),
+                    Urgency::Normal,
+                )
+                .await
+                .expect("delivery itself succeeds while the subscriber is denied");
+        }
+        assert!(
+            crate::test_support::wasm::activation_new_messages(&denied, &entry, "consume-demo")
+                .await
+                .is_empty(),
+            "nothing may be served while the ACL is revoked"
+        );
+
+        let restored = messenger_with_webhook_channel_and_wasm_subscriber(
+            db.clone(),
+            "push-alice",
+            "consume-demo",
+            true,
+        );
+        crate::test_support::wasm::attach_wasm_consumer(&restored, &entry, "consume-demo").await;
+
+        let served =
+            crate::test_support::wasm::activation_new_messages(&restored, &entry, "consume-demo")
+                .await;
+        assert_eq!(
+            served.len(),
+            2,
+            "both messages published under the revocation must be served once it is restored, \
+             got {served:?}"
+        );
+    }
+
     fn test_headers() -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert("content-type", "application/json".parse().unwrap());

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 
 use brenn_wasm::ReplayComponent;
 
@@ -104,6 +105,10 @@ pub struct AppState {
     /// calls from double-spawning CC.
     #[cfg_attr(test, allow(dead_code))]
     pub wake_locks: WakeLocks,
+    /// Per-conversation retry backoff for *failed* spawns. Declines bus-driven
+    /// spawn attempts while armed; see [`SpawnBackoff`].
+    #[cfg_attr(test, allow(dead_code))]
+    pub spawn_backoff: SpawnBackoff,
     /// Process-wide flag set by `shutdown_signal` when SIGTERM / SIGINT
     /// arrives. Bridges' `SessionEvent::Died` handler consults it (alongside
     /// `drain_on_idle`) to suppress the "CC session died" warning alert
@@ -180,12 +185,30 @@ pub struct AppState {
     /// Test-only: bridge to return from `wake_conversation`. Consumed on first call.
     #[cfg(test)]
     pub test_wake_bridge: Arc<Mutex<Option<Arc<ActiveBridge>>>>,
+    /// Test-only: the conversations whose spawn attempts the entrypoints
+    /// admitted, in order. A test build has no CC to spawn, so the spawn itself
+    /// is the one thing stubbed out; recording what reached it is what makes the
+    /// decisions in front of it — which trigger consults the backoff, and which
+    /// does not — assertable rather than a comment.
+    #[cfg(test)]
+    pub wake_spawns: Arc<std::sync::Mutex<Vec<i64>>>,
 }
 
 /// Per-conversation lock map for wake_conversation concurrency control.
 ///
 /// Lightweight: only holds entries for conversations currently being woken.
 /// The lock prevents two concurrent wake_conversation calls from both spawning CC.
+///
+/// **This is the single-spawn mechanism, and the only one.** `spawn_if_absent`'s
+/// fast-path check, this guard held across the whole spawn, the re-check under
+/// it, and registration into `active_bridges` only after the CC handshake are
+/// together the spawn state machine: spawn → active → idle/errored, never more
+/// than one live spawn per conversation, with concurrent wakes during the spawn
+/// window collapsing onto the lock. Do not add a pacing or cooldown layer in
+/// front of it on the theory that double-spawn needs a second defense — it does
+/// not, and one was removed for being exactly that. The one thing that *does*
+/// belong beside it is [`SpawnBackoff`], which damps spawns that **fail**, a
+/// different problem a mutex cannot solve.
 #[derive(Clone, Default)]
 pub struct WakeLocks {
     #[cfg_attr(test, allow(dead_code))]
@@ -210,26 +233,186 @@ impl WakeLocks {
     }
 }
 
+/// Base retry window after a failed conversation spawn: one dispatcher tick,
+/// which is the cadence the wake walk retries at anyway.
+const SPAWN_BACKOFF_BASE: Duration = brenn_lib::messaging::dispatcher::POLL_INTERVAL;
+
+/// Longest retry window a failure episode reaches. Bounds retry noise while
+/// keeping recovery latency operator-tolerable — a spawn that starts working
+/// again is picked up within 15 minutes even with no other trigger.
+const SPAWN_BACKOFF_CAP: Duration = Duration::from_secs(15 * 60);
+
+/// Per-conversation retry backoff for conversation spawns that **fail**.
+///
+/// A CC spawn is slow in wall time but cheap in resources, so a healthy wake is
+/// never paced: if a message is going to be processed at all, processing it now
+/// is strictly better than making it wait (and the token cache is hot right
+/// after a cycle). What is worth damping is the one case where retrying buys
+/// nothing — a spawn that errors. Bus-driven wakes arrive at kick rate, bounded
+/// only by the publish rate, so an unbounded retry of a persistently failing
+/// spawn is a storm.
+///
+/// The state is armed **only** by a failed attempt and cleared by a successful
+/// one, so a working conversation never touches it. While armed it declines
+/// bus-driven attempts from every trigger — kick, tick, deadline, urgency all
+/// funnel into the same eager-wake attempt and the backoff sits below them all.
+/// It does **not** decline a user-initiated spawn: a human retry is
+/// self-pacing, no storm arises from it, and it is the likeliest recovery probe
+/// in exactly this state — and its success clears the backoff for the bus side
+/// too.
+///
+/// Positions never move while it is armed, so nothing is lost: when a spawn
+/// finally succeeds, the drain serves the whole accumulated backlog.
+///
+/// This lives on the spawn machinery beside [`WakeLocks`], not on the
+/// `Messenger`: it is spawn policy, and the spawner is what knows a spawn
+/// failed.
+#[derive(Clone, Default)]
+pub struct SpawnBackoff {
+    inner: Arc<std::sync::Mutex<HashMap<i64, BackoffEntry>>>,
+}
+
+/// One conversation's open failure episode.
+struct BackoffEntry {
+    /// When the current window opened — the instant of the failure that set it.
+    opened: Instant,
+    /// How long that window runs. `SPAWN_BACKOFF_BASE` on the first failure,
+    /// doubling per consecutive failure, capped at `SPAWN_BACKOFF_CAP`.
+    window: Duration,
+    /// Whether this episode has already alerted on reaching the cap. Reset only
+    /// by the success that ends the episode, so a conversation that cannot
+    /// spawn alerts once per episode rather than once per process — an operator
+    /// must hear every episode of a conversation silently not processing.
+    alerted: bool,
+}
+
+impl SpawnBackoff {
+    /// Whether a bus-driven spawn for this conversation is inside the window a
+    /// previous failure opened.
+    pub fn declines(&self, conversation_id: i64) -> bool {
+        self.declines_at(conversation_id, Instant::now())
+    }
+
+    /// Record a failed spawn attempt: open the episode or double its window.
+    /// Returns `true` exactly once per episode — on the failure that first
+    /// reaches the cap — which is the caller's cue to alert.
+    pub fn record_failure(&self, conversation_id: i64) -> bool {
+        self.record_failure_at(conversation_id, Instant::now())
+    }
+
+    /// End any open episode: a spawn succeeded, so the next failure starts over
+    /// at the base window and may alert again.
+    pub fn clear(&self, conversation_id: i64) {
+        self.map().remove(&conversation_id);
+    }
+
+    /// The clock-taking halves of the two accessors above, so the policy is
+    /// testable without waiting out a 60-second window.
+    fn declines_at(&self, conversation_id: i64, now: Instant) -> bool {
+        self.map()
+            .get(&conversation_id)
+            .is_some_and(|entry| now.duration_since(entry.opened) < entry.window)
+    }
+
+    fn record_failure_at(&self, conversation_id: i64, now: Instant) -> bool {
+        let mut map = self.map();
+        let entry = map.entry(conversation_id).or_insert(BackoffEntry {
+            opened: now,
+            // Halved so the doubling below lands the first failure on the base
+            // window — one rule for every failure, rather than a first-failure
+            // special case that could drift from it.
+            window: SPAWN_BACKOFF_BASE / 2,
+            alerted: false,
+        });
+        entry.opened = now;
+        entry.window = (entry.window * 2).min(SPAWN_BACKOFF_CAP);
+        if entry.window == SPAWN_BACKOFF_CAP && !entry.alerted {
+            entry.alerted = true;
+            return true;
+        }
+        false
+    }
+
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<i64, BackoffEntry>> {
+        self.inner.lock().expect("spawn_backoff lock poisoned")
+    }
+}
+
 impl AppState {
-    /// Fire-and-forget eager wake: spawn `wake_conversation` in a background task.
+    /// Fire-and-forget eager wake for a **user-initiated** trigger: a browser
+    /// attaching, switching conversation, or replacing a CC that died under a
+    /// live session. Never declined by the spawn backoff — a human retry is
+    /// self-pacing, and this is the likeliest probe to find a broken spawn
+    /// working again.
+    ///
     /// Logs errors server-side but does not surface them to the user.
     ///
     /// `tz` is the spawning `WsConnection`'s browser-reported timezone,
     /// used to seed `GRAF_USER_TZ` in CC's environment. See
     /// `docs/designs/graf-user-tz.md`.
-    #[cfg(not(test))]
     pub fn spawn_eager_wake(&self, conversation_id: i64, tz: chrono_tz::Tz) {
+        self.spawn_wake_task(conversation_id, tz);
+    }
+
+    /// Fire-and-forget eager wake for a **bus-driven** trigger: the wake walk,
+    /// on kick, tick, deadline, or urgency. Every one of those funnels through
+    /// here, so declining here declines all of them — which is what makes the
+    /// backoff a bound on the whole bus side rather than on one trigger.
+    pub fn spawn_bus_wake(&self, conversation_id: i64, tz: chrono_tz::Tz) {
+        if self.spawn_backoff.declines(conversation_id) {
+            // The position does not move, so nothing is lost: the next attempt
+            // past the window finds the same backlog.
+            tracing::debug!(conversation_id, "bus wake declined by spawn backoff");
+            return;
+        }
+        self.spawn_wake_task(conversation_id, tz);
+    }
+
+    /// The spawn attempt both entrypoints make.
+    #[cfg(not(test))]
+    fn spawn_wake_task(&self, conversation_id: i64, tz: chrono_tz::Tz) {
         let state = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = state.wake_conversation(conversation_id, tz).await {
-                tracing::error!(conversation_id, "eager spawn failed: {e}");
-            }
+            let outcome = state.wake_conversation(conversation_id, tz).await;
+            state.record_spawn_outcome(conversation_id, outcome.map(|_| ()));
         });
     }
 
-    /// Test-mode no-op: eager wake does nothing (no real CC to spawn).
+    /// Test-mode stand-in: record the attempt instead of making it. There is no
+    /// CC to spawn, and the decisions worth pinning are the ones in front of
+    /// this call, not the subprocess behind it.
     #[cfg(test)]
-    pub fn spawn_eager_wake(&self, _conversation_id: i64, _tz: chrono_tz::Tz) {}
+    fn spawn_wake_task(&self, conversation_id: i64, _tz: chrono_tz::Tz) {
+        self.wake_spawns
+            .lock()
+            .expect("wake_spawns lock poisoned")
+            .push(conversation_id);
+    }
+
+    /// The one place a finished spawn attempt's outcome reaches the backoff: a
+    /// success ends any open failure episode, a failure opens or widens one, and
+    /// the failure that first reaches the cap tells the operator the
+    /// conversation is silently not processing.
+    fn record_spawn_outcome(&self, conversation_id: i64, outcome: Result<(), String>) {
+        match outcome {
+            Ok(()) => self.spawn_backoff.clear(conversation_id),
+            Err(e) => {
+                tracing::error!(conversation_id, "eager spawn failed: {e}");
+                if self.spawn_backoff.record_failure(conversation_id) {
+                    self.alert_dispatcher.alert(
+                        brenn_lib::obs::alerting::AlertSeverity::Warning,
+                        "Conversation spawn failing".to_string(),
+                        format!(
+                            "Conversation {conversation_id} has failed to spawn repeatedly and \
+                             its retry backoff has reached its {} minute ceiling; it is not \
+                             processing anything published to it. Last error: {e}",
+                            SPAWN_BACKOFF_CAP.as_secs() / 60,
+                        ),
+                    );
+                }
+            }
+        }
+    }
 
     /// Wake CC for a conversation. No-op if bridge already running.
     /// Spawns CC with `--resume` if the conversation has a prior session.
@@ -515,6 +698,7 @@ impl AppState {
             tools: Arc::new(crate::tool_registry::ToolRegistry::new(vec![])),
             tool_server_origin: Arc::from("test-origin"),
             wake_locks: Default::default(),
+            spawn_backoff: Default::default(),
             server_shutting_down: Arc::new(AtomicBool::new(false)),
             repo_sync_sender: None,
             messenger: None,
@@ -530,6 +714,7 @@ impl AppState {
             replay_components: Arc::new(HashMap::new()),
             replay_locks: Arc::new(HashMap::new()),
             test_wake_bridge: Default::default(),
+            wake_spawns: Default::default(),
         }
     }
 }
@@ -625,5 +810,202 @@ mod tests {
             state.test_wake_bridge.lock().await.is_none(),
             "fast path must not drain test_wake_bridge"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SpawnBackoff — tested with the clock passed in, so a 60-second window
+    // costs no wall time.
+    // -----------------------------------------------------------------------
+
+    use super::{SPAWN_BACKOFF_BASE, SPAWN_BACKOFF_CAP, SpawnBackoff};
+    use std::time::{Duration, Instant};
+
+    /// A healthy spawn never touches the backoff, so an untouched conversation
+    /// is never declined. This is the whole reason the arming condition is a
+    /// *failure* and not an attempt.
+    ///
+    /// Runs through the wall-clock entrypoints the spawn path itself calls, so
+    /// the rows below that pass their own clock cannot be pinning a policy that
+    /// nothing production-side reaches.
+    #[test]
+    fn an_unarmed_conversation_is_never_declined() {
+        let backoff = SpawnBackoff::default();
+        assert!(!backoff.declines(1));
+        backoff.record_failure(1);
+        assert!(backoff.declines(1), "one failure arms the base window");
+    }
+
+    /// One failure opens a window of the base length: declined inside it,
+    /// admitted the moment it lapses. Nothing renews the window but another
+    /// failure, so a conversation that simply stays broken is retried at the
+    /// tick rate rather than at the publish rate.
+    #[test]
+    fn a_failed_spawn_declines_until_its_window_lapses() {
+        let backoff = SpawnBackoff::default();
+        let t0 = Instant::now();
+        assert!(
+            !backoff.record_failure_at(1, t0),
+            "the base window is not the cap, so nothing alerts yet"
+        );
+
+        assert!(backoff.declines_at(1, t0 + SPAWN_BACKOFF_BASE / 2));
+        assert!(!backoff.declines_at(1, t0 + SPAWN_BACKOFF_BASE));
+        assert!(
+            !backoff.declines_at(2, t0),
+            "the backoff is per conversation — one broken spawn holds up nobody else"
+        );
+    }
+
+    /// Consecutive failures double the window to the cap and no further, and the
+    /// cap alert fires exactly once per episode: an operator must hear that a
+    /// conversation is silently not processing, but only once per outage.
+    #[test]
+    fn the_window_doubles_to_the_cap_and_alerts_once_per_episode() {
+        let backoff = SpawnBackoff::default();
+        let t0 = Instant::now();
+        let mut alerts = 0;
+        let mut failures = 0;
+        // Enough failures to pass the cap several times over.
+        while failures < 20 {
+            if backoff.record_failure_at(1, t0) {
+                alerts += 1;
+            }
+            failures += 1;
+        }
+        assert_eq!(alerts, 1, "one alert per failure episode, not per failure");
+        assert!(backoff.declines_at(1, t0 + SPAWN_BACKOFF_CAP - Duration::from_secs(1)));
+        assert!(
+            !backoff.declines_at(1, t0 + SPAWN_BACKOFF_CAP),
+            "the window is capped, so recovery latency stays operator-tolerable"
+        );
+    }
+
+    /// Failures until the window reaches the cap, returning how many of them
+    /// alerted. Bounded: a regression that made the cap unreachable, or the
+    /// episode's alert flag sticky, must fail an assertion rather than hang the
+    /// suite until CI times out.
+    fn failures_to_cap(backoff: &SpawnBackoff, conversation_id: i64, at: Instant) -> usize {
+        let mut alerts = 0;
+        for _ in 0..20 {
+            if backoff.record_failure_at(conversation_id, at) {
+                alerts += 1;
+            }
+        }
+        alerts
+    }
+
+    /// A successful spawn ends the episode: the next failure starts over at the
+    /// base window and may alert again. This is also how a user-initiated spawn
+    /// clears the bus side — both outcomes reach the same state.
+    #[test]
+    fn a_successful_spawn_ends_the_episode() {
+        let backoff = SpawnBackoff::default();
+        let t0 = Instant::now();
+        assert_eq!(failures_to_cap(&backoff, 1, t0), 1);
+        backoff.clear(1);
+        assert!(!backoff.declines_at(1, t0));
+
+        assert!(
+            !backoff.record_failure_at(1, t0),
+            "the episode restarted at the base window"
+        );
+        assert!(!backoff.declines_at(1, t0 + SPAWN_BACKOFF_BASE));
+        assert_eq!(
+            failures_to_cap(&backoff, 1, t0),
+            1,
+            "the cleared episode alerts again on the next outage"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The wiring in front of the spawn: which trigger consults the backoff,
+    // and what a finished attempt does to it.
+    // -----------------------------------------------------------------------
+
+    /// The backoff bounds the bus side and only the bus side: an armed
+    /// conversation declines the wake walk's every trigger, while a browser
+    /// attach still gets its spawn — a human retry is self-pacing and is the
+    /// likeliest probe to find a broken spawn working again.
+    #[tokio::test]
+    async fn an_armed_backoff_declines_the_bus_trigger_and_not_the_user_one() {
+        let state = AppState::for_test(brenn_lib::db::init_db_memory(), None);
+        let conv = 11_i64;
+
+        state.spawn_bus_wake(conv, chrono_tz::Tz::UTC);
+        assert_eq!(
+            *state.wake_spawns.lock().unwrap(),
+            vec![conv],
+            "an unarmed conversation's bus wake reaches the spawn"
+        );
+
+        state.spawn_backoff.record_failure(conv);
+        state.spawn_bus_wake(conv, chrono_tz::Tz::UTC);
+        assert_eq!(
+            *state.wake_spawns.lock().unwrap(),
+            vec![conv],
+            "the armed window declines the bus trigger"
+        );
+        state.spawn_eager_wake(conv, chrono_tz::Tz::UTC);
+        assert_eq!(
+            *state.wake_spawns.lock().unwrap(),
+            vec![conv, conv],
+            "the user trigger is never declined"
+        );
+
+        state.spawn_backoff.clear(conv);
+        state.spawn_bus_wake(conv, chrono_tz::Tz::UTC);
+        assert_eq!(
+            *state.wake_spawns.lock().unwrap(),
+            vec![conv, conv, conv],
+            "the cleared episode admits the bus side again"
+        );
+    }
+
+    /// A failed attempt arms the backoff and a successful one clears it —
+    /// the two halves of the episode, reached through the one function the
+    /// spawn task hands its outcome to.
+    #[tokio::test]
+    async fn a_spawn_outcome_arms_and_clears_the_backoff() {
+        let state = AppState::for_test(brenn_lib::db::init_db_memory(), None);
+        let conv = 12_i64;
+
+        state.record_spawn_outcome(conv, Err("no bridge".to_string()));
+        assert!(
+            state.spawn_backoff.declines(conv),
+            "a failed attempt opens the window"
+        );
+
+        state.record_spawn_outcome(conv, Ok(()));
+        assert!(
+            !state.spawn_backoff.declines(conv),
+            "a successful attempt ends the episode"
+        );
+    }
+
+    /// Reaching the cap raises exactly one `Warning` through the
+    /// `AlertDispatcher`: a conversation that cannot spawn is a conversation
+    /// silently not processing, and that is the operator's only signal.
+    #[tokio::test]
+    async fn the_cap_alerts_once_through_the_alert_dispatcher() {
+        use brenn_lib::obs::alerting::{AlertSeverity, make_capturing_alerter_with_severity};
+
+        let (alert_dispatcher, captured, handle) = make_capturing_alerter_with_severity();
+        let mut state = AppState::for_test(brenn_lib::db::init_db_memory(), None);
+        state.alert_dispatcher = alert_dispatcher;
+        let conv = 13_i64;
+
+        for _ in 0..20 {
+            state.record_spawn_outcome(conv, Err("no bridge".to_string()));
+        }
+        drop(state);
+        let _ = handle.await;
+
+        let alerts = captured.lock().unwrap();
+        assert_eq!(
+            alerts.len(),
+            1,
+            "one alert per failure episode, not per failure: {alerts:?}"
+        );
+        assert!(matches!(alerts[0].0, AlertSeverity::Warning));
     }
 }

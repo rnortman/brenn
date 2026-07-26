@@ -152,6 +152,42 @@ pub fn channel_subscriber_cursors(
         .collect()
 }
 
+/// Every cursor row in the database, each paired with the head of the channel
+/// it stands on (`last_retained_seq`, the high-water eviction does not lower).
+///
+/// The boot reconcile's read: it asks two questions of the whole table at once
+/// — does a live registration still justify this row, and does its position
+/// stand above everything the channel ever held — and neither is scoped to a
+/// channel the directory knows about, which is the point (a row on a channel
+/// dropped from config is exactly one of the orphans it removes).
+pub fn all_subscriber_cursors(conn: &Connection) -> Vec<(Uuid, SubscriberCursorRow, i64)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.channel_uuid, c.subscriber, c.app_slug, c.push_depth, c.next_owed_seq,
+                    ch.last_retained_seq
+             FROM messaging_subscriber_cursors c
+             JOIN messaging_channels ch ON ch.uuid = c.channel_uuid",
+        )
+        .expect("prepare all_subscriber_cursors");
+    let rows = stmt
+        .query_map([], |row| {
+            let uuid = Uuid::from_slice(&row.get::<_, Vec<u8>>(0)?)
+                .expect("messaging_subscriber_cursors.channel_uuid is a 16-byte uuid");
+            Ok((
+                uuid,
+                SubscriberCursorRow {
+                    subscriber: ParticipantId::from_stored(row.get::<_, String>(1)?),
+                    app_slug: row.get(2)?,
+                    push_depth: depth_from_sql(&row.get::<_, String>(3)?),
+                    next_owed_seq: row.get(4)?,
+                },
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .expect("query all_subscriber_cursors");
+    rows.map(|r| r.expect("read subscriber cursor")).collect()
+}
+
 /// Move `subscriber`'s cursor to `next_owed_seq` — the only write that changes
 /// a position.
 ///

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use brenn_lib::messaging::store::SurfaceFeedTarget;
 use brenn_lib::messaging::{
-    DeliveryShape, MessageEnvelope, ParticipantId, SubscriberEntryKind, WakeRouter, WakeServed,
+    DeliveryShape, MessageEnvelope, ParticipantId, SubscriberEntryKind, WakeRouter,
 };
 use brenn_lib::obs::alerting::{AlertDispatcher, AlertSeverity};
 use chrono_tz::Tz;
@@ -426,7 +426,11 @@ impl WakeRouter for WakeRouterImpl {
                 // Autonomous wake — no browser-reported timezone available.
                 // UTC is acceptable because every Graf tool requires a `today` param except for
                 // those where a few hours' difference is not usually critical (e.g. query horizon).
-                state.spawn_eager_wake(conversation_id, Tz::UTC);
+                //
+                // Bus-driven, so the spawn backoff applies: every trigger the
+                // walk and the dispatcher have — kick, tick, deadline, urgency —
+                // reaches a conversation through this one call.
+                state.spawn_bus_wake(conversation_id, Tz::UTC);
             }
             // Nudge every attached session of this slug to run a drain pass. No
             // per-channel filter (the wake carries only the participant): the
@@ -455,16 +459,23 @@ impl WakeRouter for WakeRouterImpl {
     /// wait for whatever the conversation did next. Every other binding's wake
     /// is its delivery trigger, so the default is the whole answer for them.
     ///
+    /// Liveness is asked before the verdict, and that order is the rule:
+    /// `spawn_permitted` prices a subprocess, and a bridge already running costs
+    /// none, so a live conversation is served its whole owed backlog at any
+    /// urgency. Only the spawn arm consults the verdict — a sleeping
+    /// conversation whose backlog is below `wake_min` waits for its next natural
+    /// drain or its deadline, which is what `wake_min` means.
+    ///
     /// The delivery itself runs on its own task. The walk that calls this is
     /// awaited by the dispatcher loop, and serving a live bridge renders markdown
     /// and writes to a CC subprocess — inline, one stalled session would hold up
     /// releases, deadline wakes, and every other channel's wakes behind it.
-    ///
-    /// Reporting that serve as [`WakeServed::Live`] is what keeps the walk's
-    /// wake cooldown off it: no subprocess was spawned, so there is no spawn to
-    /// pace, and a live bridge would otherwise be made to wait out a poll
-    /// interval for messages it is sitting there ready to render.
-    async fn wake_owed(&self, key: &SubscriberEntryKind, subscriber: &ParticipantId) -> WakeServed {
+    async fn wake_owed(
+        &self,
+        key: &SubscriberEntryKind,
+        subscriber: &ParticipantId,
+        spawn_permitted: bool,
+    ) {
         let conversation_bridge = matches!(
             self.bindings
                 .read()
@@ -490,10 +501,11 @@ impl WakeRouter for WakeRouterImpl {
                     );
                 }
             }));
-            return WakeServed::Live;
+            return;
         }
-        self.spawn_eager_wake(key, subscriber);
-        WakeServed::Spawned
+        if spawn_permitted {
+            self.spawn_eager_wake(key, subscriber);
+        }
     }
 
     fn delivery_shape(&self, key: &SubscriberEntryKind) -> DeliveryShape {
@@ -529,6 +541,34 @@ impl WakeRouter for WakeRouterImpl {
             format!(
                 "Channel {channel:?} subscriber {:?}: {count} message(s) passed the \
                  subscriber's position unread and are gone (noise = alarm).",
+                subscriber.as_str()
+            ),
+        );
+    }
+
+    fn position_ahead_of_retention(
+        &self,
+        channel: &str,
+        subscriber: &ParticipantId,
+        position: u64,
+        head: u64,
+    ) {
+        // Same wiring rule as `alarm`: production bootstrap sets the dispatcher
+        // before the Messenger it hands to this router can run a boot reconcile.
+        let dispatcher = self.alert_dispatcher.as_ref().unwrap_or_else(|| {
+            panic!(
+                "WakeRouterImpl::position_ahead_of_retention called but alert_dispatcher not set \
+                 — call set_alert_dispatcher before the boot reconcile can run"
+            )
+        });
+        dispatcher.alert(
+            AlertSeverity::Warning,
+            "Subscriber position ahead of retention".to_string(),
+            format!(
+                "Channel {channel:?} subscriber {:?}: position {position} stands above the \
+                 channel's head {head}, which no append can produce — the database was restored \
+                 under a position that outlived it. The position was reset to head; whatever the \
+                 subscriber missed is uncountable.",
                 subscriber.as_str()
             ),
         );
@@ -727,31 +767,28 @@ mod tests {
     /// something else — so a regression that falls through to it is exactly what
     /// this row catches. The delivery runs on its own task, so the assertion
     /// waits for the render rather than for `wake_owed` to return.
+    ///
+    /// Called with the spawn verdict **denied**, which is the liveness-before-
+    /// urgency rule at its own seam: the verdict prices a subprocess, this arm
+    /// spawns none, so a live bridge is served at any urgency.
     #[tokio::test]
-    async fn wake_owed_serves_a_live_bridge_from_its_position() {
+    async fn wake_owed_serves_a_live_bridge_whatever_the_verdict() {
         let (active_bridges, conversation_id, mut broadcast_rx, _cc_rx) =
             owed_conversation_bridge().await;
         let router = WakeRouterImpl::new(active_bridges);
         router.register_delivery_binding(conv_key(), DeliveryBinding::ConversationBridge);
 
-        let served = router
+        router
             .wake_owed(
                 &conv_key(),
                 &ParticipantId::for_conversation(conversation_id),
+                false,
             )
             .await;
 
         assert!(
             await_system_broadcast(&mut broadcast_rx).await,
             "the live bridge was served its backlog by the walk itself"
-        );
-        // The walk reads this to keep the spawn cooldown off a serve that
-        // spawned nothing; reporting `Spawned` here would pace a live bridge at
-        // one message per poll interval.
-        assert_eq!(
-            served,
-            WakeServed::Live,
-            "a serve that fired no wake must not be counted as one"
         );
     }
 
@@ -765,7 +802,19 @@ mod tests {
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.register_delivery_binding(conv_key(), DeliveryBinding::ConversationBridge);
         router
-            .wake_owed(&conv_key(), &ParticipantId::for_conversation(42))
+            .wake_owed(&conv_key(), &ParticipantId::for_conversation(42), true)
+            .await;
+    }
+
+    /// The other half of that rule: with no bridge to serve, a denied verdict is
+    /// the whole answer. Proven by the absence of the panic its sibling above
+    /// gets — reaching the spawn arm without an `AppState` cannot be silent.
+    #[tokio::test]
+    async fn wake_owed_without_a_bridge_respects_a_denied_verdict() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        router.register_delivery_binding(conv_key(), DeliveryBinding::ConversationBridge);
+        router
+            .wake_owed(&conv_key(), &ParticipantId::for_conversation(42), false)
             .await;
     }
 
@@ -1246,6 +1295,32 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(10), notify.notified())
             .await
             .expect("drain notifier fired for attached session");
+    }
+
+    /// Every bus-driven wake of a conversation goes through the **bus** spawn
+    /// entrypoint, so the spawn backoff bounds it: with the backoff armed the
+    /// router's wake reaches no spawn at all. Routing this arm to the
+    /// user-initiated entrypoint instead would compile, deliver, and quietly
+    /// restore the retry storm the backoff exists to damp.
+    #[tokio::test]
+    async fn the_conversation_arm_spawns_through_the_bus_entrypoint() {
+        let state = AppState::for_test(brenn_lib::db::init_db_memory(), None);
+        let spawns = Arc::clone(&state.wake_spawns);
+        let backoff = state.spawn_backoff.clone();
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        router.set_state(state);
+        router.register_delivery_binding(conv_key(), DeliveryBinding::ConversationBridge);
+
+        router.spawn_eager_wake(&conv_key(), &ParticipantId::for_conversation(42));
+        assert_eq!(*spawns.lock().unwrap(), vec![42]);
+
+        backoff.record_failure(42);
+        router.spawn_eager_wake(&conv_key(), &ParticipantId::for_conversation(42));
+        assert_eq!(
+            *spawns.lock().unwrap(),
+            vec![42],
+            "an armed conversation's bus wake is declined before it reaches a spawn"
+        );
     }
 
     /// `has_delivery_binding` is the boot cross-check's binding probe: false for

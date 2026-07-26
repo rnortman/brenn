@@ -101,15 +101,17 @@ pub struct PortWindow<E> {
     /// Index of the first new message. `new_from == envelopes.len()` is a pure
     /// context window — nothing new on this port.
     pub new_from: u32,
-    /// Messages lost to push overflow on this port since the previous
-    /// activation consumed it. Overflow retires the delivery obligation, never
-    /// the message body: the bodies are readable as context wherever retention
-    /// covers them.
+    /// Messages that passed this port's position unserved since the previous
+    /// activation consumed it. Nothing retires a message body: the bodies stay
+    /// readable as context wherever retention covers them.
     ///
-    /// Best-effort and within-lifetime: the counter lives in host memory, so a
-    /// host restart resets it and `dropped == 0` is not proof of no-gap across
-    /// one. Always 0 for a port whose `push_depth` is 0 — it has no push rows to
-    /// overflow.
+    /// Not a stored counter — the distance between the position and the oldest
+    /// message the window served, so its reach is the position's reach. A
+    /// durable channel persists the position, so a gap straddling a host
+    /// restart is still reported after it; a non-durable channel dies with the
+    /// process, so there `dropped == 0` is not proof of no-gap across one.
+    /// Always 0 for a port whose `push_depth` is 0 — it holds no position and
+    /// so can never be passed.
     pub dropped: u64,
 }
 

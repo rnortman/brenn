@@ -60,9 +60,7 @@ fn tool_resolved_channel(defaults: &MessagingGlobalConfig) -> ResolvedChannel {
 /// The `brenn:tools/<tool>` request channel for one async tool. The
 /// `system:tool-executor` subscriber is not pre-set here: it is folded in from
 /// the executor's [`SystemParticipantSpec`] subscriptions
-/// (`fold_spec_subscriptions`), like every system subscription. It is a
-/// programmatic (non-config) subscriber, so it lives only in the directory —
-/// no `messaging_subscriptions` row is written for it.
+/// (`fold_spec_subscriptions`), like every system subscription.
 pub fn request_channel_entry(tool: &str, defaults: &MessagingGlobalConfig) -> ChannelEntry {
     let address = canonical_address(&request_channel_name(tool));
     ChannelEntry {
@@ -78,9 +76,8 @@ pub fn request_channel_entry(tool: &str, defaults: &MessagingGlobalConfig) -> Ch
 
 /// The `brenn:tool-results/<slug>` inbox channel for one consumer, with no
 /// subscriber pre-set: the consumer's `Wasm(slug)` subscription is folded in
-/// through the normal wasm-subscription path (see [`inbox_subscription`]) so it
-/// is written to both the directory and `messaging_subscriptions`, exactly like a
-/// configured wasm subscription.
+/// through the normal wasm-subscription path (see [`inbox_subscription`]),
+/// exactly like a configured wasm subscription.
 pub fn result_inbox_entry(slug: &str, defaults: &MessagingGlobalConfig) -> ChannelEntry {
     let address = canonical_address(&result_inbox_name(slug));
     ChannelEntry {

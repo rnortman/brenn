@@ -4,13 +4,9 @@ use crate::db::format_ts_for_db;
 use chrono::Utc;
 
 use super::super::{
-    ChannelEntry, ChannelScheme, ResolvedMessagingConfig, SubscriberEntryKind,
-    config::{
-        Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel, ResolvedSubscription,
-        ResolvedSurfaceSubscription,
-    },
+    ChannelEntry, ChannelScheme,
+    config::{Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel},
 };
-use super::dynamic::DynamicSubscriptionRow;
 use uuid::Uuid;
 
 /// Upsert all configured channels into `messaging_channels`. UUIDs not
@@ -174,122 +170,6 @@ pub(super) fn noise_to_sql(n: NoiseLevel) -> &'static str {
     }
 }
 
-/// Truncate-and-rebuild `messaging_subscriptions` from the apps' resolved
-/// messaging configs and from WASM consumer subscriptions. Done at every server
-/// start.
-///
-/// Every push-enabled subscriber kind lands here, not just apps: the table is a
-/// flat record of subscriptions with no kind column, so a reader of it sees one
-/// shape whatever the subscriber is. `surfaces` supplies
-/// `(surface_slug, durable_subscriptions)`; each becomes a
-/// `messaging_subscriptions` row keyed on `app_slug =
-/// SubscriberEntryKind::subscriber_key()` — the surface slug for a
-/// kernel-grain subscription (the layout channel), `<slug>#<instance>` for a
-/// component instance's. That is the same key the subscriber is known by
-/// everywhere else, so the row joins to its subscriber without a translation
-/// step.
-///
-/// The `(channel_uuid, app_slug)` PK never collides: `resolve_surfaces` folds a
-/// principal's repeated bindings of one channel into a single subscription, so
-/// each (principal, channel) appears once; distinct instances carry distinct
-/// `#`-bearing keys; and boot enforces surface slugs are disjoint from app and
-/// wasm-consumer slugs, which covers the one key that has no `#`.
-pub fn rebuild_subscriptions(
-    conn: &Connection,
-    apps_with_messaging: &[(String, ResolvedMessagingConfig)],
-    wasm_consumers: &[(String, Vec<ResolvedSubscription>)],
-    surfaces: &[(String, Vec<ResolvedSurfaceSubscription>)],
-) {
-    conn.execute("DELETE FROM messaging_subscriptions", [])
-        .expect("messaging: clear subscriptions");
-    for (slug, msg) in apps_with_messaging {
-        for sub in &msg.subscriptions {
-            conn.execute(
-                "INSERT INTO messaging_subscriptions \
-                 (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    sub.channel_uuid.as_bytes().to_vec(),
-                    slug,
-                    depth_to_sql(sub.push_depth),
-                    depth_to_sql(sub.retain_depth),
-                    noise_to_sql(sub.noise),
-                    sub.wake_min.as_str(),
-                ],
-            )
-            .expect("messaging: insert app subscription");
-        }
-    }
-    // The table records no subscriber kind, so wasm-consumer and surface
-    // subscriptions insert identically once each has resolved its key.
-    let rows = wasm_consumers
-        .iter()
-        .flat_map(|(slug, subs)| subs.iter().map(move |sub| (slug.clone(), sub)))
-        .chain(surfaces.iter().flat_map(|(slug, subs)| {
-            subs.iter().map(move |sub| {
-                let key = SubscriberEntryKind::Surface {
-                    slug: slug.clone(),
-                    instance: Some(sub.instance.clone()),
-                }
-                .subscriber_key();
-                (key, &sub.subscription)
-            })
-        }));
-    for (app_slug, sub) in rows {
-        conn.execute(
-            "INSERT INTO messaging_subscriptions \
-             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                sub.channel_uuid.as_bytes().to_vec(),
-                app_slug,
-                depth_to_sql(sub.push_depth),
-                depth_to_sql(sub.retain_depth),
-                noise_to_sql(sub.noise),
-                sub.wake_min.as_str(),
-            ],
-        )
-        .expect("messaging: insert static subscription");
-    }
-}
-
-/// Mirror the surviving durable dynamic-subscription rows into the
-/// `messaging_subscriptions` table at boot (design §2.1 "Boot merge").
-///
-/// Runs *after* [`rebuild_subscriptions`] (which truncated + re-inserted the
-/// static rows) and *after* the boot merge folded these rows into the directory
-/// and resolved collisions, so this is a plain `INSERT` of non-colliding rows —
-/// never an UPSERT, and the PK `(channel_uuid, app_slug)` never collides (any
-/// dynamic row whose `(channel, app)` already had a static row was dropped at
-/// merge time, design §2.1 "Mirror collision policy").
-///
-/// The mirror is what makes `messaging_subscriptions` a complete record of every
-/// live subscription: a dynamic sub is recorded there on the same terms as a
-/// static one, so a reader of that table needs no second source to learn a
-/// subscriber's resolved params. Its one reader today is the cursor-seed
-/// migration (`db/schema.rs`), which resolves a subscriber's recorded
-/// `push_depth` from it. The MQTT-only `qos` is intentionally not mirrored:
-/// `messaging_subscriptions` has no `qos` column and no reader of it needs one
-/// (the durable truth keeps `qos`).
-pub fn mirror_dynamic_subscriptions(conn: &Connection, rows: &[DynamicSubscriptionRow]) {
-    for row in rows {
-        conn.execute(
-            "INSERT INTO messaging_subscriptions \
-             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                row.channel_uuid.as_bytes().to_vec(),
-                &row.app_slug,
-                depth_to_sql(row.push_depth),
-                depth_to_sql(row.retain_depth),
-                noise_to_sql(row.noise),
-                row.wake_min.as_str(),
-            ],
-        )
-        .expect("messaging: mirror dynamic subscription");
-    }
-}
-
 /// Prune durable dynamic-subscription rows that the boot merge dropped (their
 /// channel is gone from config, or a static sub now overrides them) from
 /// `messaging_dynamic_subscriptions`, keyed by `(channel_uuid, app_slug)`
@@ -345,91 +225,6 @@ mod tests {
         upsert_channels(conn, std::slice::from_ref(&entry));
     }
 
-    fn dyn_row(uuid: Uuid, app: &str, push: Depth, retain: Depth) -> DynamicSubscriptionRow {
-        DynamicSubscriptionRow {
-            channel_uuid: uuid,
-            app_slug: app.to_string(),
-            push_depth: push,
-            retain_depth: retain,
-            noise: NoiseLevel::Metered,
-            wake_min: WakeMin::High,
-            qos: Some(1),
-            created_at: "2026-06-20T00:00:00Z".to_string(),
-        }
-    }
-
-    /// Read a `messaging_subscriptions` row's params for assertions.
-    fn read_mirror_row(
-        conn: &Connection,
-        uuid: Uuid,
-        app: &str,
-    ) -> Option<(String, String, String, String)> {
-        conn.query_row(
-            "SELECT push_depth, retain_depth, noise, wake_min \
-             FROM messaging_subscriptions WHERE channel_uuid = ?1 AND app_slug = ?2",
-            rusqlite::params![uuid.as_bytes().to_vec(), app],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .ok()
-    }
-
-    /// Mirroring a surviving dynamic row inserts the generic params into
-    /// `messaging_subscriptions` in their SQL wire form (the `qos` is dropped —
-    /// the mirror table has no such column).
-    #[test]
-    fn mirror_inserts_dynamic_row_into_messaging_subscriptions() {
-        let conn = test_conn();
-        let uuid = Uuid::new_v4();
-        seed_channel(&conn, uuid, "heartbeat");
-        let rows = vec![dyn_row(uuid, "graf", Depth::Bounded(0), Depth::Bounded(5))];
-
-        mirror_dynamic_subscriptions(&conn, &rows);
-
-        let mirrored = read_mirror_row(&conn, uuid, "graf").expect("mirror row present");
-        assert_eq!(
-            mirrored,
-            (
-                "0".to_string(),
-                "5".to_string(),
-                "metered".to_string(),
-                "high".to_string()
-            )
-        );
-    }
-
-    /// A static row and a (non-colliding) dynamic row for the same channel,
-    /// different apps, coexist in the mirror — the dynamic insert is a plain
-    /// INSERT and never collides on the static PK (different app_slug).
-    #[test]
-    fn mirror_coexists_with_static_rows_for_other_apps() {
-        let conn = test_conn();
-        let uuid = Uuid::new_v4();
-        seed_channel(&conn, uuid, "heartbeat");
-        // Simulate rebuild_subscriptions having inserted a static row for pfin.
-        conn.execute(
-            "INSERT INTO messaging_subscriptions \
-             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min) \
-             VALUES (?1, 'pfin', '3', '3', 'silent', 'normal')",
-            rusqlite::params![uuid.as_bytes().to_vec()],
-        )
-        .expect("seed static row");
-
-        mirror_dynamic_subscriptions(
-            &conn,
-            &[dyn_row(uuid, "graf", Depth::Unbounded, Depth::Bounded(2))],
-        );
-
-        assert!(
-            read_mirror_row(&conn, uuid, "pfin").is_some(),
-            "static row intact"
-        );
-        let graf = read_mirror_row(&conn, uuid, "graf").expect("dynamic mirror row present");
-        assert_eq!(
-            graf.0, "unbounded",
-            "unbounded push_depth round-trips to wire form"
-        );
-    }
-
     /// Pruning a dropped `(channel, app)` key removes exactly that durable
     /// dynamic-subscription row, leaving others intact.
     #[test]
@@ -461,42 +256,7 @@ mod tests {
         assert_eq!(remaining, vec!["pfin".to_string()], "only graf pruned");
     }
 
-    /// `rebuild_subscriptions` truncates only `messaging_subscriptions`; a durable
-    /// dynamic row in `messaging_dynamic_subscriptions` survives the boot rebuild
-    /// untouched (design §2.1 "Storage" / §5 "Dynamic-table row survives a
-    /// simulated `rebuild_subscriptions`"). The table separation is the structural
-    /// guarantee; this guards it against a future schema change.
-    #[test]
-    fn dynamic_row_survives_rebuild_subscriptions() {
-        let conn = test_conn();
-        let uuid = Uuid::new_v4();
-        seed_channel(&conn, uuid, "heartbeat");
-        conn.execute(
-            "INSERT INTO messaging_dynamic_subscriptions \
-             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
-             VALUES (?1, 'graf', '0', '5', 'silent', 'normal', 1, '2026-06-20T00:00:00Z')",
-            rusqlite::params![uuid.as_bytes().to_vec()],
-        )
-        .expect("seed dynamic row");
-
-        // A boot rebuild with no static config — truncates messaging_subscriptions.
-        rebuild_subscriptions(&conn, &[], &[], &[]);
-
-        let dynamic_count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM messaging_dynamic_subscriptions \
-                 WHERE channel_uuid = ?1 AND app_slug = 'graf'",
-                rusqlite::params![uuid.as_bytes().to_vec()],
-                |r| r.get(0),
-            )
-            .expect("count dynamic rows");
-        assert_eq!(
-            dynamic_count, 1,
-            "rebuild_subscriptions must not touch the dynamic table"
-        );
-    }
-
-    // --- load_channels_by_uuids (design §2.1, §4 Persistence) ---
+    // --- load_channels_by_uuids ---
 
     /// Seed `messaging_channels` with one channel of a given transport so the
     /// reconstruction read has a row to decode.

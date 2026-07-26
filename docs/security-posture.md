@@ -523,10 +523,20 @@ internally-originated.
   must not base any authorization decision on a message's claimed sender or type
   for any channel that admits guest-forwarded content.** A downstream
   authorization decision keyed on forgeable provenance is a finding.
+- **Subscribe authorization is re-decided at the read.** A guest's
+  `subscribe_acl` is not merely validated at boot: the activation read
+  (`Messenger::load_activation_snapshot`) asks the same fail-closed predicate per
+  input port, and a port whose policy no longer covers its channel is served an
+  empty window and advanced over nothing — so a revocation takes effect without a
+  restart, and a restoration serves the retained backlog rather than skipping it.
+  The boot panic remains the primary structural check; the read gate is what
+  keeps enforcement from resting on that check holding forever. A delivery path
+  that reads a channel without consulting the predicate is a finding.
 
 **What the reviewer verifies:** capabilities are deny-by-default and
-structurally enforced; no ambient access exists; every untrusted-guest execution
-is CPU/wall-clock/memory bounded (or restricted to in-tree only); every WASM
+structurally enforced; no ambient access exists; the delivery read consults the
+subscribe policy per port; every untrusted-guest execution is
+CPU/wall-clock/memory bounded (or restricted to in-tree only); every WASM
 consumer's activation rate is bounded by the per-component activation pacer (no
 unpaced consumer path exists); output volume and guest strings are bounded and
 sanitized; per-component storage is isolated and injection-safe; no downstream

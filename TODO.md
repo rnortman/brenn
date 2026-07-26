@@ -3,20 +3,26 @@
 ## `substrate-unsubscribe-publish-race`
 
 `unsubscribe_dynamic` (`brenn-lib/src/messaging/subscribe.rs`) tears down a
-subscriber's push rows via `detach_subscriber`, but that delete is not serialized
-against a concurrent publish. A publish that resolved its target list (app still
-subscribed) before the unsubscribe ran can insert its push rows *after* the delete,
-leaving rows naming a fully-unsubscribed subscriber: the dispatcher keeps reporting it
-as owed work (via `channel_deliverable_subscribers`) and may deliver a message after
-the unsubscribe was acknowledged. Closing it means the push insert must pass a "durable
-sub row exists" guard in the same lock scope as the delete — which rides on the
-publish-pipeline reshape that replaces per-publish target resolution with the store's
-attached set, so it lands with that work, not as a standalone patch. Done when a
-publish racing an unsubscribe cannot leave an owed push row for the departed subscriber,
-pinned by a test.
+subscriber's delivery state via `detach_conversation` → `detach_subscriber`, which
+deletes the cursor row. That delete is not serialized against a drain already in
+flight for the same subscriber: `conversation_delivery` reads its windows under one
+lock hold, the caller renders and sends outside the lock, and `advance_conversation`
+takes the lock again to move the positions. An unsubscribe landing between the two
+leaves the advance with no row to move, and `DbStore::advance` panics
+(`store/db.rs`, "has no cursor ... to advance") — a legitimate operator action
+killing the process. Closing it means the teardown and the drain's read→advance pair
+must agree on a scope: either the advance tolerates a departed subscriber (its
+position is gone, so there is nothing to move and nothing to report), or the detach
+waits behind an in-flight delivery. Done when an unsubscribe racing a drain cannot
+panic, pinned by a test.
+
+Note: the older shape of this race — a publish inserting push rows after the
+delete, leaving a fully-unsubscribed subscriber owed work — is gone. Commits are
+target-blind now (no per-subscriber rows are written at publish), so a concurrent
+publish can no longer resurrect delivery state for a departed subscriber.
 
 Code site (`TODO(substrate-unsubscribe-publish-race)`):
-`brenn-lib/src/messaging/subscribe.rs` (the `detach_subscriber` teardown step in
+`brenn-lib/src/messaging/subscribe.rs` (the `detach_conversation` teardown step in
 `unsubscribe_dynamic`).
 
 ## `scrub-template-drift-cache-skip`
@@ -726,21 +732,6 @@ Code site (`TODO(intercept-noop-shape)`):
 
 ---
 
-## `substrate-nondurable-subscribe`
-
-`subscribe_dynamic` accepts a non-durable channel and holds the registration in
-memory, but only pull-only (`push_depth = 0`): a push-enabled subscribe is
-refused, because no delivery path carries ring-backed messages to a
-conversation. App-kind delivery today is push rows read by the dispatcher, and a
-ring has none; the ring cursor's take is destructive, so waking a sleeping
-conversation and delivering only once its bridge is up needs the store's
-peek/take delivery contract. That lands with the dispatcher/delivery collapse.
-Done when a push-enabled dynamic subscribe to a non-durable channel is accepted
-and its messages reach the conversation.
-
-Code site (`TODO(substrate-nondurable-subscribe)`):
-`brenn-lib/src/messaging/subscribe.rs` (`subscribe_dynamic`, step 3b).
-
 ## `substrate-deferred-view-count-shortcut`
 
 The WASM drain builds a deferred-window view per bound output port every
@@ -765,23 +756,3 @@ accurate across every park/cancel/release/quota site, including the durable park
 Code site (`TODO(substrate-deferred-view-count-shortcut)`):
 `brenn-server/src/wasm_dispatch/mod.rs` (the `for out in &cfg.outputs`
 deferred-view loop in `drain_step`).
-
-## `surface-reanchor-frame`
-
-`ServerFrame::ReAnchor` has a kernel handler and a test battery but no sender
-anywhere in-tree. It was built for a server that carried per-subscription
-below-water bookkeeping needing a reconcile; that bookkeeping is gone, and a
-surface's delivery state is now the cursor the client echoes at subscribe, which
-subscribe-time replay already heals. What is undecided is whether the wire keeps
-an explicit cursor-confirm / re-anchor frame at all — cheap resume hygiene that
-lets the server retire a stale server-side cursor without waiting for a
-reconnect — or relies purely on subscribe-time replay. It touches the PWA
-client, so it is a session-layer call, not a substrate one. Until it is
-answered, this is unreachable protocol surface whose handler and tests cost
-maintenance against a path no server can trigger. Done when either a server path
-sends the frame or the variant, its handler, and its tests are deleted (no compat
-concern — the frontend redeploys with the backend).
-
-Code sites (`TODO(surface-reanchor-frame)`):
-`surface/proto/src/lib.rs` (the `ServerFrame::ReAnchor` variant),
-`surface/kernel/src/core/mod.rs` (`on_re_anchor`).

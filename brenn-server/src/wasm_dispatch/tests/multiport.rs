@@ -339,6 +339,97 @@ async fn multiport_sampled_port_included_as_pure_context() {
     assert_eq!(arr[1]["dropped"].as_u64(), Some(0), "in1 dropped must be 0");
 }
 
+/// The delivery-time ACL gate on a component that reads two channels and is
+/// covered on only one: the allowed port is served normally, the denied port
+/// contributes an empty window (no entries, `new_from = 0`, nothing to advance
+/// over), and the denied port's position does not move — so a restored policy
+/// serves the backlog that accumulated rather than stepping past it.
+///
+/// Every other WASM denial pin denies the consumer's only port, which returns
+/// before a snapshot is ever built. This is the mixed shape: the branch that
+/// composes an empty window beside a served one, and the advance loop that must
+/// skip it.
+#[tokio::test]
+async fn a_denied_port_is_empty_and_unadvanced_beside_a_served_sibling() {
+    let slug = "mp-mixed-acl";
+    let (messenger, channels, wasm_sub, cfg, _alert_handle, _db) =
+        build_multi_channel_setup(slug, &["mixed-allowed-ch", "mixed-denied-ch"]).await;
+
+    // A second Messenger over the same database and directory whose registered
+    // policy covers channel[0] only: same positions, same retention, only the
+    // authorization differs.
+    let mut policies = std::collections::HashMap::new();
+    policies.insert(
+        slug.to_string(),
+        delivery_policy_for_addresses([channels[0].address.as_str()]),
+    );
+    let denied = brenn_lib::messaging::Messenger::new(
+        messenger.db().clone(),
+        Arc::clone(messenger.directory()),
+        Arc::from("test"),
+        Arc::new(IndexMap::new()),
+        Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
+        MessagingGlobalConfig::default(),
+    )
+    .with_subscriber_registrations(brenn_lib::messaging::testutils::wasm_registrations(
+        policies,
+    ));
+
+    testutils::insert_bus_message(&denied, &channels[0], "served", ChannelScheme::Brenn).await;
+    testutils::insert_bus_message(&denied, &channels[1], "withheld", ChannelScheme::Brenn).await;
+
+    let snapshots = denied
+        .load_activation_snapshot(&wasm_sub, &cfg.inputs)
+        .await
+        .expect("the allowed port is owed a message, so the component activates");
+    assert_eq!(snapshots.len(), 2);
+    assert_eq!(
+        snapshots[0].new_entries().len(),
+        1,
+        "the covered port is served its message"
+    );
+    assert!(
+        snapshots[1].entries.is_empty() && snapshots[1].new_from == 0,
+        "the denied port contributes an empty window, got {:?}",
+        snapshots[1].entries
+    );
+    assert!(
+        snapshots[1].advance_span().is_none(),
+        "an empty window has no span for the advance loop to walk"
+    );
+
+    // The real drain, through the dispatcher's own advance pass.
+    let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
+    let denied_cfg = WasmConsumerConfig {
+        slug: slug.to_string(),
+        component: Arc::clone(&cfg.component),
+        notify: Arc::clone(&cfg.notify),
+        messenger: Arc::clone(&denied),
+        alert_dispatcher,
+        inputs: cfg.inputs.clone(),
+        outputs: vec![],
+        activation_pacing: unthrottled_pacing(),
+    };
+    drain_step(&denied_cfg, &wasm_sub).await;
+
+    // Read the positions off the store directly: what the gate withheld is still
+    // owed, and only the covered channel's position moved.
+    let still_owed: Vec<String> =
+        brenn_lib::messaging::testutils::owed_everywhere(&denied, &wasm_sub)
+            .await
+            .into_iter()
+            .map(|(address, _)| address)
+            .collect();
+    assert_eq!(
+        still_owed,
+        vec![channels[1].address.clone()],
+        "the denied port's position stayed put while the served one advanced"
+    );
+
+    drop(denied_cfg);
+    let _ = alert_handle.await;
+}
+
 /// §5 test 3 (sampled-only traffic, no activation): only the sampled channel
 /// (push_depth=0) has messages (inserted as retained context only). No push rows
 /// exist so `drain_step` returns without invoking the guest and produces no output.
@@ -998,8 +1089,9 @@ async fn processor_dual_multi_port_activation_per_port_publish_resolution() {
         upsert_channels(&conn, &all_entries);
     }
     // The out1/out2 WASM subscribers are registered with a policy covering each
-    // channel they subscribe to, which is the shape boot builds: every live
-    // subscriber resolves a policy and its wake economics from its registration.
+    // channel they subscribe to, which is the shape boot builds and what the
+    // delivery-time ACL gate requires: a port whose policy does not cover its
+    // channel is served an empty window.
     let wasm_policies = wasm_policies_from_entries(&all_entries);
     let directory = Arc::new(MessagingDirectory::with_entries(all_entries));
     let router = Arc::new(NoopWakeRouter);

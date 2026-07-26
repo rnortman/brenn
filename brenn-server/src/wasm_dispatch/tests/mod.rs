@@ -168,7 +168,7 @@ pub(super) fn brenn_channel(address: &str, sub_slug: &str) -> ChannelEntry {
     }
 }
 
-use crate::test_support::app_config::wasm_policies_from_entries;
+use crate::test_support::app_config::{delivery_policy_for_addresses, wasm_policies_from_entries};
 
 const DEMO_WASM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

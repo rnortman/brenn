@@ -426,7 +426,20 @@ async fn chaining_wake_store_walk_fires_eager_wake_for_downstream_subscriber() {
         Arc::new(IndexMap::new()),
         Arc::clone(&capturing_router) as Arc<dyn WakeRouter>,
         brenn_lib::messaging::config::MessagingGlobalConfig::default(),
-    );
+    )
+    // The walk's ACL gate reads the registration, so the stand-in messenger
+    // needs the same one the fixture built or the wake it is here to observe is
+    // denied before it is decided.
+    .with_subscriber_registrations(brenn_lib::messaging::testutils::wasm_registrations(
+        wasm_policies_from_entries(
+            &messenger
+                .directory()
+                .list()
+                .iter()
+                .map(|entry| ChannelEntry::clone(entry))
+                .collect::<Vec<_>>(),
+        ),
+    ));
     walker.wake_owed_subscribers(Utc::now()).await;
 
     let woken = capturing_router.woken.lock().unwrap();
@@ -798,7 +811,13 @@ async fn build_ring_backed_consumer(
         Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
         MessagingGlobalConfig::default(),
     )
-    .with_ring_stores(Arc::clone(&ring_stores));
+    .with_ring_stores(Arc::clone(&ring_stores))
+    .with_subscriber_registrations(brenn_lib::messaging::testutils::wasm_registrations(
+        std::collections::HashMap::from([(
+            slug.to_string(),
+            delivery_policy_for_addresses([entry.address.as_str()]),
+        )]),
+    ));
 
     messenger.attach_ring_subscriber(&uuid, &wasm_sub, u64::MAX, Priming::Head);
     let ring = Arc::clone(ring_stores.get(&uuid).expect("registered ring store"));
@@ -915,7 +934,10 @@ async fn build_mixed_class_consumer(
     )
     .with_ring_stores(Arc::clone(&ring_stores))
     .with_subscriber_registrations(brenn_lib::messaging::testutils::wasm_registrations(
-        wasm_policies_from_entries(std::slice::from_ref(durable.as_ref())),
+        std::collections::HashMap::from([(
+            slug.to_string(),
+            delivery_policy_for_addresses([durable.address.as_str(), ring_entry.address.as_str()]),
+        )]),
     ));
 
     messenger.attach_ring_subscriber(&ring_entry.uuid, &wasm_sub, u64::MAX, Priming::Head);

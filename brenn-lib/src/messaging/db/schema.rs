@@ -14,10 +14,11 @@ use super::dynamic::depth_from_sql;
 /// Idempotent — pure `CREATE ... IF NOT EXISTS` DDL, safe to run on every boot
 /// (it is, via `crate::db::run_migrations`). Creates, in FK-dependency order:
 /// `messaging_channels`, `messaging_messages` (+ FTS + triggers),
-/// `messaging_subscriptions`, `messaging_dynamic_subscriptions`,
-/// `messaging_send_budget`, `messaging_pending_pushes`, and
-/// `messaging_wasm_consume_failures`. `messaging_subscriber_cursors` comes last,
-/// with its seed ([`create_and_seed_subscriber_cursors`]).
+/// `messaging_dynamic_subscriptions`, `messaging_send_budget`,
+/// `messaging_pending_pushes`, and `messaging_wasm_consume_failures`.
+/// `messaging_subscriber_cursors` comes last, with its seed
+/// ([`create_and_seed_subscriber_cursors`]) and then the drop of the flat
+/// `messaging_subscriptions` mirror that seed is the last reader of.
 ///
 /// No structural migrations are currently registered; the marked slot below is
 /// where future column/table migrations are added behind `column_exists` /
@@ -98,26 +99,14 @@ pub fn run_messaging_migrations(conn: &Connection) {
                 INSERT INTO messaging_messages_fts(rowid, body) VALUES (new.id, new.body);
             END;
 
-        CREATE TABLE IF NOT EXISTS messaging_subscriptions (
-            channel_uuid   BLOB NOT NULL REFERENCES messaging_channels(uuid),
-            app_slug       TEXT NOT NULL,
-            push_depth     TEXT NOT NULL,
-            retain_depth   TEXT NOT NULL,
-            noise          TEXT NOT NULL CHECK(noise IN ('silent','metered','alarm')),
-            wake_min       TEXT NOT NULL CHECK(wake_min IN ('very-low','low','normal','high','never')),
-            PRIMARY KEY (channel_uuid, app_slug)
-        );
-        CREATE INDEX IF NOT EXISTS idx_messaging_subscriptions_app
-            ON messaging_subscriptions(app_slug);
-
-        -- Durable dynamic (runtime-created) subscriptions (design §2.1).
-        -- Structurally parallel to messaging_subscriptions, plus a transport-
-        -- specific MQTT `qos` column (NULL for brenn:/webhook:) and a
-        -- created_at timestamp. CRUCIALLY this table is NOT touched by
-        -- rebuild_subscriptions and NOT truncated at boot: it is the durable
-        -- truth for dynamic subs, with its own independent lifecycle. The boot
-        -- merge folds these rows into the directory and mirrors them into
-        -- messaging_subscriptions; runtime subscribe/unsubscribe writes here.
+        -- Durable dynamic (runtime-created) subscriptions, carrying a
+        -- transport-specific MQTT `qos` column (NULL for brenn:/webhook:) and a
+        -- created_at timestamp. CRUCIALLY this table is NOT truncated at boot:
+        -- it is the durable truth for dynamic subs, with its own independent
+        -- lifecycle. The boot merge folds these rows into the directory;
+        -- runtime subscribe/unsubscribe writes here. Registration state, not
+        -- position state — where a subscriber stands is
+        -- messaging_subscriber_cursors' answer.
         CREATE TABLE IF NOT EXISTS messaging_dynamic_subscriptions (
             channel_uuid   BLOB NOT NULL REFERENCES messaging_channels(uuid),
             app_slug       TEXT NOT NULL,
@@ -301,7 +290,28 @@ pub fn run_messaging_migrations(conn: &Connection) {
     // passes above just numbered and released.
     create_and_seed_subscriber_cursors(conn);
 
+    drop_subscriptions_mirror(conn);
+
     delete_bus_pending_pushes(conn);
+}
+
+/// Drop the flat `messaging_subscriptions` mirror.
+///
+/// The seed above is its terminal reader, and nothing in this binary writes it:
+/// what an app subscribes to is the directory's answer, rebuilt from config at
+/// every boot, and the durable dynamic rows are their own table. A flat copy of
+/// both, maintained by three write paths for no reader, is state that can only
+/// disagree.
+///
+/// Unguarded and outside the cursor table's run-once guard, so it is idempotent
+/// rather than run-once: on the migration boot the seed reads the table earlier
+/// in this same call; a database that already ran the cursor migration under an
+/// interim build carries an orphaned table the guard would otherwise preserve
+/// forever, and converges here on its next boot; on a fresh database it is a
+/// no-op.
+fn drop_subscriptions_mirror(conn: &Connection) {
+    conn.execute_batch("DROP TABLE IF EXISTS messaging_subscriptions;")
+        .expect("failed to drop messaging_subscriptions");
 }
 
 /// Delete every channel-backed row from `messaging_pending_pushes`.
@@ -379,7 +389,7 @@ fn create_and_seed_subscriber_cursors(conn: &Connection) {
 }
 
 /// Whether `table` exists in this database.
-fn table_exists(conn: &Connection, table: &str) -> bool {
+pub(super) fn table_exists(conn: &Connection, table: &str) -> bool {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
         rusqlite::params![table],
@@ -481,6 +491,13 @@ fn seed_subscriber_cursors(conn: &Connection) {
         .collect();
     drop(stmt);
 
+    // The flat subscription mirror is the pre-cursor binary's; this boot drops it
+    // once the seed is done, and a database that never carried it (a fresh one,
+    // created by this binary) reaches the seed with no rows to read anyway. Where
+    // it is absent the seed positions from the claims alone, which is what the
+    // no-registration arm below already does.
+    let mirror_present = table_exists(conn, "messaging_subscriptions");
+
     for pos in claimed {
         let (channel_uuid, subscriber) = (pos.channel_uuid, &pos.subscriber);
         assert!(
@@ -520,15 +537,18 @@ fn seed_subscriber_cursors(conn: &Connection) {
         // System components hold none, and a subscriber whose registration is
         // gone is an orphan whose row the boot reconcile drops; both are
         // recorded unbounded, which the first window read retunes.
-        let registered_depth: Option<String> = conn
-            .query_row(
+        let registered_depth: Option<String> = if mirror_present {
+            conn.query_row(
                 "SELECT push_depth FROM messaging_subscriptions
                  WHERE channel_uuid = ?1 AND app_slug = ?2",
                 rusqlite::params![channel_uuid.as_bytes().to_vec(), &pos.app_slug],
                 |row| row.get(0),
             )
             .optional()
-            .expect("query cursor seed registration depth");
+            .expect("query cursor seed registration depth")
+        } else {
+            None
+        };
         let push_depth = match registered_depth.as_deref() {
             // Sampled: never delivered to, so these claims are residue and the
             // subscriber holds no position.
@@ -694,7 +714,6 @@ fn assert_messaging_schema_current(conn: &Connection) {
     const SENTINELS: &[(&str, &str)] = &[
         ("messaging_pending_pushes", "eager_wake"),
         ("messaging_messages", "urgency"),
-        ("messaging_subscriptions", "wake_min"),
     ];
     for (table, column) in SENTINELS {
         if !crate::db::column_exists(conn, table, column) {
@@ -812,7 +831,6 @@ mod tests {
             "messaging_channels",
             "messaging_messages",
             "messaging_messages_fts",
-            "messaging_subscriptions",
             "messaging_dynamic_subscriptions",
             "messaging_pending_pushes",
             "messaging_subscriber_cursors",
@@ -1088,20 +1106,8 @@ mod tests {
             );
         }
 
-        // messaging_subscriptions: depth/wake model present, legacy kind absent.
-        for col in &["push_depth", "retain_depth", "noise", "wake_min"] {
-            assert!(
-                column_exists(&conn, "messaging_subscriptions", col),
-                "messaging_subscriptions missing current column {col}"
-            );
-        }
-        assert!(
-            !column_exists(&conn, "messaging_subscriptions", "kind"),
-            "messaging_subscriptions still has legacy column kind"
-        );
-
-        // messaging_dynamic_subscriptions: same depth/wake model as the static
-        // mirror, plus the MQTT qos column and created_at (design §2.1).
+        // messaging_dynamic_subscriptions: the depth/wake model, plus the MQTT
+        // qos column and created_at.
         for col in &[
             "channel_uuid",
             "app_slug",
