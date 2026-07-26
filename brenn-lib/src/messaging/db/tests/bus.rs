@@ -1704,7 +1704,7 @@ fn bus_gc_evict_drop_bounds_channel() {
     assert_eq!(count_bus_pushes(&conn, &ch_uuid_bytes), 10);
 
     // frontier = 3: keep 3 most-recent, evict 7.
-    let (msgs, pushes) = bus_gc_evict_channel(
+    let eviction = bus_gc_evict_channel(
         &conn,
         ch_uuid,
         "brenn:ch",
@@ -1714,8 +1714,8 @@ fn bus_gc_evict_drop_bounds_channel() {
         None,
     );
 
-    assert_eq!(msgs, 7, "7 messages evicted");
-    assert_eq!(pushes, 7, "7 push rows reaped");
+    assert_eq!(eviction.messages_evicted, 7, "7 messages evicted");
+    assert_eq!(eviction.push_rows_retired, 7, "7 push rows reaped");
     assert_eq!(count_bus_messages(&conn, &ch_uuid_bytes), 3);
     assert_eq!(count_bus_pushes(&conn, &ch_uuid_bytes), 3);
 
@@ -1747,7 +1747,7 @@ fn bus_gc_evict_fewer_than_frontier_is_noop() {
     }
 
     // frontier=10 > 3 messages — nothing eligible.
-    let (msgs, pushes) = bus_gc_evict_channel(
+    let eviction = bus_gc_evict_channel(
         &conn,
         ch_uuid,
         "brenn:ch2",
@@ -1756,8 +1756,8 @@ fn bus_gc_evict_fewer_than_frontier_is_noop() {
         Sink::Drop,
         None,
     );
-    assert_eq!(msgs, 0);
-    assert_eq!(pushes, 0);
+    assert_eq!(eviction.messages_evicted, 0);
+    assert_eq!(eviction.push_rows_retired, 0);
     assert_eq!(count_bus_messages(&conn, &ch_uuid_bytes), 3);
 }
 
@@ -1793,7 +1793,7 @@ fn bus_gc_evict_deletes_both_delivered_and_undelivered_push_rows() {
     )
     .unwrap();
 
-    let (msgs, pushes) = bus_gc_evict_channel(
+    let eviction = bus_gc_evict_channel(
         &conn,
         ch_uuid,
         "brenn:ch3",
@@ -1802,8 +1802,8 @@ fn bus_gc_evict_deletes_both_delivered_and_undelivered_push_rows() {
         Sink::Drop,
         None,
     );
-    assert_eq!(msgs, 3);
-    assert_eq!(pushes, 3);
+    assert_eq!(eviction.messages_evicted, 3);
+    assert_eq!(eviction.push_rows_retired, 3);
     assert_eq!(count_bus_messages(&conn, &ch_uuid_bytes), 2);
 }
 
@@ -1861,7 +1861,7 @@ fn two_reaper_non_overlap_kind_fence() {
     assert_eq!(total_msgs_before, 7);
 
     // Run bus GC with frontier=2 → evict 3 bus messages.
-    let (bus_msgs, bus_pushes) = bus_gc_evict_channel(
+    let bus_eviction = bus_gc_evict_channel(
         &conn,
         ch_uuid,
         "brenn:fence",
@@ -1870,8 +1870,14 @@ fn two_reaper_non_overlap_kind_fence() {
         Sink::Drop,
         None,
     );
-    assert_eq!(bus_msgs, 3, "bus GC evicted 3 bus messages");
-    assert_eq!(bus_pushes, 3, "bus GC retired 3 bus push rows");
+    assert_eq!(
+        bus_eviction.messages_evicted, 3,
+        "bus GC evicted 3 bus messages"
+    );
+    assert_eq!(
+        bus_eviction.push_rows_retired, 3,
+        "bus GC retired 3 bus push rows"
+    );
 
     // Ingress rows must be untouched.
     let ingress_count: i64 = conn
@@ -2095,7 +2101,7 @@ fn bus_gc_evict_archive_writes_jsonl_and_removes_body() {
     let tmp = tempfile::NamedTempFile::new().expect("tmp archive file");
     let archive_path = tmp.path().to_path_buf();
 
-    let (msgs, _pushes) = bus_gc_evict_channel(
+    let eviction = bus_gc_evict_channel(
         &conn,
         ch_uuid,
         "brenn:arc",
@@ -2104,7 +2110,10 @@ fn bus_gc_evict_archive_writes_jsonl_and_removes_body() {
         Sink::Archive,
         Some(&archive_path),
     );
-    assert_eq!(msgs, 2, "2 messages evicted to archive");
+    assert_eq!(
+        eviction.messages_evicted, 2,
+        "2 messages evicted to archive"
+    );
     assert_eq!(
         count_bus_messages(&conn, &ch_uuid_bytes),
         1,
@@ -2168,7 +2177,7 @@ fn bus_gc_evict_zero_frontier_evicts_all() {
     assert_eq!(count_bus_messages(&conn, &ch_uuid_bytes), 3);
 
     // Frontier=0 → all messages are eligible for eviction.
-    let (msgs, _) = bus_gc_evict_channel(
+    let eviction = bus_gc_evict_channel(
         &conn,
         ch_uuid,
         "brenn:zero",
@@ -2177,7 +2186,10 @@ fn bus_gc_evict_zero_frontier_evicts_all() {
         Sink::Drop,
         None,
     );
-    assert_eq!(msgs, 3, "frontier=0 must evict all 3 messages");
+    assert_eq!(
+        eviction.messages_evicted, 3,
+        "frontier=0 must evict all 3 messages"
+    );
     assert_eq!(count_bus_messages(&conn, &ch_uuid_bytes), 0);
 }
 
@@ -2220,7 +2232,7 @@ fn bus_gc_evicts_lowest_retained_seq_first_late_release_survives() {
     );
 
     // frontier=2: keep the top-2 retention entries (seqs 3, 4), evict seqs 1, 2.
-    let (msgs, _) = bus_gc_evict_channel(
+    let eviction = bus_gc_evict_channel(
         &conn,
         ch_uuid,
         "brenn:late",
@@ -2229,7 +2241,10 @@ fn bus_gc_evicts_lowest_retained_seq_first_late_release_survives() {
         Sink::Drop,
         None,
     );
-    assert_eq!(msgs, 2, "the two lowest-seq retained rows are evicted");
+    assert_eq!(
+        eviction.messages_evicted, 2,
+        "the two lowest-seq retained rows are evicted"
+    );
     assert_eq!(count_bus_messages(&conn, &ch_uuid_bytes), 2);
     assert_eq!(
         retained_seq_of(&conn, late),
@@ -2262,7 +2277,7 @@ fn bus_gc_never_evicts_parked_row_which_later_releases() {
     let parked = insert_parked_bus_msg(&conn, &ch_uuid_bytes, 100, "2020-01-01T00:00:00+00:00");
 
     // frontier=0 evicts every retained row; the parked row must survive.
-    let (msgs, _) = bus_gc_evict_channel(
+    let eviction = bus_gc_evict_channel(
         &conn,
         ch_uuid,
         "brenn:park2",
@@ -2271,7 +2286,10 @@ fn bus_gc_never_evicts_parked_row_which_later_releases() {
         Sink::Drop,
         None,
     );
-    assert_eq!(msgs, 2, "only the two retained rows are evicted");
+    assert_eq!(
+        eviction.messages_evicted, 2,
+        "only the two retained rows are evicted"
+    );
     assert_eq!(
         retained_seq_of(&conn, parked),
         None,
@@ -2279,7 +2297,7 @@ fn bus_gc_never_evicts_parked_row_which_later_releases() {
     );
 
     // A second pass has nothing retained left; the parked row still survives.
-    let (msgs2, _) = bus_gc_evict_channel(
+    let eviction2 = bus_gc_evict_channel(
         &conn,
         ch_uuid,
         "brenn:park2",
@@ -2288,7 +2306,10 @@ fn bus_gc_never_evicts_parked_row_which_later_releases() {
         Sink::Drop,
         None,
     );
-    assert_eq!(msgs2, 0, "no retained rows remain to evict");
+    assert_eq!(
+        eviction2.messages_evicted, 0,
+        "no retained rows remain to evict"
+    );
     assert_eq!(
         retained_seq_of(&conn, parked),
         None,
@@ -3162,7 +3183,7 @@ fn confirm_pending_row_survives_channel_eviction() {
 
     // frontier = 1 would evict the two older messages; the tentative one is spared,
     // its message row kept alongside it (FK), so only one message is evicted.
-    let (msgs, pushes) = bus_gc_evict_channel(
+    let eviction = bus_gc_evict_channel(
         &conn,
         chan,
         "brenn:chan-a",
@@ -3171,8 +3192,14 @@ fn confirm_pending_row_survives_channel_eviction() {
         Sink::Drop,
         None,
     );
-    assert_eq!(msgs, 1, "only the non-tentative old message is evicted");
-    assert_eq!(pushes, 1, "the tentative push row is spared");
+    assert_eq!(
+        eviction.messages_evicted, 1,
+        "only the non-tentative old message is evicted"
+    );
+    assert_eq!(
+        eviction.push_rows_retired, 1,
+        "the tentative push row is spared"
+    );
     let surviving = load_confirm_pending_pushes(&conn, &sub, chan);
     assert_eq!(
         surviving.len(),
@@ -3186,7 +3213,7 @@ fn confirm_pending_row_survives_channel_eviction() {
 
     // Once confirmed, the flag clears and the next eviction reaps it normally.
     confirm_pending_pushes(&conn, &[p_old]);
-    let (msgs, pushes) = bus_gc_evict_channel(
+    let eviction = bus_gc_evict_channel(
         &conn,
         chan,
         "brenn:chan-a",
@@ -3195,8 +3222,11 @@ fn confirm_pending_row_survives_channel_eviction() {
         Sink::Drop,
         None,
     );
-    assert_eq!(msgs, 1, "the confirmed row's message is now reapable");
-    assert_eq!(pushes, 1, "and its push row too");
+    assert_eq!(
+        eviction.messages_evicted, 1,
+        "the confirmed row's message is now reapable"
+    );
+    assert_eq!(eviction.push_rows_retired, 1, "and its push row too");
 }
 
 /// Unclaiming a never-acknowledged tentative row clears both `delivered_at` and

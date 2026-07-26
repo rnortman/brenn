@@ -366,14 +366,11 @@ const ATTACH_MANAGED_SUBSCRIBER: &str = "(pp.target_subscriber LIKE 'wasm:%'
 /// a healthy component, and re-priming it hands an at-most-once consumer work it
 /// already did.
 ///
-/// TODO(substrate-cursor-registration-seed): a push-enabled subscriber holding no
-/// claim at all — never delivered anything, or its claims already reaped — gets
-/// no row here, because its identity and kind are resolvable only from the
-/// boot-resolved registration set (system components hold no
-/// `messaging_subscriptions` row at all, and a conversation's identity resolves
-/// through its app's allowed user). Seed those at head where that set exists, so
-/// a message published between this migration and such a subscriber's first
-/// attach is ordinary unseen backlog rather than a silent skip.
+/// A push-enabled subscriber holding no claim at all — never delivered anything,
+/// or its claims already reaped — gets no row here: its identity and kind are
+/// resolvable only from the boot-resolved registration set. The boot attach that
+/// every family runs creates that row at head, in the same boot, before anything
+/// publishes.
 ///
 /// # Panics
 ///

@@ -156,11 +156,16 @@ pub(crate) async fn ingress_cleanup_loop(db: brenn_lib::db::Db, retention_days: 
 ///    If `None`, skip.
 /// 2. For bounded frontiers: evict bodies past the frontier via
 ///    `bus_gc_evict_channel` (handles both drop and archive sinks).
-/// 3. Backstop push-claim retirement: retire push rows past `push_depth` for
+/// 3. Enact the noise ladder over the eviction's report: retention outran a
+///    subscriber's position, and this pass is the durable class's eviction
+///    accounting point, the sibling of the ring's displacing append. The
+///    report lands up to one GC interval after the loss — durable eviction is
+///    itself periodic, and the ladder is minutes-grade.
+/// 4. Backstop push-claim retirement: retire push rows past `push_depth` for
 ///    each bounded-`push_depth` subscriber via `bus_gc_retire_pushes`.
 pub(crate) async fn bus_gc_loop(
     db: brenn_lib::db::Db,
-    directory: std::sync::Arc<brenn_lib::messaging::MessagingDirectory>,
+    messenger: std::sync::Arc<brenn_lib::messaging::Messenger>,
     archive_path: Option<std::path::PathBuf>,
 ) {
     use brenn_lib::messaging::db as msg_db;
@@ -174,7 +179,7 @@ pub(crate) async fn bus_gc_loop(
         // Durable channels only: what this loop evicts is database rows, and a
         // non-durable channel keeps its bounded window in memory, where the ring
         // itself is the bound.
-        let channels = directory.list_durable();
+        let channels = messenger.directory().list_durable();
         let mut total_messages_evicted: usize = 0;
         let mut total_pushes_retired: usize = 0;
 
@@ -184,7 +189,7 @@ pub(crate) async fn bus_gc_loop(
             };
 
             // Evict bodies past the frontier.
-            let (msgs, pushes) = {
+            let eviction = {
                 let conn = db.lock().await;
                 msg_db::bus_gc_evict_channel(
                     &conn,
@@ -196,8 +201,11 @@ pub(crate) async fn bus_gc_loop(
                     archive_path.as_deref(),
                 )
             };
-            total_messages_evicted += msgs;
-            total_pushes_retired += pushes;
+            total_messages_evicted += eviction.messages_evicted;
+            total_pushes_retired += eviction.push_rows_retired;
+            // Enacted outside the connection hold: the ladder alarms through
+            // the router, which is no business of the eviction transaction.
+            messenger.enact_overflow_for_channel(&entry.address, &eviction.overflow);
 
             // Backstop push-claim retirement for each bounded-push_depth subscriber.
             for sub in &entry.subscribers {

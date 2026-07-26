@@ -1002,7 +1002,7 @@ impl Messenger {
             },
             None => {
                 let outcome = store.append(message).await;
-                self.enact_overflow_events(&channel, store.as_ref(), &outcome.overflow);
+                self.enact_overflow_events(&channel, &outcome.overflow);
                 (
                     outcome.committed.message_uuid,
                     Some(outcome.committed.seq.0),
@@ -1322,7 +1322,7 @@ impl Messenger {
                 }
             })
             .collect();
-        self.enact_overflow_events(&plan.entry, db_store.as_ref(), &events);
+        self.enact_overflow_events(&plan.entry, &events);
     }
 }
 
@@ -1714,7 +1714,7 @@ impl Messenger {
                 }
                 None => {
                     let outcome = store.append(message).await;
-                    self.enact_overflow_events(&entry, store.as_ref(), &outcome.overflow);
+                    self.enact_overflow_events(&entry, &outcome.overflow);
                 }
             }
         }

@@ -657,7 +657,7 @@ mod tests {
             .ring_stores()
             .get_by_address(CHANNEL)
             .expect("fixture channel")
-            .attach(&absent, 4, Priming::Head);
+            .attach(&absent, "absent", 4, Priming::Head);
 
         let publish = |body: &str| {
             messenger.publish_prepaid(&sender, &policy, CHANNEL, body, Urgency::Normal, Utc::now())
@@ -674,7 +674,7 @@ mod tests {
             vec![OverflowEvent {
                 subscriber: absent.clone(),
                 dropped: 1,
-                app_slug: None,
+                app_slug: Some("absent".to_string()),
             }]
         );
     }

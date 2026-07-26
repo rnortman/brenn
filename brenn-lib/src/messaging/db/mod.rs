@@ -52,13 +52,14 @@ pub use store_identity::{
 mod ingress;
 pub use ingress::{
     delete_delivered_ingress_pushes_before, insert_ingress_message, insert_ingress_message_raw,
-    load_pending_pushes_for_drain, mark_stale_undelivered_ingress_repo_sync,
+    load_pending_ingress_for_drain, load_pending_pushes_for_drain,
+    mark_stale_undelivered_ingress_repo_sync,
 };
 
 mod bus;
 pub use bus::{
-    ChannelPushRow, EditFieldsApplied, EditUpdateResult, InsertedMessage, MessageLookup,
-    PendingPushInsert, ReleasedPushRow, TentativePushRow, bus_gc_evict_channel,
+    BusGcEviction, ChannelPushRow, EditFieldsApplied, EditUpdateResult, InsertedMessage,
+    MessageLookup, PendingPushInsert, ReleasedPushRow, TentativePushRow, bus_gc_evict_channel,
     bus_gc_retire_pushes, cancel_pending_pushes_for_message, channel_last_retained_seq,
     channel_resume_epoch, channel_retained_count_after_seq, channel_retention_frontier,
     claim_pending_pushes, confirm_pending_pushes, delete_pending_push_by_id,
@@ -78,9 +79,9 @@ pub(crate) use bus::{LOAD_ALL_DISPATCHABLE_PUSHES_SQL, channel_has_deliverable_f
 
 mod cursors;
 pub use cursors::{
-    SubscriberCursorRow, cursor_has_deliverable, delete_subscriber_cursor,
-    deliverable_cursor_subscribers, ensure_subscriber_cursor, load_subscriber_cursor,
-    retune_subscriber_cursor_depth, set_subscriber_cursor_position,
+    SubscriberCursorRow, channel_subscriber_cursors, cursor_has_deliverable,
+    delete_subscriber_cursor, deliverable_cursor_subscribers, ensure_subscriber_cursor,
+    load_subscriber_cursor, retune_subscriber_cursor_depth, set_subscriber_cursor_position,
 };
 
 mod deferral;

@@ -182,15 +182,26 @@ pub(super) async fn bridge_with_messenger_for_drain()
     };
 
     let dir = brenn_lib::messaging::MessagingDirectory::with_entries(vec![channel_entry.clone()]);
+    // The conversation's delivery state resolves through the app: the drain
+    // reads the position held by `testapp`'s singleton conversation, so the
+    // apps map must carry the app whose allowed user owns it.
+    let mut apps = indexmap::IndexMap::new();
+    apps.insert(
+        "testapp".to_string(),
+        drain_test_app_config("drain-test-user"),
+    );
     let messenger = brenn_lib::messaging::Messenger::new(
         db.clone(),
         Arc::new(dir),
         Arc::from("test-drain-source"),
-        Arc::new(indexmap::IndexMap::new()),
+        Arc::new(apps),
         Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
             as Arc<dyn brenn_lib::messaging::WakeRouter>,
         brenn_lib::messaging::MessagingGlobalConfig::default(),
     );
+    // Boot's attach: the conversation holds a position on every channel its app
+    // subscribes to before anything is published.
+    messenger.attach_conversation_subscribers().await;
 
     let bridge = ActiveBridge::inject_for_test_full(
         user_id,
@@ -206,6 +217,26 @@ pub(super) async fn bridge_with_messenger_for_drain()
     );
 
     (bridge, broadcast_rx)
+}
+
+/// The app whose singleton conversation the drain fixtures deliver to:
+/// `allowed_user` owns it, and the policy covers `test-drain-channel` so the
+/// delivery-time ACL gate passes.
+fn drain_test_app_config(allowed_user: &str) -> brenn_lib::config::AppConfig {
+    let mut app =
+        crate::bootstrap::messaging::test_fixtures::minimal_app_config("testapp", None, vec![]);
+    app.singleton = true;
+    app.allowed_users = vec![allowed_user.to_string()];
+    app.policy
+        .grants
+        .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+    app.policy
+        .acls
+        .brenn_subscribe
+        .push(brenn_lib::access::acl::ChannelMatcher::Prefix(
+            "test-drain-channel".to_string(),
+        ));
+    app
 }
 
 /// Fixed channel UUID used by `bridge_with_messenger_for_drain` and

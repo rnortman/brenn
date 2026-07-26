@@ -870,6 +870,20 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         messaging_result.router.as_ref(),
     ) {
         router.set_state(state.clone());
+
+        // Give the tool executor its position on its request channels before
+        // anything can put a message into retention. Its drain loop attaches
+        // too, but that runs on a spawned task; the dispatcher below releases
+        // due parked messages on its first pass, and a request released before
+        // the position exists would land below it and never be served.
+        brenn_lib::messaging::system::SystemInbox::new(
+            crate::tool_registry::executor::TOOL_EXECUTOR_COMPONENT,
+            messenger.clone(),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        )
+        .attach()
+        .await;
+
         // Spawn background tasks. Returned JoinHandles are intentionally
         // dropped — these tasks are process-lifetime and never joined.
         // Lifetime-task death is ACCEPTED, not supervised: any panic is logged +
@@ -877,20 +891,14 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         // alert + manual restart is the decided mitigation. Do NOT add per-task
         // supervision. See TODO.md `task-death-supervision` (tombstone). Same applies
         // to the session/ingress/gc lifetime spawns below.
-        // Spawn the unified background dispatcher task (design §2.3, §2.7).
-        // Replaces the former `spawn_deadline_task` + `spawn_deliver_after_task`.
-        // The R7 startup kick fires immediately after spawn so conversations holding
-        // pending Immediate/deadline-expired rows are eager-woken without waiting
-        // for user interaction.
         drop(brenn_lib::messaging::dispatcher::spawn_dispatcher_task(
             state.db.clone(),
             router.clone() as std::sync::Arc<dyn brenn_lib::messaging::WakeRouter>,
             messenger.dispatch_kick_notify(),
             messenger.clone(),
         ));
-        // R7 startup sweep: kick the dispatcher immediately so any pending
-        // Immediate/deadline-expired rows trigger eager wakes without waiting
-        // for the first POLL_INTERVAL sleep.
+        // Kick immediately so pending Immediate/deadline-expired rows trigger
+        // eager wakes without waiting for the first POLL_INTERVAL sleep.
         messenger.dispatch_kick();
 
         // Spawn one off-loop WASM consumer dispatch task per [[wasm_consumer]].
@@ -1040,7 +1048,7 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
     if let Some(messenger) = messaging_result.messenger.as_ref() {
         tokio::spawn(shutdown::bus_gc_loop(
             state.db.clone(),
-            messenger.directory().clone(),
+            messenger.clone(),
             config.messaging.archive_path.clone(),
         ));
     }

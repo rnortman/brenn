@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::Utc;
 use rusqlite::OptionalExtension;
@@ -342,17 +342,11 @@ async fn dispatcher_loop(
     // (including rows published while the task was mid-flight) in publish_ts_ns order.
     let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
-    // Per-subscriber wake cooldown: records when each Conversation subscriber last
-    // had spawn_eager_wake fired by a fan-out task. It coalesces Conversation eager
-    // wakes only — the one wake with real cost (a CC spawn); re-waking every 60s is
-    // a no-op storm. It NEVER suppresses a delivery attempt: every due group still
-    // gets its fan-out and per-row dispatch_row, so a live durable/bridge delivery
-    // is never delayed by the cooldown. Armed on a fresh wake, cleared when a
-    // delivery proves the subscriber live, and left untouched (to expire via
-    // elapsed()) on a gated pass. Only Conversation groups are ever gated — a
-    // surface wake is a free notify_one, and a parked subscriber's channel-backed
-    // wake does not come from a fan-out task at all.
-    let recently_woken: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+    // The wake cooldown NEVER suppresses a delivery attempt: every due group
+    // still gets its fan-out and per-row dispatch_row, so a live
+    // durable/bridge delivery is never delayed by it. Only Conversation groups
+    // are ever gated — a surface wake is a free notify_one, and a parked
+    // subscriber's channel-backed wake does not come from a fan-out task at all.
 
     let mut fired_wakes = false;
     // Earliest deferred release across every channel's store. Seeded by one
@@ -467,14 +461,6 @@ async fn dispatcher_loop(
             }
         }
 
-        // Snapshot the recently-woken map once for this pass.
-        let woken_snapshot = {
-            recently_woken
-                .lock()
-                .expect("recently_woken poisoned")
-                .clone()
-        };
-
         // Debug-level pass summary: row count, in-flight-skipped count, and group count.
         // Helps diagnose "why is this row not being dispatched?" without DB queries.
         {
@@ -511,18 +497,14 @@ async fn dispatcher_loop(
                 registration_key(&first_row.target_subscriber, &first_row.target_app_slug);
             let urgency_gated = messenger.subscriber_wake_economics(&group_key)
                 == Some(WakeEconomics::UrgencyGated);
-            let wake_gated = urgency_gated
-                && woken_snapshot
-                    .get(&subscriber_key)
-                    .map(|t| t.elapsed() < POLL_INTERVAL)
-                    .unwrap_or(false);
+            let wake_gated = urgency_gated && messenger.inline_wake_gated(&subscriber_key);
 
             let router_clone = router.clone();
             let db_clone = db.clone();
             let messenger_clone = messenger.clone();
             // Clone Arcs for the supervisor task (fan-out task gets its own clones below).
             let in_flight_supervisor = in_flight.clone();
-            let recently_woken_supervisor = recently_woken.clone();
+            let messenger_supervisor = messenger.clone();
 
             let fan_out_handle = tokio::spawn(async move {
                 let mut delivered_ids: Vec<i64> = Vec::new();
@@ -641,17 +623,11 @@ async fn dispatcher_loop(
                             // A fresh wake means a CC spawn is in flight; re-arm the
                             // cooldown so further wakes within the window coalesce.
                             // Takes precedence over delivered_any.
-                            recently_woken_supervisor
-                                .lock()
-                                .expect("recently_woken poisoned")
-                                .insert(subscriber_key, Instant::now());
+                            messenger_supervisor.arm_inline_wake(&subscriber_key);
                         } else if delivered_any {
                             // Delivery proves the subscriber is live; clear the entry
                             // so future parked rows may re-wake immediately.
-                            recently_woken_supervisor
-                                .lock()
-                                .expect("recently_woken poisoned")
-                                .remove(&subscriber_key);
+                            messenger_supervisor.clear_inline_wake(&subscriber_key);
                         }
                         // else: a gated or wake-less pass — leave the map untouched.
                         // Clearing it would halve the cooldown to every-other-pass
@@ -672,10 +648,7 @@ async fn dispatcher_loop(
                             .expect("in_flight poisoned")
                             .remove(&subscriber_key);
                         // Also clear any cooldown entry to allow the retry to re-wake.
-                        recently_woken_supervisor
-                            .lock()
-                            .expect("recently_woken poisoned")
-                            .remove(&subscriber_key);
+                        messenger_supervisor.clear_inline_wake(&subscriber_key);
                     }
                     Err(_) => {
                         // Task was cancelled (JoinError::is_cancelled). This should not
@@ -826,7 +799,6 @@ pub(crate) async fn register_released_pushes(
                 delete_pending_push_by_id(&conn, *retired_id);
             }
             messenger.enact_overflow_noise(
-                db_store.as_ref(),
                 channel_addr,
                 &subscriber,
                 noise,

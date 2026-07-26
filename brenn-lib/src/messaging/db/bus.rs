@@ -5,7 +5,9 @@ use uuid::Uuid;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 
+use super::super::store::OverflowEvent;
 use super::super::{ChannelScheme, IngressOrBus, MessageEnvelope, ParticipantId, Urgency};
+use super::cursors;
 use super::shared::{ns_to_utc, parse_rfc3339};
 use super::types::PendingPushRow;
 use crate::db::format_ts_for_db;
@@ -276,6 +278,17 @@ pub fn seed_pending_pushes_for_messages(
 // Bus GC
 // ---------------------------------------------------------------------------
 
+/// What one channel's eviction pass deleted, and whom it cost.
+#[derive(Debug, Default)]
+pub struct BusGcEviction {
+    pub messages_evicted: usize,
+    pub push_rows_retired: usize,
+    /// One entry per cursor the evicted span passed, carrying the seqs that
+    /// subscriber will now never be served. Empty when every position was above
+    /// the span, and always empty for a pass that deleted nothing.
+    pub overflow: Vec<OverflowEvent>,
+}
+
 /// Evict bus message bodies past the channel's reap frontier,
 /// handling both `drop` and `archive` sinks in a single transaction.
 ///
@@ -285,15 +298,35 @@ pub fn seed_pending_pushes_for_messages(
 /// here matches all channel-associated transport types (`brenn`, `webhook`,
 /// future `mqtt`, etc.) without needing to enumerate them.
 ///
-/// Steps (all in one `unchecked_transaction` per design §2.5):
-/// 1. Count rows for the channel; if `<= frontier`, returns `(0, 0)` immediately.
+/// Steps (all in one `unchecked_transaction`):
+/// 1. Count rows for the channel; if `<= frontier`, returns immediately.
 /// 2. For `archive` sink: SELECT eligible bodies (NOT IN top-frontier set) and
 ///    write each as a JSONL line to `archive_path`.
 /// 3. Delete push rows for eligible messages first (satisfies FK constraint),
 ///    then delete message rows using the same NOT IN predicate (FTS triggers
 ///    fire on each row DELETE, keeping the FTS index consistent).
+/// 4. Report, per subscriber cursor this pass's eviction outran, how much of
+///    its unseen span went with the bodies.
 ///
-/// Returns `(messages_evicted, push_rows_retired)`.
+/// The report is the durable half of the channel model's eviction accounting:
+/// retention outran a position, so the loss is attributable the moment it
+/// happens rather than waiting for a read that may never come. Both frontiers
+/// are pass-local — the pass knows exactly the span it deleted — so a wedged
+/// subscriber is reported for each pass's own span and never twice for the
+/// same seq. The cursors themselves are untouched: a position left below the
+/// frontier *is* the record of what it lost.
+///
+/// Both subtractions in the accounting — this one and the advance's — rest on
+/// retention being dense, and one thing still perforates it: step 3 spares a
+/// message whose delivery is tentative (`confirm_pending = 1`), so a spared
+/// message older than the deleted ones holds the new frontier down at its own
+/// seq and the pass reports less than it removed. The gap it hides is charged by
+/// a later advance only when that advance's window starts above the spared
+/// message; a window wide enough to still serve it reports nothing for the gap.
+/// This costs noise-ladder accuracy, not delivery — every position and every
+/// message body is exactly where it would otherwise be — and it lasts as long
+/// as the tentative hold does. The carve-out belongs to the surface delivery
+/// lifecycle; density, and with it exactness, returns when that goes.
 ///
 /// # Panics
 ///
@@ -307,7 +340,7 @@ pub fn bus_gc_evict_channel(
     frontier: u64,
     sink: super::super::config::Sink,
     archive_path: Option<&std::path::Path>,
-) -> (usize, usize) {
+) -> BusGcEviction {
     use super::super::config::Sink;
     use std::io::Write as _;
 
@@ -349,8 +382,13 @@ pub fn bus_gc_evict_channel(
         )
         .expect("bus_gc_evict_channel: count rows");
     if total_rows <= frontier as i64 {
-        return (0, 0);
+        return BusGcEviction::default();
     }
+
+    // Captured before the deletes, so the span this pass is about to evict is
+    // exactly `old_frontier .. new_frontier`.
+    let old_frontier = retention_frontier_or_next(&tx, channel_uuid);
+    let cursors = cursors::channel_subscriber_cursors(&tx, channel_uuid);
 
     // Eligible = all retained rows except the `frontier` most-recent by
     // `retained_seq` (dense per-channel retention order, unique via the partial
@@ -541,8 +579,37 @@ pub fn bus_gc_evict_channel(
         )
         .expect("bus_gc_evict_channel: DELETE messages");
 
+    // Step 4: report the evicted span against every position it outran. Read
+    // after the deletes and inside the same transaction, so the frontier pair
+    // brackets precisely what this pass removed.
+    let new_frontier = retention_frontier_or_next(&tx, channel_uuid);
+    let overflow = cursors
+        .into_iter()
+        .filter_map(|cursor| {
+            let unreported_from = cursor.next_owed_seq.max(old_frontier);
+            let dropped = new_frontier.saturating_sub(unreported_from);
+            (dropped > 0).then(|| OverflowEvent {
+                subscriber: cursor.subscriber,
+                dropped: u64::try_from(dropped).expect("bus_gc_evict_channel: negative drop span"),
+                app_slug: Some(cursor.app_slug),
+            })
+        })
+        .collect();
+
     tx.commit().expect("bus_gc_evict_channel: commit");
-    (messages_deleted, push_rows_retired)
+    BusGcEviction {
+        messages_evicted: messages_deleted,
+        push_rows_retired,
+        overflow,
+    }
+}
+
+/// The channel's retention frontier, or the seq it will assign next when it
+/// retains nothing — so an emptied channel's frontier still bounds the span a
+/// pass evicted rather than reading as "no eviction happened".
+fn retention_frontier_or_next(conn: &Connection, channel_uuid: Uuid) -> i64 {
+    channel_retention_frontier(conn, channel_uuid)
+        .unwrap_or_else(|| channel_last_retained_seq(conn, channel_uuid) + 1)
 }
 
 /// Backstop push-claim retirement for bounded-`push_depth` bus subscribers.

@@ -364,6 +364,7 @@ async fn build_pipeline() -> Pipeline {
         &[(&sync_ch, Depth::Unbounded), (&inbox_ch, Depth::Unbounded)],
     )
     .await;
+    super::attach_tool_executor(&messenger).await;
     let (consumer_alert, _consumer_alert_handle) = noop_alert_dispatcher();
     let mut tool_grants: BTreeMap<String, ResolvedToolGrant> = BTreeMap::new();
     tool_grants.insert(

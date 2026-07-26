@@ -22,36 +22,31 @@ use super::super::{ActiveBridge, emit_prerendered_summary};
 ///   entry appended to the batch. The originals get marked delivered
 ///   alongside the synthesized batch.
 pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge) {
-    // Fetch pending messaging pushes — single unified source for both ingress
-    // and bus messages. Returns `IngressOrBus`-tagged payloads.
-    let messaging_pushes: Vec<(i64, brenn_lib::messaging::IngressOrBus)> =
-        if let Some(messenger) = &bridge.messenger {
-            messenger
-                .load_pending_pushes(&brenn_lib::messaging::ParticipantId::for_conversation(
-                    bridge.conversation_id,
-                ))
-                .await
-        } else {
-            Vec::new()
-        };
+    // Held until this drain has advanced past what it sent: a concurrent
+    // backlog delivery would otherwise read the same unseen suffix and send it
+    // a second time.
+    let _delivering = bridge.bus_delivery.lock().await;
 
-    // Partition into ingress events (kind='ingress') and bus envelopes
-    // (kind='brenn'). Ingress rows go through the event drain path; bus
-    // rows go through the messaging path.
-    let mut ingress_events: Vec<brenn_lib::messaging::ingress::Event> = Vec::new();
-    let mut bus_envelopes: Vec<brenn_lib::messaging::MessageEnvelope> = Vec::new();
-    let mut bus_push_ids: Vec<i64> = Vec::new();
-    for (push_id, payload) in messaging_pushes {
-        match payload {
-            brenn_lib::messaging::IngressOrBus::Ingress(ev) => {
-                ingress_events.push(ev);
-            }
-            brenn_lib::messaging::IngressOrBus::Bus(env) => {
-                bus_push_ids.push(push_id);
-                bus_envelopes.push(env);
-            }
-        }
-    }
+    // Two sources, two delivery models. Ingress events are channel-less rows
+    // handed to this conversation directly; bus messages are what the
+    // conversation's positions on its subscribed channels are holding for it.
+    let (ingress_events, bus_delivery) = if let Some(messenger) = &bridge.messenger {
+        let subscriber =
+            brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id);
+        (
+            messenger
+                .load_pending_ingress(&subscriber)
+                .await
+                .into_iter()
+                .map(|(_, ev)| ev)
+                .collect::<Vec<_>>(),
+            messenger
+                .conversation_delivery(bridge.conversation_id)
+                .await,
+        )
+    } else {
+        (Vec::new(), Default::default())
+    };
 
     // Check for repo_sync rows to fetch the conversation's updated_at.
     let conv_updated_at_str = if ingress_events
@@ -67,7 +62,7 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
         None
     };
 
-    if ingress_events.is_empty() && bus_envelopes.is_empty() {
+    if ingress_events.is_empty() && bus_delivery.is_empty() {
         return;
     }
 
@@ -98,7 +93,7 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     } else {
         (ingress_events, Vec::new())
     };
-    if kept.is_empty() && stale.is_empty() && bus_envelopes.is_empty() {
+    if kept.is_empty() && stale.is_empty() && bus_delivery.is_empty() {
         return;
     }
 
@@ -125,11 +120,6 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     // Collapse per-slug repo_sync events into a single summary entry.
     let collapsed = brenn_lib::messaging::collapse_repo_sync(kept);
 
-    // Collect bus envelopes for the messaging renderer. Push IDs are already
-    // collected above in bus_push_ids.
-    let messaging_envelopes = bus_envelopes;
-    let messaging_push_ids = bus_push_ids;
-
     // Pre-render the system-message card (collapsed <details> card in chat
     // history). `render_combined_drain` is the single producer of
     // (text, rendered_html, messaging_card_html) — `drain_pending_events`
@@ -139,7 +129,7 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     // `render_combined_drain` returns `None` only when both event and
     // messaging slices are empty — which is the early-exit case here.
     let Some(system_render) =
-        crate::system_message::render_combined_drain(&collapsed.events, &messaging_envelopes)
+        crate::system_message::render_combined_drain(&collapsed.events, &bus_delivery.messages)
     else {
         return;
     };
@@ -194,19 +184,15 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
         return;
     }
 
-    // Mark all push IDs (ingress + bus) delivered in a single critical section.
-    // Runs only after a confirmed flush (send_system_message returned Ok),
-    // so all rows in this batch are marked all-or-nothing: a flush failure
-    // above leaves all of them parked for redelivery (correct at-least-once).
-    {
+    // A flush failure leaves both untouched; the batch re-serves next wake.
+    if !ingress_push_ids_to_mark.is_empty() {
         let conn = bridge.db.lock().await;
-        let all_push_ids_to_mark: Vec<i64> = ingress_push_ids_to_mark
-            .into_iter()
-            .chain(messaging_push_ids)
-            .collect();
-        if !all_push_ids_to_mark.is_empty() {
-            brenn_lib::messaging::db::mark_pending_pushes_delivered(&conn, &all_push_ids_to_mark);
-        }
+        brenn_lib::messaging::db::mark_pending_pushes_delivered(&conn, &ingress_push_ids_to_mark);
+    }
+    if let Some(messenger) = &bridge.messenger {
+        messenger
+            .advance_conversation(bridge.conversation_id, bus_delivery)
+            .await;
     }
 
     // Emit ToolUseSummary card for received messages (the dual-broadcast).
@@ -218,4 +204,41 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
         )
         .await;
     }
+}
+
+/// Deliver whatever this conversation's channels are holding for it into a live
+/// bridge, then advance past it — the drain's bus half, on its own, for the
+/// wake path that finds the conversation already awake.
+///
+/// One delivery serves every channel's unseen suffix, in publish order, so a
+/// wake that arrives per message still renders each message once: the second
+/// wake finds the position past it and sends nothing. `Ok` therefore means "this
+/// conversation is served up to date", which is what the caller retires its
+/// delivery record on; `Err` means the send failed and the position did not
+/// move, so the next wake re-serves the batch.
+///
+/// Read, send, and advance run under the bridge's delivery lock, so "the second
+/// wake finds the position past it" holds for two wakes that arrive at once as
+/// well as for two that arrive in sequence.
+pub(crate) async fn deliver_conversation_backlog(bridge: &ActiveBridge) -> Result<(), String> {
+    let Some(messenger) = &bridge.messenger else {
+        return Ok(());
+    };
+    let _delivering = bridge.bus_delivery.lock().await;
+    let delivery = messenger
+        .conversation_delivery(bridge.conversation_id)
+        .await;
+    if delivery.is_empty() {
+        return Ok(());
+    }
+    // The live path renders messages only — no event drain rides with it, and
+    // (unlike the startup drain) no dual `ToolUseSummary` broadcast.
+    let mut render = crate::system_message::render_combined_drain(&[], &delivery.messages)
+        .expect("non-empty messages: render_combined_drain must produce a render");
+    render.messaging_card_html = None;
+    bridge.send_system_message(render, None).await?;
+    messenger
+        .advance_conversation(bridge.conversation_id, delivery)
+        .await;
+    Ok(())
 }

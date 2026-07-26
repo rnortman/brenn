@@ -64,7 +64,7 @@ mod build_tests;
 #[cfg(test)]
 mod surface_tests;
 #[cfg(test)]
-mod test_fixtures;
+pub(crate) mod test_fixtures;
 #[cfg(test)]
 mod wasm_tests;
 
@@ -1032,6 +1032,11 @@ pub(crate) async fn build_messaging(
             primed_any |= attached == messaging::store::Attached::Created;
         }
     }
+    // Every push-enabled app subscriber gets its conversation's position before
+    // anything can publish. Head priming positions a cursor at the channel's
+    // head *when it is created*, so one created at the app's first drain instead
+    // would sit above the message that woke it.
+    messenger.attach_conversation_subscribers().await;
     // Kick so primed consumers drain immediately rather than at the next poll.
     if primed_any {
         messenger.dispatch_kick();

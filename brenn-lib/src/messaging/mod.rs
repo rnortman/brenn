@@ -13,6 +13,7 @@
 //! the binary crate implements over `ActiveBridges` + `AppState`.
 
 pub mod config;
+pub mod conversations;
 pub mod db;
 pub mod dispatcher;
 pub mod edit;
@@ -1166,6 +1167,21 @@ pub trait WakeRouter: Send + Sync + 'static {
     /// after wake completes (asynchronously) will observe the new bridge.
     fn spawn_eager_wake(&self, key: &SubscriberEntryKind, subscriber: &ParticipantId);
 
+    /// Wake `subscriber` from the recurring walk over who is owed work.
+    ///
+    /// The walk names a subscriber whose position trails retention; what that
+    /// costs to serve depends on whether it is already running. An inline
+    /// subscriber that is live is served here and now — it is awake, and the
+    /// spawn-shaped wake would find it running and do nothing. One that is not
+    /// gets the ordinary eager wake.
+    ///
+    /// Default: the eager wake alone, which is the whole of the answer for a
+    /// parked subscriber (its notify is the delivery trigger) and for a surface
+    /// slug (the nudge is what makes its sessions drain).
+    async fn wake_owed(&self, key: &SubscriberEntryKind, subscriber: &ParticipantId) {
+        self.spawn_eager_wake(key, subscriber);
+    }
+
     /// The [`DeliveryShape`] of the subscriber registered under `key`, derived
     /// from its delivery binding. `dispatch_row` consults this to choose the
     /// inline-deliver vs. parked-wake path and whether to re-mark delivery.
@@ -1271,6 +1287,25 @@ pub struct Messenger {
     /// The condition never clears on its own and the walk revisits it every
     /// pass, so the set holds each pair to a single report.
     stranded_warned: Mutex<HashSet<(Uuid, String)>>,
+    /// `(channel uuid, app slug)` pairs already reported as ACL-denied at
+    /// delivery. A revoked ACL persists until an operator restores it while the
+    /// subscriber keeps its backlog, so every drain would re-report it — and a
+    /// config change is exactly when the log has to stay readable.
+    acl_denied_warned: Mutex<HashSet<(Uuid, String)>>,
+    /// When each urgency-gated subscriber was last woken, by anything.
+    ///
+    /// An urgency-gated wake spawns a subprocess, and both wake sources — the
+    /// walk over trailing positions and the dispatcher's fan-out — run on every
+    /// dispatcher kick, so a subscriber whose spawn fails, or which simply takes
+    /// a while to come up and drain, would be re-woken as fast as the bus is
+    /// busy. One map for both sources: two cooldowns that could not see each
+    /// other would each pass their own gate and double the spawn rate they exist
+    /// to bound. Eager subscribers are never held back — their wake is a notify.
+    ///
+    /// Armed on a fresh wake, cleared when a delivery proves the subscriber
+    /// live, and left to expire on a gated pass (clearing it there would halve
+    /// the cooldown under repeated kicks).
+    inline_wake_backoff: Mutex<HashMap<String, std::time::Instant>>,
     /// Serializes [`Messenger::subscribe_dynamic`] and
     /// [`Messenger::unsubscribe_dynamic`] end to end.
     ///
@@ -1335,6 +1370,17 @@ pub struct Messenger {
     /// chronically lose the race (release times set too close to its own cadence).
     /// Keyed by config-resolved principals, so the key set stays bounded.
     pub(crate) deferred_control_races: Mutex<HashMap<(String, String), u64>>,
+
+    /// Per-`(channel address, subscriber)` count of drops the noise ladder
+    /// metered — all of them on a `metered`/`alarm` subscription, none on a
+    /// `silent` one.
+    ///
+    /// It lives here because the ladder does: `enact_overflow_noise` is the one
+    /// writer, and the stores below it hold no drop state at all — every figure
+    /// they report is a subtraction between two seqs. In memory only, so a
+    /// restart forgets the tallies. A pair is forgotten at detach, so a
+    /// departed subscriber leaves nothing behind.
+    metered_drops: Mutex<HashMap<(String, String), u64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,12 +1459,11 @@ fn registered_subscriber<'a>(
 ///   and would panic the backend sink, so surface events never go there.
 /// - **Conversation-kind with no named app** — an `App(slug)` registration's
 ///   delivery participant is a `conversation:` identity, so its rung resolves
-///   only through the app the delivery record was written under. A store that
-///   writes no record names no app, and a conversation holds cursor-tracked
-///   delivery state on no channel today: push-enabled subscribe to a
-///   non-durable channel is refused. The caller panics on one rather than
-///   mis-reporting it, so lifting that refusal cannot quietly bypass the ladder
-///   (`TODO(substrate-nondurable-subscribe)`).
+///   only through the app whose slug the report carries. Both classes' cursors
+///   cache that slug and every store report names it, so this arm is not
+///   reachable from them; the caller panics on one rather than mis-reporting
+///   it, so a future reporter that names no app cannot quietly bypass the
+///   ladder.
 /// - **No matching registration** — delivery state that outlives its
 ///   registration, which the caller reports. The drop is still accounted on the
 ///   store; there is simply no resolved rung to be loud at, and inventing one
@@ -1496,6 +1541,8 @@ impl Messenger {
             db_stores: Mutex::new(HashMap::new()),
             nondurable_dynamic_subs: Mutex::new(HashSet::new()),
             stranded_warned: Mutex::new(HashSet::new()),
+            acl_denied_warned: Mutex::new(HashSet::new()),
+            inline_wake_backoff: Mutex::new(HashMap::new()),
             dynamic_subscribe_gate: tokio::sync::Mutex::new(()),
             surface_send_budgets: HashMap::new(),
             send_rate_buckets: Mutex::new(HashMap::new()),
@@ -1503,6 +1550,7 @@ impl Messenger {
             publish_denied: Mutex::new(HashMap::new()),
             dropped_deferred: Mutex::new(HashMap::new()),
             deferred_control_races: Mutex::new(HashMap::new()),
+            metered_drops: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1917,26 +1965,17 @@ impl Messenger {
                 "messaging: overflow reported for channel {channel_address:?} not in the directory"
             )
         });
-        let store = self.store_for(&entry);
-        self.enact_overflow_events(&entry, store.as_ref(), events);
+        self.enact_overflow_events(&entry, events);
     }
 
     /// Route a store's overflow events to the single noise-enactment sink, one
     /// per named subscriber.
     ///
-    /// The store counted the drops; the resolved subscription decides how loud
+    /// The store reported the drops; the resolved subscription decides how loud
     /// they are. A Surface-kind subscriber is deliberately never routed here:
     /// its drops stay on its delivery state and reach the page kernel, which is
     /// the only enactor allowed to see `fatal`.
-    ///
-    /// `store` is the one that reported the events — passed rather than
-    /// re-resolved, because every caller already holds it.
-    fn enact_overflow_events(
-        &self,
-        entry: &ChannelEntry,
-        store: &dyn store::RetentionStore,
-        events: &[store::OverflowEvent],
-    ) {
+    fn enact_overflow_events(&self, entry: &ChannelEntry, events: &[store::OverflowEvent]) {
         if events.is_empty() {
             return;
         }
@@ -1944,7 +1983,6 @@ impl Messenger {
             match overflow_noise_for(entry, &event.subscriber, event.app_slug.as_deref()) {
                 Some(noise) => {
                     self.enact_overflow_noise(
-                        store,
                         &entry.address,
                         &event.subscriber,
                         noise,
@@ -2009,8 +2047,13 @@ impl Messenger {
         push_depth: u64,
         priming: store::Priming,
     ) -> store::Attached {
+        // The cursor caches the slug of the registration it is read back
+        // through. A participant that names its own registration names that slug
+        // too; a conversation does not, and reaches its ring cursor through
+        // [`Messenger::attach_conversation`], which resolves the app first.
+        let app_slug = registration_key(subscriber, "").slug().to_string();
         self.ring_store(channel_uuid)
-            .attach(subscriber, push_depth, priming)
+            .attach(subscriber, &app_slug, push_depth, priming)
     }
 
     /// Register `subscriber`'s delivery state on the channel at
@@ -2042,9 +2085,15 @@ impl Messenger {
     }
 
     /// Tear down `subscriber`'s delivery state on the channel at
-    /// `channel_address` — its position, its in-memory push window, and its drop
-    /// tallies, all of which the store owns. The inverse of
-    /// [`Messenger::attach_subscriber`].
+    /// `channel_address` — its position and its in-memory push window, which the
+    /// store owns, plus the metered tally the noise ladder kept for it. The
+    /// inverse of [`Messenger::attach_subscriber`].
+    ///
+    /// The wake cooldown is deliberately left alone: it bounds spawn cost per
+    /// subscriber across every channel, so leaving one channel says nothing
+    /// about a window a wake for another channel's backlog armed. It lapses on
+    /// its own, and only a signal that the subscriber is live clears it early
+    /// ([`Messenger::clear_inline_wake`]).
     ///
     /// # Panics
     ///
@@ -2056,6 +2105,7 @@ impl Messenger {
             )
         });
         self.store_for(&entry).detach(subscriber).await;
+        self.forget_metered_drops(&entry.address, subscriber);
     }
 
     /// Advance `subscriber`'s position on `channel_address` over a window it
@@ -2084,13 +2134,7 @@ impl Messenger {
         let outcome = store.advance(subscriber, through, seen_floor).await;
         // noise_charge excludes losses already reported by eviction, so
         // nothing is enacted twice.
-        self.enact_overflow_noise(
-            store.as_ref(),
-            store.address(),
-            subscriber,
-            noise,
-            outcome.noise_charge,
-        );
+        self.enact_overflow_noise(&entry.address, subscriber, noise, outcome.noise_charge);
         outcome
     }
 
@@ -2204,52 +2248,164 @@ impl Messenger {
                     .push_ids
                     .extend(released.target_records.iter().map(|record| record.0));
             }
-            self.enact_overflow_events(&entry, store.as_ref(), &outcome.overflow);
+            self.enact_overflow_events(&entry, &outcome.overflow);
             let remaining = store.next_release().await;
             fold(remaining, &mut sweep);
         }
         sweep
     }
 
-    /// Wake every parked-and-woken subscriber currently owed messages, on every
-    /// channel, by asking each channel's own store who is owed.
+    /// Wake every subscriber currently owed messages that its wake economics say
+    /// to wake, on every channel, by asking each channel's own store who is
+    /// owed.
     ///
-    /// The dispatcher's one wake source for channel-backed work. Only
-    /// [`DeliveryShape::ParkedWake`] subscribers are woken — the wake *is*
-    /// their delivery trigger. Inline-shaped subscribers are passed over: their
-    /// delivery and fallback wake belong to the dispatch scan.
+    /// The one wake source for channel-backed work, over every shape a position
+    /// can belong to. A parked subscriber is woken whenever it is owed anything
+    /// — the wake *is* its delivery trigger and costs a notify. An inline
+    /// subscriber's wake may cost a subprocess, so it is woken only when the
+    /// loudest message it has not seen clears its threshold: a backlog entirely
+    /// below `wake_min` wakes nobody and waits for the subscriber's next natural
+    /// drain, which is the same economics the publish path applies to the one
+    /// message it commits.
+    ///
+    /// Because the decision is made here, from the live registration and the
+    /// unseen suffix, it is re-made on every pass: a registration change, a
+    /// louder message arriving behind a quiet backlog, or a wake that never
+    /// landed all take effect at the next walk. That is what makes this the
+    /// durable retry behind the post-commit wake — a failed subprocess spawn or
+    /// a crash between commit and wake leaves a trailing position, and a
+    /// trailing position is exactly what this walk looks for.
     ///
     /// Idempotent (`Notify` coalesces) and self-limiting: a subscriber stops
     /// being owed once it drains.
-    ///
-    /// TODO(substrate-family-cursor-subscribers): self-limiting for the families
-    /// that advance a position. The system inbox holds a seeded cursor but still
-    /// consumes through claim rows, so its position never moves and this walk
-    /// wakes it on every pass once any message lands above that position.
     pub async fn wake_owed_subscribers(&self) {
         for entry in self.directory.list() {
-            // Skip channels without a ParkedWake subscriber — asking a durable
-            // store costs a DB round trip, and a non-wakeable channel yields
-            // nothing.
-            let wakeable = entry
+            // Skip channels no subscriber holds a position on — asking a durable
+            // store costs a DB round trip, and only a push-enabled subscriber
+            // can be owed anything.
+            if !entry
                 .subscribers
                 .iter()
-                .any(|sub| self.router.delivery_shape(&sub.kind) == DeliveryShape::ParkedWake);
-            if !wakeable {
+                .any(|sub| sub.push_depth.is_push_enabled())
+            {
                 continue;
             }
             let store = self.store_for(&entry);
-            for subscriber in store.deliverable_subscribers().await {
-                // No app named: a conversation is never `ParkedWake`-shaped, so
-                // the App arm has nothing to answer for this walk.
-                let Some(registration) = registered_subscriber(&entry, &subscriber, None) else {
-                    self.warn_stranded_subscriber(&entry, &subscriber);
+            for owed in store.deliverable_subscribers().await {
+                let Some(registration) =
+                    registered_subscriber(&entry, &owed.subscriber, owed.app_slug.as_deref())
+                else {
+                    self.warn_stranded_subscriber(&entry, &owed.subscriber);
                     continue;
                 };
-                if self.router.delivery_shape(&registration.kind) == DeliveryShape::ParkedWake {
-                    self.router
-                        .spawn_eager_wake(&registration.kind, &subscriber);
+                let economics = match self.router.delivery_shape(&registration.kind) {
+                    // A parked subscriber's wake is a notify and its delivery
+                    // trigger both: it is `Eager` by construction, so reading a
+                    // registry to learn that would make a decision with one
+                    // answer depend on a second source.
+                    DeliveryShape::ParkedWake => WakeEconomics::Eager,
+                    // An inline subscriber's wake can cost a subprocess, so the
+                    // registration decides. Every directory subscriber resolves
+                    // economics — the boot cross-check asserts exactly this — so
+                    // one that does not is a host-wiring bug, and skipping it
+                    // would wedge a subscriber nothing else wakes with no signal
+                    // that it happened.
+                    DeliveryShape::Inline { .. } => self
+                        .targets
+                        .wake_economics(&registration.kind)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "wake walk: inline subscriber {:?} on channel {} has no wake \
+                                 economics — host wiring bug",
+                                registration.kind, entry.address,
+                            )
+                        }),
+                };
+                // A conversation's delivery read applies the ACL gate, so waking
+                // one the gate will deny buys a subprocess spawn that renders
+                // nothing — every pass, for as long as the revocation and the
+                // backlog both stand. The other kinds have no read-side gate, so
+                // their wakes still do work. Asked after the economics
+                // resolution, because an app missing from the apps map fails
+                // both tests and the wiring bug is the one worth reporting.
+                if let SubscriberEntryKind::App(slug) = &registration.kind
+                    && !self.channel_access_allowed(&registration.kind, &entry.address)
+                {
+                    self.warn_acl_denied(&entry, slug);
+                    continue;
                 }
+                if !store::targets::wakes_at(
+                    economics,
+                    registration.wake_min,
+                    owed.max_unseen_urgency,
+                ) {
+                    continue;
+                }
+                if economics == WakeEconomics::UrgencyGated
+                    && !self.inline_wake_due(&owed.subscriber)
+                {
+                    continue;
+                }
+                self.router
+                    .wake_owed(&registration.kind, &owed.subscriber)
+                    .await;
+            }
+        }
+    }
+
+    /// Whether an urgency-gated wake for `subscriber_key` is still inside the
+    /// cooldown the last one armed.
+    ///
+    /// The check and the arm are separate here because the dispatcher decides to
+    /// wake and learns whether the wake actually fired at two different points;
+    /// the walk, which learns both at once, uses [`Self::inline_wake_due`].
+    pub fn inline_wake_gated(&self, subscriber_key: &str) -> bool {
+        self.inline_wake_backoff
+            .lock()
+            .expect("messaging: inline_wake_backoff lock poisoned")
+            .get(subscriber_key)
+            .is_some_and(|when| when.elapsed() < dispatcher::POLL_INTERVAL)
+    }
+
+    /// Start the cooldown for `subscriber_key`: a spawn is in flight, so further
+    /// wakes within the window coalesce into it.
+    pub fn arm_inline_wake(&self, subscriber_key: &str) {
+        self.inline_wake_backoff
+            .lock()
+            .expect("messaging: inline_wake_backoff lock poisoned")
+            .insert(subscriber_key.to_string(), std::time::Instant::now());
+    }
+
+    /// End the cooldown for `subscriber_key`: something proved it live, so the
+    /// next wake need not wait the window out.
+    pub fn clear_inline_wake(&self, subscriber_key: &str) {
+        self.inline_wake_backoff
+            .lock()
+            .expect("messaging: inline_wake_backoff lock poisoned")
+            .remove(subscriber_key);
+    }
+
+    /// Whether the walk may wake this urgency-gated subscriber again yet,
+    /// recording the wake when it may.
+    ///
+    /// One wake per subscriber per [`dispatcher::POLL_INTERVAL`], counted from
+    /// the last wake anything fired. A subscriber that drains stops being owed
+    /// and never asks again; one that does not is retried at the tick rate
+    /// instead of at the publish rate.
+    ///
+    /// Check and arm under one lock hold: two passes that both read "due" would
+    /// both spawn, which is the cost this exists to bound.
+    fn inline_wake_due(&self, subscriber: &ParticipantId) -> bool {
+        let mut last = self
+            .inline_wake_backoff
+            .lock()
+            .expect("messaging: inline_wake_backoff lock poisoned");
+        let now = std::time::Instant::now();
+        match last.get(subscriber.as_str()) {
+            Some(when) if now.duration_since(*when) < dispatcher::POLL_INTERVAL => false,
+            _ => {
+                last.insert(subscriber.as_str().to_string(), now);
+                true
             }
         }
     }
@@ -2287,6 +2443,39 @@ impl Messenger {
                 subscriber = %subscriber.as_str(),
                 "owed messages for a parked subscriber with no registration on this channel — \
                  nothing will wake it (reported once per subscriber per channel)",
+            );
+        }
+    }
+
+    /// Whether `kind`'s current policy still covers `address`: the
+    /// delivery-time ACL gate, asked wherever a delivery decision is made.
+    ///
+    /// Fail-closed — a live subscriber with no resolvable policy is a wiring
+    /// bug, and denying it is the safe reading of one.
+    pub(crate) fn channel_access_allowed(&self, kind: &SubscriberEntryKind, address: &str) -> bool {
+        self.targets
+            .policy(kind)
+            .is_some_and(|p| p.allows_channel_access(address))
+    }
+
+    /// Report that `app_slug`'s subscription on `entry` was denied at delivery —
+    /// at most once per `(channel, app)` pair.
+    ///
+    /// The denial is a standing state, not an event: it holds until an operator
+    /// restores the ACL, and every drain and every wake pass re-observes it. One
+    /// report per pair names the revocation without burying it.
+    pub(crate) fn warn_acl_denied(&self, entry: &ChannelEntry, app_slug: &str) {
+        let first_report = self
+            .acl_denied_warned
+            .lock()
+            .expect("messaging: acl_denied_warned lock poisoned")
+            .insert((entry.uuid, app_slug.to_string()));
+        if first_report {
+            tracing::warn!(
+                app = %app_slug,
+                channel = %entry.address,
+                "subscription delivery denied — ACL not satisfied \
+                 (reported once per app per channel)"
             );
         }
     }
@@ -2398,38 +2587,45 @@ impl Messenger {
     /// no overflow has ever been metered for this pair. This is the telemetry
     /// read.
     ///
-    /// For the raw accounting a consumer reads as its gap signal — every drop,
-    /// whatever the noise level — see [`Messenger::dropped_total`].
+    /// There is no companion raw-loss total: a subscriber's losses are reported
+    /// as they happen, by the eviction pass that outran its position and by the
+    /// advance that passes seqs no window served, and each figure is a
+    /// subtraction rather than a stored count.
     ///
     /// # Panics
     ///
-    /// If `channel` resolves to no channel: the count lives on the channel's
-    /// store, so there is nowhere to read it from.
+    /// If `channel` resolves to no channel — a tally keyed by a channel that
+    /// does not exist could only ever read zero, which would look like "nothing
+    /// was dropped" instead of "you asked the wrong question".
     pub fn drop_counter(&self, channel: &str, subscriber: &ParticipantId) -> u64 {
-        self.store_for_address(channel).metered_drops(subscriber)
+        assert!(
+            self.directory.resolve(channel).is_some(),
+            "messaging: drop counter requested for channel {channel:?} not in the directory"
+        );
+        *self
+            .metered_drops
+            .lock()
+            .expect("messaging: metered_drops lock poisoned")
+            .get(&(channel.to_owned(), subscriber.as_str().to_owned()))
+            .unwrap_or(&0)
     }
 
-    /// Read a subscriber's lifetime drop total on `channel` — every message the
-    /// channel's store dropped out from under it, whatever the subscription's
-    /// noise level. This is the count the WASM activation window reports as its
-    /// within-lifetime gap signal.
-    ///
-    /// # Panics
-    ///
-    /// If `channel` resolves to no channel.
-    pub fn dropped_total(&self, channel: &str, subscriber: &ParticipantId) -> u64 {
-        self.store_for_address(channel).dropped_total(subscriber)
+    /// Forget every metered tally held for `subscriber` on `channel` — its
+    /// delivery state is being torn down and the tally is part of it.
+    fn forget_metered_drops(&self, channel: &str, subscriber: &ParticipantId) {
+        self.metered_drops
+            .lock()
+            .expect("messaging: metered_drops lock poisoned")
+            .remove(&(channel.to_owned(), subscriber.as_str().to_owned()));
     }
 
-    /// Enact the noise ladder for `count` overflow drops `store` charged
-    /// `subscriber`. Single enactment point — every overflow source must funnel
-    /// through here so escalation is store-independent.
+    /// Enact the noise ladder for `count` overflow drops reported against
+    /// `subscriber` on `channel`. Single enactment point — every overflow source
+    /// must funnel through here so escalation is store-independent.
     ///
-    /// The drops themselves are already accounted by the store that dropped
-    /// them; what this decides is how loud they are. `metered` and above also
-    /// tally on that store, next to the subscriber's other delivery state — so
-    /// the caller hands over the store it already holds. `channel` is the
-    /// address label for the log and the alarm; nothing is resolved from it.
+    /// The drops themselves are already accounted where they happened; what this
+    /// decides is how loud they are. `channel` is the address the tally, the log,
+    /// and the alarm are keyed by.
     ///
     /// TODO(drop-counters-export): the metered tallies have no production
     /// reader — only tests query them. Export them to whatever telemetry
@@ -2438,7 +2634,6 @@ impl Messenger {
     /// while the counters are unread; the two decisions are coupled).
     fn enact_overflow_noise(
         &self,
-        store: &dyn store::RetentionStore,
         channel: &str,
         subscriber: &ParticipantId,
         noise: config::NoiseLevel,
@@ -2450,7 +2645,12 @@ impl Messenger {
         match noise {
             config::NoiseLevel::Silent => {} // no counter, no alert
             config::NoiseLevel::Metered | config::NoiseLevel::Alarm => {
-                store.record_metered_drops(subscriber, count);
+                *self
+                    .metered_drops
+                    .lock()
+                    .expect("messaging: metered_drops lock poisoned")
+                    .entry((channel.to_owned(), subscriber.as_str().to_owned()))
+                    .or_insert(0) += count;
             }
             config::NoiseLevel::Fatal => {
                 panic!(
@@ -2804,6 +3004,21 @@ impl Messenger {
     ) -> Vec<(i64, IngressOrBus)> {
         let conn = self.db.lock().await;
         db::load_pending_pushes_for_drain(&conn, subscriber)
+    }
+
+    /// Undelivered direct-to-participant ingress events for a subscriber, with
+    /// the row id each is retired by.
+    ///
+    /// Ingress deliveries are channel-less rows a participant is handed once;
+    /// what a subscriber is owed on a *channel* is its position, read through
+    /// [`Messenger::conversation_delivery`] and its siblings. This read serves
+    /// only the former.
+    pub async fn load_pending_ingress(
+        &self,
+        subscriber: &ParticipantId,
+    ) -> Vec<(i64, ingress::Event)> {
+        let conn = self.db.lock().await;
+        db::load_pending_ingress_for_drain(&conn, subscriber)
     }
 
     /// Assemble the full multi-port activation snapshot for `subscriber`: one
@@ -5134,6 +5349,15 @@ mod tests {
     async fn wake_walk_messenger(
         channels: &[ChannelEntry],
     ) -> (Arc<Messenger>, Arc<RecordingWakeRouter>) {
+        wake_walk_messenger_with_apps(channels, indexmap::IndexMap::new()).await
+    }
+
+    /// The same, with an apps map — which is where an `App` subscriber's wake
+    /// economics come from, so a walk over conversations needs one.
+    async fn wake_walk_messenger_with_apps(
+        channels: &[ChannelEntry],
+        apps: indexmap::IndexMap<String, crate::config::AppConfig>,
+    ) -> (Arc<Messenger>, Arc<RecordingWakeRouter>) {
         let db = crate::db::init_db_memory();
         let (durable, nondurable): (Vec<ChannelEntry>, Vec<ChannelEntry>) = channels
             .iter()
@@ -5148,7 +5372,7 @@ mod tests {
             db,
             Arc::new(MessagingDirectory::with_entries(channels.to_vec())),
             Arc::from("test"),
-            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(apps),
             router.clone() as Arc<dyn WakeRouter>,
             config::MessagingGlobalConfig::default(),
         )
@@ -5405,8 +5629,9 @@ mod tests {
         );
     }
 
-    /// An inline-delivered subscriber is passed over by the walk — waking it
-    /// here would be a second wake source.
+    /// A surface session never appears in the walk at all: it holds no position
+    /// on the channel, so there is nothing for the walk to find trailing. Its
+    /// delivery state is the wire cursor its client echoes back.
     #[tokio::test]
     async fn wake_owed_subscribers_passes_over_inline_subscribers() {
         let mut channel = crate::messaging::testutils::test_channel_entry("inline-wake-ch", vec![]);
@@ -5434,7 +5659,276 @@ mod tests {
         messenger.wake_owed_subscribers().await;
         assert!(
             router.wakes.lock().unwrap().is_empty(),
-            "a surface session is delivered to inline, never woken by the walk"
+            "a surface session holds no position, so the walk never names it"
+        );
+    }
+
+    /// A durable channel carrying one `App` subscriber at `wake_min`, with the
+    /// app wired so its wake economics resolve.
+    fn conversation_wake_channel(slug: &str, name: &str, wake_min: WakeMin) -> ChannelEntry {
+        crate::messaging::testutils::test_channel_entry(
+            name,
+            vec![SubscriberEntry {
+                kind: SubscriberEntryKind::App(slug.to_string()),
+                push_depth: Depth::Bounded(8),
+                retain_depth: Depth::Bounded(8),
+                noise: config::NoiseLevel::Silent,
+                wake_min: Some(wake_min),
+            }],
+        )
+    }
+
+    /// One app, wired far enough for an `App` subscriber to resolve: the entry
+    /// must exist for wake economics, and its policy must cover the channel for
+    /// the walk's delivery gate.
+    fn wake_apps(slug: &str) -> indexmap::IndexMap<String, crate::config::AppConfig> {
+        let mut app = test_support::test_app_config(slug, None, vec![]);
+        app.policy = test_support::brenn_delivery_policy(
+            crate::access::acl::ChannelMatcher::Prefix(String::new()),
+        );
+        let mut apps = indexmap::IndexMap::new();
+        apps.insert(slug.to_string(), app);
+        apps
+    }
+
+    /// Commit one message at `urgency` onto `entry`'s store.
+    async fn publish_at(messenger: &Messenger, entry: &ChannelEntry, body: &str, urgency: Urgency) {
+        messenger
+            .store_for(entry)
+            .append(store::NewMessage {
+                source: "test".to_string(),
+                sender: "alice".to_string(),
+                body: body.to_string(),
+                urgency,
+                envelope_type: ChannelScheme::Brenn,
+                reply_to_uuid: None,
+                delivery_deadline: None,
+                publish_ts_ns: crate::messaging::db::utc_to_ns(Utc::now()),
+            })
+            .await;
+    }
+
+    /// The wake economics are applied to the loudest message a conversation has
+    /// not seen, at wake time: a backlog entirely below `wake_min` wakes nobody
+    /// and waits for the conversation's next natural drain, and one loud message
+    /// arriving behind it wakes on the same backlog the previous pass declined.
+    #[tokio::test]
+    async fn a_conversation_wakes_on_the_loudest_thing_it_has_not_seen() {
+        let channel = conversation_wake_channel("assistant", "quiet-ch", WakeMin::High);
+        let (messenger, router) =
+            wake_walk_messenger_with_apps(std::slice::from_ref(&channel), wake_apps("assistant"))
+                .await;
+        let conversation = ParticipantId::for_conversation(11);
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "assistant",
+                &conversation,
+                Depth::Bounded(8),
+                store::Priming::Head,
+            )
+            .await;
+
+        publish_at(&messenger, &channel, "chatter", Urgency::Normal).await;
+        messenger.wake_owed_subscribers().await;
+        assert!(
+            router.wakes.lock().unwrap().is_empty(),
+            "a below-threshold backlog costs no subprocess spawn"
+        );
+
+        publish_at(&messenger, &channel, "the house is on fire", Urgency::High).await;
+        messenger.wake_owed_subscribers().await;
+        assert_eq!(
+            *router.wakes.lock().unwrap(),
+            vec![SubscriberEntryKind::App("assistant".to_string())],
+            "the loud message wakes the conversation over the whole backlog"
+        );
+    }
+
+    /// The walk is the retry path, not the fast path: a conversation whose
+    /// position still trails after a wake is not re-woken on the next pass. The
+    /// wake costs a subprocess and the walk runs on every dispatcher kick, so an
+    /// ungated repeat would spawn at the publish rate.
+    #[tokio::test]
+    async fn an_inline_wake_is_not_repeated_on_the_next_pass() {
+        let channel = conversation_wake_channel("assistant", "retry-ch", WakeMin::Normal);
+        let (messenger, router) =
+            wake_walk_messenger_with_apps(std::slice::from_ref(&channel), wake_apps("assistant"))
+                .await;
+        let conversation = ParticipantId::for_conversation(12);
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "assistant",
+                &conversation,
+                Depth::Bounded(8),
+                store::Priming::Head,
+            )
+            .await;
+
+        publish_at(&messenger, &channel, "first", Urgency::Normal).await;
+        messenger.wake_owed_subscribers().await;
+        publish_at(&messenger, &channel, "second", Urgency::Normal).await;
+        messenger.wake_owed_subscribers().await;
+        assert_eq!(
+            router.wakes.lock().unwrap().len(),
+            1,
+            "the conversation never drained, so the second pass adds nothing"
+        );
+
+        // Suppression is a window, not a verdict. Once it lapses — here by the
+        // dispatcher's own "this one is live" signal, which clears it — the walk
+        // wakes the still-trailing position again. That retry is the walk's whole
+        // job behind a lost wake or a failed spawn.
+        messenger.clear_inline_wake(conversation.as_str());
+        messenger.wake_owed_subscribers().await;
+        assert_eq!(
+            router.wakes.lock().unwrap().len(),
+            2,
+            "the backlog is still owed, so a lapsed cooldown wakes it again"
+        );
+    }
+
+    /// A conversation on a ring-backed channel is as visible to the walk as one
+    /// on a durable channel: the walk resolves a conversation's registration
+    /// through the slug its position caches, and a ring position caches one for
+    /// the same reason a durable row does.
+    #[tokio::test]
+    async fn a_ring_conversation_is_woken_by_the_walk() {
+        let mut channel = crate::messaging::testutils::ephemeral_channel_entry("ring-conv-ch", 8);
+        channel.subscribers = vec![SubscriberEntry {
+            kind: SubscriberEntryKind::App("assistant".to_string()),
+            push_depth: Depth::Bounded(8),
+            retain_depth: Depth::Bounded(8),
+            noise: config::NoiseLevel::Silent,
+            wake_min: Some(WakeMin::Normal),
+        }];
+        let mut apps = wake_apps("assistant");
+        {
+            let policy = &mut apps.get_mut("assistant").expect("fixture app").policy;
+            policy
+                .grants
+                .insert(crate::access::AppCapability::EphemeralSubscribe);
+            policy
+                .acls
+                .ephemeral_subscribe
+                .push(crate::access::acl::ChannelMatcher::Prefix(String::new()));
+        }
+        let (messenger, router) =
+            wake_walk_messenger_with_apps(std::slice::from_ref(&channel), apps).await;
+        let conversation = ParticipantId::for_conversation(21);
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "assistant",
+                &conversation,
+                Depth::Bounded(8),
+                store::Priming::Head,
+            )
+            .await;
+
+        messenger.ring_store_for(&channel).append(ring_envelope(
+            &channel.address,
+            ChannelScheme::Ephemeral,
+            "hi",
+        ));
+        messenger.wake_owed_subscribers().await;
+        assert_eq!(
+            *router.wakes.lock().unwrap(),
+            vec![SubscriberEntryKind::App("assistant".to_string())],
+            "the ring position names its app, so the walk finds its registration"
+        );
+    }
+
+    /// A revoked ACL stops the wake, not just the delivery. The drain refuses to
+    /// serve the channel, so waking the conversation buys a subprocess spawn
+    /// that renders nothing — every pass, for as long as the revocation stands.
+    ///
+    /// And the report of it is once per `(channel, app)`: the revocation is a
+    /// standing state every pass re-observes, so a warn per pass would bury the
+    /// one line that names it.
+    #[tokio::test]
+    async fn a_conversation_the_acl_denies_is_not_woken() {
+        let channel = conversation_wake_channel("assistant", "denied-ch", WakeMin::Normal);
+        let mut apps = wake_apps("assistant");
+        apps.get_mut("assistant").expect("fixture app").policy =
+            crate::access::AppPolicy::default();
+        let (messenger, router) =
+            wake_walk_messenger_with_apps(std::slice::from_ref(&channel), apps).await;
+        let conversation = ParticipantId::for_conversation(22);
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "assistant",
+                &conversation,
+                Depth::Bounded(8),
+                store::Priming::Head,
+            )
+            .await;
+
+        publish_at(&messenger, &channel, "unservable", Urgency::Normal).await;
+        let (warns, _guard) = capture_messaging_warns();
+        messenger.wake_owed_subscribers().await;
+        messenger.wake_owed_subscribers().await;
+        assert!(
+            router.wakes.lock().unwrap().is_empty(),
+            "a subscriber the delivery gate will deny is not worth a spawn"
+        );
+        assert_eq!(
+            warns.load(Ordering::SeqCst),
+            1,
+            "two passes over one standing revocation report it once"
+        );
+    }
+
+    /// An inline subscriber whose economics do not resolve is a wiring bug the
+    /// boot cross-check exists to catch. Reaching the walk with one means the
+    /// subscriber can never be woken by anything, so the walk dies rather than
+    /// leaving it silently wedged.
+    #[tokio::test]
+    #[should_panic(expected = "has no wake economics")]
+    async fn an_inline_subscriber_without_economics_kills_the_walk() {
+        let channel = conversation_wake_channel("ghost", "unwired-ch", WakeMin::Normal);
+        // No apps map entry for `ghost`: the economics lookup finds nothing.
+        let (messenger, _router) = wake_walk_messenger(std::slice::from_ref(&channel)).await;
+        let conversation = ParticipantId::for_conversation(13);
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "ghost",
+                &conversation,
+                Depth::Bounded(8),
+                store::Priming::Head,
+            )
+            .await;
+
+        publish_at(&messenger, &channel, "unwakeable", Urgency::Normal).await;
+        messenger.wake_owed_subscribers().await;
+    }
+
+    /// A parked subscriber is woken by anything it is owed, whatever the
+    /// registration's `wake_min` says: its wake is a notify and its delivery
+    /// trigger both, so urgency has nothing to gate.
+    #[tokio::test]
+    async fn a_parked_subscriber_is_woken_below_its_registrations_wake_min() {
+        let mut channel = crate::messaging::testutils::ephemeral_channel_entry("parked-ch", 8);
+        channel.subscribers = vec![SubscriberEntry {
+            wake_min: Some(WakeMin::High),
+            ..crate::messaging::testutils::wasm_subscriber_entry("waker")
+        }];
+        let (messenger, router) = wake_walk_messenger(std::slice::from_ref(&channel)).await;
+        let wasm_sub = ParticipantId::for_wasm("waker");
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+
+        messenger.ring_store_for(&channel).append(ring_envelope(
+            &channel.address,
+            ChannelScheme::Ephemeral,
+            "quiet",
+        ));
+        messenger.wake_owed_subscribers().await;
+        assert_eq!(
+            *router.wakes.lock().unwrap(),
+            vec![SubscriberEntryKind::Wasm("waker".to_string())]
         );
     }
 
@@ -5452,11 +5946,8 @@ mod tests {
         ));
         assert!(messenger.ring_store_for(&channel).is_attached(&wasm_sub));
 
-        // Plant the store's metered drop tally for this subscriber (ring
-        // channels have no push window to plant).
-        messenger
-            .store_for(&channel)
-            .record_metered_drops(&wasm_sub, 3);
+        // Plant the ladder's metered tally for this subscriber.
+        messenger.enact_overflow_noise(&channel.address, &wasm_sub, config::NoiseLevel::Metered, 3);
         assert_eq!(messenger.drop_counter(&channel.address, &wasm_sub), 3);
 
         messenger
@@ -5465,6 +5956,41 @@ mod tests {
 
         assert!(!messenger.ring_store_for(&channel).is_attached(&wasm_sub));
         assert_eq!(messenger.drop_counter(&channel.address, &wasm_sub), 0);
+    }
+
+    /// One subscriber's losses on two channels are two tallies. A single
+    /// per-subscriber count would read a busy channel's overflow as the quiet
+    /// channel's, and detaching from one would erase the other's history.
+    #[tokio::test]
+    async fn the_metered_tally_is_keyed_by_channel_as_well_as_subscriber() {
+        let noisy = crate::messaging::testutils::ephemeral_channel_entry("tally-noisy", 8);
+        let quiet = crate::messaging::testutils::ephemeral_channel_entry("tally-quiet", 8);
+        let entries = vec![noisy.clone(), quiet.clone()];
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(entries.clone())),
+            Arc::from("test"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            config::MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(Arc::new(store::RingStores::build(&entries)));
+        let sub = ParticipantId::for_wasm("two-ports");
+        for channel in [&noisy, &quiet] {
+            messenger.attach_ring_subscriber(&channel.uuid, &sub, 4, store::Priming::Head);
+        }
+
+        messenger.enact_overflow_noise(&noisy.address, &sub, config::NoiseLevel::Metered, 2);
+        messenger.enact_overflow_noise(&noisy.address, &sub, config::NoiseLevel::Metered, 1);
+        assert_eq!(messenger.drop_counter(&noisy.address, &sub), 3);
+        assert_eq!(messenger.drop_counter(&quiet.address, &sub), 0);
+
+        messenger.detach_subscriber(&quiet.address, &sub).await;
+        assert_eq!(
+            messenger.drop_counter(&noisy.address, &sub),
+            3,
+            "leaving one channel says nothing about what was lost on another"
+        );
     }
 
     fn ring_envelope(channel: &str, scheme: ChannelScheme, body: &str) -> MessageEnvelope {
@@ -5955,13 +6481,27 @@ mod tests {
     }
 
     /// Publish `count` messages into `channel` through the store, enacting
-    /// overflow so the eviction accounting matches a real publish.
-    async fn commit_ring_publishes(messenger: &Messenger, channel: &ChannelEntry, count: usize) {
+    /// overflow so the eviction accounting matches a real publish. Returns how
+    /// many drops the appends reported against `subscriber`.
+    async fn commit_ring_publishes(
+        messenger: &Messenger,
+        channel: &ChannelEntry,
+        count: usize,
+        subscriber: &ParticipantId,
+    ) -> u64 {
         let store = messenger.store_for(channel);
+        let mut reported = 0;
         for i in 0..count {
             let outcome = store.append(ring_message(channel, &format!("n{i}"))).await;
-            messenger.enact_overflow_events(channel, store.as_ref(), &outcome.overflow);
+            reported += outcome
+                .overflow
+                .iter()
+                .filter(|e| &e.subscriber == subscriber)
+                .map(|e| e.dropped)
+                .sum::<u64>();
+            messenger.enact_overflow_events(channel, &outcome.overflow);
         }
+        reported
     }
 
     /// The canonical overflow producer: a consumer that never activates. Its
@@ -5981,12 +6521,11 @@ mod tests {
 
         // Two fit the depth-2 ring; the third and fourth evict the first two out
         // from under a subscriber that has never run.
-        commit_ring_publishes(&messenger, &channel, 4).await;
+        let reported = commit_ring_publishes(&messenger, &channel, 4, &wasm_sub).await;
 
         assert_eq!(
-            messenger.dropped_total(&channel.address, &wasm_sub),
-            2,
-            "both evicted-while-owed messages are accounted"
+            reported, 2,
+            "both evicted-while-owed messages are reported at the append that took them"
         );
         assert_eq!(
             messenger.drop_counter(&channel.address, &wasm_sub),
@@ -6000,10 +6539,133 @@ mod tests {
         );
     }
 
-    /// The same eviction on a `silent` registration: accounted for the guest's
-    /// gap signal, never metered, never alarmed.
+    /// A durable channel carrying `subscriber`, with `participant` attached to
+    /// it — what the GC pass finds when it outruns a position.
+    async fn durable_eviction_messenger(
+        channel_name: &str,
+        subscriber: SubscriberEntry,
+        app_slug: &str,
+        participant: &ParticipantId,
+    ) -> (Arc<Messenger>, ChannelEntry) {
+        let channel =
+            crate::messaging::testutils::test_channel_entry(channel_name, vec![subscriber]);
+        let db = crate::db::init_db_memory();
+        {
+            let conn = db.lock().await;
+            db::upsert_channels(&conn, std::slice::from_ref(&channel));
+        }
+        let messenger = Messenger::new(
+            db,
+            Arc::new(MessagingDirectory::with_entries(vec![channel.clone()])),
+            Arc::from("test"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            config::MessagingGlobalConfig::default(),
+        );
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                app_slug,
+                participant,
+                Depth::Bounded(4),
+                store::Priming::Head,
+            )
+            .await;
+        (messenger, channel)
+    }
+
+    /// Run one eviction pass over `channel`, keeping `frontier` messages.
+    async fn evict_durable(
+        messenger: &Messenger,
+        channel: &ChannelEntry,
+        frontier: u64,
+    ) -> Vec<store::OverflowEvent> {
+        let conn = messenger.db.lock().await;
+        db::bus_gc_evict_channel(
+            &conn,
+            channel.uuid,
+            &channel.address,
+            ChannelScheme::Brenn,
+            frontier,
+            config::Sink::Drop,
+            None,
+        )
+        .overflow
+    }
+
+    /// The durable eviction report is only worth computing if it reaches the
+    /// ladder: the GC pass hands its events to the same enactment sink the ring's
+    /// appends use, resolving the rung from the channel's registration. Without
+    /// this hop a wedged durable subscriber escalates nothing, and the whole
+    /// report-without-a-read property is inert.
     #[tokio::test]
-    async fn ring_eviction_on_a_silent_subscription_accounts_without_shouting() {
+    async fn a_durable_eviction_report_is_enacted_at_the_subscriptions_rung() {
+        let wasm_sub = ParticipantId::for_wasm("absent");
+        let (messenger, channel) = durable_eviction_messenger(
+            "gc-noise-ch",
+            ring_subscriber(
+                SubscriberEntryKind::Wasm("absent".to_string()),
+                config::NoiseLevel::Metered,
+            ),
+            "absent",
+            &wasm_sub,
+        )
+        .await;
+
+        for i in 0..3 {
+            publish_at(&messenger, &channel, &format!("n{i}"), Urgency::Normal).await;
+        }
+        let overflow = evict_durable(&messenger, &channel, 1).await;
+        assert_eq!(
+            overflow.iter().map(|e| e.dropped).sum::<u64>(),
+            2,
+            "the pass took two seqs from a position that never moved"
+        );
+
+        messenger.enact_overflow_for_channel(&channel.address, &overflow);
+        assert_eq!(
+            messenger.drop_counter(&channel.address, &wasm_sub),
+            2,
+            "metered: the evicted span lands on the ladder without any read"
+        );
+    }
+
+    /// The conversation arm of the same hop. A conversation names no
+    /// registration of its own, so the rung is resolved through the app slug the
+    /// cursor caches — a report that carried none would panic here rather than
+    /// escalate, which is exactly why the GC reads the slug from the cursor row.
+    #[tokio::test]
+    async fn a_durable_eviction_report_for_a_conversation_resolves_its_app() {
+        let conversation = ParticipantId::for_conversation(31);
+        let (messenger, channel) = durable_eviction_messenger(
+            "gc-conv-noise-ch",
+            ring_subscriber(
+                SubscriberEntryKind::App("chatty".to_string()),
+                config::NoiseLevel::Metered,
+            ),
+            "chatty",
+            &conversation,
+        )
+        .await;
+
+        for i in 0..3 {
+            publish_at(&messenger, &channel, &format!("n{i}"), Urgency::Normal).await;
+        }
+        let overflow = evict_durable(&messenger, &channel, 1).await;
+        assert_eq!(
+            overflow.first().and_then(|e| e.app_slug.clone()),
+            Some("chatty".to_string()),
+            "the cursor's cached slug rides the report"
+        );
+
+        messenger.enact_overflow_for_channel(&channel.address, &overflow);
+        assert_eq!(messenger.drop_counter(&channel.address, &conversation), 2);
+    }
+
+    /// The same eviction on a `silent` registration: reported to the caller,
+    /// never metered, never alarmed.
+    #[tokio::test]
+    async fn ring_eviction_on_a_silent_subscription_reports_without_shouting() {
         let mut channel = crate::messaging::testutils::local_channel_entry("evict-silent-ch", 2);
         channel.subscribers.push(ring_subscriber(
             SubscriberEntryKind::Wasm("quiet".to_string()),
@@ -6013,9 +6675,9 @@ mod tests {
             build_ring_wasm_messenger_with_alarm("quiet", channel);
         messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
 
-        commit_ring_publishes(&messenger, &channel, 4).await;
+        let reported = commit_ring_publishes(&messenger, &channel, 4, &wasm_sub).await;
 
-        assert_eq!(messenger.dropped_total(&channel.address, &wasm_sub), 2);
+        assert_eq!(reported, 2);
         assert_eq!(messenger.drop_counter(&channel.address, &wasm_sub), 0);
         assert_eq!(router.alarms.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
@@ -6023,8 +6685,8 @@ mod tests {
     /// A Surface-kind subscriber's overflow is never routed to the backend
     /// enactment sink: `fatal` is legal on a surface registration and is enacted
     /// by the page kernel, so routing it here would panic the backend on a
-    /// sanctioned config. The drop is still accounted on the store, which is
-    /// what reaches the page.
+    /// sanctioned config. The store still reports the drop, which is what
+    /// reaches the page.
     #[tokio::test]
     async fn surface_kind_ring_overflow_is_never_enacted_by_the_backend() {
         let mut channel = crate::messaging::testutils::ephemeral_channel_entry("evict-surface", 2);
@@ -6040,12 +6702,11 @@ mod tests {
         let surface_sub = ParticipantId::for_surface_component("dash", "main");
         messenger.attach_ring_subscriber(&channel.uuid, &surface_sub, 4, store::Priming::Head);
 
-        commit_ring_publishes(&messenger, &channel, 4).await;
+        let reported = commit_ring_publishes(&messenger, &channel, 4, &surface_sub).await;
 
         assert_eq!(
-            messenger.dropped_total(&channel.address, &surface_sub),
-            2,
-            "the drops still reach the page as the store's total"
+            reported, 2,
+            "the drops still reach the page through the store's report"
         );
         assert_eq!(router.alarms.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
@@ -6064,11 +6725,9 @@ mod tests {
         ));
         let (messenger, channel, _unused, _router) =
             build_ring_wasm_messenger_with_alarm("chatty", channel);
-        let store = messenger.store_for(&channel);
 
         messenger.enact_overflow_events(
             &channel,
-            store.as_ref(),
             &[store::OverflowEvent {
                 subscriber: ParticipantId::for_conversation(1),
                 dropped: 1,
@@ -6077,11 +6736,11 @@ mod tests {
         );
     }
 
-    /// Delivery state that outlived its registration: the drop is accounted on
-    /// the store, but no rung resolves for it, so nothing is metered and no
-    /// alarm fires — the event is surfaced in a log, not invented into a rung.
+    /// Delivery state that outlived its registration: the store reports the
+    /// drop, but no rung resolves for it, so nothing is metered and no alarm
+    /// fires — the event is surfaced in a log, not invented into a rung.
     #[tokio::test]
-    async fn an_unregistered_subscribers_overflow_is_accounted_but_not_enacted() {
+    async fn an_unregistered_subscribers_overflow_is_reported_but_not_enacted() {
         let mut channel = crate::messaging::testutils::local_channel_entry("stale-overflow", 2);
         channel.subscribers.push(ring_subscriber(
             SubscriberEntryKind::Wasm("known".to_string()),
@@ -6089,12 +6748,10 @@ mod tests {
         ));
         let (messenger, channel, _known, router) =
             build_ring_wasm_messenger_with_alarm("known", channel);
-        let store = messenger.store_for(&channel);
         let stranger = ParticipantId::for_wasm("gone");
 
         messenger.enact_overflow_events(
             &channel,
-            store.as_ref(),
             &[store::OverflowEvent {
                 subscriber: stranger.clone(),
                 dropped: 3,
@@ -6127,20 +6784,21 @@ mod tests {
     }
 
     /// Fill a depth-2 ring with two messages a never-running consumer is owed,
-    /// then release two deferrals over them. Returns
-    /// `(dropped_total, drop_counter, alarms)` for the consumer.
+    /// then release two deferrals over them. Returns `(drop_counter, alarms)`
+    /// for the consumer — on an `alarm` registration the ladder meters every
+    /// drop, so the counter is the enacted loss.
     ///
     /// `channel` must already carry the consumer's `alarm` registration.
-    async fn ring_release_overflow_enactment(channel: ChannelEntry) -> (u64, u64, u64) {
+    async fn ring_release_overflow_enactment(channel: ChannelEntry) -> (u64, u64) {
         let (messenger, channel, wasm_sub, router) =
             build_ring_wasm_messenger_with_alarm("absent", channel);
         messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
 
-        commit_ring_publishes(&messenger, &channel, 2).await;
+        commit_ring_publishes(&messenger, &channel, 2, &wasm_sub).await;
         let release_at = Utc::now() + chrono::Duration::seconds(1);
         park_ring_publishes(&messenger, &channel, 2, release_at).await;
         assert_eq!(
-            messenger.dropped_total(&channel.address, &wasm_sub),
+            messenger.drop_counter(&channel.address, &wasm_sub),
             0,
             "a parked message evicts nothing until it is released"
         );
@@ -6150,7 +6808,6 @@ mod tests {
             .await;
         assert_eq!(sweep.released, 2, "both deferrals came due");
         (
-            messenger.dropped_total(&channel.address, &wasm_sub),
             messenger.drop_counter(&channel.address, &wasm_sub),
             router.alarms.load(std::sync::atomic::Ordering::SeqCst),
         )
@@ -6168,9 +6825,8 @@ mod tests {
             config::NoiseLevel::Alarm,
         ));
 
-        let (dropped_total, drop_counter, alarms) = ring_release_overflow_enactment(channel).await;
-        assert_eq!(dropped_total, 2, "both owed messages were evicted");
-        assert_eq!(drop_counter, 2, "alarm meters every drop");
+        let (drop_counter, alarms) = ring_release_overflow_enactment(channel).await;
+        assert_eq!(drop_counter, 2, "alarm meters both evicted owed messages");
         assert_eq!(alarms, 1, "one alarm for the batch's merged overflow");
     }
 
@@ -6184,9 +6840,8 @@ mod tests {
             config::NoiseLevel::Alarm,
         ));
 
-        let (dropped_total, drop_counter, alarms) = ring_release_overflow_enactment(channel).await;
-        assert_eq!(dropped_total, 2, "both owed messages were evicted");
-        assert_eq!(drop_counter, 2, "alarm meters every drop");
+        let (drop_counter, alarms) = ring_release_overflow_enactment(channel).await;
+        assert_eq!(drop_counter, 2, "alarm meters both evicted owed messages");
         assert_eq!(alarms, 1, "one alarm for the batch's merged overflow");
     }
 

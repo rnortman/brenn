@@ -777,3 +777,58 @@ async fn drain_recovers_push_row_left_undelivered_after_session_death() {
              got {pushes:?}"
     );
 }
+
+/// The live wake path serves the conversation from its position, not from the
+/// envelope the wake carried: one call renders every message the conversation is
+/// owed, and a second call — the shape a per-message wake produces — renders
+/// nothing, because the first advanced past them.
+#[tokio::test]
+async fn live_delivery_serves_the_backlog_once() {
+    let (bridge, mut broadcast_rx) = bridge_with_messenger_for_drain().await;
+
+    seed_pending_push(&bridge, "live-first").await;
+    seed_pending_push(&bridge, "live-second").await;
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    crate::active_bridge::deliver_conversation_backlog(&bridge)
+        .await
+        .expect("recording session accepts the send");
+
+    let msgs = drain_broadcast(&mut broadcast_rx);
+    let broadcasts: Vec<&WsServerMessage> = msgs
+        .iter()
+        .filter(|m| matches!(m, WsServerMessage::SystemMessageBroadcast { .. }))
+        .collect();
+    assert_eq!(
+        broadcasts.len(),
+        1,
+        "both owed messages ride one render; got {msgs:?}"
+    );
+    // The live path carries no dual ToolUseSummary — that is drain-path only.
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, WsServerMessage::ToolUseSummary { .. })),
+        "live delivery emits no ToolUseSummary; got {msgs:?}"
+    );
+
+    crate::active_bridge::deliver_conversation_backlog(&bridge)
+        .await
+        .expect("a second wake with nothing owed is not a failure");
+    assert!(
+        drain_broadcast(&mut broadcast_rx)
+            .iter()
+            .all(|m| !matches!(m, WsServerMessage::SystemMessageBroadcast { .. })),
+        "the position moved past the batch, so the second wake renders nothing"
+    );
+
+    let conn = bridge.db.lock().await;
+    let pushes = brenn_lib::messaging::db::load_pending_pushes_for_drain(
+        &conn,
+        &brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id),
+    );
+    assert!(
+        pushes.is_empty(),
+        "the advance retired both claims; got {pushes:?}"
+    );
+}

@@ -167,6 +167,7 @@ async fn consumer_harness(
         &[(&push_ch, Depth::Unbounded), (&inbox, Depth::Unbounded)],
     )
     .await;
+    super::attach_tool_executor(&messenger).await;
 
     let (alert_dispatcher, _alert_handle) = noop_alert_dispatcher();
     let mut tool_grants = BTreeMap::new();
