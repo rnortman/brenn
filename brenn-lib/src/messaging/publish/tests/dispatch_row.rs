@@ -137,7 +137,8 @@ async fn dispatch_row_parked_target_quiet_row_wakes_nobody() {
 }
 
 // -----------------------------------------------------------------------
-// Wake gate: `wake_gated=true` suppresses the eager wake but never the
+// Wake gate: `wake_gated=true` — the subscriber's own urgency economics say
+// this row buys no subprocess — suppresses the eager wake but never the
 // delivery attempt.
 // -----------------------------------------------------------------------
 

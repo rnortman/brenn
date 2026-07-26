@@ -223,10 +223,22 @@ impl SystemInbox {
     ///
     /// The batch is ordered by publish time across channels, so a handler that
     /// groups by channel sees each channel's messages in publish order.
+    ///
+    /// Carries the delivery-time ACL gate: a channel this participant's policy
+    /// no longer covers is skipped without being read and without being advanced
+    /// over, so a restored policy serves the accumulated backlog rather than
+    /// silently stepping past it.
     pub async fn dequeue_batch(&self) -> Vec<(MessageSeq, MessageEnvelope)> {
         let subscriber = self.subscriber();
         let mut batch: Vec<(MessageSeq, MessageEnvelope)> = Vec::new();
         for (entry, sub) in self.subscriptions() {
+            if !self
+                .messenger
+                .channel_access_allowed(&sub.kind, &entry.address)
+            {
+                self.messenger.warn_acl_denied(&entry, &subscriber);
+                continue;
+            }
             let window = self
                 .messenger
                 .store_for(&entry)
@@ -321,6 +333,17 @@ mod tests {
         }
     }
 
+    /// [`spec`] with the subscribe ACL narrowed to `prefix` — for the
+    /// delivery-time ACL gate, which needs a policy that covers one of the
+    /// harness's two channels and not the other.
+    fn spec_covering(component: &'static str, prefix: &str) -> SystemParticipantSpec {
+        SystemParticipantSpec {
+            component,
+            policy: subscribe_policy(prefix),
+            subscriptions: vec![],
+        }
+    }
+
     fn inbox_sub() -> SubscriberEntry {
         SubscriberEntry {
             kind: SubscriberEntryKind::System(COMPONENT.to_string()),
@@ -376,6 +399,35 @@ mod tests {
 
     fn inbox(h: &Harness) -> SystemInbox {
         SystemInbox::new(COMPONENT, h.messenger.clone(), Arc::new(Notify::new()))
+    }
+
+    /// The same channels and the same database under a policy covering only
+    /// `prefix` — an operator revoking or restoring an ACL, with every position
+    /// left exactly where it was. Only the registration differs.
+    fn repolicy(h: &Harness, prefix: &str) -> Harness {
+        let entries: Vec<ChannelEntry> = h
+            .messenger
+            .directory()
+            .list()
+            .iter()
+            .map(|entry| ChannelEntry::clone(entry))
+            .collect();
+        let messenger = Messenger::new(
+            h.messenger.db().clone(),
+            Arc::new(MessagingDirectory::with_entries(entries)),
+            Arc::from("test"),
+            Arc::new(IndexMap::new()),
+            Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
+            MessagingGlobalConfig::default(),
+        )
+        .with_subscriber_registrations(registrations_from_specs(&[spec_covering(
+            COMPONENT, prefix,
+        )]));
+        Harness {
+            messenger,
+            reqs_uuid: h.reqs_uuid,
+            alt_uuid: h.alt_uuid,
+        }
     }
 
     async fn insert_on(h: &Harness, channel_uuid: uuid::Uuid, body: &str) {
@@ -509,6 +561,37 @@ mod tests {
             bodies(&inbox.dequeue_batch().await),
             vec!["alt-first", "reqs-second", "alt-third"],
             "one batch over both channels, ordered by publish time",
+        );
+    }
+
+    /// The delivery-time ACL gate, both halves. A channel the participant's
+    /// policy no longer covers is skipped without being read — and, because the
+    /// skip never advances the position, a restored policy serves the backlog
+    /// that accumulated under the revocation instead of stepping past it.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_denied_channel_is_skipped_without_advancing() {
+        let h = harness().await;
+        inbox(&h).attach().await;
+        insert_on(&h, h.reqs_uuid, "covered").await;
+        insert_on(&h, h.alt_uuid, "denied").await;
+
+        let revoked = repolicy(&h, "inbox/reqs");
+        assert_eq!(
+            bodies(&inbox(&revoked).dequeue_batch().await),
+            vec!["covered"],
+            "only the channel the narrowed policy still covers may be served",
+        );
+        assert!(
+            logs_contain("subscription delivery denied"),
+            "the gate must name the denied subscription",
+        );
+
+        let restored = repolicy(&h, "inbox/");
+        assert_eq!(
+            bodies(&inbox(&restored).dequeue_batch().await),
+            vec!["denied"],
+            "the denied channel's position never moved, so its backlog survives the revocation",
         );
     }
 

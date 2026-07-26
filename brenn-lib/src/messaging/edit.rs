@@ -489,21 +489,6 @@ mod tests {
         {
             let conn = db.lock().await;
             upsert_channels(&conn, std::slice::from_ref(&entry));
-            // Insert subscription record used for wake recomputation.
-            conn.execute(
-                "INSERT INTO messaging_subscriptions \
-                 (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    channel_uuid.as_bytes().to_vec(),
-                    "pa-alice",
-                    "unbounded",
-                    "unbounded",
-                    "silent",
-                    "normal",
-                ],
-            )
-            .unwrap();
         }
 
         let directory = Arc::new(MessagingDirectory::with_entries(vec![entry]));

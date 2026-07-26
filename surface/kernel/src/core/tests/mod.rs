@@ -392,15 +392,6 @@ pub(super) fn deliver_frame_cursor(
     .unwrap()
 }
 
-/// The server's ask to re-anchor one subscription.
-pub(super) fn re_anchor_frame(channel: &str, instance: &str) -> String {
-    serde_json::to_string(&ServerFrame::ReAnchor {
-        channel: channel.into(),
-        instance: instance.to_owned(),
-    })
-    .unwrap()
-}
-
 /// A subscription binding on a second, distinct channel, so reconcile tests
 /// can drop one channel while another survives.
 pub(super) fn other_binding() -> Binding {

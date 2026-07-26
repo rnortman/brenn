@@ -24,6 +24,7 @@ pub mod ingress;
 pub mod live;
 pub mod publish;
 pub mod query;
+pub mod reconcile;
 pub mod store;
 pub mod subscribe;
 pub mod system;
@@ -474,7 +475,7 @@ impl SubscriberEntryKind {
         }
     }
 
-    /// The key this subscriber stores in `messaging_subscriptions.app_slug` and
+    /// The key this subscriber stores in
     /// `messaging_pending_pushes.target_app_slug`. Identical to `slug()` for
     /// every kind whose principal *is* its slug; a surface component instance
     /// keys `<slug>#<instance>`, matching
@@ -1032,23 +1033,6 @@ pub enum DeliveryShape {
     ParkedWake,
 }
 
-/// What serving one wake cost, as the [`WakeRouter`] answers it.
-///
-/// The wake cooldown exists to bound subprocess spawns, so it applies to a wake
-/// that spawns one and to nothing else. A subscriber the router found already
-/// live is served in place; that costs no spawn and proves the subscriber is up,
-/// which is exactly the two conditions under which the cooldown has nothing to
-/// pace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WakeServed {
-    /// A wake was fired at a subscriber that was not running — the shape whose
-    /// cost the cooldown bounds.
-    Spawned,
-    /// The subscriber was already live and was served from its position on the
-    /// spot; no wake was fired.
-    Live,
-}
-
 /// The default [`DeliveryShape`] for a subscriber kind, mirroring the
 /// kind→binding choices bootstrap makes by hand: `App` and `Surface`
 /// subscribers deliver inline; `Wasm`/`System` subscribers are
@@ -1168,18 +1152,29 @@ pub trait WakeRouter: Send + Sync + 'static {
     /// The walk names a subscriber whose position trails retention; what that
     /// costs to serve depends on whether it is already running. An inline
     /// subscriber that is live is served here and now — it is awake, and the
-    /// spawn-shaped wake would find it running and do nothing. One that is not
-    /// gets the ordinary eager wake.
+    /// spawn-shaped wake would find it running and do nothing.
     ///
-    /// The return value tells the walk which of the two it was, so the wake
-    /// cooldown — which exists to bound spawns — paces only the spawn.
+    /// `spawn_permitted` is the walk's verdict on whether this backlog is worth
+    /// a *spawn* — the urgency economics, or a due deadline overriding them.
+    /// It governs the spawn arm and nothing else: a subscriber the router can
+    /// serve without one is served at any urgency, because `wake_min` prices a
+    /// subprocess and an already-awake subscriber costs none. A router that
+    /// cannot serve in place declines when the verdict does, leaving the
+    /// position for the subscriber's next natural drain or its deadline.
     ///
-    /// Default: the eager wake alone, which is the whole of the answer for a
-    /// parked subscriber (its notify is the delivery trigger) and for a surface
-    /// slug (the nudge is what makes its sessions drain).
-    async fn wake_owed(&self, key: &SubscriberEntryKind, subscriber: &ParticipantId) -> WakeServed {
-        self.spawn_eager_wake(key, subscriber);
-        WakeServed::Spawned
+    /// Default: the eager wake when the verdict permits, which is the whole of
+    /// the answer for a parked subscriber (its notify is the delivery trigger,
+    /// and its economics are `Eager`, so the verdict is always true) and for a
+    /// surface slug (the nudge is what makes its sessions drain).
+    async fn wake_owed(
+        &self,
+        key: &SubscriberEntryKind,
+        subscriber: &ParticipantId,
+        spawn_permitted: bool,
+    ) {
+        if spawn_permitted {
+            self.spawn_eager_wake(key, subscriber);
+        }
     }
 
     /// The [`DeliveryShape`] of the subscriber registered under `key`, derived
@@ -1196,6 +1191,29 @@ pub trait WakeRouter: Send + Sync + 'static {
     /// flooding. The metric counter is incremented separately before this is
     /// called; `alarm` handles only the alerting side.
     fn alarm(&self, channel: &str, subscriber: &ParticipantId, count: u64);
+
+    /// Escalate a position standing above everything its channel ever held:
+    /// `position` is past `head + 1`, which no sequence of appends and advances
+    /// can produce. The boot reconcile
+    /// ([`Messenger::reconcile_subscriber_cursors`]) has already logged it and
+    /// reset the position to head; this is the operator's copy.
+    ///
+    /// Its cause is external — a database restored under a cursor that outlived
+    /// it — so the loss is uncountable and the escalation says so rather than
+    /// naming a span. `AlertSeverity::Warning`, like [`WakeRouter::alarm`].
+    ///
+    /// Default: nothing. The `error!` at the call site is unconditional, so a
+    /// router without an alert channel still reports; only the operator's copy
+    /// is skipped.
+    fn position_ahead_of_retention(
+        &self,
+        channel: &str,
+        subscriber: &ParticipantId,
+        position: u64,
+        head: u64,
+    ) {
+        let _ = (channel, subscriber, position, head);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1303,20 +1321,6 @@ pub struct Messenger {
     /// subscriber keeps its backlog, so every drain would re-report it — and a
     /// config change is exactly when the log has to stay readable.
     acl_denied_warned: Mutex<HashSet<(Uuid, String)>>,
-    /// When each urgency-gated subscriber was last woken, by anything.
-    ///
-    /// An urgency-gated wake spawns a subprocess, and both wake sources — the
-    /// walk over trailing positions and the dispatcher's fan-out — run on every
-    /// dispatcher kick, so a subscriber whose spawn fails, or which simply takes
-    /// a while to come up and drain, would be re-woken as fast as the bus is
-    /// busy. One map for both sources: two cooldowns that could not see each
-    /// other would each pass their own gate and double the spawn rate they exist
-    /// to bound. Eager subscribers are never held back — their wake is a notify.
-    ///
-    /// Armed on a fresh wake, cleared when a delivery proves the subscriber
-    /// live, and left to expire on a gated pass (clearing it there would halve
-    /// the cooldown under repeated kicks).
-    inline_wake_backoff: Mutex<HashMap<String, std::time::Instant>>,
     /// Serializes [`Messenger::subscribe_dynamic`] and
     /// [`Messenger::unsubscribe_dynamic`] end to end.
     ///
@@ -1525,7 +1529,6 @@ impl Messenger {
             nondurable_dynamic_subs: Mutex::new(HashSet::new()),
             stranded_warned: Mutex::new(HashSet::new()),
             acl_denied_warned: Mutex::new(HashSet::new()),
-            inline_wake_backoff: Mutex::new(HashMap::new()),
             dynamic_subscribe_gate: tokio::sync::Mutex::new(()),
             surface_send_budgets: HashMap::new(),
             send_rate_buckets: Mutex::new(HashMap::new()),
@@ -1977,7 +1980,7 @@ impl Messenger {
     ///
     /// A ring-backed channel holds its subscriber registrations in memory (they
     /// are meaningless after the restart that empties the ring), so this is the
-    /// non-durable analogue of a `messaging_subscriptions` row: it is the
+    /// non-durable analogue of a `messaging_subscriber_cursors` row: it is the
     /// consumer's position from which [`Messenger::load_activation_snapshot`]
     /// draws its ring-backed NEW rows.
     ///
@@ -2037,12 +2040,6 @@ impl Messenger {
     /// `channel_address` — its position, which the store owns, plus the metered
     /// tally the noise ladder kept for it. The inverse of
     /// [`Messenger::attach_subscriber`].
-    ///
-    /// The wake cooldown is deliberately left alone: it bounds spawn cost per
-    /// subscriber across every channel, so leaving one channel says nothing
-    /// about a window a wake for another channel's backlog armed. It lapses on
-    /// its own, and only a signal that the subscriber is live clears it early
-    /// ([`Messenger::clear_inline_wake`]).
     ///
     /// # Panics
     ///
@@ -2230,11 +2227,13 @@ impl Messenger {
     /// The one wake source for channel-backed work, over every shape a position
     /// can belong to. A parked subscriber is woken whenever it is owed anything
     /// — the wake *is* its delivery trigger and costs a notify. An inline
-    /// subscriber's wake may cost a subprocess, so it is woken only when the
-    /// loudest message it has not seen clears its threshold: a backlog entirely
-    /// below `wake_min` wakes nobody and waits for the subscriber's next natural
-    /// drain, which is the same economics the publish path applies to the one
-    /// message it commits.
+    /// subscriber's wake may cost a subprocess, so the pass computes a verdict
+    /// on whether the loudest message it has not seen is worth one: a backlog
+    /// entirely below `wake_min` buys no spawn and waits for the subscriber's
+    /// next natural drain, which is the same economics the publish path applies
+    /// to the one message it commits. The verdict prices a spawn and only a
+    /// spawn — the router serves a subscriber that is already awake whatever
+    /// the verdict says (see [`WakeRouter::wake_owed`]).
     ///
     /// Because the decision is made here, from the live registration and the
     /// unseen suffix, it is re-made on every pass: a registration change, a
@@ -2246,11 +2245,18 @@ impl Messenger {
     ///
     /// A message's `delivery_deadline` is the second wake source here: at `now`
     /// past T, every subscriber whose position has not passed that message is
-    /// woken whatever its urgency economics say, and whatever the inline cooldown
-    /// says. The deadline leaves the pass's view the moment the position passes
-    /// the message, so nothing re-fires for a deadline already served, and no
-    /// per-subscriber copy of T is stored anywhere — the message row that has
-    /// always carried it is the only record.
+    /// woken whatever its urgency economics say. The deadline leaves the pass's
+    /// view the moment the position passes the message, so nothing re-fires for
+    /// a deadline already served, and no per-subscriber copy of T is stored
+    /// anywhere — the message row that has always carried it is the only
+    /// record.
+    ///
+    /// The pass holds no pacing state of any kind. A subscriber whose backlog
+    /// clears its threshold is handed to the router on every pass that finds it
+    /// owed; what that costs is the router's business — a live subscriber is
+    /// served in place, and the spawn path's own backoff bounds a *failing*
+    /// spawn. Nothing here bounds a healthy one: if a message is going to be
+    /// processed at all, processing it now beats making it wait.
     ///
     /// Idempotent (`Notify` coalesces) and self-limiting: a subscriber stops
     /// being owed once it drains.
@@ -2298,22 +2304,25 @@ impl Messenger {
                             )
                         }),
                 };
-                // A conversation's delivery read applies the ACL gate, so waking
-                // one the gate will deny buys a subprocess spawn that renders
-                // nothing — every pass, for as long as the revocation and the
-                // backlog both stand. The other kinds have no read-side gate, so
-                // their wakes still do work. Asked after the economics
-                // resolution, because an app missing from the apps map fails
-                // both tests and the wiring bug is the one worth reporting.
-                if let SubscriberEntryKind::App(slug) = &registration.kind
-                    && !self.channel_access_allowed(&registration.kind, &entry.address)
-                {
-                    self.warn_acl_denied(&entry, slug);
+                // Every family's delivery read applies this same gate, so waking
+                // a subscriber the gate will deny buys work that serves nothing —
+                // every pass, for as long as the revocation and the backlog both
+                // stand. Wake gate and read gate are one predicate and cannot
+                // disagree; this arm is the efficiency in front of the
+                // enforcement point, not a second enforcement point.
+                //
+                // Asked after the economics resolution, and that order matters:
+                // economics panics on a subscriber missing from the host wiring,
+                // while the fail-closed gate denies it. Asked first, the gate
+                // would eat the wiring-bug panic and turn it into a once-warned
+                // permanent silent skip.
+                if !self.channel_access_allowed(&registration.kind, &entry.address) {
+                    self.warn_acl_denied(&entry, &owed.subscriber);
                     continue;
                 }
-                // A deadline that has come due overrides both gates below: the
-                // point of `delivery_deadline` is that a message too quiet to
-                // wake anyone still gets in front of its subscriber by T.
+                // A deadline that has come due overrides the urgency verdict:
+                // the point of `delivery_deadline` is that a message too quiet
+                // to wake anyone still gets in front of its subscriber by T.
                 let deadline_due = match owed.earliest_unseen_deadline {
                     Some(deadline) if deadline <= now => true,
                     Some(deadline) => {
@@ -2326,101 +2335,28 @@ impl Messenger {
                     }
                     None => false,
                 };
-                if !deadline_due {
-                    if !store::targets::wakes_at(
+                let spawn_permitted = deadline_due
+                    || store::targets::wakes_at(
                         economics,
                         registration.wake_min,
                         owed.max_unseen_urgency,
-                    ) {
-                        continue;
-                    }
-                    if economics == WakeEconomics::UrgencyGated
-                        && !self.inline_wake_due(&owed.subscriber)
-                    {
-                        continue;
-                    }
-                } else {
-                    // The forced wake spawns like any other, so it arms the
-                    // cooldown a gated wake would have armed — what it does not
-                    // do is wait for one. A live serve clears it again below,
-                    // for the same reason a live serve never arms it.
-                    self.arm_inline_wake(owed.subscriber.as_str());
+                    );
+                if deadline_due {
                     sweep.fired_deadline_wake = true;
                 }
-                // A subscriber the router found already live was served in
-                // place, without a spawn — so the cooldown, which is there to
-                // bound spawns, has nothing to pace and would only withhold the
-                // next message from a bridge that is sitting right there. Same
-                // reasoning the ingress supervisor applies when a delivery
-                // proves its subscriber live (`dispatcher.rs`).
-                if self
-                    .router
-                    .wake_owed(&registration.kind, &owed.subscriber)
-                    .await
-                    == WakeServed::Live
-                {
-                    self.clear_inline_wake(owed.subscriber.as_str());
-                }
+                // The verdict prices a *spawn*, so it is the router's to apply,
+                // not the walk's: a subscriber the router can serve without one
+                // — an inline subscriber whose bridge is already up — is served
+                // its backlog at any urgency, and only one that would have to be
+                // spawned is held back. Deciding here instead would withhold a
+                // quiet message from a bridge sitting right there ready to
+                // render it, until whatever woke that bridge next.
+                self.router
+                    .wake_owed(&registration.kind, &owed.subscriber, spawn_permitted)
+                    .await;
             }
         }
         sweep
-    }
-
-    /// Whether an urgency-gated wake for `subscriber_key` is still inside the
-    /// cooldown the last one armed.
-    ///
-    /// The check and the arm are separate here because the dispatcher decides to
-    /// wake and learns whether the wake actually fired at two different points;
-    /// the walk, which learns both at once, uses [`Self::inline_wake_due`].
-    pub fn inline_wake_gated(&self, subscriber_key: &str) -> bool {
-        self.inline_wake_backoff
-            .lock()
-            .expect("messaging: inline_wake_backoff lock poisoned")
-            .get(subscriber_key)
-            .is_some_and(|when| when.elapsed() < dispatcher::POLL_INTERVAL)
-    }
-
-    /// Start the cooldown for `subscriber_key`: a spawn is in flight, so further
-    /// wakes within the window coalesce into it.
-    pub fn arm_inline_wake(&self, subscriber_key: &str) {
-        self.inline_wake_backoff
-            .lock()
-            .expect("messaging: inline_wake_backoff lock poisoned")
-            .insert(subscriber_key.to_string(), std::time::Instant::now());
-    }
-
-    /// End the cooldown for `subscriber_key`: something proved it live, so the
-    /// next wake need not wait the window out.
-    pub fn clear_inline_wake(&self, subscriber_key: &str) {
-        self.inline_wake_backoff
-            .lock()
-            .expect("messaging: inline_wake_backoff lock poisoned")
-            .remove(subscriber_key);
-    }
-
-    /// Whether the walk may wake this urgency-gated subscriber again yet,
-    /// recording the wake when it may.
-    ///
-    /// One wake per subscriber per [`dispatcher::POLL_INTERVAL`], counted from
-    /// the last wake anything fired. A subscriber that drains stops being owed
-    /// and never asks again; one that does not is retried at the tick rate
-    /// instead of at the publish rate.
-    ///
-    /// Check and arm under one lock hold: two passes that both read "due" would
-    /// both spawn, which is the cost this exists to bound.
-    fn inline_wake_due(&self, subscriber: &ParticipantId) -> bool {
-        let mut last = self
-            .inline_wake_backoff
-            .lock()
-            .expect("messaging: inline_wake_backoff lock poisoned");
-        let now = std::time::Instant::now();
-        match last.get(subscriber.as_str()) {
-            Some(when) if now.duration_since(*when) < dispatcher::POLL_INTERVAL => false,
-            _ => {
-                last.insert(subscriber.as_str().to_string(), now);
-                true
-            }
-        }
     }
 
     /// Report `subscriber` as owed messages on `entry` under no registration
@@ -2471,24 +2407,31 @@ impl Messenger {
             .is_some_and(|p| p.allows_channel_access(address))
     }
 
-    /// Report that `app_slug`'s subscription on `entry` was denied at delivery —
-    /// at most once per `(channel, app)` pair.
+    /// Report that `subscriber`'s subscription on `entry` was denied at
+    /// delivery — at most once per `(channel, subscriber)` pair.
     ///
     /// The denial is a standing state, not an event: it holds until an operator
-    /// restores the ACL, and every drain and every wake pass re-observes it. One
+    /// restores the ACL, and every read and every wake pass re-observes it. One
     /// report per pair names the revocation without burying it.
-    pub(crate) fn warn_acl_denied(&self, entry: &ChannelEntry, app_slug: &str) {
+    ///
+    /// Keyed by the subscriber rather than by the app it belongs to, because the
+    /// gate is kind-blind: a WASM port, a system participant, and a conversation
+    /// are three principals whose denials are three separate facts. For an app
+    /// holding several conversations that is a finer grain than the app-keyed
+    /// form it replaces — one line per conversation, which is the attribution
+    /// the operator needs to know which one stopped being served.
+    pub(crate) fn warn_acl_denied(&self, entry: &ChannelEntry, subscriber: &ParticipantId) {
         let first_report = self
             .acl_denied_warned
             .lock()
             .expect("messaging: acl_denied_warned lock poisoned")
-            .insert((entry.uuid, app_slug.to_string()));
+            .insert((entry.uuid, subscriber.as_str().to_string()));
         if first_report {
             tracing::warn!(
-                app = %app_slug,
+                subscriber = %subscriber.as_str(),
                 channel = %entry.address,
                 "subscription delivery denied — ACL not satisfied \
-                 (reported once per app per channel)"
+                 (reported once per subscriber per channel)"
             );
         }
     }
@@ -3036,6 +2979,13 @@ impl Messenger {
     /// position nothing reads — `detach` and the sampled-attach demotion rule
     /// remove it, and nothing else was ever written per message.
     ///
+    /// **The delivery-time ACL gate lives here** for this family: a port whose
+    /// policy no longer covers its channel is served nothing and advanced over
+    /// nothing, so a restored policy delivers the backlog that accumulated,
+    /// bounded by retention. This is the read-side enforcement point the
+    /// capability model requires to be structural rather than resting on the
+    /// boot-time validation holding forever.
+    ///
     /// Panics on any DB error (fail-fast; the DB is host infrastructure).
     pub async fn load_activation_snapshot(
         &self,
@@ -3047,20 +2997,53 @@ impl Messenger {
 
         // Resolving by address keeps the directory the single authority on
         // which channel a port names.
-        let stores: Vec<Arc<dyn store::RetentionStore>> = inputs
+        let entries: Vec<Arc<ChannelEntry>> = inputs
             .iter()
-            .map(|input| self.store_for_address(&input.sub.channel_address))
+            .map(|input| {
+                self.directory
+                    .resolve(&input.sub.channel_address)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "messaging: input port {:?} names channel {:?}, which is not in the \
+                             directory",
+                            input.port, input.sub.channel_address
+                        )
+                    })
+            })
+            .collect();
+        let stores: Vec<Arc<dyn store::RetentionStore>> =
+            entries.iter().map(|entry| self.store_for(entry)).collect();
+
+        // The registration key the gate reads the policy under. This is the WASM
+        // activation path, so the component's own identity is that key.
+        let kind = SubscriberEntryKind::Wasm(subscriber.as_wasm_slug().to_string());
+
+        // Denial is decided before anything else reads a position: a denied port
+        // must not contribute to the trigger decision below, or a revoked
+        // subscriber would still be activated by traffic it cannot be shown.
+        let allowed: Vec<bool> = entries
+            .iter()
+            .map(|entry| {
+                let allowed = self.channel_access_allowed(&kind, &entry.address);
+                if !allowed {
+                    self.warn_acl_denied(entry, subscriber);
+                }
+                allowed
+            })
             .collect();
 
-        // Trigger gate first: a window read carries up to
+        // Trigger gate: a window read carries up to
         // `max(push_depth, retain_depth)` envelopes per port, and a drain step
         // that activates nothing — the common case after a burst, since wakes
         // coalesce — must not pay for K of those. `has_deliverable` answers
         // "anything unseen and still retained?" from positions alone, and no
         // port owed anything means no window below could hold anything new.
         let mut any_deliverable = false;
-        for (input, store) in inputs.iter().zip(&stores) {
-            if input.sub.push_depth.is_push_enabled() && store.has_deliverable(subscriber).await {
+        for ((input, store), allowed) in inputs.iter().zip(&stores).zip(&allowed) {
+            if *allowed
+                && input.sub.push_depth.is_push_enabled()
+                && store.has_deliverable(subscriber).await
+            {
                 any_deliverable = true;
                 break;
             }
@@ -3072,9 +3055,15 @@ impl Messenger {
         // One window read per port builds context and new together. Pure reads:
         // no position moves here, so the None path below leaves every port
         // exactly as it found it and the dispatcher advances only once it has
-        // decided to activate.
+        // decided to activate. A denied port is not read at all — an empty
+        // window carries no entries to show the guest and no span to advance
+        // over, which is the "serves nothing, moves nothing" the gate promises.
         let mut windows: Vec<store::SubscriberWindow> = Vec::with_capacity(inputs.len());
-        for (input, store) in inputs.iter().zip(&stores) {
+        for ((input, store), allowed) in inputs.iter().zip(&stores).zip(&allowed) {
+            if !allowed {
+                windows.push(store::SubscriberWindow::empty());
+                continue;
+            }
             windows.push(
                 store
                     .window(
@@ -3983,7 +3972,7 @@ mod tests {
     /// is `UrgencyGated` (sourced from `apps`, not the registry), a registered
     /// non-app subscriber returns its declared economics, and an unregistered
     /// non-app subscriber returns `None` — the signal the boot cross-check trips
-    /// on. Drives the eager-wake decision and the dispatcher cooldown keying.
+    /// on. Drives the eager-wake decision on both wake paths.
     #[test]
     fn subscriber_wake_economics_resolves_per_participant() {
         use std::sync::Arc;
@@ -4842,6 +4831,74 @@ mod tests {
     // load_activation_snapshot unit tests
     // -----------------------------------------------------------------------
 
+    /// The WIT's `dropped` reaches back across a host restart on a durable
+    /// channel, because the position it is measured from does.
+    ///
+    /// Three messages arrive at a depth-1 port that never activates; the host
+    /// then dies. The figure is a subtraction against the persisted cursor, so
+    /// the first activation *after* the restart still reports the two that
+    /// passed the port unserved before it — which is the guarantee
+    /// `port-window.dropped` now states for `brenn:` channels and deliberately
+    /// does not state for a ring, whose channel and position die together.
+    #[tokio::test]
+    async fn a_durable_ports_dropped_span_survives_a_host_restart() {
+        let (messenger, channel, wasm_sub) = super::testutils::build_wasm_messenger(
+            "restart-drop",
+            "restart-drop-ch",
+            config::Depth::Bounded(1),
+            config::Depth::Bounded(0),
+        )
+        .await;
+        let db = messenger.db().clone();
+        for i in 0..3 {
+            super::testutils::insert_bus_message(
+                &messenger,
+                &channel,
+                &format!("m{i}"),
+                ChannelScheme::Brenn,
+            )
+            .await;
+        }
+        // The host dies before any activation reads the port.
+        drop(messenger);
+
+        let restarted = super::testutils::restart_wasm_messenger(db, &channel);
+        let inputs = vec![WasmInputPort {
+            port: "in".to_string(),
+            sub: config::ResolvedSubscription {
+                channel_uuid: channel.uuid,
+                channel_address: channel.address.clone(),
+                push_depth: config::Depth::Bounded(1),
+                retain_depth: config::Depth::Bounded(0),
+                noise: config::NoiseLevel::Silent,
+                wake_min: WakeMin::Normal,
+            },
+            amplification_mt: 1000,
+        }];
+        let snapshot = restarted
+            .load_activation_snapshot(&wasm_sub, &inputs)
+            .await
+            .expect("the surviving position is still owed the backlog");
+        let bodies: Vec<&str> = snapshot[0]
+            .entries
+            .iter()
+            .map(|(_, e)| e.body.as_str())
+            .collect();
+        assert_eq!(bodies, ["m2"], "the clamp serves the newest, as always");
+
+        let (through, seen_floor) = snapshot[0]
+            .advance_span()
+            .expect("a push-enabled port with a served window advances");
+        let outcome = restarted
+            .store_for(&channel)
+            .advance(&wasm_sub, through, seen_floor)
+            .await;
+        assert_eq!(
+            outcome.dropped, 2,
+            "the two the clamp skipped before the restart are still reported after it"
+        );
+    }
+
     /// A parked message holds no retention position, so it is not part of the
     /// channel's ambience: it must be absent from a port's context window until
     /// a release pass moves it into retention, and present once it has — at the
@@ -5204,7 +5261,10 @@ mod tests {
             Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
             config::MessagingGlobalConfig::default(),
         )
-        .with_ring_stores(ring_stores);
+        .with_ring_stores(ring_stores)
+        .with_subscriber_registrations(
+            crate::messaging::testutils::covering_wasm_registrations(slug),
+        );
         (messenger, Arc::new(channel), ParticipantId::for_wasm(slug))
     }
 
@@ -5212,10 +5272,10 @@ mod tests {
     #[derive(Default)]
     struct RecordingWakeRouter {
         wakes: std::sync::Mutex<Vec<SubscriberEntryKind>>,
-        /// Answer every wake with [`WakeServed::Live`] — the shape the real
-        /// router takes when it finds the subscriber's bridge already running
-        /// and serves it in place. Off by default: a spawn is the ordinary
-        /// answer, and only the live answer changes what the cooldown does.
+        /// Serve every wake in place — the shape the real router takes when it
+        /// finds the subscriber's bridge already running. Off by default: a
+        /// spawn is the ordinary answer, and the two differ in exactly one
+        /// respect, which is whether the walk's verdict is consulted at all.
         serve_live: std::sync::atomic::AtomicBool,
     }
 
@@ -5244,15 +5304,18 @@ mod tests {
             &self,
             key: &SubscriberEntryKind,
             subscriber: &ParticipantId,
-        ) -> WakeServed {
+            spawn_permitted: bool,
+        ) {
             if self.serve_live.load(Ordering::SeqCst) {
-                // Served in place, so no wake fires; the walk still named this
-                // subscriber, which is what the recording is for.
+                // Served in place at any urgency — a bridge that is already up
+                // costs no spawn, so the verdict does not apply to it. The
+                // recording is what the walk named either way.
                 self.wakes.lock().unwrap().push(key.clone());
-                return WakeServed::Live;
+                return;
             }
-            self.spawn_eager_wake(key, subscriber);
-            WakeServed::Spawned
+            if spawn_permitted {
+                self.spawn_eager_wake(key, subscriber);
+            }
         }
         fn delivery_shape(&self, key: &SubscriberEntryKind) -> DeliveryShape {
             crate::messaging::default_delivery_shape(key)
@@ -5274,6 +5337,22 @@ mod tests {
         channels: &[ChannelEntry],
         apps: indexmap::IndexMap<String, crate::config::AppConfig>,
     ) -> (Arc<Messenger>, Arc<RecordingWakeRouter>) {
+        wake_walk_messenger_scoped(
+            channels,
+            apps,
+            crate::access::acl::ChannelMatcher::Prefix(String::new()),
+        )
+        .await
+    }
+
+    /// The same, with the non-`App` subscribers' registered policies scoped by
+    /// `matcher` rather than universally — for the ACL gate, which needs a
+    /// registration that does not cover the channel.
+    async fn wake_walk_messenger_scoped(
+        channels: &[ChannelEntry],
+        apps: indexmap::IndexMap<String, crate::config::AppConfig>,
+        matcher: crate::access::acl::ChannelMatcher,
+    ) -> (Arc<Messenger>, Arc<RecordingWakeRouter>) {
         let db = crate::db::init_db_memory();
         let (durable, nondurable): (Vec<ChannelEntry>, Vec<ChannelEntry>) = channels
             .iter()
@@ -5283,6 +5362,8 @@ mod tests {
             let conn = db.lock().await;
             db::upsert_channels(&conn, &durable);
         }
+        let registrations =
+            crate::messaging::testutils::bus_subscriber_registrations(channels, matcher);
         let router = Arc::new(RecordingWakeRouter::default());
         let messenger = Messenger::new(
             db,
@@ -5292,7 +5373,8 @@ mod tests {
             router.clone() as Arc<dyn WakeRouter>,
             config::MessagingGlobalConfig::default(),
         )
-        .with_ring_stores(Arc::new(store::RingStores::build(&nondurable)));
+        .with_ring_stores(Arc::new(store::RingStores::build(&nondurable)))
+        .with_subscriber_registrations(registrations);
         (messenger, router)
     }
 
@@ -5421,6 +5503,121 @@ mod tests {
         assert!(
             router.wakes.lock().unwrap().is_empty(),
             "settled work owes nothing, so nothing wakes"
+        );
+    }
+
+    /// The walk's ACL gate is kind-blind: a `Wasm` and a `System` subscriber
+    /// owed messages on a channel their registered policy no longer covers wake
+    /// nothing, and their positions stay where they are.
+    ///
+    /// Wake gate and read gate are one predicate, so a wake the gate would let
+    /// through only buys work the read would then refuse to serve.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_denied_owed_subscriber_of_any_kind_wakes_nothing() {
+        let mut channel = (*crate::messaging::testutils::wasm_channel_entry(
+            "denied-waker",
+            "denied-wake-ch",
+            Depth::Unbounded,
+            Depth::Unbounded,
+        ))
+        .clone();
+        channel.subscribers.push(SubscriberEntry {
+            kind: SubscriberEntryKind::System("denied-system".to_string()),
+            push_depth: Depth::Unbounded,
+            retain_depth: Depth::Unbounded,
+            noise: config::NoiseLevel::Silent,
+            wake_min: None,
+        });
+        // The registered policy names a channel nobody here subscribes to, so
+        // both subscribers are live, owed, and revoked.
+        let (messenger, router) = wake_walk_messenger_scoped(
+            std::slice::from_ref(&channel),
+            indexmap::IndexMap::new(),
+            crate::access::acl::ChannelMatcher::Exact("some-other-channel".to_string()),
+        )
+        .await;
+        let wasm_sub = ParticipantId::for_wasm("denied-waker");
+        let system_sub = ParticipantId::for_system("denied-system");
+        for (slug, subscriber) in [("denied-waker", &wasm_sub), ("denied-system", &system_sub)] {
+            messenger
+                .attach_subscriber(
+                    &channel.address,
+                    slug,
+                    subscriber,
+                    Depth::Bounded(4),
+                    store::Priming::Head,
+                )
+                .await;
+        }
+        crate::messaging::testutils::insert_bus_message(
+            &messenger,
+            &channel,
+            "owed",
+            ChannelScheme::Brenn,
+        )
+        .await;
+
+        messenger.wake_owed_subscribers(Utc::now()).await;
+
+        assert!(
+            router.wakes.lock().unwrap().is_empty(),
+            "a denied subscriber wakes nothing, whatever its kind"
+        );
+        assert!(
+            logs_contain("subscription delivery denied"),
+            "the walk must name the denial rather than passing over it silently",
+        );
+        let mut still_owed: Vec<String> = messenger
+            .store_for(&channel)
+            .deliverable_subscribers()
+            .await
+            .iter()
+            .map(|owed| owed.subscriber.as_str().to_string())
+            .collect();
+        still_owed.sort();
+        assert_eq!(
+            still_owed,
+            vec![
+                system_sub.as_str().to_string(),
+                wasm_sub.as_str().to_string()
+            ],
+            "the walk moves no position, so both remain owed for a restored policy to serve",
+        );
+    }
+
+    /// The denial report is keyed by the subscriber, not by the app behind it:
+    /// two conversations delivering under one `App` subscription that lost its
+    /// ACL are two facts, and the operator needs to know *which* conversation
+    /// stopped being served. An app-keyed report collapses them into one line
+    /// and silently drops the second.
+    ///
+    /// Re-reading a subscriber already reported is the same standing state, so
+    /// it adds nothing — the once-per rule the grain sits inside.
+    #[tokio::test]
+    async fn a_denial_is_reported_per_subscriber_not_per_app() {
+        let channel = conversation_wake_channel("assistant", "denial-grain-ch", WakeMin::Normal);
+        let (messenger, _router) =
+            wake_walk_messenger_with_apps(std::slice::from_ref(&channel), wake_apps("assistant"))
+                .await;
+        let first = ParticipantId::for_conversation(1);
+        let second = ParticipantId::for_conversation(2);
+
+        let (warns, _guard) = capture_messaging_warns();
+        messenger.warn_acl_denied(&channel, &first);
+        messenger.warn_acl_denied(&channel, &second);
+        assert_eq!(
+            warns.load(Ordering::SeqCst),
+            2,
+            "each denied conversation of the app is named"
+        );
+
+        messenger.warn_acl_denied(&channel, &first);
+        messenger.warn_acl_denied(&channel, &second);
+        assert_eq!(
+            warns.load(Ordering::SeqCst),
+            2,
+            "a denial already reported is not repeated"
         );
     }
 
@@ -5682,12 +5879,13 @@ mod tests {
         );
     }
 
-    /// The cooldown that holds an urgency-gated wake to one per tick does not
-    /// hold a deadline: the subscriber has until T, and a suppressed retry could
-    /// spend it. The forced wake still arms the cooldown, so a wake the urgency
-    /// economics ask for coalesces into the one the deadline just fired.
+    /// A due deadline is not held by the urgency verdict: the subscriber has
+    /// until T, and the point of naming one is that a message too quiet to buy
+    /// a spawn still gets in front of its subscriber. The walk holds no pacing
+    /// state, so the retry is repeated on every pass until the position passes
+    /// the message.
     #[tokio::test]
-    async fn a_due_deadline_overrides_the_inline_cooldown() {
+    async fn a_due_deadline_is_retried_until_the_position_passes_it() {
         let channel = conversation_wake_channel("assistant", "deadline-retry-ch", WakeMin::High);
         let (messenger, router) =
             wake_walk_messenger_with_apps(std::slice::from_ref(&channel), wake_apps("assistant"))
@@ -5713,80 +5911,33 @@ mod tests {
             "the position still trails the deadline, so the retry is not suppressed"
         );
 
-        // The other half of the rule: the forced wake armed the cooldown, so an
-        // urgency-driven wake in the same window coalesces into it instead of
-        // spawning a second subprocess. Serve the deadline message first, so
-        // what follows is decided by the economics rather than by the deadline.
+        // A second quiet message with no deadline of its own, so the subscriber
+        // is still owed something after the advance below: without it the final
+        // walk would return on an empty backlog and assert nothing about
+        // deadlines at all.
+        publish_at(&messenger, &channel, "quiet", Urgency::Normal).await;
+
+        // Served: the deadline leaves the pass's view with the position that
+        // passed it, and the quiet message behind it buys no spawn of its own.
         messenger
             .store_for(&channel)
             .advance(&conversation, store::MessageSeq(1), store::MessageSeq(1))
             .await;
-        publish_at(&messenger, &channel, "loud", Urgency::High).await;
+        assert!(
+            !messenger
+                .store_for(&channel)
+                .deliverable_subscribers()
+                .await
+                .is_empty(),
+            "the quiet message keeps the position owed, so the walk below really \
+             reaches a deadline and an urgency verdict"
+        );
         messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             router.wakes.lock().unwrap().len(),
             2,
-            "a message above wake_min still coalesces into the wake the deadline just fired"
-        );
-
-        // And the cooldown is the only thing holding it: cleared, the same pass
-        // wakes.
-        messenger.clear_inline_wake(conversation.as_str());
-        messenger.wake_owed_subscribers(Utc::now()).await;
-        assert_eq!(
-            router.wakes.lock().unwrap().len(),
-            3,
-            "with the cooldown spent the loud message wakes on its own economics"
-        );
-    }
-
-    /// A subscriber the router found already live was served in place, at no
-    /// spawn cost — so the cooldown, which exists to bound spawns, must not hold
-    /// the next message back. Both halves of the rule run here against one
-    /// fixture shape, because the only difference between them is the router's
-    /// answer: report `Live` and the second message goes through on the next
-    /// pass; report `Spawned` and it coalesces into the first wake, a whole poll
-    /// interval away.
-    ///
-    /// Neither half advances the position, so what the second pass sees is
-    /// decided by the cooldown alone.
-    #[tokio::test]
-    async fn a_live_serve_leaves_the_next_message_unpaced() {
-        async fn two_passes(name: &str, conversation_id: i64, serve_live: bool) -> usize {
-            let channel = conversation_wake_channel("assistant", name, WakeMin::Normal);
-            let (messenger, router) = wake_walk_messenger_with_apps(
-                std::slice::from_ref(&channel),
-                wake_apps("assistant"),
-            )
-            .await;
-            router.serve_live.store(serve_live, Ordering::SeqCst);
-            let conversation = ParticipantId::for_conversation(conversation_id);
-            messenger
-                .attach_subscriber(
-                    &channel.address,
-                    "assistant",
-                    &conversation,
-                    Depth::Bounded(8),
-                    store::Priming::Head,
-                )
-                .await;
-
-            publish_at(&messenger, &channel, "first", Urgency::Normal).await;
-            messenger.wake_owed_subscribers(Utc::now()).await;
-            publish_at(&messenger, &channel, "second", Urgency::Normal).await;
-            messenger.wake_owed_subscribers(Utc::now()).await;
-            router.wakes.lock().unwrap().len()
-        }
-
-        assert_eq!(
-            two_passes("live-serve-ch", 38, true).await,
-            2,
-            "a live serve spawns nothing, so the next message is served on the next pass"
-        );
-        assert_eq!(
-            two_passes("spawned-serve-ch", 39, false).await,
-            1,
-            "a spawned wake is paced: the second message coalesces into it"
+            "a deadline the position has passed wakes nobody, and the quiet \
+             backlog still owed behind it buys no spawn of its own"
         );
     }
 
@@ -6134,16 +6285,19 @@ mod tests {
         );
     }
 
-    /// The walk is the retry path, not the fast path: a conversation whose
-    /// position still trails after a wake is not re-woken on the next pass. The
-    /// wake costs a subprocess and the walk runs on every dispatcher kick, so an
-    /// ungated repeat would spawn at the publish rate.
+    /// `wake_min` prices a subprocess, so it has nothing to say about a
+    /// conversation whose bridge is already up: the router serves it in place,
+    /// and the walk hands it every backlog it finds, at any urgency. Withholding
+    /// a quiet message from a live bridge would make it wait for whatever woke
+    /// that bridge next, which is the failure `wake_min` was never meant to
+    /// cause.
     #[tokio::test]
-    async fn an_inline_wake_is_not_repeated_on_the_next_pass() {
-        let channel = conversation_wake_channel("assistant", "retry-ch", WakeMin::Normal);
+    async fn a_live_bridge_is_served_below_the_wake_threshold() {
+        let channel = conversation_wake_channel("assistant", "live-quiet-ch", WakeMin::High);
         let (messenger, router) =
             wake_walk_messenger_with_apps(std::slice::from_ref(&channel), wake_apps("assistant"))
                 .await;
+        router.serve_live.store(true, Ordering::SeqCst);
         let conversation = ParticipantId::for_conversation(12);
         messenger
             .attach_subscriber(
@@ -6155,26 +6309,22 @@ mod tests {
             )
             .await;
 
-        publish_at(&messenger, &channel, "first", Urgency::Normal).await;
-        messenger.wake_owed_subscribers(Utc::now()).await;
-        publish_at(&messenger, &channel, "second", Urgency::Normal).await;
+        publish_at(&messenger, &channel, "chatter", Urgency::Normal).await;
         messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
-            router.wakes.lock().unwrap().len(),
-            1,
-            "the conversation never drained, so the second pass adds nothing"
+            *router.wakes.lock().unwrap(),
+            vec![SubscriberEntryKind::App("assistant".to_string())],
+            "a live bridge is served its below-threshold backlog on the walk that finds it"
         );
 
-        // Suppression is a window, not a verdict. Once it lapses — here by the
-        // dispatcher's own "this one is live" signal, which clears it — the walk
-        // wakes the still-trailing position again. That retry is the walk's whole
-        // job behind a lost wake or a failed spawn.
-        messenger.clear_inline_wake(conversation.as_str());
+        // And it stays served: the position never moved, so every pass hands it
+        // the same backlog rather than pacing itself out.
+        publish_at(&messenger, &channel, "more chatter", Urgency::Normal).await;
         messenger.wake_owed_subscribers(Utc::now()).await;
         assert_eq!(
             router.wakes.lock().unwrap().len(),
             2,
-            "the backlog is still owed, so a lapsed cooldown wakes it again"
+            "nothing paces a serve that costs no spawn"
         );
     }
 
@@ -6629,7 +6779,10 @@ mod tests {
             router.clone() as Arc<dyn WakeRouter>,
             config::MessagingGlobalConfig::default(),
         )
-        .with_ring_stores(ring_stores);
+        .with_ring_stores(ring_stores)
+        .with_subscriber_registrations(
+            crate::messaging::testutils::covering_wasm_registrations(slug),
+        );
         (
             messenger,
             Arc::new(channel),
@@ -6759,6 +6912,9 @@ mod tests {
             Arc::new(indexmap::IndexMap::new()),
             router.clone() as Arc<dyn WakeRouter>,
             config::MessagingGlobalConfig::default(),
+        )
+        .with_subscriber_registrations(
+            crate::messaging::testutils::covering_wasm_registrations(slug),
         );
         let wasm_sub = ParticipantId::for_wasm(slug);
         crate::messaging::testutils::attach_wasm_port(
@@ -7273,7 +7429,10 @@ mod tests {
             Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
             config::MessagingGlobalConfig::default(),
         )
-        .with_ring_stores(ring_stores);
+        .with_ring_stores(ring_stores)
+        .with_subscriber_registrations(
+            crate::messaging::testutils::covering_wasm_registrations("mixed"),
+        );
         let wasm_sub = ParticipantId::for_wasm("mixed");
 
         // Ring port: attach + one retained message that is not owed (context only).

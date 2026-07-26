@@ -18,6 +18,7 @@ use super::{
     query::NoopWakeRouter,
 };
 use crate::access::AppPolicy;
+use crate::db::Db;
 
 /// Build a subscriber-registration map from a `slug → policy` map for a single
 /// kind, applying `wake` to every entry. The per-kind builders below
@@ -42,6 +43,83 @@ fn registrations_for(
             )
         })
         .collect()
+}
+
+/// An `AppPolicy` authorizing delivery on every bus scheme a fixture channel can
+/// carry — `brenn:`, `ephemeral:`, and `local:` — each scoped by `matcher`.
+///
+/// The three schemes gate on three distinct transport grants, so a fixture whose
+/// channels span them needs all three. `ChannelMatcher::Prefix(String::new())`
+/// is the covering case; a matcher naming something else is the denied one.
+pub fn bus_delivery_policy(matcher: crate::access::acl::ChannelMatcher) -> AppPolicy {
+    let mut policy = AppPolicy::default();
+    policy
+        .grants
+        .insert(crate::access::AppCapability::MessagingSubscribe);
+    policy
+        .grants
+        .insert(crate::access::AppCapability::EphemeralSubscribe);
+    policy
+        .grants
+        .insert(crate::access::AppCapability::LocalSubscribe);
+    policy.acls.brenn_subscribe.push(matcher.clone());
+    policy.acls.ephemeral_subscribe.push(matcher.clone());
+    policy.acls.local_subscribe.push(matcher);
+    policy
+}
+
+/// Registrations for every non-`App` subscriber on `entries`, under one policy
+/// scoped by `matcher`.
+///
+/// Boot registers each such subscriber with the policy its ACL derives, and the
+/// delivery-time gate reads that registration — so a fixture whose subscriber
+/// has none is a subscriber the fail-closed gate denies. Deriving from the
+/// channels' own subscriber lists means a case that adds a subscriber gets its
+/// registration without editing a second list. `App` subscribers are excluded:
+/// their policy comes from the apps map, not the registry.
+pub fn bus_subscriber_registrations(
+    entries: &[ChannelEntry],
+    matcher: crate::access::acl::ChannelMatcher,
+) -> HashMap<SubscriberEntryKind, SubscriberRegistration> {
+    let policy = Arc::new(bus_delivery_policy(matcher));
+    entries
+        .iter()
+        .flat_map(|entry| entry.subscribers.iter())
+        .filter(|sub| !matches!(sub.kind, SubscriberEntryKind::App(_)))
+        .map(|sub| {
+            (
+                sub.kind.clone(),
+                SubscriberRegistration {
+                    policy: Arc::clone(&policy),
+                    wake: WakeEconomics::Eager,
+                },
+            )
+        })
+        .collect()
+}
+
+/// [`bus_subscriber_registrations`] at the covering scope — the ordinary case,
+/// where a fixture's subscribers are all authorized for the channels they are
+/// wired to.
+pub fn covering_subscriber_registrations(
+    entries: &[ChannelEntry],
+) -> HashMap<SubscriberEntryKind, SubscriberRegistration> {
+    bus_subscriber_registrations(
+        entries,
+        crate::access::acl::ChannelMatcher::Prefix(String::new()),
+    )
+}
+
+/// A covering registration for one WASM consumer slug — for the fixture that
+/// attaches its subscriber directly instead of declaring it on the channel, so
+/// [`covering_subscriber_registrations`] would find nothing to register.
+pub fn covering_wasm_registrations(
+    slug: &str,
+) -> HashMap<SubscriberEntryKind, SubscriberRegistration> {
+    wasm_registrations(HashMap::from([(
+        slug.to_string(),
+        bus_delivery_policy(crate::access::acl::ChannelMatcher::Prefix(String::new())),
+    )]))
 }
 
 /// Registrations for WASM consumer subscribers (`Eager` wake), from a
@@ -244,7 +322,10 @@ pub async fn build_wasm_messenger(
         Arc::new(indexmap::IndexMap::new()),
         Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
         MessagingGlobalConfig::default(),
-    );
+    )
+    .with_subscriber_registrations(covering_subscriber_registrations(std::slice::from_ref(
+        &*entry,
+    )));
     let wasm_sub = ParticipantId::for_wasm(slug);
     attach_wasm_port(&messenger, &entry, slug, &wasm_sub, push_depth).await;
     (messenger, entry, wasm_sub)
@@ -276,6 +357,28 @@ pub async fn attach_wasm_port(
             crate::messaging::store::Priming::Head,
         )
         .await;
+}
+
+/// A second `Messenger` over an existing database and channel — a host restart,
+/// as observable from inside one process.
+///
+/// It attaches nothing: what makes this a restart rather than a fresh boot is
+/// that the durable cursor row survives, so the returned messenger reads the
+/// position the previous one left. A caller that wants the boot attach as well
+/// calls [`attach_wasm_port`] on the result.
+pub fn restart_wasm_messenger(db: Db, entry: &ChannelEntry) -> Arc<Messenger> {
+    let directory = Arc::new(MessagingDirectory::with_entries(vec![entry.clone()]));
+    Messenger::new(
+        db,
+        directory,
+        Arc::from("test"),
+        Arc::new(indexmap::IndexMap::new()),
+        Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
+        MessagingGlobalConfig::default(),
+    )
+    .with_subscriber_registrations(covering_subscriber_registrations(std::slice::from_ref(
+        entry,
+    )))
 }
 
 /// Terse wrapper around [`build_wasm_messenger`] for the common `Unbounded`/`Unbounded` case.

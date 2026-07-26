@@ -108,8 +108,8 @@ pub(crate) fn build_apps_with_messaging(
         // MQTT ingress subscriptions are already fully resolved (address parsed,
         // channel UUID derived, generic params resolved via sub → channel →
         // global). Copy them straight across into the shared subscription list so
-        // finalize_directory_with_subscribers and rebuild_subscriptions populate
-        // channel.subscribers for mqtt: channels exactly as for webhooks. The
+        // finalize_directory_with_subscribers populates channel.subscribers for
+        // mqtt: channels exactly as it does for webhooks. The
         // per-app resolved sub already carries the full generic set, so this is a
         // direct copy, not a re-resolution.
         transport_resolved_subs.extend(app.mqtt_subscriptions.iter().map(|ms| {
@@ -133,8 +133,8 @@ pub(crate) fn build_apps_with_messaging(
                 // block but has [[app.webhook_subscription]] and/or
                 // [[app.mqtt_subscription]] entries. Build a minimal
                 // ResolvedMessagingConfig so the app appears in
-                // apps_with_messaging and its transport subscriptions reach both
-                // rebuild_subscriptions and finalize_directory_with_subscribers.
+                // apps_with_messaging and its transport subscriptions reach
+                // finalize_directory_with_subscribers.
                 apps_with_messaging.push((
                     slug.clone(),
                     ResolvedMessagingConfig {
@@ -148,42 +148,6 @@ pub(crate) fn build_apps_with_messaging(
     }
 
     apps_with_messaging
-}
-
-/// Merge webhook-derived messaging configs from `apps_with_messaging` back into
-/// the base `apps` map so the result can be handed to `Messenger::new`.
-///
-/// The merge keeps one app's two records of itself from disagreeing: a
-/// webhook-subscribed app appears in the channel's subscriber list (placed there
-/// by `finalize_directory_with_subscribers` from `apps_with_messaging`), so its
-/// own `.messaging` must name the same subscriptions rather than the subset the
-/// operator typed. `Messenger` reads the merged block for the app's send budget;
-/// a transport-only app that reached `Messenger::new` unmerged would carry no
-/// `.messaging` at all.
-///
-/// Apps absent from `apps_with_messaging` (no messaging block, no webhook
-/// subscriptions) are passed through unchanged with their original `.messaging`
-/// value (which remains `None`).
-///
-/// Extracted as a standalone function so it can be called and tested
-/// independently from `build_messaging` (which is async and DB-dependent).
-pub(crate) fn merge_apps_for_messenger(
-    apps: &IndexMap<String, brenn_lib::config::AppConfig>,
-    apps_with_messaging: &[(String, ResolvedMessagingConfig)],
-) -> IndexMap<String, brenn_lib::config::AppConfig> {
-    let mut merged = apps.clone();
-    for (slug, resolved_msg) in apps_with_messaging {
-        merged
-            .get_mut(slug)
-            .unwrap_or_else(|| {
-                panic!(
-                    "merge_apps_for_messenger: apps_with_messaging names slug {slug:?} \
-                     absent from the apps map (host bug)"
-                )
-            })
-            .messaging = Some(resolved_msg.clone());
-    }
-    merged
 }
 
 /// Scheme-strip an operator-configured system-publisher channel to its bare
@@ -533,8 +497,6 @@ pub(crate) async fn build_messaging(
     // resolve them against a directory that includes the non-durable set. The
     // surface pre_directory must stay durable-only (surface binding resolution
     // takes the ephemeral set as a separate argument).
-    let nondurable_uuids: std::collections::HashSet<uuid::Uuid> =
-        nondurable_channels.iter().map(|e| e.uuid).collect();
     let wasm_pre_directory = {
         let mut wasm_dir_entries = all_entries.clone();
         wasm_dir_entries.extend(nondurable_channels.iter().cloned());
@@ -549,9 +511,9 @@ pub(crate) async fn build_messaging(
     // Every input registers in the directory, whatever its channel's class: the
     // registration is where a subscription's resolved parameters (push depth,
     // retain depth, noise rung) live, and the substrate reads them for a
-    // ring-backed subscriber exactly as for a durable one. Only *persistence* of
-    // the registration follows durability, and that split is made once, at the
-    // `messaging_subscriptions` rebuild below.
+    // ring-backed subscriber exactly as for a durable one. What follows
+    // durability is where the subscriber's *position* lives: a durable cursor
+    // row, or the ring's in-memory cursor that dies with the data it names.
     let mut wasm_consumers_for_dir: Vec<(String, Vec<ResolvedSubscription>)> =
         resolved_wasm_consumers
             .iter()
@@ -630,14 +592,11 @@ pub(crate) async fn build_messaging(
     // executor subscribes to each as `system:tool-executor`); for each wasm
     // consumer holding ≥1 async tool grant, one `brenn:tool-results/<slug>` inbox
     // plus the derived async bus grants. The channels ride the same
-    // finalize/upsert/rebuild path as every other channel; the inbox subscription
-    // is folded through `wasm_consumers_for_dir` so it is written to both the
-    // directory and `messaging_subscriptions` like a configured wasm subscription,
-    // and as a triggering `WasmInputPort` on the consumer's `inputs` so a delivered
-    // result activates the consumer (and survives the drain's residue
-    // reconciliation, which retires rows for channels absent from `inputs`).
-    // The System request-channel subscriber is programmatic (directory-only, no
-    // `messaging_subscriptions` row); it is folded in from the executor's
+    // finalize/upsert path as every other channel; the inbox subscription is
+    // folded through `wasm_consumers_for_dir` into the directory like a
+    // configured wasm subscription, and as a triggering `WasmInputPort` on the
+    // consumer's `inputs` so a delivered result activates the consumer.
+    // The System request-channel subscriber is folded in from the executor's
     // `SystemParticipantSpec` below and validated by the deliverability check
     // like every other static subscriber.
     let async_tool_names = tool_registry.async_tool_names();
@@ -758,6 +717,11 @@ pub(crate) async fn build_messaging(
     // broker SUBSCRIBE + `IngressRoute` (boot re-activation gap — see
     // `DynamicMqttIngress`).
     let mut dynamic_mqtt_ingress: Vec<DynamicMqttIngress> = Vec::new();
+    // `(channel_uuid, app_slug)` of every dynamic row the merge held back as
+    // unauthorized. The rows stay in their table for a later re-grant, so the
+    // cursor reconcile below must count them as registrations — the directory
+    // alone cannot see them.
+    let mut dormant_dynamic: Vec<(uuid::Uuid, String)> = Vec::new();
     {
         let conn = db.lock().await;
         // Durable channels only: a non-durable channel has no `messaging_channels`
@@ -768,27 +732,6 @@ pub(crate) async fn build_messaging(
             .map(|e| (**e).clone())
             .collect();
         messaging::db::upsert_channels(&conn, &entries);
-        // Registration persistence follows channel durability: a ring-backed
-        // subscription is meaningless after the restart that empties the ring,
-        // so it registers in the directory and nowhere else.
-        let wasm_consumers_for_db: Vec<(String, Vec<ResolvedSubscription>)> =
-            wasm_consumers_for_dir
-                .iter()
-                .map(|(slug, subs)| {
-                    let durable = subs
-                        .iter()
-                        .filter(|sub| !nondurable_uuids.contains(&sub.channel_uuid))
-                        .cloned()
-                        .collect();
-                    (slug.clone(), durable)
-                })
-                .collect();
-        messaging::db::rebuild_subscriptions(
-            &conn,
-            &apps_with_messaging,
-            &wasm_consumers_for_db,
-            &surfaces_for_dir,
-        );
         // Boot merge: the directory now holds the static + WASM
         // subscribers, so collision detection against static subs is accurate.
         // Re-fold the durable dynamic rows (the table boot never truncates) onto
@@ -833,14 +776,13 @@ pub(crate) async fn build_messaging(
             messaging::config::merge_dynamic_subscriptions(&directory, &dynamic_rows, &|slug| {
                 apps.get(slug).map(|a| &a.policy)
             });
-        // Mirror the surviving dynamic rows into messaging_subscriptions (so the
-        // urgency-recompute join in bus.rs sees dynamic subscribers) and prune
-        // the dropped rows from the durable table (so the conflict does not recur
-        // next boot). Both run under the same DB lock as the rebuild above. The
-        // `revoked` rows are intentionally left untouched in the durable table.
-        messaging::db::mirror_dynamic_subscriptions(&conn, &merge_outcome.kept);
+        // Prune the dropped rows from the durable table so the conflict does not
+        // recur next boot. The surviving (`kept`) rows need no write: the merge
+        // folded them into the directory, which is where a subscription is read
+        // from. The `revoked` rows are intentionally left untouched.
         messaging::db::prune_dropped_dynamic_subscriptions(&conn, &merge_outcome.dropped);
         for row in &merge_outcome.revoked {
+            dormant_dynamic.push((row.channel_uuid, row.app_slug.clone()));
             // Surface the channel address, not just the UUID: a
             // revoked row's channel was reconstructed before the merge (revoked
             // rows are durable rows, so their UUID is in `referenced_uuids` and
@@ -915,15 +857,6 @@ pub(crate) async fn build_messaging(
         }
     }
 
-    // Build a merged apps map where each app's `.messaging` reflects the same
-    // merged ResolvedMessagingConfig that `build_apps_with_messaging` produced
-    // (including webhook-derived ResolvedSubscriptions), so the map the Messenger
-    // holds and the directory it walks describe the same subscriptions.
-    // The surface-description publisher is a `system:` participant (built into
-    // `system_participants` above), not an injected app, so the merged app map is
-    // exactly the operator apps with their webhook-derived subscriptions.
-    let merged_apps = Arc::new(merge_apps_for_messenger(apps, &apps_with_messaging));
-
     // server_origin is always Some past the messaging_configured early return
     // above, because run_server resolves it whenever that same predicate is true.
     let source = server_origin
@@ -980,11 +913,16 @@ pub(crate) async fn build_messaging(
     subscriber_registrations.extend(brenn_lib::messaging::system::registrations_from_specs(
         &system_participants,
     ));
+    // The Messenger holds the operator apps as resolved. What it reads off this
+    // map is `messaging_send_budget()`, which falls back to the global default
+    // stamped on every app at resolve time — so a transport-only app carrying no
+    // `[app.messaging]` block reports the same budget a synthesised block would.
+    // What each app *subscribes to* is the directory's answer, not this map's.
     let messenger = messaging::Messenger::new(
         db,
         directory,
         source,
-        merged_apps,
+        Arc::clone(apps),
         router.clone() as Arc<dyn messaging::WakeRouter>,
         config.messaging.clone(),
     )
@@ -1003,6 +941,23 @@ pub(crate) async fn build_messaging(
             .map(|s| (s.slug.clone(), s.principal_send_budgets().collect())),
     )
     .with_ring_stores(ring_stores);
+
+    // The cursor rows the last boot left, judged against the directory just
+    // assembled plus the dormant dynamic registrations it deliberately excludes,
+    // and before this boot's attaches touch any of them: a row no registration
+    // names is deleted, and one standing above its channel's head is reset to it.
+    // Both states can only arise while the process is down, so this is the only
+    // place they are asked about.
+    let reconciled = messenger
+        .reconcile_subscriber_cursors(&dormant_dynamic)
+        .await;
+    if !reconciled.is_clean() {
+        tracing::warn!(
+            orphans_removed = reconciled.orphans_removed,
+            positions_reset = reconciled.positions_reset,
+            "messaging: boot reconciled subscriber cursors"
+        );
+    }
 
     // Whether a queue is new is the store's determination, made from its own
     // per-subscriber position.

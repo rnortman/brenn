@@ -111,7 +111,6 @@ pub(super) fn frame_type_name(frame: &ServerFrame) -> &'static str {
         ServerFrame::Heartbeat => "Heartbeat",
         ServerFrame::SubscribeResult { .. } => "SubscribeResult",
         ServerFrame::Deliver { .. } => "Deliver",
-        ServerFrame::ReAnchor { .. } => "ReAnchor",
         ServerFrame::PublishResult { .. } => "PublishResult",
         ServerFrame::PublishBatchResult { .. } => "PublishBatchResult",
     }

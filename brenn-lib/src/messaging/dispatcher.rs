@@ -59,11 +59,14 @@ const PAST_DEADLINE_DEBOUNCE: Duration = Duration::from_secs(5);
 /// channel-subscription question, and these deliveries are addressed to a
 /// participant directly.
 ///
-/// `wake_gated`: when `true`, an eager wake is suppressed (the caller's wake
-/// cooldown is active). Delivery is never gated — only the re-firing of
-/// `spawn_eager_wake`. The caller sets this only for Conversation groups, so
-/// surface/wasm wakes are never gated even though this function stays
-/// kind-agnostic.
+/// `wake_gated`: when `true`, an eager wake is suppressed — the row's
+/// subscriber is urgency-gated and this row is not loud enough to buy a
+/// subprocess. Delivery is never gated, only the firing of `spawn_eager_wake`:
+/// a live bridge is served whatever the urgency, and a sleeping one waits for
+/// its next natural spawn, which is the same rule the bus applies to a
+/// below-`wake_min` backlog. The caller sets this only for `UrgencyGated`
+/// groups, so surface/wasm wakes are never gated even though this function
+/// stays kind-agnostic.
 ///
 /// Returns `DispatchOutcome::Delivered(push_id)` only when the underlying
 /// `router.deliver_ingress()` returns `Ok(true)`. All other outcomes return
@@ -94,7 +97,7 @@ pub async fn dispatch_row(
         Ok(true) => DispatchOutcome::Delivered(row.push_id),
         Ok(false) => {
             // No active bridge. Eager-wake if this row demands it and the wake
-            // is not gated by the caller's cooldown.
+            // is loud enough to buy one.
             if should_wake {
                 router.spawn_eager_wake(&key, &row.target_subscriber);
             }
@@ -158,11 +161,11 @@ async fn dispatcher_loop(
     // (including rows published while the task was mid-flight) in publish_ts_ns order.
     let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
-    // The wake cooldown NEVER suppresses a delivery attempt: every due group
-    // still gets its fan-out and per-row dispatch_row, so a live
-    // durable/bridge delivery is never delayed by it. Only Conversation groups
-    // are ever gated — a surface wake is a free notify_one, and a parked
-    // subscriber's channel-backed wake does not come from a fan-out task at all.
+    // The urgency gate NEVER suppresses a delivery attempt: every due group
+    // still gets its fan-out and per-row dispatch_row, so a live bridge is
+    // served whatever the row's urgency. Only `UrgencyGated` groups are ever
+    // gated — a surface wake is a free notify_one, and a parked subscriber's
+    // channel-backed wake does not come from a fan-out task at all.
 
     let mut fired_wakes = false;
     // Earliest deferred release across every channel's store. Seeded by one
@@ -285,42 +288,36 @@ async fn dispatcher_loop(
 
         // Spawn one transient per-bridge fan-out task per subscriber group.
         // The dispatcher loop does NOT await these tasks (no HOL across bridges, R11b).
-        // A supervisor task awaits each fan-out JoinHandle to clean up in_flight and
-        // recently_woken, and to log+recover from any fan-out task panic (errhandling-1
-        // fix: a panic must not leave the subscriber permanently stuck in in_flight).
+        // A supervisor task awaits each fan-out JoinHandle to clean up in_flight,
+        // and to log+recover from any fan-out task panic (errhandling-1 fix: a
+        // panic must not leave the subscriber permanently stuck in in_flight).
         for (subscriber_key, rows) in groups {
-            // Efficiency-1 wake gate: coalesce redundant eager wakes for an
-            // `UrgencyGated` subscriber woken within POLL_INTERVAL. This gates only
-            // the wake (a CC spawn) — the group is never skipped, so every row's
-            // dispatch_row delivery attempt still runs. Only `UrgencyGated` groups
-            // are gated: an `Eager` wake is a free notify_one. The gate reads the
-            // subscriber's declared wake economics per participant (via the
-            // registry), not its identity prefix.
+            // The wake gate is the subscriber's own urgency economics and
+            // nothing else: an `UrgencyGated` subscriber's spawn is priced, and
+            // an ingress row is not urgency-ranked, so it never buys one. It
+            // gates only the wake (a CC spawn) — the group is never skipped, so
+            // every row's dispatch_row delivery attempt still runs and a live
+            // bridge is served regardless. An `Eager` wake is a free notify_one
+            // and is never gated. The economics are read per participant from
+            // the registry, not from the identity prefix.
             let first_row = rows.first().expect("fan-out group is never empty");
             let group_key =
                 registration_key(&first_row.target_subscriber, &first_row.target_app_slug);
-            let urgency_gated = messenger.subscriber_wake_economics(&group_key)
+            let wake_gated = messenger.subscriber_wake_economics(&group_key)
                 == Some(WakeEconomics::UrgencyGated);
-            let wake_gated = urgency_gated && messenger.inline_wake_gated(&subscriber_key);
 
             let router_clone = router.clone();
             let db_clone = db.clone();
             // Clone Arcs for the supervisor task (fan-out task gets its own clones below).
             let in_flight_supervisor = in_flight.clone();
-            let messenger_supervisor = messenger.clone();
 
             let fan_out_handle = tokio::spawn(async move {
                 let mut delivered_ids: Vec<i64> = Vec::new();
-                // `fired_wake`: any row actually fired an eager wake.
-                // `delivered_any`: any row was delivered.
-                let mut fired_wake = false;
-                let mut delivered_any = false;
 
                 for row in &rows {
                     match dispatch_row(router_clone.as_ref(), row, wake_gated).await {
                         DispatchOutcome::Delivered(id) => {
                             delivered_ids.push(id);
-                            delivered_any = true;
                         }
                         DispatchOutcome::Parked { woke } => {
                             // Row stays stored (sleeping bridge, eager-wake fired if needed).
@@ -331,9 +328,6 @@ async fn dispatcher_loop(
                                 woke,
                                 "dispatch_row parked"
                             );
-                            if woke {
-                                fired_wake = true;
-                            }
                         }
                     }
                 }
@@ -343,8 +337,6 @@ async fn dispatcher_loop(
                     let conn = db_clone.lock().await;
                     db::mark_pending_pushes_delivered(&conn, &delivered_ids);
                 }
-
-                (fired_wake, delivered_any)
             });
 
             // Supervisor task: awaits the fan-out JoinHandle and cleans up regardless
@@ -355,11 +347,12 @@ async fn dispatcher_loop(
             // fires a Critical alert with location info when the fan-out task panics on its
             // Tokio worker thread; this log adds subscriber-specific context.
             //
-            // On normal completion: remove subscriber from in_flight and update the
-            // recently_woken cooldown map if the task fired any eager wakes (efficiency-1).
+            // On normal completion: remove subscriber from in_flight. That is the
+            // whole of it — nothing here paces a wake, so a completed fan-out
+            // leaves no bookkeeping behind.
             tokio::spawn(async move {
                 match fan_out_handle.await {
-                    Ok((fired_wake, delivered_any)) => {
+                    Ok(()) => {
                         // TODO(dispatcher-completion-kick): a scan that skipped
                         // this subscriber because its key was in_flight left
                         // rows behind, and nothing kicks the dispatcher here, so
@@ -369,19 +362,6 @@ async fn dispatcher_loop(
                             .lock()
                             .expect("in_flight poisoned")
                             .remove(&subscriber_key);
-                        if fired_wake {
-                            // A fresh wake means a CC spawn is in flight; re-arm the
-                            // cooldown so further wakes within the window coalesce.
-                            // Takes precedence over delivered_any.
-                            messenger_supervisor.arm_inline_wake(&subscriber_key);
-                        } else if delivered_any {
-                            // Delivery proves the subscriber is live; clear the entry
-                            // so future parked rows may re-wake immediately.
-                            messenger_supervisor.clear_inline_wake(&subscriber_key);
-                        }
-                        // else: a gated or wake-less pass — leave the map untouched.
-                        // Clearing it would halve the cooldown to every-other-pass
-                        // under repeated kicks; entries expire via the elapsed() check.
                     }
                     Err(join_err) if join_err.is_panic() => {
                         // Fan-out task panicked. The global panic hook already fired a
@@ -397,8 +377,6 @@ async fn dispatcher_loop(
                             .lock()
                             .expect("in_flight poisoned")
                             .remove(&subscriber_key);
-                        // Also clear any cooldown entry to allow the retry to re-wake.
-                        messenger_supervisor.clear_inline_wake(&subscriber_key);
                     }
                     Err(_) => {
                         // Task was cancelled (JoinError::is_cancelled). This should not
@@ -1298,10 +1276,10 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Wake-cooldown loop semantics: the cooldown coalesces Conversation
-    // eager wakes but must never suppress a delivery attempt. These are the first
-    // tests of the `recently_woken` cooldown at the real `dispatcher_loop` level;
-    // they crib the loop-spawning setup from `dispatcher_loop_cross_bridge_isolation`
+    // Ingress wake-gate loop semantics: an eager wake is bought by the
+    // subscriber's urgency economics alone, and delivery is never gated. These
+    // run at the real `dispatcher_loop` level; they crib the loop-spawning setup
+    // from `dispatcher_loop_cross_bridge_isolation`
     // (brenn/src/active_bridge/bridge_io.rs).
     // -------------------------------------------------------------------------
 
@@ -1335,19 +1313,24 @@ mod tests {
         panic!("timed out waiting for {what}: push {push_id} never marked delivered");
     }
 
-    /// Delivery is never gated by the wake cooldown. A sleeping conversation is
-    /// eager-woken (arming the cooldown); then, within the window, the bridge is
-    /// live and a fresh eager row is published — the group's fan-out still runs
-    /// and delivers, milliseconds later, instead of waiting out `POLL_INTERVAL`.
-    /// This is the loop-level analogue of the e2e leg-2 live-delivery bug.
+    /// An `UrgencyGated` subscriber's ingress rows buy no eager wake at all: an
+    /// ingress row carries no urgency to clear a threshold with, and `wake_min`
+    /// prices a subprocess. So a sleeping bridge stays asleep and waits for a
+    /// natural spawn — the bus rule that a below-threshold backlog wakes nobody,
+    /// applied to the one row-kind left on this path.
+    ///
+    /// Delivery is never gated by that verdict, which is the other half of the
+    /// rule: the verdict prices a spawn, not a delivery. The moment the bridge
+    /// is live, the very next pass delivers.
     #[tokio::test]
-    async fn dispatcher_loop_delivery_never_gated_by_cooldown() {
+    async fn dispatcher_loop_urgency_gated_ingress_wakes_nobody_but_still_delivers() {
         let db = init_db_memory();
         let dir = {
             let conn = db.lock().await;
             insert_conv_with_app_slug(&conn, 1, "target");
             make_directory_and_channel(&conn).0
         };
+        // "target" is an `App` subscriber, so its economics are `UrgencyGated`.
         let messenger = make_messenger_with_policy(&db, dir);
         // Router the loop delivers through; starts inactive (sleeping bridge).
         let fake = Arc::new(FakeRouter::default());
@@ -1355,89 +1338,40 @@ mod tests {
         let kick = Arc::new(Notify::new());
         let handle = spawn_dispatcher_task(db.clone(), router, kick.clone(), messenger);
 
-        // Pass 1: eager row, sleeping bridge → parked + exactly one eager wake
-        // (cooldown armed for the conversation).
+        // Pass 1: eager row, sleeping bridge → the delivery attempt runs and
+        // parks; no spawn is bought.
         {
             let conn = db.lock().await;
             insert_ingress_row(&conn, utc_to_ns(Utc::now()));
         }
         kick.notify_one();
         wait_atomic(
-            &fake.eager_wakes,
-            |n| n == 1,
-            "first eager wake (cooldown armed)",
+            &fake.deliver_calls,
+            |n| n >= 1,
+            "delivery attempt against the sleeping bridge",
         )
         .await;
+        // Give an (erroneous) wake time to land before asserting its absence.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            fake.eager_wakes.load(Ordering::SeqCst),
+            0,
+            "an ingress row for an urgency-gated subscriber buys no CC spawn",
+        );
 
-        // Let the supervisor record the cooldown before the next pass.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        // Pass 2: bridge now live; a new eager row is published within the
-        // cooldown window. The cooldown gates only the wake, never delivery, so
-        // the row is delivered promptly.
+        // Pass 2: bridge now live. Nothing paces the pass, so the row published
+        // here is delivered milliseconds later rather than at the next tick.
         fake.set_active(true);
         let p2 = {
             let conn = db.lock().await;
             insert_ingress_row(&conn, utc_to_ns(Utc::now()) + 1)
         };
         kick.notify_one();
-        wait_delivered(&db, p2, "live delivery within the cooldown window").await;
-
-        handle.abort();
-    }
-
-    /// Wake coalescing is preserved: a sleeping conversation is eager-woken once,
-    /// and repeated kicks within `POLL_INTERVAL` re-run the fan-out (delivery
-    /// attempts happen) but never re-fire the eager wake — exactly one CC spawn
-    /// per window, the storm efficiency-1 exists to prevent.
-    #[tokio::test]
-    async fn dispatcher_loop_wake_coalescing_preserved() {
-        let db = init_db_memory();
-        let dir = {
-            let conn = db.lock().await;
-            insert_conv_with_app_slug(&conn, 1, "target");
-            make_directory_and_channel(&conn).0
-        };
-        let messenger = make_messenger_with_policy(&db, dir);
-        // Router stays inactive for the whole test: every deliver returns Ok(false).
-        let fake = Arc::new(FakeRouter::default());
-        let router: Arc<dyn super::super::WakeRouter> = fake.clone();
-        let kick = Arc::new(Notify::new());
-        let handle = spawn_dispatcher_task(db.clone(), router, kick.clone(), messenger);
-
-        // Pass 1: one eager row → exactly one eager wake, cooldown armed.
-        {
-            let conn = db.lock().await;
-            insert_ingress_row(&conn, utc_to_ns(Utc::now()));
-        }
-        kick.notify_one();
-        wait_atomic(&fake.eager_wakes, |n| n == 1, "first eager wake").await;
-
-        // Let the supervisor arm the cooldown.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        // Pass 2: a second eager row + kick within the window. The fan-out runs
-        // (deliver attempts grow) but the wake is gated — no second wake.
-        let deliver_before = fake.deliver_calls.load(Ordering::SeqCst);
-        {
-            let conn = db.lock().await;
-            insert_ingress_row(&conn, utc_to_ns(Utc::now()) + 1);
-        }
-        kick.notify_one();
-        wait_atomic(
-            &fake.deliver_calls,
-            |n| n > deliver_before,
-            "delivery attempt on the gated pass",
-        )
-        .await;
-
-        // Give any (erroneous) extra wake time to land, then assert it did not:
-        // the cooldown coalesced the wake.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_delivered(&db, p2, "live delivery on the pass that follows the kick").await;
         assert_eq!(
             fake.eager_wakes.load(Ordering::SeqCst),
-            1,
-            "wake must coalesce within the cooldown window — exactly one CC spawn",
+            0,
+            "a live bridge is delivered to, not woken",
         );
 
         handle.abort();

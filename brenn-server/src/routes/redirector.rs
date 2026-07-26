@@ -223,6 +223,7 @@ mod tests {
             tools: std::sync::Arc::new(crate::tool_registry::ToolRegistry::new(vec![])),
             tool_server_origin: std::sync::Arc::from("test-origin"),
             wake_locks: WakeLocks::default(),
+            spawn_backoff: Default::default(),
             server_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             repo_sync_sender: None,
             messenger: None,
@@ -238,6 +239,7 @@ mod tests {
             replay_components: Arc::new(std::collections::HashMap::new()),
             replay_locks: Arc::new(std::collections::HashMap::new()),
             test_wake_bridge: Default::default(),
+            wake_spawns: Default::default(),
         };
         (state, buf, handle)
     }

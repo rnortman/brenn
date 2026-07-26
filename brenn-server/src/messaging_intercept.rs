@@ -3966,10 +3966,13 @@ mod tests {
         );
     }
 
-    /// A push-enabled subscribe to a non-durable channel is a tool error naming
-    /// the pull-only shape, not a silently-undelivered subscription.
+    /// A push-enabled subscribe to a non-durable channel succeeds: a ring cursor
+    /// is a position like any other, so the conversation is served from it. The
+    /// restart caveat rides along, and means more here than for a pull-only
+    /// subscription — the ring's contents and the position both die with the
+    /// process.
     #[tokio::test]
-    async fn message_subscribe_nondurable_push_enabled_is_a_tool_error() {
+    async fn message_subscribe_nondurable_push_enabled_succeeds() {
         use brenn_lib::access::AppCapability;
         use brenn_lib::access::acl::ChannelMatcher;
 
@@ -3986,13 +3989,14 @@ mod tests {
             json!({ "address": "ephemeral:test-ring", "push_depth": 3, "retain_depth": 5 }),
         )
         .await;
-        assert_eq!(v["ok"], json!(false), "expected an error: {v}");
+        assert_eq!(v["ok"], json!(true), "expected ok: {v}");
+        assert_eq!(v["status"], json!("subscribed"));
         assert!(
-            v["error"]
+            v["note"]
                 .as_str()
-                .expect("error string")
-                .contains("push_depth = 0"),
-            "the error names the supported shape: {v}"
+                .expect("non-durable subscribe carries a note")
+                .contains("does not survive a server restart"),
+            "note states the restart caveat: {v}"
         );
     }
 

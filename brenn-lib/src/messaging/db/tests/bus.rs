@@ -1,10 +1,9 @@
 use super::helpers::*;
 use crate::db::init_db_memory;
 use crate::messaging::canonical_address;
-use crate::messaging::config::ResolvedMessagingConfig;
-use crate::messaging::config::{Depth, NoiseLevel, Sink};
+use crate::messaging::config::{Depth, Sink};
 use crate::messaging::db::*;
-use crate::messaging::{ChannelEntry, ChannelScheme, Urgency, WakeMin};
+use crate::messaging::{ChannelEntry, ChannelScheme, Urgency};
 use crate::test_utils::ensure_user_and_conv;
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -448,65 +447,6 @@ fn list_pending_excludes_a_released_message() {
 // -----------------------------------------------------------------------
 // Cancel / edit / list-pending
 // -----------------------------------------------------------------------
-
-/// `rebuild_subscriptions` round-trip: truncate + re-insert from config.
-#[test]
-fn rebuild_subscriptions_round_trips() {
-    let db = init_db_memory();
-    let conn = db.blocking_lock();
-
-    let ch_uuid = Uuid::new_v4();
-    upsert_channels(
-        &conn,
-        &[ChannelEntry {
-            uuid: ch_uuid,
-            address: canonical_address("test"),
-            description: None,
-            resolved_channel: default_resolved_channel(),
-            subscribers: vec![],
-            transport_type: ChannelScheme::Brenn,
-            mount: None,
-        }],
-    );
-
-    // Insert initial subscriptions.
-    let entries = vec![(
-        "app-a".to_string(),
-        ResolvedMessagingConfig {
-            send_budget: 10,
-            subscriptions: vec![crate::messaging::config::ResolvedSubscription {
-                channel_uuid: ch_uuid,
-                channel_address: canonical_address("test"),
-                push_depth: Depth::Unbounded,
-                retain_depth: Depth::Unbounded,
-                noise: NoiseLevel::Silent,
-                wake_min: WakeMin::Normal,
-            }],
-        },
-    )];
-    rebuild_subscriptions(&conn, &entries, &[], &[]);
-
-    let count: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM messaging_subscriptions WHERE app_slug = 'app-a'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 1, "initial rebuild must insert one subscription");
-
-    // Rebuild with empty config — must truncate.
-    rebuild_subscriptions(&conn, &[], &[], &[]);
-    let count_after: i64 = conn
-        .query_row("SELECT count(*) FROM messaging_subscriptions", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(
-        count_after, 0,
-        "rebuild with empty config must truncate all subscriptions"
-    );
-}
 
 /// `mark_pending_pushes_delivered` is idempotent: calling it twice does not
 /// error and does not change the `delivered_at` timestamp.

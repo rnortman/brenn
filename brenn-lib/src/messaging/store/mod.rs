@@ -143,14 +143,17 @@ pub struct SubscriberWindow {
     /// Index of the first new entry; equal to `entries.len()` when nothing in
     /// the window is new.
     pub new_from: usize,
-    /// Whether the subscriber this window was cut for holds a position at all.
-    /// A sampled subscriber (`push_limit = 0`) does not, so nothing advances
-    /// over its window.
+    /// Whether a position may move over this window. False for a sampled
+    /// subscriber (`push_limit = 0`), which holds no position, and false for a
+    /// window withheld rather than read — a channel the delivery-time ACL gate
+    /// denies. Either way nothing advances over it.
     pub push_enabled: bool,
 }
 
 impl SubscriberWindow {
-    /// A window that served nothing.
+    /// A window that served nothing and that nothing advances over: the shape
+    /// a caller stands in for a port it did not read, such as one the
+    /// delivery-time ACL gate denied.
     pub fn empty() -> Self {
         Self {
             entries: Vec::new(),

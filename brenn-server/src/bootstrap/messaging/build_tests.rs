@@ -1,5 +1,4 @@
-//! End-to-end tests for `build_messaging`, `build_apps_with_messaging`, and
-//! `merge_apps_for_messenger`.
+//! End-to-end tests for `build_messaging` and `build_apps_with_messaging`.
 
 use super::test_fixtures::{
     minimal_app_config, minimal_surface_raw, minimal_wasm_consumer, resolved_ingress_sub,
@@ -149,44 +148,6 @@ fn mqtt_only_app_included_in_apps_with_messaging() {
     // is now decided by the app's `AppPolicy`, not this synthesised config.)
 }
 
-/// The merged apps map must expose an `[[app.mqtt_subscription]]` on the app's
-/// `.messaging`, so the map the Messenger holds names the same subscription the
-/// directory placed on the channel.
-#[test]
-fn merged_apps_map_contains_mqtt_subscription() {
-    let slug = "pa-alice";
-    let address = "mqtt:ha:home/+/state";
-
-    let mut app = minimal_app_config(slug, None, vec![]);
-    app.mqtt_subscriptions = vec![resolved_ingress_sub(address)];
-    let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
-    apps.insert(slug.to_string(), app);
-
-    let global = MessagingGlobalConfig::default();
-    let apps_with_messaging = build_apps_with_messaging(&apps, &global);
-
-    // Call the production merge function — NOT a hand-replicated loop.
-    let merged = merge_apps_for_messenger(&apps, &apps_with_messaging);
-
-    let merged_app = merged.get(slug).expect("app must be in merged map");
-    let merged_msg = merged_app
-        .messaging
-        .as_ref()
-        .expect("merged app must have messaging (synthesised from mqtt sub)");
-    let mqtt_sub = merged_msg
-        .subscriptions
-        .iter()
-        .find(|s| s.channel_address == address)
-        .expect(
-            "merged apps map must contain the mqtt subscription for the app; \
-                 without the merge the app's own config omits it",
-        );
-    assert!(
-        mqtt_sub.push_depth.is_push_enabled(),
-        "merged mqtt subscription must have push-enabled depth (Unbounded)"
-    );
-}
-
 /// An app with no messaging block and no webhook subscriptions must not
 /// appear in `apps_with_messaging` at all.
 #[test]
@@ -200,140 +161,69 @@ fn app_with_no_messaging_excluded() {
     assert!(result.is_empty(), "app with no messaging must be excluded");
 }
 
-/// Regression: `merge_apps_for_messenger` (production code, called by
-/// `build_messaging`) must write the webhook-derived `ResolvedSubscription`
-/// onto each app's `.messaging` field.
+/// The Messenger holds the plain apps map, and the one thing it reads off an
+/// app there is `messaging_send_budget()`. For a transport-only app — webhook
+/// subscriptions, no `[app.messaging]` block — that number must be the same
+/// whether the app carries a synthesised messaging block or none at all, because
+/// `build_apps_with_messaging` synthesises the block from the same global
+/// default that `config/resolve.rs` stamps on every app.
 ///
-/// Shape (a): webhook-only app (phonebuddy target shape — no [app.messaging]).
-///
-/// This test calls `merge_apps_for_messenger` directly rather than
-/// copy-pasting the merge loop. It would fail against the pre-fix code that
-/// passed `apps.clone()` (unmerged) to `Messenger::new`, because the unmerged
-/// map leaves `.messaging = None` on webhook-only apps.
+/// That equivalence is what lets the Messenger take the unmerged map. This pin
+/// makes it a contract rather than a coincidence: it asserts both numbers and
+/// asserts they agree.
 #[test]
-fn merged_apps_map_contains_webhook_subscription_webhook_only_shape() {
+fn a_transport_only_apps_budget_survives_the_unmerged_map() {
     let slug = "phonebuddy";
-    let endpoint_slug = "pb-events";
+    // Distinct from the type default, so a lost stamp cannot pass by coinciding
+    // with it.
+    let budget = MessagingGlobalConfig::default().default_send_budget + 7;
+    let global = MessagingGlobalConfig {
+        default_send_budget: budget,
+        ..Default::default()
+    };
 
-    let app = minimal_app_config(
+    let mut app = minimal_app_config(
         slug,
         None,
         vec![ResolvedWebhookSubscription {
-            endpoint_slug: endpoint_slug.to_string(),
+            endpoint_slug: "pb-events".to_string(),
             wake_min: brenn_lib::messaging::WakeMin::Normal,
         }],
     );
+    // The stamp `config/resolve.rs` puts on every app, from the same global the
+    // synthesised block below is built from.
+    app.messaging_default_send_budget = budget;
+    app.policy
+        .grants
+        .insert(brenn_lib::access::AppCapability::MessagingPublish);
     let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
     apps.insert(slug.to_string(), app);
 
-    let global = MessagingGlobalConfig::default();
+    // The block the app would have carried had it been merged.
     let apps_with_messaging = build_apps_with_messaging(&apps, &global);
-
-    // Call the production merge function — NOT a hand-replicated loop.
-    let merged = merge_apps_for_messenger(&apps, &apps_with_messaging);
-
-    // The merged map must expose the webhook subscription on the app's
-    // `.messaging` — the operator's config never mentions it.
-    let merged_app = merged.get(slug).expect("app must be in merged map");
-    let merged_msg = merged_app
-        .messaging
-        .as_ref()
-        .expect("merged app must have messaging (synthesised from webhook sub)");
-    let webhook_sub = merged_msg
-        .subscriptions
+    let (_, synthesised) = apps_with_messaging
         .iter()
-        .find(|s| s.channel_address == format!("webhook:{endpoint_slug}"));
-    let webhook_sub = webhook_sub.expect(
-        "merged apps map must contain the webhook subscription for the app; \
-             without the merge the app's own config omits it",
-    );
-    // Push-enabled depth is the point of a webhook subscription: a Bounded(0) sub
-    // would be pull-only, and the app would never be woken by an inbound webhook.
-    assert!(
-        webhook_sub.push_depth.is_push_enabled(),
-        "merged webhook subscription must have push-enabled depth (Unbounded)"
-    );
-}
+        .find(|(s, _)| s == slug)
+        .expect("a webhook-subscribed app is messaging-enabled");
 
-/// Regression: `merge_apps_for_messenger` must preserve existing brenn:
-/// subscriptions and append the webhook subscription.
-///
-/// Shape (b): app with existing [app.messaging] brenn: subscriptions PLUS
-/// a webhook subscription (pa-alice / prod target shape).
-#[test]
-fn merged_apps_map_contains_webhook_subscription_brenn_plus_webhook_shape() {
-    use brenn_lib::messaging::config::{Depth, NoiseLevel, ResolvedSubscription};
-
-    let slug = "pa-alice";
-    let endpoint_slug = "push-alice";
-    let brenn_channel_uuid = uuid::Uuid::new_v4();
-    let brenn_channel_addr = "brenn:some-channel".to_string();
-
-    let existing_brenn_sub = ResolvedSubscription {
-        channel_uuid: brenn_channel_uuid,
-        channel_address: brenn_channel_addr.clone(),
-        push_depth: Depth::Unbounded,
-        retain_depth: Depth::Unbounded,
-        noise: NoiseLevel::Silent,
-        wake_min: brenn_lib::messaging::WakeMin::Normal,
-    };
-
-    let app = minimal_app_config(
+    // The map the Messenger actually receives, read the way it reads it.
+    let resolved = brenn_lib::messaging::gates::resolve_publish_sender(
+        &apps,
         slug,
-        Some(brenn_lib::messaging::config::ResolvedMessagingConfig {
-            send_budget: 100,
-            subscriptions: vec![existing_brenn_sub.clone()],
-        }),
-        vec![ResolvedWebhookSubscription {
-            endpoint_slug: endpoint_slug.to_string(),
-            wake_min: brenn_lib::messaging::WakeMin::Normal,
-        }],
-    );
-    let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
-    apps.insert(slug.to_string(), app);
+        brenn_lib::access::AppCapability::MessagingPublish,
+    )
+    .expect("a granted app resolves as a publish sender");
 
-    let global = MessagingGlobalConfig::default();
-    let apps_with_messaging = build_apps_with_messaging(&apps, &global);
-
-    // Call the production merge function — NOT a hand-replicated loop.
-    let merged = merge_apps_for_messenger(&apps, &apps_with_messaging);
-
-    let merged_app = merged.get(slug).expect("app must be in merged map");
-    let merged_msg = merged_app
-        .messaging
-        .as_ref()
-        .expect("merged app must have messaging");
-
-    // Existing brenn: subscription must still be present.
-    assert!(
-        merged_msg
-            .subscriptions
-            .iter()
-            .any(|s| s.channel_address == brenn_channel_addr),
-        "merged app must retain the original brenn: subscription"
-    );
-
-    // The webhook subscription must have been added.
-    let webhook_sub = merged_msg
-        .subscriptions
-        .iter()
-        .find(|s| s.channel_address == format!("webhook:{endpoint_slug}"));
-    let webhook_sub = webhook_sub.expect(
-        "merged apps map must contain the webhook subscription for the app; \
-             without the merge the app's own config omits it",
-    );
-    // Push-enabled depth is the point of a webhook subscription: a Bounded(0) sub
-    // would be pull-only, and the app would never be woken by an inbound webhook.
-    assert!(
-        webhook_sub.push_depth.is_push_enabled(),
-        "merged webhook subscription must have push-enabled depth (Unbounded)"
-    );
-
-    // Total: original + webhook.
     assert_eq!(
-        merged_msg.subscriptions.len(),
-        2,
-        "merged config must have exactly 2 subscriptions (brenn + webhook)"
+        resolved.messaging_send_budget(),
+        budget,
+        "the unmerged map must report the stamped global default"
+    );
+    assert_eq!(
+        resolved.messaging_send_budget(),
+        synthesised.send_budget,
+        "merged and unmerged must report the same budget — the equivalence the \
+         Messenger's plain apps map rests on"
     );
 }
 
@@ -1999,9 +1889,8 @@ async fn build_messaging_registers_nondurable_channels_with_stores() {
     );
 }
 
-/// A WASM consumer subscribing to an `ephemeral:` channel registers as an
-/// in-memory ring cursor (not a `messaging_subscriptions` row) and writes no
-/// durable subscription row.
+/// A WASM consumer subscribing to an `ephemeral:` channel takes its position on
+/// an in-memory ring cursor and writes no durable row.
 #[tokio::test]
 async fn build_messaging_wires_wasm_ephemeral_consumer_to_a_ring_cursor() {
     use brenn_lib::access::raw::ChannelMatcherRaw;
@@ -2063,23 +1952,25 @@ async fn build_messaging_wires_wasm_ephemeral_consumer_to_a_ring_cursor() {
 
     let conn = db_probe.lock().await;
     let rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM messaging_subscriptions", [], |r| {
-            r.get(0)
-        })
-        .expect("count subscription rows");
+        .query_row(
+            "SELECT COUNT(*) FROM messaging_subscriber_cursors",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count cursor rows");
     assert_eq!(
         rows, 0,
-        "a ring-backed input's registration is the in-memory cursor, not a durable row"
+        "a ring-backed input's position is the in-memory cursor, not a durable row"
     );
 }
 
 /// Boot's registration split, both halves in one consumer: every input registers
 /// in the directory whatever its channel's class — that registration is where the
 /// noise rung a ring eviction escalates against is read from — while only the
-/// durable input's registration is *persisted*. Filtering non-durable inputs back
+/// durable input gets a *persisted position*. Filtering non-durable inputs back
 /// out of the directory would leave every ring eviction unable to resolve a rung;
-/// persisting the ring input would make the next boot treat its queue as
-/// pre-existing and skip priming it.
+/// persisting the ring input's position would make the next boot treat its queue
+/// as pre-existing and skip priming it.
 #[tokio::test]
 async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_ones() {
     use brenn_lib::access::raw::ChannelMatcherRaw;
@@ -2167,7 +2058,7 @@ async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_on
         .uuid;
     let conn = db_probe.lock().await;
     let rows: Vec<Vec<u8>> = conn
-        .prepare("SELECT channel_uuid FROM messaging_subscriptions")
+        .prepare("SELECT channel_uuid FROM messaging_subscriber_cursors")
         .expect("prepare")
         .query_map([], |r| r.get(0))
         .expect("query")
@@ -2176,7 +2067,7 @@ async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_on
     assert_eq!(
         rows,
         vec![durable_uuid.as_bytes().to_vec()],
-        "only the durable input's registration is persisted"
+        "only the durable input holds a persisted position"
     );
 }
 
@@ -2266,13 +2157,15 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
 
     let conn = db_probe.lock().await;
     let rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM messaging_subscriptions", [], |r| {
-            r.get(0)
-        })
-        .expect("count subscription rows");
+        .query_row(
+            "SELECT COUNT(*) FROM messaging_subscriber_cursors",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count cursor rows");
     assert_eq!(
         rows, 0,
-        "a confined ring-backed input's registration is the in-memory cursor, not a durable row"
+        "a confined ring-backed input's position is the in-memory cursor, not a durable row"
     );
     // A confined channel is never a message row either.
     let msg_rows: i64 = conn

@@ -26,10 +26,7 @@ pub use budget::{
 };
 
 mod bootstrap;
-pub use bootstrap::{
-    load_channels_by_uuids, mirror_dynamic_subscriptions, prune_dropped_dynamic_subscriptions,
-    rebuild_subscriptions, upsert_channels,
-};
+pub use bootstrap::{load_channels_by_uuids, prune_dropped_dynamic_subscriptions, upsert_channels};
 
 mod dynamic;
 pub use dynamic::{
@@ -71,9 +68,10 @@ pub use bus::{
 
 mod cursors;
 pub use cursors::{
-    SubscriberCursorRow, channel_subscriber_cursors, cursor_has_deliverable,
-    delete_subscriber_cursor, deliverable_cursor_subscribers, ensure_subscriber_cursor,
-    load_subscriber_cursor, retune_subscriber_cursor_depth, set_subscriber_cursor_position,
+    SubscriberCursorRow, all_subscriber_cursors, channel_subscriber_cursors,
+    cursor_has_deliverable, delete_subscriber_cursor, deliverable_cursor_subscribers,
+    ensure_subscriber_cursor, load_subscriber_cursor, retune_subscriber_cursor_depth,
+    set_subscriber_cursor_position,
 };
 
 mod deferral;

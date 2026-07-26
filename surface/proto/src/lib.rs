@@ -580,28 +580,6 @@ pub enum ServerFrame {
         envelope: MessageEnvelope,
         targets: Vec<DeliverTarget>,
     },
-    /// Re-anchor one subscription: unsubscribe it and subscribe it again with
-    /// the cursor the kernel currently holds for it.
-    ///
-    /// The server's ask, not a report of anything: it makes one subscription
-    /// re-resume on a connection that would otherwise never reconnect.
-    ///
-    /// TODO(surface-reanchor-frame): no server path sends this frame, so the
-    /// handler and its tests exercise a path nothing can trigger today.
-    ///
-    /// Class-blind: the kernel re-resumes whatever subscription is named,
-    /// echoing the opaque cursor it holds. It reads no class and no cursor
-    /// contents. The component seam observes at most a
-    /// first-window-after-resubscribe, which the contract already defines as
-    /// unremarkable.
-    ///
-    /// A `ReAnchor` for a subscription the kernel never held is a fatal
-    /// protocol error — a correct server cannot produce it. One naming a
-    /// subscription the kernel holds but is not live on (a teardown crossing
-    /// this frame in flight, a transport-down channel awaiting reconcile) is a
-    /// benign cross and is ignored: the resubscribe those paths already perform
-    /// is the re-anchor.
-    ReAnchor { channel: String, instance: String },
     PublishResult {
         correlation: Option<u64>,
         outcome: PublishOutcome,

@@ -72,10 +72,25 @@ impl ActiveBridges {
         map.values().cloned().collect()
     }
 
-    /// Register a live bridge.
+    /// Register a live bridge, and kick the dispatcher.
+    ///
+    /// Registration is the moment this conversation can accept a delivery, and
+    /// the wake walk serves a live bridge in place at any urgency — so anything
+    /// that accumulated behind the urgency gate while the spawn was in flight
+    /// is deliverable *now*. Without the kick it would wait out the dispatcher's
+    /// poll interval for a walk that has nothing else to do. The kick coalesces,
+    /// so a boot that registers many bridges costs one pass.
     pub async fn insert(&self, conversation_id: i64, bridge: Arc<ActiveBridge>) {
-        let mut map = self.inner.write().await;
-        map.insert(conversation_id, bridge);
+        // Kick after the registration is visible, never before: a walk that ran
+        // between the two would find no live bridge and fall back to the spawn
+        // arm it was just told it does not need.
+        {
+            let mut map = self.inner.write().await;
+            map.insert(conversation_id, bridge.clone());
+        }
+        if let Some(messenger) = bridge.messenger() {
+            messenger.dispatch_kick();
+        }
     }
 
     /// Unconditionally remove a bridge, ignoring allocation identity.
@@ -135,6 +150,42 @@ mod tests {
     use tokio::sync::broadcast;
 
     use crate::active_bridge::test_fixtures::TestBridgeConfig;
+
+    /// Registering a bridge kicks the dispatcher, so backlog that accumulated
+    /// behind the urgency gate while the spawn was in flight is served the
+    /// moment the bridge can accept it — the wake walk serves a live bridge at
+    /// any urgency, and this is what gets the walk to run right now rather than
+    /// at the next 60-second tick.
+    #[tokio::test]
+    async fn registering_a_bridge_kicks_the_dispatcher() {
+        use brenn_lib::messaging::{
+            MessagingDirectory, MessagingGlobalConfig, Messenger, WakeRouter,
+        };
+        let db = brenn_lib::db::init_db_memory();
+        let router: Arc<dyn WakeRouter> = Arc::new(brenn_lib::messaging::query::NoopWakeRouter);
+        let messenger = Messenger::new(
+            db.clone(),
+            Arc::new(MessagingDirectory::with_entries(vec![])),
+            Arc::from("test"),
+            Arc::new(indexmap::IndexMap::new()),
+            router,
+            MessagingGlobalConfig::default(),
+        );
+        let kick = messenger.dispatch_kick_notify();
+
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let bridge =
+            ActiveBridge::inject_for_test_with_messenger(1, 7, "test", db, tx, messenger.clone());
+
+        let registry = ActiveBridges::new();
+        registry.insert(7, bridge).await;
+
+        // `notify_one` before any waiter stores a permit, so the kick this
+        // registration fired is still there to be taken.
+        tokio::time::timeout(std::time::Duration::from_secs(5), kick.notified())
+            .await
+            .expect("registering a bridge must kick the dispatcher");
+    }
 
     #[tokio::test]
     async fn mark_all_sessions_shutting_down_flips_each_session_flag() {

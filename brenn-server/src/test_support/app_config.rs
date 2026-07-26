@@ -91,9 +91,9 @@ pub(crate) fn mqtt_acl_policy(client: &str, filter: &str) -> brenn_lib::access::
 }
 
 /// Build an `AppPolicy` that authorizes *delivery* on each given channel address
-/// (design §2.2 Point A — the delivery-time ACL gate now requires every
-/// subscriber's policy to cover its channel). For each `mqtt:`/`brenn:`/`webhook:`
-/// address, insert the matching transport grant and an exact covering matcher.
+/// — the delivery-time ACL gate requires every subscriber's policy to cover the
+/// channel it reads. For each address, insert the transport grant its scheme
+/// gates on and an exact covering matcher.
 /// `DynamicSubscribe` is intentionally **not** granted — delivery authorization
 /// must not depend on the runtime-tool grant. A malformed address panics (test
 /// fixtures pass valid addresses).
@@ -129,8 +129,24 @@ pub(crate) fn delivery_policy_for_addresses<'a>(
                     endpoint: endpoint.to_string(),
                 });
             }
-            Some((ChannelScheme::Ephemeral | ChannelScheme::PwaPush | ChannelScheme::Local, _))
-            | None => {
+            // Ephemeral and local delivery gate on their own transport grants,
+            // not on `MessagingSubscribe` — a ring-backed input needs the right
+            // one or the delivery-time gate denies it.
+            Some((ChannelScheme::Ephemeral, channel)) => {
+                policy.grants.insert(AppCapability::EphemeralSubscribe);
+                policy
+                    .acls
+                    .ephemeral_subscribe
+                    .push(ChannelMatcher::Exact(channel.to_string()));
+            }
+            Some((ChannelScheme::Local, channel)) => {
+                policy.grants.insert(AppCapability::LocalSubscribe);
+                policy
+                    .acls
+                    .local_subscribe
+                    .push(ChannelMatcher::Exact(channel.to_string()));
+            }
+            Some((ChannelScheme::PwaPush, _)) | None => {
                 panic!("delivery_policy_for_addresses: unrecognized address prefix in {address:?}");
             }
         }

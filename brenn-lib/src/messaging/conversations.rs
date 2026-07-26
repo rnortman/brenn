@@ -78,6 +78,7 @@ impl Messenger {
         else {
             return Vec::new();
         };
+        let participant = ParticipantId::for_conversation(conversation_id);
         let mut resolves_here: Option<bool> = None;
         let mut found = Vec::new();
         for entry in self.directory.list() {
@@ -96,7 +97,7 @@ impl Messenger {
                     continue;
                 }
                 if !self.channel_access_allowed(&sub.kind, &entry.address) {
-                    self.warn_acl_denied(&entry, slug);
+                    self.warn_acl_denied(&entry, &participant);
                     continue;
                 }
                 found.push((Arc::clone(&entry), sub.clone()));

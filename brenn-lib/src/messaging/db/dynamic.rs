@@ -1,11 +1,10 @@
-//! Read side of the durable dynamic-subscription store (design §2.1).
+//! Read side of the durable dynamic-subscription store.
 //!
 //! `messaging_dynamic_subscriptions` is the durable truth for runtime-created
-//! subscriptions. Unlike `messaging_subscriptions` it is NOT truncated and
-//! rebuilt at boot. This module loads its rows into typed Rust values; the boot
-//! merge (folding rows into the directory + mirroring into
-//! `messaging_subscriptions`) and the runtime subscribe/unsubscribe writes land
-//! in later increments.
+//! subscriptions, and is NOT truncated and rebuilt at boot the way the
+//! config-derived static registrations are. This module loads its rows into
+//! typed Rust values and carries the runtime subscribe/unsubscribe writes; the
+//! boot merge folds the rows into the directory.
 
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
@@ -14,9 +13,8 @@ use super::super::WakeMin;
 use super::super::config::{Depth, NoiseLevel};
 use super::bootstrap::{depth_to_sql, noise_to_sql};
 
-/// One row of `messaging_dynamic_subscriptions`, decoded into typed values.
-///
-/// Mirrors `messaging_subscriptions` (`channel_uuid`/`app_slug`/`push_depth`/
+/// One row of `messaging_dynamic_subscriptions`, decoded into typed values:
+/// the resolved subscription parameters (`channel_uuid`/`app_slug`/`push_depth`/
 /// `retain_depth`/`noise`/`wake_min`) plus the MQTT-only `qos` (`None` for
 /// `brenn:`/`webhook:`) and the `created_at` timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,26 +167,14 @@ pub fn load_dynamic_subscription_for(
 }
 
 /// Persist a newly-created (runtime) dynamic subscription: write the durable row
-/// into `messaging_dynamic_subscriptions` **and** mirror its generic params into
-/// `messaging_subscriptions`, both in **one transaction** (design §2.1 "Runtime
-/// mirror write").
+/// into `messaging_dynamic_subscriptions`.
 ///
-/// The mirror write is not optional and not deferrable to the next boot:
-/// `messaging_subscriptions` is the flat record of every live subscription
-/// whatever its origin, and a just-created dynamic sub absent from it until the
-/// next restart would leave the two tables telling different stories about the
-/// same subscriber. Sharing the durable row's transaction is what makes that
-/// disagreement unreachable rather than merely unlikely. The write is
-/// unconditional across depths so there is one code path, not two.
-///
-/// The MQTT-only `qos` lives only in the durable table; `messaging_subscriptions`
-/// has no `qos` column and no reader of it needs one. Both writes share
-/// the `(channel_uuid, app_slug)` PK; the caller guarantees neither row
-/// pre-exists. `subscribe_dynamic` re-establishes that guarantee before reaching
-/// here: it returns early on an existing directory subscriber (re-subscribe is
+/// The caller guarantees the `(channel_uuid, app_slug)` PK does not pre-exist.
+/// `subscribe_dynamic` re-establishes that guarantee before reaching here: it
+/// returns early on an existing directory subscriber (re-subscribe is
 /// identity-only) and probes the durable table for a *dormant* (unfolded)
 /// dynamic row — rejecting with `DormantSubscriptionExists` rather than colliding.
-/// So these are plain `INSERT`s — a PK collision here is a caller/host bug and
+/// So this is a plain `INSERT` — a PK collision here is a caller/host bug and
 /// panics.
 ///
 /// The probe and this INSERT are separate `db` lock acquisitions, so the
@@ -198,16 +184,12 @@ pub fn load_dynamic_subscription_for(
 /// without that gate both would pass the probe and the loser would panic here on
 /// attacker-shaped input.
 pub fn insert_dynamic_subscription(conn: &Connection, row: &DynamicSubscriptionRow) {
-    let tx = conn
-        .unchecked_transaction()
-        .expect("messaging: begin insert_dynamic_subscription tx");
-    let uuid_bytes = row.channel_uuid.as_bytes().to_vec();
-    tx.execute(
+    conn.execute(
         "INSERT INTO messaging_dynamic_subscriptions \
          (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
-            uuid_bytes,
+            row.channel_uuid.as_bytes().to_vec(),
             &row.app_slug,
             depth_to_sql(row.push_depth),
             depth_to_sql(row.retain_depth),
@@ -218,60 +200,25 @@ pub fn insert_dynamic_subscription(conn: &Connection, row: &DynamicSubscriptionR
         ],
     )
     .expect("messaging: insert durable dynamic subscription");
-    tx.execute(
-        "INSERT INTO messaging_subscriptions \
-         (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
-            uuid_bytes,
-            &row.app_slug,
-            depth_to_sql(row.push_depth),
-            depth_to_sql(row.retain_depth),
-            noise_to_sql(row.noise),
-            row.wake_min.as_str(),
-        ],
-    )
-    .expect("messaging: mirror runtime dynamic subscription");
-    tx.commit()
-        .expect("messaging: commit insert_dynamic_subscription tx");
 }
 
-/// Remove a dynamic subscription at runtime: delete both the durable
-/// `messaging_dynamic_subscriptions` row and its `messaging_subscriptions` mirror,
-/// keyed by `(channel_uuid, app_slug)`, in **one transaction** (the inverse of
-/// [`insert_dynamic_subscription`], design §2.1 "Runtime mirror write").
+/// Remove a dynamic subscription at runtime: delete the durable
+/// `messaging_dynamic_subscriptions` row keyed by `(channel_uuid, app_slug)` —
+/// the inverse of [`insert_dynamic_subscription`].
 ///
 /// Returns `true` if a durable dynamic row was removed, `false` if none existed
 /// for that `(channel, app)` — the caller (the unsubscribe tool) turns `false`
-/// into a tool error ("no dynamic subscription to remove"). The mirror delete is
-/// keyed identically; because only this app's *dynamic* sub is ever written to
-/// the mirror by [`insert_dynamic_subscription`] and static rows for the same app
-/// on the same channel are dropped at boot merge (design §2.1 "Mirror collision
-/// policy"), deleting the mirror row by PK removes exactly the dynamic
-/// subscriber's row. A static TOML sub lives only in the static table's
-/// truncate-and-rebuild lifecycle and is unreachable here (it has no durable
-/// dynamic row), so this can never remove a static subscription.
+/// into a tool error ("no dynamic subscription to remove"). A static TOML sub
+/// has no durable dynamic row and is unreachable here, so this can never remove
+/// a static subscription.
 pub fn delete_dynamic_subscription(conn: &Connection, channel_uuid: Uuid, app_slug: &str) -> bool {
-    let tx = conn
-        .unchecked_transaction()
-        .expect("messaging: begin delete_dynamic_subscription tx");
-    let uuid_bytes = channel_uuid.as_bytes().to_vec();
-    let removed = tx
-        .execute(
-            "DELETE FROM messaging_dynamic_subscriptions \
-             WHERE channel_uuid = ?1 AND app_slug = ?2",
-            rusqlite::params![uuid_bytes, app_slug],
-        )
-        .expect("messaging: delete durable dynamic subscription");
-    tx.execute(
-        "DELETE FROM messaging_subscriptions \
+    conn.execute(
+        "DELETE FROM messaging_dynamic_subscriptions \
          WHERE channel_uuid = ?1 AND app_slug = ?2",
-        rusqlite::params![uuid_bytes, app_slug],
+        rusqlite::params![channel_uuid.as_bytes().to_vec(), app_slug],
     )
-    .expect("messaging: delete mirrored dynamic subscription");
-    tx.commit()
-        .expect("messaging: commit delete_dynamic_subscription tx");
-    removed > 0
+    .expect("messaging: delete durable dynamic subscription")
+        > 0
 }
 
 #[cfg(test)]
@@ -433,27 +380,10 @@ mod tests {
         }
     }
 
-    /// Read a `messaging_subscriptions` mirror row's params for assertions.
-    fn read_mirror_row(
-        conn: &Connection,
-        uuid: Uuid,
-        app: &str,
-    ) -> Option<(String, String, String, String)> {
-        conn.query_row(
-            "SELECT push_depth, retain_depth, noise, wake_min \
-             FROM messaging_subscriptions WHERE channel_uuid = ?1 AND app_slug = ?2",
-            rusqlite::params![uuid.as_bytes().to_vec(), app],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .ok()
-    }
-
-    /// A runtime insert writes BOTH the durable dynamic-table row (with its
-    /// MQTT `qos`) and the `messaging_subscriptions` mirror row (without `qos`)
-    /// in one transaction, so the urgency-recompute join sees the subscriber
-    /// before any restart (design §2.1 "Runtime mirror write").
+    /// A runtime insert writes the durable dynamic-table row, MQTT `qos` and
+    /// all, and it decodes back as written.
     #[test]
-    fn insert_writes_durable_row_and_mirror() {
+    fn insert_writes_the_durable_row() {
         let conn = test_conn();
         let uuid = Uuid::new_v4();
         seed_channel(&conn, uuid, "mqtt:home:sensors/temp", ChannelScheme::Mqtt);
@@ -463,32 +393,19 @@ mod tests {
             &row(uuid, "graf", Depth::Bounded(3), Depth::Bounded(5), Some(2)),
         );
 
-        // Durable row decoded back, qos preserved.
         let durable = load_dynamic_subscriptions(&conn);
         assert_eq!(durable.len(), 1);
         assert_eq!(durable[0].app_slug, "graf");
         assert_eq!(durable[0].push_depth, Depth::Bounded(3));
         assert_eq!(durable[0].retain_depth, Depth::Bounded(5));
         assert_eq!(durable[0].qos, Some(2));
-
-        // Mirror row present with generic params (qos absent — no column).
-        let mirror = read_mirror_row(&conn, uuid, "graf").expect("mirror row present");
-        assert_eq!(
-            mirror,
-            (
-                "3".to_string(),
-                "5".to_string(),
-                "metered".to_string(),
-                "high".to_string()
-            )
-        );
     }
 
-    /// A runtime delete removes both the durable row and its mirror in one
-    /// transaction and reports `true`; deleting a non-existent `(channel, app)`
-    /// reports `false` (the unsubscribe tool turns that into a tool error).
+    /// A runtime delete removes the durable row and reports `true`; deleting a
+    /// non-existent `(channel, app)` reports `false` (the unsubscribe tool turns
+    /// that into a tool error).
     #[test]
-    fn delete_removes_both_rows_and_reports_match() {
+    fn delete_removes_the_row_and_reports_match() {
         let conn = test_conn();
         let uuid = Uuid::new_v4();
         seed_channel(&conn, uuid, "heartbeat", ChannelScheme::Brenn);
@@ -504,10 +421,6 @@ mod tests {
         assert!(
             load_dynamic_subscriptions(&conn).is_empty(),
             "durable row gone"
-        );
-        assert!(
-            read_mirror_row(&conn, uuid, "pfin").is_none(),
-            "mirror row gone"
         );
 
         assert!(
@@ -537,9 +450,5 @@ mod tests {
         let remaining = load_dynamic_subscriptions(&conn);
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].app_slug, "pfin", "other app's sub survives");
-        assert!(
-            read_mirror_row(&conn, uuid, "pfin").is_some(),
-            "other app's mirror survives"
-        );
     }
 }
