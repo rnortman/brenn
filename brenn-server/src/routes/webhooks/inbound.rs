@@ -1152,15 +1152,15 @@ mod tests {
     /// → real `WebhookEventRouterImpl` → real `Messenger::publish_transport_ingress`
     /// → subscribing conversation drains the message → asserts:
     ///   1. HTTP status 204.
-    ///   2. Drained as `IngressOrBus::Bus(MessageEnvelope)` (not `Ingress`).
+    ///   2. Owed to the subscribing conversation on the webhook channel.
     ///   3. Rendered text starts with `[Webhook message]` (not `[Event]`).
     ///   4. `WebhookEnvelope` JSON is present with credential header masked.
     #[tokio::test]
     async fn e2e_real_post_real_router_drains_as_webhook_envelope() {
         use crate::webhook_router::WebhookEventRouterImpl;
         use brenn_lib::messaging::ParticipantId;
+        use brenn_lib::messaging::WebhookEnvelope;
         use brenn_lib::messaging::format::{WEBHOOK_SINGLE_HEADING, format_messaging_event_single};
-        use brenn_lib::messaging::{IngressOrBus, WebhookEnvelope};
 
         // Use TEST_APP_SLUG ("pa-alice") — phonebuddy_endpoint() hardcodes it as owning_app_slug.
         let (mut state, db, _user_id) = crate::test_support::state::test_state_with_user_and_app(
@@ -1247,6 +1247,11 @@ mod tests {
         };
         // Save a reference for draining after the request.
         let messenger_ref = Arc::clone(&messenger);
+        // Boot attaches every push-enabled App subscriber's conversation, minting
+        // it if the app has never had one. A commit no longer does it lazily, so a
+        // fixture that skipped this would leave the subscriber with no position
+        // and no conversation row.
+        messenger_ref.attach_conversation_subscribers().await;
         state.messenger = Some(messenger);
 
         // Build the phonebuddy endpoint service (HmacRawBody, credential header =
@@ -1302,9 +1307,8 @@ mod tests {
         let resp = axum_router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT, "expected 204");
 
-        // Drain pending pushes for the conversation created by resolve_push_targets.
-        // The subscriber is "myapp" / user "alice" — conversation was get_or_created
-        // during publish. We query the DB directly for the conversation id.
+        // The subscriber is "myapp" / user "alice" — its singleton conversation was
+        // minted by the boot attach above. Query the DB directly for its id.
         let conversation_id: i64 = {
             let conn = db.lock().await;
             conn.query_row(
@@ -1312,24 +1316,15 @@ mod tests {
                 rusqlite::params![TEST_APP_SLUG],
                 |r| r.get(0),
             )
-            .expect("conversation must have been created by resolve_push_targets")
+            .expect("the boot attach must have minted the app's conversation")
         };
         let subscriber = ParticipantId::for_conversation(conversation_id);
 
-        let pushes: Vec<(i64, IngressOrBus)> = messenger_ref.load_pending_pushes(&subscriber).await;
+        let owed =
+            brenn_lib::messaging::testutils::owed_everywhere(&messenger_ref, &subscriber).await;
 
-        assert_eq!(pushes.len(), 1, "exactly one pending push for subscriber");
-        let (_push_id, payload) = &pushes[0];
-
-        // Assert the payload decoded as Bus(MessageEnvelope), not Ingress(Event).
-        let envelope = match payload {
-            IngressOrBus::Bus(env) => env,
-            IngressOrBus::Ingress(_) => {
-                panic!(
-                    "expected IngressOrBus::Bus but got Ingress — webhook must not use the [Event] path"
-                );
-            }
-        };
+        assert_eq!(owed.len(), 1, "exactly one message owed to the subscriber");
+        let envelope = &owed[0].1;
 
         // Assert channel address is the exact webhook:<slug> channel.
         assert_eq!(

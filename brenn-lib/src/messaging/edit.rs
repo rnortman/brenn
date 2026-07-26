@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use super::db::{self, EditFieldsApplied, EditUpdateResult};
+use super::db::{self, EditFieldsApplied};
 use super::gates::{reply_to_visible, well_formed_name};
 use super::identity::ParticipantId;
 use super::{ChannelScheme, MessageEnvelope, Messenger, Urgency};
@@ -18,19 +18,16 @@ use super::{ChannelScheme, MessageEnvelope, Messenger, Urgency};
 /// Outcome of `Messenger::cancel`.
 #[derive(Debug)]
 pub enum CancelResult {
-    /// Cancel succeeded; `cancelled_pushes` is the count of push rows deleted.
-    Ok {
-        message_id: Uuid,
-        cancelled_pushes: u32,
-    },
+    /// The parked message was withdrawn.
+    Ok { message_id: Uuid },
     /// No `messaging_messages` row with that UUID.
     UnknownMessage,
     /// Message exists but the `sender` string does not match the caller.
     NotAuthorized,
-    /// Every push for the message has `delivered_at IS NOT NULL` (genuine delivery).
+    /// The message has entered retention and is past recall: every subscriber
+    /// reads it from its own position, and the server keeps no per-subscriber
+    /// record of the delivery to revoke.
     AlreadyDelivered,
-    /// Zero undelivered push rows; covers prior cancel and zero-target broadcast.
-    NoPendingPushes,
     /// Calling app has no `[app.messaging]` section or `sender` is absent/empty.
     MissingSender,
 }
@@ -58,10 +55,9 @@ pub enum EditResult {
     UnknownMessage,
     /// Message exists but the `sender` string does not match the caller.
     NotAuthorized,
-    /// At least one push has `delivered_at IS NOT NULL` (per requirements A3).
+    /// The message has entered retention and is past editing, on the same rule
+    /// [`CancelResult::AlreadyDelivered`] states.
     AlreadyDelivered,
-    /// Zero undelivered push rows (cancelled or zero-target broadcast).
-    NoPendingPushes,
     /// No mutable fields were specified.
     NoFieldsProvided,
     /// `body` exceeds `max_body_bytes`.
@@ -84,11 +80,11 @@ pub enum EditResult {
 // ---------------------------------------------------------------------------
 
 impl Messenger {
-    /// Cancel all undelivered pending pushes for a message.
+    /// Withdraw a message the sender has not yet let into retention.
     ///
-    /// Cancel DELETEs push rows rather than marking them delivered, preserving
-    /// the semantic that `delivered_at IS NOT NULL` means "bridge actually
-    /// accepted delivery".
+    /// A parked message is the only thing there is to cancel: once a message
+    /// enters retention every subscriber reads it from its own position, and no
+    /// server-side record of who has read it exists to revoke.
     pub async fn cancel(&self, sender_app_slug: &str, message_uuid: Uuid) -> CancelResult {
         // 1. Resolve sender string.
         let sender = match self.resolve_sender(sender_app_slug) {
@@ -99,7 +95,7 @@ impl Messenger {
         // 2. Auth + status check + DELETE under a single lock acquisition so the
         //    lookup and the DELETE are linearizable (no TOCTOU gap for a delivery
         //    task to slip between them).
-        let cancelled = {
+        {
             let conn = self.db.lock().await;
             let lk = match db::lookup_message_for_authorship(&conn, message_uuid) {
                 None => return CancelResult::UnknownMessage,
@@ -108,49 +104,37 @@ impl Messenger {
             if lk.sender != sender {
                 return CancelResult::NotAuthorized;
             }
-            // A parked message holds no push claims — release mints them for
-            // whoever is attached then — so cancelling it means withdrawing the
-            // message itself. Leaving the row would deliver at its release time
-            // exactly what the sender cancelled.
-            if lk.parked {
-                db::withdraw_parked_message(&conn, lk.message_id, &sender).unwrap_or_else(|| {
-                    // The lookup that reported the message parked and this
-                    // withdrawal share one lock acquisition, and every release
-                    // pass takes the same lock, so the row cannot have moved
-                    // between them.
-                    panic!(
-                        "messaging: parked message {message_uuid} vanished between the lookup \
-                         and the withdrawal under one lock acquisition"
-                    )
-                })
-            } else {
-                // All pushes delivered (genuinely — none cancelled because cancel DELETEs).
-                if lk.undelivered_count == 0 && lk.delivered_count > 0 {
-                    return CancelResult::AlreadyDelivered;
-                }
-                // No pushes at all (zero-target broadcast, or already cancelled).
-                if lk.undelivered_count == 0 {
-                    return CancelResult::NoPendingPushes;
-                }
-                // 3. DELETE undelivered push rows while we still hold the lock.
-                db::cancel_pending_pushes_for_message(&conn, lk.message_id, &sender)
+            if !lk.parked {
+                return CancelResult::AlreadyDelivered;
             }
-        };
+            // Withdrawing the row is the whole of the cancel: its `deliver_after`
+            // is the only thing keeping it out of retention, so a row left behind
+            // would enter retention at its release time and deliver exactly what
+            // the sender cancelled.
+            //
+            // The lookup that reported the message parked and this withdrawal
+            // share one lock acquisition, and every release pass takes the same
+            // lock, so the row cannot have moved between them.
+            assert!(
+                db::withdraw_parked_message(&conn, lk.message_id, &sender),
+                "messaging: parked message {message_uuid} vanished between the lookup and the \
+                 withdrawal under one lock acquisition"
+            );
+        }
 
-        // 4. Kick the dispatcher — the cancel may have been the earliest row in
-        //    either timer queue.
+        // 4. Kick the dispatcher — the cancel may have been the earliest parked
+        //    message in the release timer.
         self.dispatch_kick();
 
         CancelResult::Ok {
             message_id: message_uuid,
-            cancelled_pushes: cancelled,
         }
     }
 
-    /// Edit a pending message in-place.
+    /// Edit a still-parked message in-place.
     ///
-    /// Fails with `AlreadyDelivered` if any push has been delivered.
-    /// Dispatches immediately if `deliver_after` is cleared.
+    /// Fails with `AlreadyDelivered` once the message has entered retention.
+    /// Releases immediately if `deliver_after` is cleared.
     /// Kicks background timers for touched scheduling fields.
     pub async fn edit(
         &self,
@@ -187,14 +171,10 @@ impl Messenger {
         if lookup.sender != sender {
             return EditResult::NotAuthorized;
         }
-        // A3: fail if any push has been delivered.
-        if lookup.delivered_count > 0 {
+        // A parked message is the only editable one: a retained message is past
+        // recall, on the same rule cancel applies.
+        if !lookup.parked {
             return EditResult::AlreadyDelivered;
-        }
-        // A parked message is editable while holding no claims: it is owed to
-        // nobody until release mints them for the subscribers attached then.
-        if lookup.undelivered_count == 0 && !lookup.parked {
-            return EditResult::NoPendingPushes;
         }
 
         // 4. Body size check.
@@ -238,7 +218,7 @@ impl Messenger {
         };
 
         // 6. Normalize deliver_after: a past timestamp is the same request as
-        //    clearing the schedule. Also determine whether we need to dispatch
+        //    clearing the schedule. Also determine whether we need to release
         //    immediately after the edit.
         let normalized_deliver_after: Option<Option<DateTime<Utc>>> = match fields.deliver_after {
             Some(Some(da)) if da <= Utc::now() => Some(None), // past → treat as null
@@ -247,12 +227,12 @@ impl Messenger {
         // Dispatch immediately when deliver_after is being cleared (explicit null or past).
         let deliver_after_cleared = matches!(normalized_deliver_after, Some(None));
         // Unscheduling a parked message means releasing it now, not blanking its
-        // column: a parked message holds no retention position and no claims,
-        // and only the release path mints them. Writing NULL here would strand
-        // the row outside retention forever — invisible to replay, history, the
-        // pending list, and cancel alike. Leaving it due instead hands it to the
-        // next release pass, which the kick below wakes at once.
-        let applied_deliver_after = if deliver_after_cleared && lookup.parked {
+        // column: only the release path assigns a retention position. Writing NULL
+        // here would strand the row outside retention forever — invisible to
+        // replay, history, the pending list, and cancel alike. Leaving it due
+        // instead hands it to the next release pass, which the kick below wakes at
+        // once.
+        let applied_deliver_after = if deliver_after_cleared {
             Some(Some(Utc::now()))
         } else {
             normalized_deliver_after
@@ -267,20 +247,13 @@ impl Messenger {
             urgency: fields.urgency,
         };
 
-        let update_result = {
+        {
             let conn = self.db.lock().await;
-            db::update_message_and_pending_pushes(&conn, lookup.message_id, &sender, &applied)
-        };
-
-        match update_result {
-            EditUpdateResult::AnyDelivered => return EditResult::AlreadyDelivered,
-            EditUpdateResult::NoPendingPushes => return EditResult::NoPendingPushes,
-            EditUpdateResult::Ok { .. } => {}
+            db::update_parked_message(&conn, lookup.message_id, &sender, &applied);
         }
 
-        // 8. Per-push wake recomputation is now folded into
-        //    `update_message_and_pending_pushes` via a correlated UPDATE inside
-        //    its own transaction (§3.5). No second lock cycle needed here.
+        // 8. Nothing per-subscriber to recompute: the wake decision is made at
+        //    wake time, from the message row this edit just rewrote.
 
         // 9. Kick the dispatcher for touched scheduling fields (§2.7).
         // Only kick deliver_after when scheduling forward (Some(Some(future))); clearing
@@ -309,8 +282,8 @@ impl Messenger {
         EditResult::Ok { envelope }
     }
 
-    /// List all pending (at least one undelivered push) messages authored by
-    /// this app's sender. Optionally filtered to a single channel.
+    /// List the still-parked messages authored by this app's sender. Optionally
+    /// filtered to a single channel.
     ///
     /// Per design §2.11: an unresolvable or malformed channel address returns
     /// an empty list (not an error); the intercept logs malformed cases.
@@ -397,11 +370,13 @@ mod tests {
         async fn deliver(
             &self,
             _key: &crate::messaging::SubscriberEntryKind,
-            subscriber: &crate::messaging::ParticipantId,
-            _: &crate::messaging::MessageEnvelope,
-            _retained_seq: Option<i64>,
+            _envelope: &std::sync::Arc<crate::messaging::MessageEnvelope>,
+            _retained_seq: i64,
         ) -> Result<bool, String> {
-            self.deliveries.lock().await.push(subscriber.clone());
+            self.deliveries
+                .lock()
+                .await
+                .push(ParticipantId::for_surface(_key.slug()));
             match self.deliver_returns.load(Ordering::SeqCst) {
                 0 => Ok(false),
                 1 => Ok(true),
@@ -434,7 +409,13 @@ mod tests {
         ) -> crate::messaging::DeliveryShape {
             crate::messaging::default_delivery_shape(key)
         }
-        fn alarm(&self, _channel: &str, _subscriber: &crate::messaging::ParticipantId) {}
+        fn alarm(
+            &self,
+            _channel: &str,
+            _subscriber: &crate::messaging::ParticipantId,
+            _count: u64,
+        ) {
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -625,16 +606,13 @@ mod tests {
         assert!(matches!(result, CancelResult::NotAuthorized));
     }
 
+    /// An unparked publish is in retention, where every subscriber reads it from
+    /// its own position — nothing to withdraw and no per-subscriber record to
+    /// revoke.
     #[tokio::test]
-    async fn cancel_already_delivered_returns_already_delivered() {
+    async fn cancel_a_published_message_returns_already_delivered() {
         let (m, _, _, _, _) = build_messenger(0).await;
         let mid = publish_one(&m, "hello", None).await;
-        // Simulate delivery: find the pending push and mark it delivered.
-        let sub = crate::messaging::ParticipantId::for_conversation(2);
-        let pending = m.load_pending_pushes(&sub).await;
-        assert_eq!(pending.len(), 1);
-        m.mark_pushes_delivered(&[pending[0].0]).await;
-        // Now cancel should see no undelivered rows → AlreadyDelivered.
         let result = m.cancel("pa-bob", mid).await;
         assert!(matches!(result, CancelResult::AlreadyDelivered));
     }
@@ -653,15 +631,7 @@ mod tests {
 
         let result = m.cancel("pa-bob", mid).await;
         assert!(
-            matches!(
-                result,
-                CancelResult::Ok {
-                    // A parked message holds no claims — cancel withdraws the
-                    // message itself, so there is no claim to report.
-                    cancelled_pushes: 0,
-                    ..
-                }
-            ),
+            matches!(result, CancelResult::Ok { .. }),
             "expected Ok, got {result:?}"
         );
 
@@ -671,13 +641,16 @@ mod tests {
             .expect("dispatch_kick not fired");
     }
 
-    /// Cancel withdraws delivery, not history: a message already in retention
-    /// stays queryable after its undelivered pushes are cancelled.
+    /// A refused cancel changes nothing: the message it named is in retention and
+    /// stays queryable.
     #[tokio::test]
-    async fn cancel_then_channel_get_still_shows_message() {
+    async fn a_refused_cancel_leaves_the_message_in_history() {
         let (m, _, _, _, _) = build_messenger(0).await;
         let mid = publish_one(&m, "cancel-then-read", None).await;
-        let _ = m.cancel("pa-bob", mid).await;
+        assert!(matches!(
+            m.cancel("pa-bob", mid).await,
+            CancelResult::AlreadyDelivered
+        ));
 
         let results = m.query(&history_query()).await.expect("query");
         assert!(results.iter().any(|e| e.message_id == mid));
@@ -758,10 +731,9 @@ mod tests {
     }
 
     /// Cancelling a parked message withdraws the row, so a second cancel has
-    /// nothing left to name. A live message's second cancel reports no pending
-    /// pushes instead — its row survives its claims.
+    /// nothing left to name.
     #[tokio::test]
-    async fn cancel_twice_is_not_found_then_not_pending() {
+    async fn cancel_twice_is_not_found_the_second_time() {
         let (m, _, _, _, _) = build_messenger(0).await;
         let future = Utc::now() + chrono::Duration::seconds(3600);
         let parked = publish_one(&m, "cancel-twice", Some(future)).await;
@@ -772,16 +744,6 @@ mod tests {
         assert!(matches!(
             m.cancel("pa-bob", parked).await,
             CancelResult::UnknownMessage
-        ));
-
-        let live = publish_one(&m, "cancel-twice-live", None).await;
-        assert!(matches!(
-            m.cancel("pa-bob", live).await,
-            CancelResult::Ok { .. }
-        ));
-        assert!(matches!(
-            m.cancel("pa-bob", live).await,
-            CancelResult::NoPendingPushes
         ));
     }
 
@@ -1077,17 +1039,12 @@ mod tests {
         assert!(matches!(result, EditResult::Ok { ref envelope } if envelope.reply_to.is_none()));
     }
 
+    /// An unparked publish is already in retention, where each subscriber reads it
+    /// from its own position — past editing.
     #[tokio::test]
-    async fn edit_after_partial_delivery_returns_already_delivered() {
+    async fn edit_a_published_message_returns_already_delivered() {
         let (m, _, _, _, _) = build_messenger(0).await;
         let mid = publish_one(&m, "hello", None).await;
-        // Simulate delivery: mark the push delivered (off-stack dispatch means
-        // publish no longer delivers inline, so we must simulate it explicitly).
-        let sub = crate::messaging::ParticipantId::for_conversation(2);
-        let pending = m.load_pending_pushes(&sub).await;
-        assert_eq!(pending.len(), 1);
-        m.mark_pushes_delivered(&[pending[0].0]).await;
-        // Edit after delivery → AlreadyDelivered.
         let result = m
             .edit(
                 "pa-bob",
@@ -1238,77 +1195,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn edit_wake_recomputes_per_push_kind() {
-        // pa-alice subscribes Immediate. Message is sent with wake=None (combined → None).
-        // Edit message wake to Immediate → push wake should flip to Immediate
-        // (because subscriber kind is Immediate).
-        let (m, _, _, _, _) = build_messenger(0).await;
-        // Publish with urgency=Low: below the subscriber's wake_min, so its
-        // claim is created without an eager wake.
-        let mid = m
-            .publish(
-                crate::messaging::PublishOrigin::Conversation { id: 1 },
-                "pa-bob",
-                &canonical_address("pa-alice"),
-                "hello",
-                crate::messaging::Urgency::Low,
-                None,
-                None,
-                None,
-            )
-            .await;
-        let mid = match mid {
-            crate::messaging::PublishResult::Ok { message_id, .. } => message_id,
-            other => panic!("publish failed: {other:?}"),
-        };
-
-        // Verify push was created with eager_wake = 0 (publish-time push insert uses
-        // eager_wake=false because the subscriber's push_depth is positive but the
-        // initial publish is deferred; edit to Immediate → push should flip to eager_wake=1).
-        let result = m
-            .edit(
-                "pa-bob",
-                mid,
-                EditFields {
-                    urgency: Some(Urgency::Normal),
-                    ..Default::default()
-                },
-            )
-            .await;
-        assert!(matches!(result, EditResult::Ok { .. }));
-
-        // Verify push eager_wake is now 1 in DB after editing to Immediate.
-        let conn = m.db.lock().await;
-        let eager_wake_int: i64 = conn
-            .query_row(
-                "SELECT pp.eager_wake FROM messaging_pending_pushes pp
-                 JOIN messaging_messages m ON pp.message_id = m.id
-                 WHERE m.uuid = ?1",
-                rusqlite::params![mid.as_bytes().to_vec()],
-                |r| r.get(0),
-            )
-            .expect("query push eager_wake");
-        assert_eq!(
-            eager_wake_int, 1,
-            "push eager_wake should flip to 1 after editing message to Immediate"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // list_pending tests
     // -----------------------------------------------------------------------
 
+    /// An unparked publish is in retention from the moment it commits, so it is
+    /// never pending.
     #[tokio::test]
-    async fn list_pending_returns_empty_for_sender_with_no_pending() {
+    async fn list_pending_returns_empty_for_sender_with_no_parked_messages() {
         let (m, _, _, _, _) = build_messenger(0).await;
-        let _ = publish_one(&m, "delivered", None).await;
-        // Simulate delivery: mark the push delivered (off-stack dispatch, R1).
-        let sub = crate::messaging::ParticipantId::for_conversation(2);
-        let pending = m.load_pending_pushes(&sub).await;
-        assert_eq!(pending.len(), 1);
-        m.mark_pushes_delivered(&[pending[0].0]).await;
-        // All delivered; pending list empty.
+        let _ = publish_one(&m, "published", None).await;
         let list = m.list_pending("pa-bob", None).await;
         assert!(list.is_empty());
     }
@@ -1369,51 +1265,6 @@ mod tests {
     // Tests from review findings
     // -----------------------------------------------------------------------
 
-    /// test-1: cancel that loses the race with delivery returns Ok{cancelled_pushes:0}.
-    /// Documents the §3.2 contract: after delivery the cancel sees no undelivered rows
-    /// and returns 0 (here simulated by manually delivering before cancel).
-    #[tokio::test]
-    async fn cancel_race_returns_ok_with_zero_pushes() {
-        // Simulate the "cancel races delivery" window: manually mark the push
-        // delivered before cancelling. Off-stack dispatch (R1) means there is no
-        // inline delivery, so we must simulate it explicitly here.
-        let (m, _, _, _, _) = build_messenger(0).await;
-        let mid = publish_one(&m, "race", None).await;
-        let sub = crate::messaging::ParticipantId::for_conversation(2);
-        let pending = m.load_pending_pushes(&sub).await;
-        assert_eq!(pending.len(), 1);
-        m.mark_pushes_delivered(&[pending[0].0]).await;
-        // All pushes now delivered → AlreadyDelivered.
-        let result = m.cancel("pa-bob", mid).await;
-        assert!(
-            matches!(result, CancelResult::AlreadyDelivered),
-            "expected AlreadyDelivered after push marked delivered, got {result:?}"
-        );
-    }
-
-    /// test-2: editing a previously-cancelled message returns NoPendingPushes.
-    #[tokio::test]
-    async fn edit_after_cancel_returns_no_pending_pushes() {
-        let (m, _, _, _, _) = build_messenger(0).await;
-        let mid = publish_one(&m, "to-cancel", None).await;
-        let cancel = m.cancel("pa-bob", mid).await;
-        assert!(matches!(cancel, CancelResult::Ok { .. }), "{cancel:?}");
-        let edit = m
-            .edit(
-                "pa-bob",
-                mid,
-                EditFields {
-                    body: Some("changed".to_string()),
-                    ..Default::default()
-                },
-            )
-            .await;
-        assert!(
-            matches!(edit, EditResult::NoPendingPushes),
-            "expected NoPendingPushes after cancel, got {edit:?}"
-        );
-    }
-
     /// The message row's `(deliver_after, retained_seq)` pair, or `None` if the
     /// row is gone.
     async fn schedule_and_position(
@@ -1433,19 +1284,22 @@ mod tests {
     /// test-3: clearing `deliver_after` on a parked message releases it — the
     /// operation the edit tool advertises as "send it now".
     ///
-    /// A parked message holds no retention position and no claims; only the
-    /// release path mints them. Blanking the column instead would leave the row
-    /// outside retention with no schedule to bring it back: invisible to replay,
-    /// history, the pending list, and cancel alike, and delivered to nobody.
+    /// A parked message holds no retention position; only the release path assigns
+    /// one. Blanking the column instead would leave the row outside retention with
+    /// no schedule to bring it back: invisible to replay, history, the pending
+    /// list, and cancel alike, and readable by nobody.
     #[tokio::test]
     async fn edit_clearing_deliver_after_releases_a_parked_message() {
-        let (m, _, _, pa_alice_conv_id, _) = build_messenger(0).await;
+        let (m, _, _, _, _) = build_messenger(0).await;
         let future = Utc::now() + chrono::Duration::seconds(3600);
         let mid = publish_one(&m, "scheduled2", Some(future)).await;
-        let sub = crate::messaging::ParticipantId::for_conversation(pa_alice_conv_id);
         assert!(
-            m.load_pending_pushes(&sub).await.is_empty(),
-            "a parked message is owed to nobody, so it holds no claim"
+            schedule_and_position(&m, mid)
+                .await
+                .expect("the parked message row")
+                .1
+                .is_none(),
+            "a parked message holds no retention position"
         );
 
         let result = m
@@ -1474,59 +1328,6 @@ mod tests {
         assert!(
             retained_seq.is_some(),
             "release assigns the retention position every read keys on"
-        );
-        assert_eq!(
-            m.load_pending_pushes(&sub).await.len(),
-            1,
-            "release mints the claim its subscriber is owed"
-        );
-    }
-
-    /// The mirror: rescheduling a live, undelivered message *into* the future
-    /// withdraws it from retention. A message holding a position while parked
-    /// stays replayable during its park, takes a second position at release, and
-    /// is exposed to a GC pass that only ever evicts positioned rows.
-    #[tokio::test]
-    async fn edit_reparking_a_live_message_withdraws_its_retention_position() {
-        let (m, _, _, _, _) = build_messenger(0).await;
-        let mid = publish_one(&m, "live", None).await;
-        let (_, seq_before) = schedule_and_position(&m, mid)
-            .await
-            .expect("the published message row");
-        assert!(seq_before.is_some(), "a live publish enters retention");
-
-        let future = Utc::now() + chrono::Duration::seconds(3600);
-        let result = m
-            .edit(
-                "pa-bob",
-                mid,
-                EditFields {
-                    deliver_after: Some(Some(future)),
-                    ..Default::default()
-                },
-            )
-            .await;
-        assert!(matches!(result, EditResult::Ok { .. }), "{result:?}");
-
-        let (deliver_after, retained_seq) = schedule_and_position(&m, mid)
-            .await
-            .expect("the re-parked message row");
-        assert!(deliver_after.is_some(), "the message is parked again");
-        assert!(
-            retained_seq.is_none(),
-            "a parked message holds no retention position, got {retained_seq:?}"
-        );
-
-        // Released later, it takes exactly one fresh position — the newest.
-        m.release_due_messages(future + chrono::Duration::seconds(1))
-            .await;
-        let (_, released_seq) = schedule_and_position(&m, mid)
-            .await
-            .expect("the released message row");
-        assert!(
-            released_seq.is_some_and(|seq| Some(seq) != seq_before),
-            "release assigns a fresh position above every entry made while it waited: \
-             {released_seq:?} vs {seq_before:?}"
         );
     }
 

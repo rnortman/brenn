@@ -124,6 +124,14 @@ async fn assemble_surface_messenger(
 ) -> (Arc<Messenger>, String) {
     let db = init_db_memory();
     let channel_addr = entry.address.clone();
+    let wasm_subscribers: Vec<String> = entry
+        .subscribers
+        .iter()
+        .filter_map(|sub| match &sub.kind {
+            SubscriberEntryKind::Wasm(slug) => Some(slug.clone()),
+            _ => None,
+        })
+        .collect();
     {
         let conn = db.lock().await;
         upsert_channels(&conn, std::slice::from_ref(&entry));
@@ -152,6 +160,19 @@ async fn assemble_surface_messenger(
         surface_policies,
     ))
     .with_surface_send_budgets(budget_principals);
+    // A subscriber holds a position or it is owed nothing: each WASM receiver
+    // attaches exactly as boot does.
+    for slug in &wasm_subscribers {
+        messenger
+            .attach_subscriber(
+                &channel_addr,
+                slug,
+                &crate::messaging::ParticipantId::for_wasm(slug),
+                Depth::Unbounded,
+                crate::messaging::store::Priming::Head,
+            )
+            .await;
+    }
     (messenger, channel_addr)
 }
 
@@ -212,11 +233,20 @@ async fn publish_from_surface_ok_stamps_surface_sender_no_budget() {
         "surface publish is System origin: Ok with no budget, got {result:?}"
     );
 
-    // The row fanned out to the Wasm subscriber.
-    let rows = m
-        .load_pending_pushes(&ParticipantId::for_wasm("surface-out-receiver"))
-        .await;
-    assert_eq!(rows.len(), 1, "one pending push for the subscriber");
+    // The message reached retention where the Wasm subscriber's position sees
+    // it — that message, not merely something.
+    let owed = crate::messaging::testutils::owed_everywhere(
+        &m,
+        &ParticipantId::for_wasm("surface-out-receiver"),
+    )
+    .await;
+    assert_eq!(
+        owed.iter()
+            .map(|(_, e)| e.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["hello"],
+        "the subscriber must be owed the message just published"
+    );
 
     // The stored sender is the backend-derived surface principal.
     let conn = m.db().lock().await;

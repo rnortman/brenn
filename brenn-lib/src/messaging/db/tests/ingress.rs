@@ -1,6 +1,5 @@
 use crate::db::init_db_memory;
 use crate::messaging::db::*;
-use crate::messaging::{ChannelScheme, IngressOrBus};
 use crate::test_utils::ensure_user_and_conv;
 
 // §4 cleanup scoping test
@@ -216,16 +215,10 @@ fn sort_key_parity_ingress_drain_order() {
     }
 
     let subscriber = ParticipantId::for_conversation(1);
-    let drain = load_pending_pushes_for_drain(&conn, &subscriber);
+    let drain = load_pending_ingress_for_drain(&conn, &subscriber);
     assert_eq!(drain.len(), 3);
 
-    let got_summaries: Vec<&str> = drain
-        .iter()
-        .map(|(_, p)| match p {
-            IngressOrBus::Ingress(ev) => ev.summary.as_str(),
-            IngressOrBus::Bus(_) => panic!("expected Ingress"),
-        })
-        .collect();
+    let got_summaries: Vec<&str> = drain.iter().map(|(_, ev)| ev.summary.as_str()).collect();
     assert_eq!(
         got_summaries,
         ["tie-first", "tie-second", "later"],
@@ -233,78 +226,66 @@ fn sort_key_parity_ingress_drain_order() {
     );
 }
 
-/// A stored `envelope_type='webhook'` row routes to `IngressOrBus::Bus`, not
-/// `IngressOrBus::Ingress`. Regression guard: a string typo in the match arm
-/// would silently deliver an `[Event]` card instead of the unified envelope.
+/// Tripwire: the drain read must be served by
+/// `idx_messaging_pending_pushes_ingress_undelivered`, not a full table scan. A
+/// drain that scans costs O(total ingress backlog) per conversation wake, and the
+/// regression is silent — the query keeps returning the right rows.
+///
+/// Uses `LOAD_PENDING_INGRESS_FOR_DRAIN_SQL` directly (the constant the production
+/// function prepares) so the asserted plan cannot drift from the real query. No
+/// `ANALYZE` is run, because production never runs it.
 #[test]
-fn webhook_row_drains_as_bus_not_ingress() {
+fn the_drain_read_uses_its_partial_index() {
     let db = init_db_memory();
     let conn = db.blocking_lock();
     ensure_user_and_conv(&conn, 1);
+    ensure_user_and_conv(&conn, 2);
 
-    // Insert a webhook channel row (needed for the FK from messaging_messages).
-    let channel_uuid = crate::messaging::webhook_channel_uuid_from_slug("test-ep");
-    let channel_uuid_bytes = channel_uuid.as_bytes().to_vec();
-    conn.execute(
-        "INSERT INTO messaging_channels (uuid, address, description, transport_type, created_at, resume_epoch) \
-         VALUES (?1, 'webhook:test-ep', NULL, 'webhook', '2024-01-01', X'00000000000000000000000000000001')",
-        rusqlite::params![channel_uuid_bytes],
-    )
-    .unwrap();
-
-    // Insert a messaging_messages row with envelope_type='webhook' and a valid
-    // WebhookEnvelope JSON body.
-    let msg_uuid = uuid::Uuid::new_v4();
-    let msg_uuid_bytes = msg_uuid.as_bytes().to_vec();
-    let webhook_body = r#"{"headers":[],"key_id":"k1","client_ip":"1.2.3.4","received_at":"2024-01-01T00:00:00Z","body":"hello","endpoint_slug":"test-ep"}"#;
-    conn.execute(
-        "INSERT INTO messaging_messages
-           (uuid, channel_uuid, source, sender, body, urgency, publish_ts_ns,
-            created_at, envelope_type)
-         VALUES (?1, ?2, 'webhook:test-ep', 'k1', ?3, 'normal', 1000,
-                 '2024-01-01', 'webhook')",
-        rusqlite::params![msg_uuid_bytes, channel_uuid_bytes, webhook_body],
-    )
-    .unwrap();
-    let msg_id = conn.last_insert_rowid();
-
-    // Insert a pending push for conversation 1.
-    conn.execute(
-        "INSERT INTO messaging_pending_pushes
-           (message_id, target_subscriber, target_app_slug, eager_wake, created_at)
-         VALUES (?1, 'conversation:1', 'app', 1, '2024-01-01')",
-        rusqlite::params![msg_id],
-    )
-    .unwrap();
-
-    let subscriber = ParticipantId::for_conversation(1);
-    let drain = load_pending_pushes_for_drain(&conn, &subscriber);
-
-    assert_eq!(drain.len(), 1, "expected exactly one pending push");
-    match &drain[0].1 {
-        IngressOrBus::Bus(env) => {
-            assert!(
-                env.channel.starts_with("webhook:"),
-                "channel should be webhook:, got: {:?}",
-                env.channel
-            );
-            assert!(
-                env.body.contains("\"endpoint_slug\""),
-                "body should contain WebhookEnvelope JSON, got: {:?}",
-                env.body
-            );
-        }
-        IngressOrBus::Ingress(_) => {
-            panic!(
-                "webhook row must drain as IngressOrBus::Bus, not Ingress — \
-                 a match-arm typo would break unified rendering"
-            );
-        }
+    // A mixed population across two subscribers, so the cost-based planner sees a
+    // table worth indexing rather than a trivial one it may scan regardless.
+    for i in 0..20i64 {
+        insert_ingress_message(
+            &conn,
+            &ParticipantId::for_conversation(1),
+            "app",
+            "mqtt:b:t",
+            "one",
+            "{}",
+            crate::messaging::Urgency::Normal,
+            1000 + i,
+        );
+        insert_ingress_message(
+            &conn,
+            &ParticipantId::for_conversation(2),
+            "app",
+            "mqtt:b:t",
+            "two",
+            "{}",
+            crate::messaging::Urgency::Normal,
+            2000 + i,
+        );
     }
 
-    // Also verify that ChannelScheme::Webhook is parsed correctly.
-    assert_eq!(
-        ChannelScheme::parse("webhook"),
-        Some(ChannelScheme::Webhook)
+    let plan: Vec<String> = {
+        let mut stmt = conn
+            .prepare(&("EXPLAIN QUERY PLAN ".to_owned() + LOAD_PENDING_INGRESS_FOR_DRAIN_SQL))
+            .expect("prepare EXPLAIN QUERY PLAN");
+        let rows = stmt
+            .query_map(["conversation:1"], |row| row.get::<_, String>(3))
+            .expect("query plan");
+        rows.map(|r| r.expect("read plan row")).collect()
+    };
+
+    assert!(
+        plan.iter()
+            .any(|d| d.contains("idx_messaging_pending_pushes_ingress_undelivered")),
+        "drain read must use idx_messaging_pending_pushes_ingress_undelivered; plan was:\n{}",
+        plan.join("\n"),
+    );
+    // A bare `SCAN pp` naming no index is the full table scan this guards against.
+    assert!(
+        !plan.iter().any(|d| d.trim() == "SCAN pp"),
+        "drain read must not full-scan messaging_pending_pushes; plan was:\n{}",
+        plan.join("\n"),
     );
 }

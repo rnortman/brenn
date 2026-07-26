@@ -8,17 +8,17 @@
 //!
 //! The message row's `deliver_after` decides *visibility*: a store's retention
 //! read skips a row that still carries one, so a message becomes retained when
-//! release clears the column, not when its instant passes. Delivery is decided
-//! at the same moment: a parked message holds no push claim, and release mints
-//! one per subscriber attached then. Both happen in one transaction, so
-//! "released" is one state rather than two half-states that disagree.
+//! release clears the column, not when its instant passes. Release is a single
+//! transaction that clears the column and allocates the retention sequence
+//! together — nobody is named at that moment, and nobody needs to be. Who is
+//! owed the message is whichever cursors are behind that sequence when the wake
+//! walk next reads them.
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::super::MessageEnvelope;
-use super::super::store::ReleaseTarget;
 use super::shared::parse_rfc3339;
 use crate::db::format_ts_for_db;
 
@@ -186,11 +186,6 @@ pub fn delete_deferred(
         return false;
     }
     tx.execute(
-        "DELETE FROM messaging_pending_pushes WHERE message_id = ?1",
-        rusqlite::params![message_id],
-    )
-    .expect("messaging: delete deferred push rows");
-    tx.execute(
         "DELETE FROM messaging_messages WHERE id = ?1",
         rusqlite::params![message_id],
     )
@@ -268,8 +263,7 @@ pub fn earliest_channel_release(conn: &Connection, channel_uuid: Uuid) -> Option
     result.as_deref().map(parse_release)
 }
 
-/// One message that release moved from parked into retention, with the push
-/// rows that became deliverable with it.
+/// One message that release moved from parked into retention.
 #[derive(Debug)]
 pub struct ReleasedRow {
     pub message_id: i64,
@@ -277,37 +271,15 @@ pub struct ReleasedRow {
     /// retention — a late-released message is the newest retention entry.
     pub retained_seq: i64,
     pub envelope: MessageEnvelope,
-    /// Empty when the message was parked with no delivery targets, or when its
-    /// targets' rows were already delivered.
-    pub push_ids: Vec<i64>,
 }
 
-/// What one release pass moved into retention, and the push claims it found
-/// stale on the way.
-#[derive(Debug)]
-pub struct ReleasedBatch {
-    pub released: Vec<ReleasedRow>,
-    /// Ids of push rows that existed for a released message and were deleted:
-    /// claims minted before the message was parked, which the release-time
-    /// target set supersedes. The caller drops them from its push windows.
-    pub stale_claims: Vec<i64>,
-}
-
-/// Release this channel's messages that have come due, in release order,
-/// delivering each to `targets` — the subscribers attached now.
+/// Release this channel's messages that have come due, in release order.
 ///
-/// Two writes make a message released. Clearing the message row's
-/// `deliver_after` is what makes it retained: retention reads treat a future
-/// `deliver_after` as "not here yet", so a released message must stop carrying
-/// one. Minting a push claim per target is what makes it deliverable. A parked
-/// message holds no claim until this call, so the target set is resolved once,
-/// here — a subscriber that attached while the message waited receives it, and
-/// one that left is not owed it. Any claim already on a released message
-/// predates the park (an edit re-parked a live message) and is deleted for the
-/// same reason.
-///
-/// Every due message is reported, including one that reaches no target at all:
-/// it enters retention like any other and carries no push ids.
+/// Clearing the message row's `deliver_after` is what makes it retained:
+/// retention reads treat a future `deliver_after` as "not here yet", so a
+/// released message must stop carrying one. Who it reaches is nobody's record to
+/// write — every subscriber reads the channel from its own position, and the
+/// release is what puts the message where those positions can see it.
 ///
 /// Scoped to one channel so a store releases only its own; the sweep that walks
 /// every channel is one call of this per store.
@@ -315,17 +287,16 @@ pub fn release_due_for_channel(
     conn: &Connection,
     channel_uuid: Uuid,
     now: DateTime<Utc>,
-    targets: &[ReleaseTarget],
-) -> ReleasedBatch {
+) -> Vec<ReleasedRow> {
     let now_str = format_ts_for_db(now);
     let channel_bytes = channel_uuid.as_bytes().to_vec();
     let tx = conn
         .unchecked_transaction()
         .expect("messaging: begin release_due_for_channel tx");
 
-    // The due messages in release order, awaiting the retention sequences and
-    // push ids that complete them. A `ReleasedRow` is built only once both are
-    // known, so no consumer can ever see one carrying a stand-in seq.
+    // The due messages in release order, awaiting the retention sequences that
+    // complete them. A `ReleasedRow` is built only once its seq is known, so no
+    // consumer can ever see one carrying a stand-in.
     let mut due: Vec<(i64, MessageEnvelope)> = Vec::new();
     {
         let sql = format!(
@@ -351,85 +322,21 @@ pub fn release_due_for_channel(
     // sequences in that order makes a late-released row the newest retention
     // entry.
     let mut released: Vec<ReleasedRow> = Vec::with_capacity(due.len());
-    let mut stale_claims: Vec<i64> = Vec::new();
     for (message_id, envelope) in due {
-        stale_claims.extend(stale_claims_for_message(&tx, message_id));
         let retained_seq = super::bus::allocate_retained_seq(&tx, channel_uuid);
         tx.execute(
             "UPDATE messaging_messages SET retained_seq = ?2, deliver_after = NULL WHERE id = ?1",
             rusqlite::params![message_id, retained_seq],
         )
         .expect("messaging: release message row");
-        let push_ids = mint_release_claims(&tx, message_id, &envelope, targets);
         released.push(ReleasedRow {
             message_id,
             retained_seq,
             envelope,
-            push_ids,
         });
     }
 
     tx.commit()
         .expect("messaging: commit release_due_for_channel");
-    ReleasedBatch {
-        released,
-        stale_claims,
-    }
-}
-
-/// Delete and report every undelivered claim on a message about to be released.
-///
-/// A parked message is minted claimless, so a claim here belongs to a live
-/// message an edit later re-parked. The release-time target set is the
-/// authority on who is owed the message, so the older claim is discarded rather
-/// than reused: reusing it would deliver to a subscriber resolved under a
-/// different attachment.
-fn stale_claims_for_message(tx: &rusqlite::Transaction<'_>, message_id: i64) -> Vec<i64> {
-    let mut stmt = tx
-        .prepare_cached(
-            "DELETE FROM messaging_pending_pushes
-             WHERE message_id = ?1 AND delivered_at IS NULL
-             RETURNING id",
-        )
-        .expect("prepare stale_claims_for_message");
-    let rows = stmt
-        .query_map(rusqlite::params![message_id], |row| row.get::<_, i64>(0))
-        .expect("query stale_claims_for_message");
-    rows.map(|r| r.expect("read stale claim id")).collect()
-}
-
-/// Mint one immediately-deliverable push claim per target for a just-released
-/// message, in target order. Wake is decided per message: a target with a wake
-/// threshold is woken only by a message whose urgency meets it.
-fn mint_release_claims(
-    tx: &rusqlite::Transaction<'_>,
-    message_id: i64,
-    envelope: &MessageEnvelope,
-    targets: &[ReleaseTarget],
-) -> Vec<i64> {
-    let now = format_ts_for_db(Utc::now());
-    let deadline = envelope.delivery_deadline.map(format_ts_for_db);
-    let mut push_ids = Vec::with_capacity(targets.len());
-    let mut stmt = tx
-        .prepare_cached(
-            "INSERT INTO messaging_pending_pushes
-             (message_id, target_subscriber, target_app_slug, eager_wake,
-              delivery_deadline, release_after, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
-        )
-        .expect("prepare mint_release_claims");
-    for target in targets {
-        let eager_wake: i64 = if target.wakes(envelope.urgency) { 1 } else { 0 };
-        stmt.execute(rusqlite::params![
-            message_id,
-            target.subscriber.as_str(),
-            target.app_slug,
-            eager_wake,
-            deadline,
-            now,
-        ])
-        .expect("messaging: mint release push claim");
-        push_ids.push(tx.last_insert_rowid());
-    }
-    push_ids
+    released
 }

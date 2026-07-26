@@ -4,12 +4,11 @@
 //! from `crate::db::run_migrations`.
 //!
 //! NOTE on retention: bus messages are evicted by `bus_gc_evict_channel` when
-//! channel depth exceeds `retain_depth`; pending pushes are reaped by
-//! `bus_gc_retire_pushes` when push depth exceeds `push_depth`. Delivered
-//! ingress messages are reaped by the ingress cleanup loop after the configured
-//! retention window (see `delete_delivered_ingress_pushes_before`).
+//! channel depth exceeds `retain_depth`. Delivered ingress messages are reaped
+//! by the ingress cleanup loop after the configured retention window (see
+//! `delete_delivered_ingress_pushes_before`).
 
-use super::{IngressOrBus, ParticipantId};
+use super::ParticipantId;
 
 mod shared;
 pub(crate) use shared::parse_rfc3339;
@@ -50,29 +49,25 @@ pub use store_identity::{
 };
 
 mod ingress;
+#[cfg(test)]
+pub(crate) use ingress::LOAD_PENDING_INGRESS_FOR_DRAIN_SQL;
 pub use ingress::{
     delete_delivered_ingress_pushes_before, insert_ingress_message, insert_ingress_message_raw,
-    load_pending_ingress_for_drain, load_pending_pushes_for_drain,
-    mark_stale_undelivered_ingress_repo_sync,
+    load_pending_ingress_for_drain, mark_stale_undelivered_ingress_repo_sync,
 };
 
 mod bus;
-pub use bus::{
-    BusGcEviction, ChannelPushRow, EditFieldsApplied, EditUpdateResult, InsertedMessage,
-    MessageLookup, PendingPushInsert, ReleasedPushRow, bus_gc_evict_channel, bus_gc_retire_pushes,
-    cancel_pending_pushes_for_message, channel_last_retained_seq, channel_resume_epoch,
-    channel_retained_count_after_seq, channel_retention_frontier, delete_pending_push_by_id,
-    delete_pushes_for_subscriber, earliest_pending_deadline, insert_message_with_pushes,
-    insert_message_with_pushes_in_tx, list_pending_messages_for_sender,
-    load_all_dispatchable_pushes, load_channel_messages_after_seq, load_channel_retained_tail,
-    load_channel_retained_window_seq, load_envelope_by_uuid, load_pending_pushes_for_channel,
-    load_push_window, load_pushes_by_ids, load_released_push_window_rows,
-    lookup_message_for_authorship, mark_pending_pushes_delivered, owed_push_positions,
-    pending_pushes_outside_channels, retained_tail_floor_seq, seed_pending_pushes_for_messages,
-    update_message_and_pending_pushes, withdraw_parked_message,
-};
 #[cfg(test)]
-pub(crate) use bus::{LOAD_ALL_DISPATCHABLE_PUSHES_SQL, channel_has_deliverable_for};
+pub(crate) use bus::LOAD_DISPATCHABLE_INGRESS_SQL;
+pub use bus::{
+    BusGcEviction, EditFieldsApplied, InsertedMessage, MessageLookup, bus_gc_evict_channel,
+    channel_last_retained_seq, channel_resume_epoch, channel_retained_count_after_seq,
+    channel_retention_frontier, insert_message, insert_message_in_tx,
+    list_pending_messages_for_sender, load_channel_messages_after_seq, load_channel_retained_tail,
+    load_channel_retained_window_seq, load_dispatchable_ingress_pushes, load_envelope_by_uuid,
+    lookup_message_for_authorship, mark_pending_pushes_delivered, retained_tail_floor_seq,
+    update_parked_message, withdraw_parked_message,
+};
 
 mod cursors;
 pub use cursors::{
@@ -83,7 +78,7 @@ pub use cursors::{
 
 mod deferral;
 pub use deferral::{
-    DeferredLookup, DeferredRow, ReleasedBatch, ReleasedRow, count_deferred, delete_deferred,
+    DeferredLookup, DeferredRow, ReleasedRow, count_deferred, delete_deferred,
     earliest_channel_release, edit_deferred, list_deferred_for_sender, lookup_deferred,
     release_due_for_channel,
 };

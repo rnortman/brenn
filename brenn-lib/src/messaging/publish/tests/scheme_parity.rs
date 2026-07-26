@@ -549,10 +549,6 @@ async fn one_release_pass_releases_a_durable_and_a_ring_deferral() {
         .release_due_messages(base + chrono::Duration::seconds(45))
         .await;
     assert_eq!(sweep.released, 2, "one pass releases both classes");
-    assert!(
-        sweep.push_ids.is_empty(),
-        "a subscriberless durable channel releases no push claims"
-    );
     assert_eq!(retained_bodies(&m, &durable_addr).await, vec!["later"]);
     assert_eq!(
         retained_bodies(&m, "ephemeral:eph-chan").await,

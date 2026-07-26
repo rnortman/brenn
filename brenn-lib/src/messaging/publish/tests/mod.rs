@@ -1,13 +1,10 @@
-mod acl_gate;
 mod dispatch_row;
 mod ingress;
-mod overflow;
 mod publish_core;
 mod scheme_parity;
 mod surface;
 mod system;
 mod transport_ingress;
-mod wake_economics;
 mod wasm;
 
 use super::*;
@@ -32,7 +29,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///       used by F26 tests to exercise the `dispatch_row` Err arm.
 #[derive(Default)]
 pub(super) struct CountingRouter {
-    // Records (subscriber, formatted_envelope) per deliver() call.
+    // Records (subscriber, formatted payload) per delivery call. The surface feed
+    // names its target by registration key, so its entry carries the key's slug;
+    // an ingress delivery carries the participant it was addressed to.
     // Stores ParticipantId directly so the mock stays opaque — test assertions
     // call as_conversation_id() or compare ParticipantId directly rather than
     // baking the conversation-kind assumption into shared mock infrastructure.
@@ -48,16 +47,15 @@ pub(super) struct CountingRouter {
 impl WakeRouter for CountingRouter {
     async fn deliver(
         &self,
-        _key: &crate::messaging::SubscriberEntryKind,
-        subscriber: &ParticipantId,
-        envelope: &crate::messaging::MessageEnvelope,
-        _retained_seq: Option<i64>,
+        key: &crate::messaging::SubscriberEntryKind,
+        envelope: &Arc<crate::messaging::MessageEnvelope>,
+        _retained_seq: i64,
     ) -> Result<bool, String> {
         use crate::messaging::format::format_messaging_event_single;
-        self.deliveries
-            .lock()
-            .await
-            .push((subscriber.clone(), format_messaging_event_single(envelope)));
+        self.deliveries.lock().await.push((
+            ParticipantId::for_surface(key.slug()),
+            format_messaging_event_single(envelope),
+        ));
         match self.deliver_returns.load(Ordering::SeqCst) {
             0 => Ok(false),
             1 => Ok(true),
@@ -106,7 +104,7 @@ impl WakeRouter for CountingRouter {
         crate::messaging::default_delivery_shape(key)
     }
 
-    fn alarm(&self, _channel: &str, _subscriber: &ParticipantId) {
+    fn alarm(&self, _channel: &str, _subscriber: &ParticipantId, _count: u64) {
         self.alarms.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -232,7 +230,18 @@ pub(super) async fn build_messenger_with(
     .with_subscriber_registrations(crate::messaging::testutils::surface_registrations(
         surface_policies,
     ));
+    // A subscriber holds a position or it is owed nothing, so the fixture attaches
+    // the App subscriber's conversation exactly as boot does.
+    messenger.attach_conversation_subscribers().await;
     (messenger, channel_uuid, 1, 2, router)
+}
+
+/// Whether `subscriber` is owed anything on the fixture's channel — the whole of
+/// what a commit leaves behind for a position-holding subscriber.
+pub(super) async fn owed_on_gate_channel(m: &Arc<Messenger>, subscriber: &ParticipantId) -> bool {
+    m.store_for_address(&canonical_address("pa-alice"))
+        .has_deliverable(subscriber)
+        .await
 }
 
 pub(super) fn test_app_config(

@@ -251,8 +251,19 @@ async fn publish_transport_ingress_panics_on_malformed_envelope() {
 
 /// `publish_transport_ingress` inserts the push row and signals the dispatcher
 /// (R1). No inline deliver or eager-wake occurs on the publish call stack.
+/// Retained (positioned) message rows on this fixture's single channel.
+async fn retained_message_count(messenger: &Arc<Messenger>) -> i64 {
+    let conn = messenger.db().lock().await;
+    conn.query_row(
+        "SELECT COUNT(*) FROM messaging_messages WHERE retained_seq IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )
+    .expect("count retained messages")
+}
+
 #[tokio::test]
-async fn publish_transport_ingress_inserts_pending_row_no_inline_dispatch() {
+async fn publish_transport_ingress_commits_without_inline_dispatch() {
     let valid_body = r#"{"headers":[],"key_id":"k","client_ip":"1.2.3.4","received_at":"2024-01-01T00:00:00Z","body":"hi","endpoint_slug":"wh-test"}"#;
 
     let (messenger, channel, _db, router) = build_webhook_messenger(true).await;
@@ -266,10 +277,12 @@ async fn publish_transport_ingress_inserts_pending_row_no_inline_dispatch() {
         )
         .await;
 
-    // Row inserted as pending; dispatcher delivers later.
-    let sub = ParticipantId::for_conversation(1);
-    let rows = messenger.load_pending_pushes(&sub).await;
-    assert_eq!(rows.len(), 1, "pending push row must exist");
+    // The message is in retention, where every subscriber's position can reach it.
+    assert_eq!(
+        retained_message_count(&messenger).await,
+        1,
+        "the message must be committed into retention"
+    );
     // No inline router calls — all dispatch is off-stack (R1).
     assert_eq!(
         router.eager_wakes.load(Ordering::SeqCst),
@@ -335,14 +348,12 @@ async fn publish_transport_ingress_mqtt_stores_typed_row_and_pending_push() {
         );
     }
 
-    // Pending push enqueued for the single subscriber despite send_budget == 0
-    // (host-originated ingress bypasses the budget).
-    let sub = ParticipantId::for_conversation(1);
-    let rows = messenger.load_pending_pushes(&sub).await;
+    // Committed into retention despite send_budget == 0 (host-originated ingress
+    // bypasses the budget).
     assert_eq!(
-        rows.len(),
+        retained_message_count(&messenger).await,
         1,
-        "pending push row must exist for the subscriber"
+        "the message must be committed into retention"
     );
 
     // No inline router calls — all dispatch is off-stack (R1).
@@ -355,69 +366,5 @@ async fn publish_transport_ingress_mqtt_stores_typed_row_and_pending_push() {
         router.deliveries.lock().await.len(),
         0,
         "publish_transport_ingress must not call deliver inline"
-    );
-}
-
-/// Point-A deny variant for an `mqtt:` channel (test-2): when the subscriber's
-/// policy carries no covering `mqtt_subscribe` matcher / `MqttSubscribe` grant,
-/// `resolve_push_targets` gates it out, so NO pending push row is persisted. This
-/// exercises `resolve_push_targets`' `allows_channel_access` dispatch for the `mqtt:`
-/// prefix through the real ingress path (the `access/mod.rs` unit tests do not go
-/// through `resolve_push_targets`).
-#[tokio::test]
-async fn publish_transport_ingress_mqtt_denied_without_covering_policy() {
-    let (messenger, channel, _db, router) = build_mqtt_messenger(false).await;
-    messenger
-        .publish_transport_ingress(
-            channel.clone(),
-            "mqtt:homeassistant:home/+/state",
-            "homeassistant",
-            VALID_MQTT_BODY,
-            Urgency::Normal,
-        )
-        .await;
-
-    // The subscriber was gated away at Point A → no pending push persisted.
-    let sub = ParticipantId::for_conversation(1);
-    let rows = messenger.load_pending_pushes(&sub).await;
-    assert!(
-        rows.is_empty(),
-        "mqtt subscriber without a covering policy must be gated out — no pending push row"
-    );
-    assert_eq!(
-        router.deliveries.lock().await.len(),
-        0,
-        "denied subscriber must not be delivered to"
-    );
-}
-
-/// Point-A deny variant for a `webhook:` channel (test-2): with no covering
-/// `webhook` matcher / `Webhook` grant the subscriber is gated out and no pending
-/// push row is persisted — exercising the `webhook:` prefix dispatch in
-/// `resolve_push_targets`.
-#[tokio::test]
-async fn publish_transport_ingress_webhook_denied_without_covering_policy() {
-    let valid_body = r#"{"headers":[],"key_id":"k","client_ip":"1.2.3.4","received_at":"2024-01-01T00:00:00Z","body":"hi","endpoint_slug":"wh-test"}"#;
-    let (messenger, channel, _db, router) = build_webhook_messenger(false).await;
-    messenger
-        .publish_transport_ingress(
-            channel.clone(),
-            "webhook:wh-test",
-            "k",
-            valid_body,
-            Urgency::Normal,
-        )
-        .await;
-
-    let sub = ParticipantId::for_conversation(1);
-    let rows = messenger.load_pending_pushes(&sub).await;
-    assert!(
-        rows.is_empty(),
-        "webhook subscriber without a covering policy must be gated out — no pending push row"
-    );
-    assert_eq!(
-        router.deliveries.lock().await.len(),
-        0,
-        "denied subscriber must not be delivered to"
     );
 }

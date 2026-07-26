@@ -151,21 +151,32 @@ pub fn run_messaging_migrations(conn: &Connection) {
             target_subscriber TEXT NOT NULL,
             target_app_slug   TEXT NOT NULL,
             eager_wake        INTEGER NOT NULL CHECK(eager_wake IN (0,1)),
+            -- Bus-era columns, both written NULL by the only remaining writer:
+            -- what this table still carries is channel-less
+            -- direct-to-participant ingress, which never defers and holds no
+            -- deadline. `release_after` stays because the boot convergence and the
+            -- cursor seed read it off *pre-migration* bus rows; nothing reads
+            -- `delivery_deadline` at all, a deadline now living only on the message
+            -- row the wake pass reads. Both go with the table
+            -- (TODO(ingress-retirement)).
             delivery_deadline TEXT,
             release_after     TEXT,
             delivered_at      TEXT,
-            confirm_pending   INTEGER NOT NULL DEFAULT 0 CHECK(confirm_pending IN (0,1)),
             created_at        TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_messaging_pending_pushes_undelivered
+        -- The drain read asks for one subscriber's undelivered rows. Its
+        -- predecessor also required `release_after IS NULL`, which the drain no
+        -- longer states, so the planner could not qualify it and the read became a
+        -- table scan; a same-named index with a different predicate survives
+        -- `IF NOT EXISTS` untouched, so the old name is dropped rather than
+        -- redefined. Deferral and deadlines were bus-claim concerns, so the two
+        -- indexes over those columns can never match a row again.
+        DROP INDEX IF EXISTS idx_messaging_pending_pushes_undelivered;
+        DROP INDEX IF EXISTS idx_messaging_pending_pushes_deadline;
+        DROP INDEX IF EXISTS idx_messaging_pending_pushes_release;
+        CREATE INDEX IF NOT EXISTS idx_messaging_pending_pushes_ingress_undelivered
             ON messaging_pending_pushes(target_subscriber)
-            WHERE delivered_at IS NULL AND release_after IS NULL;
-        CREATE INDEX IF NOT EXISTS idx_messaging_pending_pushes_deadline
-            ON messaging_pending_pushes(delivery_deadline)
-            WHERE delivered_at IS NULL AND delivery_deadline IS NOT NULL;
-        CREATE INDEX IF NOT EXISTS idx_messaging_pending_pushes_release
-            ON messaging_pending_pushes(release_after)
-            WHERE delivered_at IS NULL AND release_after IS NOT NULL;
+            WHERE delivered_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_messaging_pending_pushes_message_id
             ON messaging_pending_pushes(message_id);
         ",
@@ -178,18 +189,6 @@ pub fn run_messaging_migrations(conn: &Connection) {
     // DB; a live DB from before a column was added is brought current here. The
     // schema-currency guard runs at the end of this function
     // (assert_messaging_schema_current).
-    //
-    // confirm_pending: the below-water ack channel's tentative-delivery stamp. A
-    // pre-existing DB's pending_pushes table lacks it; add it with the same default
-    // the CREATE TABLE declares so old rows read as not-tentative.
-    if !crate::db::column_exists(conn, "messaging_pending_pushes", "confirm_pending") {
-        conn.execute_batch(
-            "ALTER TABLE messaging_pending_pushes
-                ADD COLUMN confirm_pending INTEGER NOT NULL DEFAULT 0
-                CHECK(confirm_pending IN (0,1));",
-        )
-        .expect("failed to add messaging_pending_pushes.confirm_pending column");
-    }
 
     if !crate::db::column_exists(conn, "messaging_messages", "retained_seq") {
         conn.execute_batch("ALTER TABLE messaging_messages ADD COLUMN retained_seq INTEGER;")
@@ -267,21 +266,26 @@ pub fn run_messaging_migrations(conn: &Connection) {
 
     assert_messaging_schema_current(conn);
 
-    // Dispatcher global-scan index. Its partial predicate references eager_wake, a
+    // Dispatcher ingress-scan index. Its partial predicate references eager_wake, a
     // post-urgency-redesign column, so it is created only after the schema-currency
     // guard: on a legacy DB the guard aborts with an actionable message first, rather
-    // than this DDL failing with a raw "no such column: eager_wake" error. The predicate
-    // matches the dispatcher scan's WHERE so the planner can qualify this partial index;
-    // parked no-deadline rows (eager_wake=0) fail the predicate and are never indexed.
+    // than this DDL failing with a raw "no such column: eager_wake" error. The
+    // predicate matches the `pp` conjuncts of the ingress scan's WHERE so the planner
+    // can qualify this partial index; a non-eager row is served by the drain, not the
+    // dispatcher, and is never indexed.
+    //
+    // The DROP retires the wider predicate the index carried while the table also
+    // held bus claims. A same-named index with a different predicate would survive
+    // `IF NOT EXISTS` untouched, so the old name goes rather than being redefined.
     conn.execute_batch(
         "
-        CREATE INDEX IF NOT EXISTS idx_messaging_pending_pushes_dispatchable
-            ON messaging_pending_pushes(delivery_deadline)
-            WHERE delivered_at IS NULL AND release_after IS NULL
-              AND (eager_wake = 1 OR delivery_deadline IS NOT NULL);
+        DROP INDEX IF EXISTS idx_messaging_pending_pushes_dispatchable;
+        CREATE INDEX IF NOT EXISTS idx_messaging_pending_pushes_ingress_dispatch
+            ON messaging_pending_pushes(message_id)
+            WHERE delivered_at IS NULL AND eager_wake = 1;
         ",
     )
-    .expect("failed to create idx_messaging_pending_pushes_dispatchable");
+    .expect("failed to create idx_messaging_pending_pushes_ingress_dispatch");
 
     // Backfill first: it numbers the rows that were already retained before this
     // boot, in rowid order. Normalizing afterwards releases the rows that came
@@ -291,10 +295,50 @@ pub fn run_messaging_migrations(conn: &Connection) {
 
     normalize_released_messages(conn);
 
-    // Last: the seed positions cursors by retention sequence, so every row that
-    // is going to have one must have it by now — including the rows the two
+    // Before the bus-claim delete below, which is the only remaining reader of
+    // those claims: the seed positions cursors by retention sequence, so every row
+    // that is going to have one must have it by now — including the rows the two
     // passes above just numbered and released.
     create_and_seed_subscriber_cursors(conn);
+
+    delete_bus_pending_pushes(conn);
+}
+
+/// Delete every channel-backed row from `messaging_pending_pushes`.
+///
+/// Delivery on a channel is a cursor position now, so a claim row decides
+/// nothing; what the table still carries is the channel-less
+/// direct-to-participant ingress deliveries, which `TODO(ingress-retirement)`
+/// will retire along with the table.
+///
+/// Unguarded and run on every boot rather than once: the predicate reads the rows
+/// the table actually holds (ingress-only after the first pass), so it costs a
+/// scan of a small table, and being unconditional makes it the backstop that
+/// catches a path which starts writing channel-backed claims again.
+///
+/// `warn` rather than `info` for exactly that reason. The migration boot is the
+/// one legitimate hit and an operator wants to see it once; every hit after that
+/// means some path started minting channel-backed rows again, and quietly
+/// deleting them would be self-healing a state that should be impossible.
+fn delete_bus_pending_pushes(conn: &Connection) {
+    let deleted = conn
+        .execute(
+            "DELETE FROM messaging_pending_pushes AS pp
+             WHERE EXISTS (
+                 SELECT 1 FROM messaging_messages m
+                 WHERE m.id = pp.message_id AND m.channel_uuid IS NOT NULL
+             )",
+            [],
+        )
+        .expect("failed to delete channel-backed rows from messaging_pending_pushes");
+    if deleted > 0 {
+        tracing::warn!(
+            deleted,
+            "messaging migration: deleted channel-backed pending-push rows; \
+             delivery on a channel is a cursor position. Expected exactly once, on \
+             the migration boot — a later occurrence means a path is writing them again"
+        );
+    }
 }
 
 /// Create `messaging_subscriber_cursors` and seed it, both or neither.
@@ -366,11 +410,22 @@ const ATTACH_MANAGED_SUBSCRIBER: &str = "(pp.target_subscriber LIKE 'wasm:%'
 /// a healthy component, and re-priming it hands an at-most-once consumer work it
 /// already did.
 ///
-/// A push-enabled subscriber holding no claim at all — never delivered anything,
-/// or its claims already reaped — gets no row here: its identity and kind are
-/// resolvable only from the boot-resolved registration set. The boot attach that
-/// every family runs creates that row at head, in the same boot, before anything
-/// publishes.
+/// A push-enabled subscriber holding no claim at all gets no row here: its
+/// identity and kind are resolvable only from the boot-resolved registration
+/// set. The boot attach that every family runs creates that row in the same
+/// boot, before anything publishes, at whatever `store::priming_for_kind` says
+/// for its kind — head for conversations and system components, the retained
+/// tail for a WASM port.
+///
+/// That retained priming is the reason no-claim has to mean effectively-new, and
+/// under the machinery this migrates from it does: every commit wrote a claim per
+/// push-enabled subscriber, the push-window reap kept the newest `push_depth` of
+/// them whether delivered or owed, and eviction only removed a claim whose
+/// message had left retention — so a port whose newest delivered claim was
+/// evicted necessarily still holds newer owed ones, which seed `min_owed`. Zero
+/// claims therefore means a port that never consumed anything on this channel: a
+/// new port, or a subscription that never delivered, which is exactly the case
+/// retained priming is for.
 ///
 /// # Panics
 ///
@@ -769,78 +824,6 @@ mod tests {
         }
     }
 
-    /// The `confirm_pending` ALTER path, driven on a synthesized pre-column DB:
-    /// the column is added, a row written before it existed reads as
-    /// not-tentative (the default the CREATE TABLE declares), and a second
-    /// migration pass over the now-current schema is inert.
-    #[test]
-    fn confirm_pending_migrates_onto_a_pre_column_store() {
-        let db = init_db_memory();
-        let conn = db.blocking_lock();
-        // Synthesize the old schema: drop the current table and rebuild it
-        // without `confirm_pending`, then seed a row as the old code would.
-        conn.execute_batch(
-            "DROP TABLE messaging_pending_pushes;
-             CREATE TABLE messaging_pending_pushes (
-                id                INTEGER PRIMARY KEY,
-                message_id        INTEGER NOT NULL REFERENCES messaging_messages(id),
-                target_subscriber TEXT NOT NULL,
-                target_app_slug   TEXT NOT NULL,
-                eager_wake        INTEGER NOT NULL CHECK(eager_wake IN (0,1)),
-                delivery_deadline TEXT,
-                release_after     TEXT,
-                delivered_at      TEXT,
-                created_at        TEXT NOT NULL
-             );",
-        )
-        .unwrap();
-        assert!(!column_exists(
-            &conn,
-            "messaging_pending_pushes",
-            "confirm_pending"
-        ));
-        // The row's message FK is irrelevant to the ALTER under test and seeding a
-        // real message would drag in a channel row too, so the constraint is
-        // suspended for this one insert.
-        conn.execute_batch(
-            "PRAGMA foreign_keys=OFF;
-             INSERT INTO messaging_pending_pushes
-                (id, message_id, target_subscriber, target_app_slug, eager_wake, created_at)
-             VALUES (1, 1, 'sub', 'slug', 1, 'now');
-             PRAGMA foreign_keys=ON;",
-        )
-        .unwrap();
-
-        super::run_messaging_migrations(&conn);
-        assert!(
-            column_exists(&conn, "messaging_pending_pushes", "confirm_pending"),
-            "the ALTER path adds the column to a pre-existing store"
-        );
-        let flag: i64 = conn
-            .query_row(
-                "SELECT confirm_pending FROM messaging_pending_pushes WHERE id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            flag, 0,
-            "a row written before the column reads not-tentative"
-        );
-
-        // Idempotent: re-running over the current schema neither errors nor
-        // rewrites the row.
-        super::run_messaging_migrations(&conn);
-        let flag_after: i64 = conn
-            .query_row(
-                "SELECT confirm_pending FROM messaging_pending_pushes WHERE id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(flag_after, 0, "the second pass leaves the row untouched");
-    }
-
     /// The durable-resume migration on a pre-column DB: the three columns are
     /// added, every retained (`deliver_after IS NULL`) row is assigned
     /// `retained_seq` per channel in rowid order, `last_retained_seq` records the
@@ -988,7 +971,6 @@ mod tests {
             a,
             "brenn:a",
             crate::messaging::config::Depth::Unbounded,
-            std::sync::Arc::new(crate::messaging::store::TargetResolver::unsubscribed()),
         );
 
         // The first post-migration append continues the backfilled numbering.

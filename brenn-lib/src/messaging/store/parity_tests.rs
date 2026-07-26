@@ -21,19 +21,16 @@ use brenn_queue::{GapReason, ReplayDecision};
 
 use crate::db::init_db_memory;
 use crate::messaging::ParticipantId;
+use crate::messaging::SubscriberEntry;
 use crate::messaging::config::{Depth, Sink};
 use crate::messaging::db::{
     bus_gc_evict_channel, load_subscriber_cursor, upsert_channels, utc_to_ns,
 };
 use crate::messaging::store::{
     AdvanceOutcome, Attached, DbStore, DeferralOutcome, MessageSeq, NewMessage, OverflowEvent,
-    Priming, PushRetireParams, ResumeCursor, RetentionStore, RingStore, StoreReplay,
-    SubscriberWindow, TargetResolver,
+    Priming, ResumeCursor, RetentionStore, RingStore, StoreReplay, SubscriberWindow,
 };
 use crate::messaging::testutils::test_channel_entry;
-use crate::messaging::{
-    MessagingDirectory, SubscriberEntry, SubscriberRegistration, WakeEconomics,
-};
 
 /// Retain depth every case uses unless it is testing the cap itself.
 const DEPTH: u64 = 8;
@@ -77,76 +74,32 @@ async fn durable_store_at(retain_depth: Depth) -> (DbStore, crate::db::Db) {
     durable_store_at_subscribed(retain_depth, vec![]).await
 }
 
-/// [`durable_store`] whose channel carries `subscribers`, each registered with
-/// a channel-wide delivery policy — what the store's own release-target
-/// resolution reads. Wake economics follow the production rule: a subscriber
-/// entry carrying a `wake_min` is `UrgencyGated`, one without it is `Eager`.
+/// [`durable_store`] whose channel row carries `subscribers` in the directory.
+///
+/// The store itself reads no registration — a commit and a release are
+/// target-blind — so the subscriber list is here for the cases that also read
+/// the directory, and for the channel row's own shape.
 async fn durable_store_at_subscribed(
     retain_depth: Depth,
     subscribers: Vec<SubscriberEntry>,
 ) -> (DbStore, crate::db::Db) {
-    durable_store_at_subscribed_under(
-        retain_depth,
-        subscribers,
-        crate::access::acl::ChannelMatcher::Prefix(String::new()),
-    )
-    .await
-}
-
-/// [`durable_store_at_subscribed`] whose subscribers' policies cover only the
-/// channels `matcher` names — the delivery-time ACL gate a release pass runs.
-async fn durable_store_at_subscribed_under(
-    retain_depth: Depth,
-    subscribers: Vec<SubscriberEntry>,
-    matcher: crate::access::acl::ChannelMatcher,
-) -> (DbStore, crate::db::Db) {
     let db = init_db_memory();
-    let entry = test_channel_entry("parity", subscribers.clone());
+    let entry = test_channel_entry("parity", subscribers);
     {
         let conn = db.lock().await;
         upsert_channels(&conn, std::slice::from_ref(&entry));
     }
-    let policy = Arc::new(crate::messaging::test_support::brenn_delivery_policy(
-        matcher,
-    ));
-    let registrations = subscribers
-        .iter()
-        .map(|sub| {
-            (
-                sub.kind.clone(),
-                SubscriberRegistration {
-                    policy: policy.clone(),
-                    wake: match sub.wake_min {
-                        Some(_) => WakeEconomics::UrgencyGated,
-                        None => WakeEconomics::Eager,
-                    },
-                },
-            )
-        })
-        .collect();
-    let resolver = Arc::new(TargetResolver::new(
-        Arc::new(MessagingDirectory::with_entries(vec![entry.clone()])),
-        Arc::new(indexmap::IndexMap::new()),
-        registrations,
-    ));
-    let store = DbStore::new(
-        db.clone(),
-        entry.uuid,
-        entry.address.clone(),
-        retain_depth,
-        resolver,
-    );
+    let store = DbStore::new(db.clone(), entry.uuid, entry.address.clone(), retain_depth);
     (store, db)
 }
 
-/// A WASM consumer on the parity channel, as the directory carries it: the
-/// subscriber a commit or a release resolves and mints a claim for.
+/// A WASM consumer on the parity channel, as the directory carries it.
 fn wasm_target(slug: &str, wake_min: Option<crate::messaging::WakeMin>) -> SubscriberEntry {
     wasm_target_at(slug, DEPTH, wake_min)
 }
 
-/// The same subscriber holding at most `push_depth` undelivered records — a
-/// commit past that retires its oldest claim and reports the drop.
+/// The same subscriber at an explicit `push_depth` — how many messages one
+/// activation may hand it.
 fn wasm_target_at(
     slug: &str,
     push_depth: u64,
@@ -385,7 +338,6 @@ async fn release_reports_messages_parked_without_targets() {
             "{}",
             store.address()
         );
-        assert!(released[0].target_records.is_empty(), "{}", store.address());
         assert_eq!(
             retained_bodies(&*store).await,
             vec!["lonely", "watched"],
@@ -2134,8 +2086,7 @@ async fn durable_advance_reports_a_loss_gc_already_retired() {
         RetentionStore::append(&store, msg).await;
     }
 
-    // Retention outruns the subscriber: the two oldest go, and their claims with
-    // them.
+    // Retention outruns the subscriber: the two oldest go.
     {
         let conn = db.lock().await;
         let eviction = bus_gc_evict_channel(
@@ -2148,10 +2099,6 @@ async fn durable_advance_reports_a_loss_gc_already_retired() {
             None,
         );
         assert_eq!(eviction.messages_evicted, 2);
-        assert_eq!(
-            eviction.push_rows_retired, 2,
-            "the lagging subscriber's claims go too"
-        );
         assert_eq!(
             eviction.overflow.first().map(|e| e.dropped),
             Some(2),
@@ -2284,128 +2231,6 @@ async fn a_subscriber_attached_mid_park_receives_the_message_at_release() {
     }
 }
 
-/// A claim minted before the message was parked does not survive the park: an
-/// edit that re-parks a live message hands targeting back to the release, so a
-/// subscriber that is no longer a target is not delivered to.
-///
-/// The departed subscriber's push window must lose the claim with it, and lose
-/// it *uncharged*: the claim left because it was never owed, not because its
-/// subscriber fell behind. A window still counting it would retire the next live
-/// claim early, and charging it would report a loss that never happened.
-#[tokio::test]
-async fn a_claim_predating_the_park_is_replaced_at_release() {
-    let (store, db) =
-        durable_store_at_subscribed(Depth::Bounded(DEPTH), vec![wasm_target("proc", None)]).await;
-    store
-        .attach(&wasm_sub("proc"), "proc", ATTACH_DEPTH, Priming::Head)
-        .await;
-    let departed = wasm_sub("gone");
-    let params = PushRetireParams {
-        app_slug: "gone",
-        subscriber: &departed,
-        push_depth: Depth::Bounded(1),
-    };
-
-    // A live publish, plus the claim a subscriber held on it back when it was
-    // still a target — the state an edit re-parks the message underneath.
-    let committed = store.append(message("alice", "a")).await.committed;
-    let stale = seed_claim(&store, &db, &departed, "gone", committed.message_uuid).await;
-    // Through the publish path's accounting, so the release finds a real window
-    // entry to forget rather than an empty map.
-    {
-        let conn = db.lock().await;
-        assert!(
-            store
-                .record_push_and_check_overflow(&params, stale, &conn)
-                .is_none(),
-            "the first claim fits a depth-1 window"
-        );
-    }
-    let release_at = soon();
-    {
-        let conn = db.lock().await;
-        conn.execute(
-            "UPDATE messaging_messages SET deliver_after = ?2, retained_seq = NULL \
-             WHERE uuid = ?1",
-            rusqlite::params![
-                committed.message_uuid.as_bytes().to_vec(),
-                crate::db::format_ts_for_db(release_at)
-            ],
-        )
-        .expect("re-park the live message");
-    }
-
-    store.release_due(release_at).await;
-
-    let claimants: Vec<String> = {
-        let conn = db.lock().await;
-        let mut stmt = conn
-            .prepare(
-                "SELECT target_subscriber FROM messaging_pending_pushes \
-                 WHERE delivered_at IS NULL",
-            )
-            .expect("prepare");
-        stmt.query_map([], |row| row.get(0))
-            .expect("query")
-            .map(|r| r.expect("read subscriber"))
-            .collect()
-    };
-    assert_eq!(
-        claimants,
-        vec![wasm_sub("proc").as_str().to_string()],
-        "the release-time target set is the whole target set"
-    );
-    assert!(
-        !store.has_deliverable(&departed).await,
-        "a subscriber that is no longer a target keeps no claim"
-    );
-
-    let (new, _) = serve(&store, &wasm_sub("proc"), DEPTH, 0).await;
-    assert_eq!(new, vec!["a"]);
-
-    let next = store.append(message("alice", "b")).await.committed;
-    let fresh = seed_claim(&store, &db, &departed, "gone", next.message_uuid).await;
-    let conn = db.lock().await;
-    assert!(
-        store
-            .record_push_and_check_overflow(&params, fresh, &conn)
-            .is_none(),
-        "a window still counting the withdrawn claim would retire this live one"
-    );
-}
-
-/// Mint an undelivered claim on `message_uuid` for a subscriber the channel does
-/// not register — the residue a departed subscription leaves behind, which the
-/// commit path itself can no longer produce now that a store resolves its own
-/// targets. Returns the claim id.
-async fn seed_claim(
-    store: &DbStore,
-    db: &crate::db::Db,
-    subscriber: &ParticipantId,
-    app_slug: &str,
-    message_uuid: Uuid,
-) -> i64 {
-    let conn = db.lock().await;
-    let message_id: i64 = conn
-        .query_row(
-            "SELECT id FROM messaging_messages WHERE uuid = ?1",
-            rusqlite::params![message_uuid.as_bytes().to_vec()],
-            |row| row.get(0),
-        )
-        .expect("the committed message row");
-    crate::messaging::db::seed_pending_pushes_for_messages(
-        &conn,
-        &[message_id],
-        subscriber,
-        app_slug,
-    );
-    crate::messaging::db::load_pending_pushes_for_channel(&conn, subscriber, store.channel_uuid())
-        .into_iter()
-        .map(|row| row.push_id)
-        .next_back()
-        .expect("the seeded claim")
-}
-
 #[tokio::test]
 async fn a_released_durable_push_makes_its_target_owed() {
     let (store, _db) =
@@ -2448,98 +2273,23 @@ async fn a_commit_owes_the_message_to_the_channels_registered_subscribers() {
     }
 }
 
-/// The delivery-time ACL gate runs inside the commit, on the same registrations
-/// the release pass reads. A subscriber whose policy no longer covers the
-/// channel is minted no claim, so a revoked subscription stops receiving at the
-/// publish that follows the revocation.
+/// Cancelling a parked message erases it, so no release ever positions it. A
+/// cancelled message that still released would be readable by everyone
+/// subscribed — exactly what its sender cancelled.
 #[tokio::test]
-async fn a_commit_skips_a_subscriber_whose_policy_no_longer_covers_the_channel() {
-    let (store, _db) = durable_store_at_subscribed_under(
-        Depth::Bounded(DEPTH),
-        vec![wasm_target("proc", None)],
-        crate::access::acl::ChannelMatcher::Exact("brenn:elsewhere".to_string()),
-    )
-    .await;
-
-    let committed = store.append(message("alice", "a")).await.committed;
-    assert!(
-        committed.target_records.is_empty(),
-        "a subscriber the ACL no longer covers is minted no claim"
-    );
-    assert!(store.deliverable_subscribers().await.is_empty());
-    assert_eq!(
-        retained_bodies(&store).await,
-        vec!["a"],
-        "the message still enters retention"
-    );
-}
-
-/// The release pass runs the delivery-time ACL gate, because it resolves its
-/// targets when it releases rather than reading a list the park recorded. A
-/// subscriber whose policy stopped covering the channel while its message
-/// waited is not delivered to.
-#[tokio::test]
-async fn release_skips_a_subscriber_whose_policy_no_longer_covers_the_channel() {
-    let (store, _db) = durable_store_at_subscribed_under(
-        Depth::Bounded(DEPTH),
-        vec![wasm_target("proc", None)],
-        crate::access::acl::ChannelMatcher::Exact("brenn:elsewhere".to_string()),
-    )
-    .await;
-    let release_at = soon();
-    store
-        .park(message("alice", "later"), release_at)
-        .await
-        .expect("within cap");
-
-    let released = store.release_due(release_at).await.released;
-    assert_eq!(released.len(), 1, "the message still enters retention");
-    assert!(
-        released[0].target_records.is_empty(),
-        "a subscriber the ACL no longer covers is minted no claim"
-    );
-    assert!(store.deliverable_subscribers().await.is_empty());
-}
-
-// ── The durable store's second grain ──────────────────────────────────────
-//
-// Every shared-contract read above joins through `messaging_messages`, so a
-// regression in the push-row half of a deferral write passes the battery and
-// then loses a delivery in production. These cases count the rows.
-
-/// Undelivered push rows on this channel, whatever their release state.
-async fn push_row_count(db: &crate::db::Db) -> i64 {
-    let conn = db.lock().await;
-    conn.query_row(
-        "SELECT COUNT(*) FROM messaging_pending_pushes WHERE delivered_at IS NULL",
-        [],
-        |row| row.get(0),
-    )
-    .expect("count pending pushes")
-}
-
-/// A parked message holds no delivery records, and cancelling it means none are
-/// ever minted. A cancelled message that still released would be delivered to
-/// whoever is attached then — exactly what its sender cancelled.
-#[tokio::test]
-async fn a_cancelled_parked_message_mints_no_claim_at_release() {
-    let (store, db) =
+async fn a_cancelled_parked_message_never_reaches_retention() {
+    let (store, _db) =
         durable_store_at_subscribed(Depth::Bounded(DEPTH), vec![wasm_target("proc", None)]).await;
     let release_at = soon();
     let cancelled = store
         .park(message("alice", "a"), release_at)
         .await
         .expect("within cap");
-    // A second parked message keeps the count from being trivially zero.
+    // A second parked message keeps the release from being trivially empty.
     store
         .park(message("alice", "b"), release_at)
         .await
         .expect("within cap");
-    assert_eq!(
-        push_row_count(&db).await,
-        0,
-        "a parked message is owed to nobody, so it holds no claim"
-    );
 
     assert_eq!(
         store
@@ -2549,96 +2299,12 @@ async fn a_cancelled_parked_message_mints_no_claim_at_release() {
     );
     let released = store.release_due(release_at).await.released;
     assert_eq!(released.len(), 1, "only the surviving message releases");
-    assert_eq!(
-        push_row_count(&db).await,
-        1,
-        "the surviving message mints one claim; the cancelled one none"
-    );
+    assert_eq!(retained_bodies(&store).await, vec!["b"]);
 }
 
-/// A release target carries a wake *threshold*, not a resolved decision, and the
-/// store applies it per message: one release pass carries whatever urgencies were
-/// parked. A claim minted eager for a below-threshold message wakes a phone for
-/// traffic the threshold exists to keep quiet; one minted non-eager for a
-/// qualifying message waits for the next poll instead of dispatching.
-#[tokio::test]
-async fn a_release_target_threshold_gates_the_minted_wake_per_message() {
-    let (store, db) = durable_store_at_subscribed(
-        Depth::Bounded(DEPTH),
-        vec![wasm_target("proc", Some(crate::messaging::WakeMin::Normal))],
-    )
-    .await;
-    let release_at = soon();
-    for (body, urgency) in [("quiet", Urgency::Low), ("loud", Urgency::Normal)] {
-        let mut msg = message("alice", body);
-        msg.urgency = urgency;
-        store.park(msg, release_at).await.expect("within cap");
-    }
-
-    store.release_due(release_at).await;
-
-    let wakes: Vec<(String, bool)> = {
-        let conn = db.lock().await;
-        let mut stmt = conn
-            .prepare(
-                "SELECT m.body, pp.eager_wake FROM messaging_pending_pushes pp \
-                 JOIN messaging_messages m ON m.id = pp.message_id ORDER BY pp.id",
-            )
-            .expect("prepare");
-        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .expect("query")
-            .map(|r| r.expect("read claim"))
-            .collect()
-    };
-    assert_eq!(
-        wakes,
-        vec![("quiet".to_string(), false), ("loud".to_string(), true)],
-        "the threshold decides per message, not per batch"
-    );
-}
-
-/// Detaching drops the subscriber's in-memory push window along with its DB
-/// rows. A window left behind holds push ids the detach already deleted, so the
-/// next attach starts against a full window of phantoms and retires live claims.
-#[tokio::test]
-async fn detach_clears_the_durable_push_window() {
-    let (store, db) = durable_store_for("proc", 2).await;
-    let sub = wasm_sub("proc");
-
-    // Two claims fill the depth-2 window, each offered to it by its own commit.
-    for body in ["a", "b"] {
-        let outcome = store.append(message("alice", body)).await;
-        assert!(
-            outcome.overflow.is_empty(),
-            "a full-but-not-over window retires nothing"
-        );
-    }
-
-    store.detach(&sub).await;
-    assert!(
-        store.push_windows_is_empty(),
-        "detach must drop the subscriber's window, not only its DB rows"
-    );
-
-    // Re-attached, the window starts empty again: two fresh claims fit, so
-    // nothing is retired and both push rows survive.
-    for body in ["c", "d"] {
-        let outcome = store.append(message("alice", body)).await;
-        assert!(
-            outcome.overflow.is_empty(),
-            "a re-attached subscriber must not inherit the detached window"
-        );
-    }
-    assert_eq!(
-        push_row_count(&db).await,
-        2,
-        "both post-detach claims are live"
-    );
-}
-
-/// Rescheduling moves the release, and the claim is minted at the moved-to
-/// instant. A reschedule that left the delivery behind would release the
-/// message with nothing to wake, so the rescheduled timer would never fire.
+/// Rescheduling moves the release, and the message enters retention at the
+/// moved-to instant. A reschedule that left the release time behind would strand
+/// the message outside retention, where no position can ever see it.
 #[tokio::test]
 async fn edit_reschedules_the_durable_release() {
     let (store, _db) =
@@ -2658,11 +2324,7 @@ async fn edit_reschedules_the_durable_release() {
     );
     let released = store.release_due(moved_to).await.released;
     assert_eq!(released.len(), 1);
-    assert_eq!(
-        released[0].target_records.len(),
-        1,
-        "the claim must be minted with the message it delivers"
-    );
+    assert_eq!(retained_bodies(&store).await, vec!["a"]);
 }
 
 // ── Resume replay ───────────────────────────────────────────────────────────
@@ -3043,7 +2705,6 @@ async fn durable_empty_window_after_eviction_discriminates_by_high_water() {
         entry.uuid,
         entry.address.clone(),
         Depth::Bounded(DEPTH),
-        Arc::new(TargetResolver::unsubscribed()),
     );
     let cursor = cursor_of(&store).await;
 
@@ -3101,14 +2762,12 @@ async fn durable_replay_is_immune_to_sparse_rowids() {
         e1.uuid,
         e1.address.clone(),
         Depth::Bounded(DEPTH),
-        Arc::new(TargetResolver::unsubscribed()),
     );
     let s2 = DbStore::new(
         db.clone(),
         e2.uuid,
         e2.address.clone(),
         Depth::Bounded(DEPTH),
-        Arc::new(TargetResolver::unsubscribed()),
     );
     let cursor = cursor_of(&s1).await;
 
@@ -3201,39 +2860,33 @@ async fn durable_replay_reports_a_gap_when_an_interior_seq_is_missing() {
 
 // ── Drop accounting ───────────────────────────────────────────────────────
 
-/// A durable push-window overflow reports the loss at the moment the claim is
-/// retired — the commit that displaced it — with no reference to the
-/// subscription's noise level, the same unconditional accounting the ring
-/// cursor does. The noise ladder decides how loud the drop is, never whether it
-/// happened. The commit names the loser in its overflow, so a subscriber that
-/// never reads still escalates.
+/// A durable commit past the subscriber's depth reports nothing: the claim it
+/// writes displaces no earlier one, and the loss the depth implies is the
+/// subscriber's own read to report. Charging it here as well would count one
+/// loss twice, on the class where the design says both classes agree.
 #[tokio::test]
-async fn durable_overflow_reports_the_drop_at_retirement() {
+async fn a_durable_commit_past_the_depth_reports_no_overflow() {
     let (store, _db) = durable_store_for("slow", 1).await;
     let sub = wasm_sub("slow");
+    store
+        .attach(&sub, "slow", Depth::Bounded(1), Priming::Head)
+        .await;
 
-    let mut retired = Vec::new();
     for body in ["a", "b", "c"] {
         let outcome = store.append(message("alice", body)).await;
-        retired.extend(outcome.overflow);
+        assert!(
+            outcome.overflow.is_empty(),
+            "a commit is not a drop-reporting site"
+        );
     }
 
+    // The depth-1 subscriber's own read is where the two it never sees are
+    // reported, in one figure.
+    let (new, advance) = serve(&store, &sub, 1, 0).await;
+    assert_eq!(new, vec!["c"], "the newest is what a depth-1 read serves");
+    assert_eq!(advance.dropped, 2, "the two it never saw, by subtraction");
     assert_eq!(
-        retired.len(),
-        2,
-        "a depth-1 window retires the two older claims"
-    );
-    assert!(
-        retired
-            .iter()
-            .all(|e| e.subscriber == sub && e.dropped == 1),
-        "each commit names the subscriber whose claim it displaced"
-    );
-    assert!(
-        retired
-            .iter()
-            .all(|e| e.app_slug.as_deref() == Some("slow")),
-        "the event names the app the retired claim was written under — the only \
-         route from a conversation participant back to its registration"
+        advance.noise_charge, 2,
+        "still retained, so no eviction pass has reported them"
     );
 }

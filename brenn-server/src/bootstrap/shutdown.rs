@@ -136,20 +136,19 @@ pub(crate) async fn ingress_cleanup_loop(db: brenn_lib::db::Db, retention_days: 
 }
 
 /// Background task: GC bus (channel-associated) messages past the channel reap
-/// frontier and retire stale push-claim rows for bounded subscribers.
+/// frontier.
 ///
 /// Runs once per hour. Staggered by 45 minutes relative to
 /// `session_cleanup_loop` so the three hourly loops never contend the single
 /// SQLite mutex simultaneously. The stagger is a performance optimization —
 /// correctness does not depend on it.
 ///
-/// **Two-reaper non-overlap invariant:** `bus_gc_evict_channel` /
-/// `bus_gc_retire_pushes` carry an `envelope_type != 'ingress'` predicate,
-/// which matches all channel-associated rows (`brenn`, `webhook`, future
-/// transports). `ingress_cleanup_loop` touches only `channel_uuid IS NULL`
-/// (`envelope_type = 'ingress'`) rows. The two passes are non-overlapping
-/// because `ingress` rows never have a `channel_uuid`, so they are excluded
-/// by the channel-uuid join on the GC path.
+/// **Two-reaper non-overlap invariant:** `bus_gc_evict_channel` carries an
+/// `envelope_type != 'ingress'` predicate, which matches all channel-associated
+/// rows (`brenn`, `webhook`, future transports). `ingress_cleanup_loop` touches
+/// only `channel_uuid IS NULL` (`envelope_type = 'ingress'`) rows. The two passes
+/// are non-overlapping because `ingress` rows never have a `channel_uuid`, so
+/// they are excluded by the channel-uuid join on the GC path.
 ///
 /// For each channel in the directory:
 /// 1. Compute the reap frontier via [`brenn_lib::messaging::ChannelEntry::reap_frontier`].
@@ -161,8 +160,6 @@ pub(crate) async fn ingress_cleanup_loop(db: brenn_lib::db::Db, retention_days: 
 ///    accounting point, the sibling of the ring's displacing append. The
 ///    report lands up to one GC interval after the loss — durable eviction is
 ///    itself periodic, and the ladder is minutes-grade.
-/// 4. Backstop push-claim retirement: retire push rows past `push_depth` for
-///    each bounded-`push_depth` subscriber via `bus_gc_retire_pushes`.
 pub(crate) async fn bus_gc_loop(
     db: brenn_lib::db::Db,
     messenger: std::sync::Arc<brenn_lib::messaging::Messenger>,
@@ -181,7 +178,6 @@ pub(crate) async fn bus_gc_loop(
         // itself is the bound.
         let channels = messenger.directory().list_durable();
         let mut total_messages_evicted: usize = 0;
-        let mut total_pushes_retired: usize = 0;
 
         for entry in &channels {
             let Some(frontier) = entry.reap_frontier() else {
@@ -202,29 +198,14 @@ pub(crate) async fn bus_gc_loop(
                 )
             };
             total_messages_evicted += eviction.messages_evicted;
-            total_pushes_retired += eviction.push_rows_retired;
             // Enacted outside the connection hold: the ladder alarms through
             // the router, which is no business of the eviction transaction.
             messenger.enact_overflow_for_channel(&entry.address, &eviction.overflow);
-
-            // Backstop push-claim retirement for each bounded-push_depth subscriber.
-            for sub in &entry.subscribers {
-                use brenn_lib::messaging::config::Depth;
-                if let Depth::Bounded(n) = sub.push_depth
-                    && n > 0
-                {
-                    let conn = db.lock().await;
-                    let retired =
-                        msg_db::bus_gc_retire_pushes(&conn, entry.uuid, sub.kind.slug(), n);
-                    total_pushes_retired += retired;
-                }
-            }
         }
 
-        if total_messages_evicted > 0 || total_pushes_retired > 0 {
+        if total_messages_evicted > 0 {
             tracing::info!(
                 messages_evicted = total_messages_evicted,
-                push_rows_retired = total_pushes_retired,
                 channels_processed = channels.len(),
                 "bus GC pass complete"
             );

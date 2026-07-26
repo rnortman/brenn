@@ -523,8 +523,8 @@ impl ActiveBridge {
         ]);
         // Seed "testapp" with messaging enabled so publish/cancel/edit intercept
         // tests can exercise the full happy-path through the real messenger.
-        // The subscription must be present so resolve_push_targets can look up
-        // the noise level (invariant: every channel subscriber has a ResolvedSubscription).
+        // The subscription must be present so the app's config and the directory
+        // agree about what "testapp" subscribes to.
         let mut messenger_apps = indexmap::IndexMap::new();
         let mut testapp_cfg =
             crate::test_support::app_config::default_test_app_config("testapp", "testapp");

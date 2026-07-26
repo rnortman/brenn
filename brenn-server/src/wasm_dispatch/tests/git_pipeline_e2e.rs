@@ -541,10 +541,11 @@ async fn run_pipeline(forge: Forge) -> serde_json::Value {
 
     // --- Step 3: consumer push activation → one call-async on the tool bus. ---
     drain_step(&pipeline.consumer_cfg, &pipeline.consumer_sub).await;
-    let requests = pipeline
-        .messenger
-        .load_pending_pushes(&pipeline.executor_sub)
-        .await;
+    let requests = brenn_lib::messaging::testutils::owed_everywhere(
+        &pipeline.messenger,
+        &pipeline.executor_sub,
+    )
+    .await;
     assert_eq!(
         requests.len(),
         1,

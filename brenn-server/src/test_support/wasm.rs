@@ -1,8 +1,8 @@
 //! Shared scaffolding for WASM-subscriber receive tests across the MQTT and
 //! webhook router suites: a single-`Wasm`-subscriber channel entry, a `Messenger`
-//! carrying that subscriber's policy, and the pending-push row query both suites
-//! assert on. Keeping these in one place means a `messaging_pending_pushes` schema
-//! change or a new transport edits one builder, not several near-identical copies.
+//! carrying that subscriber's policy, and the retained-message query both suites
+//! assert on. Keeping these in one place means a schema change or a new transport
+//! edits one builder, not several near-identical copies.
 
 use std::sync::Arc;
 
@@ -84,24 +84,31 @@ pub(crate) fn messenger_with_wasm_policy(
     ))
 }
 
-/// `(push_row_count, envelope_type)` for the WASM consumer `wasm_slug`'s pending
-/// pushes. `envelope_type` is `None` when no push row exists (the denied case).
-pub(crate) async fn wasm_push_rows(db: &Db, wasm_slug: &str) -> (i64, Option<String>) {
-    let target = format!("wasm:{wasm_slug}");
+/// `(retained_count, envelope_type)` for the messages a transport ingress
+/// committed onto `channel_address`.
+///
+/// A commit writes the message and nothing per-subscriber, so what a receive test
+/// asserts is that the message reached the channel's retention — which is where
+/// every subscriber's position reads it from. `envelope_type` is `None` when the
+/// channel retains nothing.
+pub(crate) async fn retained_on_channel(db: &Db, channel_address: &str) -> (i64, Option<String>) {
     let conn = db.lock().await;
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM messaging_pending_pushes WHERE target_subscriber = ?1",
-            [&target],
+            "SELECT COUNT(*) FROM messaging_messages m \
+             JOIN messaging_channels c ON c.uuid = m.channel_uuid \
+             WHERE c.address = ?1 AND m.retained_seq IS NOT NULL",
+            [channel_address],
             |r| r.get(0),
         )
-        .expect("push-count query must succeed");
+        .expect("retained-count query must succeed");
     let envelope_type: Option<String> = conn
         .query_row(
             "SELECT m.envelope_type FROM messaging_messages m \
-             JOIN messaging_pending_pushes pp ON pp.message_id = m.id \
-             WHERE pp.target_subscriber = ?1",
-            [&target],
+             JOIN messaging_channels c ON c.uuid = m.channel_uuid \
+             WHERE c.address = ?1 AND m.retained_seq IS NOT NULL \
+             ORDER BY m.retained_seq DESC LIMIT 1",
+            [channel_address],
             |r| r.get(0),
         )
         .optional()

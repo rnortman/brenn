@@ -4,16 +4,12 @@
 //!
 //! - [`Event`] — the persistent shape of an ingress message in the unified
 //!   store. Constructed at drain time from `kind='ingress'` rows.
-//! - [`IngressOrBus`] — the tagged payload returned by the drain read path;
-//!   the bus arm holds a [`MessageEnvelope`], the ingress arm holds an [`Event`].
 //! - Repo-sync constants, collapser helpers, and formatting logic (previously
 //!   in `brenn_lib::event_queue`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
-
-use super::MessageEnvelope;
 
 // ---------------------------------------------------------------------------
 // Event — ingress payload shape
@@ -38,59 +34,6 @@ pub struct Event {
     pub summary: String,
     pub payload: String,
     pub created_at: DateTime<Utc>,
-}
-
-// ---------------------------------------------------------------------------
-// IngressOrBus — tagged drain payload
-// ---------------------------------------------------------------------------
-
-/// Tagged payload returned by `load_pending_pushes_for_drain`.
-///
-/// `Bus` rows carry a [`MessageEnvelope`] built from `kind='brenn'` rows;
-/// `Ingress` rows carry an [`Event`] reconstructed from `kind='ingress'` rows.
-///
-/// **Invariant:** no code path constructs a [`MessageEnvelope`] from a
-/// `kind='ingress'` row. The bus arm of the row decoder only runs when
-/// `kind = 'brenn'`; the ingress arm never reads `c.address`.
-// TODO(ingress-retirement): once repo_sync publishes onto a real bus channel
-// and the ingress rows are migrated, this enum collapses to a bare
-// `MessageEnvelope` and the `Ingress`/`Event` paths are deleted.
-#[derive(Debug, Clone)]
-pub enum IngressOrBus {
-    Ingress(Event),
-    Bus(MessageEnvelope),
-}
-
-impl IngressOrBus {
-    /// True iff this is the `Bus` arm.
-    pub fn is_bus(&self) -> bool {
-        matches!(self, Self::Bus(_))
-    }
-
-    /// Unwrap as a bus envelope by value. Panics if this is an `Ingress` row —
-    /// callers that are bus-only by construction must use this to enforce
-    /// the invariant (fail-fast).
-    pub fn unwrap_bus(self) -> MessageEnvelope {
-        match self {
-            Self::Bus(e) => e,
-            Self::Ingress(ev) => panic!(
-                "messaging: expected bus row but got ingress row with source {:?} push_id {}",
-                ev.source, ev.id
-            ),
-        }
-    }
-
-    /// Borrow the inner [`MessageEnvelope`] for bus-only paths.
-    /// Panics if this is an `Ingress` row (fail-fast; bus-only invariant).
-    pub fn unwrap_bus_ref(&self) -> &MessageEnvelope {
-        match self {
-            Self::Bus(e) => e,
-            Self::Ingress(ev) => panic!(
-                "messaging: expected bus row but got ingress row with source {:?} push_id {}",
-                ev.source, ev.id
-            ),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -932,7 +932,7 @@ mod tests {
             ResolvedSubscription, Sink,
         };
         use brenn_lib::messaging::db::upsert_channels;
-        use brenn_lib::messaging::db::{PendingPushInsert, insert_message_with_pushes, utc_to_ns};
+        use brenn_lib::messaging::db::{insert_ingress_message, utc_to_ns};
         use brenn_lib::messaging::dispatcher::spawn_dispatcher_task;
         use brenn_lib::messaging::query::NoopWakeRouter;
         use brenn_lib::messaging::{
@@ -1136,27 +1136,16 @@ mod tests {
         // ------------------------------------------------------------------
         {
             let conn = db.lock().await;
-            let sub_a = ParticipantId::for_conversation(conv_id_a);
             let ts = utc_to_ns(Utc::now());
-            insert_message_with_pushes(
+            insert_ingress_message(
                 &conn,
-                channel_uuid_a,
-                "host",
-                "sender",
+                &ParticipantId::for_conversation(conv_id_a),
+                "app-a",
+                "mqtt:isolation",
+                "msg-for-a",
                 "msg-for-a",
                 Urgency::Normal,
-                ChannelScheme::Brenn,
-                None,
-                None,
-                None, // no release_after → immediately dispatchable
                 ts,
-                &[PendingPushInsert {
-                    target_subscriber: sub_a,
-                    target_app_slug: "app-a".to_string(),
-                    eager_wake: true,
-                    release_after: None,
-                    delivery_deadline: None,
-                }],
             );
         }
         kick.notify_one();
@@ -1178,27 +1167,16 @@ mod tests {
         // ------------------------------------------------------------------
         {
             let conn = db.lock().await;
-            let sub_b = ParticipantId::for_conversation(conv_id_b);
             let ts = utc_to_ns(Utc::now());
-            insert_message_with_pushes(
+            insert_ingress_message(
                 &conn,
-                channel_uuid_b,
-                "host",
-                "sender",
+                &ParticipantId::for_conversation(conv_id_b),
+                "app-b",
+                "mqtt:isolation",
+                "msg-for-b",
                 "msg-for-b",
                 Urgency::Normal,
-                ChannelScheme::Brenn,
-                None,
-                None,
-                None, // no release_after
                 ts,
-                &[PendingPushInsert {
-                    target_subscriber: sub_b,
-                    target_app_slug: "app-b".to_string(),
-                    eager_wake: true,
-                    release_after: None,
-                    delivery_deadline: None,
-                }],
             );
         }
         kick.notify_one();

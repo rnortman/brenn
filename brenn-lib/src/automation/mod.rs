@@ -1187,7 +1187,7 @@ mod tests {
 
     /// Engine whose `"test-app"` holds `policy`, over `directory`. Subscriptions
     /// are empty (gate tests never fire), so any `policy`/`directory` pair is
-    /// valid without the `resolve_push_targets` invariant applying.
+    /// valid without app config and directory having to agree on subscriptions.
     fn make_engine_with_policy(
         policy: crate::access::AppPolicy,
         directory: MessagingDirectory,

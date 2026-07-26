@@ -153,12 +153,13 @@ pub(crate) fn build_apps_with_messaging(
 /// Merge webhook-derived messaging configs from `apps_with_messaging` back into
 /// the base `apps` map so the result can be handed to `Messenger::new`.
 ///
-/// `Messenger::new` / `resolve_push_targets` reads each app's
-/// `.messaging.subscriptions` to find the `ResolvedSubscription` for the
-/// channel being published to. Without this merge, webhook-subscribed apps
-/// appear in the channel's subscriber list (placed there by
-/// `finalize_directory_with_subscribers`) but have no matching subscription in
-/// their `.messaging` — causing an invariant panic.
+/// The merge keeps one app's two records of itself from disagreeing: a
+/// webhook-subscribed app appears in the channel's subscriber list (placed there
+/// by `finalize_directory_with_subscribers` from `apps_with_messaging`), so its
+/// own `.messaging` must name the same subscriptions rather than the subset the
+/// operator typed. `Messenger` reads the merged block for the app's send budget;
+/// a transport-only app that reached `Messenger::new` unmerged would carry no
+/// `.messaging` at all.
 ///
 /// Apps absent from `apps_with_messaging` (no messaging block, no webhook
 /// subscriptions) are passed through unchanged with their original `.messaging`
@@ -916,9 +917,8 @@ pub(crate) async fn build_messaging(
 
     // Build a merged apps map where each app's `.messaging` reflects the same
     // merged ResolvedMessagingConfig that `build_apps_with_messaging` produced
-    // (including webhook-derived ResolvedSubscriptions). Without this,
-    // `resolve_push_targets` reads the original per-app `.messaging` and finds
-    // no subscription for the webhook channel — invariant panic.
+    // (including webhook-derived ResolvedSubscriptions), so the map the Messenger
+    // holds and the directory it walks describe the same subscriptions.
     // The surface-description publisher is a `system:` participant (built into
     // `system_participants` above), not an injected app, so the merged app map is
     // exactly the operator apps with their webhook-derived subscriptions.
@@ -959,9 +959,9 @@ pub(crate) async fn build_messaging(
     // gating and lag tracking, not a separate ACL blob.
     //
     // Every instance is registered, not just the ones with a durable binding
-    // today: `floor_decision` fails closed on a missing registration, so deriving
-    // this set from the bindings would silently deny delivery the moment a
-    // binding is added anywhere else. The declaration set is the authority.
+    // today: surface target resolution fails closed on a missing registration, so
+    // deriving this set from the bindings would silently deny delivery the moment
+    // a binding is added anywhere else. The declaration set is the authority.
     for s in &resolved_surfaces {
         let registration = brenn_lib::messaging::SubscriberRegistration {
             policy: Arc::new(s.policy.clone()),

@@ -234,6 +234,24 @@ impl IntegrationRegistry {
     }
 }
 
+/// What `BrennMessageCancel` returns for a message that is past recall.
+///
+/// The tool description below quotes this constant and the intercept emits it,
+/// so the text the model is told to expect and the text it receives are the same
+/// string by construction. They live apart otherwise — the description in this
+/// crate, the emission in `brenn-server` — and a reworded copy of either would
+/// leave the contract a lie with every test still green.
+pub const CANCEL_ALREADY_PUBLISHED_ERR: &str =
+    "this message is already published; only a scheduled message can be cancelled";
+
+/// The same, for `BrennMessageEdit`.
+pub const EDIT_ALREADY_PUBLISHED_ERR: &str =
+    "this message is already published; only a scheduled message can be edited";
+
+/// The lead-in of the second-cancel error, which appends the message UUID. The
+/// description quotes it as `"unknown message <uuid>"`.
+pub const UNKNOWN_MESSAGE_ERR: &str = "unknown message";
+
 /// Core virtual tool definitions for an app. Send tools (`BrennSend`,
 /// `PwaPushSend`, `MqttSend`) are conditionally included based on the app's
 /// channel-enablement signals; all sibling read/management tools are always present.
@@ -554,16 +572,22 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "BrennMessageCancel".to_string(),
-            description: concat!(
-                "Cancel a pending (undelivered) scheduled message by message_id UUID. ",
-                "Removes all undelivered push rows; the message remains in history ",
-                "(visible to MessageChannelGet). After cancel, no delivery, push notification, ",
-                "or wake occurs. Idempotent: cancelling an already-cancelled message returns ",
-                "NoPendingPushes. Does not consume send budget.\n\n",
-                "Success: `{ ok: true, cancelled: true, message_id, cancelled_pushes }`. ",
+            description: [
+                "Cancel a scheduled (still-parked, `deliver_after` in the future) message by ",
+                "message_id UUID. The message is withdrawn outright: it never enters retention, ",
+                "never delivers, and is gone from history (not visible to MessageChannelGet). ",
+                "Only a scheduled message can be cancelled. A message already in retention is ",
+                "past recall — every subscriber reads it from its own position and the server ",
+                "keeps no per-subscriber delivery record to revoke — and that attempt errors ",
+                "with \"",
+                CANCEL_ALREADY_PUBLISHED_ERR,
+                "\". Not idempotent: a second cancel of the same message_id errors with \"",
+                UNKNOWN_MESSAGE_ERR,
+                " <uuid>\", the row having been withdrawn. Does not consume send budget.\n\n",
+                "Success: `{ ok: true, cancelled: true, message_id }`. ",
                 "Errors: `{ ok: false, error: \"...\" }`."
-            )
-            .to_string(),
+            ]
+            .concat(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -578,21 +602,23 @@ fn messaging_virtual_tools(enabled: bool) -> Vec<VirtualToolDef> {
         },
         VirtualToolDef {
             name: "BrennMessageEdit".to_string(),
-            description: concat!(
-                "Edit a pending (undelivered) scheduled message in-place. ",
+            description: [
+                "Edit a scheduled (still-parked) message in-place. ",
                 "Same message_id (UUID handle) before and after. ",
                 "At least one mutable field must be provided. ",
-                "Fails if any push for the message has already been delivered. ",
-                "Does not consume send budget.\n\n",
+                "Fails once the message has entered retention with \"",
+                EDIT_ALREADY_PUBLISHED_ERR,
+                "\": only a scheduled message is editable, on the same past-recall rule ",
+                "BrennMessageCancel states. Does not consume send budget.\n\n",
                 "Mutable fields: `body` (markdown string), ",
                 "`deliver_after` (RFC3339 or null to deliver immediately), ",
                 "`delivery_deadline` (RFC3339 or null to clear), ",
-                "`wake` (\"none\" or \"immediate\"), ",
+                "`urgency` (\"very-low\" | \"low\" | \"normal\" | \"high\"), ",
                 "`reply_to` (brenn: address or null to clear).\n\n",
                 "Success: returns updated MessageEnvelope. ",
                 "Errors: `{ ok: false, error: \"...\" }`."
-            )
-            .to_string(),
+            ]
+            .concat(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2129,6 +2155,66 @@ mod tests {
         assert!(
             desc.contains("static") || desc.contains("Static"),
             "doc must state static subscriptions are not removable: {desc}"
+        );
+    }
+
+    /// `BrennMessageCancel`'s and `BrennMessageEdit`'s descriptions state the
+    /// parked-only rule and name no field or outcome the tools cannot produce.
+    /// These strings are the whole of what CC reads to interpret the tools, so a
+    /// deleted result field named here is a lie the model acts on.
+    #[test]
+    fn cancel_and_edit_descriptions_state_the_parked_only_rule() {
+        let cfg = minimal_app_config_for_tool_test(&[AppCapability::MessagingPublish]);
+        let tools = core_virtual_tools(&cfg);
+
+        let cancel = tools
+            .iter()
+            .find(|t| t.name == "BrennMessageCancel")
+            .expect("BrennMessageCancel registered");
+        let desc = &cancel.description;
+        // Verbatim, not paraphrased: the intercept emits this same constant, and
+        // the intercept-side rows assert that. Between the two, the text the
+        // model is told to expect and the text it receives cannot drift apart.
+        assert!(
+            desc.contains(CANCEL_ALREADY_PUBLISHED_ERR),
+            "doc must quote the retained-message error text verbatim: {desc}"
+        );
+        assert!(
+            desc.contains(UNKNOWN_MESSAGE_ERR),
+            "doc must state the second-cancel outcome: {desc}"
+        );
+        // Field and variant deleted with the claim rows: no per-subscriber push
+        // row exists to count, and no such outcome can be returned.
+        assert!(
+            !desc.contains("cancelled_pushes"),
+            "doc must not name the deleted cancelled_pushes field: {desc}"
+        );
+        assert!(
+            !desc.contains("NoPendingPushes"),
+            "doc must not name the deleted NoPendingPushes outcome: {desc}"
+        );
+
+        let edit = tools
+            .iter()
+            .find(|t| t.name == "BrennMessageEdit")
+            .expect("BrennMessageEdit registered");
+        let desc = &edit.description;
+        assert!(
+            desc.contains(EDIT_ALREADY_PUBLISHED_ERR),
+            "doc must quote the retained-message error text verbatim: {desc}"
+        );
+        assert!(
+            desc.contains("retention"),
+            "doc must state that a retained message is not editable: {desc}"
+        );
+        // The intercept rejects `wake` outright and takes `urgency` instead.
+        assert!(
+            !desc.contains("`wake`"),
+            "doc must not offer the rejected `wake` field: {desc}"
+        );
+        assert!(
+            desc.contains("`urgency`"),
+            "doc must list urgency among the mutable fields: {desc}"
         );
     }
 

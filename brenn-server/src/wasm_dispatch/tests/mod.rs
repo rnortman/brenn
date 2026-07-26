@@ -75,7 +75,10 @@ pub(super) async fn wait_pending_empty(
 ) -> bool {
     let start = std::time::Instant::now();
     loop {
-        if messenger.load_pending_pushes(subscriber).await.is_empty() {
+        if brenn_lib::messaging::testutils::owed_everywhere(messenger, subscriber)
+            .await
+            .is_empty()
+        {
             return true;
         }
         if start.elapsed() >= deadline {
@@ -465,6 +468,16 @@ pub(super) async fn build_multiport_setup_with_depths(
         .map(|(e, (_, push_depth, _))| (e.as_ref(), *push_depth))
         .collect();
     attach_input_ports(&messenger, slug, &wasm_sub, &ports).await;
+    // The output channel's reader holds a position too, or a case that reads back
+    // what the component published would be owed nothing.
+    brenn_lib::messaging::testutils::attach_wasm_port(
+        &messenger,
+        &out_entry,
+        &out_sub_slug,
+        &out_sub,
+        Depth::Unbounded,
+    )
+    .await;
 
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
     let store_db = tempfile::NamedTempFile::new().unwrap();

@@ -20,16 +20,13 @@ use brenn_lib::messaging::config::{
     ResolvedSurface, ResolvedSurfaceSubscription, Sink, SurfaceBinding, SurfaceOutput,
     SurfacePrincipalBudgets, SurfaceSendBudget, build_channel_entries,
 };
-use brenn_lib::messaging::db::{
-    PendingPushInsert, insert_message_with_pushes, load_all_dispatchable_pushes, upsert_channels,
-    utc_to_ns,
-};
+use brenn_lib::messaging::db::{insert_message, upsert_channels, utc_to_ns};
 use brenn_lib::messaging::store::RingStores;
 use brenn_lib::messaging::testutils::ephemeral_channel_entry;
 use brenn_lib::messaging::{
     ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, Messenger,
     ParticipantId, PublishResult, SubscriberEntry, SubscriberEntryKind, Urgency, WakeMin,
-    WakeRouter, dispatcher,
+    WakeRouter,
 };
 use brenn_lib::obs::alerting::{
     AlertDispatcher, AlertSeverity as NativeAlertSeverity, make_capturing_alerter_with_severity,
@@ -2818,11 +2815,10 @@ async fn surface_ws_publish_unbound_port_is_violation() {
 // ephemeral+durable on one session, and ACL-floor retire parity.
 //
 // A real `WakeRouterImpl`-backed `Messenger` is wired into the spawned server's
-// `AppState` (shared `surface_registry`), so driving the dispatcher
-// (`dispatch_pending`) fans live rows out to the attached WS sessions exactly as
-// the production background dispatcher would. Parked/retained rows are inserted
-// straight into the DB (the publish-while-detached and retained-window sources);
-// the delivery, drain, and resume machinery under test then reads them back.
+// `AppState` (shared `surface_registry`), so a commit's surface fan-out reaches
+// the attached WS sessions exactly as in production. Retained-but-unfed rows are
+// inserted straight into the DB (the publish-while-detached and retained-window
+// sources); the drain and resume machinery under test then reads them back.
 // ===========================================================================
 
 /// Bare durable channel name (ACL matcher key) + its canonical address.
@@ -2930,6 +2926,25 @@ async fn durable_rig(
     channel_entry: ChannelEntry,
     nondurable: Vec<ChannelEntry>,
 ) -> (AppState, Arc<Messenger>) {
+    // Project the surface's own subscriptions onto the channel entry, as boot
+    // does: the commit's surface fan-out resolves its targets from the directory,
+    // so a subscription the entry does not carry is fed nothing.
+    let mut channel_entry = channel_entry;
+    channel_entry.subscribers = resolved
+        .durable_subscriptions
+        .iter()
+        .filter(|sub| sub.subscription.channel_address == channel_entry.address)
+        .map(|sub| SubscriberEntry {
+            kind: SubscriberEntryKind::Surface {
+                slug: resolved.slug.clone(),
+                instance: Some(sub.instance.clone()),
+            },
+            push_depth: sub.subscription.push_depth,
+            retain_depth: sub.subscription.retain_depth,
+            noise: sub.subscription.noise,
+            wake_min: None,
+        })
+        .collect();
     {
         let conn = db.lock().await;
         upsert_channels(&conn, std::slice::from_ref(&channel_entry));
@@ -2970,9 +2985,8 @@ async fn durable_rig(
 /// A `deskbar` surface that both **subscribes to** and **publishes on**
 /// `DURABLE_ADDR`: a durable subscription (`protobar`/`messages`) for receiving
 /// plus a durable output (`writer`/`durable`) for publishing, its policy granting
-/// both directions on the channel. Exercises the design §5 self-delivery case
-/// end-to-end (publish → `resolve_push_targets` → persist → dispatch → deliver to
-/// its own session).
+/// both directions on the channel. Exercises the self-delivery case end-to-end:
+/// publish → retain → the commit's surface fan-out → deliver to its own session.
 fn durable_pubsub_surface(uuid: Uuid) -> ResolvedSurface {
     let mut policy = AppPolicy::default();
     policy.grants.insert(AppCapability::MessagingSubscribe);
@@ -3095,8 +3109,8 @@ fn surface_registrations_all_grains(
 /// `with_surface_policies`). Each entry keys a surface slug to its policy: a
 /// `brenn_publish` ACL lets that principal pass its publish gate
 /// (`publish_from_surface`); a `brenn_subscribe` ACL lets it pass the
-/// delivery-time gate in `resolve_push_targets` when it is a channel
-/// subscriber. Self-delivery passes one slug holding both ACLs; a
+/// delivery-time gate in `TargetResolver::surface_feed_targets` when it is a
+/// channel subscriber. Self-delivery passes one slug holding both ACLs; a
 /// cross-principal round trip passes a publisher slug and a distinct
 /// subscriber slug. The channel entry must list the intended `Surface`
 /// subscriber for the publish to fan out.
@@ -3193,7 +3207,7 @@ async fn surface_ws_durable_publish_delivers_to_subscriber() {
     let resolved = durable_pubsub_surface(uuid);
     let surface_policies =
         std::collections::HashMap::from([("deskbar".to_string(), resolved.policy.clone())]);
-    let (state, messenger) =
+    let (state, _messenger) =
         durable_pubsub_rig(&db, resolved, channel_entry, surface_policies).await;
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
@@ -3222,22 +3236,22 @@ async fn surface_ws_durable_publish_delivers_to_subscriber() {
         "durable publish is Ok"
     );
 
-    // A dispatcher pass delivers the parked row live to the subscribed session.
-    dispatch_pending(&messenger).await;
+    // The commit's fan-out delivered the message live to the subscribed session.
     assert_durable_deliver_to(&mut ws, COMPONENT, "hello-durable", 1).await;
 }
 
-/// The durable depth-0 context feed (design §6): a fold-0 durable subscription
-/// creates **no** `messaging_pending_pushes` row, yet an attached session still
-/// receives the message live, as a row-less deliver-if-attached fan-out at
-/// publish time. The message persists and is retained; a later dispatcher pass
-/// finds no row and delivers nothing again (no duplicate).
+/// The durable depth-0 context feed: a fold-0 durable subscription creates
+/// **no** `messaging_pending_pushes` row, yet an attached session still receives
+/// the message live, as a row-less deliver-if-attached fan-out at publish time.
+/// The message persists and is retained, and the commit's fan-out is the whole
+/// trigger — nothing delivers it a second time.
 ///
-/// The zero-row assertion is load-bearing and not incidental:
-/// `bus_gc_retire_pushes` early-returns at depth 0, so a row created here would
-/// never be reaped and the table would grow without bound behind a disconnected
-/// surface. The feed owes a disconnected session nothing — its context arrives
-/// at the next subscribe/resume (the paired test below).
+/// The zero-row assertion is load-bearing and not incidental: nothing on a
+/// channel writes to that table any more, so a row appearing here would mean a
+/// path started minting per-subscriber delivery records again — behind a
+/// disconnected surface, with nothing to reap them. The feed owes a disconnected
+/// session nothing — its context arrives at the next subscribe/resume (the
+/// paired test below).
 #[tokio::test]
 async fn surface_ws_durable_context_feed_delivers_live_with_no_push_row() {
     let db = db::init_db_memory();
@@ -3292,9 +3306,8 @@ async fn surface_ws_durable_context_feed_delivers_live_with_no_push_row() {
     // row-less context feed fanned it in at publish time.
     assert_durable_deliver_to(&mut ws, COMPONENT, "hello-durable", 1).await;
 
-    // A dispatcher pass finds no push row and delivers nothing again — the feed
-    // is not backed by a wake row, so there is nothing to duplicate.
-    dispatch_pending(&messenger).await;
+    // Nothing delivers it a second time: the fan-out at the commit is the whole
+    // of the trigger, and no row survives it to be re-dispatched.
     assert_no_deliver(&mut ws).await;
 
     let conn = messenger.db().lock().await;
@@ -3407,8 +3420,7 @@ async fn surface_ws_durable_context_feed_delivers_live_on_a_batch_flush() {
         "both the Ok and the live feed arrive"
     );
 
-    // No push row, and no duplicate on a later dispatcher pass.
-    dispatch_pending(&messenger).await;
+    // No row written, and no duplicate delivery.
     assert_no_deliver(&mut ws).await;
     let conn = messenger.db().lock().await;
     let pushes: i64 = conn
@@ -3534,7 +3546,7 @@ async fn surface_ws_durable_sibling_instances_each_get_their_own_subscription() 
 
     let surface_policies =
         std::collections::HashMap::from([("deskbar".to_string(), resolved.policy.clone())]);
-    let (state, messenger) =
+    let (state, _messenger) =
         durable_pubsub_rig(&db, resolved, channel_entry, surface_policies).await;
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
@@ -3572,7 +3584,6 @@ async fn surface_ws_durable_sibling_instances_each_get_their_own_subscription() 
     // write boundary, which is an encoding choice and not a wire guarantee: each
     // principal is resolved separately, so the two can also land as two frames.
     // What is pinned is the delivery set, so collect across frames and sort.
-    dispatch_pending(&messenger).await;
     let mut got: Vec<String> = Vec::new();
     while got.len() < 2 {
         match next_server_frame(&mut ws).await {
@@ -3709,8 +3720,6 @@ async fn surface_ws_a_row_for_an_unsubscribed_instance_parks_rather_than_being_c
         "durable publish is Ok"
     );
 
-    dispatch_pending(&messenger).await;
-
     // (a) Exactly one Deliver, naming bob. A channel-keyed filter would send
     //     alice's row here too, where the session drops it silently.
     match next_server_frame(&mut ws).await {
@@ -3731,34 +3740,34 @@ async fn surface_ws_a_row_for_an_unsubscribed_instance_parks_rather_than_being_c
     }
     assert_no_deliver(&mut ws).await;
 
-    // (b) Alice's row is still pending. This is the assertion the mutation
-    //     inverts: channel-keyed, her row is retired by a session that then
-    //     discards it — silent per-instance loss, and she can never be sent it
-    //     again.
-    let pending_for = |key: &str| {
-        let key = key.to_string();
-        let messenger = messenger.clone();
-        async move {
-            let conn = messenger.db().lock().await;
-            conn.query_row(
-                "SELECT COUNT(*) FROM messaging_pending_pushes
-                 WHERE target_app_slug = ?1 AND delivered_at IS NULL",
-                rusqlite::params![key],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("count pending pushes")
-        }
-    };
+    // (b) Alice lost nothing: her subscription's cursor is its own, so the message
+    //     bob was served is still hers to collect. This is the assertion the
+    //     mutation inverts — channel-keyed, bob's session would consume and then
+    //     discard her copy, and she could never be sent it again.
+    ws.send(subscribe_frame_as(DURABLE_ADDR, "agenda-alice", None))
+        .await
+        .expect("send Alice's Subscribe");
     assert_eq!(
-        pending_for("deskbar#agenda-alice").await,
+        next_subscribe_result(&mut ws, DURABLE_ADDR, "agenda-alice")
+            .await
+            .0,
         1,
-        "the unsubscribed instance's row stays parked for a later Subscribe"
+        "the late-subscribing instance is served the message from retention"
     );
-    assert_eq!(
-        pending_for("deskbar#agenda-bob").await,
-        0,
-        "the subscribed instance's row was dispatched and retired"
-    );
+    match next_server_frame(&mut ws).await {
+        ServerFrame::Deliver {
+            envelope, targets, ..
+        } => {
+            assert_eq!(envelope.body, "only-bob-is-here");
+            assert_eq!(
+                sole_target(&targets).instance,
+                "agenda-alice",
+                "and it is served under her own name"
+            );
+        }
+        other => panic!("expected Deliver, got {other:?}"),
+    }
+    let _ = &messenger;
 }
 
 /// End-to-end **cross-principal** durable round trip — design §4's named
@@ -3768,9 +3777,8 @@ async fn surface_ws_a_row_for_an_unsubscribed_instance_parks_rather_than_being_c
 /// `surface_ws_durable_publish_delivers_to_subscriber` does not cover: that
 /// test is a single self-subscribing principal (sender == subscriber), so it
 /// cannot rule out a bug specific to *cross-principal* fan-out. Here the
-/// publisher is not on the channel's subscriber list at all, proving
-/// `resolve_push_targets` routes a surface-published row to a subscriber that
-/// is not the sender.
+/// publisher is not on the channel's subscriber list at all, proving the commit's
+/// surface fan-out reaches a subscriber that is not the sender.
 #[tokio::test]
 async fn surface_ws_durable_publish_delivers_cross_principal() {
     let db = db::init_db_memory();
@@ -3793,7 +3801,7 @@ async fn surface_ws_durable_publish_delivers_cross_principal() {
     // Publisher principal: wallbar, a *distinct* slug granted brenn publish on
     // the same channel. It has no runtime and no subscription — it only holds a
     // surface publish policy on the Messenger. deskbar's policy is installed too
-    // so it clears the delivery-time ACL gate in `resolve_push_targets`.
+    // so it clears the fan-out's delivery-time ACL gate.
     let mut publisher_policy = AppPolicy::default();
     publisher_policy
         .grants
@@ -3834,8 +3842,7 @@ async fn surface_ws_durable_publish_delivers_cross_principal() {
         "cross-principal durable publish is Ok, got {outcome:?}"
     );
 
-    // A dispatcher pass delivers the parked row live to deskbar's session.
-    dispatch_pending(&messenger).await;
+    // The commit's surface fan-out delivers it live to deskbar's session.
     assert_durable_deliver_to(&mut ws, COMPONENT, "cross-principal-hello", 1).await;
 }
 
@@ -3903,65 +3910,22 @@ async fn surface_ws_durable_publish_parks_then_drains_on_late_subscribe() {
     assert_durable_deliver_to(&mut subscriber, COMPONENT, "offline-hello", 1).await;
 }
 
-/// Insert a parked (undelivered) push row targeting `surface:deskbar` on the
-/// durable channel — a publish-while-detached. `eager` sets the `eager_wake` flag
-/// (a non-eager row is not dispatchable and only drains on a nudge/subscribe).
-/// Returns `(push_id, message_id)` — `push_id` is `None` for a delayed release.
-async fn park_durable(
-    messenger: &Messenger,
-    uuid: Uuid,
-    body: &str,
-    eager: bool,
-) -> (Option<i64>, i64) {
-    park_durable_at(messenger, uuid, body, eager, None).await
+/// Commit `body` onto the durable channel and run the production surface
+/// fan-out over it — the live-delivery trigger for an attached session.
+/// Returns the message's retention position.
+async fn feed_durable(messenger: &Messenger, body: &str) -> i64 {
+    messenger
+        .commit_and_feed_surfaces(DURABLE_ADDR, body, Urgency::Normal)
+        .await
+        .1
 }
 
-async fn park_durable_at(
-    messenger: &Messenger,
-    uuid: Uuid,
-    body: &str,
-    eager: bool,
-    release_after: Option<chrono::DateTime<Utc>>,
-) -> (Option<i64>, i64) {
-    let conn = messenger.db().lock().await;
-    // Targeted at the subscribing *instance*, mirroring what
-    // `resolve_push_targets` stamps for these fixtures' bindings: the wake row
-    // belongs to the principal, so a row seeded at the bare surface grain would
-    // be nobody's and wake nothing.
-    let subscriber = ParticipantId::for_surface_component("deskbar", COMPONENT);
-    let push = PendingPushInsert {
-        target_app_slug: subscriber.as_surface_subscriber_key().to_string(),
-        target_subscriber: subscriber,
-        eager_wake: eager,
-        release_after,
-        delivery_deadline: None,
-    };
-    let msg = insert_message_with_pushes(
-        &conn,
-        uuid,
-        "host",
-        "sender",
-        body,
-        Urgency::Normal,
-        ChannelScheme::Brenn,
-        None,
-        None,
-        release_after,
-        utc_to_ns(Utc::now()),
-        if release_after.is_some() {
-            &[]
-        } else {
-            std::slice::from_ref(&push)
-        },
-    );
-    (msg.push_ids.first().copied(), msg.id)
-}
-
-/// Insert a retained-only message (no push row): present in the retained window
-/// for a `Resume::Durable` re-send but never parked. Returns `seq = message_id`.
+/// Commit `body` onto the durable channel with **no** fan-out: present in the
+/// retained window for a resume or a drain, but no session was ever handed it.
+/// Returns the message's retention position.
 async fn persist_durable(messenger: &Messenger, uuid: Uuid, body: &str) -> i64 {
     let conn = messenger.db().lock().await;
-    insert_message_with_pushes(
+    insert_message(
         &conn,
         uuid,
         "host",
@@ -3973,31 +3937,9 @@ async fn persist_durable(messenger: &Messenger, uuid: Uuid, body: &str) -> i64 {
         None,
         None,
         utc_to_ns(Utc::now()),
-        &[],
     )
-    .id
-}
-
-/// Drive one dispatcher pass over every currently-dispatchable row — the live
-/// delivery trigger the production background dispatcher fires. Uses the same
-/// `dispatch_row` entry point, so the real `WakeRouterImpl` Surface arm runs.
-async fn dispatch_pending(messenger: &Messenger) {
-    let rows = {
-        let conn = messenger.db().lock().await;
-        load_all_dispatchable_pushes(&conn, Utc::now())
-    };
-    let mut delivered = Vec::new();
-    for (row, expired) in &rows {
-        if let brenn_lib::messaging::publish::DispatchOutcome::Delivered(id) =
-            dispatcher::dispatch_row(messenger.router().as_ref(), row, *expired, false).await
-        {
-            delivered.push(id);
-        }
-    }
-    // The production loop retires what it delivered in one batch; a fixture that
-    // skipped it would leave every dispatched row owed and re-woken forever.
-    let conn = messenger.db().lock().await;
-    brenn_lib::messaging::db::mark_pending_pushes_delivered(&conn, &delivered);
+    .retained_seq
+    .expect("a committed message holds a retention position")
 }
 
 /// Open a `deskbar` WS session and consume its `Welcome`.
@@ -4125,9 +4067,9 @@ async fn surface_ws_durable_parked_rows_drain_in_seq_order_on_subscribe() {
         vec![],
     )
     .await;
-    let (_p1, s1) = park_durable(&messenger, uuid, "one", true).await;
-    let (_p2, s2) = park_durable(&messenger, uuid, "two", true).await;
-    let (_p3, s3) = park_durable(&messenger, uuid, "three", true).await;
+    let s1 = feed_durable(&messenger, "one").await;
+    let s2 = feed_durable(&messenger, "two").await;
+    let s3 = feed_durable(&messenger, "three").await;
 
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
@@ -4144,12 +4086,13 @@ async fn surface_ws_durable_parked_rows_drain_in_seq_order_on_subscribe() {
     assert_durable_deliver_to(&mut ws, COMPONENT, "three", s3).await;
 }
 
-/// Live delivery after subscribe: a dispatched row reaches the attached session
-/// as a `Pos::Durable` `Deliver`; a second dispatch pass finds the row already
-/// retired and the drain nudge finds nothing above the high-water, so no
-/// duplicate reaches the wire.
+/// Live delivery after subscribe: the commit's fan-out reaches the attached
+/// session as a `Pos::Durable` `Deliver`, once. There is no second trigger to be
+/// idempotent against any more — the commit fan-out is the only one — so what
+/// the trailing silence pins is that the fan-out itself sends one copy per
+/// session, not one per resolution pass.
 #[tokio::test]
-async fn surface_ws_durable_live_delivery_after_subscribe_no_duplicate() {
+async fn surface_ws_durable_live_delivery_after_subscribe_arrives_once() {
     let db = db::init_db_memory();
     let uuid = Uuid::new_v4();
     let (state, messenger) = durable_rig(
@@ -4170,12 +4113,8 @@ async fn surface_ws_durable_live_delivery_after_subscribe_no_duplicate() {
     let (replay, _) = next_subscribe_result(&mut ws, DURABLE_ADDR, COMPONENT).await;
     assert_eq!(replay, 0, "nothing parked before subscribe");
 
-    let (_p, seq) = park_durable(&messenger, uuid, "live", true).await;
-    dispatch_pending(&messenger).await;
+    let seq = feed_durable(&messenger, "live").await;
     assert_durable_deliver_to(&mut ws, COMPONENT, "live", seq).await;
-
-    // Idempotence: re-dispatch cannot re-deliver a position the high-water covers.
-    dispatch_pending(&messenger).await;
     assert_no_deliver(&mut ws).await;
 }
 
@@ -4212,13 +4151,12 @@ async fn surface_ws_durable_live_copy_above_the_high_water_heals_the_interior_ga
     );
 
     // Park a quiet row after subscribe: nothing nudges the session, so it waits.
-    let (_, quiet_seq) = park_durable(&messenger, uuid, "quiet", false).await;
+    let quiet_seq = persist_durable(&messenger, uuid, "quiet").await;
     assert_no_deliver(&mut ws).await;
 
     // A louder eager row is dispatchable → fanned out live. Its position is
     // high_water + 2, so the live copy is dropped and retention serves both.
-    let (_, loud_seq) = park_durable(&messenger, uuid, "loud", true).await;
-    dispatch_pending(&messenger).await;
+    let loud_seq = feed_durable(&messenger, "loud").await;
     assert_durable_deliver_to(&mut ws, COMPONENT, "quiet", quiet_seq).await;
     assert_durable_deliver_to(&mut ws, COMPONENT, "loud", loud_seq).await;
     assert_no_deliver(&mut ws).await;
@@ -4265,8 +4203,7 @@ async fn surface_ws_durable_drain_reports_the_span_the_clamp_left_behind() {
 
     // A dispatchable third row: its live copy is above the contiguous next
     // position, so the drain runs — and finds a suffix the clamp cannot cover.
-    let (_, newest) = park_durable(&messenger, uuid, "newest", true).await;
-    dispatch_pending(&messenger).await;
+    let newest = feed_durable(&messenger, "newest").await;
     match next_server_frame(&mut ws).await {
         ServerFrame::Deliver {
             channel,
@@ -4404,7 +4341,6 @@ async fn surface_ws_durable_siblings_are_decided_against_their_own_high_waters()
         ),
         "durable publish is Ok"
     );
-    dispatch_pending(&messenger).await;
 
     let mut behind: Vec<String> = Vec::new();
     let mut current: Vec<String> = Vec::new();
@@ -4568,8 +4504,8 @@ async fn surface_ws_durable_resume_survives_server_restart() {
         vec![],
     )
     .await;
-    let (_p1, s1) = park_durable(&messenger1, uuid, "a", true).await;
-    let (_p2, s2) = park_durable(&messenger1, uuid, "b", true).await;
+    let s1 = persist_durable(&messenger1, uuid, "a").await;
+    let s2 = persist_durable(&messenger1, uuid, "b").await;
     let (base1, sd1) = spawn_test_server(state1).await;
     {
         let mut ws = open_deskbar(&base1, &token).await;
@@ -4626,7 +4562,7 @@ async fn surface_ws_durable_multi_session_fanout_and_backlog_once() {
         vec![],
     )
     .await;
-    let (_pb, sb) = park_durable(&messenger, uuid, "backlog", true).await;
+    let sb = persist_durable(&messenger, uuid, "backlog").await;
 
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
@@ -4660,8 +4596,7 @@ async fn surface_ws_durable_multi_session_fanout_and_backlog_once() {
     assert_durable_deliver_to(&mut ws2, COMPONENT, "backlog", sb).await;
 
     // A live row after both subscribed fans out to both sessions.
-    let (_pl, sl) = park_durable(&messenger, uuid, "live", true).await;
-    dispatch_pending(&messenger).await;
+    let sl = feed_durable(&messenger, "live").await;
     assert_durable_deliver_to(&mut ws1, COMPONENT, "live", sl).await;
     assert_durable_deliver_to(&mut ws2, COMPONENT, "live", sl).await;
 }
@@ -4698,16 +4633,15 @@ async fn surface_ws_durable_live_fanout_and_its_drain_nudge_deliver_once() {
 
     // One eager row: the router fans it out and nudges the drain, which re-reads
     // retention above the high-water the fan-out just advanced.
-    let (_p, s) = park_durable(&messenger, uuid, "once", true).await;
-    dispatch_pending(&messenger).await;
+    let s = feed_durable(&messenger, "once").await;
     assert_durable_deliver_to(&mut ws, COMPONENT, "once", s).await;
     assert_no_deliver(&mut ws).await;
 }
 
 /// A row published while the session held no subscription is served by the next
 /// resume, from the cursor the session echoes — the surface's whole delivery
-/// state — and the fan-out that arrives afterwards is dropped as the duplicate
-/// it is.
+/// state — and the session goes on receiving live commits from the position the
+/// resume left it at.
 #[tokio::test]
 async fn surface_ws_durable_row_missed_while_detached_is_served_on_resume() {
     let db = db::init_db_memory();
@@ -4719,7 +4653,7 @@ async fn surface_ws_durable_row_missed_while_detached_is_served_on_resume() {
         vec![],
     )
     .await;
-    let (_p1, s1) = park_durable(&messenger, uuid, "first", true).await;
+    let s1 = persist_durable(&messenger, uuid, "first").await;
 
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
@@ -4735,8 +4669,8 @@ async fn surface_ws_durable_row_missed_while_detached_is_served_on_resume() {
     );
     assert_durable_deliver_to(&mut ws, COMPONENT, "first", s1).await;
 
-    // Published with no wake dispatched: nothing reaches the session live.
-    let (p2, s2) = park_durable(&messenger, uuid, "missed", true).await;
+    // Committed with no session subscribed: nothing reaches the wire live.
+    let s2 = persist_durable(&messenger, uuid, "missed").await;
 
     // Unsubscribe then resume at the first row's position. Frames are handled in
     // order, so the answered re-subscribe is itself the proof the unsubscribe
@@ -4762,24 +4696,13 @@ async fn surface_ws_durable_row_missed_while_detached_is_served_on_resume() {
     assert!(gap.is_none(), "an exact suffix reports no gap");
     assert_durable_deliver_to(&mut ws, COMPONENT, "missed", s2).await;
 
-    // The wake finally fires; its copy is at the high-water the resume set, so
-    // the session drops it rather than writing the position twice.
-    dispatch_pending(&messenger).await;
+    // And the resume left the session live, not merely caught up: the next
+    // commit's fan-out is one above the high-water the resume set, so it sends.
+    // (The below-water duplicate arm is pinned by
+    // `a_live_batch_decides_each_sibling_against_its_own_high_water`.)
+    let late = feed_durable(&messenger, "missed-again").await;
+    assert_durable_deliver_to(&mut ws, COMPONENT, "missed-again", late).await;
     assert_no_deliver(&mut ws).await;
-
-    // The wake row is the dispatcher's; the session never touched it.
-    let conn = messenger.db().lock().await;
-    let retired: bool = conn
-        .query_row(
-            "SELECT delivered_at IS NOT NULL FROM messaging_pending_pushes WHERE id = ?1",
-            rusqlite::params![p2.expect("the message carries a wake row")],
-            |row| row.get(0),
-        )
-        .expect("the parked push row");
-    assert!(
-        retired,
-        "the dispatcher retires its own wake row on the fan-out's report"
-    );
 }
 
 /// One session holding an ephemeral and a durable subscription concurrently
@@ -4826,8 +4749,7 @@ async fn surface_ws_durable_and_ephemeral_on_one_session() {
     // Interleave a durable live delivery and an ephemeral publish; both arrive,
     // each carrying its own store position (order between the two classes is
     // unspecified, and one cursor shape serves both, so the body names the class).
-    let (_p, seq) = park_durable(&messenger, uuid, "dur", true).await;
-    dispatch_pending(&messenger).await;
+    let seq = feed_durable(&messenger, "dur").await;
     publish_eph(&stores, "ephemeral:ticker", "eph");
 
     let mut saw_durable = false;
@@ -4849,13 +4771,12 @@ async fn surface_ws_durable_and_ephemeral_on_one_session() {
     );
 }
 
-/// Session-side delivery-floor parity: when the surface policy does not authorize
-/// brenn delivery on the channel, a durable subscribe is a silent wire —
-/// `replay_count = 0`, no `Deliver` — and it touches no wake row. A surface holds
-/// no server-side delivery state, so a denied floor leaves the rows exactly where
-/// the dispatcher left them.
+/// Session-side delivery-floor parity: when the surface policy does not
+/// authorize brenn delivery on the channel, a durable subscribe is a silent wire
+/// — `replay_count = 0` and no `Deliver`. Those two are what the floor decides;
+/// restore the authorization and both change.
 #[tokio::test]
-async fn surface_ws_durable_floor_denied_delivers_nothing_and_marks_no_row() {
+async fn surface_ws_durable_floor_denied_delivers_nothing() {
     let db = db::init_db_memory();
     let uuid = Uuid::new_v4();
     let (state, messenger) = durable_rig(
@@ -4865,8 +4786,8 @@ async fn surface_ws_durable_floor_denied_delivers_nothing_and_marks_no_row() {
         vec![],
     )
     .await;
-    let (p1, _s1) = park_durable(&messenger, uuid, "denied-1", true).await;
-    let (p2, _s2) = park_durable(&messenger, uuid, "denied-2", true).await;
+    persist_durable(&messenger, uuid, "denied-1").await;
+    persist_durable(&messenger, uuid, "denied-2").await;
 
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
@@ -4879,19 +4800,17 @@ async fn surface_ws_durable_floor_denied_delivers_nothing_and_marks_no_row() {
     assert_eq!(replay, 0, "the floor denies → empty replay");
     assert_no_deliver(&mut ws).await;
 
-    // The session wrote nothing: a denied floor is a silent wire, and the wake
-    // rows stay the dispatcher's to retire.
+    // Not a consequence of the floor — nothing on a bus channel writes that
+    // table any more, denied or not. Kept as the cheap backstop it is: a row
+    // here means some path started minting per-subscriber delivery records
+    // again, behind a subscription that is not even authorized to read.
     let conn = messenger.db().lock().await;
-    for push_id in [p1, p2] {
-        let owed: bool = conn
-            .query_row(
-                "SELECT delivered_at IS NULL FROM messaging_pending_pushes WHERE id = ?1",
-                rusqlite::params![push_id.expect("the message carries a wake row")],
-                |row| row.get(0),
-            )
-            .expect("the parked push row");
-        assert!(owed, "a floor-denied subscribe marks no wake row");
-    }
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messaging_pending_pushes", [], |row| {
+            row.get(0)
+        })
+        .expect("count pending pushes");
+    assert_eq!(rows, 0, "nothing mints delivery records on a bus channel");
 }
 
 /// Unsubscribe then re-subscribe a durable channel: the fresh subscription drains
@@ -4936,7 +4855,7 @@ async fn surface_ws_durable_unsubscribe_then_resubscribe_delivers_fresh_backlog_
     .expect("unsubscribe");
 
     // A row parked after unsubscribe drains on the fresh re-subscribe, once.
-    let (_p, seq) = park_durable(&messenger, uuid, "after", true).await;
+    let seq = persist_durable(&messenger, uuid, "after").await;
     ws.send(subscribe_frame(DURABLE_ADDR, None))
         .await
         .expect("re-subscribe");
@@ -4962,7 +4881,7 @@ async fn surface_ws_durable_subscribe_foreign_epoch_resume_gaps() {
         vec![],
     )
     .await;
-    let (_p, s) = park_durable(&messenger, uuid, "retained", true).await;
+    let s = persist_durable(&messenger, uuid, "retained").await;
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
     let mut ws = open_deskbar(&base, &token).await;

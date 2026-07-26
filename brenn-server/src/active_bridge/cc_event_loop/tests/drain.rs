@@ -20,6 +20,24 @@ use super::{
     pending_ingress_count, seed_pending_push,
 };
 
+/// Whether the bridge's conversation is still owed anything on a bus channel —
+/// its cursor position trails retention.
+///
+/// The drain's ack point is the advance it makes after a confirmed flush, so a
+/// failed send leaves this `true`: at-least-once, with no per-subscriber row
+/// involved. Takes no connection guard because it acquires its own.
+async fn owed_on_the_bus(bridge: &ActiveBridge) -> bool {
+    let messenger = bridge
+        .messenger()
+        .expect("the drain fixtures wire a messenger");
+    !brenn_lib::messaging::testutils::owed_everywhere(
+        messenger.as_ref(),
+        &brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id),
+    )
+    .await
+    .is_empty()
+}
+
 // -----------------------------------------------------------------------
 // Event queue drain tests
 // -----------------------------------------------------------------------
@@ -371,8 +389,8 @@ async fn drain_collapses_multiple_repo_sync_pulled_events() {
 /// - Exactly one `ToolUseSummary` with
 ///   `tool_name == MCP_MESSAGE_RECEIVED_PSEUDO_TOOL`.
 /// - Ingress push row is marked delivered (`pending_ingress_count` returns 0).
-/// - Bus push row is marked delivered (`load_pending_pushes_for_drain` returns
-///   empty).
+/// - The conversation is owed nothing further on the bus: the drain advanced its
+///   cursor past the message it just rendered.
 #[tokio::test]
 async fn drain_combined_events_and_messaging_marks_all_delivered() {
     let (bridge, mut broadcast_rx) = bridge_with_messenger_for_drain().await;
@@ -442,21 +460,20 @@ async fn drain_combined_events_and_messaging_marks_all_delivered() {
     );
 
     // Ingress push row marked delivered (unified store).
-    let conn = bridge.db.lock().await;
-    assert_eq!(
-        pending_ingress_count(&conn, bridge.conversation_id),
-        0,
-        "ingress push row must be marked delivered after successful drain"
-    );
+    {
+        let conn = bridge.db.lock().await;
+        assert_eq!(
+            pending_ingress_count(&conn, bridge.conversation_id),
+            0,
+            "ingress push row must be marked delivered after successful drain"
+        );
+    }
 
-    // Bus push row also marked delivered (via the messaging path).
-    let pushes = brenn_lib::messaging::db::load_pending_pushes_for_drain(
-        &conn,
-        &brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id),
-    );
+    // The bus half: the drain advanced the conversation's cursor past the
+    // message it rendered, so nothing is owed on the channel any more.
     assert!(
-        pushes.is_empty(),
-        "push row must be marked delivered after successful drain; got {pushes:?}"
+        !owed_on_the_bus(&bridge).await,
+        "the drain must advance the conversation's position past the delivered message"
     );
 }
 
@@ -514,23 +531,21 @@ async fn drain_send_failure_leaves_messaging_pushes_pending() {
         "ToolUseSummary must NOT be emitted after send failure; got {msgs:?}"
     );
 
-    // Ingress push row still pending.
-    let conn = bridge.db.lock().await;
-    assert_eq!(
-        pending_ingress_count(&conn, bridge.conversation_id),
-        1,
-        "ingress push row must stay pending after failed drain"
-    );
+    // Ingress row still pending.
+    {
+        let conn = bridge.db.lock().await;
+        assert_eq!(
+            pending_ingress_count(&conn, bridge.conversation_id),
+            1,
+            "ingress row must stay pending after failed drain"
+        );
+    }
 
-    // Both ingress push row and bus push row still pending.
-    let pushes = brenn_lib::messaging::db::load_pending_pushes_for_drain(
-        &conn,
-        &brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id),
-    );
-    assert_eq!(
-        pushes.len(),
-        2,
-        "both ingress and bus push rows must stay pending after failed drain; got {pushes:?}"
+    // And the bus half too: the position did not advance, so the conversation is
+    // still owed the message.
+    assert!(
+        owed_on_the_bus(&bridge).await,
+        "the position must not advance past a message the drain failed to send"
     );
 }
 
@@ -584,17 +599,13 @@ async fn drain_messaging_only_delivers_without_events() {
         tool_summaries.len()
     );
 
-    let conn = bridge.db.lock().await;
-
-    // Push row marked delivered.
-    let pushes = brenn_lib::messaging::db::load_pending_pushes_for_drain(
-        &conn,
-        &brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id),
-    );
+    // The position advanced past the message the drain rendered.
     assert!(
-        pushes.is_empty(),
-        "push row must be marked delivered after messaging-only drain; got {pushes:?}"
+        !owed_on_the_bus(&bridge).await,
+        "the position must advance after a messaging-only drain"
     );
+
+    let conn = bridge.db.lock().await;
 
     // No ingress events were seeded — still empty.
     assert_eq!(
@@ -671,17 +682,11 @@ async fn d1_real_window_broken_pipe_leaves_push_row_undelivered() {
     // persist_broadcast_send returns Err → drain_pending_events returns early.
     drain_pending_events(&bridge).await;
 
-    // The push row must still be undelivered: the broken-pipe error left it
-    // delivered_at IS NULL (at-least-once durability guarantee, D1).
-    let conn = bridge.db.lock().await;
-    let pushes = brenn_lib::messaging::db::load_pending_pushes_for_drain(
-        &conn,
-        &brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id),
-    );
+    // The message must still be owed: the broken-pipe error left the position
+    // where it was (at-least-once durability guarantee, D1).
     assert!(
-        !pushes.is_empty(),
-        "D1 real-window: push row must stay delivered_at IS NULL after flush failure; \
-             load_pending_pushes_for_drain returned empty (row was incorrectly marked delivered)"
+        owed_on_the_bus(&bridge).await,
+        "D1 real-window: the position must not advance past a flush failure"
     );
 }
 
@@ -747,34 +752,20 @@ async fn drain_recovers_push_row_left_undelivered_after_session_death() {
             .expect("drain task must not panic");
     }
 
-    // Verify the row is still pending after the failed drain.
-    {
-        let conn = bridge.db.lock().await;
-        let pushes = brenn_lib::messaging::db::load_pending_pushes_for_drain(
-            &conn,
-            &brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id),
-        );
-        assert!(
-            !pushes.is_empty(),
-            "AC3 drain-path: push row must stay pending after session-death flush failure; \
-                 got empty (row was incorrectly marked delivered)"
-        );
-    }
+    // Verify the message is still owed after the failed drain.
+    assert!(
+        owed_on_the_bus(&bridge).await,
+        "AC3 drain-path: the position must not advance past a session-death flush failure"
+    );
 
     // Pass 2: install recording session (auto-ack → sends succeed), run drain again.
     let _cc_rx = bridge.install_recording_session_for_test().await;
     drain_pending_events(&bridge).await;
 
-    // The row must now be delivered.
-    let conn = bridge.db.lock().await;
-    let pushes = brenn_lib::messaging::db::load_pending_pushes_for_drain(
-        &conn,
-        &brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id),
-    );
+    // The position must now have advanced past it.
     assert!(
-        pushes.is_empty(),
-        "AC3 drain-path: push row must be marked delivered after successful drain on new session; \
-             got {pushes:?}"
+        !owed_on_the_bus(&bridge).await,
+        "AC3 drain-path: the position must advance after a successful drain on a new session"
     );
 }
 
@@ -822,13 +813,8 @@ async fn live_delivery_serves_the_backlog_once() {
         "the position moved past the batch, so the second wake renders nothing"
     );
 
-    let conn = bridge.db.lock().await;
-    let pushes = brenn_lib::messaging::db::load_pending_pushes_for_drain(
-        &conn,
-        &brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id),
-    );
     assert!(
-        pushes.is_empty(),
-        "the advance retired both claims; got {pushes:?}"
+        !owed_on_the_bus(&bridge).await,
+        "the advance moved the position past both messages"
     );
 }

@@ -34,13 +34,12 @@ use brenn_envelope::{ChannelCapabilities, ChannelScheme, MessageEnvelope, Urgenc
 use brenn_queue::{GapReason, QuotaExceeded, ReplayDecision, Resume, Retained};
 
 use crate::messaging::config::Depth;
-use crate::messaging::{ParticipantId, SubscriberEntryKind, WakeMin};
+use crate::messaging::{ParticipantId, SubscriberEntryKind};
 
 pub use db::DbStore;
-pub(crate) use db::{ClaimRetirement, PushRetireParams};
 pub use registry::RingStores;
 pub use ring::RingStore;
-pub use targets::{PushTarget, SurfaceFeedTarget, TargetResolver, eager_wake_for};
+pub use targets::{SurfaceFeedTarget, TargetResolver};
 
 /// A message on its way into a channel, before the store has given it an
 /// identity or a position.
@@ -62,75 +61,22 @@ pub struct NewMessage {
     pub publish_ts_ns: i64,
 }
 
-/// One subscriber a message is being committed for.
-///
-/// Resolved by the store that records a per-subscriber delivery row, at the
-/// moment it commits. Stores whose subscribers carry their own cursor name no
-/// targets at all — their attached set already is the target set.
-#[derive(Debug, Clone)]
-pub struct DeliveryTarget {
-    pub subscriber: ParticipantId,
-    pub app_slug: String,
-    /// Resolved at publish time from the subscriber's wake economics and the
-    /// message's urgency.
-    pub eager_wake: bool,
-    pub delivery_deadline: Option<DateTime<Utc>>,
-    /// How many undelivered records this subscriber may hold on the channel.
-    /// A record-issuing store retires the oldest beyond it as the commit lands,
-    /// so the overflow is charged at the drop; a cursor-tracked store bounds the
-    /// same quantity with the cursor and ignores this.
-    pub push_depth: Depth,
-}
-
-/// One subscriber attached to the channel when a release pass runs.
-///
-/// Distinct from [`DeliveryTarget`] because a release batch carries several
-/// messages of different urgencies: the wake decision cannot be resolved before
-/// the store knows which message it is making, so the target carries the
-/// threshold and the store applies it per message.
-#[derive(Debug, Clone)]
-pub struct ReleaseTarget {
-    pub subscriber: ParticipantId,
-    pub app_slug: String,
-    /// `None` — wake on every released message. `Some(min)` — wake only for a
-    /// message whose urgency meets the threshold.
-    pub wake_min: Option<WakeMin>,
-}
-
-impl ReleaseTarget {
-    /// Whether a released message of this urgency wakes the target.
-    pub fn wakes(&self, urgency: Urgency) -> bool {
-        self.wake_min.is_none_or(|min| min.wakes(urgency))
-    }
-}
-
 /// A store-assigned position, ascending within the store's lifetime. Comparable
 /// only against other sequence numbers from the same store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MessageSeq(pub u64);
-
-/// A store's handle on one subscriber's copy of a message. Meaningful only to
-/// the store that issued it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TargetRecord(pub i64);
 
 /// What a store did with a committed message.
 #[derive(Debug, Clone)]
 pub struct Committed {
     pub message_uuid: Uuid,
     pub seq: MessageSeq,
-    /// One per subscriber the store wrote a delivery record for, in the order it
-    /// resolved them. Empty for stores that track subscriber positions by cursor
-    /// rather than by record.
-    pub target_records: Vec<TargetRecord>,
 }
 
 /// What a store did with a parked message.
 ///
-/// No sequence number and no delivery records: a parked message holds no
-/// position in retention until it releases, and it is owed to nobody until then
-/// — the subscribers attached when the release pass runs are the ones it is
-/// delivered to.
+/// No sequence number: a parked message holds no position in retention until it
+/// releases, and nothing can read it before then.
 #[derive(Debug, Clone)]
 pub struct Parked {
     pub message_uuid: Uuid,
@@ -331,10 +277,10 @@ pub struct OverflowEvent {
 /// What a store did with an appended message, plus the overflow that append
 /// caused.
 ///
-/// A commit retires the delivery obligations it displaces — a bounded ring
-/// overwriting an unread position, a record-issuing store retiring a
-/// subscriber's oldest claim to stay within its depth — and reports them here,
-/// so a subscriber that never runs still has its losses escalated.
+/// A commit charges nobody for falling behind, but entering retention can push
+/// an unread message out of the window: a bounded ring overwriting an unread
+/// position reports that eviction here, so a subscriber that never runs still
+/// has its losses escalated.
 #[derive(Debug, Clone)]
 pub struct AppendOutcome {
     pub committed: Committed,
@@ -357,9 +303,6 @@ pub struct ReleaseOutcome {
 pub struct Released {
     pub seq: MessageSeq,
     pub envelope: Arc<MessageEnvelope>,
-    /// The delivery records that came due with it, for the stores that keep
-    /// them. Empty for cursor-tracked stores.
-    pub target_records: Vec<TargetRecord>,
 }
 
 /// One of a sender's parked messages, as the sender-scoped view shows it.
@@ -597,21 +540,15 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     /// and is not an error.
     async fn detach(&self, subscriber: &ParticipantId);
 
-    /// Commit a message into retention, immediately deliverable, and report any
-    /// delivery obligations the commit retired.
+    /// Commit a message into retention, immediately deliverable, and report
+    /// whatever the message it displaced from the window cost a subscriber.
     ///
-    /// The store names its own targets, as [`RetentionStore::release_due`] does:
-    /// a cursor-tracked store's attached set is already the target set, and a
-    /// record-issuing one resolves the channel's registrations as they stand
-    /// when the commit runs — under the same connection it writes on, so a
-    /// subscription cannot appear or vanish between the two.
+    /// Target-blind: the message is written once and nothing per-subscriber is.
+    /// Who reads it is decided by each subscriber's own position, at its own
+    /// read, so a commit resolves no subscriber set and owes nobody anything.
     async fn append(&self, msg: NewMessage) -> AppendOutcome;
 
     /// Park a message until `release_at`, invisible to every read until then.
-    ///
-    /// Takes no targets: a parked message is owed to nobody, so nothing is
-    /// resolved or recorded per subscriber until release, when the attached set
-    /// is asked again.
     ///
     /// Rejects at the channel-wide cap rather than evicting the oldest parked
     /// message: silently cancelling scheduled work is worse than refusing to
@@ -673,15 +610,14 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     async fn next_release(&self) -> Option<DateTime<Utc>>;
 
     /// Move every message due at or before `now` into retention, in release
-    /// order, delivering it to the subscribers attached now. Every due message
-    /// is reported, including one released to no subscriber at all, along with
-    /// any overflow the batch caused.
+    /// order. Every due message is reported, along with any overflow the batch
+    /// caused.
     ///
-    /// The store names its own targets: a cursor-tracked store's attached set is
-    /// already the target set, and a record-issuing one resolves the channel's
-    /// registrations as they stand when the release runs. Targeting therefore
-    /// happens here rather than at park time, so a subscriber that attached
-    /// while the message was parked receives it and one that left does not.
+    /// Target-blind, as [`RetentionStore::append`] is: release is what puts a
+    /// parked message where the positions can see it, and each subscriber reads
+    /// it from its own. A subscriber that attached while the message waited
+    /// therefore receives it and one that left does not, without anyone
+    /// resolving a subscriber set here.
     async fn release_due(&self, now: DateTime<Utc>) -> ReleaseOutcome;
 
     /// One sender's parked messages on this channel, soonest release first.

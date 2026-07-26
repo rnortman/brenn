@@ -2,7 +2,6 @@
 //! WASM-subscriber channel.
 //!
 //! Available under `#[cfg(test)]` or when the `testutils` feature is enabled.
-//! Pattern mirrors `run_deliver_after_pass` / `run_deadline_pass` in `dispatcher.rs`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +13,7 @@ use super::{
     SubscriberEntryKind, SubscriberRegistration, Urgency, WakeEconomics, WakeMin, WakeRouter,
     canonical_address,
     config::{self, Depth, MessagingGlobalConfig, NoiseLevel},
-    db::{self, PendingPushInsert, insert_message_with_pushes, upsert_channels},
+    db::{self, insert_message, upsert_channels},
     ephemeral_channel_uuid_from_name,
     query::NoopWakeRouter,
 };
@@ -287,29 +286,24 @@ pub async fn build_wasm_messenger_unbounded(
     build_wasm_messenger(slug, channel_name, Depth::Unbounded, Depth::Unbounded).await
 }
 
-/// Insert one push message row for `subscriber` on `channel` at an explicit
-/// timestamp and return `(push_id, message_uuid)`.
+/// Insert one bus message on `channel` at an explicit timestamp and return its
+/// uuid.
 ///
-/// `envelope_type` is caller-supplied because some channels use `Webhook` rather than `Brenn`.
-/// `ts_ns` is the message timestamp in nanoseconds since the Unix epoch.
-/// Use [`insert_wasm_push`] when the exact timestamp does not matter.
-pub async fn insert_wasm_push_at(
+/// `envelope_type` is caller-supplied because some channels use `Webhook` rather
+/// than `Brenn`. `ts_ns` is the message timestamp in nanoseconds since the Unix
+/// epoch. Use [`insert_bus_message`] when the exact timestamp does not matter.
+///
+/// Names no subscriber: a commit writes the message and nothing per-subscriber,
+/// so who reads it is decided by each position at its own read.
+pub async fn insert_bus_message_at(
     messenger: &Messenger,
     channel: &ChannelEntry,
-    subscriber: &ParticipantId,
     body: &str,
     envelope_type: ChannelScheme,
     ts_ns: i64,
-) -> (i64, Uuid) {
+) -> Uuid {
     let conn = messenger.db().lock().await;
-    let push = PendingPushInsert {
-        target_subscriber: subscriber.clone(),
-        target_app_slug: String::new(),
-        eager_wake: true,
-        release_after: None,
-        delivery_deadline: None,
-    };
-    let inserted = insert_message_with_pushes(
+    insert_message(
         &conn,
         channel.uuid,
         "test",
@@ -321,32 +315,89 @@ pub async fn insert_wasm_push_at(
         None,
         None,
         ts_ns,
-        &[push],
-    );
-    assert_eq!(inserted.push_ids.len(), 1);
-    (inserted.push_ids[0], inserted.uuid)
+    )
+    .uuid
 }
 
-/// Insert one push message row for `subscriber` on `channel` at the current
-/// wall-clock time and return `(push_id, message_uuid)`.
+/// Insert one bus message on `channel` at the current wall-clock time and return
+/// its uuid.
 ///
-/// `envelope_type` is caller-supplied because some channels use `Webhook` rather than `Brenn`.
-/// Use [`insert_wasm_push_at`] when the test needs to control the exact timestamp.
-pub async fn insert_wasm_push(
+/// `envelope_type` is caller-supplied because some channels use `Webhook` rather
+/// than `Brenn`. Use [`insert_bus_message_at`] when the test needs to control the
+/// exact timestamp.
+pub async fn insert_bus_message(
     messenger: &Messenger,
     channel: &ChannelEntry,
-    subscriber: &ParticipantId,
     body: &str,
     envelope_type: ChannelScheme,
-) -> (i64, Uuid) {
+) -> Uuid {
     let ts_ns = db::utc_to_ns(chrono::Utc::now());
-    insert_wasm_push_at(messenger, channel, subscriber, body, envelope_type, ts_ns).await
+    insert_bus_message_at(messenger, channel, body, envelope_type, ts_ns).await
 }
 
-/// Insert a retained-context message on `channel` with **no** push rows — the
-/// message appears only in retained context (as returned by `clamp_and_fetch_context`
-/// / `load_activation_snapshot`). Used to set up sampled-port fixtures where
-/// `push_depth = Bounded(0)` so no push rows are created for a subscriber.
+/// Everything `subscriber` is still owed, across every channel it holds a
+/// position on, as `(channel address, envelope)` — oldest first within each
+/// channel.
+///
+/// A pure read: it moves no position and charges nothing, so a case may call it
+/// before and after a drain to see what the drain consumed. A channel the
+/// subscriber holds no position on contributes nothing, which is what makes this
+/// safe to call over the whole directory.
+///
+/// One side effect it does have: reading at `Depth::Unbounded` retunes the
+/// cursor's stored `push_depth` to unbounded, because the caller of a window is
+/// the authority on depth. The next production read retunes it back, but a case
+/// asserting clamp or drop behaviour must not sample it between this call and
+/// that read — pass through a real drain instead.
+///
+/// The unbounded read is not incidental and cannot be narrowed: the question
+/// this answers is "everything still owed", which a window at the subscriber's
+/// registered depth would clamp. Restoring the prior depth afterwards would need
+/// a depth read the store trait does not expose.
+pub async fn owed_everywhere(
+    messenger: &Messenger,
+    subscriber: &ParticipantId,
+) -> Vec<(String, Arc<brenn_envelope::MessageEnvelope>)> {
+    let mut owed = Vec::new();
+    for entry in messenger.directory().list() {
+        let store = messenger.store_for(&entry);
+        if !store.has_deliverable(subscriber).await {
+            continue;
+        }
+        let window = store
+            .window(subscriber, Depth::Unbounded, Depth::Bounded(0))
+            .await;
+        for (_, envelope) in window.new_entries() {
+            owed.push((entry.address.clone(), Arc::clone(envelope)));
+        }
+    }
+    owed
+}
+
+/// Advance `subscriber` past everything it is currently owed on
+/// `channel_address` — what a real consumer's drain does at its ack point.
+///
+/// For a case that needs a prior step's output out of the way before reading the
+/// next one: the position is the only delivery state, so consuming means moving
+/// it. It reads at `Depth::Unbounded` and so retunes the cursor's stored
+/// `push_depth` exactly as [`owed_everywhere`] does — same caveat.
+pub async fn consume_owed(
+    messenger: &Messenger,
+    channel_address: &str,
+    subscriber: &ParticipantId,
+) {
+    let store = messenger.store_for_address(channel_address);
+    let window = store
+        .window(subscriber, Depth::Unbounded, Depth::Bounded(0))
+        .await;
+    if let Some((through, seen_floor)) = window.advance_span() {
+        store.advance(subscriber, through, seen_floor).await;
+    }
+}
+
+/// Insert a low-urgency bus message on `channel` — the shape a sampled-port
+/// fixture wants, where the message is context for every reader and wakes
+/// nobody.
 ///
 /// Returns the inserted `message_uuid`.
 pub async fn insert_retain_only(
@@ -357,7 +408,7 @@ pub async fn insert_retain_only(
 ) -> Uuid {
     let conn = messenger.db().lock().await;
     let ts_ns = db::utc_to_ns(chrono::Utc::now());
-    let inserted = insert_message_with_pushes(
+    insert_message(
         &conn,
         channel.uuid,
         "test",
@@ -369,7 +420,6 @@ pub async fn insert_retain_only(
         None,
         None,
         ts_ns,
-        &[], // no push rows — retained context only
-    );
-    inserted.uuid
+    )
+    .uuid
 }

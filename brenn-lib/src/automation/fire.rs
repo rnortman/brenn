@@ -837,9 +837,8 @@ mod tests {
         async fn deliver(
             &self,
             _key: &crate::messaging::SubscriberEntryKind,
-            _: &crate::messaging::ParticipantId,
-            _: &MessageEnvelope,
-            _retained_seq: Option<i64>,
+            _envelope: &std::sync::Arc<MessageEnvelope>,
+            _retained_seq: i64,
         ) -> Result<bool, String> {
             Ok(true)
         }
@@ -863,7 +862,13 @@ mod tests {
         ) -> crate::messaging::DeliveryShape {
             crate::messaging::default_delivery_shape(key)
         }
-        fn alarm(&self, _channel: &str, _subscriber: &crate::messaging::ParticipantId) {}
+        fn alarm(
+            &self,
+            _channel: &str,
+            _subscriber: &crate::messaging::ParticipantId,
+            _count: u64,
+        ) {
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -2158,9 +2163,9 @@ mod tests {
 
     /// Build a single-app (`test-app`) engine whose policy is caller-supplied, so
     /// Seam-B tests can fire against a tightened/looser policy. Mirrors
-    /// `make_engine_full`'s subscription construction (the
-    /// `resolve_push_targets` invariant needs a `ResolvedSubscription` matching
-    /// each push-enabled subscriber entry) but lets the caller pick `policy`.
+    /// `make_engine_full`'s subscription construction (a `ResolvedSubscription`
+    /// matching each push-enabled subscriber entry, so app config and directory
+    /// agree) but lets the caller pick `policy`.
     fn make_engine_with_policy(
         db: crate::db::Db,
         directory: MessagingDirectory,
@@ -2170,8 +2175,8 @@ mod tests {
         // Reuse the canonical config builder (test_support) so the 30-field
         // `AppConfig` literal lives in exactly one place; only the `.policy`
         // override is Seam-B-specific. The subscription list is still derived from
-        // the directory (the `resolve_push_targets` invariant needs a
-        // `ResolvedSubscription` for each push-enabled `test-app` subscriber).
+        // the directory, so there is a `ResolvedSubscription` for each
+        // push-enabled `test-app` subscriber the directory names.
         let subscriptions: Vec<crate::messaging::config::ResolvedSubscription> = directory
             .list()
             .iter()

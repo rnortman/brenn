@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use brenn_lib::messaging::store::SurfaceFeedTarget;
 use brenn_lib::messaging::{
-    DeliveryShape, MessageEnvelope, ParticipantId, SubscriberEntryKind, WakeRouter,
+    DeliveryShape, MessageEnvelope, ParticipantId, SubscriberEntryKind, WakeRouter, WakeServed,
 };
 use brenn_lib::obs::alerting::{AlertDispatcher, AlertSeverity};
 use chrono_tz::Tz;
@@ -154,17 +154,15 @@ impl WakeRouterImpl {
 ///
 /// Every message a surface subscription is delivered sits in its channel's
 /// retention order: the store assigns positions from 1 and never re-uses one, so
-/// an absent or negative position means the message was delivered from outside
-/// retention, which no path produces.
-fn retention_position(retained_seq: Option<i64>) -> u64 {
-    retained_seq
-        .and_then(|seq| u64::try_from(seq).ok())
-        .unwrap_or_else(|| {
-            panic!(
-                "surface durable delivery: the message holds no retention position \
-                 {retained_seq:?} — a delivered bus message is always in retention"
-            )
-        })
+/// a negative position means the message was delivered from outside retention,
+/// which no path produces.
+fn retention_position(retained_seq: i64) -> u64 {
+    u64::try_from(retained_seq).unwrap_or_else(|_| {
+        panic!(
+            "surface durable delivery: retention position {retained_seq} is negative — a \
+             delivered bus message is always in retention"
+        )
+    })
 }
 
 /// The delivery mechanism for a subscriber, resolved from its [`DeliveryBinding`]
@@ -180,134 +178,98 @@ impl WakeRouter for WakeRouterImpl {
     async fn deliver(
         &self,
         key: &SubscriberEntryKind,
-        subscriber: &ParticipantId,
-        envelope: &MessageEnvelope,
-        retained_seq: Option<i64>,
+        envelope: &Arc<MessageEnvelope>,
+        retained_seq: i64,
     ) -> Result<bool, String> {
-        match self.delivery_route(key) {
-            DeliveryRoute::ConversationBridge => {
-                let conversation_id = subscriber.as_conversation_id();
-                // Check for an active bridge first — read and render only when one
-                // exists. This keeps the markdown render (pulldown-cmark) out of
-                // the shared dispatch loop for sleeping targets, and confines any
-                // malformed-envelope panic to the per-bridge path rather than the
-                // loop that serves all conversations (correctness-2 / efficiency-1).
-                let bridge = match self.active_bridges.get(conversation_id).await {
-                    Some(b) => b,
-                    None => return Ok(false),
-                };
-                // A conversation is served from its position, not from the
-                // envelope this wake carried: delivering that one message alone
-                // would leave anything published while the bridge was busy behind
-                // a position that has moved past it. The wake says "there is
-                // something"; the position says what.
-                match crate::active_bridge::deliver_conversation_backlog(&bridge).await {
-                    Ok(()) => Ok(true),
-                    Err(e) => Err(e),
-                }
-            }
-            // Parked subscribers (WASM consumers, system components) are never
-            // delivered to on the shared dispatch loop — dispatch_row routes their
-            // rows to spawn_eager_wake and never calls deliver. Reaching this is a
-            // host-wiring invariant violation.
-            DeliveryRoute::Parked => {
-                panic!(
-                    "WakeRouter::deliver called for parked subscriber {key:?} — \
-                     host-wiring invariant violated: parked subscribers must never \
-                     reach the shared dispatch loop deliver path"
-                );
-            }
-            // Row-less fan-out to attached, subscribed sessions. A surface holds
-            // no server-side delivery state: the client's echoed cursor is the
-            // whole of it, so this arm hands the envelope over and arbitrates
-            // nothing. The session drops a copy its cursor already covers, and a
-            // session that missed one — queue full, or the frame lost — resumes
-            // past its cursor and is served the suffix. `try_send` (not awaited):
-            // a hung session must not stall the shared fan-out task.
-            DeliveryRoute::SurfaceSessions => {
-                let slug = key.slug();
-                let state = self
-                    .state
-                    .get()
-                    .expect("WakeRouter state must be set before any Surface deliver call");
-                let retained_seq = retention_position(retained_seq);
+        // Row-less fan-out to attached, subscribed sessions. A surface holds no
+        // server-side delivery state: the client's echoed cursor is the whole of
+        // it, so this hands the envelope over and arbitrates nothing. The session
+        // drops a copy its cursor already covers, and a session that missed one —
+        // queue full, or the frame lost — resumes past its cursor and is served
+        // the suffix. `try_send` (not awaited): a hung session must not stall the
+        // shared fan-out task.
+        //
+        // Only surface subscribers reach here: `surface_feed_targets` is the one
+        // caller's target set, and every other kind holds a position and is served
+        // from it.
+        let SubscriberEntryKind::Surface { slug, .. } = key else {
+            panic!(
+                "WakeRouter::deliver called for non-surface subscriber {key:?} — only a surface \
+                 subscription takes the row-less live feed"
+            );
+        };
+        let state = self
+            .state
+            .get()
+            .expect("WakeRouter state must be set before any Surface deliver call");
+        let retained_seq = retention_position(retained_seq);
 
-                // The subscription this row belongs to: the principal the push
-                // row was resolved for, on the row's channel. `key` is the
-                // subscriber's registration key, so its instance half is the
-                // principal — never re-derived from the envelope.
-                // Only `Surface` keys register `SurfaceSessions` (bootstrap
-                // wiring); `surface_subscriber_instance` panics otherwise.
-                let sub = SubKey {
-                    instance: key.surface_subscriber_instance().to_owned(),
-                    channel: envelope.channel.clone(),
-                };
+        // The subscription this delivery belongs to: the principal the feed target
+        // was resolved for, on the message's channel. `key` is the subscriber's
+        // registration key, so its instance half is the principal — never
+        // re-derived from the envelope.
+        let sub = SubKey {
+            instance: key.surface_subscriber_instance().to_owned(),
+            channel: envelope.channel.clone(),
+        };
 
-                // 1. Sessions holding this exact subscription. Filtering on the
-                //    whole subscription and not the channel is what keeps the row
-                //    off a sibling instance's ports: siblings are separate
-                //    principals with separate windows, and this row is one
-                //    principal's.
-                let subscribed: Vec<_> = state
-                    .surface_registry
-                    .sessions(slug)
-                    .into_iter()
-                    .filter(|h| h.is_subscribed(&sub))
-                    .collect();
+        // 1. Sessions holding this exact subscription. Filtering on the whole
+        //    subscription and not the channel is what keeps the delivery off a
+        //    sibling instance's ports: siblings are separate principals with
+        //    separate cursors, and this delivery is one principal's.
+        let subscribed: Vec<_> = state
+            .surface_registry
+            .sessions(slug)
+            .into_iter()
+            .filter(|h| h.is_subscribed(&sub))
+            .collect();
 
-                // 2. None attached+subscribed → park; dispatch_row eager-wakes per
-                //    the row's flags, same as a sleeping conversation.
-                if subscribed.is_empty() {
-                    return Ok(false);
-                }
+        // 2. None attached+subscribed → nothing was owed to a disconnected
+        //    session; it resumes past its own cursor.
+        if subscribed.is_empty() {
+            return Ok(false);
+        }
 
-                // 3. Fan out to every subscribed session. One
-                //    `Arc<MessageEnvelope>` is built here and every session clones
-                //    the refcount — the shared dispatch task never deep-clones the
-                //    body per session.
-                let shared_envelope = Arc::new(envelope.clone());
-                let mut accepted = 0usize;
-                let mut rejected = 0usize;
-                for handle in &subscribed {
-                    let delivery = DurableDelivery {
-                        envelope: shared_envelope.clone(),
-                        retained_seq,
-                        sub: sub.clone(),
-                    };
-                    if handle.durable_tx.try_send(delivery).is_ok() {
-                        accepted += 1;
-                    } else {
-                        rejected += 1;
-                    }
-                }
-                if rejected > 0 {
-                    debug!(
-                        slug = %slug,
-                        channel = %envelope.channel,
-                        retained_seq,
-                        rejected,
-                        accepted,
-                        "surface durable live delivery: some session queues full; those \
-                         sessions are served the suffix by the drain nudge below"
-                    );
-                }
-
-                // 4. Per-delivery drain nudge on every subscribed session: serves
-                //    the suffix above each session's cursor, which is what recovers
-                //    a queue-full session and flushes anything a below-`wake_min`
-                //    publish left unwoken (dispatch_row only eager-wakes on
-                //    Ok(false)/Err). A spurious pass over a caught-up cursor is one
-                //    indexed retention read per active channel.
-                for handle in &subscribed {
-                    handle.drain_notify.notify_one();
-                }
-
-                // 5. ≥1 accepted → this wake landed somewhere. Zero (every queue
-                //    full/closed) → report undelivered so the dispatcher wakes
-                //    again; the sessions catch up from their cursors either way.
-                Ok(accepted >= 1)
+        // 3. Fan out to every subscribed session, each cloning the caller's
+        //    refcount — the shared envelope is never deep-copied per session.
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for handle in &subscribed {
+            let delivery = DurableDelivery {
+                envelope: envelope.clone(),
+                retained_seq,
+                sub: sub.clone(),
+            };
+            if handle.durable_tx.try_send(delivery).is_ok() {
+                accepted += 1;
+            } else {
+                rejected += 1;
             }
         }
+        if rejected > 0 {
+            debug!(
+                slug = %slug,
+                channel = %envelope.channel,
+                retained_seq,
+                rejected,
+                accepted,
+                "surface durable live delivery: some session queues full; those \
+                 sessions are served the suffix by the drain nudge below"
+            );
+        }
+
+        // 4. Per-delivery drain nudge on every subscribed session: serves the
+        //    suffix above each session's cursor, which is what recovers a
+        //    queue-full session. A spurious pass over a caught-up cursor is one
+        //    indexed retention read per active channel.
+        for handle in &subscribed {
+            handle.drain_notify.notify_one();
+        }
+
+        // 5. ≥1 accepted → this delivery landed somewhere. Zero (every queue
+        //    full/closed) → report it; the sessions catch up from their cursors
+        //    either way.
+        Ok(accepted >= 1)
     }
 
     async fn deliver_context(
@@ -337,9 +299,9 @@ impl WakeRouter for WakeRouterImpl {
             channel: envelope.channel.clone(),
         };
 
-        // Sessions holding this exact subscription (per-principal, like the
-        // claimed-row fan-out). None attached → nothing owed to a disconnected
-        // session; its retained context arrives at the next subscribe/resume.
+        // Sessions holding this exact subscription, per-principal. None attached
+        // → nothing owed to a disconnected session; its retained context arrives
+        // at the next subscribe/resume.
         let subscribed: Vec<_> = state
             .surface_registry
             .sessions(slug)
@@ -353,16 +315,15 @@ impl WakeRouter for WakeRouterImpl {
         for handle in &subscribed {
             let delivery = DurableDelivery {
                 envelope: envelope.clone(),
-                retained_seq: retention_position(Some(retained_seq)),
+                retained_seq: retention_position(retained_seq),
                 sub: sub.clone(),
             };
             if handle.durable_tx.try_send(delivery).is_err() {
-                // Full queue: a fold-0 feed has no row to re-park and nothing is
-                // owed, so the loss is real and the wire's silence is the
-                // contract — recovery is the retained window at the next
-                // subscribe/resume. This is the deliberate divergence from the
-                // claimed-row path (which unclaims a row for redelivery): there
-                // is no row here.
+                // Full queue: a fold-0 subscription holds no cursor, so nothing
+                // is owed and the loss is real — the wire's silence is the
+                // contract, and recovery is the retained window at the next
+                // subscribe/resume. A push-enabled subscription instead resumes
+                // from its own position and re-reads what the drop skipped.
                 warn!(
                     slug = %slug,
                     channel = %envelope.channel,
@@ -498,7 +459,12 @@ impl WakeRouter for WakeRouterImpl {
     /// awaited by the dispatcher loop, and serving a live bridge renders markdown
     /// and writes to a CC subprocess — inline, one stalled session would hold up
     /// releases, deadline wakes, and every other channel's wakes behind it.
-    async fn wake_owed(&self, key: &SubscriberEntryKind, subscriber: &ParticipantId) {
+    ///
+    /// Reporting that serve as [`WakeServed::Live`] is what keeps the walk's
+    /// wake cooldown off it: no subprocess was spawned, so there is no spawn to
+    /// pace, and a live bridge would otherwise be made to wait out a poll
+    /// interval for messages it is sitting there ready to render.
+    async fn wake_owed(&self, key: &SubscriberEntryKind, subscriber: &ParticipantId) -> WakeServed {
         let conversation_bridge = matches!(
             self.bindings
                 .read()
@@ -524,9 +490,10 @@ impl WakeRouter for WakeRouterImpl {
                     );
                 }
             }));
-            return;
+            return WakeServed::Live;
         }
         self.spawn_eager_wake(key, subscriber);
+        WakeServed::Spawned
     }
 
     fn delivery_shape(&self, key: &SubscriberEntryKind) -> DeliveryShape {
@@ -543,7 +510,7 @@ impl WakeRouter for WakeRouterImpl {
         }
     }
 
-    fn alarm(&self, channel: &str, subscriber: &ParticipantId) {
+    fn alarm(&self, channel: &str, subscriber: &ParticipantId, count: u64) {
         // Fire an alert via `AlertDispatcher` (design §2.8).
         // Production bootstrap always calls `set_alert_dispatcher` before any publish;
         // tests that need the `alarm` path use mock WakeRouter implementations
@@ -560,8 +527,8 @@ impl WakeRouter for WakeRouterImpl {
             AlertSeverity::Warning,
             "Push-depth overflow".to_string(),
             format!(
-                "Channel {channel:?} subscriber {:?}: push-depth overflow — \
-                 oldest push-claim retired (noise = alarm).",
+                "Channel {channel:?} subscriber {:?}: {count} message(s) passed the \
+                 subscriber's position unread and are gone (noise = alarm).",
                 subscriber.as_str()
             ),
         );
@@ -598,41 +565,6 @@ mod tests {
             subscriber: ParticipantId::for_surface_component("deskbar", "protobar"),
             push_enabled: true,
         }
-    }
-
-    /// `deliver` returns `Ok(false)` when the target conversation has
-    /// no active bridge (the dispatcher maps this to "park" /
-    /// eager-wake instead of error). No render work is performed because
-    /// the bridge check returns None before the renderer is called.
-    #[tokio::test]
-    async fn deliver_returns_ok_false_when_no_bridge() {
-        use brenn_lib::messaging::{MessageEnvelope, Urgency};
-        use chrono::Utc;
-        use uuid::Uuid;
-        let router = WakeRouterImpl::new(ActiveBridges::new());
-        router.register_delivery_binding(conv_key(), DeliveryBinding::ConversationBridge);
-        let env = MessageEnvelope {
-            message_id: Uuid::new_v4(),
-            source: "host".into(),
-            channel: "brenn:ch".into(),
-            sender: "alice".into(),
-            publish_ts: Utc::now(),
-            body: "hi".into(),
-            reply_to: None,
-            delivery_deadline: None,
-            deliver_after: None,
-            urgency: Urgency::Normal,
-            envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
-        };
-        let result = router
-            .deliver(
-                &conv_key(),
-                &ParticipantId::for_conversation(42),
-                &env,
-                Some(1),
-            )
-            .await;
-        assert!(matches!(result, Ok(false)));
     }
 
     /// `WakeRouterImpl::new` leaves `state` unset; the caller must
@@ -672,7 +604,7 @@ mod tests {
         tokio::sync::mpsc::Receiver<brenn_cc::session::OutgoingEnvelope>,
     ) {
         use brenn_lib::messaging::config::{Depth, NoiseLevel, ResolvedChannel, Sink};
-        use brenn_lib::messaging::db::{insert_message_with_pushes, upsert_channels, utc_to_ns};
+        use brenn_lib::messaging::db::{insert_message, upsert_channels, utc_to_ns};
         use brenn_lib::messaging::query::NoopWakeRouter;
         use brenn_lib::messaging::{
             ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, Messenger,
@@ -741,7 +673,7 @@ mod tests {
         messenger.attach_conversation_subscribers().await;
         {
             let conn = db.lock().await;
-            insert_message_with_pushes(
+            insert_message(
                 &conn,
                 channel.uuid,
                 "test",
@@ -753,7 +685,6 @@ mod tests {
                 None,
                 None,
                 utc_to_ns(chrono::Utc::now()),
-                &[],
             );
         }
 
@@ -790,55 +721,6 @@ mod tests {
         false
     }
 
-    /// `WakeRouterImpl::deliver` with an active bridge in the registry serves the
-    /// conversation from its position: the owed message is rendered and
-    /// broadcast, and the call reports delivered. A broken `as_conversation_id`
-    /// recovery would take the no-bridge arm and return `Ok(false)`; a delivery
-    /// that served nothing would still return `Ok(true)`, which is why the
-    /// broadcast is what this asserts on.
-    #[tokio::test]
-    async fn deliver_reaches_bridge_when_registered() {
-        use brenn_lib::messaging::{MessageEnvelope, Urgency};
-        use chrono::Utc;
-        use uuid::Uuid;
-
-        let (active_bridges, conversation_id, mut broadcast_rx, _cc_rx) =
-            owed_conversation_bridge().await;
-        let router = WakeRouterImpl::new(active_bridges);
-        router.register_delivery_binding(conv_key(), DeliveryBinding::ConversationBridge);
-        let env = MessageEnvelope {
-            message_id: Uuid::new_v4(),
-            source: "host".into(),
-            channel: "brenn:ch".into(),
-            sender: "alice".into(),
-            publish_ts: Utc::now(),
-            body: "hi".into(),
-            reply_to: None,
-            delivery_deadline: None,
-            deliver_after: None,
-            urgency: Urgency::Normal,
-            envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
-        };
-
-        let result = router
-            .deliver(
-                &conv_key(),
-                &ParticipantId::for_conversation(conversation_id),
-                &env,
-                Some(1),
-            )
-            .await;
-        assert!(
-            matches!(result, Ok(true)),
-            "expected Ok(true) (bridge found); Ok(false) would mean the \
-             ParticipantId → conversation_id recovery failed: {result:?}"
-        );
-        assert!(
-            await_system_broadcast(&mut broadcast_rx).await,
-            "the conversation's owed message was rendered into the live bridge"
-        );
-    }
-
     /// The walk's override: a conversation whose bridge is already live is
     /// served here and now. The spawn-shaped wake would find the bridge running
     /// and deliver nothing, leaving the backlog until the conversation did
@@ -852,7 +734,7 @@ mod tests {
         let router = WakeRouterImpl::new(active_bridges);
         router.register_delivery_binding(conv_key(), DeliveryBinding::ConversationBridge);
 
-        router
+        let served = router
             .wake_owed(
                 &conv_key(),
                 &ParticipantId::for_conversation(conversation_id),
@@ -862,6 +744,14 @@ mod tests {
         assert!(
             await_system_broadcast(&mut broadcast_rx).await,
             "the live bridge was served its backlog by the walk itself"
+        );
+        // The walk reads this to keep the spawn cooldown off a serve that
+        // spawned nothing; reporting `Spawned` here would pace a live bridge at
+        // one message per poll interval.
+        assert_eq!(
+            served,
+            WakeServed::Live,
+            "a serve that fired no wake must not be counted as one"
         );
     }
 
@@ -883,7 +773,7 @@ mod tests {
     /// host-wiring invariant violation (`dispatch_row` gates parked rows to
     /// `spawn_eager_wake` and never calls `deliver` for them).
     #[tokio::test]
-    #[should_panic(expected = "WakeRouter::deliver called for parked subscriber")]
+    #[should_panic(expected = "WakeRouter::deliver called for non-surface subscriber")]
     async fn deliver_panics_for_wasm_subscriber() {
         use brenn_lib::messaging::{MessageEnvelope, Urgency};
         use chrono::Utc;
@@ -907,9 +797,7 @@ mod tests {
             urgency: Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
         };
-        let _ = router
-            .deliver(&key, &ParticipantId::for_wasm("my-consumer"), &env, Some(1))
-            .await;
+        let _ = router.deliver(&key, &Arc::new(env), 1).await;
     }
 
     /// `deliver_ingress` for a parked (`wasm:`) subscriber panics — ingress rows
@@ -979,27 +867,18 @@ mod tests {
         );
     }
 
-    /// Build a `Messenger` over `db` (empty directory — the Surface `deliver` arm
-    /// only reaches `db()` for the claim), declare one `brenn:` channel, and
-    /// insert one Immediate pending-push row targeting `surface:<slug>` on it.
-    /// Returns `(messenger, participant, push_id, seq)` where `push_id` is the
-    /// real claimable row and `seq` is the message id.
+    /// Build a `Messenger` over `db` (empty directory), declare one `brenn:`
+    /// channel, and commit one message onto it. Returns
+    /// `(messenger, surface participant, retention position)`.
     async fn surface_push_fixture(
         db: &brenn_lib::db::Db,
         slug: &str,
         channel_addr: &str,
-    ) -> (
-        Arc<brenn_lib::messaging::Messenger>,
-        ParticipantId,
-        i64,
-        i64,
-    ) {
+    ) -> (Arc<brenn_lib::messaging::Messenger>, ParticipantId, i64) {
         use brenn_lib::messaging::config::{
             ChannelConfigRaw, MessagingGlobalConfig, build_channel_entries,
         };
-        use brenn_lib::messaging::db::{
-            PendingPushInsert, insert_message_with_pushes, upsert_channels, utc_to_ns,
-        };
+        use brenn_lib::messaging::db::{insert_message, upsert_channels, utc_to_ns};
         use brenn_lib::messaging::query::NoopWakeRouter;
         use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Messenger, Urgency};
         use chrono::Utc;
@@ -1023,17 +902,10 @@ mod tests {
             .pop()
             .expect("one channel entry");
         let participant = ParticipantId::for_surface(slug);
-        let (push_id, seq) = {
+        let seq = {
             let conn = db.lock().await;
             upsert_channels(&conn, std::slice::from_ref(&entry));
-            let push = PendingPushInsert {
-                target_subscriber: participant.clone(),
-                target_app_slug: slug.to_string(),
-                eager_wake: true,
-                release_after: None,
-                delivery_deadline: None,
-            };
-            let msg = insert_message_with_pushes(
+            insert_message(
                 &conn,
                 entry.uuid,
                 "test",
@@ -1045,9 +917,9 @@ mod tests {
                 None,
                 None,
                 utc_to_ns(Utc::now()),
-                &[push],
-            );
-            (msg.push_ids[0], msg.id)
+            )
+            .retained_seq
+            .expect("a committed message holds a retention position")
         };
         let messenger = Messenger::new(
             db.clone(),
@@ -1057,7 +929,19 @@ mod tests {
             Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
             MessagingGlobalConfig::default(),
         );
-        (messenger, participant, push_id, seq)
+        (messenger, participant, seq)
+    }
+
+    /// Whether the table holds no rows at all. A bus commit and the surface
+    /// fan-out over it both write nothing per subscriber: what a channel owes is a
+    /// position, and a surface does not even hold one.
+    async fn no_pending_push_rows(db: &brenn_lib::db::Db) -> bool {
+        let conn = db.lock().await;
+        conn.query_row("SELECT COUNT(*) FROM messaging_pending_pushes", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count pending pushes")
+            == 0
     }
 
     /// A `MessageEnvelope` on `channel` (the only field the Surface `deliver` arm
@@ -1119,19 +1003,6 @@ mod tests {
         (guard, durable_rx, drain_notify)
     }
 
-    /// Whether the pending-push row is still owed (undelivered). The surface
-    /// delivery path must never touch it: the row is the dispatcher's wake
-    /// bookkeeping, not the session's delivery state.
-    async fn push_is_owed(db: &brenn_lib::db::Db, push_id: i64) -> bool {
-        let conn = db.lock().await;
-        conn.query_row(
-            "SELECT delivered_at IS NULL FROM messaging_pending_pushes WHERE id = ?1",
-            rusqlite::params![push_id],
-            |row| row.get::<_, bool>(0),
-        )
-        .expect("the seeded push row")
-    }
-
     /// `deliver` for a `surface:` subscriber with an attached, subscribed session
     /// hands the envelope to that session's live queue and returns `Ok(true)`,
     /// writing nothing: the session's own cursor is its delivery state.
@@ -1139,8 +1010,7 @@ mod tests {
     async fn deliver_surface_fans_out_without_claiming() {
         let db = brenn_lib::db::init_db_memory();
         let channel = "brenn:durable-demo";
-        let (messenger, participant, push_id, seq) =
-            surface_push_fixture(&db, "deskbar", channel).await;
+        let (messenger, participant, seq) = surface_push_fixture(&db, "deskbar", channel).await;
 
         let mut state = AppState::for_test(db.clone(), None);
         state.messenger = Some(messenger);
@@ -1150,13 +1020,9 @@ mod tests {
         router.set_state(state);
         router.register_delivery_binding(surface_key(), DeliveryBinding::SurfaceSessions);
 
+        let _ = &participant;
         let result = router
-            .deliver(
-                &surface_key(),
-                &participant,
-                &surface_envelope(channel),
-                Some(seq),
-            )
+            .deliver(&surface_key(), &Arc::new(surface_envelope(channel)), seq)
             .await;
         assert!(matches!(result, Ok(true)));
 
@@ -1170,8 +1036,8 @@ mod tests {
             .expect("drain nudge fired");
 
         assert!(
-            push_is_owed(&db, push_id).await,
-            "the fan-out marks nothing — the dispatcher retires its own row"
+            no_pending_push_rows(&db).await,
+            "a bus commit and its fan-out write no pending-push row"
         );
     }
 
@@ -1181,8 +1047,7 @@ mod tests {
     async fn deliver_surface_no_session_parks() {
         let db = brenn_lib::db::init_db_memory();
         let channel = "brenn:durable-demo";
-        let (messenger, participant, push_id, seq) =
-            surface_push_fixture(&db, "deskbar", channel).await;
+        let (messenger, participant, seq) = surface_push_fixture(&db, "deskbar", channel).await;
 
         let mut state = AppState::for_test(db.clone(), None);
         state.messenger = Some(messenger);
@@ -1192,53 +1057,12 @@ mod tests {
         router.set_state(state);
         router.register_delivery_binding(surface_key(), DeliveryBinding::SurfaceSessions);
 
+        let _ = &participant;
         let result = router
-            .deliver(
-                &surface_key(),
-                &participant,
-                &surface_envelope(channel),
-                Some(seq),
-            )
+            .deliver(&surface_key(), &Arc::new(surface_envelope(channel)), seq)
             .await;
         assert!(matches!(result, Ok(false)));
-        assert!(push_is_owed(&db, push_id).await);
-    }
-
-    /// A row the dispatcher already retired still fans out: the wake bookkeeping
-    /// no longer arbitrates who sends, so a session subscribed now is served the
-    /// envelope and drops it only if its own cursor already covers it.
-    #[tokio::test]
-    async fn deliver_surface_fans_out_over_an_already_retired_row() {
-        let db = brenn_lib::db::init_db_memory();
-        let channel = "brenn:durable-demo";
-        let (messenger, participant, push_id, seq) =
-            surface_push_fixture(&db, "deskbar", channel).await;
-        {
-            let conn = messenger.db().lock().await;
-            brenn_lib::messaging::db::mark_pending_pushes_delivered(&conn, &[push_id]);
-        }
-
-        let mut state = AppState::for_test(db.clone(), None);
-        state.messenger = Some(messenger);
-        let (_guard, mut rx, _notify) = register_surface_session(&state, "deskbar", channel);
-
-        let router = WakeRouterImpl::new(ActiveBridges::new());
-        router.set_state(state);
-        router.register_delivery_binding(surface_key(), DeliveryBinding::SurfaceSessions);
-
-        let result = router
-            .deliver(
-                &surface_key(),
-                &participant,
-                &surface_envelope(channel),
-                Some(seq),
-            )
-            .await;
-        assert!(matches!(result, Ok(true)));
-        assert_eq!(
-            rx.try_recv().expect("live delivery enqueued").retained_seq,
-            seq as u64
-        );
+        assert!(no_pending_push_rows(&db).await);
     }
 
     /// When every subscribed session's live queue is unusable (here: receiver
@@ -1248,8 +1072,7 @@ mod tests {
     async fn deliver_surface_all_queues_full_parks() {
         let db = brenn_lib::db::init_db_memory();
         let channel = "brenn:durable-demo";
-        let (messenger, participant, push_id, seq) =
-            surface_push_fixture(&db, "deskbar", channel).await;
+        let (messenger, participant, seq) = surface_push_fixture(&db, "deskbar", channel).await;
 
         let mut state = AppState::for_test(db.clone(), None);
         state.messenger = Some(messenger);
@@ -1261,16 +1084,12 @@ mod tests {
         router.set_state(state);
         router.register_delivery_binding(surface_key(), DeliveryBinding::SurfaceSessions);
 
+        let _ = &participant;
         let result = router
-            .deliver(
-                &surface_key(),
-                &participant,
-                &surface_envelope(channel),
-                Some(seq),
-            )
+            .deliver(&surface_key(), &Arc::new(surface_envelope(channel)), seq)
             .await;
         assert!(matches!(result, Ok(false)));
-        assert!(push_is_owed(&db, push_id).await);
+        assert!(no_pending_push_rows(&db).await);
     }
 
     /// `deliver_context` (the durable depth-0 row-less feed) fans an envelope to
@@ -1505,7 +1324,7 @@ mod tests {
     /// must never reach the shared dispatch loop deliver path (host-wiring
     /// invariant). Mirrors the `wasm:` counterpart.
     #[tokio::test]
-    #[should_panic(expected = "WakeRouter::deliver called for parked subscriber")]
+    #[should_panic(expected = "WakeRouter::deliver called for non-surface subscriber")]
     async fn deliver_panics_for_system_subscriber() {
         let router = WakeRouterImpl::new(ActiveBridges::new());
         let key = SubscriberEntryKind::System("tool-executor".to_string());
@@ -1514,12 +1333,7 @@ mod tests {
             DeliveryBinding::ParkedNotify(Arc::new(tokio::sync::Notify::new())),
         );
         let _ = router
-            .deliver(
-                &key,
-                &ParticipantId::for_system("tool-executor"),
-                &surface_envelope("brenn:whatever"),
-                Some(1),
-            )
+            .deliver(&key, &Arc::new(surface_envelope("brenn:whatever")), 1)
             .await;
     }
 
@@ -1589,143 +1403,5 @@ mod tests {
         router
             .register_delivery_binding(key.clone(), DeliveryBinding::ParkedNotify(Arc::clone(&n)));
         router.register_delivery_binding(key, DeliveryBinding::ParkedNotify(Arc::clone(&n)));
-    }
-
-    /// END-TO-END regression: a `brenn:` message published to a channel whose
-    /// only subscriber is a Wasm consumer must PARK the pending-push row (leave
-    /// it pending so the off-loop dispatch task drains it), NOT deliver it
-    /// through the shared dispatch loop.
-    ///
-    /// This wires the REAL `WakeRouterImpl` (not a mock) into a REAL `Messenger`
-    /// and drives the real dispatch path (`dispatch_row`). The historical bug:
-    /// `dispatch_pending_pushes` → `deliver_or_park` → `WakeRouter::deliver`
-    /// with no Wasm gate. Post-fix: `dispatch_row` gates Wasm rows to
-    /// `spawn_eager_wake`, never calling `deliver` for them (WASM panic invariant).
-    /// Existing publish-path tests all used a mock router that returned `Ok(false)`
-    /// for Wasm, so the panic was never caught before the fix.
-    ///
-    /// Post-fix the expected behavior is: the row stays pending (parked), an
-    /// eager-wake fires to the registered notifier, and no panic occurs.
-    #[tokio::test]
-    async fn publish_to_wasm_subscriber_parks_does_not_deliver() {
-        use brenn_lib::db::init_db_memory;
-        use brenn_lib::messaging::config::{Depth, MessagingGlobalConfig};
-        use brenn_lib::messaging::db::{
-            PendingPushInsert, insert_message_with_pushes, upsert_channels, utc_to_ns,
-        };
-        use brenn_lib::messaging::testutils;
-        use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Messenger, Urgency};
-        use chrono::Utc;
-        use indexmap::IndexMap;
-
-        let slug = "demo-consumer";
-
-        // Arrange: in-memory DB + one channel whose only subscriber is the Wasm
-        // consumer. Noise Silent + Depth Unbounded so the alarm/alert path is never
-        // reached.
-        let db = init_db_memory();
-        let entry = testutils::wasm_channel_entry(
-            slug,
-            "wasm-deliver-park-ch",
-            Depth::Unbounded,
-            Depth::Unbounded,
-        );
-        {
-            let conn = db.lock().await;
-            upsert_channels(&conn, std::slice::from_ref(&*entry));
-        }
-        let directory = Arc::new(MessagingDirectory::with_entries(vec![(*entry).clone()]));
-
-        // The REAL router (not a mock). Register a ParkedNotify binding and keep a
-        // clone so we can assert the eager-wake was fired after dispatch.
-        let router = Arc::new(WakeRouterImpl::new(ActiveBridges::new()));
-        let notify = Arc::new(tokio::sync::Notify::new());
-        router.register_delivery_binding(
-            SubscriberEntryKind::Wasm(slug.to_string()),
-            DeliveryBinding::ParkedNotify(Arc::clone(&notify)),
-        );
-
-        let messenger = Messenger::new(
-            db,
-            directory,
-            Arc::from("test"),
-            Arc::new(IndexMap::new()),
-            router as Arc<dyn WakeRouter>,
-            MessagingGlobalConfig::default(),
-        );
-
-        let wasm_sub = ParticipantId::for_wasm(slug);
-        // The walk wakes positions that trail retention, so the consumer holds
-        // one — attached at head, before the message below.
-        testutils::attach_wasm_port(&messenger, &entry, slug, &wasm_sub, Depth::Unbounded).await;
-
-        // Insert a message + a single Immediate pending-push row targeting the
-        // Wasm subscriber, then drive the real publish dispatch path.
-        let message_id = {
-            let ts_ns = utc_to_ns(Utc::now());
-            let conn = messenger.db().lock().await;
-            let push = PendingPushInsert {
-                target_subscriber: wasm_sub.clone(),
-                target_app_slug: String::new(),
-                eager_wake: true,
-                release_after: None,
-                delivery_deadline: None,
-            };
-            let msg = insert_message_with_pushes(
-                &conn,
-                entry.uuid,
-                "test",
-                "test-sender",
-                "hello wasm",
-                Urgency::Normal,
-                ChannelScheme::Brenn,
-                None,
-                None,
-                None,
-                ts_ns,
-                &[push],
-            );
-            assert_eq!(msg.push_ids.len(), 1);
-            msg.id
-        };
-
-        // Act: drive the real dispatch_row (dispatcher layer) with the real router.
-        // This is the precise layer that was previously panicking for Wasm rows.
-        let push_row = {
-            let conn = messenger.db().lock().await;
-            brenn_lib::messaging::db::load_all_dispatchable_pushes(&conn, Utc::now())
-        };
-        assert_eq!(push_row.len(), 1, "exactly one dispatchable row");
-        let (ref row, deadline_expired) = push_row[0];
-        let _ = message_id; // used only during setup
-        brenn_lib::messaging::dispatcher::dispatch_row(
-            messenger.router().as_ref(),
-            row,
-            deadline_expired,
-            false,
-        )
-        .await;
-
-        // Assert: the row is PARKED (still pending), not delivered.
-        let rows = messenger.load_pending_pushes(&wasm_sub).await;
-        assert_eq!(
-            rows.len(),
-            1,
-            "Wasm pending-push row must remain parked (pending), not be delivered \
-             through the shared dispatch loop"
-        );
-
-        // Act: channel-backed rows are not woken by the scan; fire their
-        // wake source explicitly.
-        messenger.wake_owed_subscribers(Utc::now()).await;
-
-        // Assert: the eager-wake notifier was fired so the off-loop dispatch
-        // task is woken promptly. The permit is set by notify_one.
-        tokio::time::timeout(std::time::Duration::from_millis(10), notify.notified())
-            .await
-            .expect(
-                "eager-wake Notify must be fired by the store walk for a Wasm subscriber; \
-                 notified() should resolve immediately after notify_one",
-            );
     }
 }

@@ -194,15 +194,17 @@ ingress-only code paths are gone):
    `ingress_source = 'repo_sync:pulled'`) onto that channel — or delete them if
    the history is worthless; decide at migration time.
 3. **Delete the remnants**: `EnvelopeTypeColumn` collapses to a bare
-   `ChannelScheme`; remove `IngressOrBus` / `IngressEvent` and the ingress
-   decode/render (`[Event]` card) paths, `insert_ingress_message*`, and the
-   `ingress_*` columns/queries in `brenn-lib/src/messaging/db/ingress.rs`.
+   `ChannelScheme`; remove `IngressEvent` and the ingress decode/render
+   (`[Event]` card) paths, `insert_ingress_message*`, the `ingress_*`
+   columns/queries in `brenn-lib/src/messaging/db/ingress.rs`, and with them the
+   `messaging_pending_pushes` table itself — these rows are all it still carries,
+   and `dispatch_row` plus the dispatcher's ingress scan die with them.
 
 Code sites (`TODO(ingress-retirement)`):
 `brenn-lib/src/messaging/db/envelope_column.rs` (`EnvelopeTypeColumn::Ingress`),
 `brenn-lib/src/repo_sync_cursor.rs` (the two `insert_ingress_message_raw`
 writers), `brenn-lib/src/messaging/publish/mod.rs` (`insert_ingress_message`
-writer), `brenn-lib/src/messaging/ingress.rs` (`IngressOrBus`).
+writer), `brenn-lib/src/messaging/ingress.rs` (`Event`).
 
 ---
 
@@ -763,38 +765,6 @@ accurate across every park/cancel/release/quota site, including the durable park
 Code site (`TODO(substrate-deferred-view-count-shortcut)`):
 `brenn-server/src/wasm_dispatch/mod.rs` (the `for out in &cfg.outputs`
 deferred-view loop in `drain_step`).
-
-## `substrate-wake-relocation`
-
-`DbStore` delivery state is the cursor row, but the dispatcher still decides who
-to wake by scanning owed `messaging_pending_pushes` rows
-(`load_all_dispatchable_pushes` and its partial index). So the durable store
-still writes a claim per push target at commit, seeds the retained tail at a
-primed attach, and retires claims through `through` at every advance — pure wake
-bookkeeping that decides nothing about delivery, kept only because a claim left
-standing past its cursor re-wakes its consumer on every dispatcher tick. The wake
-decision belongs against the live registration directory at wake time
-(`eager_wake_for` reads only wake economics and message urgency, both available
-there), with the recurring `wake_owed_subscribers` walk — already cursor-driven —
-as the retry. Done when the wake pass reads registration rather than rows, the
-dispatchable scan and its index are gone, and no delivery path writes or retires
-a bus-channel claim.
-
-Surfaces are the one family whose delivery the scan still duplicates rather than
-drives: the publish and release paths fan the envelope out to their attached
-sessions directly (`Messenger::fan_out_surface_feed`), and the scan's later
-`deliver` for the same claim is dropped by the session's cursor comparison. The
-surface arm of commit-time `push_targets` dies with the scan.
-
-One allocation rides on that: `WakeRouter::deliver` takes `&MessageEnvelope`
-because the scan hands it a borrow, so its `SurfaceSessions` arm deep-clones the
-body into a fresh `Arc` even though `fan_out_surface_feed` already holds one.
-Once the fan-out is `deliver`'s only surface caller, the seam can carry the
-`Arc` and that copy goes with the scan.
-
-Code sites (`TODO(substrate-wake-relocation)`):
-`brenn-lib/src/messaging/store/db.rs` (the claim retirement in `advance` and the
-retained-tail seed in `attach`).
 
 ## `surface-reanchor-frame`
 

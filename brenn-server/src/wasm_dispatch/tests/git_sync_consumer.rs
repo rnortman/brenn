@@ -337,10 +337,9 @@ async fn push_event_matches_and_pulls_fixture_to_outcome() {
     let executor_sub = harness.executor_sub.clone();
 
     // Step 1: deliver a push whose remote matches the configured slug.
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &harness.messenger,
         &harness.push_ch,
-        &guest_sub,
         &push_event(&[REMOTE]),
         ChannelScheme::Brenn,
     )
@@ -348,12 +347,10 @@ async fn push_event_matches_and_pulls_fixture_to_outcome() {
     drain_step(&harness.cfg, &guest_sub).await;
 
     // The guest fired exactly one async call for the matched slug.
-    let requests = harness.messenger.load_pending_pushes(&executor_sub).await;
+    let requests =
+        brenn_lib::messaging::testutils::owed_everywhere(&harness.messenger, &executor_sub).await;
     assert_eq!(requests.len(), 1, "one git-repo-pull request expected");
-    let req: serde_json::Value = match &requests[0].1 {
-        brenn_lib::messaging::IngressOrBus::Bus(env) => serde_json::from_str(&env.body).unwrap(),
-        other => panic!("expected bus request, got {other:?}"),
-    };
+    let req: serde_json::Value = serde_json::from_str(&requests[0].1.body).unwrap();
     assert_eq!(req["call_id"], "pull-1");
     assert_eq!(req["args"]["repos"][0], SLUG);
 
@@ -395,10 +392,9 @@ async fn push_event_no_match_fires_no_call() {
     let harness = consumer_harness(slug, empty_registry(), valid_config(), &[SLUG], true).await;
     let guest_sub = harness.guest_sub.clone();
 
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &harness.messenger,
         &harness.push_ch,
-        &guest_sub,
         &push_event(&["ssh://example/unconfigured.git"]),
         ChannelScheme::Brenn,
     )
@@ -406,9 +402,7 @@ async fn push_event_no_match_fires_no_call() {
     drain_step(&harness.cfg, &guest_sub).await;
 
     assert!(
-        harness
-            .messenger
-            .load_pending_pushes(&harness.executor_sub)
+        brenn_lib::messaging::testutils::owed_everywhere(&harness.messenger, &harness.executor_sub)
             .await
             .is_empty(),
         "a push for an unconfigured remote must fire no tool call"
@@ -423,10 +417,9 @@ async fn call_id_sequence_is_monotonic_across_activations() {
     let guest_sub = harness.guest_sub.clone();
 
     for _ in 0..2 {
-        testutils::insert_wasm_push(
+        testutils::insert_bus_message(
             &harness.messenger,
             &harness.push_ch,
-            &guest_sub,
             &push_event(&[REMOTE]),
             ChannelScheme::Brenn,
         )
@@ -434,19 +427,15 @@ async fn call_id_sequence_is_monotonic_across_activations() {
         drain_step(&harness.cfg, &guest_sub).await;
     }
 
-    let requests = harness
-        .messenger
-        .load_pending_pushes(&harness.executor_sub)
-        .await;
+    let requests =
+        brenn_lib::messaging::testutils::owed_everywhere(&harness.messenger, &harness.executor_sub)
+            .await;
     assert_eq!(requests.len(), 2, "two activations, two requests");
     let call_ids: Vec<String> = requests
         .iter()
-        .map(|(_, row)| match row {
-            brenn_lib::messaging::IngressOrBus::Bus(env) => {
-                let v: serde_json::Value = serde_json::from_str(&env.body).unwrap();
-                v["call_id"].as_str().unwrap().to_string()
-            }
-            other => panic!("expected bus request, got {other:?}"),
+        .map(|(_, envelope)| {
+            let v: serde_json::Value = serde_json::from_str(&envelope.body).unwrap();
+            v["call_id"].as_str().unwrap().to_string()
         })
         .collect();
     assert!(
@@ -457,10 +446,9 @@ async fn call_id_sequence_is_monotonic_across_activations() {
 
 /// Feed a synthetic result and drain the consumer's result activation.
 async fn drive_result(harness: &ConsumerHarness, result_body: &str) {
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &harness.messenger,
         &harness.inbox_ch,
-        &harness.guest_sub,
         result_body,
         ChannelScheme::Brenn,
     )
@@ -548,10 +536,9 @@ async fn missing_remote_config_quarantines() {
     let harness = consumer_harness(slug, empty_registry(), config, &[SLUG], false).await;
     let guest_sub = harness.guest_sub.clone();
 
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &harness.messenger,
         &harness.push_ch,
-        &guest_sub,
         &push_event(&[REMOTE]),
         ChannelScheme::Brenn,
     )
@@ -578,10 +565,9 @@ async fn empty_remote_config_quarantines() {
     let harness = consumer_harness(slug, empty_registry(), config, &[SLUG], false).await;
     let guest_sub = harness.guest_sub.clone();
 
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &harness.messenger,
         &harness.push_ch,
-        &guest_sub,
         &push_event(&[REMOTE]),
         ChannelScheme::Brenn,
     )
@@ -607,10 +593,9 @@ async fn duplicate_slug_config_quarantines() {
     let harness = consumer_harness(slug, empty_registry(), config, &[SLUG], false).await;
     let guest_sub = harness.guest_sub.clone();
 
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &harness.messenger,
         &harness.push_ch,
-        &guest_sub,
         &push_event(&[REMOTE]),
         ChannelScheme::Brenn,
     )
@@ -636,10 +621,9 @@ async fn denied_tool_call_quarantines() {
     let harness = consumer_harness(slug, empty_registry(), valid_config(), &["other"], true).await;
     let guest_sub = harness.guest_sub.clone();
 
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &harness.messenger,
         &harness.push_ch,
-        &guest_sub,
         &push_event(&[REMOTE]),
         ChannelScheme::Brenn,
     )
@@ -652,9 +636,7 @@ async fn denied_tool_call_quarantines() {
         "a denied tool call must quarantine, not drop silently"
     );
     assert!(
-        harness
-            .messenger
-            .load_pending_pushes(&harness.executor_sub)
+        brenn_lib::messaging::testutils::owed_everywhere(&harness.messenger, &harness.executor_sub)
             .await
             .is_empty(),
         "a denied call must place no request on the executor inbox"
@@ -675,10 +657,9 @@ async fn unknown_push_event_schema_version_quarantines() {
         "remotes": [REMOTE],
     })
     .to_string();
-    testutils::insert_wasm_push(
+    testutils::insert_bus_message(
         &harness.messenger,
         &harness.push_ch,
-        &guest_sub,
         &body,
         ChannelScheme::Brenn,
     )
@@ -691,9 +672,7 @@ async fn unknown_push_event_schema_version_quarantines() {
         "an unknown push-event schema version must quarantine"
     );
     assert!(
-        harness
-            .messenger
-            .load_pending_pushes(&harness.executor_sub)
+        brenn_lib::messaging::testutils::owed_everywhere(&harness.messenger, &harness.executor_sub)
             .await
             .is_empty(),
         "an unknown schema version must fire no tool call"
