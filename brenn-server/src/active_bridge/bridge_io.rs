@@ -1007,55 +1007,11 @@ mod tests {
         }
 
         // ------------------------------------------------------------------
-        // 2. Build the shared ActiveBridges registry + two bridges.
-        //    make_bridge_no_loop allocates a fresh in-memory DB per call, so
-        //    we use inject_for_test_full directly with the shared DB.
-        // ------------------------------------------------------------------
-        let shared_registry = ActiveBridges::new();
-
-        let (broadcast_tx_a, _broadcast_rx_a) = tokio::sync::broadcast::channel(16);
-        let bridge_a = ActiveBridge::inject_for_test_full(
-            1,
-            conv_id_a,
-            "app-a",
-            db.clone(),
-            broadcast_tx_a,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
-            TestBridgeConfig {
-                active_bridges: Some(shared_registry.clone()),
-                ..Default::default()
-            },
-        );
-
-        let (broadcast_tx_b, _broadcast_rx_b) = tokio::sync::broadcast::channel(16);
-        let bridge_b = ActiveBridge::inject_for_test_full(
-            1,
-            conv_id_b,
-            "app-b",
-            db.clone(),
-            broadcast_tx_b,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
-            TestBridgeConfig {
-                active_bridges: Some(shared_registry.clone()),
-                ..Default::default()
-            },
-        );
-
-        // ------------------------------------------------------------------
-        // 3. Install sessions: A stalls (ack withheld), B records and auto-acks.
-        // ------------------------------------------------------------------
-        let mut rx_a = super::super::test_support::install_stalling_session(&bridge_a).await;
-        let mut rx_b = super::super::test_support::install_recording_session(&bridge_b).await;
-
-        // Insert both bridges into the shared registry.
-        shared_registry.insert(conv_id_a, bridge_a).await;
-        shared_registry.insert(conv_id_b, bridge_b).await;
-
-        // ------------------------------------------------------------------
-        // 4. Build WakeRouterImpl over the shared registry and a minimal Messenger.
-        //    The Messenger is only needed for register_released_pushes (deliver-after
-        //    rows); our Immediate rows never trigger that path. Use a NoopWakeRouter
-        //    as the Messenger's internal router to avoid circular dependency.
+        // 2. Build the Messenger both bridges deliver from. A conversation is
+        //    served from its position on its channel, so the bridges hold this
+        //    same Messenger and its positions exist before anything is
+        //    published. Use a NoopWakeRouter as the Messenger's internal router
+        //    to avoid a circular dependency with the WakeRouterImpl below.
         // ------------------------------------------------------------------
         let dir = MessagingDirectory::with_entries(vec![
             mk_entry(channel_uuid_a, &channel_addr_a, "app-a"),
@@ -1064,6 +1020,8 @@ mod tests {
 
         let mk_app_config = |slug: &str, ch_uuid: Uuid, ch_addr: &str| {
             let mut cfg = default_test_app_config(slug, slug);
+            cfg.singleton = true;
+            cfg.allowed_users = vec!["testuser".to_string()];
             cfg.messaging = Some(ResolvedMessagingConfig {
                 send_budget: 100,
                 subscriptions: vec![ResolvedSubscription {
@@ -1075,10 +1033,8 @@ mod tests {
                     wake_min: WakeMin::Normal,
                 }],
             });
-            // The dispatcher's delivery-time ACL floor (design §2.2 Point B) now
-            // re-authorizes every parked push against the app's policy; without a
-            // covering matcher the row would be denied and never delivered. Stamp
-            // the covering delivery policy for this app's channel.
+            // The delivery-time ACL gate re-authorizes every push against the
+            // app's policy; without a covering matcher the row is denied.
             cfg.policy = crate::test_support::app_config::delivery_policy_for_addresses([ch_addr]);
             cfg
         };
@@ -1101,6 +1057,54 @@ mod tests {
             internal_router,
             MessagingGlobalConfig::default(),
         );
+        messenger.attach_conversation_subscribers().await;
+
+        // ------------------------------------------------------------------
+        // 3. Build the shared ActiveBridges registry + two bridges.
+        //    make_bridge_no_loop allocates a fresh in-memory DB per call, so
+        //    we use inject_for_test_full directly with the shared DB.
+        // ------------------------------------------------------------------
+        let shared_registry = ActiveBridges::new();
+
+        let (broadcast_tx_a, _broadcast_rx_a) = tokio::sync::broadcast::channel(16);
+        let bridge_a = ActiveBridge::inject_for_test_full(
+            1,
+            conv_id_a,
+            "app-a",
+            db.clone(),
+            broadcast_tx_a,
+            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            TestBridgeConfig {
+                active_bridges: Some(shared_registry.clone()),
+                messenger: Some(messenger.clone()),
+                ..Default::default()
+            },
+        );
+
+        let (broadcast_tx_b, _broadcast_rx_b) = tokio::sync::broadcast::channel(16);
+        let bridge_b = ActiveBridge::inject_for_test_full(
+            1,
+            conv_id_b,
+            "app-b",
+            db.clone(),
+            broadcast_tx_b,
+            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            TestBridgeConfig {
+                active_bridges: Some(shared_registry.clone()),
+                messenger: Some(messenger.clone()),
+                ..Default::default()
+            },
+        );
+
+        // ------------------------------------------------------------------
+        // 4. Install sessions: A stalls (ack withheld), B records and auto-acks.
+        // ------------------------------------------------------------------
+        let mut rx_a = super::super::test_support::install_stalling_session(&bridge_a).await;
+        let mut rx_b = super::super::test_support::install_recording_session(&bridge_b).await;
+
+        // Insert both bridges into the shared registry.
+        shared_registry.insert(conv_id_a, bridge_a).await;
+        shared_registry.insert(conv_id_b, bridge_b).await;
 
         let router = Arc::new(WakeRouterImpl::new(shared_registry));
         for slug in ["app-a", "app-b"] {

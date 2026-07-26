@@ -1092,11 +1092,21 @@ async fn a_mixed_class_activation_settles_each_port_in_its_own_domain() {
         !ring.has_deliverable(&wasm_sub),
         "the ring cursor advanced past its one message"
     );
+    // The next message lands exactly on the cursor: a jump to a foreign id
+    // domain would have left it far above the ring, and this window would serve
+    // nothing while reporting the skipped span as drops.
+    append_ring_message(&messenger, &ring_entry, "ring-next".to_string()).await;
+    let window = ring.window(&wasm_sub, 8, 0);
     assert_eq!(
-        messenger.dropped_total(&ring_entry.address, &wasm_sub),
+        window.entries.len() - window.new_from,
+        1,
+        "the follow-up message is the only new one"
+    );
+    let (through, seen_floor) = window.advance_span().expect("a served window advances");
+    assert_eq!(
+        ring.advance(&wasm_sub, through, seen_floor).dropped,
         0,
-        "a cursor advanced by exactly one charges nothing — a jump to a foreign \
-         id domain would charge the skipped span as drops"
+        "a cursor advanced by exactly one loses nothing in between"
     );
 }
 

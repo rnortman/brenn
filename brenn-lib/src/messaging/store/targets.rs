@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::auth::user::get_user_by_username;
 use crate::config::AppConfig;
-use crate::conversation::get_or_create_singleton_conversation;
+use crate::conversation::{get_or_create_singleton_conversation, get_singleton_conversation_id};
 use crate::messaging::config::{Depth, NoiseLevel};
 use crate::messaging::{
     MessagingDirectory, ParticipantId, SubscriberEntry, SubscriberEntryKind,
@@ -143,6 +143,85 @@ impl TargetResolver {
         &self.apps
     }
 
+    /// The user an `App(slug)` subscriber's messages belong to: the app's single
+    /// allowed user. `None` — with a `warn` naming the failed lookup — when the
+    /// app, its `allowed_users` entry, or that user's row is missing; each is a
+    /// host wiring or config bug rather than an ordinary outcome.
+    ///
+    /// `channel_address` is diagnostic context only.
+    fn app_owner(
+        &self,
+        conn: &rusqlite::Connection,
+        slug: &str,
+        channel_address: &str,
+    ) -> Option<i64> {
+        let app = match self.apps.get(slug) {
+            Some(a) => a,
+            None => {
+                warn!(
+                    app = %slug,
+                    channel = %channel_address,
+                    "app subscriber not found in apps map — host wiring bug; skipping delivery"
+                );
+                return None;
+            }
+        };
+        // Singleton + 1 allowed_user is enforced by config validation.
+        let username = match app.allowed_users.first() {
+            Some(u) => u.clone(),
+            None => {
+                warn!(
+                    app = %slug,
+                    channel = %channel_address,
+                    "resolved app has no allowed_users — host wiring/config bug; \
+                     skipping delivery"
+                );
+                return None;
+            }
+        };
+        match get_user_by_username(conn, &username) {
+            Some(u) => Some(u.id),
+            None => {
+                warn!(
+                    app = %slug,
+                    channel = %channel_address,
+                    username = %username,
+                    "allowed_user not found in users table — host wiring bug; skipping delivery"
+                );
+                None
+            }
+        }
+    }
+
+    /// The singleton conversation an `App(slug)` subscriber holds its delivery
+    /// state under, creating it when the app has never had one.
+    ///
+    /// This is the lazy creator: an app wired to receive gets its conversation
+    /// the first time something resolves against it — at attach, or at the
+    /// commit that names it a target.
+    pub fn ensure_app_conversation(
+        &self,
+        conn: &rusqlite::Connection,
+        slug: &str,
+        channel_address: &str,
+    ) -> Option<i64> {
+        let owner = self.app_owner(conn, slug, channel_address)?;
+        Some(get_or_create_singleton_conversation(conn, owner, slug).id)
+    }
+
+    /// The same resolution, creating nothing: `None` when the app has no
+    /// conversation yet, so a reader can ask which conversation an `App(slug)`
+    /// subscriber delivers to without minting one.
+    pub fn app_conversation(
+        &self,
+        conn: &rusqlite::Connection,
+        slug: &str,
+        channel_address: &str,
+    ) -> Option<i64> {
+        let owner = self.app_owner(conn, slug, channel_address)?;
+        get_singleton_conversation_id(conn, owner, slug)
+    }
+
     /// Resolve push targets for an outbound publish: per-subscriber, find the
     /// (singleton-app, allowed_user) → conversation_id mapping that the
     /// dispatcher will inject into. Also resolves the noise level for each
@@ -224,57 +303,22 @@ impl TargetResolver {
             };
             match &sub.kind {
                 SubscriberEntryKind::App(slug) => {
-                    // These three lookups should always succeed for a subscriber
-                    // that just passed the ACL gate: its policy resolved, so the
-                    // app is wired. A `None` here is a host-wiring invariant
-                    // violation, NOT a deny-by-default outcome — surface it so a
-                    // wiring bug after the gate is distinguishable from a
-                    // successful delivery and from a normal ACL revocation.
-                    let app = match self.apps.get(slug) {
-                        Some(a) => a,
-                        None => {
-                            warn!(
-                                app = %slug,
-                                channel = %channel_address,
-                                "subscriber passed ACL gate but app not found in apps map — \
-                                 host wiring bug; skipping delivery"
-                            );
-                            continue;
-                        }
+                    // The resolution should always succeed for a subscriber that
+                    // just passed the ACL gate: its policy resolved, so the app is
+                    // wired. A `None` is a host-wiring invariant violation, NOT a
+                    // deny-by-default outcome — `app_owner` names which lookup
+                    // failed, so a wiring bug after the gate is distinguishable
+                    // from a successful delivery and from a normal ACL revocation.
+                    let Some(conversation) =
+                        self.ensure_app_conversation(conn, slug, channel_address)
+                    else {
+                        continue;
                     };
-                    let noise = sub.noise;
-                    // Singleton + 1 allowed_user is enforced by config validation.
-                    let username = match app.allowed_users.first() {
-                        Some(u) => u.clone(),
-                        None => {
-                            warn!(
-                                app = %slug,
-                                channel = %channel_address,
-                                "resolved app has no allowed_users — host wiring/config bug; \
-                                 skipping delivery"
-                            );
-                            continue;
-                        }
-                    };
-                    let user = match get_user_by_username(conn, &username) {
-                        Some(u) => u,
-                        None => {
-                            warn!(
-                                app = %slug,
-                                channel = %channel_address,
-                                username = %username,
-                                "allowed_user not found in users table — host wiring bug; \
-                                 skipping delivery"
-                            );
-                            continue;
-                        }
-                    };
-                    let conversation = get_or_create_singleton_conversation(conn, user.id, slug);
                     targets.push(PushTarget {
-                        subscriber: ParticipantId::for_conversation(conversation.id),
+                        subscriber: ParticipantId::for_conversation(conversation),
                         app_slug: slug.clone(),
                         push_depth,
-                        noise,
+                        noise: sub.noise,
                         wake,
                         wake_min: push_wake_min,
                     });
@@ -434,6 +478,26 @@ impl TargetResolver {
     }
 }
 
+/// Whether a subscriber with these wake economics is woken by a message at
+/// `urgency` — the whole of the wake rule, in one place.
+///
+/// Two callers ask it about different things and must not diverge: the publish
+/// path asks about the one message it is committing, the wake pass asks about
+/// the loudest message a subscriber has not seen. Both are the same question.
+///
+/// `Eager` subscribers wake unconditionally; `UrgencyGated` ones wake iff the
+/// urgency meets their threshold. An `UrgencyGated` subscriber with no
+/// threshold is a registration invariant violation, not a default.
+pub fn wakes_at(wake: WakeEconomics, wake_min: Option<WakeMin>, urgency: Urgency) -> bool {
+    match (wake, wake_min) {
+        (WakeEconomics::Eager, _) => true,
+        (WakeEconomics::UrgencyGated, Some(wm)) => wm.wakes(urgency),
+        (WakeEconomics::UrgencyGated, None) => unreachable!(
+            "UrgencyGated subscriber carries no wake_min — registration invariant violated"
+        ),
+    }
+}
+
 /// Whether this target's delivery claim carries an eager wake.
 ///
 /// `Eager` subscribers (parked WASM/system consumers, attached surface sessions)
@@ -445,13 +509,7 @@ impl TargetResolver {
 /// bug — a below-threshold publish parked invisibly for a live, attached surface
 /// session.
 pub fn eager_wake_for(target: &PushTarget, urgency: Urgency, channel_address: &str) -> bool {
-    let eager_wake = match (target.wake, target.wake_min) {
-        (WakeEconomics::Eager, _) => true,
-        (WakeEconomics::UrgencyGated, Some(wm)) => wm.wakes(urgency),
-        (WakeEconomics::UrgencyGated, None) => unreachable!(
-            "UrgencyGated push target carries no wake_min — push_targets invariant violated"
-        ),
-    };
+    let eager_wake = wakes_at(target.wake, target.wake_min, urgency);
     if !eager_wake {
         // Reachable only for `UrgencyGated` subscribers — a designed park
         // (conversation economics), not stranding, but a traced decision where

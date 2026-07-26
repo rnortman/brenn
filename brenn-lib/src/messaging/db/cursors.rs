@@ -16,8 +16,11 @@
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
+use brenn_envelope::Urgency;
+
 use crate::messaging::ParticipantId;
 use crate::messaging::config::Depth;
+use crate::messaging::store::DeliverableSubscriber;
 
 use super::bootstrap::depth_to_sql;
 use super::dynamic::depth_from_sql;
@@ -120,6 +123,35 @@ pub fn ensure_subscriber_cursor(
     true
 }
 
+/// Every cursor on `channel_uuid`, in no particular order.
+///
+/// The eviction pass's read: it has just deleted a span of retention and needs
+/// each position that span outran, with the `app_slug` that attributes it.
+pub fn channel_subscriber_cursors(
+    conn: &Connection,
+    channel_uuid: Uuid,
+) -> Vec<SubscriberCursorRow> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT subscriber, app_slug, push_depth, next_owed_seq
+             FROM messaging_subscriber_cursors
+             WHERE channel_uuid = ?1",
+        )
+        .expect("prepare channel_subscriber_cursors");
+    let rows = stmt
+        .query_map(rusqlite::params![channel_uuid.as_bytes().to_vec()], |row| {
+            Ok(SubscriberCursorRow {
+                subscriber: ParticipantId::from_stored(row.get::<_, String>(0)?),
+                app_slug: row.get(1)?,
+                push_depth: depth_from_sql(&row.get::<_, String>(2)?),
+                next_owed_seq: row.get(3)?,
+            })
+        })
+        .expect("query channel_subscriber_cursors");
+    rows.map(|r| r.expect("read channel subscriber cursor"))
+        .collect()
+}
+
 /// Move `subscriber`'s cursor to `next_owed_seq` — the only write that changes
 /// a position.
 ///
@@ -176,31 +208,67 @@ pub fn retune_subscriber_cursor_depth(
 }
 
 /// Every subscriber on `channel_uuid` whose position trails a message retention
-/// still holds.
+/// still holds, each with the loudest urgency in its unseen suffix.
 ///
 /// A position above everything retained is caught up; one below a frontier that
 /// has evicted past it is owed nothing that can still be served, and neither
 /// lists here. A sampled subscriber holds no row and so never appears.
-pub fn deliverable_cursor_subscribers(conn: &Connection, channel_uuid: Uuid) -> Vec<ParticipantId> {
+///
+/// The urgency is a `MAX` over the same join that decides deliverability, so the
+/// wake pass gets "is there work" and "is it loud enough" from one read of one
+/// consistent snapshot. The rank mapping mirrors [`Urgency::rank`]; a row whose
+/// urgency string matches no level ranks above every known level, so a single
+/// unmatched row among matched ones carries the `MAX` and is a hard error rather
+/// than a quiet downgrade of the group to the loudest level this mapping does
+/// know.
+pub fn deliverable_cursor_subscribers(
+    conn: &Connection,
+    channel_uuid: Uuid,
+) -> Vec<DeliverableSubscriber> {
     let mut stmt = conn
         .prepare_cached(
-            "SELECT c.subscriber
+            "SELECT c.subscriber, c.app_slug, MAX(CASE m.urgency
+                        WHEN 'very-low' THEN 0
+                        WHEN 'low'      THEN 1
+                        WHEN 'normal'   THEN 2
+                        WHEN 'high'     THEN 3
+                        ELSE 9999
+                    END)
              FROM messaging_subscriber_cursors c
+             JOIN messaging_messages m ON m.channel_uuid = c.channel_uuid
              WHERE c.channel_uuid = ?1
-               AND EXISTS (
-                   SELECT 1 FROM messaging_messages m
-                   WHERE m.channel_uuid = ?1
-                     AND m.retained_seq IS NOT NULL
-                     AND m.retained_seq >= c.next_owed_seq)",
+               AND m.retained_seq IS NOT NULL
+               AND m.retained_seq >= c.next_owed_seq
+             GROUP BY c.subscriber, c.app_slug",
         )
         .expect("prepare deliverable_cursor_subscribers");
     let rows = stmt
         .query_map(rusqlite::params![channel_uuid.as_bytes().to_vec()], |row| {
-            row.get::<_, String>(0)
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })
         .expect("query deliverable_cursor_subscribers");
-    rows.map(|r| ParticipantId::from_stored(r.expect("read deliverable cursor subscriber")))
-        .collect()
+    rows.map(|r| {
+        let (subscriber, app_slug, rank) = r.expect("read deliverable cursor subscriber");
+        let urgency = usize::try_from(rank)
+            .ok()
+            .and_then(|rank| Urgency::ALL.get(rank).copied())
+            .unwrap_or_else(|| {
+                panic!(
+                    "messaging: unseen messages on channel {channel_uuid} for {subscriber} carry \
+                     an urgency outside the known levels"
+                )
+            });
+        DeliverableSubscriber {
+            subscriber: ParticipantId::from_stored(subscriber),
+            app_slug: Some(app_slug),
+            max_unseen_urgency: urgency,
+        }
+    })
+    .collect()
 }
 
 /// Whether `subscriber`'s position trails a message retention still holds —

@@ -193,20 +193,27 @@ pub struct ActiveBridge {
     /// PostToolUse handlers to emit a `Push` trigger immediately after a
     /// successful tool invocation, so sibling clones of the same remote
     /// see the advance within seconds instead of waiting for the next
-    /// poll interval. See `docs/designs/repo-sync.md` Phase 2 Part B.
+    /// poll interval.
     pub(super) repo_sync_sender: Option<crate::repo_sync::SyncTriggerSender>,
     /// Messenger for the messaging MVP. `None` when no `[[channel]]`
     /// blocks are configured (messaging effectively disabled).
     pub(crate) messenger: Option<Arc<brenn_lib::messaging::Messenger>>,
+    /// Serializes this conversation's bus delivery: read the position, render,
+    /// send, advance. Three callers reach that sequence — the startup drain, the
+    /// dispatcher fan-out, and the wake walk — and the read is pure, so two of
+    /// them running at once would each read the same unseen suffix and each send
+    /// it. Held across the whole sequence, so the second caller reads a position
+    /// that has already moved and sends nothing.
+    pub(in crate::active_bridge) bus_delivery: tokio::sync::Mutex<()>,
     /// PWA push service. `None` when no app has `pwa_push.enabled = true`.
     pub(super) pwa_push_service: Option<Arc<dyn brenn_lib::pwa_push::PwaPushSender>>,
     /// MQTT service. `None` when no `[[mqtt_client]]` is configured.
     pub(super) mqtt_service: Option<Arc<brenn_lib::mqtt::MqttService>>,
     /// MQTT inbound event router (concrete type). `None` when MQTT is not
     /// configured. Held so a runtime `mqtt:` dynamic subscribe can add an
-    /// `IngressRoute` via `add_route` (design §2.3 step 6); the `Arc<dyn
-    /// MqttEventRouter>` clones the supervisors hold expose only `deliver_inbound`,
-    /// so the concrete handle must be threaded here to reach `add_route`.
+    /// `IngressRoute` via `add_route`; the `Arc<dyn MqttEventRouter>` clones
+    /// the supervisors hold expose only `deliver_inbound`, so the concrete
+    /// handle must be threaded here to reach `add_route`.
     pub(super) mqtt_event_router: Option<Arc<crate::mqtt_router::MqttEventRouterImpl>>,
     /// Automation engine. `None` when the automation subsystem is not configured
     /// (no messenger, or no apps with allowed_users).
@@ -478,6 +485,7 @@ impl ActiveBridge {
             server_shutting_down,
             repo_sync_sender,
             messenger,
+            bus_delivery: tokio::sync::Mutex::new(()),
             pwa_push_service,
             mqtt_service,
             mqtt_event_router,

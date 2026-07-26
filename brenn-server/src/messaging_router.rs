@@ -19,9 +19,7 @@ use crate::active_bridge::ActiveBridges;
 use crate::routes::surface::SubKey;
 use crate::routes::surface::registry::DurableDelivery;
 use crate::state::AppState;
-use crate::system_message::{
-    SystemMessageRender, render_event_drain, render_messages_received_single,
-};
+use crate::system_message::render_event_drain;
 
 /// Concrete `WakeRouter` impl. Closes over `ActiveBridges` + a clone of
 /// the `AppState` so it can call `spawn_eager_wake`.
@@ -191,8 +189,8 @@ impl WakeRouter for WakeRouterImpl {
         match self.delivery_route(key) {
             DeliveryRoute::ConversationBridge => {
                 let conversation_id = subscriber.as_conversation_id();
-                // Check for an active bridge first — render only when one exists.
-                // This keeps the markdown render (pulldown-cmark) out of
+                // Check for an active bridge first — read and render only when one
+                // exists. This keeps the markdown render (pulldown-cmark) out of
                 // the shared dispatch loop for sleeping targets, and confines any
                 // malformed-envelope panic to the per-bridge path rather than the
                 // loop that serves all conversations (correctness-2 / efficiency-1).
@@ -200,18 +198,12 @@ impl WakeRouter for WakeRouterImpl {
                     Some(b) => b,
                     None => return Ok(false),
                 };
-                // Render only after confirming a bridge is present.
-                let rendered = render_messages_received_single(envelope);
-                let render = SystemMessageRender {
-                    text: rendered.text,
-                    rendered_html: rendered.rendered_html,
-                    category: rendered.category,
-                    // Dual ToolUseSummary broadcast is drain-path only; the live
-                    // messaging path never emitted it (only `drain_pending_events`
-                    // does).
-                    messaging_card_html: None,
-                };
-                match bridge.send_system_message(render, None).await {
+                // A conversation is served from its position, not from the
+                // envelope this wake carried: delivering that one message alone
+                // would leave anything published while the bridge was busy behind
+                // a position that has moved past it. The wake says "there is
+                // something"; the position says what.
+                match crate::active_bridge::deliver_conversation_backlog(&bridge).await {
                     Ok(()) => Ok(true),
                     Err(e) => Err(e),
                 }
@@ -534,6 +526,47 @@ impl WakeRouter for WakeRouterImpl {
         }
     }
 
+    /// A conversation that already has a live bridge is served from its position
+    /// right here: it is awake, so the spawn-shaped wake would find its bridge
+    /// running and return without delivering anything, and the backlog would
+    /// wait for whatever the conversation did next. Every other binding's wake
+    /// is its delivery trigger, so the default is the whole answer for them.
+    ///
+    /// The delivery itself runs on its own task. The walk that calls this is
+    /// awaited by the dispatcher loop, and serving a live bridge renders markdown
+    /// and writes to a CC subprocess — inline, one stalled session would hold up
+    /// releases, deadline wakes, and every other channel's wakes behind it.
+    async fn wake_owed(&self, key: &SubscriberEntryKind, subscriber: &ParticipantId) {
+        let conversation_bridge = matches!(
+            self.bindings
+                .read()
+                .expect("bindings RwLock poisoned")
+                .get(key),
+            Some(DeliveryBinding::ConversationBridge)
+        );
+        if conversation_bridge
+            && let Some(bridge) = self
+                .active_bridges
+                .get(subscriber.as_conversation_id())
+                .await
+        {
+            let subscriber_key = subscriber.as_str().to_string();
+            drop(tokio::spawn(async move {
+                if let Err(e) = crate::active_bridge::deliver_conversation_backlog(&bridge).await {
+                    // The bridge was live and the send failed: the position did
+                    // not move, so the next walk finds the same backlog and
+                    // tries again.
+                    warn!(
+                        subscriber = %subscriber_key,
+                        "wake walk: delivery to a live bridge failed: {e}"
+                    );
+                }
+            }));
+            return;
+        }
+        self.spawn_eager_wake(key, subscriber);
+    }
+
     fn delivery_shape(&self, key: &SubscriberEntryKind) -> DeliveryShape {
         let map = self.bindings.read().expect("bindings RwLock poisoned");
         match map.get(key) {
@@ -659,94 +692,151 @@ mod tests {
         router.spawn_eager_wake(&conv_key(), &ParticipantId::for_conversation(42));
     }
 
-    /// `render_messages_received_single` must produce a render whose `text`
-    /// is byte-identical to `format_messaging_event_single` (singular
-    /// `[Brenn message]` heading + JSON-object body, NOT the batch shape).
-    /// This is the path-symmetry invariant: a future accidental switch to the
-    /// batch renderer would silently change CC-facing content.
-    #[test]
-    fn render_messages_received_single_produces_correct_card() {
-        use brenn_lib::messaging::{MessageEnvelope, Urgency};
-        use brenn_lib::ws_types::SystemMessageCategory;
-        use chrono::Utc;
-        use uuid::Uuid;
-
-        let env = MessageEnvelope {
-            message_id: Uuid::new_v4(),
-            source: "host".into(),
-            channel: "brenn:ch".into(),
-            sender: "alice".into(),
-            publish_ts: Utc::now(),
-            body: "hello world".into(),
-            reply_to: None,
-            delivery_deadline: None,
-            deliver_after: None,
-            urgency: Urgency::Normal,
-            envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
+    /// A live bridge whose conversation is owed one message on a channel its app
+    /// subscribes to — what both delivery entry points (the dispatcher's
+    /// `deliver` and the walk's `wake_owed`) are supposed to serve from.
+    ///
+    /// The bridge carries a recording CC session, so a send that reaches it
+    /// succeeds and the render lands on the broadcast channel.
+    async fn owed_conversation_bridge() -> (
+        ActiveBridges,
+        i64,
+        tokio::sync::broadcast::Receiver<brenn_lib::ws_types::WsServerMessage>,
+        tokio::sync::mpsc::Receiver<brenn_cc::session::OutgoingEnvelope>,
+    ) {
+        use brenn_lib::messaging::config::{Depth, NoiseLevel, ResolvedChannel, Sink};
+        use brenn_lib::messaging::db::{insert_message_with_pushes, upsert_channels, utc_to_ns};
+        use brenn_lib::messaging::query::NoopWakeRouter;
+        use brenn_lib::messaging::{
+            ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, Messenger,
+            SubscriberEntry, Urgency, WakeMin, canonical_address,
         };
 
-        let rendered = render_messages_received_single(&env);
+        let db = brenn_lib::db::init_db_memory();
+        let channel = ChannelEntry {
+            uuid: uuid::Uuid::new_v4(),
+            address: canonical_address("wake-walk-channel"),
+            description: None,
+            resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
+                push_depth: Depth::Unbounded,
+                retain_depth: Depth::Unbounded,
+                standing_retain_depth: Depth::Unbounded,
+                noise: NoiseLevel::Silent,
+                sink: Sink::Drop,
+                wake_min: WakeMin::Normal,
+            },
+            subscribers: vec![SubscriberEntry {
+                kind: conv_key(),
+                push_depth: Depth::Unbounded,
+                retain_depth: Depth::Unbounded,
+                noise: NoiseLevel::Silent,
+                wake_min: Some(WakeMin::Normal),
+            }],
+            transport_type: ChannelScheme::Brenn,
+            mount: None,
+        };
 
-        // text must be wrapped in <brenn-messages> with no preamble.
-        assert!(
-            rendered.text.starts_with("<brenn-messages>\n{"),
-            "expected <brenn-messages> + JSON-object, got: {}",
-            &rendered.text[..rendered.text.len().min(120)],
+        let (user_id, conversation_id) = {
+            let conn = db.lock().await;
+            let uid = brenn_lib::auth::user::create_user(&conn, "wake-user", "$argon2id$fake");
+            let cid = brenn_lib::conversation::create_conversation(&conn, uid, "test-app", false);
+            upsert_channels(&conn, std::slice::from_ref(&channel));
+            (uid, cid)
+        };
+
+        let mut app = crate::bootstrap::messaging::test_fixtures::minimal_app_config(
+            "test-app",
+            None,
+            vec![],
         );
-        assert!(rendered.text.ends_with("\n</brenn-messages>"));
-        // No preamble present.
-        assert!(!rendered.text.contains("[Brenn message]"));
-        // HTML wraps in the messages-received class.
-        assert!(
-            rendered
-                .rendered_html
-                .contains("brenn-system-messages-received"),
-            "rendered_html must carry brenn-system-messages-received class: {}",
-            rendered.rendered_html,
+        app.singleton = true;
+        app.allowed_users = vec!["wake-user".to_string()];
+        app.policy
+            .grants
+            .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+        app.policy
+            .acls
+            .brenn_subscribe
+            .push(brenn_lib::access::acl::ChannelMatcher::Prefix(String::new()));
+        let mut apps = indexmap::IndexMap::new();
+        apps.insert("test-app".to_string(), app);
+
+        let messenger = Messenger::new(
+            db.clone(),
+            Arc::new(MessagingDirectory::with_entries(vec![channel.clone()])),
+            Arc::from("test"),
+            Arc::new(apps),
+            Arc::new(NoopWakeRouter) as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            MessagingGlobalConfig::default(),
         );
-        // Category tag.
-        assert_eq!(rendered.category, SystemMessageCategory::MessagesReceived);
-        // messaging_card_html must be None for the live path — drain path only.
-        assert!(
-            rendered.messaging_card_html.is_none(),
-            "messaging_card_html must be None for the single-envelope renderer (live path only)",
+        // Boot's attach, then one message the conversation has not seen.
+        messenger.attach_conversation_subscribers().await;
+        {
+            let conn = db.lock().await;
+            insert_message_with_pushes(
+                &conn,
+                channel.uuid,
+                "test",
+                "someone",
+                "owed body",
+                Urgency::Normal,
+                ChannelScheme::Brenn,
+                None,
+                None,
+                None,
+                utc_to_ns(chrono::Utc::now()),
+                &[],
+            );
+        }
+
+        let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(64);
+        let bridge = crate::active_bridge::ActiveBridge::inject_for_test_with_messenger(
+            user_id,
+            conversation_id,
+            "test-app",
+            db,
+            broadcast_tx,
+            messenger,
         );
+        let cc_rx = bridge.install_recording_session_for_test().await;
+        let active_bridges = ActiveBridges::new();
+        active_bridges.insert(conversation_id, bridge).await;
+        (active_bridges, conversation_id, broadcast_rx, cc_rx)
     }
 
-    /// `WakeRouterImpl::deliver` with an active bridge in the registry returns
-    /// `Ok(true)`. This exercises the recovery-then-dispatch path
-    /// (`as_conversation_id` → `active_bridges.get` → `send_system_message`)
-    /// that the render-symmetry test above does not reach, and guards AC#1
-    /// (behavior-identical delivery) end-to-end through the adapter.
-    ///
-    /// The test bridge has no live CC session so `send_system_message` will fail
-    /// to send to CC — but persistence + broadcast succeed first, and the
-    /// function returns `Err(...)`. We therefore assert `Err` (not `Ok(true)`)
-    /// and that it reached the bridge-send path (not the no-bridge `Ok(false)` path).
+    /// Wait for the conversation's render to land on the broadcast channel.
+    async fn await_system_broadcast(
+        rx: &mut tokio::sync::broadcast::Receiver<brenn_lib::ws_types::WsServerMessage>,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(brenn_lib::ws_types::WsServerMessage::SystemMessageBroadcast { .. })) => {
+                    return true;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => return false,
+                Err(_) => continue,
+            }
+        }
+        false
+    }
+
+    /// `WakeRouterImpl::deliver` with an active bridge in the registry serves the
+    /// conversation from its position: the owed message is rendered and
+    /// broadcast, and the call reports delivered. A broken `as_conversation_id`
+    /// recovery would take the no-bridge arm and return `Ok(false)`; a delivery
+    /// that served nothing would still return `Ok(true)`, which is why the
+    /// broadcast is what this asserts on.
     #[tokio::test]
     async fn deliver_reaches_bridge_when_registered() {
         use brenn_lib::messaging::{MessageEnvelope, Urgency};
         use chrono::Utc;
         use uuid::Uuid;
 
-        let db = brenn_lib::db::init_db_memory();
-        let conversation_id = {
-            let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
-            brenn_lib::conversation::create_conversation(&conn, uid, "test-app", false)
-        };
-
-        let active_bridges = ActiveBridges::new();
-        let (broadcast_tx, _broadcast_rx) = tokio::sync::broadcast::channel(16);
-        let bridge = crate::active_bridge::ActiveBridge::inject_for_test(
-            1,
-            conversation_id,
-            "test-app",
-            db,
-            broadcast_tx,
-        );
-        active_bridges.insert(conversation_id, bridge).await;
-
+        let (active_bridges, conversation_id, mut broadcast_rx, _cc_rx) =
+            owed_conversation_bridge().await;
         let router = WakeRouterImpl::new(active_bridges);
         router.register_delivery_binding(conv_key(), DeliveryBinding::ConversationBridge);
         let env = MessageEnvelope {
@@ -763,11 +853,6 @@ mod tests {
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
         };
 
-        // The test bridge has no CC session so send_system_message returns Err
-        // after persisting. The Err proves the code reached the bridge-found branch
-        // rather than returning Ok(false) (no bridge). If deliver returned Ok(false),
-        // the bridge lookup failed — the ParticipantId → conversation_id recovery
-        // path is broken.
         let result = router
             .deliver(
                 &conv_key(),
@@ -779,10 +864,54 @@ mod tests {
             )
             .await;
         assert!(
-            result.is_err(),
-            "expected Err (bridge found but CC session absent), got Ok(false) \
-             which would indicate the bridge was not found: {result:?}"
+            matches!(result, Ok(true)),
+            "expected Ok(true) (bridge found); Ok(false) would mean the \
+             ParticipantId → conversation_id recovery failed: {result:?}"
         );
+        assert!(
+            await_system_broadcast(&mut broadcast_rx).await,
+            "the conversation's owed message was rendered into the live bridge"
+        );
+    }
+
+    /// The walk's override: a conversation whose bridge is already live is
+    /// served here and now. The spawn-shaped wake would find the bridge running
+    /// and deliver nothing, leaving the backlog until the conversation did
+    /// something else — so a regression that falls through to it is exactly what
+    /// this row catches. The delivery runs on its own task, so the assertion
+    /// waits for the render rather than for `wake_owed` to return.
+    #[tokio::test]
+    async fn wake_owed_serves_a_live_bridge_from_its_position() {
+        let (active_bridges, conversation_id, mut broadcast_rx, _cc_rx) =
+            owed_conversation_bridge().await;
+        let router = WakeRouterImpl::new(active_bridges);
+        router.register_delivery_binding(conv_key(), DeliveryBinding::ConversationBridge);
+
+        router
+            .wake_owed(
+                &conv_key(),
+                &ParticipantId::for_conversation(conversation_id),
+            )
+            .await;
+
+        assert!(
+            await_system_broadcast(&mut broadcast_rx).await,
+            "the live bridge was served its backlog by the walk itself"
+        );
+    }
+
+    /// With no live bridge there is nothing to serve, so the walk falls through
+    /// to the ordinary eager wake. Test builds make the spawn a no-op, so the
+    /// observable proof that the fall-through happened is that it demands the
+    /// `AppState` every eager wake needs — the delivery arm never touches it.
+    #[tokio::test]
+    #[should_panic(expected = "WakeRouter state must be set")]
+    async fn wake_owed_without_a_bridge_falls_through_to_the_eager_wake() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        router.register_delivery_binding(conv_key(), DeliveryBinding::ConversationBridge);
+        router
+            .wake_owed(&conv_key(), &ParticipantId::for_conversation(42))
+            .await;
     }
 
     /// `deliver` for a parked (`wasm:`) subscriber panics — reaching it is a

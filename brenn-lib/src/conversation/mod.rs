@@ -591,7 +591,6 @@ pub fn get_or_create_singleton_conversation(
 ///
 /// For event sources (cron, Discord) that know the user but not the conversation.
 /// Returns `None` if no conversation exists for this user/app.
-#[allow(dead_code)] // Called by future event sources.
 pub fn get_singleton_conversation_id(
     conn: &Connection,
     user_id: i64,

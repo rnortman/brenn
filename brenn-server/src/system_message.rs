@@ -49,47 +49,6 @@ pub struct SystemMessageRender {
 
 // ── Category 1: received intra-Brenn messages ────────────────────────────────
 
-/// Render a **single** envelope as an immediate-delivery system card.
-///
-/// Used by `WakeRouterImpl::render_immediate_message` (the live messaging
-/// path). Produces `<brenn-messages>\n{json}\n</brenn-messages>` (no
-/// `[Brenn message]` preamble — the tag provides framing). The batch renderer
-/// (`render_messages_received`) produces a JSON array body instead of a
-/// JSON object — a structural difference that makes the renderers non-
-/// interchangeable.
-///
-/// The `rendered_html` wraps the single-message card in the same
-/// `<details class="brenn-system brenn-system-messages-received">` shell
-/// that the drain path produces, giving live delivery and drain delivery
-/// identical wire shapes.
-pub fn render_messages_received_single(envelope: &MessageEnvelope) -> SystemMessageRender {
-    use brenn_lib::messaging::format::{format_messaging_event_single, single_heading};
-    let raw = format_messaging_event_single(envelope);
-    // Drop the transport-appropriate heading preamble — the `<brenn-messages>` tag provides
-    // framing. Use the same heading the formatter selected (may be `[Brenn message]` or
-    // `[Webhook message]` depending on envelope transport).
-    let body = strip_messaging_preamble(&raw, single_heading(envelope));
-    let text = wrap_cc_text("brenn-messages", body);
-    let messaging_card_html = render_messaging_card_html(std::slice::from_ref(envelope));
-    let rendered_html = wrap_system_details(
-        "brenn-system-messages-received",
-        "Brenn message received",
-        &messaging_card_html,
-        false,
-    );
-    // `messaging_card_html` is the dual-ToolUseSummary payload consumed by
-    // `drain_pending_events`. The live messaging path (this function's only
-    // caller) never emits a ToolUseSummary, so there is no consumer for
-    // that field here — setting it to None avoids the wasted allocation.
-    // The rendered card HTML is already embedded in `rendered_html` above.
-    SystemMessageRender {
-        text,
-        rendered_html,
-        category: SystemMessageCategory::MessagesReceived,
-        messaging_card_html: None,
-    }
-}
-
 /// Render a batch of received intra-Brenn messages.
 /// Returns `None` when `envelopes` is empty (so callers can skip the send).
 /// Called by `render_combined_drain` on the messages-only branch and by
@@ -1001,37 +960,6 @@ mod tests {
 
     // ── Category 1 ───────────────────────────────────────────────────────────
 
-    /// `render_messages_received_single` wraps the JSON-object body in a
-    /// `<brenn-messages>` tag (no `[Brenn message]` preamble — the tag provides
-    /// framing). This is the critical invariant of the live-delivery path.
-    #[test]
-    fn render_messages_received_single_uses_singular_heading() {
-        let env = fake_envelope("**hello**", "brenn:ch", "alice");
-        let r = super::render_messages_received_single(&env);
-        // Category must be MessagesReceived.
-        assert_eq!(
-            r.category,
-            brenn_lib::ws_types::SystemMessageCategory::MessagesReceived
-        );
-        // HTML wraps in the expected class.
-        assert!(
-            r.rendered_html.contains("brenn-system-messages-received"),
-            "HTML must carry brenn-system-messages-received class: {}",
-            r.rendered_html,
-        );
-        // LLM text is wrapped in <brenn-messages> with no [Brenn message] preamble.
-        assert!(
-            r.text.starts_with("<brenn-messages>\n{"),
-            "expected <brenn-messages> + JSON-object, got: {}",
-            &r.text[..r.text.len().min(120)],
-        );
-        assert!(r.text.ends_with("\n</brenn-messages>"));
-        assert!(r.text.contains("\"body\":\"**hello**\""));
-        assert!(r.text.contains("\"sender\":\"alice\""));
-        // No preamble present.
-        assert!(!r.text.contains("[Brenn message]"));
-    }
-
     /// `render_messages_received` with a single-element slice uses a JSON-array
     /// body inside `<brenn-messages>` — even for one message. No `[Brenn messages]`
     /// preamble; the tag provides framing. Keeps the drain path structurally uniform.
@@ -1523,10 +1451,6 @@ mod tests {
             .unwrap();
 
         let cases: &[(&str, &str)] = &[
-            (
-                "brenn-messages",
-                &render_messages_received_single(&env).text,
-            ),
             (
                 "brenn-messages",
                 &render_messages_received(std::slice::from_ref(&env))

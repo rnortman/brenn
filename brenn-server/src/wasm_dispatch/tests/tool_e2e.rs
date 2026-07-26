@@ -145,6 +145,7 @@ async fn tool_harness(
         &[(&trigger, Depth::Unbounded), (&inbox_ch, Depth::Unbounded)],
     )
     .await;
+    super::attach_tool_executor(&messenger).await;
 
     // A detached noop alert task; dropping its JoinHandle leaves the task running.
     let (alert_dispatcher, _alert_handle) = noop_alert_dispatcher();

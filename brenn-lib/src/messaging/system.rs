@@ -18,7 +18,7 @@ use crate::access::acl::ChannelMatcher;
 use crate::access::{AppCapability, AppPolicy};
 
 use super::config::{Depth, NoiseLevel};
-use super::ingress::IngressOrBus;
+use super::store::MessageSeq;
 use super::{
     ChannelEntry, MessageEnvelope, Messenger, ParticipantId, SubscriberEntry, SubscriberEntryKind,
     SubscriberRegistration, WakeEconomics,
@@ -151,11 +151,11 @@ pub fn fold_spec_subscriptions(entries: &mut [ChannelEntry], specs: &[SystemPart
     }
 }
 
-/// The shared drain loop for a subscribing system participant: a startup
-/// sweep, then `Notify`-driven passes. Each pass dequeues the participant's
-/// pending pushes with **ack-at-dequeue** (every loaded row is marked
-/// delivered before the handler runs — at-most-once; the handler must
-/// tolerate loss on crash) and hands the batch to the handler.
+/// The shared drain loop for a subscribing system participant: an attach, a
+/// startup sweep, then `Notify`-driven passes. Each pass reads the
+/// participant's window on every channel it subscribes to and advances its
+/// position **before** the handler runs — at-most-once; the handler must
+/// tolerate loss on crash.
 pub struct SystemInbox {
     component: &'static str,
     messenger: Arc<Messenger>,
@@ -174,48 +174,100 @@ impl SystemInbox {
         }
     }
 
-    /// Load the participant's pending pushes and ack the whole batch before
-    /// returning it (ack-at-dequeue, at-most-once). Empty when nothing is
-    /// pending.
-    ///
-    /// # Panics
-    ///
-    /// Panics on an ingress row: ingress rows are conversation-targeted, so
-    /// one on a system subscriber is a host-wiring invariant violation.
-    pub async fn dequeue_batch(&self) -> Vec<(i64, MessageEnvelope)> {
-        let subscriber = ParticipantId::for_system(self.component);
-        let rows = self.messenger.load_pending_pushes(&subscriber).await;
-        if rows.is_empty() {
-            return Vec::new();
-        }
-        let push_ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
-        self.messenger.mark_pushes_delivered(&push_ids).await;
-        rows.into_iter()
-            .map(|(push_id, iob)| match iob {
-                IngressOrBus::Bus(env) => (push_id, env),
-                IngressOrBus::Ingress(ev) => panic!(
-                    "system inbox {:?}: ingress row on a system subscriber — host-wiring \
-                     invariant violated; push_id={push_id} source={:?}",
-                    self.component, ev.source,
-                ),
-            })
-            .collect()
+    /// The participant's own identity on the bus.
+    fn subscriber(&self) -> ParticipantId {
+        ParticipantId::for_system(self.component)
     }
 
-    /// Park/wake drain loop: a startup sweep (rows a prior crash left
-    /// pending are picked up before the first wake), then `Notify`-driven
-    /// passes. Each non-empty batch is handed to `handler` and awaited
-    /// before the next pass, so a batch is fully processed before the loop
-    /// advances. Never returns.
+    /// Every channel carrying this participant's directory subscriber entry,
+    /// paired with that entry. The directory is the authority on what the
+    /// participant subscribes to.
+    fn subscriptions(&self) -> Vec<(Arc<ChannelEntry>, SubscriberEntry)> {
+        let kind = SubscriberEntryKind::System(self.component.to_string());
+        let mut found = Vec::new();
+        for entry in self.messenger.directory().list() {
+            if let Some(sub) = entry.subscribers.iter().find(|s| s.kind == kind) {
+                found.push((Arc::clone(&entry), sub.clone()));
+            }
+        }
+        found
+    }
+
+    /// Create the participant's position on every channel it subscribes to.
+    ///
+    /// `Head` priming (`priming_for_kind`): a system participant is not woken
+    /// with messages published before it existed. A position already there —
+    /// seeded by the migration or left by a previous boot — keeps its place, so
+    /// a restart resumes rather than skips.
+    ///
+    /// Runs before the first window read; a push-enabled window read without a
+    /// position panics.
+    pub async fn attach(&self) {
+        let subscriber = self.subscriber();
+        for (entry, sub) in self.subscriptions() {
+            self.messenger
+                .attach_subscriber(
+                    &entry.address,
+                    self.component,
+                    &subscriber,
+                    sub.push_depth,
+                    super::store::priming_for_kind(&sub.kind),
+                )
+                .await;
+        }
+    }
+
+    /// Read the participant's window on every subscribed channel and advance
+    /// its position past what the window served, before returning the batch —
+    /// ack-at-dequeue, at-most-once. Empty when every channel is caught up.
+    ///
+    /// The batch is ordered by publish time across channels, so a handler that
+    /// groups by channel sees each channel's messages in publish order.
+    pub async fn dequeue_batch(&self) -> Vec<(MessageSeq, MessageEnvelope)> {
+        let subscriber = self.subscriber();
+        let mut batch: Vec<(MessageSeq, MessageEnvelope)> = Vec::new();
+        for (entry, sub) in self.subscriptions() {
+            let window = self
+                .messenger
+                .store_for(&entry)
+                .window(&subscriber, sub.push_depth, sub.retain_depth)
+                .await;
+            if window.new_entries().is_empty() {
+                continue;
+            }
+            let new: Vec<(MessageSeq, MessageEnvelope)> = window
+                .new_entries()
+                .iter()
+                .map(|(seq, env)| (*seq, MessageEnvelope::clone(env)))
+                .collect();
+            // Advance first: the handler runs against a position already past
+            // the batch, so a crash mid-handler loses it rather than repeating it.
+            if let Some((through, seen_floor)) = window.advance_span() {
+                self.messenger
+                    .advance_subscriber(&entry.address, &subscriber, through, seen_floor, sub.noise)
+                    .await;
+            }
+            batch.extend(new);
+        }
+        batch.sort_by_key(|(_, env)| env.publish_ts);
+        batch
+    }
+
+    /// Park/wake drain loop: an attach, a startup sweep (whatever a prior
+    /// crash left unseen is picked up before the first wake), then
+    /// `Notify`-driven passes. Each non-empty batch is handed to `handler` and
+    /// awaited before the next pass, so a batch is fully processed before the
+    /// loop advances. Never returns.
     ///
     /// The handler is a plain `FnMut -> Future` (not `AsyncFnMut`) so callers
     /// can spawn the loop: an `AsyncFnMut`'s lending future cannot carry the
     /// `Send` bound `tokio::spawn` needs.
     pub async fn run<F, Fut>(self, mut handler: F)
     where
-        F: FnMut(Vec<(i64, MessageEnvelope)>) -> Fut,
+        F: FnMut(Vec<(MessageSeq, MessageEnvelope)>) -> Fut,
         Fut: Future<Output = ()>,
     {
+        self.attach().await;
         loop {
             let batch = self.dequeue_batch().await;
             if !batch.is_empty() {
@@ -283,18 +335,31 @@ mod tests {
 
     struct Harness {
         messenger: Arc<Messenger>,
-        channel_uuid: uuid::Uuid,
+        reqs_uuid: uuid::Uuid,
+        alt_uuid: uuid::Uuid,
     }
 
+    /// Two channels, both carrying the participant's subscriber entry, so the
+    /// per-channel window walk and the cross-channel batch order are both
+    /// exercisable.
     async fn harness() -> Harness {
+        harness_with(inbox_sub()).await
+    }
+
+    /// [`harness`] with the participant's subscription spelled out, for the
+    /// cases that turn the depth or the noise rung away from the defaults every
+    /// production system subscription uses.
+    async fn harness_with(sub: SubscriberEntry) -> Harness {
         let db = init_db_memory();
-        let channel = test_channel_entry("inbox/reqs", vec![inbox_sub()]);
-        let channel_uuid = channel.uuid;
+        let reqs = test_channel_entry("inbox/reqs", vec![sub.clone()]);
+        let alt = test_channel_entry("inbox/alt", vec![sub]);
+        let reqs_uuid = reqs.uuid;
+        let alt_uuid = alt.uuid;
         {
             let conn = db.lock().await;
-            upsert_channels(&conn, std::slice::from_ref(&channel));
+            upsert_channels(&conn, &[reqs.clone(), alt.clone()]);
         }
-        let directory = Arc::new(MessagingDirectory::with_entries(vec![channel]));
+        let directory = Arc::new(MessagingDirectory::with_entries(vec![reqs, alt]));
         let messenger = Messenger::new(
             db,
             directory,
@@ -306,11 +371,16 @@ mod tests {
         .with_subscriber_registrations(registrations_from_specs(&[spec(COMPONENT, vec![])]));
         Harness {
             messenger,
-            channel_uuid,
+            reqs_uuid,
+            alt_uuid,
         }
     }
 
-    async fn insert_row(h: &Harness, body: &str) -> i64 {
+    fn inbox(h: &Harness) -> SystemInbox {
+        SystemInbox::new(COMPONENT, h.messenger.clone(), Arc::new(Notify::new()))
+    }
+
+    async fn insert_on(h: &Harness, channel_uuid: uuid::Uuid, body: &str) -> i64 {
         let conn = h.messenger.db().lock().await;
         let push = PendingPushInsert {
             target_subscriber: ParticipantId::for_system(COMPONENT),
@@ -321,7 +391,7 @@ mod tests {
         };
         let msg = insert_message_with_pushes(
             &conn,
-            h.channel_uuid,
+            channel_uuid,
             "test",
             "wasm:someone",
             body,
@@ -336,25 +406,157 @@ mod tests {
         msg.push_ids[0]
     }
 
+    async fn insert_row(h: &Harness, body: &str) -> i64 {
+        insert_on(h, h.reqs_uuid, body).await
+    }
+
+    fn bodies(batch: &[(MessageSeq, MessageEnvelope)]) -> Vec<String> {
+        batch.iter().map(|(_, env)| env.body.clone()).collect()
+    }
+
     #[tokio::test]
     async fn dequeue_batch_returns_rows_and_acks_at_dequeue() {
         let h = harness().await;
+        let inbox = inbox(&h);
+        inbox.attach().await;
         insert_row(&h, &json!({ "n": 1 }).to_string()).await;
         insert_row(&h, &json!({ "n": 2 }).to_string()).await;
-        let inbox = SystemInbox::new(COMPONENT, h.messenger.clone(), Arc::new(Notify::new()));
 
         let batch = inbox.dequeue_batch().await;
-        assert_eq!(batch.len(), 2, "both pending rows dequeued");
+        assert_eq!(batch.len(), 2, "both unseen messages dequeued");
 
-        // Ack-at-dequeue: a second pass sees nothing, even though no handler ran.
+        // Ack-at-dequeue: the position moved past the batch before it was
+        // returned, so a second pass sees nothing even though no handler ran.
         let again = inbox.dequeue_batch().await;
-        assert!(again.is_empty(), "rows are acked at dequeue: {again:?}");
+        assert!(
+            again.is_empty(),
+            "the batch was advanced past at dequeue: {again:?}"
+        );
+    }
+
+    /// Production system subscriptions are unbounded for a reason, but the
+    /// substrate rule still holds under a bounded one: the window serves the
+    /// newest `push_depth`, and the seqs it skipped are charged at the
+    /// subscription's own rung — not the channel's, and not lost.
+    #[tokio::test]
+    async fn a_bounded_inbox_takes_the_newest_and_charges_what_it_skipped() {
+        let h = harness_with(SubscriberEntry {
+            push_depth: Depth::Bounded(1),
+            retain_depth: Depth::Bounded(0),
+            noise: NoiseLevel::Metered,
+            ..inbox_sub()
+        })
+        .await;
+        let inbox = inbox(&h);
+        inbox.attach().await;
+        for n in 1..=3 {
+            insert_row(&h, &json!({ "n": n }).to_string()).await;
+        }
+
+        assert_eq!(
+            bodies(&inbox.dequeue_batch().await),
+            vec![json!({ "n": 3 }).to_string()],
+            "the clamp serves the newest, not the oldest",
+        );
+        let address = h
+            .messenger
+            .directory()
+            .by_uuid(&h.reqs_uuid)
+            .expect("channel in directory")
+            .address
+            .clone();
+        assert_eq!(
+            h.messenger
+                .drop_counter(&address, &ParticipantId::for_system(COMPONENT)),
+            2,
+            "the two the clamp skipped are metered against this participant",
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_primes_at_head_so_earlier_messages_are_not_served() {
+        let h = harness().await;
+        insert_row(&h, &json!({ "phase": "before-attach" }).to_string()).await;
+        let inbox = inbox(&h);
+        inbox.attach().await;
+        insert_row(&h, &json!({ "phase": "after-attach" }).to_string()).await;
+
+        assert_eq!(
+            bodies(&inbox.dequeue_batch().await),
+            vec![json!({ "phase": "after-attach" }).to_string()],
+            "a system participant is not woken with messages published before it attached",
+        );
+    }
+
+    #[tokio::test]
+    async fn re_attach_keeps_the_position_a_previous_boot_left() {
+        let h = harness().await;
+        let inbox = inbox(&h);
+        inbox.attach().await;
+        insert_row(&h, &json!({ "n": 1 }).to_string()).await;
+        assert_eq!(inbox.dequeue_batch().await.len(), 1);
+        insert_row(&h, &json!({ "n": 2 }).to_string()).await;
+
+        // A restart re-attaches; the position it finds is the one the previous
+        // boot left, so the unseen message is served and the seen one is not.
+        inbox.attach().await;
+        assert_eq!(
+            bodies(&inbox.dequeue_batch().await),
+            vec![json!({ "n": 2 }).to_string()],
+            "re-attach resumes rather than re-priming at head",
+        );
+    }
+
+    #[tokio::test]
+    async fn dequeue_batch_spans_every_subscribed_channel_in_publish_order() {
+        let h = harness().await;
+        let inbox = inbox(&h);
+        inbox.attach().await;
+        insert_on(&h, h.alt_uuid, "alt-first").await;
+        insert_on(&h, h.reqs_uuid, "reqs-second").await;
+        insert_on(&h, h.alt_uuid, "alt-third").await;
+
+        assert_eq!(
+            bodies(&inbox.dequeue_batch().await),
+            vec!["alt-first", "reqs-second", "alt-third"],
+            "one batch over both channels, ordered by publish time",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drained_inbox_stops_being_deliverable() {
+        let h = harness().await;
+        let inbox = inbox(&h);
+        inbox.attach().await;
+        insert_row(&h, &json!({ "n": 1 }).to_string()).await;
+
+        let entry = h
+            .messenger
+            .directory()
+            .by_uuid(&h.reqs_uuid)
+            .expect("channel in directory");
+        let store = h.messenger.store_for(&entry);
+        let subscriber = ParticipantId::for_system(COMPONENT);
+        let owed = store.deliverable_subscribers().await;
+        assert_eq!(
+            owed.iter().map(|o| &o.subscriber).collect::<Vec<_>>(),
+            vec![&subscriber],
+            "an unseen message makes the participant deliverable — the wake walk's read",
+        );
+
+        assert_eq!(inbox.dequeue_batch().await.len(), 1);
+        assert!(
+            store.deliverable_subscribers().await.is_empty(),
+            "a drained inbox is caught up, so the wake walk has nothing to wake",
+        );
     }
 
     #[tokio::test]
     async fn run_sweeps_at_startup_then_drains_on_notify() {
         let h = harness().await;
-        // A row pending before the loop starts: the startup sweep must pick it up.
+        // Attach before the row lands so the startup sweep has something unseen
+        // to pick up (the loop's own attach primes at head).
+        inbox(&h).attach().await;
         insert_row(&h, &json!({ "phase": "sweep" }).to_string()).await;
 
         let notify = Arc::new(Notify::new());

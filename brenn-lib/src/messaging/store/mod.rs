@@ -42,53 +42,6 @@ pub use registry::RingStores;
 pub use ring::RingStore;
 pub use targets::{PushTarget, TargetResolver, eager_wake_for};
 
-/// A per-subscriber drop tally a store keeps in memory, keyed by subscriber id.
-///
-/// Both stores hold one for the drops the noise ladder metered, and the durable
-/// store holds a second for its raw push-overflow accounting. In memory only:
-/// a restart forgets the counts, which is why the guest-facing gap signal is
-/// documented as within-lifetime.
-#[derive(Default)]
-pub(crate) struct DropTally(std::sync::Mutex<std::collections::HashMap<String, u64>>);
-
-impl DropTally {
-    /// Add `count` drops to `subscriber`'s tally. Zero is a no-op and creates
-    /// no entry.
-    pub(crate) fn add(&self, subscriber: &ParticipantId, count: u64) {
-        if count == 0 {
-            return;
-        }
-        let mut tally = self.0.lock().expect("drop tally poisoned");
-        *tally.entry(subscriber.as_str().to_string()).or_insert(0) += count;
-    }
-
-    /// `subscriber`'s tally, `0` for a subscriber that never appeared in it.
-    pub(crate) fn get(&self, subscriber: &ParticipantId) -> u64 {
-        self.0
-            .lock()
-            .expect("drop tally poisoned")
-            .get(subscriber.as_str())
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Drop `subscriber`'s tally — used when its delivery state is torn down.
-    pub(crate) fn forget(&self, subscriber: &ParticipantId) {
-        self.0
-            .lock()
-            .expect("drop tally poisoned")
-            .remove(subscriber.as_str());
-    }
-}
-
-impl std::fmt::Debug for DropTally {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("DropTally")
-            .field(&self.0.lock().expect("drop tally poisoned").len())
-            .finish()
-    }
-}
-
 /// A message on its way into a channel, before the store has given it an
 /// identity or a position.
 #[derive(Debug, Clone)]
@@ -292,6 +245,27 @@ pub struct AdvanceOutcome {
     pub noise_charge: u64,
 }
 
+/// One subscriber a store currently owes work, with what the wake decision
+/// needs to be made about it.
+///
+/// The wake pass reads this and nothing else: who is behind, under what
+/// application, and how loud the loudest thing they have not seen is. Nothing
+/// here is stored per message — a store answers it from the position and its
+/// own retention at the moment it is asked, which is why a registration change
+/// takes effect at the next pass rather than at the next publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliverableSubscriber {
+    pub subscriber: ParticipantId,
+    /// The application this subscriber holds its position under — a
+    /// conversation's registration is keyed by app. `None` only where the
+    /// reporter never held one.
+    pub app_slug: Option<String>,
+    /// The loudest urgency among the messages this subscriber has not seen and
+    /// retention still holds. Never `None` — a subscriber with nothing unseen is
+    /// not deliverable and does not appear here at all.
+    pub max_unseen_urgency: Urgency,
+}
+
 /// The bound `limit` places on a window read, with `Unbounded` spelled as the
 /// largest count a store can hold.
 pub(crate) fn depth_bound(limit: Depth) -> u64 {
@@ -327,20 +301,22 @@ pub(crate) fn compose_window(
 /// One subscriber's overflow, as the store that dropped the messages reports
 /// it.
 ///
-/// Stores count overflow; the substrate enacts the noise ladder over it. An
+/// Stores report overflow; the substrate enacts the noise ladder over it. An
 /// event names the party that fell behind and how many of its owed messages
 /// went undelivered, and carries no policy: what the count is worth is the
-/// caller's decision, made from the subscription's resolved noise level.
+/// caller's decision, made from the subscription's resolved noise level. The
+/// figure is computed where the loss happened, never accumulated — no store
+/// holds a drop counter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverflowEvent {
     pub subscriber: ParticipantId,
     pub dropped: u64,
-    /// The application the retired delivery record was written under, for a
-    /// store that writes one. This is identity, not policy: an app's delivery
+    /// The application the losing subscriber holds its state under, where the
+    /// reporter knows it — from the retired delivery record, or from the
+    /// cursor's cached slug. This is identity, not policy: an app's delivery
     /// participant is a conversation, while the registration carrying its noise
     /// rung is keyed by app, so naming the app is the only route from the event
-    /// back to the registration. `None` from a cursor-tracked store, which
-    /// records nothing per subscriber and whose subscribers are named by kind.
+    /// back to the registration. `None` only where the reporter never held one.
     pub app_slug: Option<String>,
 }
 
@@ -502,12 +478,16 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     /// dispatcher's class-blind "where is there work" question. Empty when no
     /// subscriber is owed anything.
     ///
-    /// "Owed, deliverable" means a retained message the subscriber has not yet
-    /// taken and that has not been dropped from under it: a ring subscriber
-    /// whose cursor trails the ring head, a durable subscriber with an
-    /// undelivered, unparked push row. Parked (not-yet-released) messages are
-    /// owed to nobody until they release.
-    async fn deliverable_subscribers(&self) -> Vec<ParticipantId>;
+    /// "Owed, deliverable" means a retained message the subscriber's position
+    /// trails and that retention still holds. Parked (not-yet-released)
+    /// messages are owed to nobody until they release, and a sampled subscriber
+    /// holds no position and is owed nothing.
+    ///
+    /// Each entry carries the loudest urgency in that subscriber's unseen
+    /// suffix, because the wake decision is made here rather than stored per
+    /// message: an urgency-gated subscriber wakes only when something it is owed
+    /// clears its threshold, and the loudest unseen message is what decides it.
+    async fn deliverable_subscribers(&self) -> Vec<DeliverableSubscriber>;
 
     /// Whether `subscriber` is owed deliverable work on this channel: anything
     /// unseen that retention still holds.
@@ -572,34 +552,6 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
         through: MessageSeq,
         seen_floor: MessageSeq,
     ) -> AdvanceOutcome;
-
-    /// Lifetime count of messages this store dropped out from under
-    /// `subscriber` before any window served them — the within-lifetime gap
-    /// signal a consumer reads to know its stream is incomplete.
-    ///
-    /// This is accounting, not policy: the count rises on every drop whatever
-    /// the subscription's noise level, which decides only how loudly the
-    /// substrate reacts to one. Both stores hold it in memory only, so it starts
-    /// at zero after a restart and a gap that predates the restart is not
-    /// reflected in it.
-    ///
-    /// A subscriber this store has never seen has had nothing dropped: `0`, not
-    /// an error.
-    fn dropped_total(&self, subscriber: &ParticipantId) -> u64;
-
-    /// Add `count` to `subscriber`'s metered drop tally.
-    ///
-    /// The noise ladder's counting rung, written only by the substrate's single
-    /// enactment point. The store keeps the number next to the subscriber's
-    /// other delivery state; deciding whether a drop is worth counting is the
-    /// substrate's call, never the store's.
-    fn record_metered_drops(&self, subscriber: &ParticipantId, count: u64);
-
-    /// `subscriber`'s metered drop tally: the drops the noise ladder counted —
-    /// all of them on a `metered` or `alarm` subscription, none on a `silent`
-    /// one. Distinct from [`RetentionStore::dropped_total`], which counts every
-    /// drop whatever the noise level.
-    fn metered_drops(&self, subscriber: &ParticipantId) -> u64;
 
     /// Register `subscriber`'s delivery state on this channel, or retune an
     /// existing one's push depth. Priming positions the queue only when it comes

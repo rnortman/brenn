@@ -374,7 +374,7 @@ in `wasm_guest_component_rule`). `TODO(xtask-wasi-macro-cleanup)`.
 
 ## `drop-counters-export`
 
-`Messenger::drop_counters` (push-window overflow drops, metered/alarm noise
+`Messenger::metered_drops` (the drops the noise ladder counted at metered/alarm
 levels) is an in-memory map with no production reader — only tests query it.
 The surface's loudness ladder does not discharge this: the kernel keeps its own
 per-binding metered drop counters, and those are kernel-internal too (test- and
@@ -393,7 +393,7 @@ with retained channels.
 See docs/adr/2026/07/12-surface-ui-round2/retro-fixes.md for discussion.
 
 Code site: `brenn-lib/src/messaging/mod.rs`
-(`record_push_and_check_overflow`), `TODO(drop-counters-export)`.
+(`enact_overflow_noise`), `TODO(drop-counters-export)`.
 
 ---
 
@@ -782,20 +782,6 @@ Code site (`TODO(substrate-deferred-view-count-shortcut)`):
 `brenn-server/src/wasm_dispatch/mod.rs` (the `for out in &cfg.outputs`
 deferred-view loop in `drain_step`).
 
-## `substrate-ring-drop-total`
-
-`RingStore` keeps an in-memory per-subscriber tally of the drops reported against
-it — eviction reports at append, advance charges at read — solely to answer
-`RetentionStore::dropped_total`. The cursor itself stores no counters: every drop
-figure it produces is a subtraction between two sequence numbers, which cannot
-drift and needs no memory. The tally exists only because the trait still exposes a
-lifetime total, and the store's window/advance conversion is what removes that
-method: the guest-visible `dropped` becomes the figure the advance itself computed.
-Done when `dropped_total` is off the trait and the tally is deleted.
-
-Code site (`TODO(substrate-ring-drop-total)`):
-`brenn-lib/src/messaging/store/ring.rs` (the `dropped` field on `RingStore`).
-
 ## `substrate-wake-relocation`
 
 `DbStore` delivery state is the cursor row, but the dispatcher still decides who
@@ -815,41 +801,3 @@ a bus-channel claim.
 Code sites (`TODO(substrate-wake-relocation)`):
 `brenn-lib/src/messaging/store/db.rs` (the claim retirement in `advance` and the
 retained-tail seed in `attach`).
-
-## `substrate-cursor-registration-seed`
-
-The one-shot cursor seed in `seed_subscriber_cursors` carries a subscriber's
-delivery claims over onto a position, which covers every subscriber holding a
-claim — owed or delivered — at the moment the cursor table appeared. A
-push-enabled subscriber holding no claim at all gets no row, because the seed
-runs on a bare connection and cannot tell a conversation from a WASM component
-(system components hold no `messaging_subscriptions` row at all, and a
-conversation's identity resolves through its app's allowed user). Until the boot
-path seeds those at head, a message published between the migration and such a
-subscriber's first attach is skipped rather than delivered: head priming
-positions the cursor at head *at attach time*, so the message is neither served
-nor reported as a drop. Done when the boot path, which holds the resolved
-registration set, seeds a head cursor for every push-enabled attach-managed
-registration that has none.
-
-Code site (`TODO(substrate-cursor-registration-seed)`):
-`brenn-lib/src/messaging/db/schema.rs` (`seed_subscriber_cursors`).
-
-## `substrate-family-cursor-subscribers`
-
-Conversations and the system inbox hold cursor rows — the migration seeds them
-from their delivery claims — but neither family reads or advances one yet: both
-still consume through `messaging_pending_pushes`. Their positions therefore never
-move. A conversation's frozen row is inert (the recurring wake walk passes over
-inline-shaped subscribers), but a `system:` row is ParkedWake-shaped, so from the
-first message published after the migration it is permanently listed as
-deliverable and the walk re-wakes an inbox that is in fact caught up, on every
-dispatcher kick and tick. Churn, not loss — the inbox dequeues nothing and
-returns — and it ends the moment the families read positions instead of rows.
-Not worked around at the wake walk: a kind filter there would go silently wrong
-the other way (a real system backlog never woken) the day the families do attach.
-Done when conversations and the system inbox attach, window, and advance like
-every other cursor subscriber, and their claim paths are gone.
-
-Code site (`TODO(substrate-family-cursor-subscribers)`):
-`brenn-lib/src/messaging/mod.rs` (`wake_owed_subscribers`).

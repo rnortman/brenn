@@ -25,7 +25,7 @@ use crate::messaging::db::{self, PendingPushInsert};
 
 use super::{
     AdvanceOutcome, AppendOutcome, Attached, Committed, DeferralOutcome, DeferredMessage,
-    DeliveryTarget, DropTally, MessageSeq, NewMessage, OverflowEvent, Parked, Priming,
+    DeliverableSubscriber, DeliveryTarget, MessageSeq, NewMessage, OverflowEvent, Parked, Priming,
     ReleaseOutcome, Released, ResumeCursor, RetentionStore, StoreReplay, StoreRetained,
     SubscriberWindow, TargetRecord, TargetResolver, compose_window, depth_bound,
 };
@@ -95,14 +95,6 @@ pub struct DbStore {
     /// the caller holds the SQLite connection (the overflow methods take it), so
     /// the deque update is a brief in-memory operation under a sync mutex.
     push_windows: Mutex<HashMap<String, PushWindow>>,
-    /// Lifetime push-overflow drop count per subscriber on this channel — the
-    /// durable half of [`RetentionStore::dropped_total`]. Charged where the drop
-    /// happens, in the retirement methods below, whatever the subscription's
-    /// noise level. In memory only, like the window it accounts for.
-    dropped: DropTally,
-    /// The subset of those drops the noise ladder counted, written by the
-    /// substrate's enactment point ([`RetentionStore::record_metered_drops`]).
-    metered: DropTally,
     /// The channel's resume epoch, read from its row on first use. Immutable for
     /// the row's lifetime — it is minted with the row and dies with it, and no
     /// runtime path deletes a channel row — so one read serves every resume.
@@ -138,8 +130,6 @@ impl DbStore {
             address: address.into(),
             deferred_cap: retain_depth,
             push_windows: Mutex::new(HashMap::new()),
-            dropped: DropTally::default(),
-            metered: DropTally::default(),
             resume_epoch: OnceLock::new(),
             targets,
         }
@@ -208,8 +198,6 @@ impl DbStore {
 
         // Window is full: retire the oldest push-claim.
         let retired = window.ids.pop_front().expect("deque non-empty after push");
-        drop(windows);
-        self.charge_drops(params.subscriber, 1);
         Some(retired)
     }
 
@@ -267,8 +255,6 @@ impl DbStore {
         while window.ids.len() > depth {
             retired.push(window.ids.pop_front().expect("deque non-empty during trim"));
         }
-        drop(windows);
-        self.charge_drops(params.subscriber, retired.len() as u64);
         retired
     }
 
@@ -310,14 +296,6 @@ impl DbStore {
         for window in windows.values_mut() {
             window.ids.retain(|id| !ids.contains(id));
         }
-    }
-
-    /// Add `count` push-overflow drops to `subscriber`'s lifetime total. Called
-    /// from the retirement methods at the moment a push claim is evicted, so the
-    /// total is charged once per lost message and never depends on how the
-    /// caller reacts to the drop.
-    fn charge_drops(&self, subscriber: &ParticipantId, count: u64) {
-        self.dropped.add(subscriber, count);
     }
 
     /// Lazy one-shot seed of a subscriber's push window from the DB. `exclude_id`
@@ -497,7 +475,7 @@ impl RetentionStore for DbStore {
         ChannelCapabilities::DURABLE_TRANSPORTABLE
     }
 
-    async fn deliverable_subscribers(&self) -> Vec<ParticipantId> {
+    async fn deliverable_subscribers(&self) -> Vec<DeliverableSubscriber> {
         let conn = self.db.lock().await;
         db::deliverable_cursor_subscribers(&conn, self.channel_uuid)
     }
@@ -637,22 +615,7 @@ impl RetentionStore for DbStore {
             .collect();
         db::mark_pending_pushes_delivered(&tx, &passed);
         tx.commit().expect("messaging store: commit advance tx");
-        drop(conn);
-        self.dropped.add(subscriber, outcome.dropped);
         outcome
-    }
-
-    /// Requires no connection: safe to call while the caller already holds one.
-    fn dropped_total(&self, subscriber: &ParticipantId) -> u64 {
-        self.dropped.get(subscriber)
-    }
-
-    fn record_metered_drops(&self, subscriber: &ParticipantId, count: u64) {
-        self.metered.add(subscriber, count);
-    }
-
-    fn metered_drops(&self, subscriber: &ParticipantId) -> u64 {
-        self.metered.get(subscriber)
     }
 
     /// The cursor row is the whole of the determination: it exists, or this
@@ -697,8 +660,6 @@ impl RetentionStore for DbStore {
             .lock()
             .expect("push_windows poisoned")
             .remove(subscriber.as_str());
-        self.dropped.forget(subscriber);
-        self.metered.forget(subscriber);
     }
 
     /// Resolves the channel's subscribers, writes one claim per target, then

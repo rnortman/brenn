@@ -5361,14 +5361,10 @@ mod tests {
         );
 
         assert_eq!(
-            messenger.dropped_total("ephemeral:batch-eph", &consumer),
-            2,
-            "both evicted-while-owed messages are accounted on the store"
-        );
-        assert_eq!(
             messenger.drop_counter("ephemeral:batch-eph", &consumer),
             2,
-            "and metered — the ladder saw the drops this publish caused"
+            "both evicted-while-owed messages are metered — the ladder saw the \
+             drops this publish caused"
         );
     }
 

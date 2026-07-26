@@ -31,7 +31,7 @@ pub(super) fn resolved_ingress_sub(
 }
 
 /// Construct a minimal `AppConfig` for bootstrap tests.
-pub(super) fn minimal_app_config(
+pub(crate) fn minimal_app_config(
     slug: &str,
     messaging: Option<ResolvedMessagingConfig>,
     webhook_subscriptions: Vec<ResolvedWebhookSubscription>,

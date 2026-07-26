@@ -183,6 +183,31 @@ impl ActiveBridge {
         )
     }
 
+    /// Test-only: [`Self::inject_for_test`] with a `Messenger` wired in, for
+    /// tests outside `active_bridge` that drive the conversation's bus delivery
+    /// (`TestBridgeConfig` itself is module-private).
+    pub(crate) fn inject_for_test_with_messenger(
+        user_id: i64,
+        conversation_id: i64,
+        app_slug: &str,
+        db: Db,
+        broadcast_tx: broadcast::Sender<WsServerMessage>,
+        messenger: Arc<brenn_lib::messaging::Messenger>,
+    ) -> Arc<Self> {
+        Self::inject_for_test_full(
+            user_id,
+            conversation_id,
+            app_slug,
+            db,
+            broadcast_tx,
+            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            TestBridgeConfig {
+                messenger: Some(messenger),
+                ..Default::default()
+            },
+        )
+    }
+
     pub(crate) fn inject_for_test_shared(
         user_id: i64,
         conversation_id: i64,
@@ -393,6 +418,7 @@ impl ActiveBridge {
             server_shutting_down: Arc::new(AtomicBool::new(false)),
             repo_sync_sender,
             messenger,
+            bus_delivery: tokio::sync::Mutex::new(()),
             pwa_push_service,
             mqtt_service,
             mqtt_event_router,

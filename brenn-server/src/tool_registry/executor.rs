@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
+use brenn_lib::messaging::store::MessageSeq;
 use brenn_lib::messaging::system::SystemInbox;
 use brenn_lib::messaging::{
     MessageEnvelope, Messenger, ParticipantId, PublishResult, SubscriberKind, Urgency,
@@ -165,7 +166,7 @@ async fn process_batch(
     registry: &Arc<ToolRegistry>,
     caller_grants: &Arc<ToolCallerGrants>,
     alert: &AlertDispatcher,
-    rows: Vec<(i64, MessageEnvelope)>,
+    rows: Vec<(MessageSeq, MessageEnvelope)>,
 ) {
     if rows.is_empty() {
         return;
@@ -174,12 +175,12 @@ async fn process_batch(
     // Group by request channel (one `brenn:tools/<tool>` channel per tool) so
     // each tool drains independently: admission on one tool never head-of-line
     // blocks another.
-    let mut by_tool: HashMap<String, Vec<(i64, MessageEnvelope)>> = HashMap::new();
-    for (push_id, env) in rows {
+    let mut by_tool: HashMap<String, Vec<(MessageSeq, MessageEnvelope)>> = HashMap::new();
+    for (seq, env) in rows {
         by_tool
             .entry(env.channel.clone())
             .or_default()
-            .push((push_id, env));
+            .push((seq, env));
     }
 
     let mut tool_tasks = Vec::with_capacity(by_tool.len());
@@ -193,9 +194,9 @@ async fn process_batch(
             // the spawned execute futures and await them so the drain step
             // observes full delivery.
             let mut executions = Vec::new();
-            for (push_id, env) in tool_rows {
+            for (seq, env) in tool_rows {
                 if let Some(handle) =
-                    admit_and_dispatch(&messenger, &registry, &caller_grants, &alert, push_id, env)
+                    admit_and_dispatch(&messenger, &registry, &caller_grants, &alert, seq, env)
                         .await
                 {
                     executions.push(handle);
@@ -239,9 +240,10 @@ async fn admit_and_dispatch(
     registry: &Arc<ToolRegistry>,
     caller_grants: &Arc<ToolCallerGrants>,
     alert: &AlertDispatcher,
-    push_id: i64,
+    seq: MessageSeq,
     env: MessageEnvelope,
 ) -> Option<JoinHandle<()>> {
+    let seq = seq.0;
     // The reply target is the request envelope's `reply_to`, already the full
     // canonical `brenn:<inbox>` address (the stored channel address carries its
     // scheme). A request with no reply_to has nowhere to send its result — a
@@ -255,7 +257,7 @@ async fn admit_and_dispatch(
             // Malformed body from an internal caller — a bug (post-auth bus
             // traffic, so not fail2ban signal). Alert and best-effort return an
             // error result so the caller can correlate the failure by call_id.
-            warn!(push_id, error = %e, "tool executor: malformed request body");
+            warn!(seq, error = %e, "tool executor: malformed request body");
             alert.alert_once_per_process(
                 AlertSeverity::Warning,
                 "Tool executor received a malformed request".to_string(),
@@ -298,7 +300,7 @@ async fn admit_and_dispatch(
     // this collapses the cross-cutting non-forgeability argument to one local check.
     if env.sender != caller {
         warn!(
-            push_id, sender = %env.sender, %caller, %tool,
+            seq, sender = %env.sender, %caller, %tool,
             "tool executor: request caller does not match the host-stamped envelope sender; denying"
         );
         finish(
@@ -317,7 +319,7 @@ async fn admit_and_dispatch(
     let grant = match caller_grants.get(&caller).and_then(|g| g.get(&tool)) {
         Some(g) => g.clone(),
         None => {
-            warn!(push_id, %caller, %tool, "tool executor: caller no longer granted this tool");
+            warn!(seq, %caller, %tool, "tool executor: caller no longer granted this tool");
             finish(
                 messenger,
                 &reply_addr,
@@ -336,7 +338,7 @@ async fn admit_and_dispatch(
     let async_tool = match registry.get(&tool) {
         Some(RegisteredTool::Async(t)) => t.clone(),
         Some(RegisteredTool::Fast(_)) => {
-            warn!(push_id, %tool, "tool executor: request names a fast tool");
+            warn!(seq, %tool, "tool executor: request names a fast tool");
             finish(
                 messenger,
                 &reply_addr,
@@ -349,7 +351,7 @@ async fn admit_and_dispatch(
             return None;
         }
         None => {
-            warn!(push_id, %tool, "tool executor: request names an unregistered tool");
+            warn!(seq, %tool, "tool executor: request names an unregistered tool");
             finish(
                 messenger,
                 &reply_addr,
@@ -716,6 +718,7 @@ mod tests {
         }
 
         let results_entry = results_ch.clone();
+        let tools_entry = tools_ch.clone();
         let directory = Arc::new(MessagingDirectory::with_entries(vec![tools_ch, results_ch]));
         let messenger = Messenger::new(
             db,
@@ -749,6 +752,17 @@ mod tests {
             brenn_lib::messaging::config::Depth::Unbounded,
         )
         .await;
+        // The executor reads its request channel through a position too, primed
+        // at head before any request is inserted.
+        messenger
+            .attach_subscriber(
+                &tools_entry.address,
+                TOOL_EXECUTOR_COMPONENT,
+                &ParticipantId::for_system(TOOL_EXECUTOR_COMPONENT),
+                brenn_lib::messaging::config::Depth::Unbounded,
+                brenn_lib::messaging::store::Priming::Head,
+            )
+            .await;
 
         Harness {
             messenger,

@@ -37,7 +37,7 @@ use super::db::{
     upsert_channels,
 };
 use super::{
-    ChannelEntry, ChannelScheme, Depth, Messenger, NoiseLevel, ParticipantId, SubscriberEntry,
+    ChannelEntry, ChannelScheme, Depth, Messenger, NoiseLevel, SubscriberEntry,
     SubscriberEntryKind, WakeMin, mqtt_channel_uuid_from_address,
 };
 use crate::db::format_ts_for_db;
@@ -553,7 +553,9 @@ impl Messenger {
             });
         }
 
-        // 5. Write the registration, then fold the subscriber into the directory.
+        // 5. Write the registration, create the delivery position, then fold the
+        //    subscriber into the directory — in that order, so nothing is
+        //    deliverable here before there is something to deliver it to.
         //    The registration is the truth about "this app subscribed at runtime";
         //    the directory swap makes it visible to the publish hot path. A
         //    durable channel writes the row + mirror in one transaction; a
@@ -574,6 +576,17 @@ impl Messenger {
             insert_dynamic_subscription(&conn, &row);
         } else {
             self.register_nondurable_dynamic_sub(resolved.channel_uuid, app_slug);
+        }
+        // A push-enabled app delivers to its conversation, and a conversation
+        // reads through a position: create it before the directory starts
+        // delivering here. Head priming positions a new cursor at the channel's
+        // head, so a publish landing between the two writes would fall below a
+        // cursor created after the fold-in — served to nobody and reported as
+        // nothing. A cursor on a channel the directory does not yet deliver to
+        // costs nothing; the reverse loses a message.
+        if resolved.push_depth.is_push_enabled() {
+            self.attach_conversation(address, app_slug, resolved.push_depth)
+                .await;
         }
         let applied = self.directory.add_subscriber(
             &resolved.channel_uuid,
@@ -728,8 +741,9 @@ impl Messenger {
         // guard in the same lock scope as the delete; that guard rides on the
         // publish-pipeline reshape that replaces per-publish target resolution
         // with the store's attached set, so it lands there, not here.
-        let subscriber = ParticipantId::for_app(app_slug, &self.source);
-        self.detach_subscriber(address, &subscriber).await;
+        // The app's delivery state is held under its conversation, which is the
+        // participant every push row and every position names.
+        self.detach_conversation(address, app_slug).await;
 
         Ok(UnsubscribeOutcome {
             channel_uuid,
@@ -852,6 +866,16 @@ mod tests {
             MessagingGlobalConfig::default(),
         )
         .with_ring_stores(ring_stores)
+    }
+
+    fn push_enabled() -> DynamicSubscribeParams {
+        DynamicSubscribeParams {
+            push_depth: Depth::Bounded(5),
+            retain_depth: Depth::Bounded(5),
+            noise: None,
+            wake_min: None,
+            qos: None,
+        }
     }
 
     fn pull_only(qos: Option<u8>) -> DynamicSubscribeParams {
@@ -1711,14 +1735,29 @@ mod tests {
     async fn unsubscribe_removes_own_dynamic_sub() {
         let ch = channel("heartbeat", ChannelScheme::Brenn);
         let uuid = ch.uuid;
-        let m = messenger(vec![ch], &[("graf", false, &["u"])]).await;
-        m.subscribe_dynamic("graf", "heartbeat", pull_only(None))
+        let m = messenger(vec![ch], &[("graf", true, &["u"])]).await;
+        let conversation = {
+            let conn = m.db.lock().await;
+            let user = crate::auth::user::create_user(&conn, "u", "$argon2id$fake");
+            crate::conversation::get_or_create_singleton_conversation(&conn, user, "graf").id
+        };
+        m.subscribe_dynamic("graf", "heartbeat", push_enabled())
             .await
             .expect("subscribe succeeds");
 
+        // A push-enabled subscribe attaches the app's conversation: the position
+        // must exist before the first publish this subscription is meant to catch.
+        let subscriber = ParticipantId::for_conversation(conversation);
+        {
+            let conn = m.db.lock().await;
+            assert!(
+                crate::messaging::db::load_subscriber_cursor(&conn, uuid, &subscriber).is_some(),
+                "subscribe created the conversation's position"
+            );
+        }
+
         // Plant delivery state: a pending push owed to this subscriber, so the
         // channel reports it as owed work before the unsubscribe tears it down.
-        let subscriber = ParticipantId::for_app("graf", &m.source);
         {
             let conn = m.db.lock().await;
             insert_message_with_pushes(
@@ -1764,9 +1803,14 @@ mod tests {
         };
         assert!(rows.is_empty(), "durable row removed");
 
-        // Delivery state torn down: no pending pushes remain for the subscriber.
+        // Delivery state torn down: the conversation's position and the pushes
+        // owed to it are both gone.
         {
             let conn = m.db.lock().await;
+            assert!(
+                crate::messaging::db::load_subscriber_cursor(&conn, uuid, &subscriber).is_none(),
+                "unsubscribe deleted the conversation's position"
+            );
             assert!(
                 !channel_has_deliverable_for(&conn, uuid, &subscriber),
                 "detach deleted the subscriber's delivery state on unsubscribe"

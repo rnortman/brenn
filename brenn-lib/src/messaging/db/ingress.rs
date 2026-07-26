@@ -273,44 +273,85 @@ pub fn mark_stale_undelivered_ingress_repo_sync(conn: &Connection, staleness_day
     stale_count + orphan_count
 }
 
-/// Load all undelivered, unparked pending-push rows for `subscriber`,
-/// in `publish_ts_ns ASC, id ASC` order. Rows of `kind='brenn'` produce
-/// `Bus(MessageEnvelope)`, `kind='ingress'` rows produce an
-/// `Ingress(Event)`. The drain caller partitions these into two slices for
-/// `render_combined_drain`.
-///
-/// Used by the binary crate's drain-on-wake path.
-pub fn load_pending_pushes_for_drain(
+/// The drain read, up to its row-kind filter: undelivered, unparked pending-push
+/// rows for one subscriber, oldest publish first.
+const DRAIN_PUSHES_SQL: &str = "SELECT pp.id, pp.target_subscriber, pp.eager_wake,
+            m.uuid, m.source, m.sender, m.body,
+            m.urgency AS msg_urgency,
+            m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
+            c.address, rc.address,
+            m.envelope_type, m.ingress_source, m.ingress_summary,
+            pp.message_id, pp.target_app_slug
+     FROM messaging_pending_pushes pp
+     JOIN messaging_messages m ON pp.message_id = m.id
+     LEFT JOIN messaging_channels c ON c.uuid = m.channel_uuid
+     LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
+     WHERE pp.target_subscriber = ?1
+       AND pp.delivered_at IS NULL
+       AND pp.release_after IS NULL";
+
+const DRAIN_PUSHES_ORDER_SQL: &str = " ORDER BY m.publish_ts_ns ASC, m.id ASC";
+
+/// Run the drain read, optionally narrowed to the channel-less ingress
+/// row-kind. Narrowing in SQL rather than in Rust is what keeps a caller that
+/// wants only ingress from loading — and discarding — every bus body the
+/// subscriber is owed.
+fn load_drain_pushes(
     conn: &Connection,
     subscriber: &ParticipantId,
+    only_ingress: bool,
 ) -> Vec<(i64, IngressOrBus)> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT pp.id, pp.target_subscriber, pp.eager_wake,
-                    m.uuid, m.source, m.sender, m.body,
-                    m.urgency AS msg_urgency,
-                    m.delivery_deadline, m.deliver_after, m.publish_ts_ns,
-                    c.address, rc.address,
-                    m.envelope_type, m.ingress_source, m.ingress_summary,
-                    pp.message_id, pp.target_app_slug
-             FROM messaging_pending_pushes pp
-             JOIN messaging_messages m ON pp.message_id = m.id
-             LEFT JOIN messaging_channels c ON c.uuid = m.channel_uuid
-             LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid
-             WHERE pp.target_subscriber = ?1
-               AND pp.delivered_at IS NULL
-               AND pp.release_after IS NULL
-             ORDER BY m.publish_ts_ns ASC, m.id ASC",
-        )
-        .expect("prepare load_pending_pushes_for_drain");
+    let mut sql = String::from(DRAIN_PUSHES_SQL);
+    if only_ingress {
+        sql.push_str(" AND m.envelope_type = '");
+        sql.push_str(super::EnvelopeTypeColumn::Ingress.as_str());
+        sql.push('\'');
+    }
+    sql.push_str(DRAIN_PUSHES_ORDER_SQL);
+    let mut stmt = conn.prepare(&sql).expect("prepare drain push read");
     let rows = stmt
         .query_map(rusqlite::params![subscriber.as_str()], row_to_drain_push)
-        .expect("query load_pending_pushes_for_drain");
+        .expect("query drain push read");
     rows.map(|r| {
         let row = r.expect("read pending push");
         (row.push_id, row.payload)
     })
     .collect()
+}
+
+/// Load all undelivered, unparked pending-push rows for `subscriber`,
+/// in `publish_ts_ns ASC, id ASC` order. Rows of `kind='brenn'` produce
+/// `Bus(MessageEnvelope)`, `kind='ingress'` rows produce an
+/// `Ingress(Event)`. The drain caller partitions these into two slices for
+/// `render_combined_drain`.
+pub fn load_pending_pushes_for_drain(
+    conn: &Connection,
+    subscriber: &ParticipantId,
+) -> Vec<(i64, IngressOrBus)> {
+    load_drain_pushes(conn, subscriber, false)
+}
+
+/// The same read, narrowed to the channel-less ingress row-kind: what a
+/// participant is owed on a *channel* is its position, read through its window,
+/// so a drain that already reads its windows wants only these rows here.
+///
+/// A bus row reaching the decoder would mean the row-kind predicate and the
+/// decoder disagree — a host bug, not a row to skip.
+pub fn load_pending_ingress_for_drain(
+    conn: &Connection,
+    subscriber: &ParticipantId,
+) -> Vec<(i64, IngressEvent)> {
+    load_drain_pushes(conn, subscriber, true)
+        .into_iter()
+        .map(|(id, payload)| match payload {
+            IngressOrBus::Ingress(event) => (id, event),
+            IngressOrBus::Bus(envelope) => panic!(
+                "messaging: push {id} on channel {} decoded as a bus message under an \
+                 ingress-only predicate",
+                envelope.channel
+            ),
+        })
+        .collect()
 }
 
 /// Row decoder for the drain query (columns 0-15, `LEFT JOIN` channel).

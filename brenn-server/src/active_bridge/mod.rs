@@ -34,6 +34,7 @@ pub use bridge::ActiveBridge;
 // (inject_for_test is used instead). The cfg(not(test)) gate keeps test builds clean.
 #[cfg(not(test))]
 pub use bridge::SpawnContext;
+pub(crate) use cc_event_loop::drain::deliver_conversation_backlog;
 pub(crate) use cc_spawn_config::write_virtual_tools_file;
 pub(in crate::active_bridge) use compaction::CompactionPhase;
 pub use registry::ActiveBridges;

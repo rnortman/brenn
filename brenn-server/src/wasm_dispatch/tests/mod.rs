@@ -193,6 +193,19 @@ pub(super) async fn attach_input_ports(
     }
 }
 
+/// Prime the tool executor's position on its request channels at head.
+/// Fixtures that insert a request before building the executor need this
+/// to have run first.
+pub(super) async fn attach_tool_executor(messenger: &Arc<brenn_lib::messaging::Messenger>) {
+    brenn_lib::messaging::system::SystemInbox::new(
+        crate::tool_registry::executor::TOOL_EXECUTOR_COMPONENT,
+        Arc::clone(messenger),
+        Arc::new(tokio::sync::Notify::new()),
+    )
+    .attach()
+    .await;
+}
+
 /// Build a `WasmConsumerConfig` using the demo WASM and a noop alerter.
 /// Returns the config, the alert join handle, and the store tempfile — the
 /// caller must keep the tempfile alive (bind to `_db`) for the component's lifetime.

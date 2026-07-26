@@ -613,11 +613,9 @@ async fn push_window_seed_truncates_excess_db_rows() {
 
     let subscriber = crate::messaging::ParticipantId::for_conversation(2);
     // One overflow retire on the first publish. NoiseLevel::Silent keeps the
-    // metered counter at zero, but the drop itself is accounted either way —
-    // silence is about how loud a drop is, not about whether the consumer's gap
-    // signal reflects it.
+    // metered counter at zero — silence is about how loud a drop is, not about
+    // whether the store reported it.
     assert_eq!(m.drop_counter(&channel_addr, &subscriber), 0);
-    assert_eq!(m.dropped_total(&channel_addr, &subscriber), 1);
 
     // Second publish: deque was [kept_row, pub1] (size=2=push_depth) after first.
     // This publish overflows → 1 more row retired from DB. DB: 4 + 1 - 1 = 4.

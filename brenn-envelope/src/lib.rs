@@ -463,8 +463,8 @@ impl Urgency {
         }
     }
 
-    /// Integer rank for SQL comparisons (mirrors the SQL CASE in `update_message_and_pending_pushes`).
-    /// `VeryLow=0, Low=1, Normal=2, High=3`. The SQL CASE must stay in sync with this mapping.
+    /// Integer rank for SQL comparisons. `VeryLow=0, Low=1, Normal=2, High=3`.
+    /// SQL CASE expressions that rank urgency must stay in sync with this mapping.
     pub fn rank(self) -> i64 {
         match self {
             Self::VeryLow => 0,

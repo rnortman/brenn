@@ -728,6 +728,17 @@ fn wasm_sub(slug: &str) -> ParticipantId {
     ParticipantId::for_wasm(slug)
 }
 
+/// Just the identities from the owed walk, for rows that assert on who is owed
+/// rather than on how loud their backlog is.
+async fn owed_ids(store: &dyn RetentionStore) -> Vec<ParticipantId> {
+    store
+        .deliverable_subscribers()
+        .await
+        .into_iter()
+        .map(|owed| owed.subscriber)
+        .collect()
+}
+
 /// Retained priming on a fresh queue owes the channel's retained tail as
 /// NEW — both stores agree.
 #[tokio::test]
@@ -744,7 +755,7 @@ async fn attach_with_retained_priming_seeds_the_tail_as_owed() {
         assert_eq!(attached, Attached::Created, "{}", store.address());
         assert!(store.has_deliverable(&sub).await, "{}", store.address());
         assert_eq!(
-            store.deliverable_subscribers().await,
+            owed_ids(store.as_ref()).await,
             vec![sub],
             "{}",
             store.address()
@@ -1027,7 +1038,7 @@ async fn a_position_below_an_emptied_retention_is_not_deliverable() {
 
     {
         let conn = db.lock().await;
-        let (evicted, _) = bus_gc_evict_channel(
+        let eviction = bus_gc_evict_channel(
             &conn,
             store.channel_uuid(),
             store.address(),
@@ -1036,7 +1047,10 @@ async fn a_position_below_an_emptied_retention_is_not_deliverable() {
             Sink::Drop,
             None,
         );
-        assert_eq!(evicted, 1, "the channel retains nothing now");
+        assert_eq!(
+            eviction.messages_evicted, 1,
+            "the channel retains nothing now"
+        );
     }
 
     assert!(!store.has_deliverable(&sub).await);
@@ -1057,7 +1071,7 @@ async fn deliverable_subscribers_and_has_deliverable_agree_across_stores() {
     )
     .await;
     db_store.append(message("alice", "a")).await;
-    ring.attach(&wasm_sub("proc"), 4, Priming::Head);
+    ring.attach(&wasm_sub("proc"), "proc", 4, Priming::Head);
     RetentionStore::append(&ring, message_for(&ring, "alice", "a")).await;
 
     for store in [
@@ -1070,7 +1084,7 @@ async fn deliverable_subscribers_and_has_deliverable_agree_across_stores() {
             store.address()
         );
         assert_eq!(
-            store.deliverable_subscribers().await,
+            owed_ids(store).await,
             vec![wasm_sub("proc")],
             "{}",
             store.address()
@@ -1094,6 +1108,159 @@ async fn deliverable_subscribers_and_has_deliverable_agree_across_stores() {
             "{}",
             store.address()
         );
+        assert!(
+            store.deliverable_subscribers().await.is_empty(),
+            "{}",
+            store.address()
+        );
+    }
+}
+
+/// The owed walk reports the loudest urgency a subscriber has not seen, on both
+/// classes — the figure the wake pass gates an urgency-gated subscriber on. It
+/// is read from the unseen suffix, not from the channel, so a loud message the
+/// subscriber has already passed does not keep waking it: what the walk answers
+/// changes as the position moves, without anything being stored per message.
+#[tokio::test]
+async fn the_owed_walk_reports_the_loudest_unseen_urgency() {
+    for store in stores_for_proc(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+            .await;
+
+        for (body, urgency) in [
+            ("shout", Urgency::High),
+            ("chat", Urgency::Low),
+            ("chat again", Urgency::Low),
+        ] {
+            let mut msg = message_for(store.as_ref(), "alice", body);
+            msg.urgency = urgency;
+            store.append(msg).await;
+        }
+        let owed = store.deliverable_subscribers().await;
+        assert_eq!(
+            owed.iter()
+                .map(|o| o.max_unseen_urgency)
+                .collect::<Vec<_>>(),
+            vec![Urgency::High],
+            "{}",
+            store.address()
+        );
+
+        // Pass the loud one; the quiet remainder is what is left to decide on.
+        store.advance(&sub, MessageSeq(1), MessageSeq(1)).await;
+        let owed = store.deliverable_subscribers().await;
+        assert_eq!(
+            owed.iter()
+                .map(|o| o.max_unseen_urgency)
+                .collect::<Vec<_>>(),
+            vec![Urgency::Low],
+            "{}",
+            store.address()
+        );
+    }
+}
+
+/// Every level in turn is the loudest thing a position has not seen. The
+/// durable side ranks urgency in hand-written SQL, so the walk is driven off
+/// `Urgency::ALL` rather than the two levels one case happens to use: a level
+/// added to the enum and not to that mapping fails here instead of quietly
+/// ranking below the levels the SQL does know.
+#[tokio::test]
+async fn the_owed_walk_ranks_every_urgency_level() {
+    for urgency in Urgency::ALL {
+        for store in stores_for_proc(DEPTH).await {
+            let sub = wasm_sub("proc");
+            store
+                .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+                .await;
+            let mut msg = message_for(store.as_ref(), "alice", "one");
+            msg.urgency = urgency;
+            store.append(msg).await;
+            assert_eq!(
+                store
+                    .deliverable_subscribers()
+                    .await
+                    .iter()
+                    .map(|owed| owed.max_unseen_urgency)
+                    .collect::<Vec<_>>(),
+                vec![urgency],
+                "{} at {urgency:?}",
+                store.address()
+            );
+        }
+    }
+}
+
+/// The ring answers the same question from a table of suffix maxima indexed by
+/// where the position lands in what is *still retained*, so the cases that
+/// matter are the ends of that table: a position retention has already outrun
+/// reads the loudest survivor, and one sitting just above the loudest survivor
+/// reads the quieter suffix over it — down to the last retained seq.
+#[tokio::test]
+async fn the_ring_ranks_the_unseen_suffix_of_what_survived() {
+    let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(3));
+    let sub = wasm_sub("proc");
+    ring.attach(&sub, "proc", DEPTH, Priming::Head);
+    for (body, urgency) in [
+        ("a", Urgency::High),
+        ("b", Urgency::High),
+        ("c", Urgency::High),
+        ("d", Urgency::Low),
+        ("e", Urgency::VeryLow),
+    ] {
+        let mut msg = message_for(&ring, "alice", body);
+        msg.urgency = urgency;
+        RetentionStore::append(&ring, msg).await;
+    }
+
+    let loudest = |ring: &RingStore| {
+        ring.deliverable_subscribers()
+            .into_iter()
+            .map(|owed| owed.max_unseen_urgency)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        loudest(&ring),
+        vec![Urgency::High],
+        "the position is below the frontier, so the whole retained window is unseen"
+    );
+
+    // Past the loudest survivor — which is also the oldest retained entry.
+    RetentionStore::advance(&ring, &sub, MessageSeq(3), MessageSeq(3)).await;
+    assert_eq!(
+        loudest(&ring),
+        vec![Urgency::Low],
+        "a loud message the position has passed does not keep waking it"
+    );
+
+    RetentionStore::advance(&ring, &sub, MessageSeq(4), MessageSeq(4)).await;
+    assert_eq!(
+        loudest(&ring),
+        vec![Urgency::VeryLow],
+        "at the last retained seq the suffix is that one entry"
+    );
+
+    RetentionStore::advance(&ring, &sub, MessageSeq(5), MessageSeq(5)).await;
+    assert!(
+        loudest(&ring).is_empty(),
+        "caught up: nothing unseen, so nothing to rank"
+    );
+}
+
+/// A sampled subscriber holds no position, so nothing is ever owed to it and the
+/// walk never names it — on either class, and whatever the channel carries.
+#[tokio::test]
+async fn a_sampled_subscriber_is_never_owed_anything() {
+    for store in stores_for_proc(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store
+            .attach(&sub, "proc", Depth::Bounded(0), Priming::Head)
+            .await;
+        store
+            .append(message_for(store.as_ref(), "alice", "loud"))
+            .await;
         assert!(
             store.deliverable_subscribers().await.is_empty(),
             "{}",
@@ -1701,14 +1868,19 @@ async fn a_ring_window_panics_for_an_unattached_subscriber() {
 /// subscriber read before its losses are accountable — which is what lets an
 /// absent consumer's overflow escalate at all.
 #[tokio::test]
-async fn ring_eviction_charges_the_drop_total_without_a_read() {
+async fn ring_eviction_reports_the_loss_without_a_read() {
     let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(2));
     let sub = wasm_sub("absent");
-    ring.attach(&sub, 8, Priming::Head);
+    ring.attach(&sub, "absent", 8, Priming::Head);
     for body in ["a", "b"] {
-        RetentionStore::append(&ring, message_for(&ring, "alice", body)).await;
+        assert!(
+            RetentionStore::append(&ring, message_for(&ring, "alice", body))
+                .await
+                .overflow
+                .is_empty(),
+            "nothing evicted yet"
+        );
     }
-    assert_eq!(ring.dropped_total(&sub), 0, "nothing evicted yet");
 
     let evicting = RetentionStore::append(&ring, message_for(&ring, "alice", "c")).await;
     assert_eq!(
@@ -1716,15 +1888,158 @@ async fn ring_eviction_charges_the_drop_total_without_a_read() {
         vec![OverflowEvent {
             subscriber: sub.clone(),
             dropped: 1,
-            app_slug: None,
+            app_slug: Some("absent".to_string()),
         }]
     );
-    assert_eq!(ring.dropped_total(&sub), 1);
+}
+
+/// The durable twin of the row above: the GC pass that outruns a position
+/// reports against it by name, with no read from the subscriber and no cursor
+/// movement — and reports each evicted seq exactly once, so a wedged subscriber
+/// escalates at the pass's cadence rather than accumulating a re-report per
+/// pass.
+#[tokio::test]
+async fn durable_eviction_reports_the_loss_once_per_evicted_span() {
+    let (store, db) = durable_store_for("proc", DEPTH).await;
+    let sub = wasm_sub("proc");
+    store
+        .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+        .await;
+    for body in ["a", "b", "c", "d"] {
+        RetentionStore::append(&store, message_for(&store, "alice", body)).await;
+    }
+
+    let evict = |frontier: u64| {
+        let db = db.clone();
+        let store = &store;
+        async move {
+            let conn = db.lock().await;
+            bus_gc_evict_channel(
+                &conn,
+                store.channel_uuid(),
+                store.address(),
+                ChannelScheme::Brenn,
+                frontier,
+                Sink::Drop,
+                None,
+            )
+        }
+    };
+
+    let first = evict(3).await;
+    assert_eq!(first.messages_evicted, 1);
     assert_eq!(
-        ring.metered_drops(&sub),
-        0,
-        "nothing metered it: the store accounts, the substrate enacts"
+        first.overflow,
+        vec![OverflowEvent {
+            subscriber: sub.clone(),
+            dropped: 1,
+            app_slug: Some("proc".to_string()),
+        }],
+        "the app slug rides the cursor row, so the report is attributable"
     );
+
+    let second = evict(2).await;
+    assert_eq!(second.messages_evicted, 1);
+    assert_eq!(
+        second.overflow,
+        vec![OverflowEvent {
+            subscriber: sub.clone(),
+            dropped: 1,
+            app_slug: Some("proc".to_string()),
+        }],
+        "the second pass reports only its own span, never the first pass's"
+    );
+
+    let third = evict(2).await;
+    assert_eq!(third.messages_evicted, 0);
+    assert!(
+        third.overflow.is_empty(),
+        "a pass that evicts nothing reports nothing, however far the cursor lags"
+    );
+}
+
+/// The two eviction reporters agree on the figure for the same history. They
+/// report at different moments — the ring at the displacing append, the durable
+/// store at the GC pass that outruns the position — but the same four messages
+/// over a two-deep retention cost a never-running subscriber the same two seqs
+/// on either class. Deposition, not delivery, is what a drop is.
+#[tokio::test]
+async fn eviction_reporting_agrees_across_the_classes() {
+    let sub = wasm_sub("absent");
+    const HISTORY: [&str; 4] = ["a", "b", "c", "d"];
+    const RETAINED: u64 = 2;
+
+    let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(RETAINED));
+    ring.attach(&sub, "absent", DEPTH, Priming::Head);
+    let mut ring_reported = 0;
+    for body in HISTORY {
+        ring_reported += RetentionStore::append(&ring, message_for(&ring, "alice", body))
+            .await
+            .overflow
+            .iter()
+            .map(|e| e.dropped)
+            .sum::<u64>();
+    }
+
+    let (store, db) = durable_store_for("absent", DEPTH).await;
+    store
+        .attach(&sub, "absent", ATTACH_DEPTH, Priming::Head)
+        .await;
+    for body in HISTORY {
+        RetentionStore::append(&store, message_for(&store, "alice", body)).await;
+    }
+    let durable_reported = {
+        let conn = db.lock().await;
+        bus_gc_evict_channel(
+            &conn,
+            store.channel_uuid(),
+            store.address(),
+            ChannelScheme::Brenn,
+            RETAINED,
+            Sink::Drop,
+            None,
+        )
+        .overflow
+        .iter()
+        .map(|e| e.dropped)
+        .sum::<u64>()
+    };
+
+    assert_eq!(ring_reported, 2);
+    assert_eq!(durable_reported, ring_reported);
+}
+
+/// A caught-up subscriber is not reported against by an eviction: its position
+/// is above the span the pass removed, and a sampled subscriber holds no
+/// position for a pass to find at all.
+#[tokio::test]
+async fn durable_eviction_reports_only_positions_it_outran() {
+    let (store, db) = durable_store_for("proc", DEPTH).await;
+    let caught_up = wasm_sub("proc");
+    let sampled = wasm_sub("sampled");
+    store
+        .attach(&caught_up, "proc", ATTACH_DEPTH, Priming::Head)
+        .await;
+    store
+        .attach(&sampled, "sampled", Depth::Bounded(0), Priming::Head)
+        .await;
+    for body in ["a", "b", "c"] {
+        RetentionStore::append(&store, message_for(&store, "alice", body)).await;
+    }
+    serve(&store, &caught_up, DEPTH, 0).await;
+
+    let conn = db.lock().await;
+    let eviction = bus_gc_evict_channel(
+        &conn,
+        store.channel_uuid(),
+        store.address(),
+        ChannelScheme::Brenn,
+        1,
+        Sink::Drop,
+        None,
+    );
+    assert_eq!(eviction.messages_evicted, 2);
+    assert!(eviction.overflow.is_empty());
 }
 
 /// The durable advance reports a loss whatever retired the claims that named
@@ -1752,7 +2067,7 @@ async fn durable_advance_reports_a_loss_gc_already_retired() {
     // them.
     {
         let conn = db.lock().await;
-        let (evicted, claims_retired) = bus_gc_evict_channel(
+        let eviction = bus_gc_evict_channel(
             &conn,
             store.channel_uuid(),
             store.address(),
@@ -1761,8 +2076,16 @@ async fn durable_advance_reports_a_loss_gc_already_retired() {
             Sink::Drop,
             None,
         );
-        assert_eq!(evicted, 2);
-        assert_eq!(claims_retired, 2, "the lagging subscriber's claims go too");
+        assert_eq!(eviction.messages_evicted, 2);
+        assert_eq!(
+            eviction.push_rows_retired, 2,
+            "the lagging subscriber's claims go too"
+        );
+        assert_eq!(
+            eviction.overflow.first().map(|e| e.dropped),
+            Some(2),
+            "the pass reports the whole span it took from this position"
+        );
     }
 
     let (new, advance) = serve(&store, &sub, DEPTH, 0).await;
@@ -1802,7 +2125,7 @@ async fn durable_advance_charges_only_the_still_retained_half_of_a_loss() {
     }
     {
         let conn = db.lock().await;
-        let (evicted, _) = bus_gc_evict_channel(
+        let eviction = bus_gc_evict_channel(
             &conn,
             store.channel_uuid(),
             store.address(),
@@ -1811,7 +2134,15 @@ async fn durable_advance_charges_only_the_still_retained_half_of_a_loss() {
             Sink::Drop,
             None,
         );
-        assert_eq!(evicted, 3, "the frontier lands above the cursor, at seq 4");
+        assert_eq!(
+            eviction.messages_evicted, 3,
+            "the frontier lands above the cursor, at seq 4"
+        );
+        assert_eq!(
+            eviction.overflow.first().map(|e| e.dropped),
+            Some(1),
+            "only seq 3 was both unseen and evicted"
+        );
     }
 
     // The push limit serves only the newest, so seq 4 is unseen, still
@@ -1823,6 +2154,76 @@ async fn durable_advance_charges_only_the_still_retained_half_of_a_loss() {
         advance.noise_charge, 1,
         "seq 3 went with the eviction that reported it; only seq 4 is charged here"
     );
+}
+
+/// The one thing that perforates retention today: a message spared by a
+/// tentative delivery hold, older than the ones the same pass deletes. It keeps
+/// the frontier at its own seq, so the pass's frontier pair understates what it
+/// removed, and a window wide enough to still serve the spared message starts
+/// its advance below the gap — so neither reporter charges the seqs in between.
+///
+/// Positions and bodies are untouched by this: what is served is exactly what
+/// survives, and the cursor moves exactly over it. Only the ladder's figure is
+/// short. Pinned so the accounting is a known quantity while the hold exists;
+/// deleting the tentative lifecycle restores density and makes both subtractions
+/// exact again, and this row goes with it.
+#[tokio::test]
+async fn a_tentative_hold_below_an_evicted_span_shortens_the_report() {
+    let (store, db) = durable_store_for("proc", DEPTH).await;
+    let sub = wasm_sub("proc");
+    store
+        .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+        .await;
+    for body in ["a", "b", "c", "d"] {
+        RetentionStore::append(&store, message_for(&store, "alice", body)).await;
+    }
+
+    // Hold the oldest message's delivery below water, as an unconfirmed surface
+    // delivery does. Whose row carries the flag does not matter to eviction —
+    // the flag alone spares the message.
+    {
+        let conn = db.lock().await;
+        conn.execute(
+            "UPDATE messaging_pending_pushes SET confirm_pending = 1
+             WHERE message_id = (SELECT id FROM messaging_messages
+                                 ORDER BY retained_seq ASC LIMIT 1)",
+            [],
+        )
+        .expect("hold the oldest delivery");
+    }
+
+    let eviction = {
+        let conn = db.lock().await;
+        bus_gc_evict_channel(
+            &conn,
+            store.channel_uuid(),
+            store.address(),
+            ChannelScheme::Brenn,
+            1,
+            Sink::Drop,
+            None,
+        )
+    };
+    assert_eq!(
+        eviction.messages_evicted, 2,
+        "seqs 2 and 3 go; the held seq 1 stays, out of retention order"
+    );
+    assert!(
+        eviction.overflow.is_empty(),
+        "the held message keeps the frontier at seq 1, so the pair spans nothing"
+    );
+
+    let (new, advance) = serve(&store, &sub, DEPTH, 0).await;
+    assert_eq!(
+        new,
+        vec!["a", "d"],
+        "the held message is still retained, so the window still serves it"
+    );
+    assert_eq!(
+        advance.dropped, 0,
+        "the window's floor is the held seq, so the subtraction sees no gap"
+    );
+    assert_eq!(advance.noise_charge, 0, "and the ladder is charged nothing");
 }
 
 #[tokio::test]
@@ -1953,11 +2354,6 @@ async fn a_claim_predating_the_park_is_replaced_at_release() {
     let (new, _) = serve(&store, &wasm_sub("proc"), DEPTH, 0).await;
     assert_eq!(new, vec!["a"]);
 
-    assert_eq!(
-        store.dropped_total(&departed),
-        0,
-        "a claim withdrawn because it was never owed is not a loss its subscriber suffered"
-    );
     let next = store.append(message("alice", "b")).await.committed;
     let fresh = seed_claim(&store, &db, &departed, "gone", next.message_uuid).await;
     let conn = db.lock().await;
@@ -2016,10 +2412,7 @@ async fn a_released_durable_push_makes_its_target_owed() {
     assert!(store.deliverable_subscribers().await.is_empty());
 
     store.release_due(release_at).await;
-    assert_eq!(
-        store.deliverable_subscribers().await,
-        vec![wasm_sub("proc")]
-    );
+    assert_eq!(owed_ids(&store).await, vec![wasm_sub("proc")]);
     assert!(store.has_deliverable(&wasm_sub("proc")).await);
 }
 
@@ -2038,7 +2431,7 @@ async fn a_commit_owes_the_message_to_the_channels_registered_subscribers() {
         store.append(message_for(&*store, "alice", "a")).await;
 
         assert_eq!(
-            store.deliverable_subscribers().await,
+            owed_ids(store.as_ref()).await,
             vec![wasm_sub("proc")],
             "{}",
             store.address()
@@ -2652,7 +3045,7 @@ async fn durable_empty_window_after_eviction_discriminates_by_high_water() {
     // at 4 — GC removes rows, never the high-water.
     {
         let conn = db.lock().await;
-        let (evicted, _) = bus_gc_evict_channel(
+        let eviction = bus_gc_evict_channel(
             &conn,
             entry.uuid,
             &entry.address,
@@ -2661,7 +3054,10 @@ async fn durable_empty_window_after_eviction_discriminates_by_high_water() {
             Sink::Drop,
             None,
         );
-        assert_eq!(evicted, 4, "all four retained rows evicted");
+        assert_eq!(
+            eviction.messages_evicted, 4,
+            "all four retained rows evicted"
+        );
     }
 
     let at_hw = store.replay_from(Some(cursor(4)), Depth::Unbounded).await;
@@ -2772,7 +3168,7 @@ async fn durable_replay_reports_a_gap_when_eviction_left_a_hole() {
             rusqlite::params![protected],
         )
         .expect("stamp the claim tentative");
-        let (evicted, _) = bus_gc_evict_channel(
+        let eviction = bus_gc_evict_channel(
             &conn,
             store.channel_uuid(),
             store.address(),
@@ -2782,7 +3178,7 @@ async fn durable_replay_reports_a_gap_when_eviction_left_a_hole() {
             None,
         );
         assert_eq!(
-            evicted, 2,
+            eviction.messages_evicted, 2,
             "seqs 2 and 3 are evicted; 1 is protected, 4 kept"
         );
     }
@@ -2806,65 +3202,14 @@ async fn durable_replay_reports_a_gap_when_eviction_left_a_hole() {
 
 // ── Drop accounting ───────────────────────────────────────────────────────
 
-/// Asking about a subscriber the store never saw is not an error on either
-/// tally: nothing has been dropped for it, and nothing metered.
+/// A durable push-window overflow reports the loss at the moment the claim is
+/// retired — the commit that displaced it — with no reference to the
+/// subscription's noise level, the same unconditional accounting the ring
+/// cursor does. The noise ladder decides how loud the drop is, never whether it
+/// happened. The commit names the loser in its overflow, so a subscriber that
+/// never reads still escalates.
 #[tokio::test]
-async fn drop_tallies_answer_zero_for_an_unknown_subscriber() {
-    for store in stores(DEPTH).await {
-        let sub = wasm_sub("never-here");
-        assert_eq!(store.dropped_total(&sub), 0);
-        assert_eq!(store.metered_drops(&sub), 0);
-    }
-}
-
-/// The metered tally is written by the substrate's enactment point and by
-/// nothing else, so it stays at zero while the store accounts drops of its own.
-/// The two counts are deliberately separate: the raw total is a consumer's gap
-/// signal whatever the noise level, the metered one is what the ladder counted.
-#[tokio::test]
-async fn metered_tally_is_written_only_by_the_substrate() {
-    for store in stores(DEPTH).await {
-        let sub = wasm_sub("meter-me");
-        store.record_metered_drops(&sub, 2);
-        store.record_metered_drops(&sub, 3);
-        assert_eq!(store.metered_drops(&sub), 5, "metered drops accumulate");
-        assert_eq!(
-            store.dropped_total(&sub),
-            0,
-            "metering a drop does not invent an accounted one"
-        );
-
-        store.record_metered_drops(&sub, 0);
-        assert_eq!(store.metered_drops(&sub), 5, "zero is a no-op");
-    }
-}
-
-/// Detach takes the subscriber's tallies with the rest of its delivery state.
-/// A tally left behind would report a departed subscriber's history against
-/// whoever next attaches under the same identity.
-#[tokio::test]
-async fn detach_forgets_the_drop_tallies() {
-    for store in stores(DEPTH).await {
-        let sub = wasm_sub("leaver");
-        store
-            .attach(&sub, "leaver", Depth::Bounded(4), Priming::Head)
-            .await;
-        store.record_metered_drops(&sub, 7);
-
-        store.detach(&sub).await;
-        assert_eq!(store.metered_drops(&sub), 0);
-        assert_eq!(store.dropped_total(&sub), 0);
-    }
-}
-
-/// A durable push-window overflow charges the subscriber's drop total at the
-/// moment the claim is retired — the commit that displaced it — with no
-/// reference to the subscription's noise level, the same unconditional
-/// accounting the ring cursor does. The noise ladder decides how loud the drop
-/// is, never whether it happened. The commit names the loser in its overflow,
-/// so a subscriber that never reads still escalates.
-#[tokio::test]
-async fn durable_overflow_charges_the_drop_total_at_retirement() {
+async fn durable_overflow_reports_the_drop_at_retirement() {
     let (store, _db) = durable_store_for("slow", 1).await;
     let sub = wasm_sub("slow");
 
@@ -2891,15 +3236,5 @@ async fn durable_overflow_charges_the_drop_total_at_retirement() {
             .all(|e| e.app_slug.as_deref() == Some("slow")),
         "the event names the app the retired claim was written under — the only \
          route from a conversation participant back to its registration"
-    );
-    assert_eq!(
-        store.dropped_total(&sub),
-        2,
-        "every retired claim is a drop the subscriber can see"
-    );
-    assert_eq!(
-        store.metered_drops(&sub),
-        0,
-        "nothing metered it: the store accounts, the substrate enacts"
     );
 }

@@ -16,7 +16,7 @@ use super::compaction::handle_turn_completed;
 use super::{ActiveBridge, CompactionPhase, emit_tool_result_summaries};
 
 mod death;
-mod drain;
+pub(super) mod drain;
 mod initialized;
 mod rate_limit;
 mod status;
