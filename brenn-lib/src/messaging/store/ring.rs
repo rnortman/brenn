@@ -558,45 +558,49 @@ impl RingStore {
     /// some other port, and never retunes one — writing its zero into a cursor
     /// would leave a depth the model says the cursor cannot hold.
     ///
-    /// Panics for a push-enabled read by a subscriber that is not attached.
+    /// `None` for a push-enabled read by a subscriber holding no cursor.
     pub fn window(
         &self,
         subscriber: &ParticipantId,
         push_limit: u64,
         retain_limit: u64,
-    ) -> RingWindow {
+    ) -> Option<RingWindow> {
         let mut state = self.state();
         let RingState { ring, cursors, .. } = &mut *state;
         let Some(attached) = cursors.get_mut(subscriber) else {
             if push_limit > 0 {
-                Self::unattached(&self.address, subscriber);
+                return None;
             }
             let entries: Vec<_> = ring.tail(retain_limit).cloned().collect();
-            return RingWindow {
+            return Some(RingWindow {
                 new_from: entries.len(),
                 entries,
                 push_enabled: false,
-            };
+            });
         };
         if push_limit > 0 {
             attached.cursor.set_push_depth(push_limit);
         }
-        attached.cursor.window(ring, push_limit, retain_limit)
+        Some(attached.cursor.window(ring, push_limit, retain_limit))
     }
 
     /// Move this subscriber's cursor to `through + 1` and report the unseen
     /// seqs no window ever served it — `seen_floor` being the oldest seq the
     /// window it is advancing over carried.
     ///
-    /// Panics for a subscriber that is not attached.
-    pub fn advance(&self, subscriber: &ParticipantId, through: u64, seen_floor: u64) -> Advance {
+    /// `None` for a subscriber holding no cursor: nothing to move, nothing to
+    /// report, and nothing mutated.
+    pub fn advance(
+        &self,
+        subscriber: &ParticipantId,
+        through: u64,
+        seen_floor: u64,
+    ) -> Option<Advance> {
         let mut state = self.state();
         let RingState { ring, cursors, .. } = &mut *state;
         let advance = cursors
             .get_mut(subscriber)
-            .unwrap_or_else(|| Self::unattached(&self.address, subscriber))
-            .cursor
-            .advance(ring, through, seen_floor);
+            .map(|attached| attached.cursor.advance(ring, through, seen_floor));
         drop(state);
         advance
     }
@@ -866,20 +870,21 @@ impl RetentionStore for RingStore {
     /// retunes the cursor's stored depth first, so the window the caller asked
     /// for is the window the cursor cuts.
     ///
-    /// Panics for a subscriber with no cursor on this channel.
+    /// `None` for a push-enabled read by a subscriber with no cursor on this
+    /// channel.
     async fn window(
         &self,
         subscriber: &ParticipantId,
         push_limit: Depth,
         retain_limit: Depth,
-    ) -> SubscriberWindow {
+    ) -> Option<SubscriberWindow> {
         let window = RingStore::window(
             self,
             subscriber,
             depth_bound(push_limit),
             depth_bound(retain_limit),
-        );
-        SubscriberWindow {
+        )?;
+        Some(SubscriberWindow {
             new_from: window.new_from,
             push_enabled: window.push_enabled,
             entries: window
@@ -887,21 +892,21 @@ impl RetentionStore for RingStore {
                 .into_iter()
                 .map(|entry| (MessageSeq(entry.seq), entry.message))
                 .collect(),
-        }
+        })
     }
 
-    /// Panics for a subscriber with no cursor on this channel.
+    /// `None` for a subscriber with no cursor on this channel.
     async fn advance(
         &self,
         subscriber: &ParticipantId,
         through: MessageSeq,
         seen_floor: MessageSeq,
-    ) -> AdvanceOutcome {
-        let advance = RingStore::advance(self, subscriber, through.0, seen_floor.0);
-        AdvanceOutcome {
+    ) -> Option<AdvanceOutcome> {
+        let advance = RingStore::advance(self, subscriber, through.0, seen_floor.0)?;
+        Some(AdvanceOutcome {
             dropped: advance.dropped,
             noise_charge: advance.noise_charge,
-        }
+        })
     }
 
     /// Cursor-tracked: the store self-determines Created vs Existing from
@@ -1102,14 +1107,20 @@ mod tests {
     /// consumer does: the bodies it was handed as new, and the drops the
     /// advance reported.
     fn serve(s: &RingStore, subscriber: &ParticipantId, push_limit: u64) -> (Vec<String>, u64) {
-        let window = s.window(subscriber, push_limit, 0);
+        let window = s
+            .window(subscriber, push_limit, 0)
+            .expect("the case attached this subscriber");
         let bodies = window
             .new_entries()
             .iter()
             .map(|e| e.message.body.clone())
             .collect();
         let dropped = match window.advance_span() {
-            Some((through, seen_floor)) => s.advance(subscriber, through, seen_floor).noise_charge,
+            Some((through, seen_floor)) => {
+                s.advance(subscriber, through, seen_floor)
+                    .expect("the case attached this subscriber")
+                    .noise_charge
+            }
             None => 0,
         };
         (bodies, dropped)
@@ -1584,10 +1595,34 @@ mod tests {
         assert!(s.attached().is_empty());
     }
 
+    /// A push-enabled read needs a cursor; without one the ring reports the
+    /// absence rather than fabricating an empty window. The sampled read of the
+    /// same subscriber is served regardless — it borrows no position.
     #[test]
-    #[should_panic(expected = "has no queue for subscriber")]
-    fn a_window_for_an_unattached_subscriber_panics() {
-        store(4).window(&sub("proc"), 4, 0);
+    fn a_push_window_for_an_unattached_subscriber_reports_no_position() {
+        let s = store(4);
+        publish(&s, "alice", &["a"]);
+        assert!(s.window(&sub("proc"), 4, 0).is_none());
+        let sampled = s
+            .window(&sub("proc"), 0, 4)
+            .expect("a sampled window needs no position");
+        assert_eq!(sampled.entries.len(), 1);
+    }
+
+    /// An advance for a subscriber whose cursor is gone moves nothing and
+    /// reports the absence: the ring half of the departed-subscriber contract.
+    #[test]
+    fn an_advance_for_an_unattached_subscriber_reports_no_position() {
+        let s = store(4);
+        s.attach(&sub("proc"), "proc", 4, Priming::Head);
+        publish(&s, "alice", &["a"]);
+        let window = s
+            .window(&sub("proc"), 4, 0)
+            .expect("the case attached this subscriber");
+        let (through, seen_floor) = window.advance_span().expect("entries were served");
+        s.detach(&sub("proc"));
+        assert!(s.advance(&sub("proc"), through, seen_floor).is_none());
+        assert!(!s.is_attached(&sub("proc")));
     }
 
     // ── Deferral ──────────────────────────────────────────────────────────

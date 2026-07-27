@@ -239,11 +239,22 @@ impl SystemInbox {
                 self.messenger.warn_acl_denied(&entry, &subscriber);
                 continue;
             }
+            // A system participant's subscriptions are static: attached at the
+            // top of its loop and torn down by nothing, so a missing position
+            // is a wiring bug rather than a departure to tolerate.
             let window = self
                 .messenger
                 .store_for(&entry)
                 .window(&subscriber, sub.push_depth, sub.retain_depth)
-                .await;
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "messaging: no position for system subscriber {} on {} — a push-enabled \
+                         read over a queue that was never created",
+                        subscriber.as_str(),
+                        entry.address
+                    )
+                });
             if window.new_entries().is_empty() {
                 continue;
             }
@@ -257,7 +268,14 @@ impl SystemInbox {
             if let Some((through, seen_floor)) = window.advance_span() {
                 self.messenger
                     .advance_subscriber(&entry.address, &subscriber, through, seen_floor, sub.noise)
-                    .await;
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "messaging: no position for system subscriber {} on {} to advance",
+                            subscriber.as_str(),
+                            entry.address
+                        )
+                    });
             }
             batch.extend(new);
         }
@@ -453,6 +471,22 @@ mod tests {
 
     fn bodies(batch: &[(MessageSeq, MessageEnvelope)]) -> Vec<String> {
         batch.iter().map(|(_, env)| env.body.clone()).collect()
+    }
+
+    /// A system participant's positions are static — attached at the top of its
+    /// loop and torn down by nothing — so a push-enabled read that finds none is
+    /// a wiring bug. The store reports the absence; this caller judges it fatal.
+    ///
+    /// The expected text names the *read* site specifically. The advance site
+    /// carries its own panic, and no single-threaded case can reach it: once the
+    /// window answered `Some`, the position exists. That one is held by review,
+    /// not by this test.
+    #[tokio::test]
+    #[should_panic(expected = "a push-enabled read over a queue that was never created")]
+    async fn dequeue_without_a_position_panics() {
+        let h = harness().await;
+        insert_row(&h, "unattached").await;
+        inbox(&h).dequeue_batch().await;
     }
 
     #[tokio::test]

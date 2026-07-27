@@ -12,6 +12,8 @@
 
 use std::sync::Arc;
 
+use tracing::debug;
+
 use super::config::NoiseLevel;
 use super::store::{MessageSeq, priming_for_kind};
 use super::{
@@ -110,9 +112,9 @@ impl Messenger {
     /// directory, on the channel it subscribes to.
     ///
     /// Run at boot, and again whenever an app gains a subscription: a
-    /// push-enabled subscriber with no position is a wiring bug its first window
-    /// read panics on, and `Head` priming means the position must exist before
-    /// the publish it is meant to catch, not after.
+    /// push-enabled subscriber with no position is served nothing, and `Head`
+    /// priming means the position must exist before the publish it is meant to
+    /// catch, not after.
     ///
     /// The conversation itself is minted here when the app has never had one —
     /// an app wired to receive is a delivery target whether or not anything has
@@ -186,6 +188,10 @@ impl Messenger {
     /// A pure read — the conversation's positions do not move until
     /// [`Messenger::advance_conversation`] runs, so a render or a send that
     /// fails leaves the batch owed.
+    ///
+    /// A subscription whose position is gone by the time its window is read is
+    /// skipped: an unsubscribe can land between the enumeration above and the
+    /// read below, and a subscriber that left is owed nothing.
     pub async fn conversation_delivery(&self, conversation_id: i64) -> ConversationDelivery {
         let subscriber = ParticipantId::for_conversation(conversation_id);
         let mut delivery = ConversationDelivery::default();
@@ -199,6 +205,14 @@ impl Messenger {
                 .store_for(&entry)
                 .window(&subscriber, sub.push_depth, sub.retain_depth)
                 .await;
+            let Some(window) = window else {
+                debug!(
+                    channel = %entry.address,
+                    subscriber = %subscriber.as_str(),
+                    "conversation delivery skips a subscription with no position"
+                );
+                continue;
+            };
             if window.new_entries().is_empty() {
                 continue;
             }
@@ -226,17 +240,29 @@ impl Messenger {
     ///
     /// Called after the batch has been rendered and accepted — the drain's
     /// at-least-once ack point.
+    ///
+    /// A span whose position is gone by the time it is advanced is skipped: an
+    /// unsubscribe can land between the read that produced the span and this
+    /// call, and there is then no position to move and nothing to report.
     pub async fn advance_conversation(&self, conversation_id: i64, delivery: ConversationDelivery) {
         let subscriber = ParticipantId::for_conversation(conversation_id);
         for span in delivery.spans {
-            self.advance_subscriber(
-                &span.channel_address,
-                &subscriber,
-                span.through,
-                span.seen_floor,
-                span.noise,
-            )
-            .await;
+            let advanced = self
+                .advance_subscriber(
+                    &span.channel_address,
+                    &subscriber,
+                    span.through,
+                    span.seen_floor,
+                    span.noise,
+                )
+                .await;
+            if advanced.is_none() {
+                debug!(
+                    channel = %span.channel_address,
+                    subscriber = %subscriber.as_str(),
+                    "conversation advance skips a span whose position is gone"
+                );
+            }
         }
     }
 }
@@ -450,6 +476,69 @@ mod tests {
         assert!(
             m.conversation_delivery(conversation).await.is_empty(),
             "both channels advanced"
+        );
+    }
+
+    /// A detach landing between the subscription enumeration and the window read
+    /// leaves one subscription with no position. The drain skips it — it is owed
+    /// nothing — and the conversation's other channels still deliver.
+    #[tokio::test]
+    async fn a_subscription_detached_mid_read_is_skipped_and_the_rest_deliver() {
+        let ch_a = channel("chat-a", Depth::Bounded(5));
+        let ch_b = channel("chat-b", Depth::Bounded(5));
+        let (uuid_a, uuid_b) = (ch_a.uuid, ch_b.uuid);
+        let addr_a = ch_a.address.clone();
+        let m = messenger(vec![ch_a, ch_b]).await;
+        m.attach_conversation_subscribers().await;
+        let conversation = conversation_of(&m).await;
+        publish(&m, uuid_a, "gone").await;
+        publish(&m, uuid_b, "kept").await;
+
+        // The directory still lists the subscription; only its position is gone.
+        m.detach_conversation(&addr_a, APP).await;
+
+        let delivery = m.conversation_delivery(conversation).await;
+        assert_eq!(
+            delivery
+                .messages
+                .iter()
+                .map(|e| e.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kept"],
+            "the departed subscription is skipped, the rest is served"
+        );
+        m.advance_conversation(conversation, delivery).await;
+        assert!(
+            m.conversation_delivery(conversation).await.is_empty(),
+            "the served channel advanced and the departed one still serves nothing"
+        );
+    }
+
+    /// A detach landing between the read and the ack: the span the read produced
+    /// no longer has a position to move. Two legal operations interleaving, so
+    /// the advance completes as a no-op rather than killing the process.
+    #[tokio::test]
+    async fn an_advance_over_a_detached_subscription_is_a_no_op() {
+        let mut ch = channel("chat", Depth::Bounded(1));
+        ch.subscribers[0].noise = NoiseLevel::Metered;
+        let (uuid, address) = (ch.uuid, ch.address.clone());
+        let m = messenger(vec![ch]).await;
+        m.attach_conversation_subscribers().await;
+        let conversation = conversation_of(&m).await;
+        for body in ["one", "two", "three"] {
+            publish(&m, uuid, body).await;
+        }
+
+        let delivery = m.conversation_delivery(conversation).await;
+        assert_eq!(delivery.spans.len(), 1, "the read produced a span to ack");
+
+        m.detach_conversation(&address, APP).await;
+        m.advance_conversation(conversation, delivery).await;
+
+        assert_eq!(
+            m.drop_counter(&address, &ParticipantId::for_conversation(conversation)),
+            0,
+            "a refused advance charges the departed subscriber nothing"
         );
     }
 

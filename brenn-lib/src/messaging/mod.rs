@@ -2058,11 +2058,16 @@ impl Messenger {
     /// has been served, and enact the noise for whatever that window skipped.
     ///
     /// Returns what the advance passed unserved, so the caller can hand the
-    /// subscriber its own drop figure.
+    /// subscriber its own drop figure, or `None` when the store held no
+    /// position to move — the subscriber departed, was demoted to sampled, or
+    /// never attached. Nothing is enacted on that path: a departed
+    /// subscriber's metered tally went with its detach.
     ///
     /// # Panics
     ///
-    /// If `channel_address` resolves to no channel.
+    /// If `channel_address` resolves to no channel. A channel does not vanish
+    /// under a subscriber, so an unresolvable one is a wiring bug even where a
+    /// missing position is not.
     pub async fn advance_subscriber(
         &self,
         channel_address: &str,
@@ -2070,18 +2075,18 @@ impl Messenger {
         through: store::MessageSeq,
         seen_floor: store::MessageSeq,
         noise: config::NoiseLevel,
-    ) -> store::AdvanceOutcome {
+    ) -> Option<store::AdvanceOutcome> {
         let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
             panic!(
                 "messaging: advance requested for channel {channel_address:?} not in the directory"
             )
         });
         let store = self.store_for(&entry);
-        let outcome = store.advance(subscriber, through, seen_floor).await;
+        let outcome = store.advance(subscriber, through, seen_floor).await?;
         // noise_charge excludes losses already reported by eviction, so
         // nothing is enacted twice.
         self.enact_overflow_noise(&entry.address, subscriber, noise, outcome.noise_charge);
-        outcome
+        Some(outcome)
     }
 
     /// Does `app_slug` hold a dynamic subscription on the non-durable channel
@@ -3064,6 +3069,9 @@ impl Messenger {
                 windows.push(store::SubscriberWindow::empty());
                 continue;
             }
+            // A WASM port's position is created at boot and torn down by
+            // nothing: no dynamic unsubscribe path targets a WASM subscriber.
+            // Absence here is a wiring bug, so it stays fail-fast.
             windows.push(
                 store
                     .window(
@@ -3071,7 +3079,15 @@ impl Messenger {
                         Depth::Bounded(input.sub.push_depth.clamped_to(WASM_WINDOW_MAX_NEW)),
                         Depth::Bounded(input.sub.retain_depth.clamped_to(WASM_WINDOW_MAX_RETAIN)),
                     )
-                    .await,
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "messaging: no position for WASM subscriber {} on {} — a push-enabled \
+                             port that was never attached",
+                            subscriber.as_str(),
+                            input.sub.channel_address
+                        )
+                    }),
             );
         }
         if windows.iter().all(|w| w.new_entries().is_empty()) {
@@ -4892,7 +4908,8 @@ mod tests {
         let outcome = restarted
             .store_for(&channel)
             .advance(&wasm_sub, through, seen_floor)
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(
             outcome.dropped, 2,
             "the two the clamp skipped before the restart are still reported after it"
@@ -5052,7 +5069,8 @@ mod tests {
                 store::MessageSeq(1),
                 config::NoiseLevel::Silent,
             )
-            .await;
+            .await
+            .expect("the case attached this subscriber");
 
         // Build an inputs list with one port bound to the channel (Unbounded depths).
         let inputs = vec![WasmInputPort {
@@ -5183,7 +5201,8 @@ mod tests {
                 seen_floor,
                 config::NoiseLevel::Silent,
             )
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(outcome.dropped, 2, "the two the clamp skipped");
 
         assert!(
@@ -5239,6 +5258,92 @@ mod tests {
                 .has_deliverable(&wasm_sub)
                 .await,
             "a sampled port holds no position, so nothing is owed on it"
+        );
+    }
+
+    /// A WASM port's position is created at boot and torn down by nothing, so a
+    /// push-enabled port that has none is a wiring bug: the store reports the
+    /// absence and this caller dies on it. Pinned because the tolerant shape —
+    /// skip the port and carry on — lives two files away in the conversation
+    /// drain, and copying it here would turn a mis-wired port into silent,
+    /// unreported message loss.
+    ///
+    /// Two ports, because the trigger gate answers `None` before any window is
+    /// read when nothing is deliverable: the attached port carries the message
+    /// that gets past the gate, and the unattached one is what the read then
+    /// hits.
+    #[tokio::test]
+    #[should_panic(expected = "no position for WASM subscriber")]
+    async fn a_window_over_an_unattached_wasm_port_panics() {
+        let slug = "unattached-port";
+        let attached = crate::messaging::testutils::wasm_channel_entry(
+            slug,
+            "unattached-port-live",
+            Depth::Bounded(4),
+            Depth::Bounded(0),
+        );
+        let orphan = crate::messaging::testutils::wasm_channel_entry(
+            slug,
+            "unattached-port-orphan",
+            Depth::Bounded(4),
+            Depth::Bounded(0),
+        );
+        let db = crate::db::init_db_memory();
+        {
+            let conn = db.lock().await;
+            crate::messaging::db::upsert_channels(&conn, &[(*attached).clone(), (*orphan).clone()]);
+        }
+        let messenger = Messenger::new(
+            db,
+            Arc::new(MessagingDirectory::with_entries(vec![
+                (*attached).clone(),
+                (*orphan).clone(),
+            ])),
+            Arc::from("test"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            config::MessagingGlobalConfig::default(),
+        )
+        .with_subscriber_registrations(
+            crate::messaging::testutils::covering_wasm_registrations(slug),
+        );
+        let wasm_sub = ParticipantId::for_wasm(slug);
+
+        messenger
+            .attach_subscriber(
+                &attached.address,
+                slug,
+                &wasm_sub,
+                Depth::Bounded(4),
+                store::Priming::Head,
+            )
+            .await;
+        super::testutils::insert_bus_message(
+            &messenger,
+            &attached,
+            "trigger",
+            ChannelScheme::Brenn,
+        )
+        .await;
+
+        let port = |entry: &ChannelEntry| WasmInputPort {
+            port: entry.address.clone(),
+            sub: config::ResolvedSubscription {
+                channel_uuid: entry.uuid,
+                channel_address: entry.address.clone(),
+                push_depth: Depth::Bounded(4),
+                retain_depth: Depth::Bounded(0),
+                noise: config::NoiseLevel::Silent,
+                wake_min: WakeMin::Normal,
+            },
+            amplification_mt: 1000,
+        };
+        let inputs = vec![port(&attached), port(&orphan)];
+
+        let snapshot = messenger.load_activation_snapshot(&wasm_sub, &inputs).await;
+        panic!(
+            "the read survived an unattached port, returning {} snapshots",
+            snapshot.map_or(0, |s| s.len())
         );
     }
 
@@ -5475,7 +5580,8 @@ mod tests {
                 Depth::Bounded(4),
                 Depth::Bounded(0),
             )
-            .await;
+            .await
+            .expect("the case attached this subscriber");
             let (through, seen_floor) = window.advance_span().expect("the durable port owed one");
             store::RetentionStore::advance(
                 durable_store.as_ref(),
@@ -5483,7 +5589,8 @@ mod tests {
                 through,
                 seen_floor,
             )
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         }
         {
             let ring_store = messenger.ring_store_for(&ring);
@@ -5493,10 +5600,12 @@ mod tests {
                 Depth::Bounded(4),
                 Depth::Bounded(0),
             )
-            .await;
+            .await
+            .expect("the case attached this subscriber");
             let (through, seen_floor) = window.advance_span().expect("the ring owed a message");
             store::RetentionStore::advance(ring_store.as_ref(), &ring_sub, through, seen_floor)
-                .await;
+                .await
+                .expect("the case attached this subscriber");
         }
         router.wakes.lock().unwrap().clear();
         messenger.wake_owed_subscribers(Utc::now()).await;
@@ -5922,7 +6031,8 @@ mod tests {
         messenger
             .store_for(&channel)
             .advance(&conversation, store::MessageSeq(1), store::MessageSeq(1))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert!(
             !messenger
                 .store_for(&channel)
@@ -6003,7 +6113,8 @@ mod tests {
         messenger
             .store_for(&channel)
             .advance(&conversation, store::MessageSeq(1), store::MessageSeq(1))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
 
         let sweep = messenger.wake_owed_subscribers(Utc::now()).await;
         assert!(
@@ -6633,7 +6744,8 @@ mod tests {
                 seen_floor,
                 config::NoiseLevel::Silent,
             )
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(
             outcome.dropped, 0,
             "every unseen message was served, as new or as context"
@@ -6715,7 +6827,8 @@ mod tests {
                 seen_floor,
                 config::NoiseLevel::Silent,
             )
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(
             outcome.dropped, 2,
             "two evicted-before-read messages are accountable drops"
@@ -6843,7 +6956,8 @@ mod tests {
         let (through, seen_floor) = snap[0].advance_span().expect("the window served entries");
         let outcome = messenger
             .advance_subscriber(&channel.address, &wasm_sub, through, seen_floor, noise)
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         (
             messenger.drop_counter(&channel.address, &wasm_sub),
             router.alarms.load(std::sync::atomic::Ordering::SeqCst),
@@ -6969,7 +7083,8 @@ mod tests {
         let (through, seen_floor) = snap[0].advance_span().expect("the window served entries");
         let outcome = messenger
             .advance_subscriber(&channel.address, &wasm_sub, through, seen_floor, noise)
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         (
             messenger.drop_counter(&channel.address, &wasm_sub),
             router.alarms.load(std::sync::atomic::Ordering::SeqCst),
@@ -7449,10 +7564,12 @@ mod tests {
                 Depth::Bounded(4),
                 Depth::Bounded(0),
             )
-            .await;
+            .await
+            .expect("the case attached this subscriber");
             let (through, seen_floor) = window.advance_span().expect("one retained message");
             store::RetentionStore::advance(ring_store.as_ref(), &wasm_sub, through, seen_floor)
-                .await;
+                .await
+                .expect("the case attached this subscriber");
         }
 
         // Durable port: attached at head, then one publish → the activation

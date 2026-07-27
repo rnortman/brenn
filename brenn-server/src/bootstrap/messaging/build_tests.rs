@@ -2147,7 +2147,9 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         urgency: brenn_lib::messaging::Urgency::Normal,
         envelope_type: brenn_lib::messaging::ChannelScheme::Local,
     });
-    let window = store.window(&subscriber, 4, 0);
+    let window = store
+        .window(&subscriber, 4, 0)
+        .expect("the case attached this subscriber");
     assert_eq!(
         window.new_len(),
         1,

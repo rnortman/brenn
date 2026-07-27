@@ -441,6 +441,10 @@ pub(in crate::wasm_dispatch) async fn drain_step(
             dropped_per_port.push(0);
             continue;
         };
+        // A WASM port's position outlives every activation — no dynamic
+        // unsubscribe path targets a WASM subscriber — so a span produced by
+        // the read above and refused here is a wiring bug: a port that was
+        // never attached, or one advanced while sampled.
         let outcome = cfg
             .messenger
             .advance_subscriber(
@@ -450,7 +454,14 @@ pub(in crate::wasm_dispatch) async fn drain_step(
                 seen_floor,
                 input.sub.noise,
             )
-            .await;
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "wasm dispatch: no position for {} on {} to advance",
+                    subscriber.as_str(),
+                    snap.channel_address
+                )
+            });
         dropped_per_port.push(outcome.dropped);
     }
 

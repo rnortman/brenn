@@ -706,14 +706,9 @@ impl Messenger {
         //    so `detach_subscriber` resolves.
         //
         // The app's delivery state is its conversation's position, which is what
-        // this deletes.
-        //
-        // TODO(substrate-unsubscribe-publish-race): the delete is not serialized
-        // against a drain already in flight for the same subscriber. A drain
-        // reads its windows under one lock hold and advances under a later one;
-        // an unsubscribe landing between the two leaves the advance with no row
-        // to move, which panics. Closing it means the teardown and the drain's
-        // read→advance pair must agree on a scope.
+        // this deletes. It is not serialized against a drain already in flight
+        // for the same subscriber: that drain's advance finds no position and
+        // no-ops, which is the whole of what a departed subscriber is owed.
         self.detach_conversation(address, app_slug).await;
 
         Ok(UnsubscribeOutcome {
@@ -1879,6 +1874,96 @@ mod tests {
                 .iter()
                 .any(|s| matches!(&s.kind, SubscriberEntryKind::App(slug) if slug == "graf")),
             "subscriber folded out of directory"
+        );
+    }
+
+    /// The interleaving the teardown is not serialized against: a drain reads
+    /// its windows, a full `unsubscribe_dynamic` runs before the ack, and the
+    /// advance then finds no position. Both operations are legal and neither
+    /// waits for the other, so the pair completes — the departed subscriber is
+    /// owed nothing and charged nothing.
+    #[tokio::test]
+    async fn unsubscribe_between_a_drains_read_and_its_advance_completes() {
+        // The delivery gate classifies by scheme, so this case needs the
+        // canonical address a real channel carries.
+        let ch = channel(
+            &crate::messaging::canonical_address("heartbeat"),
+            ChannelScheme::Brenn,
+        );
+        let (uuid, address) = (ch.uuid, ch.address.clone());
+        // The delivery-time ACL gate reads the app's policy, so the app needs
+        // one that covers the channel or the drain serves nothing to race with.
+        let mut app = test_app_config("graf", None, vec!["u".to_string()]);
+        app.singleton = true;
+        app.policy = crate::messaging::test_support::brenn_delivery_policy(
+            crate::access::acl::ChannelMatcher::Prefix(String::new()),
+        );
+        let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
+        apps.insert("graf".to_string(), app);
+        let m = messenger_with_apps(vec![ch], apps).await;
+        let conversation = {
+            let conn = m.db.lock().await;
+            let user = crate::auth::user::create_user(&conn, "u", "$argon2id$fake");
+            crate::conversation::get_or_create_singleton_conversation(&conn, user, "graf").id
+        };
+        let subscriber = ParticipantId::for_conversation(conversation);
+        m.subscribe_dynamic(
+            "graf",
+            &address,
+            DynamicSubscribeParams {
+                push_depth: Depth::Bounded(1),
+                noise: Some(NoiseLevel::Metered),
+                ..push_enabled()
+            },
+        )
+        .await
+        .expect("subscribe succeeds");
+
+        // Two messages against a depth-1 window, so the span the read produces
+        // carries a drop the advance would otherwise charge.
+        for body in ["one", "two"] {
+            let conn = m.db.lock().await;
+            insert_message(
+                &conn,
+                uuid,
+                "src",
+                "someone",
+                body,
+                Urgency::Normal,
+                ChannelScheme::Brenn,
+                None,
+                None,
+                None,
+                0,
+            );
+        }
+
+        let delivery = m.conversation_delivery(conversation).await;
+        assert!(
+            !delivery.is_empty(),
+            "the read served a batch, so it carries the span that acks it"
+        );
+
+        m.unsubscribe_dynamic("graf", &address)
+            .await
+            .expect("unsubscribe succeeds");
+
+        m.advance_conversation(conversation, delivery).await;
+
+        // The one wrong outcome: an advance that resurrects the row it found
+        // missing. A "nothing owed" question cannot see that — a fresh cursor at
+        // `through + 1` is owed nothing either — so ask for the position itself.
+        assert!(
+            m.store_for_address(&address)
+                .window(&subscriber, Depth::Unbounded, Depth::Bounded(0))
+                .await
+                .is_none(),
+            "the refused advance minted no position"
+        );
+        assert_eq!(
+            m.drop_counter(&address, &subscriber),
+            0,
+            "a refused advance charges the departed subscriber nothing"
         );
     }
 
