@@ -1,30 +1,5 @@
 # TODOs
 
-## `substrate-unsubscribe-publish-race`
-
-`unsubscribe_dynamic` (`brenn-lib/src/messaging/subscribe.rs`) tears down a
-subscriber's delivery state via `detach_conversation` → `detach_subscriber`, which
-deletes the cursor row. That delete is not serialized against a drain already in
-flight for the same subscriber: `conversation_delivery` reads its windows under one
-lock hold, the caller renders and sends outside the lock, and `advance_conversation`
-takes the lock again to move the positions. An unsubscribe landing between the two
-leaves the advance with no row to move, and `DbStore::advance` panics
-(`store/db.rs`, "has no cursor ... to advance") — a legitimate operator action
-killing the process. Closing it means the teardown and the drain's read→advance pair
-must agree on a scope: either the advance tolerates a departed subscriber (its
-position is gone, so there is nothing to move and nothing to report), or the detach
-waits behind an in-flight delivery. Done when an unsubscribe racing a drain cannot
-panic, pinned by a test.
-
-Note: the older shape of this race — a publish inserting push rows after the
-delete, leaving a fully-unsubscribed subscriber owed work — is gone. Commits are
-target-blind now (no per-subscriber rows are written at publish), so a concurrent
-publish can no longer resurrect delivery state for a departed subscriber.
-
-Code site (`TODO(substrate-unsubscribe-publish-race)`):
-`brenn-lib/src/messaging/subscribe.rs` (the `detach_conversation` teardown step in
-`unsubscribe_dynamic`).
-
 ## `scrub-template-drift-cache-skip`
 
 `repo_template_matches_the_tracked_public_config` (scrub/tests/rules.rs) guards

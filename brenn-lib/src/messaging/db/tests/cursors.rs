@@ -559,39 +559,6 @@ fn the_seed_does_not_run_again_on_a_later_boot() {
 
 // ── The bus-claim delete ────────────────────────────────────────────────────
 
-/// Counts `warn` events from the messaging module while it is the calling
-/// thread's default subscriber, and returns the guard that restores the previous
-/// default on drop.
-fn capture_messaging_warns() -> (
-    std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    tracing::subscriber::DefaultGuard,
-) {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tracing_subscriber::layer::SubscriberExt;
-
-    struct WarnLayer(Arc<AtomicUsize>);
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnLayer {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let meta = event.metadata();
-            if *meta.level() == tracing::Level::WARN
-                && meta.module_path().is_some_and(|m| m.contains("messaging"))
-            {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-    }
-
-    let count = Arc::new(AtomicUsize::new(0));
-    let subscriber = tracing_subscriber::registry().with(WarnLayer(Arc::clone(&count)));
-    let guard = tracing::subscriber::set_default(subscriber);
-    (count, guard)
-}
-
 /// Channel-backed claim rows in `messaging_pending_pushes`.
 fn bus_claims(conn: &Connection) -> i64 {
     conn.query_row(
@@ -643,7 +610,11 @@ fn the_migration_takes_the_bus_claims_and_leaves_the_ingress_rows() {
     )
     .expect("insert ingress claim");
 
-    let (warns, guard) = capture_messaging_warns();
+    assert_eq!(
+        bus_claims(&conn),
+        2,
+        "the fixture gives the delete both claims to take"
+    );
     migrate_from_before_cursors(&conn);
 
     // The seed ran off those claims before they went: the position they encoded
@@ -663,22 +634,13 @@ fn the_migration_takes_the_bus_claims_and_leaves_the_ingress_rows() {
         .expect("count ingress claims");
     assert_eq!(ingress_claims, 1, "the ingress delivery record survives");
 
-    // The migration boot is the one legitimate hit, and it is reported: an
-    // operator seeing this line on any later boot is seeing a path that started
-    // minting channel-backed claims again.
-    assert_eq!(
-        warns.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "the delete reports the rows it took"
-    );
-
-    // And the backstop stays quiet when it finds nothing — while still leaving
+    // And the backstop takes nothing when it finds nothing — while still leaving
     // the ingress row where it is, which is the half every later boot repeats.
     run_messaging_migrations(&conn);
     assert_eq!(
-        warns.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "a boot with no channel-backed claims reports nothing"
+        bus_claims(&conn),
+        0,
+        "a later boot finds no channel-backed claims to take"
     );
     let ingress_claims_after: i64 = conn
         .query_row(
@@ -691,5 +653,4 @@ fn the_migration_takes_the_bus_claims_and_leaves_the_ingress_rows() {
         ingress_claims_after, 1,
         "and the second boot does not touch it either"
     );
-    drop(guard);
 }

@@ -1101,7 +1101,10 @@ async fn the_owed_walk_reports_the_loudest_unseen_urgency() {
         );
 
         // Pass the loud one; the quiet remainder is what is left to decide on.
-        store.advance(&sub, MessageSeq(1), MessageSeq(1)).await;
+        store
+            .advance(&sub, MessageSeq(1), MessageSeq(1))
+            .await
+            .expect("the case attached this subscriber");
         let owed = store.deliverable_subscribers().await;
         assert_eq!(
             owed.iter()
@@ -1362,10 +1365,14 @@ async fn serve(
             Depth::Bounded(push_limit),
             Depth::Bounded(retain_limit),
         )
-        .await;
+        .await
+        .expect("the case attached this subscriber");
     let new = new_bodies(&window);
     let advance = match window.advance_span() {
-        Some((through, seen_floor)) => store.advance(sub, through, seen_floor).await,
+        Some((through, seen_floor)) => store
+            .advance(sub, through, seen_floor)
+            .await
+            .expect("the case attached this subscriber"),
         None => AdvanceOutcome::default(),
     };
     (new, advance)
@@ -1447,7 +1454,8 @@ async fn unseen_context_inside_the_window_is_not_a_drop() {
 
         let window = store
             .window(&sub, Depth::Bounded(1), Depth::Bounded(4))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(
             window_bodies(&window),
             vec!["a", "b", "c", "d"],
@@ -1457,7 +1465,10 @@ async fn unseen_context_inside_the_window_is_not_a_drop() {
         assert_eq!(new_bodies(&window), vec!["d"], "{}", store.address());
 
         let (through, seen_floor) = window.advance_span().expect("the window served entries");
-        let advance = store.advance(&sub, through, seen_floor).await;
+        let advance = store
+            .advance(&sub, through, seen_floor)
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(
             advance.dropped,
             0,
@@ -1483,7 +1494,8 @@ async fn a_sampled_window_is_all_context() {
 
         let window = store
             .window(&sub, Depth::Bounded(0), Depth::Bounded(4))
-            .await;
+            .await
+            .expect("a sampled window needs no position");
         assert_eq!(
             window_bodies(&window),
             vec!["a", "b"],
@@ -1512,7 +1524,8 @@ async fn the_window_is_capped_by_the_larger_limit_not_their_sum() {
 
         let window = store
             .window(&sub, Depth::Bounded(2), Depth::Bounded(4))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(
             window_bodies(&window),
             vec!["e", "f", "g", "h"],
@@ -1540,7 +1553,8 @@ async fn an_unbounded_push_limit_serves_every_unseen_entry() {
 
         let window = store
             .window(&sub, Depth::Unbounded, Depth::Bounded(0))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(
             new_bodies(&window),
             vec!["a", "b", "c", "d", "e"],
@@ -1549,7 +1563,10 @@ async fn an_unbounded_push_limit_serves_every_unseen_entry() {
         );
 
         let (through, seen_floor) = window.advance_span().expect("the window served entries");
-        let advance = store.advance(&sub, through, seen_floor).await;
+        let advance = store
+            .advance(&sub, through, seen_floor)
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(advance.dropped, 0, "{}", store.address());
         assert_eq!(advance.noise_charge, 0, "{}", store.address());
     }
@@ -1571,7 +1588,8 @@ async fn an_unbounded_retain_limit_widens_the_window_not_the_new_set() {
 
         let window = store
             .window(&sub, Depth::Bounded(1), Depth::Unbounded)
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(
             window_bodies(&window),
             vec!["a", "b", "c", "d", "e"],
@@ -1581,7 +1599,10 @@ async fn an_unbounded_retain_limit_widens_the_window_not_the_new_set() {
         assert_eq!(new_bodies(&window), vec!["e"], "{}", store.address());
 
         let (through, seen_floor) = window.advance_span().expect("the window served entries");
-        let advance = store.advance(&sub, through, seen_floor).await;
+        let advance = store
+            .advance(&sub, through, seen_floor)
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(
             advance.dropped,
             0,
@@ -1607,7 +1628,8 @@ async fn a_sampled_window_offers_no_advance() {
 
         let window = store
             .window(&sub, Depth::Bounded(0), Depth::Bounded(4))
-            .await;
+            .await
+            .expect("a sampled window needs no position");
         assert!(!window.entries.is_empty(), "{}", store.address());
         assert!(
             window.advance_span().is_none(),
@@ -1620,38 +1642,64 @@ async fn a_sampled_window_offers_no_advance() {
     }
 }
 
-/// Advancing a sampled subscriber anyway is a wiring bug, not a tolerated
-/// no-op: a sampled attach leaves no position on either class, and the store
-/// dies rather than move one that does not exist.
+/// A sampled attach leaves no position on either class, so advancing one anyway
+/// finds nothing to move: the store reports the absence and mutates nothing,
+/// leaving the caller to decide whether absence is legal on its path.
 #[tokio::test]
-#[should_panic(expected = "has no queue for subscriber")]
-async fn advancing_a_sampled_ring_subscriber_panics() {
+async fn advancing_a_sampled_ring_subscriber_reports_no_position() {
     let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH));
     let sub = wasm_sub("sampled");
     RetentionStore::attach(&ring, &sub, "sampled", Depth::Bounded(0), Priming::Head).await;
     RetentionStore::append(&ring, message_for(&ring, "alice", "a")).await;
-    RetentionStore::advance(&ring, &sub, MessageSeq(1), MessageSeq(1)).await;
+    assert!(
+        RetentionStore::advance(&ring, &sub, MessageSeq(1), MessageSeq(1))
+            .await
+            .is_none()
+    );
+    // The refused advance moved nothing: the sampled read still sees the whole
+    // ambience as context.
+    let after = RetentionStore::window(&ring, &sub, Depth::Bounded(0), Depth::Bounded(DEPTH))
+        .await
+        .expect("a sampled window needs no position");
+    assert_eq!(window_bodies(&after), vec!["a"]);
+    assert!(after.new_entries().is_empty());
 }
 
 #[tokio::test]
-#[should_panic(expected = "to advance")]
-async fn advancing_a_sampled_durable_subscriber_panics() {
+async fn advancing_a_sampled_durable_subscriber_reports_no_position() {
     let (store, _db) = durable_store(DEPTH).await;
     let sub = wasm_sub("sampled");
     RetentionStore::attach(&store, &sub, "sampled", Depth::Bounded(0), Priming::Head).await;
     store.append(message("alice", "a")).await;
-    RetentionStore::advance(&store, &sub, MessageSeq(1), MessageSeq(1)).await;
+    assert!(
+        RetentionStore::advance(&store, &sub, MessageSeq(1), MessageSeq(1))
+            .await
+            .is_none()
+    );
+    let after = RetentionStore::window(&store, &sub, Depth::Bounded(0), Depth::Bounded(DEPTH))
+        .await
+        .expect("a sampled window needs no position");
+    assert_eq!(window_bodies(&after), vec!["a"]);
+    assert!(after.new_entries().is_empty());
 }
 
-/// The same contract for a subscriber that never attached at all: with no
-/// position to move, the durable store dies rather than retire the claims below
-/// a cursor that was never there.
+/// The same contract for a subscriber that never attached at all: no position,
+/// so nothing to move and nothing to report. The store cannot tell a stranger
+/// from a departure, which is why it reports rather than judges.
 #[tokio::test]
-#[should_panic(expected = "to advance")]
-async fn advancing_an_unattached_durable_subscriber_panics() {
+async fn advancing_an_unattached_durable_subscriber_reports_no_position() {
     let (store, _db) = durable_store(DEPTH).await;
     store.append(message("alice", "a")).await;
-    RetentionStore::advance(&store, &wasm_sub("stranger"), MessageSeq(1), MessageSeq(1)).await;
+    let sub = wasm_sub("stranger");
+    assert!(
+        RetentionStore::advance(&store, &sub, MessageSeq(1), MessageSeq(1))
+            .await
+            .is_none()
+    );
+    let after = RetentionStore::window(&store, &sub, Depth::Bounded(0), Depth::Bounded(DEPTH))
+        .await
+        .expect("a sampled window needs no position");
+    assert_eq!(window_bodies(&after), vec!["a"]);
 }
 
 /// Reading a window owed nothing is empty, not an error, and there is nothing to
@@ -1666,7 +1714,8 @@ async fn an_idle_queue_serves_an_empty_window() {
 
         let window = store
             .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert!(window.entries.is_empty(), "{}", store.address());
         assert!(window.advance_span().is_none(), "{}", store.address());
     }
@@ -1688,7 +1737,8 @@ async fn a_window_read_moves_nothing() {
 
         let first = store
             .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(
             new_bodies(&first),
             vec!["a", "b", "c"],
@@ -1697,7 +1747,8 @@ async fn a_window_read_moves_nothing() {
         );
         let second = store
             .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(
             new_bodies(&second),
             new_bodies(&first),
@@ -1723,7 +1774,8 @@ async fn nothing_deliverable_means_nothing_new_in_the_window() {
         assert!(!store.has_deliverable(&sub).await, "{}", store.address());
         let window = store
             .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(DEPTH))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert!(window.new_entries().is_empty(), "{}", store.address());
 
         // Owed.
@@ -1736,13 +1788,18 @@ async fn nothing_deliverable_means_nothing_new_in_the_window() {
         // Caught up: advanced over everything the window served.
         let window = store
             .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(DEPTH))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         let (through, seen_floor) = window.advance_span().expect("the window served entries");
-        store.advance(&sub, through, seen_floor).await;
+        store
+            .advance(&sub, through, seen_floor)
+            .await
+            .expect("the case attached this subscriber");
         assert!(!store.has_deliverable(&sub).await, "{}", store.address());
         let window = store
             .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(DEPTH))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         assert!(
             window.new_entries().is_empty(),
             "caught up but the window still holds new entries: {}",
@@ -1774,9 +1831,13 @@ async fn advancing_over_a_prefix_leaves_the_remainder_owed() {
 
         let window = store
             .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         let accepted = &window.new_entries()[..2];
-        let advance = store.advance(&sub, accepted[1].0, accepted[0].0).await;
+        let advance = store
+            .advance(&sub, accepted[1].0, accepted[0].0)
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(advance.dropped, 0, "{}", store.address());
 
         let (new, _) = serve(store.as_ref(), &sub, DEPTH, 0).await;
@@ -1803,10 +1864,14 @@ async fn advancing_nothing_keeps_every_obligation() {
 
         let window = store
             .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         let floor = window.entries[0].0;
         // Advancing to just below the floor is the "accepted nothing" advance.
-        let advance = store.advance(&sub, MessageSeq(floor.0 - 1), floor).await;
+        let advance = store
+            .advance(&sub, MessageSeq(floor.0 - 1), floor)
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(advance.dropped, 0, "{}", store.address());
 
         let (new, _) = serve(store.as_ref(), &sub, DEPTH, 0).await;
@@ -1830,10 +1895,17 @@ async fn advance_is_idempotent() {
 
         let window = store
             .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
-            .await;
+            .await
+            .expect("the case attached this subscriber");
         let (through, seen_floor) = window.advance_span().expect("entries were served");
-        store.advance(&sub, through, seen_floor).await;
-        let again = store.advance(&sub, through, seen_floor).await;
+        store
+            .advance(&sub, through, seen_floor)
+            .await
+            .expect("the case attached this subscriber");
+        let again = store
+            .advance(&sub, through, seen_floor)
+            .await
+            .expect("the case attached this subscriber");
         assert_eq!(again.dropped, 0, "{}", store.address());
         assert_eq!(again.noise_charge, 0, "{}", store.address());
     }
@@ -1848,42 +1920,116 @@ async fn a_durable_sampled_window_is_all_context() {
     store.append(message("alice", "a")).await;
     let window = store
         .window(&wasm_sub("ghost"), Depth::Bounded(0), Depth::Bounded(DEPTH))
-        .await;
+        .await
+        .expect("a sampled window needs no position");
     assert!(window.new_entries().is_empty());
     assert_eq!(window_bodies(&window), vec!["a"], "the ambience is served");
     assert_eq!(window.new_from, 1, "and all of it is context");
 }
 
 /// Both classes keep an explicit position per push-enabled subscriber, so a
-/// push window over a queue that was never created is a wiring bug rather than
-/// an empty window.
+/// push window over a queue that does not exist reports the absence rather than
+/// fabricating an empty window. The sampled read of the same subscriber still
+/// serves the ambience: only the push half needs a position.
 #[tokio::test]
-#[should_panic(expected = "a push-enabled window over a queue that was never created")]
-async fn a_durable_window_panics_for_an_unattached_subscriber() {
+async fn a_durable_push_window_reports_no_position_when_unattached() {
     let (store, _db) = durable_store_for("proc", DEPTH).await;
     store.append(message("alice", "a")).await;
-    RetentionStore::window(
-        &store,
-        &wasm_sub("ghost"),
-        Depth::Bounded(DEPTH),
-        Depth::Bounded(0),
-    )
-    .await;
+    let ghost = wasm_sub("ghost");
+    assert!(
+        RetentionStore::window(&store, &ghost, Depth::Bounded(DEPTH), Depth::Bounded(0))
+            .await
+            .is_none()
+    );
+    let sampled = RetentionStore::window(&store, &ghost, Depth::Bounded(0), Depth::Bounded(DEPTH))
+        .await
+        .expect("a sampled window needs no position");
+    assert_eq!(window_bodies(&sampled), vec!["a"]);
 }
 
-/// The ring keeps an explicit cursor per subscriber, so reading without one is a
-/// wiring bug rather than an empty window.
+/// The ring twin of the same contract.
 #[tokio::test]
-#[should_panic(expected = "has no queue for subscriber")]
-async fn a_ring_window_panics_for_an_unattached_subscriber() {
+async fn a_ring_push_window_reports_no_position_when_unattached() {
     let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH));
-    RetentionStore::window(
-        &ring,
-        &wasm_sub("ghost"),
-        Depth::Bounded(DEPTH),
-        Depth::Bounded(0),
-    )
-    .await;
+    RetentionStore::append(&ring, message_for(&ring, "alice", "a")).await;
+    let ghost = wasm_sub("ghost");
+    assert!(
+        RetentionStore::window(&ring, &ghost, Depth::Bounded(DEPTH), Depth::Bounded(0))
+            .await
+            .is_none()
+    );
+    let sampled = RetentionStore::window(&ring, &ghost, Depth::Bounded(0), Depth::Bounded(DEPTH))
+        .await
+        .expect("a sampled window needs no position");
+    assert_eq!(window_bodies(&sampled), vec!["a"]);
+}
+
+/// A detach landing between a window read and the advance over it: the advance
+/// finds no position, reports it, and moves nothing. A re-attach afterwards
+/// primes from the channel rather than from whatever the stale advance carried.
+#[tokio::test]
+async fn an_advance_over_a_detached_subscribers_window_reports_no_position() {
+    for store in stores_for_proc(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+            .await;
+        for body in ["a", "b"] {
+            let msg = message_for(store.as_ref(), "alice", body);
+            store.append(msg).await;
+        }
+        let window = store
+            .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
+            .await
+            .expect("the case attached this subscriber");
+        let (through, seen_floor) = window.advance_span().expect("entries were served");
+
+        store.detach(&sub).await;
+
+        assert!(
+            store.advance(&sub, through, seen_floor).await.is_none(),
+            "the departed subscriber has no position to move: {}",
+            store.address()
+        );
+
+        // Re-attaching mints a fresh position at the retained tail: the stale
+        // advance marked nothing seen on the way past.
+        store
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
+            .await;
+        let (new, _) = serve(store.as_ref(), &sub, DEPTH, 0).await;
+        assert_eq!(new, vec!["a", "b"], "{}", store.address());
+    }
+}
+
+/// A depth-0 attach removes the position it demotes, so an advance behind it
+/// meets the same absence a detach leaves — one absence path in the contract,
+/// however the position went.
+#[tokio::test]
+async fn an_advance_behind_a_sampled_demotion_reports_no_position() {
+    for store in stores_for_proc(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store
+            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
+            .await;
+        let msg = message_for(store.as_ref(), "alice", "a");
+        store.append(msg).await;
+        let window = store
+            .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
+            .await
+            .expect("the case attached this subscriber");
+        let (through, seen_floor) = window.advance_span().expect("entries were served");
+
+        store
+            .attach(&sub, "proc", Depth::Bounded(0), Priming::Head)
+            .await;
+
+        assert!(
+            store.advance(&sub, through, seen_floor).await.is_none(),
+            "{}",
+            store.address()
+        );
+    }
 }
 
 /// The ring twin of the durable clamp: an eviction retires a delivery obligation,

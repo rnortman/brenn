@@ -469,7 +469,14 @@ pub async fn owed_everywhere(
         }
         let window = store
             .window(subscriber, Depth::Unbounded, Depth::Bounded(0))
-            .await;
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "owed_everywhere: {} answers has_deliverable for {} yet holds no position for it",
+                    entry.address,
+                    subscriber.as_str()
+                )
+            });
         for (_, envelope) in window.new_entries() {
             owed.push((entry.address.clone(), Arc::clone(envelope)));
         }
@@ -492,9 +499,19 @@ pub async fn consume_owed(
     let store = messenger.store_for_address(channel_address);
     let window = store
         .window(subscriber, Depth::Unbounded, Depth::Bounded(0))
-        .await;
+        .await
+        .unwrap_or_else(|| {
+            panic!("consume_owed: {subscriber:?} holds no position on {channel_address}")
+        });
     if let Some((through, seen_floor)) = window.advance_span() {
-        store.advance(subscriber, through, seen_floor).await;
+        store
+            .advance(subscriber, through, seen_floor)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "consume_owed: {subscriber:?} lost its position on {channel_address} between the read and the advance"
+                )
+            });
     }
 }
 

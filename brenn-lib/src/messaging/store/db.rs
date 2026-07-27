@@ -224,14 +224,14 @@ impl RetentionStore for DbStore {
     ///
     /// A sampled subscriber holds no cursor and is never delivered to: its
     /// window is all context, cut at a position above everything the channel
-    /// ever assigned. A push-enabled subscriber with no cursor is a wiring bug
-    /// and panics.
+    /// ever assigned. A push-enabled read finds no cursor and answers `None`
+    /// for the caller to judge.
     async fn window(
         &self,
         subscriber: &ParticipantId,
         push_limit: Depth,
         retain_limit: Depth,
-    ) -> SubscriberWindow {
+    ) -> Option<SubscriberWindow> {
         let conn = self.db.lock().await;
         let next_owed = match db::load_subscriber_cursor(&conn, self.channel_uuid, subscriber) {
             Some(cursor) => {
@@ -251,13 +251,9 @@ impl RetentionStore for DbStore {
                 retained_seq(cursor.next_owed_seq)
             }
             None => {
-                assert!(
-                    !push_limit.is_push_enabled(),
-                    "messaging store: {} has no cursor for {} — a push-enabled window over a \
-                     queue that was never created",
-                    self.address,
-                    subscriber.as_str()
-                );
+                if push_limit.is_push_enabled() {
+                    return None;
+                }
                 MessageSeq(
                     retained_seq(db::channel_last_retained_seq(&conn, self.channel_uuid)).0 + 1,
                 )
@@ -271,19 +267,20 @@ impl RetentionStore for DbStore {
             .into_iter()
             .map(|(seq, envelope)| (retained_seq(seq), Arc::new(envelope)))
             .collect();
-        compose_window(entries, next_owed, push_limit)
+        Some(compose_window(entries, next_owed, push_limit))
     }
 
     /// Move the cursor to `through + 1` and report the unseen seqs no window
     /// served, both figures subtractions between seqs.
     ///
-    /// Panics for a subscriber holding no cursor — sampled or never attached.
+    /// `None` for a subscriber holding no cursor: there is no position to move
+    /// and nothing to report, and nothing is written on that path.
     async fn advance(
         &self,
         subscriber: &ParticipantId,
         through: MessageSeq,
         seen_floor: MessageSeq,
-    ) -> AdvanceOutcome {
+    ) -> Option<AdvanceOutcome> {
         assert!(
             seen_floor.0 <= through.0.saturating_add(1),
             "messaging store: {} seen_floor {} is above the window it came from (through {})",
@@ -292,14 +289,7 @@ impl RetentionStore for DbStore {
             through.0
         );
         let conn = self.db.lock().await;
-        let cursor = db::load_subscriber_cursor(&conn, self.channel_uuid, subscriber)
-            .unwrap_or_else(|| {
-                panic!(
-                    "messaging store: {} has no cursor for {} to advance",
-                    self.address,
-                    subscriber.as_str()
-                )
-            });
+        let cursor = db::load_subscriber_cursor(&conn, self.channel_uuid, subscriber)?;
         let next_owed = retained_seq(cursor.next_owed_seq).0;
         let dropped = seen_floor.0.saturating_sub(next_owed);
         let outcome = AdvanceOutcome {
@@ -324,7 +314,7 @@ impl RetentionStore for DbStore {
                 seq_column(MessageSeq(through.0 + 1)),
             );
         }
-        outcome
+        Some(outcome)
     }
 
     /// The cursor row is the whole of the determination: it exists, or this

@@ -471,16 +471,20 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     /// (`push_limit = 0`) subscriber is never delivered to, so nothing in its
     /// window is ever new — it still sees `retain_limit` of context.
     ///
-    /// Pure read: no position moves and nothing is charged. A store that keeps
-    /// an explicit per-subscriber position panics when asked for a subscriber
-    /// that has none: reading a queue that was never created is a wiring bug,
-    /// not an empty window.
+    /// Pure read: no position moves and nothing is charged.
+    ///
+    /// `None` means the store holds no position for this subscriber —
+    /// departed, demoted to sampled, or never attached, and the store cannot
+    /// tell which; the caller decides whether that is legal on its own path.
+    /// Only a push-enabled request can answer `None`: a sampled
+    /// (`push_limit = 0`) one needs no position and is always served its
+    /// retain-only view.
     async fn window(
         &self,
         subscriber: &ParticipantId,
         push_limit: Depth,
         retain_limit: Depth,
-    ) -> SubscriberWindow;
+    ) -> Option<SubscriberWindow>;
 
     /// Advance `subscriber` past everything through `through`, and report the
     /// unseen seqs no window ever served it.
@@ -496,16 +500,21 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     /// consumer that never advances just has an ever-lagging position that
     /// eviction eventually reports against.
     ///
-    /// Only a push-enabled subscriber may be advanced. A sampled
-    /// (`push_limit = 0`) subscriber holds no position: its window yields no
-    /// [`SubscriberWindow::advance_span`], and a store that keeps an explicit
-    /// position panics when asked to move one it does not have.
+    /// `None` means the store holds no position to move — the subscriber
+    /// departed, was demoted to sampled, or never attached, and the store
+    /// cannot tell which; the caller decides whether that is legal on its own
+    /// path. It is a different fact from `Some` carrying a zeroed outcome,
+    /// which is a position that moved over a window that lost nothing.
+    ///
+    /// Only a push-enabled subscriber holds a position at all: a sampled
+    /// (`push_limit = 0`) one's window yields no
+    /// [`SubscriberWindow::advance_span`], so no correct caller advances it.
     async fn advance(
         &self,
         subscriber: &ParticipantId,
         through: MessageSeq,
         seen_floor: MessageSeq,
-    ) -> AdvanceOutcome;
+    ) -> Option<AdvanceOutcome>;
 
     /// Register `subscriber`'s delivery state on this channel, or retune an
     /// existing one's push depth. Priming positions the queue only when it comes

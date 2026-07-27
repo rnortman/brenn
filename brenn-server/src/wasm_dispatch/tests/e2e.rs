@@ -1045,7 +1045,9 @@ async fn a_mixed_class_activation_settles_each_port_in_its_own_domain() {
     // domain would have left it far above the ring, and this window would serve
     // nothing while reporting the skipped span as drops.
     append_ring_message(&messenger, &ring_entry, "ring-next".to_string()).await;
-    let window = ring.window(&wasm_sub, 8, 0);
+    let window = ring
+        .window(&wasm_sub, 8, 0)
+        .expect("the case attached this subscriber");
     assert_eq!(
         window.entries.len() - window.new_from,
         1,
@@ -1053,7 +1055,9 @@ async fn a_mixed_class_activation_settles_each_port_in_its_own_domain() {
     );
     let (through, seen_floor) = window.advance_span().expect("a served window advances");
     assert_eq!(
-        ring.advance(&wasm_sub, through, seen_floor).dropped,
+        ring.advance(&wasm_sub, through, seen_floor)
+            .expect("the case attached this subscriber")
+            .dropped,
         0,
         "a cursor advanced by exactly one loses nothing in between"
     );
