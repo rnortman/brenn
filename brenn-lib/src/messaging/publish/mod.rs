@@ -1123,69 +1123,6 @@ impl Messenger {
             }
         }
     }
-
-    /// Commit `body` onto `channel_address` and run the surface live fan-out over
-    /// it — the two halves of a durable commit, without the sender-side gates a
-    /// real principal would pass. Returns the message uuid and its retention
-    /// position.
-    ///
-    /// Test-only. A surface holds no server-side position, so the fan-out at the
-    /// commit is the whole of its delivery trigger: a case that writes a message
-    /// row directly reaches no session at all. This is the one seam that lets a
-    /// fixture stand in for a publishing principal it has no reason to build.
-    #[cfg(any(test, feature = "testutils"))]
-    pub async fn commit_and_feed_surfaces(
-        &self,
-        channel_address: &str,
-        body: &str,
-        urgency: Urgency,
-    ) -> (Uuid, i64) {
-        let channel = self.directory.resolve(channel_address).unwrap_or_else(|| {
-            panic!("commit_and_feed_surfaces: {channel_address} not registered")
-        });
-        let publish_ts_ns = db::utc_to_ns(Utc::now());
-        let inserted = {
-            let conn = self.db.lock().await;
-            let tx = conn
-                .unchecked_transaction()
-                .expect("commit_and_feed_surfaces: begin tx");
-            let inserted = self.insert_message(
-                &tx,
-                &channel,
-                ChannelScheme::Brenn,
-                self.source.as_ref(),
-                "sender",
-                body,
-                urgency,
-                publish_ts_ns,
-                None,
-                None,
-                None,
-            );
-            tx.commit().expect("commit_and_feed_surfaces: commit tx");
-            inserted
-        };
-        let retained_seq = inserted
-            .retained_seq
-            .expect("an unparked durable message holds a retention position");
-        let feed_targets =
-            self.resolve_surface_feed_targets(&channel.address, channel.subscribers.as_slice());
-        let envelope = Arc::new(surface_feed_envelope(
-            inserted.uuid,
-            self.source.as_ref().to_owned(),
-            channel.address.clone(),
-            "sender".to_owned(),
-            publish_ts_ns,
-            body.to_owned(),
-            None,
-            None,
-            None,
-            urgency,
-        ));
-        self.fan_out_surface_feed(&feed_targets, envelope, retained_seq)
-            .await;
-        (inserted.uuid, retained_seq)
-    }
 }
 
 /// Build the row-less envelope a just-committed durable message is fanned out

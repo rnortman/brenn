@@ -20,7 +20,7 @@ use brenn_lib::messaging::config::{
     ResolvedSurface, ResolvedSurfaceSubscription, Sink, SurfaceBinding, SurfaceOutput,
     SurfacePrincipalBudgets, SurfaceSendBudget, build_channel_entries,
 };
-use brenn_lib::messaging::db::{insert_message, upsert_channels, utc_to_ns};
+use brenn_lib::messaging::db::{insert_message, message_retained_seq, upsert_channels, utc_to_ns};
 use brenn_lib::messaging::store::RingStores;
 use brenn_lib::messaging::testutils::ephemeral_channel_entry;
 use brenn_lib::messaging::{
@@ -2915,6 +2915,23 @@ fn durable_surface(
     }
 }
 
+/// Add the publish half of the durable channel's authority — the
+/// `MessagingPublish` grant plus a `brenn_publish` ACL naming it — to a surface
+/// that already subscribes. Opt-in per test, so the cases whose principal must
+/// stay receive-only keep it.
+fn grant_durable_publish(mut resolved: ResolvedSurface) -> ResolvedSurface {
+    resolved
+        .policy
+        .grants
+        .insert(AppCapability::MessagingPublish);
+    resolved
+        .policy
+        .acls
+        .brenn_publish
+        .push(ChannelMatcher::Exact(DURABLE_NAME.to_string()));
+    resolved
+}
+
 /// Wire a real `WakeRouterImpl`-backed `Messenger` into a fresh test `AppState`
 /// whose `deskbar` runtime projects the durable channel, sharing the state's
 /// `surface_registry` so live dispatch reaches attached WS sessions. Returns the
@@ -2968,6 +2985,9 @@ async fn durable_rig(
         MessagingGlobalConfig::default(),
     )
     .with_subscriber_registrations(surface_registrations_all_grains(surface_policies, surfaces))
+    // The publish path requires every principal grain in the budget map — a
+    // missing entry is a broken invariant; a non-publishing principal never draws.
+    .with_surface_send_budgets(budget_principals(surfaces))
     .with_ring_stores(fixture_stores(nondurable));
     let mut state = crate::test_support::state::test_state(db);
     state.messenger = Some(messenger.clone());
@@ -3910,14 +3930,23 @@ async fn surface_ws_durable_publish_parks_then_drains_on_late_subscribe() {
     assert_durable_deliver_to(&mut subscriber, COMPONENT, "offline-hello", 1).await;
 }
 
-/// Commit `body` onto the durable channel and run the production surface
-/// fan-out over it — the live-delivery trigger for an attached session.
-/// Returns the message's retention position.
+/// Publish `body` onto the durable channel as the `deskbar` surface's own
+/// (bare-grain, publisher-only) principal, through the production publish
+/// path — attached sessions receive live delivery. Returns the message's
+/// retention position.
+///
+/// Every non-`Ok` outcome is a rig bug — a missing grant, ACL, or budget —
+/// and panics rather than being absorbed into a delivery-count mismatch later.
 async fn feed_durable(messenger: &Messenger, body: &str) -> i64 {
-    messenger
-        .commit_and_feed_surfaces(DURABLE_ADDR, body, Urgency::Normal)
+    let message_id = match messenger
+        .publish_from_surface("deskbar", None, DURABLE_ADDR, body, Urgency::Normal)
         .await
-        .1
+    {
+        PublishResult::Ok { message_id, .. } => message_id,
+        other => panic!("feed_durable expected Ok, got {other:?}"),
+    };
+    let conn = messenger.db().lock().await;
+    message_retained_seq(&conn, message_id)
 }
 
 /// Commit `body` onto the durable channel with **no** fan-out: present in the
@@ -4062,7 +4091,13 @@ async fn surface_ws_durable_parked_rows_drain_in_seq_order_on_subscribe() {
     let uuid = Uuid::new_v4();
     let (state, messenger) = durable_rig(
         &db,
-        durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
+        grant_durable_publish(durable_surface(
+            uuid,
+            Depth::Unbounded,
+            WakeMin::Normal,
+            true,
+            None,
+        )),
         durable_channel_entry(uuid, Depth::Unbounded),
         vec![],
     )
@@ -4097,7 +4132,13 @@ async fn surface_ws_durable_live_delivery_after_subscribe_arrives_once() {
     let uuid = Uuid::new_v4();
     let (state, messenger) = durable_rig(
         &db,
-        durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
+        grant_durable_publish(durable_surface(
+            uuid,
+            Depth::Unbounded,
+            WakeMin::Normal,
+            true,
+            None,
+        )),
         durable_channel_entry(uuid, Depth::Unbounded),
         vec![],
     )
@@ -4130,7 +4171,13 @@ async fn surface_ws_durable_live_copy_above_the_high_water_heals_the_interior_ga
     let uuid = Uuid::new_v4();
     let (state, messenger) = durable_rig(
         &db,
-        durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
+        grant_durable_publish(durable_surface(
+            uuid,
+            Depth::Unbounded,
+            WakeMin::Normal,
+            true,
+            None,
+        )),
         durable_channel_entry(uuid, Depth::Unbounded),
         vec![],
     )
@@ -4174,7 +4221,13 @@ async fn surface_ws_durable_drain_reports_the_span_the_clamp_left_behind() {
     let (state, messenger) = durable_rig(
         &db,
         // One position per drain: a suffix of three cannot fit.
-        durable_surface(uuid, Depth::Bounded(1), WakeMin::Normal, true, None),
+        grant_durable_publish(durable_surface(
+            uuid,
+            Depth::Bounded(1),
+            WakeMin::Normal,
+            true,
+            None,
+        )),
         durable_channel_entry(uuid, Depth::Unbounded),
         vec![],
     )
@@ -4557,7 +4610,13 @@ async fn surface_ws_durable_multi_session_fanout_and_backlog_once() {
     let uuid = Uuid::new_v4();
     let (state, messenger) = durable_rig(
         &db,
-        durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
+        grant_durable_publish(durable_surface(
+            uuid,
+            Depth::Unbounded,
+            WakeMin::Normal,
+            true,
+            None,
+        )),
         durable_channel_entry(uuid, Depth::Unbounded),
         vec![],
     )
@@ -4612,7 +4671,13 @@ async fn surface_ws_durable_live_fanout_and_its_drain_nudge_deliver_once() {
     let uuid = Uuid::new_v4();
     let (state, messenger) = durable_rig(
         &db,
-        durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
+        grant_durable_publish(durable_surface(
+            uuid,
+            Depth::Unbounded,
+            WakeMin::Normal,
+            true,
+            None,
+        )),
         durable_channel_entry(uuid, Depth::Unbounded),
         vec![],
     )
@@ -4648,7 +4713,13 @@ async fn surface_ws_durable_row_missed_while_detached_is_served_on_resume() {
     let uuid = Uuid::new_v4();
     let (state, messenger) = durable_rig(
         &db,
-        durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, None),
+        grant_durable_publish(durable_surface(
+            uuid,
+            Depth::Unbounded,
+            WakeMin::Normal,
+            true,
+            None,
+        )),
         durable_channel_entry(uuid, Depth::Unbounded),
         vec![],
     )
@@ -4716,7 +4787,13 @@ async fn surface_ws_durable_and_ephemeral_on_one_session() {
     let eph = "ticker";
     let (state, messenger) = durable_rig(
         &db,
-        durable_surface(uuid, Depth::Unbounded, WakeMin::Normal, true, Some(eph)),
+        grant_durable_publish(durable_surface(
+            uuid,
+            Depth::Unbounded,
+            WakeMin::Normal,
+            true,
+            Some(eph),
+        )),
         durable_channel_entry(uuid, Depth::Unbounded),
         vec![ephemeral_channel_entry(eph, 0)],
     )

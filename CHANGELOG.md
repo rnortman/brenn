@@ -2,6 +2,19 @@
 
 All notable changes to Brenn are documented here.
 
+## [0.14.3] — 2026-07-27
+
+### Added
+
+- Extensive refactoring of message bus substrate on the backend brings parity to
+  all transports: both LLMs and WASM apps can now publish and subscribe with all
+  features in parity across `brenn:`, `ephemeral:`, and `local:` channels. Many
+  redundant internal code paths unified onto common traits.
+- WASM apps gain the ability to query retained messages on inputs, set
+  `deliver_after` on output messages, and view/edit/cancel deferred/pending
+  output messages, giving them the ability to self-schedule timed events
+  (replacing the need for timers, cron, and scheduling).
+
 ## [0.14.2] — 2026-07-22
 
 ### Added
