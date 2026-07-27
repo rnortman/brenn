@@ -56,6 +56,8 @@ pub use ingress::{
 mod bus;
 #[cfg(test)]
 pub(crate) use bus::LOAD_DISPATCHABLE_INGRESS_SQL;
+#[cfg(any(test, feature = "testutils"))]
+pub use bus::message_retained_seq;
 pub use bus::{
     BusGcEviction, EditFieldsApplied, InsertedMessage, MessageLookup, bus_gc_evict_channel,
     channel_last_retained_seq, channel_resume_epoch, channel_retained_count_after_seq,

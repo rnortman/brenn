@@ -676,6 +676,24 @@ pub fn channel_last_retained_seq(conn: &Connection, channel_uuid: Uuid) -> i64 {
     .unwrap_or_else(|e| panic!("messaging: channel {channel_uuid} has no row: {e}"))
 }
 
+/// Test-only: the retention position of a committed message, by uuid.
+///
+/// Panics if the row is missing or still parked — callers ask about a message
+/// they just published unparked, so either answer is a broken invariant rather
+/// than a case to handle. Reading by uuid rather than through
+/// [`channel_last_retained_seq`] is direct evidence: the channel high-water is a
+/// proxy that a misassigned position would still satisfy.
+#[cfg(any(test, feature = "testutils"))]
+pub fn message_retained_seq(conn: &Connection, message_id: Uuid) -> i64 {
+    conn.query_row(
+        "SELECT retained_seq FROM messaging_messages WHERE uuid = ?1",
+        rusqlite::params![message_id.as_bytes().to_vec()],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .unwrap_or_else(|e| panic!("messaging: message {message_id} has no row: {e}"))
+    .unwrap_or_else(|| panic!("messaging: message {message_id} holds no retention position"))
+}
+
 /// The oldest retention sequence the channel still holds, or `None` when it
 /// holds nothing — the boundary below which every message is gone.
 ///

@@ -1588,3 +1588,80 @@ fn the_retained_seq_unique_index_rejects_a_duplicate() {
         .expect("unsequenced rows are not constrained by the partial index");
     }
 }
+
+#[test]
+fn message_retained_seq_reads_the_named_row_not_the_channel_high_water() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let (a, _b) = upsert_two_channels(&conn);
+
+    let first = insert_message(
+        &conn,
+        a,
+        "src",
+        "sender",
+        "first",
+        Urgency::Low,
+        ChannelScheme::Brenn,
+        None,
+        None,
+        None,
+        utc_to_ns(Utc::now()),
+    );
+    assert_eq!(
+        message_retained_seq(&conn, first.uuid),
+        first
+            .retained_seq
+            .expect("an unparked append is positioned"),
+        "the read agrees with the position the insert reported"
+    );
+
+    append_msg(&conn, a, "second");
+    assert_eq!(
+        message_retained_seq(&conn, first.uuid),
+        1,
+        "a later append does not move an earlier row's position"
+    );
+    assert!(
+        message_retained_seq(&conn, first.uuid) < last_retained_seq_of(&conn, a),
+        "the high-water has moved past the first row, so the two are distinguishable"
+    );
+}
+
+/// An unknown uuid is a broken caller invariant, not a `None` to handle.
+#[test]
+#[should_panic(expected = "has no row")]
+fn message_retained_seq_panics_on_an_unknown_uuid() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let (_a, _b) = upsert_two_channels(&conn);
+    message_retained_seq(&conn, Uuid::new_v4());
+}
+
+/// A parked row holds no position; reporting one would be the silent-wrong
+/// answer, so the read dies instead.
+#[test]
+#[should_panic(expected = "holds no retention position")]
+fn message_retained_seq_panics_on_a_parked_row() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+    let (a, _b) = upsert_two_channels(&conn);
+    let parked = insert_message(
+        &conn,
+        a,
+        "src",
+        "sender",
+        "parked",
+        Urgency::Low,
+        ChannelScheme::Brenn,
+        None,
+        None,
+        Some(Utc::now() + chrono::Duration::hours(1)),
+        utc_to_ns(Utc::now()),
+    );
+    assert_eq!(
+        parked.retained_seq, None,
+        "the fixture row is really parked"
+    );
+    message_retained_seq(&conn, parked.uuid);
+}
