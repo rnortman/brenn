@@ -34,6 +34,7 @@ use crate::core::{
     ActivationOutcome, ClientCore, Command, CoreConfig, Effect, Event, Input, MessageStamp,
     PublishBuffer, PublishStatus, ReadyActivation,
 };
+use crate::core::{checked_epoch_ms, epoch_ms};
 use crate::handle::{
     ActivationEntry, AlertCommand, DriverChannels, HandleCommand, PublishCommand, PublishGate,
     TelemetryCommand,
@@ -55,6 +56,22 @@ fn new_stamp() -> MessageStamp {
         message_id: uuid::Uuid::new_v4(),
         publish_ts: wall_now(),
     }
+}
+
+/// One stamp per publish in a flush, all carrying the same wall-clock instant.
+///
+/// One read, because a flush is one commit: its entries take their positions in
+/// one uninterrupted stretch, and each entry's release time is compared against
+/// that instant to decide park-vs-immediate. Reading the clock per entry would let
+/// two entries of one flush disagree about when "now" was.
+fn flush_stamps(count: usize) -> Vec<MessageStamp> {
+    let publish_ts = wall_now();
+    (0..count)
+        .map(|_| MessageStamp {
+            message_id: uuid::Uuid::new_v4(),
+            publish_ts,
+        })
+        .collect()
 }
 
 /// The async driver, generic over the transport connector.
@@ -131,6 +148,14 @@ pub struct Driver<C: TransportConnector> {
     /// `None` disarms — the ordinary state, since a retry is only owed while some
     /// instance's outbox is blocked.
     retry_wakeup: Option<crate::Millis>,
+    /// The core's most recently requested release deadline, epoch milliseconds
+    /// UTC, armed on its own select arm.
+    ///
+    /// A wall-clock deadline rather than a [`crate::Millis`] one, unlike the two
+    /// above: a release time is an instant a component named, so the delay is
+    /// recomputed against the wall clock each pass. `None` disarms — the ordinary
+    /// state, since nothing is owed a release until something is parked.
+    release_wakeup: Option<u64>,
     /// A URL the core asked to connect to, awaiting the connect race in the run
     /// loop. Set by [`Effect::Connect`], consumed at the top of the loop.
     pending_connect: Option<String>,
@@ -270,6 +295,7 @@ impl<C: TransportConnector> Driver<C> {
             clock,
             wakeup: None,
             retry_wakeup: None,
+            release_wakeup: None,
             pending_connect: None,
             initial,
             terminal: false,
@@ -287,7 +313,22 @@ impl<C: TransportConnector> Driver<C> {
     /// kernel is gone (see [`Driver::run_terminal_drain`]).
     pub async fn run(mut self) {
         let initial = std::mem::take(&mut self.initial);
-        self.execute(initial).await;
+        // The device clock is checked once, here, before anything depends on a
+        // reading of it: the page stamps every publish, every activation `now`
+        // and every schedule comparison from this clock, so one that reads before
+        // the epoch cannot be worked around, only refused. Failing here trades an
+        // undiagnosed trap on the first activation for the ordinary fatal state,
+        // which names the cause. The connect-on-spawn effects are dropped
+        // unexecuted: a page that cannot timestamp has no business connecting.
+        match checked_epoch_ms(wall_now()) {
+            Ok(_) => self.execute(initial).await,
+            Err(detail) => {
+                let effects = self
+                    .core
+                    .on_input(Input::HostFatal { detail }, self.clock.now());
+                self.execute(effects).await;
+            }
+        }
         while !self.terminal {
             match self.pending_connect.take() {
                 Some(url) => self.run_connect(url).await,
@@ -542,6 +583,7 @@ impl<C: TransportConnector> Driver<C> {
                 clock,
                 wakeup,
                 retry_wakeup,
+                release_wakeup,
                 control_rx,
                 control_closed,
                 publish_rx,
@@ -594,6 +636,7 @@ impl<C: TransportConnector> Driver<C> {
             .fuse();
             let timer = sleep_until(clock, *wakeup).fuse();
             let retry = sleep_until(clock, *retry_wakeup).fuse();
+            let release = sleep_until_release(*release_wakeup).fuse();
             // Ready when an instance is dispatchable, pending forever otherwise.
             // This is what makes `drain_activations`' bounded pass safe: whatever
             // the pass left ready comes back here rather than waiting on an
@@ -625,6 +668,7 @@ impl<C: TransportConnector> Driver<C> {
                 telemetry,
                 timer,
                 retry,
+                release,
                 activations
             );
             // Control is biased ahead of the publish and best-effort alert /
@@ -643,6 +687,7 @@ impl<C: TransportConnector> Driver<C> {
                 command = telemetry => SelectOutcome::Telemetry(command),
                 () = timer => SelectOutcome::Tick,
                 () = retry => SelectOutcome::RetryTick,
+                () = release => SelectOutcome::ReleaseDue,
                 () = activations => SelectOutcome::Activations,
             }
         };
@@ -743,6 +788,12 @@ impl<C: TransportConnector> Driver<C> {
             }
             SelectOutcome::Tick => Input::Tick,
             SelectOutcome::RetryTick => Input::RetryTick,
+            // The wall clock is read here rather than derived from the deadline:
+            // the timer may fire late (a throttled background tab) or early (a
+            // clock step), and what releases is what is due *now*.
+            SelectOutcome::ReleaseDue => Input::ReleaseDue {
+                now_ms: epoch_ms(wall_now()),
+            },
             // No input to feed: the core already holds the readiness and the
             // activation, put there by whatever turn delivered the message. This
             // arm exists only so that work the previous turn's bounded pass left
@@ -791,7 +842,7 @@ impl<C: TransportConnector> Driver<C> {
     async fn drain_activations(&mut self) {
         let mut budget = self.core.registered_count();
         while budget > 0
-            && let Some(ready) = self.core.take_ready_activation()
+            && let Some(ready) = self.core.take_ready_activation(epoch_ms(wall_now()))
         {
             budget -= 1;
             let ReadyActivation {
@@ -831,7 +882,7 @@ impl<C: TransportConnector> Driver<C> {
             // `local:` entries of a flush and reads no entropy itself. Minted for
             // every entry, local or not, for the same reason a single publish is
             // stamped unconditionally — only the core resolves locality.
-            let stamps = (0..buffer.len()).map(|_| new_stamp()).collect();
+            let stamps = flush_stamps(buffer.len());
             let now = self.clock.now();
             let effects = self.core.on_input(
                 Input::ActivationDone {
@@ -899,6 +950,7 @@ impl<C: TransportConnector> Driver<C> {
                 }
                 Effect::SetWakeup(deadline) => self.wakeup = deadline,
                 Effect::SetRetryWakeup(deadline) => self.retry_wakeup = deadline,
+                Effect::SetReleaseWakeup(deadline) => self.release_wakeup = deadline,
                 Effect::SendFrame(frame) => match self.conn.as_mut() {
                     Some(conn) => {
                         let text = serde_json::to_string(&frame)
@@ -1033,6 +1085,8 @@ enum SelectOutcome {
     Tick,
     /// The outbox-retry deadline fired.
     RetryTick,
+    /// The release deadline fired: something parked on a confined channel is due.
+    ReleaseDue,
     /// An instance is dispatchable and nothing above it in the bias order had
     /// work. Carries nothing: the core holds the readiness and the activation.
     Activations,
@@ -1073,6 +1127,24 @@ async fn sleep_until(clock: &Clock, wakeup: Option<crate::Millis>) {
     }
 }
 
+/// Sleep until the core's armed release deadline, or forever when disarmed.
+///
+/// The delay is the distance from the wall clock read now to the deadline, so a
+/// clock that steps is followed rather than fought: the release time a component
+/// named is a wall-clock instant, and a page whose clock jumps forward owes its
+/// parked messages sooner. A deadline already past sleeps not at all, which is
+/// correct — the core releases everything due on the fire, so the next armed
+/// deadline is always in the future of the same read.
+async fn sleep_until_release(release: Option<u64>) {
+    match release {
+        Some(deadline) => {
+            let delay = deadline.saturating_sub(epoch_ms(wall_now()));
+            timer::sleep(Duration::from_millis(delay)).await;
+        }
+        None => future::pending::<()>().await,
+    }
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
@@ -1099,7 +1171,14 @@ mod tests {
             deferred: vec![],
             now: None,
         };
-        let buffer = || PublishBuffer::new(Default::default(), Default::default(), 1024);
+        let buffer = || {
+            PublishBuffer::new(
+                Default::default(),
+                Default::default(),
+                1024,
+                Default::default(),
+            )
+        };
 
         let ok: ActivationEntry = Box::new(|_, _| Ok(()));
         assert_eq!(invoke(&ok, &activation, buffer()).0, ActivationOutcome::Ok);

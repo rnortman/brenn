@@ -14,15 +14,41 @@ use std::sync::{Arc, Mutex};
 
 use super::SubKey;
 use brenn_lib::messaging::MessageEnvelope;
+use brenn_surface_proto::DeferredViewEntry;
 use chrono::{DateTime, Utc};
 use tokio::sync::{Notify, mpsc};
+use tracing::warn;
 use uuid::Uuid;
 
-/// Bounded depth of a session's live durable-delivery queue. The router fans a
-/// live row out with `try_send`, so a full queue drops the live copy (the row
-/// re-parks and the session catches up on its next drain) rather than stalling
-/// the shared dispatch fan-out task.
-pub const DURABLE_QUEUE_FRAMES: usize = 256;
+/// Bounded depth of a session's push queue. Every producer hands work over with
+/// `try_send`, so a full queue drops the copy rather than stalling the shared
+/// dispatch fan-out task.
+pub const PUSH_QUEUE_FRAMES: usize = 256;
+
+/// One item handed from a producer outside the session task to a session's own
+/// task, over its bounded `push_tx`.
+///
+/// Two variants because two independent planes reach a session from outside:
+/// retained rows the session must sequence against its own cursor state, and
+/// deferred-view snapshots it forwards verbatim.
+#[derive(Clone)]
+pub enum SessionPush {
+    Durable(DurableDelivery),
+    DeferredView(DeferredViewPush),
+}
+
+/// One `(channel, instance)` deferred-view snapshot bound for a session's
+/// `ServerFrame::DeferredView`.
+///
+/// Carries no delivery state: the frame is a full replacement, so a session that
+/// drops one under a full queue is corrected by the next emission rather than
+/// owed a resend.
+#[derive(Clone)]
+pub struct DeferredViewPush {
+    pub channel: String,
+    pub instance: String,
+    pub entries: Vec<DeferredViewEntry>,
+}
 
 /// One live durable row handed from the `WakeRouter` fan-out to a subscribed
 /// session's task via its bounded `durable_tx`. The channel is
@@ -76,11 +102,9 @@ pub struct SurfaceRegistry {
 
 /// Per-connection record for one attached session.
 ///
-/// The three durable-delivery fields are the live-projection handle the
-/// `WakeRouter` Surface arm reaches through: it snapshots the sessions of a
-/// slug, keeps those whose `durable_subs` covers the row's subscription, and
-/// hands the row to `durable_tx` / nudges `drain_notify`. They are created in the WS
-/// handler and shared (by `Arc`/`Sender` clone) with the session task.
+/// The push fields (`push_tx`, `durable_subs`, `drain_notify`) are shared
+/// between the registry (where producers write) and the session task (which
+/// drains). Created in the WS handler.
 #[derive(Clone)]
 pub struct SurfaceSessionHandle {
     /// Per-connection id, for log attribution.
@@ -88,8 +112,9 @@ pub struct SurfaceSessionHandle {
     pub username: String,
     pub client_ip: IpAddr,
     pub connected_at: DateTime<Utc>,
-    /// Live durable rows to this session's task (bounded, `try_send`).
-    pub durable_tx: mpsc::Sender<DurableDelivery>,
+    /// Live rows and deferred-view snapshots to this session's task (bounded,
+    /// `try_send`).
+    pub push_tx: mpsc::Sender<SessionPush>,
     /// The durable subscriptions this session currently holds — `(instance,
     /// channel)`, not just channel, because the subscription belongs to the
     /// principal that bound it. Written by the session task
@@ -118,18 +143,27 @@ impl SurfaceSessionHandle {
             .contains(sub)
     }
 
+    /// Push one deferred-view snapshot at this session, reporting whether the
+    /// queue took it. A full queue drops it: the snapshot is a full replacement,
+    /// so the next emission carries the same answer and nothing is owed.
+    pub fn try_push_deferred_view(&self, view: DeferredViewPush) -> bool {
+        self.push_tx
+            .try_send(SessionPush::DeferredView(view))
+            .is_ok()
+    }
+
     /// Minimal handle for tests that only care about `username` / capacity:
-    /// fresh id, localhost IP, throwaway durable channel, empty subscriptions.
+    /// fresh id, localhost IP, throwaway push channel, empty subscriptions.
     /// One constructor so a new field lands in one place, not every test file.
     #[cfg(test)]
     pub fn for_test(username: &str) -> Self {
-        let (durable_tx, _durable_rx) = mpsc::channel(DURABLE_QUEUE_FRAMES);
+        let (push_tx, _push_rx) = mpsc::channel(PUSH_QUEUE_FRAMES);
         Self {
             session_id: Uuid::new_v4(),
             username: username.to_string(),
             client_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             connected_at: Utc::now(),
-            durable_tx,
+            push_tx,
             durable_subs: Arc::new(Mutex::new(HashSet::new())),
             drain_notify: Arc::new(Notify::new()),
         }
@@ -197,6 +231,31 @@ impl SurfaceRegistry {
     pub fn sessions(&self, slug: &str) -> Vec<Arc<SurfaceSessionHandle>> {
         let map = self.inner.lock().expect("surface_registry poisoned");
         map.get(slug).cloned().unwrap_or_default()
+    }
+
+    /// Hand one deferred-view snapshot to every session attached to `slug`.
+    ///
+    /// Every session, not just the one whose action changed the set: the parked
+    /// set belongs to `surface:<slug>#<instance>`, which every tab of the
+    /// surface shares, so a view held by only one of them would be a second
+    /// answer to a question that has one.
+    ///
+    /// One place for the fan-out because two producers reach it — the session
+    /// task's own park/cancel/edit and the release sweep, which arrives through
+    /// the `WakeRouter` seam with no session of its own.
+    pub fn push_deferred_view(&self, slug: &str, view: &DeferredViewPush) {
+        for handle in self.sessions(slug) {
+            if !handle.try_push_deferred_view(view.clone()) {
+                warn!(
+                    surface = slug,
+                    instance = view.instance,
+                    channel = view.channel,
+                    session = %handle.session_id,
+                    "deferred view dropped: session push queue full; the next change to this \
+                     sender's parked set carries the whole snapshot again"
+                );
+            }
+        }
     }
 
     /// Count of sessions attached to `slug`.

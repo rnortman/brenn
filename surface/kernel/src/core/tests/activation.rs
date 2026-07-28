@@ -1,4 +1,4 @@
-//! Activation delivery: rings, windows, batching, budgets, flush, parking.
+//! Activation delivery: stores, windows, batching, budgets, flush, parking.
 //!
 //! The design's client-core test block. These are the executable statements of
 //! the backend-parity claims — most of all the recovery property, which is the
@@ -16,7 +16,7 @@ const INST: &str = "protobar";
 
 /// An envelope with a distinct `message_id`, which the shared `sample_envelope`
 /// fixture cannot give (it pins one id, deliberately — every other suite asserts
-/// exact envelopes). Identity is the whole subject of the ring's dedup and the
+/// exact envelopes). Identity is the whole subject of the store's dedup and the
 /// window's context/new split, so these tests must be able to tell two messages
 /// apart.
 fn env(body: &str, id: u128) -> MessageEnvelope {
@@ -111,6 +111,33 @@ fn deliver(core: &mut ClientCore, envelope: &MessageEnvelope, seq: u64) -> Vec<E
     deliver_dropped(core, envelope, seq, 0)
 }
 
+/// Feed one `Deliver` per body on `channel`, seqs ascending from 1.
+///
+/// The shape a page-side drop needs: a binding's view is `max(push_depth,
+/// retain_depth)` deep, and only a message pushed out of *that* is lost — what
+/// the window still serves was delivered, as context if not as new. So a burst
+/// longer than the deepest view on the channel is what charges a cursor.
+/// Returns every effect the burst produced: eviction is charged at insert, so the
+/// loudness ladder's alert, toast and fatal kill are the *delivery's* effects, not
+/// a later activation's.
+fn deliver_burst_on(core: &mut ClientCore, channel: &str, bodies: &[&str]) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    for (i, body) in bodies.iter().enumerate() {
+        let seq = i as u64 + 1;
+        effects.extend(deliver_ch(core, channel, &env(body, i as u128 + 1), seq, 0));
+    }
+    effects
+}
+
+/// [`deliver_burst_on`] for the suite's default channel.
+fn deliver_burst(core: &mut ClientCore, bodies: &[&str]) -> Vec<Effect> {
+    deliver_burst_on(core, "ephemeral:demo", bodies)
+}
+
+/// Five bodies against a view four deep: the oldest is pushed out of the view
+/// entirely, so exactly one message is charged as dropped.
+const OVERFLOWING_BURST: &[&str] = &["a", "b", "c", "d", "e"];
+
 fn deliver_dropped(
     core: &mut ClientCore,
     envelope: &MessageEnvelope,
@@ -167,6 +194,7 @@ fn batches(effects: &[Effect]) -> Vec<(String, u64, Vec<BatchEntry>)> {
                 instance,
                 correlation,
                 publishes,
+                ..
             }) => Some((instance.clone(), *correlation, publishes.clone())),
             _ => None,
         })
@@ -211,18 +239,18 @@ fn every_bound_port_windows_every_activation_in_config_order() {
     assert_eq!(beta.new_from, 0, "pure context: new_from == len");
 }
 
-/// Context comes from the subscription's ring at **this binding's own** depth,
-/// even though the ring is folded to the max over the instance's bindings.
+/// Each binding reads a view **`max(push_depth, retain_depth)` deep of its own**,
+/// out of the one store the subscription's bindings share.
 ///
-/// `retain_depth` bounds the whole *view*, not the context half: the ring is fed
-/// before the window is assembled, so a new message occupies one of its own
-/// binding's slots and the context is what is left under the depth. A depth-3
-/// port with one new message therefore sees 2 context + 1 new — three messages,
-/// which is what "a view three deep" means.
+/// Both depths bound the whole view, not the context half: the store is fed before
+/// the window is assembled, so a new message occupies one of the binding's own
+/// slots and the context is what is left under the depth. A binding with a 3-deep
+/// view and one new message therefore sees 2 context + 1 new, while its sibling
+/// reading 2 deep out of the same store sees 1 context + 1 new.
 #[test]
-fn each_binding_reads_context_at_its_own_depth_from_the_folded_ring() {
+fn each_binding_reads_its_own_view_depth_from_the_folded_store() {
     let mut core = registered_core(
-        vec![binding("deep", 4, 3), binding("shallow", 4, 1)],
+        vec![binding("deep", 2, 3), binding("shallow", 2, 1)],
         vec![],
     );
     for (i, body) in ["m1", "m2", "m3"].iter().enumerate() {
@@ -230,7 +258,7 @@ fn each_binding_reads_context_at_its_own_depth_from_the_folded_ring() {
         let ready = take_one(&mut core);
         complete(&mut core, INST, ActivationOutcome::Ok, ready.buffer);
     }
-    // The ring folded to 3 (the deeper binding), and now holds m2..m4.
+    // The store folded to 3 (the deeper binding's view), and now holds m2..m4.
     deliver(&mut core, &env("m4", 4), 4);
     let ready = take_one(&mut core);
     let deep = window(&ready.activation, "deep");
@@ -242,8 +270,8 @@ fn each_binding_reads_context_at_its_own_depth_from_the_folded_ring() {
     let shallow = window(&ready.activation, "shallow");
     assert_eq!(
         split(shallow),
-        (vec![], vec!["m4"]),
-        "a 1-deep view out of the same ring: the one message it can see is the new one"
+        (vec!["m3"], vec!["m4"]),
+        "a 2-deep view out of the same store: one context behind the new one"
     );
 }
 
@@ -258,7 +286,7 @@ fn context_is_deduped_by_message_id_against_the_new_rows() {
     deliver(&mut core, &env("m2", 2), 2);
     let ready = take_one(&mut core);
     let w = window(&ready.activation, "in");
-    // Both are in the ring (it is fed by the same delivery that queued them), but
+    // Both are in the store (it is fed by the same delivery), but
     // both are new, so context is empty rather than a duplicate of `new`.
     assert_eq!(split(w), (vec![], vec!["m1", "m2"]));
     assert_eq!(w.envelopes.len(), 2, "no message appears twice");
@@ -269,31 +297,32 @@ fn context_is_deduped_by_message_id_against_the_new_rows() {
 /// **The executable backend-recovery property**, and the reason the per-message
 /// dialect's gap vocabulary is deleted rather than ported.
 ///
-/// `push_depth = 1`, `retain_depth = 2`, two deliveries in one dispatch turn:
-/// the first is evicted from the pending queue by the second, and it is
-/// nonetheless visible — as retained context, in the **same** activation, with
-/// `dropped = 1`. Overflow retired the delivery obligation; it did not retire the
-/// message. No gap event, no replay, no component-visible loss.
+/// `push_depth = 1`, `retain_depth = 2`, two deliveries in one dispatch turn: only
+/// the newest is handed over as new, and the other is nonetheless visible — as
+/// context, in the **same** activation. Nothing is charged as dropped: a message
+/// the window serves was delivered, whichever side of the boundary it lands on.
+/// Loss is the window losing it, not the push half of the window losing it. No gap
+/// event, no replay, no component-visible loss.
 #[test]
-fn a_message_dropped_from_the_pending_queue_is_context_in_the_same_activation() {
+fn a_message_past_the_push_depth_is_context_in_the_same_activation() {
     let mut core = registered_core(vec![binding("in", 1, 2)], vec![]);
-    deliver(&mut core, &env("evicted", 1), 1);
-    deliver(&mut core, &env("survivor", 2), 2);
+    deliver(&mut core, &env("earlier", 1), 1);
+    deliver(&mut core, &env("newest", 2), 2);
     let ready = take_one(&mut core);
     let w = window(&ready.activation, "in");
     assert_eq!(
         split(w),
-        (vec!["evicted"], vec!["survivor"]),
-        "the evicted message is still in the view, as context"
+        (vec!["earlier"], vec!["newest"]),
+        "the message past the push depth is still in the view, as context"
     );
-    assert_eq!(w.dropped, 1, "and the drop is reported honestly");
+    assert_eq!(w.dropped, 0, "what the window serves was not dropped");
 }
 
-/// Ring displacement is retention, not push overflow: a message that falls out of
-/// the ring is simply no longer in the view, and no drop counter moves for it.
+/// Retention displacing a message the binding already saw is not a drop: it is
+/// simply no longer in the view, and no drop counter moves for it.
 #[test]
-fn ring_displacement_is_not_a_drop() {
-    let mut core = registered_core(vec![binding("in", 4, 1)], vec![]);
+fn displacing_a_seen_message_is_not_a_drop() {
+    let mut core = registered_core(vec![binding("in", 1, 1)], vec![]);
     deliver(&mut core, &env("m1", 1), 1);
     let ready = take_one(&mut core);
     assert_eq!(window(&ready.activation, "in").dropped, 0);
@@ -301,8 +330,8 @@ fn ring_displacement_is_not_a_drop() {
     deliver(&mut core, &env("m2", 2), 2);
     let ready = take_one(&mut core);
     let w = window(&ready.activation, "in");
-    // `m1` fell out of the depth-1 ring — gone from the view, but nothing was
-    // dropped: the queue delivered it.
+    // `m1` fell out of the one-deep store — gone from the view, but nothing was
+    // dropped: this binding had already been served it.
     assert_eq!(split(w), (vec![], vec!["m2"]));
     assert_eq!(w.dropped, 0);
 }
@@ -341,7 +370,7 @@ fn deliveries_during_an_in_flight_handler_become_one_follow_up_activation() {
     deliver(&mut core, &env("during-a", 2), 2);
     deliver(&mut core, &env("during-b", 3), 3);
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "invocations never overlap for one instance"
     );
     complete(&mut core, INST, ActivationOutcome::Ok, ready.buffer);
@@ -410,7 +439,7 @@ fn the_dispatch_pick_rotates_so_a_self_feeding_instance_cannot_starve_a_sibling(
             Millis(10 + i as u64),
         );
         let ready = core
-            .take_ready_activation()
+            .take_ready_activation(TEST_WALL_MS)
             .expect("both instances are ready");
         order.push(ready.instance.clone());
         complete(
@@ -473,9 +502,11 @@ fn two_registered_instances_activate_independently() {
         )),
         Millis(11),
     );
-    let first = core.take_ready_activation().expect("one is ready");
+    let first = core
+        .take_ready_activation(TEST_WALL_MS)
+        .expect("one is ready");
     let second = core
-        .take_ready_activation()
+        .take_ready_activation(TEST_WALL_MS)
         .expect("the other is ready too, independently");
     let mut names = vec![first.instance.clone(), second.instance.clone()];
     names.sort();
@@ -485,7 +516,7 @@ fn two_registered_instances_activate_independently() {
 // ── Ack semantics ──────────────────────────────────────────────────────────
 
 /// An err consumes: the messages the failed activation was assembled with are
-/// gone from the queue and never re-window as new. Recovery is retention, not
+/// behind its position and never re-window as new. Recovery is retention, not
 /// redelivery.
 #[test]
 fn err_consumes_the_messages_it_was_activated_for() {
@@ -498,7 +529,7 @@ fn err_consumes_the_messages_it_was_activated_for() {
         [Effect::EmitEvent(Event::ActivationFailed { instance, .. })] if instance == INST
     ));
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "the consumed message does not re-activate the instance"
     );
     // It reappears only as context, on the next activation something else causes.
@@ -511,17 +542,17 @@ fn err_consumes_the_messages_it_was_activated_for() {
     );
 }
 
-/// Drop deltas advance at ack, not at completion: each window reports the drops
-/// since the previous activation consumed the queue, and never re-reports them.
+/// Drop deltas advance at assembly, not at completion: each window reports the
+/// drops since the previous activation moved this binding's position, and never
+/// re-reports them.
 #[test]
 fn drop_deltas_advance_at_ack_and_are_never_double_reported() {
     let mut core = registered_core(vec![binding("in", 1, 4)], vec![]);
-    deliver(&mut core, &env("a", 1), 1);
-    deliver(&mut core, &env("b", 2), 2);
+    deliver_burst(&mut core, OVERFLOWING_BURST);
     let ready = take_one(&mut core);
     assert_eq!(window(&ready.activation, "in").dropped, 1);
     complete(&mut core, INST, ActivationOutcome::Ok, ready.buffer);
-    deliver(&mut core, &env("c", 3), 3);
+    deliver(&mut core, &env("f", 6), 6);
     let ready = take_one(&mut core);
     assert_eq!(
         window(&ready.activation, "in").dropped,
@@ -530,28 +561,59 @@ fn drop_deltas_advance_at_ack_and_are_never_double_reported() {
     );
 }
 
-/// A server-reported subscription drop is every binding's drop: each of them
-/// missed those messages.
+/// A server-reported subscription drop is every *delivered-to* binding's drop:
+/// each of them missed those messages. A sampled binding holds no position on the
+/// subscription, is never delivered to, and so takes none of the count.
+///
+/// And the count is *drained* by the activation that reports it, not merely read:
+/// the next window reports its own delta, and the ladder's counters do not move
+/// again for a loss already accounted for.
 #[test]
 fn server_reported_drops_count_against_every_binding_on_the_subscription() {
-    let mut core = registered_core(vec![binding("one", 4, 0), binding("two", 4, 0)], vec![]);
+    let mut core = ladder_core_with(
+        vec![
+            binding_noise("one", 4, 0, NoiseLevel::Metered),
+            binding_noise("two", 4, 0, NoiseLevel::Metered),
+            binding_noise("sampled", 0, 4, NoiseLevel::Metered),
+        ],
+        &["ephemeral:demo"],
+    );
     deliver_dropped(&mut core, &env("m1", 1), 1, 3);
     let ready = take_one(&mut core);
     assert_eq!(window(&ready.activation, "one").dropped, 3);
     assert_eq!(window(&ready.activation, "two").dropped, 3);
+    assert_eq!(
+        window(&ready.activation, "sampled").dropped,
+        0,
+        "a sampled binding is never delivered to, so it is never reported against"
+    );
+    assert_eq!(core.metered_drop_count(INST, "one"), 3);
+    assert_eq!(core.metered_drop_count(INST, "two"), 3);
+    assert_eq!(core.metered_drop_count(INST, "sampled"), 0);
+
+    complete(&mut core, INST, ActivationOutcome::Ok, ready.buffer);
+    deliver(&mut core, &env("m2", 2), 2);
+    let ready = take_one(&mut core);
+    for port in ["one", "two"] {
+        assert_eq!(
+            window(&ready.activation, port).dropped,
+            0,
+            "{port} was told about the server's loss once"
+        );
+        assert_eq!(core.metered_drop_count(INST, port), 3);
+    }
 }
 
 // ── Loudness ladder: metered counters ──────────────────────────────────────
 
 use brenn_surface_proto::NoiseLevel;
 
-/// The `metered` rung counts a pending-queue overflow (drop-oldest): the drop the
+/// The `metered` rung counts a message lost past the binding's view: the drop the
 /// window reports at assembly advances the binding's kernel-internal counter.
 #[test]
-fn metered_binding_counts_pending_queue_overflow() {
+fn metered_binding_counts_a_message_lost_past_its_view() {
     let mut core = registered_core(vec![binding_noise("in", 1, 4, NoiseLevel::Metered)], vec![]);
-    deliver(&mut core, &env("a", 1), 1);
-    deliver(&mut core, &env("b", 2), 2);
+    deliver_burst(&mut core, OVERFLOWING_BURST);
     let ready = take_one(&mut core);
     assert_eq!(window(&ready.activation, "in").dropped, 1);
     assert_eq!(core.metered_drop_count(INST, "in"), 1);
@@ -562,15 +624,14 @@ fn metered_binding_counts_pending_queue_overflow() {
 #[test]
 fn silent_binding_is_uncounted() {
     let mut core = registered_core(vec![binding_noise("in", 1, 4, NoiseLevel::Silent)], vec![]);
-    deliver(&mut core, &env("a", 1), 1);
-    deliver(&mut core, &env("b", 2), 2);
+    deliver_burst(&mut core, OVERFLOWING_BURST);
     let ready = take_one(&mut core);
     assert_eq!(window(&ready.activation, "in").dropped, 1);
     assert_eq!(core.metered_drop_count(INST, "in"), 0);
 }
 
 /// The `metered` rung counts the other drop origin too: a server-reported
-/// subscription drop delta advances the same counter as a kernel-queue overflow.
+/// subscription drop delta advances the same counter as a page-side eviction.
 #[test]
 fn metered_binding_counts_server_reported_delta() {
     let mut core = registered_core(vec![binding_noise("in", 4, 0, NoiseLevel::Alarm)], vec![]);
@@ -587,13 +648,16 @@ fn metered_binding_counts_server_reported_delta() {
 #[test]
 fn metered_counter_accumulates_across_activations() {
     let mut core = registered_core(vec![binding_noise("in", 1, 4, NoiseLevel::Metered)], vec![]);
-    deliver(&mut core, &env("a", 1), 1);
-    deliver(&mut core, &env("b", 2), 2);
+    deliver_burst(&mut core, OVERFLOWING_BURST);
     let ready = take_one(&mut core);
     complete(&mut core, INST, ActivationOutcome::Ok, ready.buffer);
     assert_eq!(core.metered_drop_count(INST, "in"), 1);
-    deliver(&mut core, &env("c", 3), 3);
-    deliver(&mut core, &env("d", 4), 4);
+    // A second burst past the view charges once more, from a position that had
+    // already caught up.
+    for (i, body) in ["f", "g", "h", "i", "j"].iter().enumerate() {
+        let seq = i as u64 + 6;
+        deliver(&mut core, &env(body, u128::from(seq)), seq);
+    }
     let ready = take_one(&mut core);
     complete(&mut core, INST, ActivationOutcome::Ok, ready.buffer);
     assert_eq!(core.metered_drop_count(INST, "in"), 2);
@@ -601,7 +665,7 @@ fn metered_counter_accumulates_across_activations() {
 
 // ── Loudness ladder: alarm and fatal ─────────────────────────────────────────
 
-use brenn_surface_proto::{AlertSeverity, ToastBody, ToastSeverity, ToastSource};
+use brenn_surface_proto::{AlertSeverity, ToastSeverity, ToastSource};
 
 /// A registered single-instance core on `channel` at the given noise, holding the
 /// alert grant — which the boot check proves present for any `alarm`/`fatal`
@@ -633,6 +697,146 @@ fn ladder_core(channel: &str, noise: NoiseLevel, push_depth: u64) -> ClientCore 
     core
 }
 
+/// Reconnect a [`ladder_core`] on the same single binding at new depths — an
+/// operator retuning the wiring, which is the one thing that shrinks a store.
+///
+/// Returns the `Welcome`'s own effects, which is where a retune's loss lands.
+fn ladder_reconnect(
+    core: &mut ClientCore,
+    noise: NoiseLevel,
+    push_depth: u64,
+    retain_depth: u64,
+) -> Vec<Effect> {
+    core.on_input(
+        Input::Disconnected {
+            code: None,
+            reason: String::new(),
+        },
+        Millis(1_000),
+    );
+    core.on_input(Input::Tick, Millis(4_000));
+    core.on_input(Input::Opened, Millis(4_001));
+    let welcome =
+        brenn_surface_test_fixtures::welcome_frame(brenn_surface_test_fixtures::WelcomeParams {
+            subscriptions: vec![Binding {
+                channel: "ephemeral:demo".into(),
+                instance: INST.into(),
+                port: "in".into(),
+                push_depth,
+                retain_depth,
+                noise,
+            }],
+            components: vec![INST],
+            alert_granted: true,
+            ..Default::default()
+        });
+    let effects = core.on_input(Input::TextFrame(welcome), Millis(4_002));
+    core.on_input(
+        Input::TextFrame(subscribe_result("ephemeral:demo", SubscribeOutcome::Ok)),
+        Millis(4_003),
+    );
+    effects
+}
+
+/// A `Welcome` whose depths shrink a store retires messages out from under a
+/// lagging position, and that is loss like any other: counted at the reconcile
+/// that trimmed it, announced at the binding's next window, and never counted
+/// twice. An operator lowering a depth is as accountable a cause of loss as a
+/// burst is.
+#[test]
+fn a_depth_shrink_at_reconnect_charges_the_lagging_binding() {
+    // View `max(push 1, retain 4)` = 4 deep, filled exactly: nothing retired yet.
+    let mut core = ladder_core("ephemeral:demo", NoiseLevel::Alarm, 1);
+    let filling = deliver_burst(&mut core, &["a", "b", "c", "d"]);
+    assert_eq!(core.metered_drop_count(INST, "in"), 0);
+    assert!(toasts(&filling).is_empty());
+
+    // Retune to a one-deep view. Three of the four leave retention with the
+    // position still behind them.
+    let retuning = ladder_reconnect(&mut core, NoiseLevel::Alarm, 1, 1);
+    assert_eq!(
+        core.metered_drop_count(INST, "in"),
+        3,
+        "the trim is counted where it happened"
+    );
+    assert!(
+        toasts(&retuning).is_empty(),
+        "the announcement is still the next window's: {retuning:?}"
+    );
+
+    let ready = take_one(&mut core);
+    let view = window(&ready.activation, "in");
+    assert_eq!(view.dropped, 3, "the guest is told what the trim cost it");
+    assert_eq!(split(view).1, vec!["d"], "the survivor is still new");
+    let shown = toasts(&ready.effects);
+    assert_eq!(shown.len(), 1, "one announcement: {:?}", ready.effects);
+    assert!(
+        shown[0].text.contains("dropped 3"),
+        "naming the trimmed span: {}",
+        shown[0].text
+    );
+    assert_eq!(alerts(&ready.effects).len(), 1);
+    assert_eq!(
+        core.metered_drop_count(INST, "in"),
+        3,
+        "the window's own charge is the still-retained remainder: nothing"
+    );
+}
+
+/// The same trim under a `fatal` binding kills the instance at the reconcile: the
+/// kill is not deferrable, so it and its announcement ride the trim.
+#[test]
+fn a_depth_shrink_kills_a_fatal_binding_at_the_reconcile() {
+    let mut core = ladder_core("ephemeral:demo", NoiseLevel::Fatal, 1);
+    deliver_burst(&mut core, &["a", "b", "c", "d"]);
+    assert!(!core.is_failed(INST));
+
+    // The `Welcome` that trimmed is the frame that kills.
+    let retuning = ladder_reconnect(&mut core, NoiseLevel::Fatal, 1, 1);
+    let failures = instance_failures(&retuning);
+    assert_eq!(failures.len(), 1, "one kill: {retuning:?}");
+    assert_eq!(failures[0].0, INST);
+    assert!(
+        failures[0].1.contains("3 message(s)"),
+        "the reason names the trimmed span: {}",
+        failures[0].1
+    );
+    // Cumulative: the fatal rung announces here too, because there is no next
+    // window to defer to.
+    assert_eq!(toasts(&retuning).len(), 1);
+    assert_eq!(alerts(&retuning).len(), 1);
+
+    assert!(core.is_failed(INST));
+    assert!(
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
+        "a killed instance never activates again"
+    );
+}
+
+/// A registered core on arbitrary input bindings, holding the alert grant every
+/// `alarm`/`fatal` binding is proven to have at boot, with every named
+/// subscription acked.
+fn ladder_core_with(subscriptions: Vec<Binding>, channels: &[&str]) -> ClientCore {
+    let welcome =
+        brenn_surface_test_fixtures::welcome_frame(brenn_surface_test_fixtures::WelcomeParams {
+            subscriptions,
+            components: vec![INST],
+            alert_granted: true,
+            ..Default::default()
+        });
+    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
+    core.on_input(Input::Opened, Millis(1));
+    core.on_input(Input::TextFrame(welcome), Millis(2));
+    register(&mut core, INST, Millis(5));
+    for channel in channels {
+        core.on_input(
+            Input::TextFrame(subscribe_result(channel, SubscribeOutcome::Ok)),
+            Millis(6),
+        );
+    }
+    core
+}
+
 /// A ladder core with two bindings on one instance, each on its own channel and
 /// port, so per-*binding* behavior can be told apart from per-*instance*.
 fn two_binding_ladder_core(
@@ -647,24 +851,114 @@ fn two_binding_ladder_core(
         retain_depth: 4,
         noise,
     };
-    let welcome =
-        brenn_surface_test_fixtures::welcome_frame(brenn_surface_test_fixtures::WelcomeParams {
-            subscriptions: vec![mk(a), mk(b)],
-            components: vec![INST],
-            alert_granted: true,
-            ..Default::default()
-        });
-    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
-    core.on_input(Input::Opened, Millis(1));
-    core.on_input(Input::TextFrame(welcome), Millis(2));
-    register(&mut core, INST, Millis(5));
-    for channel in [a.0, b.0] {
-        core.on_input(
-            Input::TextFrame(subscribe_result(channel, SubscribeOutcome::Ok)),
-            Millis(6),
+    ladder_core_with(vec![mk(a), mk(b)], &[a.0, b.0])
+}
+
+/// Two bindings of one instance on **one** channel: a deep sibling whose view
+/// covers the whole store, and a shallow one that lags inside it. That is the only
+/// shape in which a binding loses messages the store still retains — the ladder's
+/// third drop origin, `Advance::noise_charge`, which no single-binding fixture can
+/// produce because there a binding's view is the store's whole depth.
+fn shallow_and_deep_ladder_core(shallow_noise: NoiseLevel) -> ClientCore {
+    let mk = |port: &str, push_depth: u64, retain_depth: u64, noise: NoiseLevel| Binding {
+        channel: "ephemeral:demo".into(),
+        instance: INST.into(),
+        port: port.into(),
+        push_depth,
+        retain_depth,
+        noise,
+    };
+    ladder_core_with(
+        vec![
+            mk("deep", 8, 8, NoiseLevel::Metered),
+            mk("shallow", 1, 1, shallow_noise),
+        ],
+        &["ephemeral:demo"],
+    )
+}
+
+/// The third drop origin, on its own: a shallow binding whose advance passes a
+/// span the store still retains. Nothing is evicted and the server reports
+/// nothing, so every figure here comes from `Advance::noise_charge` — counted and
+/// announced at the assembly that passed it.
+#[test]
+fn a_shallow_binding_is_charged_for_the_retained_span_its_window_skipped() {
+    let mut core = shallow_and_deep_ladder_core(NoiseLevel::Alarm);
+    // Four into an eight-deep store: nothing leaves retention.
+    let arrivals = deliver_burst(&mut core, &["a", "b", "c", "d"]);
+    assert_eq!(wire_bodies(&core, INST, "ephemeral:demo").len(), 4);
+    assert!(
+        toasts(&arrivals).is_empty() && instance_failures(&arrivals).is_empty(),
+        "no retirement happened: {arrivals:?}"
+    );
+
+    let ready = take_one(&mut core);
+    // The deep sibling's view covers the store, so it loses nothing.
+    let deep = window(&ready.activation, "deep");
+    assert_eq!(deep.dropped, 0);
+    assert_eq!(split(deep).1, vec!["a", "b", "c", "d"]);
+    assert_eq!(core.metered_drop_count(INST, "deep"), 0);
+    // The shallow one is served the newest and charged the three its one-deep
+    // window never showed it — messages the store still holds for its sibling.
+    let shallow = window(&ready.activation, "shallow");
+    assert_eq!(shallow.dropped, 3);
+    assert_eq!(split(shallow), (vec![], vec!["d"]));
+    assert_eq!(core.metered_drop_count(INST, "shallow"), 3);
+
+    let shown = toasts(&ready.effects);
+    assert_eq!(shown.len(), 1, "the shallow binding alone: {shown:?}");
+    assert!(shown[0].text.contains("dropped 3"));
+    assert!(shown[0].text.contains("shallow"));
+    let raised = alerts(&ready.effects);
+    assert_eq!(raised.len(), 1);
+    assert!(raised[0].2.contains("shallow"));
+}
+
+/// The ladder's books balance against the cursor model's own, per binding, over a
+/// history mixing all three drop origins: an eviction the store outran, a
+/// still-retained span a shallow window skipped, and a server-reported delta.
+///
+/// The invariant: what the ladder counted for a binding equals what the guest was
+/// told it lost. Nothing double-counted (the eviction charge and the advance's
+/// charge are disjoint spans), nothing lost (the two page-side sites plus the wire
+/// addend are the whole of it).
+#[test]
+fn the_ladder_totals_match_the_guests_dropped_over_a_mixed_history() {
+    let mut core = shallow_and_deep_ladder_core(NoiseLevel::Metered);
+    // Ten into an eight-deep store, the last one reporting two lost upstream:
+    // seqs 1 and 2 are evicted with both positions still behind them.
+    for seq in 1..=10u64 {
+        let dropped = if seq == 10 { 2 } else { 0 };
+        deliver_ch(
+            &mut core,
+            "ephemeral:demo",
+            &env(&format!("m{seq}"), u128::from(seq)),
+            seq,
+            dropped,
         );
     }
-    core
+    // Counted at the evictions: each position was outrun by two of them.
+    assert_eq!(core.metered_drop_count(INST, "deep"), 2);
+    assert_eq!(core.metered_drop_count(INST, "shallow"), 2);
+
+    let ready = take_one(&mut core);
+    // The deep binding: two evicted + two reported by the server.
+    let deep = window(&ready.activation, "deep");
+    assert_eq!(deep.dropped, 4);
+    assert_eq!(split(deep).1.len(), 8, "the whole store, all of it new");
+    // The shallow binding: the same two evictions and the same server pair, plus
+    // the seven retained messages its one-deep window skipped.
+    let shallow = window(&ready.activation, "shallow");
+    assert_eq!(shallow.dropped, 11);
+    assert_eq!(split(shallow), (vec![], vec!["m10"]));
+
+    for (port, expected) in [("deep", 4u64), ("shallow", 11)] {
+        assert_eq!(
+            core.metered_drop_count(INST, port),
+            expected,
+            "the ladder's total for {port} is the figure the guest was given",
+        );
+    }
 }
 
 /// The contract is one coalesced alert + toast **per binding** per activation,
@@ -727,34 +1021,6 @@ fn deliver_ch(
     )
 }
 
-/// The `Alert` frames in an effect list, as (severity, title, body).
-fn alerts(effects: &[Effect]) -> Vec<(AlertSeverity, String, String)> {
-    effects
-        .iter()
-        .filter_map(|e| match e {
-            Effect::SendFrame(ClientFrame::Alert {
-                severity,
-                title,
-                body,
-            }) => Some((*severity, title.clone(), body.clone())),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The decoded `local:brenn/toast` bodies in an effect list.
-fn toasts(effects: &[Effect]) -> Vec<ToastBody> {
-    effects
-        .iter()
-        .filter_map(|e| match e {
-            Effect::PublishControl { channel, body } if channel == LOCAL_TOAST_CHANNEL => {
-                Some(serde_json::from_str(body).expect("a kernel toast body decodes"))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 /// The `InstanceFailed` (instance, reason) pairs in an effect list.
 fn instance_failures(effects: &[Effect]) -> Vec<(String, String)> {
     effects
@@ -768,39 +1034,100 @@ fn instance_failures(effects: &[Effect]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `alarm` on a pending-queue overflow: the cumulative rung counts, then raises
-/// exactly one backend `Alert` (severity `Warning`) and one coalesced toast,
-/// both naming the delta. The instance is not killed.
+/// `alarm` on a message lost past the view: the cumulative rung counts at the
+/// loss, then raises exactly one backend `Alert` (severity `Warning`) and one
+/// coalesced toast at the binding's next window, both naming the delta. The
+/// instance is not killed.
+///
+/// The two moments are the contract: the counter moves where the loss happens —
+/// the delivery whose insert pushed the oldest entry out from under a lagging
+/// position — while the announcement waits for the window that reports the drop,
+/// so a binding that lags by many messages is announced once, not once per
+/// message.
 #[test]
-fn alarm_binding_alerts_and_toasts_on_pending_queue_overflow() {
+fn alarm_binding_alerts_and_toasts_on_a_message_lost_past_its_view() {
     let mut core = ladder_core("ephemeral:demo", NoiseLevel::Alarm, 1);
-    deliver_ch(&mut core, "ephemeral:demo", &env("a", 1), 1, 0);
-    deliver_ch(&mut core, "ephemeral:demo", &env("b", 2), 2, 0);
+    let evicting = deliver_burst(&mut core, OVERFLOWING_BURST);
+    assert_eq!(core.metered_drop_count(INST, "in"), 1);
+    assert!(
+        alerts(&evicting).is_empty() && toasts(&evicting).is_empty(),
+        "the announcement is the next window's, not the delivery's: {evicting:?}"
+    );
+    assert!(instance_failures(&evicting).is_empty());
+    assert!(!core.is_failed(INST));
+
     let ready = take_one(&mut core);
     assert_eq!(window(&ready.activation, "in").dropped, 1);
-    assert_eq!(core.metered_drop_count(INST, "in"), 1);
 
-    let alerts = alerts(&ready.effects);
-    assert_eq!(alerts.len(), 1, "one alert: {:?}", ready.effects);
-    assert_eq!(alerts[0].0, AlertSeverity::Warning);
+    let raised = alerts(&ready.effects);
+    assert_eq!(raised.len(), 1, "one alert: {:?}", ready.effects);
+    assert_eq!(raised[0].0, AlertSeverity::Warning);
     assert!(
-        alerts[0].2.contains("dropped 1"),
+        raised[0].2.contains("dropped 1"),
         "names the delta: {}",
-        alerts[0].2
+        raised[0].2
     );
 
-    let toasts = toasts(&ready.effects);
-    assert_eq!(toasts.len(), 1, "one coalesced toast: {:?}", ready.effects);
-    assert_eq!(toasts[0].severity, ToastSeverity::Warning);
-    assert_eq!(toasts[0].source, ToastSource::Kernel);
-    assert!(toasts[0].text.contains("dropped 1"));
+    let shown = toasts(&ready.effects);
+    assert_eq!(shown.len(), 1, "one coalesced toast: {:?}", ready.effects);
+    assert_eq!(shown[0].severity, ToastSeverity::Warning);
+    assert_eq!(shown[0].source, ToastSource::Kernel);
+    assert!(shown[0].text.contains("dropped 1"));
 
-    assert!(instance_failures(&ready.effects).is_empty());
-    assert!(!core.is_failed(INST));
+    // Counted once, at the eviction: the window's own charge is the still-retained
+    // remainder, which is nothing here.
+    assert_eq!(core.metered_drop_count(INST, "in"), 1);
+    complete(&mut core, INST, ActivationOutcome::Ok, ready.buffer);
+    deliver(&mut core, &env("f", 6), 6);
+    let ready = take_one(&mut core);
+    assert!(
+        alerts(&ready.effects).is_empty() && toasts(&ready.effects).is_empty(),
+        "an announced drop is never announced again: {:?}",
+        ready.effects
+    );
+}
+
+/// A sustained lag announces once per activation, not once per lost message.
+/// Ten messages against a four-deep view retires six of them, and the binding
+/// hears about all six in one alert and one toast naming six.
+#[test]
+fn a_sustained_lag_announces_once_naming_the_whole_delta() {
+    let mut core = ladder_core("ephemeral:demo", NoiseLevel::Alarm, 1);
+    let mut effects = Vec::new();
+    for seq in 1..=10u64 {
+        effects.extend(deliver_ch(
+            &mut core,
+            "ephemeral:demo",
+            &env(&format!("m{seq}"), u128::from(seq)),
+            seq,
+            0,
+        ));
+    }
+    assert!(
+        alerts(&effects).is_empty() && toasts(&effects).is_empty(),
+        "no alert storm across the burst: {} alerts, {} toasts",
+        alerts(&effects).len(),
+        toasts(&effects).len()
+    );
+    // The view is `max(push 1, retain 4)` = 4 deep: six of the ten were retired
+    // under the position, and of the four the window still serves, three are
+    // context and the newest is new.
+    let ready = take_one(&mut core);
+    assert_eq!(window(&ready.activation, "in").dropped, 6);
+    assert_eq!(split(window(&ready.activation, "in")).1, vec!["m10"]);
+    assert_eq!(alerts(&ready.effects).len(), 1);
+    let shown = toasts(&ready.effects);
+    assert_eq!(shown.len(), 1);
+    assert!(
+        shown[0].text.contains("dropped 6"),
+        "the coalesced delta: {}",
+        shown[0].text
+    );
+    assert_eq!(core.metered_drop_count(INST, "in"), 6);
 }
 
 /// `alarm` fires on the other drop origin too: a server-reported subscription
-/// delta raises the same alert and toast as a kernel-queue overflow.
+/// delta raises the same alert and toast as a page-side eviction.
 #[test]
 fn alarm_binding_alerts_on_server_reported_delta() {
     let mut core = ladder_core("ephemeral:demo", NoiseLevel::Alarm, 4);
@@ -816,26 +1143,19 @@ fn alarm_binding_alerts_on_server_reported_delta() {
 
 /// `fatal` is cumulative — it still alerts and toasts — and then kills the
 /// instance via the trap-terminal path: `InstanceFailed` naming the binding and
-/// the overflow, `is_failed`, and no further activation on new traffic.
+/// the loss, `is_failed`, and no further activation on new traffic.
+///
+/// The kill lands at the loss, so the instance never runs again — not even for the
+/// activation the surviving messages would otherwise have caused.
 #[test]
 fn fatal_binding_kills_the_instance_and_stays_terminal() {
     let mut core = ladder_core("ephemeral:demo", NoiseLevel::Fatal, 1);
-    deliver_ch(&mut core, "ephemeral:demo", &env("a", 1), 1, 0);
-    deliver_ch(&mut core, "ephemeral:demo", &env("b", 2), 2, 0);
-    let ready = take_one(&mut core);
+    let evicting = deliver_burst(&mut core, OVERFLOWING_BURST);
 
-    assert_eq!(
-        alerts(&ready.effects).len(),
-        1,
-        "fatal is cumulative: alerts"
-    );
-    assert_eq!(
-        toasts(&ready.effects).len(),
-        1,
-        "fatal is cumulative: toasts"
-    );
+    assert_eq!(alerts(&evicting).len(), 1, "fatal is cumulative: alerts");
+    assert_eq!(toasts(&evicting).len(), 1, "fatal is cumulative: toasts");
 
-    let failures = instance_failures(&ready.effects);
+    let failures = instance_failures(&evicting);
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].0, INST);
     assert!(
@@ -850,10 +1170,14 @@ fn fatal_binding_kills_the_instance_and_stays_terminal() {
     );
 
     assert!(core.is_failed(INST));
-    // Terminal: new traffic never re-activates the killed instance.
-    deliver_ch(&mut core, "ephemeral:demo", &env("c", 3), 3, 0);
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
+        "the killed instance was dispatched for the messages it survived"
+    );
+    // Terminal: new traffic never re-activates the killed instance either.
+    deliver_ch(&mut core, "ephemeral:demo", &env("z", 26), 6, 0);
+    assert!(
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "a killed instance never activates again"
     );
 }
@@ -866,8 +1190,7 @@ fn fatal_binding_kills_the_instance_and_stays_terminal() {
 fn the_ladder_is_class_blind_over_brenn_and_ephemeral() {
     let run = |channel: &str| {
         let mut core = ladder_core(channel, NoiseLevel::Alarm, 1);
-        deliver_ch(&mut core, channel, &env("a", 1), 1, 0);
-        deliver_ch(&mut core, channel, &env("b", 2), 2, 0);
+        deliver_burst_on(&mut core, channel, OVERFLOWING_BURST);
         let ready = take_one(&mut core);
         (
             window(&ready.activation, "in").dropped,
@@ -930,60 +1253,52 @@ fn fatal_kill_leaves_a_sibling_delivering() {
         Millis(7),
     );
 
-    // Overflow the doomed instance's queue and deliver one to the sibling.
-    core.on_input(
-        Input::TextFrame(deliver_frame_for_dropped(
-            "ephemeral:demo",
-            INST,
-            &env("a", 1),
-            1,
-            0,
-        )),
-        Millis(20),
-    );
-    core.on_input(
-        Input::TextFrame(deliver_frame_for_dropped(
-            "ephemeral:demo",
-            INST,
-            &env("b", 2),
-            2,
-            0,
-        )),
-        Millis(21),
-    );
+    // Push a message past the doomed instance's view — the kill lands right there,
+    // on the delivery that evicted it.
+    let mut doomed_effects = Vec::new();
+    for (i, body) in OVERFLOWING_BURST.iter().enumerate() {
+        let seq = i as u64 + 1;
+        doomed_effects.extend(core.on_input(
+            Input::TextFrame(deliver_frame_for_dropped(
+                "ephemeral:demo",
+                INST,
+                &env(body, i as u128 + 1),
+                seq,
+                0,
+            )),
+            Millis(20 + seq),
+        ));
+    }
+    assert_eq!(instance_failures(&doomed_effects).len(), 1);
     core.on_input(
         Input::TextFrame(deliver_frame_for_dropped(
             "ephemeral:sib",
             SIB,
-            &env("s", 3),
+            &env("s", 30),
             1,
             0,
         )),
-        Millis(22),
+        Millis(30),
     );
 
-    // Drain both ready activations: the doomed one is killed at assembly, the
-    // sibling activates normally.
-    let mut failed = None;
+    // Every dispatch left is the sibling's: the doomed instance is terminal and
+    // holds no position, while its neighbour windows and delivers as usual.
     let mut sibling_windowed = false;
-    while let Some(ready) = core.take_ready_activation() {
-        if ready.instance == INST {
-            failed = Some(ready);
-        } else {
-            assert_eq!(ready.instance, SIB);
-            assert_eq!(
-                window(&ready.activation, "in")
-                    .envelopes
-                    .last()
-                    .unwrap()
-                    .body,
-                "s"
-            );
-            sibling_windowed = true;
-        }
+    while let Some(ready) = core.take_ready_activation(TEST_WALL_MS) {
+        assert_eq!(
+            ready.instance, SIB,
+            "the killed instance was dispatched anyway"
+        );
+        assert_eq!(
+            window(&ready.activation, "in")
+                .envelopes
+                .last()
+                .unwrap()
+                .body,
+            "s"
+        );
+        sibling_windowed = true;
     }
-    let failed = failed.expect("the doomed instance was dispatched");
-    assert_eq!(instance_failures(&failed.effects).len(), 1);
     assert!(core.is_failed(INST));
     assert!(!core.is_failed(SIB), "the sibling is untouched");
     assert!(sibling_windowed, "the sibling still delivered");
@@ -1019,18 +1334,20 @@ fn ok_flushes_one_batch_in_call_order() {
                 port: "out".into(),
                 body: "first".into(),
                 urgency: None,
+                deliver_after: None,
             },
             BatchEntry {
                 port: "out".into(),
                 body: "second".into(),
                 urgency: Some(Urgency::High),
+                deliver_after: None,
             },
         ]
     );
 }
 
 /// `local:` entries commit through the router at the flush point — seq assigned,
-/// ring fed, fan-out — and never ride the wire.
+/// store fed, fan-out — and never ride the wire.
 #[test]
 fn ok_routes_local_entries_through_the_router() {
     let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
@@ -1062,15 +1379,13 @@ fn ok_routes_local_entries_through_the_router() {
         batches(&effects).is_empty(),
         "local traffic never rides the wire"
     );
-    // Committed through the router at the flush point: seq assigned, ring fed —
+    // Committed through the router at the flush point: seq assigned, store fed —
     // the depth-1 plane holds it for whatever attaches later.
-    let ring = core
-        .local_rings
-        .get(LOCAL_THEME_CHANNEL)
-        .expect("the reserved plane's ring");
-    let replayed: Vec<(String, String)> = ring
-        .ring
-        .entries()
+    let replayed: Vec<(String, String)> = core
+        .stores
+        .get(&StoreKey::Confined(LOCAL_THEME_CHANNEL.to_string()))
+        .expect("the reserved plane's store")
+        .retained()
         .map(|(e, _)| (e.body.clone(), e.sender.clone()))
         .collect();
     assert_eq!(
@@ -1192,9 +1507,9 @@ fn an_err_returns_the_carryover_but_the_spending_survives_it() {
 }
 
 /// A trap discards the buffer and is terminal for that instance — and for that
-/// instance only. Its rings survive and keep being fed; a sibling is untouched.
+/// instance only. Its stores survive and keep being fed; a sibling is untouched.
 #[test]
-fn trap_is_terminal_for_one_instance_and_its_rings_survive() {
+fn trap_is_terminal_for_one_instance_and_its_stores_survive() {
     let mut core = registered_core(
         vec![binding("in", 4, 2)],
         vec![output("out", "ephemeral:sink")],
@@ -1216,21 +1531,12 @@ fn trap_is_terminal_for_one_instance_and_its_rings_survive() {
     // Delivery stops: no further activation, ever.
     deliver(&mut core, &env("m2", 2), 2);
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "a failed instance never activates again"
     );
-    // But its ring kept filling — rings are the subscription's, page-lifetime,
+    // But its store kept filling — retention is the channel's, page-lifetime,
     // and inert rather than corrupt.
-    let ring = core
-        .wire_rings
-        .get(&SubKey::for_instance(INST, "ephemeral:demo"))
-        .expect("the subscription's ring outlives the instance");
-    assert_eq!(
-        ring.entries()
-            .map(|(e, _)| e.body.clone())
-            .collect::<Vec<_>>(),
-        vec!["m1", "m2"]
-    );
+    assert_eq!(wire_bodies(&core, INST, "ephemeral:demo"), vec!["m1", "m2"]);
 }
 
 /// The component's own account of a failure reaches the diagnostic event. The
@@ -1477,9 +1783,10 @@ fn the_per_activation_byte_cap_bounds_a_generous_budget_and_keeps_the_prefix() {
 
 // ── Depth 0 ────────────────────────────────────────────────────────────────
 
-/// A depth-0 binding never activates its instance and never queues — but its
-/// ring is fed throughout, and it windows as pure context when a sibling port
-/// does the waking. Depth 0 means "don't activate me", never "don't show me".
+/// A depth-0 binding never activates its instance and holds no position — but
+/// its channel's store is fed throughout, and it windows as pure context when a
+/// sibling port does the waking. Depth 0 means "don't activate me", never
+/// "don't show me".
 #[test]
 fn a_depth_zero_port_never_activates_and_windows_as_pure_context() {
     let mut core = registered_core(
@@ -1506,7 +1813,7 @@ fn a_depth_zero_port_never_activates_and_windows_as_pure_context() {
         );
     }
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "a depth-0 port never activates its instance"
     );
     // A sibling port wakes it; the depth-0 port is there, as pure context.
@@ -1521,16 +1828,18 @@ fn a_depth_zero_port_never_activates_and_windows_as_pure_context() {
     assert_eq!(sampled.new_from, 2, "new_from == len");
     assert_eq!(
         sampled.dropped, 0,
-        "no queue, so no push overflow to report"
+        "no position, so nothing is ever reported against it"
     );
 }
 
 // ── Registration seam ──────────────────────────────────────────────────────
 
-/// Deregistration drops the entry's queues but not the subscription's rings: a
-/// re-register reads the retained history, exactly as a reconnect would.
+/// Deregistration drops the entry's positions, and — because it releases the
+/// instance's last reference on the subscription — the mirror those positions read
+/// too. A re-register is a fresh consumer of the subscription: it starts from an
+/// empty store, so only what arrives after it reaches its window.
 #[test]
-fn deregistration_drops_queues_but_not_rings() {
+fn deregistration_drops_positions_and_the_mirror_with_them() {
     let mut core = registered_core(vec![binding("in", 4, 2)], vec![]);
     deliver(&mut core, &env("m1", 1), 1);
     core.on_input(
@@ -1540,12 +1849,11 @@ fn deregistration_drops_queues_but_not_rings() {
         Millis(30),
     );
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "no entry, no activation"
     );
-    // Deregistering released the instance's last reference on the subscription,
-    // so re-registering opens it afresh — a registered instance is a subscriber
-    // like any other.
+    // Re-registering opens the subscription afresh — a registered instance is a
+    // subscriber like any other — and the fresh `Subscribe` is what catches it up.
     register(&mut core, INST, Millis(5));
     core.on_input(
         Input::TextFrame(subscribe_result("ephemeral:demo", SubscribeOutcome::Ok)),
@@ -1555,8 +1863,9 @@ fn deregistration_drops_queues_but_not_rings() {
     let ready = take_one(&mut core);
     assert_eq!(
         split(window(&ready.activation, "in")),
-        (vec!["m1"], vec!["m2"]),
-        "the ring outlived the registration"
+        (vec![], vec!["m2"]),
+        "the mirror went with the reference; nothing older than the new subscription \
+         is page-side history"
     );
 }
 
@@ -1569,14 +1878,16 @@ fn double_registration_panics() {
     register(&mut core, INST, Millis(30));
 }
 
-// ── Rings ──────────────────────────────────────────────────────────────────
+// ── Stores ─────────────────────────────────────────────────────────────────
 
-/// The ring's depth is the max fold over the instance's bindings on the channel,
-/// and the ring is fed for the subscription — not per binding. Retention is a
-/// property of the subscription, which is why one ring serves two ports reading
-/// it at two depths.
+/// The store's depth is the fold over the subscription's bindings of
+/// `max(push_depth, retain_depth)`, and the store is fed for the subscription —
+/// not per binding. Retention is a property of the channel as the subscription
+/// sees it, which is why one store serves two ports reading it at two depths,
+/// and the push halves are in the fold because the store is what holds what
+/// those ports will be served.
 #[test]
-fn ring_depth_is_the_max_fold_over_the_instances_bindings() {
+fn store_depth_is_the_fold_over_the_subscriptions_bindings() {
     let mut core = active_core_with(vec![binding("shallow", 4, 1), binding("deep", 4, 3)]);
     register(&mut core, INST, Millis(5));
     core.on_input(
@@ -1585,31 +1896,77 @@ fn ring_depth_is_the_max_fold_over_the_instances_bindings() {
     );
     let key = SubKey::for_instance(INST, "ephemeral:demo");
     assert_eq!(
-        core.wire_rings.get(&key).expect("ring exists").depth(),
-        3,
-        "max over the instance's bindings on the channel"
+        core.stores
+            .get(&StoreKey::Wire(key.clone()))
+            .expect("store exists")
+            .depth(),
+        4,
+        "max over the instance's bindings of max(push_depth, retain_depth)"
     );
     for i in 1..=4u64 {
         deliver(&mut core, &env(&format!("m{i}"), i as u128), i);
     }
-    let held: Vec<String> = core.wire_rings[&key]
-        .entries()
-        .map(|(e, _)| e.body.clone())
-        .collect();
     assert_eq!(
-        held,
-        vec!["m2", "m3", "m4"],
+        wire_bodies(&core, INST, "ephemeral:demo"),
+        vec!["m1", "m2", "m3", "m4"],
         "bounded by the fold, oldest out"
     );
 }
 
-/// **The ring feed is idempotent by `message_id`.** Rings survive reconnect while
-/// several reconnect paths legitimately re-deliver what the ring already holds
-/// (fresh-attach replay, gap-past-ring replay, epoch-change replay). Without the
-/// dedup a post-reconnect window's context would carry the same message twice —
-/// a shape the backend's distinct-row context read can never produce.
+/// A late position on a surviving mirror is primed from the mirror's tail,
+/// capped at its own push depth, and charged nothing.
+///
+/// The mirror is the subscription's honest recent history of the channel — a
+/// store holds no messages it disavows — so a binding coming into existence on
+/// one is owed `min(push_depth, tail)` of it as new, exactly as on any other
+/// store. This is the surviving-subscription case specifically: no fresh
+/// `Subscribe` will replay for it, so the prime is the only catch-up there is.
 #[test]
-fn the_ring_feed_is_idempotent_and_survives_reconnect() {
+fn a_late_position_is_primed_from_the_surviving_mirrors_tail() {
+    let mut core = registered_core(vec![binding("in", 4, 1)], vec![]);
+    let store = core
+        .stores
+        .get(&StoreKey::Wire(SubKey::for_instance(
+            INST,
+            "ephemeral:demo",
+        )))
+        .expect("store exists");
+    assert_eq!(store.depth(), 4, "the fold over the bindings");
+
+    for i in 1..=4u64 {
+        deliver(&mut core, &env(&format!("m{i}"), i as u128), i);
+    }
+    let ready = take_one(&mut core);
+    complete(&mut core, INST, ActivationOutcome::Ok, ready.buffer);
+    // A second port bound on the same channel: the instance keeps its reference
+    // throughout (references are diffed, never dropped and retaken), so the mirror
+    // survives and priming from it is the new position's only catch-up.
+    reconnect(
+        &mut core,
+        vec![binding("in", 4, 1), binding("late", 4, 1)],
+        vec![],
+    );
+    let ready = take_one(&mut core);
+    assert_eq!(
+        split(window(&ready.activation, "late")),
+        (vec![], vec!["m1", "m2", "m3", "m4"]),
+        "the whole tail is new: four held, a push depth of four to hold them"
+    );
+    assert_eq!(
+        window(&ready.activation, "late").dropped,
+        0,
+        "priming charges nothing"
+    );
+}
+
+/// **The store's insert is idempotent by `message_id`.** Stores survive
+/// reconnect while several reconnect paths legitimately re-present what a store
+/// already holds (fresh-attach replay, gap-past-retention replay, epoch-change
+/// replay). Without the dedup a post-reconnect window's context would carry the
+/// same message twice — a shape the backend's distinct-row context read can
+/// never produce.
+#[test]
+fn the_store_insert_is_idempotent_and_survives_reconnect() {
     let mut core = registered_core(vec![binding("in", 4, 4)], vec![]);
     deliver(&mut core, &env("m1", 1), 1);
     deliver(&mut core, &env("m2", 2), 2);
@@ -1618,9 +1975,23 @@ fn the_ring_feed_is_idempotent_and_survives_reconnect() {
     // Drop the link and come back; the page did not reload, so the ring must not
     // have been discarded.
     reconnect(&mut core, vec![binding("in", 4, 4)], vec![]);
-    // The server replays what it retained: the same two envelopes, same ids.
+    // The server replays what it retained: the same two envelopes, same ids. The
+    // store already holds them, so nothing is taken and nothing is owed — a
+    // message already delivered is not delivered a second time.
     deliver(&mut core, &env("m1", 1), 3);
     deliver(&mut core, &env("m2", 2), 4);
+    assert!(
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
+        "a replayed envelope re-woke the instance"
+    );
+    assert_eq!(
+        wire_bodies(&core, INST, "ephemeral:demo"),
+        vec!["m1", "m2"],
+        "one copy of each, whatever the replay presented"
+    );
+    // A genuinely new message activates, and carries the replayed pair as context
+    // exactly once each.
+    deliver(&mut core, &env("m3", 3), 5);
     let ready = take_one(&mut core);
     let w = window(&ready.activation, "in");
     let ids: Vec<Uuid> = w.envelopes.iter().map(|e| e.message_id).collect();
@@ -1633,19 +2004,17 @@ fn the_ring_feed_is_idempotent_and_survives_reconnect() {
         "each message_id appears at most once in the window: {:?}",
         w.envelopes.iter().map(|e| &e.body).collect::<Vec<_>>()
     );
-    // The replayed pair is new (it was re-delivered), and the ring held only one
-    // copy of each throughout.
-    assert_eq!(split(w), (vec![], vec!["m1", "m2"]));
+    assert_eq!(split(w), (vec!["m1", "m2"], vec!["m3"]));
 }
 
-/// A subscription no surviving binding names loses its ring: nothing can route
+/// A subscription no surviving binding names loses its store: nothing can route
 /// on it again.
 #[test]
-fn a_ring_whose_binding_vanished_is_dropped_at_reconcile() {
+fn a_store_whose_binding_vanished_is_dropped_at_reconcile() {
     let mut core = registered_core(vec![binding("in", 4, 2)], vec![]);
     deliver(&mut core, &env("m1", 1), 1);
     let key = SubKey::for_instance(INST, "ephemeral:demo");
-    assert!(core.wire_rings.contains_key(&key));
+    assert!(core.stores.contains_key(&StoreKey::Wire(key.clone())));
     // Bindings change only across a reconnect: a second `Welcome` on a live
     // connection is a fatal protocol error.
     reconnect(
@@ -1654,8 +2023,8 @@ fn a_ring_whose_binding_vanished_is_dropped_at_reconcile() {
         vec![],
     );
     assert!(
-        !core.wire_rings.contains_key(&key),
-        "the operator un-declared the binding; its ring goes with it"
+        !core.stores.contains_key(&StoreKey::Wire(key)),
+        "the operator un-declared the binding; its store goes with it"
     );
 }
 
@@ -1749,7 +2118,7 @@ fn loop_reconnect_at_body_cap(
 }
 
 /// Answer the batch `correlation` carries and return the core's effects.
-fn answer(
+pub(super) fn answer(
     core: &mut ClientCore,
     correlation: u64,
     outcome: PublishBatchOutcome,
@@ -2070,7 +2439,7 @@ fn a_rate_limited_batch_is_parked_at_the_head_and_retried_whole() {
     );
     // Still live and still delivering.
     deliver(&mut core, &env("m2", 2), 2);
-    assert!(core.take_ready_activation().is_some());
+    assert!(core.take_ready_activation(TEST_WALL_MS).is_some());
 }
 
 /// A newer flush during the refusal window queues *behind* the refused head and
@@ -2170,7 +2539,9 @@ fn a_siblings_steady_results_do_not_starve_a_parked_heads_retry() {
 
     // B flushes and the server refuses it: parked at the head, timer armed.
     deliver(&mut core, &env("b1", 1), 1);
-    let b = core.take_ready_activation().expect("B is ready");
+    let b = core
+        .take_ready_activation(TEST_WALL_MS)
+        .expect("B is ready");
     assert_eq!(b.instance, INST);
     let mut buf = b.buffer;
     buf.publish("out", "b-head".into()).unwrap();
@@ -2203,7 +2574,9 @@ fn a_siblings_steady_results_do_not_starve_a_parked_heads_retry() {
             )),
             Millis(100 + (i as u64) * 100),
         );
-        let a = core.take_ready_activation().expect("A is ready");
+        let a = core
+            .take_ready_activation(TEST_WALL_MS)
+            .expect("A is ready");
         assert_eq!(a.instance, "sibling");
         let mut buf = a.buffer;
         buf.publish("out", format!("a{i}")).unwrap();

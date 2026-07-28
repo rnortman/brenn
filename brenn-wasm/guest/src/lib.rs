@@ -131,7 +131,8 @@ impl Activation {
 
     /// The host's wall clock at drain, epoch milliseconds UTC. Use it to compute
     /// an absolute `deliver_after` for [`publish_deferred`] without holding a
-    /// clock. `None` when the host exposes no UTC clock (the surface kernel).
+    /// clock. `None` where the host exposes no UTC clock; decline to schedule
+    /// rather than invent an instant.
     pub fn now(&self) -> Option<u64> {
         self.now
     }

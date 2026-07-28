@@ -23,7 +23,9 @@
 //!   [`brenn_surface_contract::element_name_for_instance`]) **plus the activation
 //!   entry**: the kernel calls that entry once per activation with every bound
 //!   input port windowed, and [`Publisher`] buffers the publishes it makes,
-//!   flushing them atomically iff it returns ok.
+//!   flushing them atomically iff it returns ok. Deferred publishes and the
+//!   cancel/edit of a message already parked ride the same buffer on the same
+//!   terms.
 //! - [`claim_initialized`] — the `connectedCallback` re-entry guard (a
 //!   `data-<kind>-initialized` marker) so a re-insertion does not rebuild the UI
 //!   or double-register listeners.
@@ -54,7 +56,9 @@ pub use timeout::clamp_timeout_ms;
 // the types the seam hands them. wasm-gated with the contract dep and with every
 // consumer of these types (`register_component` and the entry it wraps).
 #[cfg(target_arch = "wasm32")]
-pub use brenn_surface_contract::{Activation, ActivationError, PortWindow};
+pub use brenn_surface_contract::{
+    Activation, ActivationError, DeferError, DeferredEntry, DeferredWindow, PortWindow,
+};
 
 /// The recommended maximum `setTimeout` delay for a wall-clock-driven component:
 /// recompute at least every ~15 minutes so a wall-clock jump (suspend/resume,
@@ -69,8 +73,9 @@ pub use wasm::*;
 mod wasm {
     use brenn_surface_contract::{
         ACTIVATION_REGISTER, Activation, ActivationError, COMPONENT_LOG, COMPONENT_PANIC,
-        PORT_PUBLISH, PUBLISH_STATUS_FIELD, PublishError, element_name_for_instance,
-        parse_publish_status,
+        DEFER_OP_CANCEL, DEFER_OP_EDIT, DEFER_OP_PUBLISH, DEFER_STATUS_FIELD, DeferError,
+        PORT_DEFER, PORT_PUBLISH, PUBLISH_STATUS_FIELD, PublishError, element_name_for_instance,
+        parse_defer_status, parse_publish_status,
     };
     use brenn_surface_proto::LogLevel;
     use brenn_surface_proto::Urgency;
@@ -370,6 +375,146 @@ export function define_component(tag, connected) {\n\
                 None => panic!(
                     "component-support: no publish status on a buffered publish of port {port:?} \
                      — the kernel did not route it into this activation's buffer"
+                ),
+            }
+        }
+
+        /// Buffer a publish of `body` that becomes observable no earlier than
+        /// `deliver_after` (epoch milliseconds UTC).
+        ///
+        /// A component computes that instant from the activation's own `now`, never
+        /// from a clock of its own: activations are hermetic, and the timestamp
+        /// arrives with them. A `deliver_after` at or before the flush's clock
+        /// reading publishes immediately, exactly like [`publish`](Self::publish).
+        ///
+        /// Buffered on the same terms as every other publish — nothing is parked
+        /// until the entry returns ok — and answered in the same
+        /// [`PublishError`] vocabulary: scheduling adds no way for a publish to be
+        /// refused.
+        pub fn publish_deferred(
+            &mut self,
+            port: &str,
+            body: &str,
+            deliver_after: u64,
+        ) -> Result<(), PublishError> {
+            let status = self.defer_dispatch(
+                DEFER_OP_PUBLISH,
+                port,
+                &[
+                    ("body", JsValue::from_str(body)),
+                    (
+                        "deliver_after",
+                        JsValue::from_str(&deliver_after.to_string()),
+                    ),
+                ],
+            );
+            match parse_publish_status(&status) {
+                Some(status) => status,
+                None => panic!(
+                    "component-support: {status:?} is not a publish status — the kernel answered \
+                     a deferred publish of port {port:?} in a vocabulary this contract does not \
+                     spell"
+                ),
+            }
+        }
+
+        /// Buffer a cancel of one message this component already parked on `port`'s
+        /// channel, naming it by its `index` in the [`DeferredWindow`] this
+        /// activation delivered for that port.
+        ///
+        /// Ok does not promise the message was unparked: it may release between this
+        /// call and the flush, which the contract rules a benign race the kernel
+        /// logs and counts. The component has already returned by then, so the race
+        /// is not a refusal.
+        pub fn defer_cancel(&mut self, port: &str, index: u32) -> Result<(), DeferError> {
+            let status = self.defer_dispatch(
+                DEFER_OP_CANCEL,
+                port,
+                &[("index", JsValue::from_str(&index.to_string()))],
+            );
+            self.parse_defer_answer(port, DEFER_OP_CANCEL, &status)
+        }
+
+        /// Buffer an edit of one message this component already parked on `port`'s
+        /// channel: its body, its release time, or both. `None` leaves that half
+        /// alone; the index resolves and the race treatment applies exactly as for
+        /// [`defer_cancel`](Self::defer_cancel).
+        pub fn defer_edit(
+            &mut self,
+            port: &str,
+            index: u32,
+            body: Option<&str>,
+            deliver_after: Option<u64>,
+        ) -> Result<(), DeferError> {
+            let mut fields = vec![("index", JsValue::from_str(&index.to_string()))];
+            // Each half is omitted rather than sent as null to leave it alone: the
+            // kernel reads absence as "do not touch", and a present-but-empty body
+            // is a component asking for an empty body.
+            if let Some(body) = body {
+                fields.push(("body", JsValue::from_str(body)));
+            }
+            if let Some(deliver_after) = deliver_after {
+                fields.push((
+                    "deliver_after",
+                    JsValue::from_str(&deliver_after.to_string()),
+                ));
+            }
+            let status = self.defer_dispatch(DEFER_OP_EDIT, port, &fields);
+            self.parse_defer_answer(port, DEFER_OP_EDIT, &status)
+        }
+
+        /// Dispatch one deferred-message op on the [`PORT_DEFER`] event and return
+        /// the kernel's synchronous answer as its raw wire string.
+        ///
+        /// `op` and `port` are stamped here so no caller can forget them; `fields`
+        /// carries only what its op needs. `index` and `deliver_after` go out as
+        /// decimal strings, the contract's spelling for this seam's numerics.
+        ///
+        /// A missing status means the kernel refused the op for want of an in-flight
+        /// activation of this instance — structurally impossible from inside an
+        /// entry, so it is a kernel/SDK contract break and panics rather than being
+        /// guessed at as an ok. Which vocabulary the answer is in is the caller's
+        /// business: a deferred publish answers in `publish-error`, the control ops
+        /// in `defer-error`.
+        fn defer_dispatch(
+            &mut self,
+            op: &'static str,
+            port: &str,
+            fields: &[(&str, JsValue)],
+        ) -> String {
+            let mut all = vec![
+                ("op", JsValue::from_str(op)),
+                ("port", JsValue::from_str(port)),
+            ];
+            all.extend(fields.iter().map(|(k, v)| (*k, v.clone())));
+            let detail = detail_object(&all);
+            dispatch_conformant(&self.host, PORT_DEFER, &detail)
+                .expect("dispatch brenn-port-defer on the host element");
+            Reflect::get(&detail, &JsValue::from_str(DEFER_STATUS_FIELD))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "component-support: no status on a buffered {op} of port {port:?} — the \
+                         kernel did not route it into this activation's buffer"
+                    )
+                })
+        }
+
+        /// Read a control op's answer in the `defer-error` vocabulary, panicking on
+        /// a spelling this contract does not know — the same seam-break treatment a
+        /// missing status gets.
+        fn parse_defer_answer(
+            &self,
+            port: &str,
+            op: &'static str,
+            status: &str,
+        ) -> Result<(), DeferError> {
+            match parse_defer_status(status) {
+                Some(status) => status,
+                None => panic!(
+                    "component-support: {status:?} is not a defer status — the kernel answered a \
+                     {op} of port {port:?} in a vocabulary this contract does not spell"
                 ),
             }
         }
@@ -1160,6 +1305,154 @@ export function define_component(tag, connected) {\n\
                 &[Ok(()), Err(PublishError::QuotaExceeded)],
                 "each call gets its own synchronous answer back"
             );
+        }
+
+        /// One deferred-message op as the kernel-playing listener saw it: (op, port,
+        /// index, body, deliver_after) — the last three exactly as they crossed, so
+        /// an omitted key is distinguishable from a present one.
+        type SeenDeferOp = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+
+        #[wasm_bindgen_test]
+        fn the_deferred_ops_carry_their_detail_and_read_each_answer_back() {
+            // The producing half of the deferred seam, and the only thing that pins
+            // it: the three ops must cross as the contract's `op` selector plus
+            // decimal-string numerics, omit the halves an edit leaves alone, and take
+            // each call's own answer back off the detail — in the op's own
+            // vocabulary, since a deferred publish answers in `publish-error` and the
+            // control ops in `defer-error`.
+            let body_el = document().body().expect("test page has a body");
+            let seen: Recorder<SeenDeferOp> = Rc::new(RefCell::new(Vec::new()));
+            let closure = {
+                let seen = Rc::clone(&seen);
+                Closure::<dyn Fn(Event)>::new(move |event: Event| {
+                    let ce = event.dyn_into::<CustomEvent>().expect("a CustomEvent");
+                    let detail = ce.detail();
+                    let op = detail_field(&detail, "op").as_string().unwrap_or_default();
+                    seen.borrow_mut().push((
+                        op.clone(),
+                        detail_field(&detail, "port")
+                            .as_string()
+                            .unwrap_or_default(),
+                        detail_field(&detail, "index").as_string(),
+                        detail_field(&detail, "body").as_string(),
+                        detail_field(&detail, "deliver_after").as_string(),
+                    ));
+                    // The kernel plays each op's own vocabulary, and refuses the
+                    // cancel so a component is shown to read its own answer rather
+                    // than one verdict for the activation.
+                    let status = if op == DEFER_OP_PUBLISH {
+                        brenn_surface_contract::publish_status_str(Ok(()))
+                    } else if op == DEFER_OP_CANCEL {
+                        brenn_surface_contract::defer_status_str(Err(DeferError::OutOfRange))
+                    } else {
+                        brenn_surface_contract::defer_status_str(Ok(()))
+                    };
+                    Reflect::set(
+                        &detail,
+                        &JsValue::from_str(DEFER_STATUS_FIELD),
+                        &JsValue::from_str(status),
+                    )
+                    .expect("write the status onto the detail");
+                })
+            };
+            body_el
+                .add_event_listener_with_callback(PORT_DEFER, closure.as_ref().unchecked_ref())
+                .expect("listen for the defer event");
+
+            let published: Recorder<Result<(), PublishError>> = Rc::new(RefCell::new(Vec::new()));
+            let controlled: Recorder<Result<(), DeferError>> = Rc::new(RefCell::new(Vec::new()));
+            let entry = {
+                let published = Rc::clone(&published);
+                let controlled = Rc::clone(&controlled);
+                registered_entry("wbt-cs-act-defer", move |_a, publisher| {
+                    published.borrow_mut().push(publisher.publish_deferred(
+                        "out",
+                        "one",
+                        1_770_000_000_000,
+                    ));
+                    controlled
+                        .borrow_mut()
+                        .push(publisher.defer_cancel("out", 2));
+                    controlled
+                        .borrow_mut()
+                        .push(publisher.defer_edit("out", 0, Some("two"), None));
+                    controlled
+                        .borrow_mut()
+                        .push(publisher.defer_edit("out", 1, None, Some(9)));
+                    Ok(())
+                })
+            };
+            call_entry(&entry, &activation_json()).expect("ok does not throw");
+            body_el
+                .remove_event_listener_with_callback(PORT_DEFER, closure.as_ref().unchecked_ref())
+                .expect("unlisten");
+
+            assert_eq!(
+                seen.borrow().as_slice(),
+                &[
+                    (
+                        "publish".to_string(),
+                        "out".to_string(),
+                        None,
+                        Some("one".to_string()),
+                        Some("1770000000000".to_string()),
+                    ),
+                    (
+                        "cancel".to_string(),
+                        "out".to_string(),
+                        Some("2".to_string()),
+                        None,
+                        None,
+                    ),
+                    (
+                        "edit".to_string(),
+                        "out".to_string(),
+                        Some("0".to_string()),
+                        Some("two".to_string()),
+                        None,
+                    ),
+                    (
+                        "edit".to_string(),
+                        "out".to_string(),
+                        Some("1".to_string()),
+                        None,
+                        Some("9".to_string()),
+                    ),
+                ],
+                "each op names itself, spells its numerics in decimal, and carries no \
+                 key for the half it leaves alone"
+            );
+            assert_eq!(
+                published.borrow().as_slice(),
+                &[Ok(())],
+                "a deferred publish is answered in the publish vocabulary"
+            );
+            assert_eq!(
+                controlled.borrow().as_slice(),
+                &[Err(DeferError::OutOfRange), Ok(()), Ok(())],
+                "each control op gets its own synchronous answer in the defer vocabulary"
+            );
+        }
+
+        #[wasm_bindgen_test]
+        #[should_panic(expected = "no status on a buffered cancel")]
+        fn a_defer_op_the_kernel_did_not_buffer_panics_rather_than_passing_for_ok() {
+            // A missing status means the kernel refused the op for want of an
+            // in-flight activation — impossible from inside an entry. Reading it as
+            // an ok would tell a component its parked message is cancelled when
+            // nothing touched it.
+            let entry = registered_entry("wbt-cs-act-nodefst", |_a, publisher| {
+                let _ = publisher.defer_cancel("out", 0);
+                Ok(())
+            });
+            // Nothing listens for PORT_DEFER, so no status is ever written.
+            call_entry(&entry, &activation_json()).expect("the inner panic surfaces as a throw");
         }
 
         #[wasm_bindgen_test]

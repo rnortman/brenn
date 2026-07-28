@@ -55,6 +55,33 @@ fn publisher(slug: &str) -> crate::config::AppConfig {
     cfg
 }
 
+/// A sender carrying the **`brenn:` half only**: `MessagingPublish` plus a
+/// `brenn_publish` matcher covering every bare name, and nothing else. Its
+/// matcher therefore covers `eph-chan` too — the wrong-grant probe for the
+/// `ephemeral:` scheme.
+fn brenn_only(slug: &str) -> crate::config::AppConfig {
+    test_app_config(
+        slug,
+        Some(ResolvedMessagingConfig {
+            send_budget: 100,
+            subscriptions: vec![],
+        }),
+        vec!["bob".to_string()],
+    )
+}
+
+/// The mirror of [`brenn_only`]: the **`ephemeral:` half only**, with a matcher
+/// covering every bare name including `durable-chan`.
+fn eph_only(slug: &str) -> crate::config::AppConfig {
+    let mut cfg = test_app_config(slug, None, vec!["bob".to_string()]);
+    cfg.policy.grants.insert(AppCapability::EphemeralPublish);
+    cfg.policy
+        .acls
+        .ephemeral_publish
+        .push(ChannelMatcher::Prefix(String::new()));
+    cfg
+}
+
 /// A messenger holding one channel of each class — durable, transportable
 /// non-durable, and confined non-durable — with its stores and bus wired the way
 /// boot wires them.
@@ -106,6 +133,8 @@ async fn parity_messenger(rate: SendRate) -> Arc<Messenger> {
         "no-grants".to_string(),
         test_app_config("no-grants", None, vec!["bob".to_string()]),
     );
+    apps.insert("brenn-only".to_string(), brenn_only("brenn-only"));
+    apps.insert("eph-only".to_string(), eph_only("eph-only"));
 
     let stores = Arc::new(RingStores::build(&nondurable));
     Messenger::new(
@@ -316,6 +345,41 @@ async fn a_grantless_sender_is_missing_on_every_scheme() {
             "{addr}: got {result:?}",
         );
     }
+}
+
+/// Layer-1 reads the **scheme's own** grant, not the union of the sender's
+/// transport grants: `MessagingPublish` plus a `brenn_publish` matcher covering
+/// the bare name does not authorize the `ephemeral:` form of that channel.
+///
+/// The mirror holds too, so neither half can be leaned on by the other. This is
+/// the property surface fixtures rely on when one policy carries both halves
+/// with disjoint matcher lists.
+#[tokio::test]
+async fn the_wrong_schemes_grant_does_not_authorize_a_publish() {
+    let m = parity_messenger(SendRate::default()).await;
+
+    // `brenn-only`'s `brenn_publish` matcher is `Prefix("")`, so it covers
+    // `eph-chan` — only the missing `EphemeralPublish` grant denies this.
+    let result = send(&m, "brenn-only", "ephemeral:eph-chan", "hi").await;
+    assert!(
+        matches!(result, PublishResult::MissingSender),
+        "MessagingPublish must not admit an ephemeral: publish; got {result:?}",
+    );
+    assert_eq!(ring_store(&m, "ephemeral:eph-chan").publish_count(), 0);
+
+    // Mirror: `eph-only`'s `ephemeral_publish` matcher covers `durable-chan`,
+    // and only the missing `MessagingPublish` grant denies it.
+    let result = send(&m, "eph-only", &canonical_address(DURABLE), "hi").await;
+    assert!(
+        matches!(result, PublishResult::MissingSender),
+        "EphemeralPublish must not admit a brenn: publish; got {result:?}",
+    );
+    assert!(
+        retained_bodies(&m, &canonical_address(DURABLE))
+            .await
+            .is_empty(),
+        "a denied publish commits nothing",
+    );
 }
 
 #[tokio::test]

@@ -4,16 +4,23 @@
     "definition both hostings are driven from and checked against.",
     "",
     "`config` is the instance's config map. `activations` is the scripted",
-    "sequence of activations, each naming every bound input port's window:",
-    "`envelopes` are (id, body) pairs in window order, `new_from` splits",
-    "retained context from new, `dropped` is the binding's drop-counter delta.",
-    "Each harness expands a pair into the canonical MessageEnvelope JSON using",
-    "the fixed non-identifying fields in `envelope_template`.",
+    "sequence of activations. Each names, in the kernel's own field spelling:",
+    "`ports` — every bound input port's window, where `envelopes` are (id, body)",
+    "pairs in window order, `new_from` splits retained context from new, and",
+    "`dropped` is the binding's drop-counter delta; `deferred` — one window per",
+    "bound output port holding this component's own parked messages,",
+    "release-ordered; and `now` — the host's wall clock in epoch milliseconds",
+    "UTC, or null for a host that exposes none. Each harness expands an",
+    "(id, body) pair into the canonical MessageEnvelope JSON using the fixed",
+    "non-identifying fields in `envelope_template`.",
     "",
     "`transcript` is the reduced observable of each activation: the flush",
-    "outcome and, in call order, the publishes that actually reached the sink.",
-    "An err or trap activation flushes nothing — that is what discard-on-err",
-    "looks like reduced to observables.",
+    "outcome and, in call order, the immediate publishes, the deferred publishes",
+    "(body + release instant), and the deferred-message control ops that",
+    "actually reached the host. An err or trap activation flushes nothing —",
+    "that is what discard-on-err looks like reduced to observables, and it",
+    "covers deferral: a parked schedule and a buffered cancel/edit are discarded",
+    "with the publishes.",
     "",
     "Wire class: every channel here is `brenn:`. That is an owner scoping",
     "decision, not doctrine — backend WASM consumers cannot bind `ephemeral:`",
@@ -35,7 +42,7 @@
   },
   "activations": [
     {
-      "_why": "First window: one new message, and a bound port whose window is empty. Every bound port appears in every activation.",
+      "_why": "First window: one new message, and a bound port whose window is empty. Every bound port appears in every activation, and so does every bound output port's deferred window. A clockless host: `now` is null and the guest runs anyway.",
       "ports": [
         {
           "port": "in",
@@ -46,7 +53,9 @@
           "dropped": 0
         },
         { "port": "ctx", "envelopes": [], "new_from": 0, "dropped": 0 }
-      ]
+      ],
+      "deferred": [{ "port": "out", "entries": [] }],
+      "now": null
     },
     {
       "_why": "Retained context ahead of new-from on the triggering port, and a depth-0 port carrying pure context.",
@@ -68,7 +77,151 @@
           "new_from": 1,
           "dropped": 0
         }
-      ]
+      ],
+      "deferred": [{ "port": "out", "entries": [] }],
+      "now": null
+    },
+    {
+      "_why": "The park marker: the guest reads `now`, adds its own delay, and publishes deferred. Nothing is parked yet, so the deferred window is empty.",
+      "ports": [
+        {
+          "port": "in",
+          "envelopes": [
+            {
+              "id": "00000000-0000-0000-0000-000000000006",
+              "body": "__park__:60000"
+            }
+          ],
+          "new_from": 0,
+          "dropped": 0
+        },
+        { "port": "ctx", "envelopes": [], "new_from": 0, "dropped": 0 }
+      ],
+      "deferred": [{ "port": "out", "entries": [] }],
+      "now": 1767225600000
+    },
+    {
+      "_why": "Two parked messages are visible now, release-ordered. The edit marker names index 0 and changes both halves.",
+      "ports": [
+        {
+          "port": "in",
+          "envelopes": [
+            {
+              "id": "00000000-0000-0000-0000-000000000007",
+              "body": "__edit__:0:120000"
+            }
+          ],
+          "new_from": 0,
+          "dropped": 0
+        },
+        { "port": "ctx", "envelopes": [], "new_from": 0, "dropped": 0 }
+      ],
+      "deferred": [
+        {
+          "port": "out",
+          "entries": [
+            {
+              "index": 0,
+              "payload": "parked:60000",
+              "deliver_after": 1767225660000
+            },
+            {
+              "index": 1,
+              "payload": "parked:900000",
+              "deliver_after": 1767226500000
+            }
+          ]
+        }
+      ],
+      "now": 1767225660000
+    },
+    {
+      "_why": "The cancel marker names the far entry. Index 0 now shows the previous activation's edit, so the window is the host's answer, not the guest's memory.",
+      "ports": [
+        {
+          "port": "in",
+          "envelopes": [
+            {
+              "id": "00000000-0000-0000-0000-000000000008",
+              "body": "__cancel__:1"
+            }
+          ],
+          "new_from": 0,
+          "dropped": 0
+        },
+        { "port": "ctx", "envelopes": [], "new_from": 0, "dropped": 0 }
+      ],
+      "deferred": [
+        {
+          "port": "out",
+          "entries": [
+            {
+              "index": 0,
+              "payload": "edited@0",
+              "deliver_after": 1767225780000
+            },
+            {
+              "index": 1,
+              "payload": "parked:900000",
+              "deliver_after": 1767226500000
+            }
+          ]
+        }
+      ],
+      "now": 1767225700000
+    },
+    {
+      "_why": "The retime marker edits the release half only: the body stays whatever the host holds, which is the `none` arm of the edit pair.",
+      "ports": [
+        {
+          "port": "in",
+          "envelopes": [
+            {
+              "id": "00000000-0000-0000-0000-000000000009",
+              "body": "__retime__:0:5000"
+            }
+          ],
+          "new_from": 0,
+          "dropped": 0
+        },
+        { "port": "ctx", "envelopes": [], "new_from": 0, "dropped": 0 }
+      ],
+      "deferred": [
+        {
+          "port": "out",
+          "entries": [
+            {
+              "index": 0,
+              "payload": "edited@0",
+              "deliver_after": 1767225780000
+            }
+          ]
+        }
+      ],
+      "now": 1767225750000
+    },
+    {
+      "_why": "A park and an err in one window: the schedule is buffered and then discarded with everything else. Deferral is inside the atomic flush, not beside it.",
+      "ports": [
+        {
+          "port": "in",
+          "envelopes": [
+            {
+              "id": "00000000-0000-0000-0000-00000000000a",
+              "body": "__park__:60000"
+            },
+            {
+              "id": "00000000-0000-0000-0000-00000000000b",
+              "body": "__err__"
+            }
+          ],
+          "new_from": 0,
+          "dropped": 0
+        },
+        { "port": "ctx", "envelopes": [], "new_from": 0, "dropped": 0 }
+      ],
+      "deferred": [{ "port": "out", "entries": [] }],
+      "now": 1767225800000
     },
     {
       "_why": "Err sentinel: the handler buffers publishes and then returns err. The buffer is discarded; the instance lives.",
@@ -82,7 +235,9 @@
           "dropped": 0
         },
         { "port": "ctx", "envelopes": [], "new_from": 0, "dropped": 0 }
-      ]
+      ],
+      "deferred": [{ "port": "out", "entries": [] }],
+      "now": null
     },
     {
       "_why": "The instance is still delivering after the err, and a nonzero drop-counter delta reaches the guest.",
@@ -96,7 +251,9 @@
           "dropped": 2
         },
         { "port": "ctx", "envelopes": [], "new_from": 0, "dropped": 0 }
-      ]
+      ],
+      "deferred": [{ "port": "out", "entries": [] }],
+      "now": null
     },
     {
       "_why": "Trap sentinel: buffer discarded and the instance is terminal.",
@@ -110,38 +267,106 @@
           "dropped": 0
         },
         { "port": "ctx", "envelopes": [], "new_from": 0, "dropped": 0 }
-      ]
+      ],
+      "deferred": [{ "port": "out", "entries": [] }],
+      "now": null
     }
   ],
   "transcript": [
     {
       "outcome": "ok",
       "publishes": [
-        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000001\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"greeting\":\"hello, transplant\",\"absent\":null}",
+        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000001\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[]}],\"now\":null,\"greeting\":\"hello, transplant\",\"absent\":null}",
         "in:alpha"
+      ],
+      "deferred_publishes": [],
+      "ops": []
+    },
+    {
+      "outcome": "ok",
+      "publishes": [
+        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000001\",\"00000000-0000-0000-0000-000000000002\"],\"new_from\":1,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[\"00000000-0000-0000-0000-000000000010\"],\"new_from\":1,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[]}],\"now\":null,\"greeting\":\"hello, transplant\",\"absent\":null}",
+        "in:beta"
+      ],
+      "deferred_publishes": [],
+      "ops": []
+    },
+    {
+      "outcome": "ok",
+      "publishes": [
+        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000006\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[]}],\"now\":1767225600000,\"greeting\":\"hello, transplant\",\"absent\":null}"
+      ],
+      "deferred_publishes": [
+        { "body": "parked:60000", "deliver_after": 1767225660000 }
+      ],
+      "ops": []
+    },
+    {
+      "outcome": "ok",
+      "publishes": [
+        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000007\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[{\"index\":0,\"payload\":\"parked:60000\",\"deliver_after\":1767225660000},{\"index\":1,\"payload\":\"parked:900000\",\"deliver_after\":1767226500000}]}],\"now\":1767225660000,\"greeting\":\"hello, transplant\",\"absent\":null}"
+      ],
+      "deferred_publishes": [],
+      "ops": [
+        {
+          "op": "edit",
+          "port": "out",
+          "index": 0,
+          "payload": "edited@0",
+          "deliver_after": 1767225780000
+        }
       ]
     },
     {
       "outcome": "ok",
       "publishes": [
-        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000001\",\"00000000-0000-0000-0000-000000000002\"],\"new_from\":1,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[\"00000000-0000-0000-0000-000000000010\"],\"new_from\":1,\"dropped\":0}],\"greeting\":\"hello, transplant\",\"absent\":null}",
-        "in:beta"
+        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000008\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[{\"index\":0,\"payload\":\"edited@0\",\"deliver_after\":1767225780000},{\"index\":1,\"payload\":\"parked:900000\",\"deliver_after\":1767226500000}]}],\"now\":1767225700000,\"greeting\":\"hello, transplant\",\"absent\":null}"
+      ],
+      "deferred_publishes": [],
+      "ops": [{ "op": "cancel", "port": "out", "index": 1 }]
+    },
+    {
+      "outcome": "ok",
+      "publishes": [
+        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000009\"],\"new_from\":0,\"dropped\":0},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[{\"index\":0,\"payload\":\"edited@0\",\"deliver_after\":1767225780000}]}],\"now\":1767225750000,\"greeting\":\"hello, transplant\",\"absent\":null}"
+      ],
+      "deferred_publishes": [],
+      "ops": [
+        {
+          "op": "edit",
+          "port": "out",
+          "index": 0,
+          "payload": null,
+          "deliver_after": 1767225755000
+        }
       ]
     },
     {
       "outcome": "err",
-      "publishes": []
+      "publishes": [],
+      "deferred_publishes": [],
+      "ops": []
+    },
+    {
+      "outcome": "err",
+      "publishes": [],
+      "deferred_publishes": [],
+      "ops": []
     },
     {
       "outcome": "ok",
       "publishes": [
-        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000004\"],\"new_from\":0,\"dropped\":2},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"greeting\":\"hello, transplant\",\"absent\":null}",
+        "{\"ports\":[{\"port\":\"in\",\"ids\":[\"00000000-0000-0000-0000-000000000004\"],\"new_from\":0,\"dropped\":2},{\"port\":\"ctx\",\"ids\":[],\"new_from\":0,\"dropped\":0}],\"deferred\":[{\"port\":\"out\",\"entries\":[]}],\"now\":null,\"greeting\":\"hello, transplant\",\"absent\":null}",
         "in:delta"
-      ]
+      ],
+      "deferred_publishes": [],
+      "ops": []
     },
     {
       "outcome": "trap",
-      "publishes": []
+      "publishes": [],
+      "deferred_publishes": [],
+      "ops": []
     }
   ]
 }

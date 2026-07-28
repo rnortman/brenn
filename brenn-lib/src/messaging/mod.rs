@@ -63,7 +63,7 @@ pub use ingress::{
 };
 pub use live::{
     EphemeralDelivery, EphemeralEvent, EphemeralReceiver, EphemeralResume, EphemeralSubscribeError,
-    EphemeralSubscription, GapReason, LiveCounters, Replay,
+    EphemeralSubscription, GapReason, LiveCounters, PrepaidEntry, Replay,
 };
 pub use publish::{
     PublishOrigin, PublishResult, SurfaceBatchPublish, SurfaceSendDraw, SurfaceSendVerdict,
@@ -776,10 +776,10 @@ impl MessagingDirectory {
 pub use brenn_envelope::{
     BRENN_ADDRESS_PREFIX, ChannelScheme, DeliveryClass, EPHEMERAL_ADDRESS_PREFIX,
     LOCAL_ADDRESS_PREFIX, MQTT_ADDRESS_PREFIX, MessageEnvelope, MqttEnvelope, MqttPayloadBody,
-    PWA_PUSH_ADDRESS_PREFIX, Urgency, WEBHOOK_ADDRESS_PREFIX, WebhookEnvelope,
+    PWA_PUSH_ADDRESS_PREFIX, Urgency, WEBHOOK_ADDRESS_PREFIX, WebhookEnvelope, utc_from_epoch_ms,
 };
 
-/// Per-subscription wake policy set by the subscriber (design §2.1).
+/// Per-subscription wake policy set by the subscriber.
 ///
 /// Controls when an incoming push row triggers an eager wake of the subscriber:
 /// - `VeryLow`…`High`: wake iff message urgency `>=` this level.
@@ -1106,6 +1106,53 @@ pub trait WakeRouter: Send + Sync + 'static {
         let _ = (key, envelope, retained_seq);
     }
 
+    /// Hand one surface component instance's recomputed parked view on
+    /// `channel` to that surface's attached sessions.
+    ///
+    /// The page mirrors this set rather than maintaining it: durable parked
+    /// entries outlive the page, releases run on the server's clock, and every
+    /// session of the surface shares the sender identity. `view` is therefore a
+    /// full snapshot, in release order, idempotent and last-writer-wins — a
+    /// session that misses one is corrected by the next, and is owed no resend.
+    /// "Last" is the last *read*, not the last arrival: emitters recompute and
+    /// hand off under [`Messenger::deferred_view_gate`], which is what makes the
+    /// two orders the same.
+    ///
+    /// Called where the parked set changes below the route layer: the release
+    /// sweep, which runs on the dispatcher loop and reaches sessions only
+    /// through this trait. The changes a session task makes itself
+    /// (park, cancel, edit) are pushed there, where the slug and the registry
+    /// are already in hand.
+    ///
+    /// Default no-op: only the surface router impl routes it. Test doubles that
+    /// host no surface sessions inherit the no-op.
+    async fn push_surface_deferred_view(
+        &self,
+        slug: &str,
+        instance: &str,
+        channel: &str,
+        view: &[store::DeferredMessage],
+    ) {
+        let _ = (slug, instance, channel, view);
+    }
+
+    /// Cheap precheck for a surface deferred-view push: is any session of `slug`
+    /// attached at all? A `false` answer lets the release sweep skip recomputing
+    /// the sender's parked view — a store read that copies every parked body —
+    /// for a page that is not there. Nothing is owed to a closed page: it is
+    /// seeded from the truth when it comes back.
+    ///
+    /// Slug-grained, not subscription-grained: the view belongs to the surface's
+    /// sub-identity, and every session of the slug receives every emission.
+    ///
+    /// Default `true`: a router that hosts no surface sessions is only asked
+    /// about a slug some sender named, so the default costs it one wasted
+    /// recompute at most, and never a wrong answer.
+    fn any_surface_session_attached(&self, slug: &str) -> bool {
+        let _ = slug;
+        true
+    }
+
     /// Cheap precheck for the surface live feed: does any currently-attached
     /// session hold a subscription on `channel` for one of `targets`? A `false`
     /// answer lets the publish path skip building the owned, body-copying feed
@@ -1135,7 +1182,7 @@ pub trait WakeRouter: Send + Sync + 'static {
     /// **Invariant:** invoked by `dispatcher::dispatch_row` for ingress-typed rows.
     /// Ingress rows flow through `dispatch_row`, not directly through `WakeRouter::deliver`.
     /// All ingress — single or batched, live-inject or drain — renders through the
-    /// single timestamped batch formatter (design §2.10, R9).
+    /// single timestamped batch formatter.
     async fn deliver_ingress(
         &self,
         key: &SubscriberEntryKind,
@@ -1214,6 +1261,20 @@ pub trait WakeRouter: Send + Sync + 'static {
     ) {
         let _ = (channel, subscriber, position, head);
     }
+}
+
+/// One surface deferred-view set: a channel, and the component instance whose
+/// parked messages on it are in question.
+///
+/// Named rather than a `(String, String)` because two producers answer about the
+/// same pairs — which sets a page can be seeded for, and which sets exist at all
+/// ([`Messenger::parked_surface_components`]) — and their answers are compared
+/// against each other. Two structurally identical string pairs let one side be
+/// read in the other's order, which type-checks clean and answers wrongly.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ParkedSet {
+    pub channel: String,
+    pub instance: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1337,6 +1398,29 @@ pub struct Messenger {
     /// gate costs nothing that per-`(channel, app)` keying would buy. Lock order
     /// is gate → `db`; nothing acquires them the other way.
     dynamic_subscribe_gate: tokio::sync::Mutex<()>,
+    /// Serializes one surface deferred-view emission end to end: the read of the
+    /// sender's parked set and the hand-off of that snapshot to the pages.
+    ///
+    /// A snapshot carries no version, so a page keeps whichever arrives last.
+    /// Reading and handing off in two unsynchronized steps therefore lets two
+    /// emitters whose reads interleave queue their snapshots in the reverse
+    /// order, and the page ends up mirroring a set that no longer exists — with
+    /// no later emission owed, if that change was the set's last. Under this gate
+    /// hand-off order is read order, and each session's push queue is FIFO from
+    /// there, so the newest read is the snapshot the page keeps.
+    ///
+    /// Held by every emitter: the release sweep below the route layer, and the
+    /// session task that parks or applies a control op
+    /// ([`Messenger::lock_deferred_view_gate`]). They reach a page by different
+    /// routes — the [`WakeRouter`] seam and the session registry — so what they
+    /// share is the order, not the delivery.
+    ///
+    /// Process-wide rather than per-`(channel, sender)`: an emission is one
+    /// deferred-set read plus a non-blocking hand-off, on paths that run at the
+    /// pace of parks, control ops and releases. Lock order is gate → `db`;
+    /// nothing acquires them the other way, and nothing holds it across a socket
+    /// write — one stalled connection must never stop the release sweep.
+    deferred_view_gate: tokio::sync::Mutex<()>,
     /// Durable send budgets for surface principals, keyed by the principal's two
     /// grains: `(slug, None)` is the surface's own kernel identity, `(slug,
     /// Some(instance))` is one declared component instance on it. Installed
@@ -1530,6 +1614,7 @@ impl Messenger {
             stranded_warned: Mutex::new(HashSet::new()),
             acl_denied_warned: Mutex::new(HashSet::new()),
             dynamic_subscribe_gate: tokio::sync::Mutex::new(()),
+            deferred_view_gate: tokio::sync::Mutex::new(()),
             surface_send_budgets: HashMap::new(),
             send_rate_buckets: Mutex::new(HashMap::new()),
             publish_rate_limited: Mutex::new(HashMap::new()),
@@ -1540,26 +1625,30 @@ impl Messenger {
         })
     }
 
-    /// Count one deferred WASM publish dropped at flush for `(consumer, channel)`
+    /// Count one deferred publish dropped at flush for `(principal, channel)`
     /// because the channel's deferred set was at its `retain_depth` cap.
-    pub(crate) fn record_dropped_deferred(&self, consumer: &str, channel: &str) {
+    ///
+    /// Recorded by whichever flush path owns the park, since only it knows the
+    /// principal at the grain that parked: a WASM consumer's slug, a surface
+    /// component's sub-identity.
+    pub fn record_dropped_deferred(&self, principal: &str, channel: &str) {
         *self
             .dropped_deferred
             .lock()
             .expect("messaging: dropped_deferred lock poisoned")
-            .entry((consumer.to_owned(), channel.to_owned()))
+            .entry((principal.to_owned(), channel.to_owned()))
             .or_insert(0) += 1;
     }
 
-    /// Count of deferred publishes dropped at flush for a `(consumer, channel)`
+    /// Count of deferred publishes dropped at flush for a `(principal, channel)`
     /// pair — a scheduled self-publish that never landed because the deferred set
     /// was at its cap.
-    pub fn dropped_deferred_count(&self, consumer: &str, channel: &str) -> u64 {
+    pub fn dropped_deferred_count(&self, principal: &str, channel: &str) -> u64 {
         *self
             .dropped_deferred
             .lock()
             .expect("messaging: dropped_deferred lock poisoned")
-            .get(&(consumer.to_owned(), channel.to_owned()))
+            .get(&(principal.to_owned(), channel.to_owned()))
             .unwrap_or(&0)
     }
 
@@ -1820,11 +1909,12 @@ impl Messenger {
     /// Cancel one of `sender`'s parked messages on `channel_address`, named by its
     /// message uuid — the substrate half of a WASM output port's `defer-cancel`.
     ///
-    /// Resolves the channel's store and applies the cancel on its sender-scoped
-    /// deferred surface. Authorization is structural: the store cancels only a
-    /// message whose recorded sender equals `sender`. Returns [`NotDeferred`] when
-    /// the message already released between the caller's view and this call — a
-    /// benign race, not a failure.
+    /// Cancels only a message whose recorded sender equals `sender`; answers
+    /// [`WrongSender`] otherwise. Returns [`NotDeferred`] when the message
+    /// already released between the caller's view and this call — a benign race,
+    /// not a failure. What a [`WrongSender`] means is the caller's to decide: a
+    /// host acting on its own snapshot's ids has a broken invariant, a route
+    /// acting on client-supplied ids has a protocol violation.
     ///
     /// # Panics
     ///
@@ -1832,6 +1922,7 @@ impl Messenger {
     /// resolve).
     ///
     /// [`NotDeferred`]: store::DeferralOutcome::NotDeferred
+    /// [`WrongSender`]: store::DeferralOutcome::WrongSender
     pub async fn cancel_deferred_for_sender(
         &self,
         channel_address: &str,
@@ -2219,10 +2310,107 @@ impl Messenger {
                     }
                 }
             }
+            // A release also changes what the sender still holds parked, and a
+            // surface component reads that set from a page-side mirror of the
+            // backend's answer. The page cannot compute the change itself — the
+            // release ran here, on this clock — so the recomputed view is pushed.
+            self.push_released_surface_views(&entry.address, &outcome.released, now)
+                .await;
             let remaining = store.next_release().await;
             fold(remaining, &mut sweep);
         }
         sweep
+    }
+
+    /// Take the gate that orders surface deferred-view emissions, for an emitter
+    /// that pushes by its own route rather than through the [`WakeRouter`] seam —
+    /// the session task, which holds the slug and the registry.
+    ///
+    /// Hold it across the recompute *and* the hand-off, and never across a socket
+    /// write. See [`Messenger::deferred_view_gate`] for what it buys.
+    pub async fn lock_deferred_view_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.deferred_view_gate.lock().await
+    }
+
+    /// Restate the parked view of every surface component instance among
+    /// `released`'s senders, on `channel_address`.
+    ///
+    /// Resolved after the store's lock is gone and once per distinct sender.
+    /// A sender of any other kind names no page and is skipped, as is one whose
+    /// surface has no session attached — the recompute reads the store and copies
+    /// every parked body, and a durable schedule usually releases with the page
+    /// closed, which is the whole reason it was durable.
+    ///
+    /// Recompute and hand-off run under [`Messenger::deferred_view_gate`], so a
+    /// sweep that races a session's own emission cannot leave the page holding
+    /// the older of the two snapshots.
+    async fn push_released_surface_views(
+        &self,
+        channel_address: &str,
+        released: &[store::Released],
+        now: DateTime<Utc>,
+    ) {
+        let mut components: Vec<(&str, &str)> = released
+            .iter()
+            .filter_map(|r| ParticipantId::surface_component_of(&r.envelope.sender))
+            .collect();
+        components.sort_unstable();
+        components.dedup();
+        for (slug, instance) in components {
+            if !self.router.any_surface_session_attached(slug) {
+                continue;
+            }
+            let sender = ParticipantId::for_surface_component(slug, instance);
+            // TODO(surface-op-send-budget): this gate take runs on the dispatcher
+            // loop, so op-driven recomputes elsewhere delay sweeps and subscriber
+            // wakes bus-wide.
+            let _order = self.deferred_view_gate.lock().await;
+            let view = self
+                .deferred_view_for_sender(channel_address, sender.as_str(), now)
+                .await;
+            self.router
+                .push_surface_deferred_view(slug, instance, channel_address, &view)
+                .await;
+        }
+    }
+
+    /// Every component instance of surface `slug` holding something parked at
+    /// `now`, sorted.
+    ///
+    /// The question the sender-scoped view cannot answer: which of this
+    /// surface's schedules exist at all. A page is seeded only for the
+    /// instances its `Welcome` declares and the channels their outputs bind, so
+    /// this is what tells the seeding pass about a parked set no frame will
+    /// reach — an instance the config no longer declares, or one whose output
+    /// binding on that channel is gone. Those entries still release normally;
+    /// what is lost is the page's ability to see or cancel them, which is an
+    /// operator's business.
+    ///
+    /// Walks every channel's store, so it costs one deferred-set read per
+    /// channel — a query per durable channel. Called at attach, not per frame.
+    pub async fn parked_surface_components(
+        &self,
+        slug: &str,
+        now: DateTime<Utc>,
+    ) -> Vec<ParkedSet> {
+        let mut found: Vec<ParkedSet> = Vec::new();
+        for entry in self.directory.list() {
+            for sender in self.store_for(&entry).deferred_senders(now).await {
+                let Some((sender_slug, instance)) = ParticipantId::surface_component_of(&sender)
+                else {
+                    continue;
+                };
+                if sender_slug == slug {
+                    found.push(ParkedSet {
+                        channel: entry.address.clone(),
+                        instance: instance.to_string(),
+                    });
+                }
+            }
+        }
+        found.sort();
+        found.dedup();
+        found
     }
 
     /// Wake every subscriber currently owed messages that its wake economics say
@@ -4220,6 +4408,205 @@ mod tests {
             .await;
         assert_eq!(bob_view.len(), 1);
         assert_eq!(bob_view[0].envelope.body, "bob-mid");
+    }
+
+    /// A router that records the deferred views the release sweep pushes and
+    /// no-ops everything else.
+    #[derive(Default)]
+    struct ViewRecordingRouter {
+        pushed: std::sync::Mutex<Vec<RecordedView>>,
+        /// Stands in for every session of every surface being closed, which is
+        /// what the sweep's attachment precheck asks about. Default: attached.
+        all_pages_closed: bool,
+    }
+
+    /// One recorded push: slug, instance, channel, and the view's bodies.
+    type RecordedView = (String, String, String, Vec<String>);
+
+    #[async_trait::async_trait]
+    impl WakeRouter for ViewRecordingRouter {
+        async fn deliver(
+            &self,
+            _key: &SubscriberEntryKind,
+            _envelope: &std::sync::Arc<MessageEnvelope>,
+            _retained_seq: i64,
+        ) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        async fn push_surface_deferred_view(
+            &self,
+            slug: &str,
+            instance: &str,
+            channel: &str,
+            view: &[store::DeferredMessage],
+        ) {
+            self.pushed.lock().expect("recorder poisoned").push((
+                slug.to_string(),
+                instance.to_string(),
+                channel.to_string(),
+                view.iter().map(|d| d.envelope.body.clone()).collect(),
+            ));
+        }
+
+        fn any_surface_session_attached(&self, _slug: &str) -> bool {
+            !self.all_pages_closed
+        }
+
+        async fn deliver_ingress(
+            &self,
+            _key: &SubscriberEntryKind,
+            _: &ParticipantId,
+            _event: &super::ingress::Event,
+        ) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        fn spawn_eager_wake(&self, _key: &SubscriberEntryKind, _: &ParticipantId) {}
+
+        fn delivery_shape(&self, key: &SubscriberEntryKind) -> DeliveryShape {
+            default_delivery_shape(key)
+        }
+
+        fn alarm(&self, _channel: &str, _subscriber: &ParticipantId, _count: u64) {}
+    }
+
+    /// **A release restates the releasing sender's page-side view.** The page
+    /// mirrors a set the backend owns, and this sweep is the one change to it
+    /// that happens with no session in the loop — so the sweep pushes the
+    /// recomputed remainder, once per sender however many of its messages the
+    /// batch released, and says nothing about senders that name no page.
+    #[tokio::test]
+    async fn a_release_pushes_the_surface_senders_recomputed_view() {
+        use std::sync::Arc;
+
+        use chrono::Duration;
+
+        use crate::messaging::store::NewMessage;
+
+        let ephemeral = crate::messaging::testutils::ephemeral_channel_entry("timers", 8);
+        let ring_stores = Arc::new(store::RingStores::build(std::slice::from_ref(&ephemeral)));
+        let router = Arc::new(ViewRecordingRouter::default());
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![ephemeral.clone()])),
+            Arc::from("node"),
+            Arc::new(indexmap::IndexMap::new()),
+            router.clone() as Arc<dyn WakeRouter>,
+            crate::messaging::config::MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(ring_stores);
+
+        let agenda = ParticipantId::for_surface_component("deskbar", "agenda");
+        let ticker = ParticipantId::for_surface_component("deskbar", "ticker");
+        let backend = ParticipantId::for_wasm("proc-alice");
+        let now = Utc::now();
+        let store = messenger.store_for(&ephemeral);
+
+        let park = |sender: &str, body: &str, offset: i64| {
+            let store = Arc::clone(&store);
+            let msg = NewMessage {
+                source: "node".to_string(),
+                sender: sender.to_string(),
+                body: body.to_string(),
+                urgency: Urgency::Normal,
+                envelope_type: ChannelScheme::Ephemeral,
+                reply_to_uuid: None,
+                delivery_deadline: None,
+                publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
+            };
+            async move {
+                store
+                    .park(msg, now + Duration::seconds(offset))
+                    .await
+                    .expect("under the cap");
+            }
+        };
+
+        // Two of agenda's release together and one survives; ticker releases
+        // nothing; the backend component's release names no page at all.
+        park(agenda.as_str(), "agenda-due-first", 10).await;
+        park(agenda.as_str(), "agenda-due-second", 20).await;
+        park(agenda.as_str(), "agenda-survivor", 600).await;
+        park(ticker.as_str(), "ticker-later", 600).await;
+        park(backend.as_str(), "backend-due", 15).await;
+
+        let sweep = messenger
+            .release_due_messages(now + Duration::seconds(60))
+            .await;
+        assert_eq!(sweep.released, 3);
+
+        let pushed = router.pushed.lock().expect("recorder poisoned").clone();
+        assert_eq!(
+            pushed,
+            vec![(
+                "deskbar".to_string(),
+                "agenda".to_string(),
+                ephemeral.address.clone(),
+                vec!["agenda-survivor".to_string()],
+            )],
+            "one push for the one surface sender that released, carrying what it still holds"
+        );
+    }
+
+    /// **A release with no page attached recomputes nothing.** The recompute is a
+    /// store read that copies every parked body, and a durable schedule usually
+    /// comes due with the page closed — which is why it was durable. A page that
+    /// returns is seeded from the truth, so the skipped push owes nothing.
+    #[tokio::test]
+    async fn a_release_with_no_attached_session_pushes_no_view() {
+        use std::sync::Arc;
+
+        use chrono::Duration;
+
+        use crate::messaging::store::NewMessage;
+
+        let ephemeral = crate::messaging::testutils::ephemeral_channel_entry("timers", 8);
+        let ring_stores = Arc::new(store::RingStores::build(std::slice::from_ref(&ephemeral)));
+        let router = Arc::new(ViewRecordingRouter {
+            all_pages_closed: true,
+            ..ViewRecordingRouter::default()
+        });
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![ephemeral.clone()])),
+            Arc::from("node"),
+            Arc::new(indexmap::IndexMap::new()),
+            router.clone() as Arc<dyn WakeRouter>,
+            crate::messaging::config::MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(ring_stores);
+
+        let agenda = ParticipantId::for_surface_component("deskbar", "agenda");
+        let now = Utc::now();
+        let store = messenger.store_for(&ephemeral);
+        for (body, offset) in [("agenda-due", 10), ("agenda-survivor", 600)] {
+            store
+                .park(
+                    NewMessage {
+                        source: "node".to_string(),
+                        sender: agenda.as_str().to_string(),
+                        body: body.to_string(),
+                        urgency: Urgency::Normal,
+                        envelope_type: ChannelScheme::Ephemeral,
+                        reply_to_uuid: None,
+                        delivery_deadline: None,
+                        publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
+                    },
+                    now + Duration::seconds(offset),
+                )
+                .await
+                .expect("under the cap");
+        }
+
+        let sweep = messenger
+            .release_due_messages(now + Duration::seconds(60))
+            .await;
+        assert_eq!(sweep.released, 1, "the due schedule released as always");
+        assert!(
+            router.pushed.lock().expect("recorder poisoned").is_empty(),
+            "no session of the surface is attached, so no view is computed for it"
+        );
     }
 
     /// The substrate half of a WASM output port's `defer-cancel` / `defer-edit`:

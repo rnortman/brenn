@@ -852,6 +852,21 @@ describe("surface processor bring-up", () => {
             brenn_processor_publish: vi.fn(
                 (_i: string, _p: string, _b: string, _u?: string) => "",
             ),
+            brenn_processor_publish_deferred: vi.fn(
+                (_i: string, _p: string, _b: string, _d: bigint) => "",
+            ),
+            brenn_processor_defer_cancel: vi.fn(
+                (_i: string, _p: string, _x: number) => "",
+            ),
+            brenn_processor_defer_edit: vi.fn(
+                (
+                    _i: string,
+                    _p: string,
+                    _x: number,
+                    _b?: string,
+                    _d?: bigint,
+                ) => "",
+            ),
             brenn_processor_log: vi.fn(),
             brenn_processor_alert: vi.fn(),
             brenn_processor_config_get: vi.fn(
@@ -946,6 +961,81 @@ describe("surface processor bring-up", () => {
         );
     });
 
+    it("delegates the deferred family and throws its refusals as defer-error", async () => {
+        const kernel = fakeKernel();
+        kernel.brenn_processor_defer_cancel = vi.fn(
+            (_i: string, _p: string, _x: number) => "out-of-range",
+        );
+        let captured: Record<string, Record<string, unknown>> | undefined;
+        const importModule = vi.fn(async () => ({
+            instantiate: async (
+                _core: unknown,
+                imports: Record<string, Record<string, unknown>>,
+            ) => {
+                captured = imports;
+                return { receive: vi.fn() };
+            },
+        }));
+
+        await startProcessors(
+            kernel as unknown as Parameters<typeof startProcessors>[0],
+            manifest([processorEntry("p1")]),
+            ["p1"],
+            importModule as unknown as ModuleImporter,
+        );
+
+        const ports = captured?.["brenn:processor/ports"] as {
+            publishDeferred: (
+                port: string,
+                payload: string,
+                deliverAfter: bigint,
+            ) => void;
+            deferCancel: (port: string, index: number) => void;
+            deferEdit: (
+                port: string,
+                index: number,
+                payload: string | undefined,
+                deliverAfter: bigint | undefined,
+            ) => void;
+        };
+
+        ports.publishDeferred("out", "{}", 1_700_000_060_000n);
+        expect(kernel.brenn_processor_publish_deferred).toHaveBeenCalledWith(
+            "p1",
+            "out",
+            "{}",
+            1_700_000_060_000n,
+        );
+
+        // Both `option` arguments of an edit, in both states: `undefined` is the
+        // guest asking to leave that half alone, and must not become a value.
+        ports.deferEdit("out", 1, "next", 1_700_000_120_000n);
+        expect(kernel.brenn_processor_defer_edit).toHaveBeenCalledWith(
+            "p1",
+            "out",
+            1,
+            "next",
+            1_700_000_120_000n,
+        );
+        ports.deferEdit("out", 1, undefined, undefined);
+        expect(kernel.brenn_processor_defer_edit).toHaveBeenLastCalledWith(
+            "p1",
+            "out",
+            1,
+            undefined,
+            undefined,
+        );
+
+        // A refusal from the control family carries a `defer-error` tag, which the
+        // publish vocabulary has no spelling for — proof the shim forwards the
+        // kernel's answer rather than a fixed set of its own.
+        expect(() => ports.deferCancel("out", 7)).toThrowError(
+            expect.objectContaining({
+                payload: { tag: "out-of-range" },
+            }) as Error,
+        );
+    });
+
     it("throws the publish-error variant so the glue lifts the err arm", async () => {
         const kernel = fakeKernel();
         kernel.brenn_processor_publish = vi.fn(
@@ -1021,13 +1111,57 @@ describe("surface processor bring-up", () => {
 
         const activation = JSON.stringify({
             ports: [{ port: "in", envelopes: ["{}"], new_from: 1, dropped: 2 }],
+            deferred: [
+                {
+                    port: "out",
+                    entries: [
+                        {
+                            index: 0,
+                            payload: "ping",
+                            deliver_after: 1_700_000_060_000,
+                        },
+                    ],
+                },
+            ],
+            now: 1_700_000_000_000,
         });
 
         // ok: the kernel reads undefined as "flush the buffer".
         expect(entry?.(activation)).toBeUndefined();
-        // The record reaches the component in the canonical ABI's shape.
+        // All three fields, with the u64s as BigInts: the canonical ABI traps on
+        // a missing field, not a smaller activation.
         expect(seen[0]).toEqual({
             ports: [{ port: "in", envelopes: ["{}"], newFrom: 1, dropped: 2 }],
+            deferred: [
+                {
+                    port: "out",
+                    entries: [
+                        {
+                            index: 0,
+                            payload: "ping",
+                            deliverAfter: 1_700_000_060_000n,
+                        },
+                    ],
+                },
+            ],
+            now: 1_700_000_000_000n,
+        });
+
+        // Absent `now` serializes as `null`; the shim must lower it to
+        // `undefined`, not to 0n.
+        expect(
+            entry?.(
+                JSON.stringify({
+                    ports: [],
+                    deferred: [],
+                    now: null,
+                }),
+            ),
+        ).toBeUndefined();
+        expect(seen[1]).toStrictEqual({
+            ports: [],
+            deferred: [],
+            now: undefined,
         });
 
         // err: a returned string — buffer discarded, instance lives.

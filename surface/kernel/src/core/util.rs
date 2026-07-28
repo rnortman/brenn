@@ -113,6 +113,7 @@ pub(super) fn frame_type_name(frame: &ServerFrame) -> &'static str {
         ServerFrame::Deliver { .. } => "Deliver",
         ServerFrame::PublishResult { .. } => "PublishResult",
         ServerFrame::PublishBatchResult { .. } => "PublishBatchResult",
+        ServerFrame::DeferredView { .. } => "DeferredView",
     }
 }
 
@@ -148,8 +149,59 @@ fn hex_upper(nibble: u8) -> char {
     }
 }
 
+/// Epoch milliseconds UTC of a wall-clock instant, or a diagnosis of why the
+/// reading cannot be used.
+///
+/// The whole page runs on this currency: every `publish_ts` it stamps, every
+/// activation `now` it carries, every schedule comparison it makes. A device
+/// clock reading before the Unix epoch poisons all of them, and clamping would
+/// silently turn every deferred publish into an immediate one — so the reading
+/// is refused rather than repaired.
+pub(crate) fn checked_epoch_ms(ts: chrono::DateTime<chrono::Utc>) -> Result<u64, String> {
+    u64::try_from(ts.timestamp_millis()).map_err(|_| {
+        format!(
+            "the device clock reads before the Unix epoch ({}); the page cannot timestamp or \
+             schedule anything honestly",
+            ts.to_rfc3339()
+        )
+    })
+}
+
+/// Epoch milliseconds UTC of a wall-clock instant — the currency every release
+/// time in the channel model is expressed in, and the one an activation's `now`
+/// carries to a component.
+///
+/// Panics on an instant before the Unix epoch. The device clock is expected to
+/// be validated with [`checked_epoch_ms`] before any code path reaches this
+/// function, so this panic fires only if a clock that was sane at boot is
+/// stepped back past 1970 mid-session. Better dead than wrong.
+pub(crate) fn epoch_ms(ts: chrono::DateTime<chrono::Utc>) -> u64 {
+    checked_epoch_ms(ts).unwrap_or_else(|detail| panic!("surface client: {detail}"))
+}
+
 /// Milliseconds of a config `Duration`. Config durations are small (seconds);
 /// a value large enough to overflow `u64` millis is a configuration error.
 pub(super) fn duration_ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).expect("surface client: config duration too large")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_epoch_or_later_reading_is_its_millisecond_value() {
+        let epoch = chrono::DateTime::from_timestamp_millis(0).expect("in range");
+        assert_eq!(checked_epoch_ms(epoch), Ok(0));
+        let later = chrono::DateTime::from_timestamp_millis(1_700_000_000_123).expect("in range");
+        assert_eq!(checked_epoch_ms(later), Ok(1_700_000_000_123));
+    }
+
+    #[test]
+    fn a_pre_epoch_reading_is_refused_and_names_the_clock_and_the_reading() {
+        let before = chrono::DateTime::from_timestamp_millis(-1).expect("in range");
+        let detail = checked_epoch_ms(before).expect_err("before the epoch");
+        assert!(detail.contains("device clock"), "{detail}");
+        assert!(detail.contains("1969-12-31"), "{detail}");
+    }
 }

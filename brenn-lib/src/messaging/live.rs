@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
-use brenn_queue::{ReplayDecision, Resume};
+use brenn_queue::{QuotaExceeded, ReplayDecision, Resume};
 
 /// Why a replay carries a gap (a discontinuity the consumer must be told about).
 pub use brenn_queue::GapReason;
@@ -179,6 +179,28 @@ impl Drop for EphemeralReceiver {
     }
 }
 
+/// One entry of an activation flush the caller has already paid for, resolved
+/// against its own boot-resolved output map: who is publishing, under which
+/// policy, onto which channel, with what body, at which urgency and stamp.
+///
+/// A struct rather than a parameter list because the two entry points that take
+/// it — [`Messenger::publish_prepaid`] and [`Messenger::park_prepaid`] — must
+/// take *exactly* the same admitted entry, and because three of its fields are
+/// `&str`-shaped and would typecheck transposed.
+///
+/// Caller invariant: `sender` and `policy` MUST both be derived from the same
+/// config-resolved principal, never from client input.
+pub struct PrepaidEntry<'a> {
+    pub sender: &'a ParticipantId,
+    pub policy: &'a AppPolicy,
+    pub channel_address: &'a str,
+    pub body: &'a str,
+    pub urgency: Urgency,
+    /// Assigned by the caller in call order across the whole flush, before it was
+    /// split by class, so call order stays visible across the class boundary.
+    pub publish_ts: DateTime<Utc>,
+}
+
 impl Messenger {
     /// The incarnation every non-durable channel of this process carries. A
     /// resume cursor bearing a different epoch is a guaranteed gap, which is how
@@ -309,7 +331,8 @@ impl Messenger {
         })
     }
 
-    /// Apply one entry of an activation flush that is **already paid for**.
+    /// Apply one entry of an activation flush that is **already paid for**,
+    /// committing it into retention.
     ///
     /// Runs the validate-only gates and commits into retention exactly as the
     /// publish ladder does, with two differences:
@@ -342,18 +365,55 @@ impl Messenger {
     /// moment it happens, so a discarded event is a drop no later take will ever
     /// surface.
     #[must_use]
-    pub fn publish_prepaid(
+    pub fn publish_prepaid(&self, entry: PrepaidEntry<'_>) -> Appended {
+        let (store, envelope) = self.prepaid_envelope(entry);
+        store.append(envelope)
+    }
+
+    /// Park one entry of an already-paid-for activation flush until `release_at`,
+    /// instead of committing it into retention.
+    ///
+    /// The gates and the caller invariants are [`publish_prepaid`]'s, whole — this
+    /// is the same admitted entry taking the other branch of the same decision.
+    /// Only the destination differs: the message goes to the channel's deferred
+    /// set, where no retention read can observe it until the release sweep moves
+    /// it, and the release time lives in that set rather than on the envelope.
+    ///
+    /// The cap is the store's own, checked there: a channel holds at most as much
+    /// parked future as it holds retained past. Exhaustion is [`QuotaExceeded`]
+    /// rather than a drop of the oldest schedule, and it is the caller's to report
+    /// — a flush has no error channel back to the guest, so the only honest
+    /// treatment is a logged, counted dropped schedule.
+    ///
+    /// [`publish_prepaid`]: Messenger::publish_prepaid
+    pub fn park_prepaid(
         &self,
-        sender: &ParticipantId,
-        policy: &AppPolicy,
-        channel_address: &str,
-        body: &str,
-        urgency: Urgency,
-        publish_ts: DateTime<Utc>,
-    ) -> Appended {
+        entry: PrepaidEntry<'_>,
+        release_at: DateTime<Utc>,
+    ) -> Result<Uuid, QuotaExceeded> {
+        let (store, envelope) = self.prepaid_envelope(entry);
+        store.park(envelope, release_at)
+    }
+
+    /// The gates every prepaid entry passes, plus the envelope it mints and the
+    /// store that takes it. Shared by the immediate and the parking entry points
+    /// so one admitted entry cannot be admitted by two slightly different rules.
+    ///
+    /// The mint stamps `deliver_after: None` on both paths: a parked message's
+    /// release time belongs to the channel's deferred set, and the envelope a
+    /// consumer eventually reads is the one that was minted here.
+    fn prepaid_envelope(&self, prepaid: PrepaidEntry<'_>) -> (Arc<RingStore>, MessageEnvelope) {
+        let PrepaidEntry {
+            sender,
+            policy,
+            channel_address,
+            body,
+            urgency,
+            publish_ts,
+        } = prepaid;
         let entry = self.live_channel(channel_address).unwrap_or_else(|err| {
             panic!(
-                "publish_prepaid: bound output {channel_address:?} is not a live-attachable \
+                "prepaid publish: bound output {channel_address:?} is not a live-attachable \
                  channel ({err:?}) — boot validation proves every bound output resolves, so this \
                  is a broken boot invariant"
             )
@@ -362,14 +422,14 @@ impl Messenger {
             .expect("a directory entry's address always carries its scheme");
         assert!(
             publish_acl_allows(policy, scheme, name),
-            "publish_prepaid: sender {sender:?} has no publish ACL covering bound output \
+            "prepaid publish: sender {sender:?} has no publish ACL covering bound output \
              {channel_address:?} — boot validation proves every bound output is policy-covered, so \
              this is a broken boot invariant",
             sender = sender.as_str(),
         );
         if let Err(e) = check_body_size(body, self.defaults.max_body_bytes) {
             panic!(
-                "publish_prepaid: bound output {channel_address:?} carries a {len}-byte body over \
+                "prepaid publish: bound output {channel_address:?} carries a {len}-byte body over \
                  the {max}-byte cap — the caller rejects an over-cap entry as a violation before \
                  drawing, so the two caps disagree",
                 len = e.len,
@@ -377,7 +437,7 @@ impl Messenger {
             );
         }
 
-        self.live_store(&entry).append(MessageEnvelope {
+        let envelope = MessageEnvelope {
             message_id: Uuid::new_v4(),
             source: self.source().into(),
             channel: entry.address.clone(),
@@ -389,7 +449,8 @@ impl Messenger {
             deliver_after: None,
             urgency,
             envelope_type: scheme,
-        })
+        };
+        (self.live_store(&entry), envelope)
     }
 }
 
@@ -660,7 +721,14 @@ mod tests {
             .attach(&absent, "absent", 4, Priming::Head);
 
         let publish = |body: &str| {
-            messenger.publish_prepaid(&sender, &policy, CHANNEL, body, Urgency::Normal, Utc::now())
+            messenger.publish_prepaid(PrepaidEntry {
+                sender: &sender,
+                policy: &policy,
+                channel_address: CHANNEL,
+                body,
+                urgency: Urgency::Normal,
+                publish_ts: Utc::now(),
+            })
         };
 
         let first = publish("a");
@@ -680,30 +748,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn park_prepaid_holds_the_entry_out_of_retention_until_it_is_due() {
+        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 4)], RING_FAN_OUT_CAPACITY);
+        let store = messenger
+            .ring_stores()
+            .get_by_address(CHANNEL)
+            .expect("fixture channel");
+        let now = Utc::now();
+        let later = now + chrono::Duration::minutes(10);
+
+        messenger
+            .park_prepaid(
+                PrepaidEntry {
+                    sender: &pid("pub"),
+                    policy: &publisher_policy(NAME),
+                    channel_address: CHANNEL,
+                    body: "scheduled",
+                    urgency: Urgency::Normal,
+                    publish_ts: now,
+                },
+                later,
+            )
+            .expect("the deferred set has room");
+
+        // The deferred set carries epoch-ms, so the deadline comes back rounded to
+        // the millisecond the schedule named.
+        assert_eq!(
+            store.next_release(),
+            DateTime::from_timestamp_millis(later.timestamp_millis())
+        );
+        assert!(
+            store.retained_tail(u64::MAX).is_empty(),
+            "a parked message is not retained"
+        );
+
+        let released = store.release_due(later);
+        assert_eq!(
+            released
+                .messages
+                .iter()
+                .map(|r| r.envelope.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["scheduled"],
+            "the release moves it onto the channel"
+        );
+    }
+
+    /// The cap is the channel's `retain_depth`, and exhaustion refuses the *new*
+    /// schedule rather than dropping an older one: silently cancelling scheduled
+    /// work is worse than declining to schedule more.
+    #[tokio::test]
+    async fn park_prepaid_refuses_at_the_channels_deferred_cap() {
+        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 1)], RING_FAN_OUT_CAPACITY);
+        let later = Utc::now() + chrono::Duration::minutes(10);
+        let park = |body: &str| {
+            messenger.park_prepaid(
+                PrepaidEntry {
+                    sender: &pid("pub"),
+                    policy: &publisher_policy(NAME),
+                    channel_address: CHANNEL,
+                    body,
+                    urgency: Urgency::Normal,
+                    publish_ts: Utc::now(),
+                },
+                later,
+            )
+        };
+
+        assert!(park("first").is_ok());
+        assert_eq!(park("second"), Err(QuotaExceeded { cap: 1 }));
+
+        let store = messenger
+            .ring_stores()
+            .get_by_address(CHANNEL)
+            .expect("fixture channel");
+        assert_eq!(
+            store
+                .release_due(later)
+                .messages
+                .iter()
+                .map(|r| r.envelope.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first"],
+            "the refusal left the schedule that was already there"
+        );
+    }
+
+    #[tokio::test]
     #[should_panic(expected = "not a live-attachable channel")]
     async fn publish_prepaid_panics_on_a_channel_that_is_not_live_attachable() {
         let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 2)], RING_FAN_OUT_CAPACITY);
-        let _ = messenger.publish_prepaid(
-            &pid("pub"),
-            &publisher_policy(NAME),
-            "ephemeral:nope",
-            "x",
-            Urgency::Normal,
-            Utc::now(),
-        );
+        let _ = messenger.publish_prepaid(PrepaidEntry {
+            sender: &pid("pub"),
+            policy: &publisher_policy(NAME),
+            channel_address: "ephemeral:nope",
+            body: "x",
+            urgency: Urgency::Normal,
+            publish_ts: Utc::now(),
+        });
     }
 
     #[tokio::test]
     #[should_panic(expected = "no publish ACL covering bound output")]
     async fn publish_prepaid_panics_on_an_uncovered_sender() {
         let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 2)], RING_FAN_OUT_CAPACITY);
-        let _ = messenger.publish_prepaid(
-            &pid("pub"),
-            &AppPolicy::with_grants(&[AppCapability::EphemeralPublish]),
-            CHANNEL,
-            "x",
-            Urgency::Normal,
-            Utc::now(),
-        );
+        let _ = messenger.publish_prepaid(PrepaidEntry {
+            sender: &pid("pub"),
+            policy: &AppPolicy::with_grants(&[AppCapability::EphemeralPublish]),
+            channel_address: CHANNEL,
+            body: "x",
+            urgency: Urgency::Normal,
+            publish_ts: Utc::now(),
+        });
     }
 }

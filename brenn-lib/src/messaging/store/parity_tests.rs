@@ -379,6 +379,48 @@ async fn deferred_view_is_sender_scoped_and_release_ordered() {
     }
 }
 
+/// The channel-wide peer of the sender view: every holder named once, sorted,
+/// on the same maturity boundary the sender views use — a sender whose only
+/// entry has come due is gone from both, because there is nothing left to view.
+#[tokio::test]
+async fn deferred_senders_names_every_holder_once_on_the_view_boundary() {
+    for store in stores(DEPTH).await {
+        for (sender, body, offset) in [
+            ("bob", "b", 60),
+            ("alice", "a-first", 30),
+            ("alice", "a-second", 90),
+            ("carol", "matured", -60),
+        ] {
+            let msg = message_for(&*store, sender, body);
+            store
+                .park(msg, now() + Duration::seconds(offset))
+                .await
+                .expect("within cap");
+        }
+
+        assert_eq!(
+            store.deferred_senders(now()).await,
+            vec!["alice".to_string(), "bob".to_string()],
+            "{}",
+            store.address()
+        );
+        assert_eq!(
+            store.deferred_len().await,
+            4,
+            "the matured entry still holds its cap slot: {}",
+            store.address()
+        );
+        assert!(
+            store
+                .deferred_senders(now() + Duration::seconds(120))
+                .await
+                .is_empty(),
+            "past every release time nothing is viewable: {}",
+            store.address()
+        );
+    }
+}
+
 /// The cap is the channel's `retain_depth`, shared across senders — a channel
 /// holds at most as much parked future as retained past.
 #[tokio::test]
@@ -646,29 +688,45 @@ async fn edit_after_release_is_a_no_op() {
     }
 }
 
-/// Structural authorization: a component only ever names ids its own
-/// sender-scoped view gave it, so reaching another sender's message means the
-/// scoping was bypassed.
-async fn cancel_across_senders(index: usize) {
-    let store = stores(DEPTH).await.remove(index);
-    let msg = message_for(&*store, "bob", "b");
-    let parked = store.park(msg, soon()).await.expect("within cap");
-    store
-        .cancel_deferred("alice", parked.message_uuid, now())
-        .await;
-}
-
-/// Two cases rather than a loop because the assertion is a panic.
+/// Structural authorization, reported alike by both stores: an id parked under
+/// another sender is `WrongSender` — distinct from the release race's
+/// `NotDeferred`, and leaving the entry untouched.
 #[tokio::test]
-#[should_panic(expected = "a sender-scoped view was bypassed")]
-async fn touching_another_senders_parked_message_panics_on_db() {
-    cancel_across_senders(0).await;
-}
+async fn touching_another_senders_parked_message_is_reported() {
+    for store in stores(DEPTH).await {
+        let msg = message_for(&*store, "bob", "b");
+        let parked = store.park(msg, soon()).await.expect("within cap");
 
-#[tokio::test]
-#[should_panic(expected = "a sender-scoped view was bypassed")]
-async fn touching_another_senders_parked_message_panics_on_ring() {
-    cancel_across_senders(1).await;
+        assert_eq!(
+            store
+                .cancel_deferred("alice", parked.message_uuid, now())
+                .await,
+            DeferralOutcome::WrongSender,
+            "{}",
+            store.address()
+        );
+        assert_eq!(
+            store
+                .edit_deferred(
+                    "alice",
+                    parked.message_uuid,
+                    Some("edited".into()),
+                    None,
+                    now()
+                )
+                .await,
+            DeferralOutcome::WrongSender,
+            "{}",
+            store.address()
+        );
+        assert_eq!(
+            deferred_bodies(&*store, "bob").await,
+            vec!["b"],
+            "the refused ops must leave the owner's entry alone: {}",
+            store.address()
+        );
+        assert_eq!(store.deferred_len().await, 1, "{}", store.address());
+    }
 }
 
 // ── Wake source ─────────────────────────────────────────────────────────────

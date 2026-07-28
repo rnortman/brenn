@@ -56,15 +56,14 @@ pub(super) fn test_app_config(
         // Grant both messaging capabilities whenever a messaging config is
         // supplied, so messaging_enabled() treats the app as a participant.
         // Also stamp a universal `brenn_subscribe` ACL matcher so the
-        // delivery-time gate (design §2.2 Point A) authorizes these test apps to
-        // receive on their `brenn:` channels — `MessagingSubscribe` alone is not
-        // sufficient now that delivery requires a covering matcher. `Prefix("")`
-        // covers every channel (the resolution-time narrowing that rejects an
-        // empty prefix does not apply when the `AclSet` is constructed directly).
-        // A matching universal `brenn_publish` matcher is stamped for the same
-        // reason: Phase-2 Seam A (design §2.2) gates publish on a covering
-        // `brenn_publish` matcher, so `MessagingPublish` alone no longer
-        // authorizes a send.
+        // delivery-time gate authorizes these test apps to receive on their
+        // `brenn:` channels — `MessagingSubscribe` alone is not sufficient;
+        // delivery requires a covering matcher too. `Prefix("")` covers every
+        // channel (the resolution-time narrowing that rejects an empty prefix
+        // does not apply when the `AclSet` is constructed directly). A
+        // matching universal `brenn_publish` matcher is stamped for the same
+        // reason: the publish gate requires a covering `brenn_publish` matcher,
+        // so `MessagingPublish` alone does not authorize a send.
         policy: {
             let mut p = crate::access::AppPolicy::default();
             if messaging.is_some() {

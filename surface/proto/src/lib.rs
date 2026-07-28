@@ -32,7 +32,7 @@
 
 use std::collections::BTreeMap;
 
-use brenn_envelope::{ChannelScheme, DeliveryClass, MessageEnvelope};
+use brenn_envelope::{ChannelCapabilities, ChannelScheme, DeliveryClass, MessageEnvelope};
 use chrono::{DateTime, Utc};
 
 /// The RFC 8030 urgency ladder, re-exported from the carrier crate.
@@ -218,6 +218,17 @@ pub enum ClientFrame {
         /// `brenn_budget::MAX_PUBLISHES_PER_ACTIVATION`; a longer batch is a
         /// violation.
         publishes: Vec<BatchEntry>,
+        /// The activation's buffered control ops against messages this instance
+        /// already parked on a transportable channel, in call order. Applied
+        /// **before** `publishes`: an op names a message an earlier activation
+        /// parked, so applying it first keeps this activation's own publishes out
+        /// of its way. Bounded by the same per-activation cap as `publishes`.
+        ///
+        /// A flush carrying only ops is a whole batch — a component may cancel a
+        /// schedule without publishing anything — so a `PublishBatch` is empty
+        /// only when both lists are.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deferred_ops: Vec<BatchDeferredOp>,
     },
     /// Alert plane. Grant-gated (deny-by-default) and disciplined like `Publish`:
     /// an `Alert` from an ungranted surface is a protocol
@@ -292,6 +303,71 @@ pub struct BatchEntry {
     /// enum-only validation, as [`ClientFrame::Publish::urgency`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub urgency: Option<Urgency>,
+    /// The component's requested release time, epoch milliseconds UTC; `None` for
+    /// an ordinary publish.
+    ///
+    /// A transportable channel's deferral authority is the server — it holds the
+    /// channel's retention, and a durable schedule must outlive the page — so the
+    /// page states the time and the server decides park-vs-immediate against its
+    /// own clock. A value in the past commits immediately, like the backend host's
+    /// own flush.
+    ///
+    /// A value chrono cannot carry is a violation, not an outcome: the kernel
+    /// refuses one at buffer time with `invalid-payload`, so an unrepresentable
+    /// time here is a batch no kernel produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliver_after: Option<u64>,
+}
+
+/// One buffered control op inside a [`ClientFrame::PublishBatch`]: what an
+/// activation did to a message it had already parked on a transportable channel.
+///
+/// The backend is that channel's deferral authority — it holds the retention, and
+/// a durable schedule must outlive the page — so the page cannot apply the op
+/// itself. It states which message and what to do, and the server applies it
+/// against the parked set under the same sub-identity the publishes use.
+///
+/// Names the **port**, like [`BatchEntry`]: a component sees logical port names
+/// and the server resolves port → channel from its own boot-resolved bindings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchDeferredOp {
+    /// A bound output port of the batch's `instance`. Anything else is a
+    /// violation — the kernel already answered the component `not-permitted`.
+    pub port: String,
+    /// The parked message's identity, taken from the deferred window the
+    /// activation was handed — which is the backend's own pushed
+    /// [`ServerFrame::DeferredView`], so the id is one the server minted.
+    ///
+    /// An id parked by a *different* sender is a protocol violation, not an
+    /// outcome: a conforming kernel can only name what a sender-scoped view
+    /// showed it, and a client naming another sender's schedule is reaching for
+    /// something no window ever offered. A message that simply released between
+    /// the snapshot and this frame is the benign race instead, and the server
+    /// logs and counts it.
+    pub message_id: Uuid,
+    pub op: DeferredOpKind,
+}
+
+/// What a [`BatchDeferredOp`] does to the message it names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum DeferredOpKind {
+    /// Drop the schedule: the message never publishes.
+    Cancel,
+    /// Rewrite the message's body, its release time, or both; `None` leaves that
+    /// half alone.
+    ///
+    /// An oversize `body` is a violation for the same reason a
+    /// [`BatchEntry::body`] over the cap is — the kernel refuses it at buffer
+    /// time. A `deliver_after` chrono cannot carry is a violation too, and one
+    /// already in the past does not publish here: the edit lands and the server's
+    /// next release pass takes it.
+    Edit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deliver_after: Option<u64>,
+    },
 }
 
 /// One instance's mount status in a [`ClientFrame::Status`] report. The kernel
@@ -589,6 +665,36 @@ pub enum ServerFrame {
         correlation: u64,
         outcome: PublishBatchOutcome,
     },
+    /// The backend's view of what one component instance has parked on one
+    /// transportable output channel, soonest release first.
+    ///
+    /// A **full snapshot**: it replaces whatever the page held for
+    /// `(channel, instance)`, so it is idempotent and last-writer-wins. The page
+    /// cannot maintain this itself — durable parked entries outlive the page,
+    /// releases happen on the server's clock, and every session of the surface
+    /// shares one sender identity — so the authority pushes it.
+    ///
+    /// Emitted to every session of the surface whenever the parked set changes,
+    /// and once per nonempty set after `Welcome`. The page clears every mirror at
+    /// `Welcome`, so a set with no frame is empty.
+    DeferredView {
+        channel: String,
+        instance: String,
+        entries: Vec<DeferredViewEntry>,
+    },
+}
+
+/// One parked message in a [`ServerFrame::DeferredView`].
+///
+/// Carries `message_id` where an activation's deferred entry carries a snapshot
+/// index: the id is the identity both authorities know a parked message by, and
+/// the index is per-snapshot. `deliver_after` is the release time, epoch
+/// milliseconds UTC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredViewEntry {
+    pub message_id: Uuid,
+    pub body: String,
+    pub deliver_after: u64,
 }
 
 /// Surface self-description telemetry parameters, delivered in every `Welcome`.
@@ -632,9 +738,13 @@ pub struct SurfaceBindings {
 
 /// One page-local channel a surface declares, resolved for its router.
 ///
-/// `ring_depth` is the retained-ring depth: the number of most-recent messages
-/// the router replays to a port on attach. Bounded by construction — the ring
-/// lives in page memory, so an unbounded depth is rejected at boot.
+/// `ring_depth` is the floor under the depth the page sizes the channel's store
+/// to; the store's actual depth folds it with what the deepest window bound on
+/// the channel must be served. Everything the store holds is the channel's
+/// history, so a port coming into existence is owed the retained tail capped at
+/// its own `push_depth` — which may be more than `ring_depth` when a binding
+/// deepened the store. Bounded by construction: the store lives in page memory,
+/// so an unbounded depth is rejected at boot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalChannel {
     pub channel: String,
@@ -779,6 +889,24 @@ pub fn surface_delivery_class(channel: &str) -> Option<DeliveryClass> {
         .flatten()
 }
 
+/// The capability set a surface-bound channel address carries, or `None` when
+/// the address carries no recognized prefix, names a scheme that does not bind
+/// to a surface, or names no pub/sub channel at all.
+///
+/// The page's single capability-derivation point, and the only place either end
+/// of the surface wire may ask what a channel class *does*: retention, delivery
+/// and publish paths all branch on
+/// [`ChannelCapabilities::transportable`](brenn_envelope::ChannelCapabilities)
+/// read from here, never on a scheme or a delivery class. Bindability is the
+/// separate question [`surface_bindable`] answers, which is why this composes
+/// with it rather than replacing it.
+pub fn channel_capabilities(channel: &str) -> Option<ChannelCapabilities> {
+    let scheme = ChannelScheme::of(channel)?;
+    surface_bindable(scheme)
+        .then(|| scheme.capabilities())
+        .flatten()
+}
+
 /// Whether `channel` names a page-local (`local:`) channel.
 ///
 /// The single spelling of "does this address stay in the page?", shared by both
@@ -828,10 +956,18 @@ pub const LOCAL_OVERLAY_STATE_CHANNEL: &str = "local:brenn/overlay-state";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReservedLocalChannel {
     pub address: &'static str,
-    /// Contract-fixed retained-ring depth. The control planes carry 1
-    /// (last-value replay — what makes a late-attaching chrome's handoff
-    /// gap-free); the toast stream carries 0: it is an event stream, not a
-    /// control plane, and replaying a stale toast would resurface a past event.
+    /// Contract-fixed floor under the depth the page's store for this plane is
+    /// sized to; the store's actual depth folds it with the windows bound on the
+    /// plane. The control planes carry 1 (last-value replay — what makes a
+    /// late-attaching chrome's handoff gap-free); the toast stream carries 0,
+    /// promising no retention of its own, so its store is exactly as deep as its
+    /// bindings require.
+    ///
+    /// The floor is not a bound on what a late attach is owed. Everything a store
+    /// holds is the channel's history, and a binding coming into existence is
+    /// owed the retained tail capped at its own `push_depth` on every plane — so
+    /// a consumer attaching just after a toast was published is woken by it and
+    /// served it as new.
     pub ring_depth: u64,
     /// Whether only the kernel may publish here. An `[[surface.output]]` bound
     /// to such a channel is rejected at boot: v1 has no component producers for
@@ -1382,6 +1518,27 @@ mod tests {
         assert_eq!(surface_delivery_class("webhook:hook"), None);
         assert_eq!(surface_delivery_class("pwa_push:target"), None);
         assert_eq!(surface_delivery_class("bare"), None);
+    }
+
+    /// The capability table, row by row. Every retention and delivery decision on
+    /// either end of the surface wire branches on `transportable` read from here,
+    /// and which store key a channel's retention lands in follows from it — so a
+    /// row silently changing its answer would move a channel between retention
+    /// models. `None` is load-bearing too: an address that classifies as nothing
+    /// is a kernel bug the kernel panics on, which only holds while these stay
+    /// `None`.
+    #[test]
+    fn channel_capabilities_by_scheme() {
+        let caps =
+            |channel: &str| channel_capabilities(channel).map(|c| (c.durable, c.transportable));
+        assert_eq!(caps("brenn:orders"), Some((true, true)));
+        assert_eq!(caps("ephemeral:protobar"), Some((false, true)));
+        assert_eq!(caps("local:brenn/theme"), Some((false, false)));
+        // Non-surface schemes and garbage carry no capabilities here.
+        assert_eq!(caps("mqtt:topic"), None);
+        assert_eq!(caps("webhook:hook"), None);
+        assert_eq!(caps("pwa_push:target"), None);
+        assert_eq!(caps("bare"), None);
     }
 
     /// `mqtt:`/`webhook:` are durable-class on the bus yet do not bind to a
@@ -2034,28 +2191,160 @@ mod tests {
                     port: "out".into(),
                     body: "{}".into(),
                     urgency: None,
+                    deliver_after: None,
                 },
                 BatchEntry {
                     port: "out".into(),
                     body: "[]".into(),
                     urgency: Some(Urgency::High),
+                    deliver_after: Some(1_700_000_000_000),
                 },
             ],
+            deferred_ops: Vec::new(),
         };
         let v = serde_json::to_value(&f).unwrap();
         assert_eq!(v["type"], json!("PublishBatch"));
         assert_eq!(v["instance"], json!("agenda"));
         assert_eq!(v["correlation"], json!(7));
+        assert!(
+            v.get("deferred_ops").is_none(),
+            "a flush with no control ops carries no list at all: {v}"
+        );
         // Absent urgency means "the port's configured default", which the server
         // owns — so it must be *absent*, never a null the server might read as a
-        // claim, and never an echoed default that could be stale.
+        // claim, and never an echoed default that could be stale. An absent
+        // release time is the same shape for the same reason: nothing to schedule.
         assert_eq!(v["publishes"][0], json!({ "port": "out", "body": "{}" }));
         assert_eq!(
             v["publishes"][1],
-            json!({ "port": "out", "body": "[]", "urgency": "high" })
+            json!({
+                "port": "out",
+                "body": "[]",
+                "urgency": "high",
+                "deliver_after": 1_700_000_000_000_u64,
+            })
         );
         let back: ClientFrame = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
         assert_eq!(back, f);
+    }
+
+    /// A flush that only touches its own schedule: no publishes, two control ops,
+    /// each naming a **port** and a message identity the backend minted.
+    #[test]
+    fn client_publish_batch_deferred_ops_golden_and_roundtrip() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-0000000000f1").unwrap();
+        let f = ClientFrame::PublishBatch {
+            instance: "agenda".into(),
+            correlation: 9,
+            publishes: Vec::new(),
+            deferred_ops: vec![
+                BatchDeferredOp {
+                    port: "out".into(),
+                    message_id: id,
+                    op: DeferredOpKind::Cancel,
+                },
+                BatchDeferredOp {
+                    port: "out".into(),
+                    message_id: id,
+                    op: DeferredOpKind::Edit {
+                        body: Some("{}".into()),
+                        deliver_after: Some(1_700_000_000_000),
+                    },
+                },
+                BatchDeferredOp {
+                    port: "out".into(),
+                    message_id: id,
+                    op: DeferredOpKind::Edit {
+                        body: None,
+                        deliver_after: None,
+                    },
+                },
+            ],
+        };
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["publishes"], json!([]));
+        assert_eq!(
+            v["deferred_ops"][0],
+            json!({
+                "port": "out",
+                "message_id": "00000000-0000-0000-0000-0000000000f1",
+                "op": { "kind": "cancel" },
+            })
+        );
+        assert_eq!(
+            v["deferred_ops"][1]["op"],
+            json!({
+                "kind": "edit",
+                "body": "{}",
+                "deliver_after": 1_700_000_000_000_u64,
+            })
+        );
+        // Each half of an edit is absent when the caller left it alone — a null
+        // would be a claim that the half was set to nothing.
+        assert_eq!(v["deferred_ops"][2]["op"], json!({ "kind": "edit" }));
+        let back: ClientFrame = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(back, f);
+    }
+
+    /// The one frame with no test crossing the backend/kernel boundary: the server
+    /// builds it from its own store and the kernel reads its own construction of
+    /// the same type, so this golden is the only place the wire shape is stated
+    /// once instead of assumed twice — the tag, the three field names, the string
+    /// spelling of `message_id`, and `deliver_after` as bare epoch milliseconds.
+    ///
+    /// The empty snapshot is load-bearing: it is how the backend says "this sender
+    /// holds nothing here any more", which the page must not confuse with an absent
+    /// frame.
+    #[test]
+    fn server_deferred_view_golden_and_roundtrip() {
+        let id = Uuid::parse_str("00000000-0000-0000-0000-0000000000f1").unwrap();
+        let f = ServerFrame::DeferredView {
+            channel: "brenn:agenda".into(),
+            instance: "agenda".into(),
+            entries: vec![DeferredViewEntry {
+                message_id: id,
+                body: "{}".into(),
+                deliver_after: 1_700_000_000_000,
+            }],
+        };
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["type"], json!("DeferredView"));
+        assert_eq!(v["channel"], json!("brenn:agenda"));
+        assert_eq!(v["instance"], json!("agenda"));
+        assert_eq!(
+            v["entries"],
+            json!([{
+                "message_id": "00000000-0000-0000-0000-0000000000f1",
+                "body": "{}",
+                "deliver_after": 1_700_000_000_000_u64,
+            }])
+        );
+        // `ServerFrame` carries no `PartialEq`, so the round trip is compared as
+        // the value it serializes back to — which is the wire shape under test.
+        let back: ServerFrame = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), v);
+        match back {
+            ServerFrame::DeferredView { entries, .. } => {
+                assert_eq!(entries[0].message_id, id);
+                assert_eq!(entries[0].deliver_after, 1_700_000_000_000);
+            }
+            other => panic!("expected DeferredView, got {other:?}"),
+        }
+
+        let drained = ServerFrame::DeferredView {
+            channel: "brenn:agenda".into(),
+            instance: "agenda".into(),
+            entries: Vec::new(),
+        };
+        let v = serde_json::to_value(&drained).unwrap();
+        assert_eq!(
+            v["entries"],
+            json!([]),
+            "an emptied set is an empty list: {v}"
+        );
+        let back: ServerFrame =
+            serde_json::from_str(&serde_json::to_string(&drained).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), v);
     }
 
     /// The batch result carries exactly two outcomes. The single publish's other

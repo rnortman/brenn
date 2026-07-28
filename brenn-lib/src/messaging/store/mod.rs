@@ -31,7 +31,13 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use brenn_envelope::{ChannelCapabilities, ChannelScheme, MessageEnvelope, Urgency};
-use brenn_queue::{GapReason, QuotaExceeded, ReplayDecision, Resume, Retained};
+use brenn_queue::{GapReason, ReplayDecision, Resume, Retained};
+
+/// A park refused because the channel's deferred set is already at its cap.
+///
+/// Re-exported so callers outside this crate can match a park's refusal without
+/// linking the primitives crate.
+pub use brenn_queue::QuotaExceeded;
 
 use crate::messaging::config::Depth;
 use crate::messaging::{ParticipantId, SubscriberEntryKind};
@@ -82,48 +88,33 @@ pub struct Parked {
     pub message_uuid: Uuid,
 }
 
-/// Whether a subscriber's delivery state already existed when it attached.
-///
-/// Shared vocabulary across the stores: priming is a delivery point, so it
-/// applies only when the queue comes into existence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Attached {
-    /// The queue came into existence on this attach. The caller's priming
-    /// choice took effect, and a primed queue is owed the retained tail.
-    Created,
-    /// The subscriber was already attached; its position carried over and only
-    /// its push depth was retuned.
-    Existing,
-}
-
-/// Where a subscriber's delivery state starts when its queue comes into
-/// existence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Priming {
-    /// Owed the channel's retained tail, capped by the subscriber's push depth
-    /// — attach is a delivery point. The rule for component queues.
-    Retained,
-    /// Owed only what is published from now on. The rule for subscriber kinds
-    /// that get their attach history by another route, or none at all.
-    Head,
-}
+/// Whether a subscriber's delivery state already existed when it attached
+/// ([`Attached`]), and where it starts when it did not ([`Priming`]).
+pub use brenn_queue::{Attached, Priming};
 
 /// Where a subscriber of this kind starts when its queue comes into existence
 /// — the one site that decides priming.
 ///
 /// A component queue is primed because attach is a delivery point for it: a
 /// message published before the component existed still reaches and still wakes
-/// it. No other kind is primed, and each for its own reason: a surface
-/// subscription's fresh-attach replay already delivers the retained tail, so
-/// seeding it here would deliver that tail twice; a conversation or a system
-/// subscriber reads channel ambience on demand and is not woken with old
-/// messages presented as new.
+/// it. A conversation or a system subscriber is not: it reads channel ambience
+/// on demand and is not woken with old messages presented as new.
+///
+/// A surface subscription is neither, because it holds no cursor here at all —
+/// the cursor it echoes at subscribe is its whole delivery state, and boot
+/// reconcile deletes any surface-keyed row it finds as an orphan. Answering for
+/// one would hand a caller a default it must decide deliberately.
+// TODO(surface-wire-cursors): re-ground the wire's resume layer in this
+// vocabulary, at which point a surface subscription does hold a cursor and this
+// arm gets a real answer.
 pub fn priming_for_kind(kind: &SubscriberEntryKind) -> Priming {
     match kind {
         SubscriberEntryKind::Wasm(_) => Priming::Retained,
-        SubscriberEntryKind::App(_)
-        | SubscriberEntryKind::System(_)
-        | SubscriberEntryKind::Surface { .. } => Priming::Head,
+        SubscriberEntryKind::App(_) | SubscriberEntryKind::System(_) => Priming::Head,
+        SubscriberEntryKind::Surface { .. } => panic!(
+            "surface subscriptions hold no store cursors; their delivery state is the wire \
+             session's (see TODO(surface-wire-cursors))"
+        ),
     }
 }
 
@@ -329,6 +320,17 @@ pub enum DeferralOutcome {
     /// caller acted on and this call. Inherent to scheduling, so it is a
     /// reportable no-op rather than a failure.
     NotDeferred,
+    /// The message is parked, but under a different sender. Distinct from
+    /// [`NotDeferred`](Self::NotDeferred) because the two mean opposite things
+    /// about the caller: losing the release race is what a correct caller does
+    /// occasionally, while naming another sender's message means the id came
+    /// from outside any view this caller was shown.
+    ///
+    /// Reported rather than asserted in the store, because what it means depends
+    /// on how the caller obtained the id: a host acting on ids from its own
+    /// snapshot has an invariant violation, while a route acting on ids a client
+    /// supplied has a protocol violation to punish. Both stores answer alike.
+    WrongSender,
 }
 
 /// A resume-style consumer's last-read position: the epoch that numbered its
@@ -635,6 +637,20 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     /// One sender's parked messages on this channel, soonest release first.
     async fn deferred_for_sender(&self, sender: &str, now: DateTime<Utc>) -> Vec<DeferredMessage>;
 
+    /// Who holds something parked on this channel at `now` — every distinct
+    /// sender, once, sorted.
+    ///
+    /// The channel-wide peer of [`RetentionStore::deferred_for_sender`], for a
+    /// caller that must ask "whose schedules are here?" before it knows which
+    /// senders to name. It answers on the same `now` boundary as the sender
+    /// views, so a sender whose only entry has matured is absent from both: it
+    /// has nothing left that can be viewed, cancelled, or edited.
+    ///
+    /// Sorted rather than release-ordered because the question is set
+    /// membership, and a stable order is what lets both implementations be held
+    /// to one answer.
+    async fn deferred_senders(&self, now: DateTime<Utc>) -> Vec<String>;
+
     /// How many unreleased messages this channel holds, channel-wide — the
     /// quantity the deferred cap bounds, and the one [`RetentionStore::park`]
     /// admits against.
@@ -647,6 +663,11 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     /// admitted on one class from being refused on the other.
     async fn deferred_len(&self) -> u64;
 
+    /// Cancel one of `sender`'s parked messages, named by its message uuid.
+    ///
+    /// The outcome distinguishes a lost release race
+    /// ([`DeferralOutcome::NotDeferred`]) from an id belonging to another sender
+    /// ([`DeferralOutcome::WrongSender`]).
     async fn cancel_deferred(
         &self,
         sender: &str,
@@ -698,5 +719,18 @@ mod tests {
     #[should_panic(expected = "precedes the Unix epoch")]
     fn pre_epoch_release_time_panics() {
         release_time_of(DateTime::from_timestamp_millis(-1).unwrap());
+    }
+
+    /// A surface subscription has no priming to ask for, and the question is
+    /// unreachable in production: boot reconcile deletes surface-keyed cursor
+    /// rows as orphans, so nothing here ever attaches one. A future caller must
+    /// decide deliberately rather than inherit a default.
+    #[test]
+    #[should_panic(expected = "hold no store cursors")]
+    fn priming_for_a_surface_subscription_panics() {
+        priming_for_kind(&SubscriberEntryKind::Surface {
+            slug: "kiosk".to_string(),
+            instance: Some("protobar".to_string()),
+        });
     }
 }

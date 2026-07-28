@@ -17,11 +17,19 @@
 //!   bound the host's own memory and log volume against a hostile or broken
 //!   guest, which is why they are constants and not operator knobs.
 //!
+//! [`ActivationGate`] composes both layers into the one per-activation gate each
+//! host runs a guest's publish and control-op calls through: the counters, the
+//! buckets, and the order the checks fire in.
+//!
 //! Config parsing lives elsewhere: the `f64` knobs an operator writes are
 //! resolved to the millitokens below by whoever reads the config. This crate
 //! sees only resolved integers.
 
 #![forbid(unsafe_code)]
+
+mod gate;
+
+pub use gate::{ActivationGate, GateRefusal, PublishCheck, check_deliver_after};
 
 /// Millitokens charged per publish: the token-bucket fixed-point scale.
 ///

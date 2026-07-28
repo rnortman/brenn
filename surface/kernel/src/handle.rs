@@ -567,25 +567,86 @@ impl ClientHandle {
         body: &str,
         urgency: Option<Urgency>,
     ) -> Option<Result<(), brenn_surface_contract::PublishError>> {
-        // A short synchronous borrow that calls out to nothing: `publish_inner`
-        // on the buffer touches only the buffer. The driver cannot be holding
-        // this cell — it installed the buffer and is blocked in the entry call
-        // this dispatch came from.
-        //
         // `body` is borrowed and only owned once the in-flight instance matches:
         // the common gesture publish (no activation in flight, or a different
         // instance's) returns `None` after the instance compare without paying
         // the body's allocation.
+        self.with_in_flight(instance, |buffer| match urgency {
+            Some(urgency) => buffer.publish_with_urgency(port, body.to_owned(), urgency),
+            None => buffer.publish(port, body.to_owned()),
+        })
+    }
+
+    /// Route a deferred publish into the in-flight activation's buffer, if it
+    /// belongs there. `deliver_after` is epoch milliseconds UTC.
+    ///
+    /// Same routing rule and same `None` meaning as
+    /// [`try_buffered_publish`](Self::try_buffered_publish): only the instance
+    /// whose entry is on the stack can buffer, and there is no unbuffered fallback
+    /// — a schedule laundered onto the gesture path would escape the flush-iff-ok
+    /// rule that makes an err schedule nothing.
+    #[cfg(target_arch = "wasm32")]
+    pub fn try_buffered_publish_deferred(
+        &self,
+        instance: &str,
+        port: &str,
+        body: &str,
+        deliver_after: u64,
+    ) -> Option<Result<(), brenn_surface_contract::PublishError>> {
+        self.with_in_flight(instance, |buffer| {
+            buffer.publish_deferred(port, body.to_owned(), deliver_after)
+        })
+    }
+
+    /// Route a cancel of one of this instance's parked messages into the in-flight
+    /// activation's buffer, if it belongs there. `index` names the message by its
+    /// position in the deferred window this activation delivered for `port`.
+    #[cfg(target_arch = "wasm32")]
+    pub fn try_buffered_defer_cancel(
+        &self,
+        instance: &str,
+        port: &str,
+        index: u32,
+    ) -> Option<Result<(), brenn_surface_contract::DeferError>> {
+        self.with_in_flight(instance, |buffer| buffer.defer_cancel(port, index))
+    }
+
+    /// Route an edit of one of this instance's parked messages into the in-flight
+    /// activation's buffer, if it belongs there. `body` and `deliver_after` are
+    /// each `Some` to change and `None` to leave alone.
+    #[cfg(target_arch = "wasm32")]
+    pub fn try_buffered_defer_edit(
+        &self,
+        instance: &str,
+        port: &str,
+        index: u32,
+        body: Option<String>,
+        deliver_after: Option<u64>,
+    ) -> Option<Result<(), brenn_surface_contract::DeferError>> {
+        self.with_in_flight(instance, |buffer| {
+            buffer.defer_edit(port, index, body, deliver_after)
+        })
+    }
+
+    /// Run `f` against the in-flight activation's buffer, but only when the
+    /// activation on the stack is `instance`'s.
+    ///
+    /// A short synchronous borrow that calls out to nothing: every buffer method
+    /// touches only the buffer. The driver cannot be holding this cell — it
+    /// installed the buffer and is blocked in the entry call this dispatch came
+    /// from.
+    #[cfg(target_arch = "wasm32")]
+    fn with_in_flight<R>(
+        &self,
+        instance: &str,
+        f: impl FnOnce(&mut PublishBuffer) -> R,
+    ) -> Option<R> {
         let mut slot = self.in_flight.borrow_mut();
         let in_flight = slot.as_mut()?;
         if in_flight.instance != instance {
             return None;
         }
-        let body = body.to_owned();
-        Some(match urgency {
-            Some(urgency) => in_flight.buffer.publish_with_urgency(port, body, urgency),
-            None => in_flight.buffer.publish(port, body),
-        })
+        Some(f(&mut in_flight.buffer))
     }
 
     /// Publish a surface error report at `level`, best-effort — the wire side of
@@ -919,7 +980,7 @@ impl PublishGate {
                 (
                     b.instance.clone(),
                     b.port.clone(),
-                    crate::core::is_local_channel(&b.channel),
+                    !crate::core::channel_is_transportable(&b.channel),
                 )
             })
             .collect();

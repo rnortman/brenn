@@ -26,7 +26,7 @@ pub struct Activation<E> {
     /// component's own parked (deferred) messages on each output channel, a
     /// snapshot at drain. Separate from `ports`: a future in/out port appears in
     /// both lists, additively.
-    pub deferred: Vec<DeferredWindow<E>>,
+    pub deferred: Vec<DeferredWindow>,
     /// The host's wall clock at drain, epoch milliseconds UTC. Lets a guest
     /// compute an absolute future instant (e.g. for a deferred publish) without
     /// holding a clock of its own. `None` when the host exposes no UTC wall
@@ -44,26 +44,31 @@ pub struct Activation<E> {
 /// own schedule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct DeferredWindow<E> {
+pub struct DeferredWindow {
     /// Logical output port name, as declared in config — never a raw channel
     /// address.
     pub port: String,
     /// This component's parked messages on the port's channel, soonest release
     /// first.
-    pub entries: Vec<DeferredEntry<E>>,
+    pub entries: Vec<DeferredEntry>,
 }
 
 /// One parked message in a [`DeferredWindow`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct DeferredEntry<E> {
+pub struct DeferredEntry {
     /// Position within the window's `entries` list (which is release-ordered).
     /// The handle a future cancel/edit names; snapshot-relative, valid only
     /// against the window it arrived in.
     pub index: u32,
     /// The message body the component published, as handed to the deferred
     /// publish — not an envelope.
-    pub payload: E,
+    ///
+    /// A body rather than the activation's envelope type `E`: what a component
+    /// gets back here is the same opaque string it handed the host, so this half
+    /// of the activation carries the same shape on every hosting even where the
+    /// input windows do not.
+    pub payload: String,
     /// Scheduled release time, epoch milliseconds UTC.
     pub deliver_after: u64,
 }
@@ -163,7 +168,7 @@ mod tests {
                 port: "reminders".to_string(),
                 entries: vec![DeferredEntry {
                     index: 0,
-                    payload: "ping",
+                    payload: "ping".to_string(),
                     deliver_after: 1_700_000_060_000,
                 }],
             }],

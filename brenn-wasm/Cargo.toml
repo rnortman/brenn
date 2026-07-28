@@ -13,6 +13,7 @@ tracing = "0.1"
 semver = "1.0.28"
 brenn-budget = { version = "0.1.0", path = "../brenn-budget" }
 brenn-activation = { version = "0.1.0", path = "../brenn-activation" }
+brenn-envelope = { version = "0.1.0", path = "../brenn-envelope" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -3,7 +3,7 @@
 //!
 //! The properties under test are the ones that distinguish `local:` from the
 //! wire classes — it never emits a frame, it keeps routing with the link down,
-//! and its rings outlive a reconnect — plus the envelope synthesis the core only
+//! and its stores outlive a reconnect — plus the envelope synthesis the core only
 //! does for this class.
 
 use super::*;
@@ -33,8 +33,8 @@ fn local_binding(channel: &str, instance: &str, port: &str) -> Binding {
         instance: instance.into(),
         port: port.into(),
         push_depth: TEST_PUSH_DEPTH,
-        // A `local:` binding reads its channel's router ring; the fixtures'
-        // rings are depth 1, so this reads the last value.
+        // A `local:` binding reads its channel's store; the fixtures'
+        // stores are depth 1, so this reads the last value.
         retain_depth: 1,
         noise: brenn_surface_proto::NoiseLevel::Silent,
     }
@@ -72,9 +72,9 @@ const APP_EVENTS: &str = "local:app-events";
 fn core_wired_to(channel: &str, depth: u64) -> ClientCore {
     let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
     core.on_input(Input::Opened, Millis(1));
-    // The `in` binding reads its channel's ring at its own `retain_depth`, so a
-    // fixture wanting the whole depth-`depth` ring as context binds at that
-    // depth — a depth-1 binding on a depth-2 ring would only ever see the last
+    // The `in` binding reads its channel's store at its own `retain_depth`, so a
+    // fixture wanting the whole depth-`depth` store as context binds at that
+    // depth — a depth-1 binding on a depth-2 store would only ever see the last
     // entry.
     let in_binding = Binding {
         retain_depth: depth,
@@ -105,12 +105,12 @@ fn local_core() -> ClientCore {
 /// activation.
 ///
 /// The router emits no per-message effect: it fills the channel's ring and the
-/// bound instances' pending queues, and the messages reach a component as one
+/// bound instances' positions, and the messages reach a component as one
 /// activation's windows. So a local delivery is observed the same way a wire
 /// delivery is — which is the point of the model.
 fn new_bodies_for(core: &mut ClientCore, instance: &str) -> Vec<String> {
     let mut bodies = Vec::new();
-    while let Some(ready) = core.take_ready_activation() {
+    while let Some(ready) = core.take_ready_activation(TEST_WALL_MS) {
         if ready.instance != instance {
             continue;
         }
@@ -127,7 +127,7 @@ fn new_bodies_for(core: &mut ClientCore, instance: &str) -> Vec<String> {
 /// The envelopes `instance` sees as new on its `in` port, whole.
 fn new_envelopes_for(core: &mut ClientCore, instance: &str) -> Vec<MessageEnvelope> {
     let mut out = Vec::new();
-    while let Some(ready) = core.take_ready_activation() {
+    while let Some(ready) = core.take_ready_activation(TEST_WALL_MS) {
         if ready.instance != instance {
             continue;
         }
@@ -259,11 +259,11 @@ fn a_welcome_retuning_a_reserved_ring_depth_is_fatal() {
     );
 }
 
-/// The reserved plane's ring keeps its contract-fixed depth even though the
-/// `Welcome` restated it — the agreeing case, pinned so the retain/skip halves
-/// of the reconcile cannot start rebuilding reserved rings from peer input.
+/// The reserved plane keeps its store even though the `Welcome` restated its
+/// depth — the agreeing case, pinned so the retain/skip halves of the reconcile
+/// cannot start rebuilding reserved stores from peer input.
 #[test]
-fn a_reserved_ring_survives_a_welcome_that_restates_its_depth() {
+fn a_reserved_plane_survives_a_welcome_that_restates_its_depth() {
     let mut core = core_bound_to(LINK_STATE, 1);
     control(
         &mut core,
@@ -271,7 +271,7 @@ fn a_reserved_ring_survives_a_welcome_that_restates_its_depth() {
         r#"{"v":1,"state":"connected"}"#,
         Millis(3),
     );
-    // Reconnect, and a second Welcome names the plane again: the ring — and the
+    // Reconnect, and a second Welcome names the plane again: the store — and the
     // state a late chrome depends on — must survive it.
     core.on_input(
         Input::Disconnected {
@@ -291,14 +291,14 @@ fn a_reserved_ring_survives_a_welcome_that_restates_its_depth() {
         Millis(3_007),
     );
     register(&mut core, "protobar", Millis(3_008));
-    // The value is in the channel's ring, so registration primes it into the
-    // component's queue and it arrives as new — that is the handoff the plane's
-    // fixed depth exists for.
+    // The value is in the channel's store, so registration primes the binding's
+    // position behind it and it arrives as new — that is the gap-free handoff a
+    // late-attaching chrome depends on.
     let ready = take_one(&mut core);
     assert_eq!(
         split(window(&ready.activation, "in")).1,
         vec![r#"{"v":1,"state":"connected"}"#],
-        "the ring survived the Welcome and was delivered on attach"
+        "the retained value survived the Welcome and was delivered on attach"
     );
     complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
     control(
@@ -310,10 +310,82 @@ fn a_reserved_ring_survives_a_welcome_that_restates_its_depth() {
     let ready = take_one(&mut core);
     let (context, new) = split(window(&ready.activation, "in"));
     assert_eq!(new, vec![r#"{"v":1,"state":"reconnecting"}"#]);
-    assert!(
-        context.is_empty(),
-        "depth-1 ring: the newer value displaced the old, {context:?}"
+    // The declared 1 is a floor, not a ceiling: the binding's push depth sized the
+    // store deeper, so the superseded value trails as context.
+    assert_eq!(context, vec![r#"{"v":1,"state":"connected"}"#]);
+}
+
+/// The retain predicate's rule, not just its reserved-plane exception: an
+/// operator `local:` channel a `Welcome` no longer declares loses its store, and
+/// the one still declared keeps it. A store kept past its declaration would let
+/// the router go on accepting publishes on a channel the operator removed, with
+/// page retention as the only authority and no server agreeing it exists.
+#[test]
+fn an_undeclared_confined_channel_loses_its_store_at_the_reconcile() {
+    const OTHER: &str = "local:app-other";
+    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
+    core.on_input(Input::Opened, Millis(1));
+    core.on_input(
+        Input::TextFrame(welcome_frame_local(
+            vec![
+                local_binding(APP_EVENTS, "protobar", "in"),
+                Binding {
+                    port: "other".into(),
+                    ..local_binding(OTHER, "protobar", "other")
+                },
+            ],
+            vec![
+                local_output(APP_EVENTS, "protobar", "out"),
+                local_output(OTHER, "protobar", "out-other"),
+            ],
+            vec![local_channel(APP_EVENTS, 1), local_channel(OTHER, 1)],
+        )),
+        Millis(2),
     );
+    publish(&mut core, 1, "protobar", "out", "kept", Millis(3));
+    publish(&mut core, 2, "protobar", "out-other", "doomed", Millis(4));
+    assert_eq!(confined_bodies(&core, OTHER), vec!["doomed".to_string()]);
+
+    // Reconnect on a `Welcome` naming only one of the two.
+    core.on_input(
+        Input::Disconnected {
+            code: None,
+            reason: String::new(),
+        },
+        Millis(5),
+    );
+    core.on_input(Input::Tick, Millis(3_005));
+    core.on_input(Input::Opened, Millis(3_006));
+    core.on_input(
+        Input::TextFrame(welcome_frame_local(
+            vec![local_binding(APP_EVENTS, "protobar", "in")],
+            vec![local_output(APP_EVENTS, "protobar", "out")],
+            vec![local_channel(APP_EVENTS, 1)],
+        )),
+        Millis(3_007),
+    );
+
+    assert!(
+        !core
+            .stores
+            .contains_key(&StoreKey::Confined(OTHER.to_string())),
+        "the un-declared channel's store outlived its declaration"
+    );
+    assert_eq!(
+        confined_bodies(&core, APP_EVENTS),
+        vec!["kept".to_string()],
+        "the survivor keeps its retention across the reconnect"
+    );
+    // And the contract's own planes are declared by nothing, so no `Welcome` can
+    // un-declare them.
+    for reserved in RESERVED_LOCAL_CHANNELS {
+        assert!(
+            core.stores
+                .contains_key(&StoreKey::Confined(reserved.address.to_string())),
+            "reserved plane {} was dropped",
+            reserved.address
+        );
+    }
 }
 
 #[test]
@@ -489,24 +561,16 @@ fn local_publish_assigns_dense_ascending_seq_per_channel() {
     for i in 0..4 {
         publish(&mut core, i, "protobar", "out", "b", Millis(4 + i));
     }
-    let seqs: Vec<u64> = core
-        .local_rings
-        .get(APP_EVENTS)
-        .expect("the channel's ring")
-        .ring
-        .entries()
-        .map(|(_, pos)| pos.seq)
-        .collect();
-    // Dense and ascending: the router assigns seq atomically with delivery, so
-    // there is no hole for a consumer to mistake for a drop.
-    assert_eq!(seqs, vec![0, 1, 2, 3]);
-    // And the epoch is the page's, on every one.
-    assert!(
-        core.local_rings[APP_EVENTS]
-            .ring
-            .entries()
-            .all(|(_, pos)| pos.epoch == TEST_LOCAL_EPOCH)
-    );
+    let store = core
+        .stores
+        .get(&StoreKey::Confined(APP_EVENTS.to_string()))
+        .expect("the channel's store");
+    let seqs: Vec<u64> = store.retained().map(|(_, seq)| seq).collect();
+    // Dense and ascending from 1: the router assigns seq atomically with
+    // delivery, so there is no hole for a consumer to mistake for a drop.
+    assert_eq!(seqs, vec![1, 2, 3, 4]);
+    // And the epoch is the page's.
+    assert_eq!(store.epoch(), TEST_LOCAL_EPOCH);
 }
 
 #[test]
@@ -532,7 +596,7 @@ fn local_publish_fans_out_to_every_attached_port() {
     // subscription to scope a delivery to, so the router delivers to everyone
     // bound (including the publisher itself).
     let mut seen: Vec<String> = Vec::new();
-    while let Some(ready) = core.take_ready_activation() {
+    while let Some(ready) = core.take_ready_activation(TEST_WALL_MS) {
         assert_eq!(split(window(&ready.activation, "in")).1, vec!["b"]);
         seen.push(ready.instance);
     }
@@ -544,13 +608,13 @@ fn local_publish_fans_out_to_every_attached_port() {
 /// published while nobody is listening reaches the instance that attaches
 /// afterwards, **as new**, with no second publish to carry it.
 #[test]
-fn a_late_registering_instance_is_primed_from_the_local_ring() {
+fn a_late_registering_instance_is_primed_from_the_confined_store() {
     let mut core = local_core();
     // Publish before anyone is listening — the mode-clock-boots-before-chrome
     // case.
     publish(&mut core, 1, "protobar", "out", "dark", Millis(4));
     register(&mut core, "protobar", Millis(5));
-    // Registration alone wakes it: the queue came into existence primed, so the
+    // Registration alone wakes it: the position came into existence primed, so the
     // instance is ready without any further input.
     let ready = take_one(&mut core);
     let (context, new) = split(window(&ready.activation, "in"));
@@ -561,12 +625,14 @@ fn a_late_registering_instance_is_primed_from_the_local_ring() {
     );
 }
 
-/// A ring deeper than 1 primes the whole retained window, oldest-first, trimmed
-/// to the binding's own `retain_depth`.
+/// The prime is `min(push_depth, tail)` over the store's *folded* depth: the
+/// declared depth is a floor, not a ceiling, so a channel whose bindings sized
+/// its store deeper hands a fresh position everything that store holds.
 #[test]
-fn the_local_prime_trims_to_the_rings_depth() {
-    // A depth-2 ring on the one plane whose depth a `Welcome` may choose, which
-    // makes 2 a legal thing for a `Welcome` to say here at all.
+fn the_local_prime_takes_the_folded_stores_whole_tail() {
+    // Declared depth 2 on the one plane whose depth a `Welcome` may choose, which
+    // makes 2 a legal thing for a `Welcome` to say here at all. The `in` binding's
+    // push depth of 8 folds the store up to 8.
     let mut core = core_wired_to(APP_EVENTS, 2);
     for i in 0..5 {
         publish(
@@ -581,18 +647,20 @@ fn the_local_prime_trims_to_the_rings_depth() {
     register(&mut core, "protobar", Millis(20));
     let ready = take_one(&mut core);
     let (context, new) = split(window(&ready.activation, "in"));
-    // Oldest-first, trimmed to depth: a depth-2 ring holds the last two, and
-    // retention already discarded the rest.
-    assert_eq!(new, vec!["v3", "v4"]);
-    assert!(context.is_empty(), "primed entries are new: {context:?}");
+    // Oldest-first, the whole of what the store holds: five messages under a
+    // depth-8 store, and a push depth of 8 to hand them over.
+    assert_eq!(new, vec!["v0", "v1", "v2", "v3", "v4"]);
+    assert!(
+        context.is_empty(),
+        "the whole tail was delivered as new: {context:?}"
+    );
     complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
-    // The next publish is ordinary delivery; the primed pair is now context, at
-    // the ring's depth.
+    // The next publish is ordinary delivery; everything already served is context.
     publish(&mut core, 9, "protobar", "out", "v5", Millis(21));
     let ready = take_one(&mut core);
     let (context, new) = split(window(&ready.activation, "in"));
     assert_eq!(new, vec!["v5"]);
-    assert_eq!(context, vec!["v4"]);
+    assert_eq!(context, vec!["v0", "v1", "v2", "v3", "v4"]);
 }
 
 /// The prime is capped at the binding's `push_depth`, and the cap costs no
@@ -637,13 +705,17 @@ fn the_local_prime_caps_at_push_depth_without_counting_drops() {
     assert_eq!(w.dropped, 0, "the cap is not an overflow");
 }
 
-/// `retain_depth` bounds the prime on its own, independently of the queue's
-/// capacity: a binding that asks to read one deep on a deeper ring is primed
-/// with one. The other arm of the cap — a `push_depth` below `retain_depth` —
-/// is `the_local_prime_caps_at_push_depth_without_counting_drops`; both are
+/// A binding's own `retain_depth` does **not** bound its prime: attach is a
+/// delivery point, and what it is owed is the store's retained tail capped at
+/// `push_depth` — the same rule a backend-hosted component and a surface *wire*
+/// binding get, where the prime is enacted by the server. A shallow reader on a
+/// deeper channel is therefore primed with everything the store holds, and its
+/// `retain_depth` governs only the context floor its window is composed from. The
+/// other arm of the cap — a `push_depth` below the tail — is
+/// `the_local_prime_caps_at_push_depth_without_counting_drops`; both are
 /// load-bearing, and chrome's real bindings (read 1, hold 8) are this one.
 #[test]
-fn a_shallow_binding_is_primed_only_to_its_retain_depth() {
+fn a_shallow_binding_is_primed_from_the_whole_retained_tail() {
     let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
     core.on_input(Input::Opened, Millis(1));
     let in_binding = Binding {
@@ -674,24 +746,23 @@ fn a_shallow_binding_is_primed_only_to_its_retain_depth() {
     let (context, new) = split(window(&ready.activation, "in"));
     assert_eq!(
         new,
-        vec!["v3"],
-        "the ring holds four, the queue would hold eight, and the binding asked for one"
+        vec!["v0", "v1", "v2", "v3"],
+        "the store holds four and the binding can hold eight, so all four are new"
     );
-    // Context is the ring at the same `retain_depth`, deduped against new, so a
-    // one-deep reader has nothing left over — the deeper history is not its
-    // ambience either.
+    // Everything the store held arrived as new, so nothing is left to back-fill
+    // behind the boundary.
     assert!(
         context.is_empty(),
-        "read one deep, so no context: {context:?}"
+        "the whole tail was delivered as new: {context:?}"
     );
 }
 
-/// The prime fires once per queue, at its creation — never again. `Welcome`
+/// The prime fires once per position, at its creation — never again. `Welcome`
 /// reconciles every registered instance, and a reconnecting page can see many of
-/// them, so re-priming a surviving queue would re-deliver the retained tail on
+/// them, so re-priming a surviving position would re-deliver the retained tail on
 /// every reconnect.
 #[test]
-fn a_second_welcome_does_not_re_prime_a_surviving_queue() {
+fn a_second_welcome_does_not_re_prime_a_surviving_position() {
     let mut core = local_core();
     publish(&mut core, 1, "protobar", "out", "dark", Millis(4));
     register(&mut core, "protobar", Millis(5));
@@ -699,7 +770,7 @@ fn a_second_welcome_does_not_re_prime_a_surviving_queue() {
     assert_eq!(split(window(&ready.activation, "in")).1, vec!["dark"]);
     complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
 
-    // Blip and reconnect onto the same bindings: the queue survives, so nothing
+    // Blip and reconnect onto the same bindings: the position survives, so nothing
     // is primed into it and the instance stays quiet.
     core.on_input(
         Input::Disconnected {
@@ -719,13 +790,13 @@ fn a_second_welcome_does_not_re_prime_a_surviving_queue() {
         Millis(3_008),
     );
     assert!(
-        core.take_ready_activation().is_none(),
-        "a surviving queue was re-primed by the reconnect's Welcome"
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
+        "a surviving position was re-primed by the reconnect's Welcome"
     );
 }
 
-/// A binding that appears at a later `Welcome` gets a fresh queue, and a fresh
-/// queue is primed — the operator wired a port onto a plane that already has
+/// A binding that appears at a later `Welcome` gets a fresh position, and a fresh
+/// position is primed — the operator wired a port onto a plane that already has
 /// state, and the component must learn it without waiting for a republish.
 #[test]
 fn a_binding_added_at_a_later_welcome_is_primed() {
@@ -769,9 +840,9 @@ fn a_binding_added_at_a_later_welcome_is_primed() {
     );
 }
 
-/// A port rebound to a different channel is a different queue: the old
+/// A port rebound to a different channel is a different position: the old
 /// channel's envelopes are shed unread and the new channel's retained tail is
-/// primed. Keying the queue by port alone would keep stale envelopes and skip
+/// primed. Keying the position by port alone would keep stale history and skip
 /// the prime — the silent-loss shape this whole mechanism removes.
 #[test]
 fn a_port_rebound_to_another_local_channel_sheds_and_re_primes() {
@@ -820,8 +891,8 @@ fn a_port_rebound_to_another_local_channel_sheds_and_re_primes() {
 }
 
 /// A port rebound across channel *classes*, wire to `local:`, is primed like any
-/// other new local queue: the class of the new channel decides, not the class of
-/// the old one. The old channel's unconsumed envelope goes with the queue it sat
+/// other new local position: the class of the new channel decides, not the class
+/// of the old one. The old channel's unconsumed history stays with the store it sat
 /// in, and no replay is coming to double the prime — the subscription was
 /// released by the same reconcile.
 #[test]
@@ -879,7 +950,7 @@ fn a_wire_port_rebound_to_a_local_channel_is_primed() {
     );
 }
 
-/// The mirror: `local:` to wire. The recreated queue is not primed — a fresh
+/// The mirror: `local:` to wire. The recreated position is not primed — a fresh
 /// wire attach is filled by the server's replay, and priming it here would
 /// double every replayed envelope in the first window.
 #[test]
@@ -919,16 +990,39 @@ fn a_local_port_rebound_to_a_wire_channel_is_not_primed() {
         "the new wire channel must be subscribed: {effects:?}"
     );
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "the shed local prime surfaced under the wire binding"
     );
     assert!(
-        core.registered["protobar"].queues["in"].is_empty(),
-        "the rebound port waits for the server's replay, empty"
+        !core.owed_anything("protobar"),
+        "the rebound port waits for the server's replay, owed nothing"
+    );
+
+    // Owed nothing *yet* — the port is attached to the new channel, not shed. The
+    // server's replay lands on it as new, and the local plane's history does not.
+    core.on_input(
+        Input::TextFrame(subscribe_result("ephemeral:demo", SubscribeOutcome::Ok)),
+        Millis(3_008),
+    );
+    core.on_input(
+        Input::TextFrame(deliver_frame_for(
+            "ephemeral:demo",
+            "protobar",
+            &sample_envelope("w1"),
+            1,
+        )),
+        Millis(3_009),
+    );
+    let ready = take_one(&mut core);
+    let view = window(&ready.activation, "in");
+    assert_eq!(split(view), (vec![], vec!["w1"]));
+    assert!(
+        !view.envelopes.iter().any(|e| e.body == "a1"),
+        "the local plane's retained value is nowhere in the rebound port's window"
     );
 }
 
-/// A `push_depth = 0` binding has no queue, so there is nothing to prime and
+/// A `push_depth = 0` binding holds no position, so there is nothing to prime and
 /// nothing to wake on. That is the whole of "never activates me": the retained
 /// value still reaches it, as context, when a sibling port does the waking.
 #[test]
@@ -951,7 +1045,7 @@ fn a_depth_zero_binding_is_not_primed_and_never_wakes() {
     publish(&mut core, 1, "protobar", "out", "a1", Millis(3));
     register(&mut core, "protobar", Millis(4));
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "a sampled port was primed into an activation"
     );
 }
@@ -986,7 +1080,7 @@ fn a_depth_zero_sibling_is_context_only_when_a_prime_does_the_waking() {
     assert_eq!(
         split(window(&ready.activation, "watch")).1,
         vec!["a1"],
-        "the queued sibling is what wakes the instance"
+        "the sibling's unseen message is what wakes the instance"
     );
     let (context, new) = split(window(&ready.activation, "in"));
     assert!(new.is_empty(), "a sampled port has no new rows: {new:?}");
@@ -998,7 +1092,7 @@ fn a_depth_zero_sibling_is_context_only_when_a_prime_does_the_waking() {
 }
 
 /// A binding added while the instance has an activation out is primed then and
-/// delivered after: the prime is queue state, and an in-flight activation's ack
+/// delivered after: the prime is position state, and an in-flight activation's ack
 /// covers only the rows it was dispatched with. Once, not twice, and not lost.
 #[test]
 fn a_binding_added_while_an_activation_is_in_flight_is_primed_once() {
@@ -1030,8 +1124,8 @@ fn a_binding_added_while_an_activation_is_in_flight_is_primed_once() {
         Millis(3_007),
     );
     assert!(
-        core.take_ready_activation().is_none(),
-        "a primed queue must not dispatch over an in-flight activation"
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
+        "a primed position must not dispatch over an in-flight activation"
     );
 
     complete(
@@ -1052,16 +1146,17 @@ fn a_binding_added_while_an_activation_is_in_flight_is_primed_once() {
     );
     complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "the primed envelope was delivered twice"
     );
 }
 
-/// A trapped instance's queues are recreated at the next `Welcome`, but they
-/// are not primed. A dead instance never activates, so priming it would only
-/// park stale envelopes waiting to surface as new.
+/// A trapped instance is attached *nothing* at the next `Welcome`: the reconcile
+/// strips a terminal instance of every position it held and gives it none back. A
+/// dead instance never activates, so a position kept for it would be one every
+/// retirement charges and no window will ever serve.
 #[test]
-fn a_trapped_instance_is_not_primed_at_the_next_welcome() {
+fn a_trapped_instance_is_attached_no_position_at_the_next_welcome() {
     let mut core = local_core();
     register(&mut core, "protobar", Millis(3));
     publish(&mut core, 1, "protobar", "out", "dark", Millis(4));
@@ -1091,38 +1186,55 @@ fn a_trapped_instance_is_not_primed_at_the_next_welcome() {
         Millis(3_007),
     );
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "a failed instance was primed back into life"
     );
     assert!(
-        core.registered["protobar"].queues["in"].is_empty(),
-        "the recreated queue of a failed instance must be empty"
+        !core.owed_anything("protobar"),
+        "a failed instance holds no position and is owed nothing"
+    );
+    assert!(
+        !core
+            .stores
+            .get(&StoreKey::Confined(THEME.to_string()))
+            .expect("the plane's store")
+            .bindings()
+            .any(|b| b.instance == "protobar"),
+        "the terminal instance was re-attached a position"
     );
 }
 
+/// The toast plane's declared depth of 0 is a floor of zero — the plane promises
+/// no retention of its own — not a promise that a late attach is owed nothing.
+/// Its store is sized to the bound windows like any other, and what that store
+/// holds is this page's own recent history: `local:` channels exist only from
+/// page load, so there is no stale pre-page toast to protect a consumer from. A
+/// chrome attaching moments after a page-init error toast must show it.
 #[test]
-fn the_toast_plane_retains_nothing() {
-    // Depth 0 exercised on the plane the contract actually fixes at 0, and via
-    // the kernel publish that is toast's only legal producer — rather than by
-    // retuning some other plane to 0, which is precisely what a `Welcome` may
-    // not do. Toast is an event stream, not a control plane: replaying a stale
-    // toast to a late-attaching chrome would resurface an already-past event.
+fn a_late_attach_is_owed_the_toasts_the_plane_still_holds() {
+    // Exercised on the plane the contract actually fixes at 0, and via the kernel
+    // publish that is toast's only legal producer — rather than by retuning some
+    // other plane to 0, which is precisely what a `Welcome` may not do.
     let mut core = core_bound_to(TOAST, 0);
     control(&mut core, TOAST, r#"{"v":1,"severity":"info"}"#, Millis(4));
     register(&mut core, "protobar", Millis(5));
-    // Nothing retained is nothing to prime: a toast published while chrome was
-    // still instantiating stays lost, deliberately.
+    // Registration alone wakes it: the position came into existence primed behind
+    // the toast the store still holds.
+    let ready = take_one(&mut core);
+    let (context, new) = split(window(&ready.activation, "in"));
+    assert_eq!(new, vec![r#"{"v":1,"severity":"info"}"#]);
     assert!(
-        core.take_ready_activation().is_none(),
-        "a depth-0 ring primed something"
+        context.is_empty(),
+        "a primed toast is new, never also context: {context:?}"
     );
-    // A second toast dispatches the view; the first is not in its context,
-    // because a depth-0 ring retained nothing.
+    complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
+    // Thereafter it is an ordinary event stream: the next toast is new and the
+    // one already served trails as context.
     control(&mut core, TOAST, r#"{"v":1,"severity":"warn"}"#, Millis(6));
     let ready = take_one(&mut core);
     let (context, new) = split(window(&ready.activation, "in"));
     assert_eq!(new, vec![r#"{"v":1,"severity":"warn"}"#]);
-    assert!(context.is_empty(), "the toast ring retained: {context:?}");
+    assert_eq!(context, vec![r#"{"v":1,"severity":"info"}"#]);
 }
 
 #[test]
@@ -1169,7 +1281,7 @@ fn a_wire_publish_while_the_link_is_down_is_still_rejected() {
 }
 
 #[test]
-fn local_rings_and_seqs_survive_a_reconnect() {
+fn confined_stores_and_seqs_survive_a_reconnect() {
     // A depth-2 ring so the pre-blip value and the post-blip value coexist as
     // context ++ new in one window — the observation the survival claim needs.
     // THEME is contract-fixed at depth 1, so the arbitrary-depth plane is wired.
@@ -1219,7 +1331,7 @@ fn local_rings_and_seqs_survive_a_reconnect() {
 }
 
 #[test]
-fn a_local_channel_dropped_from_welcome_drops_its_ring_and_its_queues() {
+fn a_local_channel_dropped_from_welcome_drops_its_store_and_its_positions() {
     let mut core = local_core();
     register(&mut core, "protobar", Millis(3));
     publish(&mut core, 1, "protobar", "out", "dark", Millis(4));
@@ -1237,7 +1349,7 @@ fn a_local_channel_dropped_from_welcome_drops_its_ring_and_its_queues() {
         Input::TextFrame(welcome_frame_local(vec![], vec![], vec![])),
         Millis(3_007),
     );
-    // The binding vanished, so reconcile dropped the instance's queue for it: it
+    // The binding vanished, so reconcile dropped the instance's position for it: it
     // simply stops being activated on that channel, which is not a failure and
     // not a deregistration.
     assert!(
@@ -1254,7 +1366,7 @@ fn a_local_publish_after_the_core_goes_terminal_is_not_connected() {
     let mut core = local_core();
     register(&mut core, "protobar", Millis(3));
     // Any fatal protocol error ends delivery for the page; routing after that
-    // would queue a message no activation will ever carry.
+    // would retain a message no activation will ever carry.
     core.on_input(Input::BinaryFrame, Millis(4));
     let effects = publish(&mut core, 7, "protobar", "out", "dark", Millis(5));
     assert_eq!(
@@ -1294,16 +1406,9 @@ fn deregistering_a_local_only_instance_emits_no_unsubscribe_and_keeps_the_ring()
         frames(&effects).is_empty(),
         "a local-only deregistration emitted wire frames: {effects:?}"
     );
-    // The ring kept the value.
-    assert_eq!(
-        core.local_rings[THEME]
-            .ring
-            .entries()
-            .map(|(e, _)| e.body.clone())
-            .collect::<Vec<_>>(),
-        vec!["dark".to_string()]
-    );
-    // And a fresh registration is a fresh attach: it is primed from the ring and
+    // The store kept the value.
+    assert_eq!(confined_bodies(&core, THEME), vec!["dark".to_string()]);
+    // And a fresh registration is a fresh attach: it is primed from the store and
     // receives the value again, as new. Wire symmetry — a re-subscribe re-replays
     // too, and a component with a side-effecting fold owes itself at-most-once
     // handling by `message_id` on either class.
@@ -1314,6 +1419,33 @@ fn deregistering_a_local_only_instance_emits_no_unsubscribe_and_keeps_the_ring()
     publish(&mut core, 2, "protobar", "out", "light", Millis(7));
     let ready = take_one(&mut core);
     assert_eq!(split(window(&ready.activation, "in")).1, vec!["light"]);
+}
+
+/// A page-minted envelope is asserted not to be already retained, rather than
+/// taking the store's re-presentation path. The identity is a fresh v4 the driver
+/// just minted for this publish, so a collision is a kernel bug — and swallowing
+/// it would report the publish `Ok` to the component while the message was never
+/// retained and never delivered on the channel.
+#[test]
+#[should_panic(expected = "already retained on")]
+fn a_minted_local_envelope_that_collides_panics_rather_than_dedup() {
+    let mut core = core_wired_to(APP_EVENTS, 4);
+    // One stamp, two publishes: the driver's identity source repeating itself.
+    let repeated = test_stamp(7);
+    for (correlation, body) in [(1u64, "first"), (2, "second")] {
+        core.on_input(
+            Input::Command(Command::Publish {
+                correlation,
+                instance: "protobar".into(),
+                port: "out".into(),
+                body: body.into(),
+                subject_instance: None,
+                urgency: None,
+                stamp: repeated,
+            }),
+            Millis(3 + correlation),
+        );
+    }
 }
 
 // ── Local publish urgency ─────────────────────────────────────────────
@@ -1461,17 +1593,6 @@ fn takeover_body(action: TakeoverAction, instance: &str) -> String {
     .expect("a TakeoverBody serializes")
 }
 
-/// The bodies a `local:` channel's ring retains, oldest first.
-fn ring_bodies(core: &ClientCore, channel: &str) -> Vec<String> {
-    core.local_rings
-        .get(channel)
-        .expect("the channel's router ring")
-        .ring
-        .entries()
-        .map(|(e, _)| e.body.clone())
-        .collect()
-}
-
 /// A core driven to `Active` with `protobar` reading `local:brenn/theme` on
 /// `in`, and publishing on both `local:brenn/takeover` (port `takeover`) and
 /// `local:brenn/theme` (port `theme-out`).
@@ -1528,7 +1649,7 @@ fn a_buffered_takeover_publish_carries_the_activating_instance() {
         &takeover_body(TakeoverAction::Request, ""),
     );
 
-    let body = ring_bodies(&core, TAKEOVER)
+    let body = confined_bodies(&core, TAKEOVER)
         .pop()
         .expect("a routed takeover message");
     let parsed: TakeoverBody = serde_json::from_str(&body).unwrap();
@@ -1551,7 +1672,7 @@ fn a_buffered_takeover_publish_naming_another_instance_is_overwritten() {
         &takeover_body(TakeoverAction::Release, "victim"),
     );
 
-    let body = ring_bodies(&core, TAKEOVER)
+    let body = confined_bodies(&core, TAKEOVER)
         .pop()
         .expect("a routed takeover message");
     let parsed: TakeoverBody = serde_json::from_str(&body).unwrap();
@@ -1569,7 +1690,7 @@ fn a_buffered_non_takeover_publish_is_routed_byte_for_byte() {
     let body = r#"{"instance":"victim","arbitrary":"payload"}"#;
     publish_from_activation(&mut core, "protobar", "theme-out", body);
 
-    assert_eq!(ring_bodies(&core, THEME).pop().unwrap(), body);
+    assert_eq!(confined_bodies(&core, THEME).pop().unwrap(), body);
 }
 
 #[test]
@@ -1592,7 +1713,7 @@ fn a_release_published_while_ingesting_a_replacement_is_attributable() {
         Millis(4),
     );
     let request: TakeoverBody =
-        serde_json::from_str(&ring_bodies(&core, TAKEOVER).pop().unwrap()).unwrap();
+        serde_json::from_str(&confined_bodies(&core, TAKEOVER).pop().unwrap()).unwrap();
     publish(&mut core, 2, "protobar", "theme-out", "{}", Millis(5));
     publish_from_activation(
         &mut core,
@@ -1601,7 +1722,7 @@ fn a_release_published_while_ingesting_a_replacement_is_attributable() {
         &takeover_body(TakeoverAction::Release, ""),
     );
     let release: TakeoverBody =
-        serde_json::from_str(&ring_bodies(&core, TAKEOVER).pop().unwrap()).unwrap();
+        serde_json::from_str(&confined_bodies(&core, TAKEOVER).pop().unwrap()).unwrap();
 
     assert_eq!(request.action, TakeoverAction::Request);
     assert_eq!(release.action, TakeoverAction::Release);
@@ -1612,15 +1733,15 @@ fn a_release_published_while_ingesting_a_replacement_is_attributable() {
 #[test]
 fn a_takeover_published_from_a_primed_replay_activation_is_attributable() {
     // The replay face of the same defect: a fresh page's first activation is
-    // driven by the retained ring primed into its queue at attach, and the
+    // driven by the store's retention primed into its position at attach, and the
     // publish its ingestion makes takes the same buffered path. Nothing about
     // attribution may depend on how the activation was triggered.
     let mut core = core_ingesting_theme_publishing_takeover();
-    // Published before the instance registers: nothing is queued, the ring
+    // Published before the instance registers: nobody holds a position, the store
     // retains it.
     publish(&mut core, 1, "protobar", "theme-out", "{}", Millis(4));
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "an unregistered instance does not activate"
     );
     // Attach primes the retained value in as new, which activates the instance
@@ -1633,7 +1754,7 @@ fn a_takeover_published_from_a_primed_replay_activation_is_attributable() {
         &takeover_body(TakeoverAction::Request, ""),
     );
 
-    let body = ring_bodies(&core, TAKEOVER)
+    let body = confined_bodies(&core, TAKEOVER)
         .pop()
         .expect("a routed takeover message");
     let parsed: TakeoverBody = serde_json::from_str(&body).unwrap();
@@ -1823,7 +1944,7 @@ fn an_overlay_state_publish_from_a_non_chrome_instance_is_refused() {
     // only word it gets, and `Ok` for a dropped body would be a lie.
     assert_eq!(publish_statuses(&effects), vec![PublishStatus::Refused]);
     // Not on the plane, and the recorded overlay still says what chrome said.
-    assert_eq!(ring_bodies(&core, OVERLAY_STATE).len(), 1);
+    assert_eq!(confined_bodies(&core, OVERLAY_STATE).len(), 1);
     assert_eq!(
         reported_overlay(&mut core, Millis(6))
             .expect("the recorded overlay survives the refusal")
@@ -1867,7 +1988,7 @@ fn an_unreportable_overlay_state_body_is_refused() {
         rejections[0].1
     );
     assert_eq!(publish_statuses(&ghost), vec![PublishStatus::Refused]);
-    assert!(ring_bodies(&core, OVERLAY_STATE).is_empty());
+    assert!(confined_bodies(&core, OVERLAY_STATE).is_empty());
     assert_eq!(reported_overlay(&mut core, Millis(6)), None);
 }
 
@@ -1890,7 +2011,7 @@ fn a_buffered_overlay_state_publish_from_chrome_is_recorded() {
 
     let held = reported_overlay(&mut core, Millis(5)).expect("an overlay is held");
     assert_eq!(held.holder, "meeting");
-    assert_eq!(ring_bodies(&core, OVERLAY_STATE).len(), 1);
+    assert_eq!(confined_bodies(&core, OVERLAY_STATE).len(), 1);
 }
 
 #[test]
@@ -1925,7 +2046,7 @@ fn a_buffered_overlay_state_publish_from_a_non_chrome_instance_is_refused() {
         "a buffered publish was answered at buffer time: {effects:?}"
     );
     // Neither the plane nor the kernel's record moved.
-    assert_eq!(ring_bodies(&core, OVERLAY_STATE).len(), 1);
+    assert_eq!(confined_bodies(&core, OVERLAY_STATE).len(), 1);
     assert_eq!(
         reported_overlay(&mut core, Millis(6))
             .expect("the recorded overlay survives the refusal")
@@ -2018,6 +2139,7 @@ fn the_kernel_may_not_mint_a_takeover_message() {
         takeover_body(TakeoverAction::Release, ""),
         test_stamp(1),
         Urgency::Normal,
+        None,
     );
 }
 
@@ -2034,6 +2156,7 @@ fn the_kernel_may_not_mint_an_overlay_state_message() {
         overlay_state_body(Some("meeting")),
         test_stamp(1),
         Urgency::Normal,
+        None,
     );
 }
 
@@ -2187,7 +2310,7 @@ fn a_reserved_plane_needs_no_declaration_to_be_publishable() {
 /// Retention holds the value and attach-time priming delivers it, so the handoff
 /// is gap-free without a republish.
 #[test]
-fn a_reserved_planes_ring_hands_the_last_value_to_a_late_registrant() {
+fn a_reserved_planes_store_hands_the_last_value_to_a_late_registrant() {
     let mut core = core_bound_to(LINK_STATE, 1);
     control(
         &mut core,
@@ -2198,13 +2321,9 @@ fn a_reserved_planes_ring_hands_the_last_value_to_a_late_registrant() {
     register(&mut core, "protobar", Millis(4));
     // The value is retained…
     assert_eq!(
-        core.local_rings[LINK_STATE]
-            .ring
-            .entries()
-            .map(|(e, _)| e.body.clone())
-            .collect::<Vec<_>>(),
+        confined_bodies(&core, LINK_STATE),
         vec![r#"{"v":1,"state":"connected"}"#.to_string()],
-        "the ring must hold the state published before the instance registered"
+        "the store must hold the state published before the instance registered"
     );
     // …and registration alone dispatches it, as new.
     let ready = take_one(&mut core);
@@ -2221,7 +2340,7 @@ fn registering_against_an_empty_local_ring_dispatches_nothing() {
     let mut core = core_bound_to(LINK_STATE, 1);
     register(&mut core, "protobar", Millis(4));
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "an empty ring primes nothing, so nothing is ready"
     );
 }
@@ -2253,19 +2372,19 @@ fn a_control_publish_before_the_first_welcome_is_dropped() {
     );
     register(&mut core, "protobar", Millis(4));
     assert!(
-        core.local_rings[LINK_STATE].ring.entries().next().is_none(),
-        "the dropped pre-Welcome publish left a value in the ring"
+        confined_bodies(&core, LINK_STATE).is_empty(),
+        "the dropped pre-Welcome publish left a value in the store"
     );
 }
 
 /// The reachable half of the pre-`Welcome` story: a control publish needs an
 /// identity, so it must follow some `Welcome`, but it need not follow the one
-/// that creates the consuming queue. Published with the link down, retained, and
-/// primed into a queue the *next* `Welcome`'s binding table brings into
+/// that creates the consuming position. Published with the link down, retained,
+/// and primed into a position the *next* `Welcome`'s binding table brings into
 /// existence — the transition reaches a port that did not exist when it
 /// happened.
 #[test]
-fn a_control_publish_between_welcomes_primes_a_queue_created_later() {
+fn a_control_publish_between_welcomes_primes_a_position_created_later() {
     let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
     core.on_input(Input::Opened, Millis(1));
     // Nothing bound to the plane yet: the component is registered, but this
@@ -2305,7 +2424,7 @@ fn a_control_publish_between_welcomes_primes_a_queue_created_later() {
     assert_eq!(
         split(window(&ready.activation, "in")).1,
         vec![r#"{"v":1,"state":"connecting"}"#],
-        "the queue this Welcome created is primed with what was published before it"
+        "the position this Welcome created is primed with what was published before it"
     );
 }
 
@@ -2324,4 +2443,199 @@ fn the_kernel_may_not_publish_a_component_producer_plane() {
 fn a_control_publish_outside_the_reserved_table_panics() {
     let mut core = local_core();
     control(&mut core, "local:app/notes", "{}", Millis(3));
+}
+
+// ── the reserved planes' guard, across a deferred edit ───────────────────────
+
+/// Take the one ready activation, run `act` on its buffer, and complete it ok —
+/// the buffered path for the deferral ops, whose window `act` indexes into.
+fn with_activation(
+    core: &mut ClientCore,
+    instance: &str,
+    act: impl FnOnce(&mut PublishBuffer),
+) -> Vec<Effect> {
+    let ready = take_one(core);
+    assert_eq!(ready.instance, instance, "the expected instance activated");
+    let mut buffer = ready.buffer;
+    act(&mut buffer);
+    complete(core, instance, ActivationOutcome::Ok, buffer)
+}
+
+/// A wall-clock instant a minute out, the ordinary "schedule it for later".
+const PLANE_LATER: u64 = TEST_WALL_MS + 60_000;
+
+#[test]
+fn a_deferred_takeover_edits_body_is_restamped_with_the_publisher() {
+    // The anti-spoof stamp is not a property of the *publish* call, it is a
+    // property of every body that reaches the plane. An edit is a component
+    // stating a new body, so it is stamped exactly as the publish was — otherwise
+    // scheduling a well-formed takeover and rewriting it before release is a
+    // one-activation forgery of another instance's takeover.
+    let mut core = core_ingesting_theme_publishing_takeover();
+    register(&mut core, "protobar", Millis(3));
+    publish(&mut core, 1, "protobar", "theme-out", "{}", Millis(4));
+    with_activation(&mut core, "protobar", |buffer| {
+        buffer
+            .publish_deferred(
+                "takeover",
+                takeover_body(TakeoverAction::Request, ""),
+                PLANE_LATER,
+            )
+            .expect("the port is bound");
+    });
+
+    publish(&mut core, 2, "protobar", "theme-out", "{}", Millis(6));
+    with_activation(&mut core, "protobar", |buffer| {
+        buffer
+            .defer_edit(
+                "takeover",
+                0,
+                Some(takeover_body(TakeoverAction::Release, "victim")),
+                None,
+            )
+            .expect("the window showed the entry");
+    });
+    core.on_input(
+        Input::ReleaseDue {
+            now_ms: PLANE_LATER,
+        },
+        Millis(60),
+    );
+
+    let body = confined_bodies(&core, TAKEOVER)
+        .pop()
+        .expect("the released takeover message");
+    let parsed: TakeoverBody = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        parsed.instance, "protobar",
+        "the edit's forged instance is overwritten with the publisher's"
+    );
+    assert_eq!(parsed.action, TakeoverAction::Release, "the edit applied");
+}
+
+#[test]
+fn a_deferred_overlay_edit_to_an_undeclared_holder_is_refused() {
+    // The overlay plane's refusal half, across the same seam. A `holder` the
+    // surface does not declare is what the guard exists to keep out of the
+    // kernel's `Status` frame — the server kills the session over one — so an
+    // edit that introduces it changes nothing and reports the violation.
+    let mut core = core_with_chrome();
+    register(&mut core, "chrome", Millis(3));
+    publish(&mut core, 1, "chrome", "app-out", "{}", Millis(4));
+    with_activation(&mut core, "chrome", |buffer| {
+        buffer
+            .publish_deferred(
+                "overlay-state",
+                overlay_state_body(Some("meeting")),
+                PLANE_LATER,
+            )
+            .expect("the port is bound");
+    });
+
+    publish(&mut core, 2, "chrome", "app-out", "{}", Millis(6));
+    let effects = with_activation(&mut core, "chrome", |buffer| {
+        buffer
+            .defer_edit(
+                "overlay-state",
+                0,
+                Some(overlay_state_body(Some("ghost"))),
+                None,
+            )
+            .expect("the window showed the entry");
+    });
+    assert_eq!(
+        overlay_rejections(&effects),
+        vec![(
+            "chrome".to_string(),
+            "holder \"ghost\" is not a declared instance".to_string()
+        )],
+        "the refusal is reported against its publisher: {effects:?}"
+    );
+
+    core.on_input(
+        Input::ReleaseDue {
+            now_ms: PLANE_LATER,
+        },
+        Millis(60),
+    );
+    assert_eq!(
+        reported_overlay(&mut core, Millis(61))
+            .expect("the parked report released")
+            .holder,
+        "meeting",
+        "the refused edit left the parked body as it was"
+    );
+}
+
+#[test]
+fn the_overlay_is_recorded_when_its_report_reaches_the_plane_not_when_it_is_parked() {
+    // A parked report is not on the plane: no consumer has seen it, and the
+    // schedule may still be cancelled or refused. Recording it at the mint would
+    // have the kernel telling the server an overlay is held that nobody is
+    // rendering — for as long as it takes the schedule to mature, or forever.
+    let mut core = core_with_chrome();
+    register(&mut core, "chrome", Millis(3));
+    publish(&mut core, 1, "chrome", "app-out", "{}", Millis(4));
+    with_activation(&mut core, "chrome", |buffer| {
+        buffer
+            .publish_deferred(
+                "overlay-state",
+                overlay_state_body(Some("meeting")),
+                PLANE_LATER,
+            )
+            .expect("the port is bound");
+    });
+    assert_eq!(
+        reported_overlay(&mut core, Millis(5)),
+        None,
+        "a parked report is not the kernel's record"
+    );
+
+    core.on_input(
+        Input::ReleaseDue {
+            now_ms: PLANE_LATER,
+        },
+        Millis(60),
+    );
+    let held = reported_overlay(&mut core, Millis(61)).expect("the release recorded it");
+    assert_eq!(held.holder, "meeting");
+}
+
+#[test]
+fn a_cancelled_overlay_report_never_becomes_the_kernels_record() {
+    // The permanent-divergence case: a schedule the component un-says must leave
+    // nothing behind. Nothing re-evaluates `overlay` on its own, so a record set
+    // at park time and then cancelled would be reported until chrome happened to
+    // publish again.
+    let mut core = core_with_chrome();
+    register(&mut core, "chrome", Millis(3));
+    publish(&mut core, 1, "chrome", "app-out", "{}", Millis(4));
+    with_activation(&mut core, "chrome", |buffer| {
+        buffer
+            .publish_deferred(
+                "overlay-state",
+                overlay_state_body(Some("meeting")),
+                PLANE_LATER,
+            )
+            .expect("the port is bound");
+    });
+
+    publish(&mut core, 2, "chrome", "app-out", "{}", Millis(6));
+    with_activation(&mut core, "chrome", |buffer| {
+        buffer
+            .defer_cancel("overlay-state", 0)
+            .expect("the window showed the entry");
+    });
+    core.on_input(
+        Input::ReleaseDue {
+            now_ms: PLANE_LATER,
+        },
+        Millis(60),
+    );
+
+    assert_eq!(
+        reported_overlay(&mut core, Millis(61)),
+        None,
+        "a cancelled report was never on the plane"
+    );
 }

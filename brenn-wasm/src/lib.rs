@@ -904,8 +904,7 @@ pub enum ProcessorUrgency {
 }
 
 use brenn_budget::{
-    MAX_PUBLISH_BYTES_PER_ACTIVATION, MAX_PUBLISH_CALLS_PER_ACTIVATION,
-    MAX_PUBLISHES_PER_ACTIVATION, seed_sink_budget,
+    ActivationGate, GateRefusal, PublishCheck, check_deliver_after, seed_sink_budget,
 };
 /// The publish-budget vocabulary, re-exported: this crate's public API hands
 /// out `SinkBudget`s and charges `MILLITOKENS_PER_PUBLISH` per publish, so the
@@ -966,12 +965,13 @@ pub type ProcessorPortWindow = brenn_activation::PortWindow<String>;
 
 /// One output port's deferred-message view handed to `ProcessorComponent::handle`.
 ///
-/// This host carries a parked message's payload as its body text — the same
-/// string the guest passed to `ports.publish-deferred`.
-pub type ProcessorDeferredWindow = brenn_activation::DeferredWindow<String>;
+/// A parked message's payload is its body text — the same string the guest passed
+/// to `ports.publish-deferred` — on every host, so this type carries no envelope
+/// parameter.
+pub type ProcessorDeferredWindow = brenn_activation::DeferredWindow;
 
 /// One entry in a [`ProcessorDeferredWindow`].
-pub type ProcessorDeferredEntry = brenn_activation::DeferredEntry<String>;
+pub type ProcessorDeferredEntry = brenn_activation::DeferredEntry;
 
 /// Host-side activation handed to `ProcessorComponent::handle`.
 ///
@@ -1024,19 +1024,17 @@ struct ProcessorData {
     output_ports: Arc<HashMap<String, OutputPortSpec>>,
     config: Arc<HashMap<String, String>>,
     slug: Arc<str>,
-    max_payload_bytes: usize,
-    publish_buffer: Vec<ProcessorPublish>,
-    published_bytes: usize,
-    /// Total `publish` import calls this activation (successful + rejected).
-    /// Bounds log-flood DoS from repeated not-permitted / invalid-payload calls.
-    publish_call_count: usize,
-    /// Remaining per-sink publish budget this activation (millitokens), seeded at
-    /// activation start from carryover + fill + input grant. Each accepted bus
-    /// publish / attempted MQTT publish subtracts `MILLITOKENS_PER_PUBLISH`.
-    publish_budget_by_sink: HashMap<SinkKey, u64>,
-    /// Per-sink count of publishes suppressed this activation by an exhausted
-    /// budget. Drained into a single post-activation warn.
+    /// The shared per-activation gate: the payload cap, the per-sink millitoken
+    /// buckets, the call/entry/op counts and the byte aggregate, and the order the
+    /// checks fire in. Every budget answer a guest gets comes from here, so a rule
+    /// cannot hold on this hosting and not the surface's.
+    gate: ActivationGate<SinkKey>,
+    /// Per-sink count of publishes this activation's gate refused for an exhausted
+    /// bucket. Observability, not enforcement — the gate refuses, this counts, and
+    /// the count drains into a single post-activation warn so the operator sees a
+    /// budget being hit even when the guest swallows the error.
     publish_suppressed_by_sink: HashMap<SinkKey, u32>,
+    publish_buffer: Vec<ProcessorPublish>,
     /// Host callback for guest-originated alerts (via the `alert` WIT interface).
     alerter: Arc<dyn ProcessorAlerter>,
     /// Output-channel ACL. Called in `do_publish` with the resolved channel
@@ -1087,6 +1085,45 @@ impl ProcessorData {
 
 // --- ports::Host impl ---
 
+/// A gate verdict as the guest sees it on the publish path.
+///
+/// An oversize payload and an impossible release time are facts about the
+/// argument — `invalid-payload`, with the detail the guest needs to fix it;
+/// everything else is a budget — `quota-exceeded`.
+fn publish_error(refusal: GateRefusal) -> PublishError {
+    match refusal {
+        GateRefusal::BodyTooLarge { len, max } => {
+            PublishError::InvalidPayload(format!("payload {len} bytes exceeds max {max}"))
+        }
+        GateRefusal::UnrepresentableDeliverAfter { ms } => PublishError::InvalidPayload(format!(
+            "deliver_after {ms} ms is not a representable timestamp"
+        )),
+        GateRefusal::CallCap { .. }
+        | GateRefusal::SinkExhausted
+        | GateRefusal::EntryCap { .. }
+        | GateRefusal::ByteCap { .. }
+        | GateRefusal::OpCap { .. } => PublishError::QuotaExceeded,
+    }
+}
+
+/// A gate verdict as the guest sees it on the control-op path.
+///
+/// An impossible release time has its own variant here — the op is otherwise
+/// well-formed, and collapsing it into a quota refusal would tell the guest to
+/// retry later. An oversize edit payload *is* a quota refusal: the payload is
+/// charged against the activation's byte aggregate like any other.
+fn defer_error(refusal: GateRefusal) -> DeferError {
+    match refusal {
+        GateRefusal::UnrepresentableDeliverAfter { .. } => DeferError::InvalidDeliverAfter,
+        GateRefusal::CallCap { .. }
+        | GateRefusal::BodyTooLarge { .. }
+        | GateRefusal::SinkExhausted
+        | GateRefusal::EntryCap { .. }
+        | GateRefusal::ByteCap { .. }
+        | GateRefusal::OpCap { .. } => DeferError::QuotaExceeded,
+    }
+}
+
 impl ProcessorData {
     /// Inner publish implementation shared by `publish` and `publish_with_urgency`.
     ///
@@ -1104,10 +1141,7 @@ impl ProcessorData {
         // hostile out-of-tree components. Failed calls consume budget because they
         // are otherwise free from the attacker's perspective (no payload bytes, no
         // successful buffer slot used).
-        self.publish_call_count += 1;
-        if self.publish_call_count > MAX_PUBLISH_CALLS_PER_ACTIVATION {
-            return Err(PublishError::QuotaExceeded);
-        }
+        self.gate.charge_call().map_err(publish_error)?;
 
         // Resolve port name → binding + budget (attenuation check).
         // Port name is guest-controlled: cap and debug-escape before logging to prevent
@@ -1139,55 +1173,6 @@ impl ProcessorData {
             );
             return Err(PublishError::NotPermitted);
         }
-        // Payload size gate.
-        if payload.len() > self.max_payload_bytes {
-            return Err(PublishError::InvalidPayload(format!(
-                "payload {} bytes exceeds max {}",
-                payload.len(),
-                self.max_payload_bytes
-            )));
-        }
-        // deliver_after is guest-supplied epoch-ms UTC. The host schedules it as a
-        // timestamp, whose representable range is far narrower than u64; a value
-        // outside it would otherwise collapse host-side into an immediate publish,
-        // silently turning a deferred publish into a now one. Reject it here, where
-        // the guest still has the error channel, using chrono itself as the range
-        // authority so the bound cannot drift.
-        if let Some(ms) = deliver_after
-            && i64::try_from(ms)
-                .ok()
-                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-                .is_none()
-        {
-            return Err(PublishError::InvalidPayload(format!(
-                "deliver_after {ms} ms is not a representable timestamp"
-            )));
-        }
-        // Per-sink token-bucket budget — checked before the global buffer/byte
-        // backstops (tightest, most specific gate first; globals remain outer
-        // defense-in-depth). A bound port always has a seeded budget entry; a
-        // miss is a host invariant violation. Charged only on acceptance, at
-        // buffer-push time below.
-        let sink_key = SinkKey::Port(port.clone());
-        let sink_budget_mt = self
-            .publish_budget_by_sink
-            .get(&sink_key)
-            .copied()
-            .unwrap_or_else(|| panic!("host invariant: no sink budget for bound port {port:?}"));
-        if sink_budget_mt < MILLITOKENS_PER_PUBLISH {
-            *self.publish_suppressed_by_sink.entry(sink_key).or_insert(0) += 1;
-            return Err(PublishError::QuotaExceeded);
-        }
-        // Per-activation successful-publish budget, shared with buffered async tool
-        // requests (both flush as bus publishes) so the ceiling bounds the total.
-        if self.publish_buffer.len() + self.tool_request_buffer.len()
-            >= MAX_PUBLISHES_PER_ACTIVATION
-        {
-            return Err(PublishError::QuotaExceeded);
-        }
-        if self.published_bytes + payload.len() > MAX_PUBLISH_BYTES_PER_ACTIVATION {
-            return Err(PublishError::QuotaExceeded);
-        }
         use processor_bindings::brenn::processor::ports::Urgency as WitUrgency;
         let urgency = match guest_urgency {
             Some(WitUrgency::VeryLow) => ProcessorUrgency::VeryLow,
@@ -1196,23 +1181,31 @@ impl ProcessorData {
             Some(WitUrgency::High) => ProcessorUrgency::High,
             None => *port_default_urgency,
         };
-        let channel_address = channel_address.clone();
-        self.published_bytes += payload.len();
+        // A bound port always has a seeded bucket, so the gate's miss panic is a
+        // host invariant violation. Buffered async tool requests ride the entry
+        // ceiling with the port publishes — both flush as bus publishes — so
+        // they travel as the addend. The sink key is the one allocation a refused
+        // publish makes; the channel name is cloned below, on acceptance only.
+        let sink_key = SinkKey::Port(port.clone());
+        if let Err(refusal) = self.gate.admit_publish(PublishCheck {
+            sink: &sink_key,
+            body_len: payload.len(),
+            deliver_after,
+            entry_addend: self.tool_request_buffer.len(),
+        }) {
+            if refusal == GateRefusal::SinkExhausted {
+                *self.publish_suppressed_by_sink.entry(sink_key).or_insert(0) += 1;
+            }
+            return Err(publish_error(refusal));
+        }
         self.publish_buffer.push(ProcessorPublish {
             port,
-            channel_address,
+            channel_address: spec.channel_address.clone(),
             payload,
             urgency,
             reply_to: None,
             deliver_after,
         });
-        // Charge the sink on acceptance. The entry existed and had sufficient budget
-        // above; a vanished entry here is a host invariant violation — fail fast.
-        let remaining = self
-            .publish_budget_by_sink
-            .get_mut(&sink_key)
-            .expect("host invariant: sink budget entry vanished between check and charge");
-        *remaining -= MILLITOKENS_PER_PUBLISH;
         Ok(())
     }
 
@@ -1221,7 +1214,9 @@ impl ProcessorData {
     /// Validation is fail-fast at buffer time, while the guest still holds the
     /// error channel: an unbound port is `NotPermitted`, an `index` outside the
     /// deferred window this activation delivered for the port is `OutOfRange` (a
-    /// guest bug). The actual cancel/edit is applied at flush by the host, which
+    /// guest bug), and everything budgetary is the shared gate's — including an
+    /// edit payload, which is capped and charged exactly as a published payload
+    /// is. The actual cancel/edit is applied at flush by the host, which
     /// resolves `index` against the snapshot's captured identities — so a message
     /// that releases between drain and flush is a benign no-op there, not an error
     /// here.
@@ -1230,28 +1225,26 @@ impl ProcessorData {
             ProcessorDeferredOp::Cancel { port, index } => (port, *index),
             ProcessorDeferredOp::Edit { port, index, .. } => (port, *index),
         };
-        // A `defer-edit` release time is guest-supplied epoch-ms UTC; reject a
-        // non-representable value here, where the guest still holds the error
-        // channel, using chrono as the range authority — a value outside it would
-        // otherwise panic the host at flush (`instant_of`). Mirrors `do_publish`.
-        if let ProcessorDeferredOp::Edit {
-            deliver_after: Some(ms),
-            ..
-        } = &op
-            && i64::try_from(*ms)
-                .ok()
-                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-                .is_none()
-        {
-            return Err(DeferError::InvalidDeliverAfter);
-        }
+        let (edit_deliver_after, edit_payload_len) = match &op {
+            ProcessorDeferredOp::Edit {
+                payload,
+                deliver_after,
+                ..
+            } => (*deliver_after, payload.as_ref().map(String::len)),
+            ProcessorDeferredOp::Cancel { .. } => (None, None),
+        };
+        // Reject a non-representable value here, where the guest still holds the
+        // error channel, against the same shared bound `do_publish` uses — a value
+        // outside it would otherwise panic the host at flush (`instant_of`).
+        // Ahead of the call charge, so this one refusal draws no slot: it reads
+        // the argument and returns, touching no map and writing no log, and the
+        // activation deadline bounds a guest that loops on it.
+        check_deliver_after(edit_deliver_after).map_err(defer_error)?;
         // Per-activation total-call budget, shared with `do_publish` (anti-flood):
-        // a rejected op consumes budget too, so a guest cannot flood the surface
-        // with failing control ops for free.
-        self.publish_call_count += 1;
-        if self.publish_call_count > MAX_PUBLISH_CALLS_PER_ACTIVATION {
-            return Err(DeferError::QuotaExceeded);
-        }
+        // every op that gets this far consumes budget whether or not it is
+        // accepted, so a guest cannot flood the host with failing control ops for
+        // free.
+        self.gate.charge_call().map_err(defer_error)?;
         // Port must be a bound output port. `port` is guest-controlled: cap and
         // debug-escape before logging, like `do_publish`.
         if !self.output_ports.contains_key(port) {
@@ -1269,11 +1262,7 @@ impl ProcessorData {
         if index >= bound {
             return Err(DeferError::OutOfRange);
         }
-        // Bound the buffer size (shared per-activation ceiling with publishes and
-        // tool requests): control ops are cheap but not free at flush.
-        if self.deferred_op_buffer.len() >= MAX_PUBLISHES_PER_ACTIVATION {
-            return Err(DeferError::QuotaExceeded);
-        }
+        self.gate.admit_op(edit_payload_len).map_err(defer_error)?;
         self.deferred_op_buffer.push(op);
         Ok(())
     }
@@ -1286,17 +1275,13 @@ impl ProcessorData {
 
     /// Synchronous MQTT publish (the `mqtt.mqtt-publish` import).
     ///
-    /// Unlike `do_publish` (buffered, flushed at activation end), this goes
-    /// STRAIGHT to the broker via the injected `mqtt_publish` callback (which
-    /// calls the shared `enforce_and_publish` pipeline in the binary crate) and
-    /// returns the broker outcome inline — no store-and-forward.
+    /// Unlike `do_publish` (buffered, flushed at activation end), this reaches
+    /// the broker inline and returns its outcome — no store-and-forward.
     ///
-    /// Per-activation flood bound: shares the `publish_call_count` budget with
-    /// `do_publish`, checked against `MAX_PUBLISH_CALLS_PER_ACTIVATION`
-    /// — so a hostile guest cannot flood across the combined
-    /// `ports.publish` + `mqtt-publish` surface (design §2.5; deliberately reuses
-    /// the existing 512 call-count cap, no new MQTT-specific constant). The 256
-    /// buffered-publish count does NOT apply here — nothing is buffered.
+    /// Shares the gate's per-activation call budget with `do_publish`, so a
+    /// hostile guest cannot flood across the combined `ports.publish` +
+    /// `mqtt-publish` surface. The buffered-publish count does not apply here —
+    /// nothing is buffered.
     fn do_mqtt_publish(
         &mut self,
         client: String,
@@ -1309,8 +1294,7 @@ impl ProcessorData {
         // Per-activation total-call budget, shared with `do_publish`. Bumped and
         // checked first (anti-flood) — a failed call consumes budget too, exactly
         // as in `do_publish`.
-        self.publish_call_count += 1;
-        if self.publish_call_count > MAX_PUBLISH_CALLS_PER_ACTIVATION {
+        if self.gate.charge_call().is_err() {
             return Err(MqttPublishWitError::QuotaExceeded);
         }
 
@@ -1318,10 +1302,9 @@ impl ProcessorData {
         // (identical treatment to the guest-controlled `port` in `do_publish`).
         let display_client = cap_guest_for_log(&client);
 
-        // Caller-owned input validation (design §2.2), mirroring the LLM
-        // intercept's up-front checks so both call sites reject malformed guest
-        // input as *permanent* `invalid-payload` rather than letting it fall
-        // through to a *transient*-classified `broker` error downstream.
+        // Caller-owned input validation: malformed guest input is a permanent
+        // `invalid-payload`, not a transient `broker` error — falling through
+        // would invite a guest retry loop on an unfixable bug.
         //
         // qos range: the WIT type is `u8` (0..=255) but only 0/1/2 are valid.
         // Without this check an out-of-range qos reaches `publish_on_handle`,
@@ -1333,18 +1316,15 @@ impl ProcessorData {
                 "invalid qos {qos}: must be 0, 1, or 2"
             )));
         }
-        // Per-message payload size cap. The buffered `do_publish` path enforces
-        // this (and a per-activation byte budget); the synchronous MQTT path must
-        // also bound a single message so a hostile guest holding the `mqtt` grant
-        // cannot emit arbitrary-size broker publishes. The per-activation byte
-        // budget governs the buffer and is deliberately not applied here (nothing
-        // is buffered, design §2.5), but the per-message cap is load-bearing and
-        // matches the documented `invalid-payload` "oversize" semantics.
-        if payload.len() > self.max_payload_bytes {
+        // Per-message payload size cap: a hostile guest holding the `mqtt` grant
+        // must not emit arbitrary-size broker publishes. The per-activation byte
+        // budget is deliberately not applied here (nothing is buffered), but the
+        // per-message cap is load-bearing.
+        let max_payload_bytes = self.gate.max_body_bytes();
+        if payload.len() > max_payload_bytes {
             return Err(MqttPublishWitError::InvalidPayload(format!(
-                "payload {} bytes exceeds max {}",
+                "payload {} bytes exceeds max {max_payload_bytes}",
                 payload.len(),
-                self.max_payload_bytes
             )));
         }
 
@@ -1356,12 +1336,9 @@ impl ProcessorData {
         // existing ACL/NoConnector handling in the callback governs; no per-sink
         // counting for it (exactly like an unbound bus port).
         let sink_key = SinkKey::MqttClient(client.clone());
-        if let Some(remaining) = self.publish_budget_by_sink.get_mut(&sink_key) {
-            if *remaining < MILLITOKENS_PER_PUBLISH {
-                *self.publish_suppressed_by_sink.entry(sink_key).or_insert(0) += 1;
-                return Err(MqttPublishWitError::QuotaExceeded);
-            }
-            *remaining -= MILLITOKENS_PER_PUBLISH;
+        if self.gate.charge_sink_on_attempt(&sink_key).is_err() {
+            *self.publish_suppressed_by_sink.entry(sink_key).or_insert(0) += 1;
+            return Err(MqttPublishWitError::QuotaExceeded);
         }
 
         // The callback is `Some` iff the `Mqtt` capability is linked (the host fn
@@ -1376,10 +1353,8 @@ impl ProcessorData {
             MqttPublishOutcome::Ok => Ok(()),
             MqttPublishOutcome::NotPermitted => {
                 // Security-relevant: an operator policy actively blocking a WASM
-                // publish. Both callers must log the denial (design §3.3); the
-                // LLM intercept logs the analogous warn!. Without this, a WASM
-                // ACL deny would be invisible — a posture regression vs the LLM
-                // path.
+                // publish. ACL denials must be logged on both the WASM and LLM
+                // publish paths; without this a deny would be invisible.
                 warn!(
                     slug = %self.slug,
                     client = %display_client,
@@ -1636,9 +1611,7 @@ impl ProcessorData {
         // so they share the one per-activation publish ceiling with port publishes
         // (`do_publish` counts both buffers against the same bound). This keeps the
         // total per-activation bus writes bounded by a single constant.
-        if self.publish_buffer.len() + self.tool_request_buffer.len()
-            >= MAX_PUBLISHES_PER_ACTIVATION
-        {
+        if self.gate.entries_at_ceiling(self.tool_request_buffer.len()) {
             return Err(ToolWitError::Internal(
                 "too-many-async-requests".to_string(),
             ));
@@ -1681,6 +1654,15 @@ impl ProcessorData {
     /// `reply_to: None`. On `Err`/`Trap` this is never called and both buffers drop
     /// with the store — the trap-discard guarantee.
     fn take_ok_publishes(&mut self) -> Vec<ProcessorPublish> {
+        // The gate counts the entry ceiling, this buffer holds the entries: a push
+        // that skipped `admit_publish` would let the two disagree and the ceiling
+        // would bound nothing. Tool requests ride the ceiling as the gate's addend,
+        // so they are not part of its count.
+        assert_eq!(
+            self.gate.entries(),
+            self.publish_buffer.len(),
+            "every buffered publish must have been admitted by the gate"
+        );
         let mut publishes = std::mem::take(&mut self.publish_buffer);
         for req in std::mem::take(&mut self.tool_request_buffer) {
             publishes.push(ProcessorPublish {
@@ -2503,12 +2485,9 @@ impl ProcessorComponent {
                 output_ports: Arc::clone(&self.output_ports),
                 config: Arc::clone(&self.config),
                 slug: Arc::clone(&self.slug),
-                max_payload_bytes: self.max_payload_bytes,
-                publish_buffer: Vec::new(),
-                published_bytes: 0,
-                publish_call_count: 0,
-                publish_budget_by_sink,
+                gate: ActivationGate::new(self.max_payload_bytes, publish_budget_by_sink),
                 publish_suppressed_by_sink: HashMap::new(),
+                publish_buffer: Vec::new(),
                 alerter: Arc::clone(&self.alerter),
                 output_acl: Arc::clone(&self.output_acl),
                 mqtt_publish: self.mqtt_publish.clone(),
@@ -2752,7 +2731,7 @@ impl ProcessorComponent {
             // are not refunded on failure — a crash-retry loop must not amplify. The
             // caller holds the carry lock across the whole activation (seeded from
             // this same map), so the seed-spend-writeback cycle is atomic per sink.
-            carry.clone_from(&data.publish_budget_by_sink);
+            carry.clone_from(data.gate.sinks());
         }
 
         outcome
@@ -2866,6 +2845,10 @@ mod processor_store_host_tests {
 
     use super::*;
     use crate::store::{DEFAULT_MAX_PAGE_COUNT, KvStore};
+    use brenn_budget::{
+        MAX_PUBLISH_BYTES_PER_ACTIVATION, MAX_PUBLISH_CALLS_PER_ACTIVATION,
+        MAX_PUBLISHES_PER_ACTIVATION,
+    };
     use processor_bindings::brenn::processor::store::{Host, HostTransaction};
 
     /// No-op alerter for unit tests that don't exercise the alert path.
@@ -2934,12 +2917,9 @@ mod processor_store_host_tests {
             output_ports: Arc::new(HashMap::new()),
             config: Arc::new(HashMap::new()),
             slug: Arc::from("test-slug"),
-            max_payload_bytes: 1024,
-            publish_buffer: Vec::new(),
-            published_bytes: 0,
-            publish_call_count: 0,
-            publish_budget_by_sink: HashMap::new(),
+            gate: ActivationGate::new(1024, HashMap::new()),
             publish_suppressed_by_sink: HashMap::new(),
+            publish_buffer: Vec::new(),
             alerter: Arc::new(NoopAlerter),
             output_acl: Arc::new(|_| true),
             mqtt_publish: None,
@@ -2969,12 +2949,9 @@ mod processor_store_host_tests {
             output_ports: Arc::new(ports),
             config: Arc::new(HashMap::new()),
             slug: Arc::from("test-slug"),
-            max_payload_bytes: 1024,
-            publish_buffer: Vec::new(),
-            published_bytes: 0,
-            publish_call_count: 0,
-            publish_budget_by_sink: budgets,
+            gate: ActivationGate::new(1024, budgets),
             publish_suppressed_by_sink: HashMap::new(),
+            publish_buffer: Vec::new(),
             alerter: Arc::new(NoopAlerter),
             output_acl,
             mqtt_publish: None,
@@ -3011,13 +2988,15 @@ mod processor_store_host_tests {
             "denied publish must not buffer the payload"
         );
         assert_eq!(
-            data.published_bytes, 0,
+            data.gate.bytes(),
+            0,
             "denied publish must not count payload bytes"
         );
         // The deny consumes the per-activation call budget (anti-flood), exactly
         // like the unbound-port path — the gate sits after the call-count bump.
         assert_eq!(
-            data.publish_call_count, 1,
+            data.gate.calls(),
+            1,
             "denied publish must still consume the per-activation call budget"
         );
     }
@@ -3041,11 +3020,11 @@ mod processor_store_host_tests {
         assert_eq!(buffered.channel_address, "brenn:allowed");
         assert_eq!(buffered.payload, "payload");
         assert_eq!(
-            data.published_bytes,
+            data.gate.bytes(),
             "payload".len(),
             "allowed publish must count its payload bytes"
         );
-        assert_eq!(data.publish_call_count, 1);
+        assert_eq!(data.gate.calls(), 1);
     }
 
     /// A `deliver_after` outside the representable timestamp range is rejected at
@@ -3074,7 +3053,8 @@ mod processor_store_host_tests {
             "a rejected deferred publish must buffer nothing"
         );
         assert_eq!(
-            data.published_bytes, 0,
+            data.gate.bytes(),
+            0,
             "a rejected deferred publish must count no bytes"
         );
 
@@ -3091,6 +3071,35 @@ mod processor_store_host_tests {
             data.publish_buffer[0].deliver_after,
             Some(4_000_000_000_000)
         );
+    }
+
+    /// An oversize payload is `invalid-payload` with the size detail, not a quota
+    /// refusal: the guest can fix a body it made too big, and telling it
+    /// `quota-exceeded` would tell it to retry the same body next activation
+    /// forever. The surface kernel maps this verdict the same way, and the two
+    /// hostings' guest-facing contracts have to agree.
+    #[test]
+    fn do_publish_rejects_oversize_payload_as_invalid_payload() {
+        let acl: OutputAclFn = Arc::new(|addr: &str| addr == "brenn:allowed");
+        // `make_publish_data` seeds the gate with a 1024-byte per-message cap.
+        let mut data = make_publish_data("brenn:allowed", acl);
+
+        let err = data
+            .do_publish("out".to_string(), "x".repeat(1025), None, None)
+            .expect_err("a payload one byte over the cap must be refused");
+        let PublishError::InvalidPayload(detail) = &err else {
+            panic!("an oversize payload must be invalid-payload, got {err:?}");
+        };
+        assert!(
+            detail.contains("exceeds max"),
+            "the refusal must name the size the guest has to fix, got {detail:?}"
+        );
+        assert_eq!(data.publish_buffer.len(), 0);
+        assert_eq!(data.gate.bytes(), 0);
+
+        data.do_publish("out".to_string(), "x".repeat(1024), None, None)
+            .expect("a payload exactly at the cap must buffer");
+        assert_eq!(data.publish_buffer.len(), 1);
     }
 
     // --- defer-control host-fn tests (do_defer / defer-cancel / defer-edit) ---
@@ -3210,7 +3219,7 @@ mod processor_store_host_tests {
     }
 
     /// The per-activation total-call budget is *shared* with `do_publish`: a
-    /// defer op consumes the same `publish_call_count`, and once the publishes
+    /// defer op consumes the same gate call count, and once the publishes
     /// have exhausted it the next (otherwise valid) defer op is `QuotaExceeded`,
     /// buffering nothing. This bounds a guest that mixes publishes and control
     /// ops to flood the flush surface.
@@ -3222,7 +3231,7 @@ mod processor_store_host_tests {
         for _ in 0..MAX_PUBLISH_CALLS_PER_ACTIVATION {
             let _ = data.do_publish("nope".to_string(), "x".to_string(), None, None);
         }
-        assert_eq!(data.publish_call_count, MAX_PUBLISH_CALLS_PER_ACTIVATION);
+        assert_eq!(data.gate.calls(), MAX_PUBLISH_CALLS_PER_ACTIVATION);
         assert_eq!(
             data.publish_buffer.len(),
             0,
@@ -3272,6 +3281,84 @@ mod processor_store_host_tests {
         );
     }
 
+    /// An edit payload answers to the same per-message cap a published payload
+    /// does. It is held in host memory until the flush exactly as a publish is, so
+    /// an unbounded one is the same exposure.
+    #[test]
+    fn do_defer_edit_rejects_an_oversize_payload() {
+        let mut data = make_defer_data(1); // the gate's cap is 1024 bytes
+        let err = data
+            .do_defer(ProcessorDeferredOp::Edit {
+                port: "out".to_string(),
+                index: 0,
+                payload: Some("x".repeat(1025)),
+                deliver_after: None,
+            })
+            .expect_err("an edit payload one byte over the cap must be refused");
+        assert!(matches!(err, DeferError::QuotaExceeded));
+        assert_eq!(data.deferred_op_buffer.len(), 0);
+
+        // A payload exactly at the cap buffers, so only the cap refused above.
+        data.do_defer(ProcessorDeferredOp::Edit {
+            port: "out".to_string(),
+            index: 0,
+            payload: Some("x".repeat(1024)),
+            deliver_after: None,
+        })
+        .expect("a payload exactly at the cap must buffer");
+        assert_eq!(data.deferred_op_buffer.len(), 1);
+    }
+
+    /// An edit payload is charged to the one per-activation byte aggregate the
+    /// publishes draw on, in both directions. Without this an activation could
+    /// hold a full aggregate of publishes *and* another of edit payloads.
+    #[test]
+    fn do_defer_edit_payload_is_charged_to_the_publish_byte_aggregate() {
+        let budgets = HashMap::from([(SinkKey::Port("out".to_string()), TEST_GENEROUS_MT)]);
+        // A per-message cap as wide as the aggregate, so one payload can reach it
+        // and the op ceiling never gets a chance to answer first.
+        let mut data = make_defer_data(1);
+        data.gate = ActivationGate::new(MAX_PUBLISH_BYTES_PER_ACTIVATION, budgets.clone());
+        data.do_defer(ProcessorDeferredOp::Edit {
+            port: "out".to_string(),
+            index: 0,
+            payload: Some("x".repeat(MAX_PUBLISH_BYTES_PER_ACTIVATION)),
+            deliver_after: None,
+        })
+        .expect("the edit payload fills the aggregate exactly");
+        let err = data
+            .do_publish("out".to_string(), "y".to_string(), None, None)
+            .expect_err("a one-byte publish is refused by the aggregate the edit spent");
+        assert!(matches!(err, PublishError::QuotaExceeded));
+        assert_eq!(data.publish_buffer.len(), 0);
+        assert!(
+            data.publish_suppressed_by_sink.is_empty(),
+            "a byte-aggregate refusal is not a sink suppression: the operator warn \
+             names the one knob an operator can turn, and this is not it"
+        );
+
+        // And the converse: a publish that fills the aggregate refuses a later edit.
+        let mut data = make_defer_data(1);
+        data.gate = ActivationGate::new(MAX_PUBLISH_BYTES_PER_ACTIVATION, budgets);
+        data.do_publish(
+            "out".to_string(),
+            "x".repeat(MAX_PUBLISH_BYTES_PER_ACTIVATION),
+            None,
+            None,
+        )
+        .expect("the published payload fills the aggregate exactly");
+        let err = data
+            .do_defer(ProcessorDeferredOp::Edit {
+                port: "out".to_string(),
+                index: 0,
+                payload: Some("y".to_string()),
+                deliver_after: None,
+            })
+            .expect_err("a one-byte edit is refused by the aggregate the publish spent");
+        assert!(matches!(err, DeferError::QuotaExceeded));
+        assert_eq!(data.deferred_op_buffer.len(), 0);
+    }
+
     // --- do_mqtt_publish host-fn tests ---
 
     /// Build a `ProcessorData` whose MQTT-publish callback returns `outcome`.
@@ -3286,12 +3373,9 @@ mod processor_store_host_tests {
             output_ports: Arc::new(HashMap::new()),
             config: Arc::new(HashMap::new()),
             slug: Arc::from("test-slug"),
-            max_payload_bytes: 1024,
-            publish_buffer: Vec::new(),
-            published_bytes: 0,
-            publish_call_count: 0,
-            publish_budget_by_sink: HashMap::new(),
+            gate: ActivationGate::new(1024, HashMap::new()),
             publish_suppressed_by_sink: HashMap::new(),
+            publish_buffer: Vec::new(),
             alerter: Arc::new(NoopAlerter),
             output_acl: Arc::new(|_| true),
             mqtt_publish: Some(cb),
@@ -3313,10 +3397,7 @@ mod processor_store_host_tests {
         let mut ok = make_mqtt_data(MqttPublishOutcome::Ok);
         ok.do_mqtt_publish("home".into(), "t".into(), vec![1], None, 0, false)
             .expect("Ok outcome must map to Ok(())");
-        assert_eq!(
-            ok.publish_call_count, 1,
-            "a call consumes the shared budget"
-        );
+        assert_eq!(ok.gate.calls(), 1, "a call consumes the shared budget");
 
         // NotPermitted → not-permitted.
         let mut np = make_mqtt_data(MqttPublishOutcome::NotPermitted);
@@ -3407,8 +3488,10 @@ mod processor_store_host_tests {
         ports.insert("out".to_string(), test_out_spec("brenn:out"));
         data.output_ports = Arc::new(ports);
         // Generous per-sink budget so the shared 512-call cap trips first.
-        data.publish_budget_by_sink
-            .insert(SinkKey::Port("out".to_string()), TEST_GENEROUS_MT);
+        data.gate = ActivationGate::new(
+            1024,
+            HashMap::from([(SinkKey::Port("out".to_string()), TEST_GENEROUS_MT)]),
+        );
 
         // Spend half the budget via ports.publish, the rest via mqtt-publish.
         let half = MAX_PUBLISH_CALLS_PER_ACTIVATION / 2;
@@ -3420,7 +3503,7 @@ mod processor_store_host_tests {
             data.do_mqtt_publish("home".into(), "t".into(), vec![], None, 0, false)
                 .expect("under budget");
         }
-        assert_eq!(data.publish_call_count, MAX_PUBLISH_CALLS_PER_ACTIVATION);
+        assert_eq!(data.gate.calls(), MAX_PUBLISH_CALLS_PER_ACTIVATION);
         // One more — over the shared cap — must be quota-exceeded, even though the
         // callback would otherwise return Ok.
         assert!(
@@ -3438,13 +3521,15 @@ mod processor_store_host_tests {
     #[test]
     fn do_mqtt_publish_quota_reject_consumes_budget() {
         let mut data = make_mqtt_data(MqttPublishOutcome::Ok);
-        data.publish_call_count = MAX_PUBLISH_CALLS_PER_ACTIVATION;
+        for _ in 0..MAX_PUBLISH_CALLS_PER_ACTIVATION {
+            data.gate.charge_call().expect("under the cap");
+        }
         assert!(matches!(
             data.do_mqtt_publish("home".into(), "t".into(), vec![], None, 0, false),
             Err(MqttPublishWitError::QuotaExceeded)
         ));
         assert_eq!(
-            data.publish_call_count,
+            data.gate.calls(),
             MAX_PUBLISH_CALLS_PER_ACTIVATION + 1,
             "an over-cap call still bumps the counter (no free retries)"
         );
@@ -3465,7 +3550,8 @@ mod processor_store_host_tests {
                 .unwrap_or_else(|e| panic!("call {i} within budget must be Ok, got {e:?}"));
         }
         assert_eq!(
-            data.publish_call_count, MAX_PUBLISH_CALLS_PER_ACTIVATION,
+            data.gate.calls(),
+            MAX_PUBLISH_CALLS_PER_ACTIVATION,
             "exactly the cap many successful calls consumed exactly the cap many slots"
         );
         assert!(
@@ -3505,7 +3591,7 @@ mod processor_store_host_tests {
             "the callback (and thus the broker) must never be reached for an invalid qos"
         );
         // The call still consumed a budget slot (validation is after the bump).
-        assert_eq!(data.publish_call_count, 1);
+        assert_eq!(data.gate.calls(), 1);
     }
 
     /// A payload larger than `max_payload_bytes` is rejected as `invalid-payload`
@@ -3634,12 +3720,9 @@ mod processor_store_host_tests {
             output_ports: Arc::new(HashMap::new()),
             config: Arc::new(HashMap::new()),
             slug: Arc::from("test-slug"),
-            max_payload_bytes: 1024,
-            publish_buffer: Vec::new(),
-            published_bytes: 0,
-            publish_call_count: 0,
-            publish_budget_by_sink: HashMap::new(),
+            gate: ActivationGate::new(1024, HashMap::new()),
             publish_suppressed_by_sink: HashMap::new(),
+            publish_buffer: Vec::new(),
             alerter: Arc::new(NoopAlerter),
             output_acl: Arc::new(|_| true),
             mqtt_publish: None,
@@ -3793,6 +3876,52 @@ mod processor_store_host_tests {
         );
     }
 
+    /// Buffered async requests and port publishes answer to one entry ceiling,
+    /// in both directions: each is the other's addend. Both host sites pass the
+    /// *other* buffer's length to the gate, and passing the wrong one (or zero)
+    /// would let an activation buffer half again as many bus writes as the stated
+    /// bound — invisibly, since the flush-time invariant compares the gate against
+    /// the publish buffer alone.
+    #[test]
+    fn publishes_and_async_requests_share_one_entry_ceiling() {
+        let req = QueuedToolRequest {
+            channel: "brenn:tools/apull".to_string(),
+            reply_to: "brenn:tool-results/sync".to_string(),
+            body_json: "{\"v\":1}".to_string(),
+        };
+        let mut data = make_tool_data(StubToolHost::queue_ok(req));
+        let mut ports = HashMap::new();
+        ports.insert("out".to_string(), test_out_spec("brenn:allowed"));
+        data.output_ports = Arc::new(ports);
+        data.gate = ActivationGate::new(
+            1024,
+            HashMap::from([(SinkKey::Port("out".to_string()), TEST_GENEROUS_MT)]),
+        );
+
+        for _ in 0..MAX_PUBLISHES_PER_ACTIVATION - 1 {
+            data.do_publish("out".to_string(), "x".to_string(), None, None)
+                .expect("under the shared entry ceiling");
+        }
+        assert_eq!(data.gate.entries(), MAX_PUBLISHES_PER_ACTIVATION - 1);
+
+        data.do_queue_async("apull".into(), "{}".into(), "c")
+            .expect("the last slot is free");
+        let err = data
+            .do_queue_async("apull".into(), "{}".into(), "c")
+            .expect_err("the combined count is at the ceiling");
+        assert!(
+            matches!(&err, ToolWitError::Internal(m) if m == "too-many-async-requests"),
+            "the async site must refuse on the shared entry ceiling, got {err:?}"
+        );
+        assert_eq!(data.tool_request_buffer.len(), 1);
+
+        let err = data
+            .do_publish("out".to_string(), "x".to_string(), None, None)
+            .expect_err("the buffered async request holds the last entry slot");
+        assert!(matches!(err, PublishError::QuotaExceeded));
+        assert_eq!(data.publish_buffer.len(), MAX_PUBLISHES_PER_ACTIVATION - 1);
+    }
+
     /// A validated async call is buffered with the host-resolved envelope pieces,
     /// pending the activation's transactional flush (`take_ok_publishes`).
     #[test]
@@ -3821,15 +3950,16 @@ mod processor_store_host_tests {
             body_json: r#"{"v":1,"tool":"git-repo-pull","call_id":"c1"}"#.to_string(),
         };
         let mut data = make_tool_data(StubToolHost::queue_ok(req.clone()));
-        // A prior ordinary port publish already in the buffer.
-        data.publish_buffer.push(ProcessorPublish {
-            port: "out".to_string(),
-            channel_address: "brenn:some-port".to_string(),
-            payload: "port-body".to_string(),
-            urgency: ProcessorUrgency::Normal,
-            reply_to: None,
-            deliver_after: None,
-        });
+        // A prior ordinary port publish already in the buffer, put there the only
+        // way production does it — through the gate, so its entry count matches.
+        let mut ports = HashMap::new();
+        ports.insert("out".to_string(), test_out_spec("brenn:some-port"));
+        data.output_ports = Arc::new(ports);
+        let mut budgets = HashMap::new();
+        budgets.insert(SinkKey::Port("out".to_string()), TEST_GENEROUS_MT);
+        data.gate = ActivationGate::new(1024, budgets);
+        data.do_publish("out".into(), "port-body".into(), None, None)
+            .expect("a bound port publish must buffer");
         data.do_queue_async("git-repo-pull".into(), "{}".into(), "c1")
             .expect("valid async call must buffer");
         assert_eq!(data.tool_request_buffer.len(), 1);
@@ -4001,8 +4131,10 @@ mod processor_store_host_tests {
         assert_eq!(budget_mt, 1000 * (n + 1));
 
         let mut data = make_publish_data("brenn:allowed", Arc::new(|_| true));
-        data.publish_budget_by_sink
-            .insert(SinkKey::Port("out".to_string()), budget_mt);
+        data.gate = ActivationGate::new(
+            1024,
+            HashMap::from([(SinkKey::Port("out".to_string()), budget_mt)]),
+        );
 
         for i in 0..(n + 1) {
             data.do_publish("out".to_string(), "p".to_string(), None, None)
@@ -4037,12 +4169,9 @@ mod processor_store_host_tests {
             output_ports: Arc::new(ports),
             config: Arc::new(HashMap::new()),
             slug: Arc::from("test-slug"),
-            max_payload_bytes: 1024,
-            publish_buffer: Vec::new(),
-            published_bytes: 0,
-            publish_call_count: 0,
-            publish_budget_by_sink: budgets,
+            gate: ActivationGate::new(1024, budgets),
             publish_suppressed_by_sink: HashMap::new(),
+            publish_buffer: Vec::new(),
             alerter: Arc::new(NoopAlerter),
             output_acl: Arc::new(|_| true),
             mqtt_publish: None,
@@ -4079,8 +4208,10 @@ mod processor_store_host_tests {
     fn mqtt_per_sink_charged_on_attempt_even_on_broker_error() {
         let mut data = make_mqtt_data(MqttPublishOutcome::Broker("down".into()));
         // Budget for exactly two attempts.
-        data.publish_budget_by_sink
-            .insert(SinkKey::MqttClient("home".to_string()), 2000u64);
+        data.gate = ActivationGate::new(
+            1024,
+            HashMap::from([(SinkKey::MqttClient("home".to_string()), 2000u64)]),
+        );
         for _ in 0..2 {
             let r = data.do_mqtt_publish("home".into(), "t".into(), vec![], None, 0, false);
             assert!(
@@ -4288,12 +4419,9 @@ mod processor_config_host_tests {
             output_ports: Arc::new(HashMap::new()),
             config: Arc::new(config),
             slug: Arc::from("test-slug"),
-            max_payload_bytes: 1024,
-            publish_buffer: Vec::new(),
-            published_bytes: 0,
-            publish_call_count: 0,
-            publish_budget_by_sink: HashMap::new(),
+            gate: ActivationGate::new(1024, HashMap::new()),
             publish_suppressed_by_sink: HashMap::new(),
+            publish_buffer: Vec::new(),
             alerter: Arc::new(NoopAlerter),
             output_acl: Arc::new(|_| true),
             mqtt_publish: None,

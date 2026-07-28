@@ -658,6 +658,49 @@ fn close_fails_outstanding_publishes_connection_lost() {
 }
 
 #[test]
+fn a_host_fatal_carries_the_hosts_diagnosis_into_the_fatal_path() {
+    // The host's verdict on a precondition the core cannot check for itself — a
+    // device clock reading before the Unix epoch. The core owes it the ordinary
+    // fatal path: close, the terminal `Event::Fatal`, no timer. The banner and the
+    // link-state publish hang off that event and are pinned where the kernel folds
+    // it; what is pinned here is that the event fires and carries the host's words.
+    let mut core = active_core();
+    let effects = core.on_input(
+        Input::HostFatal {
+            detail: "device clock reads before the Unix epoch (-86400000 ms)".into(),
+        },
+        Millis(10),
+    );
+    assert_eq!(
+        assert_fatal_shape(&effects),
+        "device clock reads before the Unix epoch (-86400000 ms)",
+        "the detail is the host's, verbatim"
+    );
+    // Terminal like every other fatal: nothing activates afterwards.
+    assert_post_terminal_register_absorbed(&mut core, Millis(11));
+}
+
+#[test]
+fn a_host_fatal_before_welcome_is_fatal_too() {
+    // The boot clock check runs before the page ever connects, so the arm must fire
+    // from `Connecting` as readily as from `Active` — it sits ahead of every
+    // state-specific arm for exactly that reason. A close with no live transport is
+    // a no-op, so the effect shape is the same one.
+    let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
+    let effects = core.on_input(
+        Input::HostFatal {
+            detail: "device clock reads before the Unix epoch".into(),
+        },
+        Millis(1),
+    );
+    assert_eq!(
+        assert_fatal_shape(&effects),
+        "device clock reads before the Unix epoch"
+    );
+    assert_post_terminal_register_absorbed(&mut core, Millis(2));
+}
+
+#[test]
 fn post_terminal_registration_is_absorbed() {
     // Every terminal state absorbs a post-terminal registration silently: there
     // are no bindings to open, no wire to open them on, and nobody to tell. The

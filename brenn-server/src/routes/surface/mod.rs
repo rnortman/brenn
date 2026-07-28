@@ -47,7 +47,7 @@ use chrono::Utc;
 use tracing::warn;
 use uuid::Uuid;
 
-use self::registry::{DURABLE_QUEUE_FRAMES, RegisterRejection, SessionCaps, SurfaceSessionHandle};
+use self::registry::{PUSH_QUEUE_FRAMES, RegisterRejection, SessionCaps, SurfaceSessionHandle};
 use self::session::{SurfaceSessionParams, run_surface_session};
 use crate::client_ip::ClientIp;
 use crate::routes::ws::close_with_stale_client;
@@ -450,6 +450,9 @@ impl SurfaceRuntime {
     }
 
     /// Build the runtime for one resolved surface.
+    ///
+    /// Does not validate that output channels exist in the directory — that is
+    /// boot's gate (`bootstrap::messaging::surfaces`).
     ///
     /// `max_body_bytes` is `messaging.max_body_bytes` from config.
     pub fn build(
@@ -1073,10 +1076,10 @@ pub async fn surface_ws_handler(
     // 3. Capacity: register the slot before upgrading so the check has no
     //    check-then-register race and a full surface never upgrades the socket.
     let session_id = Uuid::new_v4();
-    // Durable-delivery handle, shared between the registry (read by the router
-    // fan-out) and the session task (which drains it): a bounded live-delivery
-    // queue, the active-durable-channel set, and the drain nudge.
-    let (durable_tx, durable_rx) = tokio::sync::mpsc::channel(DURABLE_QUEUE_FRAMES);
+    // Push handle, shared between the registry (read by the router fan-out and by
+    // sibling session tasks) and this session task (which drains it): a bounded
+    // push queue, the active-durable-channel set, and the drain nudge.
+    let (push_tx, push_rx) = tokio::sync::mpsc::channel(PUSH_QUEUE_FRAMES);
     let durable_subs = Arc::new(Mutex::new(HashSet::new()));
     let drain_notify = Arc::new(tokio::sync::Notify::new());
     let handle = SurfaceSessionHandle {
@@ -1084,7 +1087,7 @@ pub async fn surface_ws_handler(
         username: session.user.username.clone(),
         client_ip: ip,
         connected_at: Utc::now(),
-        durable_tx,
+        push_tx,
         durable_subs: durable_subs.clone(),
         drain_notify: drain_notify.clone(),
     };
@@ -1141,6 +1144,7 @@ pub async fn surface_ws_handler(
     let params_username = session.user.username;
     let heartbeat_secs = state.surface_heartbeat_secs;
     let alert_dispatcher = state.alert_dispatcher.clone();
+    let registry = state.surface_registry.clone();
     Ok(ws
         .max_message_size(cap)
         .max_frame_size(cap)
@@ -1151,9 +1155,10 @@ pub async fn surface_ws_handler(
                 username: params_username,
                 ip,
                 guard,
+                registry,
                 heartbeat_secs,
                 alert_dispatcher,
-                durable_rx,
+                push_rx,
                 durable_subs,
                 drain_notify,
                 socket,

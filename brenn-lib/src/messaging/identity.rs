@@ -337,6 +337,26 @@ impl ParticipantId {
             .map(|(_slug, instance)| instance)
     }
 
+    /// The `(slug, instance)` behind a surface component sender, or `None` for
+    /// every other identity — the classifier for an identity read back off a
+    /// stored message, where any kind can appear.
+    ///
+    /// Non-panicking where [`ParticipantId::kind`] and
+    /// [`ParticipantId::surface_component`] are not, and that is the whole
+    /// reason it exists: a message's sender is whatever published it, so an
+    /// `app:` or `wasm:` spelling is an ordinary answer here rather than a
+    /// wiring bug. Callers that hold a surface identity by construction keep
+    /// the panicking accessors.
+    ///
+    /// Takes a `&str` rather than `&self`: the caller has a stored sender
+    /// string and is asking whether it is one of these at all, which is a
+    /// question about the string.
+    pub fn surface_component_of(sender: &str) -> Option<(&str, &str)> {
+        sender
+            .strip_prefix("surface:")?
+            .split_once(SURFACE_SUB_IDENTITY_SEP)
+    }
+
     /// Recover the WASM component slug this identity denotes. PANICS if the
     /// identity is not a `wasm:<slug>` — an unrecognized kind at a recovery
     /// point is a structural host-wiring bug (BETTER DEAD THAN WRONG; mirrors
@@ -661,6 +681,35 @@ mod tests {
         let a = ParticipantId::for_surface_component("kitchen", "graf-todos");
         let b = ParticipantId::for_surface_component("kitchen", "protobar");
         assert_ne!(a, b);
+    }
+
+    /// The classifier a stored sender is run through: it answers for a
+    /// component sub-identity and stays quiet for every other kind, including
+    /// the ones the panicking accessors refuse.
+    #[test]
+    fn surface_component_of_answers_only_for_a_sub_identity() {
+        let sub = ParticipantId::for_surface_component("kitchen", "graf-todos");
+        assert_eq!(
+            ParticipantId::surface_component_of(sub.as_str()),
+            Some(("kitchen", "graf-todos"))
+        );
+        for other in [
+            ParticipantId::for_surface("kitchen").as_str().to_string(),
+            ParticipantId::for_wasm("proc").as_str().to_string(),
+            ParticipantId::for_app("pa", "https://brenn.example")
+                .as_str()
+                .to_string(),
+            ParticipantId::for_system("tool-executor")
+                .as_str()
+                .to_string(),
+            "not-an-identity".to_string(),
+        ] {
+            assert_eq!(
+                ParticipantId::surface_component_of(&other),
+                None,
+                "only a surface sub-identity names a component: {other}"
+            );
+        }
     }
 
     /// The slug half wears the `for_surface` guards — `for_surface_component`

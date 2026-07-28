@@ -102,6 +102,35 @@ pub fn list_deferred_for_sender(
     rows.map(|r| r.expect("read deferred row")).collect()
 }
 
+/// Every sender holding at least one message still parked on `channel_uuid` at
+/// `now`, once each, sorted.
+///
+/// The same `now` boundary [`list_deferred_for_sender`] applies, for the same
+/// reason: a matured entry no release pass has taken is out of every view, so a
+/// sender holding only those has nothing here either.
+pub fn list_deferred_senders(
+    conn: &Connection,
+    channel_uuid: Uuid,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT sender FROM messaging_messages
+             WHERE channel_uuid = ?1
+               AND deliver_after IS NOT NULL
+               AND deliver_after > ?2
+             ORDER BY sender ASC",
+        )
+        .expect("prepare list_deferred_senders");
+    let rows = stmt
+        .query_map(
+            rusqlite::params![channel_uuid.as_bytes().to_vec(), format_ts_for_db(now)],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("query list_deferred_senders");
+    rows.map(|r| r.expect("read deferred sender")).collect()
+}
+
 /// How many messages on `channel_uuid` are unreleased, across all senders — the
 /// quantity the channel-wide deferred cap bounds.
 ///

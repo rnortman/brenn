@@ -9,12 +9,17 @@
 //
 // This half hosts the *real* transpiled tree — the emitted glue and its core
 // wasm modules, instantiated through the `--instantiation async` entry point the
-// bootstrap loader uses. What it supplies around the guest is the activation
-// contract the kernel supplies in the browser: the four surface imports, and
-// buffer-during-receive / flush-iff-ok. The kernel's own implementation of that
-// contract is pinned separately (`surface/kernel/src/logic.rs` core tests and
-// the loader cases in `surface.test.ts`); what is under test here is the guest
-// on the transpiled hosting, which is the half the wasmtime run cannot reach.
+// bootstrap loader uses — and lifts each activation through the production
+// `activationEntry` from `surface.ts`, the same function the kernel registers.
+// So the `deferred` windows and `now` a scripted activation names cross into the
+// guest by the code path a real page uses, field renaming and `bigint` widening
+// included; a lift that lost either would fail here. What the harness still
+// supplies itself is the surrounding contract the kernel supplies in the
+// browser: the four surface imports, and buffer-during-receive /
+// flush-iff-ok. The kernel's own implementation of that contract is pinned
+// separately (`surface/kernel/src/logic.rs` core tests and the loader cases in
+// `surface.test.ts`); what is under test here is the guest on the transpiled
+// hosting, which is the half the wasmtime run cannot reach.
 //
 // Wire class: the script is `brenn:`-bound throughout. That is an owner scoping
 // decision, not doctrine — backend WASM consumers cannot bind `ephemeral:`
@@ -33,6 +38,11 @@ import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
+import {
+    activationEntry,
+    type KernelActivation,
+    type ProcessorInstance,
+} from "./surface.js";
 
 // vitest runs with its config root (`frontend/`) as cwd, so the repo root is one
 // level up. Both inputs are build/source artifacts outside the frontend tree:
@@ -52,15 +62,43 @@ interface ScriptPort {
     dropped: number;
 }
 
+/**
+ * One scripted activation: the kernel's own field spelling for everything except
+ * the input envelopes, which the script names by identity and each harness
+ * expands.
+ */
+interface ScriptActivation {
+    ports: ScriptPort[];
+    deferred: KernelActivation["deferred"];
+    now: number | null;
+}
+
+/** One deferred publish as the transcript reduces it. */
+interface DeferredPublish {
+    body: string;
+    deliver_after: number;
+}
+
+/** One buffered control op as the transcript reduces it. */
+interface TranscriptOp {
+    op: "cancel" | "edit";
+    port: string;
+    index: number;
+    payload?: string | null;
+    deliver_after?: number | null;
+}
+
 interface TranscriptEntry {
     outcome: "ok" | "err" | "trap";
     publishes: string[];
+    deferred_publishes: DeferredPublish[];
+    ops: TranscriptOp[];
 }
 
 interface Script {
     envelope_template: Record<string, unknown>;
     config: Record<string, string>;
-    activations: { ports: ScriptPort[] }[];
+    activations: ScriptActivation[];
     transcript: TranscriptEntry[];
 }
 
@@ -68,7 +106,7 @@ interface Script {
 type Instantiate = (
     getCoreModule: (name: string) => Promise<WebAssembly.Module>,
     imports: Record<string, Record<string, unknown>>,
-) => Promise<{ receive: (activation: unknown) => void }>;
+) => Promise<ProcessorInstance>;
 
 const script: Script = JSON.parse(readFileSync(SCRIPT, "utf8"));
 
@@ -97,18 +135,29 @@ function envelope(pair: { id: string; body: string }): string {
 }
 
 /**
+ * Everything one activation buffered, in call order per class. Reset before each
+ * activation and reported only on ok: keeping it iff `receive` returns ok is the
+ * flush-on-ok / discard-on-err contract reduced to what a transcript can see,
+ * and it covers deferral — a parked schedule and a control op are discarded with
+ * the publishes.
+ */
+interface Buffer {
+    publishes: string[];
+    deferredPublishes: DeferredPublish[];
+    ops: TranscriptOp[];
+}
+
+function emptyBuffer(): Buffer {
+    return { publishes: [], deferredPublishes: [], ops: [] };
+}
+
+/**
  * Drive the whole script against one instance and return the transcript.
  *
- * `publish` appends to the activation's buffer rather than reaching a sink
- * directly: the buffer is kept iff `receive` returns ok, which is the
- * flush-on-ok / discard-on-err contract reduced to what a transcript can see.
- *
- * Err vs trap is discriminated on an own `payload` property, not `instanceof`:
- * jco lifts the `err` arm of `result<_, receive-error>` by throwing a
- * `ComponentError`, but that class is module-private, so nothing outside the
- * transpiled module can name it. A trap arrives as a `WebAssembly.RuntimeError`,
- * which carries no `payload`. (The loader's shim in `surface.ts` uses this same
- * rule; this test is where the rule is checked against a real trapping guest.)
+ * Err vs trap is discriminated by the production `activationEntry`, not here: it
+ * answers in the kernel's vocabulary — `undefined` for ok, a diagnostic string
+ * for the err arm, a rethrow for a trap — so this harness reads the outcome off
+ * the same seam the page reads it off.
  */
 async function runScript(): Promise<TranscriptEntry[]> {
     const { instantiate } = (await import(
@@ -117,8 +166,8 @@ async function runScript(): Promise<TranscriptEntry[]> {
         ).href
     )) as { instantiate: Instantiate };
 
-    let buffer: string[] = [];
-    const { receive } = await instantiate(
+    let buffer = emptyBuffer();
+    const instance = await instantiate(
         (name) => WebAssembly.compile(readFileSync(resolve(DIST, name))),
         {
             "brenn:processor/config": {
@@ -132,37 +181,77 @@ async function runScript(): Promise<TranscriptEntry[]> {
             "brenn:processor/log": { log: () => {} },
             "brenn:processor/ports": {
                 publish: (_port: string, payload: string) => {
-                    buffer.push(payload);
+                    buffer.publishes.push(payload);
+                },
+                publishDeferred: (
+                    _port: string,
+                    payload: string,
+                    deliverAfter: bigint,
+                ) => {
+                    buffer.deferredPublishes.push({
+                        body: payload,
+                        deliver_after: Number(deliverAfter),
+                    });
+                },
+                deferCancel: (port: string, index: number) => {
+                    buffer.ops.push({ op: "cancel", port, index });
+                },
+                deferEdit: (
+                    port: string,
+                    index: number,
+                    payload: string | undefined,
+                    deliverAfter: bigint | undefined,
+                ) => {
+                    buffer.ops.push({
+                        op: "edit",
+                        port,
+                        index,
+                        // `undefined` is the absent half; the transcript spells
+                        // absence `null`, which is what JSON can carry.
+                        payload: payload === undefined ? null : payload,
+                        deliver_after:
+                            deliverAfter === undefined
+                                ? null
+                                : Number(deliverAfter),
+                    });
                 },
             },
         },
     );
+    const entry = activationEntry(instance);
 
     return script.activations.map((activation) => {
-        buffer = [];
-        const record = {
+        buffer = emptyBuffer();
+        const record: KernelActivation = {
             ports: activation.ports.map((p) => ({
                 port: p.port,
                 envelopes: p.envelopes.map(envelope),
-                // The canonical ABI lifts `new-from` camel-cased.
-                newFrom: p.new_from,
+                new_from: p.new_from,
                 dropped: p.dropped,
             })),
-            // Output-port deferral is backend scope; a surface-hosted transplant
-            // carries no deferred windows, but the field is required by the ABI.
-            deferred: [],
+            deferred: activation.deferred,
+            now: activation.now,
         };
+        let outcome: TranscriptEntry["outcome"];
         try {
-            receive(record);
-            return { outcome: "ok" as const, publishes: buffer };
-        } catch (e) {
-            const isErrArm =
-                e !== null && typeof e === "object" && hasOwn(e, "payload");
+            outcome = entry(JSON.stringify(record)) === undefined ? "ok" : "err";
+        } catch {
+            outcome = "trap";
+        }
+        if (outcome !== "ok") {
             return {
-                outcome: isErrArm ? ("err" as const) : ("trap" as const),
+                outcome,
                 publishes: [],
+                deferred_publishes: [],
+                ops: [],
             };
         }
+        return {
+            outcome,
+            publishes: buffer.publishes,
+            deferred_publishes: buffer.deferredPublishes,
+            ops: buffer.ops,
+        };
     });
 }
 
@@ -187,7 +276,7 @@ describe("processor transplant — surface hosting", () => {
     });
 
     it("survives err and dies on trap", () => {
-        // The transcript's shape is itself the contract for err vs trap: the err
+        // The transcript's shape is itself the contract for err vs trap: an err
         // activation flushes nothing yet is followed by an ok activation, and the
         // trap activation flushes nothing and is last. Asserted separately from
         // the equality above so a regenerated transcript cannot quietly lose it —
@@ -202,11 +291,44 @@ describe("processor transplant — surface hosting", () => {
         expect(outcomes.indexOf("trap")).toBe(outcomes.length - 1);
         expect(outcomes.slice(errAt + 1)).toContain("ok");
         transcript.forEach((entry, i) => {
+            // Every buffered class is discarded together: publishes, deferred
+            // schedules, and control ops.
+            const flushed =
+                entry.publishes.length +
+                entry.deferred_publishes.length +
+                entry.ops.length;
             if (outcomes[i] === "ok") {
-                expect(entry.publishes.length).toBeGreaterThan(0);
+                expect(flushed).toBeGreaterThan(0);
             } else {
-                expect(entry.publishes).toEqual([]);
+                expect(flushed).toBe(0);
             }
         });
+    });
+
+    it("carries the deferred windows and the clock into the guest", () => {
+        // The lift is the production one, so this is the pin on `deferred`/`now`
+        // reaching a real guest: the script's clock and parked-message windows
+        // are only observable in the transcript because the fixture read them
+        // back out of the activation it was handed. Derived from the script, so
+        // it follows the fixture rather than freezing a literal.
+        const scripted = script.activations.map((a) => ({
+            deferred: a.deferred,
+            now: a.now,
+        }));
+        const reported = transcript.map((entry, i) => {
+            if (entry.outcome !== "ok") {
+                return scripted[i];
+            }
+            const summary = JSON.parse(entry.publishes[0]) as {
+                deferred: KernelActivation["deferred"];
+                now: number | null;
+            };
+            return { deferred: summary.deferred, now: summary.now };
+        });
+        expect(reported).toEqual(scripted);
+        // At least one activation carries a clock and at least one carries none:
+        // a script that lost either case would make the pin vacuous.
+        expect(scripted.some((a) => a.now !== null)).toBe(true);
+        expect(scripted.some((a) => a.now === null)).toBe(true);
     });
 });

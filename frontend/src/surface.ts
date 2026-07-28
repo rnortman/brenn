@@ -452,6 +452,25 @@ export interface KernelModule extends WasmModule {
         body: string,
         urgency: string | undefined,
     ): string;
+    /** `deliverAfter` is epoch milliseconds UTC, typed `bigint` because the WIT `u64` exceeds `number`'s safe integer range. */
+    brenn_processor_publish_deferred(
+        instance: string,
+        port: string,
+        body: string,
+        deliverAfter: bigint,
+    ): string;
+    brenn_processor_defer_cancel(
+        instance: string,
+        port: string,
+        index: number,
+    ): string;
+    brenn_processor_defer_edit(
+        instance: string,
+        port: string,
+        index: number,
+        body: string | undefined,
+        deliverAfter: bigint | undefined,
+    ): string;
     brenn_processor_log(instance: string, level: string, message: string): void;
     brenn_processor_alert(
         instance: string,
@@ -484,7 +503,7 @@ interface ProcessorModule {
 }
 
 /** What a transpiled `world processor` exports: the activation entry point. */
-interface ProcessorInstance {
+export interface ProcessorInstance {
     receive(activation: WitActivation): void;
 }
 
@@ -500,16 +519,39 @@ interface WitActivation {
         newFrom: number;
         dropped: number;
     }[];
+    deferred: {
+        port: string;
+        entries: {
+            index: number;
+            payload: string;
+            deliverAfter: bigint;
+        }[];
+    }[];
+    now: bigint | undefined;
 }
 
-/** The same record as the kernel serializes it. */
-interface KernelActivation {
+/**
+ * The same record as the kernel serializes it. Exported for the transplant
+ * parity harness, which drives a real transpiled guest through
+ * `activationEntry` — the shape a scripted activation must be written in to
+ * reach a component the way the kernel reaches one.
+ */
+export interface KernelActivation {
     ports: {
         port: string;
         envelopes: string[];
         new_from: number;
         dropped: number;
     }[];
+    deferred: {
+        port: string;
+        entries: {
+            index: number;
+            payload: string;
+            deliver_after: number;
+        }[];
+    }[];
+    now: number | null;
 }
 
 /** How the bootstrap dynamically imports a module URL; overridable in tests. */
@@ -632,25 +674,27 @@ class ProcessorKindCache {
  * that does had its surface's alert grant proven at boot (and the kernel's own
  * `brenn_processor_alert` re-checks the live grant regardless).
  *
- * A refused publish reaches the guest as the WIT `publish-error` variant: the
- * glue's `getErrorPayload` reads a thrown value's own `payload` property, so the
- * shim throws the variant rather than returning it.
+ * A refused publish reaches the guest as the WIT `publish-error` variant, and a
+ * refused deferred-message control op as the `defer-error` variant: the glue's
+ * `getErrorPayload` reads a thrown value's own `payload` property, so the shim
+ * throws the variant rather than returning it.
  */
 function processorImports(
     kernel: KernelModule,
     instance: string,
 ): Record<string, Record<string, unknown>> {
-    const publish = (port: string, payload: string, urgency?: string): void => {
-        const error = kernel.brenn_processor_publish(
-            instance,
-            port,
-            payload,
-            urgency,
-        );
+    // The kernel answers every one of these calls with a variant name or the empty
+    // string for ok; whether that name comes from `publish-error` or `defer-error`
+    // is the kernel's business, so one thrower serves them all.
+    const refuse = (error: string): void => {
         if (error !== "") {
             throw { payload: { tag: error } };
         }
     };
+    const publish = (port: string, payload: string, urgency?: string): void =>
+        refuse(
+            kernel.brenn_processor_publish(instance, port, payload, urgency),
+        );
     return {
         "brenn:processor/ports": {
             publish: (port: string, payload: string) => publish(port, payload),
@@ -659,6 +703,38 @@ function processorImports(
                 payload: string,
                 urgency: string,
             ) => publish(port, payload, urgency),
+            publishDeferred: (
+                port: string,
+                payload: string,
+                deliverAfter: bigint,
+            ) =>
+                refuse(
+                    kernel.brenn_processor_publish_deferred(
+                        instance,
+                        port,
+                        payload,
+                        deliverAfter,
+                    ),
+                ),
+            deferCancel: (port: string, index: number) =>
+                refuse(
+                    kernel.brenn_processor_defer_cancel(instance, port, index),
+                ),
+            deferEdit: (
+                port: string,
+                index: number,
+                payload: string | undefined,
+                deliverAfter: bigint | undefined,
+            ) =>
+                refuse(
+                    kernel.brenn_processor_defer_edit(
+                        instance,
+                        port,
+                        index,
+                        payload,
+                        deliverAfter,
+                    ),
+                ),
         },
         "brenn:processor/log": {
             log: (level: string, message: string) =>
@@ -689,10 +765,13 @@ function processorImports(
  * transpiled module and never exported. A component returning err keeps running
  * with its buffer discarded; anything else is a trap and is terminal for the
  * instance.
+ *
+ * Exported for the transplant parity harness, which drives a real transpiled
+ * guest through this exact lift rather than a hand-rolled copy of it.
  */
-function activationEntry(
+export function activationEntry(
     instance: ProcessorInstance,
-): (activation: string) => void {
+): (activation: string) => string | undefined {
     return (json: string) => {
         const parsed = JSON.parse(json) as KernelActivation;
         const lifted: WitActivation = {
@@ -702,6 +781,19 @@ function activationEntry(
                 newFrom: window.new_from,
                 dropped: window.dropped,
             })),
+            // All three fields, always: the canonical ABI traps on a missing one,
+            // not a degraded activation.
+            deferred: parsed.deferred.map((window) => ({
+                port: window.port,
+                entries: window.entries.map((entry) => ({
+                    index: entry.index,
+                    payload: entry.payload,
+                    deliverAfter: BigInt(entry.deliver_after),
+                })),
+            })),
+            // option<u64>: null must lower to `undefined`, not BigInt(null) (0n —
+            // present zero, not absence).
+            now: parsed.now === null ? undefined : BigInt(parsed.now),
         };
         try {
             instance.receive(lifted);

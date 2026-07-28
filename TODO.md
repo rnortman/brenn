@@ -731,3 +731,112 @@ accurate across every park/cancel/release/quota site, including the durable park
 Code site (`TODO(substrate-deferred-view-count-shortcut)`):
 `brenn-server/src/wasm_dispatch/mod.rs` (the `for out in &cfg.outputs`
 deferred-view loop in `drain_step`).
+
+---
+
+## `wasm-durable-park-cap`
+
+The WASM activation flush parks a *durable* deferred publish with a bare
+`insert_message` — no deferred-cap check — so a backend component can park an
+unbounded number of messages on a `brenn:` channel. Every other park in the
+system enforces the channel-wide cap the WIT states ("bounded channel-wide by the
+channel's retain depth"): `DbStore::park` counts then inserts under one connection
+guard, `RingStore::park` refuses at the store's cap, and the surface batch flush
+checks the cap in-transaction on its durable half. Only this path is exempt, and a
+component that loops `publish-deferred` grows the table without bound. Done when
+the durable WASM deferred flush enforces the retain-depth cap with the same
+count-then-insert-under-one-guard discipline (or the WIT text is amended to say
+durable parks are uncapped, if that is the decision).
+
+Code site (`TODO(wasm-durable-park-cap)`):
+`brenn-lib/src/messaging/publish/mod.rs` (the durable arm of `publish_from_wasm`).
+
+---
+
+## `surface-wire-cursors`
+
+The surface wire protocol's resume/replay layer is a parallel, pre-cursor
+implementation of what `brenn_queue::SubscriberCursor` + window/advance already
+express: the opaque client-echoed `Cursor` token is a subscriber position;
+`replay_from`'s five-way `Replay` decision (`Fresh`/`UpToDate`/`Exact`/`Gap{..}`)
+is prime-at-position plus window, with the gap arms re-deriving what
+`Advance.dropped` computes as arithmetic; the session-side `WireSpans` durable
+high-water is a hand-rolled cursor advance; `GapInfo` is the drop report.
+
+Correctness does not depend on the refactor — page-side priming is plain
+`Retained` on both classes and every observable satisfies `docs/message-bus.md`;
+the bespoke-ness is server-internal vocabulary. It is a genuine project, not a
+cleanup: it rewires `handle_subscribe`/`handle_durable_subscribe`/
+`drain_durable_channel`, `WireSpans`, `attach_live`, both stores' `replay_from`
+and the token codec under ~250 session tests, and it carries design questions
+that must not be answered in passing:
+
+- **Grain and residence.** Delivery state is per *connection* (two tabs of one
+  surface are two independent delivery states) while store cursors are keyed by
+  participant. The client-held token is what makes the server stateless across
+  disconnects. A cursor-grounded wire either keeps the token as a cursor-shaped
+  position echo, or accepts server-side per-connection cursor rows with a
+  lifetime story.
+- **Page-reload semantics.** A fresh page must receive the retained tail even
+  though the subscription identity saw it before, so any persistent
+  per-(slug, instance, channel) cursor is wrong by construction.
+- **The mirror-lifetime inversion.** A token surviving refcount zero would let a
+  re-acquired subscription *resume* — the page mirror catches up from the unseen
+  suffix instead of being discarded, and wire stores become page-lifetime like
+  confined ones. Design it against the `client_reattach_replays_latest_retained_value`
+  contract and the M ≤ N question (a page window deeper than the server ring's N).
+- `TODO(processor-typed-gaps)` rides the same cycle: gaps become cursor
+  arithmetic on the backend too.
+
+Code sites (`TODO(surface-wire-cursors)`):
+`brenn-lib/src/messaging/store/mod.rs` (`priming_for_kind`'s surface arm, which
+panics because a surface subscription holds no store cursor at all),
+`brenn-server/src/routes/surface/session.rs` (`handle_subscribe`).
+
+---
+
+## `surface-op-send-budget`
+
+A surface `PublishBatch` draws its send-budget tokens per *publish*; the control
+ops it carries are free. So an ops-only flush draws one token however many ops it
+carries, up to `MAX_PUBLISHES_PER_ACTIVATION`, while a publish-only flush of the
+same width draws the full 256. Each applied durable op is its own DB write and
+each touched channel costs a view recompute plus a slug-wide fan-out, so a
+conforming-shaped client can buy roughly two orders of magnitude more backend
+write work per token through ops than through publishes. Bounded (op cap,
+frame-size cap, authenticated principal, session count), so this is a calibration
+gap rather than a hole.
+
+Not a local patch, which is why it is ledgered: `SURFACE_SEND_BURST` is
+deliberately equal to `brenn_budget::MAX_PUBLISHES_PER_ACTIVATION` so that a full
+bucket admits exactly one maximal conforming flush, and boot asserts it. Pricing
+ops at one token each makes the maximal conforming flush 512 units — 256
+publishes plus 256 ops, two separate kernel-side ceilings — so the bucket would
+refuse truthful traffic and the kernel would re-park and retry it to the outbox
+cap. Fixing it therefore means deciding what the budget meters (publishes, or
+units of flush work), re-sizing the burst against that answer, and restating the
+operator-facing `burst` config whose documented unit is publishes.
+
+What the amplification also buys, beyond the write work: every view restatement
+runs under the process-wide `deferred_view_gate`
+(`brenn-lib/src/messaging/mod.rs`), held across the deferred-set read, and the
+release sweep takes that same gate while running on the single dispatcher loop
+that also wakes ordinary subscribers (`push_released_surface_views`;
+`brenn-lib/src/messaging/dispatcher.rs`). Op-driven recomputes therefore queue
+ahead of sweeps and subscriber wakes — bus-wide dispatch delay, on the order of
+fractions of a second to seconds of aggregate delay under a deliberate burst, not
+merely delay for the surface that caused it. A raced (`NotDeferred`) op restates
+the view by design — the restatement heals a mirror whose earlier emission was
+dropped on a full push queue — so the composition needs nothing actually parked.
+Removing that restatement is not the fix.
+
+Done when ops are priced and the burst is sized so one maximal conforming flush
+still fits, **and** it has been re-assessed whether pricing alone re-bounds the
+gate/dispatcher composition or whether the sweep's gated emission must
+additionally move off the dispatcher loop.
+
+Code sites (`TODO(surface-op-send-budget)`):
+`brenn-server/src/routes/surface/session.rs` (the `draw` in
+`handle_publish_batch`); `brenn-lib/src/messaging/mod.rs`
+(`push_released_surface_views`, the sweep-side gate take on the dispatcher loop).
+
