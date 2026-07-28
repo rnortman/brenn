@@ -53,9 +53,10 @@ const ALLOWLIST: &[Allowed] = &[
     },
     Allowed {
         path: "git-fixture/src/lib.rs",
-        count: 5,
-        why: "the hermetic fixture crate itself: its spawns, its own tests, \
-              and the pattern quoted in its module docs",
+        count: 6,
+        why: "the hermetic fixture crate itself: its spawns (including the \
+              failure-tolerating one), its own tests, and the pattern quoted \
+              in its module docs",
     },
 ];
 
@@ -238,7 +239,7 @@ mod tests {
     fn a_stale_allowlist_entry_fails() {
         let out = violations_from(&obs(&without("git-fixture/src/lib.rs")));
         assert_eq!(out.len(), 1, "{out:?}");
-        assert!(out[0].starts_with("git-fixture/src/lib.rs: allowlisted for 5"));
+        assert!(out[0].starts_with("git-fixture/src/lib.rs: allowlisted for 6"));
     }
 
     #[test]

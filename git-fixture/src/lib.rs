@@ -130,6 +130,26 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
     })
 }
 
+/// Run `git <args>` hermetically in `dir`, reporting success rather than
+/// panicking on it.
+///
+/// For the fixture step that is *supposed* to fail — a merge built to conflict,
+/// most of all. [`git`] is right everywhere else, and a raw `Command` here would
+/// be a fixture spawn outside this crate's isolation, which is the thing the
+/// crate exists to prevent. Output is discarded; a caller that needs it wants a
+/// step that succeeded.
+pub fn try_git(dir: &Path, args: &[&str]) -> bool {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    hermetic(&mut cmd);
+    cmd.status()
+        .unwrap_or_else(|e| panic!("git-fixture: failed to spawn git {args:?}: {e}"))
+        .success()
+}
+
 /// Initialize a fixture repo in `dir` (which must already exist), on branch
 /// `main`, with a local identity, and assert it is isolated.
 ///
@@ -509,6 +529,20 @@ mod tests {
         init_repo(dir.path());
         let decoy_index = decoy.path().join(".git").join("index");
         assert_repo_is_with_env(dir.path(), &[("GIT_INDEX_FILE", decoy_index.as_os_str())]);
+    }
+
+    /// `try_git` must distinguish the two outcomes it exists for, and stay
+    /// hermetic doing it.
+    #[test]
+    fn try_git_reports_failure_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_repo(dir.path());
+        assert!(try_git(dir.path(), &["rev-parse", "HEAD"]));
+        assert!(!try_git(
+            dir.path(),
+            &["rev-parse", "--verify", "no/such/ref"]
+        ));
+        assert_repo_is(dir.path());
     }
 
     #[test]

@@ -109,9 +109,28 @@ pub fn try_repo_root(from: &Path) -> Option<PathBuf> {
     );
 }
 
-/// Tracked files, optionally scoped to a path.
-pub fn tracked_files(repo: &Path, scope: Option<&str>) -> Vec<PathBuf> {
-    let mut args = vec!["ls-files", "-z"];
+/// The index mode git records for a submodule entry (a gitlink). Its whole
+/// recorded content is the commit id of the submodule; the superproject stores
+/// no file bytes for it.
+const GITLINK_MODE: &str = "160000";
+
+/// One tracked index entry.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TrackedEntry {
+    pub path: PathBuf,
+    /// The commit id recorded for a gitlink; `None` for every other entry.
+    pub gitlink: Option<String>,
+}
+
+/// Tracked entries, optionally scoped to a path.
+///
+/// The index mode comes along because it is the only reliable way to recognize
+/// a submodule. The worktree cannot answer: a submodule path is legitimately
+/// absent (never initialized), an empty directory (initialized, not fetched),
+/// or a populated checkout, and only the index distinguishes any of those from
+/// an ordinary file.
+pub fn tracked_entries(repo: &Path, scope: Option<&str>) -> Vec<TrackedEntry> {
+    let mut args = vec!["ls-files", "-s", "-z"];
     if let Some(s) = scope {
         args.push("--");
         args.push(s);
@@ -119,8 +138,48 @@ pub fn tracked_files(repo: &Path, scope: Option<&str>) -> Vec<PathBuf> {
     run(repo, &args)
         .split('\0')
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+        .map(parse_index_entry)
         .collect()
+}
+
+/// Parse one `ls-files -s -z` record: `<mode> <object> <stage>\t<path>`.
+///
+/// The path starts after the first tab, so a filename containing a tab (or a
+/// space, or a newline) survives intact. A record that does not have this shape
+/// is fatal rather than skipped: a dropped entry is a tracked path silently
+/// left out of a scan that then reports a clean tree.
+///
+/// Stage 0 is the only stage an index entry has outside a conflict. During an
+/// unresolved merge the same path arrives three times, once per side, and none
+/// of the three is the worktree content the operator is looking at. Picking one
+/// would scan the wrong bytes; listing all three would hand the caller a
+/// duplicate path. Both are guesses about a tree whose content is mid-decision,
+/// so a nonzero stage is fatal.
+fn parse_index_entry(record: &str) -> TrackedEntry {
+    let (header, path) = record
+        .split_once('\t')
+        .unwrap_or_else(|| panic!("git ls-files -s record has no tab before the path: {record:?}"));
+    let fields: Vec<&str> = header.split(' ').collect();
+    assert!(
+        fields.len() == 3,
+        "git ls-files -s record header is not `<mode> <object> <stage>`: {record:?}"
+    );
+    let (mode, object, stage) = (fields[0], fields[1], fields[2]);
+    assert!(
+        stage == "0",
+        "tracked path {path} is at merge stage {stage}: the index has unmerged entries. \
+         Resolve the merge first; refusing to scan a tree whose content is mid-conflict"
+    );
+    TrackedEntry {
+        path: PathBuf::from(path),
+        gitlink: (mode == GITLINK_MODE).then(|| object.to_string()),
+    }
+}
+
+/// The text git records for a gitlink, and the text a diff of one shows. Tree
+/// scans mirror this so they see exactly what a staged or range scan sees.
+pub fn gitlink_pointer_text(object: &str) -> String {
+    format!("Subproject commit {object}\n")
 }
 
 /// Tracked paths with no file in the worktree: deleted, but not yet committed.
@@ -575,8 +634,15 @@ diff --git a/src/a.rs b/src/a.rs
         assert_eq!(log_opts_for(p, &update), Some(local));
     }
 
+    fn tracked_paths(repo: &Path, scope: Option<&str>) -> Vec<PathBuf> {
+        tracked_entries(repo, scope)
+            .into_iter()
+            .map(|e| e.path)
+            .collect()
+    }
+
     #[test]
-    fn tracked_files_lists_committed_paths_and_honors_a_scope() {
+    fn tracked_entries_lists_committed_paths_and_honors_a_scope() {
         let dir = repo_with_commit();
         let p = dir.path();
         std::fs::create_dir_all(p.join("docs")).unwrap();
@@ -585,7 +651,7 @@ diff --git a/src/a.rs b/src/a.rs
         fixture_git(p, &["add", "docs/a.md"]);
         fixture_git(p, &["commit", "-qm", "docs"]);
 
-        let all = tracked_files(p, None);
+        let all = tracked_paths(p, None);
         assert!(all.contains(&PathBuf::from("f.rs")));
         assert!(all.contains(&PathBuf::from("docs/a.md")));
         assert!(
@@ -594,9 +660,93 @@ diff --git a/src/a.rs b/src/a.rs
         );
 
         assert_eq!(
-            tracked_files(p, Some("docs")),
+            tracked_paths(p, Some("docs")),
             vec![PathBuf::from("docs/a.md")]
         );
+    }
+
+    #[test]
+    fn a_regular_file_is_not_reported_as_a_gitlink() {
+        let dir = repo_with_commit();
+        let entries = tracked_entries(dir.path(), None);
+        assert_eq!(
+            entries,
+            vec![TrackedEntry {
+                path: PathBuf::from("f.rs"),
+                gitlink: None
+            }]
+        );
+    }
+
+    #[test]
+    fn a_submodule_entry_carries_its_recorded_commit_id() {
+        let dir = repo_with_commit();
+        let p = dir.path();
+        let pin = "0123456789abcdef0123456789abcdef01234567";
+        fixture_git(
+            p,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{pin},vendor/thing"),
+            ],
+        );
+        fixture_git(p, &["commit", "-qm", "gitlink"]);
+
+        let entries = tracked_entries(p, None);
+        assert!(
+            entries.contains(&TrackedEntry {
+                path: PathBuf::from("vendor/thing"),
+                gitlink: Some(pin.to_string())
+            }),
+            "{entries:?}"
+        );
+        // Against git's own rendering, not a re-spelling of the function body:
+        // the pointer text exists to be byte-identical to what a staged or
+        // range scan reads out of a diff, so git is the only authority for it.
+        let diff = fixture_git(p, &["show", "--format=", "HEAD"]);
+        let pointer = gitlink_pointer_text(pin);
+        assert!(
+            diff.contains(&pointer),
+            "the mirrored pointer must be the line git puts in a gitlink diff: \
+             {pointer:?} not in {diff:?}"
+        );
+    }
+
+    /// A conflicted path arrives three times, once per merge stage, and none of
+    /// the three is the worktree content. Returning all three would hand the
+    /// caller a duplicate path, which the tree mirror would process three times.
+    #[test]
+    #[should_panic(expected = "the index has unmerged entries")]
+    fn an_unmerged_index_record_is_fatal() {
+        parse_index_entry("100644 abc123 2\tf.txt");
+    }
+
+    /// The header ends at the first tab, so a tab in a filename cannot shorten
+    /// the path and leave a scan pointed at a file that does not exist.
+    #[test]
+    fn an_index_record_splits_at_the_first_tab_only() {
+        let entry = parse_index_entry("100644 abc123 0\tdocs/od\td\tname.md");
+        assert_eq!(
+            entry,
+            TrackedEntry {
+                path: PathBuf::from("docs/od\td\tname.md"),
+                gitlink: None
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "no tab before the path")]
+    fn an_index_record_without_a_tab_is_fatal() {
+        parse_index_entry("100644 abc123 0 docs/a.md");
+    }
+
+    #[test]
+    #[should_panic(expected = "is not `<mode> <object> <stage>`")]
+    fn an_index_record_with_an_unexpected_header_is_fatal() {
+        parse_index_entry("100644 abc123\tdocs/a.md");
     }
 
     #[test]

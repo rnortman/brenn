@@ -20,6 +20,7 @@ mod mirror;
 use exclude::Exclusions;
 use gitleaks::{Finding, Version};
 use mirror::Mirror;
+use std::collections::HashMap;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -370,16 +371,24 @@ fn mode_tree(scope: Option<&str>, exclusions: &Exclusions) -> ExitCode {
         Err(code) => return code,
     };
 
-    let tracked = git::tracked_files(&repo, scope);
+    let entries = git::tracked_entries(&repo, scope);
     // A scan of zero files is never a meaningful green -- it is a mistyped
     // scope.
     assert!(
-        !tracked.is_empty(),
+        !entries.is_empty(),
         "scope matched no tracked files{}; refusing to report a clean tree",
         scope.map(|s| format!(" ({s})")).unwrap_or_default()
     );
 
-    let (tracked, dropped) = exclusions.partition(tracked);
+    let paths = entries.iter().map(|e| e.path.clone()).collect();
+    // The worktree is never consulted for a gitlink — git records only a
+    // commit id for it.
+    let gitlinks: HashMap<PathBuf, String> = entries
+        .into_iter()
+        .filter_map(|e| e.gitlink.map(|object| (e.path, object)))
+        .collect();
+
+    let (tracked, dropped) = exclusions.partition(paths);
     for (prefix, count) in &dropped {
         eprintln!("EXCLUDED: {prefix} ({count} files not scanned)");
     }
@@ -395,6 +404,19 @@ fn mode_tree(scope: Option<&str>, exclusions: &Exclusions) -> ExitCode {
     let deleted = git::deleted_files(&repo);
     let mirror = Mirror::new();
     for rel in tracked {
+        // A gitlink's scannable content is its pointer text, whatever the
+        // worktree holds at that path. Stating it here also keeps the pointer
+        // out of the stat arms below, where every worktree state a submodule
+        // can be in reads as an error.
+        if let Some(object) = gitlinks.get(&rel) {
+            eprintln!(
+                "SUBMODULE: {} (pointer scanned; the submodule's own contents are \
+                 a separate repository and are not covered by this scan)",
+                rel.display()
+            );
+            mirror.write(&rel, git::gitlink_pointer_text(object).as_bytes());
+            continue;
+        }
         let src = repo.join(&rel);
         match std::fs::symlink_metadata(&src) {
             Ok(md) if md.is_file() => mirror.link_or_copy(&rel, &src),

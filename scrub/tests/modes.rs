@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use common::gitleaks_available;
-use git_fixture::{git, init_repo};
+use git_fixture::{git, init_repo, try_git};
 
 const BIN: &str = env!("CARGO_BIN_EXE_brenn-scrub");
 
@@ -65,11 +65,16 @@ struct Output {
 }
 
 fn run_in(repo: &Path, args: &[&str], stdin: &str) -> Output {
+    run_in_env(repo, args, stdin, &[])
+}
+
+fn run_in_env(repo: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(BIN);
     cmd.current_dir(repo)
         // The overlay is a local convention; these assertions are about the
         // public rules only, so a machine's local overlay must not leak in.
         .env_remove("BRENN_SCRUB_DENYLIST")
+        .envs(env.iter().copied())
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -298,5 +303,290 @@ fn a_staged_deletion_is_skipped_out_loud_and_does_not_fail_the_scan() {
         out.stderr.contains("SKIPPED: src/gone.rs"),
         "an unmirrored tracked path must be named: {}",
         out.stderr
+    );
+}
+
+/// The commit id a fixture submodule is pinned at. Nothing dereferences it, so
+/// no object has to exist: git records a gitlink's id without resolving it,
+/// which is what lets these fixtures stay hermetic and network-free.
+const SUBMODULE_PIN: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// Add a tracked gitlink at `rel`, the way a `git submodule add` would leave
+/// the index, without a submodule repository behind it.
+fn add_gitlink(repo: &Path, rel: &str) {
+    git(
+        repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{SUBMODULE_PIN},{rel}"),
+        ],
+    );
+    git(repo, &["commit", "-qm", "gitlink"]);
+}
+
+/// An overlay whose one rule matches the fixture's pointer *line*, so a scan
+/// that reads the pointer as the text git records reports a finding, and one
+/// that skips it -- or renders it differently from a diff -- does not.
+fn overlay_matching_the_pin(dir: &Path) -> PathBuf {
+    let path = dir.join("overlay.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[[rules]]\nid = \"fixture-submodule-pin\"\n\
+             description = \"fixture rule matching a submodule pointer\"\n\
+             regex = '''Subproject commit {SUBMODULE_PIN}'''\n"
+        ),
+    )
+    .expect("write overlay");
+    path
+}
+
+/// The worktree states a submodule can legitimately be in. Typed rather than
+/// stringly, so a label and the fixture it selects cannot drift apart: a
+/// misspelled arm would silently run one state twice while every failure
+/// message still named the other.
+#[derive(Debug, Clone, Copy)]
+enum WorktreeState {
+    Absent,
+    Empty,
+    Populated,
+}
+
+/// Put `path` into `state` and assert it really is in it -- the setup is what
+/// the case is about, so an assertion on the fixture belongs with it.
+fn set_up_worktree_state(path: &Path, state: WorktreeState) {
+    match state {
+        WorktreeState::Absent => {
+            assert!(!path.exists(), "the absent case must have no path at all");
+        }
+        WorktreeState::Empty => {
+            std::fs::create_dir_all(path).expect("mkdir");
+            assert!(path.is_dir(), "the empty case must be a directory");
+            assert_eq!(
+                std::fs::read_dir(path).expect("read_dir").count(),
+                0,
+                "the empty case must be an empty directory"
+            );
+        }
+        WorktreeState::Populated => {
+            std::fs::create_dir_all(path).expect("mkdir");
+            std::fs::write(path.join("upstream.rs"), "let user = \"bob\";\n").expect("write");
+            // Untracked, inside the checkout, and matching a built-in rule: the
+            // one thing that separates "the pointer was scanned" from "the
+            // submodule's whole tree was swept under our rules". Descending is
+            // rejected by design -- it would run the operator's private overlay
+            // across third-party code -- and only an assertion keeps a later
+            // widening of the gitlink arm from doing it unnoticed.
+            std::fs::write(path.join("leak.rs"), canary()).expect("write");
+            assert!(
+                path.join("upstream.rs").exists() && path.join("leak.rs").exists(),
+                "the populated case must have a checkout in it"
+            );
+        }
+    }
+}
+
+/// All three worktree states a submodule can be in (absent, empty directory,
+/// populated checkout) are legitimate, so none of them may decide anything —
+/// only the index pointer matters.
+#[test]
+fn a_tracked_submodule_is_scanned_as_its_pointer_in_every_worktree_state() {
+    if !gitleaks_available() {
+        return;
+    }
+    for state in [
+        WorktreeState::Absent,
+        WorktreeState::Empty,
+        WorktreeState::Populated,
+    ] {
+        let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+        add_gitlink(dir.path(), "vendor/thing");
+        let path = dir.path().join("vendor/thing");
+        set_up_worktree_state(&path, state);
+        let state = format!("{state:?}");
+
+        let out = run_in(dir.path(), &["tree"], "");
+        assert_eq!(
+            out.code,
+            Some(0),
+            "a clean tree with a submodule must pass ({state}); stderr: {}",
+            out.stderr
+        );
+        assert_eq!(
+            tree_json(&out)["findings"].as_array().expect("array").len(),
+            0,
+            "only the pointer is scanned; nothing inside the checkout is ({state}): {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.contains("SUBMODULE: vendor/thing"),
+            "the submodule must be named on stderr ({state}): {}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("separate repository"),
+            "the announcement must say the contents are out of scope ({state}): {}",
+            out.stderr
+        );
+        assert!(
+            !out.stderr.contains("SKIPPED: vendor/thing"),
+            "a submodule pointer is scanned, not skipped ({state}): {}",
+            out.stderr
+        );
+    }
+}
+
+/// The announcement alone would be satisfied by skipping the entry with a
+/// friendlier message. A rule matching the pointer id has to fire, which is
+/// only possible if the pointer text reached the scan.
+#[test]
+fn a_rule_matching_the_pointer_reports_a_finding_against_the_submodule_path() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    add_gitlink(dir.path(), "vendor/thing");
+    let overlay = overlay_matching_the_pin(dir.path());
+
+    let out = run_in_env(
+        dir.path(),
+        &["tree"],
+        "",
+        &[("BRENN_SCRUB_DENYLIST", overlay.to_str().expect("utf-8"))],
+    );
+    assert_eq!(
+        out.code,
+        Some(1),
+        "a match must fail the scan: {:?}",
+        out.stdout
+    );
+    let json = tree_json(&out);
+    let findings = json["findings"].as_array().expect("findings is an array");
+    assert_eq!(findings.len(), 1, "{:?}", out.stdout);
+    assert_eq!(
+        findings[0]["File"], "vendor/thing",
+        "the finding must name the submodule path"
+    );
+    assert_eq!(findings[0]["RuleID"], "fixture-submodule-pin");
+}
+
+/// A gitlink under an excluded prefix is dropped and counted like any other
+/// entry -- not announced, not scanned, and still credited to the prefix so the
+/// inert-exclusion check does not misfire.
+#[test]
+fn an_excluded_submodule_is_dropped_and_counted_like_a_file() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    add_gitlink(dir.path(), "vendor/thing");
+    let overlay = overlay_matching_the_pin(dir.path());
+    let env = [("BRENN_SCRUB_DENYLIST", overlay.to_str().expect("utf-8"))];
+
+    let out = run_in_env(dir.path(), &["tree", "--exclude", "vendor"], "", &env);
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert_eq!(
+        tree_json(&out)["findings"].as_array().expect("array").len(),
+        0,
+        "the excluded pointer must not be scanned: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stderr
+            .contains("EXCLUDED: vendor (1 files not scanned)"),
+        "the gitlink must be counted against the prefix: {}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("SUBMODULE:"),
+        "an excluded entry is not announced as scanned: {}",
+        out.stderr
+    );
+}
+
+/// The gitlink arm is an exemption from the stat loop's refusal, and the
+/// refusal is what holds "no tracked entry unscanned under a green". Widening
+/// the arm to tolerate directories -- the plausible next edit, since a
+/// populated submodule is one -- would turn every tracked non-file into a
+/// silent skip inside a run still printing `clean`.
+#[test]
+fn a_tracked_path_that_is_neither_file_nor_symlink_still_refuses() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[
+        ("src/a.rs", "let user = \"alice\";\n"),
+        ("weird", "tracked as a regular file\n"),
+    ]);
+    // git cannot add a fifo or a directory, so the route to a tracked non-file
+    // is to replace one in the worktree after the fact.
+    let weird = dir.path().join("weird");
+    std::fs::remove_file(&weird).expect("remove");
+    std::fs::create_dir(&weird).expect("mkdir");
+
+    let out = run_in(dir.path(), &["tree"], "");
+    assert_eq!(
+        out.code,
+        Some(101),
+        "an unmirrorable tracked path must abort the scan: {:?} / {}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("neither a regular file nor a symlink"),
+        "the refusal must name what it will not scan: {}",
+        out.stderr
+    );
+}
+
+/// A path in an unresolved merge is three index entries, one per side. Without
+/// the stage-zero guard, all three arrive: the first mirrors the worktree file
+/// as a hardlink, the second falls through to `fs::copy` onto that same inode
+/// and truncates the operator's conflicted file to zero, and the scan reports
+/// the empty result as clean. Both halves are asserted here -- the content
+/// survives, and no green is printed over it.
+#[test]
+fn an_unresolved_merge_refuses_instead_of_scanning_or_truncating() {
+    if !gitleaks_available() {
+        return;
+    }
+    let dir = repo_with(&[("src/a.rs", "let user = \"alice\";\n")]);
+    let p = dir.path();
+    git(p, &["checkout", "-q", "-b", "other"]);
+    write_file(p, "src/a.rs", &format!("{}// other\n", canary()));
+    git(p, &["commit", "-qam", "other side"]);
+    git(p, &["checkout", "-q", "main"]);
+    write_file(p, "src/a.rs", "let user = \"carol\";\n");
+    git(p, &["commit", "-qam", "main side"]);
+    assert!(
+        !try_git(p, &["merge", "other"]),
+        "the fixture merge must conflict"
+    );
+
+    let conflicted = std::fs::read_to_string(p.join("src/a.rs")).expect("read");
+    assert!(
+        conflicted.contains("<<<<<<<") && conflicted.contains(&canary()),
+        "the fixture must leave a real conflict in the worktree: {conflicted:?}"
+    );
+
+    let out = run_in(p, &["tree"], "");
+    assert_eq!(
+        out.code,
+        Some(101),
+        "a mid-conflict tree must not be scanned: {:?} / {}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("unmerged entries"),
+        "the refusal must name the unresolved merge: {}",
+        out.stderr
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("src/a.rs")).expect("read"),
+        conflicted,
+        "the scan must not touch the conflicted worktree file"
     );
 }

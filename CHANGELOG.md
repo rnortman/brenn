@@ -2,6 +2,25 @@
 
 All notable changes to Brenn are documented here.
 
+## [0.14.4] — 2026-07-28
+
+### Fixed
+
+- **scrub:** `brenn-scrub tree` handles submodules. A tracked gitlink is now
+  recognized from the index and scanned as the pointer text git records for it
+  — the same text the staged and push scans see in a diff — with one stderr
+  line naming the path and saying the submodule's own contents belong to
+  another repository. Previously a repository carrying a submodule could not be
+  swept at all: a checked-out submodule directory aborted the scan, and an
+  uninitialized one was mislabeled a staged deletion and skipped.
+- **scrub:** `brenn-scrub tree` refuses a repository with an unresolved merge
+  instead of destroying the conflicted file. A path in conflict is three index
+  entries, and the tree sweep processed all three: the second one copied the
+  mirror's hardlink back onto the worktree file, truncating it to zero bytes,
+  and the run then reported the empty result as a clean tree. Unmerged entries
+  are now a hard refusal naming the path, and mirroring one path twice is
+  refused outright.
+
 ## [0.14.3] — 2026-07-27
 
 ### Added
