@@ -303,6 +303,13 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
             Some(OUTCOME_ACTION_ERROR),
             Some(format!("deferred-message quota exceeded (cap {cap})")),
         ),
+        // A job's action fields cannot express impetus — a construction
+        // bug, not a fire outcome.
+        PublishResult::ImpetusUnauthorized => unreachable!(
+            "automation fire publish returned ImpetusUnauthorized: a job's publish passes no \
+             impetus; job uuid={}",
+            job.uuid
+        ),
     };
 
     finish_fire(
@@ -1536,6 +1543,7 @@ mod tests {
                 pwa_push: None,
                 webhook_subscriptions: vec![],
                 mqtt_subscriptions: vec![],
+                chat_harness_policy: crate::access::AppPolicy::default(),
             };
             apps.insert("test-app".to_string(), app_cfg);
             let apps = Arc::new(apps);
@@ -1676,6 +1684,7 @@ mod tests {
                 pwa_push: None,
                 webhook_subscriptions: vec![],
                 mqtt_subscriptions: vec![],
+                chat_harness_policy: crate::access::AppPolicy::default(),
             };
             apps.insert("test-app".to_string(), app_cfg);
             let apps = Arc::new(apps);
@@ -1890,6 +1899,7 @@ mod tests {
                 pwa_push: None,
                 webhook_subscriptions: vec![],
                 mqtt_subscriptions: vec![],
+                chat_harness_policy: crate::access::AppPolicy::default(),
             };
             apps.insert("test-app".to_string(), app_cfg);
             let apps = Arc::new(apps);

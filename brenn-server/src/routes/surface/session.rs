@@ -2240,12 +2240,15 @@ async fn handle_publish(
         // component's deferred publish is buffered, and buffered publishes flush
         // as batches — where a full deferred set is per-entry normal operation
         // rather than an outcome this ladder could carry.
+        // `ImpetusUnauthorized` joins them on the same argument: the surface
+        // publish frames carry no impetus field, so this call passes none.
         other @ (PublishResult::MissingSender
         | PublishResult::AclDenied(_)
         | PublishResult::UnknownChannel(_)
         | PublishResult::MalformedAddress(_)
         | PublishResult::UnsupportedOption { .. }
-        | PublishResult::DeferredQuotaExceeded { .. }) => {
+        | PublishResult::DeferredQuotaExceeded { .. }
+        | PublishResult::ImpetusUnauthorized) => {
             if is_error_report {
                 error!(
                     surface = %slug,
@@ -4447,6 +4450,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             ts_ns,
         )
         .id
@@ -4584,6 +4588,7 @@ mod tests {
                 reply_to: None,
                 delivery_deadline: None,
                 deliver_after: None,
+                impetus: None,
                 urgency: Urgency::Normal,
                 envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
             })
@@ -4709,6 +4714,7 @@ mod tests {
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
+            impetus: None,
             urgency: Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
         });
@@ -6142,6 +6148,7 @@ mod tests {
                     envelope_type: brenn_lib::messaging::ChannelScheme::Ephemeral,
                     reply_to_uuid: None,
                     delivery_deadline: None,
+                    impetus: None,
                     publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
                 },
                 now + chrono::Duration::hours(1),
@@ -6473,6 +6480,7 @@ mod tests {
                     envelope_type: brenn_lib::messaging::ChannelScheme::Ephemeral,
                     reply_to_uuid: None,
                     delivery_deadline: None,
+                    impetus: None,
                     publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
                 },
                 now + chrono::Duration::hours(1),
@@ -6555,6 +6563,7 @@ mod tests {
                     envelope_type: brenn_lib::messaging::ChannelScheme::Ephemeral,
                     reply_to_uuid: None,
                     delivery_deadline: None,
+                    impetus: None,
                     publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
                 },
                 now + chrono::Duration::hours(1),

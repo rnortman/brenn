@@ -10,15 +10,15 @@ use super::{ChannelEntry, MessageEnvelope, Messenger};
 
 /// Common SELECT base for `messaging_messages` reads that feed [`row_to_envelope`].
 ///
-/// Covers columns 0–12 (m.uuid .. m.envelope_type), the mandatory channel JOIN, and the
+/// Covers columns 0–13 (m.uuid .. m.impetus), the mandatory channel JOIN, and the
 /// optional reply-to LEFT JOIN. Terminates with a trailing space **before** any FTS JOIN or
 /// `WHERE` clause so callers can append either immediately.
 ///
-/// Column layout matches [`row_to_envelope`]'s documented 0–12 contract exactly; do not
+/// Column layout matches [`row_to_envelope`]'s documented 0–13 contract exactly; do not
 /// reorder or add columns here without updating that decoder and the byte-identity tests.
 const SELECT_ENVELOPE_BASE: &str = "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency, \
             m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns, \
-            c.address, rc.address, m.envelope_type \
+            c.address, rc.address, m.envelope_type, m.impetus \
      FROM messaging_messages m \
      JOIN messaging_channels c ON c.uuid = m.channel_uuid \
      LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid ";
@@ -245,14 +245,14 @@ fn run_query(
     Ok(out)
 }
 
-/// Decode one SELECT row (columns 0–12) into a [`MessageEnvelope`].
+/// Decode one SELECT row (columns 0–13) into a [`MessageEnvelope`].
 ///
 /// Column layout expected:
 /// - 0: m.uuid (bytes)  1: m.channel_uuid (bytes, unused)  2: m.source  3: m.sender
 /// - 4: m.body  5: m.urgency  6: m.reply_to_uuid (bytes, unused)
 /// - 7: m.delivery_deadline  8: m.deliver_after  9: m.publish_ts_ns
 /// - 10: c.address (channel address string)  11: rc.address (reply_to, nullable)
-/// - 12: m.envelope_type
+/// - 12: m.envelope_type  13: m.impetus (nullable)
 pub(crate) fn row_to_envelope(row: &rusqlite::Row) -> rusqlite::Result<MessageEnvelope> {
     let msg_uuid_bytes: Vec<u8> = row.get(0)?;
     // col 1 (channel_uuid bytes) is selected but not used here — address is in col 10.
@@ -270,6 +270,7 @@ pub(crate) fn row_to_envelope(row: &rusqlite::Row) -> rusqlite::Result<MessageEn
     // NULL when not a reply.
     let reply_to: Option<String> = row.get(11)?;
     let envelope_type_str: String = row.get(12)?;
+    let impetus_str: Option<String> = row.get(13)?;
 
     let message_id = Uuid::from_slice(&msg_uuid_bytes)
         .unwrap_or_else(|e| panic!("messaging: query row uuid malformed: {e}"));
@@ -279,6 +280,10 @@ pub(crate) fn row_to_envelope(row: &rusqlite::Row) -> rusqlite::Result<MessageEn
     let deliver_after = deliver_after_s.and_then(|s| super::db::parse_rfc3339(&s));
     let envelope_type = super::ChannelScheme::parse(&envelope_type_str).unwrap_or_else(|| {
         panic!("messaging: unknown envelope_type {envelope_type_str:?} — host wrote every row")
+    });
+    let impetus = impetus_str.map(|s| {
+        super::Impetus::parse(&s)
+            .unwrap_or_else(|| panic!("messaging: unknown impetus {s:?} — host wrote every row"))
     });
 
     Ok(MessageEnvelope {
@@ -291,6 +296,7 @@ pub(crate) fn row_to_envelope(row: &rusqlite::Row) -> rusqlite::Result<MessageEn
         reply_to,
         delivery_deadline,
         deliver_after,
+        impetus,
         urgency,
         envelope_type,
     })
@@ -388,6 +394,7 @@ pub mod tests {
             body,
             Urgency::Low,
             crate::messaging::ChannelScheme::Brenn,
+            None,
             None,
             None,
             None,
@@ -1397,6 +1404,7 @@ pub mod tests {
             },
             webhook_subscriptions: vec![],
             mqtt_subscriptions: vec![],
+            chat_harness_policy: crate::access::AppPolicy::default(),
         }
     }
 
@@ -1709,16 +1717,16 @@ pub mod tests {
     }
 
     // Byte-identity tests: pin each constant (and the assembled window-snapshot SQL) against
-    // the pre-refactor literal text. These fail loudly if a constant is edited without updating
-    // the golden, guarding against whitespace/boundary drift and silent future column-list
-    // divergence.
+    // its literal text spelled out here. These fail loudly if a constant is edited without
+    // updating the golden, guarding against whitespace/boundary drift and silent column-list
+    // divergence from the decoder's positional contract.
 
     #[test]
     fn select_envelope_base_matches_prerefactor_literal() {
-        // Golden: the base SELECT fragment from the pre-refactor run_query literal, verbatim.
+        // Golden: the base SELECT fragment, verbatim.
         let golden = "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency, \
                       m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns, \
-                      c.address, rc.address, m.envelope_type \
+                      c.address, rc.address, m.envelope_type, m.impetus \
                FROM messaging_messages m \
                JOIN messaging_channels c ON c.uuid = m.channel_uuid \
                LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid ";
@@ -1727,17 +1735,17 @@ pub mod tests {
 
     #[test]
     fn select_envelope_order_limit_tail_matches_prerefactor_literal() {
-        // Golden: the ORDER BY + LIMIT tail from the pre-refactor run_query literal, verbatim.
+        // Golden: the ORDER BY + LIMIT tail, verbatim.
         let golden = "ORDER BY m.publish_ts_ns DESC, m.id DESC LIMIT ?";
         assert_eq!(SELECT_ENVELOPE_ORDER_LIMIT_TAIL, golden);
     }
 
     #[test]
     fn assembled_window_snapshot_sql_matches_prerefactor_literal() {
-        // Golden: the complete SQL string from the pre-refactor load_window_snapshot prepare call.
+        // Golden: the complete SQL string `load_window_snapshot` prepares.
         let golden = "SELECT m.uuid, m.channel_uuid, m.source, m.sender, m.body, m.urgency, \
                       m.reply_to_uuid, m.delivery_deadline, m.deliver_after, m.publish_ts_ns, \
-                      c.address, rc.address, m.envelope_type \
+                      c.address, rc.address, m.envelope_type, m.impetus \
                FROM messaging_messages m \
                JOIN messaging_channels c ON c.uuid = m.channel_uuid \
                LEFT JOIN messaging_channels rc ON rc.uuid = m.reply_to_uuid \
@@ -1771,6 +1779,7 @@ pub mod tests {
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
+            impetus: None,
             urgency: Urgency::Normal,
             envelope_type: scheme,
         }

@@ -156,6 +156,7 @@ pub(super) fn default_app_cfg_with_subscriptions(
         pwa_push: None,
         webhook_subscriptions: vec![],
         mqtt_subscriptions: vec![],
+        chat_harness_policy: crate::access::AppPolicy::default(),
     }
 }
 

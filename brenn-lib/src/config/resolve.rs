@@ -811,6 +811,9 @@ pub fn validate_and_resolve(
             // phase (after all other phases). Default (empty, deny-everything)
             // here; populated from explicit `grants`/`[app.acl.*]` later.
             policy: crate::access::AppPolicy::default(),
+            // Derived in the same follow-up phase, from the app slug and the
+            // `[llm_chat]` prefix. Default (deny-everything) here.
+            chat_harness_policy: crate::access::AppPolicy::default(),
             // Per-app pwa_push block: carry through as-is; validation happens
             // in `resolve_pwa_push_layer` (Phase 5 below).
             pwa_push: raw.pwa_push.clone(),
@@ -1051,10 +1054,9 @@ fn resolve_messaging_layer(
 /// `mqtt_subscribe`/`mqtt_publish` matcher naming a client absent from
 /// `resolved_clients` (the Phase 6 MQTT client map).
 ///
-/// The derived chat-tree grant (`LlmChatConfig::grant_app_chat_tree`) is
-/// applied *after* `warn_granted_publish_no_matcher` so that diagnostic keeps
-/// reading the operator's authored coverage — the derived matcher would
-/// otherwise make every publish list non-empty and silence it forever.
+/// The app's derived chat-harness policy is stamped beside the authored one, on
+/// its own field: the harness's chat-tree authority never enters `policy`, so
+/// the app's LLM sees only what the operator wrote.
 fn resolve_access_policies(
     raw_apps: &[AppConfigRaw],
     apps: &mut IndexMap<String, AppConfig>,
@@ -1080,7 +1082,7 @@ fn resolve_access_policies(
         app.policy.tool_grants =
             crate::tools::config::resolve_app_tool_grants(&owner, &raw.tool_grants, &mount_slugs);
         warn_granted_publish_no_matcher(&raw.slug, &app.policy);
-        llm_chat.grant_app_chat_tree(&raw.slug, &mut app.policy);
+        app.chat_harness_policy = llm_chat.harness_policy(&raw.slug);
     }
 }
 
@@ -1231,10 +1233,13 @@ fn validate_primary_ownership(apps: &mut IndexMap<String, AppConfig>) {
 
 /// Validate `server.public_url` at config load time.
 ///
-/// If `public_url` is `None`, this is a no-op — consumers that require the
-/// field panic independently with their own messages.
+/// The field is **required**. It is the message source identifier stamped on
+/// every published message, and messaging is configured in every real
+/// deployment — a Brenn with no apps, no channels and no surfaces has nothing to
+/// serve. Absence is a config error, refused here before any subsystem starts.
 ///
-/// If `Some`, rejects:
+/// Rejects:
+/// - A missing or empty value.
 /// - Raw bytes that are control characters (`b < 0x20` or `b == 0x7F`), which
 ///   URL parsers would silently percent-encode rather than reject.
 /// - Values that are not syntactically valid URLs per the `url` crate.
@@ -1244,10 +1249,20 @@ fn validate_primary_ownership(apps: &mut IndexMap<String, AppConfig>) {
 /// Panics with a message identifying the offending byte or parse error so the
 /// operator can fix the config without reading source.
 fn validate_public_url(server: &ServerConfig) {
-    let url_str = match server.public_url.as_deref() {
-        None => return,
-        Some(s) => s,
-    };
+    let url_str = server.public_url.as_deref().unwrap_or_else(|| {
+        panic!(
+            "config: server.public_url is required — it is the externally-visible \
+             URL Brenn stamps as the source of every published message and mentions \
+             in runbooks and alerts. Set it to the public HTTPS URL in front of the \
+             reverse proxy (e.g. \"https://brenn.example.com\", no trailing slash). \
+             Refusing to start (fail-fast on invalid config)."
+        )
+    });
+    assert!(
+        !url_str.is_empty(),
+        "config: server.public_url is set but empty — it is required and must be a \
+         well-formed URL. Refusing to start (fail-fast on invalid config).",
+    );
 
     // Check for control characters before URL parsing: url::Url would
     // percent-encode these rather than reject them.

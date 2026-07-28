@@ -775,6 +775,7 @@ mod tests {
             reply_to_uuid,
             None,
             None,
+            None,
             utc_to_ns(Utc::now()),
         );
     }

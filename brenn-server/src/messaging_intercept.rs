@@ -449,6 +449,21 @@ pub async fn try_handle_messaging_tool(
                     .await,
                 );
             }
+            // Reject `impetus` by name rather than ignoring it: carried
+            // user-interaction authority is not an LLM's to assert, and a model
+            // probing for it hears "no" instead of silence.
+            if tool_input.get("impetus").is_some() {
+                return Some(
+                    tool_error_response(
+                        bridge,
+                        tool_name,
+                        tool_input,
+                        "unknown field `impetus`; a message's user-interaction authority is set \
+                         by the server, never by a tool call",
+                    )
+                    .await,
+                );
+            }
             let urgency_str = tool_input
                 .get("urgency")
                 .and_then(|v| v.as_str())
@@ -582,6 +597,13 @@ pub async fn try_handle_messaging_tool(
                     "deferred-message quota exceeded: this channel already holds its cap of {cap} \
                      scheduled messages; retry after some release"
                 ))),
+                // `Messenger::publish` carries no impetus and the `impetus` key
+                // is rejected by name before we get here, so this is a
+                // construction bug, not an outcome to hand the model.
+                PublishResult::ImpetusUnauthorized => unreachable!(
+                    "BrennSend publish returned ImpetusUnauthorized: this entry point passes no \
+                     impetus"
+                ),
             };
             let output_str = serde_json::to_string(&outcome_value)
                 .expect("outcome_value serialization is infallible");
@@ -3747,6 +3769,7 @@ mod tests {
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
+            impetus: None,
             urgency: Urgency::Low,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
         };
@@ -3805,6 +3828,32 @@ mod tests {
                 assert!(
                     err.contains("urgency"),
                     "error must mention 'urgency': {err}"
+                );
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// BrennSend naming `impetus` returns `ok:false` naming the field. Carried
+    /// user-interaction authority is not an LLM's to assert, and a probing model
+    /// must hear "no" rather than have the key silently ignored.
+    #[tokio::test]
+    async fn brenn_send_impetus_key_returns_error() {
+        let bridge = crate::active_bridge::ActiveBridge::test_new_with_combined_services().await;
+        let req = post_tool_use_req(
+            MCP_MESSAGE_SEND_TOOL,
+            json!({ "to": "brenn:test-channel", "body": "x", "impetus": "replenish" }),
+        );
+        match try_handle_messaging_tool(&bridge, &req).await {
+            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
+                updated_output: Some(out),
+            })) => {
+                let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(v["ok"], json!(false), "expected ok:false, got: {out}");
+                let err = v["error"].as_str().unwrap_or("");
+                assert!(
+                    err.contains("impetus"),
+                    "error must name the `impetus` field: {err}"
                 );
             }
             other => panic!("unexpected result: {other:?}"),

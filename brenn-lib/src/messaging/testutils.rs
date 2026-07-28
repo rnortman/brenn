@@ -417,6 +417,7 @@ pub async fn insert_bus_message_at(
         None,
         None,
         None,
+        None,
         ts_ns,
     )
     .uuid
@@ -536,6 +537,7 @@ pub async fn insert_retain_only(
         body,
         Urgency::Low,
         envelope_type,
+        None,
         None,
         None,
         None,

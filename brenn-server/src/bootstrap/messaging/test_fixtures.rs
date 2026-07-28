@@ -75,6 +75,7 @@ pub(crate) fn minimal_app_config(
         pwa_push: None,
         webhook_subscriptions,
         mqtt_subscriptions: vec![],
+        chat_harness_policy: brenn_lib::access::AppPolicy::default(),
     }
 }
 

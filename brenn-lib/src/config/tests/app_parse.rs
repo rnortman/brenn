@@ -147,6 +147,7 @@ fn validate_preserves_declared_app_order() {
         .collect();
 
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: apps_raw,
         ..Default::default()
     };
@@ -194,6 +195,7 @@ fn validate_resolves_messaging_layer_for_apps_with_messaging_blocks() {
     };
 
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![sender_app, quiet_app],
         channels: vec![channel],
         ..Default::default()
@@ -262,6 +264,7 @@ slug = "pfin"
 fn validate_mcp_servers_carried_through() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pfin".to_string(),
             working_dir: Some(dir.path().to_path_buf()),

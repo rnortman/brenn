@@ -41,10 +41,13 @@ pub struct ServerConfig {
     ///
     /// Used wherever Brenn needs to mention its own externally-visible URL —
     /// runbook messages, alert bodies, webhook endpoint documentation,
-    /// eventually shareable links. Separate from `bind_address`, which is the
+    /// eventually shareable links — and as the message source identifier stamped
+    /// on every published message. Separate from `bind_address`, which is the
     /// internal socket the reverse proxy connects to.
     ///
-    /// Optional, but recommended for every deployment.
+    /// **Required.** `Option` here only so that a missing key produces the
+    /// explanatory load-time panic (`validate_and_resolve`) rather than a terse
+    /// serde parse error; a config without it does not start.
     pub public_url: Option<String>,
 }
 

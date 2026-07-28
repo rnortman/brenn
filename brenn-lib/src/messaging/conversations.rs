@@ -46,8 +46,14 @@ struct ConversationAdvance {
 
 impl ConversationDelivery {
     /// Nothing was owed on any channel.
+    ///
+    /// Keyed on the spans, not the messages: a batch consisting entirely of the
+    /// conversation's own utterances is filtered down to no messages while its
+    /// positions are still owed an advance. A caller that read emptiness off the
+    /// message list would leave those positions in place and be handed the same
+    /// batch on every subsequent wake, forever.
     pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
+        self.spans.is_empty()
     }
 }
 
@@ -192,6 +198,19 @@ impl Messenger {
     /// A subscription whose position is gone by the time its window is read is
     /// skipped: an unsubscribe can land between the enumeration above and the
     /// read below, and a subscriber that left is owed nothing.
+    ///
+    /// **A conversation is never handed a message it itself sent.** Envelopes
+    /// whose sender is this conversation are dropped from the batch: its own
+    /// utterances are already in its context, so repeating them back is zero
+    /// information at the price of a real turn. It also breaks the cycle an
+    /// operator-authored subscription on a conversation's own record would
+    /// otherwise arm, where a delivery is injected as a system message, the
+    /// system message is republished to the record, and the record delivers it
+    /// again — a loop with no decision in it anywhere.
+    ///
+    /// The spans are computed over everything the windows held, filtered or not,
+    /// so the positions advance past a self-echo rather than being re-served it
+    /// on every wake.
     pub async fn conversation_delivery(&self, conversation_id: i64) -> ConversationDelivery {
         let subscriber = ParticipantId::for_conversation(conversation_id);
         let mut delivery = ConversationDelivery::default();
@@ -220,6 +239,7 @@ impl Messenger {
                 window
                     .new_entries()
                     .iter()
+                    .filter(|(_, env)| env.sender != subscriber.as_str())
                     .map(|(_, env)| MessageEnvelope::clone(env)),
             );
             if let Some((through, seen_floor)) = window.advance_span() {
@@ -367,15 +387,21 @@ mod tests {
     }
 
     async fn publish(m: &Messenger, channel_uuid: Uuid, body: &str) {
+        publish_from(m, channel_uuid, "someone", body).await;
+    }
+
+    /// [`publish`] with the sender named, for the cases that turn on who spoke.
+    async fn publish_from(m: &Messenger, channel_uuid: Uuid, sender: &str, body: &str) {
         let conn = m.db.lock().await;
         insert_message(
             &conn,
             channel_uuid,
             "test-source",
-            "someone",
+            sender,
             body,
             Urgency::Normal,
             ChannelScheme::Brenn,
+            None,
             None,
             None,
             None,
@@ -444,6 +470,74 @@ mod tests {
         assert!(
             m.conversation_delivery(conversation).await.is_empty(),
             "the advance moved the position past the batch"
+        );
+    }
+
+    /// A conversation subscribed to a channel it also publishes on is served
+    /// everyone else's messages and none of its own.
+    #[tokio::test]
+    async fn a_conversation_is_not_served_its_own_utterances() {
+        let ch = channel("chat", Depth::Bounded(5));
+        let uuid = ch.uuid;
+        let m = messenger(vec![ch]).await;
+        m.attach_conversation_subscribers().await;
+        let conversation = conversation_of(&m).await;
+        let me = ParticipantId::for_conversation(conversation);
+
+        publish_from(&m, uuid, "someone", "from a peer").await;
+        publish_from(&m, uuid, me.as_str(), "my own echo").await;
+        publish_from(&m, uuid, "app:other@host", "from an app").await;
+
+        let delivery = m.conversation_delivery(conversation).await;
+        assert_eq!(
+            delivery
+                .messages
+                .iter()
+                .map(|e| e.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["from a peer", "from an app"],
+            "only the conversation's own sender is filtered"
+        );
+    }
+
+    /// The livelock pin: a batch that filters down to nothing still owes an
+    /// advance, and taking it leaves nothing owed. A caller that read emptiness
+    /// off the message list would be handed this batch on every wake forever.
+    #[tokio::test]
+    async fn an_all_self_batch_advances_without_serving_anything() {
+        let ch = channel("chat", Depth::Bounded(5));
+        let uuid = ch.uuid;
+        let m = messenger(vec![ch]).await;
+        m.attach_conversation_subscribers().await;
+        let conversation = conversation_of(&m).await;
+        let me = ParticipantId::for_conversation(conversation);
+
+        publish_from(&m, uuid, me.as_str(), "one").await;
+        publish_from(&m, uuid, me.as_str(), "two").await;
+
+        let delivery = m.conversation_delivery(conversation).await;
+        assert!(delivery.messages.is_empty(), "nothing to say");
+        assert!(
+            !delivery.is_empty(),
+            "the positions are still owed an advance"
+        );
+
+        m.advance_conversation(conversation, delivery).await;
+        assert!(
+            m.conversation_delivery(conversation).await.is_empty(),
+            "the advance retired the batch; a later wake finds nothing owed"
+        );
+
+        // And the channel is live again for a real message.
+        publish_from(&m, uuid, "someone", "after").await;
+        let delivery = m.conversation_delivery(conversation).await;
+        assert_eq!(
+            delivery
+                .messages
+                .iter()
+                .map(|e| e.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["after"]
         );
     }
 

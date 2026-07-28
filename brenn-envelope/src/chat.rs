@@ -7,6 +7,12 @@
 //! fields and new event types. A breaking change bumps
 //! [`CHAT_PROTOCOL_VERSION`].
 //!
+//! `docs/chat-protocol.md` is the normative specification, written for a peer
+//! author who reads no Rust; this module is its implementation. **A vocabulary
+//! change updates both in the same commit** — the test at the bottom of this
+//! file derives every wire tag from the types below and fails when one of them
+//! is missing from that document.
+//!
 //! Three vocabularies, one per direction:
 //!
 //! - [`ChatCommand`] — peer → conversation, on the durable `…in.<id>` channel.
@@ -662,5 +668,196 @@ mod tests {
     #[test]
     fn legacy_sender_form_is_not_a_participant_id() {
         assert_eq!(legacy_ws_sender("alice"), "legacy-ws:alice");
+    }
+
+    /// Register one chat vocabulary: each published variant's pattern, its wire
+    /// tag, and a sample value of that variant, in a single declaration.
+    ///
+    /// The generated match is exhaustive, so adding a variant to
+    /// [`ChatCommand`], [`ChatEvent`] or [`ChatStreamEvent`] stops this file
+    /// compiling — and the registration that fixes the compile carries the
+    /// sample with it, so [`every_wire_tag`] cannot silently omit the new tag
+    /// and [`the_document_describes_every_wire_tag`] keeps failing until
+    /// `docs/chat-protocol.md` describes it.
+    ///
+    /// `never_published` variants are decode artifacts: [`decode`] produces them
+    /// for bodies it does not recognize and nothing publishes them, so they are
+    /// not wire tags and have nothing to document.
+    macro_rules! wire_vocabulary {
+        (
+            $ty:ty, $tag_fn:ident, $samples_fn:ident,
+            published { $( $pattern:pat => $tag:literal, sample $sample:expr ; )+ }
+            never_published { $( $artifact:pat ),* $(,)? }
+        ) => {
+            fn $tag_fn(value: &$ty) -> &'static str {
+                match value {
+                    $( $pattern => $tag, )+
+                    $( $artifact => panic!(concat!(
+                        stringify!($ty),
+                        " decode artifacts are never published tags"
+                    )), )*
+                }
+            }
+
+            fn $samples_fn() -> Vec<$ty> {
+                vec![$( $sample ),+]
+            }
+        };
+    }
+
+    wire_vocabulary! {
+        ChatCommand, tag_of_command, command_samples,
+        published {
+            ChatCommand::Send { .. } => "send", sample ChatCommand::Send {
+                text: "hi".to_string(),
+                model: None,
+                attachments: Vec::new(),
+                correlation: None,
+            };
+            ChatCommand::Stop { .. } => "stop", sample ChatCommand::Stop { correlation: None };
+            ChatCommand::SetModel { .. } => "set_model", sample ChatCommand::SetModel {
+                model: "sonnet".to_string(),
+                correlation: None,
+            };
+            ChatCommand::Compact { .. } => "compact", sample ChatCommand::Compact {
+                correlation: None,
+            };
+        }
+        never_published {}
+    }
+
+    wire_vocabulary! {
+        ChatEvent, tag_of_event, event_samples,
+        published {
+            ChatEvent::UserMessage { .. } => "user_message", sample ChatEvent::UserMessage {
+                text: "hi".to_string(),
+                attachments: Vec::new(),
+                sender: legacy_ws_sender("alice"),
+                correlation: None,
+            };
+            ChatEvent::AssistantMessage { .. } => "assistant_message",
+                sample ChatEvent::AssistantMessage {
+                    text: "hello".to_string(),
+                    turn: "t1".to_string(),
+                };
+            ChatEvent::SystemMessage { .. } => "system_message", sample ChatEvent::SystemMessage {
+                text: "note".to_string(),
+                category: SystemMessageCategory::EventDrain,
+            };
+            ChatEvent::Status { .. } => "status", sample ChatEvent::Status {
+                state: CcState::Idle,
+            };
+            ChatEvent::Error { .. } => "error", sample ChatEvent::Error {
+                message: "no".to_string(),
+                correlation: None,
+            };
+            ChatEvent::Ack { .. } => "ack", sample ChatEvent::Ack {
+                command: "stop".to_string(),
+                correlation: None,
+            };
+            ChatEvent::ModelChanged { .. } => "model_changed", sample ChatEvent::ModelChanged {
+                model: "sonnet".to_string(),
+                correlation: None,
+            };
+            ChatEvent::Models { .. } => "models", sample ChatEvent::Models {
+                available: Vec::new(),
+            };
+            ChatEvent::ToolUse { .. } => "tool_use", sample ChatEvent::ToolUse {
+                tool_name: "Read".to_string(),
+                summary: "read a file".to_string(),
+            };
+            ChatEvent::ContextUsage { .. } => "context_usage", sample ChatEvent::ContextUsage {
+                usage_pct: 1,
+                current_tokens: 1,
+                max_tokens: 2,
+                reminder_pct: 70,
+                red_pct: 90,
+                reminder_tokens: None,
+                red_tokens: None,
+            };
+            ChatEvent::CostUsage { .. } => "cost_usage", sample ChatEvent::CostUsage {
+                last_turn_usd: 0.0,
+                since_last_compaction_usd: 0.0,
+                last_24h_usd: 0.0,
+            };
+        }
+        never_published { ChatEvent::Unknown }
+    }
+
+    wire_vocabulary! {
+        ChatStreamEvent, tag_of_stream_event, stream_event_samples,
+        published {
+            ChatStreamEvent::Tokens { .. } => "tokens", sample ChatStreamEvent::Tokens {
+                text: "par".to_string(),
+                kind: TokenKind::Text,
+                turn: "t1".to_string(),
+            };
+        }
+        never_published { ChatStreamEvent::Unknown }
+    }
+
+    /// Every tag a build can put on the wire, each cross-checked against what
+    /// serde actually serializes — so the registered literals cannot drift from
+    /// the wire form either.
+    fn every_wire_tag() -> Vec<&'static str> {
+        fn serialized_tag<T: Serialize>(value: &T) -> String {
+            let body = encode(value);
+            let parsed: serde_json::Value = serde_json::from_str(&body).expect("body is JSON");
+            parsed["type"]
+                .as_str()
+                .expect("body carries a type")
+                .to_string()
+        }
+
+        let mut tags = Vec::new();
+
+        for command in &command_samples() {
+            let tag = tag_of_command(command);
+            assert_eq!(serialized_tag(command), tag);
+            tags.push(tag);
+        }
+        for event in &event_samples() {
+            let tag = tag_of_event(event);
+            assert_eq!(serialized_tag(event), tag);
+            tags.push(tag);
+        }
+        for event in &stream_event_samples() {
+            let tag = tag_of_stream_event(event);
+            assert_eq!(serialized_tag(event), tag);
+            tags.push(tag);
+        }
+
+        tags
+    }
+
+    /// The normative spec lives beside the code and must describe every tag the
+    /// code can emit. Crude on purpose: it turns "added a variant, forgot the
+    /// doc" into a red test.
+    ///
+    /// The match is on the tag's own section heading, not on the tag appearing
+    /// somewhere in the prose: these are ordinary words (`send`, `error`,
+    /// `status`, `models`), and a check the running text can satisfy by accident
+    /// is a check a new undocumented variant walks straight through.
+    #[test]
+    fn the_document_describes_every_wire_tag() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("docs/chat-protocol.md");
+        let spec = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} is readable: {e}", path.display()));
+        let headings: Vec<&str> = spec.lines().map(str::trim_end).collect();
+
+        let missing: Vec<&str> = every_wire_tag()
+            .into_iter()
+            .filter(|tag| {
+                let heading = format!("### `{tag}`");
+                !headings.contains(&heading.as_str())
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/chat-protocol.md has no `### `<tag>`` section for {missing:?} — the \
+             vocabulary and its normative spec change in the same commit"
+        );
     }
 }

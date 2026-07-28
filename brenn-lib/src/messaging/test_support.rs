@@ -85,6 +85,10 @@ pub(super) fn test_app_config(
         pwa_push: None,
         webhook_subscriptions: vec![],
         mqtt_subscriptions: vec![],
+        // Deny-everything: a test that drives the chat machinery stamps
+        // `LlmChatConfig::harness_policy` over this itself, so nothing else
+        // silently gains chat-tree reach.
+        chat_harness_policy: crate::access::AppPolicy::default(),
     }
 }
 

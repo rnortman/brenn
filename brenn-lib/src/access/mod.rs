@@ -380,6 +380,19 @@ pub enum AppCapability {
     Webhook,
     /// Receive PWA push notifications (no per-channel scope).
     PwaPush,
+    // carried authority
+    /// Set `impetus` on a published message — the claim that live user
+    /// interaction produced it. Orthogonal to channel ACL: a minting principal
+    /// still needs publish authority over its target, and a publish carrying
+    /// impetus without this grant is refused whole rather than stripped.
+    ///
+    /// TODO(chat-surface-mints-impetus): nothing in production mints yet, so a
+    /// conversation's impetus pool is refilled only by the legacy websocket
+    /// door. A user who reaches their conversations over the bus alone will see
+    /// them exhaust and stall with no bus-side remedy. The chat surface is the
+    /// first minter: it authors the grant mapping, carries the field on its
+    /// publish frames, and derives it from a real user gesture.
+    MintImpetus,
     // WASM host capabilities. Authored as `WasmGrant` on WASM components and
     // mapped to these variants internally; not part of the LLM `grants` token
     // vocabulary. Because `Deserialize` is derived for the whole enum, these
@@ -453,6 +466,7 @@ mod tests {
         AppCapability::MqttSubscribe,
         AppCapability::Webhook,
         AppCapability::PwaPush,
+        AppCapability::MintImpetus,
         AppCapability::WasmStore,
         AppCapability::WasmLog,
         AppCapability::WasmAlert,
@@ -477,6 +491,7 @@ mod tests {
             | AppCapability::MqttSubscribe
             | AppCapability::Webhook
             | AppCapability::PwaPush
+            | AppCapability::MintImpetus
             | AppCapability::WasmStore
             | AppCapability::WasmLog
             | AppCapability::WasmAlert

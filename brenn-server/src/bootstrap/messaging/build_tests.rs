@@ -2144,6 +2144,7 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         reply_to: None,
         delivery_deadline: None,
         deliver_after: None,
+        impetus: None,
         urgency: brenn_lib::messaging::Urgency::Normal,
         envelope_type: brenn_lib::messaging::ChannelScheme::Local,
     });
@@ -2249,6 +2250,7 @@ async fn warm_channel_with_messages(db: &brenn_lib::db::Db, channel_uuid: uuid::
             &format!("body-{i}"),
             brenn_lib::messaging::Urgency::Normal,
             brenn_lib::messaging::ChannelScheme::Brenn,
+            None,
             None,
             None,
             None,

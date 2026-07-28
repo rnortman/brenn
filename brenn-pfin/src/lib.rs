@@ -642,6 +642,7 @@ mod tests {
             pwa_push: None,
             webhook_subscriptions: vec![],
             mqtt_subscriptions: vec![],
+            chat_harness_policy: brenn_lib::access::AppPolicy::default(),
         };
         assert!(pfin_config(&app).is_none());
     }
@@ -666,6 +667,9 @@ mod tests {
         let registry = IntegrationRegistry::new(vec![Box::new(PfinFactory)]);
         let config: BrennConfig = toml::from_str(&format!(
             r#"
+[server]
+public_url = "https://brenn.example.com"
+
 [integrations.pfin]
 command = "pf"
 
@@ -698,6 +702,9 @@ integrations = ["pfin"]
         let registry = IntegrationRegistry::new(vec![Box::new(PfinFactory)]);
         let config: BrennConfig = toml::from_str(&format!(
             r#"
+[server]
+public_url = "https://brenn.example.com"
+
 [integrations.pfin]
 command = "pf"
 
@@ -740,6 +747,9 @@ env = {{ PFIN_DATA = "/data/pfin", PFIN_ENV_FILE = "/etc/pfin.env" }}
         // No [integrations.pfin] block — factory.create() should panic.
         let config: BrennConfig = toml::from_str(&format!(
             r#"
+[server]
+public_url = "https://brenn.example.com"
+
 [[app]]
 slug = "myapp"
 working_dir = "{}"

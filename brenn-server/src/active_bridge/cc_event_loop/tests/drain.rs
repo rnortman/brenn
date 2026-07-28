@@ -16,8 +16,9 @@ use super::super::super::test_support::{
 };
 use super::super::*;
 use super::{
-    bridge_with_messenger_for_drain, bridge_with_unspawned_event_loop, enqueue_ingress,
-    pending_ingress_count, seed_pending_push,
+    bridge_with_messenger_for_drain, bridge_with_messenger_for_drain_at_ceiling,
+    bridge_with_unspawned_event_loop, enqueue_ingress, pending_ingress_count, seed_pending_push,
+    seed_pending_push_from, seed_pending_push_with_impetus,
 };
 
 /// Whether the bridge's conversation is still owed anything on a bus channel —
@@ -477,6 +478,74 @@ async fn drain_combined_events_and_messaging_marks_all_delivered() {
     );
 }
 
+/// A bus batch consisting solely of the conversation's own utterances costs it
+/// nothing: no CC turn, no broadcast — and the position still advances, so a
+/// later wake finds nothing owed rather than the same batch forever.
+///
+/// This is the machinery loop's break: an operator-authored subscription on a
+/// conversation's own record would otherwise inject each record event as a
+/// system message, which is republished to the record, and round again.
+#[tokio::test]
+async fn a_self_echo_batch_advances_and_injects_nothing() {
+    let (bridge, mut broadcast_rx) = bridge_with_messenger_for_drain().await;
+
+    let me = brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id);
+    seed_pending_push_from(&bridge, me.as_str(), "my own words, coming back").await;
+
+    // A live session, so a send would succeed if the drain attempted one.
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    drain_pending_events(&bridge).await;
+
+    let msgs = drain_broadcast(&mut broadcast_rx);
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, WsServerMessage::SystemMessageBroadcast { .. })),
+        "a conversation must not be told what it itself said; got {msgs:?}"
+    );
+    assert!(
+        !owed_on_the_bus(&bridge).await,
+        "the position must advance past a self-echo or every wake re-serves it"
+    );
+}
+
+/// The other half of the filter: a batch mixing the conversation's own message
+/// with a peer's delivers the peer's and only the peer's.
+#[tokio::test]
+async fn a_mixed_batch_delivers_only_what_the_conversation_did_not_say() {
+    let (bridge, mut broadcast_rx) = bridge_with_messenger_for_drain().await;
+
+    let me = brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id);
+    seed_pending_push_from(&bridge, me.as_str(), "self-echo-body").await;
+    seed_pending_push_from(&bridge, "conversation:99", "peer-body").await;
+
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    drain_pending_events(&bridge).await;
+
+    let msgs = drain_broadcast(&mut broadcast_rx);
+    let rendered: Vec<&String> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            WsServerMessage::SystemMessageBroadcast { rendered_html, .. } => Some(rendered_html),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rendered.len(), 1, "one injection for the batch: {msgs:?}");
+    assert!(
+        rendered[0].contains("peer-body"),
+        "the peer's message must be delivered; html: {}",
+        rendered[0]
+    );
+    assert!(
+        !rendered[0].contains("self-echo-body"),
+        "the conversation's own message must not be; html: {}",
+        rendered[0]
+    );
+    assert!(!owed_on_the_bus(&bridge).await);
+}
+
 /// Send-failure path: one event + one pending push, no session installed.
 ///
 /// Asserts:
@@ -817,4 +886,408 @@ async fn live_delivery_serves_the_backlog_once() {
         !owed_on_the_bus(&bridge).await,
         "the advance moved the position past both messages"
     );
+}
+
+// -----------------------------------------------------------------------
+// The impetus pool: what an ambience injection costs, and what restores it
+// -----------------------------------------------------------------------
+
+/// The ceiling the bridge's app resolves — read from the bridge rather than
+/// duplicated, so a fixture that changes it fails on the assertion that cares
+/// instead of on an unrelated literal.
+fn ceiling(bridge: &ActiveBridge) -> u32 {
+    bridge.app_config_default_send_budget()
+}
+
+/// What the conversation's pool holds, or `None` where nothing has touched it.
+async fn pool(bridge: &ActiveBridge) -> Option<u32> {
+    let conn = bridge.db.lock().await;
+    brenn_lib::messaging::db::read_send_budget(&conn, bridge.conversation_id)
+}
+
+/// Put the pool at a known level — an exhausted conversation, or one with
+/// exactly enough left to be worth counting.
+async fn set_pool(bridge: &ActiveBridge, remaining: u32) {
+    let conn = bridge.db.lock().await;
+    brenn_lib::messaging::db::reset_send_budget(&conn, bridge.conversation_id, remaining);
+}
+
+/// One injection is one CC turn, and one CC turn is one unit — however many
+/// messages rode in it.
+#[tokio::test]
+async fn an_ambience_batch_draws_one_unit_whatever_its_size() {
+    let (bridge, _broadcast_rx) = bridge_with_messenger_for_drain().await;
+    set_pool(&bridge, 10).await;
+    seed_pending_push(&bridge, "first").await;
+    seed_pending_push(&bridge, "second").await;
+    seed_pending_push(&bridge, "third").await;
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    drain_pending_events(&bridge).await;
+
+    assert_eq!(
+        pool(&bridge).await,
+        Some(9),
+        "three messages in one render is one turn and one unit"
+    );
+    assert!(!owed_on_the_bus(&bridge).await);
+}
+
+/// Ingress rows are not bus injections and do not draw: a render with no
+/// envelopes in it leaves the pool alone.
+#[tokio::test]
+async fn an_events_only_drain_draws_nothing() {
+    let (bridge, _broadcast_rx) = bridge_with_messenger_for_drain().await;
+    set_pool(&bridge, 10).await;
+    {
+        let conn = bridge.db.lock().await;
+        enqueue_ingress(&conn, bridge.conversation_id, "cron", "a cron poke", "{}");
+    }
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    drain_pending_events(&bridge).await;
+
+    assert_eq!(
+        pool(&bridge).await,
+        Some(10),
+        "an ingress-only render is outside the pool's scope"
+    );
+}
+
+/// Carried impetus restores the pool before the turn it pays for, so the batch
+/// lands at the ceiling less its own unit.
+#[tokio::test]
+async fn a_batch_carrying_impetus_refills_the_pool_then_draws() {
+    let (bridge, _broadcast_rx) = bridge_with_messenger_for_drain().await;
+    set_pool(&bridge, 2).await;
+    seed_pending_push(&bridge, "ordinary traffic").await;
+    seed_pending_push_with_impetus(&bridge, "someone is actually here").await;
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    drain_pending_events(&bridge).await;
+
+    assert_eq!(
+        pool(&bridge).await,
+        Some(ceiling(&bridge) - 1),
+        "one impetus-bearing envelope refills the batch it rides in"
+    );
+}
+
+/// An exhausted pool holds the bus batch: nothing is injected, the positions
+/// stay owed, and the ingress half of the same drain still delivers.
+#[tokio::test]
+async fn at_zero_the_bus_batch_is_held_and_the_ingress_half_still_delivers() {
+    let (bridge, mut broadcast_rx) = bridge_with_messenger_for_drain().await;
+    set_pool(&bridge, 0).await;
+    {
+        let conn = bridge.db.lock().await;
+        enqueue_ingress(&conn, bridge.conversation_id, "cron", "a cron poke", "{}");
+    }
+    seed_pending_push(&bridge, "held-bus-body").await;
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    drain_pending_events(&bridge).await;
+
+    let rendered: Vec<String> = drain_broadcast(&mut broadcast_rx)
+        .iter()
+        .filter_map(|m| match m {
+            WsServerMessage::SystemMessageBroadcast { rendered_html, .. } => {
+                Some(rendered_html.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rendered.len(), 1, "the ingress half renders on its own");
+    assert!(
+        !rendered[0].contains("held-bus-body"),
+        "the bus half is held, not injected; html: {}",
+        rendered[0]
+    );
+    assert_eq!(pool(&bridge).await, Some(0), "a held batch draws nothing");
+    assert!(
+        owed_on_the_bus(&bridge).await,
+        "a held batch leaves its positions owed so a refill can deliver it"
+    );
+    {
+        let conn = bridge.db.lock().await;
+        assert_eq!(
+            pending_ingress_count(&conn, bridge.conversation_id),
+            0,
+            "the ingress half draws nothing and delivers regardless"
+        );
+    }
+}
+
+/// The live wake path holds too, and reports served-for-now so the wake record
+/// retires instead of spinning.
+#[tokio::test]
+async fn at_zero_the_live_delivery_holds_and_still_reports_served() {
+    let (bridge, mut broadcast_rx) = bridge_with_messenger_for_drain().await;
+    set_pool(&bridge, 0).await;
+    seed_pending_push(&bridge, "held-live-body").await;
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    crate::active_bridge::deliver_conversation_backlog(&bridge)
+        .await
+        .expect("a held batch is served for now, not a failure");
+
+    assert!(
+        !drain_broadcast(&mut broadcast_rx)
+            .iter()
+            .any(|m| matches!(m, WsServerMessage::SystemMessageBroadcast { .. })),
+        "an exhausted conversation is told nothing"
+    );
+    assert!(owed_on_the_bus(&bridge).await, "the batch stays owed");
+    assert_eq!(pool(&bridge).await, Some(0));
+}
+
+/// The revival hook: a refill delivers what the exhausted pool was holding,
+/// riding the turn that revived the conversation rather than waiting for
+/// unrelated bus traffic to wake it again.
+#[tokio::test]
+async fn a_refill_delivers_the_held_backlog() {
+    let (bridge, mut broadcast_rx) = bridge_with_messenger_for_drain().await;
+    set_pool(&bridge, 0).await;
+    seed_pending_push(&bridge, "waiting-for-a-human").await;
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    crate::active_bridge::deliver_conversation_backlog(&bridge)
+        .await
+        .expect("held, not failed");
+    assert!(owed_on_the_bus(&bridge).await);
+    let _ = drain_broadcast(&mut broadcast_rx);
+
+    bridge.refill_impetus_pool().await;
+
+    let delivered: Vec<String> = drain_broadcast(&mut broadcast_rx)
+        .iter()
+        .filter_map(|m| match m {
+            WsServerMessage::SystemMessageBroadcast { rendered_html, .. } => {
+                Some(rendered_html.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered.len(), 1, "the held batch rides the refill");
+    assert!(delivered[0].contains("waiting-for-a-human"));
+    assert!(
+        !owed_on_the_bus(&bridge).await,
+        "delivering the held batch advances past it"
+    );
+    assert_eq!(
+        pool(&bridge).await,
+        Some(ceiling(&bridge) - 1),
+        "the refill restored the pool and the delivered batch drew its unit"
+    );
+}
+
+/// The filter runs before the pool, so a batch of nothing but the
+/// conversation's own utterances advances even at zero — it costs no turn, so it
+/// costs no unit, and leaving it owed would spin the wake pass forever.
+#[tokio::test]
+async fn a_self_echo_only_batch_advances_without_drawing_even_at_zero() {
+    let (bridge, mut broadcast_rx) = bridge_with_messenger_for_drain().await;
+    set_pool(&bridge, 0).await;
+    let me = brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id);
+    seed_pending_push_from(&bridge, me.as_str(), "my own words").await;
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    drain_pending_events(&bridge).await;
+
+    assert!(
+        !drain_broadcast(&mut broadcast_rx)
+            .iter()
+            .any(|m| matches!(m, WsServerMessage::SystemMessageBroadcast { .. })),
+        "a self-echo is never injected"
+    );
+    assert!(
+        !owed_on_the_bus(&bridge).await,
+        "an exhausted pool must not turn a self-echo into a wake livelock"
+    );
+    assert_eq!(pool(&bridge).await, Some(0));
+}
+
+/// A handoff that fails is a tolerated transient: the batch stays owed and costs
+/// nothing, so a dying bridge cannot burn the conversation's runway of real
+/// turns on attempts. The retry after recovery draws exactly once.
+#[tokio::test]
+async fn a_failed_handoff_draws_nothing_and_the_retry_draws_once() {
+    let (bridge, _broadcast_rx) = bridge_with_messenger_for_drain().await;
+    set_pool(&bridge, 10).await;
+    seed_pending_push(&bridge, "against-a-dead-bridge").await;
+
+    // No session installed: send_system_message fails.
+    drain_pending_events(&bridge).await;
+    assert_eq!(
+        pool(&bridge).await,
+        Some(10),
+        "an attempt that never reached the harness is not a turn"
+    );
+    assert!(owed_on_the_bus(&bridge).await);
+
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+    drain_pending_events(&bridge).await;
+    assert_eq!(
+        pool(&bridge).await,
+        Some(9),
+        "the retry that landed draws once, not once per attempt"
+    );
+    assert!(!owed_on_the_bus(&bridge).await);
+}
+
+/// A pool nothing has touched holds the ceiling: the row is minted by the first
+/// draw, not by the conversation.
+#[tokio::test]
+async fn a_conversation_that_has_never_drawn_holds_the_ceiling() {
+    let (bridge, _broadcast_rx) = bridge_with_messenger_for_drain().await;
+    assert_eq!(
+        pool(&bridge).await,
+        None,
+        "nothing has touched the pool yet"
+    );
+    seed_pending_push(&bridge, "first-ever-traffic").await;
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    drain_pending_events(&bridge).await;
+
+    assert_eq!(
+        pool(&bridge).await,
+        Some(ceiling(&bridge) - 1),
+        "an untouched pool is a full one, and the first batch draws from the ceiling"
+    );
+}
+
+/// A ceiling of zero makes the conversation attended-only: the bus provokes no
+/// turn on it, and carried impetus is no exception — the reset it redeems
+/// restores the pool to zero, which still cannot pay for a turn.
+#[tokio::test]
+async fn a_zero_ceiling_conversation_is_attended_only() {
+    let (bridge, mut broadcast_rx) = bridge_with_messenger_for_drain_at_ceiling(0).await;
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+    seed_pending_push(&bridge, "unattended-traffic").await;
+
+    drain_pending_events(&bridge).await;
+
+    assert!(
+        !drain_broadcast(&mut broadcast_rx)
+            .iter()
+            .any(|m| matches!(m, WsServerMessage::SystemMessageBroadcast { .. })),
+        "a zero ceiling injects nothing"
+    );
+    assert!(owed_on_the_bus(&bridge).await, "the batch is held");
+    assert_eq!(pool(&bridge).await, None, "and nothing drew");
+
+    seed_pending_push_with_impetus(&bridge, "someone-is-actually-here").await;
+    drain_pending_events(&bridge).await;
+
+    assert!(
+        !drain_broadcast(&mut broadcast_rx)
+            .iter()
+            .any(|m| matches!(m, WsServerMessage::SystemMessageBroadcast { .. })),
+        "a refill to zero is still zero"
+    );
+    assert!(owed_on_the_bus(&bridge).await, "the batch stays held");
+    assert_eq!(
+        pool(&bridge).await,
+        Some(0),
+        "the redemption reset the pool to its ceiling, and its ceiling is nothing"
+    );
+
+    // The attended door is the one that still works on such a conversation.
+    let cc_err = legacy_websocket_turn(&bridge, "typed by a person").await;
+    assert!(
+        cc_err.is_none(),
+        "the legacy door takes the turn: {cc_err:?}"
+    );
+}
+
+/// The legacy websocket door is the attended surface: its turn restores the
+/// pool to full and spends nothing — an attended turn does not pay out of the
+/// allowance that attention just granted.
+#[tokio::test]
+async fn a_legacy_websocket_turn_refills_the_pool_without_drawing() {
+    let (bridge, _broadcast_rx) = bridge_with_messenger_for_drain().await;
+    set_pool(&bridge, 3).await;
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    let cc_err = legacy_websocket_turn(&bridge, "hello again").await;
+    assert!(
+        cc_err.is_none(),
+        "the recording session takes it: {cc_err:?}"
+    );
+
+    assert_eq!(
+        pool(&bridge).await,
+        Some(ceiling(&bridge)),
+        "the attended turn refills and draws nothing — ceiling less one would be a stray draw"
+    );
+}
+
+/// A human turn through the legacy websocket delivers the backlog an exhausted
+/// pool was holding, so a stalled conversation is unstalled by the same touch
+/// that refilled it rather than by the next unrelated bus traffic.
+#[tokio::test]
+async fn a_legacy_websocket_turn_delivers_the_held_backlog() {
+    let (bridge, mut broadcast_rx) = bridge_with_messenger_for_drain().await;
+    set_pool(&bridge, 0).await;
+    seed_pending_push(&bridge, "waiting-for-the-legacy-door").await;
+    let _cc_rx = bridge.install_recording_session_for_test().await;
+
+    crate::active_bridge::deliver_conversation_backlog(&bridge)
+        .await
+        .expect("held, not failed");
+    assert!(owed_on_the_bus(&bridge).await, "the batch is held");
+    let _ = drain_broadcast(&mut broadcast_rx);
+
+    let cc_err = legacy_websocket_turn(&bridge, "are you still there").await;
+    assert!(
+        cc_err.is_none(),
+        "the recording session takes it: {cc_err:?}"
+    );
+
+    let delivered: Vec<String> = drain_broadcast(&mut broadcast_rx)
+        .iter()
+        .filter_map(|m| match m {
+            WsServerMessage::SystemMessageBroadcast { rendered_html, .. } => {
+                Some(rendered_html.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered.len(), 1, "the held batch rides the attended turn");
+    assert!(delivered[0].contains("waiting-for-the-legacy-door"));
+    assert!(
+        !owed_on_the_bus(&bridge).await,
+        "delivering it advances past it"
+    );
+    assert_eq!(
+        pool(&bridge).await,
+        Some(ceiling(&bridge) - 1),
+        "the turn refilled without drawing; the unit is the released batch's own"
+    );
+}
+
+/// One human turn through the legacy websocket door.
+/// `restores_impetus_pool` is the bit that makes it attended.
+async fn legacy_websocket_turn(bridge: &Arc<ActiveBridge>, text: &str) -> Option<String> {
+    crate::active_bridge::accept_user_send(
+        bridge,
+        crate::active_bridge::AcceptedSend {
+            text,
+            cc_text: text.to_string(),
+            extra_blocks: Vec::new(),
+            sender_user_id: bridge.user_id,
+            sender_tz: None,
+            sender_device_id: None,
+            attachments: Vec::new(),
+            selected_tasks: Vec::new(),
+            origin: crate::active_bridge::SendOrigin::LegacyWs {
+                username: "drain-test-user".to_string(),
+                timestamp: "2026-01-01T00:00:00+00:00".to_string(),
+            },
+            interstitial: None,
+            restores_impetus_pool: true,
+        },
+    )
+    .await
 }

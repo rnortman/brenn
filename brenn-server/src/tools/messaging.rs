@@ -166,6 +166,7 @@ mod tests {
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
+            impetus: None,
             urgency: Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
         }

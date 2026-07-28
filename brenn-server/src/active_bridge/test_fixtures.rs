@@ -74,6 +74,10 @@ pub(in crate::active_bridge) struct TestBridgeConfig {
     /// This app's resolved tool grants. Empty (default) = no registry tools
     /// granted.
     pub tool_grants: std::collections::BTreeMap<String, brenn_lib::tools::ResolvedToolGrant>,
+    /// The app's `messaging_send_budget`: the ceiling of the conversation's
+    /// impetus pool, and of the outbound draws that share it. `0` makes the
+    /// conversation attended-only.
+    pub send_budget: u32,
 }
 
 impl Default for TestBridgeConfig {
@@ -97,6 +101,7 @@ impl Default for TestBridgeConfig {
             integrations: HashMap::new(),
             tools: None,
             tool_grants: std::collections::BTreeMap::new(),
+            send_budget: 100,
         }
     }
 }
@@ -356,6 +361,7 @@ impl ActiveBridge {
             integrations,
             tools,
             tool_grants,
+            send_budget,
         } = cfg;
         // Resolve: None → fresh per-bridge registry; Some → caller-supplied shared registry.
         let active_bridges = active_bridges_opt.unwrap_or_else(ActiveBridges::new);
@@ -431,7 +437,7 @@ impl ActiveBridge {
             mqtt_event_router,
             automation_engine,
             usage_session_gap_secs: 1800,
-            messaging_default_send_budget: 100,
+            messaging_default_send_budget: send_budget,
             last_cost_prune_at: AtomicI64::new(0),
             last_lint_snapshot: std::sync::Mutex::new(None),
             event_loop_handle: std::sync::Mutex::new(None),
@@ -1088,6 +1094,7 @@ impl ActiveBridge {
                 pwa_push: None,
                 webhook_subscriptions: vec![],
                 mqtt_subscriptions: vec![],
+                chat_harness_policy: brenn_lib::access::AppPolicy::default(),
             },
         );
         let apps_arc = Arc::new(apps);
@@ -1572,6 +1579,7 @@ fn make_test_push_app_config(
         }),
         webhook_subscriptions: vec![],
         mqtt_subscriptions: vec![],
+        chat_harness_policy: brenn_lib::access::AppPolicy::default(),
     }
 }
 

@@ -90,17 +90,19 @@ impl TargetResolver {
 
     /// Access-control policy for a directory subscriber of any kind.
     ///
-    /// A chat conversation reads under its owning app's policy, which is the
-    /// same authority its publishes ride: the app's grant covers the whole
-    /// `<prefix>.app.<slug>.` subtree, so revoking it closes the conversation's
-    /// read and its write together. That is also why a subscription minted at
-    /// runtime needs no registration of its own — there is nothing per
+    /// A chat conversation reads under its owning app's **harness** policy —
+    /// the derived `<prefix>.app.<slug>.` authority, which is the same authority
+    /// its publishes ride, so revoking it closes the conversation's read and its
+    /// write together. It is deliberately not the app's authored policy: the
+    /// harness and the app's LLM are separate principals. That the harness
+    /// policy is per-app rather than per-conversation is also why a subscription
+    /// minted at runtime needs no registration of its own — there is nothing per
     /// conversation to register.
     pub fn policy(&self, kind: &SubscriberEntryKind) -> Option<&crate::access::AppPolicy> {
         match kind {
-            SubscriberEntryKind::App(slug)
-            | SubscriberEntryKind::ChatConversation { app_slug: slug, .. } => {
-                self.apps.get(slug).map(|app| &app.policy)
+            SubscriberEntryKind::App(slug) => self.apps.get(slug).map(|app| &app.policy),
+            SubscriberEntryKind::ChatConversation { app_slug, .. } => {
+                self.apps.get(app_slug).map(|app| &app.chat_harness_policy)
             }
             other => self.subscribers.get(other).map(|r| r.policy.as_ref()),
         }

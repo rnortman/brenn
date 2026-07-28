@@ -307,15 +307,15 @@ fn validate_static_subscriptions_deliverable(
                     system_policy_by_component.get(component.as_str()).copied(),
                 ),
                 // A conversation reads its command channel under its app's
-                // policy, so the check it has to pass is the app's — that the
-                // derived chat-tree grant really does cover the conversation's
-                // own leaves. This walk runs before chat provisioning today, so
-                // nothing reaches this arm at boot; resolving it correctly costs
-                // one lookup and keeps the answer right if that order changes.
+                // derived harness policy, so that is the policy the check has to
+                // read — the same one the runtime read and wake gates consult.
+                // This walk runs before chat provisioning today, so nothing
+                // reaches this arm at boot; resolving it correctly costs one
+                // lookup and keeps the answer right if that order changes.
                 SubscriberEntryKind::ChatConversation { app_slug, .. } => (
                     "chat conversation",
                     app_slug.as_str(),
-                    apps.get(app_slug).map(|a| &a.policy),
+                    apps.get(app_slug).map(|a| &a.chat_harness_policy),
                 ),
             };
             match policy {

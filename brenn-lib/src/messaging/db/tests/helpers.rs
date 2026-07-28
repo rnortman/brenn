@@ -56,6 +56,7 @@ pub(super) fn insert_msg(
         None,
         None,
         deliver_after,
+        None,
         ns,
     );
     (inserted.id, inserted.uuid)

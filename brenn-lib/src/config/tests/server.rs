@@ -43,13 +43,12 @@ fn valid_config_with_public_url(
 }
 
 #[test]
-fn public_url_none_passes() {
-    let dir = tempfile::tempdir().unwrap();
-    // Should not panic.
+#[should_panic(expected = "server.public_url is required")]
+fn public_url_none_panics() {
     validate_and_resolve(
-        &valid_config_with_public_url(dir.path().to_path_buf(), None),
+        &minimal_config_with_public_url(None),
         &IntegrationRegistry::new(vec![]),
-        Some(super::test_runtime_dir()),
+        None,
     );
 }
 
@@ -107,7 +106,7 @@ fn public_url_del_char_panics() {
 }
 
 #[test]
-#[should_panic(expected = "server.public_url is not a valid URL")]
+#[should_panic(expected = "server.public_url is set but empty")]
 fn public_url_empty_string_panics() {
     validate_and_resolve(
         &minimal_config_with_public_url(Some("")),
@@ -138,6 +137,7 @@ fn trusted_proxy_hops_over_cap_rejected() {
         }],
         server: crate::config::server::ServerConfig {
             trusted_proxy_hops: 9,
+            public_url: Some("https://brenn.example.com".to_string()),
             ..Default::default()
         },
         ..Default::default()
@@ -151,7 +151,8 @@ fn trusted_proxy_hops_over_cap_rejected() {
 #[test]
 fn trusted_proxy_hops_cap_accepted() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = valid_config_with_public_url(dir.path().to_path_buf(), None);
+    let mut config =
+        valid_config_with_public_url(dir.path().to_path_buf(), Some("https://brenn.example.com"));
     config.server.trusted_proxy_hops = 8;
     // Should not panic.
     validate_and_resolve(

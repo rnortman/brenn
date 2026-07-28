@@ -1,7 +1,8 @@
 //! Accepting a user turn, from whichever door it arrived by.
 //!
-//! Persist the row, echo it to every attached browser, reset the messaging
-//! budget, hand the text to CC. That sequence is identical for a message typed
+//! Persist the row, echo it to every attached browser, restore the impetus pool
+//! if this door is the attended one, hand the text to CC. That sequence is
+//! identical for a message typed
 //! into the legacy websocket and one published on the conversation's command
 //! channel; only the attribution and the CC prefix differ, and both are the
 //! caller's to compute. Nothing here touches connection state, so the bus
@@ -97,13 +98,20 @@ pub(crate) struct AcceptedSend<'a> {
     pub origin: SendOrigin,
     /// A system message to land after the echo and before the CC send.
     pub interstitial: Option<Interstitial>,
-    /// Per-app messaging send budget to restore, or `None` where the deployment
-    /// has no bus. A human turn is the load-bearing signal that bounds runaway
-    /// agent-to-agent loops.
-    pub reset_send_budget: Option<u32>,
+    /// Whether this turn restores the conversation's impetus pool.
+    ///
+    /// True for the legacy websocket door, which *is* the attended surface: a
+    /// person typed this, so the pool that bounds unattended activity goes back
+    /// to full and whatever an exhausted pool was holding rides the same turn.
+    /// It refills and never draws — an attended turn does not spend the
+    /// allowance that attention just granted.
+    ///
+    /// False for a bus command, which restores the pool only on carried impetus
+    /// and does that for itself, and false where the deployment has no bus.
+    pub restores_impetus_pool: bool,
 }
 
-/// Persist the turn, echo it, reset the budget, and hand it to CC.
+/// Persist the turn, echo it, restore the impetus pool, and hand it to CC.
 ///
 /// Returns the CC send error, if any. The row and the echo are already
 /// committed at that point and are not rolled back — the message happened; only
@@ -151,9 +159,8 @@ pub(crate) async fn accept_user_send(
         bus_sender: send.origin.bus_sender(),
     });
 
-    if let Some(budget) = send.reset_send_budget {
-        let conn = bridge.db.lock().await;
-        brenn_lib::messaging::db::reset_send_budget(&conn, bridge.conversation_id, budget);
+    if send.restores_impetus_pool {
+        bridge.refill_impetus_pool().await;
     }
 
     if let Some(interstitial) = send.interstitial {

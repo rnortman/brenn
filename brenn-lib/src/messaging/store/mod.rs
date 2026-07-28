@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use brenn_envelope::{ChannelCapabilities, ChannelScheme, MessageEnvelope, Urgency};
+use brenn_envelope::{ChannelCapabilities, ChannelScheme, Impetus, MessageEnvelope, Urgency};
 use brenn_queue::{GapReason, ReplayDecision, Resume, Retained};
 
 /// A park refused because the channel's deferred set is already at its cap.
@@ -64,6 +64,10 @@ pub struct NewMessage {
     pub reply_to_uuid: Option<Uuid>,
     /// Durable-only, same rule as `reply_to_uuid`.
     pub delivery_deadline: Option<DateTime<Utc>>,
+    /// Carried user-interaction authority, already gated at publish: a store
+    /// sees it only after the mint capability check passed, and retains it
+    /// verbatim on every scheme.
+    pub impetus: Option<Impetus>,
     pub publish_ts_ns: i64,
 }
 

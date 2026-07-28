@@ -73,6 +73,7 @@ fn two_app_mount_config(
         tool_grants: vec![],
     };
     BrennConfig {
+        server: super::test_server_config(),
         repo_dir: Some(dir.to_path_buf()),
         repos,
         apps: vec![

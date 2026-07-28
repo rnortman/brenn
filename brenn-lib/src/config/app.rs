@@ -96,10 +96,20 @@ pub struct AppConfigRaw {
     #[serde(default)]
     pub multiuser: bool,
     /// Prepend `[username ...]` to messages sent to CC. Defaults to `multiuser` value.
+    ///
+    /// Governs the legacy websocket door only. Input arriving over the bus
+    /// always carries the publishing participant's id — which peer is speaking
+    /// is not optional context on a channel several peers can drive.
     pub prefix_username: Option<bool>,
     /// Prepend timestamp (with timezone) to messages sent to CC. Defaults to `multiuser` value.
+    ///
+    /// Governs the legacy websocket door only. Input arriving over the bus
+    /// always carries a UTC timestamp: a bus peer has no timezone to render in.
     pub prefix_timestamp: Option<bool>,
     /// Prepend device slug to messages sent to CC. Defaults to `true`.
+    ///
+    /// Governs the legacy websocket door only. A bus peer has no device, so
+    /// bus-originated input never carries a device prefix whatever this says.
     pub prefix_device: Option<bool>,
     /// Name of a `[container.<name>]` definition. If absent, CC runs as a bare process.
     pub container: Option<String>,
@@ -228,10 +238,18 @@ pub struct AppConfig {
     /// Multiuser mode: conversations default to shared, cross-user participation allowed.
     pub multiuser: bool,
     /// Prepend `[username ...]` to messages sent to CC.
+    ///
+    /// Read by the legacy websocket door only. Bus-originated commands are
+    /// prefixed with the publishing participant's id and a UTC timestamp
+    /// regardless of these three flags, and never with a device.
     pub prefix_username: bool,
     /// Prepend timestamp (with timezone) to messages sent to CC.
+    ///
+    /// Read by the legacy websocket door only; see `prefix_username`.
     pub prefix_timestamp: bool,
     /// Prepend device slug to messages sent to CC. Default: true.
+    ///
+    /// Read by the legacy websocket door only; see `prefix_username`.
     pub prefix_device: bool,
     /// Path mapper for translating between host and CC-visible paths.
     pub path_mapper: PathMapper,
@@ -306,6 +324,17 @@ pub struct AppConfig {
     /// deny-everything) until populated by the access-policy resolution phase.
     /// See `crate::access::AppPolicy`.
     pub policy: crate::access::AppPolicy,
+    /// Authority for the server-side chat harness of this app's conversations:
+    /// the adapter that publishes a conversation's record and token stream and
+    /// reads its command channel.
+    ///
+    /// **Derived, never authored.** Built by `LlmChatConfig::harness_policy`;
+    /// no operator config contributes to it and nothing merges it into `policy`,
+    /// so the app's own LLM, which acts under `policy`, gains nothing from it.
+    ///
+    /// `Default` (empty, deny-everything) until the access-policy resolution
+    /// phase stamps it.
+    pub chat_harness_policy: crate::access::AppPolicy,
 }
 
 impl AppConfig {

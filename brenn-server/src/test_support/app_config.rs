@@ -49,6 +49,7 @@ pub(crate) fn default_test_app_config(slug: &str, name: &str) -> AppConfig {
         pwa_push: None,
         webhook_subscriptions: vec![],
         mqtt_subscriptions: vec![],
+        chat_harness_policy: brenn_lib::access::AppPolicy::default(),
     }
 }
 

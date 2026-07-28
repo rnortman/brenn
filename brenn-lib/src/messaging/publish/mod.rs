@@ -52,9 +52,13 @@ use super::gates::{
     check_body_size, publish_acl_allows, reply_to_visible, resolve_publish_sender, well_formed_name,
 };
 use super::store::SurfaceFeedTarget;
-use super::{ChannelScheme, Messenger, ParticipantId, SubscriberEntryKind, Urgency, store};
+use super::{
+    ChannelScheme, Impetus, Messenger, ParticipantId, SubscriberEntryKind, Urgency, store,
+};
 use crate::access::AppCapability;
-use crate::obs::security::DenialKind;
+use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
+
+use crate::obs::security::{DenialKind, SecurityEventType, log_component_security_event};
 
 /// Per-channel memoized resolution for a batch flush: the channel entry and its
 /// live surface-feed targets.
@@ -113,6 +117,12 @@ pub enum PublishResult {
     /// work rather than silently cancelling already-scheduled work; no message
     /// was parked and no budget was consumed.
     DeferredQuotaExceeded { cap: u64 },
+    /// The publish carried `impetus` from a principal whose policy lacks
+    /// `MintImpetus`. Refused whole — never stripped and accepted: a publish
+    /// claiming authority it does not hold is a wrong thing, not a field to
+    /// quietly drop. Nothing was stored, no rate token and no budget were
+    /// consumed.
+    ImpetusUnauthorized,
 }
 
 impl PublishResult {
@@ -132,6 +142,7 @@ impl PublishResult {
             Self::MissingSender => Some(DenialKind::MissingSender),
             Self::AclDenied(_) => Some(DenialKind::AclDenied),
             Self::BodyTooLarge { .. } => Some(DenialKind::BodyTooLarge),
+            Self::ImpetusUnauthorized => Some(DenialKind::ImpetusUnauthorized),
             Self::Ok { .. }
             | Self::BudgetExhausted
             | Self::RateLimited
@@ -260,10 +271,15 @@ enum PublishPrincipal<'a> {
     System { component: &'a str },
     /// A conversation speaking for itself on its own chat channels — the record
     /// it writes and the token batches it streams. `app_slug` selects the owning
-    /// app's policy; layer-1 and layer-2 both resolve against it.
+    /// app's **harness** policy (`AppConfig::chat_harness_policy`, derived and
+    /// never authored); layer-1 and layer-2 both resolve against it. The app's
+    /// authored policy is not consulted and does not widen or narrow this arm:
+    /// the harness is a separate principal from the app's LLM.
     ///
     /// The stored principal is `for_conversation(id)`, distinct from the app's
     /// own `app:<slug>@<server>`, so the record shows which of the two spoke.
+    /// Bus identity and authority are separate concepts here: the envelope says
+    /// the conversation spoke, the gates read the harness policy.
     ///
     /// Always paired with a `System` origin: the per-conversation send budget
     /// prices an LLM's *tool* publishes, and chat output volume is not that —
@@ -312,6 +328,7 @@ impl Messenger {
             reply_to,
             deliver_after,
             delivery_deadline,
+            None,
         )
         .await
     }
@@ -368,6 +385,7 @@ impl Messenger {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -408,6 +426,8 @@ impl Messenger {
             None,
             None,
             None,
+            // Server-constructed telemetry: no user gesture behind it.
+            None,
         )
         .await
     }
@@ -440,6 +460,8 @@ impl Messenger {
             reply_to,
             None,
             None,
+            // In-process substrate output; nothing here descends from a gesture.
+            None,
         )
         .await
     }
@@ -448,10 +470,12 @@ impl Messenger {
     /// conversation record (`brenn:`) and token stream (`ephemeral:`).
     ///
     /// No bypass: runs the identical gate sequence as every other entry
-    /// (`publish_core`), reaching only what the owning app's policy authorizes.
+    /// (`publish_core`), reaching only what the owning app's derived harness
+    /// policy authorizes — its own chat subtree and nothing else.
     ///
-    /// `app_slug` selects the owning app's policy. `conversation_id` is stamped
-    /// as the sender (`conversation:<id>`).
+    /// `app_slug` selects the owning app's harness policy
+    /// (`AppConfig::chat_harness_policy`); the app's authored policy plays no
+    /// part. `conversation_id` is stamped as the sender (`conversation:<id>`).
     ///
     /// `System` origin: no per-conversation send budget, so `BudgetExhausted` is
     /// unreachable here. No `reply_to`/`deliver_after`/`delivery_deadline` — a
@@ -475,6 +499,10 @@ impl Messenger {
             urgency,
             None,
             None,
+            None,
+            // The conversation's own record and stream. Impetus does not
+            // propagate outward through the machinery's republish legs: an
+            // attended turn's record must not re-arm every observer downstream.
             None,
         )
         .await
@@ -609,6 +637,7 @@ impl Messenger {
         reply_to: Option<&str>,
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
+        impetus: Option<Impetus>,
     ) -> PublishResult {
         let sender = self.principal_identity(principal);
         let result = self
@@ -622,6 +651,7 @@ impl Messenger {
                 reply_to,
                 deliver_after,
                 delivery_deadline,
+                impetus,
             )
             .await;
         self.record_publish_denial(&sender, &result);
@@ -726,6 +756,7 @@ impl Messenger {
         reply_to: Option<&str>,
         deliver_after: Option<DateTime<Utc>>,
         delivery_deadline: Option<DateTime<Utc>>,
+        impetus: Option<Impetus>,
     ) -> PublishResult {
         // 1. Validate address shape, then resolve. Shape errors return
         //    `MalformedAddress`; well-formed
@@ -860,15 +891,24 @@ impl Messenger {
                 )
             }
             PublishPrincipal::Conversation { app_slug, .. } => {
-                // Resolved through the same grant-filtering lookup the `App`
-                // arm uses: an app whose policy lacks the transport grant is
-                // `MissingSender`, not a quiet bypass.
-                let app = match resolve_publish_sender(&self.apps, app_slug, grant) {
-                    Some(a) => a,
+                // Authority is the app's derived harness policy, not its
+                // authored one: the app's LLM holds no chat-tree grant unless an
+                // operator wrote one, and this arm must not lend it any. A
+                // missing app is `MissingSender`; the grant check against the
+                // harness policy is defensive — the four transport grants are
+                // there by construction — and a failure is a resolution bug, not
+                // a quiet bypass.
+                let policy = match self
+                    .apps
+                    .get(app_slug)
+                    .map(|app| &app.chat_harness_policy)
+                    .filter(|p| p.has_grant(grant))
+                {
+                    Some(p) => p,
                     None => return PublishResult::MissingSender,
                 };
                 (
-                    &app.policy,
+                    policy,
                     // Paired with a `System` origin (see
                     // `publish_from_conversation`), which never reads the budget
                     // below — same structural `None` as Surface and System.
@@ -902,6 +942,33 @@ impl Messenger {
                     return PublishResult::UnsupportedOption { field };
                 }
             }
+        }
+
+        // 2a (continued). Impetus is capability-gated, not capability-scoped: it
+        //     is carried authority, meaningful on every scheme, so no channel
+        //     class refuses it. What refuses it is a policy without
+        //     `MintImpetus` — and the refusal is of the whole publish, never of
+        //     the field alone. Stripping and accepting would turn an
+        //     unauthorized claim into a silently-downgraded success, and the
+        //     redemption side reads the stored field as proof the claim was
+        //     authorized when it was made.
+        //
+        //     Same placement rule as the option fields above: after layer-1 and
+        //     layer-2, so an unauthorized sender attaching impetus hears about
+        //     its own missing grant or ACL rather than learning the channel
+        //     exists. Validate-only, so it precedes both spending gates.
+        //
+        //     Logged here: no caller boundary reports this denial.
+        if impetus.is_some() && !policy.has_grant(AppCapability::MintImpetus) {
+            log_component_security_event(
+                SecurityEventType::ImpetusMintDenied,
+                &sanitize_untrusted_str(sender, MAX_LOGGED_UNTRUSTED_BYTES),
+                &format!(
+                    "impetus claimed without the mint grant; publish refused whole; address={}",
+                    sanitize_untrusted_str(addr, MAX_LOGGED_UNTRUSTED_BYTES)
+                ),
+            );
+            return PublishResult::ImpetusUnauthorized;
         }
 
         // 3. Body length.
@@ -1050,6 +1117,7 @@ impl Messenger {
             envelope_type: scheme,
             reply_to_uuid,
             delivery_deadline,
+            impetus,
             publish_ts_ns,
         };
         let (message_id, retained_seq) = match deliver_after {
@@ -1115,6 +1183,7 @@ impl Messenger {
                     reply_to.map(|s| s.to_owned()),
                     delivery_deadline,
                     deliver_after,
+                    impetus,
                     urgency,
                 ));
                 self.fan_out_surface_feed(
@@ -1212,6 +1281,7 @@ fn surface_feed_envelope(
     reply_to: Option<String>,
     delivery_deadline: Option<DateTime<Utc>>,
     deliver_after: Option<DateTime<Utc>>,
+    impetus: Option<Impetus>,
     urgency: Urgency,
 ) -> super::MessageEnvelope {
     super::MessageEnvelope {
@@ -1224,6 +1294,7 @@ fn surface_feed_envelope(
         reply_to,
         delivery_deadline,
         deliver_after,
+        impetus,
         urgency,
         envelope_type: ChannelScheme::Brenn,
     }
@@ -1238,6 +1309,8 @@ impl Messenger {
     ///
     /// The caller holds the DB lock (`conn` / the transaction) and commits it
     /// after all `insert_message` calls for the batch.
+    ///
+    /// Always inserts with no impetus.
     #[allow(clippy::too_many_arguments)]
     fn insert_message(
         &self,
@@ -1264,6 +1337,7 @@ impl Messenger {
             reply_to_uuid,
             delivery_deadline,
             deliver_after,
+            None,
             publish_ts_ns,
         )
     }
@@ -1513,6 +1587,7 @@ impl Messenger {
                         envelope_type: scheme,
                         reply_to_uuid: None,
                         delivery_deadline: None,
+                        impetus: None,
                         publish_ts_ns: db::utc_to_ns(Utc::now()),
                     };
                     nondurable_pending.push((entry, message, release));
@@ -1587,6 +1662,7 @@ impl Messenger {
                             publish_ts_ns,
                             publish.body.to_owned(),
                             publish.reply_to.map(|s| s.to_owned()),
+                            None,
                             None,
                             None,
                             publish.urgency,
@@ -1887,6 +1963,7 @@ impl Messenger {
                             sender.clone(),
                             publish.publish_ts_ns,
                             publish.body.to_owned(),
+                            None,
                             None,
                             None,
                             None,

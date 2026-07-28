@@ -587,7 +587,7 @@ mod tests {
             vec!["bob".to_string()],
         );
         app.policy = crate::access::AppPolicy::default();
-        LlmChatConfig::default().grant_app_chat_tree(APP, &mut app.policy);
+        app.chat_harness_policy = LlmChatConfig::default().harness_policy(APP);
         apps.insert(APP.to_string(), app);
 
         let router = Arc::new(RecordingRouter::default());
@@ -783,26 +783,72 @@ mod tests {
         assert_eq!(entries.len(), 4, "and still answers with the whole family");
     }
 
-    /// Every row-count teardown asserts must be non-zero before the call, or the
-    /// assertion holds whether or not the statement that clears it exists.
-    fn table_counts(conn: &Connection) -> (i64, i64, i64) {
+    /// Every row-count teardown assert must be non-zero before the call, or the
+    /// assertion holds whether or not the statement that clears it exists. One
+    /// entry per table `delete_channel_rows` touches.
+    fn table_counts(conn: &Connection) -> (i64, i64, i64, i64, i64) {
         let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
         (
             count("SELECT COUNT(*) FROM messaging_channels"),
             count("SELECT COUNT(*) FROM messaging_messages"),
             count("SELECT COUNT(*) FROM messaging_subscriber_cursors"),
+            count("SELECT COUNT(*) FROM messaging_pending_pushes"),
+            count("SELECT COUNT(*) FROM messaging_dynamic_subscriptions"),
         )
     }
 
+    /// The uuid the directory holds for a chat address.
+    fn leaf_uuid(m: &Messenger, conversation_id: i64, leaf: ChatLeaf) -> Uuid {
+        let address = chat_address("chat", APP, leaf, conversation_id);
+        m.directory
+            .resolve(&address)
+            .unwrap_or_else(|| panic!("{address} is provisioned"))
+            .uuid
+    }
+
+    /// A push claim on the newest message of `channel`, inserted raw — the row
+    /// shape the conversation-targeted ingress path writes.
+    fn seed_pending_push(conn: &Connection, channel: Uuid, subscriber: &str) {
+        conn.execute(
+            "INSERT INTO messaging_pending_pushes \
+             (message_id, target_subscriber, target_app_slug, eager_wake, created_at) \
+             VALUES ((SELECT id FROM messaging_messages WHERE channel_uuid = ?1 \
+                      ORDER BY id DESC LIMIT 1), ?2, ?3, 1, 'now')",
+            rusqlite::params![channel.as_bytes().to_vec(), subscriber, APP],
+        )
+        .expect("seed pending push");
+    }
+
+    /// A durable dynamic subscription on `channel`, through the production
+    /// writer so the row satisfies its FK to `messaging_channels`.
+    fn seed_dynamic_subscription(conn: &Connection, channel: Uuid, app_slug: &str) {
+        crate::messaging::db::insert_dynamic_subscription(
+            conn,
+            &crate::messaging::db::DynamicSubscriptionRow {
+                channel_uuid: channel,
+                app_slug: app_slug.to_string(),
+                push_depth: Depth::Bounded(4),
+                retain_depth: Depth::Bounded(4),
+                noise: crate::messaging::NoiseLevel::Silent,
+                wake_min: crate::messaging::WakeMin::Normal,
+                qos: None,
+                created_at: "2024-01-01T00:00:00Z".to_string(),
+            },
+        );
+    }
+
     /// Teardown removes the names, the rows, and the ring. What it must leave is
-    /// a directory that no longer answers for a conversation that is gone.
+    /// a directory that no longer answers for a conversation that is gone — and
+    /// a sibling conversation with every row it had.
     #[tokio::test]
     async fn teardown_removes_the_channels_and_their_contents() {
         let (m, db) = messenger().await;
         {
             let conn = db.lock().await;
             insert_conversation(&conn, 7, APP);
+            insert_conversation(&conn, 8, APP);
             m.provision_conversation_chat_channels(&conn, APP, 7);
+            m.provision_conversation_chat_channels(&conn, APP, 8);
         }
         // A second cursor beside the one provisioning makes, so the cursor
         // assertion below is about the delete rather than about an empty table.
@@ -814,39 +860,59 @@ mod tests {
             crate::messaging::store::Priming::Head,
         )
         .await;
-        let result = m
-            .publish_from_conversation(
-                7,
-                APP,
-                &chat_address("chat", APP, ChatLeaf::Out, 7),
-                "body",
-                Urgency::Normal,
-            )
-            .await;
-        assert!(matches!(
-            result,
-            crate::messaging::publish::PublishResult::Ok { .. }
-        ));
+        for conversation_id in [7, 8] {
+            let result = m
+                .publish_from_conversation(
+                    conversation_id,
+                    APP,
+                    &chat_address("chat", APP, ChatLeaf::Out, conversation_id),
+                    "body",
+                    Urgency::Normal,
+                )
+                .await;
+            assert!(matches!(
+                result,
+                crate::messaging::publish::PublishResult::Ok { .. }
+            ));
+        }
+        // The two tables `delete_channel_rows` clears that nothing else in this
+        // test would populate. Each conversation gets one of each, so the
+        // sibling's rows are what proves the deletes are scoped.
         {
             let conn = db.lock().await;
-            let (channels, messages, cursors) = table_counts(&conn);
-            assert_eq!(channels, 2, "the two durable leaves have rows");
-            assert_eq!(messages, 1, "the record holds the published message");
+            for conversation_id in [7, 8] {
+                seed_pending_push(
+                    &conn,
+                    leaf_uuid(&m, conversation_id, ChatLeaf::Out),
+                    &format!("app:{APP}:conversation-{conversation_id}"),
+                );
+                seed_dynamic_subscription(
+                    &conn,
+                    leaf_uuid(&m, conversation_id, ChatLeaf::In),
+                    &format!("watcher-{conversation_id}"),
+                );
+            }
             assert_eq!(
-                cursors, 2,
-                "the command cursor and the attached subscriber both hold positions"
+                table_counts(&conn),
+                (4, 2, 3, 2, 2),
+                "two conversations' durable leaves, records, cursors (one command \
+                 cursor each plus the attached subscriber), pushes and dynamic subs"
             );
         }
 
         let removed = {
             let conn = db.lock().await;
             let removed = m.deprovision_conversation_chat_channels(&conn, APP, 7);
-            assert_eq!(table_counts(&conn), (0, 0, 0));
+            assert_eq!(
+                table_counts(&conn),
+                (2, 1, 1, 1, 1),
+                "exactly the sibling's rows survive, one per table"
+            );
             removed
         };
         assert_eq!(removed, 4);
-        assert!(m.ring_stores.is_empty());
-        assert!(m.directory.list().is_empty());
+        assert_eq!(m.ring_stores.len(), 2, "the sibling keeps its two rings");
+        assert_eq!(m.directory.list().len(), 4, "and its four names");
 
         // Nothing answers for the conversation any more.
         let result = m
@@ -1207,7 +1273,7 @@ mod tests {
         conn.execute_batch("COMMIT").unwrap();
 
         assert_eq!(removed, 4);
-        assert_eq!(table_counts(&conn), (0, 0, 0));
+        assert_eq!(table_counts(&conn), (0, 0, 0, 0, 0));
     }
 
     /// The chat seam and the ambience-injection seam coexist without touching.

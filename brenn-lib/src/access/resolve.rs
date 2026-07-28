@@ -82,6 +82,12 @@ pub fn build_app_policy(
                 "app {app_slug:?}: grant {cap:?} is not authorable on an LLM app's `grants` \
                  (surface takeover is authored as `SurfaceGrant` on a `[[surface]]`)",
             ),
+            // No LLM-reachable API sets impetus, so the grant would be dead
+            // config surface.
+            AppCapability::MintImpetus => panic!(
+                "app {app_slug:?}: grant {cap:?} is not authorable on an LLM app's `grants` \
+                 (no LLM-reachable API sets impetus)",
+            ),
             // No delivery path carries confined `local:` traffic to a
             // conversation in v1, so the grant would be dead config.
             AppCapability::LocalSubscribe => panic!(
@@ -790,6 +796,16 @@ mod tests {
         // it has no LLM-app enforcement point and must be rejected at the
         // resolution boundary.
         let grants = vec![AppCapability::SurfaceTakeover];
+        build_app_policy("home", &grants, &AppAclRaw::default(), &clients(&[]));
+    }
+
+    #[test]
+    #[should_panic(expected = "not authorable on an LLM app")]
+    fn mint_impetus_grant_token_in_llm_grants_panics() {
+        // `mint_impetus` deserializes from an LLM `grants` list but nothing an
+        // LLM can reach sets the envelope field, so the grant would be dead
+        // config surface. Rejected at the resolution boundary.
+        let grants = vec![AppCapability::MintImpetus];
         build_app_policy("home", &grants, &AppAclRaw::default(), &clients(&[]));
     }
 

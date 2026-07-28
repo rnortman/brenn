@@ -42,6 +42,19 @@ pub(super) fn test_runtime_dir() -> &'static PathBuf {
     crate::runtime_dir::test_runtime_dir_once()
 }
 
+/// A `ServerConfig` carrying the `public_url` every config must set.
+///
+/// `validate_and_resolve` refuses a config without one before it reaches
+/// anything else, so a test that means to exercise some *other* validation has
+/// to satisfy this one first.
+#[allow(dead_code)]
+pub(super) fn test_server_config() -> ServerConfig {
+    ServerConfig {
+        public_url: Some("https://brenn.example.com".to_string()),
+        ..Default::default()
+    }
+}
+
 #[allow(dead_code)]
 fn raw_with_token_thresholds(
     dir: &std::path::Path,
@@ -107,6 +120,7 @@ fn minimal_app_config_for_budget_test(
         pwa_push: None,
         webhook_subscriptions: vec![],
         mqtt_subscriptions: vec![],
+        chat_harness_policy: crate::access::AppPolicy::default(),
     }
 }
 
@@ -146,6 +160,7 @@ fn mount_test_config(
     container_working_dir: Option<PathBuf>,
 ) -> BrennConfig {
     BrennConfig {
+        server: test_server_config(),
         repo_dir: Some(dir.to_path_buf()),
         repos,
         apps: vec![AppConfigRaw {
@@ -177,6 +192,7 @@ fn two_app_mount_config(
         ..Default::default()
     };
     BrennConfig {
+        server: test_server_config(),
         repo_dir: Some(dir.to_path_buf()),
         repos,
         apps: vec![
