@@ -153,6 +153,247 @@ pub fn route_publish_intent(
     }
 }
 
+/// A `brenn-port-defer` event's untrusted detail, as read at the
+/// kernel↔component trust boundary.
+///
+/// Every field arrives as the DOM executor read it and nothing more: `op`/`port`
+/// are `None` for a missing or non-string value, and the three string-typed
+/// numerics keep their [`OptionalField`] three-state because which of them an op
+/// requires is the router's decision, not the reader's. Grouped into a struct
+/// rather than spread across the listener's callback because five untrusted
+/// fields on one event is where a positional argument list stops being readable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferDetail {
+    /// Which op: [`contract::DEFER_OP_PUBLISH`], [`contract::DEFER_OP_CANCEL`] or
+    /// [`contract::DEFER_OP_EDIT`].
+    pub op: Option<String>,
+    /// The output port the op names.
+    pub port: Option<String>,
+    /// Decimal-string position in the port's deferred window (cancel, edit).
+    pub index: OptionalField,
+    /// The message body (publish), or its replacement (edit).
+    pub body: OptionalField,
+    /// Decimal-string epoch-millisecond release time (publish), or its
+    /// replacement (edit).
+    pub deliver_after: OptionalField,
+}
+
+/// One well-formed deferred-message op, resolved to the instance that dispatched
+/// it and ready for the in-flight activation's buffer.
+///
+/// Not a [`KernelAction`], unlike a publish, because there is no effect to apply
+/// outside an activation: every op here is buffered-only
+/// ([`contract::PORT_DEFER`]), so the only two outcomes are "hand it to the
+/// buffer" and "drop and report", and the router returns them as the two arms of a
+/// `Result`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferIntent {
+    /// Park `body` on the port's channel until `deliver_after` (epoch ms UTC).
+    Publish {
+        instance: String,
+        port: String,
+        body: String,
+        deliver_after: u64,
+    },
+    /// Unpark the message at `index` in the port's deferred window.
+    Cancel {
+        instance: String,
+        port: String,
+        index: u32,
+    },
+    /// Rewrite the message at `index`: its body, its release time, or both. `None`
+    /// leaves that half alone.
+    Edit {
+        instance: String,
+        port: String,
+        index: u32,
+        body: Option<String>,
+        deliver_after: Option<u64>,
+    },
+}
+
+impl DeferIntent {
+    /// The op's contract name, for the breadcrumb a refused op leaves.
+    pub fn op_name(&self) -> &'static str {
+        match self {
+            DeferIntent::Publish { .. } => contract::DEFER_OP_PUBLISH,
+            DeferIntent::Cancel { .. } => contract::DEFER_OP_CANCEL,
+            DeferIntent::Edit { .. } => contract::DEFER_OP_EDIT,
+        }
+    }
+
+    /// The instance that dispatched the op — the routing identity the DOM
+    /// executor resolved, never anything the detail claimed.
+    pub fn instance(&self) -> &str {
+        match self {
+            DeferIntent::Publish { instance, .. }
+            | DeferIntent::Cancel { instance, .. }
+            | DeferIntent::Edit { instance, .. } => instance,
+        }
+    }
+}
+
+/// Read one of [`DeferDetail`]'s decimal-string numerics: `Ok(None)` for an
+/// omitted field, `Err(())` for a non-string one or one that is not a decimal
+/// integer in range. Callers that require the field turn `None` into malformed
+/// themselves, so absence stays the router's judgement.
+fn optional_number<T: std::str::FromStr>(field: &OptionalField) -> Result<Option<T>, ()> {
+    match field {
+        OptionalField::Absent => Ok(None),
+        OptionalField::Present(raw) => raw.parse::<T>().map(Some).map_err(|_| ()),
+        OptionalField::Malformed => Err(()),
+    }
+}
+
+/// The drop-and-report for a `brenn-port-defer` whose detail does not spell a
+/// well-formed op. Malformed detail from a mounted instance is never coerced into
+/// an op: a guessed index names another message, and a guessed release time
+/// schedules a message for a moment the component never chose.
+fn malformed_defer(instance: &str, target_tag: &str, detail: &str) -> KernelAction {
+    KernelAction::Report {
+        level: LogLevel::Warn,
+        message: format!(
+            "dropped malformed {} from <{target_tag}>: {detail}",
+            contract::PORT_DEFER
+        ),
+        subject: Some(instance.to_string()),
+    }
+}
+
+/// The drop-and-report for a well-formed op the kernel could not buffer: no
+/// activation of the dispatching instance is on the stack.
+///
+/// Not a status a component can read — by the time the kernel knows, the dispatch
+/// is the only thing that happened — and deliberately not an immediate effect
+/// either: the whole point of the buffered-only rule is that a schedule staged
+/// outside the flush boundary must not exist.
+pub fn unbuffered_defer_refused(intent: &DeferIntent) -> KernelAction {
+    KernelAction::Report {
+        level: LogLevel::Warn,
+        message: format!(
+            "dropped {} {} from component {}: no activation of it is in flight, and a \
+             deferred-message op has no unbuffered path",
+            contract::PORT_DEFER,
+            intent.op_name(),
+            intent.instance()
+        ),
+        subject: Some(intent.instance().to_string()),
+    }
+}
+
+/// Route a component's `brenn-port-defer` intent to the op the in-flight
+/// activation's buffer should be offered, or to the drop-and-report for a detail
+/// that does not spell one.
+///
+/// Dispatch identity resolves exactly as [`route_publish_intent`]: `instance` is
+/// the DOM-resolved mounted-instance id for the retargeted target, and a target
+/// that does not resolve to a mounted instance element is dropped with `Report`.
+/// `target_tag` is carried for the breadcrumb.
+///
+/// What each op requires of the detail is stated here and nowhere else: a publish
+/// needs a body and a release time and no index; a cancel needs an index; an edit
+/// needs an index and takes the other two as present-to-change / absent-to-leave.
+/// Fields an op does not read are ignored rather than rejected, matching every
+/// other event on this seam.
+pub fn route_defer_intent(
+    instance: Option<&str>,
+    target_tag: &str,
+    detail: DeferDetail,
+) -> Result<DeferIntent, KernelAction> {
+    let instance = require_mounted_instance(instance, target_tag, contract::PORT_DEFER)?;
+    let Some(port) = detail.port else {
+        return Err(malformed_defer(
+            instance,
+            target_tag,
+            "port must be a string",
+        ));
+    };
+    // Each field is read — and so judged — only by the ops that use it. Parsing
+    // them all up front would reject a publish carrying a stray malformed
+    // `index`, which is precisely the "ignored rather than rejected" this seam
+    // promises, and would blame a field the op never looks at.
+    let index = || {
+        optional_number::<u32>(&detail.index)
+            .map_err(|()| malformed_defer(instance, target_tag, "index must be a decimal u32"))
+    };
+    let deliver_after = || {
+        optional_number::<u64>(&detail.deliver_after).map_err(|()| {
+            malformed_defer(
+                instance,
+                target_tag,
+                "deliver_after must be decimal epoch milliseconds",
+            )
+        })
+    };
+    let body = || match &detail.body {
+        OptionalField::Absent => Ok(None),
+        OptionalField::Present(body) => Ok(Some(body.clone())),
+        OptionalField::Malformed => Err(malformed_defer(
+            instance,
+            target_tag,
+            "body must be a string",
+        )),
+    };
+    match detail.op.as_deref() {
+        Some(contract::DEFER_OP_PUBLISH) => {
+            let (body, deliver_after) = (body()?, deliver_after()?);
+            let instance = instance.to_string();
+            match (body, deliver_after) {
+                (Some(body), Some(deliver_after)) => Ok(DeferIntent::Publish {
+                    instance,
+                    port,
+                    body,
+                    deliver_after,
+                }),
+                _ => Err(malformed_defer(
+                    &instance,
+                    target_tag,
+                    "a deferred publish needs both body and deliver_after",
+                )),
+            }
+        }
+        Some(contract::DEFER_OP_CANCEL) => {
+            let index = index()?;
+            let instance = instance.to_string();
+            match index {
+                Some(index) => Ok(DeferIntent::Cancel {
+                    instance,
+                    port,
+                    index,
+                }),
+                None => Err(malformed_defer(
+                    &instance,
+                    target_tag,
+                    "a cancel needs an index",
+                )),
+            }
+        }
+        Some(contract::DEFER_OP_EDIT) => {
+            let (index, body, deliver_after) = (index()?, body()?, deliver_after()?);
+            let instance = instance.to_string();
+            match index {
+                Some(index) => Ok(DeferIntent::Edit {
+                    instance,
+                    port,
+                    index,
+                    body,
+                    deliver_after,
+                }),
+                None => Err(malformed_defer(
+                    &instance,
+                    target_tag,
+                    "an edit needs an index",
+                )),
+            }
+        }
+        _ => Err(malformed_defer(
+            instance,
+            target_tag,
+            "op must be publish, cancel or edit",
+        )),
+    }
+}
+
 /// Route a component's `brenn-log` intent to a component-log action.
 ///
 /// Dispatch identity resolves exactly as [`route_publish_intent`]: `instance` is
@@ -326,18 +567,19 @@ pub fn route_processor_alert(
     }
 }
 
-/// The WIT `publish-error` name for a refused buffered publish. Each arm is one
-/// exact wire string the guest matches on; a wrong mapping hands the component
-/// the wrong error variant, so the map is pinned natively here rather than in
-/// the wasm-only entry wrapper that calls it.
+/// The WIT `publish-error` name for a refused buffered publish, as an owned
+/// `String`.
+///
+/// The vocabulary is [`contract::publish_status_str`]. Lives here rather than in
+/// the wasm-only entry wrapper because that wrapper cannot be tested on the host.
 pub fn publish_error_str(err: contract::PublishError) -> String {
-    use contract::PublishError;
-    match err {
-        PublishError::NotPermitted => "not-permitted",
-        PublishError::InvalidPayload => "invalid-payload",
-        PublishError::QuotaExceeded => "quota-exceeded",
-    }
-    .to_string()
+    contract::publish_status_str(Err(err)).to_string()
+}
+
+/// The WIT `defer-error` name for a refused buffered control op (cancel / edit),
+/// the twin of [`publish_error_str`] for the deferred-message family.
+pub fn defer_error_str(err: contract::DeferError) -> String {
+    contract::defer_status_str(Err(err)).to_string()
 }
 
 /// What the kernel's pre-chrome connect indicator currently shows. This is the
@@ -1892,6 +2134,353 @@ mod tests {
         }
     }
 
+    // ── route_defer_intent ────────────────────────────────────────────────
+
+    /// A `brenn-port-defer` detail with everything omitted but the op and the
+    /// port — the shape each case below fills in only what it is about.
+    fn defer_detail(op: &str, port: &str) -> DeferDetail {
+        DeferDetail {
+            op: Some(op.to_string()),
+            port: Some(port.to_string()),
+            index: OptionalField::Absent,
+            body: OptionalField::Absent,
+            deliver_after: OptionalField::Absent,
+        }
+    }
+
+    #[test]
+    fn a_deferred_publish_carries_its_body_and_release_time() {
+        let intent = route_defer_intent(
+            Some("p1"),
+            "brenn-protobar",
+            DeferDetail {
+                body: OptionalField::Present("42".to_string()),
+                deliver_after: OptionalField::Present("1770000000000".to_string()),
+                ..defer_detail(contract::DEFER_OP_PUBLISH, "out")
+            },
+        );
+        assert_eq!(
+            intent,
+            Ok(DeferIntent::Publish {
+                instance: "p1".to_string(),
+                port: "out".to_string(),
+                body: "42".to_string(),
+                deliver_after: 1_770_000_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn a_cancel_and_an_edit_resolve_their_snapshot_index() {
+        assert_eq!(
+            route_defer_intent(
+                Some("p1"),
+                "brenn-protobar",
+                DeferDetail {
+                    index: OptionalField::Present("2".to_string()),
+                    ..defer_detail(contract::DEFER_OP_CANCEL, "out")
+                }
+            ),
+            Ok(DeferIntent::Cancel {
+                instance: "p1".to_string(),
+                port: "out".to_string(),
+                index: 2,
+            })
+        );
+        assert_eq!(
+            route_defer_intent(
+                Some("p1"),
+                "brenn-protobar",
+                DeferDetail {
+                    index: OptionalField::Present("0".to_string()),
+                    body: OptionalField::Present("later".to_string()),
+                    deliver_after: OptionalField::Present("7".to_string()),
+                    ..defer_detail(contract::DEFER_OP_EDIT, "out")
+                }
+            ),
+            Ok(DeferIntent::Edit {
+                instance: "p1".to_string(),
+                port: "out".to_string(),
+                index: 0,
+                body: Some("later".to_string()),
+                deliver_after: Some(7),
+            })
+        );
+    }
+
+    #[test]
+    fn an_edit_omits_the_half_it_leaves_alone() {
+        // Absent is the contract's "do not touch", and it must not collapse into an
+        // empty body or a zero release time — either would rewrite the parked
+        // message with something the component never said.
+        assert_eq!(
+            route_defer_intent(
+                Some("p1"),
+                "brenn-protobar",
+                DeferDetail {
+                    index: OptionalField::Present("1".to_string()),
+                    deliver_after: OptionalField::Present("9".to_string()),
+                    ..defer_detail(contract::DEFER_OP_EDIT, "out")
+                }
+            ),
+            Ok(DeferIntent::Edit {
+                instance: "p1".to_string(),
+                port: "out".to_string(),
+                index: 1,
+                body: None,
+                deliver_after: Some(9),
+            })
+        );
+        // Both halves absent is a well-formed no-op edit, not malformed detail: the
+        // WIT lets a guest ask for one, and refusing it here would be the kernel
+        // inventing a rule the seam does not have.
+        assert_eq!(
+            route_defer_intent(
+                Some("p1"),
+                "brenn-protobar",
+                DeferDetail {
+                    index: OptionalField::Present("1".to_string()),
+                    ..defer_detail(contract::DEFER_OP_EDIT, "out")
+                }
+            ),
+            Ok(DeferIntent::Edit {
+                instance: "p1".to_string(),
+                port: "out".to_string(),
+                index: 1,
+                body: None,
+                deliver_after: None,
+            })
+        );
+    }
+
+    /// Assert an op was dropped as malformed and attributed to its instance, with
+    /// `needle` naming the field at fault.
+    fn assert_malformed_defer(intent: Result<DeferIntent, KernelAction>, needle: &str) {
+        let Err(KernelAction::Report {
+            level,
+            message,
+            subject,
+        }) = intent
+        else {
+            panic!("expected a malformed Report, got {intent:?}");
+        };
+        assert_eq!(level, LogLevel::Warn);
+        assert_eq!(subject.as_deref(), Some("p1"));
+        assert!(message.contains("malformed"), "message: {message}");
+        assert!(message.contains(needle), "message: {message}");
+    }
+
+    #[test]
+    fn a_numeric_field_that_is_not_a_decimal_integer_is_malformed() {
+        // The seam's numerics are decimal strings, so junk is a component bug and
+        // must not be coerced: a guessed index names another message and a guessed
+        // release time schedules a moment the component never chose.
+        for index in [
+            OptionalField::Present("1.5".to_string()),
+            OptionalField::Present("-1".to_string()),
+            OptionalField::Present(String::new()),
+            OptionalField::Present("4294967296".to_string()),
+            OptionalField::Malformed,
+        ] {
+            assert_malformed_defer(
+                route_defer_intent(
+                    Some("p1"),
+                    "brenn-protobar",
+                    DeferDetail {
+                        index: index.clone(),
+                        ..defer_detail(contract::DEFER_OP_CANCEL, "out")
+                    },
+                ),
+                "index",
+            );
+        }
+        for deliver_after in [
+            OptionalField::Present("soon".to_string()),
+            OptionalField::Present("1e12".to_string()),
+            OptionalField::Malformed,
+        ] {
+            assert_malformed_defer(
+                route_defer_intent(
+                    Some("p1"),
+                    "brenn-protobar",
+                    DeferDetail {
+                        body: OptionalField::Present("42".to_string()),
+                        deliver_after: deliver_after.clone(),
+                        ..defer_detail(contract::DEFER_OP_PUBLISH, "out")
+                    },
+                ),
+                "deliver_after",
+            );
+        }
+    }
+
+    #[test]
+    fn each_op_needs_the_fields_it_reads() {
+        // A publish with no release time is not a publish, and a control op with no
+        // index names nothing. Each op states its own requirement, so each is
+        // pinned.
+        assert_malformed_defer(
+            route_defer_intent(
+                Some("p1"),
+                "brenn-protobar",
+                DeferDetail {
+                    body: OptionalField::Present("42".to_string()),
+                    ..defer_detail(contract::DEFER_OP_PUBLISH, "out")
+                },
+            ),
+            "deferred publish",
+        );
+        assert_malformed_defer(
+            route_defer_intent(
+                Some("p1"),
+                "brenn-protobar",
+                DeferDetail {
+                    deliver_after: OptionalField::Present("7".to_string()),
+                    ..defer_detail(contract::DEFER_OP_PUBLISH, "out")
+                },
+            ),
+            "deferred publish",
+        );
+        assert_malformed_defer(
+            route_defer_intent(
+                Some("p1"),
+                "brenn-protobar",
+                defer_detail(contract::DEFER_OP_CANCEL, "out"),
+            ),
+            "cancel",
+        );
+        assert_malformed_defer(
+            route_defer_intent(
+                Some("p1"),
+                "brenn-protobar",
+                defer_detail(contract::DEFER_OP_EDIT, "out"),
+            ),
+            "edit",
+        );
+        // A missing port is malformed for every op: the seam names ports, and there
+        // is no default one.
+        assert_malformed_defer(
+            route_defer_intent(
+                Some("p1"),
+                "brenn-protobar",
+                DeferDetail {
+                    port: None,
+                    index: OptionalField::Present("0".to_string()),
+                    ..defer_detail(contract::DEFER_OP_CANCEL, "out")
+                },
+            ),
+            "port",
+        );
+    }
+
+    #[test]
+    fn a_field_an_op_does_not_read_is_ignored_however_malformed() {
+        // The seam's stated convention, both directions. A dispatcher that emits a
+        // stray field a given op ignores must not have its op dropped — and the
+        // drop would name a field the op never looks at, which is a diagnosis
+        // dead end on top of the lost work.
+        assert_eq!(
+            route_defer_intent(
+                Some("p1"),
+                "brenn-protobar",
+                DeferDetail {
+                    body: OptionalField::Present("42".to_string()),
+                    deliver_after: OptionalField::Present("7".to_string()),
+                    index: OptionalField::Present("not-a-number".to_string()),
+                    ..defer_detail(contract::DEFER_OP_PUBLISH, "out")
+                },
+            ),
+            Ok(DeferIntent::Publish {
+                instance: "p1".to_string(),
+                port: "out".to_string(),
+                body: "42".to_string(),
+                deliver_after: 7,
+            }),
+            "a publish reads no index, so a junk one is ignored"
+        );
+        assert_eq!(
+            route_defer_intent(
+                Some("p1"),
+                "brenn-protobar",
+                DeferDetail {
+                    index: OptionalField::Present("2".to_string()),
+                    deliver_after: OptionalField::Present("later".to_string()),
+                    body: OptionalField::Malformed,
+                    ..defer_detail(contract::DEFER_OP_CANCEL, "out")
+                },
+            ),
+            Ok(DeferIntent::Cancel {
+                instance: "p1".to_string(),
+                port: "out".to_string(),
+                index: 2,
+            }),
+            "a cancel reads neither body nor release time"
+        );
+    }
+
+    #[test]
+    fn an_unknown_op_is_dropped_as_malformed() {
+        // The op selector is the only thing that says what the rest of the detail
+        // means, so an unrecognized one cannot be guessed at.
+        for op in [None, Some("park"), Some("PUBLISH"), Some("")] {
+            let mut detail = defer_detail(contract::DEFER_OP_CANCEL, "out");
+            detail.op = op.map(str::to_string);
+            detail.index = OptionalField::Present("0".to_string());
+            assert_malformed_defer(
+                route_defer_intent(Some("p1"), "brenn-protobar", detail),
+                "op must be",
+            );
+        }
+    }
+
+    #[test]
+    fn a_defer_op_from_an_unresolved_target_is_dropped_and_reported() {
+        // Same rule as every other event on this seam: a target that resolves to no
+        // mounted instance has no subject to name, so nothing is attributed by
+        // guess.
+        let intent = route_defer_intent(
+            None,
+            "button",
+            defer_detail(contract::DEFER_OP_CANCEL, "out"),
+        );
+        let Err(KernelAction::Report {
+            level,
+            message,
+            subject,
+        }) = intent
+        else {
+            panic!("expected a Report, got {intent:?}");
+        };
+        assert_eq!(level, LogLevel::Warn);
+        assert_eq!(subject, None);
+        assert!(message.contains("button"), "message: {message}");
+        assert!(message.contains(contract::PORT_DEFER), "message: {message}");
+    }
+
+    #[test]
+    fn an_op_the_buffer_cannot_take_is_reported_against_its_instance() {
+        // The buffered-only rule's other half: there is no immediate path, so an op
+        // dispatched with no activation of its instance in flight is dropped with a
+        // breadcrumb naming the instance and the op.
+        let action = unbuffered_defer_refused(&DeferIntent::Cancel {
+            instance: "p1".to_string(),
+            port: "out".to_string(),
+            index: 0,
+        });
+        let KernelAction::Report {
+            level,
+            message,
+            subject,
+        } = action
+        else {
+            panic!("expected a Report, got {action:?}");
+        };
+        assert_eq!(level, LogLevel::Warn);
+        assert_eq!(subject.as_deref(), Some("p1"));
+        assert!(message.contains("cancel"), "message: {message}");
+        assert!(message.contains("in flight"), "message: {message}");
+    }
+
     // ── route_component_log ───────────────────────────────────────────────
 
     #[test]
@@ -2788,20 +3377,19 @@ mod tests {
         ));
     }
 
+    /// Each delegation must carry the error through: a helper that lost the
+    /// `Err` would answer `"ok"` and tell a refused component it succeeded.
+    /// Individual spellings are pinned by the contract's own round-trip test.
     #[test]
-    fn publish_error_str_maps_each_variant_to_its_wit_name() {
-        use contract::PublishError;
-        assert_eq!(
-            publish_error_str(PublishError::NotPermitted),
-            "not-permitted"
-        );
+    fn the_error_str_helpers_carry_the_error_into_the_contract_vocabulary() {
+        use contract::{DeferError, PublishError};
         assert_eq!(
             publish_error_str(PublishError::InvalidPayload),
             "invalid-payload"
         );
         assert_eq!(
-            publish_error_str(PublishError::QuotaExceeded),
-            "quota-exceeded"
+            defer_error_str(DeferError::InvalidDeliverAfter),
+            "invalid-deliver-after"
         );
     }
 

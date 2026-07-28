@@ -1,11 +1,13 @@
 //! `RingStore` — the in-memory retention store for non-durable channels.
 //!
-//! One store per `ephemeral:` or `local:` channel. It owns four things, all of
-//! them `brenn-queue` mechanics wrapped in the backend's identity and locking:
-//! a bounded drop-oldest retained ring, one cursor per attached subscriber, a
-//! release-time-ordered set of parked messages, and — on a transportable
-//! channel — a broadcast fan-out to consumers that read the channel as a live
-//! stream rather than from a cursor.
+//! One store per `ephemeral:` or `local:` channel. The channel itself — a
+//! bounded drop-oldest retained ring, one cursor per attached subscriber, and a
+//! release-time-ordered set of parked messages, composed — is
+//! [`brenn_queue::RingCore`], shared with every other host that owns
+//! non-durable channels. This store is what the backend adds around it: one
+//! lock, participant and application identity, envelope minting, `DateTime`
+//! conversion, and — on a transportable channel — a broadcast fan-out to
+//! consumers that read the channel as a live stream rather than from a cursor.
 //!
 //! The store holds no policy. Whether a subscriber's fresh cursor is primed
 //! with the retained tail, whether a publish is allowed at all, and what a
@@ -29,8 +31,8 @@ use uuid::Uuid;
 
 use brenn_envelope::{ChannelCapabilities, ChannelScheme, MessageEnvelope, Urgency};
 use brenn_queue::{
-    Advance, Deferred, DeferredId, DeferredSet, NoSuchDeferred, QuotaExceeded, Replay,
-    ReplayDecision, Resume, RetainedRing, SubscriberCursor, retention_frontier,
+    Advance, CursorOverflow, Deferred, DeferredId, OwnedDeferred, QuotaExceeded, Replay,
+    ReplayDecision, Resume, RingCore,
 };
 
 /// One subscriber's activation view over this channel's retained ring.
@@ -99,75 +101,21 @@ pub struct LiveAttach {
     pub receiver: broadcast::Receiver<Arc<RetainedMessage>>,
 }
 
-/// One subscriber's position on this channel, plus the application it holds
-/// that position under.
-///
-/// The slug is identity, not policy: a conversation is named by its id, while
-/// the registration carrying its wake economics and noise rung is keyed by app,
-/// so naming the app is the only route from a position back to the registration
-/// that governs it.
-#[derive(Debug)]
-struct AttachedCursor {
-    cursor: SubscriberCursor,
-    app_slug: String,
-}
-
-/// Per-channel mutable state. One lock covers all three structures, so seq
-/// assignment, ring append, and cursor bookkeeping are atomic with respect to
-/// an attach: for any attach, a message is either entirely before the cursor's
-/// starting position or entirely after it.
+/// This channel, plus the identity the backend reports its positions under. One
+/// lock covers both, so seq assignment, ring append, and cursor bookkeeping are
+/// atomic with respect to an attach: for any attach, a message is either
+/// entirely before the cursor's starting position or entirely after it.
 #[derive(Debug)]
 struct RingState {
-    ring: RetainedRing<Arc<MessageEnvelope>, Uuid>,
-    deferred: DeferredSet<Arc<MessageEnvelope>>,
-    cursors: HashMap<ParticipantId, AttachedCursor>,
-}
-
-impl RingState {
-    /// Append into the ring and report every attached cursor the append pushed
-    /// retention past.
+    core: RingCore<Arc<MessageEnvelope>, Uuid, ParticipantId>,
+    /// The application each attached subscriber holds its position under, kept
+    /// in lockstep with the core's cursors.
     ///
-    /// Reporting the eviction here, under the same lock that performed it, is
-    /// what makes a drop attributable the moment it happens: a subscriber that
-    /// never runs — wedged, starved, or simply idle — is still reported against,
-    /// and the noise ladder escalates without waiting for a read that may never
-    /// come. Each append reports only the span it itself evicted, so a wedged
-    /// subscriber's loss is never counted twice; the cursors do not move, since
-    /// a cursor left below the frontier *is* the record of what it lost.
-    fn append_reporting_evictions(
-        &mut self,
-        message: Arc<MessageEnvelope>,
-    ) -> (u64, Vec<OverflowEvent>) {
-        let RingState { ring, cursors, .. } = self;
-        let frontier = retention_frontier(ring);
-        let appended = ring.append(message);
-        if appended.evicted == 0 {
-            return (appended.seq, Vec::new());
-        }
-        let mut overflow = Vec::new();
-        for (subscriber, attached) in cursors.iter() {
-            let dropped = attached.cursor.evicted_since(ring, frontier);
-            if dropped > 0 {
-                overflow.push(OverflowEvent {
-                    subscriber: subscriber.clone(),
-                    dropped,
-                    app_slug: Some(attached.app_slug.clone()),
-                });
-            }
-        }
-        (appended.seq, overflow)
-    }
-}
-
-/// Fold one append's overflow into a batch's, so a subscriber that lost
-/// messages to several appends is named once with the total.
-fn merge_overflow(into: &mut Vec<OverflowEvent>, more: Vec<OverflowEvent>) {
-    for event in more {
-        match into.iter_mut().find(|e| e.subscriber == event.subscriber) {
-            Some(existing) => existing.dropped += event.dropped,
-            None => into.push(event),
-        }
-    }
+    /// The slug is identity, not policy: a conversation is named by its id, while
+    /// the registration carrying its wake economics and noise rung is keyed by
+    /// app, so naming the app is the only route from a position back to the
+    /// registration that governs it.
+    app_slugs: HashMap<ParticipantId, String>,
 }
 
 /// The in-memory retention store for one non-durable channel.
@@ -245,16 +193,20 @@ impl RingStore {
         fan_out_capacity: u32,
     ) -> Self {
         let address = address.into();
+        let capabilities = ChannelScheme::of(&address)
+            .and_then(ChannelScheme::capabilities)
+            .unwrap_or_else(|| {
+                panic!(
+                    "messaging store: {address} names no pub/sub channel, so it holds no retention"
+                )
+            });
         // A ring-backed durable channel would be a mis-wiring that loses data on
         // restart, so it is rejected here rather than at the first read.
-        let capabilities = match ChannelScheme::split(&address).map(|(scheme, _)| scheme) {
-            Some(ChannelScheme::Ephemeral) => ChannelCapabilities::TRANSPORTABLE,
-            Some(ChannelScheme::Local) => ChannelCapabilities::CONFINED,
-            other => panic!(
-                "messaging store: {address} is ring-backed but its scheme {other:?} is not a \
-                 non-durable pub/sub scheme"
-            ),
-        };
+        assert!(
+            !capabilities.durable,
+            "messaging store: {address} is ring-backed but its scheme is durable, so its \
+             retention would not survive a restart"
+        );
         let depth = match retain_depth {
             Depth::Bounded(n) => n,
             Depth::Unbounded => panic!(
@@ -284,9 +236,8 @@ impl RingStore {
             fan_out_gate: Mutex::new(()),
             publishes: AtomicU64::new(0),
             state: Mutex::new(RingState {
-                ring: RetainedRing::new(epoch, depth),
-                deferred: DeferredSet::new(Some(depth)),
-                cursors: HashMap::new(),
+                core: RingCore::new(epoch, depth),
+                app_slugs: HashMap::new(),
             }),
         }
     }
@@ -397,19 +348,53 @@ impl RingStore {
     pub fn append(&self, envelope: MessageEnvelope) -> Appended {
         let envelope = Arc::new(envelope);
         let _gate = self.fan_out_gate();
-        let (seq, overflow) = self
-            .state()
-            .append_reporting_evictions(Arc::clone(&envelope));
-        let retained = RetainedMessage { seq, envelope };
+        let mut state = self.state();
+        let report = state.core.append(Arc::clone(&envelope));
+        let overflow = Self::overflow_events(&state, report.overflow);
+        drop(state);
+        let retained = RetainedMessage {
+            seq: report.seq,
+            envelope,
+        };
         self.announce(&retained);
         Appended { retained, overflow }
+    }
+
+    /// Name each charged position with the application it is held under: the
+    /// noise rung a drop escalates on belongs to the registration, and the slug
+    /// is the only route from a position back to it.
+    fn overflow_events(
+        state: &RingState,
+        overflow: Vec<CursorOverflow<ParticipantId>>,
+    ) -> Vec<OverflowEvent> {
+        overflow
+            .into_iter()
+            .map(|event| OverflowEvent {
+                app_slug: Some(Self::app_slug(state, &event.subscriber)),
+                subscriber: event.subscriber,
+                dropped: event.evicted,
+            })
+            .collect()
+    }
+
+    /// The application `subscriber` holds its position under. Recorded at every
+    /// attach and dropped at every detach, so a position without one is a
+    /// bookkeeping bug rather than a subscriber the store may report anonymously.
+    fn app_slug(state: &RingState, subscriber: &ParticipantId) -> String {
+        state.app_slugs.get(subscriber).cloned().unwrap_or_else(|| {
+            panic!(
+                "messaging store: subscriber {} holds a position under no application",
+                subscriber.as_str()
+            )
+        })
     }
 
     /// The most recent `n` retained messages, oldest first — the channel's
     /// ambience, independent of any subscriber's position.
     pub fn retained_tail(&self, n: u64) -> Vec<RetainedMessage> {
         self.state()
-            .ring
+            .core
+            .ring()
             .tail(n)
             .map(|e| RetainedMessage {
                 seq: e.seq,
@@ -420,18 +405,18 @@ impl RingStore {
 
     /// Number of retained messages.
     pub fn retained_len(&self) -> usize {
-        self.state().ring.len()
+        self.state().core.ring().len()
     }
 
     /// The highest sequence number this epoch ever assigned, or 0 if none.
     pub fn newest_seq(&self) -> u64 {
-        self.state().ring.newest_seq()
+        self.state().core.ring().newest_seq()
     }
 
     /// What a subscriber resuming at `resume` is owed, and whether its
     /// continuity broke. The whole retained window plus a typed gap when it did.
     pub fn replay(&self, resume: Option<Resume<Uuid>>) -> Replay<Arc<MessageEnvelope>> {
-        self.state().ring.replay(resume)
+        self.state().core.ring().replay(resume)
     }
 
     // ── Subscribers ───────────────────────────────────────────────────────
@@ -444,6 +429,10 @@ impl RingStore {
     /// same queue is not a new attach. `app_slug` is refreshed either way — the
     /// registration is its authority, and a re-attach is where a changed one
     /// arrives.
+    ///
+    /// A sampled (`push_depth = 0`) attach holds no position, so it records no
+    /// application either: the slug exists to name a charged position, and a
+    /// sampled subscriber has none to charge.
     pub fn attach(
         &self,
         subscriber: &ParticipantId,
@@ -452,38 +441,32 @@ impl RingStore {
         priming: Priming,
     ) -> Attached {
         let mut state = self.state();
-        if let Some(attached) = state.cursors.get_mut(subscriber) {
-            attached.cursor.set_push_depth(push_depth);
-            attached.app_slug = app_slug.to_string();
-            return Attached::Existing;
+        let attached = state.core.attach(subscriber.clone(), push_depth, priming);
+        if state.core.is_attached(subscriber) {
+            state
+                .app_slugs
+                .insert(subscriber.clone(), app_slug.to_string());
+        } else {
+            state.app_slugs.remove(subscriber);
         }
-        let cursor = match priming {
-            Priming::Retained => SubscriberCursor::primed(&state.ring, push_depth),
-            Priming::Head => SubscriberCursor::at_head(&state.ring, push_depth),
-        };
-        state.cursors.insert(
-            subscriber.clone(),
-            AttachedCursor {
-                cursor,
-                app_slug: app_slug.to_string(),
-            },
-        );
-        Attached::Created
+        attached
     }
 
     /// Drop a subscriber's position. Its unread obligations go with it — the
     /// messages themselves stay retained for whoever else is owed them.
     pub fn detach(&self, subscriber: &ParticipantId) {
-        self.state().cursors.remove(subscriber);
+        let mut state = self.state();
+        state.core.detach(subscriber);
+        state.app_slugs.remove(subscriber);
     }
 
     pub fn is_attached(&self, subscriber: &ParticipantId) -> bool {
-        self.state().cursors.contains_key(subscriber)
+        self.state().core.is_attached(subscriber)
     }
 
     /// Every attached subscriber, in no particular order.
     pub fn attached(&self) -> Vec<ParticipantId> {
-        self.state().cursors.keys().cloned().collect()
+        self.state().core.cursors().keys().cloned().collect()
     }
 
     /// Every attached subscriber that currently has owed, deliverable messages,
@@ -500,8 +483,8 @@ impl RingStore {
     /// subscriber, lock held, on every dispatcher pass.
     pub fn deliverable_subscribers(&self) -> Vec<DeliverableSubscriber> {
         let state = self.state();
-        let retained: Vec<(u64, Urgency)> = state
-            .ring
+        let ring = state.core.ring();
+        let retained: Vec<(u64, Urgency)> = ring
             .tail(u64::MAX)
             .map(|entry| (entry.seq, entry.message.urgency))
             .collect();
@@ -515,15 +498,15 @@ impl RingStore {
         }
         loudest_from.reverse();
         state
-            .cursors
+            .core
+            .cursors()
             .iter()
-            .filter(|(_, attached)| attached.cursor.has_deliverable(&state.ring))
-            .map(|(subscriber, attached)| {
-                let first_unseen =
-                    retained.partition_point(|(seq, _)| *seq < attached.cursor.next_owed());
+            .filter(|(_, cursor)| cursor.has_deliverable(ring))
+            .map(|(subscriber, cursor)| {
+                let first_unseen = retained.partition_point(|(seq, _)| *seq < cursor.next_owed());
                 DeliverableSubscriber {
                     subscriber: subscriber.clone(),
-                    app_slug: Some(attached.app_slug.clone()),
+                    app_slug: Some(Self::app_slug(&state, subscriber)),
                     max_unseen_urgency: *loudest_from
                         .get(first_unseen)
                         .expect("ring: a deliverable cursor trails a retained message"),
@@ -543,7 +526,10 @@ impl RingStore {
     /// does not exist is a wiring bug, not a state to tolerate.
     pub fn has_deliverable(&self, subscriber: &ParticipantId) -> bool {
         let state = self.state();
-        self.cursor(&state, subscriber).has_deliverable(&state.ring)
+        if !state.core.is_attached(subscriber) {
+            Self::unattached(&self.address, subscriber);
+        }
+        state.core.has_deliverable(subscriber)
     }
 
     /// This subscriber's activation view: the most recent
@@ -565,23 +551,9 @@ impl RingStore {
         push_limit: u64,
         retain_limit: u64,
     ) -> Option<RingWindow> {
-        let mut state = self.state();
-        let RingState { ring, cursors, .. } = &mut *state;
-        let Some(attached) = cursors.get_mut(subscriber) else {
-            if push_limit > 0 {
-                return None;
-            }
-            let entries: Vec<_> = ring.tail(retain_limit).cloned().collect();
-            return Some(RingWindow {
-                new_from: entries.len(),
-                entries,
-                push_enabled: false,
-            });
-        };
-        if push_limit > 0 {
-            attached.cursor.set_push_depth(push_limit);
-        }
-        Some(attached.cursor.window(ring, push_limit, retain_limit))
+        self.state()
+            .core
+            .window(subscriber, push_limit, retain_limit)
     }
 
     /// Move this subscriber's cursor to `through + 1` and report the unseen
@@ -596,21 +568,7 @@ impl RingStore {
         through: u64,
         seen_floor: u64,
     ) -> Option<Advance> {
-        let mut state = self.state();
-        let RingState { ring, cursors, .. } = &mut *state;
-        let advance = cursors
-            .get_mut(subscriber)
-            .map(|attached| attached.cursor.advance(ring, through, seen_floor));
-        drop(state);
-        advance
-    }
-
-    fn cursor<'a>(&self, state: &'a RingState, subscriber: &ParticipantId) -> &'a SubscriberCursor {
-        &state
-            .cursors
-            .get(subscriber)
-            .unwrap_or_else(|| Self::unattached(&self.address, subscriber))
-            .cursor
+        self.state().core.advance(subscriber, through, seen_floor)
     }
 
     fn unattached(address: &str, subscriber: &ParticipantId) -> ! {
@@ -640,7 +598,7 @@ impl RingStore {
         let sender = envelope.sender.clone();
         let message_uuid = envelope.message_id;
         self.state()
-            .deferred
+            .core
             .park(sender, Arc::new(envelope), release_time_of(release_at))?;
         Ok(message_uuid)
     }
@@ -654,7 +612,7 @@ impl RingStore {
     /// that matured in between.
     pub fn next_release(&self) -> Option<DateTime<Utc>> {
         // The set is release-ordered, so the head is the earliest deadline.
-        self.state().deferred.next_release().map(instant_of)
+        self.state().core.next_release().map(instant_of)
     }
 
     /// Release every message due at or before `now` into retention, in release
@@ -667,16 +625,17 @@ impl RingStore {
     pub fn release_due(&self, now: DateTime<Utc>) -> ReleasedBatch {
         let _gate = self.fan_out_gate();
         let mut state = self.state();
-        let due = state.deferred.release_due(release_time_of(now));
-        let mut messages = Vec::with_capacity(due.len());
-        let mut overflow: Vec<OverflowEvent> = Vec::new();
-        for entry in due {
-            let envelope = Arc::clone(&entry.message);
-            let (seq, evicted) = state.append_reporting_evictions(entry.message);
-            messages.push(RetainedMessage { seq, envelope });
-            merge_overflow(&mut overflow, evicted);
-        }
+        let report = state.core.release_due(release_time_of(now));
+        let overflow = Self::overflow_events(&state, report.overflow);
         drop(state);
+        let messages: Vec<RetainedMessage> = report
+            .released
+            .into_iter()
+            .map(|released| RetainedMessage {
+                seq: released.seq,
+                envelope: released.message,
+            })
+            .collect();
         for retained in &messages {
             self.announce(retained);
         }
@@ -689,23 +648,34 @@ impl RingStore {
     /// sender can never observe another sender's parked message, so an edit or
     /// cancel naming an id from this view needs no further identity check.
     pub fn deferred_for_sender(&self, sender: &str, now: DateTime<Utc>) -> Vec<DeferredMessage> {
-        let cutoff = release_time_of(now);
         self.state()
-            .deferred
-            .for_sender(sender)
-            .filter(|e| e.release_at > cutoff)
+            .core
+            .deferred_for_sender(sender, release_time_of(now))
             .map(Self::view)
             .collect()
+    }
+
+    /// Every sender holding something parked at `now`, once each, sorted.
+    ///
+    /// The scan is bounded by the deferred cap, which is the channel's depth.
+    pub fn deferred_senders(&self, now: DateTime<Utc>) -> Vec<String> {
+        let mut senders: Vec<String> = self
+            .state()
+            .core
+            .deferred_at(release_time_of(now))
+            .map(|entry| entry.sender.clone())
+            .collect();
+        senders.sort_unstable();
+        senders.dedup();
+        senders
     }
 
     /// Every message still parked at `now`, release order. Operator-facing; not
     /// a per-sender view.
     pub fn deferred(&self, now: DateTime<Utc>) -> Vec<DeferredMessage> {
-        let cutoff = release_time_of(now);
         self.state()
-            .deferred
-            .iter()
-            .filter(|e| e.release_at > cutoff)
+            .core
+            .deferred_at(release_time_of(now))
             .map(Self::view)
             .collect()
     }
@@ -718,24 +688,31 @@ impl RingStore {
     /// until the release loop takes it, because it is still held in memory.
     /// That is what the cap bounds, so that is what this counts.
     pub fn deferred_len(&self) -> usize {
-        self.state().deferred.len()
+        self.state().core.deferred_len()
     }
 
     /// Cancel one of `sender`'s parked messages.
     ///
-    /// `false` means the entry is no longer parked — it released between the
-    /// view the caller acted on and this call. That race is inherent to
+    /// `NotDeferred` means the entry is no longer parked — it released between
+    /// the view the caller acted on and this call. That race is inherent to
     /// scheduling, so it is a reportable no-op rather than a failure.
-    ///
-    /// Panics if the entry exists under a different sender: the caller obtained
-    /// the id from a sender-scoped view, so reaching another sender's entry
-    /// means the scoping was bypassed.
-    pub fn cancel_deferred(&self, sender: &str, message_uuid: Uuid, now: DateTime<Utc>) -> bool {
+    /// `WrongSender` means the entry is parked under someone else; the caller
+    /// judges that, since only the caller knows where the id came from.
+    pub fn cancel_deferred(
+        &self,
+        sender: &str,
+        message_uuid: Uuid,
+        now: DateTime<Utc>,
+    ) -> DeferralOutcome {
         let mut state = self.state();
-        let Some(id) = self.owned_id(&state, sender, message_uuid, now) else {
-            return false;
+        let id = match self.owned_id(&state, sender, message_uuid, now) {
+            Ok(id) => id,
+            Err(outcome) => return outcome,
         };
-        state.deferred.cancel(id).is_some()
+        match state.core.cancel_deferred(id).is_some() {
+            true => DeferralOutcome::Applied,
+            false => DeferralOutcome::NotDeferred,
+        }
     }
 
     /// Replace one of `sender`'s parked messages' body, release time, or both.
@@ -748,26 +725,32 @@ impl RingStore {
         body: Option<String>,
         release_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
-    ) -> bool {
+    ) -> DeferralOutcome {
         let mut state = self.state();
-        let Some(id) = self.owned_id(&state, sender, message_uuid, now) else {
-            return false;
+        let id = match self.owned_id(&state, sender, message_uuid, now) {
+            Ok(id) => id,
+            Err(outcome) => return outcome,
         };
         let edited = body.map(|body| {
-            let mut envelope = (*state.deferred.get(id).expect("checked above").message).clone();
+            let mut envelope = (*state
+                .core
+                .deferred_entry(id)
+                .expect("checked above")
+                .message)
+                .clone();
             envelope.body = body;
             Arc::new(envelope)
         });
         let release_at = release_at.map(release_time_of);
-        match state.deferred.edit(id, edited, release_at) {
-            Ok(()) => true,
-            Err(NoSuchDeferred(_)) => false,
+        match state.core.edit_deferred(id, edited, release_at).is_ok() {
+            true => DeferralOutcome::Applied,
+            false => DeferralOutcome::NotDeferred,
         }
     }
 
     /// The parking slot holding `message_uuid`, if it is still parked at `now`
-    /// and belongs to `sender`. Absent is the benign release race; present under
-    /// another sender means a sender-scoped view was bypassed, and panics.
+    /// and belongs to `sender`. Otherwise the outcome the caller reports: the
+    /// benign release race, or an entry parked under another sender.
     ///
     /// The scan is bounded by the deferred cap, which is the channel's
     /// `retain_depth`.
@@ -777,20 +760,16 @@ impl RingStore {
         sender: &str,
         message_uuid: Uuid,
         now: DateTime<Utc>,
-    ) -> Option<DeferredId> {
-        let cutoff = release_time_of(now);
-        let entry = state
-            .deferred
-            .iter()
-            .find(|e| e.message.message_id == message_uuid && e.release_at > cutoff)?;
-        assert!(
-            entry.sender == sender,
-            "messaging store: {} message {message_uuid} belongs to {}, not {sender} — a \
-             sender-scoped view was bypassed",
-            self.address,
-            entry.sender
-        );
-        Some(entry.id)
+    ) -> Result<DeferredId, DeferralOutcome> {
+        match state.core.owned_deferred(
+            sender,
+            |message| message.message_id == message_uuid,
+            release_time_of(now),
+        ) {
+            OwnedDeferred::Owned(id, _) => Ok(id),
+            OwnedDeferred::WrongSender { .. } => Err(DeferralOutcome::WrongSender),
+            OwnedDeferred::NotFound => Err(DeferralOutcome::NotDeferred),
+        }
     }
 
     fn view(entry: &Deferred<Arc<MessageEnvelope>>) -> DeferredMessage {
@@ -852,18 +831,9 @@ impl RetentionStore for RingStore {
     /// The inherent `has_deliverable` panics for an unattached subscriber (its
     /// callers hold a live cursor and a missing one is a wiring bug); the trait
     /// contract is looser — an unknown subscriber is owed nothing — so this
-    /// answers `false` rather than panicking when no cursor exists.
-    ///
-    /// Resolved under a single lock hold: a check-then-act over two `state()`
-    /// acquisitions would let a concurrent `detach` remove the cursor between
-    /// the attach check and the deliverable read, dropping into the inherent
-    /// method's unattached panic.
+    /// takes the core's own answer, which is `false` when no cursor exists.
     async fn has_deliverable(&self, subscriber: &ParticipantId) -> bool {
-        let state = self.state();
-        state
-            .cursors
-            .get(subscriber)
-            .is_some_and(|attached| attached.cursor.has_deliverable(&state.ring))
+        self.state().core.has_deliverable(subscriber)
     }
 
     /// The cursor's own view, repacked to the trait's shape. `push_limit`
@@ -927,17 +897,7 @@ impl RetentionStore for RingStore {
         push_depth: Depth,
         priming: Priming,
     ) -> Attached {
-        if !push_depth.is_push_enabled() {
-            self.state().cursors.remove(subscriber);
-            return Attached::Existing;
-        }
-        RingStore::attach(
-            self,
-            subscriber,
-            app_slug,
-            super::depth_bound(push_depth),
-            priming,
-        )
+        RingStore::attach(self, subscriber, app_slug, depth_bound(push_depth), priming)
     }
 
     async fn detach(&self, subscriber: &ParticipantId) {
@@ -1019,6 +979,10 @@ impl RetentionStore for RingStore {
         RingStore::deferred_for_sender(self, sender, now)
     }
 
+    async fn deferred_senders(&self, now: DateTime<Utc>) -> Vec<String> {
+        RingStore::deferred_senders(self, now)
+    }
+
     async fn deferred_len(&self) -> u64 {
         u64::try_from(RingStore::deferred_len(self))
             .expect("messaging store: deferred set larger than u64")
@@ -1030,10 +994,7 @@ impl RetentionStore for RingStore {
         message_uuid: Uuid,
         now: DateTime<Utc>,
     ) -> DeferralOutcome {
-        match RingStore::cancel_deferred(self, sender, message_uuid, now) {
-            true => DeferralOutcome::Applied,
-            false => DeferralOutcome::NotDeferred,
-        }
+        RingStore::cancel_deferred(self, sender, message_uuid, now)
     }
 
     async fn edit_deferred(
@@ -1044,10 +1005,7 @@ impl RetentionStore for RingStore {
         release_at: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> DeferralOutcome {
-        match RingStore::edit_deferred(self, sender, message_uuid, body, release_at, now) {
-            true => DeferralOutcome::Applied,
-            false => DeferralOutcome::NotDeferred,
-        }
+        RingStore::edit_deferred(self, sender, message_uuid, body, release_at, now)
     }
 }
 
@@ -1143,9 +1101,17 @@ mod tests {
     /// A ring-backed durable channel would lose data on restart, so the mismatch
     /// is a boot panic rather than a latent one at the first capability read.
     #[test]
-    #[should_panic(expected = "not a non-durable pub/sub scheme")]
+    #[should_panic(expected = "its scheme is durable")]
     fn a_durable_scheme_is_rejected_at_construction() {
         RingStore::new(Uuid::new_v4(), "brenn:room", Depth::Bounded(4));
+    }
+
+    /// An address that names no channel at all answers neither capability
+    /// question, so it cannot be ring-backed either.
+    #[test]
+    #[should_panic(expected = "names no pub/sub channel")]
+    fn a_scheme_that_names_no_channel_is_rejected_at_construction() {
+        RingStore::new(Uuid::new_v4(), "pwa_push:device", Depth::Bounded(4));
     }
 
     #[test]
@@ -1393,68 +1359,11 @@ mod tests {
     }
 
     // ── Subscribers ───────────────────────────────────────────────────────
-
-    #[test]
-    fn head_priming_owes_nothing_already_published() {
-        let s = store(8);
-        publish(&s, "alice", &["old"]);
-        assert_eq!(
-            s.attach(&sub("proc"), "proc", 4, Priming::Head),
-            Attached::Created
-        );
-        assert!(bodies(&s, &sub("proc"), 4).is_empty());
-
-        publish(&s, "alice", &["new"]);
-        assert_eq!(bodies(&s, &sub("proc"), 4), vec!["new"]);
-    }
-
-    /// Attach is a delivery point: what was published before the queue existed
-    /// is new to it, capped by the queue's push depth.
-    #[test]
-    fn retained_priming_delivers_the_tail_as_new() {
-        let s = store(8);
-        publish(&s, "alice", &["a", "b", "c"]);
-        s.attach(&sub("proc"), "proc", 2, Priming::Retained);
-
-        let (new, dropped) = serve(&s, &sub("proc"), 2);
-        assert_eq!(new, vec!["b", "c"]);
-        assert_eq!(dropped, 0);
-    }
-
-    #[test]
-    fn reattach_keeps_position_and_retunes_depth() {
-        let s = store(8);
-        s.attach(&sub("proc"), "proc", 4, Priming::Head);
-        publish(&s, "alice", &["a"]);
-        assert_eq!(bodies(&s, &sub("proc"), 4), vec!["a"]);
-
-        publish(&s, "alice", &["b", "c"]);
-        assert_eq!(
-            s.attach(&sub("proc"), "proc", 1, Priming::Retained),
-            Attached::Existing
-        );
-        // Position carried over, so `b` is still unseen — and the retuned depth
-        // of 1 clamps the window to the newest, reporting the older as a drop.
-        let (new, dropped) = serve(&s, &sub("proc"), 1);
-        assert_eq!(new, vec!["c"]);
-        assert_eq!(dropped, 1);
-    }
-
-    #[test]
-    fn overflow_is_charged_per_subscriber() {
-        let s = store(8);
-        s.attach(&sub("fast"), "fast", 8, Priming::Head);
-        s.attach(&sub("slow"), "slow", 1, Priming::Head);
-        publish(&s, "alice", &["a", "b", "c"]);
-
-        let (fast, fast_dropped) = serve(&s, &sub("fast"), 8);
-        assert_eq!(fast, vec!["a", "b", "c"]);
-        assert_eq!(fast_dropped, 0);
-
-        let (slow, slow_dropped) = serve(&s, &sub("slow"), 1);
-        assert_eq!(slow, vec!["c"]);
-        assert_eq!(slow_dropped, 2);
-    }
+    //
+    // Priming, retuning and window arithmetic are `RingCore`'s and are pinned
+    // in `brenn-queue`. What these cases pin is what the store adds: the
+    // participant and application a position is charged under, and the
+    // repacking of the core's answers.
 
     /// A subscriber whose unseen messages the ring overwrites is reported
     /// against by the append that overwrote them, and named in that append's
@@ -1706,10 +1615,15 @@ mod tests {
     fn cancel_removes_the_entry_and_reports_the_release_race() {
         let s = store(4);
         let id = s.park(envelope("alice", "a"), at(1_000)).unwrap();
-        assert!(s.cancel_deferred("alice", id, now()));
+        assert_eq!(
+            s.cancel_deferred("alice", id, now()),
+            DeferralOutcome::Applied
+        );
         assert_eq!(s.deferred_len(), 0);
-        // Second cancel names an entry that is gone: a reportable no-op.
-        assert!(!s.cancel_deferred("alice", id, now()));
+        assert_eq!(
+            s.cancel_deferred("alice", id, now()),
+            DeferralOutcome::NotDeferred
+        );
     }
 
     #[test]
@@ -1717,7 +1631,10 @@ mod tests {
         let s = store(4);
         let id = s.park(envelope("alice", "a"), at(1_000)).unwrap();
         assert_eq!(s.release_due(at(1_000)).messages.len(), 1);
-        assert!(!s.cancel_deferred("alice", id, now()));
+        assert_eq!(
+            s.cancel_deferred("alice", id, now()),
+            DeferralOutcome::NotDeferred
+        );
     }
 
     #[test]
@@ -1726,7 +1643,10 @@ mod tests {
         let late = s.park(envelope("alice", "late"), at(3_000)).unwrap();
         s.park(envelope("alice", "soon"), at(1_000)).unwrap();
 
-        assert!(s.edit_deferred("alice", late, Some("edited".into()), Some(at(500)), now()));
+        assert_eq!(
+            s.edit_deferred("alice", late, Some("edited".into()), Some(at(500)), now()),
+            DeferralOutcome::Applied
+        );
         let view = s.deferred_for_sender("alice", now());
         assert_eq!(view[0].envelope.body, "edited");
         assert_eq!(view[0].release_at, at(500));
@@ -1739,16 +1659,28 @@ mod tests {
         let s = store(4);
         let id = s.park(envelope("alice", "a"), at(1_000)).unwrap();
         s.release_due(at(1_000));
-        assert!(!s.edit_deferred("alice", id, Some("edited".into()), None, now()));
+        assert_eq!(
+            s.edit_deferred("alice", id, Some("edited".into()), None, now()),
+            DeferralOutcome::NotDeferred
+        );
     }
 
-    /// A component may only reach the ids a sender-scoped view gave it, so an
-    /// id belonging to someone else means that scoping was bypassed.
+    /// An id parked under another sender is reported, not enacted and not
+    /// panicked on: the store leaves the entry alone and lets the caller judge
+    /// how an id it was never shown reached it.
     #[test]
-    #[should_panic(expected = "a sender-scoped view was bypassed")]
-    fn touching_another_senders_deferred_message_panics() {
+    fn touching_another_senders_deferred_message_is_reported() {
         let s = store(4);
         let id = s.park(envelope("bob", "b"), at(1_000)).unwrap();
-        s.cancel_deferred("alice", id, now());
+        assert_eq!(
+            s.cancel_deferred("alice", id, now()),
+            DeferralOutcome::WrongSender
+        );
+        assert_eq!(
+            s.edit_deferred("alice", id, Some("edited".into()), None, now()),
+            DeferralOutcome::WrongSender
+        );
+        assert_eq!(s.deferred_for_sender("bob", now())[0].envelope.body, "b");
+        assert_eq!(s.deferred_len(), 1);
     }
 }

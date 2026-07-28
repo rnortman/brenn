@@ -12,22 +12,23 @@
 //! `Unsubscribed → Pending → Active` wire-state machine, and the
 //! `Subscribe`/`Unsubscribe` edges as ports attach and detach.
 //!
-//! It also owns the **`local:` router**: page-local pub/sub whose sole source of
-//! truth is this core. A `local:` channel has no wire state at all — no
-//! `Subscribe`, no refcount, no resume token — because no server mediates it.
-//! The router assigns `LocalPos { epoch, seq }`, retains a bounded per-channel
-//! ring, and routes a publish into the subscribed instances' pending queues
-//! synchronously, so local delivery keeps working with the link down. See
-//! [`LocalRing`].
+//! It also owns the **router for confined channels**: page-local pub/sub whose
+//! sole source of truth is this core. A confined channel has no wire state at
+//! all — no `Subscribe`, no refcount, no resume token — because no server
+//! mediates it. The router mints the envelope, appends it to the channel's
+//! store, and wakes every bound instance synchronously, so page-local delivery
+//! keeps working with the link down. Retention itself is class-blind: confined
+//! and transportable channels are held by one type, [`SurfaceChannelStore`],
+//! over the channel mechanics the backend runs.
 //!
 //! # Err consumes; retention is the recovery
 //!
-//! The messages an activation is assembled for are acked **at assembly**, on
-//! both hostings. A failed activation is therefore never re-driven: returning
-//! err or trapping discards the buffered publishes and nothing else, and the
-//! messages that activation saw reappear only as retained context, in this or a
-//! later window whose `retain_depth` still covers them. There is no gap-and-
-//! replay choreography and no terminal port failure.
+//! Every window an activation is assembled from advances its binding's cursor
+//! **at assembly**, on both hostings. A failed activation is therefore never
+//! re-driven: returning err or trapping discards the buffered publishes and
+//! nothing else, and the messages that activation saw reappear only as retained
+//! context, in this or a later window whose `retain_depth` still covers them.
+//! There is no gap-and-replay choreography and no terminal port failure.
 //!
 //! Author rule: if you cannot afford to lose it on a failed activation, either
 //! do not err after observing it, or give the port retention.
@@ -35,16 +36,30 @@
 //! # The loudness ladder
 //!
 //! The kernel is the single surface-side enforcement site for per-binding
-//! overflow loudness. Drops from both queues in series — the kernel-side pending
-//! queue and the server-side push window (reported on `Deliver` and folded in) —
-//! surface as one per-binding drop delta at window assembly, and that delta is
-//! the ladder's only input. Rungs are cumulative: `silent` does nothing beyond
+//! overflow loudness. It acts on drops from three origins, all charged against
+//! the same per-binding counter: a retirement that outran the binding's cursor
+//! (charged where it happened — the arrival, or the depth shrink, that retired
+//! it), a still-retained span the binding's advance passed unserved (charged at
+//! assembly, frontier-bounded so no span is enacted twice), and the server-side
+//! push window's own loss (reported on `Deliver` and folded in per binding).
+//! Rungs are cumulative: `silent` does nothing beyond
 //! the existing `dropped` accounting; `metered` adds kernel-internal per-binding
 //! lifetime counters; `alarm` adds an `Alert` frame and a coalesced
 //! `local:brenn/toast` (one per binding per activation); `fatal` adds the kill,
 //! taking the same trap-terminal path an entry's own trap takes. Noise governs
 //! loudness only — it never changes what happens to the data, which is always
 //! the delivery class's own overflow behaviour.
+//!
+//! Counting and announcing therefore happen at different moments. A loss is
+//! *counted* the instant it happens, so a lagging binding is on the books
+//! whether or not it ever runs again; the `alarm` rung's alert and toast are
+//! *announced* at the binding's next window, naming the whole delta that window
+//! reports. Announcing at each retirement instead would emit one alert frame and
+//! one toast per message for as long as a binding lagged — a storm in exactly the
+//! degraded condition the rung exists to report calmly — and a retirement always
+//! implies traffic the binding will be activated for, so nothing is lost by
+//! waiting for it. The one exception is the `fatal` rung: the kill ends the
+//! instance, so there is no next window and its announcement rides the kill.
 //!
 //! Server-side push windows for surface subscriptions are registered with noise
 //! clamped to `min(resolved, Metered)`, so the loud half fires here and only
@@ -66,15 +81,17 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency, surface_sub_identity};
-use brenn_surface_contract::{Activation, ActivationError, PortWindow};
+use brenn_surface_contract::{
+    Activation, ActivationError, DeferredEntry, DeferredWindow, PortWindow,
+};
 use brenn_surface_proto::{
-    AlertSeverity, BatchEntry, CONTROL_PLANE_VERSION, ClientFrame, Cursor, DeliverTarget, GapInfo,
-    InstanceReport, LOCAL_OVERLAY_STATE_CHANNEL, LOCAL_TAKEOVER_CHANNEL, LOCAL_TOAST_CHANNEL,
-    LogLevel, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES, NoiseLevel, OverlayReport,
-    OverlayStateBody, PublishBatchOutcome, PublishOutcome, RESERVED_LOCAL_CHANNELS,
-    STALE_BUILD_CLOSE_CODE, ServerFrame, StatusCounters, SubscribeOutcome, SurfaceBindings,
-    SurfaceDescription, TakeoverBody, ToastBody, ToastSeverity, ToastSource,
-    reserved_local_channel,
+    AlertSeverity, BatchDeferredOp, BatchEntry, CONTROL_PLANE_VERSION, ClientFrame, Cursor,
+    DeferredOpKind, DeferredViewEntry, DeliverTarget, GapInfo, InstanceReport,
+    LOCAL_OVERLAY_STATE_CHANNEL, LOCAL_TAKEOVER_CHANNEL, LOCAL_TOAST_CHANNEL, LogLevel,
+    MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES, NoiseLevel, OverlayReport, OverlayStateBody,
+    PublishBatchOutcome, PublishOutcome, RESERVED_LOCAL_CHANNELS, STALE_BUILD_CLOSE_CODE,
+    ServerFrame, StatusCounters, SubscribeOutcome, SurfaceBindings, SurfaceDescription,
+    TakeoverBody, ToastBody, ToastSeverity, ToastSource, reserved_local_channel,
 };
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -113,6 +130,15 @@ enum LocalOrigin<'a> {
     Kernel,
 }
 
+/// What the reserved confined planes' guard made of one body.
+enum GuardedBody {
+    /// The body to carry onto the channel — rewritten where the plane rewrites
+    /// it, the caller's own bytes everywhere else.
+    Carry(String),
+    /// Refused, with the report that says why. Nothing reaches the channel.
+    Refused(Effect),
+}
+
 /// What the local mint did with one publish, carrying the effects it produced
 /// either way.
 ///
@@ -121,7 +147,7 @@ enum LocalOrigin<'a> {
 /// the caller: a refused message is neither retained nor delivered, and telling
 /// its publisher `Ok` would report a delivery that did not happen.
 enum LocalMint {
-    /// Minted, retained on the ring, and fanned out to every bound port.
+    /// Minted, retained in the store, and fanned out to every bound port.
     Routed(Vec<Effect>),
     /// Refused at a plane guard before the mint. The effects carry the
     /// violation report.
@@ -140,17 +166,21 @@ impl LocalMint {
 
 mod activation;
 mod publish_buffer;
+mod store;
 mod util;
 
-use activation::{LocalRing, ParkedBatch, PendingQueue, RegisteredInstance, RetainedRing};
-/// Re-exported so the handle's `PublishGate` asks the same question the core's
-/// wire paths do: a publish to a page-local port must not be pre-rejected as
-/// `NotConnected` while the link is down.
-pub(crate) use brenn_surface_proto::is_local_channel;
+use activation::{ParkedBatch, RegisteredInstance};
+use brenn_queue::CursorOverflow;
+use brenn_surface_proto::is_local_channel;
 pub use publish_buffer::PublishBuffer;
-use publish_buffer::{BufferedPublish, OutputSpec};
-pub(crate) use util::truncate_report_field;
+use publish_buffer::{BufferedDeferOp, BufferedPublish, OutputSpec};
+/// Re-exported so the handle's `PublishGate` asks the same question the core's
+/// publish paths do: a publish to a confined port must not be pre-rejected as
+/// `NotConnected` while the link is down.
+pub(crate) use store::channel_is_transportable;
+use store::{BindingKey, DeferOp, DeferOpOutcome, StoreKey, SurfaceChannelStore, store_key};
 use util::*;
+pub(crate) use util::{checked_epoch_ms, epoch_ms, truncate_report_field};
 
 /// A monotonic timestamp in milliseconds, supplied by the driver on every
 /// input. wasm32 has no working `std::time::Instant`, so the driver reads the
@@ -191,11 +221,26 @@ pub enum Input {
     /// A binary frame arrived. The server never sends binary, so this is always
     /// a fatal protocol error.
     BinaryFrame,
+    /// A precondition the core cannot check for itself failed on the host side —
+    /// today, a device clock reading before the Unix epoch. Terminal, and it
+    /// carries its own diagnosis into the ordinary fatal path so the banner, the
+    /// link-state plane and the terminal `Event::Fatal` all fire as for any
+    /// other fatal.
+    HostFatal { detail: String },
     /// The armed timer fired.
     Tick,
     /// The armed outbox-retry timer fired: every instance whose outbox head is
     /// waiting on a refusal gets one more attempt.
     RetryTick,
+    /// The armed release timer fired: every message parked on a confined channel
+    /// whose release time has arrived enters retention now. `now_ms` is the
+    /// driver's wall-clock read at the fire, epoch milliseconds UTC — the same
+    /// sans-I/O seam as [`Millis`] on every other input, in the currency release
+    /// times are stated in.
+    ///
+    /// A fire that finds nothing due (a wall clock that stepped back, a timer
+    /// that fired early) releases nothing and is not an error.
+    ReleaseDue { now_ms: u64 },
     /// A command issued through the client handle and routed to the core by the
     /// driver.
     Command(Command),
@@ -315,6 +360,38 @@ fn loud_drop_effects(instance: &str, channel: &str, port: &str, dropped: u64) ->
             .expect("surface client: a toast body serializes"),
         },
     ]
+}
+
+/// One activation's read of what its instance has parked: the windows the
+/// component sees, and the identity behind each entry of each window.
+///
+/// Two views of one read. The component works in indices, which are only
+/// meaningful against the window it was handed; the kernel works in identities,
+/// which survive a release. Taking both from the same read is what makes an index
+/// the component names resolvable to the message it meant.
+#[derive(Debug, Default)]
+struct DeferredSnapshot {
+    windows: Vec<DeferredWindow>,
+    /// Per output port, the identities of that port's window entries, in window
+    /// order.
+    ids: HashMap<String, Vec<Uuid>>,
+}
+
+/// One binding's drop charge for the loudness ladder.
+///
+/// Two figures, because counting and announcing happen at different moments (see
+/// the module's ladder section): `counted` is this site's own accountable span,
+/// never overlapping another site's, and `announced` is the delta a coalesced
+/// alert and toast name — zero where the site defers the announcement to the
+/// binding's next window.
+struct DropCharge {
+    port: String,
+    channel: String,
+    noise: NoiseLevel,
+    /// Charged to the metered counter, and what arms the `fatal` kill.
+    counted: u64,
+    /// The delta the `alarm` rung announces here, or `0` to announce nothing.
+    announced: u64,
 }
 
 /// A command to the core, carried on [`Input::Command`], originating from the
@@ -458,6 +535,9 @@ struct PendingBatch {
     /// The entries the frame carries, kept so a `RateLimited` answer can re-park
     /// the batch verbatim rather than reconstruct it.
     entries: Vec<BatchEntry>,
+    /// The control ops the frame carries, kept for the same reason. Re-parked
+    /// with the entries: a refused batch was applied nowhere, ops included.
+    ops: Vec<BatchDeferredOp>,
 }
 
 /// How long the kernel waits before re-offering a refused outbox head.
@@ -491,6 +571,17 @@ pub enum Effect {
     /// other. The core states the deadline; the driver owns the clock and the
     /// select arm, the same division every timer here uses.
     SetRetryWakeup(Option<Millis>),
+    /// Arm the release timer to fire when the soonest message parked on a
+    /// confined channel comes due, or disarm it (`None`). The deadline is epoch
+    /// milliseconds UTC, not [`Millis`]: a release time is a wall-clock instant a
+    /// component named, so the driver converts it against the wall clock it reads
+    /// and the core states it in the currency the model uses.
+    ///
+    /// A third deadline alongside [`Effect::SetWakeup`] and
+    /// [`Effect::SetRetryWakeup`] for the same reason those two are separate:
+    /// each is an independent promise, and folding them would make every re-arm
+    /// cancel the others. Emitted only when the soonest deadline changes.
+    SetReleaseWakeup(Option<u64>),
     /// Send a client frame over the transport; the driver serializes and
     /// writes it.
     SendFrame(ClientFrame),
@@ -747,7 +838,7 @@ struct ChannelState {
     /// kernel never interprets it — it stores the latest accepted one and echoes
     /// it verbatim. Its lifetime is exactly "at least one port attached": it is
     /// discarded the moment the refcount reaches zero (so a later fresh 0→1
-    /// attach subscribes with `resume: None` and receives the retained ring
+    /// attach subscribes with `resume: None` and receives the retained tail
     /// rather than resuming past the latest value). Survives disconnects and
     /// Backoff — the ports stay attached across a transport blip and are resumed
     /// at reconcile.
@@ -785,7 +876,7 @@ impl ChannelState {
     /// matching attach is a core bug, not peer input). On reaching zero the
     /// resume token is discarded — its lifetime is exactly "at least one port
     /// attached", so a later fresh 0→1 attach subscribes with `resume: None`
-    /// and receives the retained ring rather than resuming past the latest
+    /// and receives the retained tail rather than resuming past the latest
     /// value. Returns the new refcount.
     fn release_ref(&mut self) -> u32 {
         self.refcount = self
@@ -843,31 +934,33 @@ impl SubKey {
     }
 }
 
-/// One input binding's pending queue as the reconcile resolves it: what the
-/// queue for this port must be after the binding table is applied.
+/// The depth the wire mirror for `sub` is built at: the fold over the
+/// subscription's bindings of `max(push_depth, retain_depth)`.
 ///
-/// `channel` is half the queue's identity, not decoration — a surviving port
-/// whose channel changed needs a new queue, and the reconcile can only see that
-/// by comparing this against what the existing queue carries.
-struct WantedQueue {
-    /// The binding's `push_depth`, already proven `usize`-representable.
-    capacity: usize,
-    channel: String,
-    /// How deep into the channel's ring this binding reads. Bounds the prime as
-    /// well as the context window.
-    retain_depth: u64,
+/// Both halves are load-bearing — `retain_depth` is what a binding reads as
+/// context, `push_depth` is what it can be handed as new — and the store is the
+/// only thing holding either. A mirror is created at two moments (the `Welcome`
+/// reconcile, and a registration attaching to a subscription whose mirror was
+/// discarded at refcount zero), so the fold lives here rather than at either of
+/// them.
+fn wire_store_depth(bindings: &SurfaceBindings, sub: &SubKey) -> u64 {
+    bindings
+        .subscriptions
+        .iter()
+        .filter(|b| b.instance == sub.instance && b.channel == sub.channel)
+        .map(|b| b.push_depth.max(b.retain_depth))
+        .max()
+        .unwrap_or(0)
 }
 
-/// Whether an existing queue survives a reconcile: the wanted set still holds
-/// this port, bound to the same channel.
-///
-/// Both call sites (retain and prime-skip) must use this shared predicate; if
-/// they drift, one direction silently duplicates messages and the other
-/// silently empties queues.
-fn queue_survives(wanted: &HashMap<String, WantedQueue>, port: &str, queue: &PendingQueue) -> bool {
-    wanted
-        .get(port)
-        .is_some_and(|w| w.channel == queue.channel())
+/// Whether a store is a reserved control plane's: the kernel's own, seeded at
+/// construction from the contract and never declared — or un-declared — by a
+/// `Welcome`.
+fn reserved_store(key: &StoreKey) -> bool {
+    match key {
+        StoreKey::Confined(channel) => reserved_local_channel(channel).is_some(),
+        StoreKey::Wire(_) => false,
+    }
 }
 
 /// The `Welcome` handshake fields the core consumes, grouped so `on_welcome`
@@ -985,38 +1078,37 @@ pub struct ClientCore {
     dispatch_cursor: Option<String>,
     /// Per-subscription refcount + wire state, keyed by [`SubKey`] — the owning
     /// principal *and* the channel, because the subscription is the principal's,
-    /// not the page's. Wire subscriptions only: a `local:` channel has no wire
-    /// state and lives in [`Self::local_rings`] instead.
+    /// not the page's. Wire subscriptions only: a confined channel has no wire
+    /// state, only the store every class has.
     channels: HashMap<SubKey, ChannelState>,
-    /// The `local:` router's retained rings, keyed by channel address. Operator
-    /// channels are rebuilt from `Welcome.bindings.local_channels` (their depths
-    /// are resolvable nowhere else: `local:` channels have no `[[channel]]`
-    /// block); the reserved `local:brenn/*` planes are seeded at construction at
-    /// their contract-fixed depths and never rebuilt, because the contract, not
-    /// a `Welcome`, is what declares them. Page-local state, so a reconnect
-    /// preserves every existing ring — only a page reload clears them, and that
-    /// mints a new `local_epoch` too.
-    local_rings: HashMap<String, LocalRing>,
-    /// Per-subscription retained rings for **wire** channels, keyed by the same
-    /// [`SubKey`] the subscription table uses. Depth is the max fold over that
-    /// instance's bindings' `retain_depth` on the channel (`reap_frontier`'s
-    /// documented fold for capacities), and each binding reads its own depth back
-    /// out of it.
+    /// Every channel this page retains, keyed by [`StoreKey`] — the channel
+    /// address for a confined channel, the subscription for a transportable one
+    /// (the distinction, and its reason, are `store`'s).
     ///
-    /// Fed by `on_deliver` for **every** subscription, uniformly — registered or
-    /// not, and before any pending queue — because the ring is what makes a
-    /// dropped message recoverable, and whether a component is activation- or
-    /// dialect-delivered is not a fact about retention.
+    /// Depth is the fold over the store's bindings of `max(push_depth,
+    /// retain_depth)`: the store serves delivery as well as context, so a
+    /// binding whose push window is deeper than its retained one still needs the
+    /// capacity to hold what it will be served. A confined store takes its
+    /// server-resolved `ring_depth` as a floor, and a reserved plane its
+    /// contract-fixed depth. Each binding still windows at its own depths, and
+    /// each attach primes from the channel's declared retention rather than the
+    /// folded depth, so a deeper store never widens anyone's visibility and
+    /// never owes anyone the padding as new.
     ///
-    /// `local:` channels are absent by construction: the router's own ring
-    /// (`local_rings`) is their context source. A second ring on the same
-    /// messages would be a mirror that could disagree with the router about what
-    /// the page retained.
-    wire_rings: HashMap<SubKey, RetainedRing>,
-    /// Instances delivered by activation, keyed by instance id. Holds the pending
-    /// queues, the scheduler flags, the sink carryover, and the parked flushes.
-    /// Every `dom` and headless instance the page delivers to is in here — it is
-    /// the only delivery model there is.
+    /// Fed for **every** channel uniformly, registered instances or not, because
+    /// retention is what makes a dropped message recoverable and is not a fact
+    /// about who is listening. Page-lifetime state: a reconnect preserves every
+    /// store, since discarding one would manufacture a loss the link never
+    /// caused; only a page reload clears them, and that mints a new
+    /// `local_epoch` too. The reserved `local:brenn/*` planes are seeded at
+    /// construction at their contract-fixed depths, because the contract, not a
+    /// `Welcome`, is what declares them.
+    stores: HashMap<StoreKey, SurfaceChannelStore>,
+    /// Instances delivered by activation, keyed by instance id. Holds the
+    /// scheduler flags, the sink carryover, and the parked flushes; what each of
+    /// its bindings is owed is a cursor in that channel's store. Every `dom` and
+    /// headless instance the page delivers to is in here — it is the only
+    /// delivery model there is.
     registered: HashMap<String, RegisteredInstance>,
     /// The page-load epoch stamped on every `LocalPos` (`CoreConfig::local_epoch`).
     local_epoch: Uuid,
@@ -1040,9 +1132,32 @@ pub struct ClientCore {
     /// traffic: chrome drops takeover messages the router routes (unknown
     /// instance, mismatched release), so "what the router carried" and "what
     /// chrome holds" are different facts, and only the second one is the
-    /// overlay. Page-local like the rings — a reload starts at `None`, which is
+    /// overlay. Page-local like the stores — a reload starts at `None`, which is
     /// the truth for a fresh page.
     overlay: Option<OverlayReport>,
+    /// The release deadline the driver's timer is armed at, epoch milliseconds
+    /// UTC, or `None` when nothing is parked on any confined channel.
+    ///
+    /// Held so the re-arm after every input emits [`Effect::SetReleaseWakeup`]
+    /// only when the soonest deadline actually moved: parking, editing,
+    /// cancelling, and releasing can all change it, and a page whose components
+    /// publish steadily would otherwise re-state the same deadline on every turn.
+    release_wakeup: Option<u64>,
+    /// What the backend says each `(channel, instance)` has parked on a
+    /// transportable output channel, release-ordered — the page's cache of the
+    /// only answer there is.
+    ///
+    /// A transportable channel's deferral authority is the backend: its parked
+    /// entries can outlive the page, they release on the server's clock, and
+    /// every session of the surface shares the sender identity that owns them. So
+    /// the page holds no deferred set for one, it holds what it was last told,
+    /// and it is told by [`ServerFrame::DeferredView`] — a full snapshot that
+    /// replaces the entry wholesale.
+    ///
+    /// Cleared at every `Welcome`, so an unmentioned pair is an empty set rather
+    /// than a stale one. Distinct from a wire store, which mirrors delivered
+    /// retention for a *subscription*; this mirrors a *sender's* schedule.
+    deferred_views: HashMap<(String, String), Vec<DeferredViewEntry>>,
 }
 
 impl ClientCore {
@@ -1072,25 +1187,111 @@ impl ClientCore {
             // The reserved control planes exist from the page's first instant,
             // before any `Welcome`: they are contract-defined, so their depths
             // come from the contract and not from a server that has not answered
-            // yet. Seeding them here is what "auto-bound by the kernel" means.
-            local_rings: RESERVED_LOCAL_CHANNELS
+            // yet. An unbound plane has no binding windows to fold in, so the
+            // contract depth is the whole of it. Seeding them here is what
+            // "auto-bound by the kernel" means.
+            stores: RESERVED_LOCAL_CHANNELS
                 .iter()
-                .map(|c| (c.address.to_string(), LocalRing::new(c.ring_depth)))
+                .map(|c| {
+                    (
+                        StoreKey::Confined(c.address.to_string()),
+                        SurfaceChannelStore::new(config.local_epoch, c.ring_depth),
+                    )
+                })
                 .collect(),
-            wire_rings: HashMap::new(),
             registered: HashMap::new(),
             local_epoch: config.local_epoch,
             participant_id: String::new(),
             jitter_rng: SplitMix64::new(config.backoff_jitter_seed),
             overlay: None,
+            release_wakeup: None,
+            deferred_views: HashMap::new(),
         };
         let effects = core.begin_connect(now);
         (core, effects)
     }
 
     /// Feed one input at monotonic time `now`; returns the ordered effects.
+    ///
+    /// The release timer is re-armed after every input, here rather than at each
+    /// site that could move it: a park at flush, a release sweep, and a depth
+    /// retune that refuses new parks all change when the next message comes due,
+    /// and one re-arm over the stores cannot be forgotten at a new site the way
+    /// per-site arming can.
     pub fn on_input(&mut self, input: Input, now: Millis) -> Vec<Effect> {
+        let mut effects = self.dispatch_input(input, now);
+        effects.extend(self.rearm_release());
+        effects
+    }
+
+    /// State the release deadline if the soonest parked message moved.
+    ///
+    /// Confined stores only: a transportable channel's deferred set lives with its
+    /// retention authority, which is the backend, so the page parks nothing there
+    /// and has nothing to time.
+    fn rearm_release(&mut self) -> Vec<Effect> {
+        let next = self
+            .stores
+            .iter()
+            .filter(|(key, _)| matches!(key, StoreKey::Confined(_)))
+            .filter_map(|(_, store)| store.next_release())
+            .min();
+        if next == self.release_wakeup {
+            return Vec::new();
+        }
+        self.release_wakeup = next;
+        vec![Effect::SetReleaseWakeup(next)]
+    }
+
+    /// Take every confined channel's due parked messages into retention.
+    ///
+    /// Each release is an ordinary arrival on its channel: a fresh tail seq, the
+    /// same eviction charges, and every bound instance woken by it exactly as a
+    /// page-local publish wakes them. Channels are swept in address order so a
+    /// page releasing on several at one fire enacts its loud rungs
+    /// reproducibly.
+    fn on_release_due(&mut self, now_ms: u64) -> Vec<Effect> {
+        let mut due: Vec<String> = self
+            .stores
+            .iter()
+            .filter_map(|(key, store)| match key {
+                StoreKey::Confined(channel)
+                    if store.next_release().is_some_and(|at| at <= now_ms) =>
+                {
+                    Some(channel.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        due.sort();
+        let mut effects = Vec::new();
+        for channel in due {
+            let report = self
+                .stores
+                .get_mut(&StoreKey::Confined(channel.clone()))
+                .expect("surface client: the store named by this sweep")
+                .release_due(now_ms);
+            tracing::debug!(
+                %channel,
+                released = report.released.len(),
+                "surface client: released parked messages into retention"
+            );
+            // A release is the first moment a parked message is observable, so a
+            // plane whose state the kernel reports records it here — the same
+            // point an immediate publish records it.
+            for released in &report.released {
+                self.record_overlay_state(&released.message);
+            }
+            effects.extend(self.enact_overflow(&channel, report.overflow));
+        }
+        effects
+    }
+
+    /// The input's own state transition, ahead of the release re-arm every input
+    /// gets ([`Self::on_input`]).
+    fn dispatch_input(&mut self, input: Input, now: Millis) -> Vec<Effect> {
         match (self.state, input) {
+            (_, Input::HostFatal { detail }) => self.go_fatal(detail),
             (State::Connecting, Input::Opened) => {
                 self.state = State::AwaitingWelcome;
                 Vec::new()
@@ -1161,6 +1362,12 @@ impl ClientCore {
                     stamp,
                 }),
             ) => self.on_publish_control(channel, body, stamp),
+            // A release is the page's own schedule maturing, and it is honoured in
+            // every state, terminal ones included — like the control publish above,
+            // and for a related reason: the confined router and its stores outlive
+            // the terminal transition, and a fire absorbed without releasing would
+            // leave the driver's armed deadline permanently due.
+            (_, Input::ReleaseDue { now_ms }) => self.on_release_due(now_ms),
             // Terminal: after the death decision (fatal error, stale-build
             // reload, or kernel-requested close), any in-flight transport or timer
             // event is expected and simply absorbed — not a bug to panic on.
@@ -1450,9 +1657,9 @@ impl ClientCore {
         // inexplicable ⇒ fatal. Never silently honoured: the depth is the plane's
         // semantics, not a tunable — `link-state` at 0 would kill the late-attach
         // replay the plane exists for, and `toast` above 0 would resurface stale
-        // events to a late chrome. Checked here so `reconcile_local_rings` can
-        // hold reserved rings untouched: past this point a reserved entry agrees
-        // with the ring already seeded at construction.
+        // events to a late chrome. The depth is a *floor* on the store, which a
+        // deep push window may raise; it is never lowered, and never sourced
+        // from anywhere but the contract.
         for lc in &bindings.local_channels {
             if let Some(reserved) = reserved_local_channel(&lc.channel)
                 && lc.ring_depth != reserved.ring_depth
@@ -1540,13 +1747,18 @@ impl ClientCore {
         {
             self.overlay = None;
         }
-        // Before `reconcile_attached`, which may force-detach ports on local
-        // channels this Welcome dropped, and before any attach resolves — a
-        // ring must exist for every declared local channel before a port can
-        // bind to it and replay it.
-        self.reconcile_local_rings(&bindings);
-        // The wire half of the same job, before anything can deliver into either.
-        self.reconcile_wire_rings(&bindings);
+        // Every deferred-view mirror goes: the backend re-seeds the nonempty ones
+        // immediately behind this frame, so an unmentioned pair is an empty set.
+        // Clearing is what makes that true — a set that emptied while the page was
+        // away is answered by the seeding pass saying nothing about it, and a
+        // retained mirror would answer with the schedule it had before the
+        // disconnect.
+        self.deferred_views.clear();
+        // Before `reconcile_attached`, which may force-detach ports on confined
+        // channels this Welcome dropped, and before any attach or delivery
+        // resolves — a store must exist for every declared channel before a
+        // binding can take a position in it.
+        let retuned = self.reconcile_stores(&bindings);
         self.max_body_bytes = max_body_bytes;
         self.alert_granted = alert_granted;
         self.error_report_floor = error_report_floor;
@@ -1554,6 +1766,10 @@ impl ClientCore {
         // deadline; any inbound text frame will push it out.
         let deadline = self.arm_liveness(now);
         let mut effects = vec![Effect::SetWakeup(Some(deadline))];
+        // A depth shrink's loss, enacted before the position reconcile below: a
+        // `fatal` binding trimmed past is killed here, and the reconcile then
+        // treats it as the terminal instance it now is.
+        effects.extend(retuned);
         // Reconnect-reconcile before a single Subscribe goes out: every registered
         // instance's queues follow the new binding table and its subscription
         // references are diffed onto it, so `resubscribe_survivors` below opens
@@ -1578,187 +1794,240 @@ impl ClientCore {
         effects
     }
 
-    /// Reconcile the `local:` router's rings against a just-received `Welcome`.
+    /// Reconcile every channel store against a just-received `Welcome`.
     ///
-    /// Existing rings are **preserved across a reconnect**, contents and seq
-    /// counter intact: the ring is page-local state and the page did not reload,
-    /// so discarding it would manufacture a data loss the link never caused —
-    /// exactly what `local:` exists to avoid (its whole point is that a dropped
-    /// link does not interrupt page-local delivery). A channel absent from this
-    /// `Welcome` is dropped: the operator un-declared it, and nothing may route
-    /// on it again. An operator ring whose declared depth changed is re-trimmed
-    /// in place.
+    /// Existing stores are **preserved across a reconnect**, contents, positions
+    /// and seq counter intact: references are diffed rather than dropped and
+    /// retaken, so no subscription's contents are scoped out by a reconnect, and
+    /// the store is exactly what a post-reconnect window's context is read from.
+    /// Discarding one here would manufacture a loss the link never caused. A store
+    /// no surviving binding names is dropped: nothing can route on it again. A
+    /// surviving one is retuned in place, which takes effect at each binding's next
+    /// window.
     ///
-    /// Reserved `local:brenn/*` planes are neither dropped nor retuned by any
-    /// `Welcome`: the contract declares them and fixes their depths, so both
-    /// halves below step over them. A `Welcome` that disagrees about a reserved
-    /// depth never reaches here — [`Self::on_welcome`] fatals on it.
+    /// A wire store this reconcile creates may be empty for a subscription nothing
+    /// currently references — its contents were discarded when its last reference
+    /// went ([`Self::release_channel_ref`]), and only the contents are
+    /// subscription-scoped, not the map entry.
     ///
-    /// Ports attached to a dropped local channel are force-detached by
+    /// A store has one size. It is the fold over the store's bindings of
+    /// `max(push_depth, retain_depth)`, floored for a confined channel by the
+    /// server-resolved `ring_depth` (and for a reserved plane by its
+    /// contract-fixed depth). Both halves of the per-binding max are
+    /// load-bearing: `retain_depth` is what a binding reads as context, and
+    /// `push_depth` is what it can be handed as new — and since the store is the
+    /// only thing holding either, a store shallower than a binding's push window
+    /// would silently cap its delivery. The default wire shape is exactly that
+    /// case (`retain_depth` unset is 0). What the store holds under that depth is
+    /// the channel's history on the page, and a position coming into existence is
+    /// primed from it.
+    ///
+    /// Reserved `local:brenn/*` planes are never dropped: the contract declares
+    /// them, so no `Welcome` declares them into existence and none can un-declare
+    /// them. Ports attached to a dropped confined channel are force-detached by
     /// [`Self::reconcile_attached`], which runs off the same bindings.
-    fn reconcile_local_rings(&mut self, bindings: &SurfaceBindings) {
-        self.local_rings.retain(|channel, _| {
-            // Reserved planes are the kernel's own, seeded at construction and
-            // never dropped: they are contract-defined, so no `Welcome` declares
-            // them into existence and none can un-declare them.
-            reserved_local_channel(channel).is_some()
-                || bindings
-                    .local_channels
-                    .iter()
-                    .any(|lc| &lc.channel == channel)
-        });
+    fn reconcile_stores(&mut self, bindings: &SurfaceBindings) -> Vec<Effect> {
+        let mut wanted: HashMap<StoreKey, u64> = HashMap::new();
+        // A declared confined channel gets a store whether or not anything binds
+        // it: the router accepts publishes on it, and the server's resolution is
+        // the floor under its depth.
         for lc in &bindings.local_channels {
-            // Reserved planes are left exactly as construction seeded them — the
-            // other half of the retain rule above. A `Welcome` names one whenever
-            // a component binds it, but the contract owns its depth, so there is
-            // nothing here to apply: `on_welcome` already fataled on an entry
-            // that disagreed, and re-applying an agreeing one would only make the
-            // contract-fixed depth look server-supplied.
-            if reserved_local_channel(&lc.channel).is_some() {
-                continue;
-            }
-            self.local_rings
-                .entry(lc.channel.clone())
-                .or_insert_with(|| LocalRing::new(lc.ring_depth))
-                .ring
-                .set_depth(lc.ring_depth);
+            let depth = wanted
+                .entry(StoreKey::Confined(lc.channel.clone()))
+                .or_default();
+            *depth = (*depth).max(lc.ring_depth);
         }
-    }
-
-    /// Reconcile the per-subscription retained rings for wire channels against a
-    /// just-received `Welcome`.
-    ///
-    /// Same rule as the `local:` rings, for the same reason: a ring is
-    /// page-lifetime state, so a reconnect preserves it — discarding it would
-    /// manufacture a loss the link never caused, and the ring is exactly what a
-    /// post-reconnect window's context is read from. A subscription no binding
-    /// names any more is dropped (nothing can route on it again); a surviving
-    /// one is retuned in place if its fold changed.
-    ///
-    /// Depth is the **max** over that instance's bindings' `retain_depth` on the
-    /// channel — the codebase's documented fold for capacities (`reap_frontier`).
-    /// Two ports of one instance on one channel share one subscription and one
-    /// ring, and each reads its own binding's depth back out of it, so the fold
-    /// must cover the deepest reader.
-    fn reconcile_wire_rings(&mut self, bindings: &SurfaceBindings) {
-        let mut folded: HashMap<SubKey, u64> = HashMap::new();
         for b in &bindings.subscriptions {
-            // `local:` bindings take no ring here: the router's per-channel ring
-            // is their context source. A second ring over the same messages could
-            // disagree with the router about what the page retained.
-            if is_local_channel(&b.channel) {
-                continue;
-            }
-            let key = SubKey::for_instance(&b.instance, &b.channel);
-            let depth = folded.entry(key).or_insert(0);
-            *depth = (*depth).max(b.retain_depth);
+            let depth = wanted
+                .entry(store_key(&b.channel, &b.instance))
+                .or_default();
+            *depth = (*depth).max(b.push_depth.max(b.retain_depth));
         }
-        self.wire_rings.retain(|key, _| folded.contains_key(key));
-        for (key, depth) in folded {
-            match self.wire_rings.get_mut(&key) {
-                Some(ring) => ring.set_depth(depth),
-                None => {
-                    self.wire_rings.insert(key, RetainedRing::new(depth));
+        for reserved in RESERVED_LOCAL_CHANNELS {
+            if let Some(depth) = wanted.get_mut(&StoreKey::Confined(reserved.address.to_string())) {
+                *depth = (*depth).max(reserved.ring_depth);
+            }
+        }
+        // A store going away takes its deferred set with it, and a dropped
+        // schedule is the only account of a timer a component believes it set —
+        // the same reason the quota refusal and the lost control-op race are
+        // loud. An operator un-declaring a `local:` channel is as accountable a
+        // cause of that loss as a full deferred set. Sorted by channel so the
+        // page's telemetry does not depend on hash order.
+        let mut lost: Vec<(String, Vec<String>)> = self
+            .stores
+            .iter()
+            .filter(|(key, _)| !reserved_store(key) && !wanted.contains_key(*key))
+            .filter_map(|(key, store)| match key {
+                StoreKey::Confined(channel) => {
+                    let senders: Vec<String> = store.parked_senders().map(str::to_string).collect();
+                    (!senders.is_empty()).then(|| (channel.clone(), senders))
+                }
+                // A wire channel's deferral authority is the backend, so a
+                // discarded mirror holds no schedule to lose.
+                StoreKey::Wire(_) => None,
+            })
+            .collect();
+        lost.sort_by(|a, b| a.0.cmp(&b.0));
+        let participant_id = self.participant_id.clone();
+        for (channel, senders) in lost {
+            tracing::warn!(
+                %channel,
+                schedules = senders.len(),
+                "surface client: this Welcome no longer declares the channel, dropping the \
+                 schedules parked on it"
+            );
+            for sender in senders {
+                if let Some((_, reg)) = self
+                    .registered
+                    .iter_mut()
+                    .find(|(instance, _)| surface_sub_identity(&participant_id, instance) == sender)
+                {
+                    reg.deferred_dropped += 1;
                 }
             }
         }
+        self.stores
+            .retain(|key, _| reserved_store(key) || wanted.contains_key(key));
+        let epoch = self.local_epoch;
+        // A shrink retires messages out from under lagging positions, which is the
+        // ladder's business exactly as an arrival's eviction is. Collected here and
+        // enacted below because enacting mutates the same maps this loop borrows.
+        let mut retired: Vec<(String, Vec<CursorOverflow<BindingKey>>)> = Vec::new();
+        for (key, depth) in wanted {
+            let channel = match &key {
+                StoreKey::Confined(channel) => channel.clone(),
+                StoreKey::Wire(sub) => sub.channel.clone(),
+            };
+            let overflow = self
+                .stores
+                .entry(key)
+                .or_insert_with(|| SurfaceChannelStore::new(epoch, depth))
+                .retune(depth);
+            if !overflow.is_empty() {
+                retired.push((channel, overflow));
+            }
+        }
+        let mut effects = Vec::new();
+        // Stable order across stores: the map iteration above is not ordered, and a
+        // page's telemetry should not depend on hash order.
+        retired.sort_by(|a, b| a.0.cmp(&b.0));
+        for (channel, overflow) in retired {
+            effects.extend(self.enact_overflow(&channel, overflow));
+        }
+        effects
     }
 
-    /// Rebuild every registered instance's pending queues and subscription
+    /// Rebuild every registered instance's delivery positions and subscription
     /// references against `bindings`.
     ///
     /// Run at every `Welcome` and at each registration — the two moments either
     /// side of the relationship can change. It is idempotent, which is what lets
     /// both call it without either knowing about the other.
     ///
-    /// Queues are per binding and keyed by `(port, channel)`, so the binding
-    /// table defines the set: a binding that vanished loses its queue (and the
-    /// messages in it — nothing can deliver them to a port that no longer
-    /// exists), a port rebound to a different channel is treated as removed and
-    /// re-added (its old channel's envelopes are stale under the new binding),
-    /// and a surviving one keeps its contents and its drop counters with its
-    /// depth retuned. A dropped queue takes its drop counters with it, including
-    /// a delta that accrued since the last ack and was never reported: the count
-    /// describes losses on a binding, and that binding is gone. So an overflow
-    /// on a port rebound before its next activation is never surfaced — the
-    /// noise ladder reports at dispatch, and no dispatch of that binding
-    /// follows. Carrying the counters across would mean claiming losses on a
-    /// channel the port was never bound to. A registered instance whose bindings
-    /// all vanish simply
-    /// stops being activated; it is not failed and not deregistered — the
+    /// A position is per binding and lives in the store the binding's channel
+    /// resolves to, so the binding table defines the set: a binding that vanished
+    /// loses its position (nothing can deliver to a port that no longer exists),
+    /// a port rebound to a different channel is removed from the old channel's
+    /// store and attached fresh to the new one (its old channel's history is
+    /// stale under the new binding), and a surviving one keeps its position with
+    /// its push depth retuned. A dropped position takes its undelivered drop
+    /// count with it: the count describes losses on a binding, and that binding
+    /// is gone — carrying it across would mean claiming losses on a channel the
+    /// port was never bound to. A registered instance whose bindings all vanish
+    /// simply stops being activated; it is not failed and not deregistered — the
     /// operator un-wired it, which is not the component's fault.
     ///
-    /// A queue coming into existence on a `local:` channel is **primed** from
-    /// that channel's ring — [`Self::local_primes`] — so a component that
-    /// attaches after a publish still receives it as new. That is the whole
-    /// point: a queue's creation is the `local:` analogue of a fresh wire
-    /// attach, where the server's replay lands in the new queue as ordinary
-    /// deliveries. Surviving queues are never re-primed, which is what keeps a
-    /// reconcile at every `Welcome` idempotent.
+    /// A position coming into existence is **primed** behind the retained tail,
+    /// capped at `push_depth`, on both classes: attach is a delivery point, so a
+    /// component that binds after a publish still receives it as new — as much of
+    /// it as its push window can hold. Surviving positions are never re-primed,
+    /// which is what keeps a reconcile at every `Welcome` idempotent.
     ///
-    /// Depth-0 bindings get no queue — that is the mechanism of "never activates
-    /// me", not an optimization — but they *do* take a subscription reference:
-    /// they still see their channel.
+    /// Depth-0 bindings hold no position — that is the mechanism of "never
+    /// activates me", not an optimization — but they *do* take a subscription
+    /// reference: they still see their channel.
+    ///
+    /// A terminal instance is attached nothing and stripped of every position it
+    /// held: it will never activate again, so a position kept for it would be one
+    /// every eviction charges and no window will ever serve.
     ///
     /// References are diffed rather than dropped-and-retaken. Releasing a
     /// surviving reference to zero would discard the subscription's resume token
     /// (that is what refcount zero means), so a reconnect would re-subscribe from
     /// scratch and re-replay the retained window — manufacturing exactly the
-    /// duplicate delivery the ring's dedup exists to prevent.
+    /// duplicate delivery the store's dedup exists to prevent.
     fn reconcile_registered(&mut self, bindings: &SurfaceBindings) -> Vec<Effect> {
         let mut instances: Vec<String> = self.registered.keys().cloned().collect();
         instances.sort();
         let mut release: Vec<SubKey> = Vec::new();
         let mut acquire: Vec<SubKey> = Vec::new();
         for instance in &instances {
-            let mut queues: HashMap<String, WantedQueue> = HashMap::new();
+            let mut positions: Vec<(StoreKey, BindingKey, u64)> = Vec::new();
             let mut wanted_subs: Vec<String> = Vec::new();
             for b in bindings
                 .subscriptions
                 .iter()
                 .filter(|b| b.instance == *instance)
             {
-                if !is_local_channel(&b.channel) {
+                let key = store_key(&b.channel, &b.instance);
+                if matches!(key, StoreKey::Wire(_)) {
                     wanted_subs.push(b.channel.clone());
                 }
-                if b.push_depth == 0 {
-                    continue;
-                }
-                let capacity = usize::try_from(b.push_depth).expect(
-                    "surface client: on_welcome proves every binding's push_depth fits a usize",
-                );
-                queues.insert(
-                    b.port.clone(),
-                    WantedQueue {
-                        capacity,
-                        channel: b.channel.clone(),
-                        retain_depth: b.retain_depth,
-                    },
-                );
+                positions.push((key, BindingKey::new(instance, &b.port), b.push_depth));
             }
-            // The rings are read here, under an immutable borrow, because the
-            // `get_mut` below holds `self.registered` for the rest of the loop
-            // body. Nothing in between can change a ring: `local_primes` is a
-            // pure read.
-            let mut primes = self.local_primes(instance, &queues);
+            let failed = self
+                .registered
+                .get(instance)
+                .expect("surface client: instance from this map")
+                .failed;
+            for (key, store) in self.stores.iter_mut() {
+                let stale: Vec<BindingKey> = store
+                    .bindings()
+                    .filter(|held| held.instance == *instance)
+                    .filter(|held| {
+                        failed
+                            || !positions
+                                .iter()
+                                .any(|(wanted_key, wanted, _)| wanted_key == key && wanted == *held)
+                    })
+                    .cloned()
+                    .collect();
+                for binding in stale {
+                    store.detach(&binding);
+                }
+            }
+            if !failed {
+                let epoch = self.local_epoch;
+                for (key, binding, push_depth) in positions {
+                    // A wire mirror's contents are the subscription's, discarded
+                    // when its last reference went, so a subscription being
+                    // referenced again starts from an empty store: the fresh
+                    // `Subscribe` this reconcile is about to send is the catch-up
+                    // authority, and its replay must arrive unseen. The shape is
+                    // computed into a local first — the fold reads the bindings
+                    // while the entry borrows the stores.
+                    let store = match &key {
+                        StoreKey::Wire(sub) => {
+                            let depth = wire_store_depth(bindings, sub);
+                            self.stores
+                                .entry(key.clone())
+                                .or_insert_with(|| SurfaceChannelStore::new(epoch, depth))
+                        }
+                        // A confined channel's store is page-lifetime, so its
+                        // absence is a seeding bug rather than a lifetime.
+                        StoreKey::Confined(_) => self.stores.get_mut(&key).expect(
+                            "surface client: every bound confined channel has a store (reserved \
+                             planes seeded at construction, the rest reconciled from this Welcome)",
+                        ),
+                    };
+                    store.attach(binding, push_depth);
+                }
+            }
             let reg = self
                 .registered
                 .get_mut(instance)
                 .expect("surface client: instance from this map");
-            reg.queues
-                .retain(|port, queue| queue_survives(&queues, port, queue));
-            for (port, wanted) in queues {
-                match reg.queues.get_mut(&port) {
-                    Some(queue) => queue.set_capacity(wanted.capacity),
-                    None => {
-                        let mut queue = PendingQueue::new(wanted.capacity, wanted.channel);
-                        for envelope in primes.remove(&port).into_iter().flatten() {
-                            queue.push(envelope);
-                        }
-                        reg.queues.insert(port, queue);
-                    }
-                }
-            }
             // Multiset diff against the references currently held: what is left
             // over is released, what was not matched is acquired, and everything
             // matched is untouched.
@@ -1785,70 +2054,6 @@ impl ClientCore {
             effects.extend(self.acquire_channel_ref(sub));
         }
         effects
-    }
-
-    /// The envelopes each about-to-be-created `local:` queue is primed with,
-    /// keyed by port: the channel ring's tail, oldest first, capped at
-    /// `min(retain_depth, push_depth)`.
-    ///
-    /// **Only queues that do not already exist at their wanted channel.** A
-    /// surviving `(port, channel)` queue is skipped, so a reconcile at every
-    /// `Welcome` cannot re-deliver what the component already has, and the ring
-    /// is not even read for it.
-    ///
-    /// **Only `local:` channels.** A fresh wire attach is primed by the server:
-    /// its `SubscribeResult` replay arrives as ordinary `Deliver`s and lands in
-    /// the same queue. The ring dedups a redelivered envelope but the queue does
-    /// not, so priming a wire queue here would double every replayed message in
-    /// the first window's new slice.
-    ///
-    /// **Capped at `push_depth` before pushing, not by the queue's own trim.**
-    /// Trimming counts an eviction as a drop, and "losses since your last ack"
-    /// must not report messages that were never a delivery obligation on this
-    /// binding. Retained entries beyond the cap are still visible as context.
-    ///
-    /// A `failed` instance is skipped: it never activates, so priming its
-    /// recreated queues would only park stale envelopes in a dead instance.
-    fn local_primes(
-        &self,
-        instance: &str,
-        wanted: &HashMap<String, WantedQueue>,
-    ) -> HashMap<String, Vec<MessageEnvelope>> {
-        let reg = self
-            .registered
-            .get(instance)
-            .expect("surface client: instance from this map");
-        let mut primes: HashMap<String, Vec<MessageEnvelope>> = HashMap::new();
-        if reg.failed {
-            return primes;
-        }
-        for (port, w) in wanted {
-            if !is_local_channel(&w.channel) {
-                continue;
-            }
-            if reg
-                .queues
-                .get(port)
-                .is_some_and(|queue| queue_survives(wanted, port, queue))
-            {
-                continue;
-            }
-            let ring = &self
-                .local_rings
-                .get(&w.channel)
-                .expect(
-                    "surface client: every routable local channel has a ring (reserved planes \
-                     seeded at construction, the rest proven by on_welcome)",
-                )
-                .ring;
-            let depth = w.retain_depth.min(w.capacity as u64);
-            let envelopes: Vec<MessageEnvelope> =
-                ring.recent(depth).map(|(e, _)| e.clone()).collect();
-            if !envelopes.is_empty() {
-                primes.insert(port.clone(), envelopes);
-            }
-        }
-        primes
     }
 
     /// Take one reference on a wire subscription, opening it if this is the
@@ -1908,15 +2113,18 @@ impl ClientCore {
 
     /// Withdraw an instance's activation entry — the mirror of `detach`.
     ///
-    /// Its pending queues go with it (nothing will consume them). Its rings do
-    /// not: rings belong to the subscription, not to the entry, and a re-register
-    /// reads the same retained history a reconnect would have kept.
+    /// Its positions go with it (nothing will consume what they were owed), and so
+    /// does every subscription reference it held — which discards those
+    /// subscriptions' mirrors. A confined channel's store stays: the page is its
+    /// retention authority and no subscription scopes it, so a re-register reads
+    /// the same retained history a reconnect would have kept.
     ///
-    /// A re-registration is therefore a fresh attach: the queues it rebuilds are
-    /// primed from the `local:` rings and replayed into by the wire subscribes,
-    /// so retained messages the instance already folded arrive again as new. That
-    /// is wire symmetry, and the reason a component with side-effecting folds
-    /// owes itself at-most-once handling by `message_id` on any class.
+    /// A re-registration is therefore a fresh attach: the positions it takes are
+    /// primed from each confined channel's retained tail and replayed into by the
+    /// wire subscribes, so retained messages the instance already folded arrive
+    /// again as new. That is wire symmetry, and the reason a component with
+    /// side-effecting folds owes itself at-most-once handling by `message_id` on
+    /// any class.
     ///
     /// Deregistering an unregistered instance is a caller bug and panics, exactly
     /// as detaching an unknown port is.
@@ -1924,6 +2132,9 @@ impl ClientCore {
         let reg = self.registered.remove(instance).unwrap_or_else(|| {
             panic!("surface client: deregistration of unregistered instance {instance:?}")
         });
+        for store in self.stores.values_mut() {
+            store.detach_instance(instance);
+        }
         // The instance's parked outbox dies with it. Those are ok'd flushes not
         // yet applied — announce the drop rather than let it vanish silently.
         if !reg.parked.is_empty() {
@@ -1973,11 +2184,16 @@ impl ClientCore {
     /// through that order (see `dispatch_cursor`): a stable order alone would
     /// starve every instance but the lowest-named one as soon as one of them
     /// re-readies itself synchronously, which a `local:` republisher does.
-    pub fn take_ready_activation(&mut self) -> Option<ReadyActivation> {
+    ///
+    /// `wall_now_ms` is the driver's wall-clock read for this assembly, epoch
+    /// milliseconds UTC. One read serves both the `now` the component is handed
+    /// and the boundary its deferred view is taken at, so what a component is told
+    /// the time is and what it is shown as still parked cannot disagree.
+    pub fn take_ready_activation(&mut self, wall_now_ms: u64) -> Option<ReadyActivation> {
         let mut ready: Vec<&String> = self
             .registered
             .iter()
-            .filter(|(_, reg)| reg.ready())
+            .filter(|(instance, reg)| reg.runnable() && self.owed_anything(instance))
             .map(|(instance, _)| instance)
             .collect();
         ready.sort();
@@ -1993,7 +2209,7 @@ impl ClientCore {
             .or_else(|| ready.first())
             .map(|i| (*i).clone())?;
         self.dispatch_cursor = Some(instance.clone());
-        Some(self.dispatch_activation(instance))
+        Some(self.dispatch_activation(instance, wall_now_ms))
     }
 
     /// Whether any instance could be dispatched right now — [`Self::
@@ -2004,7 +2220,22 @@ impl ClientCore {
     /// from the loop, one activation per turn, instead of inside an unbounded
     /// drain that would never return to the transport.
     pub fn has_ready_activation(&self) -> bool {
-        self.registered.values().any(|reg| reg.ready())
+        self.registered
+            .iter()
+            .any(|(instance, reg)| reg.runnable() && self.owed_anything(instance))
+    }
+
+    /// Whether any of `instance`'s input bindings is owed a message its channel
+    /// still holds — the wake question, asked of the stores rather than of a
+    /// queue of copies.
+    ///
+    /// Coalescing falls out of this: arrivals move no position, so an instance
+    /// woken once for three arrivals is woken once, and the window it is
+    /// assembled from serves the newest.
+    fn owed_anything(&self, instance: &str) -> bool {
+        self.stores
+            .values()
+            .any(|store| store.has_deliverable_for_instance(instance))
     }
 
     /// How many instances hold a registered activation entry. The driver's
@@ -2026,6 +2257,24 @@ impl ClientCore {
             .unwrap_or(0)
     }
 
+    /// Lifetime count of this instance's deferred publishes whose schedule was
+    /// dropped because the target channel's deferred set was full. Zero for an
+    /// instance that never over-scheduled, and for one the core does not hold.
+    pub fn deferred_drop_count(&self, instance: &str) -> u64 {
+        self.registered
+            .get(instance)
+            .map_or(0, |reg| reg.deferred_dropped)
+    }
+
+    /// Lifetime count of this instance's control ops that found their message
+    /// already released — the benign race, not a failure. Zero for an instance the
+    /// core does not hold.
+    pub fn deferred_race_count(&self, instance: &str) -> u64 {
+        self.registered
+            .get(instance)
+            .map_or(0, |reg| reg.deferred_races)
+    }
+
     /// Whether an instance is terminal (its activation entry trapped, or a
     /// `fatal`-rung binding overflowed). The driver consults this after a
     /// ready activation's loud-rung effects run: a killed instance is not
@@ -2034,74 +2283,92 @@ impl ClientCore {
         self.registered.get(instance).is_some_and(|reg| reg.failed)
     }
 
-    /// Assemble one activation for a ready instance: ack, window, seed.
-    fn dispatch_activation(&mut self, instance: String) -> ReadyActivation {
+    /// Assemble one activation for a ready instance: window, advance, seed.
+    fn dispatch_activation(&mut self, instance: String, wall_now_ms: u64) -> ReadyActivation {
         // Only this instance's input bindings, and of those only what a window
-        // needs. Lifting them out first is what lets the loop below borrow `self`
-        // for the rings; cloning the whole table instead would make every
-        // activation pay for every sibling component's config.
-        let inputs: Vec<(String, String, u64, NoiseLevel)> = self
+        // needs. Lifting them out first is what lets the loop below borrow the
+        // stores; cloning the whole table instead would make every activation pay
+        // for every sibling component's config.
+        let inputs: Vec<(String, String, u64, u64, NoiseLevel)> = self
             .bindings
             .as_ref()
             .expect("surface client: a ready activation implies bindings")
             .subscriptions
             .iter()
             .filter(|b| b.instance == instance)
-            .map(|b| (b.port.clone(), b.channel.clone(), b.retain_depth, b.noise))
+            .map(|b| {
+                (
+                    b.port.clone(),
+                    b.channel.clone(),
+                    b.push_depth,
+                    b.retain_depth,
+                    b.noise,
+                )
+            })
             .collect();
-        // 1. Ack every pending queue of the instance and snapshot each binding's
-        //    drop delta. Ack-at-activation-start is backend parity, and it is
-        //    what makes err/trap consume: the messages are gone from the queue
-        //    before the entry ever sees them, and retention is their only
-        //    recovery.
-        let reg = self
-            .registered
+        self.registered
             .get_mut(&instance)
-            .expect("surface client: dispatch of an unregistered instance");
-        reg.in_flight = true;
-        let mut acked: HashMap<String, (Vec<MessageEnvelope>, u64)> = HashMap::new();
-        for (port, queue) in &mut reg.queues {
-            acked.insert(port.clone(), queue.ack());
-        }
-        // 2. Window every bound input port, in config order, present or not:
-        //    a port with nothing new is a pure-context window, and a component
-        //    must be able to read every port's view on every activation.
+            .expect("surface client: dispatch of an unregistered instance")
+            .in_flight = true;
+        // Window every bound input port, in config order, present or not: a port
+        // with nothing new is a pure-context window, and a component must be able
+        // to read every port's view on every activation.
+        //
+        // Each window's cursor advances **before the entry runs**. That is backend
+        // parity and it is what makes err/trap consume: what the activation saw is
+        // behind the binding's position whatever the entry does with it, and
+        // retention is its only recovery. A window that served nothing, and a
+        // sampled binding (which holds no position), advance nothing.
         let mut ports = Vec::new();
-        // The loud rungs, applied after the window loop: `context_for` borrows
-        // `self` immutably, so both the `metered` counter mutation and the `fatal`
-        // kill (which mutate `self.registered`) cannot ride inside the loop. The
-        // `alarm` alert/toast effects read nothing on `self`, so they accumulate
-        // freely here and are handed out on the `ReadyActivation`.
-        let mut metered: Vec<(String, u64)> = Vec::new();
-        let mut loud_effects: Vec<Effect> = Vec::new();
-        let mut fatal_reason: Option<String> = None;
-        for (port, channel, retain_depth, noise) in inputs {
-            let (new, dropped) = acked.remove(&port).unwrap_or_else(|| (Vec::new(), 0));
-            // Every rung acts on the same input: the binding's drop delta this
-            // activation, from either origin (both fold into the one ack delta).
-            // The ladder is cumulative — a louder rung performs everything below
-            // it. `Silent` does nothing beyond the honest `dropped` accounting.
-            if dropped > 0 {
-                if noise >= NoiseLevel::Metered {
-                    metered.push((port.clone(), dropped));
-                }
-                if noise >= NoiseLevel::Alarm {
-                    // One coalesced backend alert + toast per binding per
-                    // activation; the delta rides the text.
-                    loud_effects.extend(loud_drop_effects(&instance, &channel, &port, dropped));
-                }
-                if noise >= NoiseLevel::Fatal && fatal_reason.is_none() {
-                    fatal_reason = Some(format!(
-                        "input overflow: {dropped} message(s) dropped on port {port:?} \
-                         ({channel}) — binding noise is fatal"
-                    ));
-                }
+        // Drop charges, collected and enacted after the loop: the ladder's metered
+        // counter and its fatal kill both mutate `self.registered`, and the fatal
+        // rung must fire once for the activation rather than once per port.
+        let mut charges: Vec<DropCharge> = Vec::new();
+        for (port, channel, push_depth, retain_depth, noise) in inputs {
+            let binding = BindingKey::new(&instance, &port);
+            // Both `expect`s are invariants of the reconcile, which is the only
+            // thing that creates stores and positions and runs at both moments
+            // either side of the relationship: a runnable registered instance
+            // holds a position in an existing store for every binding the table
+            // gives it. Answering a broken one with an empty window would leave a
+            // component silently starved of a port it is bound to.
+            let store = self
+                .stores
+                .get_mut(&store_key(&channel, &instance))
+                .expect("surface client: a bound channel has a store at dispatch");
+            let window = store.window(&binding, push_depth, retain_depth).expect(
+                "surface client: a push-enabled binding of a runnable instance holds a position",
+            );
+            let advance = window
+                .advance_span()
+                .and_then(|(through, seen_floor)| store.advance(&binding, through, seen_floor));
+            // Drained with the advance whose figures it joins, so one activation
+            // reports each loss exactly once. The two are disjoint: server-side
+            // loss never reached this store, so no cursor subtraction can see it.
+            let from_server = store.take_server_drops(&binding);
+            let new_from = u32::try_from(window.new_from)
+                .expect("surface client: a window's depth is a config-bounded page-memory value");
+            let envelopes: Vec<MessageEnvelope> = window
+                .entries
+                .into_iter()
+                .map(|entry| entry.message)
+                .collect();
+            let dropped = advance.map_or(0, |a| a.dropped) + from_server;
+            // Counted here: only the still-retained part, since a span the
+            // retirement that retired it already charged must not be enacted
+            // twice. Announced here: the whole delta this window reports, which is
+            // the coalesced figure — every earlier retirement charge deferred its
+            // announcement to exactly this moment.
+            let charge = DropCharge {
+                port: port.clone(),
+                channel,
+                noise,
+                counted: advance.map_or(0, |a| a.noise_charge) + from_server,
+                announced: dropped,
+            };
+            if charge.counted > 0 || charge.announced > 0 {
+                charges.push(charge);
             }
-            let context = self.context_for(&instance, &channel, retain_depth, &new);
-            let new_from = u32::try_from(context.len())
-                .expect("surface client: context depth is a config-bounded page-memory value");
-            let mut envelopes = context;
-            envelopes.extend(new);
             ports.push(PortWindow {
                 port,
                 envelopes,
@@ -2109,85 +2376,207 @@ impl ClientCore {
                 dropped,
             });
         }
-        // Apply the metered counts now that the immutable ring borrows are done.
-        if !metered.is_empty() {
-            let reg = self
-                .registered
-                .get_mut(&instance)
-                .expect("surface client: dispatch of an unregistered instance");
-            for (port, dropped) in metered {
-                *reg.metered_drops.entry(port).or_insert(0) += dropped;
-            }
-        }
-        // The `fatal` rung: the instance takes the trap-terminal path — the same
-        // one an entry's own trap takes (delivery stops, pending queues and parked
-        // flushes cleared, `InstanceFailed` for the kernel to error-card, report,
-        // and republish `surface-state`). The reason names the binding and the
-        // overflow. Its buffer, assembled just above, is discarded: the driver
-        // sees `is_failed` and never invokes the entry, so nothing flushes.
-        if let Some(reason) = fatal_reason {
-            let reg = self
-                .registered
-                .get_mut(&instance)
-                .expect("surface client: dispatch of an unregistered instance");
-            reg.in_flight = false;
-            reg.failed = true;
-            reg.queues.clear();
-            reg.parked.clear();
-            loud_effects.push(Effect::EmitEvent(Event::InstanceFailed {
-                instance: instance.clone(),
-                reason,
-            }));
-        }
-        // 3. Seed the publish buffer: the entry gets inline quota answers without
-        //    the driver re-entering the core mid-handler.
-        let buffer = self.seed_buffer(&instance, &ports);
+        let loud_effects = self.enact_drop_charges(&instance, charges);
+        let DeferredSnapshot {
+            windows: deferred,
+            ids: deferred_ids,
+        } = self.deferred_windows(&instance, wall_now_ms);
+        // Seed the publish buffer: the entry gets inline quota answers without the
+        // driver re-entering the core mid-handler, and the identities behind the
+        // deferred windows it was just handed, so a control op resolves against the
+        // very window the component read.
+        let buffer = self.seed_buffer(&instance, &ports, deferred_ids);
         ReadyActivation {
             instance,
-            // The page kernel has no UTC wall clock (only a monotonic
-            // performance.now() timer), so no honest value to give. Output-port
-            // deferral is backend scope; the surface carries no deferred view.
             activation: Activation {
                 ports,
-                deferred: vec![],
-                now: None,
+                deferred,
+                // The wall clock the driver read for this assembly. A component
+                // gets time only here — an activation stays hermetic, and a live
+                // clock call inside one would make it neither reproducible nor
+                // short-lived.
+                now: Some(wall_now_ms),
             },
             buffer,
             effects: loud_effects,
         }
     }
 
-    /// One port's retained context: the subscription's ring at **this binding's
-    /// own** depth, deduped by `message_id` against the port's new rows.
+    /// One deferred window per bound output port, in config order: what this
+    /// instance itself has parked on each output channel, soonest release first —
+    /// and, beside it, the identity of each entry the window presents.
     ///
-    /// The dedup is what keeps `new_from` honest. A message that is both retained
-    /// and newly delivered — the ordinary case, since the ring is fed by the same
-    /// delivery that queued it — must appear once, after the boundary: it is new.
-    /// Reporting it on both sides would tell the component it had already seen
-    /// something it is being woken for.
+    /// Scoped to the instance's own sender identity — the same string the router
+    /// stamps on its confined publishes — so a channel two components park on
+    /// still shows each of them only its own schedule.
     ///
-    /// For `local:` channels the router's ring is the source (§4.6): the page has
-    /// exactly one retained copy of page-local traffic, and it is the router's.
-    fn context_for(
-        &self,
-        instance: &str,
-        channel: &str,
-        retain_depth: u64,
-        new: &[MessageEnvelope],
-    ) -> Vec<MessageEnvelope> {
-        let ring = if is_local_channel(channel) {
-            self.local_rings.get(channel).map(|r| &r.ring)
-        } else {
-            self.wire_rings
-                .get(&SubKey::for_instance(instance, channel))
+    /// Every bound output port appears, empty or not, so an index into the window
+    /// means the same thing on every activation.
+    ///
+    /// The identities never reach the component: an index is what it names a parked
+    /// message by, and the identity is what the kernel resolves that index to while
+    /// the two are still known to agree. Built here, from this one read, for exactly
+    /// that reason — a second read could have released an entry and shifted every
+    /// index after it.
+    fn deferred_windows(&self, instance: &str, wall_now_ms: u64) -> DeferredSnapshot {
+        let Some(bindings) = self.bindings.as_ref() else {
+            return DeferredSnapshot::default();
         };
-        let Some(ring) = ring else {
+        let outputs: Vec<(String, String)> = bindings
+            .outputs
+            .iter()
+            .filter(|b| b.instance == instance)
+            .map(|b| (b.port.clone(), b.channel.clone()))
+            .collect();
+        if outputs.is_empty() {
+            return DeferredSnapshot::default();
+        }
+        let sender = self.local_sender(instance);
+        let mut snapshot = DeferredSnapshot::default();
+        for (port, channel) in outputs {
+            let (entries, ids): (Vec<DeferredEntry>, Vec<Uuid>) =
+                if channel_is_transportable(&channel) {
+                    // The backend is this channel's deferral authority, so the
+                    // window is the snapshot it last pushed, already release-
+                    // ordered and already scoped to this sender. A pair with no
+                    // mirror is an empty set — that is what the clearance at
+                    // `Welcome` plus seed-only-if-nonempty means.
+                    self.deferred_views
+                        .get(&(channel.clone(), instance.to_string()))
+                        .map_or_else(
+                            || (Vec::new(), Vec::new()),
+                            |view| {
+                                view.iter()
+                                    .enumerate()
+                                    .map(|(index, entry)| {
+                                        (
+                                            DeferredEntry {
+                                                index: u32::try_from(index).expect(
+                                                    "surface client: a deferred view is bounded \
+                                                     by the channel's depth",
+                                                ),
+                                                payload: entry.body.clone(),
+                                                deliver_after: entry.deliver_after,
+                                            },
+                                            entry.message_id,
+                                        )
+                                    })
+                                    .unzip()
+                            },
+                        )
+                } else {
+                    self.stores
+                        .get(&StoreKey::Confined(channel))
+                        .expect(
+                            "surface client: every routable confined channel has a store \
+                             (reserved planes seeded at construction, the rest proven by \
+                             on_welcome)",
+                        )
+                        .deferred_for_sender(&sender, wall_now_ms)
+                        .enumerate()
+                        .map(|(index, parked)| {
+                            (
+                                DeferredEntry {
+                                    index: u32::try_from(index).expect(
+                                        "surface client: a deferred set is bounded by its \
+                                         channel's depth",
+                                    ),
+                                    // The body, not the envelope: what a component gets
+                                    // back is what it handed the host, on every hosting.
+                                    payload: parked.message.body.clone(),
+                                    deliver_after: parked.release_at,
+                                },
+                                parked.message.message_id,
+                            )
+                        })
+                        .unzip()
+                };
+            snapshot.ids.insert(port.clone(), ids);
+            snapshot.windows.push(DeferredWindow { port, entries });
+        }
+        snapshot
+    }
+
+    /// Enact the loudness ladder for a set of per-binding drop charges.
+    ///
+    /// Rungs are cumulative: `Silent` does nothing beyond the honest `dropped`
+    /// figure the window already carries, `metered` counts per binding, `alarm`
+    /// adds one coalesced alert + toast per binding, and `fatal` kills the
+    /// instance. Noise governs loudness only — it never changes what happens to
+    /// the data, which is always drop-oldest.
+    ///
+    /// The alert and toast are emitted for [`DropCharge::announced`] and the
+    /// counter takes [`DropCharge::counted`]: a charge raised where the loss
+    /// happened counts there and announces at the binding's next window, which is
+    /// what keeps one alert per binding per activation however many messages the
+    /// binding lagged by.
+    ///
+    /// The kill fires once for the whole set, naming the first `fatal` binding:
+    /// an instance dies once however many of its bindings overflowed together.
+    fn enact_drop_charges(&mut self, instance: &str, charges: Vec<DropCharge>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let mut fatal: Option<(String, String, u64)> = None;
+        for DropCharge {
+            port,
+            channel,
+            noise,
+            counted,
+            announced,
+        } in charges
+        {
+            if noise >= NoiseLevel::Metered
+                && counted > 0
+                && let Some(reg) = self.registered.get_mut(instance)
+            {
+                *reg.metered_drops.entry(port.clone()).or_insert(0) += counted;
+            }
+            if noise >= NoiseLevel::Alarm && announced > 0 {
+                effects.extend(loud_drop_effects(instance, &channel, &port, announced));
+            }
+            if noise >= NoiseLevel::Fatal && counted > 0 && fatal.is_none() {
+                fatal = Some((port, channel, counted));
+            }
+        }
+        if let Some((port, channel, dropped)) = fatal {
+            effects.extend(self.fail_instance(
+                instance,
+                format!(
+                    "input overflow: {dropped} message(s) dropped on port {port:?} ({channel}) — \
+                     binding noise is fatal"
+                ),
+            ));
+        }
+        effects
+    }
+
+    /// Take an instance terminal: stop delivering to it, drop the positions and
+    /// the ok'd flushes nobody is left to answer for, and surface the failure.
+    ///
+    /// Its channels' stores are untouched: a channel does not stop retaining
+    /// because one of its readers died, and the remaining readers are owed
+    /// exactly what they were before. An instance already terminal is left alone
+    /// and reported once.
+    fn fail_instance(&mut self, instance: &str, reason: String) -> Vec<Effect> {
+        let reg = self
+            .registered
+            .get_mut(instance)
+            .expect("surface client: failing an unregistered instance");
+        if reg.failed {
             return Vec::new();
-        };
-        ring.recent(retain_depth)
-            .filter(|(e, _)| !new.iter().any(|n| n.message_id == e.message_id))
-            .map(|(e, _)| e.clone())
-            .collect()
+        }
+        reg.in_flight = false;
+        reg.failed = true;
+        // Its parked flushes die with it: they were produced by a component whose
+        // memory is now presumed poisoned, and there is nobody left to answer for
+        // them.
+        reg.parked.clear();
+        for store in self.stores.values_mut() {
+            store.detach_instance(instance);
+        }
+        vec![Effect::EmitEvent(Event::InstanceFailed {
+            instance: instance.to_string(),
+            reason,
+        })]
     }
 
     /// Seed one activation's publish buffer: the instance's outputs, their sink
@@ -2200,7 +2589,12 @@ impl ClientCore {
     /// context): a component that republishes what it consumes stays solvent at
     /// 1:1 without an operator raising a knob. No per-cause amplification
     /// vocabulary is invented — reserve, don't fake.
-    fn seed_buffer(&self, instance: &str, ports: &[PortWindow]) -> PublishBuffer {
+    fn seed_buffer(
+        &self,
+        instance: &str,
+        ports: &[PortWindow],
+        deferred_ids: HashMap<String, Vec<Uuid>>,
+    ) -> PublishBuffer {
         let bindings = self
             .bindings
             .as_ref()
@@ -2236,7 +2630,7 @@ impl ClientCore {
                 ),
             );
         }
-        PublishBuffer::new(outputs, sink_mt, self.max_body_bytes)
+        PublishBuffer::new(outputs, sink_mt, self.max_body_bytes, deferred_ids)
     }
 
     /// An activation entry returned: flush or discard, and clear `in_flight`.
@@ -2257,11 +2651,23 @@ impl ClientCore {
         }
         match outcome {
             ActivationOutcome::Ok => {
-                let (entries, carry) = buffer.take();
+                let flushed = buffer.take();
                 let reg = self.registered.get_mut(&instance).unwrap();
                 reg.in_flight = false;
-                reg.carry_mt = carry;
-                self.flush(&instance, entries, stamps)
+                reg.carry_mt = flushed.carry;
+                // Each op goes to its channel's deferral authority: a confined
+                // channel's set is here, a transportable channel's is at the
+                // backend, so those ops ride the flush's batch frame. Both halves
+                // apply ahead of this activation's publishes — an op acts on a
+                // message an earlier activation parked, and applying it first
+                // keeps the two from interleaving.
+                let (wire_ops, local_ops): (Vec<_>, Vec<_>) = flushed
+                    .defer_ops
+                    .into_iter()
+                    .partition(|op| channel_is_transportable(&op.channel));
+                let mut effects = self.apply_defer_ops(&instance, local_ops);
+                effects.extend(self.flush(&instance, flushed.publishes, stamps, wire_ops));
+                effects
             }
             ActivationOutcome::Err(err) => {
                 let carry = buffer.into_carry();
@@ -2277,39 +2683,122 @@ impl ClientCore {
                     message: err.message,
                 })]
             }
-            ActivationOutcome::Trap(reason) => {
-                let reg = self.registered.get_mut(&instance).unwrap();
-                reg.in_flight = false;
-                reg.failed = true;
-                // Its queues die with it — nothing will ever consume them. Its
-                // rings do not: they are per-subscription and page-lifetime, and
-                // a failed instance never activates, so they are inert rather
-                // than something to clean up. Its parked flushes die too: they
-                // were produced by a component whose memory is now presumed
-                // poisoned, and there is nobody left to answer for them.
-                reg.queues.clear();
-                reg.parked.clear();
-                vec![Effect::EmitEvent(Event::InstanceFailed {
-                    instance,
-                    reason,
-                })]
-            }
+            ActivationOutcome::Trap(reason) => self.fail_instance(&instance, reason),
         }
     }
 
+    /// Apply one ok activation's control ops against **confined** channels to its
+    /// own parked messages. A transportable channel's ops are the flush's
+    /// business, not this function's: they ride the batch frame.
+    ///
+    /// Each op names its message by the identity the component's own deferred
+    /// window carried, resolved when the component made the call. So the only thing
+    /// that can have changed by now is whether that message is still parked:
+    ///
+    /// - **Still parked** — cancelled or edited. An edit to a release time already
+    ///   past does not publish here; the release pass the caller's input re-arms
+    ///   takes it, which is the same answer a deferred publish in the past gets.
+    /// - **Gone** — the benign drain-vs-release race the contract names explicitly.
+    ///   Logged and counted, never an error: the component had already returned by
+    ///   the time the race was resolvable, and a conforming component can always
+    ///   lose it.
+    /// - **Someone else's** — a panic. The identity came from a view scoped to this
+    ///   instance's own sender, so a cross-sender hit is the page having built that
+    ///   view wrong, not anything a component did.
+    ///
+    /// An edit's replacement body runs the reserved planes' guard
+    /// ([`Self::guard_local_body`]) before it is written, exactly as a publish's
+    /// body does: an edit is how a component states a new body on a confined
+    /// channel, so a guard it skipped would police only half the ways onto the
+    /// plane. A refused edit changes nothing and reports the violation.
+    ///
+    /// Nothing else is emitted: a schedule changing wakes nobody. Only a release
+    /// does, and that is the timer's business.
+    fn apply_defer_ops(&mut self, instance: &str, ops: Vec<BufferedDeferOp>) -> Vec<Effect> {
+        if ops.is_empty() {
+            return Vec::new();
+        }
+        let mut effects = Vec::new();
+        let sender = self.local_sender(instance);
+        for BufferedDeferOp {
+            port,
+            channel,
+            message_id,
+            kind: op,
+        } in ops
+        {
+            debug_assert!(
+                !channel_is_transportable(&channel),
+                "surface client: a transportable channel's op belongs on the batch frame"
+            );
+            let op = match op {
+                DeferOp::Edit {
+                    body: Some(body),
+                    deliver_after,
+                } => match self.guard_local_body(&channel, LocalOrigin::Instance(instance), body) {
+                    GuardedBody::Carry(body) => DeferOp::Edit {
+                        body: Some(body),
+                        deliver_after,
+                    },
+                    GuardedBody::Refused(effect) => {
+                        effects.push(effect);
+                        continue;
+                    }
+                },
+                op => op,
+            };
+            // The op carries an identity from a confined channel's own deferred
+            // set, so that store existed when the component read it and a flush
+            // cannot outrun a `Welcome`: the driver holds one activation at a time
+            // and feeds its completion before any other input.
+            let outcome = self
+                .stores
+                .get_mut(&StoreKey::Confined(channel.clone()))
+                .expect("surface client: a deferred identity implies its channel's store")
+                .apply_defer_op(&sender, message_id, op);
+            match outcome {
+                DeferOpOutcome::Applied => {}
+                DeferOpOutcome::NotParked => {
+                    tracing::info!(
+                        instance,
+                        %port,
+                        %channel,
+                        "surface client: deferred control op is a no-op — the message released \
+                         between the activation's snapshot and the flush"
+                    );
+                    if let Some(reg) = self.registered.get_mut(instance) {
+                        reg.deferred_races += 1;
+                    }
+                }
+                DeferOpOutcome::WrongSender { owner } => panic!(
+                    "surface client: {instance} named message {message_id} on {channel}, parked \
+                     by {owner} — the deferred window this page built for {sender} carried an id \
+                     it does not own"
+                ),
+            }
+        }
+        effects
+    }
+
     /// Flush one ok activation's buffer: `local:` entries through the router,
-    /// wire entries as one `PublishBatch`.
+    /// wire entries and `wire_ops` as one `PublishBatch`.
     ///
     /// Both commit at this one point. Call order is preserved **within** each
     /// class — the router routes its entries in order, the frame carries its
     /// entries in order — but the two classes commit in different places (one in
     /// this page, one in the server), so their relative order is not guaranteed.
     /// That is contract text, not an implementation artifact.
+    ///
+    /// `wire_ops` are the flush's control ops against transportable channels, in
+    /// call order. They travel with the entries because the server applies one
+    /// batch's ops and publishes together, ops first — and because a flush that
+    /// carries only ops is still a flush the server has to answer.
     fn flush(
         &mut self,
         instance: &str,
         entries: Vec<BufferedPublish>,
         stamps: Vec<MessageStamp>,
+        wire_ops: Vec<BufferedDeferOp>,
     ) -> Vec<Effect> {
         assert_eq!(
             entries.len(),
@@ -2319,8 +2808,8 @@ impl ClientCore {
         let mut effects = Vec::new();
         let mut wire: Vec<BatchEntry> = Vec::new();
         for (entry, stamp) in entries.into_iter().zip(stamps) {
-            if is_local_channel(&entry.channel) {
-                // The router commits it here and now: seq assigned, ring fed,
+            if !channel_is_transportable(&entry.channel) {
+                // The router commits it here and now: seq assigned, store fed,
                 // fan-out — synchronously, in call order, with no await between,
                 // which is the single-router property `local:` rests on. It never
                 // touches the wire, so a down link is no reason to delay it.
@@ -2335,6 +2824,7 @@ impl ClientCore {
                         entry.body,
                         stamp,
                         entry.urgency,
+                        entry.deliver_after,
                     )
                     .into_effects(),
                 );
@@ -2344,16 +2834,37 @@ impl ClientCore {
                 // override rides the frame, not the resolved urgency — the
                 // server holds the port's default and applies it, and echoing
                 // back a possibly-stale advertised default would let the client
-                // override the operator.
+                // override the operator. The release time rides it verbatim for
+                // the same reason: this channel's deferral authority is the
+                // backend, so the page states the time and the server decides
+                // park-vs-immediate against its own clock.
                 wire.push(BatchEntry {
                     port: entry.port,
                     body: entry.body,
                     urgency: entry.urgency_override,
+                    deliver_after: entry.deliver_after,
                 });
             }
         }
-        if !wire.is_empty() {
-            effects.extend(self.send_or_park(instance, wire));
+        let ops: Vec<BatchDeferredOp> = wire_ops
+            .into_iter()
+            .map(|op| BatchDeferredOp {
+                port: op.port,
+                message_id: op.message_id,
+                op: match op.kind {
+                    DeferOp::Cancel => DeferredOpKind::Cancel,
+                    DeferOp::Edit {
+                        body,
+                        deliver_after,
+                    } => DeferredOpKind::Edit {
+                        body,
+                        deliver_after,
+                    },
+                },
+            })
+            .collect();
+        if !wire.is_empty() || !ops.is_empty() {
+            effects.extend(self.send_or_park(instance, wire, ops));
         }
         effects
     }
@@ -2373,11 +2884,16 @@ impl ClientCore {
     /// The batch drops **whole**. It is the unit the server applies in one
     /// transaction, so half of one is not a smaller version of it — it is a
     /// different, wrong thing.
-    fn send_or_park(&mut self, instance: &str, entries: Vec<BatchEntry>) -> Vec<Effect> {
+    fn send_or_park(
+        &mut self,
+        instance: &str,
+        entries: Vec<BatchEntry>,
+        ops: Vec<BatchDeferredOp>,
+    ) -> Vec<Effect> {
         if self.wire_free_for(instance) {
-            return vec![self.batch_frame(instance, entries)];
+            return vec![self.batch_frame(instance, entries, ops)];
         }
-        self.park_batch(instance, ParkedBatch { entries }, false)
+        self.park_batch(instance, ParkedBatch { entries, ops }, false)
     }
 
     /// Whether a flush for this instance may go straight to the wire.
@@ -2438,7 +2954,7 @@ impl ClientCore {
         let Some(batch) = reg.parked.pop_front() else {
             return Vec::new();
         };
-        vec![self.batch_frame(instance, batch.entries)]
+        vec![self.batch_frame(instance, batch.entries, batch.ops)]
     }
 
     /// Arm or disarm the retry timer from the outbox state.
@@ -2552,7 +3068,12 @@ impl ClientCore {
     /// Compose one `PublishBatch` frame and record it as outstanding — both in
     /// the correlation table (which answers "whose result is this?") and on the
     /// instance (which answers "is this instance's wire free?").
-    fn batch_frame(&mut self, instance: &str, entries: Vec<BatchEntry>) -> Effect {
+    fn batch_frame(
+        &mut self,
+        instance: &str,
+        entries: Vec<BatchEntry>,
+        ops: Vec<BatchDeferredOp>,
+    ) -> Effect {
         let correlation = self.next_batch_correlation;
         self.next_batch_correlation += 1;
         let reg = self
@@ -2569,12 +3090,14 @@ impl ClientCore {
             PendingBatch {
                 instance: instance.to_string(),
                 entries: entries.clone(),
+                ops: ops.clone(),
             },
         );
         Effect::SendFrame(ClientFrame::PublishBatch {
             instance: instance.to_string(),
             correlation,
             publishes: entries,
+            deferred_ops: ops,
         })
     }
 
@@ -2594,7 +3117,15 @@ impl ClientCore {
     ///
     /// Either would take a protocol death — and feed fail2ban — for honestly
     /// replaying what the page buffered under the contract in force when it
-    /// buffered it. Batches that clear both gates stay queued.
+    /// buffered it. Batches that clear both gates stay queued. Both gates apply to
+    /// the batch's control ops as well: an op names a port, and an edit carries a
+    /// body.
+    ///
+    /// A held op's `message_id` needs no re-validation. It came from a view scoped
+    /// to this instance's own sender, and the sender identity does not depend on
+    /// the connection — so across a reconnect the id either still names that
+    /// sender's parked message or names one that released, which is the benign race
+    /// the server logs and counts.
     ///
     /// Only the surviving head goes out here: the outbox is ordered and carries
     /// at most one flush per instance on the wire, so the rest leave as each
@@ -2621,13 +3152,24 @@ impl ClientCore {
                 // check time rather than carried alongside them: both are derived
                 // from what the batch names, and a stored copy is a second truth
                 // to keep in step.
-                let survives = batch.entries.iter().all(|entry| {
+                let bound = |port: &str| {
                     bindings
                         .outputs
                         .iter()
-                        .any(|b| b.instance == instance && b.port == entry.port)
-                        && entry.body.len() as u64 <= max_body_bytes
-                });
+                        .any(|b| b.instance == instance && b.port == port)
+                };
+                let survives =
+                    batch.entries.iter().all(|entry| {
+                        bound(&entry.port) && entry.body.len() as u64 <= max_body_bytes
+                    }) && batch.ops.iter().all(|op| {
+                        bound(&op.port)
+                            && match &op.op {
+                                DeferredOpKind::Edit {
+                                    body: Some(body), ..
+                                } => body.len() as u64 <= max_body_bytes,
+                                _ => true,
+                            }
+                    });
                 let reg = self
                     .registered
                     .get_mut(&instance)
@@ -2647,11 +3189,11 @@ impl ClientCore {
 
     /// Route a publish on a `local:` channel: mint the envelope, assign the
     /// position, retain, and fan out — the page-local twin of what the server's
-    /// ring store does for `ephemeral:`, and the reason a `local:` publish never
+    /// store does for `ephemeral:`, and the reason a `local:` publish never
     /// touches the wire.
     ///
-    /// Seq assignment, ring append, and fan-out are one synchronous step with no
-    /// await between them, so the ring and the delivered order can never diverge
+    /// Seq assignment, store append, and fan-out are one synchronous step with no
+    /// await between them, so the store and the delivered order can never diverge
     /// — the single-router property that buys `local:` its freedom from the echo
     /// and dual-position problems.
     ///
@@ -2695,6 +3237,9 @@ impl ClientCore {
             body,
             stamp,
             urgency,
+            // The single-frame path carries no release time: a deferred publish is
+            // always a buffered one, and a buffered publish always flushes.
+            None,
         );
         let status = match mint {
             LocalMint::Routed(_) => PublishStatus::Ok,
@@ -2731,7 +3276,7 @@ impl ClientCore {
     /// have mounted that early either (the instance set rides the same
     /// `Welcome`), and the kernel's own pre-chrome indicator owns that window
     /// rather than this plane. The first post-`Welcome` transition
-    /// publishes, and the depth-1 ring replays it to whatever attaches later.
+    /// publishes, and the depth-1 store replays it to whatever attaches later.
     fn on_publish_control(
         &mut self,
         channel: String,
@@ -2758,20 +3303,31 @@ impl ClientCore {
         if self.participant_id.is_empty() {
             return Vec::new();
         }
-        // Inert: urgency is wake economics and page-local delivery never parks.
-        // Normal is the honest value — the kernel states no preference, and there
-        // is no operator knob on a contract-defined plane to resolve one from.
-        self.mint_and_route_local(&channel, LocalOrigin::Kernel, body, stamp, Urgency::Normal)
-            .into_effects()
+        // Inert: urgency decides whether a parked row is worth waking a consumer
+        // for, and page-local delivery wakes on every arrival regardless. Normal is
+        // the honest value — the kernel states no preference, and there is no
+        // operator knob on a contract-defined plane to resolve one from.
+        self.mint_and_route_local(
+            &channel,
+            LocalOrigin::Kernel,
+            body,
+            stamp,
+            Urgency::Normal,
+            // The kernel states its control planes now or not at all: a plane whose
+            // reader mounts later reads the retained value, so there is nothing a
+            // schedule would buy.
+            None,
+        )
+        .into_effects()
     }
 
-    /// Record chrome's overlay holdership from a publish on
-    /// [`LOCAL_OVERLAY_STATE_CHANNEL`], or refuse the publish.
+    /// Judge a publish on [`LOCAL_OVERLAY_STATE_CHANNEL`] against the plane's
+    /// publisher rules, without recording anything.
     ///
     /// `Some(effect)` means refused: the message is neither retained nor
-    /// delivered, and the effect reports the violation. `None` means recorded,
-    /// and the publish goes on to mint like any other (the plane keeps its
-    /// depth-1 ring so a page-local consumer can read the same value).
+    /// delivered, and the effect reports the violation. `None` means the body may
+    /// become a message on the plane (which keeps its depth-1 ring so a
+    /// page-local consumer can read the same value).
     ///
     /// Three refusals, all of them "the kernel would otherwise report something
     /// it cannot stand behind": a publisher that is not this surface's chrome (a
@@ -2781,17 +3337,16 @@ impl ClientCore {
     /// not declare, which the server would treat as a protocol violation and
     /// kill the session over.
     ///
+    /// Who holds the overlay is recorded separately, by
+    /// [`Self::record_overlay_state`], at the moment the message reaches the
+    /// plane.
+    ///
     /// # Panics
     ///
     /// If the kernel itself publishes here. The kernel holds no overlay and
     /// renders none; a kernel-minted overlay report would be the kernel
     /// inventing telemetry about a component's state.
-    fn observe_overlay_state(
-        &mut self,
-        origin: LocalOrigin<'_>,
-        body: &str,
-        publish_ts: DateTime<Utc>,
-    ) -> Option<Effect> {
+    fn validate_overlay_state(&self, origin: LocalOrigin<'_>, body: &str) -> Option<Effect> {
         let instance = match origin {
             LocalOrigin::Instance(instance) => instance,
             LocalOrigin::Kernel => panic!(
@@ -2820,11 +3375,85 @@ impl ClientCore {
         {
             return refuse(format!("holder {holder:?} is not a declared instance"));
         }
+        None
+    }
+
+    /// The reserved confined planes' rules for one component-authored body about
+    /// to become a message on `channel`.
+    ///
+    /// `Carry(body)` is the body to use — the takeover plane rewrites it, every
+    /// other channel passes it through. `Refused(effect)` means the body was
+    /// rejected, and the effect reports the violation.
+    ///
+    /// **Every** path that puts a component-authored body onto a confined channel
+    /// runs this: the immediate mint, the park, and the rewrite a deferred edit
+    /// makes. A guard the edit skipped would be one a component walks around by
+    /// scheduling a well-formed message and rewriting it before it releases.
+    fn guard_local_body(
+        &self,
+        channel: &str,
+        origin: LocalOrigin<'_>,
+        body: String,
+    ) -> GuardedBody {
+        if channel == LOCAL_OVERLAY_STATE_CHANNEL
+            && let Some(effect) = self.validate_overlay_state(origin, &body)
+        {
+            return GuardedBody::Refused(effect);
+        }
+        // The takeover plane's payload carries a request/deny/release identity
+        // that the consumer (chrome) trusts; overwrite it with the authenticated
+        // publishing instance so a component cannot forge another's takeover.
+        // Derived from the router's own port wiring, exactly like `sender` — the
+        // component names only its port.
+        if channel != LOCAL_TAKEOVER_CHANNEL {
+            return GuardedBody::Carry(body);
+        }
+        match origin {
+            LocalOrigin::Instance(instance) => {
+                GuardedBody::Carry(inject_takeover_instance(body, instance))
+            }
+            // The kernel has no takeover identity to stamp, and an unattributable
+            // takeover message is precisely what the identity model forbids. A
+            // future kernel-emitted takeover (a forced release on instance
+            // failure, say) must carry an explicit attributed mechanism rather
+            // than ride an anonymous body through the mint.
+            LocalOrigin::Kernel => {
+                panic!("surface client: the kernel does not publish on {channel}")
+            }
+        }
+    }
+
+    /// Record who holds the overlay, from a message that has just reached
+    /// [`LOCAL_OVERLAY_STATE_CHANNEL`].
+    ///
+    /// Called where the message becomes observable — an immediate append and a
+    /// release alike — rather than where it was minted. A schedule that is
+    /// parked, then cancelled or refused by the deferred cap, never reaches a
+    /// consumer, so recording it at the mint would leave the kernel reporting an
+    /// overlay no page consumer ever saw and that will never exist.
+    ///
+    /// A holder the surface no longer declares is skipped: a `Status` frame
+    /// naming an unconfigured instance is a protocol violation the server kills
+    /// the session over, and a `Welcome` can retire an instance between a park
+    /// and its release.
+    fn record_overlay_state(&mut self, envelope: &MessageEnvelope) {
+        if envelope.channel != LOCAL_OVERLAY_STATE_CHANNEL {
+            return;
+        }
+        let parsed: OverlayStateBody = serde_json::from_str(&envelope.body)
+            .expect("surface client: a body on the overlay plane parsed when it was accepted");
+        let declared = parsed.holder.as_ref().is_none_or(|holder| {
+            self.bindings
+                .as_ref()
+                .is_some_and(|b| b.components.iter().any(|c| c.instance == *holder))
+        });
+        if !declared {
+            return;
+        }
         self.overlay = parsed.holder.map(|holder| OverlayReport {
             holder,
-            since: publish_ts,
+            since: envelope.publish_ts,
         });
-        None
     }
 
     /// Mint a `local:` envelope, assign its position, retain it, and fan it out
@@ -2835,10 +3464,11 @@ impl ClientCore {
     /// retention, or fan-out. They differ in exactly one value — the identity
     /// derived from `origin` — and no other.
     ///
-    /// This is also the single point every `local:` publish passes through, so
-    /// it is where the takeover plane's identity stamping belongs: the gesture
-    /// path and the activation-buffer flush both arrive here, and a stamp
-    /// applied anywhere upstream would cover only one of them.
+    /// This is the single point every `local:` publish passes through — the
+    /// gesture path and the activation-buffer flush both arrive here — so it is
+    /// where the reserved planes' guard ([`Self::guard_local_body`]) runs for a
+    /// publish. A deferred edit rewrites a body without passing through here, so
+    /// it runs the same guard itself.
     ///
     /// Returns [`LocalMint::Refused`] when a plane guard rejects the body, so a
     /// caller with a publisher to answer can say so rather than report a
@@ -2850,46 +3480,19 @@ impl ClientCore {
         body: String,
         stamp: MessageStamp,
         urgency: Urgency,
+        deliver_after: Option<u64>,
     ) -> LocalMint {
-        if channel == LOCAL_OVERLAY_STATE_CHANNEL
-            && let Some(effect) = self.observe_overlay_state(origin, &body, stamp.publish_ts)
-        {
-            return LocalMint::Refused(vec![effect]);
-        }
-        // The takeover plane's payload carries a request/deny/release identity
-        // that the consumer (chrome) trusts; overwrite it with the authenticated
-        // publishing instance so a component cannot forge another's takeover.
-        // Derived from the router's own port wiring, exactly like `sender` — the
-        // component names only its port.
-        let body = if channel == LOCAL_TAKEOVER_CHANNEL {
-            match origin {
-                LocalOrigin::Instance(instance) => inject_takeover_instance(body, instance),
-                // The kernel has no takeover identity to stamp, and an
-                // unattributable takeover message is precisely what the identity
-                // model forbids. A future kernel-emitted takeover (a forced
-                // release on instance failure, say) must carry an explicit
-                // attributed mechanism rather than ride an anonymous body
-                // through the mint.
-                LocalOrigin::Kernel => {
-                    panic!("surface client: the kernel does not publish on {channel}")
-                }
-            }
-        } else {
-            body
+        let body = match self.guard_local_body(channel, origin, body) {
+            GuardedBody::Carry(body) => body,
+            GuardedBody::Refused(effect) => return LocalMint::Refused(vec![effect]),
         };
-        // Resolved before the ring is borrowed: both read `self`.
+        // Resolved before the store is borrowed: both read `self`.
         let sender = match origin {
             LocalOrigin::Instance(instance) => self.local_sender(instance),
             LocalOrigin::Kernel => self.participant_id.clone(),
         };
         let source = self.participant_id.clone();
-        let epoch = self.local_epoch;
         let channel = channel.to_string();
-
-        let ring = self.local_rings.get_mut(&channel).expect(
-            "surface client: every routable local channel has a ring (reserved planes \
-                 seeded at construction, the rest proven by on_welcome)",
-        );
         let envelope = MessageEnvelope {
             message_id: stamp.message_id,
             // Provenance. On the wire this is the server's origin, because the
@@ -2913,98 +3516,173 @@ impl ClientCore {
             body,
             reply_to: None,
             delivery_deadline: None,
+            // Always `None`, even for the parked message below: a schedule is the
+            // channel's, held in its deferred set until it releases, and a released
+            // message is an ordinary arrival nobody is owed a release time for.
             deliver_after: None,
             // The caller's override, else the port's configured default —
             // resolved by the caller, since this core is the router and no
             // server downstream will apply the default for it.
             //
-            // Inert for delivery: urgency is wake economics — it decides whether
-            // a parked row is worth waking a consumer for — and local delivery
-            // never parks and never wakes anything (the fan-out below is
-            // synchronous and unconditional). Carried honestly anyway: the field
-            // exists on the envelope, so it should report what the sender and the
-            // operator actually said rather than a hard-coded value a reader
-            // would mistake for one of them.
+            // Inert for waking: urgency decides whether a parked row is worth
+            // waking a consumer for, and page-local delivery wakes on every
+            // arrival regardless (the fan-out below is synchronous and
+            // unconditional). Carried honestly anyway: the field exists on the
+            // envelope, so it should report what the sender and the operator
+            // actually said rather than a hard-coded value a reader would mistake
+            // for one of them.
             urgency,
             envelope_type: ChannelScheme::Local,
         };
-        // The ring is the channel's retention and the context source for every
-        // window assembled off it; the returned position is the router's own
-        // ordering record, which nothing downstream of the ring reads.
-        ring.ring.push(&envelope, epoch);
-        // Bindings on this channel take the router's message into their pending
-        // queues; the ring above is already their context source, so there is
-        // nothing else for them here. No per-message effect — that batching *is*
-        // the delivery model. Every instance bound to the channel, because a
-        // `local:` channel has no per-instance subscription to scope a delivery
-        // to: the router simply delivers to everyone bound.
-        self.deliver_to_registered(&channel, None, &envelope, 0);
+        // A release time still ahead of the mint holds the message out of
+        // retention until it arrives; one already past publishes immediately, which
+        // is the contract every host gives a `deliver_after` in the past.
+        if let Some(release_at) = deliver_after.filter(|at| *at > epoch_ms(stamp.publish_ts)) {
+            let LocalOrigin::Instance(instance) = origin else {
+                // The kernel's own planes are stated now or not at all, so no
+                // kernel publish carries a release time; one that did would be a
+                // schedule with no component to account it to.
+                panic!("surface client: the kernel does not park on {channel}")
+            };
+            return self.park_local(instance, &channel, envelope, release_at);
+        }
+        // The plane's state is recorded here rather than at the guard above,
+        // because here is where the message actually reaches its readers.
+        self.record_overlay_state(&envelope);
+        // The store is the channel's retention and the source of every window
+        // assembled off it. The page is the authority for a confined channel, so
+        // this append *is* the delivery: every instance bound to the channel is
+        // woken by it — there is no per-instance subscription to scope a confined
+        // publish to — and no per-message effect is emitted, because that batching
+        // is the delivery model.
+        let overflow = self
+            .stores
+            .get_mut(&StoreKey::Confined(channel.clone()))
+            .expect(
+                "surface client: every routable confined channel has a store (reserved planes \
+                 seeded at construction, the rest proven by on_welcome)",
+            )
+            .append_minted(envelope);
+        LocalMint::Routed(self.enact_overflow(&channel, overflow))
+    }
+
+    /// Hold a minted confined envelope in its channel's deferred set until
+    /// `release_at`.
+    ///
+    /// Nothing is retained, nothing is woken, and no effect is emitted: a parked
+    /// message is not on the channel yet. The release timer the caller's input
+    /// re-arms is what brings it back.
+    ///
+    /// **Quota exhaustion is normal operation, not an error.** The schedule is
+    /// dropped, logged, and counted against the instance — never reported to the
+    /// component, because a post-activation flush has no error channel back to a
+    /// guest that already returned.
+    fn park_local(
+        &mut self,
+        instance: &str,
+        channel: &str,
+        envelope: MessageEnvelope,
+        release_at: u64,
+    ) -> LocalMint {
+        let sender = envelope.sender.clone();
+        let parked = self
+            .stores
+            .get_mut(&StoreKey::Confined(channel.to_string()))
+            .expect(
+                "surface client: every routable confined channel has a store (reserved planes \
+                 seeded at construction, the rest proven by on_welcome)",
+            )
+            .park(&sender, envelope, release_at);
+        if let Err(brenn_queue::QuotaExceeded { cap }) = parked {
+            tracing::warn!(
+                instance,
+                %channel,
+                cap,
+                release_at,
+                "surface client: deferred set full, dropping the schedule"
+            );
+            if let Some(reg) = self.registered.get_mut(instance) {
+                reg.deferred_dropped += 1;
+            }
+        }
         LocalMint::Routed(Vec::new())
     }
 
-    /// Push one delivered envelope, plus its share of any server-reported drops,
-    /// into every activation-registered binding on `channel` — the batching
-    /// point. No effect is emitted: the message sits in its pending queue until
-    /// the driver next drains ready activations, which is what coalesces a turn's
-    /// deliveries into one activation.
+    /// Enact the loudness ladder for the positions one retirement outran — an
+    /// arrival that evicted, or a depth shrink that trimmed.
     ///
-    /// `only_instance` scopes the delivery to one subscription's owner, which is
-    /// the wire case: a `Deliver` belongs to `(channel, instance)`, and a sibling
-    /// instance on the same channel has its own subscription and its own cursor.
-    /// `None` is the `local:` router, where the channel *is* the unit — there is
-    /// no subscription to own and no cursor to keep, so every bound instance gets
-    /// it.
+    /// The loss is *counted* the moment it happens, against every binding
+    /// retention was pushed past: a binding that lags is on the books whether or
+    /// not it runs again, which is the whole reason the charge is here rather than
+    /// only at the next window. The `alarm` rung's announcement is deferred to
+    /// that window, where one alert names the whole delta instead of one per
+    /// message. The `fatal` rung's is not deferrable — the kill means there is no
+    /// next window — so a fatal charge announces here.
     ///
-    /// `dropped` is the subscription-level count the server reported: every
-    /// binding on that subscription takes the **full** count, because each of
-    /// them missed those messages. Page-side evictions are different and are
-    /// counted by the evicting queue alone.
+    /// The still-retained remainder is counted at the next window instead, so no
+    /// span is counted twice.
     ///
-    /// A depth-0 binding has no queue and is skipped: it never activates its
-    /// instance and never carries new envelopes — nor is there anything for the
-    /// attach-time prime to fill. The ring already fed it, as context: that is
-    /// the whole of what depth 0 means. It takes no drop count either: ring
-    /// displacement is retention, not push overflow.
-    ///
-    /// A `failed` instance is skipped too. Its queues are gone; its rings keep
-    /// filling. Delivery stops without disturbing anything the subscription
-    /// shares with a live sibling.
-    fn deliver_to_registered(
+    /// Sorted by binding so a page whose several bindings overflowed on one
+    /// retirement emits its loud effects in a stable order — the bindings are
+    /// independent, so any total order is correct and a stable one keeps the
+    /// page's telemetry reproducible.
+    fn enact_overflow(
         &mut self,
         channel: &str,
-        only_instance: Option<&str>,
-        envelope: &MessageEnvelope,
-        dropped: u64,
-    ) {
-        // This is the busiest path the kernel has — every wire `Deliver` and every
-        // `local:` publish — so it asks the cheap question before doing any work at
-        // all. Nothing is registered until the components' elements mount.
-        if self.registered.is_empty() {
-            return;
+        overflow: Vec<CursorOverflow<BindingKey>>,
+    ) -> Vec<Effect> {
+        if overflow.is_empty() {
+            return Vec::new();
         }
-        let Some(bindings) = self.bindings.as_ref() else {
-            return;
-        };
-        let registered = &self.registered;
-        let targets: Vec<(String, String)> = bindings
+        let mut charged = overflow;
+        charged.sort_by(|a, b| {
+            (&a.subscriber.instance, &a.subscriber.port)
+                .cmp(&(&b.subscriber.instance, &b.subscriber.port))
+        });
+        let mut effects = Vec::new();
+        for CursorOverflow {
+            subscriber,
+            evicted,
+        } in charged
+        {
+            let BindingKey { instance, port } = subscriber;
+            // A position outliving its binding in the table cannot be charged
+            // against a noise level, and there is one moment where that happens: a
+            // `Welcome` reconciles the stores — trimming a shrunk one — before it
+            // reconciles the positions, so a trim can outrun a position whose
+            // binding this very `Welcome` removed. Nothing is owed a charge on a
+            // binding the operator has unwired; the position is about to go with
+            // it.
+            let Some(noise) = self.binding_noise(&instance, &port) else {
+                continue;
+            };
+            effects.extend(self.enact_drop_charges(
+                &instance,
+                vec![DropCharge {
+                    port,
+                    channel: channel.to_string(),
+                    noise,
+                    counted: evicted,
+                    announced: if noise >= NoiseLevel::Fatal {
+                        evicted
+                    } else {
+                        0
+                    },
+                }],
+            ));
+        }
+        effects
+    }
+
+    /// The resolved noise level of one input binding, or `None` when the binding
+    /// table does not hold it.
+    fn binding_noise(&self, instance: &str, port: &str) -> Option<NoiseLevel> {
+        self.bindings
+            .as_ref()?
             .subscriptions
             .iter()
-            .filter(|b| b.channel == channel)
-            .filter(|b| only_instance.is_none_or(|i| b.instance == i))
-            // Filter before cloning: a binding of an instance that has not
-            // registered yet (element not mounted) has no queue to push.
-            .filter(|b| registered.contains_key(&b.instance))
-            .map(|b| (b.instance.clone(), b.port.clone()))
-            .collect();
-        for (instance, port) in targets {
-            if let Some(reg) = self.registered.get_mut(&instance)
-                && !reg.failed
-                && let Some(queue) = reg.queues.get_mut(&port)
-            {
-                queue.count_server_drops(dropped);
-                queue.push(envelope.clone());
-            }
-        }
+            .find(|b| b.instance == instance && b.port == port)
+            .map(|b| b.noise)
     }
 
     /// The component sub-identity for a publish from `instance`:
@@ -3109,7 +3787,34 @@ impl ClientCore {
                 correlation,
                 outcome,
             } => self.on_publish_batch_result(correlation, outcome, now),
+            ServerFrame::DeferredView {
+                channel,
+                instance,
+                entries,
+            } => self.on_deferred_view(channel, instance, entries, now),
         }
+    }
+
+    /// The backend restated what one component instance has parked on one
+    /// transportable channel.
+    ///
+    /// A full snapshot, so it replaces the mirror wholesale — idempotent,
+    /// last-writer-wins, and an empty one is a legitimate answer meaning the set
+    /// is empty. Nothing is validated against the binding table: a view for a pair
+    /// this page no longer binds is inert (no window reads it), and refusing it
+    /// would make an ordinary reconnect race fatal.
+    ///
+    /// Wakes nobody. A schedule changing is not an arrival — only a release is,
+    /// and a released message reaches the page as an ordinary `Deliver`.
+    fn on_deferred_view(
+        &mut self,
+        channel: String,
+        instance: String,
+        entries: Vec<DeferredViewEntry>,
+        now: Millis,
+    ) -> Vec<Effect> {
+        self.deferred_views.insert((channel, instance), entries);
+        vec![Effect::SetWakeup(Some(self.arm_liveness(now)))]
     }
 
     /// The server answered one `PublishBatch`.
@@ -3138,7 +3843,11 @@ impl ClientCore {
                 "PublishBatchResult for unknown correlation {correlation}"
             ));
         };
-        let PendingBatch { instance, entries } = pending;
+        let PendingBatch {
+            instance,
+            entries,
+            ops,
+        } = pending;
         // The instance can have deregistered under the outstanding frame; its
         // outbox went with it and there is nothing to clear or re-park.
         let registered = match self.registered.get_mut(&instance) {
@@ -3180,7 +3889,7 @@ impl ClientCore {
                     "surface client: server rate-limited an activation flush — parked at the \
                      head of the instance's outbox and retried"
                 );
-                effects.extend(self.park_batch(&instance, ParkedBatch { entries }, true));
+                effects.extend(self.park_batch(&instance, ParkedBatch { entries, ops }, true));
             }
         }
         effects.extend(self.retry_wakeup(now));
@@ -3281,7 +3990,7 @@ impl ClientCore {
                 channel: channel.clone(),
             };
             // The envelope is cloned per target because each subscription's
-            // retained ring owns its entries. Fan-out cost is per-subscription
+            // retained store owns its entries. Fan-out cost is per-subscription
             // page state, which the design keeps; what the consolidation removes
             // is paying that cost N times on the wire.
             effects.extend(self.on_deliver(sub, envelope.clone(), seq, cursor, dropped));
@@ -3290,8 +3999,7 @@ impl ClientCore {
     }
 
     /// One target of a `Deliver` frame. Route the envelope into the
-    /// subscription's retained ring and pending queue, from which the next
-    /// activation window is assembled.
+    /// subscription's store, from which the next activation window is assembled.
     ///
     /// The caller has already established that the subscription has been
     /// `Active` on this connection. A subscription that *has* been `Active` but
@@ -3300,7 +4008,7 @@ impl ClientCore {
     /// target is a previous-span straggler and is discarded entirely — no
     /// routing, no token/seq effect.
     ///
-    /// `dropped > 0` (server-side ring overflow since this subscription's
+    /// `dropped > 0` (server-side overflow since this subscription's
     /// previous accepted delivery) is accumulated as the loss counter the next
     /// window reports through `PortWindow::dropped`; there is no marker in the
     /// message stream. A discarded straggler advances no state and contributes
@@ -3350,38 +4058,38 @@ impl ClientCore {
             .expect("surface client: Active subscription has state");
         cs.span_hw = Some(seq);
         cs.token = Some(cursor);
-        let epoch = self.local_epoch;
-        // Feed the subscription's retained ring, for **every** subscription and
-        // before any pending queue below. That independence is the recovery
-        // model: a message the pending queue drops on overflow is still in the
-        // ring, so it is still visible as context. The feed is idempotent by
-        // `message_id` (`RetainedRing::push`) because several reconnect paths
-        // legitimately re-deliver what the ring already holds.
+        // Into the subscription's store, for **every** subscription uniformly —
+        // registered instances or not, since retention is what makes a dropped
+        // message recoverable and is not a fact about who is listening. Arrival
+        // moves no position, which is what coalesces a turn's deliveries into one
+        // activation; a binding whose position the entry outran is charged here,
+        // at the arrival that caused it.
         //
-        // Into the subscription's retained ring first: the ring is the context
-        // source every window assembled off this subscription reads, and it takes
-        // the envelope before and independently of the pending queues below — that
-        // ordering is what makes a message dropped from a queue still recoverable
-        // as context.
+        // The insert is idempotent by `message_id` because several reconnect paths
+        // legitimately re-present what the store already holds.
         //
-        // Every surface subscription is an instance's and is welcome-time seeded
-        // with a ring. A ring-less subscription is a broken seeding invariant —
-        // fail fast rather than silently deliver a message no window can ever show
-        // as context.
-        match self.wire_rings.get_mut(&sub) {
-            Some(ring) => {
-                ring.push(&envelope, epoch);
+        // A subscription this frame reaches is `Active`, so it holds at least one
+        // reference, and taking a reference is what created its store. A store-less
+        // `Active` subscription is a broken invariant — fail fast rather than
+        // silently deliver a message no window can ever show as context.
+        let channel = sub.channel.clone();
+        let overflow = match self.stores.get_mut(&StoreKey::Wire(sub.clone())) {
+            Some(store) => {
+                // The server's figure is the subscription's, so every binding
+                // holding a position on it takes the full count: each of them
+                // missed those messages, and no page-side arithmetic can see a loss
+                // that happened upstream of the page.
+                store.count_server_drops(dropped);
+                store.insert(envelope)
             }
             None => {
                 return self.go_fatal(format!(
-                    "wire Deliver on a ring-less subscription: {} (instance {:?})",
+                    "wire Deliver on a store-less subscription: {} (instance {:?})",
                     sub.channel, sub.instance
                 ));
             }
-        }
-        // Then the pending queues of this subscription's owner — the batching
-        // point for activation-delivered bindings.
-        self.deliver_to_registered(&sub.channel, Some(&sub.instance), &envelope, dropped);
+        };
+        effects.extend(self.enact_overflow(&channel, overflow));
         effects
     }
 
@@ -3584,7 +4292,8 @@ impl ClientCore {
             .bindings
             .as_ref()
             .and_then(|b| resolve_output(b, &instance, &port));
-        let local = out.is_some_and(|b| is_local_channel(&b.channel)) && self.local_router_live();
+        let local =
+            out.is_some_and(|b| !channel_is_transportable(&b.channel)) && self.local_router_live();
         if let Err(r) = check_publish(
             self.state == State::Active || local,
             || self.is_error_report_port(&instance, &port) || out.is_some(),
@@ -3600,9 +4309,9 @@ impl ClientCore {
             //
             // Resolve urgency here rather than forwarding it: this core is the
             // router, so there is no server downstream to apply the port's
-            // default. Inert for delivery — page-local traffic never parks and
-            // wakes nothing — but the envelope carries the field, and it should
-            // say what the operator declared rather than a hard-coded `Normal`.
+            // default. Inert for waking — page-local delivery wakes on every
+            // arrival — but the envelope carries the field, and it should say what
+            // the operator declared rather than a hard-coded `Normal`.
             let out = out.expect("surface client: local publish resolved an output binding");
             let channel = out.channel.clone();
             let urgency_sent = urgency.unwrap_or(out.urgency);
@@ -3671,13 +4380,23 @@ impl ClientCore {
     /// effect: an `Unsubscribe` when this was the last port on an `Active`
     /// channel, nothing otherwise. Shared by ordinary detach and the reconcile's
     /// force-detach — both drop exactly one attachment from a channel.
+    ///
+    /// The last reference off also **discards the subscription's mirror**. The
+    /// mirror is a record of what this subscription delivered, in the same family
+    /// of subscription state as the resume token dropped here: once no port is owed
+    /// replay, the next attach is a fresh consumer, its `Subscribe` carries no
+    /// resume, and the server replays the channel's retained tail. Keeping the old
+    /// contents would let the store's dedup swallow that replay as
+    /// re-presentation — the page would sit indefinitely on history it can no
+    /// longer be told about, since the server is the catch-up authority on a
+    /// transportable channel and its cursors are opaque to the page.
     fn release_channel_ref(&mut self, sub: SubKey) -> Vec<Effect> {
-        // A local port held no refcount and no `ChannelState` to release, and
-        // there is no `Unsubscribe` to send — the router keeps the ring for the
-        // page's life regardless of who is attached, so a later re-attach replays
-        // it. Detaching is simply the removal from `attached` the caller already
-        // did.
-        if is_local_channel(&sub.channel) {
+        // A confined port held no refcount and no `ChannelState` to release, and
+        // there is no `Unsubscribe` to send — the channel keeps its store for the
+        // page's life regardless of who is attached, so a later re-attach is primed
+        // from it. Detaching is simply the removal from `attached` the caller
+        // already did.
+        if !channel_is_transportable(&sub.channel) {
             return Vec::new();
         }
         let cs = self
@@ -3688,19 +4407,27 @@ impl ClientCore {
         // `Pending` re-subscribe (the refcount-zero-while-Pending edge), or a
         // durable force-detach: no port is owed replay, so `release_ref`
         // discards the resume token. A later fresh attach re-subscribes with
-        // `resume: None` and receives the retained ring rather than resuming
+        // `resume: None` and receives the retained tail rather than resuming
         // past the latest value.
         if cs.release_ref() > 0 {
             return Vec::new();
         }
-        match cs.wire {
-            WireState::Active => {
-                cs.wire = WireState::Unsubscribed;
-                vec![Effect::SendFrame(ClientFrame::Unsubscribe {
-                    channel: sub.channel,
-                    instance: sub.instance,
-                })]
-            }
+        let wire = cs.wire;
+        if wire == WireState::Active {
+            cs.wire = WireState::Unsubscribed;
+        }
+        // The mirror goes with the token, whatever the wire state was: all three
+        // arms mean no port is owed replay on this subscription any more. Its
+        // per-binding server-drop counts go with it, which is right — no binding
+        // remains to report them to. Removal is idempotent: a `Welcome` that
+        // un-declares a binding drops the store in `reconcile_stores` before the
+        // force-detach releases the reference.
+        self.stores.remove(&StoreKey::Wire(sub.clone()));
+        match wire {
+            WireState::Active => vec![Effect::SendFrame(ClientFrame::Unsubscribe {
+                channel: sub.channel,
+                instance: sub.instance,
+            })],
             // Pending: defer — the SubscribeResult, arriving at refcount 0, sends
             // the deferred Unsubscribe. Unsubscribed: nothing.
             WireState::Pending | WireState::Unsubscribed => Vec::new(),

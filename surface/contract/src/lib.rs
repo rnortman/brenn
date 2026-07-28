@@ -118,6 +118,11 @@
 //! any other context is a **gesture publish**: immediate, unanswered, the named
 //! bounded gap above.
 //!
+//! The deferred-message ops — park a message for later, cancel one, edit one —
+//! ride [`PORT_DEFER`] on the same routing rule, and are buffered *only*: they
+//! have no gesture counterpart, because a schedule that escaped the flush-iff-ok
+//! boundary would outlive the activation that failed to stage it.
+//!
 //! # Component-contract events (kernel ↔ component)
 //!
 //! Delivery is not on this list: it is the direct entry call described above, not
@@ -135,6 +140,10 @@
 //!   { port, body, urgency? }`; `body` is a string. Components see **ports
 //!   only** — logical config names — never channel addresses, mirroring the
 //!   backend WASM port model for exact policy symmetry.
+//! - [`PORT_DEFER`] — a component's intent to park a message for later, or to
+//!   cancel or edit one it already parked. Same dispatch rule and same identity
+//!   resolution as [`PORT_PUBLISH`]; `detail = { op, port, index?, body?,
+//!   deliver_after? }`, all strings. Buffered only — see [`PORT_DEFER`].
 //! - [`COMPONENT_LOG`] — a component's intent to log. Same dispatch rule as
 //!   [`PORT_PUBLISH`] (`bubbles: true, composed: true`, on the mounted element
 //!   or from within its shadow root), so the kernel derives component identity
@@ -374,6 +383,13 @@ pub type Activation = brenn_activation::Activation<MessageEnvelope>;
 /// fields mean — the port is a view, not a pipe.
 pub type PortWindow = brenn_activation::PortWindow<MessageEnvelope>;
 
+/// One output port's view onto the messages this component itself has parked on
+/// that port's channel, soonest release first.
+///
+/// Re-exported rather than aliased at an envelope type: a parked message is a body
+/// and a release time, so the carrier is the same on every hosting.
+pub use brenn_activation::{DeferredEntry, DeferredWindow};
+
 /// Why a buffered publish was refused, returned synchronously to the component
 /// from inside its activation entry.
 ///
@@ -395,6 +411,34 @@ pub enum PublishError {
     /// (publishes / bytes / calls) or the port's own millitoken sink bucket.
     /// Buckets refill per activation, so the next activation may well succeed.
     QuotaExceeded,
+}
+
+/// Why a buffered deferred-message control op (cancel / edit) was refused,
+/// returned synchronously to the component from inside its activation entry.
+///
+/// The `processor.wit` `defer-error` variants verbatim. Note what is *not* here: a
+/// drain-vs-release race is not a refusal. The op names a message by an index into
+/// the deferred window this activation was handed, and the message may release
+/// before the flush applies it — the kernel logs and counts that and the op still
+/// returned ok, because the component had already returned by the time the race
+/// was resolvable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferError {
+    /// The port is not a bound output of this instance.
+    NotPermitted,
+    /// The index is outside the deferred window this activation delivered for the
+    /// port. Snapshot-relative: an index valid against another activation's window
+    /// is still out of range here. A component bug, so it fails while the
+    /// component still holds the error channel.
+    OutOfRange,
+    /// A budget is exhausted — the per-activation call budget (shared with
+    /// publishes), the buffered-op ceiling, or, for an edit that replaces the
+    /// body, the publish-body cap or the activation's aggregate body bytes, both
+    /// shared with publishes. An edit body is weighed exactly as a published body.
+    QuotaExceeded,
+    /// An edit's release time is not a representable timestamp. Refused here
+    /// rather than left to collapse into an immediate release downstream.
+    InvalidDeliverAfter,
 }
 
 /// Why an activation entry returned unsuccessfully.
@@ -485,6 +529,63 @@ pub fn parse_publish_status(status: &str) -> Option<Result<(), PublishError>> {
     }
 }
 
+// ── The deferred-message ops (component → kernel) ───────────────────────────
+
+/// The [`PORT_DEFER`] detail's `op` field for a deferred publish: park `body` on
+/// the port's channel until `deliver_after`.
+pub const DEFER_OP_PUBLISH: &str = "publish";
+
+/// The [`PORT_DEFER`] detail's `op` field for a cancel: unpark the message the
+/// `index` names.
+pub const DEFER_OP_CANCEL: &str = "cancel";
+
+/// The [`PORT_DEFER`] detail's `op` field for an edit: rewrite the body and/or
+/// the release time of the message the `index` names.
+pub const DEFER_OP_EDIT: &str = "edit";
+
+/// The [`PORT_DEFER`] detail field the kernel writes the op's answer into,
+/// synchronously, before the dispatch returns — the deferred family's twin of
+/// [`PUBLISH_STATUS_FIELD`].
+///
+/// Unlike the publish seam, the *vocabulary* on this field depends on the op,
+/// because the WIT's does: a [`DEFER_OP_PUBLISH`] answers in
+/// [`publish_status_str`]'s spellings (a deferred publish is a publish and adds no
+/// error vocabulary), while [`DEFER_OP_CANCEL`] and [`DEFER_OP_EDIT`] answer in
+/// [`defer_status_str`]'s. A caller knows which op it dispatched, so it knows
+/// which parser to read the answer with.
+///
+/// Absent means the kernel did not route the op into an in-flight activation's
+/// buffer. For this event that is not a second path but a refusal: every op here
+/// is buffered-only, so the kernel drops and reports it (see [`PORT_DEFER`]).
+pub const DEFER_STATUS_FIELD: &str = "status";
+
+/// The [`DEFER_STATUS_FIELD`] wire string for a cancel's or an edit's answer. The
+/// single executable definition of the values, shared by the kernel that writes
+/// them and the SDK that reads them, so the seam cannot drift by hand-copied
+/// literal.
+pub fn defer_status_str(status: Result<(), DeferError>) -> &'static str {
+    match status {
+        Ok(()) => "ok",
+        Err(DeferError::NotPermitted) => "not-permitted",
+        Err(DeferError::OutOfRange) => "out-of-range",
+        Err(DeferError::QuotaExceeded) => "quota-exceeded",
+        Err(DeferError::InvalidDeliverAfter) => "invalid-deliver-after",
+    }
+}
+
+/// The inverse of [`defer_status_str`]: parse a [`DEFER_STATUS_FIELD`] value from
+/// a cancel or an edit, or `None` for a string this contract never spells.
+pub fn parse_defer_status(status: &str) -> Option<Result<(), DeferError>> {
+    match status {
+        "ok" => Some(Ok(())),
+        "not-permitted" => Some(Err(DeferError::NotPermitted)),
+        "out-of-range" => Some(Err(DeferError::OutOfRange)),
+        "quota-exceeded" => Some(Err(DeferError::QuotaExceeded)),
+        "invalid-deliver-after" => Some(Err(DeferError::InvalidDeliverAfter)),
+        _ => None,
+    }
+}
+
 // ── Component-contract events (kernel ↔ component) ──────────────────────────
 
 /// Component → kernel. Must be `bubbles: true, composed: true` and dispatched on
@@ -500,6 +601,39 @@ pub fn parse_publish_status(status: &str) -> Option<Result<(), PublishError>> {
 /// (`level`, `severity`): silently downgrading a component's stated intent to
 /// `normal` would be a fallback that hides the bug.
 pub const PORT_PUBLISH: &str = "brenn-port-publish";
+
+/// Component → kernel. Same dispatch rule as [`PORT_PUBLISH`] (`bubbles: true,
+/// composed: true`, on the mounted element or from within its shadow root). One
+/// event for the whole deferred-message family: park a message for later, cancel
+/// one already parked, or edit one already parked.
+///
+/// `detail = { op, port, index?, body?, deliver_after? }`, every field a string:
+///
+/// - `op` — [`DEFER_OP_PUBLISH`], [`DEFER_OP_CANCEL`] or [`DEFER_OP_EDIT`].
+/// - `port` — a bound output port of this instance, as everywhere on this seam.
+/// - `index` — required by cancel and edit, unused by publish: the position of
+///   the message in the [`DeferredWindow`] *this activation* delivered for the
+///   port. Snapshot-relative, so an index from another activation is out of range
+///   here, not a wrong message.
+/// - `body` — required by publish; on an edit, present to replace the body and
+///   absent to leave it alone.
+/// - `deliver_after` — required by publish; on an edit, present to reschedule and
+///   absent to leave the release time alone.
+///
+/// `index` and `deliver_after` are **decimal strings**, not JS numbers:
+/// `deliver_after` is epoch milliseconds UTC as a `u64`, and every other value on
+/// this seam is already a string, so a string keeps the boundary uniform and the
+/// integer exact rather than routed through a float. An unparseable one is
+/// malformed detail, dropped and reported like any other.
+///
+/// **Buffered only, with no second path.** Each op is answered synchronously on
+/// [`DEFER_STATUS_FIELD`] by the in-flight activation's buffer, and there is no
+/// gesture equivalent: a schedule staged outside an activation would escape the
+/// flush-iff-ok rule that makes a failed activation schedule nothing. That is why
+/// the family gets its own event rather than riding [`PORT_PUBLISH`] with an extra
+/// field — an event with an immediate path cannot honor a deferral. Dispatched
+/// with no activation of this instance in flight, the op is dropped and reported.
+pub const PORT_DEFER: &str = "brenn-port-defer";
 
 /// Component → kernel. Same dispatch rule as [`PORT_PUBLISH`] (`bubbles: true,
 /// composed: true`, on the mounted element or from within its shadow root).
@@ -677,6 +811,45 @@ mod tests {
         assert_eq!(SURFACE_RELOAD, "brenn-surface-reload");
         assert_eq!(SURFACE_READY, "brenn-surface-ready");
         assert_eq!(ACTIVATION_REGISTER, "brenn-activation-register");
+        assert_eq!(PORT_DEFER, "brenn-port-defer");
+    }
+
+    #[test]
+    fn defer_status_strings_round_trip() {
+        // Same argument as the publish status: the kernel writes these and the SDK
+        // reads them across a wasm-module boundary, so the halves agree only if the
+        // mapping is one function.
+        for status in [
+            Ok(()),
+            Err(DeferError::NotPermitted),
+            Err(DeferError::OutOfRange),
+            Err(DeferError::QuotaExceeded),
+            Err(DeferError::InvalidDeliverAfter),
+        ] {
+            assert_eq!(
+                parse_defer_status(defer_status_str(status.clone())),
+                Some(status)
+            );
+        }
+        assert_eq!(DEFER_STATUS_FIELD, "status");
+        assert_eq!(parse_defer_status("nope"), None);
+        assert_eq!(parse_defer_status(""), None);
+        // The two vocabularies share a field and overlap on two spellings, so each
+        // parser must refuse the other's exclusive ones rather than mapping them to
+        // a neighbouring variant.
+        assert_eq!(parse_defer_status("invalid-payload"), None);
+        assert_eq!(parse_publish_status("out-of-range"), None);
+        assert_eq!(parse_publish_status("invalid-deliver-after"), None);
+    }
+
+    #[test]
+    fn defer_op_names_frozen() {
+        // The op selector is read by the kernel's router and written by every SDK;
+        // a rename on one side alone is a component whose schedules silently become
+        // malformed detail.
+        assert_eq!(DEFER_OP_PUBLISH, "publish");
+        assert_eq!(DEFER_OP_CANCEL, "cancel");
+        assert_eq!(DEFER_OP_EDIT, "edit");
     }
 
     #[test]

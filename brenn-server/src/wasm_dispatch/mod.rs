@@ -58,7 +58,9 @@ fn processor_urgency_to_messaging(u: ProcessorUrgency) -> Urgency {
 /// captured here, so an unbound port or an index outside the captured snapshot is
 /// a host invariant violation (the two disagree about the delivered window) and
 /// panics. A [`DeferralOutcome::NotDeferred`] is the benign drain-vs-release race:
-/// logged, not a failure.
+/// logged, not a failure. A [`DeferralOutcome::WrongSender`] is the same class of
+/// violation as a bad index — the snapshot this host built named a message parked
+/// under someone else — and panics too.
 async fn apply_deferred_ops(
     cfg: &WasmConsumerConfig,
     sender: &str,
@@ -114,15 +116,23 @@ async fn apply_deferred_ops(
                     .await
             }
         };
-        if outcome == DeferralOutcome::NotDeferred {
-            cfg.messenger
-                .record_deferred_control_race(&cfg.slug, &out.channel_address);
-            info!(
-                slug = %cfg.slug,
-                port = %port,
-                "wasm_dispatch: deferred control op is a no-op — the message released between \
-                 the activation snapshot and flush"
-            );
+        match outcome {
+            DeferralOutcome::Applied => {}
+            DeferralOutcome::NotDeferred => {
+                cfg.messenger
+                    .record_deferred_control_race(&cfg.slug, &out.channel_address);
+                info!(
+                    slug = %cfg.slug,
+                    port = %port,
+                    "wasm_dispatch: deferred control op is a no-op — the message released between \
+                     the activation snapshot and flush"
+                );
+            }
+            DeferralOutcome::WrongSender => panic!(
+                "wasm_dispatch: deferred op names message {uuid} on {} parked by another sender \
+                 — the snapshot this host built for {} carried an id it does not own",
+                out.channel_address, cfg.slug
+            ),
         }
     }
 }

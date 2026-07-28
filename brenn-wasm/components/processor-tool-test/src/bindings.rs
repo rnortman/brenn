@@ -298,8 +298,11 @@ pub mod brenn {
         /// activation's window is still out of range here. This is a guest bug,
         /// so it fails fail-fast at buffer time.
         OutOfRange,
-        /// Per-activation control-op budget exhausted (shared with the publish
-        /// call budget).
+        /// A per-activation budget is exhausted: the call budget (shared with
+        /// publishes), the buffered-op ceiling, or — for an edit that replaces
+        /// the payload — the per-message payload cap or the activation's
+        /// aggregate payload bytes, both shared with publishes. An edit payload
+        /// is weighed exactly as a published payload is.
         QuotaExceeded,
         /// A `defer-edit` `deliver-after` is not a representable timestamp. Like
         /// `publish-deferred`, the host rejects it at buffer time (where the guest
@@ -2175,9 +2178,11 @@ pub mod brenn {
       /// `now` is the host's wall clock at drain, epoch milliseconds UTC. It lets
       /// a guest compute an absolute `deliver-after` for `ports.publish-deferred`
       /// without holding a clock of its own — clock authority stays with the host.
-      /// It is `none` when the host exposes no UTC wall clock (the surface page
-      /// kernel, whose clock is a monotonic page-load timer, not UTC); a guest
-      /// that needs deferred publish runs only where `now` is `some`.
+      /// Both hostings supply it, read once per activation: the backend from the
+      /// process clock, the surface page kernel from the device clock. It is `none`
+      /// only on a host that exposes no UTC wall clock at all; a guest that needs
+      /// deferred publish must handle `none` by declining to schedule rather than
+      /// inventing an instant.
       #[derive(Clone)]
       pub struct Activation {
         pub ports: _rt::Vec::<PortWindow>,

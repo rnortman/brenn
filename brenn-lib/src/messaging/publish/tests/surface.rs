@@ -122,6 +122,27 @@ async fn assemble_surface_messenger(
     max_body_bytes: usize,
     principals: &[(Option<String>, SurfaceSendBudget)],
 ) -> (Arc<Messenger>, String) {
+    let (messenger, addr, _router) = assemble_surface_messenger_router(
+        entry,
+        wasm_policies,
+        surface_policies,
+        max_body_bytes,
+        principals,
+    )
+    .await;
+    (messenger, addr)
+}
+
+/// [`assemble_surface_messenger`] handing back the mock router as well, for the
+/// tests whose subject is what the publish path *fed* rather than what it
+/// stored. A feed writes no row, so nothing else can observe one.
+async fn assemble_surface_messenger_router(
+    entry: ChannelEntry,
+    wasm_policies: std::collections::HashMap<String, AppPolicy>,
+    surface_policies: std::collections::HashMap<String, AppPolicy>,
+    max_body_bytes: usize,
+    principals: &[(Option<String>, SurfaceSendBudget)],
+) -> (Arc<Messenger>, String, Arc<CountingRouter>) {
     let db = init_db_memory();
     let channel_addr = entry.address.clone();
     let wasm_subscribers: Vec<String> = entry
@@ -142,12 +163,13 @@ async fn assemble_surface_messenger(
         .map(|slug| (slug, principals.to_vec()))
         .collect();
     let directory = Arc::new(MessagingDirectory::with_entries(vec![entry]));
+    let router = Arc::new(CountingRouter::default());
     let messenger = Messenger::new(
         db,
         directory,
         Arc::from("test"),
         Arc::new(IndexMap::new()),
-        Arc::new(CountingRouter::default()) as Arc<dyn WakeRouter>,
+        Arc::clone(&router) as Arc<dyn WakeRouter>,
         MessagingGlobalConfig {
             max_body_bytes,
             ..Default::default()
@@ -173,7 +195,7 @@ async fn assemble_surface_messenger(
             )
             .await;
     }
-    (messenger, channel_addr)
+    (messenger, channel_addr, router)
 }
 
 /// Build a `Messenger` with one `brenn:` channel carrying a single Wasm
@@ -841,6 +863,7 @@ fn batch<'a>(
             body,
             urgency,
             publish_ts_ns: stamp(i),
+            deliver_after: None,
         })
         .collect()
 }
@@ -849,6 +872,256 @@ fn batch<'a>(
 /// rather than `now` so a test's expected order is readable in its assertions.
 fn stamp(i: usize) -> i64 {
     1_700_000_000_000_000_000 + i as i64
+}
+
+/// One batch entry scheduled for `release_at` instead of committing now.
+fn deferred<'a>(
+    addr: &'a str,
+    body: &'a str,
+    i: usize,
+    release_at: DateTime<Utc>,
+) -> SurfaceBatchPublish<'a> {
+    SurfaceBatchPublish {
+        channel_address: addr,
+        body,
+        urgency: Urgency::Normal,
+        publish_ts_ns: stamp(i),
+        deliver_after: Some(release_at),
+    }
+}
+
+/// The same fixture as [`build_surface_publish_messenger`] with the channel's
+/// `retain_depth` bounded, which is also its deferred cap: a channel holds at
+/// most as much parked future as it holds retained past.
+async fn build_surface_publish_messenger_at_retain(
+    retain_depth: Depth,
+) -> (Arc<Messenger>, String) {
+    let mut entry = surface_channel_entry(vec![]);
+    entry.resolved_channel.retain_depth = retain_depth;
+    let mut surface_policies = std::collections::HashMap::new();
+    surface_policies.insert(
+        "durabar".to_string(),
+        surface_publish_policy(ChannelMatcher::Prefix(String::new())),
+    );
+    assemble_surface_messenger(
+        entry,
+        std::collections::HashMap::new(),
+        surface_policies,
+        65_536,
+        &default_principals(&FIXTURE_INSTANCES),
+    )
+    .await
+}
+
+/// Every stored body with the release time and retention position of its row —
+/// the two facts that say whether a message is parked. A parked row carries a
+/// `deliver_after` and no `retained_seq`; nothing that reads retention can see it.
+async fn stored_rows(m: &Messenger) -> Vec<(String, bool, Option<i64>)> {
+    let conn = m.db().lock().await;
+    let mut stmt = conn
+        .prepare(
+            "SELECT body, deliver_after IS NOT NULL, retained_seq FROM messaging_messages \
+             ORDER BY publish_ts_ns",
+        )
+        .unwrap();
+    stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0).unwrap(),
+            r.get::<_, bool>(1).unwrap(),
+            r.get::<_, Option<i64>>(2).unwrap(),
+        ))
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// A deferred entry parks inside the batch transaction: its row carries a release
+/// time and **no retention position**, so no retained read can observe it before
+/// the release sweep moves it — while its unscheduled siblings commit normally.
+#[tokio::test]
+async fn a_deferred_batch_entry_parks_and_the_rest_of_the_batch_commits() {
+    let (m, addr) = build_surface_publish_messenger_at_retain(Depth::Unbounded).await;
+    let later = Utc::now() + Duration::from_secs(600);
+
+    let dropped = m
+        .publish_batch_from_surface(
+            "durabar",
+            "clock",
+            &[
+                SurfaceBatchPublish {
+                    channel_address: &addr,
+                    body: "now",
+                    urgency: Urgency::Normal,
+                    publish_ts_ns: stamp(0),
+                    deliver_after: None,
+                },
+                deferred(&addr, "later", 1, later),
+            ],
+        )
+        .await;
+
+    assert_eq!(dropped, 0, "the cap is unbounded, so nothing is refused");
+    assert_eq!(
+        stored_rows(&m).await,
+        vec![
+            ("now".to_string(), false, Some(1)),
+            ("later".to_string(), true, None),
+        ],
+        "the immediate entry took a position; the scheduled one holds none"
+    );
+}
+
+/// The release sweep is what puts a parked entry on the channel, at its own
+/// position, exactly as an ordinary publish would have.
+#[tokio::test]
+async fn a_parked_batch_entry_enters_retention_when_it_comes_due() {
+    let (m, addr) = build_surface_publish_messenger_at_retain(Depth::Unbounded).await;
+    let now = Utc::now();
+    let later = now + Duration::from_secs(600);
+
+    m.publish_batch_from_surface("durabar", "clock", &[deferred(&addr, "later", 0, later)])
+        .await;
+    assert_eq!(
+        m.release_due_messages(now).await.released,
+        0,
+        "nothing is due before its release time"
+    );
+
+    let sweep = m.release_due_messages(later).await;
+    assert_eq!(sweep.released, 1);
+    assert_eq!(
+        stored_rows(&m).await,
+        vec![("later".to_string(), false, Some(1))],
+        "the release clears the schedule and assigns the position"
+    );
+}
+
+/// The same surface both publishes onto the channel and subscribes it, so a
+/// batch's live fan-out is observable on the mock router. A feed writes no row,
+/// so the router is the only witness there is.
+async fn build_surface_feed_messenger() -> (Arc<Messenger>, String, Arc<CountingRouter>) {
+    let mut policy = surface_publish_policy(ChannelMatcher::Prefix(String::new()));
+    policy.grants.insert(AppCapability::MessagingSubscribe);
+    policy
+        .acls
+        .brenn_subscribe
+        .push(ChannelMatcher::Prefix(String::new()));
+    let entry = surface_channel_entry(vec![SubscriberEntry {
+        kind: SubscriberEntryKind::Surface {
+            slug: "durabar".to_string(),
+            instance: None,
+        },
+        push_depth: Depth::Unbounded,
+        retain_depth: Depth::Unbounded,
+        noise: NoiseLevel::Silent,
+        wake_min: None,
+    }]);
+    let mut surface_policies = std::collections::HashMap::new();
+    surface_policies.insert("durabar".to_string(), policy);
+    assemble_surface_messenger_router(
+        entry,
+        std::collections::HashMap::new(),
+        surface_policies,
+        65_536,
+        &default_principals(&FIXTURE_INSTANCES),
+    )
+    .await
+}
+
+/// The bodies the router was handed as live surface deliveries, in order.
+async fn fed_bodies(router: &CountingRouter) -> Vec<String> {
+    router
+        .deliveries
+        .lock()
+        .await
+        .iter()
+        .map(|(_, payload)| payload.clone())
+        .collect()
+}
+
+/// **A parked entry is not fed.** The row assertions cannot see this: a live
+/// surface feed writes nothing, so a parked entry handed to an attached session
+/// leaves exactly the same rows behind as one correctly withheld — while the
+/// component's schedule arrives at a time it explicitly did not choose, and then
+/// again at the release sweep.
+#[tokio::test]
+async fn a_parked_batch_entry_is_fed_only_at_its_release() {
+    let (m, addr, router) = build_surface_feed_messenger().await;
+    let now = Utc::now();
+    let later = now + Duration::from_secs(600);
+
+    m.publish_batch_from_surface(
+        "durabar",
+        "clock",
+        &[
+            SurfaceBatchPublish {
+                channel_address: &addr,
+                body: "now",
+                urgency: Urgency::Normal,
+                publish_ts_ns: stamp(0),
+                deliver_after: None,
+            },
+            deferred(&addr, "later", 1, later),
+        ],
+    )
+    .await;
+
+    let fed = fed_bodies(&router).await;
+    assert_eq!(fed.len(), 1, "exactly one entry was fed: {fed:?}");
+    assert!(
+        fed[0].contains("now") && !fed[0].contains("later"),
+        "the immediate entry, and only it: {fed:?}"
+    );
+
+    assert_eq!(m.release_due_messages(later).await.released, 1);
+    let fed = fed_bodies(&router).await;
+    assert_eq!(fed.len(), 2, "the release fed it exactly once: {fed:?}");
+    assert!(
+        fed[1].contains("later"),
+        "and it is the scheduled one: {fed:?}"
+    );
+}
+
+/// Quota is per-entry, never a transaction abort: refusing one schedule does not
+/// discard the entries the component published unconditionally.
+#[tokio::test]
+async fn the_deferred_cap_refuses_one_schedule_and_the_batch_still_commits() {
+    let (m, addr) = build_surface_publish_messenger_at_retain(Depth::Bounded(1)).await;
+    let later = Utc::now() + Duration::from_secs(600);
+
+    let dropped = m
+        .publish_batch_from_surface(
+            "durabar",
+            "clock",
+            &[
+                deferred(&addr, "first", 0, later),
+                deferred(&addr, "refused", 1, later),
+                SurfaceBatchPublish {
+                    channel_address: &addr,
+                    body: "immediate",
+                    urgency: Urgency::Normal,
+                    publish_ts_ns: stamp(2),
+                    deliver_after: None,
+                },
+            ],
+        )
+        .await;
+
+    assert_eq!(dropped, 1, "the cap refused exactly one schedule");
+    assert_eq!(
+        stored_rows(&m).await,
+        vec![
+            ("first".to_string(), true, None),
+            ("immediate".to_string(), false, Some(1)),
+        ],
+        "the refused entry left no row and the batch carried on"
+    );
+    assert_eq!(
+        m.dropped_deferred_count("surface:durabar#clock", &addr),
+        1,
+        "the drop is counted against the component that asked for it"
+    );
 }
 
 /// Every stored body, oldest first by publish timestamp — the order a subscriber
@@ -922,12 +1195,14 @@ async fn publish_batch_from_surface_preserves_per_entry_urgency() {
                 body: "low",
                 urgency: Urgency::Low,
                 publish_ts_ns: stamp(0),
+                deliver_after: None,
             },
             SurfaceBatchPublish {
                 channel_address: &addr,
                 body: "high",
                 urgency: Urgency::High,
                 publish_ts_ns: stamp(1),
+                deliver_after: None,
             },
         ],
     )
@@ -976,12 +1251,14 @@ async fn a_mid_batch_failure_leaves_zero_rows() {
                 body: "first",
                 urgency: Urgency::Normal,
                 publish_ts_ns: stamp(0),
+                deliver_after: None,
             },
             SurfaceBatchPublish {
                 channel_address: "brenn:not-in-the-directory",
                 body: "doomed",
                 urgency: Urgency::Normal,
                 publish_ts_ns: stamp(1),
+                deliver_after: None,
             },
         ];
         m2.publish_batch_from_surface("durabar", "clock", &entries)

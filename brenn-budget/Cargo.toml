@@ -5,10 +5,13 @@ edition = "2024"
 publish = false
 description = "Publish-budget arithmetic and per-activation caps, shared by every host that mints activations"
 
-# Deliberately dependency-free: std only, no serde, no I/O. The three consumers
-# — the wasmtime host (brenn-wasm), the bus config resolver (brenn-lib), and the
-# surface kernel (surface/client, compiled to wasm32) — can each depend on this
-# crate, which is the whole point: brenn-lib and brenn-wasm both pull
-# dependencies the kernel cannot compile, so a constant either lives here or
-# lives twice.
+# Std plus the one shared wire type this crate's checks are stated against; no
+# serde of its own, no I/O. The three consumers — the wasmtime host
+# (brenn-wasm), the bus config resolver (brenn-lib), and the surface kernel
+# (surface/client, compiled to wasm32) — can each depend on this crate, which is
+# the whole point: brenn-lib and brenn-wasm both pull dependencies the kernel
+# cannot compile, so a rule either lives here or lives twice.
 [dependencies]
+# For `utc_from_epoch_ms`, the single representable-timestamp bound every
+# deliver-after gate in the system shares. wasm32-clean (chrono/serde/uuid only).
+brenn-envelope = { path = "../brenn-envelope" }

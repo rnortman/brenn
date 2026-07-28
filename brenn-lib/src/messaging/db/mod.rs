@@ -79,8 +79,8 @@ pub use cursors::{
 mod deferral;
 pub use deferral::{
     DeferredLookup, DeferredRow, ReleasedRow, count_deferred, delete_deferred,
-    earliest_channel_release, edit_deferred, list_deferred_for_sender, lookup_deferred,
-    release_due_for_channel,
+    earliest_channel_release, edit_deferred, list_deferred_for_sender, list_deferred_senders,
+    lookup_deferred, release_due_for_channel,
 };
 
 #[cfg(test)]

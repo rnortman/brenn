@@ -8,6 +8,18 @@
 //! This is surface-suite-specific and deliberately not in `crate::test_support`
 //! (which holds crate-wide helpers); it consumes `test_support` rather than
 //! belonging to it.
+//!
+//! **Rigs model only configurations boot would accept.** A fixture installed
+//! into a post-boot harness must satisfy every assertion boot makes about a
+//! surface it starts — its transportable outputs name declared channels, and its
+//! own policy covers each of those outputs
+//! (`bootstrap::messaging::assert_output_bindings_covered`). A fixture that
+//! diverges lets a reader reconcile a production/fixture disagreement toward the
+//! fixture. The coverage half is enforced in [`install_surface_runtimes`], which
+//! every rig that puts surfaces on an `AppState` calls, over the whole set it
+//! installs. The rule governs running-server rigs only: a fixture whose purpose
+//! is to pin boot's own *rejection* (e.g. [`surface_outputting_to`]) models
+//! config under validation, not a running server, and is exempt by nature.
 
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +36,7 @@ use brenn_lib::messaging::testutils::ephemeral_channel_entry;
 use brenn_lib::messaging::{ChannelEntry, ParticipantId, Urgency};
 use brenn_lib::obs::alerting::AlertDispatcher;
 
-use super::build_surface_runtimes;
+use super::{SurfaceDescriptionParams, SurfaceRuntime, build_surface_runtimes};
 use crate::state::AppState;
 use crate::test_support::state::test_state_with_capturing_alerter;
 use crate::test_support::surface::SurfaceFixture;
@@ -91,25 +103,54 @@ pub(crate) fn deskbar_context_feed() -> ResolvedSurface {
         .build()
 }
 
-/// The fixture's ring stores, one per given non-durable channel. Single
-/// construction site so every surface test exercises the same registry shape.
-pub(crate) fn fixture_stores(entries: Vec<ChannelEntry>) -> Arc<RingStores> {
-    Arc::new(RingStores::build(&entries))
+/// The fixture's ring stores, one per channel among `entries`.
+///
+/// Rejects a durable entry: a durable channel's retention is the database's, so
+/// a fixture that declares one owes it a DB row, and `declare_channels` is the
+/// only thing here that writes one.
+pub(crate) fn fixture_stores(entries: &[ChannelEntry]) -> Arc<RingStores> {
+    assert!(
+        entries.iter().all(|e| !e.capabilities().durable),
+        "a durable channel's retention is the database's, not a ring store; \
+         build the registry with declare_channels"
+    );
+    Arc::new(RingStores::build(entries))
 }
 
-/// Directory holding one declared `brenn:` channel with the given bare address,
-/// built the same way boot does (`build_channel_entries`). `standing_retain_depth`
-/// sets the channel's standing retain depth (so its reap frontier is exactly that
-/// value, no subscribers); `None` leaves it at the global default (`Unbounded` →
-/// pinned). Shared by the single-writer channel-validation suites in `mod.rs` and
-/// `description.rs`.
-pub(crate) fn directory_with_standing(
+/// Declare `entries` the way boot does: every durable channel gets its DB row,
+/// every non-durable one an in-memory ring store. Returns the store registry.
+///
+/// The caller hands the whole set to the directory — boot's final directory
+/// carries both halves — so this is the one place a fixture's durable channel
+/// becomes a channel the messenger can resolve.
+pub(crate) async fn declare_channels(db: &db::Db, entries: &[ChannelEntry]) -> Arc<RingStores> {
+    let (nondurable, durable): (Vec<ChannelEntry>, Vec<ChannelEntry>) = entries
+        .iter()
+        .cloned()
+        .partition(|e| !e.capabilities().durable);
+    {
+        let conn = db.lock().await;
+        brenn_lib::messaging::db::upsert_channels(&conn, &durable);
+    }
+    fixture_stores(&nondurable)
+}
+
+/// One `brenn:` channel declaration built the way boot builds it
+/// (`build_channel_entries` over a raw `[[channel]]` shape), at the given uuid so
+/// a test can read the channel's persisted rows back.
+pub(crate) fn brenn_channel_entry(bare_address: &str, uuid: uuid::Uuid) -> ChannelEntry {
+    channel_entry_at(bare_address, &uuid.to_string(), None)
+}
+
+/// The shared raw→resolved path behind the declaration helpers.
+fn channel_entry_at(
     bare_address: &str,
+    uuid: &str,
     standing_retain_depth: Option<Depth>,
-) -> MessagingDirectory {
+) -> ChannelEntry {
     let raw = ChannelConfigRaw {
         send_rate: None,
-        uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
+        uuid: Some(uuid.to_string()),
         address: bare_address.to_string(),
         description: None,
         push_depth: None,
@@ -119,8 +160,25 @@ pub(crate) fn directory_with_standing(
         sink: None,
         wake_min: None,
     };
-    let entries = build_channel_entries(&[raw], &MessagingGlobalConfig::default());
-    MessagingDirectory::with_entries(entries)
+    build_channel_entries(&[raw], &MessagingGlobalConfig::default())
+        .pop()
+        .expect("one raw channel resolves to one entry")
+}
+
+/// Directory holding one declared `brenn:` channel with the given bare address,
+/// built the same way boot does (`build_channel_entries`). `standing_retain_depth`
+/// sets the channel's standing retain depth (so its reap frontier is exactly that
+/// value, no subscribers); `None` leaves it at the global default (`Unbounded` →
+/// pinned).
+pub(crate) fn directory_with_standing(
+    bare_address: &str,
+    standing_retain_depth: Option<Depth>,
+) -> MessagingDirectory {
+    MessagingDirectory::with_entries(vec![channel_entry_at(
+        bare_address,
+        "11111111-1111-4111-8111-111111111111",
+        standing_retain_depth,
+    )])
 }
 
 /// Directory with one declared `brenn:` channel at the default (pinned) standing
@@ -132,6 +190,10 @@ pub(crate) fn directory_with(bare_address: &str) -> MessagingDirectory {
 /// A minimal single-component surface whose sole output binding targets
 /// `channel_address` — the foreign-writer case both single-writer sweeps reject.
 /// All other fields are inert defaults the sweep never reads.
+///
+/// Exempt from the module's boot-validity rule: its default policy covers no
+/// output, which is a shape boot refuses, and refusing it is the point. It is
+/// config under validation, never installed into a running harness.
 pub(crate) fn surface_outputting_to(channel_address: &str) -> ResolvedSurface {
     ResolvedSurface {
         slug: "writer-surface".to_string(),
@@ -182,25 +244,52 @@ pub(crate) struct SurfaceTestHarness {
     pub messenger: Arc<brenn_lib::messaging::Messenger>,
 }
 
-/// Build a `SurfaceTestHarness` around `surface` and stores carrying `entries`.
-///
-/// The capturing alerter's drainer `JoinHandle` is dropped here: dropping a
-/// tokio `JoinHandle` detaches the task, which keeps draining for the test's
-/// lifetime. `flusher` (a clone of the dispatcher) is the barrier onto that
-/// task; no test needs to await the handle.
+/// Build a `SurfaceTestHarness` around `surface` and stores carrying `entries`,
+/// all of which must be non-durable (`surface_harness_with_durable` otherwise).
 pub(crate) fn surface_harness(
     db: &db::Db,
     surface: ResolvedSurface,
     entries: Vec<ChannelEntry>,
 ) -> SurfaceTestHarness {
+    let stores = fixture_stores(&entries);
+    surface_harness_over(db, surface, entries, stores)
+}
+
+/// `surface_harness` for a channel set carrying a durable channel: the durable
+/// half gets its DB row before the runtime is built, so a durable channel is
+/// declared the way a booted server declares one rather than as a directory-only
+/// entry. Declaration is the whole of what this establishes; whether the caller's
+/// surface policy authorizes the bindings that name these channels is the
+/// caller's own business.
+pub(crate) async fn surface_harness_with_durable(
+    db: &db::Db,
+    surface: ResolvedSurface,
+    entries: Vec<ChannelEntry>,
+) -> SurfaceTestHarness {
+    let stores = declare_channels(db, &entries).await;
+    surface_harness_over(db, surface, entries, stores)
+}
+
+/// The shared assembly behind both harness builders: runtime over `surface`, a
+/// directory carrying every entry, and the caller's store registry.
+///
+/// The capturing alerter's drainer `JoinHandle` is dropped here: dropping a
+/// tokio `JoinHandle` detaches the task, which keeps draining for the test's
+/// lifetime. `flusher` (a clone of the dispatcher) is the barrier onto that
+/// task; no test needs to await the handle.
+fn surface_harness_over(
+    db: &db::Db,
+    surface: ResolvedSurface,
+    entries: Vec<ChannelEntry>,
+    stores: Arc<RingStores>,
+) -> SurfaceTestHarness {
     let (mut state, alerts, _handle) = test_state_with_capturing_alerter(db);
     let flusher = state.alert_dispatcher.clone();
-    let stores = fixture_stores(entries.clone());
     // The surface publishes through the Messenger, so the fixture needs one
     // with the channels, stores, and a subscriber registration carrying the
     // surface's boot-resolved policy.
     let messenger = fixture_messenger(db, &entries, &surface, Arc::clone(&stores));
-    state.surfaces = Arc::new(build_surface_runtimes(
+    state.surfaces = Arc::new(install_surface_runtimes(
         vec![surface],
         Some(Arc::clone(&messenger)),
         TEST_MAX_BODY_BYTES,
@@ -216,7 +305,46 @@ pub(crate) fn surface_harness(
     }
 }
 
-/// A `Messenger` over the fixture's channels, wired the way boot wires one.
+/// Build the runtimes for `surfaces` and hand them back for an `AppState` to
+/// hold, asserting first that the whole installed set satisfies boot's
+/// output-coverage rule (the module's boot-validity rule).
+///
+/// The assertion runs in boot's own order — a rig that widens a policy through a
+/// substrate injector has already done so by the time it installs — so an output
+/// bound to the configured error channel is covered by the injected grant rather
+/// than failing coverage a fixture constructor away from the injection. It also
+/// sees every surface a rig installs, including second surfaces that no
+/// messenger was built for.
+pub(crate) fn install_surface_runtimes(
+    surfaces: Vec<ResolvedSurface>,
+    messenger: Option<Arc<brenn_lib::messaging::Messenger>>,
+    max_body_bytes: usize,
+    error_report: Option<(String, brenn_surface_proto::LogLevel)>,
+    surface_description: SurfaceDescriptionParams,
+) -> std::collections::HashMap<String, Arc<SurfaceRuntime>> {
+    crate::bootstrap::messaging::assert_output_bindings_covered(&surfaces);
+    build_surface_runtimes(
+        surfaces,
+        messenger,
+        max_body_bytes,
+        error_report,
+        surface_description,
+    )
+}
+
+/// A `Messenger` over the fixture's channels, wired the way boot wires one: the
+/// surface's own policy at **every** principal grain
+/// (`ResolvedSurface::principals` — the kernel identity plus one per declared
+/// component instance), and one send-budget bucket per principal
+/// `ResolvedSurface::principal_send_budgets` names. Both read the same
+/// declaration set boot reads, so a fixture cannot register or budget a
+/// different principal set than the surface it installs.
+///
+/// Every grain is registered because surface target resolution fails closed on a
+/// missing registration: an instance-grain miss is a silent delivery denial, not
+/// an error, so a kernel-grain-only map would make a durable subscription's
+/// deliveries vanish instead of failing loudly. A missing budget bucket is a "no
+/// send budget" panic at the publish gate, not a silently unmetered publish.
 pub(crate) fn fixture_messenger(
     db: &db::Db,
     entries: &[ChannelEntry],
@@ -244,16 +372,23 @@ pub(crate) fn fixture_messenger(
     };
     messenger
         .with_subscriber_registrations(
-            [(
-                SubscriberEntryKind::Surface {
-                    slug: surface.slug.clone(),
-                    instance: None,
-                },
-                registration,
-            )]
-            .into_iter()
-            .collect(),
+            surface
+                .principals()
+                .map(|instance| {
+                    (
+                        SubscriberEntryKind::Surface {
+                            slug: surface.slug.clone(),
+                            instance,
+                        },
+                        registration.clone(),
+                    )
+                })
+                .collect(),
         )
+        .with_surface_send_budgets([(
+            surface.slug.clone(),
+            surface.principal_send_budgets().collect(),
+        )])
         .with_ring_stores(stores)
 }
 

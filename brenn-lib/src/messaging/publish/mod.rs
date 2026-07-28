@@ -313,8 +313,11 @@ impl Messenger {
     /// durable surface send budget (`surface_send_budgets`) bounds it in
     /// `publish_core`, so `BudgetExhausted` is a client-reachable outcome here.
     /// Urgency is `Normal` in v1 (the surface `Publish` frame carries none). No
-    /// `reply_to`/`deliver_after`/`delivery_deadline` — not exposed to surfaces in
-    /// v1.
+    /// `reply_to`/`delivery_deadline` — not exposed to surfaces. No
+    /// `deliver_after` either: a surface's deferred publish is always a *buffered*
+    /// component publish, and buffered publishes flush as batches, so surface
+    /// deferral rides [`Messenger::publish_batch_from_surface`] and never this
+    /// single-frame path.
     ///
     /// `component` is the identity grain, and both halves are backend-validated,
     /// never client-trusted fields: `Some(instance)` stamps
@@ -1480,6 +1483,11 @@ impl Messenger {
                 });
 
                 let release = publish.deliver_after.filter(|da| *da > flush_now);
+                // TODO(wasm-durable-park-cap): this park writes the row with no
+                // deferred-cap check, so a durable channel's parked set is
+                // unbounded here — unlike every other park in the system. The
+                // non-durable arm below and the surface batch flush both check the
+                // cap before inserting.
                 let inserted = self.insert_message(
                     &tx,
                     channel,
@@ -1582,6 +1590,15 @@ pub struct SurfaceBatchPublish<'a> {
     /// substrate could not promise. Nanosecond precision; the durable row
     /// persists it verbatim as `publish_ts_ns`.
     pub publish_ts_ns: i64,
+    /// When set, park this entry until then instead of committing it into
+    /// retention.
+    ///
+    /// **Already judged against the flush's single clock read**: the caller reads
+    /// the clock once for the whole flush and passes `None` for a time that has
+    /// already passed, so every entry of one flush — both substrates — decides
+    /// park-vs-immediate against the same instant. This entry point re-reads no
+    /// clock and re-compares nothing.
+    pub deliver_after: Option<DateTime<Utc>>,
 }
 
 impl Messenger {
@@ -1624,14 +1641,29 @@ impl Messenger {
     /// identity model exists to make impossible. `handle_publish_batch` admits it
     /// against the boot-resolved declaration set and kills the connection
     /// otherwise; any future caller owes the same check.
+    ///
+    /// **Deferral is per-entry and its refusal is not an error.** An entry
+    /// carrying a release time is parked inside the same transaction — the row
+    /// goes in without a retention position, so nothing observes it before
+    /// release — under an explicit count-then-insert check against the channel's
+    /// `retain_depth` cap, the discipline [`store::DbStore`]'s own `park` holds.
+    /// An entry the cap refuses has its *schedule* dropped: no row, a warn naming
+    /// the channel and the cap, a counter, and the rest of the batch commits.
+    /// Aborting the transaction instead would discard entries the component
+    /// published unconditionally over one it merely scheduled, and a
+    /// post-activation flush has no error channel back to the guest to carry
+    /// either outcome.
+    ///
+    /// Returns the number of entries whose schedule was refused that way, so the
+    /// caller counts as published only what published.
     pub async fn publish_batch_from_surface(
         &self,
         slug: &str,
         component: &str,
         publishes: &[SurfaceBatchPublish<'_>],
-    ) {
+    ) -> usize {
         if publishes.is_empty() {
-            return;
+            return 0;
         }
 
         // Layer-1, once per batch: the surface's boot-resolved policy, keyed at
@@ -1670,6 +1702,9 @@ impl Messenger {
         // after release. See `publish_from_wasm`.
         let mut surface_feeds: Vec<(Arc<super::MessageEnvelope>, i64, Vec<SurfaceFeedTarget>)> =
             Vec::new();
+        // Schedules the deferred cap refused, warned about after the lock is
+        // released so the transaction is not held across the logging.
+        let mut refused: Vec<(String, u64)> = Vec::new();
 
         {
             let conn = self.db.lock().await;
@@ -1727,6 +1762,36 @@ impl Messenger {
                     );
                 }
 
+                // A parked entry is admitted against the channel's deferred cap
+                // under the same guard it is inserted under, so the count it was
+                // judged against is the count it joins. Refused → the schedule is
+                // dropped and the batch carries on.
+                if let Some(release_at) = publish.deliver_after {
+                    if let super::config::Depth::Bounded(cap) =
+                        channel.resolved_channel.retain_depth
+                        && db::count_deferred(&tx, channel.uuid) >= cap
+                    {
+                        refused.push((channel.address.clone(), cap));
+                        continue;
+                    }
+                    self.insert_message(
+                        &tx,
+                        channel,
+                        ChannelScheme::Brenn,
+                        source,
+                        &sender,
+                        publish.body,
+                        publish.urgency,
+                        publish.publish_ts_ns,
+                        None, // no reply_to — not exposed to surfaces
+                        Some(release_at),
+                        None, // no delivery_deadline
+                    );
+                    // Not fed now: a parked message is not observable before
+                    // release, and the release sweep does its own fan-out.
+                    continue;
+                }
+
                 let inserted = self.insert_message(
                     &tx,
                     channel,
@@ -1737,7 +1802,7 @@ impl Messenger {
                     publish.urgency,
                     publish.publish_ts_ns,
                     None, // no reply_to — not exposed to surfaces
-                    None, // no deliver_after — an activation flush is immediate
+                    None,
                     None, // no delivery_deadline
                 );
                 if !feed_targets.is_empty()
@@ -1774,7 +1839,23 @@ impl Messenger {
             self.fan_out_surface_feed(&targets, envelope, seq).await;
         }
 
+        // A dropped schedule is a component that never wakes when it meant to, so
+        // it is loud and counted even though it is not an error — a health check
+        // reads the counter, an operator reads the line.
+        for (channel, cap) in &refused {
+            self.record_dropped_deferred(&sender, channel);
+            warn!(
+                surface = %slug,
+                principal = %sender,
+                channel = %channel,
+                cap,
+                "publish_batch_from_surface: deferred publish dropped — channel deferred set at \
+                 its retain_depth cap"
+            );
+        }
+
         self.dispatch_kick();
+        refused.len()
     }
 }
 

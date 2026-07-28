@@ -781,6 +781,60 @@ async fn output_port_defer_edit_reschedules_the_guests_own_parked_message() {
     );
 }
 
+/// The store reports a cross-sender id instead of panicking, so the judgement
+/// belongs to each caller. This host's judgement: every id it passes came from a
+/// snapshot it built from that component's own sender-scoped view, so a
+/// cross-sender hit means the snapshot and the store disagree — a broken
+/// invariant, not a runtime condition.
+///
+/// Driven directly rather than through a guest, because the WIT gives a guest no
+/// way to name a message outside its own window; only a host bug can.
+#[tokio::test]
+#[should_panic(expected = "parked by another sender")]
+async fn a_deferred_op_naming_another_senders_parked_message_panics() {
+    let slug = "e2e-foreign";
+    let (messenger, _in_entry, _out_entry, _wasm_sub, _out_sub, cfg, _alert_handle, _db) =
+        build_two_channel_setup(slug, "e2e-foreign-out-sub").await;
+
+    let other = "e2e-foreign-other";
+    messenger
+        .publish_from_wasm(
+            other,
+            &[WasmPublish {
+                channel_address: "brenn:e2e-out",
+                body: "not-yours",
+                urgency: Urgency::Normal,
+                reply_to: None,
+                deliver_after: Some(Utc::now() + chrono::Duration::seconds(60)),
+            }],
+        )
+        .await;
+    let now = Utc::now();
+    let foreign = messenger
+        .deferred_view_for_sender(
+            "brenn:e2e-out",
+            ParticipantId::for_wasm(other).as_str(),
+            now,
+        )
+        .await;
+    let uuid = foreign
+        .first()
+        .expect("the other component's publish parked one message")
+        .message_uuid();
+
+    apply_deferred_ops(
+        &cfg,
+        ParticipantId::for_wasm(slug).as_str(),
+        &HashMap::from([("out".to_string(), vec![uuid])]),
+        &[ProcessorDeferredOp::Cancel {
+            port: "out".to_string(),
+            index: 0,
+        }],
+        now,
+    )
+    .await;
+}
+
 /// A `wasm:<slug>` consumer with one ring-backed (`ephemeral:`) input, its
 /// cursor attached at the ring head.
 async fn build_ring_backed_consumer(

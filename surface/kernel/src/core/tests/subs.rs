@@ -2,7 +2,6 @@ use super::super::*;
 use super::*;
 use crate::test_support::cfg;
 use brenn_surface_proto::{Binding, ServerFrame, SubscribeOutcome, SurfaceBindings};
-use brenn_surface_test_fixtures::sample_envelope;
 use brenn_surface_test_fixtures::wire_cursor;
 
 // ── Subscription table: registration direction ────────────────────────
@@ -91,7 +90,7 @@ fn subscribe_result_gap_activates_the_channel_and_reaches_no_component() {
     // Liveness re-arm and nothing else: the channel activates, no frame is sent,
     // and no activation is minted for a gap.
     assert_eq!(effects, vec![Effect::SetWakeup(Some(Millis(60_007)))]);
-    assert!(core.take_ready_activation().is_none());
+    assert!(core.take_ready_activation(TEST_WALL_MS).is_none());
 }
 
 /// Every gap reason takes the same silent path — the kernel never reads which
@@ -114,7 +113,10 @@ fn every_gap_reason_reaches_no_component() {
             vec![Effect::SetWakeup(Some(Millis(60_006)))],
             "{reason:?}"
         );
-        assert!(core.take_ready_activation().is_none(), "{reason:?}");
+        assert!(
+            core.take_ready_activation(TEST_WALL_MS).is_none(),
+            "{reason:?}"
+        );
     }
 }
 
@@ -151,7 +153,7 @@ fn durable_subscribe_activates_and_delivers() {
     );
     assert_eq!(effects, vec![Effect::SetWakeup(Some(Millis(60_007)))]);
     // A durable delivery reaches the component exactly as an ephemeral one does:
-    // through the pending queue, into a window. That parity is the maxim.
+    // through its position on the store, into a window. That parity is the maxim.
     let ready = take_one(&mut core);
     assert_eq!(split(window(&ready.activation, "in")).1, vec!["durable-1"]);
 }
@@ -228,7 +230,7 @@ fn durable_reconnect_resumes_with_the_stored_cursor_and_a_gap_stops_there() {
         Millis(3_011),
     );
     assert_eq!(resumed, vec![Effect::SetWakeup(Some(Millis(63_011)))]);
-    assert!(core.take_ready_activation().is_none());
+    assert!(core.take_ready_activation(TEST_WALL_MS).is_none());
     // And delivery continues normally on the resumed span.
     core.on_input(
         Input::TextFrame(deliver_frame_for(
@@ -692,12 +694,12 @@ fn a_deliver_reaches_only_its_own_instance() {
     assert_eq!(split(window(&ready.activation, "in")).1, vec!["for-alice"]);
 }
 
-/// The queue depth is a per-binding operator knob, so the policy the core stamps
-/// carries the *binding's* depth — not one global number for the page. Two ports
-/// of one instance with different declared depths is the case a global constant
-/// could not express: the shallow one overflows while the deep one does not.
+/// The push depth is a per-binding operator knob, so each position reads its own
+/// *binding's* depth — not one global number for the page. Two ports of one
+/// instance with different declared depths is the case a global constant could
+/// not express: the shallow one loses messages while the deep one does not.
 #[test]
-fn each_ports_queue_carries_its_own_bindings_push_depth() {
+fn each_position_reads_its_own_bindings_push_depth() {
     let mut core = active_core_with(vec![
         Binding {
             push_depth: 1,
@@ -786,13 +788,17 @@ fn a_depth_zero_binding_is_context_only_and_never_activates() {
     assert_eq!(sampled.dropped, 0);
 }
 
-/// Wire queues are never primed from their ring at attach: the server's
-/// fresh-attach replay is what fills them, arriving as ordinary `Deliver`s. The
-/// ring dedups a redelivered envelope; the pending queue does not, so a
-/// kernel-side prime here would double every replayed message in the first
-/// window's new slice.
+/// **A wire mirror's contents are the subscription's, and die with its last
+/// reference.** Deregistering releases that reference, so re-registering is a
+/// fresh consumer: it is primed from an empty store and owed nothing, and the
+/// server's fresh-attach replay — the catch-up authority on a transportable
+/// channel, whose cursors the page cannot even read — arrives entirely as new.
+///
+/// Keeping the old contents instead would let the store's dedup swallow that
+/// replay as re-presentation, leaving the page indefinitely on history nothing
+/// can ever tell it about again.
 #[test]
-fn a_re_registered_wire_port_is_replayed_by_the_server_not_primed() {
+fn releasing_a_subscriptions_last_reference_discards_its_mirror() {
     let mut core = active_core_with(vec![Binding {
         retain_depth: 4,
         ..sub_binding()
@@ -809,15 +815,33 @@ fn a_re_registered_wire_port_is_replayed_by_the_server_not_primed() {
     let ready = take_one(&mut core);
     complete(&mut core, "protobar", ActivationOutcome::Ok, ready.buffer);
 
-    // The ring holds `m1`. Deregistering and re-registering rebuilds the queue —
-    // and the rebuilt queue is empty, because the replay comes from the server.
+    // Deregistering releases the instance's last reference on the subscription,
+    // which discards the resume token — and the mirror with it.
     deregister(&mut core, "protobar", Millis(8));
+    assert!(
+        !core
+            .stores
+            .contains_key(&StoreKey::Wire(SubKey::for_instance(
+                "protobar",
+                "ephemeral:demo"
+            ))),
+        "the mirror outlived the subscription's last reference"
+    );
     register(&mut core, "protobar", Millis(9));
     assert!(
-        core.take_ready_activation().is_none(),
-        "a wire queue was primed from its ring"
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
+        "a fresh consumer's empty mirror owes it nothing"
     );
-    // The server's replay is what wakes it, and it arrives once.
+    // Re-created at the depth the reconcile would have given it: the fold of
+    // `max(push, retain)` over the subscription's bindings. A recreate that
+    // guessed it would silently widen or gut the prime of the next binding to
+    // attach here.
+    assert_eq!(
+        wire_depth(&core, "protobar", "ephemeral:demo"),
+        TEST_PUSH_DEPTH.max(4)
+    );
+    // The fresh `Subscribe` carries no resume, so the server replays what it
+    // retains. Nothing dedups it now: it is the catch-up, and it is new.
     core.on_input(
         Input::TextFrame(subscribe_result("ephemeral:demo", SubscribeOutcome::Ok)),
         Millis(10),
@@ -827,15 +851,82 @@ fn a_re_registered_wire_port_is_replayed_by_the_server_not_primed() {
         Millis(11),
     );
     let ready = take_one(&mut core);
-    assert_eq!(split(window(&ready.activation, "messages")).1, vec!["m1"]);
+    assert_eq!(
+        split(window(&ready.activation, "messages")).1,
+        vec!["m1"],
+        "the fresh-attach replay is delivered as new"
+    );
+}
+
+/// Recovery from instance failure passes through the same refcount zero, so it
+/// gets the same fresh-consumer treatment: a failed instance is recovered by
+/// deregistering and re-registering it (a double registration panics), and
+/// deregistration releases every reference it held. No path attaches a recovering
+/// instance to the mirror its failed incarnation filled.
+#[test]
+fn recovery_after_failure_re_subscribes_from_an_empty_mirror() {
+    let mut core = active_core_with(vec![Binding {
+        retain_depth: 4,
+        ..sub_binding()
+    }]);
+    register(&mut core, "protobar", Millis(5));
+    core.on_input(
+        Input::TextFrame(subscribe_result("ephemeral:demo", SubscribeOutcome::Ok)),
+        Millis(6),
+    );
+    core.on_input(
+        Input::TextFrame(deliver_frame("ephemeral:demo", &sample_envelope("m1"), 1)),
+        Millis(7),
+    );
+    let ready = take_one(&mut core);
+    // The entry traps: the instance is terminal and holds no position, but its
+    // references — and so its mirror — are still there.
+    complete(
+        &mut core,
+        "protobar",
+        ActivationOutcome::Trap("boom".into()),
+        ready.buffer,
+    );
+    assert!(core.is_failed("protobar"));
+    assert_eq!(
+        wire_bodies(&core, "protobar", "ephemeral:demo"),
+        vec!["m1"],
+        "failure sheds positions, not retention"
+    );
+
+    deregister(&mut core, "protobar", Millis(8));
+    register(&mut core, "protobar", Millis(9));
+    assert!(
+        wire_bodies(&core, "protobar", "ephemeral:demo").is_empty(),
+        "recovery re-subscribes from an empty mirror"
+    );
+    assert_eq!(
+        wire_depth(&core, "protobar", "ephemeral:demo"),
+        TEST_PUSH_DEPTH.max(4),
+        "and at the depth the reconcile would have built"
+    );
+    core.on_input(
+        Input::TextFrame(subscribe_result("ephemeral:demo", SubscribeOutcome::Ok)),
+        Millis(10),
+    );
+    core.on_input(
+        Input::TextFrame(deliver_frame("ephemeral:demo", &sample_envelope("m1"), 1)),
+        Millis(11),
+    );
+    let ready = take_one(&mut core);
+    assert_eq!(
+        split(window(&ready.activation, "messages")).1,
+        vec!["m1"],
+        "the recovered instance is caught up by the replay"
+    );
 }
 
 /// A wire port rebound to a different channel takes the same drop-and-recreate
-/// path a `local:` one does: the old channel's queued envelopes are shed rather
-/// than surfacing under the new binding, and the fresh subscribe's replay fills
-/// the new queue.
+/// path a `local:` one does: its position on the old channel goes rather than
+/// surfacing the old channel's history under the new binding, and a fresh
+/// position on the new channel is filled by the fresh subscribe's replay.
 #[test]
-fn a_wire_port_rebound_to_another_channel_sheds_its_old_queue() {
+fn a_wire_port_rebound_to_another_channel_sheds_its_old_position() {
     let mut core = active_core_with(vec![sub_binding()]);
     register(&mut core, "protobar", Millis(5));
     core.on_input(
@@ -870,11 +961,47 @@ fn a_wire_port_rebound_to_another_channel_sheds_its_old_queue() {
         Millis(3_010),
     );
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "the old channel's envelope surfaced under the new binding"
     );
     assert!(
-        core.registered["protobar"].queues["messages"].is_empty(),
-        "the rebound port's queue starts empty, awaiting the new subscribe's replay"
+        !core.owed_anything("protobar"),
+        "the rebound port starts owed nothing, awaiting the new subscribe's replay"
     );
+
+    // And it is a live port, not a shed one: ack the new `Subscribe` and the new
+    // channel's first message windows as new on it, with nothing of the old
+    // channel's history anywhere in the window.
+    core.on_input(
+        Input::TextFrame(subscribe_result("ephemeral:other", SubscribeOutcome::Ok)),
+        Millis(3_011),
+    );
+    core.on_input(
+        Input::TextFrame(deliver_frame_for(
+            "ephemeral:other",
+            "protobar",
+            &sample_envelope("n1"),
+            1,
+        )),
+        Millis(3_012),
+    );
+    let ready = take_one(&mut core);
+    let view = window(&ready.activation, "messages");
+    assert_eq!(split(view), (vec![], vec!["n1"]));
+    assert!(
+        !view.envelopes.iter().any(|e| e.body == "m1"),
+        "the old channel's envelope is nowhere in the rebound port's window"
+    );
+}
+
+/// Every channel address the kernel routes came from a boot-validated binding or
+/// the reserved table, so one that classifies as nothing is a kernel bug rather
+/// than tolerated input. The single capability-derivation point says so out loud
+/// instead of guessing a retention model — a `None` answer routed as either class
+/// would silently put a channel in the wrong store with the wrong lifetime.
+#[test]
+#[should_panic(expected = "unclassifiable channel address")]
+fn an_unclassifiable_address_panics_at_the_capability_derivation() {
+    // Durable-class on the bus, and deliberately not surface-bindable.
+    channel_is_transportable("mqtt:topic");
 }

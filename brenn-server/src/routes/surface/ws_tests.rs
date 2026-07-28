@@ -50,11 +50,15 @@ use super::registry::{SessionCaps, SurfaceSessionHandle};
 use super::session::ALERT_BURST;
 use super::test_fixtures::{
     COMPONENT, EPH_ADDR, EPH_NAME, PORT, SurfaceTestHarness, TEST_MAX_BODY_BYTES, TEST_ORIGIN,
-    assert_no_alerts, deskbar_context_feed, deskbar_sub, durable_resume, fixture_stores, publish,
-    publish_as, subscribe_harness, surface_harness,
+    assert_no_alerts, brenn_channel_entry, declare_channels, deskbar_context_feed, deskbar_sub,
+    durable_resume, fixture_stores, install_surface_runtimes, publish, publish_as,
+    subscribe_harness, surface_harness, surface_harness_with_durable,
 };
-use super::{MAX_SESSIONS_PER_SURFACE, MAX_SESSIONS_PER_USER_PER_SURFACE, build_surface_runtimes};
+use super::{MAX_SESSIONS_PER_SURFACE, MAX_SESSIONS_PER_USER_PER_SURFACE};
 use crate::active_bridge::ActiveBridges;
+use crate::bootstrap::messaging::{
+    inject_surface_error_grant, inject_surface_geometry_status_grants,
+};
 use crate::messaging_router::WakeRouterImpl;
 use crate::state::AppState;
 use crate::test_support::http::{
@@ -122,9 +126,9 @@ fn surface_state_severity(
     // Barrier channel so `drain_barrier` (an ephemeral no-op publish) resolves
     // for any severity test that uses it.
     let entries = vec![ephemeral_channel_entry(BARRIER_EPH_NAME, 0)];
-    let stores = fixture_stores(entries.clone());
+    let stores = fixture_stores(&entries);
     let messenger = super::test_fixtures::fixture_messenger(db, &entries, &resolved, stores);
-    state.surfaces = Arc::new(build_surface_runtimes(
+    state.surfaces = Arc::new(install_surface_runtimes(
         vec![resolved],
         Some(messenger),
         TEST_MAX_BODY_BYTES,
@@ -1639,13 +1643,13 @@ async fn surface_ws_no_existence_oracle_unbound_vs_nonexistent() {
         &db,
         &entries,
         &deskbar_sub(),
-        fixture_stores(entries.clone()),
+        fixture_stores(&entries),
     );
     // `deskbar` binds EPH_ADDR; `otherbar` binds OTHERBAR_ADDR. From a deskbar
     // session the latter is a channel absent from deskbar's own
     // `subscription_channels` — indistinguishable, in the single fail-closed
     // lookup, from a channel bound nowhere.
-    state.surfaces = Arc::new(build_surface_runtimes(
+    state.surfaces = Arc::new(install_surface_runtimes(
         vec![deskbar_sub(), otherbar()],
         Some(messenger),
         TEST_MAX_BODY_BYTES,
@@ -1965,7 +1969,12 @@ fn unsubscribe_frame_as(channel: &str, instance: &str) -> Message {
 #[tokio::test]
 async fn surface_ws_unsubscribe_removes_active_subscription() {
     let db = db::init_db_memory();
-    let SurfaceTestHarness { state, alerts, .. } = subscribe_harness(&db, 0);
+    let SurfaceTestHarness {
+        state,
+        alerts,
+        flusher,
+        ..
+    } = subscribe_harness(&db, 0);
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -2002,11 +2011,7 @@ async fn surface_ws_unsubscribe_removes_active_subscription() {
             ..
         }
     ));
-    assert!(
-        alerts.lock().unwrap().is_empty(),
-        "Unsubscribe of an active channel must not fire a security event, got {:?}",
-        alerts.lock().unwrap()
-    );
+    assert_no_alerts(&flusher, &alerts, "Unsubscribe of an active channel").await;
 }
 
 #[tokio::test]
@@ -2043,18 +2048,10 @@ const DUR_OUT_ADDR: &str = "brenn:writer-out";
 /// Bare name of `DUR_OUT_ADDR` (for `brenn_publish` ACL matchers + channel decl).
 const DUR_OUT_NAME: &str = "writer-out";
 /// The `writer`/`durable` port's configured default urgency on the publish
-/// fixture. Deliberately not `Normal` — the rung the removed hard-coded constant
-/// used — so a test asserting a persisted row's urgency proves the port's
-/// configured default was actually resolved and applied.
+/// fixture. Deliberately not `Normal`, so a test asserting a persisted row's
+/// urgency proves the port's configured default was actually resolved and applied.
 const DUR_OUT_DEFAULT_URGENCY: Urgency = Urgency::Low;
 
-/// A `deskbar` surface wired for Publish: an ephemeral output port
-/// (`writer`/`out` → `EPH_ADDR`), a durable output port (`writer`/`durable` →
-/// `DUR_OUT_ADDR`), and an ephemeral subscription on `EPH_ADDR` so a second
-/// session can observe the published message. Its policy covers ephemeral
-/// publish + subscribe on the fixture channel, so the runtime's own
-/// `bus.publish`/`bus.subscribe` pass their ACL checks. Rate caps are
-/// parameterized so flood/no-token-consumed tests can pin small budgets.
 /// The budgeted surface principals for a set of resolved surfaces, derived from
 /// `ResolvedSurface::principal_send_budgets` — the same authority boot uses in
 /// `bootstrap::messaging`, so a fixture cannot budget a different principal set
@@ -2067,13 +2064,57 @@ fn budget_principals(surfaces: &[ResolvedSurface]) -> Vec<(String, SurfacePrinci
         .collect()
 }
 
-fn deskbar_pub(publish_burst: u32, publish_per_sec: u32) -> ResolvedSurface {
+/// The publish fixture: the surface and the channels its bindings obligate,
+/// which travel together so a rig cannot install one without the other.
+struct DeskbarPubFixture {
+    surface: ResolvedSurface,
+    /// `EPH_ADDR` and `DUR_OUT_ADDR` — the set a rig must declare, the durable
+    /// half of which owes a DB row (`declare_channels`).
+    entries: Vec<ChannelEntry>,
+    /// `DUR_OUT_ADDR`'s channel uuid, for reading its persisted rows back.
+    dur_out_uuid: Uuid,
+}
+
+/// A `deskbar` surface wired for Publish: an ephemeral output port
+/// (`writer`/`out` → `EPH_ADDR`), a durable output port (`writer`/`durable` →
+/// `DUR_OUT_ADDR`), and an ephemeral subscription on `EPH_ADDR` so a second
+/// session can observe the published message. Rate caps are parameterized so
+/// flood/no-token-consumed tests can pin small budgets.
+///
+/// The policy authorizes each port through its own scheme's half, and the two
+/// halves are disjoint: `writer`/`out` publishes `ephemeral:` and is admitted by
+/// `EphemeralPublish` + an `ephemeral_publish` matcher on `EPH_NAME` alone;
+/// `writer`/`durable` publishes `brenn:` and is admitted by `MessagingPublish` +
+/// a `brenn_publish` matcher on `DUR_OUT_NAME` alone. Neither channel appears in
+/// the other's matcher list, so a gate that read the grant sets as a union would
+/// still be denied here on the ACL. That per-scheme split is pinned where it
+/// belongs, at the publish ladder
+/// (`brenn-lib` `publish::tests::scheme_parity`), not by these WS tests.
+///
+/// A surface's transportable outputs must name declared channels, so the
+/// channel set comes with the surface: a rig that declares `entries` gives both
+/// output bindings a directory entry and a store, which is what the deferred-view
+/// seeding pass requires of a bound output. One uuid per fixture means the
+/// durable channel has one identity per rig.
+///
+/// The policy covers every output binding — the shape boot demands, enforced by
+/// `fixture_messenger` once each rig's substrate grants are injected. Rigs
+/// simulating a substrate injection must add their grant through the production
+/// injector, not replace the policy: boot keeps the subscriber registration
+/// identical to the surface policy.
+fn deskbar_pub_fixture(publish_burst: u32, publish_per_sec: u32) -> DeskbarPubFixture {
+    let dur_out_uuid = Uuid::new_v4();
     let mut policy = AppPolicy::default();
     policy.grants.insert(AppCapability::EphemeralPublish);
     policy.grants.insert(AppCapability::EphemeralSubscribe);
+    policy.grants.insert(AppCapability::MessagingPublish);
     policy.acls.ephemeral_publish = vec![ChannelMatcher::Exact(EPH_NAME.to_string())];
     policy.acls.ephemeral_subscribe = vec![ChannelMatcher::Exact(EPH_NAME.to_string())];
-    ResolvedSurface {
+    policy
+        .acls
+        .brenn_publish
+        .push(ChannelMatcher::Exact(DUR_OUT_NAME.to_string()));
+    let surface = ResolvedSurface {
         slug: "deskbar".to_string(),
         skin: "bench".to_string(),
         components: vec![
@@ -2126,10 +2167,9 @@ fn deskbar_pub(publish_burst: u32, publish_per_sec: u32) -> ResolvedSurface {
                 channel_address: DUR_OUT_ADDR.to_string(),
                 instance: "writer".to_string(),
                 port: "durable".to_string(),
-                // Deliberately *not* the `Normal` the old hard-coded call site
-                // sent: the persisted-row assertions below would pass either way
-                // at `Normal`, and could not tell "the port's default was
-                // applied" from "the dead constant is still there".
+                // Deliberately *not* `Normal`: the persisted-row assertions would
+                // pass either way at `Normal` and could not tell "the port's
+                // default was applied" from "a hard-coded constant".
                 default_urgency: DUR_OUT_DEFAULT_URGENCY,
                 budget: brenn_budget::SinkBudget {
                     fill_mt: brenn_budget::MILLITOKENS_PER_PUBLISH,
@@ -2141,155 +2181,54 @@ fn deskbar_pub(publish_burst: u32, publish_per_sec: u32) -> ResolvedSurface {
         allowed_users: vec![],
         publish_burst,
         publish_per_sec,
+    };
+    DeskbarPubFixture {
+        surface,
+        entries: vec![
+            ephemeral_channel_entry(EPH_NAME, 0),
+            brenn_channel_entry(DUR_OUT_NAME, dur_out_uuid),
+        ],
+        dur_out_uuid,
     }
 }
 
 /// Capturing-alerter harness whose `deskbar` surface is the publish fixture
 /// (`retain_depth 0`: no ring, so a subscriber sees only live deliveries).
-fn publish_state(db: &db::Db, publish_burst: u32, publish_per_sec: u32) -> SurfaceTestHarness {
-    surface_harness(
-        db,
-        deskbar_pub(publish_burst, publish_per_sec),
-        vec![ephemeral_channel_entry(EPH_NAME, 0)],
-    )
-}
-
-/// Publish-fixture state whose `deskbar_pub` surface can publish to its durable
-/// output (`brenn:writer-out`) for real: a `Messenger` declares that channel and
-/// `surface_policies` grants `deskbar` `MessagingPublish` + `brenn_publish`
-/// coverage, so `handle_publish`'s durable arm runs `publish_from_surface`.
-/// Returns the capturing alerts and the durable channel UUID (to read back the
-/// persisted row).
-async fn durable_publish_state(
+///
+/// Returns the whole harness — its `flusher` is what lets a caller barrier the
+/// alert drainer before reading `alerts` — and the durable output channel's UUID,
+/// for the tests that read `brenn:writer-out`'s persisted rows back.
+async fn publish_state(
     db: &db::Db,
     publish_burst: u32,
-) -> (AppState, Arc<Mutex<Vec<(String, String)>>>, Uuid) {
-    let (mut state, alerts, _handle) = test_state_with_capturing_alerter(db);
-
-    // Declare brenn:writer-out in the DB + directory.
-    let channel_uuid = Uuid::new_v4();
-    let raw = ChannelConfigRaw {
-        send_rate: None,
-        uuid: Some(channel_uuid.to_string()),
-        address: DUR_OUT_NAME.to_string(),
-        description: None,
-        push_depth: None,
-        retain_depth: None,
-        standing_retain_depth: None,
-        noise: None,
-        sink: None,
-        wake_min: None,
-    };
-    let entry = build_channel_entries(&[raw], &MessagingGlobalConfig::default())
-        .pop()
-        .expect("one channel entry");
-    {
-        let conn = db.lock().await;
-        brenn_lib::messaging::db::upsert_channels(&conn, std::slice::from_ref(&entry));
-    }
-
-    // deskbar's surface policy: MessagingPublish + a covering brenn_publish matcher.
-    let mut deskbar_policy = AppPolicy::default();
-    deskbar_policy
-        .grants
-        .insert(AppCapability::MessagingPublish);
-    deskbar_policy
-        .acls
-        .brenn_publish
-        .push(ChannelMatcher::Exact(DUR_OUT_NAME.to_string()));
-    let mut surface_policies = std::collections::HashMap::new();
-    surface_policies.insert("deskbar".to_string(), deskbar_policy);
-    let surfaces = vec![deskbar_pub(publish_burst, 1)];
-
-    let eph = ephemeral_channel_entry(EPH_NAME, 0);
-    let stores = fixture_stores(vec![eph.clone()]);
-    let messenger = Messenger::new(
-        db.clone(),
-        Arc::new(MessagingDirectory::with_entries(vec![entry, eph])),
-        Arc::from(TEST_ORIGIN),
-        Arc::new(indexmap::IndexMap::new()),
-        Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-            as Arc<dyn brenn_lib::messaging::WakeRouter>,
-        MessagingGlobalConfig::default(),
-    )
-    .with_subscriber_registrations(brenn_lib::messaging::testutils::surface_registrations(
-        surface_policies,
-    ))
-    .with_surface_send_budgets(budget_principals(&surfaces))
-    .with_ring_stores(Arc::clone(&stores));
-
-    state.surfaces = Arc::new(build_surface_runtimes(
-        surfaces,
-        Some(messenger),
-        TEST_MAX_BODY_BYTES,
-        None,
-        crate::test_support::surface::description_params(),
-    ));
-    (state, alerts, channel_uuid)
+    publish_per_sec: u32,
+) -> (SurfaceTestHarness, Uuid) {
+    let fixture = deskbar_pub_fixture(publish_burst, publish_per_sec);
+    let dur_out_uuid = fixture.dur_out_uuid;
+    let harness = surface_harness_with_durable(db, fixture.surface, fixture.entries).await;
+    (harness, dur_out_uuid)
 }
 
 /// Publish-fixture state wired for the reserved error-report port: the error
 /// channel `brenn:surface-errors` is declared, `deskbar`'s policy carries the
-/// substrate-injected error-channel grant (as `resolve`+injection would produce),
-/// and `build_surface_runtimes` binds the reserved `#brenn`/`error-reports` port
-/// and advertises the `warn` floor. A `Publish` to that port routes through
-/// `publish_from_surface` exactly like any bound durable output. Returns the
+/// substrate-injected error-channel grant, and `install_surface_runtimes` binds
+/// the reserved `#brenn`/`error-reports` port with a `warn` floor. Returns the
 /// error channel UUID so the persisted report can be read back.
 async fn error_report_publish_state(db: &db::Db) -> (AppState, Uuid) {
     let (mut state, _alerts, _handle) = test_state_with_capturing_alerter(db);
 
     let channel_uuid = Uuid::new_v4();
-    let raw = ChannelConfigRaw {
-        send_rate: None,
-        uuid: Some(channel_uuid.to_string()),
-        address: "surface-errors".to_string(),
-        description: None,
-        push_depth: None,
-        retain_depth: None,
-        standing_retain_depth: None,
-        noise: None,
-        sink: None,
-        wake_min: None,
-    };
-    let entry = build_channel_entries(&[raw], &MessagingGlobalConfig::default())
-        .pop()
-        .expect("one channel entry");
-    {
-        let conn = db.lock().await;
-        brenn_lib::messaging::db::upsert_channels(&conn, std::slice::from_ref(&entry));
-    }
+    let fixture = deskbar_pub_fixture(60, 1);
 
-    // Substrate-injected grant: deskbar may publish onto the error channel.
-    let mut deskbar_policy = AppPolicy::default();
-    deskbar_policy
-        .grants
-        .insert(AppCapability::MessagingPublish);
-    deskbar_policy
-        .acls
-        .brenn_publish
-        .push(ChannelMatcher::Exact("surface-errors".to_string()));
-    let mut surface_policies = std::collections::HashMap::new();
-    surface_policies.insert("deskbar".to_string(), deskbar_policy);
-    let surfaces = vec![deskbar_pub(60, 1)];
+    let mut surfaces = vec![fixture.surface];
+    inject_surface_error_grant(&mut surfaces, "surface-errors");
 
-    let eph = ephemeral_channel_entry(EPH_NAME, 0);
-    let stores = fixture_stores(vec![eph.clone()]);
-    let messenger = Messenger::new(
-        db.clone(),
-        Arc::new(MessagingDirectory::with_entries(vec![entry, eph])),
-        Arc::from(TEST_ORIGIN),
-        Arc::new(indexmap::IndexMap::new()),
-        Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-            as Arc<dyn brenn_lib::messaging::WakeRouter>,
-        MessagingGlobalConfig::default(),
-    )
-    .with_subscriber_registrations(brenn_lib::messaging::testutils::surface_registrations(
-        surface_policies,
-    ))
-    .with_surface_send_budgets(budget_principals(&surfaces))
-    .with_ring_stores(Arc::clone(&stores));
+    let mut entries = vec![brenn_channel_entry("surface-errors", channel_uuid)];
+    entries.extend(fixture.entries);
+    let stores = declare_channels(db, &entries).await;
+    let messenger = super::test_fixtures::fixture_messenger(db, &entries, &surfaces[0], stores);
 
-    state.surfaces = Arc::new(build_surface_runtimes(
+    state.surfaces = Arc::new(install_surface_runtimes(
         surfaces,
         Some(messenger),
         TEST_MAX_BODY_BYTES,
@@ -2459,8 +2398,33 @@ fn publish_batch_frame(instance: &str, correlation: u64, entries: &[(&str, &str)
                 port: port.to_string(),
                 body: body.to_string(),
                 urgency: None,
+                deliver_after: None,
             })
             .collect(),
+        deferred_ops: Vec::new(),
+    };
+    Message::Text(serde_json::to_string(&frame).expect("serialize").into())
+}
+
+/// A `PublishBatch` frame carrying one scheduled entry: the flush shape that
+/// parks rather than publishes.
+fn deferred_batch_frame(
+    instance: &str,
+    correlation: u64,
+    port: &str,
+    body: &str,
+    deliver_after: u64,
+) -> Message {
+    let frame = ClientFrame::PublishBatch {
+        instance: instance.to_string(),
+        correlation,
+        publishes: vec![BatchEntry {
+            port: port.to_string(),
+            body: body.to_string(),
+            urgency: None,
+            deliver_after: Some(deliver_after),
+        }],
+        deferred_ops: Vec::new(),
     };
     Message::Text(serde_json::to_string(&frame).expect("serialize").into())
 }
@@ -2483,12 +2447,16 @@ fn publish_result_outcome(frame: ServerFrame, correlation: Option<u64>) -> Publi
 #[tokio::test]
 async fn surface_ws_publish_ok_delivers_to_sibling() {
     let db = db::init_db_memory();
-    let SurfaceTestHarness {
-        state,
-        alerts,
-        stores,
-        ..
-    } = publish_state(&db, 60, 1);
+    let (
+        SurfaceTestHarness {
+            state,
+            alerts,
+            flusher,
+            stores,
+            ..
+        },
+        _,
+    ) = publish_state(&db, 60, 1).await;
     let (token, _) = setup_authenticated_user(&db).await;
     let epoch = stores.epoch();
     let (base, _sd) = spawn_test_server(state).await;
@@ -2533,17 +2501,23 @@ async fn surface_ws_publish_ok_delivers_to_sibling() {
         epoch,
     );
 
-    assert!(
-        alerts.lock().unwrap().is_empty(),
-        "a successful Publish must not fire a security event, got {:?}",
-        alerts.lock().unwrap()
-    );
+    // The observed `Deliver` is the happens-before edge; the flush barrier then
+    // makes any alert the server already dispatched visible to the read.
+    assert_no_alerts(&flusher, &alerts, "a successful Publish").await;
 }
 
 #[tokio::test]
 async fn surface_ws_publish_durable_output_persists_and_stays_open() {
     let db = db::init_db_memory();
-    let (state, alerts, channel_uuid) = durable_publish_state(&db, 60).await;
+    let (
+        SurfaceTestHarness {
+            state,
+            alerts,
+            flusher,
+            ..
+        },
+        channel_uuid,
+    ) = publish_state(&db, 60, 1).await;
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -2577,11 +2551,85 @@ async fn surface_ws_publish_durable_output_persists_and_stays_open() {
         saw_heartbeat_within(&mut ws, 4).await,
         "connection must stay open after a durable Publish"
     );
-    assert!(
-        alerts.lock().unwrap().is_empty(),
-        "a successful durable Publish must not fire a security event, got {:?}",
-        alerts.lock().unwrap()
-    );
+    // The observed heartbeat is the happens-before edge; the flush barrier then
+    // makes any alert the server already dispatched visible to the read.
+    assert_no_alerts(&flusher, &alerts, "a successful durable Publish").await;
+}
+
+/// A durable schedule outlives the connection that made it, so a page that
+/// arrives afterwards has to be *told* what it has parked — and told before it
+/// can act. The seeding pass rides the same FIFO writer queue `Welcome` just
+/// entered, which is what puts the view immediately behind it: end to end, the
+/// frame the page reads after `Welcome` is the snapshot of its own parked set.
+#[tokio::test]
+async fn surface_ws_a_fresh_session_is_seeded_with_what_is_still_parked() {
+    let db = db::init_db_memory();
+    let (SurfaceTestHarness { state, .. }, _channel_uuid) = publish_state(&db, 60, 1).await;
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(state).await;
+
+    // On a whole second: a durable row keeps its release time to the second, so
+    // this is the value that comes back in the view.
+    let release_at = u64::try_from((Utc::now() + chrono::Duration::hours(1)).timestamp_millis())
+        .expect("a positive epoch")
+        / 1_000
+        * 1_000;
+
+    let mut first = open_deskbar(&base, &token).await;
+    first
+        .send(deferred_batch_frame(
+            "writer",
+            5,
+            "durable",
+            "scheduled",
+            release_at,
+        ))
+        .await
+        .expect("send PublishBatch");
+    // The park's own view push and the batch result race on the wire; the result is
+    // the happens-before edge the second session needs.
+    loop {
+        match next_server_frame(&mut first).await {
+            ServerFrame::PublishBatchResult {
+                correlation,
+                outcome,
+            } => {
+                assert_eq!(correlation, 5);
+                assert_eq!(outcome, PublishBatchOutcome::Ok, "the entry parked");
+                break;
+            }
+            ServerFrame::DeferredView { .. } => continue,
+            other => panic!("expected the batch result, got {other:?}"),
+        }
+    }
+
+    // A second session, seeded from the truth rather than from anything the first
+    // one said.
+    let url = http_to_ws_url(&base, &format!("/surface/deskbar/ws?build={TEST_BUILD_ID}"));
+    let mut second = surface_ws_open(&url, &token).await;
+    match next_server_frame(&mut second).await {
+        ServerFrame::Welcome { surface, .. } => assert_eq!(surface, "deskbar"),
+        other => panic!("expected Welcome first, got {other:?}"),
+    }
+    match next_server_frame(&mut second).await {
+        ServerFrame::DeferredView {
+            channel,
+            instance,
+            entries,
+        } => {
+            assert_eq!(channel, DUR_OUT_ADDR);
+            assert_eq!(instance, "writer");
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|e| (e.body.as_str(), e.deliver_after))
+                    .collect::<Vec<_>>(),
+                vec![("scheduled", release_at)],
+                "the seed is the backend's own recompute, body and release time"
+            );
+        }
+        other => panic!("expected the seeded DeferredView behind Welcome, got {other:?}"),
+    }
 }
 
 /// The per-connection publish bucket gates the durable arm exactly as it does the
@@ -2590,7 +2638,7 @@ async fn surface_ws_publish_durable_output_persists_and_stays_open() {
 #[tokio::test]
 async fn surface_ws_publish_durable_output_rate_limited() {
     let db = db::init_db_memory();
-    let (state, _alerts, channel_uuid) = durable_publish_state(&db, 1).await;
+    let (SurfaceTestHarness { state, .. }, channel_uuid) = publish_state(&db, 1, 1).await;
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -2632,7 +2680,15 @@ async fn surface_ws_publish_oversized_body_consumes_no_token() {
     // Burst 1: exactly one token. If the oversized publish consumed it, the
     // subsequent legal publish would be RateLimited; asserting it is Ok proves
     // the oversized publish was gated before the bucket.
-    let SurfaceTestHarness { state, alerts, .. } = publish_state(&db, 1, 1);
+    let (
+        SurfaceTestHarness {
+            state,
+            alerts,
+            flusher,
+            ..
+        },
+        _,
+    ) = publish_state(&db, 1, 1).await;
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -2663,11 +2719,7 @@ async fn surface_ws_publish_oversized_body_consumes_no_token() {
         "oversized publish must consume no rate token, got {outcome:?}"
     );
 
-    assert!(
-        alerts.lock().unwrap().is_empty(),
-        "oversized Publish must not fire a security event, got {:?}",
-        alerts.lock().unwrap()
-    );
+    assert_no_alerts(&flusher, &alerts, "an oversized Publish").await;
 }
 
 #[tokio::test]
@@ -2675,12 +2727,15 @@ async fn surface_ws_persistent_oversized_body_escalates_to_violation() {
     let db = db::init_db_memory();
     // Generous burst so the interleaved valid publish is never rate-limited;
     // oversized rejects consume no token, so only the valid publish needs one.
-    let SurfaceTestHarness {
-        state,
-        alerts,
-        flusher,
-        ..
-    } = publish_state(&db, 8, 8);
+    let (
+        SurfaceTestHarness {
+            state,
+            alerts,
+            flusher,
+            ..
+        },
+        _,
+    ) = publish_state(&db, 8, 8).await;
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -2729,7 +2784,15 @@ async fn surface_ws_persistent_oversized_body_escalates_to_violation() {
 async fn surface_ws_publish_flood_rate_limited_sibling_unaffected() {
     let db = db::init_db_memory();
     // Burst 2, slow refill: a tight flood exhausts the connection bucket.
-    let SurfaceTestHarness { state, alerts, .. } = publish_state(&db, 2, 1);
+    let (
+        SurfaceTestHarness {
+            state,
+            alerts,
+            flusher,
+            ..
+        },
+        _,
+    ) = publish_state(&db, 2, 1).await;
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -2775,22 +2838,21 @@ async fn surface_ws_publish_flood_rate_limited_sibling_unaffected() {
         "a sibling session's fresh bucket must admit its publish, got {outcome:?}"
     );
 
-    assert!(
-        alerts.lock().unwrap().is_empty(),
-        "a rate-limited Publish flood must not fire a security event, got {:?}",
-        alerts.lock().unwrap()
-    );
+    assert_no_alerts(&flusher, &alerts, "a rate-limited Publish flood").await;
 }
 
 #[tokio::test]
 async fn surface_ws_publish_unbound_port_is_violation() {
     let db = db::init_db_memory();
-    let SurfaceTestHarness {
-        state,
-        alerts,
-        flusher,
-        ..
-    } = publish_state(&db, 60, 1);
+    let (
+        SurfaceTestHarness {
+            state,
+            alerts,
+            flusher,
+            ..
+        },
+        _,
+    ) = publish_state(&db, 60, 1).await;
     let (token, _) = setup_authenticated_user(&db).await;
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -2988,10 +3050,10 @@ async fn durable_rig(
     // The publish path requires every principal grain in the budget map — a
     // missing entry is a broken invariant; a non-publishing principal never draws.
     .with_surface_send_budgets(budget_principals(surfaces))
-    .with_ring_stores(fixture_stores(nondurable));
+    .with_ring_stores(fixture_stores(&nondurable));
     let mut state = crate::test_support::state::test_state(db);
     state.messenger = Some(messenger.clone());
-    state.surfaces = Arc::new(build_surface_runtimes(
+    state.surfaces = Arc::new(install_surface_runtimes(
         vec![resolved],
         Some(messenger.clone()),
         TEST_MAX_BODY_BYTES,
@@ -3192,7 +3254,7 @@ async fn durable_pubsub_rig(
     .with_surface_send_budgets(budgets);
     let mut state = crate::test_support::state::test_state(db);
     state.messenger = Some(messenger.clone());
-    state.surfaces = Arc::new(build_surface_runtimes(
+    state.surfaces = Arc::new(install_surface_runtimes(
         surfaces,
         Some(messenger.clone()),
         TEST_MAX_BODY_BYTES,
@@ -5022,11 +5084,11 @@ const GEOMETRY_NAME: &str = "surface.surface.deskbar.geometry";
 const STATUS_NAME: &str = "surface.surface.deskbar.status";
 
 /// Telemetry rig: the two derived channels declared in DB + directory
-/// (bounded retain), a `Messenger` whose `surface_policies` grant `deskbar` the
-/// injected `MessagingPublish` + `brenn_publish` coverage build_messaging would
-/// inject, and `build_surface_runtimes` wired with the description runtime
-/// (prefix `surface`, 60 s interval). `flusher`/`alerts` back the protocol-
-/// violation assertions; the channel UUIDs read back the persisted telemetry.
+/// (bounded retain), a `Messenger` with `deskbar` registered for
+/// geometry/status publishing, and `install_surface_runtimes` wired with the
+/// description runtime (prefix `surface`, 60 s interval). `flusher`/`alerts`
+/// back the protocol-violation assertions; the channel UUIDs read back the
+/// persisted telemetry.
 struct GeoStatusRig {
     state: AppState,
     flusher: AlertDispatcher,
@@ -5060,46 +5122,26 @@ async fn geometry_status_rig(db: &db::Db) -> GeoStatusRig {
         ],
         &MessagingGlobalConfig::default(),
     );
-    {
-        let conn = db.lock().await;
-        upsert_channels(&conn, &entries);
-    }
+    let fixture = deskbar_pub_fixture(60, 60);
 
-    let mut deskbar_policy = AppPolicy::default();
-    deskbar_policy
-        .grants
-        .insert(AppCapability::MessagingPublish);
-    deskbar_policy.acls.brenn_publish = vec![
-        ChannelMatcher::Exact(GEOMETRY_NAME.to_string()),
-        ChannelMatcher::Exact(STATUS_NAME.to_string()),
-    ];
-    let mut surface_policies = std::collections::HashMap::new();
-    surface_policies.insert("deskbar".to_string(), deskbar_policy);
-    let surfaces = vec![deskbar_pub(60, 60)];
+    // The injector derives channel names from the same prefix the description
+    // runtime below is built with, so the two cannot drift apart.
+    let mut surfaces = vec![fixture.surface];
+    let params = crate::test_support::surface::description_params();
+    inject_surface_geometry_status_grants(&mut surfaces, &params.prefix);
 
-    let eph = ephemeral_channel_entry(EPH_NAME, 0);
     let mut directory_entries = entries;
-    directory_entries.push(eph.clone());
-    let messenger = Messenger::new(
-        db.clone(),
-        Arc::new(MessagingDirectory::with_entries(directory_entries)),
-        Arc::from(TEST_ORIGIN),
-        Arc::new(indexmap::IndexMap::new()),
-        Arc::new(brenn_lib::messaging::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
-        MessagingGlobalConfig::default(),
-    )
-    .with_subscriber_registrations(brenn_lib::messaging::testutils::surface_registrations(
-        surface_policies,
-    ))
-    .with_surface_send_budgets(budget_principals(&surfaces))
-    .with_ring_stores(fixture_stores(vec![eph]));
+    directory_entries.extend(fixture.entries);
+    let stores = declare_channels(db, &directory_entries).await;
+    let messenger =
+        super::test_fixtures::fixture_messenger(db, &directory_entries, &surfaces[0], stores);
 
-    state.surfaces = Arc::new(build_surface_runtimes(
+    state.surfaces = Arc::new(install_surface_runtimes(
         surfaces,
         Some(messenger),
         TEST_MAX_BODY_BYTES,
         None,
-        crate::test_support::surface::description_params(),
+        params,
     ));
     GeoStatusRig {
         state,

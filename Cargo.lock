@@ -423,6 +423,9 @@ dependencies = [
 [[package]]
 name = "brenn-budget"
 version = "0.1.0"
+dependencies = [
+ "brenn-envelope",
+]
 
 [[package]]
 name = "brenn-cal"
@@ -734,6 +737,7 @@ version = "0.1.0"
 dependencies = [
  "brenn-budget",
  "brenn-envelope",
+ "brenn-queue",
  "brenn-surface-component-support",
  "brenn-surface-contract",
  "brenn-surface-proto",
@@ -808,6 +812,7 @@ dependencies = [
  "brenn-budget",
  "brenn-cal",
  "brenn-common",
+ "brenn-envelope",
  "chrono",
  "rusqlite",
  "semver",

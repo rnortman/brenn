@@ -27,11 +27,11 @@ use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
 use brenn_lib::access::AppCapability;
-use brenn_lib::messaging::store::ResumeCursor;
+use brenn_lib::messaging::store::{DeferralOutcome, DeferredMessage, QuotaExceeded, ResumeCursor};
 use brenn_lib::messaging::{
     EphemeralDelivery, EphemeralEvent, EphemeralReceiver, EphemeralResume,
-    GapReason as BusGapReason, MessageEnvelope, Messenger, PublishResult, Replay,
-    SurfaceBatchPublish, SurfaceSendVerdict, Urgency, db,
+    GapReason as BusGapReason, MessageEnvelope, Messenger, ParkedSet, ParticipantId, PrepaidEntry,
+    PublishResult, Replay, SurfaceBatchPublish, SurfaceSendVerdict, Urgency, db, utc_from_epoch_ms,
 };
 use brenn_lib::obs::alerting::{AlertDispatcher, AlertSeverity as NativeAlertSeverity};
 use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
@@ -47,17 +47,20 @@ use uuid::Uuid;
 use brenn_budget::{MAX_PUBLISH_BYTES_PER_ACTIVATION, MAX_PUBLISHES_PER_ACTIVATION};
 use brenn_common::sanitize_untrusted_str;
 use brenn_surface_proto::{
-    AlertSeverity as ProtoAlertSeverity, BatchEntry, ClientFrame, Cursor, DeliverTarget, GapInfo,
-    GapReason as ProtoGapReason, InstanceReport, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES,
-    PublishBatchOutcome, PublishOutcome, ServerFrame, SubscribeOutcome, SurfaceDescription,
+    AlertSeverity as ProtoAlertSeverity, BatchDeferredOp, BatchEntry, ClientFrame, Cursor,
+    DeferredOpKind, DeferredViewEntry, DeliverTarget, GapInfo, GapReason as ProtoGapReason,
+    InstanceReport, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES, PublishBatchOutcome,
+    PublishOutcome, ServerFrame, SubscribeOutcome, SurfaceDescription,
 };
 
 use super::cursor::{self, CursorState};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use super::telemetry::{self, Health};
 
-use super::registry::{DurableDelivery, SurfaceSessionGuard};
+use super::registry::{
+    DeferredViewPush, DurableDelivery, SessionPush, SurfaceRegistry, SurfaceSessionGuard,
+};
 use super::{DeliveryClass, OutputPort, SubKey, SurfaceRuntime, sanitize_client_detail};
 
 /// Outbound frame queue depth. A slow reader fills this, then the delivery path
@@ -100,11 +103,16 @@ pub(crate) struct SurfaceSessionParams {
     pub username: String,
     pub ip: IpAddr,
     pub guard: SurfaceSessionGuard,
+    /// The attached-session registry, for reaching **every** session of this
+    /// surface. A deferred view is the sender's, not the connection's — one
+    /// surface's tabs share the sub-identity that owns the parked set — so a
+    /// change this session causes must reach its siblings too.
+    pub registry: SurfaceRegistry,
     pub heartbeat_secs: u32,
     pub alert_dispatcher: AlertDispatcher,
-    /// Live durable rows from the router fan-out (paired with the `durable_tx` in
-    /// this session's registry handle).
-    pub durable_rx: mpsc::Receiver<DurableDelivery>,
+    /// Live rows and deferred-view snapshots pushed at this session from outside
+    /// its task (paired with the `push_tx` in this session's registry handle).
+    pub push_rx: mpsc::Receiver<SessionPush>,
     /// Active durable subscriptions, shared with the registry handle so the
     /// router can see which of them this session covers. Written only by the
     /// session task.
@@ -135,9 +143,10 @@ async fn session_loop(params: SurfaceSessionParams) {
         username,
         ip,
         guard,
+        registry,
         heartbeat_secs,
         alert_dispatcher,
-        mut durable_rx,
+        mut push_rx,
         durable_subs,
         drain_notify,
         socket,
@@ -160,6 +169,7 @@ async fn session_loop(params: SurfaceSessionParams) {
         username,
         ip,
         alert_dispatcher,
+        registry,
         tx,
     };
     let slug = ctx.runtime.resolved.slug.clone();
@@ -192,6 +202,15 @@ async fn session_loop(params: SurfaceSessionParams) {
     };
     if let FrameOutcome::Disconnect = send_frame(&ctx.tx, welcome, &mut counters).await {
         // Writer already exited (socket died at upgrade): tear down.
+        drop(ctx);
+        writer.await.expect("surface writer task panicked");
+        drop(guard);
+        return;
+    }
+    // Behind `Welcome` in the same FIFO writer queue, before any inbound frame is
+    // read: the page cleared its mirrors at `Welcome`, so these frames are what
+    // refills them and their absence is what says a set is empty.
+    if let FrameOutcome::Disconnect = seed_deferred_views(&ctx, &mut counters).await {
         drop(ctx);
         writer.await.expect("surface writer task panicked");
         drop(guard);
@@ -314,19 +333,18 @@ async fn session_loop(params: SurfaceSessionParams) {
                     }
                 }
             }
-            // A live durable row from the router fan-out. Skipped (with a debug
-            // log) when the channel is no longer active (unsubscribed while
-            // queued) or when the subscribe replay already sent this seq.
-            Some(delivery) = durable_rx.recv() => {
-                // Take every co-available row before writing: the router queues one
+            // A push from outside this task: a live durable row or a deferred-view
+            // snapshot.
+            Some(push) = push_rx.recv() => {
+                // Take every co-available push before writing: the router queues one
                 // message's sibling rows back to back, so they coalesce into one
                 // frame.
-                let mut batch = vec![delivery];
-                while let Ok(next) = durable_rx.try_recv() {
-                    batch.push(next);
+                let mut pushes = vec![push];
+                while let Ok(next) = push_rx.try_recv() {
+                    pushes.push(next);
                 }
                 if let FrameOutcome::Disconnect =
-                    send_durable_live(&ctx, &durable, &mut spans, batch, &mut counters).await
+                    send_session_pushes(&ctx, &durable, &mut spans, pushes, &mut counters).await
                 {
                     break;
                 }
@@ -336,13 +354,13 @@ async fn session_loop(params: SurfaceSessionParams) {
             // already in hand goes out first — as the frame the fan-out composed,
             // not as a retention read that would beat it to the position.
             _ = drain_notify.notified() => {
-                let mut batch = Vec::new();
-                while let Ok(next) = durable_rx.try_recv() {
-                    batch.push(next);
+                let mut pushes = Vec::new();
+                while let Ok(next) = push_rx.try_recv() {
+                    pushes.push(next);
                 }
-                if !batch.is_empty()
+                if !pushes.is_empty()
                     && let FrameOutcome::Disconnect =
-                        send_durable_live(&ctx, &durable, &mut spans, batch, &mut counters).await
+                        send_session_pushes(&ctx, &durable, &mut spans, pushes, &mut counters).await
                 {
                     break;
                 }
@@ -619,6 +637,11 @@ struct SessionCtx {
     /// Read-only per-session handle: `handle_alert` pages through it and the
     /// session loop routes `SurfaceProtocolViolation` security events through it.
     alert_dispatcher: AlertDispatcher,
+    /// The attached-session registry. Reached for the planes whose subject is the
+    /// surface rather than the connection — a deferred view belongs to a
+    /// sub-identity every tab shares, so a change one session causes is pushed at
+    /// all of them.
+    registry: SurfaceRegistry,
     /// Outbound frame sender to the writer task. Owning it here means dropping
     /// the context at teardown closes the channel and exits the writer.
     tx: mpsc::Sender<ServerFrame>,
@@ -916,6 +939,62 @@ async fn send_multi_deliver(
     send_frame(&ctx.tx, frame, counters).await
 }
 
+/// Write one turn's worth of pushes, splitting the two planes that share the
+/// session's push queue.
+///
+/// The durable rows go first, as one coalesced pass, so the batching
+/// [`send_durable_live`] depends on is not broken up by an interleaved view.
+/// The views follow in arrival order, which is emission order — each is a full
+/// replacement, so the last one for a `(channel, instance)` is the answer the
+/// page keeps.
+async fn send_session_pushes(
+    ctx: &SessionCtx,
+    durable: &DurableSessionState,
+    spans: &mut WireSpans,
+    pushes: Vec<SessionPush>,
+    counters: &mut SessionCounters,
+) -> FrameOutcome {
+    let mut rows = Vec::new();
+    let mut views = Vec::new();
+    for push in pushes {
+        match push {
+            SessionPush::Durable(delivery) => rows.push(delivery),
+            SessionPush::DeferredView(view) => views.push(view),
+        }
+    }
+    if !rows.is_empty()
+        && let FrameOutcome::Disconnect =
+            send_durable_live(ctx, durable, spans, rows, counters).await
+    {
+        return FrameOutcome::Disconnect;
+    }
+    for view in views {
+        if let FrameOutcome::Disconnect = send_deferred_view(ctx, view, counters).await {
+            return FrameOutcome::Disconnect;
+        }
+    }
+    FrameOutcome::Continue
+}
+
+/// Write one deferred-view snapshot to this connection.
+async fn send_deferred_view(
+    ctx: &SessionCtx,
+    view: DeferredViewPush,
+    counters: &mut SessionCounters,
+) -> FrameOutcome {
+    let DeferredViewPush {
+        channel,
+        instance,
+        entries,
+    } = view;
+    let frame = ServerFrame::DeferredView {
+        channel,
+        instance,
+        entries,
+    };
+    send_frame(&ctx.tx, frame, counters).await
+}
+
 /// Send one turn's worth of live durable router deliveries, coalescing the rows
 /// of one message across this connection's sibling subscriptions into one frame.
 ///
@@ -1081,7 +1160,18 @@ async fn handle_client_frame(
             instance,
             correlation,
             publishes,
-        } => handle_publish_batch(ctx, &instance, correlation, &publishes, counters).await,
+            deferred_ops,
+        } => {
+            handle_publish_batch(
+                ctx,
+                &instance,
+                correlation,
+                &publishes,
+                &deferred_ops,
+                counters,
+            )
+            .await
+        }
         ClientFrame::Subscribe {
             channel,
             instance,
@@ -1401,6 +1491,10 @@ fn parse_resume_cursor(
 /// ephemeral channels attach the broadcast stream. The FIFO writer queue
 /// serializes `SubscribeResult` → replay → live deliveries, so ordering holds by
 /// construction.
+// TODO(surface-wire-cursors): the echoed resume token, `replay_from`'s five-way
+// decision, `WireSpans` and `GapInfo` are a parallel implementation of
+// `SubscriberCursor` + window/advance. Re-grounding them in that vocabulary is
+// its own design cycle.
 async fn handle_subscribe(
     ctx: &SessionCtx,
     subscriptions: &mut StreamMap<SubKey, SubscriptionStream>,
@@ -2142,7 +2236,10 @@ async fn handle_publish(
         // `DeferredQuotaExceeded` joins them for the same reason as
         // `UnsupportedOption`: it can only arise from a future `deliver_after`,
         // an option field this call never passes, so producing one means the
-        // pipeline invented it.
+        // pipeline invented it. Surface deferral rides the batch path — a
+        // component's deferred publish is buffered, and buffered publishes flush
+        // as batches — where a full deferred set is per-entry normal operation
+        // rather than an outcome this ladder could carry.
         other @ (PublishResult::MissingSender
         | PublishResult::AclDenied(_)
         | PublishResult::UnknownChannel(_)
@@ -2204,22 +2301,43 @@ async fn handle_publish(
 /// Order:
 /// 1. `instance` names a declared component — the sub-identity is *derived* from
 ///    it, never claimed. Unknown → violation, exactly the single-publish rule.
-/// 2. Batch shape: non-empty, within the per-activation publish cap the kernel
-///    buffers against, and within the per-activation *byte* cap it buffers
-///    against. All three bound the work steps 3–5 do before any budget is
-///    consulted.
-/// 3. Per entry: a bound output port of *this* instance, and a body within the
-///    cap. `local:` targets fall out of the port check for free — the boot-resolved
-///    output map excludes them by construction, so a page-local address is an
-///    unbound port here and dies as one.
+/// 2. Batch shape: non-empty (in *either* list — a flush that only cancels a
+///    schedule carries no publishes), each list within the per-activation cap the
+///    kernel buffers against, and the publishes within the per-activation *byte*
+///    cap it buffers against. All of them bound the work steps 3–5 do before any
+///    budget is consulted.
+/// 3. Per entry: a bound output port of *this* instance, a body within the cap,
+///    and a representable `deliver_after`. `local:` targets fall out of the port
+///    check for free — the boot-resolved output map excludes them by
+///    construction, so a page-local address is an unbound port here and dies as
+///    one. The release time is judged against one clock read for the whole flush,
+///    so a time already past becomes an immediate publish for every entry
+///    identically. Control ops resolve the same way: bound port, an edit body
+///    within the cap, a representable release time.
 /// 4. The instance's send budget, drawn once for the whole batch as N tokens (see
 ///    [`Messenger::draw_surface_send_budget_for_batch`]). Denial is
 ///    `RateLimited` — never a violation, never a kill: it is the honest answer
 ///    when the two budget tiers disagree, and the kernel's tier is the binding
-///    one for any non-malicious page.
-/// 5. Apply: durable entries in one transaction, ephemeral entries fanned out, both
+///    one for any non-malicious page. Drawn before anything is applied, because a
+///    refused batch is re-parked and retried whole by the kernel: an op applied
+///    ahead of the draw would apply again on the retry.
+/// 5. Apply the control ops, ahead of the publishes: an op names a message an
+///    earlier activation parked, so applying it first keeps this activation's own
+///    publishes out of its way. An applied op re-states the sender's view and kicks the
+///    dispatcher (an edit can move a release earlier than the sweep's current
+///    sleep target). A `NotDeferred` is the benign drain-vs-release race: logged
+///    and counted, never a kill. A `WrongSender` is a violation — a conforming
+///    kernel can only name what a sender-scoped view showed it, so naming another
+///    sender's parked message is a client reaching past every window it was ever
+///    offered.
+/// 6. Apply: durable entries in one transaction, ephemeral entries fanned out, both
 ///    in call order. Cross-class relative order is not guaranteed — one class
-///    commits in the server's DB and the other in its bus.
+///    commits in the server's DB and the other in its bus. A deferred entry parks
+///    at its class's retention authority instead of committing, and a full
+///    deferred set drops that entry's schedule — a warn and a counter, never a
+///    wire error and never the batch: the component already returned, so there is
+///    nothing left to answer, and the entries it published unconditionally must
+///    not be lost to one it merely scheduled.
 ///
 /// The per-connection publish bucket does not gate this frame: it meters whole
 /// publishes and a batch is one frame carrying up to
@@ -2232,6 +2350,7 @@ async fn handle_publish_batch(
     instance: &str,
     correlation: u64,
     publishes: &[BatchEntry],
+    deferred_ops: &[BatchDeferredOp],
     counters: &mut SessionCounters,
 ) -> FrameOutcome {
     let runtime = &ctx.runtime;
@@ -2255,7 +2374,7 @@ async fn handle_publish_batch(
     // 2. Batch shape. A conforming kernel never flushes an empty buffer (it sends
     //    no frame at all) and never buffers past the cap (it answers the component
     //    `quota-exceeded` at the cap instead), so both are non-kernel signal.
-    if publishes.is_empty() {
+    if publishes.is_empty() && deferred_ops.is_empty() {
         return FrameOutcome::Violation(format!(
             "surface {slug} user {username}: empty PublishBatch from instance {}",
             sanitize_client_detail(instance),
@@ -2267,6 +2386,16 @@ async fn handle_publish_batch(
              over the {MAX_PUBLISHES_PER_ACTIVATION} per-activation cap",
             sanitize_client_detail(instance),
             publishes.len(),
+        ));
+    }
+    // The ops have their own ceiling on the kernel side, the same number, counted
+    // separately — so it is mirrored the same way and for the same reason.
+    if deferred_ops.len() > MAX_PUBLISHES_PER_ACTIVATION {
+        return FrameOutcome::Violation(format!(
+            "surface {slug} user {username}: PublishBatch from instance {} carries {} control \
+             ops, over the {MAX_PUBLISHES_PER_ACTIVATION} per-activation cap",
+            sanitize_client_detail(instance),
+            deferred_ops.len(),
         ));
     }
     // The kernel's third buffer-time gate, mirrored for the same reason as the
@@ -2287,7 +2416,13 @@ async fn handle_publish_batch(
     // 3. Resolve every entry before applying any of them: the batch is atomic, so
     //    a check that runs per entry as it applies could kill the connection with
     //    a prefix already committed.
-    let mut resolved: Vec<(&OutputPort, &str, Urgency)> = Vec::with_capacity(publishes.len());
+    //
+    //    One clock read serves the whole batch's park-vs-immediate decisions, so
+    //    every entry — both substrates — is judged against the same instant, and
+    //    a release time already past becomes an ordinary immediate publish here
+    //    rather than at each substrate's own reading of "now".
+    let flush_now = Utc::now();
+    let mut resolved: Vec<ResolvedBatchEntry<'_>> = Vec::with_capacity(publishes.len());
     for entry in publishes {
         let Some(out) = runtime
             .output_ports
@@ -2311,15 +2446,40 @@ async fn handle_publish_batch(
                 runtime.max_body_bytes,
             ));
         }
+        // A release time chrono cannot carry is violation-grade like every other
+        // per-entry check here: the kernel refuses one at buffer time with
+        // `invalid-payload`, so it never reaches the wire from a kernel. Left
+        // unchecked it would collapse into an immediate publish, silently turning
+        // a component's schedule into a now.
+        let deliver_after = match entry.deliver_after {
+            None => None,
+            Some(ms) => {
+                let Some(at) = utc_from_epoch_ms(ms) else {
+                    return FrameOutcome::Violation(format!(
+                        "surface {slug} user {username}: PublishBatch entry on port {}/{} carries \
+                         an unrepresentable deliver_after of {ms} ms, which the kernel refuses at \
+                         buffer time",
+                        sanitize_client_detail(instance),
+                        sanitize_client_detail(&entry.port),
+                    ));
+                };
+                Some(at).filter(|at| *at > flush_now)
+            }
+        };
         // Sender intent, else the port's boot-resolved default — read from the
         // server's own output map, never echoed from the frame, so a client whose
         // `Welcome` snapshot went stale still gets the operator's value.
-        resolved.push((
+        resolved.push(ResolvedBatchEntry {
             out,
-            entry.body.as_str(),
-            entry.urgency.unwrap_or(out.default_urgency),
-        ));
+            body: entry.body.as_str(),
+            urgency: entry.urgency.unwrap_or(out.default_urgency),
+            deliver_after,
+        });
     }
+    let resolved_ops = match resolve_batch_deferred_ops(ctx, instance, deferred_ops) {
+        Ok(ops) => ops,
+        Err(violation) => return violation,
+    };
 
     // 4. The instance's send budget, one all-or-nothing draw. A `brenn:` output
     //    implies a Messenger (the boot invariant `handle_publish` documents), and
@@ -2333,7 +2493,16 @@ async fn handle_publish_batch(
              so there is no budget to draw without one"
         )
     });
-    let draw = u32::try_from(resolved.len()).expect("batch length is capped well below u32::MAX");
+    // One token per publish, and one for a batch that publishes nothing: an
+    // ops-only flush is still a frame the principal sent and work the server did,
+    // and a path that draws zero is a path a client can ride for free.
+    //
+    // The control ops themselves are unpriced, which is deliberate for now and not
+    // symmetric: each applied durable op is its own DB write, so a flush carrying
+    // the op cap costs far more server work than the one token it draws.
+    // TODO(surface-op-send-budget): price control ops in the send budget.
+    let draw =
+        u32::try_from(resolved.len().max(1)).expect("batch length is capped well below u32::MAX");
     if messenger.draw_surface_send_budget_for_batch(slug, instance, draw)
         == SurfaceSendVerdict::Denied
     {
@@ -2350,7 +2519,49 @@ async fn handle_publish_batch(
         return send_frame(&ctx.tx, frame, counters).await;
     }
 
-    // 5. Stamp every wire entry, in call order, in one pass across the whole
+    // 5. The control ops, ahead of the publishes. A violation here can leave
+    //    earlier ops of the same batch applied: whether a message is someone
+    //    else's is only knowable by asking the store, and each ask is its own
+    //    round trip. The ops that landed were legitimate ones; the connection dies
+    //    on the one that was not.
+    //
+    //    The channels every op named are collected rather than restated here, so
+    //    the one view-emission pass at the end of the batch covers ops and
+    //    schedules together — a channel this flush both edited and parked on is
+    //    restated once, from the truth after both. An op that lost the race to a
+    //    release is collected too: it changed nothing, but it is evidence that
+    //    some page named a schedule the backend does not hold.
+    let mut op_channels: Vec<&str> = Vec::with_capacity(resolved_ops.len());
+    let mut applied_any = false;
+    for op in &resolved_ops {
+        match apply_batch_deferred_op(ctx, messenger, instance, op, flush_now).await {
+            Ok(effect) => {
+                applied_any |= matches!(effect, OpEffect::Applied);
+                op_channels.push(op.out.address.as_str());
+            }
+            Err(violation) => {
+                // This connection dies, so the end-of-batch emission pass never
+                // runs — but the ops that landed before the violating one changed
+                // a set every session of the surface mirrors. Restate those here
+                // or a sibling tab keeps a schedule that no longer exists: if the
+                // op emptied the set, no release and no later change will ever
+                // push a correcting view.
+                if applied_any {
+                    messenger.dispatch_kick();
+                }
+                emit_op_views(ctx, messenger, instance, &op_channels, flush_now).await;
+                return violation;
+            }
+        }
+    }
+    // The release sweep sleeps to the earliest deadline it last computed, so an
+    // edit that moved a release earlier has to wake it or the message waits out the
+    // poll interval. A lost race moved no deadline, so it does not kick.
+    if applied_any {
+        messenger.dispatch_kick();
+    }
+
+    // 6. Stamp every wire entry, in call order, in one pass across the whole
     //    batch — before the substrate split, so call order is visible *across*
     //    the class boundary and not merely within each half. Each entry takes
     //    max(prev + 1, now), so the stamps are strictly increasing whatever the
@@ -2370,46 +2581,77 @@ async fn handle_publish_batch(
         })
         .collect();
 
-    // 6. Apply. Durable first as one transaction, then the ephemeral fan-out; each
+    // 7. Apply. Durable first as one transaction, then the ephemeral fan-out; each
     //    class in call order, with no order promised between them — the guarantee
     //    is the position assignment above plus per-session Deliver sequencing,
     //    never a shared commit instant.
     let durable: Vec<SurfaceBatchPublish<'_>> = resolved
         .iter()
         .zip(&stamps)
-        .filter(|((out, _, _), _)| matches!(out.class, DeliveryClass::Durable))
-        .map(|((out, body, urgency), ts)| SurfaceBatchPublish {
-            channel_address: out.address.as_str(),
-            body,
-            urgency: *urgency,
+        .filter(|(entry, _)| matches!(entry.out.class, DeliveryClass::Durable))
+        .map(|(entry, ts)| SurfaceBatchPublish {
+            channel_address: entry.out.address.as_str(),
+            body: entry.body,
+            urgency: entry.urgency,
             publish_ts_ns: *ts,
+            deliver_after: entry.deliver_after,
         })
         .collect();
     let durable_count = durable.len();
-    messenger
+    // Entries whose schedule the cap refused published nothing, so they reduce
+    // the publish count. No wire error: the guest has no error channel left.
+    let schedules_dropped = messenger
         .publish_batch_from_surface(slug, instance, &durable)
         .await;
-    for _ in 0..durable_count {
+    for _ in 0..(durable_count - schedules_dropped) {
         counters.publish_ok(Some(instance));
     }
 
-    for ((out, body, urgency), ts) in resolved
+    let mut parked_ephemeral = false;
+    for (entry, ts) in resolved
         .iter()
         .zip(&stamps)
-        .filter(|((out, _, _), _)| !matches!(out.class, DeliveryClass::Durable))
+        .filter(|(entry, _)| !matches!(entry.out.class, DeliveryClass::Durable))
     {
-        publish_batch_ephemeral(
+        parked_ephemeral |= publish_batch_ephemeral(
             ctx,
             messenger,
             instance,
             EphemeralBatchPublish {
-                out,
-                body,
-                urgency: *urgency,
+                out: entry.out,
+                body: entry.body,
+                urgency: entry.urgency,
                 publish_ts_ns: *ts,
+                deliver_after: entry.deliver_after,
             },
             counters,
         );
+    }
+    // The release sweep keeps the earliest deadline it last computed and sleeps
+    // to it, so a park that lands afterwards must wake it or the schedule waits
+    // out the poll interval. The durable half kicks from inside
+    // `publish_batch_from_surface`, which runs before this loop — too early to
+    // cover a park made here, and skipped entirely for a batch with no durable
+    // entries.
+    if parked_ephemeral {
+        messenger.dispatch_kick();
+    }
+
+    // Re-state the sender's parked view on every channel this batch scheduled
+    // against or aimed a control op at, whichever half carried it and whether or
+    // not the park or the op was admitted: the view is recomputed from the store,
+    // so a refused schedule and a lost race both land on the truth. Judged at the
+    // flush's one clock read, the same instant that decided park-vs-immediate.
+    let mut scheduled: Vec<&str> = resolved
+        .iter()
+        .filter(|entry| entry.deliver_after.is_some())
+        .map(|entry| entry.out.address.as_str())
+        .chain(op_channels)
+        .collect();
+    scheduled.sort_unstable();
+    scheduled.dedup();
+    for channel in scheduled {
+        broadcast_deferred_view(messenger, &ctx.registry, slug, instance, channel, flush_now).await;
     }
 
     let frame = ServerFrame::PublishBatchResult {
@@ -2417,6 +2659,384 @@ async fn handle_publish_batch(
         outcome: PublishBatchOutcome::Ok,
     };
     send_frame(&ctx.tx, frame, counters).await
+}
+
+/// One control op of a `PublishBatch`, resolved against the server's own
+/// boot-resolved output map before any of the batch is applied.
+///
+/// Resolution is complete for the same reason [`ResolvedBatchEntry`]'s is: the
+/// batch is atomic, so every check that can kill the connection runs before
+/// anything is applied.
+struct ResolvedDeferredOp<'a> {
+    out: &'a OutputPort,
+    /// The port name, for the log line a benign race writes — the address alone
+    /// does not say which of an instance's ports named it.
+    port: &'a str,
+    message_id: Uuid,
+    /// `None` for a cancel; the edit's two halves otherwise, `release_at` already
+    /// converted from the wire's epoch milliseconds.
+    edit: Option<(Option<String>, Option<DateTime<Utc>>)>,
+}
+
+/// Resolve every control op of a `PublishBatch`, or the violation that kills the
+/// connection.
+///
+/// Each check mirrors one the kernel already made at buffer time, so a failure
+/// here says the client is not the kernel — the same doctrine the publish entries
+/// are held to.
+fn resolve_batch_deferred_ops<'a>(
+    ctx: &'a SessionCtx,
+    instance: &'a str,
+    ops: &'a [BatchDeferredOp],
+) -> Result<Vec<ResolvedDeferredOp<'a>>, FrameOutcome> {
+    let slug = &ctx.runtime.resolved.slug;
+    let username = &ctx.username;
+    let mut resolved = Vec::with_capacity(ops.len());
+    for op in ops {
+        let Some(out) = ctx
+            .runtime
+            .output_ports
+            .iter()
+            .find(|(key, _)| key.0.as_str() == instance && key.1.as_str() == op.port)
+            .map(|(_, value)| value)
+        else {
+            return Err(FrameOutcome::Violation(format!(
+                "surface {slug} user {username}: PublishBatch control op names unbound port {}/{}",
+                sanitize_client_detail(instance),
+                sanitize_client_detail(&op.port),
+            )));
+        };
+        let edit = match &op.op {
+            DeferredOpKind::Cancel => None,
+            DeferredOpKind::Edit {
+                body,
+                deliver_after,
+            } => {
+                if let Some(body) = body
+                    && body.len() > ctx.runtime.max_body_bytes
+                {
+                    return Err(FrameOutcome::Violation(format!(
+                        "surface {slug} user {username}: PublishBatch control op on port {}/{} \
+                         carries a {}-byte edit body, over the {}-byte cap the kernel enforces at \
+                         buffer time",
+                        sanitize_client_detail(instance),
+                        sanitize_client_detail(&op.port),
+                        body.len(),
+                        ctx.runtime.max_body_bytes,
+                    )));
+                }
+                let release_at = match deliver_after {
+                    None => None,
+                    Some(ms) => {
+                        let Some(at) = utc_from_epoch_ms(*ms) else {
+                            return Err(FrameOutcome::Violation(format!(
+                                "surface {slug} user {username}: PublishBatch control op on port \
+                                 {}/{} carries an unrepresentable deliver_after of {ms} ms, which \
+                                 the kernel refuses at buffer time",
+                                sanitize_client_detail(instance),
+                                sanitize_client_detail(&op.port),
+                            )));
+                        };
+                        Some(at)
+                    }
+                };
+                Some((body.clone(), release_at))
+            }
+        };
+        resolved.push(ResolvedDeferredOp {
+            out,
+            port: op.port.as_str(),
+            message_id: op.message_id,
+            edit,
+        });
+    }
+    Ok(resolved)
+}
+
+/// What one control op left behind.
+enum OpEffect {
+    /// The sender's parked set changed: the sweep needs waking and the view needs
+    /// restating.
+    Applied,
+    /// The message released between the snapshot the component read and this
+    /// frame. Nothing changed, but the view is restated anyway — see
+    /// [`apply_batch_deferred_op`].
+    Raced,
+}
+
+/// Apply one resolved control op under the batch's sub-identity. The caller
+/// restates the view for the channel on either outcome.
+///
+/// The three outcomes:
+///
+/// - **Applied** — the sender's parked set changed, so its view owes a restatement.
+/// - **`NotDeferred`** — the message released between the snapshot the component
+///   read and this frame. Logged and counted, never punished: a conforming
+///   component can always lose that race, and the page has no way to have known.
+///   The view is restated regardless, because a mirror is the only place an op's
+///   id can come from: an op naming something the backend does not hold is the one
+///   event a *wrong* mirror reliably provokes — one whose emission was dropped on
+///   a full push queue, say — and it would otherwise be the single set-touching
+///   event that pushes nothing, leaving the phantom entry to be cancelled over and
+///   over. A recompute is idempotent, so restating on a genuine race costs one
+///   redundant snapshot.
+/// - **`WrongSender`** — a violation. The ids a conforming kernel can name come
+///   from a sender-scoped view, so this is a client naming a schedule no window
+///   ever offered it. Reported rather than panicked precisely because it is
+///   client-reachable: a panic here would be a remote kill switch.
+async fn apply_batch_deferred_op(
+    ctx: &SessionCtx,
+    messenger: &Messenger,
+    instance: &str,
+    op: &ResolvedDeferredOp<'_>,
+    now: DateTime<Utc>,
+) -> Result<OpEffect, FrameOutcome> {
+    let slug = &ctx.runtime.resolved.slug;
+    let sender = ParticipantId::for_surface_component(slug, instance);
+    let channel = op.out.address.as_str();
+    let outcome = match &op.edit {
+        None => {
+            messenger
+                .cancel_deferred_for_sender(channel, sender.as_str(), op.message_id, now)
+                .await
+        }
+        Some((body, release_at)) => {
+            messenger
+                .edit_deferred_for_sender(
+                    channel,
+                    sender.as_str(),
+                    op.message_id,
+                    body.clone(),
+                    *release_at,
+                    now,
+                )
+                .await
+        }
+    };
+    match outcome {
+        DeferralOutcome::Applied => Ok(OpEffect::Applied),
+        DeferralOutcome::NotDeferred => {
+            messenger.record_deferred_control_race(sender.as_str(), channel);
+            info!(
+                surface = slug,
+                instance,
+                port = op.port,
+                channel,
+                "surface deferred control op is a no-op — the message released between the \
+                 activation's snapshot and the flush"
+            );
+            Ok(OpEffect::Raced)
+        }
+        DeferralOutcome::WrongSender => Err(FrameOutcome::Violation(format!(
+            "surface {slug} user {}: PublishBatch control op from instance {} names message {} on \
+             {channel}, parked by another sender",
+            ctx.username,
+            sanitize_client_detail(instance),
+            op.message_id,
+        ))),
+    }
+}
+
+/// Restate the sender's parked view on every channel the batch's control ops
+/// named.
+///
+/// The violation exit from the op pass, where the connection dies before the
+/// end-of-batch emission runs. The normal exit folds these channels into that one
+/// pass instead, so a channel a flush both edited and parked on is restated once,
+/// from the truth after both.
+async fn emit_op_views(
+    ctx: &SessionCtx,
+    messenger: &Messenger,
+    instance: &str,
+    op_channels: &[&str],
+    now: DateTime<Utc>,
+) {
+    if op_channels.is_empty() {
+        return;
+    }
+    let mut channels = op_channels.to_vec();
+    channels.sort_unstable();
+    channels.dedup();
+    for channel in channels {
+        broadcast_deferred_view(
+            messenger,
+            &ctx.registry,
+            &ctx.runtime.resolved.slug,
+            instance,
+            channel,
+            now,
+        )
+        .await;
+    }
+}
+
+/// Every set a deferred view can be seeded for: each declared instance crossed
+/// with the transportable channels its bound output ports publish onto, deduped
+/// (two ports may share a channel) and sorted so the seeding order is the same on
+/// every attach.
+///
+/// The boot-resolved output map holds no `local:` address — a page-local channel
+/// is the page's own retention authority and the backend parks nothing on it —
+/// so every address here is transportable by construction.
+///
+/// Every address here also has a store: boot refuses to start a surface whose
+/// transportable output names an undeclared channel
+/// (`bootstrap::messaging::surfaces`), and the directory carries every declared
+/// channel. An unresolvable address is a state boot cannot produce; the store
+/// lookup behind the recompute panics on it.
+fn deferred_view_targets(runtime: &SurfaceRuntime) -> Vec<ParkedSet> {
+    let mut targets: Vec<ParkedSet> = runtime
+        .output_ports
+        .iter()
+        .filter(|((instance, _), _)| runtime.is_declared_instance(instance))
+        .map(|((instance, _), out)| ParkedSet {
+            channel: out.address.clone(),
+            instance: instance.clone(),
+        })
+        .collect();
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+/// The wire form of one sender's parked messages: the identity both authorities
+/// know each message by, its body, and its release time in epoch milliseconds
+/// UTC — the units the page's clock reads.
+pub(crate) fn deferred_view_entries(parked: &[DeferredMessage]) -> Vec<DeferredViewEntry> {
+    parked
+        .iter()
+        .map(|message| DeferredViewEntry {
+            message_id: message.envelope.message_id,
+            body: message.envelope.body.clone(),
+            deliver_after: u64::try_from(message.release_at.timestamp_millis()).expect(
+                "a surface component's release time was admitted from epoch milliseconds, so it \
+                 is at or after the epoch",
+            ),
+        })
+        .collect()
+}
+
+/// Recompute one component instance's parked view on `channel` and push it at
+/// every attached session of the surface.
+///
+/// Recompute and push run under the messenger's deferred-view gate, so this
+/// emission and the release sweep's reach a page in the order they read the
+/// store. Without it the two can invert — a snapshot carries no version, so the
+/// page would keep the older one and mirror a schedule that has already released,
+/// with no further emission owed if that release was the set's last change.
+async fn broadcast_deferred_view(
+    messenger: &Messenger,
+    registry: &SurfaceRegistry,
+    slug: &str,
+    instance: &str,
+    channel: &str,
+    now: DateTime<Utc>,
+) {
+    let sender = ParticipantId::for_surface_component(slug, instance);
+    let _order = messenger.lock_deferred_view_gate().await;
+    let entries = deferred_view_entries(
+        &messenger
+            .deferred_view_for_sender(channel, sender.as_str(), now)
+            .await,
+    );
+    registry.push_deferred_view(
+        slug,
+        &DeferredViewPush {
+            channel: channel.to_string(),
+            instance: instance.to_string(),
+            entries,
+        },
+    );
+}
+
+/// Seed this connection's deferred-view mirrors, immediately behind `Welcome`.
+///
+/// One frame per `(instance, channel)` whose parked set is nonempty. The page
+/// clears every mirror at `Welcome`, so an absent frame means an empty set —
+/// which is also what makes a set that emptied while the page was away arrive
+/// correctly empty.
+///
+/// This connection only: the frames ride the same FIFO writer queue `Welcome`
+/// just entered, which is what puts them behind it.
+async fn seed_deferred_views(ctx: &SessionCtx, counters: &mut SessionCounters) -> FrameOutcome {
+    let Some(messenger) = ctx.runtime.messenger.as_ref() else {
+        return FrameOutcome::Continue;
+    };
+    let slug = &ctx.runtime.resolved.slug;
+    let now = Utc::now();
+    let targets = deferred_view_targets(&ctx.runtime);
+    for target in &targets {
+        let sender = ParticipantId::for_surface_component(slug, &target.instance);
+        let entries = deferred_view_entries(
+            &messenger
+                .deferred_view_for_sender(&target.channel, sender.as_str(), now)
+                .await,
+        );
+        if entries.is_empty() {
+            continue;
+        }
+        let frame = ServerFrame::DeferredView {
+            channel: target.channel.clone(),
+            instance: target.instance.clone(),
+            entries,
+        };
+        if let FrameOutcome::Disconnect = send_frame(&ctx.tx, frame, counters).await {
+            return FrameOutcome::Disconnect;
+        }
+    }
+    for orphan in orphaned_parked_sets(messenger, slug, &targets, now).await {
+        warn!(
+            surface = slug,
+            instance = orphan.instance,
+            channel = orphan.channel,
+            "parked messages this page cannot see: the sender has a schedule on a channel no \
+             declared instance binds an output onto. They release normally; nothing on the page \
+             can view, edit, or cancel them until the config declares that instance and binding \
+             again"
+        );
+    }
+    FrameOutcome::Continue
+}
+
+/// The parked sets of `slug` that seeding cannot reach — the ones outside
+/// `targets`.
+///
+/// A set goes orphaned when the config that would have named it goes away: an
+/// instance a `Welcome` no longer declares, or one whose output binding on that
+/// channel is gone. The entries release on the backend regardless — a durable
+/// schedule outliving its author's binding is part of what durable parking is
+/// for — so nothing is lost and no ladder is charged. What is gone is the page's
+/// ability to see them, and that is an operator's decision to have made, so it
+/// is reported rather than repaired here.
+async fn orphaned_parked_sets(
+    messenger: &Messenger,
+    slug: &str,
+    targets: &[ParkedSet],
+    now: DateTime<Utc>,
+) -> Vec<ParkedSet> {
+    messenger
+        .parked_surface_components(slug, now)
+        .await
+        .into_iter()
+        .filter(|parked| !targets.contains(parked))
+        .collect()
+}
+
+/// One admitted entry of a `PublishBatch`, resolved against the server's own
+/// boot-resolved output map before any of the batch is applied.
+///
+/// Resolution is complete: nothing below re-reads the frame. The port, the
+/// urgency the operator's config or the sender chose, and the park-vs-immediate
+/// verdict are all settled here, so the two substrate halves apply the same
+/// decisions and neither re-derives one.
+struct ResolvedBatchEntry<'a> {
+    out: &'a OutputPort,
+    body: &'a str,
+    urgency: Urgency,
+    /// The release time this entry parks until, or `None` for an immediate
+    /// publish — already judged against the flush's single clock read, so a time
+    /// in the past arrives here as `None`.
+    deliver_after: Option<DateTime<Utc>>,
 }
 
 /// One ephemeral entry of an admitted `PublishBatch`, borrowed for the duration
@@ -2427,6 +3047,8 @@ struct EphemeralBatchPublish<'a> {
     body: &'a str,
     urgency: Urgency,
     publish_ts_ns: i64,
+    /// See [`ResolvedBatchEntry::deliver_after`].
+    deliver_after: Option<DateTime<Utc>>,
 }
 
 /// Apply one ephemeral entry of an admitted `PublishBatch`.
@@ -2447,25 +3069,60 @@ struct EphemeralBatchPublish<'a> {
 /// eviction as reported at the moment it overwrites an unread position, so a
 /// drop this publish caused is escalated here or nowhere — no later consumer
 /// take carries it.
+///
+/// A deferred entry parks instead of appending, against the channel's own
+/// deferred cap. Exhaustion drops that entry's schedule with a warn and a
+/// counter and is not counted as a publish — normal operation on a full deferred
+/// set, because the component already returned and there is nothing to answer.
+///
+/// Returns whether a schedule landed, so the caller can wake the release sweep
+/// once for the whole ephemeral half.
+#[must_use]
 fn publish_batch_ephemeral(
     ctx: &SessionCtx,
     messenger: &Messenger,
     instance: &str,
     publish: EphemeralBatchPublish<'_>,
     counters: &mut SessionCounters,
-) {
+) -> bool {
     let runtime = &ctx.runtime;
     let address = publish.out.address.as_str();
-    let appended = messenger.publish_prepaid(
-        &runtime.participant,
-        &runtime.policy,
-        address,
-        publish.body,
-        publish.urgency,
-        brenn_lib::messaging::db::ns_to_utc(publish.publish_ts_ns),
-    );
+    let publish_ts = brenn_lib::messaging::db::ns_to_utc(publish.publish_ts_ns);
+    // The sender is the deferred set's ownership key: a parked entry must carry
+    // the identity that will later see it in its deferred view and name it in a
+    // control op.
+    let sender = ParticipantId::for_surface_component(&runtime.resolved.slug, instance);
+    let prepaid = || PrepaidEntry {
+        sender: &sender,
+        policy: &runtime.policy,
+        channel_address: address,
+        body: publish.body,
+        urgency: publish.urgency,
+        publish_ts,
+    };
+    if let Some(release_at) = publish.deliver_after {
+        return match messenger.park_prepaid(prepaid(), release_at) {
+            Ok(_) => {
+                counters.publish_ok(Some(instance));
+                true
+            }
+            Err(QuotaExceeded { cap }) => {
+                messenger.record_dropped_deferred(sender.as_str(), address);
+                warn!(
+                    instance,
+                    channel = address,
+                    cap,
+                    "surface deferred publish dropped — channel deferred set at its retain_depth \
+                     cap"
+                );
+                false
+            }
+        };
+    }
+    let appended = messenger.publish_prepaid(prepaid());
     messenger.enact_overflow_for_channel(address, &appended.overflow);
     counters.publish_ok(Some(instance));
+    false
 }
 
 /// Send one `ServerFrame` to the writer, counting it and mapping a closed
@@ -2810,6 +3467,18 @@ mod tests {
     /// key on (the scheme prefix is stripped before matching).
     const CHANNEL_NAME: &str = "protobar";
 
+    /// [`handle_publish_batch`] for a flush carrying no control ops — the shape
+    /// every test about the publish half wants.
+    async fn flush_batch(
+        ctx: &SessionCtx,
+        instance: &str,
+        correlation: u64,
+        publishes: &[BatchEntry],
+        counters: &mut SessionCounters,
+    ) -> FrameOutcome {
+        handle_publish_batch(ctx, instance, correlation, publishes, &[], counters).await
+    }
+
     /// A `Messenger` over one `ephemeral:` channel — everything a live attach
     /// needs and nothing else.
     fn ring_messenger(retain_depth: u64, fan_out_capacity: u32) -> Arc<Messenger> {
@@ -2976,6 +3645,7 @@ mod tests {
             username: "dev".to_string(),
             ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             alert_dispatcher,
+            registry: SurfaceRegistry::default(),
             tx,
         }
     }
@@ -3277,6 +3947,7 @@ mod tests {
             username: "dev".to_string(),
             ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             alert_dispatcher,
+            registry: SurfaceRegistry::default(),
             tx,
         };
         (ctx, rx, channel_uuid)
@@ -3385,6 +4056,7 @@ mod tests {
             username: "dev".to_string(),
             ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             alert_dispatcher,
+            registry: SurfaceRegistry::default(),
             tx,
         };
         (ctx, rx)
@@ -3986,6 +4658,137 @@ mod tests {
         );
     }
 
+    /// **One turn of the push queue becomes frames: durable rows first as one
+    /// coalesced pass, then the views in arrival order.** The middle link of the
+    /// view plane — the registry test stops at the queue and the kernel tests start
+    /// at a serialized frame, so without this a view that never became a frame would
+    /// leave every page mirror frozen at whatever the seeding pass supplied, with
+    /// both neighbouring tests still green. The order is load-bearing too: an
+    /// interleaved view would split one message's sibling rows across frames and
+    /// break the coalescing `send_durable_live` exists to do.
+    #[tokio::test]
+    async fn a_turn_of_pushes_writes_the_rows_first_then_every_view_in_order() {
+        const BEHIND: &str = "protobar";
+        const CURRENT: &str = "agenda";
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, mut rx, uuid) = durable_ctx_for(&db, Depth::Bounded(8), &[BEHIND, CURRENT]).await;
+        let behind = SubKey {
+            instance: BEHIND.to_string(),
+            channel: DURABLE_ADDR.to_string(),
+        };
+        let current = SubKey {
+            instance: CURRENT.to_string(),
+            channel: DURABLE_ADDR.to_string(),
+        };
+
+        let durable_subs = Arc::new(Mutex::new(HashSet::new()));
+        let mut durable = DurableSessionState::new(durable_subs);
+        let mut counters = SessionCounters::default();
+        let mut spans = WireSpans::new();
+        for sub in [&behind, &current] {
+            handle_durable_subscribe(
+                &ctx,
+                &mut durable,
+                &mut spans,
+                sub.clone(),
+                None,
+                &mut counters,
+            )
+            .await;
+            let _ = rx.try_recv().expect("SubscribeResult");
+        }
+
+        let seq = seed_message(&db, uuid, "shared", 100).await;
+        let envelope = Arc::new(MessageEnvelope {
+            message_id: Uuid::new_v4(),
+            source: "test".into(),
+            channel: DURABLE_ADDR.to_string(),
+            sender: "sender".into(),
+            publish_ts: Utc::now(),
+            body: "shared".to_string(),
+            reply_to: None,
+            delivery_deadline: None,
+            deliver_after: None,
+            urgency: Urgency::Normal,
+            envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
+        });
+        let view = |body: &str| {
+            SessionPush::DeferredView(DeferredViewPush {
+                channel: DURABLE_ADDR.to_string(),
+                instance: BEHIND.to_string(),
+                entries: vec![DeferredViewEntry {
+                    message_id: Uuid::nil(),
+                    body: body.to_string(),
+                    deliver_after: 1_700_000_000_000,
+                }],
+            })
+        };
+
+        // A view arrives between the two sibling rows of one message: exactly the
+        // interleaving that must not reach the writer.
+        let outcome = send_session_pushes(
+            &ctx,
+            &durable,
+            &mut spans,
+            vec![
+                SessionPush::Durable(DurableDelivery {
+                    envelope: Arc::clone(&envelope),
+                    retained_seq: seq as u64,
+                    sub: behind.clone(),
+                }),
+                view("first"),
+                SessionPush::Durable(DurableDelivery {
+                    envelope: Arc::clone(&envelope),
+                    retained_seq: seq as u64,
+                    sub: current.clone(),
+                }),
+                view("second"),
+            ],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+
+        match rx.try_recv().expect("the coalesced delivery") {
+            ServerFrame::Deliver {
+                envelope, targets, ..
+            } => {
+                assert_eq!(envelope.body, "shared");
+                let mut named: Vec<String> = targets.iter().map(|t| t.instance.clone()).collect();
+                named.sort();
+                assert_eq!(
+                    named,
+                    vec![CURRENT.to_string(), BEHIND.to_string()],
+                    "both sibling rows rode one frame: the view did not split them"
+                );
+            }
+            other => panic!("expected the rows first, got {other:?}"),
+        }
+        for want in ["first", "second"] {
+            match rx.try_recv().expect("a view frame") {
+                ServerFrame::DeferredView {
+                    channel,
+                    instance,
+                    entries,
+                } => {
+                    assert_eq!(channel, DURABLE_ADDR);
+                    assert_eq!(instance, BEHIND);
+                    assert_eq!(
+                        entries.iter().map(|e| e.body.as_str()).collect::<Vec<_>>(),
+                        vec![want],
+                        "views follow the rows, in arrival order — the last one is what \
+                         the page keeps"
+                    );
+                }
+                other => panic!("expected a DeferredView, got {other:?}"),
+            }
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "one turn, four pushes, three frames"
+        );
+    }
+
     /// An unparseable resume cursor is a protocol violation whose detail names the
     /// parse cause — the fail2ban-relevant mapping the class-mismatch tests do not
     /// exercise.
@@ -4541,6 +5344,47 @@ mod tests {
     /// budget installed for both principal grains. The two classes together are
     /// what the batch's split-and-apply step exists for.
     async fn batch_ctx(db: &brenn_lib::db::Db) -> (SessionCtx, mpsc::Receiver<ServerFrame>) {
+        batch_ctx_shaped(db, None, &[]).await
+    }
+
+    /// [`batch_ctx`] with an explicit `retain_depth` on the durable channel,
+    /// which is also its deferred cap — the one fixture knob the schedule-refusal
+    /// cases need. `None` leaves the resolved default.
+    async fn batch_ctx_at_durable_retain(
+        db: &brenn_lib::db::Db,
+        durable_retain_depth: Option<u64>,
+    ) -> (SessionCtx, mpsc::Receiver<ServerFrame>) {
+        batch_ctx_shaped(db, durable_retain_depth, &[]).await
+    }
+
+    /// The address of [`batch_ctx_with_undeclared_output`]'s third output: a
+    /// `brenn:` channel the fixture's directory does not hold.
+    const UNDECLARED_OUT_ADDR: &str = "brenn:nonesuch";
+
+    /// [`batch_ctx`] plus a third bound output on [`UNDECLARED_OUT_ADDR`], which
+    /// the fixture's two-entry directory cannot resolve — the configuration a
+    /// booted server refuses (`bootstrap::messaging::surfaces` asserts channel
+    /// existence on every transportable output), reachable here because
+    /// `SurfaceRuntime::build` validates no output address.
+    ///
+    /// It is the only shape that tells enumeration from resolution apart: every
+    /// other fixture output resolves, so a filter over the directory would return
+    /// the same targets as no filter at all.
+    async fn batch_ctx_with_undeclared_output(
+        db: &brenn_lib::db::Db,
+    ) -> (SessionCtx, mpsc::Receiver<ServerFrame>) {
+        batch_ctx_shaped(db, None, &[UNDECLARED_OUT_ADDR]).await
+    }
+
+    /// The assembly behind the `batch_ctx` family: `durable_retain_depth` tunes
+    /// the durable channel's retain/deferred cap, and each address in
+    /// `extra_outputs` binds one more `protobar` output port (`extra0`, `extra1`,
+    /// …) without declaring a channel for it.
+    async fn batch_ctx_shaped(
+        db: &brenn_lib::db::Db,
+        durable_retain_depth: Option<u64>,
+        extra_outputs: &[&str],
+    ) -> (SessionCtx, mpsc::Receiver<ServerFrame>) {
         use brenn_lib::messaging::config::{
             ChannelConfigRaw, Depth, MessagingGlobalConfig, NoiseLevel, SurfaceSendBudget,
             build_channel_entries,
@@ -4558,7 +5402,7 @@ mod tests {
             address: "batch-out".to_string(),
             description: None,
             push_depth: None,
-            retain_depth: None,
+            retain_depth: durable_retain_depth.map(Depth::Bounded),
             standing_retain_depth: None,
             noise: None,
             sink: None,
@@ -4624,11 +5468,13 @@ mod tests {
             ],
         )]);
 
-        let resolved = crate::test_support::surface::SurfaceFixture::new("deskbar", "protobar")
+        let mut fixture = crate::test_support::surface::SurfaceFixture::new("deskbar", "protobar")
             .output("brenn:batch-out", "protobar", "out")
-            .output("ephemeral:batch-eph", "protobar", "eph")
-            .policy(policy)
-            .build();
+            .output("ephemeral:batch-eph", "protobar", "eph");
+        for (i, address) in extra_outputs.iter().enumerate() {
+            fixture = fixture.output(address, "protobar", &format!("extra{i}"));
+        }
+        let resolved = fixture.policy(policy).build();
         let runtime = SurfaceRuntime::build(
             resolved,
             Some(Arc::clone(&messenger)),
@@ -4644,17 +5490,27 @@ mod tests {
             username: "dev".to_string(),
             ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             alert_dispatcher,
+            registry: SurfaceRegistry::default(),
             tx,
         };
         (ctx, rx)
     }
 
-    /// One batch entry naming `port`, no urgency override.
+    /// One batch entry naming `port`, no urgency override, published now.
     fn entry(port: &str, body: &str) -> BatchEntry {
         BatchEntry {
             port: port.to_string(),
             body: body.to_string(),
             urgency: None,
+            deliver_after: None,
+        }
+    }
+
+    /// One batch entry naming `port`, scheduled for `deliver_after` epoch-ms.
+    fn deferred_entry(port: &str, body: &str, deliver_after: u64) -> BatchEntry {
+        BatchEntry {
+            deliver_after: Some(deliver_after),
+            ..entry(port, body)
         }
     }
 
@@ -4685,7 +5541,7 @@ mod tests {
 
         // Interleaved on purpose: the boundary is crossed twice, so a per-half
         // stamp would be caught in either direction.
-        let outcome = handle_publish_batch(
+        let outcome = flush_batch(
             &ctx,
             "protobar",
             1,
@@ -4761,7 +5617,7 @@ mod tests {
         );
         let wide: Vec<BatchEntry> = (0..n).map(|_| entry("eph", "x")).collect();
 
-        let outcome = handle_publish_batch(&ctx, "protobar", 5, &wide, &mut counters).await;
+        let outcome = flush_batch(&ctx, "protobar", 5, &wide, &mut counters).await;
         assert!(matches!(outcome, FrameOutcome::Continue));
         assert!(
             matches!(
@@ -4820,7 +5676,7 @@ mod tests {
         // Six into a depth-4 ring: the last two overwrite messages the consumer,
         // which never runs, is still owed.
         let flush: Vec<BatchEntry> = (0..6).map(|_| entry("eph", "x")).collect();
-        let outcome = handle_publish_batch(&ctx, "protobar", 9, &flush, &mut counters).await;
+        let outcome = flush_batch(&ctx, "protobar", 9, &flush, &mut counters).await;
         assert!(matches!(outcome, FrameOutcome::Continue));
         assert!(
             matches!(
@@ -4862,7 +5718,7 @@ mod tests {
             .expect("ephemeral subscribe")
             .receiver;
 
-        let outcome = handle_publish_batch(
+        let outcome = flush_batch(
             &ctx,
             "protobar",
             77,
@@ -4914,6 +5770,1113 @@ mod tests {
         assert_eq!(counters.publishes, 3, "all three entries counted Ok");
     }
 
+    /// Ten minutes out, in the epoch-ms a `BatchEntry` carries.
+    fn later_ms() -> u64 {
+        u64::try_from((Utc::now() + chrono::Duration::minutes(10)).timestamp_millis())
+            .expect("a positive epoch")
+    }
+
+    /// **Deferral crosses the wire and parks at each class's retention
+    /// authority.** The durable entry's row carries a release time and no
+    /// retention position, so nothing that reads retention can see it; the
+    /// ephemeral entry is in its ring's deferred set, so the live consumer gets
+    /// only the sibling that published now. Both are counted as publishes — the
+    /// schedule landed, which is what the component asked for.
+    #[tokio::test]
+    async fn a_deferred_batch_entry_parks_on_both_classes_and_delivers_neither_now() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, mut rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let later = later_ms();
+
+        let mut sub = ctx
+            .runtime
+            .messenger()
+            .attach_live(
+                ctx.runtime.participant.clone(),
+                ctx.runtime.policy.clone(),
+                "ephemeral:batch-eph",
+                None,
+            )
+            .expect("ephemeral subscribe")
+            .receiver;
+
+        let outcome = flush_batch(
+            &ctx,
+            "protobar",
+            9,
+            &[
+                deferred_entry("out", "d-later", later),
+                deferred_entry("eph", "e-later", later),
+                entry("eph", "e-now"),
+            ],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+        assert!(matches!(
+            rx.try_recv().expect("PublishBatchResult frame"),
+            ServerFrame::PublishBatchResult {
+                outcome: PublishBatchOutcome::Ok,
+                ..
+            }
+        ));
+
+        let conn = db.lock().await;
+        let rows: Vec<(String, bool, Option<i64>)> = conn
+            .prepare("SELECT body, deliver_after IS NOT NULL, retained_seq FROM messaging_messages")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get(0).unwrap(),
+                    r.get::<_, bool>(1).unwrap(),
+                    r.get(2).unwrap(),
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("d-later".to_string(), true, None)],
+            "the durable entry is parked: a release time and no retention position"
+        );
+        drop(conn);
+
+        match sub.recv().await.expect("ephemeral delivery") {
+            EphemeralEvent::Delivery(d) => assert_eq!(
+                d.envelope.body, "e-now",
+                "only the unscheduled ephemeral entry is on the channel"
+            ),
+            other => panic!("expected a delivery, got {other:?}"),
+        }
+        assert_eq!(counters.publishes, 3, "three entries landed");
+    }
+
+    /// Attach one session to `ctx`'s registry under the fixture slug, returning
+    /// its guard (keep it alive — dropping it unregisters) and the push queue the
+    /// deferred-view fan-out writes into.
+    fn attach_view_session(
+        ctx: &SessionCtx,
+    ) -> (
+        crate::routes::surface::registry::SurfaceSessionGuard,
+        mpsc::Receiver<SessionPush>,
+    ) {
+        use crate::routes::surface::registry::{
+            PUSH_QUEUE_FRAMES, SessionCaps, SurfaceSessionHandle,
+        };
+
+        let (push_tx, push_rx) = mpsc::channel(PUSH_QUEUE_FRAMES);
+        let mut handle = SurfaceSessionHandle::for_test("dev");
+        handle.push_tx = push_tx;
+        let guard = ctx
+            .registry
+            .try_register(&ctx.runtime.resolved.slug, handle, SessionCaps::UNCAPPED)
+            .expect("the fixture registry is uncapped");
+        (guard, push_rx)
+    }
+
+    /// One drained deferred view: its channel, its instance, and each entry as
+    /// `(body, deliver_after)` — an edit's two halves are exactly those fields.
+    type ViewSnapshot = (String, String, Vec<(String, u64)>);
+
+    /// The deferred views waiting in one session's push queue.
+    fn drain_view_entries(rx: &mut mpsc::Receiver<SessionPush>) -> Vec<ViewSnapshot> {
+        let mut views = Vec::new();
+        while let Ok(push) = rx.try_recv() {
+            if let SessionPush::DeferredView(view) = push {
+                views.push((
+                    view.channel,
+                    view.instance,
+                    view.entries
+                        .into_iter()
+                        .map(|e| (e.body, e.deliver_after))
+                        .collect(),
+                ));
+            }
+        }
+        views
+    }
+
+    /// The deferred views waiting in one session's push queue, as
+    /// `(channel, instance, bodies)`.
+    fn drain_views(rx: &mut mpsc::Receiver<SessionPush>) -> Vec<(String, String, Vec<String>)> {
+        let mut views = Vec::new();
+        while let Ok(push) = rx.try_recv() {
+            if let SessionPush::DeferredView(view) = push {
+                views.push((
+                    view.channel,
+                    view.instance,
+                    view.entries.into_iter().map(|e| e.body).collect(),
+                ));
+            }
+        }
+        views
+    }
+
+    /// **A park restates the sender's view to every session of the surface.** The
+    /// parked set belongs to `surface:<slug>#<instance>`, which every tab shares,
+    /// so both sessions are told — and told the same thing, on both classes.
+    #[tokio::test]
+    async fn a_parked_batch_entry_pushes_the_view_to_every_session_of_the_surface() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let later = later_ms();
+
+        let (_g1, mut first) = attach_view_session(&ctx);
+        let (_g2, mut second) = attach_view_session(&ctx);
+
+        let outcome = flush_batch(
+            &ctx,
+            "protobar",
+            21,
+            &[
+                deferred_entry("out", "d-later", later),
+                deferred_entry("eph", "e-later", later),
+                entry("eph", "e-now"),
+            ],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+
+        let expected = vec![
+            (
+                "brenn:batch-out".to_string(),
+                "protobar".to_string(),
+                vec!["d-later".to_string()],
+            ),
+            (
+                "ephemeral:batch-eph".to_string(),
+                "protobar".to_string(),
+                vec!["e-later".to_string()],
+            ),
+        ];
+        assert_eq!(
+            drain_views(&mut first),
+            expected,
+            "one view per scheduled channel, in channel order"
+        );
+        assert_eq!(
+            drain_views(&mut second),
+            expected,
+            "the sibling session is told the same thing"
+        );
+    }
+
+    /// **A batch that scheduled nothing restates nothing.** The view is pushed at
+    /// the change, not at every flush; a page that parked nothing is not handed a
+    /// snapshot it already has.
+    #[tokio::test]
+    async fn a_batch_with_no_schedule_pushes_no_deferred_view() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let (_guard, mut pushes) = attach_view_session(&ctx);
+
+        let outcome = flush_batch(
+            &ctx,
+            "protobar",
+            22,
+            // A release time already past is an immediate publish, so it parks
+            // nothing and owes no view either.
+            &[entry("out", "a"), deferred_entry("eph", "past", 1)],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+        assert!(
+            drain_views(&mut pushes).is_empty(),
+            "nothing parked, so nothing to restate"
+        );
+    }
+
+    /// **Seeding sends one frame per nonempty set, and nothing for an empty one.**
+    /// The page clears its mirrors at `Welcome`, so silence about a channel is the
+    /// statement that its set is empty — which is what makes a set that drained
+    /// while the page was away arrive correctly empty.
+    #[tokio::test]
+    async fn seeding_frames_the_nonempty_sets_and_stays_silent_about_the_rest() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, mut rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let later = later_ms();
+
+        // Park on the durable channel only; the ephemeral one stays empty.
+        let outcome = flush_batch(
+            &ctx,
+            "protobar",
+            23,
+            &[
+                deferred_entry("out", "survivor", later),
+                entry("eph", "now"),
+            ],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+        while rx.try_recv().is_ok() {}
+
+        assert!(matches!(
+            seed_deferred_views(&ctx, &mut counters).await,
+            FrameOutcome::Continue
+        ));
+
+        let mut seeded = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            match frame {
+                ServerFrame::DeferredView {
+                    channel,
+                    instance,
+                    entries,
+                } => seeded.push((
+                    channel,
+                    instance,
+                    entries.into_iter().map(|e| e.body).collect::<Vec<_>>(),
+                )),
+                other => panic!("expected only DeferredView frames, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            seeded,
+            vec![(
+                "brenn:batch-out".to_string(),
+                "protobar".to_string(),
+                vec!["survivor".to_string()],
+            )],
+            "the empty ephemeral set is stated by its absence"
+        );
+    }
+
+    /// **Every bound output of a declared instance is a seeding target**, on both
+    /// classes and whether or not the directory holds its channel. The enumeration
+    /// is the config's alone — declared instance crossed with the channels its
+    /// output ports name — so the third output here, whose address the fixture's
+    /// directory does not carry, is a target like the other two. Reintroducing a
+    /// directory filter over this set fails on that one.
+    ///
+    /// What an unseedable set must not do is vanish from the targets: absent from
+    /// them, a set with something parked on it reports as an orphaned instance
+    /// rather than as the config gap it is.
+    #[tokio::test]
+    async fn every_bound_output_of_a_declared_instance_is_a_seeding_target() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx_with_undeclared_output(&db).await;
+
+        assert_eq!(
+            deferred_view_targets(&ctx.runtime),
+            vec![
+                ParkedSet {
+                    channel: "brenn:batch-out".to_string(),
+                    instance: "protobar".to_string(),
+                },
+                ParkedSet {
+                    channel: UNDECLARED_OUT_ADDR.to_string(),
+                    instance: "protobar".to_string(),
+                },
+                ParkedSet {
+                    channel: "ephemeral:batch-eph".to_string(),
+                    instance: "protobar".to_string(),
+                },
+            ],
+            "all three bound outputs, sorted, the undeclared one included"
+        );
+    }
+
+    /// **Seeding an output the directory cannot resolve panics; it does not skip.**
+    /// The seeding pass enumerates from the config and trusts boot's assertion that
+    /// every transportable output names a declared channel, so the recompute's
+    /// store lookup is where a violated invariant surfaces — loudly, on a state a
+    /// booted server cannot reach. Skipping instead would turn an operator's config
+    /// gap into a page mirror that is silently and permanently empty.
+    #[tokio::test]
+    #[should_panic(expected = "a bound output port must resolve")]
+    async fn seeding_a_bound_output_the_directory_lacks_panics() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx_with_undeclared_output(&db).await;
+        let mut counters = SessionCounters::default();
+
+        let _outcome = seed_deferred_views(&ctx, &mut counters).await;
+    }
+
+    /// **A parked set no seeding target covers is reported, not seeded.** An
+    /// instance the config no longer declares still holds its schedules on the
+    /// backend, and they still release; what is gone is the page's view of them,
+    /// so the seeding pass names the orphan for the operator and stays silent to
+    /// the page about it.
+    #[tokio::test]
+    async fn a_parked_set_outside_the_seeding_targets_is_reported_as_orphaned() {
+        use brenn_lib::messaging::store::NewMessage;
+
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, mut rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let later = later_ms();
+        let messenger = ctx.runtime.messenger.as_ref().expect("fixture messenger");
+
+        // The declared instance parks through its bound output: a seedable set.
+        let outcome = flush_batch(
+            &ctx,
+            "protobar",
+            24,
+            &[deferred_entry("out", "declared", later)],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+        while rx.try_recv().is_ok() {}
+
+        // A sub-identity the fixture's `Welcome` does not declare — the shape a
+        // config change leaves behind — parks on a channel it once bound.
+        let ghost = ParticipantId::for_surface_component(&ctx.runtime.resolved.slug, "ghost");
+        let now = Utc::now();
+        messenger
+            .store_for_address("ephemeral:batch-eph")
+            .park(
+                NewMessage {
+                    source: "test".to_string(),
+                    sender: ghost.as_str().to_string(),
+                    body: "orphaned".to_string(),
+                    urgency: Urgency::Normal,
+                    envelope_type: brenn_lib::messaging::ChannelScheme::Ephemeral,
+                    reply_to_uuid: None,
+                    delivery_deadline: None,
+                    publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
+                },
+                now + chrono::Duration::hours(1),
+            )
+            .await
+            .expect("under the cap");
+
+        let targets = deferred_view_targets(&ctx.runtime);
+        assert_eq!(
+            orphaned_parked_sets(messenger, &ctx.runtime.resolved.slug, &targets, now).await,
+            vec![ParkedSet {
+                channel: "ephemeral:batch-eph".to_string(),
+                instance: "ghost".to_string(),
+            }],
+            "only the set no target covers is orphaned; the declared instance's is seeded"
+        );
+
+        // Seeding itself is unchanged by the orphan: the page hears about the
+        // set it can act on and nothing about the one it cannot.
+        assert!(matches!(
+            seed_deferred_views(&ctx, &mut counters).await,
+            FrameOutcome::Continue
+        ));
+        let mut seeded = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            match frame {
+                ServerFrame::DeferredView {
+                    channel, instance, ..
+                } => seeded.push((channel, instance)),
+                other => panic!("expected only DeferredView frames, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            seeded,
+            vec![("brenn:batch-out".to_string(), "protobar".to_string())]
+        );
+    }
+
+    /// The identities of `protobar`'s parked messages on `channel`, in release
+    /// order — the same view the page is pushed, which is where a conforming
+    /// kernel's op ids come from.
+    async fn parked_ids(ctx: &SessionCtx, channel: &str) -> Vec<Uuid> {
+        let messenger = ctx.runtime.messenger.as_ref().expect("fixture messenger");
+        let sender = ParticipantId::for_surface_component(&ctx.runtime.resolved.slug, "protobar");
+        messenger
+            .deferred_view_for_sender(channel, sender.as_str(), Utc::now())
+            .await
+            .into_iter()
+            .map(|m| m.envelope.message_id)
+            .collect()
+    }
+
+    /// The bodies of `protobar`'s parked messages on `channel`, in release order.
+    async fn parked_bodies(ctx: &SessionCtx, channel: &str) -> Vec<String> {
+        let messenger = ctx.runtime.messenger.as_ref().expect("fixture messenger");
+        let sender = ParticipantId::for_surface_component(&ctx.runtime.resolved.slug, "protobar");
+        messenger
+            .deferred_view_for_sender(channel, sender.as_str(), Utc::now())
+            .await
+            .into_iter()
+            .map(|m| m.envelope.body.clone())
+            .collect()
+    }
+
+    /// One control op naming `port` and `message_id`.
+    fn cancel_op(port: &str, message_id: Uuid) -> BatchDeferredOp {
+        BatchDeferredOp {
+            port: port.to_string(),
+            message_id,
+            op: DeferredOpKind::Cancel,
+        }
+    }
+
+    /// **A cancel travelling the wire applies to the sender's own parked set, and
+    /// the page is told.** The sub-identity is derived from the named instance
+    /// exactly as a publish's is, so the op reaches the same schedule the view
+    /// showed and nothing else.
+    #[tokio::test]
+    async fn a_wire_cancel_applies_under_the_sub_identity_and_restates_the_view() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let later = later_ms();
+        let (_guard, mut pushes) = attach_view_session(&ctx);
+
+        assert!(matches!(
+            flush_batch(
+                &ctx,
+                "protobar",
+                31,
+                &[
+                    deferred_entry("out", "keep", later),
+                    deferred_entry("out", "drop", later + 1_000),
+                ],
+                &mut counters,
+            )
+            .await,
+            FrameOutcome::Continue
+        ));
+        let ids = parked_ids(&ctx, "brenn:batch-out").await;
+        assert_eq!(ids.len(), 2, "both entries parked");
+        let _ = drain_views(&mut pushes);
+
+        let outcome = handle_publish_batch(
+            &ctx,
+            "protobar",
+            32,
+            &[],
+            &[cancel_op("out", ids[1])],
+            &mut counters,
+        )
+        .await;
+        assert!(
+            matches!(outcome, FrameOutcome::Continue),
+            "an ops-only flush is a whole batch"
+        );
+        assert_eq!(
+            parked_bodies(&ctx, "brenn:batch-out").await,
+            vec!["keep".to_string()],
+            "the cancel took exactly the message it named"
+        );
+        assert_eq!(
+            drain_views(&mut pushes),
+            vec![(
+                "brenn:batch-out".to_string(),
+                "protobar".to_string(),
+                vec!["keep".to_string()],
+            )],
+            "the applied op restates the view"
+        );
+    }
+
+    /// **The ops apply before the batch's publishes.** Observed through the
+    /// deferred cap: with room for exactly one schedule, a batch that cancels the
+    /// parked entry and parks a new one lands the new one. Publishes-first would
+    /// meet a full set and drop the schedule.
+    #[tokio::test]
+    async fn control_ops_apply_before_the_batchs_publishes() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx_at_durable_retain(&db, Some(1)).await;
+        let mut counters = SessionCounters::default();
+        let later = later_ms();
+
+        assert!(matches!(
+            flush_batch(
+                &ctx,
+                "protobar",
+                33,
+                &[deferred_entry("out", "old", later)],
+                &mut counters,
+            )
+            .await,
+            FrameOutcome::Continue
+        ));
+        let ids = parked_ids(&ctx, "brenn:batch-out").await;
+        assert_eq!(ids.len(), 1, "the cap admitted one");
+
+        let outcome = handle_publish_batch(
+            &ctx,
+            "protobar",
+            34,
+            &[deferred_entry("out", "new", later + 1_000)],
+            &[cancel_op("out", ids[0])],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+        assert_eq!(
+            parked_bodies(&ctx, "brenn:batch-out").await,
+            vec!["new".to_string()],
+            "the cancel freed the slot the park then took"
+        );
+    }
+
+    /// **An edit that moves a release earlier wakes the sweep, and restates the
+    /// view it rewrote.** The sweep sleeps to the earliest deadline it last
+    /// computed, so an edit is exactly as capable of stranding a schedule past its
+    /// time as a park is — and both halves it rewrote are what the page must end up
+    /// mirroring, since an edit is the one op that changes an entry rather than
+    /// removing it.
+    #[tokio::test]
+    async fn an_applied_edit_wakes_the_release_sweep_and_restates_the_view() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let later = later_ms();
+        let (_guard, mut pushes) = attach_view_session(&ctx);
+
+        assert!(matches!(
+            flush_batch(
+                &ctx,
+                "protobar",
+                35,
+                &[deferred_entry("out", "distant", later + 3_600_000)],
+                &mut counters,
+            )
+            .await,
+            FrameOutcome::Continue
+        ));
+        let ids = parked_ids(&ctx, "brenn:batch-out").await;
+        let _ = drain_view_entries(&mut pushes);
+        // On a whole second: a durable row keeps its release time to the second, so
+        // this is the value that survives the write and comes back in the view.
+        let edited = later - later % 1_000;
+
+        // The park above kicked too; consume that permit so the one asserted below
+        // is unambiguously the edit's.
+        let notify = ctx.runtime.messenger().dispatch_kick_notify();
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified()).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified())
+                .await
+                .is_err(),
+            "no kick is outstanding before the edit, so the one below is the op's"
+        );
+
+        let outcome = handle_publish_batch(
+            &ctx,
+            "protobar",
+            36,
+            &[],
+            &[BatchDeferredOp {
+                port: "out".to_string(),
+                message_id: ids[0],
+                op: DeferredOpKind::Edit {
+                    body: Some("rewritten".to_string()),
+                    deliver_after: Some(edited),
+                },
+            }],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+        assert_eq!(
+            parked_bodies(&ctx, "brenn:batch-out").await,
+            vec!["rewritten".to_string()],
+            "both halves of the edit landed"
+        );
+        assert_eq!(
+            drain_view_entries(&mut pushes),
+            vec![(
+                "brenn:batch-out".to_string(),
+                "protobar".to_string(),
+                vec![("rewritten".to_string(), edited)],
+            )],
+            "the pushed view is recomputed, so it carries the new body and the new \
+             release time"
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified())
+            .await
+            .expect("the applied edit kicked the release sweep");
+    }
+
+    /// **A message that released between the snapshot and the frame is a benign
+    /// race — and the view is restated anyway.** The component acted on the only
+    /// truth it had, and the page could not have known better; the op is logged and
+    /// counted, the batch continues, and the connection lives. The restatement is
+    /// what closes the loop for a mirror that is wrong for any other reason: an op
+    /// naming a schedule the backend does not hold is the one event a stale mirror
+    /// reliably provokes, so it must not be the one set-touching event that pushes
+    /// nothing.
+    #[tokio::test]
+    async fn a_control_op_naming_nothing_parked_is_a_counted_no_op() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let (_guard, mut pushes) = attach_view_session(&ctx);
+        let messenger = ctx.runtime.messenger();
+        let sender = ParticipantId::for_surface_component(&ctx.runtime.resolved.slug, "protobar");
+
+        let outcome = handle_publish_batch(
+            &ctx,
+            "protobar",
+            37,
+            &[entry("out", "alongside")],
+            &[cancel_op("out", Uuid::new_v4())],
+            &mut counters,
+        )
+        .await;
+        assert!(
+            matches!(outcome, FrameOutcome::Continue),
+            "a race is never a kill"
+        );
+        assert_eq!(
+            messenger.deferred_control_race_count(sender.as_str(), "brenn:batch-out"),
+            1,
+            "the race is counted against the sender and channel"
+        );
+        assert_eq!(
+            counters.publishes, 1,
+            "the batch's publish landed regardless"
+        );
+        assert_eq!(
+            drain_views(&mut pushes),
+            vec![(
+                "brenn:batch-out".to_string(),
+                "protobar".to_string(),
+                Vec::new(),
+            )],
+            "the lost race still restates the set — empty, which is exactly what the \
+             page needed to hear"
+        );
+    }
+
+    /// **Naming another sender's parked message is a protocol violation.** A
+    /// conforming kernel can only name what a sender-scoped view showed it, so this
+    /// is a client reaching for a schedule no window ever offered — fail2ban signal.
+    /// Reported rather than panicked on purpose: the uuid comes off the wire, and a
+    /// panic on client input is a remote kill switch.
+    #[tokio::test]
+    async fn a_control_op_naming_another_senders_message_is_a_violation() {
+        use brenn_lib::messaging::store::NewMessage;
+
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let messenger = ctx.runtime.messenger();
+        let ghost = ParticipantId::for_surface_component(&ctx.runtime.resolved.slug, "ghost");
+        let now = Utc::now();
+
+        let parked = messenger
+            .store_for_address("ephemeral:batch-eph")
+            .park(
+                NewMessage {
+                    source: "test".to_string(),
+                    sender: ghost.as_str().to_string(),
+                    body: "not yours".to_string(),
+                    urgency: Urgency::Normal,
+                    envelope_type: brenn_lib::messaging::ChannelScheme::Ephemeral,
+                    reply_to_uuid: None,
+                    delivery_deadline: None,
+                    publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
+                },
+                now + chrono::Duration::hours(1),
+            )
+            .await
+            .expect("under the cap");
+
+        let outcome = handle_publish_batch(
+            &ctx,
+            "protobar",
+            38,
+            &[],
+            &[cancel_op("eph", parked.message_uuid)],
+            &mut counters,
+        )
+        .await;
+        let FrameOutcome::Violation(detail) = outcome else {
+            panic!("expected a violation for a foreign message id");
+        };
+        assert!(
+            detail.contains("parked by another sender"),
+            "the log line names the reason: {detail}"
+        );
+        assert_eq!(
+            messenger
+                .deferred_view_for_sender("ephemeral:batch-eph", ghost.as_str(), Utc::now())
+                .await
+                .len(),
+            1,
+            "the other sender's schedule is untouched"
+        );
+    }
+
+    /// **A violation mid-batch still restates what the earlier ops changed.** The
+    /// offending connection dies, but the applied ops were legitimate and the
+    /// parked set belongs to the sub-identity every session of the surface shares.
+    /// Left unsaid, a sibling tab would hold a cancelled schedule with nothing left
+    /// to correct it: an emptied set has no release and no later change to push a
+    /// view from.
+    #[tokio::test]
+    async fn a_violating_op_still_restates_the_sets_its_predecessors_changed() {
+        use brenn_lib::messaging::store::NewMessage;
+
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let later = later_ms();
+        let messenger = ctx.runtime.messenger();
+        let now = Utc::now();
+
+        // The sibling tab: it shares the sender, so it mirrors the same set and
+        // survives the violating connection's death.
+        let (_sibling, mut sibling) = attach_view_session(&ctx);
+
+        assert!(matches!(
+            flush_batch(
+                &ctx,
+                "protobar",
+                41,
+                &[deferred_entry("out", "only-one", later)],
+                &mut counters,
+            )
+            .await,
+            FrameOutcome::Continue
+        ));
+        let ids = parked_ids(&ctx, "brenn:batch-out").await;
+        assert_eq!(ids.len(), 1);
+        let _ = drain_views(&mut sibling);
+
+        // Another sender's schedule, for the op that kills the connection.
+        let ghost = ParticipantId::for_surface_component(&ctx.runtime.resolved.slug, "ghost");
+        let foreign = messenger
+            .store_for_address("ephemeral:batch-eph")
+            .park(
+                NewMessage {
+                    source: "test".to_string(),
+                    sender: ghost.as_str().to_string(),
+                    body: "not yours".to_string(),
+                    urgency: Urgency::Normal,
+                    envelope_type: brenn_lib::messaging::ChannelScheme::Ephemeral,
+                    reply_to_uuid: None,
+                    delivery_deadline: None,
+                    publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
+                },
+                now + chrono::Duration::hours(1),
+            )
+            .await
+            .expect("under the cap");
+
+        let outcome = handle_publish_batch(
+            &ctx,
+            "protobar",
+            42,
+            &[],
+            &[
+                cancel_op("out", ids[0]),
+                cancel_op("eph", foreign.message_uuid),
+            ],
+            &mut counters,
+        )
+        .await;
+        assert!(
+            matches!(outcome, FrameOutcome::Violation(_)),
+            "the foreign id still kills the connection"
+        );
+        assert!(
+            parked_bodies(&ctx, "brenn:batch-out").await.is_empty(),
+            "the legitimate cancel stands"
+        );
+        assert_eq!(
+            drain_views(&mut sibling),
+            vec![(
+                "brenn:batch-out".to_string(),
+                "protobar".to_string(),
+                Vec::<String>::new(),
+            )],
+            "the sibling is told the set is now empty, which nothing else would say"
+        );
+    }
+
+    /// **Every per-op shape check the kernel makes at buffer time is a violation
+    /// here.** An unbound port, an oversize edit body, an unrepresentable release
+    /// time, an op list past the per-activation cap, and a frame with neither
+    /// publishes nor ops are all things a kernel refuses before the wire, so each
+    /// one arriving says the client is not the kernel.
+    #[tokio::test]
+    async fn malformed_control_ops_are_violations() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let id = Uuid::new_v4();
+
+        let edit = |body: Option<String>, deliver_after: Option<u64>| BatchDeferredOp {
+            port: "out".to_string(),
+            message_id: id,
+            op: DeferredOpKind::Edit {
+                body,
+                deliver_after,
+            },
+        };
+        let cases: Vec<(&str, Vec<BatchDeferredOp>)> = vec![
+            ("unbound port", vec![cancel_op("nope", id)]),
+            (
+                "oversize edit body",
+                vec![edit(Some("x".repeat(TEST_MAX_BODY_BYTES + 1)), None)],
+            ),
+            (
+                "unrepresentable release time",
+                vec![edit(None, Some(u64::MAX))],
+            ),
+            (
+                "over the op cap",
+                (0..=MAX_PUBLISHES_PER_ACTIVATION)
+                    .map(|_| cancel_op("out", id))
+                    .collect(),
+            ),
+        ];
+        for (name, ops) in cases {
+            let outcome =
+                handle_publish_batch(&ctx, "protobar", 39, &[], &ops, &mut counters).await;
+            assert!(
+                matches!(outcome, FrameOutcome::Violation(_)),
+                "{name} must be violation-grade"
+            );
+        }
+        assert!(
+            matches!(
+                handle_publish_batch(&ctx, "protobar", 40, &[], &[], &mut counters).await,
+                FrameOutcome::Violation(_)
+            ),
+            "a frame carrying neither publishes nor ops is empty"
+        );
+    }
+
+    /// A release time already past is an immediate publish, on both classes — the
+    /// WIT's rule, decided against one clock read for the whole flush.
+    #[tokio::test]
+    async fn a_deliver_after_already_past_publishes_immediately() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+
+        let mut sub = ctx
+            .runtime
+            .messenger()
+            .attach_live(
+                ctx.runtime.participant.clone(),
+                ctx.runtime.policy.clone(),
+                "ephemeral:batch-eph",
+                None,
+            )
+            .expect("ephemeral subscribe")
+            .receiver;
+
+        let outcome = flush_batch(
+            &ctx,
+            "protobar",
+            11,
+            &[
+                deferred_entry("out", "d-past", 1),
+                deferred_entry("eph", "e-past", 1),
+            ],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+
+        let conn = db.lock().await;
+        let rows: Vec<(String, bool, Option<i64>)> = conn
+            .prepare("SELECT body, deliver_after IS NOT NULL, retained_seq FROM messaging_messages")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get(0).unwrap(),
+                    r.get::<_, bool>(1).unwrap(),
+                    r.get(2).unwrap(),
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("d-past".to_string(), false, Some(1))],
+            "a past release time carries no schedule and takes a position"
+        );
+        drop(conn);
+
+        match sub.recv().await.expect("ephemeral delivery") {
+            EphemeralEvent::Delivery(d) => assert_eq!(d.envelope.body, "e-past"),
+            other => panic!("expected a delivery, got {other:?}"),
+        }
+    }
+
+    /// A release time chrono cannot carry is violation-grade like every other
+    /// per-entry check: the kernel refuses one at buffer time, so it reaches the
+    /// server only from a client that is not the kernel.
+    #[tokio::test]
+    async fn an_unrepresentable_deliver_after_is_a_violation() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+
+        let outcome = flush_batch(
+            &ctx,
+            "protobar",
+            13,
+            &[
+                entry("out", "sibling"),
+                deferred_entry("out", "impossible", u64::MAX),
+            ],
+            &mut counters,
+        )
+        .await;
+        match outcome {
+            FrameOutcome::Violation(detail) => assert!(
+                detail.contains("unrepresentable deliver_after"),
+                "the detail names the refused field: {detail}"
+            ),
+            _ => panic!("an unrepresentable release time must kill the connection"),
+        }
+
+        let conn = db.lock().await;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messaging_messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "the batch resolves whole before it applies, so the sibling never committed"
+        );
+    }
+
+    /// A full deferred set is normal operation, not an error: the cap refuses
+    /// one schedule and the batch is still answered `Ok`.
+    #[tokio::test]
+    async fn a_full_ephemeral_deferred_set_drops_one_schedule_and_the_batch_is_still_ok() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, mut rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let later = later_ms();
+
+        // The fixture channel retains 4, which is its deferred cap.
+        let entries: Vec<BatchEntry> = (0..5)
+            .map(|i| deferred_entry("eph", &format!("s{i}"), later))
+            .collect();
+        let outcome = flush_batch(&ctx, "protobar", 15, &entries, &mut counters).await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+        assert!(matches!(
+            rx.try_recv().expect("PublishBatchResult frame"),
+            ServerFrame::PublishBatchResult {
+                outcome: PublishBatchOutcome::Ok,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            counters.publishes, 4,
+            "the refused schedule published nothing"
+        );
+        assert_eq!(
+            ctx.runtime
+                .messenger()
+                .dropped_deferred_count("surface:deskbar#protobar", "ephemeral:batch-eph"),
+            1,
+            "the drop is counted against the component that asked for it"
+        );
+    }
+
+    /// **A park must wake the release sweep.** The sweep sleeps to the earliest
+    /// deadline it last computed, capped at the poll interval, so a schedule that
+    /// lands afterwards is late by up to a whole poll unless the park kicks the
+    /// loop. The durable half kicks from inside `publish_batch_from_surface`,
+    /// which returns before it does anything for a batch with no durable entries
+    /// — so the ephemeral half must kick for itself.
+    #[tokio::test]
+    async fn an_ephemeral_only_deferred_batch_wakes_the_release_sweep() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, _rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let notify = ctx.runtime.messenger().dispatch_kick_notify();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified())
+                .await
+                .is_err(),
+            "no kick is outstanding before the batch, so the one below is the park's"
+        );
+
+        let outcome = flush_batch(
+            &ctx,
+            "protobar",
+            21,
+            &[deferred_entry("eph", "e-later", later_ms())],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+
+        tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified())
+            .await
+            .expect("the ephemeral park kicked the release sweep");
+    }
+
+    /// The session's own use of the refused-schedule count: a durable schedule the
+    /// cap turned away published nothing, so it must not be counted as a publish.
+    /// The counter is what an operator reads for work the surface actually landed,
+    /// and the subtraction that keeps it honest also underflows — panicking the
+    /// session task on a client-reachable frame — if the returned count ever
+    /// stops being a subset of the durable entries.
+    #[tokio::test]
+    async fn a_refused_durable_schedule_is_not_counted_as_a_publish() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, mut rx) = batch_ctx_at_durable_retain(&db, Some(1)).await;
+        let mut counters = SessionCounters::default();
+        let later = later_ms();
+
+        let outcome = flush_batch(
+            &ctx,
+            "protobar",
+            23,
+            &[
+                deferred_entry("out", "d-first", later),
+                deferred_entry("out", "d-refused", later),
+                entry("out", "d-now"),
+            ],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+        assert!(matches!(
+            rx.try_recv().expect("PublishBatchResult frame"),
+            ServerFrame::PublishBatchResult {
+                outcome: PublishBatchOutcome::Ok,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            counters.publishes, 2,
+            "the refused schedule published nothing, so only two entries landed"
+        );
+        assert_eq!(
+            ctx.runtime
+                .messenger()
+                .dropped_deferred_count("surface:deskbar#protobar", "brenn:batch-out"),
+            1,
+            "the drop is counted against the component that asked for it"
+        );
+
+        let conn = db.lock().await;
+        let bodies: Vec<String> = conn
+            .prepare("SELECT body FROM messaging_messages ORDER BY publish_ts_ns")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            bodies,
+            vec!["d-first".to_string(), "d-now".to_string()],
+            "the refused entry left no row and the rest of the batch committed"
+        );
+    }
+
     /// A per-call urgency override wins over the port's configured default; an
     /// entry that states none takes the operator's value. The server reads the
     /// default from its own output map, never from the frame.
@@ -4931,7 +6894,7 @@ mod tests {
             .default_urgency = Urgency::Low;
         let mut counters = SessionCounters::default();
 
-        let outcome = handle_publish_batch(
+        let outcome = flush_batch(
             &ctx,
             "protobar",
             1,
@@ -4941,6 +6904,7 @@ mod tests {
                     port: "out".to_string(),
                     body: "overridden".to_string(),
                     urgency: Some(Urgency::High),
+                    deliver_after: None,
                 },
             ],
             &mut counters,
@@ -4975,8 +6939,7 @@ mod tests {
         let (ctx, _rx) = batch_ctx(&db).await;
         let mut counters = SessionCounters::default();
 
-        let outcome =
-            handle_publish_batch(&ctx, "ghost", 1, &[entry("out", "a")], &mut counters).await;
+        let outcome = flush_batch(&ctx, "ghost", 1, &[entry("out", "a")], &mut counters).await;
         assert!(
             matches!(outcome, FrameOutcome::Violation(_)),
             "an undeclared instance kills the connection"
@@ -4993,7 +6956,7 @@ mod tests {
         let (ctx, _rx) = batch_ctx(&db).await;
         let mut counters = SessionCounters::default();
 
-        let outcome = handle_publish_batch(
+        let outcome = flush_batch(
             &ctx,
             brenn_surface_contract::ERROR_REPORT_INSTANCE,
             1,
@@ -5024,8 +6987,7 @@ mod tests {
         let mut counters = SessionCounters::default();
         assert!(
             matches!(
-                handle_publish_batch(&ctx, "protobar", 1, &[entry("nope", "a")], &mut counters)
-                    .await,
+                flush_batch(&ctx, "protobar", 1, &[entry("nope", "a")], &mut counters).await,
                 FrameOutcome::Violation(_)
             ),
             "an unbound port is a violation"
@@ -5036,7 +6998,7 @@ mod tests {
         let oversized = "x".repeat(TEST_MAX_BODY_BYTES + 1);
         assert!(
             matches!(
-                handle_publish_batch(
+                flush_batch(
                     &ctx,
                     "protobar",
                     1,
@@ -5056,7 +7018,7 @@ mod tests {
             .collect();
         assert!(
             matches!(
-                handle_publish_batch(&ctx, "protobar", 1, &too_many, &mut counters).await,
+                flush_batch(&ctx, "protobar", 1, &too_many, &mut counters).await,
                 FrameOutcome::Violation(_)
             ),
             "a batch over the per-activation cap is a violation"
@@ -5066,7 +7028,7 @@ mod tests {
         let mut counters = SessionCounters::default();
         assert!(
             matches!(
-                handle_publish_batch(&ctx, "protobar", 1, &[], &mut counters).await,
+                flush_batch(&ctx, "protobar", 1, &[], &mut counters).await,
                 FrameOutcome::Violation(_)
             ),
             "an empty batch is a violation"
@@ -5095,7 +7057,7 @@ mod tests {
         let batch: Vec<BatchEntry> = (0..count).map(|_| entry("out", &body)).collect();
         assert!(
             matches!(
-                handle_publish_batch(&ctx, "protobar", 1, &batch, &mut counters).await,
+                flush_batch(&ctx, "protobar", 1, &batch, &mut counters).await,
                 FrameOutcome::Violation(_)
             ),
             "a batch over the per-activation byte cap is a violation"
@@ -5117,7 +7079,7 @@ mod tests {
         let (ctx, _rx) = batch_ctx(&db).await;
         let mut counters = SessionCounters::default();
 
-        let outcome = handle_publish_batch(
+        let outcome = flush_batch(
             &ctx,
             "protobar",
             1,
@@ -5152,7 +7114,7 @@ mod tests {
             .map(|_| entry("out", "x"))
             .collect();
         assert!(matches!(
-            handle_publish_batch(&ctx, "protobar", 1, &wide, &mut counters).await,
+            flush_batch(&ctx, "protobar", 1, &wide, &mut counters).await,
             FrameOutcome::Continue
         ));
         assert!(
@@ -5167,8 +7129,7 @@ mod tests {
         );
 
         // The next batch finds an empty balance and is refused.
-        let outcome =
-            handle_publish_batch(&ctx, "protobar", 2, &[entry("out", "b")], &mut counters).await;
+        let outcome = flush_batch(&ctx, "protobar", 2, &[entry("out", "b")], &mut counters).await;
         assert!(
             matches!(outcome, FrameOutcome::Continue),
             "a refused batch never kills the connection"
@@ -5204,6 +7165,147 @@ mod tests {
         );
     }
 
+    /// **A batch that publishes nothing still draws a token.** The floor is what
+    /// keeps an ops-only flush from being a path a client rides for free: it is a
+    /// frame the principal sent and work the server did.
+    #[tokio::test]
+    async fn an_ops_only_flush_draws_the_one_token_floor() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, mut rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let later = later_ms();
+
+        // Park one entry, then spend the bucket down to a single token.
+        assert!(matches!(
+            flush_batch(
+                &ctx,
+                "protobar",
+                1,
+                &[deferred_entry("out", "parked", later)],
+                &mut counters,
+            )
+            .await,
+            FrameOutcome::Continue
+        ));
+        let ids = parked_ids(&ctx, "brenn:batch-out").await;
+        assert_eq!(ids.len(), 1, "the entry parked");
+        let rest: Vec<BatchEntry> = (0..MAX_PUBLISHES_PER_ACTIVATION - 2)
+            .map(|_| entry("out", "x"))
+            .collect();
+        assert!(matches!(
+            flush_batch(&ctx, "protobar", 2, &rest, &mut counters).await,
+            FrameOutcome::Continue
+        ));
+        while rx.try_recv().is_ok() {}
+
+        // One token left, one ops-only flush: admitted, and it spends that token.
+        let outcome = handle_publish_batch(
+            &ctx,
+            "protobar",
+            3,
+            &[],
+            &[cancel_op("out", ids[0])],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+        match rx.try_recv().expect("the ops-only batch result") {
+            ServerFrame::PublishBatchResult { outcome, .. } => {
+                assert_eq!(
+                    outcome,
+                    PublishBatchOutcome::Ok,
+                    "the last token covered it"
+                );
+            }
+            other => panic!("expected PublishBatchResult, got {other:?}"),
+        }
+
+        // The balance is gone, so a second ops-only flush is refused — one token per
+        // ops-only flush, no more and no less.
+        let outcome = handle_publish_batch(
+            &ctx,
+            "protobar",
+            4,
+            &[],
+            &[cancel_op("out", Uuid::new_v4())],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+        match rx.try_recv().expect("the second ops-only batch result") {
+            ServerFrame::PublishBatchResult { outcome, .. } => {
+                assert_eq!(
+                    outcome,
+                    PublishBatchOutcome::RateLimited,
+                    "the floor really drew from the bucket"
+                );
+            }
+            other => panic!("expected PublishBatchResult, got {other:?}"),
+        }
+    }
+
+    /// **The draw comes before anything is applied.** A refused batch is re-parked
+    /// and retried whole by the kernel, so an op applied ahead of the draw would
+    /// apply twice — and the page would be told nothing landed while its mirror was
+    /// restated behind its back.
+    #[tokio::test]
+    async fn a_rate_limited_ops_only_flush_applies_nothing_and_pushes_no_view() {
+        let db = brenn_lib::db::init_db_memory();
+        let (ctx, mut rx) = batch_ctx(&db).await;
+        let mut counters = SessionCounters::default();
+        let later = later_ms();
+        let (_guard, mut pushes) = attach_view_session(&ctx);
+
+        assert!(matches!(
+            flush_batch(
+                &ctx,
+                "protobar",
+                1,
+                &[deferred_entry("out", "parked", later)],
+                &mut counters,
+            )
+            .await,
+            FrameOutcome::Continue
+        ));
+        let ids = parked_ids(&ctx, "brenn:batch-out").await;
+        // Drain the rest of the bucket, then the views the parks pushed.
+        let rest: Vec<BatchEntry> = (0..MAX_PUBLISHES_PER_ACTIVATION - 1)
+            .map(|_| entry("out", "x"))
+            .collect();
+        assert!(matches!(
+            flush_batch(&ctx, "protobar", 2, &rest, &mut counters).await,
+            FrameOutcome::Continue
+        ));
+        while rx.try_recv().is_ok() {}
+        let _ = drain_views(&mut pushes);
+
+        let outcome = handle_publish_batch(
+            &ctx,
+            "protobar",
+            3,
+            &[],
+            &[cancel_op("out", ids[0])],
+            &mut counters,
+        )
+        .await;
+        assert!(matches!(outcome, FrameOutcome::Continue));
+        match rx.try_recv().expect("the refused batch result") {
+            ServerFrame::PublishBatchResult { outcome, .. } => {
+                assert_eq!(outcome, PublishBatchOutcome::RateLimited)
+            }
+            other => panic!("expected PublishBatchResult, got {other:?}"),
+        }
+        assert_eq!(
+            parked_bodies(&ctx, "brenn:batch-out").await,
+            vec!["parked".to_string()],
+            "the refused flush cancelled nothing"
+        );
+        assert!(
+            drain_views(&mut pushes).is_empty(),
+            "and restated nothing: a set that did not change owes no emission"
+        );
+    }
+
     /// A single `Publish` after a batch has spent the instance's balance is
     /// rejected with today's rate-limit outcome — one bucket, one principal, so a
     /// flush's spending is a real cost against the instance's own ordinary
@@ -5219,7 +7321,7 @@ mod tests {
             .map(|_| entry("out", "x"))
             .collect();
         assert!(matches!(
-            handle_publish_batch(&ctx, "protobar", 1, &wide, &mut counters).await,
+            flush_batch(&ctx, "protobar", 1, &wide, &mut counters).await,
             FrameOutcome::Continue
         ));
         let _ = rx.try_recv();

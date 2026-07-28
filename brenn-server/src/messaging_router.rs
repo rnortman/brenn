@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use brenn_lib::messaging::store::SurfaceFeedTarget;
+use brenn_lib::messaging::store::{DeferredMessage, SurfaceFeedTarget};
 use brenn_lib::messaging::{
     DeliveryShape, MessageEnvelope, ParticipantId, SubscriberEntryKind, WakeRouter,
 };
@@ -18,7 +18,8 @@ use tracing::{debug, warn};
 
 use crate::active_bridge::ActiveBridges;
 use crate::routes::surface::SubKey;
-use crate::routes::surface::registry::DurableDelivery;
+use crate::routes::surface::registry::{DeferredViewPush, DurableDelivery, SessionPush};
+use crate::routes::surface::session::deferred_view_entries;
 use crate::state::AppState;
 use crate::system_message::render_event_drain;
 
@@ -240,7 +241,11 @@ impl WakeRouter for WakeRouterImpl {
                 retained_seq,
                 sub: sub.clone(),
             };
-            if handle.durable_tx.try_send(delivery).is_ok() {
+            if handle
+                .push_tx
+                .try_send(SessionPush::Durable(delivery))
+                .is_ok()
+            {
                 accepted += 1;
             } else {
                 rejected += 1;
@@ -318,7 +323,11 @@ impl WakeRouter for WakeRouterImpl {
                 retained_seq: retention_position(retained_seq),
                 sub: sub.clone(),
             };
-            if handle.durable_tx.try_send(delivery).is_err() {
+            if handle
+                .push_tx
+                .try_send(SessionPush::Durable(delivery))
+                .is_err()
+            {
                 // Full queue: a fold-0 subscription holds no cursor, so nothing
                 // is owed and the loss is real — the wire's silence is the
                 // contract, and recovery is the retained window at the next
@@ -333,6 +342,38 @@ impl WakeRouter for WakeRouterImpl {
                 );
             }
         }
+    }
+
+    async fn push_surface_deferred_view(
+        &self,
+        slug: &str,
+        instance: &str,
+        channel: &str,
+        view: &[DeferredMessage],
+    ) {
+        // The release sweep's only route to a page. It runs on the dispatcher
+        // loop, which starts after `set_state`, so an unset state here is the
+        // same wiring violation `deliver` reports.
+        let state = self
+            .state
+            .get()
+            .expect("WakeRouter state must be set before any deferred-view push");
+        state.surface_registry.push_deferred_view(
+            slug,
+            &DeferredViewPush {
+                channel: channel.to_string(),
+                instance: instance.to_string(),
+                entries: deferred_view_entries(view),
+            },
+        );
+    }
+
+    fn any_surface_session_attached(&self, slug: &str) -> bool {
+        let Some(state) = self.state.get() else {
+            // No state wired yet — no session can be attached.
+            return false;
+        };
+        state.surface_registry.count(slug) > 0
     }
 
     fn any_surface_session_subscribed(&self, channel: &str, targets: &[SurfaceFeedTarget]) -> bool {
@@ -619,6 +660,78 @@ mod tests {
     fn new_leaves_state_unset() {
         let router = WakeRouterImpl::new(ActiveBridges::new());
         assert!(router.state.get().is_none());
+    }
+
+    /// **A pushed deferred view reaches every session of its surface, and only
+    /// that surface.** The parked set belongs to the sub-identity every tab
+    /// shares, so the sweep's push is a broadcast; a neighbouring surface's
+    /// sessions are no part of it.
+    #[tokio::test]
+    async fn a_pushed_deferred_view_reaches_every_session_of_its_surface() {
+        use brenn_lib::messaging::{ChannelScheme, Urgency};
+        use chrono::{TimeZone, Utc};
+
+        use crate::routes::surface::registry::{
+            PUSH_QUEUE_FRAMES, SessionCaps, SurfaceSessionHandle,
+        };
+
+        let db = brenn_lib::db::init_db_memory();
+        let state = crate::test_support::state::test_state(&db);
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        router.set_state(state.clone());
+
+        let attach = |slug: &str| {
+            let (push_tx, push_rx) = tokio::sync::mpsc::channel(PUSH_QUEUE_FRAMES);
+            let mut handle = SurfaceSessionHandle::for_test("dev");
+            handle.push_tx = push_tx;
+            let guard = state
+                .surface_registry
+                .try_register(slug, handle, SessionCaps::UNCAPPED)
+                .expect("the test registry is uncapped");
+            (guard, push_rx)
+        };
+        let (_deskbar_one, mut deskbar_one) = attach("deskbar");
+        let (_deskbar_two, mut deskbar_two) = attach("deskbar");
+        let (_kitchen, mut kitchen) = attach("kitchen");
+
+        let release_at = Utc.timestamp_opt(1_800_000_060, 0).unwrap();
+        let view = vec![DeferredMessage {
+            release_at,
+            envelope: Arc::new(MessageEnvelope {
+                message_id: uuid::Uuid::nil(),
+                source: "node".to_string(),
+                channel: "brenn:sched".to_string(),
+                sender: "surface:deskbar#protobar".to_string(),
+                publish_ts: release_at,
+                body: "wake me".to_string(),
+                reply_to: None,
+                delivery_deadline: None,
+                deliver_after: Some(release_at),
+                urgency: Urgency::Normal,
+                envelope_type: ChannelScheme::Brenn,
+            }),
+        }];
+        router
+            .push_surface_deferred_view("deskbar", "protobar", "brenn:sched", &view)
+            .await;
+
+        for queue in [&mut deskbar_one, &mut deskbar_two] {
+            let SessionPush::DeferredView(pushed) = queue.try_recv().expect("view pushed") else {
+                panic!("expected a deferred view");
+            };
+            assert_eq!(pushed.channel, "brenn:sched");
+            assert_eq!(pushed.instance, "protobar");
+            assert_eq!(pushed.entries.len(), 1);
+            assert_eq!(pushed.entries[0].body, "wake me");
+            assert_eq!(
+                pushed.entries[0].deliver_after, 1_800_000_060_000,
+                "the release time travels as epoch milliseconds, the page's units"
+            );
+        }
+        assert!(
+            kitchen.try_recv().is_err(),
+            "another surface's sessions hold no part of this sender's set"
+        );
     }
 
     /// After F2, `spawn_eager_wake` panics rather than warn-and-no-op
@@ -1012,6 +1125,20 @@ mod tests {
         }
     }
 
+    /// The durable row inside a session push, panicking on any other variant —
+    /// these tests drive the delivery fan-out, so anything else is a wiring bug.
+    fn durable_push(push: SessionPush) -> DurableDelivery {
+        match push {
+            SessionPush::Durable(delivery) => delivery,
+            SessionPush::DeferredView(view) => {
+                panic!(
+                    "expected a durable row, got a deferred view for {}",
+                    view.channel
+                )
+            }
+        }
+    }
+
     /// Register a session handle for `slug` subscribed to `channel`, returning the
     /// guard (keep alive), the live-delivery receiver, and the drain notifier.
     fn register_surface_session(
@@ -1020,36 +1147,30 @@ mod tests {
         channel: &str,
     ) -> (
         crate::routes::surface::registry::SurfaceSessionGuard,
-        tokio::sync::mpsc::Receiver<DurableDelivery>,
+        tokio::sync::mpsc::Receiver<SessionPush>,
         Arc<tokio::sync::Notify>,
     ) {
-        use std::collections::HashSet;
-        use std::net::{IpAddr, Ipv4Addr};
-        use std::sync::Mutex;
-
         use crate::routes::surface::registry::{
-            DURABLE_QUEUE_FRAMES, SessionCaps, SurfaceSessionHandle,
+            PUSH_QUEUE_FRAMES, SessionCaps, SurfaceSessionHandle,
         };
 
-        let (durable_tx, durable_rx) = tokio::sync::mpsc::channel(DURABLE_QUEUE_FRAMES);
-        let drain_notify = Arc::new(tokio::sync::Notify::new());
-        let handle = SurfaceSessionHandle {
-            session_id: uuid::Uuid::new_v4(),
-            username: "dev".to_string(),
-            client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            connected_at: chrono::Utc::now(),
-            durable_tx,
-            durable_subs: Arc::new(Mutex::new(HashSet::from([SubKey {
+        let (push_tx, push_rx) = tokio::sync::mpsc::channel(PUSH_QUEUE_FRAMES);
+        let mut handle = SurfaceSessionHandle::for_test("dev");
+        handle.push_tx = push_tx;
+        handle
+            .durable_subs
+            .lock()
+            .expect("durable_subs poisoned")
+            .insert(SubKey {
                 instance: "protobar".to_string(),
                 channel: channel.to_string(),
-            }]))),
-            drain_notify: drain_notify.clone(),
-        };
+            });
+        let drain_notify = Arc::clone(&handle.drain_notify);
         let guard = state
             .surface_registry
             .try_register(slug, handle, SessionCaps::UNCAPPED)
             .expect("register");
-        (guard, durable_rx, drain_notify)
+        (guard, push_rx, drain_notify)
     }
 
     /// `deliver` for a `surface:` subscriber with an attached, subscribed session
@@ -1076,7 +1197,7 @@ mod tests {
         assert!(matches!(result, Ok(true)));
 
         // The row landed on the session's live queue with the wire seq.
-        let delivered = rx.try_recv().expect("live delivery enqueued");
+        let delivered = durable_push(rx.try_recv().expect("live delivery enqueued"));
         assert_eq!(delivered.envelope.channel, channel);
         assert_eq!(delivered.retained_seq, seq as u64);
         // Per-delivery drain nudge fired.
@@ -1160,7 +1281,7 @@ mod tests {
             .deliver_context(&surface_key(), &Arc::new(surface_envelope(channel)), 7)
             .await;
 
-        let delivered = rx.try_recv().expect("row-less delivery enqueued");
+        let delivered = durable_push(rx.try_recv().expect("row-less delivery enqueued"));
         assert_eq!(delivered.envelope.channel, channel);
         assert_eq!(delivered.retained_seq, 7);
     }
@@ -1208,6 +1329,30 @@ mod tests {
         assert!(
             !router.any_surface_session_subscribed("brenn:other-channel", &[surface_feed_target()]),
             "subscribed to a different channel — not a target here"
+        );
+    }
+
+    /// `any_surface_session_attached` — the release sweep's recompute-skip
+    /// precheck — answers per slug and ignores what the session is subscribed to:
+    /// the parked set belongs to the surface, and every session of it is told.
+    #[tokio::test]
+    async fn any_surface_session_attached_answers_per_slug() {
+        let db = brenn_lib::db::init_db_memory();
+        let state = AppState::for_test(db.clone(), None);
+
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        router.set_state(state.clone());
+        assert!(
+            !router.any_surface_session_attached("deskbar"),
+            "no session open — the sweep skips the view recompute"
+        );
+
+        // Subscribed to one channel; the answer is about the surface, not it.
+        let (_guard, _rx, _notify) = register_surface_session(&state, "deskbar", "brenn:unrelated");
+        assert!(router.any_surface_session_attached("deskbar"));
+        assert!(
+            !router.any_surface_session_attached("kitchen"),
+            "another surface's sessions are no part of this one's answer"
         );
     }
 

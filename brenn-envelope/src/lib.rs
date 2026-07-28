@@ -476,6 +476,25 @@ impl Urgency {
 }
 
 // ---------------------------------------------------------------------------
+// Epoch-millisecond times
+// ---------------------------------------------------------------------------
+
+/// A caller-supplied epoch-millisecond UTC time as the instant the envelope
+/// family carries, or `None` for a value no `DateTime<Utc>` can represent.
+///
+/// The single definition of that boundary, shared by every gate that admits a
+/// guest- or client-supplied time. The representable range is far narrower than
+/// `u64`, and a value outside it collapses downstream into an immediate publish —
+/// silently turning a schedule into a now — so the refusals on both sides of the
+/// wire must agree on exactly one bound. Chrono is that bound's authority; this
+/// function is where the whole system asks it.
+pub fn utc_from_epoch_ms(ms: u64) -> Option<DateTime<Utc>> {
+    i64::try_from(ms)
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+}
+
+// ---------------------------------------------------------------------------
 // MessageEnvelope
 // ---------------------------------------------------------------------------
 
@@ -531,6 +550,24 @@ mod tests {
             urgency,
             envelope_type,
         }
+    }
+
+    // ── Epoch-millisecond times ───────────────────────────────────────────
+
+    #[test]
+    fn epoch_ms_conversion_refuses_what_chrono_cannot_carry() {
+        assert_eq!(
+            utc_from_epoch_ms(1_700_000_000_123),
+            DateTime::<Utc>::from_timestamp_millis(1_700_000_000_123)
+        );
+        assert_eq!(
+            utc_from_epoch_ms(0),
+            DateTime::<Utc>::from_timestamp_millis(0)
+        );
+        assert_eq!(utc_from_epoch_ms(u64::MAX), None);
+        // Inside i64 but outside chrono's own range: the reason the check cannot
+        // stop at the integer cast.
+        assert_eq!(utc_from_epoch_ms(i64::MAX as u64), None);
     }
 
     // ── Address scheme ────────────────────────────────────────────────────

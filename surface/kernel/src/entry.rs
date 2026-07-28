@@ -13,14 +13,15 @@ use futures_util::StreamExt;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::contract::element_name_for_instance;
+use crate::contract::{defer_status_str, element_name_for_instance, publish_status_str};
 use crate::proto::LogLevel;
 use crate::{ClientConfig, ClientHandle, Event, EventStream, WebSysConnector, new};
 
 use crate::dom;
 use crate::logic::{
-    ConnectIndicatorState, KernelAction, KernelCore, malformed_registration, route_component_alert,
-    route_component_log, route_processor_alert, route_processor_log, route_publish_intent,
+    ConnectIndicatorState, DeferIntent, KernelAction, KernelCore, malformed_registration,
+    route_component_alert, route_component_log, route_defer_intent, route_processor_alert,
+    route_processor_log, route_publish_intent, unbuffered_defer_refused,
 };
 
 /// Bring the kernel online and hand the bootstrap a handle to it.
@@ -111,6 +112,62 @@ pub fn start() -> KernelHandle {
                 return;
             }
             dom::apply_actions(std::slice::from_ref(&action), &handle);
+        });
+    }
+
+    // Route component deferred-message ops. A misrouted or malformed one becomes a
+    // `Report`, never a schedule. There is deliberately no immediate path: a
+    // schedule staged outside the flush boundary would survive the very activation
+    // that failed to stage it.
+    {
+        let handle = Rc::clone(&handle);
+        dom::install_defer_listener(move |instance, target_tag, detail, js_detail| {
+            let intent = match route_defer_intent(instance, target_tag, detail) {
+                Ok(intent) => intent,
+                Err(drop) => {
+                    dom::apply_actions(std::slice::from_ref(&drop), &handle);
+                    return;
+                }
+            };
+            let answer = match &intent {
+                DeferIntent::Publish {
+                    instance,
+                    port,
+                    body,
+                    deliver_after,
+                } => handle
+                    .try_buffered_publish_deferred(instance, port, body, *deliver_after)
+                    .map(|status| {
+                        // A refused publish is not a publish this component made.
+                        if status.is_ok() {
+                            dom::count_publish(instance);
+                        }
+                        publish_status_str(status)
+                    }),
+                DeferIntent::Cancel {
+                    instance,
+                    port,
+                    index,
+                } => handle
+                    .try_buffered_defer_cancel(instance, port, *index)
+                    .map(defer_status_str),
+                DeferIntent::Edit {
+                    instance,
+                    port,
+                    index,
+                    body,
+                    deliver_after,
+                } => handle
+                    .try_buffered_defer_edit(instance, port, *index, body.clone(), *deliver_after)
+                    .map(defer_status_str),
+            };
+            match answer {
+                Some(status) => dom::set_defer_status(js_detail, status),
+                None => dom::apply_actions(
+                    std::slice::from_ref(&unbuffered_defer_refused(&intent)),
+                    &handle,
+                ),
+            }
         });
     }
 
@@ -294,6 +351,83 @@ pub fn brenn_processor_publish(
             // "not-permitted") depends on the live wasm host slot and can only
             // be pinned by the browser test runner, unlike the variant map,
             // which is natively tested in `logic`.
+            None => "not-permitted".to_string(),
+        }
+    })
+}
+
+/// A processor instance's `ports.publish-deferred` import. `deliver_after` is
+/// epoch milliseconds UTC, the instant the message becomes observable; a value at
+/// or before the flush's own clock reading publishes immediately, exactly like
+/// `publish`.
+///
+/// Buffered on the same terms as [`brenn_processor_publish`], for the same reason:
+/// a schedule an activation staged and then failed on must not exist. The answer
+/// is the WIT `publish-error` string, or the empty string for ok — deferral adds no
+/// error vocabulary to the publish family.
+#[wasm_bindgen]
+pub fn brenn_processor_publish_deferred(
+    instance: &str,
+    port: &str,
+    body: &str,
+    deliver_after: u64,
+) -> String {
+    with_processor_host("processor deferred publish", |host| {
+        match host
+            .handle
+            .try_buffered_publish_deferred(instance, port, body, deliver_after)
+        {
+            Some(Ok(())) => {
+                dom::count_publish(instance);
+                String::new()
+            }
+            Some(Err(err)) => crate::logic::publish_error_str(err),
+            None => "not-permitted".to_string(),
+        }
+    })
+}
+
+/// A processor instance's `ports.defer-cancel` import: unpark one message this
+/// instance already scheduled on `port`'s channel, named by its `index` into the
+/// deferred window this activation was handed.
+///
+/// Buffered like a publish, so an err or trap cancels nothing. The answer is the
+/// WIT `defer-error` string, or the empty string for ok. Note what ok does *not*
+/// promise: the named message may release between this call and the flush, which
+/// the WIT rules a benign race the host logs and counts — the component has
+/// already returned by then, so it is not a refusal.
+#[wasm_bindgen]
+pub fn brenn_processor_defer_cancel(instance: &str, port: &str, index: u32) -> String {
+    with_processor_host("processor defer cancel", |host| {
+        match host.handle.try_buffered_defer_cancel(instance, port, index) {
+            Some(Ok(())) => String::new(),
+            Some(Err(err)) => crate::logic::defer_error_str(err),
+            None => "not-permitted".to_string(),
+        }
+    })
+}
+
+/// A processor instance's `ports.defer-edit` import: rewrite one message this
+/// instance already scheduled on `port`'s channel — its body, its release time, or
+/// both. An absent argument leaves that half alone.
+///
+/// Same buffered semantics, index resolution, and race treatment as
+/// [`brenn_processor_defer_cancel`].
+#[wasm_bindgen]
+pub fn brenn_processor_defer_edit(
+    instance: &str,
+    port: &str,
+    index: u32,
+    body: Option<String>,
+    deliver_after: Option<u64>,
+) -> String {
+    with_processor_host("processor defer edit", |host| {
+        match host
+            .handle
+            .try_buffered_defer_edit(instance, port, index, body, deliver_after)
+        {
+            Some(Ok(())) => String::new(),
+            Some(Err(err)) => crate::logic::defer_error_str(err),
             None => "not-permitted".to_string(),
         }
     })

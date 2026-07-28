@@ -2051,8 +2051,9 @@ fn local_retain_depth_on_a_reserved_channel_panics() {
 }
 
 /// The contract-fixed depths, pinned end-to-end through resolution: the four
-/// control planes replay their last value (what makes a late-attaching chrome
-/// gap-free); toast replays nothing (a stale toast is a resurfaced past event).
+/// control planes floor their store at their last value (what makes a
+/// late-attaching chrome gap-free); toast floors at zero, promising no retention
+/// of its own beyond what its bindings' windows require.
 #[test]
 fn reserved_local_channels_carry_their_contract_fixed_ring_depths() {
     use brenn_lib::messaging::config::SurfaceGrant;

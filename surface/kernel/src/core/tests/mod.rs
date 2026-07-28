@@ -12,23 +12,78 @@ use brenn_surface_proto::{
     Binding, GapReason, OutputBinding, PublishOutcome, ServerFrame, SubscribeOutcome,
     SurfaceBindings, Urgency,
 };
+use brenn_surface_test_fixtures::wire_cursor;
 pub(super) use brenn_surface_test_fixtures::{deliver_frame_multi, deliver_target as target};
-use brenn_surface_test_fixtures::{sample_envelope, wire_cursor};
+
+/// The canonical wire envelope with an identity derived from its body.
+///
+/// The shared fixture pins one constant `message_id` on every envelope it builds,
+/// which the page's store reads as one message presented over and over: insertion
+/// is idempotent by identity, so two "different" deliveries under a constant id
+/// would collapse into one retained entry. These suites need both halves of that
+/// — distinct messages to fill a window, and genuine re-presentation to exercise
+/// the dedup — so identity follows the body: same body, same message; different
+/// body, different message. A test that wants an explicit identity states one.
+pub(super) fn sample_envelope(body: &str) -> MessageEnvelope {
+    let mut envelope = brenn_surface_test_fixtures::sample_envelope(body);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(body, &mut hasher);
+    envelope.message_id = Uuid::from_u128(u128::from(std::hash::Hasher::finish(&hasher)));
+    envelope
+}
 
 mod activation;
+mod defer;
 mod deliver;
 mod lifecycle;
 mod local;
 mod publish;
 mod subs;
 
+/// The bodies a confined channel's store retains, oldest first.
+pub(super) fn confined_bodies(core: &ClientCore, channel: &str) -> Vec<String> {
+    core.stores
+        .get(&StoreKey::Confined(channel.to_string()))
+        .expect("the channel's store")
+        .retained()
+        .map(|(e, _)| e.body.clone())
+        .collect()
+}
+
+/// One subscription mirror's depth — the fold over its bindings that decides
+/// how much history it holds, and so how much a fresh position on it is owed.
+pub(super) fn wire_depth(core: &ClientCore, instance: &str, channel: &str) -> u64 {
+    core.stores
+        .get(&StoreKey::Wire(SubKey::for_instance(instance, channel)))
+        .expect("the subscription's store")
+        .depth()
+}
+
+/// The bodies one subscription's store retains, oldest first.
+pub(super) fn wire_bodies(core: &ClientCore, instance: &str, channel: &str) -> Vec<String> {
+    core.stores
+        .get(&StoreKey::Wire(SubKey::for_instance(instance, channel)))
+        .expect("the subscription's store")
+        .retained()
+        .map(|(e, _)| e.body.clone())
+        .collect()
+}
+
+/// The wall clock every assembly and flush in this suite reads, epoch
+/// milliseconds UTC (2023-11-14T22:13:20Z).
+///
+/// Fixed, like [`test_stamp`]: the core takes wall-clock time as data, so a test
+/// can state exactly what a component was told the time was and what its release
+/// times are measured against.
+pub(super) const TEST_WALL_MS: u64 = 1_700_000_000_000;
+
 /// Take the one ready activation, asserting there is exactly one.
 pub(super) fn take_one(core: &mut ClientCore) -> ReadyActivation {
     let ready = core
-        .take_ready_activation()
+        .take_ready_activation(TEST_WALL_MS)
         .expect("an activation is ready");
     assert!(
-        core.take_ready_activation().is_none(),
+        core.take_ready_activation(TEST_WALL_MS).is_none(),
         "exactly one activation is ready"
     );
     ready
@@ -43,10 +98,29 @@ pub(super) fn complete(
     outcome: ActivationOutcome,
     buffer: PublishBuffer,
 ) -> Vec<Effect> {
+    complete_at(core, instance, outcome, buffer, TEST_WALL_MS)
+}
+
+/// [`complete`] with an explicit flush instant, epoch milliseconds UTC — the
+/// clock a deferred entry's release time is compared against to decide whether it
+/// parks or publishes now.
+///
+/// One instant across every stamp, exactly as the driver's flush reads it once.
+pub(super) fn complete_at(
+    core: &mut ClientCore,
+    instance: &str,
+    outcome: ActivationOutcome,
+    buffer: PublishBuffer,
+    flush_ms: u64,
+) -> Vec<Effect> {
+    let publish_ts = DateTime::from_timestamp_millis(
+        i64::try_from(flush_ms).expect("test flush instant is representable"),
+    )
+    .expect("test flush instant is representable");
     let stamps = (0..buffer.len())
         .map(|i| MessageStamp {
             message_id: Uuid::from_u128(0xf000 + i as u128),
-            publish_ts: chrono::DateTime::UNIX_EPOCH,
+            publish_ts,
         })
         .collect();
     core.on_input(
@@ -58,6 +132,34 @@ pub(super) fn complete(
         },
         Millis(50),
     )
+}
+
+/// The `Alert` frames in an effect list, as (severity, title, body).
+pub(super) fn alerts(effects: &[Effect]) -> Vec<(AlertSeverity, String, String)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::SendFrame(ClientFrame::Alert {
+                severity,
+                title,
+                body,
+            }) => Some((*severity, title.clone(), body.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The decoded `local:brenn/toast` bodies in an effect list.
+pub(super) fn toasts(effects: &[Effect]) -> Vec<ToastBody> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::PublishControl { channel, body } if channel == LOCAL_TOAST_CHANNEL => {
+                Some(serde_json::from_str(body).expect("a kernel toast body decodes"))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// The bodies of a window's context half and new half.
@@ -174,9 +276,9 @@ pub(super) fn subscribe_result_gap_for(
     .unwrap()
 }
 
-/// The queue depth every test binding carries. Deliberately not 1 (the handle's
+/// The push depth every test binding carries. Deliberately not 1 (the handle's
 /// provisional capacity) so a test asserting a stamped policy would fail if the
-/// binding's depth never reached the queue.
+/// binding's depth never reached its position.
 pub(super) const TEST_PUSH_DEPTH: u64 = 8;
 
 /// Sink-budget fill and carryover ceiling every output helper carries: the

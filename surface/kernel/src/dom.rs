@@ -6,9 +6,9 @@
 
 use crate::contract::ActivationError;
 use crate::contract::{
-    ACTIVATION_REGISTER, COMPONENT_ALERT, COMPONENT_LOG, COMPONENT_PANIC, PORT_PUBLISH,
-    PROCESSOR_START, PUBLISH_STATUS_FIELD, PublishError, SURFACE_READY, SURFACE_RELOAD,
-    SURFACE_ROOT_ID, element_name_for_instance, publish_status_str,
+    ACTIVATION_REGISTER, COMPONENT_ALERT, COMPONENT_LOG, COMPONENT_PANIC, DEFER_STATUS_FIELD,
+    PORT_DEFER, PORT_PUBLISH, PROCESSOR_START, PUBLISH_STATUS_FIELD, PublishError, SURFACE_READY,
+    SURFACE_RELOAD, SURFACE_ROOT_ID, element_name_for_instance, publish_status_str,
 };
 use crate::proto::LogLevel;
 use crate::{ActivationEntry, ActivationOutcome, ClientHandle};
@@ -23,7 +23,7 @@ use web_sys::{CustomEvent, CustomEventInit, Document, Element, Event, HtmlElemen
 
 use crate::proto::{InstanceCounters, StatusCounters};
 
-use crate::logic::{ConnectIndicatorState, KernelAction, OptionalField};
+use crate::logic::{ConnectIndicatorState, DeferDetail, KernelAction, OptionalField};
 
 /// The `source` reported alongside kernel-originated log messages.
 const KERNEL_LOG_SOURCE: &str = "kernel";
@@ -765,6 +765,62 @@ pub fn set_publish_status(detail: &JsValue, status: Result<(), PublishError>) {
     );
 }
 
+/// Install the delegated `brenn-port-defer` listener: forwards the resolved
+/// instance, the retargeted tag, the untrusted [`DeferDetail`], and the event's
+/// `detail` object to `callback`, wired to
+/// [`crate::logic::route_defer_intent`].
+///
+/// Built on [`install_root_event_listener`]: three of the five detail fields are
+/// optional, so they need the
+/// three-state read ([`custom_event_optional_string`]) that distinguishes an
+/// omitted field from a non-string one. The `detail` object rides along because
+/// every op on this event is answered synchronously on it (see
+/// [`set_defer_status`]).
+pub fn install_defer_listener(
+    callback: impl Fn(Option<&str>, &str, DeferDetail, &JsValue) + 'static,
+) {
+    install_root_event_listener(PORT_DEFER, move |instance, tag, event| {
+        let index = custom_event_optional_string(&event, "index");
+        let body = custom_event_optional_string(&event, "body");
+        let deliver_after = custom_event_optional_string(&event, "deliver_after");
+        let detail = event
+            .dyn_ref::<CustomEvent>()
+            .map(|ce| ce.detail())
+            .unwrap_or(JsValue::UNDEFINED);
+        let [op, port] = custom_event_string_fields(event, ["op", "port"]);
+        callback(
+            instance,
+            tag,
+            DeferDetail {
+                op,
+                port,
+                index,
+                body,
+                deliver_after,
+            },
+            &detail,
+        );
+    });
+}
+
+/// Write a buffered deferred-message op's answer onto the dispatching event's
+/// `detail`, where the component's SDK reads it as its call returns.
+///
+/// `status` is already the contract's wire string, because the vocabulary is the
+/// op's: a deferred publish answers in `publish-error` spellings and a
+/// cancel/edit in `defer-error` ones (see
+/// [`crate::contract::DEFER_STATUS_FIELD`]).
+///
+/// A detail that refuses the write is a non-conformant dispatcher, so the answer
+/// is dropped rather than panicking the kernel on a component's malformed event.
+pub fn set_defer_status(detail: &JsValue, status: &str) {
+    let _ = Reflect::set(
+        detail,
+        &JsValue::from_str(DEFER_STATUS_FIELD),
+        &JsValue::from_str(status),
+    );
+}
+
 /// Count one publish for `instance` — the lifetime totals a status report carries.
 /// Shared by the immediate path in [`apply_action`] and the buffered path in the
 /// publish listener, so what an operator reads does not depend on which route the
@@ -1120,6 +1176,9 @@ mod tests {
             )>,
         >,
     >;
+    /// Sink for `install_defer_listener`: instance + tag + the untrusted
+    /// [`DeferDetail`].
+    type DeferSink = Rc<RefCell<Vec<(Option<String>, String, DeferDetail)>>>;
     /// Sink for `install_alert_listener`: instance + tag + three string fields.
     type AlertSink = Rc<
         RefCell<
@@ -1681,6 +1740,127 @@ mod tests {
             OptionalField::Malformed,
             "a non-string urgency is Malformed, never coerced to Absent"
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn install_defer_listener_reads_every_field_of_an_op_across_the_dom_seam() {
+        // The reader's whole job on this event: five untrusted fields, three of them
+        // three-state. `route_defer_intent`'s tests take an already-built
+        // `DeferDetail`, so nothing else pins that an omitted `body` reaches the
+        // router as `Absent` (leave it alone) while a number-typed `index` reaches it
+        // as `Malformed` rather than being coerced into an absence — which for a
+        // cancel would silently become malformed-detail wording about the wrong
+        // field, and for an edit a rewrite of a message the component never named.
+        fresh_root();
+        let element = mount_probe("wbt-defer-i", "wbt-defer");
+        let sink: DeferSink = Rc::new(RefCell::new(Vec::new()));
+        {
+            let sink = Rc::clone(&sink);
+            install_defer_listener(move |instance, tag, detail, _js_detail| {
+                sink.borrow_mut()
+                    .push((instance.map(String::from), tag.to_string(), detail));
+            });
+        }
+        dispatch_bubbling(
+            &element,
+            PORT_DEFER,
+            &detail_object(&[
+                ("op", JsValue::from_str("publish")),
+                ("port", JsValue::from_str("out")),
+                ("body", JsValue::from_str("hello")),
+                ("deliver_after", JsValue::from_str("1770000000000")),
+            ]),
+        );
+        dispatch_bubbling(
+            &element,
+            PORT_DEFER,
+            &detail_object(&[
+                ("op", JsValue::from_str("edit")),
+                ("port", JsValue::from_str("out")),
+                ("index", JsValue::from_f64(2.0)),
+            ]),
+        );
+        let got = sink.borrow();
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got[0].0.as_deref(),
+            Some("wbt-defer-i"),
+            "resolved instance"
+        );
+        assert_eq!(
+            got[0].1,
+            probe_tag("wbt-defer-i", "wbt-defer"),
+            "retargeted tag"
+        );
+        assert_eq!(
+            got[0].2,
+            DeferDetail {
+                op: Some("publish".to_string()),
+                port: Some("out".to_string()),
+                index: OptionalField::Absent,
+                body: OptionalField::Present("hello".to_string()),
+                deliver_after: OptionalField::Present("1770000000000".to_string()),
+            }
+        );
+        assert_eq!(
+            got[1].2,
+            DeferDetail {
+                op: Some("edit".to_string()),
+                port: Some("out".to_string()),
+                index: OptionalField::Malformed,
+                body: OptionalField::Absent,
+                deliver_after: OptionalField::Absent,
+            },
+            "a non-string index is Malformed and an omitted body is Absent"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn set_defer_status_answers_on_the_dispatching_detail() {
+        // The synchronous answer's only channel back across the module boundary is
+        // the detail the component dispatched, so the write must land on that same
+        // object — and a detail that refuses the write (a primitive from a
+        // non-conformant dispatcher) must be dropped rather than panicking the
+        // kernel.
+        fresh_root();
+        let element = mount_probe("wbt-defst-i", "wbt-defst");
+        let answered: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        {
+            let answered = Rc::clone(&answered);
+            install_defer_listener(move |_instance, _tag, _detail, js_detail| {
+                set_defer_status(js_detail, "out-of-range");
+                *answered.borrow_mut() = Reflect::get(
+                    js_detail,
+                    &JsValue::from_str(crate::contract::DEFER_STATUS_FIELD),
+                )
+                .ok()
+                .and_then(|v| v.as_string());
+            });
+        }
+        let detail = detail_object(&[
+            ("op", JsValue::from_str("cancel")),
+            ("port", JsValue::from_str("out")),
+            ("index", JsValue::from_str("0")),
+        ]);
+        dispatch_bubbling(&element, PORT_DEFER, &detail);
+        assert_eq!(
+            answered.borrow().as_deref(),
+            Some("out-of-range"),
+            "the status is readable off the dispatching detail"
+        );
+        assert_eq!(
+            Reflect::get(
+                &detail,
+                &JsValue::from_str(crate::contract::DEFER_STATUS_FIELD)
+            )
+            .ok()
+            .and_then(|v| v.as_string())
+            .as_deref(),
+            Some("out-of-range"),
+            "and the dispatcher's own reference sees it"
+        );
+        // A frozen/primitive detail: the write fails and is swallowed.
+        set_defer_status(&JsValue::from_str("not an object"), "ok");
     }
 
     #[wasm_bindgen_test]

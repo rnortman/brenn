@@ -1,16 +1,16 @@
 use super::super::*;
 use super::*;
 use brenn_surface_proto::SubscribeOutcome;
-use brenn_surface_test_fixtures::{sample_envelope, wire_cursor};
+use brenn_surface_test_fixtures::wire_cursor;
 
 // ── Deliver fan-out ───────────────────────────────────────────────────
 
-/// A `Deliver` emits **no** per-message effect: it re-arms liveness, fills the
-/// subscription's ring and its bindings' pending queues, and marks the instance
-/// pending. The batching is the delivery model — the message reaches the
-/// component when the driver next drains ready activations.
+/// A `Deliver` emits **no** per-message effect: it re-arms liveness, takes the
+/// envelope into the subscription's store, and marks the instance pending. The
+/// batching is the delivery model — the message reaches the component when the
+/// driver next drains ready activations.
 #[test]
-fn deliver_on_active_channel_queues_the_message_and_resets_liveness() {
+fn deliver_on_active_channel_retains_the_message_and_resets_liveness() {
     let mut core = active_subscribed_core(); // protobar registered on ephemeral:demo, Active
     let envelope = sample_envelope("hello");
     let effects = core.on_input(
@@ -52,7 +52,7 @@ fn deliver_straggler_with_dropped_emits_diagnostic_but_no_marker() {
     deregister(&mut core, "protobar", Millis(7));
     // A straggler carrying dropped>0 is discarded entirely: liveness re-arm plus
     // the diagnostic event (which carries the discarded dropped-count), and
-    // nothing queued.
+    // nothing retained.
     let effects = core.on_input(
         Input::TextFrame(deliver_frame_dropped(
             "ephemeral:demo",
@@ -106,7 +106,7 @@ fn deliver_reaches_every_bound_port_of_the_instance() {
 // ── Multi-target demux (wire fan-out consolidation) ───────────────────
 
 /// The kernel is the fan-out site: one envelope carried once on the wire lands
-/// in every named subscription's queues, each at its own per-subscription state.
+/// in every named subscription's store, each at its own per-subscription state.
 #[test]
 fn multi_target_deliver_feeds_every_named_subscription() {
     let mut core = active_sibling_core();
@@ -122,7 +122,7 @@ fn multi_target_deliver_feeds_every_named_subscription() {
     // Both siblings activate, each seeing the envelope as new in its own window:
     // targets share a frame, never a subscription.
     let mut seen: Vec<(String, Vec<String>)> = Vec::new();
-    while let Some(ready) = core.take_ready_activation() {
+    while let Some(ready) = core.take_ready_activation(TEST_WALL_MS) {
         let new: Vec<String> = split(window(&ready.activation, "messages"))
             .1
             .iter()
@@ -154,7 +154,7 @@ fn multi_target_deliver_keeps_dropped_per_target() {
         Millis(10),
     );
     let mut dropped: Vec<(String, u64)> = Vec::new();
-    while let Some(ready) = core.take_ready_activation() {
+    while let Some(ready) = core.take_ready_activation(TEST_WALL_MS) {
         dropped.push((
             ready.instance,
             window(&ready.activation, "messages").dropped,
@@ -237,6 +237,33 @@ fn deliver_with_no_targets_is_fatal() {
     assert!(detail.contains("no targets"), "{detail}");
 }
 
+/// `Active ⇒ its mirror exists`: a subscription is `Active` only while something
+/// references it, and taking that reference is what created its store. Break the
+/// invariant behind the kernel's back and the `Deliver` is a clean protocol fatal
+/// — the transport closes and the page reloads — rather than a panic in the
+/// driver, which is a worse failure than the designed one.
+#[test]
+fn deliver_on_a_store_less_active_subscription_is_fatal() {
+    let mut core = active_subscribed_core();
+    let removed = core
+        .stores
+        .remove(&StoreKey::Wire(SubKey::for_instance(
+            TEST_INSTANCE,
+            "ephemeral:demo",
+        )))
+        .expect("the live subscription's mirror");
+    drop(removed);
+    let effects = core.on_input(
+        Input::TextFrame(deliver_frame("ephemeral:demo", &sample_envelope("x"), 1)),
+        Millis(10),
+    );
+    // The frame armed liveness before it looked at its targets — inbound traffic
+    // is inbound traffic — and the fatal shape follows it.
+    assert!(matches!(effects.first(), Some(Effect::SetWakeup(Some(_)))));
+    let detail = assert_fatal_shape(&effects[1..]);
+    assert!(detail.contains("store-less"), "{detail}");
+}
+
 /// The duplicate-target check must not fire across *frames*: the same
 /// subscription named by two successive frames is ordinary delivery.
 #[test]
@@ -303,7 +330,7 @@ fn deliver_straggler_after_unsubscribe_is_discarded() {
         })]
     );
     // A straggler Deliver arriving after the Unsubscribe is discarded: the
-    // liveness re-arm plus the diagnostic event, nothing queued, not fatal.
+    // liveness re-arm plus the diagnostic event, nothing retained, not fatal.
     let effects = core.on_input(
         Input::TextFrame(deliver_frame(
             "ephemeral:demo",
@@ -585,7 +612,7 @@ fn reconnect_resubscribes_shared_channel_once() {
 #[test]
 fn reconnect_reconcile_drops_removed_binding_before_any_subscribe() {
     // The kiosk scenario (config edit + restart under auto-reconnect): a binding
-    // vanishes from the new Welcome. Its queue is dropped, no Subscribe is ever
+    // vanishes from the new Welcome. Its position is dropped, no Subscribe is ever
     // emitted for its channel, the survivor is resubscribed, and Connected is
     // emitted last. The instance is not failed and not deregistered — it simply
     // stops being activated on that channel.
@@ -946,10 +973,10 @@ fn resumed_span_accepts_any_first_seq() {
         Millis(3_012),
     );
     assert_eq!(effects, vec![Effect::SetWakeup(Some(Millis(63_012)))]);
-    // "v" was delivered pre-blip and queued but never drained into an
-    // activation; the reconnect keeps the instance registered, so its pending
-    // delivery obligation survives the blip and drains as new alongside the
-    // post-resume "fresh". The ring dedup keeps both out of the context half.
+    // "v" was delivered pre-blip and retained but never windowed into an
+    // activation; the reconnect keeps the instance registered, so its position
+    // stays behind it and it arrives as new alongside the post-resume "fresh".
+    // The store's dedup keeps both out of the context half.
     let ready = take_one(&mut core);
     assert_eq!(
         split(window(&ready.activation, "messages")).1,
@@ -1015,9 +1042,9 @@ fn reconnect_accepts_fresh_span_replay_below_prior_high_water() {
         Millis(3_012),
     );
     assert_eq!(effects, vec![Effect::SetWakeup(Some(Millis(63_012)))]);
-    // "pre-restart" was delivered and queued before the blip but never drained;
-    // the instance stays registered across the reconnect, so its pending
-    // obligation survives and drains as new with the post-resume "post-restart".
+    // "pre-restart" was delivered and retained before the blip but never
+    // windowed; the instance stays registered across the reconnect, so its
+    // position stays behind it and it arrives as new with "post-restart".
     // The server resumes past the stored cursor, so it never re-sends
     // "pre-restart" — one delivery, in the new half, deduped out of context.
     let ready = take_one(&mut core);

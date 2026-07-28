@@ -178,15 +178,9 @@ impl DbStore {
         }
     }
 
-    fn assert_owner(&self, lookup: &db::DeferredLookup, sender: &str) {
-        assert!(
-            lookup.sender == sender,
-            "messaging store: {} message {} belongs to {}, not {sender} — a sender-scoped view \
-             was bypassed",
-            self.address,
-            lookup.message_id,
-            lookup.sender
-        );
+    /// Whether a parked row is `sender`'s to cancel or edit.
+    fn owned_by(lookup: &db::DeferredLookup, sender: &str) -> bool {
+        lookup.sender == sender
     }
 }
 
@@ -525,6 +519,11 @@ impl RetentionStore for DbStore {
             .collect()
     }
 
+    async fn deferred_senders(&self, now: DateTime<Utc>) -> Vec<String> {
+        let conn = self.db.lock().await;
+        db::list_deferred_senders(&conn, self.channel_uuid, now)
+    }
+
     async fn deferred_len(&self) -> u64 {
         let conn = self.db.lock().await;
         db::count_deferred(&conn, self.channel_uuid)
@@ -540,7 +539,9 @@ impl RetentionStore for DbStore {
         let Some(lookup) = db::lookup_deferred(&conn, self.channel_uuid, message_uuid, now) else {
             return DeferralOutcome::NotDeferred;
         };
-        self.assert_owner(&lookup, sender);
+        if !Self::owned_by(&lookup, sender) {
+            return DeferralOutcome::WrongSender;
+        }
         match db::delete_deferred(&conn, self.channel_uuid, lookup.message_id, now) {
             true => DeferralOutcome::Applied,
             false => DeferralOutcome::NotDeferred,
@@ -559,7 +560,9 @@ impl RetentionStore for DbStore {
         let Some(lookup) = db::lookup_deferred(&conn, self.channel_uuid, message_uuid, now) else {
             return DeferralOutcome::NotDeferred;
         };
-        self.assert_owner(&lookup, sender);
+        if !Self::owned_by(&lookup, sender) {
+            return DeferralOutcome::WrongSender;
+        }
         let applied = db::edit_deferred(
             &conn,
             self.channel_uuid,
