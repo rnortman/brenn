@@ -363,6 +363,11 @@ impl ActiveBridge {
         let tools =
             tools.unwrap_or_else(|| Arc::new(crate::tool_registry::ToolRegistry::new(vec![])));
         let (epoch_tx, _epoch_rx) = watch::channel(0u64);
+        // Same rule as production: the bus door exists exactly where a messenger
+        // does.
+        let bus_idle_timeout = messenger
+            .as_ref()
+            .map(|m| Duration::from_secs(m.llm_chat().idle_timeout_secs));
         Arc::new(Self {
             session: tokio::sync::Mutex::new(None),
             event_tx: broadcast_tx,
@@ -378,8 +383,8 @@ impl ActiveBridge {
             subscribers: tokio::sync::RwLock::new(HashMap::new()),
             drain_on_idle: AtomicBool::new(false),
             cc_idle: AtomicBool::new(true),
-            idle_timeout,
-            idle_shutdown: std::sync::Mutex::new(None),
+            lifetime: super::lifetime::LifetimeArbiter::new(idle_timeout, bus_idle_timeout),
+            lifetime_timer: std::sync::Mutex::new(None),
             spawn_instant: Instant::now(),
             active_bridges,
             tool_registry: Arc::new(HashMap::new()),
@@ -419,6 +424,8 @@ impl ActiveBridge {
             repo_sync_sender,
             messenger,
             bus_delivery: tokio::sync::Mutex::new(()),
+            chat_commands: Arc::new(tokio::sync::Notify::new()),
+            chat_shutdown: Arc::new(tokio::sync::Notify::new()),
             pwa_push_service,
             mqtt_service,
             mqtt_event_router,
@@ -428,6 +435,7 @@ impl ActiveBridge {
             last_cost_prune_at: AtomicI64::new(0),
             last_lint_snapshot: std::sync::Mutex::new(None),
             event_loop_handle: std::sync::Mutex::new(None),
+            chat_adapter_handle: std::sync::Mutex::new(None),
             died_handled: AtomicBool::new(false),
             event_loop_epoch: epoch_tx,
         })

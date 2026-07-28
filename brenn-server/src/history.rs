@@ -204,6 +204,7 @@ pub fn build_history(
                             category,
                             timestamp,
                             seq: Some(msg.seq),
+                            text: None,
                         })
                     } else {
                         // Chat-input row (or legacy `send_internal_user_message` row).
@@ -234,6 +235,7 @@ pub fn build_history(
                             // Replayed messages won't show task chips. See select-and-chat design.
                             selected_tasks: vec![],
                             seq: Some(msg.seq),
+                            bus_sender: None,
                         })
                     }
                 }
@@ -245,6 +247,7 @@ pub fn build_history(
                     Some(WsServerMessage::AssistantMessage {
                         content: rendered,
                         seq: Some(msg.seq),
+                        text: None,
                     })
                 }
                 "tool_summary" => {
@@ -258,6 +261,7 @@ pub fn build_history(
                         rendered_summary: rendered_summary.to_string(),
                         detail_html,
                         seq: Some(msg.seq),
+                        summary_text: None,
                     })
                 }
                 "artifact" => {

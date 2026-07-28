@@ -67,6 +67,7 @@ fn user_message_echo_omits_empty_selected_tasks() {
         attachments: vec![],
         selected_tasks: vec![],
         seq: None,
+        bus_sender: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(
@@ -86,6 +87,7 @@ fn user_message_echo_includes_non_empty_selected_tasks() {
             task_ref: "todo/task.md".into(),
         }],
         seq: None,
+        bus_sender: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(

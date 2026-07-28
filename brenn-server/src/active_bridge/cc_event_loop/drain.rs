@@ -165,6 +165,7 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     // `ToolUseSummary` broadcast below. `Option::take` avoids cloning.
     let mut system_render = system_render;
     let messaging_card_html = system_render.messaging_card_html.take();
+    let delivered_message_count = bus_delivery.messages.len();
 
     // Deliver the batch. If send fails (CC died between init and now),
     // events stay pending — at-least-once semantics. Stale rows stay too,
@@ -201,6 +202,7 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
             bridge,
             crate::tools::messaging::MCP_MESSAGE_RECEIVED_PSEUDO_TOOL,
             html,
+            format!("{delivered_message_count} bus message(s) delivered"),
         )
         .await;
     }

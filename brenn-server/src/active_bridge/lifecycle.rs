@@ -9,6 +9,7 @@ use brenn_lib::ws_types::{CcState, PresenceUser, WsServerMessage};
 use tracing::{debug, info, warn};
 
 use super::ActiveBridge;
+use super::lifetime::Verdict;
 use super::registry::ActiveBridges;
 
 /// Info about a user currently subscribed to a bridge (for presence).
@@ -22,7 +23,7 @@ impl ActiveBridge {
     /// Register a user as present on this bridge. Ref-counted for multi-tab.
     /// Returns the current presence list (for sending to the newly attached connection).
     /// Broadcasts `PresenceUpdate` to all subscribers when a user first appears.
-    /// Clears `drain_on_idle` and cancels any idle shutdown timer.
+    /// Clears `drain_on_idle` and cancels any armed lifetime timer.
     pub async fn add_subscriber(&self, user_id: i64, username: &str) -> Vec<PresenceUser> {
         let mut subs = self.subscribers.write().await;
 
@@ -33,16 +34,14 @@ impl ActiveBridge {
         // Note: if drain_on_idle was true and kill_session is already in
         // progress, this subscriber will attach to a dying bridge. The
         // subscriber detects this via BroadcastResult::Closed and recovers
-        // by spawning a new bridge. This is a known benign race (see design
-        // doc "Concurrency Analysis, Race 1").
+        // by spawning a new bridge. This is a known benign race.
         self.drain_on_idle.store(false, Ordering::SeqCst);
 
-        // Cancel idle shutdown timer if running.
         {
             let mut handle = self
-                .idle_shutdown
+                .lifetime_timer
                 .lock()
-                .expect("idle_shutdown lock poisoned");
+                .expect("lifetime_timer lock poisoned");
             if let Some(h) = handle.take() {
                 h.abort();
             }
@@ -85,10 +84,10 @@ impl ActiveBridge {
     /// Unregister a user connection from this bridge. Ref-counted for multi-tab.
     /// Broadcasts `PresenceUpdate` when a user fully disappears (count reaches 0).
     ///
-    /// For ephemeral apps: when all subscribers leave, calls `maybe_drain` to
-    /// kill CC immediately (or defer to turn completion).
-    /// For persistent apps: when all subscribers leave, starts an idle timer.
-    /// `maybe_drain` runs when the timer fires.
+    /// When all subscribers leave, the browser door lets go and the lifetime
+    /// question is re-asked: another door may still be holding the bridge, the
+    /// browser's own post-detach grace may still be running, or nothing may want
+    /// it and the drain begins.
     pub async fn remove_subscriber(self: &Arc<Self>, user_id: i64) {
         let mut subs = self.subscribers.write().await;
         let should_broadcast = if let Some(entry) = subs.get_mut(&user_id) {
@@ -129,28 +128,66 @@ impl ActiveBridge {
 
         // Note: `all_gone` was captured under the lock but we're acting on it
         // after the lock was released. A subscriber could have arrived in
-        // between. This is safe: both paths below converge on `maybe_drain`
-        // which re-acquires the lock and re-checks emptiness before draining.
-        // At worst we start an idle timer that fires and no-ops.
+        // between. This is safe: the drain path converges on `maybe_drain`,
+        // which re-acquires the lock and re-asks before condemning the bridge.
+        // At worst we start a timer that fires and no-ops.
         if all_gone {
-            if let Some(timeout) = self.idle_timeout {
-                // Persistent app: start idle timer instead of killing immediately.
-                info!(
-                    conversation_id = self.conversation_id,
-                    timeout_secs = timeout.as_secs(),
-                    "all subscribers gone (persistent), starting idle shutdown timer"
-                );
-                self.start_idle_timer(timeout);
-            } else {
-                // Ephemeral app: drain immediately (same as before).
-                self.maybe_drain().await;
-            }
+            self.lifetime.note_detach();
+            self.reconsider_lifetime().await;
         }
     }
 
-    /// Attempt to drain (kill) CC. Called when all subscribers are gone.
+    /// Ask every door whether it still wants this bridge, and act on the answer:
+    /// drain now, or wait until the soonest hold expires and ask again.
     ///
-    /// Acquires the subscribers write lock and re-checks emptiness + sets
+    /// The single place a lifetime verdict becomes an action. Every trigger — the
+    /// last tab closing, the timer firing, a bus peer speaking — routes through
+    /// here, so which door moved never changes how the OR is applied.
+    pub(in crate::active_bridge) async fn reconsider_lifetime(self: &Arc<Self>) {
+        // Scoped: `maybe_drain` re-asks under the write lock, which this read
+        // guard would deadlock against if it were still alive.
+        let subscribers = { self.subscribers.read().await.len() };
+        match self.lifetime.verdict(subscribers) {
+            Verdict::Drain => self.maybe_drain().await,
+            Verdict::KeepAlive {
+                recheck: Some(after),
+            } => {
+                // A bus-driven conversation reaches this arm on every exchange,
+                // so at info it is one line per utterance for the life of the
+                // conversation. The verdict already debug-logs holders and
+                // recheck.
+                debug!(
+                    conversation_id = self.conversation_id,
+                    recheck_secs = after.as_secs(),
+                    "bridge still held open; re-asking when the soonest hold expires"
+                );
+                self.start_lifetime_timer(after);
+            }
+            // Nothing expires by waiting — an attached tab has to detach before
+            // the answer can change, and detaching re-asks.
+            Verdict::KeepAlive { recheck: None } => {}
+        }
+    }
+
+    /// A bus peer drove this conversation: the bus door takes hold for its idle
+    /// window.
+    ///
+    /// A drain flagged while the bus was quiet is cancelled here, exactly as a
+    /// reconnecting browser cancels one, and under the same lock — writing
+    /// `drain_on_idle` only while holding the subscribers lock is what keeps the
+    /// flag and the verdict that set it one step.
+    pub(crate) async fn note_bus_activity(self: &Arc<Self>) {
+        self.lifetime.note_bus_activity();
+        {
+            let _subs = self.subscribers.write().await;
+            self.drain_on_idle.store(false, Ordering::SeqCst);
+        }
+        self.reconsider_lifetime().await;
+    }
+
+    /// Attempt to drain (kill) CC. Called when no door holds the bridge.
+    ///
+    /// Acquires the subscribers write lock and re-asks the doors + sets
     /// `drain_on_idle` atomically. This prevents races where a subscriber
     /// connects between the caller's check and the drain decision.
     ///
@@ -167,8 +204,8 @@ impl ActiveBridge {
     async fn maybe_drain(self: &Arc<Self>) {
         {
             let subs = self.subscribers.write().await;
-            if !subs.is_empty() {
-                // A subscriber arrived between the caller's check and now.
+            if let Verdict::KeepAlive { .. } = self.lifetime.verdict(subs.len()) {
+                // A door took hold between the caller's check and now.
                 return;
             }
             self.drain_on_idle.store(true, Ordering::SeqCst);
@@ -177,7 +214,7 @@ impl ActiveBridge {
 
         info!(
             conversation_id = self.conversation_id,
-            "all subscribers gone, marked drain_on_idle"
+            "nothing holds this bridge open, marked drain_on_idle"
         );
 
         // If CC is idle, try to kill now. Re-check drain_on_idle first.
@@ -230,13 +267,13 @@ impl ActiveBridge {
     /// the `git status` fan-out on the common clean-shutdown path.
     ///
     /// Must only be called when `drain_on_idle` is already set and we
-    /// are at a CC idle boundary. Re-checks emptiness under the
-    /// subscribers lock and re-checks `drain_on_idle` to narrow the
-    /// known race with a concurrent subscriber.
+    /// are at a CC idle boundary. Re-asks the doors under the subscribers
+    /// lock and re-checks `drain_on_idle` to narrow the known race with a
+    /// concurrent subscriber.
     pub(super) async fn drain_no_hooks(self: &Arc<Self>) {
         {
             let subs = self.subscribers.write().await;
-            if !subs.is_empty() {
+            if let Verdict::KeepAlive { .. } = self.lifetime.verdict(subs.len()) {
                 return;
             }
         }
@@ -283,13 +320,17 @@ impl ActiveBridge {
         self.kill_session(&self.active_bridges).await;
     }
 
-    /// Start (or replace) the idle shutdown timer for persistent apps.
+    /// Start (or replace) the timer that re-asks the lifetime question when the
+    /// soonest current hold is due to expire.
     ///
     /// The timer task looks up the bridge from the `ActiveBridges` registry
     /// when it fires (we can't capture `Arc<Self>` here since we only have
     /// `&self`). If the bridge has been removed (CC died), the lookup returns
-    /// `None` and the timer is a no-op.
-    fn start_idle_timer(&self, timeout: Duration) {
+    /// `None` and the timer is a no-op. It re-asks rather than draining outright,
+    /// because the hold that expired need not be the only one — a bus
+    /// interaction during the browser's grace re-arms this timer for its own
+    /// window instead.
+    fn start_lifetime_timer(&self, timeout: Duration) {
         let conversation_id = self.conversation_id;
         let active_bridges = self.active_bridges.clone();
 
@@ -300,23 +341,36 @@ impl ActiveBridge {
             // (e.g., CC already died), there's nothing to drain.
             let bridge = active_bridges.get(conversation_id).await;
             if let Some(bridge) = bridge {
-                info!(
-                    conversation_id,
-                    "idle shutdown timer fired, attempting drain"
-                );
-                bridge.maybe_drain().await;
+                info!(conversation_id, "lifetime timer fired, re-asking the doors");
+                bridge.forget_lifetime_timer();
+                bridge.reconsider_lifetime().await;
             }
         });
 
         let mut guard = self
-            .idle_shutdown
+            .lifetime_timer
             .lock()
-            .expect("idle_shutdown lock poisoned");
+            .expect("lifetime_timer lock poisoned");
         // Abort any existing timer before replacing.
         if let Some(old) = guard.take() {
             old.abort();
         }
         *guard = Some(handle);
+    }
+
+    /// Drop the stored timer handle without aborting it.
+    ///
+    /// For the timer task's own use, once it has fired: `start_lifetime_timer`
+    /// aborts whatever handle it finds, and the re-ask a fired timer performs can
+    /// arm a fresh one — which would otherwise abort the very task doing the
+    /// asking, at its next await.
+    fn forget_lifetime_timer(&self) {
+        drop(
+            self.lifetime_timer
+                .lock()
+                .expect("lifetime_timer lock poisoned")
+                .take(),
+        );
     }
 
     /// Whether CC is alive but idle (between turns, waiting for input).
@@ -381,6 +435,9 @@ impl ActiveBridge {
         active_bridges
             .remove_if_same(self.conversation_id, std::ptr::from_ref(self) as usize)
             .await;
+        // This bridge is done regardless of whether a replacement holds the slot,
+        // and its adapter is the one thing that would otherwise outlive it.
+        self.stop_chat_adapter();
         let mut session = self.session.lock().await;
         if let Some(ref s) = *session {
             s.mark_shutting_down();
@@ -887,8 +944,8 @@ mod tests {
         assert!(!bridge.drain_on_idle.load(Ordering::SeqCst));
         // Timer should be running.
         {
-            let guard = bridge.idle_shutdown.lock().expect("lock");
-            assert!(guard.is_some(), "idle timer should be started");
+            let guard = bridge.lifetime_timer.lock().expect("lock");
+            assert!(guard.is_some(), "lifetime timer should be armed");
         }
         // Bridge should still be alive.
         assert!(
@@ -907,17 +964,17 @@ mod tests {
 
         // Timer should be running.
         {
-            let guard = bridge.idle_shutdown.lock().expect("lock");
+            let guard = bridge.lifetime_timer.lock().expect("lock");
             assert!(guard.is_some());
         }
 
         // Reconnect — timer should be cancelled.
         bridge.add_subscriber(bridge.user_id, "testuser").await;
 
-        let guard = bridge.idle_shutdown.lock().expect("lock");
+        let guard = bridge.lifetime_timer.lock().expect("lock");
         assert!(
             guard.is_none(),
-            "idle timer should be cancelled on reconnect"
+            "lifetime timer should be cancelled on reconnect"
         );
     }
 

@@ -128,7 +128,16 @@ impl WsConnection {
             Some(id) if self.state.active_bridges.get(id).await.is_none() => id,
             _ => {
                 let conn = self.state.db.lock().await;
-                conversation::create_conversation(&conn, self.user_id, &self.app_slug, shared)
+                let id =
+                    conversation::create_conversation(&conn, self.user_id, &self.app_slug, shared);
+                // The conversation is addressable on the bus from the moment it
+                // exists, not from the moment a bridge spawns: waking a dormant
+                // conversation means publishing to its command channel, which
+                // has to be there already.
+                if let Some(messenger) = &self.state.messenger {
+                    messenger.provision_conversation_chat_channels(&conn, &self.app_slug, id);
+                }
+                id
             }
         };
         self.current_conversation_id = Some(conv_id);
@@ -2181,6 +2190,7 @@ mod tests {
         let assistant_msg = WsServerMessage::AssistantMessage {
             content: "<p>live response</p>".to_string(),
             seq: Some(1),
+            text: Some("live response".to_string()),
         };
         {
             let db_conn = db.lock().await;

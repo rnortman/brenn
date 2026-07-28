@@ -31,6 +31,10 @@ enum WedgePredicate {
     /// `cc_idle == false` but the session cannot make progress (absent, dead, or
     /// its I/O tasks have exited). Grace-gated to let an in-flight `Died` win.
     DeadIoBusy,
+    /// The chat bus adapter's task has finished while the bridge still holds a
+    /// sender on the broadcast it reads — so it did not exit, it died.
+    /// Deterministic; fires on the first sweep.
+    ChatAdapterDied,
 }
 
 impl std::fmt::Display for WedgePredicate {
@@ -38,6 +42,7 @@ impl std::fmt::Display for WedgePredicate {
         match self {
             WedgePredicate::DeadEventLoop => write!(f, "dead event loop"),
             WedgePredicate::DeadIoBusy => write!(f, "dead session I/O while bridge busy"),
+            WedgePredicate::ChatAdapterDied => write!(f, "dead chat bus adapter"),
         }
     }
 }
@@ -92,6 +97,18 @@ impl Watchdog {
             // would wedge silently forever.
             if bridge.event_loop_finished() {
                 self.handle_wedge(&bridge, WedgePredicate::DeadEventLoop)
+                    .await;
+                continue;
+            }
+
+            // Predicate 1b: the chat bus adapter reads a broadcast this bridge
+            // keeps a sender on, so it runs until the bridge is dropped. A
+            // finished handle on a live bridge means it panicked, and the bus
+            // record has silently stopped while the browsers still see a
+            // working conversation — the record must not read as complete when
+            // it is truncated.
+            if bridge.chat_adapter_finished() {
+                self.handle_wedge(&bridge, WedgePredicate::ChatAdapterDied)
                     .await;
                 continue;
             }
@@ -162,6 +179,13 @@ impl Watchdog {
             drop(guard);
             drop(taken);
         }
+
+        // End the chat adapter. Nothing else can: it holds an `Arc` on the bridge
+        // whose broadcast it reads, so a reaped bridge would keep its adapter and
+        // everything the bridge holds alive for the rest of the process. Ordered
+        // after the reset so the error events that reset just broadcast are still
+        // in the buffer the adapter flushes on its way out.
+        bridge.stop_chat_adapter();
 
         // Deregister so each wedge fires exactly once and the next user message
         // spawns a fresh bridge. No auto-respawn: recovery is on user demand.

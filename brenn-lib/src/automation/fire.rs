@@ -146,18 +146,22 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
         }
     };
 
-    // Resolve sender conversation id (§2.9).
     let is_singleton = app_config.singleton;
     let sender_conv_id = {
         let conn = engine.db.lock().await;
-        if is_singleton {
+        let id = if is_singleton {
             let conv =
                 get_or_create_singleton_conversation(&conn, owner_user_id, &job.owner_app_slug);
             conv.id
         } else {
-            // Non-singleton: use/create the per-app automation events conversation (§2.9).
             get_or_create_automation_events_conversation(&conn, &job.owner_app_slug, owner_user_id)
-        }
+        };
+        // Either branch may have just created the conversation, and a
+        // conversation without its chat channels is unaddressable on the bus.
+        engine
+            .messenger
+            .provision_conversation_chat_channels(&conn, &job.owner_app_slug, id);
+        id
     };
 
     // Verify that the action destination still resolves in the directory.
@@ -610,6 +614,9 @@ pub(crate) async fn resolve_report_conversation(
     } else {
         get_or_create_automation_events_conversation(&conn, &job.owner_app_slug, owner_user.id)
     };
+    engine
+        .messenger
+        .provision_conversation_chat_channels(&conn, &job.owner_app_slug, conv_id);
     Some(conv_id)
 }
 

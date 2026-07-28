@@ -1014,12 +1014,11 @@ fn validate_same_topic_two_clients_yields_two_channels() {
 }
 
 // -----------------------------------------------------------------------
-// Access policy resolution (access-control design §2.5.2/§2.5.3, §6.6)
+// Access policy resolution
 // -----------------------------------------------------------------------
 
 /// An app authored with explicit `grants` + `[app.acl.*]` resolves to an
-/// `AppPolicy` whose grants and matchers match the authored config exactly (the
-/// §2.5.3 explicit-build contract — no projection from legacy fields).
+/// `AppPolicy` whose grants and matchers match the authored config exactly.
 #[test]
 fn validate_resolves_explicit_grants_and_acl_into_policy() {
     use crate::access::AppCapability;
@@ -1095,13 +1094,21 @@ fn validate_resolves_explicit_grants_and_acl_into_policy() {
             client: "office".to_string(),
         }]
     );
+    // Authored entries first, then the derived chat-tree matcher
+    // (`LlmChatConfig::grant_app_chat_tree`).
     assert_eq!(
         policy.acls.brenn_subscribe,
-        vec![ChannelMatcher::Prefix("alerts.".to_string())]
+        vec![
+            ChannelMatcher::Prefix("alerts.".to_string()),
+            ChannelMatcher::Prefix("chat.app.home.".to_string()),
+        ]
     );
     assert_eq!(
         policy.acls.brenn_publish,
-        vec![ChannelMatcher::Exact("outbox".to_string())]
+        vec![
+            ChannelMatcher::Exact("outbox".to_string()),
+            ChannelMatcher::Prefix("chat.app.home.".to_string()),
+        ]
     );
     assert_eq!(
         policy.acls.webhook,
@@ -1139,12 +1146,67 @@ fn validate_app_without_grants_resolves_default_deny_policy() {
     assert!(!policy.allows_mqtt_dynamic_subscribe("home", "sensors/temp"));
 }
 
+/// Every LLM app leaves resolution with authority over its own chat subtree,
+/// whether or not it authored messaging config.
+#[test]
+fn validate_derives_chat_tree_authority_for_every_app() {
+    use crate::access::AppCapability;
+    use crate::config::{ChatLeaf, chat_bare_name};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = BrennConfig {
+        apps: vec![
+            AppConfigRaw {
+                slug: "home".to_string(),
+                working_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+            AppConfigRaw {
+                slug: "office".to_string(),
+                working_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let ResolvedConfig { apps, .. } = validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        Some(super::test_runtime_dir()),
+    );
+
+    let policy = &apps["home"].policy;
+    for grant in [
+        AppCapability::MessagingPublish,
+        AppCapability::MessagingSubscribe,
+        AppCapability::EphemeralPublish,
+        AppCapability::EphemeralSubscribe,
+    ] {
+        assert!(policy.has_grant(grant), "{grant:?} must be derived");
+    }
+    assert!(apps["home"].messaging_enabled());
+
+    assert!(policy.allows_brenn_publish(&chat_bare_name("chat", "home", ChatLeaf::Out, 7)));
+    assert!(policy.allows_brenn_delivery(&chat_bare_name("chat", "home", ChatLeaf::In, 7)));
+    assert!(policy.allows_ephemeral_publish(&chat_bare_name("chat", "home", ChatLeaf::Stream, 7)));
+    assert!(policy.allows_ephemeral_delivery(&chat_bare_name("chat", "home", ChatLeaf::Wake, 7)));
+
+    // Cross-app isolation is untouched by the derivation.
+    assert!(!policy.allows_brenn_publish(&chat_bare_name("chat", "office", ChatLeaf::Out, 7)));
+    assert!(!apps["office"].policy.allows_brenn_publish(&chat_bare_name(
+        "chat",
+        "home",
+        ChatLeaf::Out,
+        7
+    )));
+}
+
 /// A publishing app (`MessagingPublish` grant) that authors **no**
 /// `brenn_publish` matcher resolves — without panicking — to a deny-all publish
-/// policy: the grant is present but `allows_brenn_publish` denies every channel
-/// (access-control design §3 failure mode 1, §4 config-shape clause). The
-/// granted-but-no-matcher state is a legitimate intermediate (a deferred ACL),
-/// so resolution emits a non-fatal warning rather than failing fast.
+/// policy: the grant is present but `allows_brenn_publish` denies every channel.
+/// The granted-but-no-matcher state is a legitimate intermediate (a deferred
+/// ACL), so resolution emits a non-fatal warning rather than failing fast.
 #[test]
 fn validate_publish_grant_without_matcher_resolves_deny_all_no_panic() {
     use crate::access::AppCapability;
@@ -1168,9 +1230,15 @@ fn validate_publish_grant_without_matcher_resolves_deny_all_no_panic() {
     );
 
     let policy = &apps["home"].policy;
-    // Layer-1 grant resolved, layer-2 list empty ⇒ deny-all publish.
+    // Layer-1 grant resolved; the only layer-2 entry is the derived chat-tree
+    // matcher, so every channel the operator meant to reach is denied.
     assert!(policy.has_grant(AppCapability::MessagingPublish));
-    assert!(policy.acls.brenn_publish.is_empty());
+    assert_eq!(
+        policy.acls.brenn_publish,
+        vec![crate::access::acl::ChannelMatcher::Prefix(
+            "chat.app.home.".to_string()
+        )]
+    );
     assert!(!policy.allows_brenn_publish("anything"));
     assert!(!policy.allows_brenn_publish("outbox"));
 }
@@ -1178,8 +1246,7 @@ fn validate_publish_grant_without_matcher_resolves_deny_all_no_panic() {
 /// A publishing app that authors explicit `[[app.acl.brenn_publish]]` matchers
 /// (the prod deployment shape, scoping each app to its own outbound channels)
 /// resolves to a policy whose `allows_brenn_publish` *covers* exactly the listed
-/// channels and denies the rest (access-control design §3 failure mode 1, §4
-/// config-shape clause — the positive half of "the updated shape resolves").
+/// channels and denies the rest.
 #[test]
 fn validate_publish_grant_with_matchers_resolves_covering_policy() {
     use crate::access::AppCapability;

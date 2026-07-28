@@ -380,13 +380,8 @@ impl WsConnection {
 
         let now = chrono::Utc::now();
 
-        // Pre-compute echo metadata and CC text before persist consumes resolved.
-        let attachment_metas: Vec<brenn_lib::ws_types::AttachmentMeta> =
-            resolved.iter().map(|r| r.to_meta()).collect();
-
-        // Load device + device_user in one lock scope; also check reminder trigger.
         // `local_now` is computed here from the device_user row so that the
-        // tz_override is honoured — one lock, one load (design §2.2).
+        // tz_override is honoured — one lock, one load.
         let (device_slug_owned, slug_reminder, prefix_device, local_now) = {
             let conn = self.state.db.lock().await;
             let device = brenn_lib::auth::device::load_device(&conn, self.device_id);
@@ -444,78 +439,16 @@ impl WsConnection {
             }
         };
 
-        // Persist raw text + attachment metadata in a single DB lock scope.
-        // Capture db_seq so the UserMessageEcho broadcast can carry it for
-        // frontend deduplication against history replay.
-        let (_msg_id, echo_db_seq) = bridge
-            .persist_user_message_with_attachments(
-                text,
-                self.user_id,
-                Some(self.timezone_str()),
-                Some(self.device_id),
-                |msg_id| {
-                    resolved
-                        .into_iter()
-                        .map(|r| brenn_lib::conversation::StoredAttachment {
-                            upload_id: r.upload_id.to_string(),
-                            message_id: msg_id,
-                            filename: r.filename,
-                            media_type: r.media_type,
-                            size: r.size,
-                            disk_filename: r.disk_filename,
-                        })
-                        .collect()
-                },
-            )
-            .await;
-
-        // Broadcast echo with attribution, attachments, and selected tasks.
-        // seq: Some(echo_db_seq) lets the frontend deduplicate this live broadcast
-        // against a concurrent history replay (reconnect-from-idle race fix).
-        bridge.broadcast_user_echo(WsServerMessage::UserMessageEcho {
-            text: text.to_string(),
-            username: self.username.clone(),
-            timestamp: timestamp.clone(),
-            attachments: attachment_metas,
-            selected_tasks: selected_tasks.to_vec(),
-            seq: Some(echo_db_seq),
+        let interstitial = slug_reminder.map(|render| crate::active_bridge::Interstitial {
+            render,
+            attribute_to_user_id: Some(self.user_id),
         });
 
-        // Messaging budget reset: a user chat message is the load-bearing
-        // signal that bounds runaway agent-to-agent loops. See design §7.7.
-        // Tool approvals, event injection, and idle hooks do NOT reset.
-        // `AppConfig::messaging_send_budget()` honors per-app override →
-        // global `[messaging].default_send_budget` → 100.
-        if self.state.messenger.is_some() {
-            let budget = self.app_config().messaging_send_budget();
-            let conn = self.state.db.lock().await;
-            brenn_lib::messaging::db::reset_send_budget(&conn, bridge.conversation_id, budget);
-        }
-
-        // Inject unassigned-slug reminder if needed: persist+broadcast to DB/UI now,
-        // then include the reminder text as an extra block in the CC send below so
-        // that the reminder and user message arrive in the same NDJSON envelope.
-        // This closes the partial-failure window (CC never sees a dangling reminder
-        // without its accompanying user message).
-        let slug_reminder_text = if let Some(reminder) = slug_reminder {
-            let text = reminder.text.clone();
-            bridge
-                .persist_and_broadcast_system_message(reminder, Some(self.user_id))
-                .await;
-            Some(text)
-        } else {
-            None
-        };
-
-        // Build the CC message: plain text, multi-block with context, and/or reminder.
-        // Collect extra blocks: reminder (if any) + selected-task context (if any).
         let mut extra_blocks: Vec<String> = Vec::new();
-        if let Some(ref reminder_text) = slug_reminder_text {
-            extra_blocks.push(reminder_text.clone());
+        if let Some(ref reminder) = interstitial {
+            extra_blocks.push(reminder.render.text.clone());
         }
         if !selected_tasks.is_empty() {
-            // Build compact JSON context block for selected tasks.
-            // SelectedTask already has #[serde(rename = "ref")] so serializes correctly.
             #[derive(serde::Serialize)]
             struct ContextBlock<'a> {
                 context: &'static str,
@@ -529,12 +462,30 @@ impl WsConnection {
             extra_blocks.push(context_block);
         }
 
-        let cc_send_err: Option<String> = if extra_blocks.is_empty() {
-            bridge.send_message(&cc_text).await.err()
-        } else {
-            let msg = brenn_cc::protocol::user_message_with_context(&cc_text, &extra_blocks);
-            bridge.send_outgoing(msg).await.err()
-        };
+        let cc_send_err = crate::active_bridge::accept_user_send(
+            &bridge,
+            crate::active_bridge::AcceptedSend {
+                text,
+                cc_text,
+                extra_blocks,
+                sender_user_id: self.user_id,
+                sender_tz: Some(self.timezone_str()),
+                sender_device_id: Some(self.device_id),
+                attachments: resolved,
+                selected_tasks: selected_tasks.to_vec(),
+                origin: crate::active_bridge::SendOrigin::LegacyWs {
+                    username: self.username.clone(),
+                    timestamp,
+                },
+                interstitial,
+                reset_send_budget: self
+                    .state
+                    .messenger
+                    .is_some()
+                    .then(|| self.app_config().messaging_send_budget()),
+            },
+        )
+        .await;
         if let Some(e) = cc_send_err {
             warn!(
                 conversation_id = self.current_conversation_id,

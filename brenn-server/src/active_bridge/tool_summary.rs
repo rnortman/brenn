@@ -86,6 +86,7 @@ pub(super) async fn emit_prerendered_summary(
     bridge: &ActiveBridge,
     tool_name: &str,
     rendered: String,
+    summary_text: String,
 ) {
     let payload = serde_json::json!({
         "tool_name": tool_name,
@@ -115,6 +116,7 @@ pub(super) async fn emit_prerendered_summary(
         rendered_summary: rendered,
         detail_html: None,
         seq: Some(db_seq),
+        summary_text: Some(summary_text),
     });
 }
 
@@ -189,6 +191,9 @@ pub(super) async fn emit_tool_summary(
         rendered_summary: rendered,
         detail_html,
         seq: Some(db_seq),
+        summary_text: Some(crate::approval_formatter::format_tool_summary_text(
+            tool_name, tool_input,
+        )),
     });
 }
 

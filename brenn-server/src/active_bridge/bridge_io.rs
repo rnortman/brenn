@@ -235,6 +235,7 @@ impl ActiveBridge {
             category,
             timestamp,
             seq: Some(db_seq),
+            text: Some(cc_text.to_string()),
         });
 
         // 3. Enqueue to CC and acquire the flush-ack receiver.
@@ -316,6 +317,7 @@ impl ActiveBridge {
             category: rendered.category,
             timestamp,
             seq: Some(db_seq),
+            text: Some(rendered.text),
         });
     }
 

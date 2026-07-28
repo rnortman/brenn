@@ -12,6 +12,7 @@
 //! types. Wake / dispatch is abstracted via the `WakeRouter` trait, which
 //! the binary crate implements over `ActiveBridges` + `AppState`.
 
+pub mod chat_provision;
 pub mod config;
 pub mod conversations;
 pub mod db;
@@ -173,6 +174,24 @@ pub fn tool_channel_uuid_from_address(address: &str) -> Uuid {
     // namespace = UUIDv5(DNS-namespace, "brenn.tool-channel")
     // channel UUID = UUIDv5(namespace, address)
     let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.tool-channel");
+    Uuid::new_v5(&ns, address.as_bytes())
+}
+
+/// Derive a deterministic UUIDv5 for a durable chat channel from its full
+/// canonical address (`brenn:<prefix>.app.<slug>.<leaf>.<id>`).
+///
+/// A conversation's command and record channels are minted at conversation
+/// creation, not authored in config, so they need an identity that survives
+/// restart: the retained record and every subscriber cursor key off the channel
+/// UUID, and a fresh UUID each boot would orphan both. Deriving it from the
+/// address makes provisioning idempotent by construction — the same
+/// conversation always resolves to the same channel.
+///
+/// The namespace seed (`"brenn.chat-channel"`) is deliberately distinct from
+/// the webhook, MQTT, ephemeral, and tool seeds, so the chat address space
+/// cannot collide with any other.
+pub fn chat_channel_uuid_from_address(address: &str) -> Uuid {
+    let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.chat-channel");
     Uuid::new_v5(&ns, address.as_bytes())
 }
 
@@ -460,44 +479,44 @@ pub enum SubscriberEntryKind {
     /// `Messenger::system_policies`. Created programmatically (not from config),
     /// parked-and-woken like a `Wasm` subscriber.
     System(String),
+    /// One conversation reading its own chat command channel, as
+    /// `conversation:<id>`.
+    ///
+    /// The only kind minted at runtime rather than declared: a conversation's
+    /// chat channels carry its id in their names, so the subscription cannot
+    /// exist before the conversation does. Chat provisioning is its one
+    /// constructor.
+    ///
+    /// It is deliberately *not* an [`SubscriberEntryKind::App`] entry, and that
+    /// is the whole reason it exists. An `App` subscription is walked by
+    /// `attach_conversation_subscribers`, which would attach every one of the
+    /// app's conversations to every other one's command channel, and is drained
+    /// by the ambience path, which renders what it finds into a system message.
+    /// A command is neither. Being a kind of its own keeps chat out of both
+    /// walks by construction rather than by a filter someone has to remember.
+    ///
+    /// `app_slug` is carried, not looked up: authority for the chat tree is the
+    /// owning app's policy (the auto-granted `<prefix>.app.<slug>.` matchers), so
+    /// policy and wake economics resolve through the same apps map an `App` entry
+    /// uses, with no per-conversation registration anywhere.
+    ChatConversation {
+        app_slug: String,
+        conversation_id: i64,
+    },
 }
 
 impl SubscriberEntryKind {
     /// Returns the config slug regardless of kind — for a `Surface` that is the
-    /// `[[surface]]` slug, not the instance. Useful for logging; callers needing
-    /// the storage key ask [`SubscriberEntryKind::subscriber_key`].
+    /// `[[surface]]` slug, not the instance. For logging and for the apps-map
+    /// lookups every kind's authority resolves through; it is not a storage key,
+    /// and the pending-push keyspace is not built from it.
     pub fn slug(&self) -> &str {
         match self {
             SubscriberEntryKind::App(s)
             | SubscriberEntryKind::Wasm(s)
             | SubscriberEntryKind::System(s) => s.as_str(),
             SubscriberEntryKind::Surface { slug, .. } => slug.as_str(),
-        }
-    }
-
-    /// The key this subscriber stores in
-    /// `messaging_pending_pushes.target_app_slug`. Identical to `slug()` for
-    /// every kind whose principal *is* its slug; a surface component instance
-    /// keys `<slug>#<instance>`, matching
-    /// [`ParticipantId::as_surface_subscriber_key`].
-    ///
-    /// The single source of truth for that encoding: boot's row writer, the
-    /// push-target resolver, and the GC's window query must agree on it exactly,
-    /// or a subscription and its own push rows land in different keyspaces and
-    /// the window silently never bounds.
-    pub fn subscriber_key(&self) -> String {
-        match self {
-            SubscriberEntryKind::App(s)
-            | SubscriberEntryKind::Wasm(s)
-            | SubscriberEntryKind::System(s) => s.clone(),
-            SubscriberEntryKind::Surface { slug, instance } => match instance {
-                Some(instance) => {
-                    crate::messaging::identity::ParticipantId::for_surface_component(slug, instance)
-                        .as_surface_subscriber_key()
-                        .to_owned()
-                }
-                None => slug.clone(),
-            },
+            SubscriberEntryKind::ChatConversation { app_slug, .. } => app_slug.as_str(),
         }
     }
 
@@ -762,6 +781,26 @@ impl MessagingDirectory {
         inner.by_address.insert(entry.address.clone(), uuid);
         inner.order.push(uuid);
         inner.by_uuid.insert(uuid, Arc::new(entry));
+    }
+
+    /// Remove a channel entirely (entry + address index + iteration order).
+    ///
+    /// Returns `true` if the channel was present. Used by teardown paths whose
+    /// channel family is scoped to something that can end — a conversation's
+    /// chat channels die with the conversation — so the directory does not
+    /// accumulate names nothing can ever reach again.
+    ///
+    /// The caller owns whatever the channel's messages live in: a durable
+    /// channel's rows and a non-durable channel's ring both outlive this call
+    /// unless the caller removes them too.
+    pub fn remove_channel(&self, channel_uuid: &Uuid) -> bool {
+        let mut inner = self.inner.write().expect("directory lock poisoned");
+        let Some(entry) = inner.by_uuid.remove(channel_uuid) else {
+            return false;
+        };
+        inner.by_address.remove(&entry.address);
+        inner.order.retain(|uuid| uuid != channel_uuid);
+        true
     }
 }
 
@@ -1045,7 +1084,9 @@ pub enum DeliveryShape {
 /// full binding map; keep it in step with bootstrap's choices by hand.
 pub fn default_delivery_shape(key: &SubscriberEntryKind) -> DeliveryShape {
     match key {
-        SubscriberEntryKind::App(_) | SubscriberEntryKind::Surface { .. } => DeliveryShape::Inline,
+        SubscriberEntryKind::App(_)
+        | SubscriberEntryKind::Surface { .. }
+        | SubscriberEntryKind::ChatConversation { .. } => DeliveryShape::Inline,
         SubscriberEntryKind::Wasm(_) | SubscriberEntryKind::System(_) => DeliveryShape::ParkedWake,
     }
 }
@@ -1352,6 +1393,15 @@ pub struct Messenger {
     /// a durable channel's messages sit in the database, but its store is still
     /// constructed once per channel and reused.
     ring_stores: Arc<store::RingStores>,
+    /// `[llm_chat]`, the shape of every conversation's chat channel family.
+    ///
+    /// It lives here rather than being passed at each call because chat channels
+    /// are provisioned from wherever a conversation is created — a websocket
+    /// handler, the automation engine — and every one of those places already
+    /// holds the messenger. Boot installs the operator's section via
+    /// [`Messenger::with_llm_chat`]; a messenger built without it carries the
+    /// defaults.
+    llm_chat: crate::config::LlmChatConfig,
     /// Durable channels' retention stores, one per channel UUID, constructed on
     /// first request and reused for the process lifetime.
     ///
@@ -1515,6 +1565,16 @@ fn registered_subscriber<'a>(
                 instance: named_instance,
             },
         ) => *slug == named_slug && *instance == named_instance,
+        // A chat subscription names the one conversation it belongs to, so it
+        // matches on the id and never on the app the cursor was written under —
+        // which is what stops one conversation of an app from resolving to a
+        // sibling's command channel.
+        (
+            SubscriberEntryKind::ChatConversation {
+                conversation_id, ..
+            },
+            SubscriberKind::Conversation(named),
+        ) => *conversation_id == named,
         _ => false,
     };
     entry.subscribers.iter().find(|sub| matches_kind(&sub.kind))
@@ -1609,6 +1669,7 @@ impl Messenger {
             pending_bus_pushes_scan_count: AtomicU64::new(0),
             live_counters: Arc::new(live::LiveCounters::default()),
             ring_stores,
+            llm_chat: crate::config::LlmChatConfig::default(),
             db_stores: Mutex::new(HashMap::new()),
             nondurable_dynamic_subs: Mutex::new(HashSet::new()),
             stranded_warned: Mutex::new(HashSet::new()),
@@ -1804,6 +1865,22 @@ impl Messenger {
         &self.ring_stores
     }
 
+    /// Install the operator's `[llm_chat]` section before the `Messenger` is
+    /// shared, replacing the defaults from `new`. Same once-at-boot contract as
+    /// [`Messenger::with_ring_stores`].
+    pub fn with_llm_chat(mut self: Arc<Self>, llm_chat: crate::config::LlmChatConfig) -> Arc<Self> {
+        let inner = Arc::get_mut(&mut self).expect(
+            "with_llm_chat must run before the Messenger Arc is shared (boot-ordering bug)",
+        );
+        inner.llm_chat = llm_chat;
+        self
+    }
+
+    /// The chat channel family's shape: prefix, retained window, wake threshold.
+    pub fn llm_chat(&self) -> &crate::config::LlmChatConfig {
+        &self.llm_chat
+    }
+
     /// The retention store for a registered channel — where its messages live
     /// between publish and delivery.
     ///
@@ -1970,7 +2047,7 @@ impl Messenger {
     /// If the entry is durable, or if a non-durable entry has no ring — both are
     /// the registry disagreeing with itself.
     #[cfg(test)]
-    pub(crate) fn ring_store_for(&self, entry: &ChannelEntry) -> &Arc<store::RingStore> {
+    pub(crate) fn ring_store_for(&self, entry: &ChannelEntry) -> Arc<store::RingStore> {
         assert!(
             !entry.capabilities().durable,
             "messaging: channel {:?} is durable and has no ring store",
@@ -2229,7 +2306,7 @@ impl Messenger {
 
     /// The ring store for a non-durable channel uuid, panicking if there is
     /// none — the shared lookup behind the ring-subscriber and snapshot paths.
-    fn ring_store(&self, channel_uuid: &Uuid) -> &Arc<store::RingStore> {
+    fn ring_store(&self, channel_uuid: &Uuid) -> Arc<store::RingStore> {
         self.ring_stores.get(channel_uuid).unwrap_or_else(|| {
             panic!(
                 "messaging: channel {channel_uuid} has no ring store — it is durable or the \
@@ -4322,7 +4399,7 @@ mod tests {
         assert!(
             std::ptr::eq(
                 Arc::as_ptr(&ring_store) as *const store::RingStore,
-                Arc::as_ptr(ring_stores.get(&ephemeral.uuid).expect("registered")),
+                Arc::as_ptr(&ring_stores.get(&ephemeral.uuid).expect("registered")),
             ),
             "the store handed out is the registry's, not a fresh ring"
         );
