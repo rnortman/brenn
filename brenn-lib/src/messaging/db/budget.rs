@@ -90,14 +90,19 @@ pub fn refund_send_budget(conn: &Connection, conversation_id: i64, default_budge
     .expect("messaging: refund send budget");
 }
 
-/// Read the current send-budget remaining for a conversation. Returns
-/// `None` if no row exists yet. Test/debug helper.
+/// Read the current send-budget remaining for a conversation. `None` means no
+/// row exists yet — nothing has ever been drawn.
+///
+/// Errors panic rather than resolving to `None`: a silent "untouched" on a
+/// corrupt read would let a turn-provoking injection through.
 pub fn read_send_budget(conn: &Connection, conversation_id: i64) -> Option<u32> {
-    conn.query_row(
+    match conn.query_row(
         "SELECT remaining FROM messaging_send_budget WHERE conversation_id = ?1",
         rusqlite::params![conversation_id],
         |row| row.get::<_, i64>(0),
-    )
-    .ok()
-    .map(|n| n.max(0) as u32)
+    ) {
+        Ok(remaining) => Some(remaining.max(0) as u32),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => panic!("messaging: read_send_budget: {e}"),
+    }
 }

@@ -69,6 +69,7 @@ bogus_field = true
 fn validate_mcp_server_reserved_name_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pfin".to_string(),
             working_dir: Some(dir.path().to_path_buf()),

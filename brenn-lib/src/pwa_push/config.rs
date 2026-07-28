@@ -222,6 +222,7 @@ mod tests {
             pwa_push,
             webhook_subscriptions: vec![],
             mqtt_subscriptions: vec![],
+            chat_harness_policy: crate::access::AppPolicy::default(),
         }
     }
 

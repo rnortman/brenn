@@ -16,6 +16,7 @@ mod cc_event_loop;
 mod cc_spawn_config;
 mod compaction;
 mod idle_hooks;
+mod impetus_pool;
 mod lifecycle;
 mod lifetime;
 mod mcp_constants;

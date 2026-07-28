@@ -59,5 +59,6 @@ pub(crate) fn test_app_config(
         pwa_push: None,
         webhook_subscriptions: vec![],
         mqtt_subscriptions: vec![],
+        chat_harness_policy: brenn_lib::access::AppPolicy::default(),
     }
 }

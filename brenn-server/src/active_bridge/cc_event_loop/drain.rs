@@ -126,11 +126,51 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     // does not call the formatters itself. Rendering is pure (markdown →
     // HTML, no I/O); doing it before the send + mark sequence means a
     // future panic in the renderer can't strand already-delivered rows.
+    // The bus half is turn-provoking work, and the conversation's impetus pool
+    // pays for it. Impetus carried by anything in the batch restores the pool
+    // before the turn it buys; an empty pool holds the batch — nothing injected,
+    // positions left owed, delivered after the next refill. The self-echo filter
+    // ran upstream, so a batch of nothing but the conversation's own utterances
+    // never reaches the pool at all.
+    let bus_held = if bus_delivery.messages.is_empty() {
+        false
+    } else {
+        bridge.redeem_batch_impetus(&bus_delivery.messages).await;
+        !bridge.impetus_pool_has_room().await
+    };
+    if bus_held {
+        info!(
+            conversation_id = bridge.conversation_id,
+            held = bus_delivery.messages.len(),
+            "impetus pool empty — holding the bus batch until the conversation is attended"
+        );
+    }
+    // The ingress half draws nothing and delivers regardless, so a held bus
+    // batch renders as an events-only drain rather than as nothing.
+    let no_messages: [brenn_lib::messaging::MessageEnvelope; 0] = [];
+    let to_inject: &[brenn_lib::messaging::MessageEnvelope] = if bus_held {
+        &no_messages
+    } else {
+        &bus_delivery.messages
+    };
+    let delivered_message_count = to_inject.len();
+
     // `render_combined_drain` returns `None` only when both event and
-    // messaging slices are empty — which is the early-exit case here.
+    // messaging slices are empty. That is reachable with positions still owed:
+    // a bus batch consisting entirely of this conversation's own utterances is
+    // filtered away by `conversation_delivery` and leaves nothing to inject.
+    // The positions must still move, or every wake re-serves the same batch —
+    // unless the batch is held, where leaving them owed is the whole point.
     let Some(system_render) =
-        crate::system_message::render_combined_drain(&collapsed.events, &bus_delivery.messages)
+        crate::system_message::render_combined_drain(&collapsed.events, to_inject)
     else {
+        if let Some(messenger) = &bridge.messenger
+            && !bus_held
+        {
+            messenger
+                .advance_conversation(bridge.conversation_id, bus_delivery)
+                .await;
+        }
         return;
     };
 
@@ -165,7 +205,6 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     // `ToolUseSummary` broadcast below. `Option::take` avoids cloning.
     let mut system_render = system_render;
     let messaging_card_html = system_render.messaging_card_html.take();
-    let delivered_message_count = bus_delivery.messages.len();
 
     // Deliver the batch. If send fails (CC died between init and now),
     // events stay pending — at-least-once semantics. Stale rows stay too,
@@ -190,10 +229,17 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
         let conn = bridge.db.lock().await;
         brenn_lib::messaging::db::mark_pending_pushes_delivered(&conn, &ingress_push_ids_to_mark);
     }
-    if let Some(messenger) = &bridge.messenger {
-        messenger
-            .advance_conversation(bridge.conversation_id, bus_delivery)
-            .await;
+    if !bus_held {
+        if let Some(messenger) = &bridge.messenger {
+            messenger
+                .advance_conversation(bridge.conversation_id, bus_delivery)
+                .await;
+        }
+        // One turn, one unit, whatever the batch's size — and nothing at all for
+        // an events-only render, which the pool does not meter.
+        if delivered_message_count > 0 {
+            bridge.draw_impetus_pool().await;
+        }
     }
 
     // Emit ToolUseSummary card for received messages (the dual-broadcast).
@@ -222,6 +268,11 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
 /// Read, send, and advance run under the bridge's delivery lock, so "the second
 /// wake finds the position past it" holds for two wakes that arrive at once as
 /// well as for two that arrive in sequence.
+///
+/// The batch draws one unit from the conversation's impetus pool, after carried
+/// impetus has restored it. An empty pool holds the batch: nothing is injected,
+/// the positions stay owed, and this still reports `Ok` — "served for now", so
+/// the wake record retires instead of spinning. The next refill delivers it.
 pub(crate) async fn deliver_conversation_backlog(bridge: &ActiveBridge) -> Result<(), String> {
     let Some(messenger) = &bridge.messenger else {
         return Ok(());
@@ -233,6 +284,24 @@ pub(crate) async fn deliver_conversation_backlog(bridge: &ActiveBridge) -> Resul
     if delivery.is_empty() {
         return Ok(());
     }
+    if delivery.messages.is_empty() {
+        // Positions are owed but there is nothing to say: the batch was all
+        // self-echo. Advance past it and report served, or the wake pass hands
+        // it back on every pass.
+        messenger
+            .advance_conversation(bridge.conversation_id, delivery)
+            .await;
+        return Ok(());
+    }
+    bridge.redeem_batch_impetus(&delivery.messages).await;
+    if !bridge.impetus_pool_has_room().await {
+        info!(
+            conversation_id = bridge.conversation_id,
+            held = delivery.messages.len(),
+            "impetus pool empty — holding the bus batch until the conversation is attended"
+        );
+        return Ok(());
+    }
     // The live path renders messages only — no event drain rides with it, and
     // (unlike the startup drain) no dual `ToolUseSummary` broadcast.
     let mut render = crate::system_message::render_combined_drain(&[], &delivery.messages)
@@ -242,5 +311,6 @@ pub(crate) async fn deliver_conversation_backlog(bridge: &ActiveBridge) -> Resul
     messenger
         .advance_conversation(bridge.conversation_id, delivery)
         .await;
+    bridge.draw_impetus_pool().await;
     Ok(())
 }

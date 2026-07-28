@@ -11,14 +11,13 @@ fn parse_empty_toml_uses_defaults() {
     assert_eq!(config.logging.console_level, LevelFilter::INFO);
 }
 
-// Parse a checked-in config file and assert the messaging/public_url boot
-// invariant. Full validation (validate_and_resolve) needs host-side paths to
-// exist, so it only runs at server startup — but this invariant needs none of
-// those paths: once any messaging is configured (a [[surface]] or
-// [[channel]]), the message-source resolver requires a non-empty
-// server.public_url or boot panics. Asserting it here guards the file against a
-// regression that make check would otherwise miss (only a live server start
-// would catch it — and make e2e is not part of make check).
+// Parse a checked-in config file and assert the public_url contract. Full
+// validation (validate_and_resolve) needs host-side paths to exist, so it only
+// runs at server startup — but this invariant needs none of those paths:
+// server.public_url is required config, unconditionally, and a config lacking it
+// refuses to start. Asserting it here guards the file against a regression that
+// make check would otherwise miss (only a live server start would catch it — and
+// make e2e is not part of make check).
 fn assert_config_file_messaging_invariant(filename: &str) {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -26,15 +25,15 @@ fn assert_config_file_messaging_invariant(filename: &str) {
     let contents = std::fs::read_to_string(&path).unwrap();
     let config: BrennConfig =
         toml::from_str(&contents).unwrap_or_else(|e| panic!("{filename} parse failed: {e}"));
-    if !config.surfaces.is_empty() || !config.channels.is_empty() {
-        let public_url = config.server.public_url.as_deref().unwrap_or_else(|| {
-            panic!("{filename} configures messaging, so server.public_url is required")
-        });
-        assert!(
-            !public_url.is_empty(),
-            "server.public_url must be non-empty once messaging is configured"
-        );
-    }
+    let public_url = config
+        .server
+        .public_url
+        .as_deref()
+        .unwrap_or_else(|| panic!("{filename} must set server.public_url; it is required"));
+    assert!(
+        !public_url.is_empty(),
+        "{filename} sets an empty server.public_url; it must be a well-formed URL"
+    );
 }
 
 #[test]

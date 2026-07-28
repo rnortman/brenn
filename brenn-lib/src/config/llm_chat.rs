@@ -105,28 +105,29 @@ impl LlmChatConfig {
         );
     }
 
-    /// Extend an LLM app's resolved policy with authority over its own chat
-    /// subtree: one `Prefix("<prefix>.app.<slug>.")` matcher on each of the four
-    /// pub/sub ACL lists the chat channels use, plus the transport grant each of
-    /// those lists is narrowed by.
+    /// The harness policy for one LLM app: authority over that app's chat
+    /// subtree and nothing else. One `Prefix("<prefix>.app.<slug>.")` matcher on
+    /// each of the four pub/sub ACL lists the chat channels use, plus the
+    /// transport grant each of those lists is narrowed by.
     ///
-    /// A conversation must publish its record and stream and read its commands,
-    /// and it does so through the production gate ladder like every other
-    /// principal — there is no publisher bypass anywhere — so the authority has
-    /// to exist as policy. It is derived here rather than authored because the
-    /// conversation ids that terminate the names are minted at runtime, while
-    /// matchers are runtime patterns: one app-level prefix covers every present
-    /// and future conversation.
+    /// This is the authority the *harness* acts under — the server-side
+    /// machinery wrapping the LLM: the adapter that publishes a conversation's
+    /// record and stream and reads its commands. That machinery runs the
+    /// production gate ladder like every other principal — there is no publisher
+    /// bypass anywhere — so its authority has to exist as policy. It is derived
+    /// rather than authored because the conversation ids that terminate the
+    /// names are minted at runtime, while matchers are runtime patterns: one
+    /// app-level prefix covers every present and future conversation.
     ///
-    /// The app's own LLM publishes as the `App` principal under this same
-    /// policy, so it can also publish into its conversations' tree; sender
-    /// attribution (`app:<slug>@<server>` versus `conversation:<id>`) is what
-    /// keeps the record honest, and cross-app isolation is untouched.
+    /// It is deliberately a **separate** policy object from the app's authored
+    /// one. The app's LLM publishes as the `App` principal under the authored
+    /// policy; folding the chat tree into that policy would hand the LLM its own
+    /// command channel, its own record, and bus tools it was never granted.
     ///
-    /// Idempotent per list and per grant: an operator who authored the same
-    /// coverage keeps their entry and gains a redundant one, which changes no
-    /// decision.
-    pub fn grant_app_chat_tree(&self, app_slug: &str, policy: &mut AppPolicy) {
+    /// Cross-app isolation is untouched: the prefix stops at the owning app's
+    /// slug boundary.
+    pub fn harness_policy(&self, app_slug: &str) -> AppPolicy {
+        let mut policy = AppPolicy::default();
         let matcher = ChannelMatcher::Prefix(chat_app_prefix(&self.prefix, app_slug));
         for list in [
             &mut policy.acls.brenn_publish,
@@ -144,6 +145,7 @@ impl LlmChatConfig {
         ] {
             policy.grants.insert(grant);
         }
+        policy
     }
 }
 
@@ -377,9 +379,8 @@ mod tests {
     }
 
     #[test]
-    fn the_derived_grant_covers_every_leaf_of_every_conversation() {
-        let mut policy = AppPolicy::default();
-        LlmChatConfig::default().grant_app_chat_tree("alice", &mut policy);
+    fn the_harness_policy_covers_every_leaf_of_every_conversation() {
+        let policy = LlmChatConfig::default().harness_policy("alice");
 
         assert!(policy.has_grant(AppCapability::MessagingPublish));
         assert!(policy.has_grant(AppCapability::MessagingSubscribe));
@@ -407,9 +408,8 @@ mod tests {
     }
 
     #[test]
-    fn the_derived_grant_stops_at_the_owning_app() {
-        let mut policy = AppPolicy::default();
-        LlmChatConfig::default().grant_app_chat_tree("alice", &mut policy);
+    fn the_harness_policy_stops_at_the_owning_app() {
+        let policy = LlmChatConfig::default().harness_policy("alice");
 
         assert!(!policy.allows_brenn_publish(&chat_bare_name("chat", "bob", ChatLeaf::Out, 1)));
         assert!(!policy.allows_brenn_delivery(&chat_bare_name("chat", "bob", ChatLeaf::In, 1)));
@@ -420,28 +420,58 @@ mod tests {
     }
 
     #[test]
-    fn the_derived_grant_follows_the_configured_prefix() {
+    fn the_harness_policy_follows_the_configured_prefix() {
         let config = LlmChatConfig {
             prefix: "talk".to_string(),
             ..LlmChatConfig::default()
         };
-        let mut policy = AppPolicy::default();
-        config.grant_app_chat_tree("alice", &mut policy);
+        let policy = config.harness_policy("alice");
 
         assert!(policy.allows_brenn_publish("talk.app.alice.out.1"));
         assert!(!policy.allows_brenn_publish("chat.app.alice.out.1"));
     }
 
+    /// The harness policy is built from nothing: it carries exactly the four
+    /// transport grants and the four chat matchers, so no authored entry can
+    /// leak into it and it can never widen an app's own reach.
     #[test]
-    fn the_derived_grant_leaves_authored_entries_alone() {
-        let mut policy = AppPolicy::default();
-        policy.grants.insert(AppCapability::MessagingPublish);
-        policy.acls.brenn_publish = vec![ChannelMatcher::Exact("outbox".to_string())];
+    fn the_harness_policy_carries_nothing_but_the_chat_tree() {
+        let policy = LlmChatConfig::default().harness_policy("alice");
 
-        LlmChatConfig::default().grant_app_chat_tree("alice", &mut policy);
+        let chat = ChannelMatcher::Prefix("chat.app.alice.".to_string());
+        assert_eq!(policy.acls.brenn_publish, vec![chat.clone()]);
+        assert_eq!(policy.acls.brenn_subscribe, vec![chat.clone()]);
+        assert_eq!(policy.acls.ephemeral_publish, vec![chat.clone()]);
+        assert_eq!(policy.acls.ephemeral_subscribe, vec![chat]);
 
-        assert!(policy.allows_brenn_publish("outbox"));
-        assert!(policy.allows_brenn_publish("chat.app.alice.out.1"));
+        for granted in [
+            AppCapability::MessagingPublish,
+            AppCapability::MessagingSubscribe,
+            AppCapability::EphemeralPublish,
+            AppCapability::EphemeralSubscribe,
+        ] {
+            assert!(
+                policy.has_grant(granted),
+                "{granted:?} is a transport grant"
+            );
+        }
+        for withheld in [
+            AppCapability::DynamicSubscribe,
+            AppCapability::LocalPublish,
+            AppCapability::LocalSubscribe,
+            AppCapability::PwaPush,
+            AppCapability::MqttPublish,
+            AppCapability::Webhook,
+        ] {
+            assert!(
+                !policy.has_grant(withheld),
+                "{withheld:?} is not the harness's business"
+            );
+        }
+        assert!(policy.tool_grants.is_empty());
+        assert!(policy.acls.local_publish.is_empty());
+        assert!(policy.acls.mqtt_publish.is_empty());
+        assert!(policy.acls.webhook.is_empty());
     }
 
     #[test]

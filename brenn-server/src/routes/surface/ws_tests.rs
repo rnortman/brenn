@@ -4027,6 +4027,7 @@ async fn persist_durable(messenger: &Messenger, uuid: Uuid, body: &str) -> i64 {
         None,
         None,
         None,
+        None,
         utc_to_ns(Utc::now()),
     )
     .retained_seq

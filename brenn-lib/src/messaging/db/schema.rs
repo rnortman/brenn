@@ -67,6 +67,11 @@ pub fn run_messaging_migrations(conn: &Connection) {
             -- enters retention (append commit, or release for a parked row);
             -- NULL while parked. Carries retention order, which the rowid cannot.
             retained_seq        INTEGER,
+            -- Carried user-interaction authority, NULL on nearly every row. The
+            -- value set is `Impetus::as_str`; no CHECK, because the variant set
+            -- is additive by design and the decoder panics on an unknown value
+            -- (the host wrote every row).
+            impetus             TEXT,
             -- Non-brenn envelope rows must never have deliver_after or delivery_deadline;
             -- those are bus-only dispatch fields. This constraint makes the
             -- invariant machine-enforced rather than convention-enforced.
@@ -182,6 +187,10 @@ pub fn run_messaging_migrations(conn: &Connection) {
     if !crate::db::column_exists(conn, "messaging_messages", "retained_seq") {
         conn.execute_batch("ALTER TABLE messaging_messages ADD COLUMN retained_seq INTEGER;")
             .expect("failed to add messaging_messages.retained_seq column");
+    }
+    if !crate::db::column_exists(conn, "messaging_messages", "impetus") {
+        conn.execute_batch("ALTER TABLE messaging_messages ADD COLUMN impetus TEXT;")
+            .expect("failed to add messaging_messages.impetus column");
     }
     if !crate::db::column_exists(conn, "messaging_channels", "last_retained_seq") {
         conn.execute_batch(
@@ -1001,6 +1010,7 @@ mod tests {
                 envelope_type: crate::messaging::ChannelScheme::Brenn,
                 reply_to_uuid: None,
                 delivery_deadline: None,
+                impetus: None,
                 publish_ts_ns: 0,
             })
             .await;

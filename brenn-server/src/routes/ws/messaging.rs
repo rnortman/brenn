@@ -478,11 +478,7 @@ impl WsConnection {
                     timestamp,
                 },
                 interstitial,
-                reset_send_budget: self
-                    .state
-                    .messenger
-                    .is_some()
-                    .then(|| self.app_config().messaging_send_budget()),
+                restores_impetus_pool: self.state.messenger.is_some(),
             },
         )
         .await;

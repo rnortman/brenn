@@ -937,6 +937,7 @@ async fn append_ring_message(
             envelope_type: ChannelScheme::Ephemeral,
             reply_to_uuid: None,
             delivery_deadline: None,
+            impetus: None,
             publish_ts_ns: Utc::now().timestamp_nanos_opt().unwrap(),
         })
         .await;

@@ -351,6 +351,7 @@ impl RetentionStore for DbStore {
                 msg.reply_to_uuid,
                 msg.delivery_deadline,
                 None,
+                msg.impetus,
                 msg.publish_ts_ns,
             )),
             overflow: Vec::new(),
@@ -383,6 +384,10 @@ impl RetentionStore for DbStore {
             msg.reply_to_uuid,
             msg.delivery_deadline,
             Some(release_at),
+            // A parked message keeps its impetus and redeems on release: the
+            // interaction happened, and when the message is processed is the
+            // usual bus question, not an authority one.
+            msg.impetus,
             msg.publish_ts_ns,
         );
         Ok(Parked {

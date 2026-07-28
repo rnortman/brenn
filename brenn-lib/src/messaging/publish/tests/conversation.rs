@@ -8,7 +8,7 @@
 
 use super::super::*;
 use super::{CHAT_PREFIX, ChatFixture, test_app_config};
-use crate::config::{ChatLeaf, LlmChatConfig, chat_address};
+use crate::config::{ChatLeaf, LlmChatConfig, chat_address, chat_bare_name};
 use crate::messaging::config::ResolvedMessagingConfig;
 use crate::messaging::testutils::test_channel_entry;
 use indexmap::IndexMap;
@@ -20,8 +20,9 @@ const OWNER: &str = "pa-bob";
 const NEIGHBOR: &str = "pa-alice";
 const CONVERSATION: i64 = 1;
 
-/// An app whose policy carries nothing but the derived chat-tree authority —
-/// the shape resolution produces for an app that authored no messaging config.
+/// An app that authored nothing — an empty (deny-everything) policy — carrying
+/// the derived chat-tree authority on its harness policy alone. The shape
+/// resolution produces for an app with no messaging config of its own.
 fn chat_app(slug: &str) -> crate::config::AppConfig {
     let mut cfg = test_app_config(
         slug,
@@ -32,7 +33,7 @@ fn chat_app(slug: &str) -> crate::config::AppConfig {
         vec!["bob".to_string()],
     );
     cfg.policy = crate::access::AppPolicy::default();
-    LlmChatConfig::default().grant_app_chat_tree(slug, &mut cfg.policy);
+    cfg.chat_harness_policy = LlmChatConfig::default().harness_policy(slug);
     cfg
 }
 
@@ -132,10 +133,63 @@ async fn a_conversation_reaches_nothing_outside_the_chat_tree() {
 }
 
 #[tokio::test]
-async fn without_the_derived_grant_there_is_no_bypass() {
-    // The adapter's authority is entirely the owning app's policy. An app that
-    // somehow resolved without the chat grants publishes nothing — this arm is
-    // what makes "no ACL bypass anywhere" checkable rather than asserted.
+async fn the_authored_policy_is_not_what_authorizes_the_adapter() {
+    // Every app in this fixture authored an empty, deny-everything policy; the
+    // record and stream land anyway. Authority is the harness policy, and the
+    // separation is the point of the arm rather than an incidental fixture
+    // detail.
+    let m = chat_messenger().await;
+    assert!(
+        !m.apps[OWNER].policy.allows_brenn_publish(&chat_bare_name(
+            CHAT_PREFIX,
+            OWNER,
+            ChatLeaf::Out,
+            CONVERSATION
+        )),
+        "the fixture's authored policy must reach nothing"
+    );
+    assert!(matches!(
+        send(&m, OWNER, &addr(OWNER, ChatLeaf::Out)).await,
+        PublishResult::Ok { .. }
+    ));
+}
+
+#[tokio::test]
+async fn the_apps_own_llm_cannot_publish_into_its_chat_tree() {
+    // The `App` principal — the shape a `BrennSend` tool call takes — under the
+    // same app, same channels, same messenger. It resolves the authored policy,
+    // which carries no chat matcher, so its own command channel and its own
+    // record are both out of reach.
+    let m = chat_messenger().await;
+    for leaf in [ChatLeaf::In, ChatLeaf::Out] {
+        let target = addr(OWNER, leaf);
+        let result = m
+            .publish(
+                PublishOrigin::Conversation { id: CONVERSATION },
+                OWNER,
+                &target,
+                "body",
+                Urgency::Normal,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                PublishResult::MissingSender | PublishResult::AclDenied(_)
+            ),
+            "{target} must be refused to the app principal, got {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_the_harness_policy_there_is_no_bypass() {
+    // The adapter's authority is entirely the owning app's harness policy. An
+    // app that somehow resolved without it publishes nothing — this arm is what
+    // makes "no ACL bypass anywhere" checkable rather than asserted.
     let m = chat_messenger().await;
     let result = m
         .publish_from_conversation(
@@ -147,6 +201,44 @@ async fn without_the_derived_grant_there_is_no_bypass() {
         )
         .await;
     assert!(matches!(result, PublishResult::MissingSender), "{result:?}");
+}
+
+#[tokio::test]
+async fn the_chat_tree_is_outside_the_apps_listing() {
+    // What the app's LLM can enumerate is what its authored policy covers. The
+    // chat channels exist in the directory and are not among them.
+    let m = chat_messenger().await;
+    let listed: Vec<String> = m
+        .list_accessible_channels(OWNER)
+        .into_iter()
+        .map(|c| c.address)
+        .collect();
+    assert!(
+        listed.iter().all(|a| !a.contains("chat.app.")),
+        "no chat channel may appear in the app's listing, got {listed:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_conversation_subscriber_reads_under_the_harness_policy() {
+    // The read gate and the wake gate both go through `targets.policy`, so this
+    // one predicate is where the split between the two principals shows up on
+    // the read side.
+    let m = chat_messenger().await;
+    let conversation = SubscriberEntryKind::ChatConversation {
+        app_slug: OWNER.to_string(),
+        conversation_id: CONVERSATION,
+    };
+    assert!(m.channel_access_allowed(&conversation, &addr(OWNER, ChatLeaf::In)));
+    assert!(m.channel_access_allowed(&conversation, &addr(OWNER, ChatLeaf::Stream)));
+    assert!(!m.channel_access_allowed(&conversation, &addr(NEIGHBOR, ChatLeaf::In)));
+    assert!(!m.channel_access_allowed(&conversation, "brenn:alerts.high"));
+
+    // The same app as an ordinary `App` subscriber resolves the authored policy
+    // and reaches none of it.
+    let app = SubscriberEntryKind::App(OWNER.to_string());
+    assert!(!m.channel_access_allowed(&app, &addr(OWNER, ChatLeaf::Out)));
+    assert!(!m.channel_access_allowed(&app, &addr(OWNER, ChatLeaf::Stream)));
 }
 
 #[tokio::test]

@@ -312,14 +312,17 @@ pub struct WasmBatchFailure<'a> {
 ///
 /// # Panics
 ///
-/// Panics if `public_url` is missing or empty — messaging is configured but
-/// `server.public_url` is required as the message source identifier.
+/// Panics if `public_url` is missing or empty. This is defense in depth: config
+/// load already refuses a config without it, with a message that explains what
+/// to set. Reaching this panic means something built a `ServerConfig` without
+/// going through validation.
 pub fn resolve_source(server: &ServerConfig) -> Arc<str> {
     match server.public_url.as_deref().filter(|s| !s.is_empty()) {
         Some(url) => Arc::from(url),
         None => panic!(
             "messaging is configured but `server.public_url` is missing or empty \
-             — required as the message source identifier"
+             — required as the message source identifier, and load-time config \
+             validation is the primary gate for it"
         ),
     }
 }
@@ -496,9 +499,10 @@ pub enum SubscriberEntryKind {
     /// walks by construction rather than by a filter someone has to remember.
     ///
     /// `app_slug` is carried, not looked up: authority for the chat tree is the
-    /// owning app's policy (the auto-granted `<prefix>.app.<slug>.` matchers), so
-    /// policy and wake economics resolve through the same apps map an `App` entry
-    /// uses, with no per-conversation registration anywhere.
+    /// owning app's derived harness policy (`AppConfig::chat_harness_policy`,
+    /// the `<prefix>.app.<slug>.` matchers), not the app's authored policy, so
+    /// policy and wake economics resolve through the same apps map an `App`
+    /// entry uses, with no per-conversation registration anywhere.
     ChatConversation {
         app_slug: String,
         conversation_id: i64,
@@ -813,7 +817,7 @@ impl MessagingDirectory {
 // that lightweight crate without pulling in all of brenn-lib's host dependencies.
 // Re-exporting at the same paths keeps every existing host caller unchanged.
 pub use brenn_envelope::{
-    BRENN_ADDRESS_PREFIX, ChannelScheme, DeliveryClass, EPHEMERAL_ADDRESS_PREFIX,
+    BRENN_ADDRESS_PREFIX, ChannelScheme, DeliveryClass, EPHEMERAL_ADDRESS_PREFIX, Impetus,
     LOCAL_ADDRESS_PREFIX, MQTT_ADDRESS_PREFIX, MessageEnvelope, MqttEnvelope, MqttPayloadBody,
     PWA_PUSH_ADDRESS_PREFIX, Urgency, WEBHOOK_ADDRESS_PREFIX, WebhookEnvelope, utc_from_epoch_ms,
 };
@@ -4452,6 +4456,7 @@ mod tests {
                 envelope_type: ChannelScheme::Ephemeral,
                 reply_to_uuid: None,
                 delivery_deadline: None,
+                impetus: None,
                 publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
             };
             async move {
@@ -4590,6 +4595,7 @@ mod tests {
                 envelope_type: ChannelScheme::Ephemeral,
                 reply_to_uuid: None,
                 delivery_deadline: None,
+                impetus: None,
                 publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
             };
             async move {
@@ -4668,6 +4674,7 @@ mod tests {
                         envelope_type: ChannelScheme::Ephemeral,
                         reply_to_uuid: None,
                         delivery_deadline: None,
+                        impetus: None,
                         publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
                     },
                     now + Duration::seconds(offset),
@@ -4727,6 +4734,7 @@ mod tests {
                 envelope_type: ChannelScheme::Ephemeral,
                 reply_to_uuid: None,
                 delivery_deadline: None,
+                impetus: None,
                 publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
             };
             async move {
@@ -5403,6 +5411,7 @@ mod tests {
                     envelope_type: ChannelScheme::Brenn,
                     reply_to_uuid: None,
                     delivery_deadline: None,
+                    impetus: None,
                     publish_ts_ns: park_ts,
                 },
                 release_at,
@@ -6385,6 +6394,7 @@ mod tests {
                 envelope_type: ChannelScheme::Brenn,
                 reply_to_uuid: None,
                 delivery_deadline: None,
+                impetus: None,
                 publish_ts_ns: crate::messaging::db::utc_to_ns(Utc::now()),
             })
             .await;
@@ -6408,6 +6418,7 @@ mod tests {
                 envelope_type: ChannelScheme::Brenn,
                 reply_to_uuid: None,
                 delivery_deadline: Some(deadline),
+                impetus: None,
                 publish_ts_ns: crate::messaging::db::utc_to_ns(Utc::now()),
             })
             .await;
@@ -6624,6 +6635,7 @@ mod tests {
                     envelope_type: ChannelScheme::Brenn,
                     reply_to_uuid: None,
                     delivery_deadline: Some(deadline),
+                    impetus: None,
                     publish_ts_ns: crate::messaging::db::utc_to_ns(now),
                 },
                 now - chrono::Duration::seconds(30),
@@ -7132,6 +7144,7 @@ mod tests {
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
+            impetus: None,
             urgency: Urgency::Normal,
             envelope_type: scheme,
         }
@@ -7610,6 +7623,7 @@ mod tests {
             envelope_type: channel.transport_type,
             reply_to_uuid: None,
             delivery_deadline: None,
+            impetus: None,
             publish_ts_ns: db::utc_to_ns(Utc::now()),
         }
     }

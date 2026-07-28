@@ -14,6 +14,7 @@ fn validate_container_app_resolves_correctly() {
     std::fs::create_dir(&working_dir).unwrap();
 
     let config = BrennConfig {
+        server: super::test_server_config(),
         container: HashMap::from([(
             "sandbox".to_string(),
             ContainerConfig {
@@ -136,6 +137,7 @@ fn validate_bare_app_state_dir_uses_validated_xdg_runtime_dir() {
     let working_dir = tempfile::tempdir().unwrap();
 
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "bare-test".to_string(),
             working_dir: Some(working_dir.path().to_path_buf()),
@@ -175,6 +177,7 @@ fn validate_app_extra_mounts_appended_after_container_extra_mounts() {
     std::fs::create_dir(&working_dir).unwrap();
 
     let config = BrennConfig {
+        server: super::test_server_config(),
         container: HashMap::from([(
             "sandbox".to_string(),
             ContainerConfig {
@@ -257,6 +260,7 @@ fn validate_app_extra_mounts_appended_after_container_extra_mounts() {
 fn validate_bare_app_with_extra_mounts_panics() {
     let working_dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "bare-with-mounts".to_string(),
             name: None,
@@ -328,6 +332,7 @@ home_dir = "/tmp"
 fn validate_nonexistent_container_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pfin".to_string(),
             name: None,
@@ -389,6 +394,7 @@ fn validate_container_without_working_dir_panics() {
     let dir = tempfile::tempdir().unwrap();
     let home_dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         container: HashMap::from([(
             "sandbox".to_string(),
             ContainerConfig {
@@ -460,6 +466,7 @@ fn validate_relative_container_working_dir_panics() {
     let dir = tempfile::tempdir().unwrap();
     let home_dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         container: HashMap::from([(
             "sandbox".to_string(),
             ContainerConfig {
@@ -530,6 +537,7 @@ fn validate_relative_container_working_dir_panics() {
 fn validate_nonexistent_container_home_dir_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         container: HashMap::from([(
             "sandbox".to_string(),
             ContainerConfig {
@@ -600,6 +608,7 @@ fn validate_nonexistent_container_home_dir_panics() {
 fn validate_container_hooks_on_bare_app_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pfin".to_string(),
             name: None,
@@ -663,6 +672,7 @@ fn validate_container_hooks_on_bare_app_panics() {
 fn validate_post_pull_container_hooks_on_bare_app_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pfin".to_string(),
             name: None,
@@ -726,6 +736,7 @@ fn validate_post_pull_container_hooks_on_bare_app_panics() {
 fn validate_startup_container_hooks_on_bare_app_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pfin".to_string(),
             name: None,

@@ -755,6 +755,7 @@ mod tests {
                 reply_to: None,
                 delivery_deadline: None,
                 deliver_after: Some(release_at),
+                impetus: None,
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Brenn,
             }),
@@ -880,6 +881,7 @@ mod tests {
                 "owed body",
                 Urgency::Normal,
                 ChannelScheme::Brenn,
+                None,
                 None,
                 None,
                 None,
@@ -1091,6 +1093,7 @@ mod tests {
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
+            impetus: None,
             urgency: Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
         };
@@ -1213,6 +1216,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 utc_to_ns(Utc::now()),
             )
             .retained_seq
@@ -1255,6 +1259,7 @@ mod tests {
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
+            impetus: None,
             urgency: Urgency::Normal,
             envelope_type: brenn_lib::messaging::ChannelScheme::Brenn,
         }

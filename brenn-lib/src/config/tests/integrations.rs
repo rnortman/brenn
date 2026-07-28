@@ -56,6 +56,7 @@ fn integration_enabled_by_name() {
     let dir = tempfile::tempdir().unwrap();
     let registry = IntegrationRegistry::new(vec![Box::new(TestFactory)]);
     let config = BrennConfig {
+        server: super::test_server_config(),
         integrations: HashMap::from([(
             "test-int".to_string(),
             toml::Value::Table(toml::map::Map::from_iter([(
@@ -132,6 +133,7 @@ fn integration_per_app_override() {
     let dir = tempfile::tempdir().unwrap();
     let registry = IntegrationRegistry::new(vec![Box::new(TestFactory)]);
     let config = BrennConfig {
+        server: super::test_server_config(),
         integrations: HashMap::from([(
             "test-int".to_string(),
             toml::Value::Table(toml::map::Map::from_iter([(
@@ -212,6 +214,7 @@ fn integration_unknown_name_panics() {
     let dir = tempfile::tempdir().unwrap();
     let registry = IntegrationRegistry::new(vec![]);
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "myapp".to_string(),
             name: None,
@@ -273,6 +276,7 @@ fn integration_mcp_server_collision_panics() {
     let dir = tempfile::tempdir().unwrap();
     let registry = IntegrationRegistry::new(vec![Box::new(TestFactory)]);
     let config = BrennConfig {
+        server: super::test_server_config(),
         integrations: HashMap::from([(
             "test-int".to_string(),
             toml::Value::Table(toml::map::Map::from_iter([(
@@ -522,6 +526,7 @@ fn inter_integration_mcp_server_collision_panics() {
         }),
     ]);
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "myapp".to_string(),
             name: None,

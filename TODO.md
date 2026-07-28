@@ -860,6 +860,33 @@ Code sites (`TODO(chat-bus-attachments)`): `brenn-envelope/src/chat.rs`, the
 `brenn-server/src/active_bridge/bus_chat.rs`.
 
 
+## `chat-surface-mints-impetus`
+
+A message may carry *impetus* — publish-time-checked evidence that live user
+interaction produced it — and a conversation redeems it by resetting its impetus
+pool, the stock every unattended turn-provoking bus injection draws from. Setting
+the field requires the `mint_impetus` capability, and **nothing in production
+holds or sets it**: the capability is not authorable from TOML, no surface or
+WASM publish path carries the field, and every internal wrapper passes `None`.
+Only the legacy websocket door refills a pool today.
+
+Consequence: a conversation driven purely over the bus — or an observer
+conversation fed by ambience — has a bounded runway (the pool ceiling's worth of
+unattended turns) per attended legacy-door touch, then stalls: sends are refused
+with a correlated `error`, ambience is held unadvanced. Someone whose only door
+to Brenn is a bus surface has no way to restart it. That is transitional, not the
+intended end state.
+
+The chat-surface project (voice gateway behind it) is the first minter: author
+the `SurfaceGrant` → `MintImpetus` mapping, carry the field on the surface
+publish frames, and derive `Impetus::Replenish` from a genuine user gesture —
+never from component say-so alone. Done when an attended bus send refills the
+pool it draws from.
+
+Code site (`TODO(chat-surface-mints-impetus)`): `brenn-lib/src/access/mod.rs`,
+the `AppCapability::MintImpetus` variant.
+
+
 ## `chat-history-on-demand`
 
 A conversation's record channel retains `[llm_chat].retained_window` messages,

@@ -142,6 +142,15 @@ pub(super) async fn bridge_with_unspawned_event_loop(
 /// (a multi-mode escape hatch).
 pub(super) async fn bridge_with_messenger_for_drain()
 -> (Arc<ActiveBridge>, broadcast::Receiver<WsServerMessage>) {
+    bridge_with_messenger_for_drain_at_ceiling(100).await
+}
+
+/// [`bridge_with_messenger_for_drain`] whose app sets the impetus pool's
+/// ceiling, for the cases that turn on it — `0` in particular, which makes the
+/// conversation attended-only.
+pub(super) async fn bridge_with_messenger_for_drain_at_ceiling(
+    send_budget: u32,
+) -> (Arc<ActiveBridge>, broadcast::Receiver<WsServerMessage>) {
     let db = brenn_lib::db::init_db_memory();
     let (broadcast_tx, broadcast_rx) = broadcast::channel(64);
 
@@ -212,6 +221,7 @@ pub(super) async fn bridge_with_messenger_for_drain()
         brenn_lib::obs::alerting::noop_alert_dispatcher().0,
         TestBridgeConfig {
             messenger: Some(messenger),
+            send_budget,
             ..Default::default()
         },
     );
@@ -257,19 +267,48 @@ const DRAIN_TEST_CHANNEL_UUID: uuid::Uuid = uuid::Uuid::from_bytes([
 /// `messaging_channels` row with `DRAIN_TEST_CHANNEL_UUID`. A mismatch
 /// produces an FK violation panic from `insert_message`.
 pub(super) async fn seed_pending_push(bridge: &ActiveBridge, body: &str) {
+    seed_pending_push_from(bridge, "test-sender", body).await;
+}
+
+/// [`seed_pending_push`] with the sender named, for the cases that turn on who
+/// spoke — the drain filters a conversation's own utterances out of its batch.
+pub(super) async fn seed_pending_push_from(bridge: &ActiveBridge, sender: &str, body: &str) {
+    seed_push_row(bridge, sender, body, None).await;
+}
+
+/// [`seed_pending_push`] carrying user-interaction authority, for the cases that
+/// turn on the redemption. Stamps the impetus column directly rather than going
+/// through the publish gate, which owns the minting check in production.
+pub(super) async fn seed_pending_push_with_impetus(bridge: &ActiveBridge, body: &str) {
+    seed_push_row(
+        bridge,
+        "test-sender",
+        body,
+        Some(brenn_lib::messaging::Impetus::Replenish),
+    )
+    .await;
+}
+
+async fn seed_push_row(
+    bridge: &ActiveBridge,
+    sender: &str,
+    body: &str,
+    impetus: Option<brenn_lib::messaging::Impetus>,
+) {
     let conn = bridge.db.lock().await;
     let now_ns = brenn_lib::messaging::db::utc_to_ns(chrono::Utc::now());
     brenn_lib::messaging::db::insert_message(
         &conn,
         DRAIN_TEST_CHANNEL_UUID,
         "test-drain-source",
-        "test-sender",
+        sender,
         body,
         brenn_lib::messaging::Urgency::Normal,
         brenn_lib::messaging::ChannelScheme::Brenn,
         None,
         None,
         None,
+        impetus,
         now_ns,
     );
     // Verify the message entered retention: a FK violation (channel not seeded)

@@ -461,6 +461,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             utc_to_ns(Utc::now()),
         );
     }

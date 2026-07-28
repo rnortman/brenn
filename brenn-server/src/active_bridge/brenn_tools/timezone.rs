@@ -831,6 +831,7 @@ mod tests {
             pwa_push: None,
             webhook_subscriptions: vec![],
             mqtt_subscriptions: vec![],
+            chat_harness_policy: brenn_lib::access::AppPolicy::default(),
         };
 
         let tools = brenn_lib::integration::core_virtual_tools(&cfg);

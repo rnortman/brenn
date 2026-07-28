@@ -346,6 +346,41 @@ publish **writes to SQLite** (a message row + per-subscriber pending-push rows).
   identity (a cross-restart send budget in front of `publish_from_surface`, per
   parent D7's "additive gate" note), not just the per-connection bucket.
 
+### 6.4 Malformed chat commands are outside fail2ban's perimeter, deliberately
+
+A conversation's chat command channel carries JSON bodies the bus itself never
+parses; the chat adapter decodes them and refuses what it cannot understand,
+answering the peer with a correlated `error` on the conversation record and
+logging a sender-keyed `schema_violation` security event.
+
+That event is **not** a fail2ban signal and is not meant to become one. A body
+that reaches the adapter has already passed session authentication *and* the
+publish ACL gate on the command channel, so its author is one of: an
+authenticated user's browser surface, an operator-granted app or WASM principal,
+or in-process machinery. Banning the address behind an authenticated session
+bans the user, not an attacker. There is also no participant → connection/IP
+mapping at that depth — attribution is a `ParticipantId`, by design — and
+building one to feed a mis-aimed signal would buy nothing.
+
+- **The correct response** to a hostile or broken authenticated principal is
+  alerting and grant revocation, not an IP ban. The sender-keyed warn-level event
+  is that record; volume is the signal, so individual rejections raise no phone
+  alert.
+- **Where fail2ban's chat surface actually is:** the same place it is for
+  everything else — the perimeter, where the IP exists and is already
+  instrumented (§5): auth failures, unrecognized URLs, and surface-WS protocol
+  violations, including a publish to an unbound port.
+- **Not done, and why:** parsing chat bodies earlier, at the surface-WS publish
+  path, would break the load-bearing invariant that the bus never parses bodies,
+  and would cover only one of the doors a command can arrive through. A bus-level
+  ACL denial on a surface's *bound* output is not attacker probing either — it is
+  config skew between the binding and the ACL, which boot validation makes
+  impossible and the session answers with a panic rather than a log.
+- **What the log line must not contain:** the rejection detail embeds
+  peer-supplied bytes (a decoder's rendering of the body it could not parse), so
+  it is sanitized before interpolation like every other untrusted value that
+  reaches a log.
+
 ---
 
 ## 7. Boundaries B2 / B3 — The Claude Code Subprocess

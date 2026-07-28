@@ -3520,6 +3520,10 @@ impl ClientCore {
             // channel's, held in its deferred set until it releases, and a released
             // message is an ordinary arrival nobody is owed a release time for.
             deliver_after: None,
+            // A page-local publish carries no user-interaction authority: the
+            // component names only its port, and nothing in the browser is in a
+            // position to assert a gesture on the operator's behalf.
+            impetus: None,
             // The caller's override, else the port's configured default —
             // resolved by the caller, since this core is the router and no
             // server downstream will apply the default for it.

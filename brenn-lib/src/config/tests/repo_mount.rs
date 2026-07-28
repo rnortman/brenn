@@ -58,6 +58,7 @@ fn repo_duplicate_slug_panics() {
     std::fs::create_dir(&app_dir).unwrap();
 
     let config = BrennConfig {
+        server: super::test_server_config(),
         repo_dir: Some(dir.path().to_path_buf()),
         repos: vec![
             RepoDeclRaw {
@@ -135,6 +136,7 @@ fn repo_reserved_slug_panics() {
     std::fs::create_dir(&app_dir).unwrap();
 
     let config = BrennConfig {
+        server: super::test_server_config(),
         repo_dir: Some(dir.path().to_path_buf()),
         repos: vec![RepoDeclRaw {
             slug: "all".to_string(),
@@ -248,6 +250,7 @@ fn repo_invalid_slug_format_panics() {
     std::fs::create_dir(&app_dir).unwrap();
 
     let config = BrennConfig {
+        server: super::test_server_config(),
         repo_dir: Some(dir.path().to_path_buf()),
         repos: vec![RepoDeclRaw {
             slug: "BAD SLUG".to_string(),
@@ -323,6 +326,7 @@ fn mount_test_config(
     container_working_dir: Option<PathBuf>,
 ) -> BrennConfig {
     BrennConfig {
+        server: super::test_server_config(),
         repo_dir: Some(dir.to_path_buf()),
         repos,
         apps: vec![AppConfigRaw {

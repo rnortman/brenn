@@ -41,6 +41,7 @@ fn insert_message_round_trip() {
         None,
         None,
         None,
+        None,
         now_ns,
     );
     assert!(inserted.id > 0);
@@ -90,6 +91,7 @@ fn fts_search_via_match() {
         None,
         None,
         None,
+        None,
         utc_to_ns(Utc::now()),
     );
     let count: i64 = conn
@@ -133,6 +135,7 @@ fn release_due_for_channel_positions_the_message_and_clears_its_hold() {
         None,
         None,
         Some(release_at),
+        None,
         utc_to_ns(Utc::now()),
     );
     assert!(inserted.id > 0);
@@ -1007,6 +1010,60 @@ fn bus_gc_evict_archive_writes_jsonl_and_removes_body() {
     }
 }
 
+/// The archive decoder reads the impetus column: an archived envelope is the
+/// message as it was published, and dropping a field on the way out would make
+/// the archive a lossy record of it.
+#[test]
+fn bus_gc_evict_archive_carries_impetus() {
+    let db = init_db_memory();
+    let conn = db.blocking_lock();
+
+    let ch_uuid = Uuid::new_v4();
+    let ch_uuid_bytes = ch_uuid.as_bytes().to_vec();
+    conn.execute(
+        "INSERT INTO messaging_channels (uuid, address, created_at, resume_epoch) VALUES (?1, 'brenn:arc', '2024-01-01', X'00000000000000000000000000000001')",
+        rusqlite::params![ch_uuid_bytes],
+    )
+    .unwrap();
+
+    let row_id = insert_bus_msg(&conn, &ch_uuid_bytes, 1000);
+    conn.execute(
+        "UPDATE messaging_messages SET impetus = 'replenish' WHERE id = ?1",
+        rusqlite::params![row_id],
+    )
+    .unwrap();
+    // A second, impetus-free message, so the assertion is about the column
+    // rather than about a constant.
+    insert_bus_msg(&conn, &ch_uuid_bytes, 2000);
+
+    let tmp = tempfile::NamedTempFile::new().expect("tmp archive file");
+    let archive_path = tmp.path().to_path_buf();
+    bus_gc_evict_channel(
+        &conn,
+        ch_uuid,
+        "brenn:arc",
+        ChannelScheme::Brenn,
+        0,
+        Sink::Archive,
+        Some(&archive_path),
+    );
+
+    let content = std::fs::read_to_string(&archive_path).expect("read archive");
+    let lines: Vec<serde_json::Value> = content
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("archive line is valid JSON"))
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(
+        lines[0].get("impetus").and_then(|v| v.as_str()),
+        Some("replenish")
+    );
+    assert!(
+        lines[1].get("impetus").is_none(),
+        "an impetus-free row archives without the key"
+    );
+}
+
 /// `bus_gc_evict_channel` with frontier=0 evicts all messages.
 #[test]
 fn bus_gc_evict_zero_frontier_evicts_all() {
@@ -1368,6 +1425,7 @@ fn append_msg(conn: &Connection, channel: Uuid, body: &str) -> i64 {
         None,
         None,
         None,
+        None,
         utc_to_ns(Utc::now()),
     )
     .id
@@ -1385,6 +1443,7 @@ fn park_msg(conn: &Connection, channel: Uuid, body: &str, release_at: DateTime<U
         None,
         None,
         Some(release_at),
+        None,
         utc_to_ns(Utc::now()),
     )
     .id
@@ -1511,6 +1570,7 @@ fn park_with_push(conn: &Connection, channel: Uuid, body: &str, release_at: Date
         None,
         None,
         Some(release_at),
+        None,
         utc_to_ns(Utc::now()),
     )
     .id
@@ -1606,6 +1666,7 @@ fn message_retained_seq_reads_the_named_row_not_the_channel_high_water() {
         None,
         None,
         None,
+        None,
         utc_to_ns(Utc::now()),
     );
     assert_eq!(
@@ -1657,6 +1718,7 @@ fn message_retained_seq_panics_on_a_parked_row() {
         None,
         None,
         Some(Utc::now() + chrono::Duration::hours(1)),
+        None,
         utc_to_ns(Utc::now()),
     );
     assert_eq!(

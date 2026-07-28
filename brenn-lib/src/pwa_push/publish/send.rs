@@ -291,6 +291,7 @@ impl PwaPushService {
                 None, // no reply_to
                 None, // no delivery_deadline
                 None, // no deliver_after
+                None, // no impetus — a push is egress, never a user gesture
                 publish_ts_ns,
             );
             inserted.uuid

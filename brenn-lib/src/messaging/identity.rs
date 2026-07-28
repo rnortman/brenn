@@ -294,30 +294,6 @@ impl ParticipantId {
         }
     }
 
-    /// The subscriber key this surface identity stores in
-    /// `messaging_pending_pushes.target_app_slug`: everything after the
-    /// `surface:` prefix, so
-    /// `surface:kitchen` keys `"kitchen"` and `surface:kitchen#agenda-alice`
-    /// keys `"kitchen#agenda-alice"`.
-    ///
-    /// The two grains therefore occupy disjoint keyspaces without a second
-    /// column: `#` is outside the operator slug charset, so a component's key
-    /// can never collide with its own surface's platform key, with a sibling
-    /// instance's, or with an app/wasm slug. The platform grain shares the
-    /// bare-slug namespace with apps and wasm consumers but holds no durable
-    /// subscription, so no bare-slug surface subscriber row exists to collide.
-    ///
-    /// PANICS if the identity is not a `surface:` one, matching
-    /// `as_surface_slug`.
-    pub fn as_surface_subscriber_key(&self) -> &str {
-        self.0.strip_prefix("surface:").unwrap_or_else(|| {
-            panic!(
-                "ParticipantId::as_surface_subscriber_key: not a surface identity: {:?}",
-                self.0
-            )
-        })
-    }
-
     /// Recover the component instance of a `surface:<slug>#<instance>`
     /// sub-identity, or `None` for the bare `surface:<slug>` platform identity.
     /// The executable definition of "is this publish attributed to a component
@@ -782,28 +758,6 @@ mod tests {
                 slug: "kitchen".to_string(),
                 instance: None,
             }
-        );
-    }
-
-    /// The subscriber key is the storage encoding for `app_slug` /
-    /// `target_app_slug`: the two grains must land in disjoint keyspaces, and
-    /// the component grain must never collide with a sibling's.
-    #[test]
-    fn surface_subscriber_keys_separate_the_grains() {
-        assert_eq!(
-            ParticipantId::for_surface("kitchen").as_surface_subscriber_key(),
-            "kitchen"
-        );
-        assert_eq!(
-            ParticipantId::for_surface_component("kitchen", "agenda-alice")
-                .as_surface_subscriber_key(),
-            "kitchen#agenda-alice"
-        );
-        assert_ne!(
-            ParticipantId::for_surface_component("kitchen", "agenda-alice")
-                .as_surface_subscriber_key(),
-            ParticipantId::for_surface_component("kitchen", "agenda-bob")
-                .as_surface_subscriber_key(),
         );
     }
 

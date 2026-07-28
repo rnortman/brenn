@@ -1,6 +1,7 @@
 mod chat_roles;
 mod conversation;
 mod dispatch_row;
+mod impetus;
 mod ingress;
 mod publish_core;
 mod scheme_parity;

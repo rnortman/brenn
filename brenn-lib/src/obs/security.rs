@@ -117,6 +117,14 @@ pub enum SecurityEventType {
     /// `conversation_id` (WASM consumers have none). The response channel is the
     /// phone alert (once per process per slug).
     WasmActivationThrottled,
+    /// A publish claimed carried user-interaction authority (`impetus`) that the
+    /// publishing principal's policy does not grant. The publish is refused
+    /// whole, so this is a record of the claim, not of an effect.
+    ///
+    /// Sender-keyed, no `ip`: whoever made the claim is an authenticated
+    /// principal (an app, a surface component, in-process machinery), so the
+    /// response is operator action — revoking or correcting a grant — not a ban.
+    ImpetusMintDenied,
 }
 
 impl fmt::Display for SecurityEventType {
@@ -139,6 +147,7 @@ impl fmt::Display for SecurityEventType {
             Self::BrennPublishDenied => write!(f, "brenn_publish_denied"),
             Self::MqttPublishDenied => write!(f, "mqtt_publish_denied"),
             Self::WasmActivationThrottled => write!(f, "wasm_activation_throttled"),
+            Self::ImpetusMintDenied => write!(f, "impetus_mint_denied"),
         }
     }
 }
@@ -158,6 +167,8 @@ pub enum DenialKind {
     /// (layer-2, grant held). Minted only by the LLM MQTT intercept's
     /// `has_grant` branch; no result enum produces it.
     GrantAbsent,
+    /// The publish carried `impetus` without the `MintImpetus` grant.
+    ImpetusUnauthorized,
 }
 
 impl DenialKind {
@@ -169,6 +180,7 @@ impl DenialKind {
             Self::AclDenied => "acl_denied",
             Self::BodyTooLarge => "body_too_large",
             Self::GrantAbsent => "grant_absent",
+            Self::ImpetusUnauthorized => "impetus_unauthorized",
         }
     }
 }

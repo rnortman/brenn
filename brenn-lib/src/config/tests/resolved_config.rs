@@ -26,6 +26,7 @@ fn resolved_config_webhook_round_trip() {
     let secret_path = write_secret(dir.path(), "hmac.secret", "my-super-secret");
 
     let config = BrennConfig {
+        server: super::test_server_config(),
         webhook_endpoints: vec![WebhookEndpointConfigRaw {
             slug: "test-hook".to_string(),
             mount: None,
@@ -157,6 +158,7 @@ fn app_owned_endpoint_stamps_resolved_wake_min() {
     let secret_wasm = write_secret(dir.path(), "wasm.secret", "s3");
 
     let mut config = BrennConfig {
+        server: super::test_server_config(),
         webhook_endpoints: vec![
             make_endpoint("hook-override", secret_override),
             make_endpoint("hook-default", secret_default),
@@ -259,6 +261,7 @@ fn resolved_config_pwa_push_round_trip() {
     let subject = "mailto:test@example.com";
 
     let config = BrennConfig {
+        server: super::test_server_config(),
         pwa_push: PwaPushGlobalConfig {
             keypair_file: Some(keypair_path),
             subject: Some(subject.to_string()),
@@ -320,6 +323,7 @@ fn resolved_config_pwa_push_round_trip() {
 fn resolved_config_pwa_push_absent_is_none() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "myapp".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -372,6 +376,7 @@ fn git_pipeline_reference_config_resolves() {
     };
 
     let config = BrennConfig {
+        server: super::test_server_config(),
         webhook_endpoints: vec![
             endpoint("git-forgejo", "X-Gitea-Signature", "hex", secret_forgejo),
             endpoint(

@@ -447,6 +447,7 @@ impl Messenger {
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
+            impetus: None,
             urgency,
             envelope_type: scheme,
         };
@@ -521,6 +522,7 @@ mod tests {
                 reply_to: None,
                 delivery_deadline: None,
                 deliver_after: None,
+                impetus: None,
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
             });
@@ -689,6 +691,7 @@ mod tests {
                 reply_to: None,
                 delivery_deadline: None,
                 deliver_after: None,
+                impetus: None,
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
             }),

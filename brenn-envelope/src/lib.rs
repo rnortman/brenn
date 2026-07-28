@@ -497,6 +497,50 @@ pub fn utc_from_epoch_ms(ms: u64) -> Option<DateTime<Utc>> {
 }
 
 // ---------------------------------------------------------------------------
+// Impetus
+// ---------------------------------------------------------------------------
+
+/// Publish-time-checked evidence that live user interaction produced this
+/// message. Most messages carry none.
+///
+/// Carrying it requires the `mint_impetus` capability: the publish gate refuses
+/// a claim the publisher's policy does not justify, so impetus on a stored
+/// message is proof it was authorized when it was published, and a redeeming
+/// consumer needs no second check.
+///
+/// Scheme-agnostic and inert by default — it means nothing until a consumer
+/// defines a redemption for it.
+///
+/// Externally tagged with one v1 variant, so a future form (a fixed-amount
+/// grant, say) is an additive variant that leaves this one untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Impetus {
+    /// The redeeming consumer may treat this message as the product of live user
+    /// interaction and restore the allowance it governs to full.
+    Replenish,
+}
+
+impl Impetus {
+    /// Wire/DB string representation. The wire form is serde's (`"replenish"`);
+    /// this is the same string, for the DB column and for log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replenish => "replenish",
+        }
+    }
+
+    /// Parse from a wire/DB string. Returns `None` on unknown values. Named
+    /// `parse` rather than `from_str` for the same reason as [`Urgency::parse`].
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "replenish" => Some(Self::Replenish),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MessageEnvelope
 // ---------------------------------------------------------------------------
 
@@ -517,6 +561,11 @@ pub struct MessageEnvelope {
     pub delivery_deadline: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deliver_after: Option<DateTime<Utc>>,
+    /// Carried user-interaction authority, or `None` — which is what nearly
+    /// every message carries. Skip-serialized when absent so an impetus-free
+    /// envelope carries no `impetus` key on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impetus: Option<Impetus>,
     /// Sender-assigned urgency intent. Stored in `messaging_messages.urgency`.
     /// Controls per-subscriber `eager_wake` (via `WakeMin::wakes`) at insert time.
     /// LLM-visible via serde kebab-case (`"very-low"` / `"low"` / `"normal"` / `"high"`).
@@ -549,6 +598,7 @@ mod tests {
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
+            impetus: None,
             urgency,
             envelope_type,
         }
@@ -913,6 +963,7 @@ mod tests {
             reply_to: None,
             delivery_deadline: None,
             deliver_after: None,
+            impetus: None,
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Brenn,
         };
@@ -926,6 +977,44 @@ mod tests {
         assert_eq!(v["channel"], json!("brenn:chan"));
         // Confirm optional fields are absent in golden shape
         assert!(v.get("reply_to").is_none());
+    }
+
+    // ── Impetus ───────────────────────────────────────────────────────────
+
+    /// The wire form out-of-tree envelope consumers parse. A rename here is a
+    /// protocol break, so the literal is pinned rather than derived.
+    #[test]
+    fn impetus_wire_form_is_replenish() {
+        assert_eq!(
+            serde_json::to_value(Impetus::Replenish).unwrap(),
+            json!("replenish")
+        );
+        assert_eq!(Impetus::Replenish.as_str(), "replenish");
+        assert_eq!(Impetus::parse("replenish"), Some(Impetus::Replenish));
+        assert_eq!(Impetus::parse("Replenish"), None);
+        assert_eq!(Impetus::parse(""), None);
+    }
+
+    #[test]
+    fn message_envelope_carries_impetus_through_a_roundtrip() {
+        let mut env = make_envelope(Urgency::Normal, ChannelScheme::Brenn);
+        env.impetus = Some(Impetus::Replenish);
+        let v: Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["impetus"], json!("replenish"));
+        let env2: MessageEnvelope = serde_json::from_value(v).unwrap();
+        assert_eq!(env2.impetus, Some(Impetus::Replenish));
+    }
+
+    /// An impetus-free envelope carries no `impetus` key — strict deserializers
+    /// that do not know the field continue to accept the wire form.
+    #[test]
+    fn an_impetus_free_envelope_carries_no_impetus_key() {
+        let env = make_envelope(Urgency::Normal, ChannelScheme::Brenn);
+        let v: Value = serde_json::to_value(&env).unwrap();
+        assert!(v.get("impetus").is_none(), "impetus should be absent");
+        // And the absent key decodes back to None without a `default` attribute.
+        let env2: MessageEnvelope = serde_json::from_value(v).unwrap();
+        assert_eq!(env2.impetus, None);
     }
 
     // ── WebhookEnvelope serde ─────────────────────────────────────────────

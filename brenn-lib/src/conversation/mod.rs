@@ -145,6 +145,15 @@ pub struct Message {
 
 /// Create a new conversation for a user within an app. Returns the conversation id.
 /// `shared` controls visibility: true = all app users can see/participate, false = owner only.
+///
+/// **Provisioning obligation.** Every conversation row owes a chat channel
+/// family, and this function does not create one — it cannot, since this module
+/// sits below the messaging layer. Every caller must (transitively) see
+/// `Messenger::provision_conversation_chat_channels` run for the returned id
+/// before a bridge can spawn for it. A bridge spawned for an unprovisioned
+/// conversation panics naming the missing channel, and the boot backfill heals
+/// the row at next start — that backfill is recovery from a bug, not license to
+/// skip the call.
 pub fn create_conversation(conn: &Connection, user_id: i64, app_slug: &str, shared: bool) -> i64 {
     let now = format_ts_for_db(Utc::now());
     conn.execute(

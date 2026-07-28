@@ -1078,6 +1078,7 @@ mod tests {
                 envelope_type: ChannelScheme::Ephemeral,
                 reply_to_uuid: None,
                 delivery_deadline: None,
+                impetus: None,
                 publish_ts_ns: crate::messaging::db::utc_to_ns(chrono::Utc::now()),
             })
             .await;
@@ -1827,6 +1828,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 0,
             );
         }
@@ -1931,6 +1933,7 @@ mod tests {
                 body,
                 Urgency::Normal,
                 ChannelScheme::Brenn,
+                None,
                 None,
                 None,
                 None,

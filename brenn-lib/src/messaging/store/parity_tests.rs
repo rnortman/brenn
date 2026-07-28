@@ -139,6 +139,7 @@ fn message(sender: &str, body: &str) -> NewMessage {
         envelope_type: ChannelScheme::Brenn,
         reply_to_uuid: None,
         delivery_deadline: None,
+        impetus: None,
         publish_ts_ns: utc_to_ns(Utc::now()),
     }
 }

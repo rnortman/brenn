@@ -10,6 +10,7 @@ use crate::integration::IntegrationRegistry;
 fn validate_resolves_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         claude_defaults: ClaudeDefaultsConfig {
             model: "sonnet".to_string(),
             ..Default::default()
@@ -36,6 +37,7 @@ fn validate_resolves_defaults() {
 fn validate_per_app_model_override() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         claude_defaults: ClaudeDefaultsConfig {
             model: "sonnet".to_string(),
             ..Default::default()
@@ -77,6 +79,7 @@ fn validate_no_apps_panics() {
 fn validate_invalid_slug_uppercase_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "PFin".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -92,6 +95,7 @@ fn validate_invalid_slug_uppercase_panics() {
 fn validate_invalid_slug_leading_hyphen_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "-pfin".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -107,6 +111,7 @@ fn validate_invalid_slug_leading_hyphen_panics() {
 fn validate_invalid_slug_special_chars_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "my_app".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -122,6 +127,7 @@ fn validate_invalid_slug_special_chars_panics() {
 fn validate_duplicate_slugs_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![
             AppConfigRaw {
                 slug: "pfin".to_string(),
@@ -147,6 +153,7 @@ fn validate_duplicate_slugs_panics() {
 #[should_panic(expected = "does not exist or is not a directory")]
 fn validate_nonexistent_working_dir_panics() {
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pfin".to_string(),
             working_dir: Some(PathBuf::from("/nonexistent/path")),
@@ -162,6 +169,7 @@ fn validate_nonexistent_working_dir_panics() {
 fn validate_singleton_multiuser_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -180,6 +188,7 @@ fn validate_singleton_multiuser_panics() {
 fn validate_multiuser_without_allowed_users_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "collab".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -197,6 +206,7 @@ fn validate_multiuser_without_allowed_users_panics() {
 fn validate_singleton_requires_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -213,6 +223,7 @@ fn validate_singleton_requires_compaction() {
 fn validate_compaction_without_singleton_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "dev".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -229,6 +240,7 @@ fn validate_compaction_without_singleton_panics() {
 fn validate_compaction_soft_exceeds_hard_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -250,6 +262,7 @@ fn validate_compaction_soft_exceeds_default_hard_panics() {
     // the default hard is 95 and soft must be <= red (default 80).
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -268,6 +281,7 @@ fn validate_compaction_soft_exceeds_default_hard_panics() {
 fn validate_compaction_reminder_exceeds_soft_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -285,6 +299,7 @@ fn validate_compaction_reminder_exceeds_soft_panics() {
 fn validate_compaction_red_exceeds_hard_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -325,6 +340,7 @@ fn raw_with_token_thresholds(
 fn validate_compaction_reminder_tokens_exceeds_soft_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![raw_with_token_thresholds(
             dir.path(),
             Some(200_000),
@@ -342,6 +358,7 @@ fn validate_compaction_reminder_tokens_exceeds_soft_panics() {
 fn validate_compaction_soft_tokens_exceeds_red_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![raw_with_token_thresholds(
             dir.path(),
             None,
@@ -359,6 +376,7 @@ fn validate_compaction_soft_tokens_exceeds_red_panics() {
 fn validate_compaction_red_tokens_exceeds_hard_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![raw_with_token_thresholds(
             dir.path(),
             None,
@@ -376,6 +394,7 @@ fn validate_compaction_red_tokens_exceeds_hard_panics() {
 fn validate_compaction_reminder_tokens_below_1000_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![raw_with_token_thresholds(
             dir.path(),
             Some(200), // Almost certainly meant 200_000.
@@ -395,6 +414,7 @@ fn validate_compaction_soft_tokens_only_succeeds() {
     // plus the soft_tokens populated.
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![raw_with_token_thresholds(
             dir.path(),
             None,
@@ -436,6 +456,7 @@ fn validate_compaction_mixed_pct_and_tokens_succeeds() {
     raw.compact_reminder_pct = Some(50); // reminder via pct
     raw.compact_red_pct = Some(78); // red via pct
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![raw],
         ..Default::default()
     };
@@ -460,6 +481,7 @@ fn validate_compaction_idle_default_is_270() {
     // should produce idle_duration = 270s (the prompt-cache TTL margin).
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![raw_with_token_thresholds(
             dir.path(),
             None,
@@ -520,6 +542,7 @@ fn user_has_access_empty_allows_all() {
         policy: crate::access::AppPolicy::default(),
         webhook_subscriptions: vec![],
         mqtt_subscriptions: vec![],
+        chat_harness_policy: crate::access::AppPolicy::default(),
     };
     assert!(app.user_has_access("anyone"));
 }
@@ -565,6 +588,7 @@ fn user_has_access_restricted() {
         policy: crate::access::AppPolicy::default(),
         webhook_subscriptions: vec![],
         mqtt_subscriptions: vec![],
+        chat_harness_policy: crate::access::AppPolicy::default(),
     };
     assert!(app.user_has_access("alice"));
     assert!(!app.user_has_access("bob"));
@@ -614,6 +638,7 @@ fn minimal_app_config_for_budget_test(
         pwa_push: None,
         webhook_subscriptions: vec![],
         mqtt_subscriptions: vec![],
+        chat_harness_policy: crate::access::AppPolicy::default(),
     }
 }
 
@@ -747,6 +772,7 @@ fn validate_resolves_app_mqtt_subscriptions() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -841,6 +867,7 @@ fn validate_wasm_consumer_slug_colliding_with_app_panics() {
     };
 
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -869,6 +896,7 @@ fn validate_unknown_client_subscription_panics() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -934,6 +962,7 @@ fn validate_two_apps_same_channel_dedup_to_one_ingress_channel() {
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![
             AppConfigRaw {
                 slug: "a".to_string(),
@@ -979,6 +1008,7 @@ fn validate_same_topic_two_clients_yields_two_channels() {
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![
             AppConfigRaw {
                 slug: "a".to_string(),
@@ -1029,6 +1059,7 @@ fn validate_resolves_explicit_grants_and_acl_into_policy() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         // Both ACL-referenced MQTT clients must be configured (resolution
         // cross-checks each matcher's client against `[[mqtt_client]]`).
         mqtt_clients: vec![ingress_test_broker("home"), ingress_test_broker("office")],
@@ -1094,21 +1125,15 @@ fn validate_resolves_explicit_grants_and_acl_into_policy() {
             client: "office".to_string(),
         }]
     );
-    // Authored entries first, then the derived chat-tree matcher
-    // (`LlmChatConfig::grant_app_chat_tree`).
+    // Authored entries and nothing else: the chat tree lives on the app's
+    // separate harness policy and never enters the policy its LLM acts under.
     assert_eq!(
         policy.acls.brenn_subscribe,
-        vec![
-            ChannelMatcher::Prefix("alerts.".to_string()),
-            ChannelMatcher::Prefix("chat.app.home.".to_string()),
-        ]
+        vec![ChannelMatcher::Prefix("alerts.".to_string())]
     );
     assert_eq!(
         policy.acls.brenn_publish,
-        vec![
-            ChannelMatcher::Exact("outbox".to_string()),
-            ChannelMatcher::Prefix("chat.app.home.".to_string()),
-        ]
+        vec![ChannelMatcher::Exact("outbox".to_string())]
     );
     assert_eq!(
         policy.acls.webhook,
@@ -1116,6 +1141,22 @@ fn validate_resolves_explicit_grants_and_acl_into_policy() {
             endpoint: "github".to_string(),
         }]
     );
+    // The app authored no publish grants, so it holds none.
+    assert!(!policy.has_grant(AppCapability::MessagingPublish));
+    assert!(!policy.has_grant(AppCapability::EphemeralPublish));
+    assert!(!policy.has_grant(AppCapability::EphemeralSubscribe));
+
+    let harness = &apps["home"].chat_harness_policy;
+    assert_eq!(
+        harness.acls.brenn_publish,
+        vec![ChannelMatcher::Prefix("chat.app.home.".to_string())]
+    );
+    assert_eq!(
+        harness.acls.brenn_subscribe,
+        vec![ChannelMatcher::Prefix("chat.app.home.".to_string())]
+    );
+    assert!(harness.has_grant(AppCapability::MessagingPublish));
+    assert!(harness.acls.mqtt_publish.is_empty());
 }
 
 /// An app with no `grants`/`acl` resolves to the default (empty, deny-everything)
@@ -1126,6 +1167,7 @@ fn validate_app_without_grants_resolves_default_deny_policy() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "home".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -1146,8 +1188,9 @@ fn validate_app_without_grants_resolves_default_deny_policy() {
     assert!(!policy.allows_mqtt_dynamic_subscribe("home", "sensors/temp"));
 }
 
-/// Every LLM app leaves resolution with authority over its own chat subtree,
-/// whether or not it authored messaging config.
+/// Every LLM app leaves resolution with a harness policy carrying authority over
+/// its own chat subtree, whether or not it authored messaging config — and with
+/// an authored policy that gained nothing from the derivation.
 #[test]
 fn validate_derives_chat_tree_authority_for_every_app() {
     use crate::access::AppCapability;
@@ -1155,6 +1198,7 @@ fn validate_derives_chat_tree_authority_for_every_app() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![
             AppConfigRaw {
                 slug: "home".to_string(),
@@ -1176,30 +1220,121 @@ fn validate_derives_chat_tree_authority_for_every_app() {
         Some(super::test_runtime_dir()),
     );
 
-    let policy = &apps["home"].policy;
+    let harness = &apps["home"].chat_harness_policy;
     for grant in [
         AppCapability::MessagingPublish,
         AppCapability::MessagingSubscribe,
         AppCapability::EphemeralPublish,
         AppCapability::EphemeralSubscribe,
     ] {
-        assert!(policy.has_grant(grant), "{grant:?} must be derived");
+        assert!(harness.has_grant(grant), "{grant:?} must be derived");
     }
-    assert!(apps["home"].messaging_enabled());
 
-    assert!(policy.allows_brenn_publish(&chat_bare_name("chat", "home", ChatLeaf::Out, 7)));
-    assert!(policy.allows_brenn_delivery(&chat_bare_name("chat", "home", ChatLeaf::In, 7)));
-    assert!(policy.allows_ephemeral_publish(&chat_bare_name("chat", "home", ChatLeaf::Stream, 7)));
-    assert!(policy.allows_ephemeral_delivery(&chat_bare_name("chat", "home", ChatLeaf::Wake, 7)));
+    assert!(harness.allows_brenn_publish(&chat_bare_name("chat", "home", ChatLeaf::Out, 7)));
+    assert!(harness.allows_brenn_delivery(&chat_bare_name("chat", "home", ChatLeaf::In, 7)));
+    assert!(harness.allows_ephemeral_publish(&chat_bare_name("chat", "home", ChatLeaf::Stream, 7)));
+    assert!(harness.allows_ephemeral_delivery(&chat_bare_name("chat", "home", ChatLeaf::Wake, 7)));
 
     // Cross-app isolation is untouched by the derivation.
-    assert!(!policy.allows_brenn_publish(&chat_bare_name("chat", "office", ChatLeaf::Out, 7)));
-    assert!(!apps["office"].policy.allows_brenn_publish(&chat_bare_name(
-        "chat",
-        "home",
-        ChatLeaf::Out,
-        7
-    )));
+    assert!(!harness.allows_brenn_publish(&chat_bare_name("chat", "office", ChatLeaf::Out, 7)));
+    assert!(
+        !apps["office"]
+            .chat_harness_policy
+            .allows_brenn_publish(&chat_bare_name("chat", "home", ChatLeaf::Out, 7))
+    );
+
+    // The app authored nothing, so its own policy stays deny-everything: no
+    // transport grants, no chat matchers, and no bus participation.
+    let authored = &apps["home"].policy;
+    for grant in [
+        AppCapability::MessagingPublish,
+        AppCapability::MessagingSubscribe,
+        AppCapability::EphemeralPublish,
+        AppCapability::EphemeralSubscribe,
+    ] {
+        assert!(!authored.has_grant(grant), "{grant:?} must not be authored");
+    }
+    assert!(authored.acls.brenn_publish.is_empty());
+    assert!(authored.acls.brenn_subscribe.is_empty());
+    assert!(!authored.allows_brenn_publish(&chat_bare_name("chat", "home", ChatLeaf::In, 7)));
+    assert!(!authored.allows_brenn_delivery(&chat_bare_name("chat", "home", ChatLeaf::Out, 7)));
+    assert!(!apps["home"].messaging_enabled());
+}
+
+/// An app that authored no publish grant is offered no bus send tool. Tool
+/// visibility reads the authored policy, and the chat tree's transport grants
+/// live on the harness policy, so they cannot put `BrennSend` in a prompt.
+#[test]
+fn validate_app_without_authored_grants_gets_no_bus_send_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = BrennConfig {
+        server: super::test_server_config(),
+        apps: vec![AppConfigRaw {
+            slug: "home".to_string(),
+            working_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let ResolvedConfig { apps, .. } = validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        Some(super::test_runtime_dir()),
+    );
+
+    let names: Vec<String> = crate::integration::core_virtual_tools(&apps["home"])
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(
+        !names.iter().any(|n| n == "BrennSend"),
+        "an app that authored nothing must not be offered BrennSend, got {names:?}"
+    );
+}
+
+/// `DynamicSubscribe` alone does not reach the chat tree: the covering-matcher
+/// conjunct reads the authored ACLs, which no longer carry a chat matcher.
+#[test]
+fn validate_dynamic_subscribe_does_not_reach_the_chat_tree() {
+    use crate::access::AppCapability;
+    use crate::access::raw::{AppAclRaw, ChannelMatcherRaw};
+    use crate::config::{ChatLeaf, chat_bare_name};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = BrennConfig {
+        server: super::test_server_config(),
+        apps: vec![AppConfigRaw {
+            slug: "home".to_string(),
+            working_dir: Some(dir.path().to_path_buf()),
+            grants: vec![
+                AppCapability::DynamicSubscribe,
+                AppCapability::MessagingSubscribe,
+            ],
+            acl: AppAclRaw {
+                brenn_subscribe: vec![ChannelMatcherRaw::Prefix("alerts.".to_string())],
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let ResolvedConfig { apps, .. } = validate_and_resolve(
+        &config,
+        &IntegrationRegistry::new(vec![]),
+        Some(super::test_runtime_dir()),
+    );
+
+    let policy = &apps["home"].policy;
+    assert!(policy.allows_brenn_dynamic_subscribe("alerts.high"));
+    for leaf in [ChatLeaf::In, ChatLeaf::Out] {
+        let name = chat_bare_name("chat", "home", leaf, 7);
+        assert!(
+            !policy.allows_brenn_dynamic_subscribe(&name),
+            "{name} must be out of dynamic-subscribe reach"
+        );
+    }
 }
 
 /// A publishing app (`MessagingPublish` grant) that authors **no**
@@ -1213,6 +1348,7 @@ fn validate_publish_grant_without_matcher_resolves_deny_all_no_panic() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "home".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -1230,15 +1366,9 @@ fn validate_publish_grant_without_matcher_resolves_deny_all_no_panic() {
     );
 
     let policy = &apps["home"].policy;
-    // Layer-1 grant resolved; the only layer-2 entry is the derived chat-tree
-    // matcher, so every channel the operator meant to reach is denied.
+    // Layer-1 grant resolved; layer 2 is empty, so every channel is denied.
     assert!(policy.has_grant(AppCapability::MessagingPublish));
-    assert_eq!(
-        policy.acls.brenn_publish,
-        vec![crate::access::acl::ChannelMatcher::Prefix(
-            "chat.app.home.".to_string()
-        )]
-    );
+    assert!(policy.acls.brenn_publish.is_empty());
     assert!(!policy.allows_brenn_publish("anything"));
     assert!(!policy.allows_brenn_publish("outbox"));
 }
@@ -1254,6 +1384,7 @@ fn validate_publish_grant_with_matchers_resolves_covering_policy() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa-alice".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -1297,6 +1428,7 @@ fn validate_mqtt_publish_grant_without_matcher_resolves_deny_all_no_panic() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "home".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -1329,6 +1461,7 @@ fn validate_malformed_mqtt_subscribe_filter_panics() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         // The matcher's client must be configured so the client cross-check
         // passes and the *topic-filter* validation is what fails.
         mqtt_clients: vec![ingress_test_broker("home")],
@@ -1365,6 +1498,7 @@ fn validate_acl_unconfigured_mqtt_client_panics() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         // Only `home` is configured; the matcher names `typo`.
         mqtt_clients: vec![ingress_test_broker("home")],
         apps: vec![AppConfigRaw {
@@ -1415,6 +1549,7 @@ fn wasm_consumer_with_sub(
 fn validate_resolves_wasm_consumer_mqtt_ingress_channel() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -1458,6 +1593,7 @@ fn validate_resolves_wasm_consumer_mqtt_ingress_channel() {
 fn validate_app_and_wasm_same_mqtt_channel_dedup_to_one() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -1495,6 +1631,7 @@ fn validate_app_and_wasm_same_mqtt_channel_dedup_to_one() {
 fn validate_wasm_non_mqtt_subscription_derives_no_ingress_channel() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -1530,6 +1667,7 @@ fn validate_wasm_non_mqtt_subscription_derives_no_ingress_channel() {
 fn validate_wasm_mqtt_subscription_unknown_client_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),
@@ -1557,6 +1695,7 @@ fn validate_wasm_mqtt_subscription_unknown_client_panics() {
 fn validate_wasm_mqtt_subscription_malformed_filter_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![AppConfigRaw {
             slug: "pa".to_string(),
             working_dir: Some(dir.path().to_path_buf()),

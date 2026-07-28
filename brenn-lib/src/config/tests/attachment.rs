@@ -36,6 +36,7 @@ fn make_import_target(name: &str) -> AttachmentTargetRaw {
 fn attachment_target_valid_config() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![app_raw_with_targets(
             dir.path(),
             vec![make_import_target("import")],
@@ -58,6 +59,7 @@ fn attachment_target_valid_config() {
 fn attachment_target_duplicate_name_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![app_raw_with_targets(
             dir.path(),
             vec![make_import_target("import"), make_import_target("import")],
@@ -72,6 +74,7 @@ fn attachment_target_duplicate_name_panics() {
 fn attachment_target_reserved_chat_name_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![app_raw_with_targets(
             dir.path(),
             vec![make_import_target("chat")],
@@ -86,6 +89,7 @@ fn attachment_target_reserved_chat_name_panics() {
 fn attachment_target_empty_name_panics() {
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![app_raw_with_targets(
             dir.path(),
             vec![make_import_target("")],
@@ -102,6 +106,7 @@ fn attachment_target_empty_accept_panics() {
     let mut target = make_import_target("import");
     target.accept = vec![];
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![app_raw_with_targets(dir.path(), vec![target])],
         ..Default::default()
     };
@@ -115,6 +120,7 @@ fn attachment_target_extension_without_dot_panics() {
     let mut target = make_import_target("import");
     target.accept = vec!["ofx".to_string()];
     let config = BrennConfig {
+        server: super::test_server_config(),
         apps: vec![app_raw_with_targets(dir.path(), vec![target])],
         ..Default::default()
     };
