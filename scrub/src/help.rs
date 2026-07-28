@@ -86,6 +86,9 @@ stdin: nothing -- do not pipe input. Piped input is ignored entirely.
 scans: tracked files only (never untracked or ignored ones), from the working
        tree, so uncommitted fixes count. Diff-only rules are dropped, since a
        grandfathered backlog would otherwise make the scan permanently red.
+       A submodule is scanned as the pointer git records for it, named on
+       stderr; its own contents belong to another repository and are scanned
+       under that repository's gates.
 <path>: restrict to a subtree.
 --exclude <prefix>: skip a repo-relative prefix; repeatable. Matching is on
        whole path components. Excluded files are never scanned and never
@@ -169,5 +172,9 @@ mod tests {
         assert!(TREE.contains("hard error"));
         assert!(TREE.contains("\"findings\""));
         assert!(TREE.contains("\"excluded\""));
+        // A `SUBMODULE:` line on stderr is part of a clean sweep, not a warning
+        // about something skipped, and this is where an operator learns that.
+        assert!(TREE.contains("submodule"));
+        assert!(TREE.contains("another repository"));
     }
 }

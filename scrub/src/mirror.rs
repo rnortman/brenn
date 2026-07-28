@@ -27,7 +27,13 @@ impl Mirror {
     }
 
     /// Resolve a repo-relative path inside the mirror, refusing anything that
-    /// would escape it.
+    /// would escape it or land on an entry already mirrored.
+    ///
+    /// The mirror is fresh per run and every caller iterates a set of distinct
+    /// paths, so a name arriving twice means the caller's idea of "one entry"
+    /// broke. It is refused rather than overwritten: the second write of a
+    /// hardlinked entry would go through `fs::copy`, whose truncate-then-read
+    /// destroys the worktree file it is reading from.
     fn target(&self, rel: &Path) -> PathBuf {
         assert!(
             rel.is_relative(),
@@ -40,6 +46,11 @@ impl Mirror {
             rel.display()
         );
         let target = self.dir.path().join(rel);
+        assert!(
+            !target.exists(),
+            "mirror path is already mirrored: {}",
+            rel.display()
+        );
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)
                 .unwrap_or_else(|e| panic!("cannot create {}: {e}", parent.display()));
@@ -105,6 +116,38 @@ mod tests {
     #[should_panic(expected = "must not contain '..'")]
     fn parent_dir_escape_panics() {
         Mirror::new().write(Path::new("a/../../outside.rs"), b"x");
+    }
+
+    #[test]
+    #[should_panic(expected = "already mirrored")]
+    fn mirroring_one_path_twice_panics_rather_than_overwriting() {
+        let m = Mirror::new();
+        m.write(Path::new("src/a.rs"), b"first");
+        m.write(Path::new("src/a.rs"), b"second");
+    }
+
+    /// The sharpest consequence of a duplicate: the first `link_or_copy`
+    /// hardlinks the mirror entry to the worktree file, so a second one falls
+    /// through to `fs::copy(src, target)` with `src` and `target` the same
+    /// inode -- which truncates the *source* to zero and then mirrors the empty
+    /// result. That is data destruction plus a scan of nothing, both silent.
+    #[test]
+    fn a_repeated_link_or_copy_cannot_truncate_the_source() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("orig.rs");
+        std::fs::write(&src, b"let token = \"keepme\";\n").unwrap();
+
+        let m = Mirror::new();
+        m.link_or_copy(Path::new("orig.rs"), &src);
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            m.link_or_copy(Path::new("orig.rs"), &src)
+        }));
+        assert!(again.is_err(), "a second mirror of one path must refuse");
+        assert_eq!(
+            std::fs::read(&src).unwrap(),
+            b"let token = \"keepme\";\n",
+            "the source file must survive a refused duplicate"
+        );
     }
 
     #[test]
