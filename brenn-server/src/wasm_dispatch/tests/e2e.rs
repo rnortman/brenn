@@ -874,7 +874,7 @@ async fn build_ring_backed_consumer(
     ));
 
     messenger.attach_ring_subscriber(&uuid, &wasm_sub, u64::MAX, Priming::Head);
-    let ring = Arc::clone(ring_stores.get(&uuid).expect("registered ring store"));
+    let ring = ring_stores.get(&uuid).expect("registered ring store");
 
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
@@ -1002,11 +1002,9 @@ async fn build_mixed_class_consumer(
         &[(durable.as_ref(), Depth::Unbounded)],
     )
     .await;
-    let ring = Arc::clone(
-        ring_stores
-            .get(&ring_entry.uuid)
-            .expect("registered ring store"),
-    );
+    let ring = ring_stores
+        .get(&ring_entry.uuid)
+        .expect("registered ring store");
 
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
     let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {

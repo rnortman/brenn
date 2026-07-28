@@ -306,6 +306,17 @@ fn validate_static_subscriptions_deliverable(
                     component.as_str(),
                     system_policy_by_component.get(component.as_str()).copied(),
                 ),
+                // A conversation reads its command channel under its app's
+                // policy, so the check it has to pass is the app's — that the
+                // derived chat-tree grant really does cover the conversation's
+                // own leaves. This walk runs before chat provisioning today, so
+                // nothing reaches this arm at boot; resolving it correctly costs
+                // one lookup and keeps the answer right if that order changes.
+                SubscriberEntryKind::ChatConversation { app_slug, .. } => (
+                    "chat conversation",
+                    app_slug.as_str(),
+                    apps.get(app_slug).map(|a| &a.policy),
+                ),
             };
             match policy {
                 Some(policy) if policy.allows_channel_access(&entry.address) => {}
@@ -361,6 +372,11 @@ pub(crate) fn messaging_configured(
         || !mqtt_ingress_channels.is_empty()
         || !config.wasm_consumers.is_empty()
         || !config.surfaces.is_empty()
+        // Every LLM app's conversations carry a chat channel family, and those
+        // channels are messaging like any other. A deployment that declares an
+        // app has therefore activated the subsystem whether or not it declared a
+        // `[[channel]]`.
+        || !config.apps.is_empty()
 }
 
 /// Build the channel directory, upsert configured channels, rebuild
@@ -918,6 +934,7 @@ pub(crate) async fn build_messaging(
     // stamped on every app at resolve time — so a transport-only app carrying no
     // `[app.messaging]` block reports the same budget a synthesised block would.
     // What each app *subscribes to* is the directory's answer, not this map's.
+    let chat_db = db.clone();
     let messenger = messaging::Messenger::new(
         db,
         directory,
@@ -940,7 +957,16 @@ pub(crate) async fn build_messaging(
             .iter()
             .map(|s| (s.slug.clone(), s.principal_send_budgets().collect())),
     )
-    .with_ring_stores(ring_stores);
+    .with_ring_stores(ring_stores)
+    .with_llm_chat(config.llm_chat.clone());
+
+    // A dormant conversation must be addressable before anything wakes it — a
+    // peer's first command is a publish, and a publish to a name the directory
+    // does not hold is refused.
+    {
+        let conn = chat_db.lock().await;
+        messenger.backfill_conversation_chat_channels(&conn);
+    }
 
     // The cursor rows the last boot left, judged against the directory just
     // assembled plus the dormant dynamic registrations it deliberately excludes,

@@ -121,6 +121,62 @@ async fn watchdog_detects_dead_event_loop() {
     );
 }
 
+/// The chat adapter reads a broadcast this bridge keeps a sender on, so it runs
+/// until the bridge is dropped. A finished one died — and a conversation that
+/// cannot write its record must not keep serving browsers as if it could.
+#[tokio::test]
+async fn watchdog_detects_dead_chat_adapter() {
+    let registry = ActiveBridges::new();
+    let (bridge, _broadcast_rx) = registered_bridge(&registry).await;
+    let cid = bridge.conversation_id;
+
+    bridge.install_event_loop_handle(live_handle());
+    bridge.install_chat_adapter_handle(finished_handle().await);
+
+    let (ad, captured, drain_handle) = make_capturing_alerter_with_severity();
+    let mut watchdog = Watchdog::new(WatchdogConfig::default(), registry.clone(), ad);
+    watchdog.sweep().await;
+
+    assert!(
+        registry.get(cid).await.is_none(),
+        "a bridge whose chat adapter died must be deregistered"
+    );
+    assert!(bridge.died_handled(), "death must be marked handled");
+
+    drop(watchdog);
+    drain_handle.await.unwrap();
+    let alerts = captured.lock().unwrap();
+    assert_eq!(alerts.len(), 1, "exactly one alert expected: {alerts:?}");
+    assert!(
+        alerts[0].2.contains("dead chat bus adapter"),
+        "alert body must name the predicate: {}",
+        alerts[0].2
+    );
+}
+
+/// A live adapter is the normal case and must not look like a wedge.
+#[tokio::test]
+async fn watchdog_leaves_a_running_chat_adapter_alone() {
+    let registry = ActiveBridges::new();
+    let (bridge, _broadcast_rx) = registered_bridge(&registry).await;
+    let cid = bridge.conversation_id;
+
+    bridge.install_event_loop_handle(live_handle());
+    bridge.install_chat_adapter_handle(live_handle());
+    bridge.cc_idle.store(true, Ordering::SeqCst);
+
+    let (ad, _captured, drain_handle) = make_capturing_alerter_with_severity();
+    let mut watchdog = Watchdog::new(WatchdogConfig::default(), registry.clone(), ad);
+    watchdog.sweep().await;
+
+    assert!(
+        registry.get(cid).await.is_some(),
+        "a healthy bridge stays registered"
+    );
+    drop(watchdog);
+    drain_handle.await.unwrap();
+}
+
 #[tokio::test]
 async fn watchdog_ignores_server_shutdown() {
     let registry = ActiveBridges::new();

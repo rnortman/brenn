@@ -840,3 +840,53 @@ Code sites (`TODO(surface-op-send-budget)`):
 `handle_publish_batch`); `brenn-lib/src/messaging/mod.rs`
 (`push_released_surface_views`, the sweep-side gate take on the dispatcher loop).
 
+---
+
+## `chat-bus-attachments`
+
+A `send` command arriving on a conversation's chat command channel may name
+attachments in its schema, but the server rejects any such command whole. Upload
+ids resolve through a per-user pending-upload registry, and a bus command's
+sender is a `ParticipantId` with no user mapping — there is no correct user to
+resolve against, and a partial send (text without the files) would silently
+misrepresent what the peer asked for. Lifting the restriction needs a decision
+about how a bus peer acquires and proves ownership of an upload; the schema
+field is already in place so the change is purely additive when that decision
+lands. Done when a bus `send` with attachments resolves them and reaches the
+harness with the files attached.
+
+Code sites (`TODO(chat-bus-attachments)`): `brenn-envelope/src/chat.rs`, the
+`attachments` field on `ChatCommand::Send`; the rejection itself in
+`brenn-server/src/active_bridge/bus_chat.rs`.
+
+
+## `chat-history-on-demand`
+
+A conversation's record channel retains `[llm_chat].retained_window` messages,
+and that window is the whole history story for a bus peer today: a subscriber
+reads back as far as its own retain depth and no further. There is no way to ask
+for older messages, so a peer that wants the start of a long conversation cannot
+get it. Wants a request/response on the chat tree (or the surface websocket's
+existing paging shape) that serves a deeper slice on demand rather than forcing
+the retained window to be sized for the worst case. Done when a peer can read
+past its retain depth without the channel retaining more.
+
+Code site (`TODO(chat-history-on-demand)`):
+`brenn-lib/src/messaging/chat_provision.rs`, where the record channel's retained
+window is fixed.
+
+
+## `chat-deletion-teardown`
+
+`Messenger::deprovision_conversation_chat_channels` removes a conversation's chat
+channels, their retained record, and every cursor on them — and nothing calls it,
+because no conversation-deletion path exists in the tree yet. Whoever builds
+conversation deletion has to call it in the deletion's own transaction; a delete
+that does not will leak a directory entry, two channel rows, the whole retained
+record, and a cursor row per deleted conversation, with nothing failing to say
+so. Done when conversation deletion tears the chat family down with the
+conversation.
+
+Code site (`TODO(chat-deletion-teardown)`):
+`brenn-lib/src/messaging/chat_provision.rs`, on
+`deprovision_conversation_chat_channels`.

@@ -34,6 +34,21 @@ pub(super) fn handle_stream_event(
     }
 }
 
+/// The visible text of an assistant message: its text blocks, concatenated.
+///
+/// Thinking blocks are excluded; including them would put reasoning content
+/// inside the completed message.
+fn assistant_text(blocks: &[brenn_cc::protocol::incoming::ContentBlock]) -> String {
+    use brenn_cc::protocol::incoming::ContentBlock;
+    let mut text = String::new();
+    for block in blocks {
+        if let ContentBlock::Text { text: t } = block {
+            text.push_str(t);
+        }
+    }
+    text
+}
+
 /// Parse the `/context` response from a synthetic assistant message.
 ///
 /// Expected format: `**Tokens:** 13.7k / 200k (7%)` or `**Tokens:** 67.2k / 1m (7%)`
@@ -121,6 +136,7 @@ pub(in crate::active_bridge) async fn handle_assistant_message(
     bridge.broadcast(WsServerMessage::AssistantMessage {
         content,
         seq: Some(db_seq),
+        text: Some(assistant_text(&msg.message.content)),
     });
     // Thinking state is owned by `set_cc_busy`, not broadcast per message.
 }

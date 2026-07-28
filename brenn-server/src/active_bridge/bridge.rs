@@ -74,13 +74,14 @@ pub struct ActiveBridge {
     /// set to `false` by `send_message` (user sends a new message → CC starts working).
     /// Used by `maybe_drain` to decide kill-now vs wait-for-turn.
     pub(super) cc_idle: AtomicBool,
-    /// Idle timeout for persistent apps. `Some` = persistent mode (CC survives
-    /// browser tab closes and shuts down after this timeout). `None` = ephemeral
-    /// (CC killed immediately when last subscriber leaves).
-    pub(super) idle_timeout: Option<Duration>,
-    /// Cancel handle for the idle shutdown timer (persistent apps only).
-    /// `std::sync::Mutex` because `JoinHandle::abort()` is sync.
-    pub(super) idle_shutdown: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The doors that can hold this bridge open — the browser, and the bus where
+    /// the deployment has one — and what each has last seen. Every keep-alive
+    /// decision is the OR over them; see `lifetime.rs`.
+    pub(in crate::active_bridge) lifetime: super::lifetime::LifetimeArbiter,
+    /// Cancel handle for the timer that re-asks the lifetime question when the
+    /// soonest hold is due to expire. `std::sync::Mutex` because
+    /// `JoinHandle::abort()` is sync.
+    pub(super) lifetime_timer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// When this bridge was constructed (`Instant::now()` at spawn time).
     /// Used to measure init latency and diagnose stuck spawns.
     pub(super) spawn_instant: Instant,
@@ -137,7 +138,7 @@ pub struct ActiveBridge {
     pub(super) idle_hooks: std::sync::Mutex<Vec<Arc<dyn crate::idle_hooks::IdleHook>>>,
     /// Cancel handle for the shared idle-hook timer. `std::sync::Mutex`
     /// because `JoinHandle::abort()` is sync — same pattern as
-    /// `idle_shutdown`.
+    /// `lifetime_timer`.
     pub(super) idle_hook_timer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Per-app frontmatter rendering rules. Read by the DisplayFile
     /// PreToolUse intercept when rendering markdown files.
@@ -205,6 +206,16 @@ pub struct ActiveBridge {
     /// it. Held across the whole sequence, so the second caller reads a position
     /// that has already moved and sends nothing.
     pub(in crate::active_bridge) bus_delivery: tokio::sync::Mutex<()>,
+    /// Rung when this conversation's chat command channel may have something
+    /// new. The chat adapter waits on it; permits coalesce, so a burst of
+    /// commands costs one drain that serves all of them.
+    pub(crate) chat_commands: Arc<tokio::sync::Notify>,
+    /// Rung when the chat adapter should stop. Nothing else can end it: it holds
+    /// an `Arc` on this bridge and reads a broadcast this bridge owns the only
+    /// sender for, so the channel it waits on cannot close while it is waiting.
+    /// A permit is stored, so signalling before the adapter reaches its wait is
+    /// not a race.
+    pub(in crate::active_bridge) chat_shutdown: Arc<tokio::sync::Notify>,
     /// PWA push service. `None` when no app has `pwa_push.enabled = true`.
     pub(super) pwa_push_service: Option<Arc<dyn brenn_lib::pwa_push::PwaPushSender>>,
     /// MQTT service. `None` when no `[[mqtt_client]]` is configured.
@@ -245,6 +256,14 @@ pub struct ActiveBridge {
     /// while held). `None` until `install_event_loop_handle` runs, and in test
     /// bridges that never spawn a loop.
     pub(in crate::active_bridge) event_loop_handle:
+        std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The chat bus adapter's task handle, stored for the same reason as
+    /// `event_loop_handle`: the adapter panics rather than write a truncated
+    /// record, and a detached task's panic unwinds nothing but itself. While
+    /// this bridge lives it holds a sender on the broadcast the adapter reads,
+    /// so a finished adapter means it died — which the watchdog treats as a
+    /// wedge. `None` where the deployment has no bus, and in test bridges.
+    pub(in crate::active_bridge) chat_adapter_handle:
         std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Set once the clean-slate death reset has run for this bridge (from the
     /// event loop's `Died` handler or the watchdog). Lets the watchdog tell a
@@ -343,8 +362,11 @@ impl ActiveBridge {
         // Create event channels.
         let (cc_event_tx, cc_event_rx) = mpsc::channel(256);
         // Keep the initial receiver — it must exist before the event loop starts
-        // so the spawning connection doesn't miss any broadcasts.
+        // so the spawning connection doesn't miss any broadcasts. The chat bus
+        // adapter's receiver is taken here for the same reason: the conversation
+        // record must start at the conversation's first event.
         let (broadcast_tx, initial_rx) = broadcast::channel(512);
+        let bus_chat_rx = broadcast_tx.subscribe();
 
         let container_name_suffix = format!("conv{conversation_id}");
         let transcript_name = format!("cc-{}-{container_name_suffix}.ndjson", app_config.slug);
@@ -431,6 +453,11 @@ impl ActiveBridge {
             let (tx, _rx) = watch::channel(0u64);
             tx
         };
+        // A deployment with no bus has no bus door: nothing can drive this
+        // conversation over the wire, so there is no hold for it to take.
+        let bus_idle_timeout = messenger
+            .as_ref()
+            .map(|m| Duration::from_secs(m.llm_chat().idle_timeout_secs));
         let bridge = Arc::new(Self {
             session: tokio::sync::Mutex::new(Some(session)),
             event_tx: broadcast_tx.clone(),
@@ -452,8 +479,11 @@ impl ActiveBridge {
             // is informational metadata, not a readiness signal — see
             // docs/designs/init-not-required.md.
             cc_idle: AtomicBool::new(true),
-            idle_timeout: app_config.idle_timeout,
-            idle_shutdown: std::sync::Mutex::new(None),
+            lifetime: super::lifetime::LifetimeArbiter::new(
+                app_config.idle_timeout,
+                bus_idle_timeout,
+            ),
+            lifetime_timer: std::sync::Mutex::new(None),
             spawn_instant,
             active_bridges: active_bridges.clone(),
             tool_registry,
@@ -486,6 +516,8 @@ impl ActiveBridge {
             repo_sync_sender,
             messenger,
             bus_delivery: tokio::sync::Mutex::new(()),
+            chat_commands: Arc::new(tokio::sync::Notify::new()),
+            chat_shutdown: Arc::new(tokio::sync::Notify::new()),
             pwa_push_service,
             mqtt_service,
             mqtt_event_router,
@@ -495,6 +527,7 @@ impl ActiveBridge {
             last_cost_prune_at: AtomicI64::new(0),
             last_lint_snapshot: std::sync::Mutex::new(None),
             event_loop_handle: std::sync::Mutex::new(None),
+            chat_adapter_handle: std::sync::Mutex::new(None),
             died_handled: AtomicBool::new(false),
             #[cfg(test)]
             event_loop_epoch: epoch_tx,
@@ -507,6 +540,14 @@ impl ActiveBridge {
         if !bridge.mounts.is_empty() {
             bridge.register_idle_hook(Arc::new(crate::idle_hooks::DirtyRepoHook::new()));
         }
+
+        // Start the outbound bus leg before the event loop, so nothing it would
+        // have published can be broadcast first.
+        super::bus_chat::spawn_bus_chat_adapter(
+            bridge.clone(),
+            bus_chat_rx,
+            init_ack_info.models.clone(),
+        );
 
         // Spawn the detached event loop task and retain its handle so the wedge
         // watchdog can detect a dead loop.
@@ -543,6 +584,45 @@ impl ActiveBridge {
             .expect("event_loop_handle lock poisoned")
             .as_ref()
             .is_some_and(|h| h.is_finished())
+    }
+
+    /// Store the chat bus adapter's task handle so the wedge watchdog can
+    /// observe whether the adapter is still running.
+    pub(in crate::active_bridge) fn install_chat_adapter_handle(
+        &self,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        *self
+            .chat_adapter_handle
+            .lock()
+            .expect("chat_adapter_handle lock poisoned") = Some(handle);
+    }
+
+    /// Whether the stored chat-adapter handle reports the adapter has finished.
+    /// `false` when no handle is installed — a deployment without a bus runs no
+    /// adapter, and there is nothing to supervise.
+    pub(in crate::active_bridge) fn chat_adapter_finished(&self) -> bool {
+        self.chat_adapter_handle
+            .lock()
+            .expect("chat_adapter_handle lock poisoned")
+            .as_ref()
+            .is_some_and(|h| h.is_finished())
+    }
+
+    /// Tell the chat bus adapter to finish.
+    ///
+    /// Every path that takes a bridge out of the registry calls this. The
+    /// adapter holds an `Arc` on the bridge and waits on a broadcast whose only
+    /// sender the bridge owns, so a deregistered bridge with a running adapter is
+    /// a cycle: the task, the broadcast buffer, and everything else the bridge
+    /// holds would live as long as the process, once per bridge ever torn down.
+    ///
+    /// The adapter publishes whatever the broadcast is already holding before it
+    /// goes, so events produced before the teardown still reach the record;
+    /// events produced after it do not, which is the honest bound when the
+    /// bridge itself is gone.
+    pub(in crate::active_bridge) fn stop_chat_adapter(&self) {
+        self.chat_shutdown.notify_one();
     }
 
     /// Whether the clean-slate death reset has already run for this bridge.

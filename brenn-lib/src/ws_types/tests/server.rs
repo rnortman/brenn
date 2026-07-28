@@ -31,6 +31,7 @@ fn server_message_variants_serialize() {
         WsServerMessage::AssistantMessage {
             content: "hello world".into(),
             seq: None,
+            text: Some("hello world".into()),
         },
         WsServerMessage::PermissionRequest {
             request_id: "req_1".into(),
@@ -101,6 +102,7 @@ fn server_message_variants_serialize() {
             attachments: vec![],
             selected_tasks: vec![],
             seq: None,
+            bus_sender: None,
         },
         WsServerMessage::UserMessageEcho {
             text: "check this receipt".into(),
@@ -114,6 +116,7 @@ fn server_message_variants_serialize() {
             }],
             selected_tasks: vec![],
             seq: Some(7),
+            bus_sender: Some("conversation:4".into()),
         },
         WsServerMessage::ArtifactContent {
             file_path: "docs/plan.md".into(),
@@ -140,6 +143,7 @@ fn server_message_variants_serialize() {
             rendered_summary: "<div>src/main.rs</div>".into(),
             detail_html: None,
             seq: None,
+            summary_text: Some("src/main.rs".into()),
         },
         WsServerMessage::ArtifactIndex {
             files: vec![ArtifactFileInfo {
@@ -267,6 +271,7 @@ fn server_message_variants_serialize() {
             category: SystemMessageCategory::UiError,
             timestamp: "2026-03-26T14:32:00+09:00".into(),
             seq: None,
+            text: Some("sys".into()),
         },
         WsServerMessage::TargetResult {
             target: "import".into(),
@@ -408,6 +413,7 @@ fn system_message_broadcast_wire_format() {
         category: SystemMessageCategory::UiError,
         timestamp: "2026-03-26T14:32:00+09:00".into(),
         seq: None,
+        text: Some("card".into()),
     };
     assert_wire(
         &live,
@@ -419,6 +425,7 @@ fn system_message_broadcast_wire_format() {
         category: SystemMessageCategory::EventDrain,
         timestamp: "2026-03-26T14:32:00+09:00".into(),
         seq: Some(7),
+        text: None,
     };
     assert_wire(
         &replay,

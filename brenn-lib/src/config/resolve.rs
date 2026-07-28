@@ -135,6 +135,11 @@ pub fn validate_and_resolve(
     // so cap the value and fail fast on absurd configs.
     validate_trusted_proxy_hops(&config.server);
 
+    // The chat prefix roots channel addresses minted per conversation at
+    // runtime; a malformed one produces names no publish gate would accept, so
+    // it is refused before anything derives from it.
+    config.llm_chat.validate();
+
     let slug_re = regex::Regex::new(r"^[a-z0-9][a-z0-9-]*$").unwrap();
 
     // Validate top-level repo declarations.
@@ -966,15 +971,14 @@ pub fn validate_and_resolve(
     // --- Phase 8: access policies ---
     //
     // Build each LLM app's `AppPolicy` from its explicit `grants` + `[app.acl.*]`
-    // config (access-control design §2.5.2/§2.5.3). Runs after the other phases so
-    // it can cross-check matchers against already-resolved state — every
-    // `mqtt_subscribe`/`mqtt_publish` matcher's client slug is verified against the
-    // resolved MQTT client map (Phase 6, `resolved_clients`) so an ACL naming a
-    // nonexistent client fails fast here rather than silently never-matching at
-    // runtime. The policy itself is built *solely* from the operator's explicit
-    // grants/acl — there is no legacy-signal projection (resolved OQ2). Panics on
-    // any invalid matcher or duplicate grant (operator-authored config, fail-fast).
-    resolve_access_policies(&config.apps, &mut apps, &resolved_clients);
+    // config. Runs after the other phases so it can cross-check matchers against
+    // already-resolved state — every `mqtt_subscribe`/`mqtt_publish` matcher's
+    // client slug is verified against the resolved MQTT client map (Phase 6,
+    // `resolved_clients`) so an ACL naming a nonexistent client fails fast here
+    // rather than silently never-matching at runtime. The policy itself is built
+    // *solely* from the operator's explicit grants/acl. Panics on any invalid
+    // matcher or duplicate grant (operator-authored config, fail-fast).
+    resolve_access_policies(&config.apps, &mut apps, &resolved_clients, &config.llm_chat);
 
     // --- Phase 9: pwa_push ---
     //
@@ -1038,18 +1042,24 @@ fn resolve_messaging_layer(
 }
 
 /// Build each LLM app's resolved `AppPolicy` from its explicit `grants` +
-/// `[app.acl.*]` config (access-control design §2.5.2/§2.5.3) and stamp it onto
-/// the app's `AppConfig::policy`. Runs as the last resolution phase.
+/// `[app.acl.*]` config and stamp it onto the app's `AppConfig::policy`. Runs
+/// as the last resolution phase.
 ///
-/// The policy is built solely from the operator's explicit `grants`/`acl` (no
-/// legacy-signal projection — resolved OQ2). `build_app_policy` panics on a
-/// duplicate grant or an invalid matcher (operator-authored config, fail-fast),
-/// including an `mqtt_subscribe`/`mqtt_publish` matcher naming a client absent
-/// from `resolved_clients` (the Phase 6 MQTT client map).
+/// The policy is built solely from the operator's explicit `grants`/`acl`.
+/// `build_app_policy` panics on a duplicate grant or an invalid matcher
+/// (operator-authored config, fail-fast), including an
+/// `mqtt_subscribe`/`mqtt_publish` matcher naming a client absent from
+/// `resolved_clients` (the Phase 6 MQTT client map).
+///
+/// The derived chat-tree grant (`LlmChatConfig::grant_app_chat_tree`) is
+/// applied *after* `warn_granted_publish_no_matcher` so that diagnostic keeps
+/// reading the operator's authored coverage — the derived matcher would
+/// otherwise make every publish list non-empty and silence it forever.
 fn resolve_access_policies(
     raw_apps: &[AppConfigRaw],
     apps: &mut IndexMap<String, AppConfig>,
     resolved_clients: &IndexMap<String, crate::mqtt::config::MqttClientConfig>,
+    llm_chat: &crate::config::llm_chat::LlmChatConfig,
 ) {
     for raw in raw_apps {
         let Some(app) = apps.get_mut(&raw.slug) else {
@@ -1070,6 +1080,7 @@ fn resolve_access_policies(
         app.policy.tool_grants =
             crate::tools::config::resolve_app_tool_grants(&owner, &raw.tool_grants, &mount_slugs);
         warn_granted_publish_no_matcher(&raw.slug, &app.policy);
+        llm_chat.grant_app_chat_tree(&raw.slug, &mut app.policy);
     }
 }
 

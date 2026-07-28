@@ -1,3 +1,5 @@
+mod chat_roles;
+mod conversation;
 mod dispatch_row;
 mod ingress;
 mod publish_core;
@@ -8,12 +10,15 @@ mod transport_ingress;
 mod wasm;
 
 use super::*;
+use crate::config::{ChatLeaf, chat_bare_name};
 use crate::db::init_db_memory;
 use crate::messaging::config::{
     Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel, ResolvedMessagingConfig,
     ResolvedSubscription, Sink,
 };
 use crate::messaging::db::upsert_channels;
+use crate::messaging::store::RingStores;
+use crate::messaging::testutils::{ephemeral_channel_entry, test_channel_entry};
 use crate::messaging::{
     ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntry, SubscriberEntryKind, WakeMin,
     WakeRouter, canonical_address,
@@ -106,6 +111,101 @@ impl WakeRouter for CountingRouter {
 
     fn alarm(&self, _channel: &str, _subscriber: &ParticipantId, _count: u64) {
         self.alarms.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+pub(super) const CHAT_PREFIX: &str = "chat";
+
+/// Deep enough that no chat test can lose a message to ring overflow while
+/// being small enough to be obviously not the thing under test.
+const CHAT_RING_DEPTH: u64 = 8;
+
+/// The chat-tree scaffolding a chat suite needs: the four leaves of each
+/// `(app, conversation)` pair as channels, the conversation rows a publish is
+/// attributed to, and a messenger over the lot.
+///
+/// The suites differ in what they *author* — which policies the apps carry,
+/// which pairs exist, whether a channel outside the tree is wanted. How a chat
+/// messenger is assembled is not one of the differences, so it lives only here.
+pub(super) struct ChatFixture {
+    /// `(app slug, conversation id)` pairs to mint the four chat leaves for.
+    pub(super) leaves: Vec<(String, i64)>,
+    /// `(conversation id, owning app slug)` — each conversation a suite
+    /// publishes from must have a row or the publish is unattributable.
+    pub(super) conversations: Vec<(i64, String)>,
+    /// The apps map, policies already authored by the caller.
+    pub(super) apps: IndexMap<String, crate::config::AppConfig>,
+    /// Durable channels outside the chat tree, for a suite that needs to show
+    /// where chat authority stops.
+    pub(super) extra_durable: Vec<ChannelEntry>,
+}
+
+impl ChatFixture {
+    pub(super) async fn build(self) -> Arc<Messenger> {
+        let ChatFixture {
+            leaves,
+            conversations,
+            apps,
+            extra_durable,
+        } = self;
+        let db = init_db_memory();
+
+        let durable: Vec<_> = leaves
+            .iter()
+            .flat_map(|(app, id)| {
+                [ChatLeaf::In, ChatLeaf::Out].into_iter().map(move |leaf| {
+                    test_channel_entry(&chat_bare_name(CHAT_PREFIX, app, leaf, *id), vec![])
+                })
+            })
+            .chain(extra_durable)
+            .collect();
+        let nondurable: Vec<_> = leaves
+            .iter()
+            .flat_map(|(app, id)| {
+                [ChatLeaf::Stream, ChatLeaf::Wake]
+                    .into_iter()
+                    .map(move |leaf| {
+                        ephemeral_channel_entry(
+                            &chat_bare_name(CHAT_PREFIX, app, leaf, *id),
+                            CHAT_RING_DEPTH,
+                        )
+                    })
+            })
+            .collect();
+
+        {
+            let conn = db.lock().await;
+            conn.execute(
+                "INSERT INTO users (id, username, password_hash, created_at) \
+                 VALUES (1, 'bob', 'h', '2024-01-01')",
+                [],
+            )
+            .unwrap();
+            for (id, app) in &conversations {
+                conn.execute(
+                    "INSERT INTO conversations (id, user_id, status, app_slug, created_at, updated_at) \
+                     VALUES (?1, 1, 'active', ?2, '2024-01-01', '2024-01-01')",
+                    rusqlite::params![id, app],
+                )
+                .unwrap();
+            }
+            upsert_channels(&conn, &durable);
+        }
+
+        let stores = Arc::new(RingStores::build(&nondurable));
+        let directory = Arc::new(MessagingDirectory::with_entries(
+            durable.into_iter().chain(nondurable).collect(),
+        ));
+
+        Messenger::new(
+            db,
+            directory,
+            Arc::from("test-source"),
+            Arc::new(apps),
+            Arc::new(CountingRouter::default()) as Arc<dyn WakeRouter>,
+            MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(stores)
     }
 }
 

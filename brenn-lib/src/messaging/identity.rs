@@ -90,9 +90,10 @@ pub enum SubscriberKind {
 }
 
 impl ParticipantId {
-    /// The LLM (Claude conversation) as participant. Subscriber-side
-    /// constructor; also the only `conversation:` producer (no publisher emits
-    /// this in this slice).
+    /// The LLM (Claude conversation) as participant: subscriber on its command
+    /// channels, publisher of its own conversation record and token stream.
+    /// Distinct from the owning app's `app:<slug>@<server>` — the two are
+    /// separable in the record.
     pub fn for_conversation(conversation_id: i64) -> Self {
         Self(format!("conversation:{conversation_id}"))
     }

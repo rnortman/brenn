@@ -191,7 +191,7 @@ pub struct AppState {
     /// decisions in front of it — which trigger consults the backoff, and which
     /// does not — assertable rather than a comment.
     #[cfg(test)]
-    pub wake_spawns: Arc<std::sync::Mutex<Vec<i64>>>,
+    pub wake_spawns: Arc<std::sync::Mutex<Vec<(i64, BusHold)>>>,
 }
 
 /// Per-conversation lock map for wake_conversation concurrency control.
@@ -338,6 +338,43 @@ impl SpawnBackoff {
     }
 }
 
+/// Whether the bridge a wake brings up is left held by the bus door.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BusHold {
+    /// A peer asked for this conversation by name — a command or a pre-warm on
+    /// its own chat channels — so the bus door holds the bridge for its idle
+    /// window.
+    ///
+    /// The hold is taken at the spawn rather than left to the adapter's drain
+    /// because a start-up drain can legitimately find nothing to serve: a
+    /// predecessor bridge's last pass may have advanced the cursor between the
+    /// wake pass reading it as owed and this spawn, or the position may be gone
+    /// altogether. A spawned bridge that stamps nothing takes no hold from any
+    /// door and arms no timer, and nothing ever re-asks the lifetime question
+    /// for it — a CC subprocess parked forever for a conversation nobody
+    /// touches again.
+    Held,
+    /// The wake is a delivery trigger for something else — an app subscriber's
+    /// backlog — whose bridge lifetime this call does not decide.
+    Unheld,
+}
+
+/// One wake attempt: bring the bridge up (or find it already up), leave the bus
+/// door holding it when the trigger was the conversation's own, and hand the
+/// outcome to the backoff.
+pub(crate) async fn run_wake_attempt(
+    state: AppState,
+    conversation_id: i64,
+    tz: chrono_tz::Tz,
+    hold: BusHold,
+) {
+    let outcome = state.wake_conversation(conversation_id, tz).await;
+    if let (BusHold::Held, Ok(bridge)) = (hold, &outcome) {
+        bridge.note_bus_activity().await;
+    }
+    state.record_spawn_outcome(conversation_id, outcome.map(|_| ()));
+}
+
 impl AppState {
     /// Fire-and-forget eager wake for a **user-initiated** trigger: a browser
     /// attaching, switching conversation, or replacing a CC that died under a
@@ -351,7 +388,8 @@ impl AppState {
     /// used to seed `GRAF_USER_TZ` in CC's environment. See
     /// `docs/designs/graf-user-tz.md`.
     pub fn spawn_eager_wake(&self, conversation_id: i64, tz: chrono_tz::Tz) {
-        self.spawn_wake_task(conversation_id, tz);
+        // The browser attaching is its own door, and it takes its own hold.
+        self.spawn_wake_task(conversation_id, tz, BusHold::Unheld);
     }
 
     /// Fire-and-forget eager wake for a **bus-driven** trigger: the wake walk,
@@ -359,34 +397,49 @@ impl AppState {
     /// here, so declining here declines all of them — which is what makes the
     /// backoff a bound on the whole bus side rather than on one trigger.
     pub fn spawn_bus_wake(&self, conversation_id: i64, tz: chrono_tz::Tz) {
+        self.bus_wake(conversation_id, tz, BusHold::Unheld);
+    }
+
+    /// The same bus-driven trigger for a conversation's **own** chat channels,
+    /// which additionally leaves the bus door holding what it brought up.
+    pub fn spawn_chat_wake(&self, conversation_id: i64, tz: chrono_tz::Tz) {
+        self.bus_wake(conversation_id, tz, BusHold::Held);
+    }
+
+    /// The backoff gate both bus entrypoints share.
+    fn bus_wake(&self, conversation_id: i64, tz: chrono_tz::Tz, hold: BusHold) {
         if self.spawn_backoff.declines(conversation_id) {
             // The position does not move, so nothing is lost: the next attempt
             // past the window finds the same backlog.
             tracing::debug!(conversation_id, "bus wake declined by spawn backoff");
             return;
         }
-        self.spawn_wake_task(conversation_id, tz);
+        self.spawn_wake_task(conversation_id, tz, hold);
     }
 
-    /// The spawn attempt both entrypoints make.
+    /// The spawn attempt every entrypoint makes.
     #[cfg(not(test))]
-    fn spawn_wake_task(&self, conversation_id: i64, tz: chrono_tz::Tz) {
+    fn spawn_wake_task(&self, conversation_id: i64, tz: chrono_tz::Tz, hold: BusHold) {
         let state = self.clone();
-        tokio::spawn(async move {
-            let outcome = state.wake_conversation(conversation_id, tz).await;
-            state.record_spawn_outcome(conversation_id, outcome.map(|_| ()));
-        });
+        drop(tokio::spawn(run_wake_attempt(
+            state,
+            conversation_id,
+            tz,
+            hold,
+        )));
     }
 
     /// Test-mode stand-in: record the attempt instead of making it. There is no
     /// CC to spawn, and the decisions worth pinning are the ones in front of
-    /// this call, not the subprocess behind it.
+    /// this call, not the subprocess behind it. The hold is recorded with it —
+    /// it is one of those decisions, and the only observable difference between
+    /// the two bus entrypoints.
     #[cfg(test)]
-    fn spawn_wake_task(&self, conversation_id: i64, _tz: chrono_tz::Tz) {
+    fn spawn_wake_task(&self, conversation_id: i64, _tz: chrono_tz::Tz, hold: BusHold) {
         self.wake_spawns
             .lock()
             .expect("wake_spawns lock poisoned")
-            .push(conversation_id);
+            .push((conversation_id, hold));
     }
 
     /// The one place a finished spawn attempt's outcome reaches the backoff: a
@@ -777,7 +830,7 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use super::AppState;
+    use super::{AppState, BusHold};
     use crate::active_bridge::ActiveBridge;
 
     /// Verify that `test_wake_bridge_impl` returns the cached `Arc<ActiveBridge>`
@@ -922,6 +975,17 @@ mod tests {
     // and what a finished attempt does to it.
     // -----------------------------------------------------------------------
 
+    /// The conversations whose spawn attempts got through, in order.
+    fn admitted(state: &AppState) -> Vec<i64> {
+        state
+            .wake_spawns
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(conversation_id, _)| *conversation_id)
+            .collect()
+    }
+
     /// The backoff bounds the bus side and only the bus side: an armed
     /// conversation declines the wake walk's every trigger, while a browser
     /// attach still gets its spawn — a human retry is self-pacing and is the
@@ -933,7 +997,7 @@ mod tests {
 
         state.spawn_bus_wake(conv, chrono_tz::Tz::UTC);
         assert_eq!(
-            *state.wake_spawns.lock().unwrap(),
+            admitted(&state),
             vec![conv],
             "an unarmed conversation's bus wake reaches the spawn"
         );
@@ -941,13 +1005,13 @@ mod tests {
         state.spawn_backoff.record_failure(conv);
         state.spawn_bus_wake(conv, chrono_tz::Tz::UTC);
         assert_eq!(
-            *state.wake_spawns.lock().unwrap(),
+            admitted(&state),
             vec![conv],
             "the armed window declines the bus trigger"
         );
         state.spawn_eager_wake(conv, chrono_tz::Tz::UTC);
         assert_eq!(
-            *state.wake_spawns.lock().unwrap(),
+            admitted(&state),
             vec![conv, conv],
             "the user trigger is never declined"
         );
@@ -955,9 +1019,38 @@ mod tests {
         state.spawn_backoff.clear(conv);
         state.spawn_bus_wake(conv, chrono_tz::Tz::UTC);
         assert_eq!(
-            *state.wake_spawns.lock().unwrap(),
+            admitted(&state),
             vec![conv, conv, conv],
             "the cleared episode admits the bus side again"
+        );
+    }
+
+    /// The chat entrypoint shares the backoff with the rest of the bus side and
+    /// differs from it in exactly one thing: what it leaves holding the bridge.
+    #[tokio::test]
+    async fn only_the_chat_entrypoint_asks_for_the_bus_hold() {
+        let state = AppState::for_test(brenn_lib::db::init_db_memory(), None);
+        let conv = 11_i64;
+
+        state.spawn_chat_wake(conv, chrono_tz::Tz::UTC);
+        state.spawn_bus_wake(conv, chrono_tz::Tz::UTC);
+        state.spawn_eager_wake(conv, chrono_tz::Tz::UTC);
+        assert_eq!(
+            *state.wake_spawns.lock().unwrap(),
+            vec![
+                (conv, BusHold::Held),
+                (conv, BusHold::Unheld),
+                (conv, BusHold::Unheld),
+            ],
+            "a peer asking for a conversation by name is the one trigger that holds it",
+        );
+
+        state.spawn_backoff.record_failure(conv);
+        state.spawn_chat_wake(conv, chrono_tz::Tz::UTC);
+        assert_eq!(
+            admitted(&state).len(),
+            3,
+            "and it is declined by the armed backoff like every other bus trigger",
         );
     }
 

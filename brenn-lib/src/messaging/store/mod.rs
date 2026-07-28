@@ -110,7 +110,9 @@ pub use brenn_queue::{Attached, Priming};
 pub fn priming_for_kind(kind: &SubscriberEntryKind) -> Priming {
     match kind {
         SubscriberEntryKind::Wasm(_) => Priming::Retained,
-        SubscriberEntryKind::App(_) | SubscriberEntryKind::System(_) => Priming::Head,
+        SubscriberEntryKind::App(_)
+        | SubscriberEntryKind::System(_)
+        | SubscriberEntryKind::ChatConversation { .. } => Priming::Head,
         SubscriberEntryKind::Surface { .. } => panic!(
             "surface subscriptions hold no store cursors; their delivery state is the wire \
              session's (see TODO(surface-wire-cursors))"

@@ -661,6 +661,7 @@ dependencies = [
  "brenn-cal",
  "brenn-cc",
  "brenn-common",
+ "brenn-envelope",
  "brenn-graf",
  "brenn-lib",
  "brenn-pfin",

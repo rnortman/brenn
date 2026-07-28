@@ -118,6 +118,10 @@ pub struct BrennConfig {
     /// `SurfaceDescriptionConfig::default()` (no prefix ⇒ feature off) when absent.
     #[serde(default)]
     pub surface_description: SurfaceDescriptionConfig,
+    /// Chat-over-pubsub settings (`[llm_chat]`). Defaults to
+    /// `LlmChatConfig::default()` when absent.
+    #[serde(default)]
+    pub llm_chat: super::llm_chat::LlmChatConfig,
     /// Global VAPID keypair and subject for PWA push notifications.
     /// `[pwa_push]` block. Defaults to `PwaPushGlobalConfig::default()`
     /// (all-None) when absent — safe zero values; no keypair loaded unless

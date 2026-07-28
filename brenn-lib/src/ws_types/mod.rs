@@ -521,6 +521,14 @@ pub enum WsServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(type = "number | null")]
         seq: Option<i64>,
+        /// The same message before rendering, as the model produced it.
+        ///
+        /// `Some` on every live broadcast; `None` on a history-replay
+        /// reconstruction, which is sent to one browser and never enters the
+        /// broadcast channel.
+        #[serde(skip)]
+        #[ts(skip)]
+        text: Option<String>,
     },
     /// CC requests permission to use a tool (synchronous — CC blocks waiting).
     PermissionRequest {
@@ -619,6 +627,14 @@ pub enum WsServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(type = "number | null")]
         seq: Option<i64>,
+        /// The bus participant that published the command this echoes, or
+        /// `None` when the text was typed into a browser session.
+        ///
+        /// Never crosses the websocket. Set for bus-origin sends so the
+        /// outbound chat adapter skips the duplicate record entry.
+        #[serde(skip)]
+        #[ts(skip)]
+        bus_sender: Option<String>,
     },
     /// Broadcast of a Brenn-generated system message. The visible payload is
     /// the pre-rendered HTML card; the LLM-facing text never reaches the browser.
@@ -634,6 +650,13 @@ pub enum WsServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(type = "number | null")]
         seq: Option<i64>,
+        /// The LLM-facing text this card was rendered from.
+        ///
+        /// `Some` on every live broadcast; `None` on a history-replay
+        /// reconstruction.
+        #[serde(skip)]
+        #[ts(skip)]
+        text: Option<String>,
     },
     /// Rendered markdown file content for the artifact viewer.
     ArtifactContent {
@@ -667,6 +690,13 @@ pub enum WsServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(type = "number | null")]
         seq: Option<i64>,
+        /// The same summary as raw text.
+        ///
+        /// `Some` on every live broadcast; `None` on a history-replay
+        /// reconstruction.
+        #[serde(skip)]
+        #[ts(skip)]
+        summary_text: Option<String>,
     },
     /// Index of all artifact files and their versions for a conversation.
     /// Sent after history replay, after live DisplayFile, and on conversation clear.

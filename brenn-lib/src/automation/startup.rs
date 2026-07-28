@@ -95,6 +95,9 @@ pub async fn run_startup_consistency_checks(engine: &AutomationEngine) {
 
         // Mismatch: create a new conversation for the current owner and rebind.
         let new_conv_id = create_conversation(&conn, owner_user_id, &owner_app_slug, false);
+        engine
+            .messenger
+            .provision_conversation_chat_channels(&conn, &owner_app_slug, new_conv_id);
         conn.execute(
             "UPDATE automation_app_event_conversation \
              SET conversation_id = ?1 \

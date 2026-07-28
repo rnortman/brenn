@@ -192,8 +192,10 @@ pub enum PublishOrigin {
     /// LLM/automation publish attributed to a conversation; the per-conversation
     /// send budget applies (decrement_send_budget).
     Conversation { id: i64 },
-    /// In-process system publisher (no conversation). No send budget — flood
-    /// protection is upstream at the caller. `BudgetExhausted` is
+    /// Every publisher the per-conversation send budget does not price: the
+    /// in-process system publishers, surfaces, and a conversation publishing its
+    /// own chat record. No send budget — flood protection is the per-channel
+    /// send rate plus whatever bounds the caller applies. `BudgetExhausted` is
     /// unrepresentable for this origin.
     System,
 }
@@ -256,6 +258,18 @@ enum PublishPrincipal<'a> {
     /// with a `System` origin — no send budget; the substrate self-limits at
     /// its admission point.
     System { component: &'a str },
+    /// A conversation speaking for itself on its own chat channels — the record
+    /// it writes and the token batches it streams. `app_slug` selects the owning
+    /// app's policy; layer-1 and layer-2 both resolve against it.
+    ///
+    /// The stored principal is `for_conversation(id)`, distinct from the app's
+    /// own `app:<slug>@<server>`, so the record shows which of the two spoke.
+    ///
+    /// Always paired with a `System` origin: the per-conversation send budget
+    /// prices an LLM's *tool* publishes, and chat output volume is not that —
+    /// it is governed by the chat channels' own `send_rate`, which this arm
+    /// draws like every other principal.
+    Conversation { id: i64, app_slug: &'a str },
 }
 
 impl Messenger {
@@ -430,6 +444,42 @@ impl Messenger {
         .await
     }
 
+    /// Publish on behalf of a conversation, on any pub/sub scheme — writing its
+    /// conversation record (`brenn:`) and token stream (`ephemeral:`).
+    ///
+    /// No bypass: runs the identical gate sequence as every other entry
+    /// (`publish_core`), reaching only what the owning app's policy authorizes.
+    ///
+    /// `app_slug` selects the owning app's policy. `conversation_id` is stamped
+    /// as the sender (`conversation:<id>`).
+    ///
+    /// `System` origin: no per-conversation send budget, so `BudgetExhausted` is
+    /// unreachable here. No `reply_to`/`deliver_after`/`delivery_deadline` — a
+    /// conversation's own output is neither a reply nor scheduled.
+    pub async fn publish_from_conversation(
+        &self,
+        conversation_id: i64,
+        app_slug: &str,
+        addr: &str,
+        body: &str,
+        urgency: super::Urgency,
+    ) -> PublishResult {
+        self.publish_core(
+            PublishOrigin::System,
+            PublishPrincipal::Conversation {
+                id: conversation_id,
+                app_slug,
+            },
+            addr,
+            body,
+            urgency,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
     /// Draw against one surface principal's send budget — the defense-in-depth
     /// backstop on everything a surface republishes into the server's substrate.
     ///
@@ -594,6 +644,7 @@ impl Messenger {
                 ..
             } => ParticipantId::for_surface(slug),
             PublishPrincipal::System { component } => ParticipantId::for_system(component),
+            PublishPrincipal::Conversation { id, .. } => ParticipantId::for_conversation(id),
         }
         .as_str()
         .to_owned()
@@ -604,10 +655,12 @@ impl Messenger {
     /// publish is admitted, `false` when the rate limit refused it.
     ///
     /// The grain is deliberate: a sender's aggregate allowance is this rate
-    /// times the channels its ACLs cover, and that channel set is
-    /// operator-declared config — no publisher can mint a channel to widen its
-    /// own budget. If dynamic channel creation is ever added, a bus-wide
-    /// per-sender backstop bucket must land with it.
+    /// times the channels its ACLs cover, and that channel set is bounded
+    /// because no publisher can mint a channel to widen its own budget. Channels
+    /// that are not operator-declared config are created by the server on its
+    /// own initiative — a conversation's chat family at conversation creation —
+    /// with no path from a publish to a creation. If peer-initiated creation is
+    /// ever added, a bus-wide per-sender backstop bucket must land with it.
     ///
     /// This gate is not surface-specific — it runs on every scheme — so it
     /// reports a plain admit/deny rather than a [`SurfaceSendVerdict`].
@@ -803,6 +856,22 @@ impl Messenger {
                     policy,
                     // System is always paired with a `System` origin, which never
                     // reads the budget below — same structural `None` as Surface.
+                    None,
+                )
+            }
+            PublishPrincipal::Conversation { app_slug, .. } => {
+                // Resolved through the same grant-filtering lookup the `App`
+                // arm uses: an app whose policy lacks the transport grant is
+                // `MissingSender`, not a quiet bypass.
+                let app = match resolve_publish_sender(&self.apps, app_slug, grant) {
+                    Some(a) => a,
+                    None => return PublishResult::MissingSender,
+                };
+                (
+                    &app.policy,
+                    // Paired with a `System` origin (see
+                    // `publish_from_conversation`), which never reads the budget
+                    // below — same structural `None` as Surface and System.
                     None,
                 )
             }

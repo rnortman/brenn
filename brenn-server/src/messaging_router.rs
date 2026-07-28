@@ -36,7 +36,7 @@ pub struct WakeRouterImpl {
     /// (per CLAUDE.md "BETTER DEAD THAN WRONG" — never silently no-op on a
     /// structural invariant violation).
     state: tokio::sync::OnceCell<AppState>,
-    /// Alert dispatcher for push-overflow alarms (design §2.8). Wired at
+    /// Alert dispatcher for push-overflow alarms. Wired at
     /// construction by the binary crate bootstrap, which has access to the
     /// already-built `AlertDispatcher`. `None` when no alert dispatcher is
     /// configured (e.g. in tests that don't need alarm wiring).
@@ -128,10 +128,12 @@ impl WakeRouterImpl {
     /// publish can reach the dispatch path (a missing binding at dispatch time
     /// panics; the cross-check turns that into a named boot failure).
     pub(crate) fn has_delivery_binding(&self, key: &SubscriberEntryKind) -> bool {
-        self.bindings
-            .read()
-            .expect("bindings RwLock poisoned")
-            .contains_key(key)
+        chat_conversation(key).is_some()
+            || self
+                .bindings
+                .read()
+                .expect("bindings RwLock poisoned")
+                .contains_key(key)
     }
 
     /// Resolve a subscriber's delivery route from its registered binding,
@@ -148,6 +150,25 @@ impl WakeRouterImpl {
                  (every subscriber gets a binding at bootstrap)"
             ),
         }
+    }
+}
+
+/// The conversation `key` is the chat subscription of, if it is one.
+///
+/// The one place this kind's delivery mechanism is decided, and the one kind
+/// decided this way rather than from the registered binding map. Every other
+/// subscriber is declared in config and bound at bootstrap, so a binding table
+/// is what keeps a new kind from silently inheriting someone else's delivery
+/// path. A chat subscription is minted at runtime, one per conversation, and has
+/// exactly one mechanism by construction — its conversation's own bridge. A
+/// per-conversation row in that table would carry no information and would have
+/// to be torn down in step with the channels.
+fn chat_conversation(key: &SubscriberEntryKind) -> Option<i64> {
+    match key {
+        SubscriberEntryKind::ChatConversation {
+            conversation_id, ..
+        } => Some(*conversation_id),
+        _ => None,
     }
 }
 
@@ -411,11 +432,6 @@ impl WakeRouter for WakeRouterImpl {
                     Some(b) => b,
                     None => return Ok(false),
                 };
-                // Render via the unified timestamped batch formatter (design §2.10, R9).
-                // All ingress — single or batched, live-inject or drain — renders through
-                // render_event_drain (which calls format_event_batch with the event's
-                // created_at timestamp). This is strictly better than the former
-                // render_immediate_event: every event now gains a timestamp.
                 let rendered =
                     render_event_drain(std::slice::from_ref(event)).unwrap_or_else(|| {
                         panic!(
@@ -429,12 +445,11 @@ impl WakeRouter for WakeRouterImpl {
                     Err(e) => Err(e),
                 }
             }
-            // Ingress rows are conversation-targeted by invariant (submit_ingress
-            // writes for_conversation; design §2.2). Surfaces bind only
-            // brenn:/ephemeral: channels while ingress rows exist only on
-            // webhook:/mqtt: channels, and parked subscribers (WASM/system) take
-            // bus tool requests, not ingress — so any non-conversation ingress
-            // target is a host-wiring invariant violation → panic.
+            // Ingress is conversation-targeted by invariant: surfaces bind
+            // brenn:/ephemeral: channels, parked subscribers (WASM/system) take
+            // bus tool requests, and neither intersects the webhook:/mqtt:
+            // channels ingress arrives on. A non-conversation target here is a
+            // host-wiring invariant violation.
             DeliveryRoute::SurfaceSessions | DeliveryRoute::Parked => {
                 panic!(
                     "WakeRouter::deliver_ingress called for non-conversation subscriber {key:?} — \
@@ -445,6 +460,23 @@ impl WakeRouter for WakeRouterImpl {
     }
 
     fn spawn_eager_wake(&self, key: &SubscriberEntryKind, subscriber: &ParticipantId) {
+        // A chat subscription's wake is its conversation's spawn — the same
+        // spawn an app subscriber's wake buys, subject to the same backoff. What
+        // the woken bridge does with it differs (its adapter drains the command
+        // channel), and that is the adapter's business, not the wake's.
+        //
+        // The one thing the wake does decide is the hold: a peer asked for this
+        // conversation by name, so the bridge it buys is the bus door's to
+        // account for, whether or not the adapter's drain finds anything left to
+        // serve by the time it runs.
+        if let Some(conversation_id) = chat_conversation(key) {
+            let state = self
+                .state
+                .get()
+                .expect("WakeRouter state must be set before any spawn_eager_wake call");
+            state.spawn_chat_wake(conversation_id, Tz::UTC);
+            return;
+        }
         // Resolve the binding under the read lock; the wake work (notify / state
         // call) is sync so holding the guard across it is fine.
         let map = self.bindings.read().expect("bindings RwLock poisoned");
@@ -517,6 +549,22 @@ impl WakeRouter for WakeRouterImpl {
         subscriber: &ParticipantId,
         spawn_permitted: bool,
     ) {
+        // A live conversation's chat backlog costs a notify, so it is served
+        // whatever the verdict says — the same rule the arm below applies, for
+        // the same reason. The notify coalesces, so a burst of commands and a
+        // pre-warm landing together cost one drain. Nothing is delivered from
+        // here: the adapter owns the read, because acting on a command is not
+        // the same as rendering one into a conversation.
+        if let Some(conversation_id) = chat_conversation(key) {
+            if let Some(bridge) = self.active_bridges.get(conversation_id).await {
+                bridge.chat_commands.notify_one();
+                return;
+            }
+            if spawn_permitted {
+                self.spawn_eager_wake(key, subscriber);
+            }
+            return;
+        }
         let conversation_bridge = matches!(
             self.bindings
                 .read()
@@ -550,6 +598,12 @@ impl WakeRouter for WakeRouterImpl {
     }
 
     fn delivery_shape(&self, key: &SubscriberEntryKind) -> DeliveryShape {
+        // Inline, in the sense the shape means: it is served where it stands
+        // rather than parked for an off-loop task, and its wake can cost a
+        // subprocess, so the wake pass reads its urgency threshold.
+        if chat_conversation(key).is_some() {
+            return DeliveryShape::Inline;
+        }
         let map = self.bindings.read().expect("bindings RwLock poisoned");
         match map.get(key) {
             Some(DeliveryBinding::ConversationBridge) | Some(DeliveryBinding::SurfaceSessions) => {
@@ -564,7 +618,6 @@ impl WakeRouter for WakeRouterImpl {
     }
 
     fn alarm(&self, channel: &str, subscriber: &ParticipantId, count: u64) {
-        // Fire an alert via `AlertDispatcher` (design §2.8).
         // Production bootstrap always calls `set_alert_dispatcher` before any publish;
         // tests that need the `alarm` path use mock WakeRouter implementations
         // (AlarmCountingRouter / FakeWakeRouter), not WakeRouterImpl. A None dispatcher
@@ -649,13 +702,8 @@ mod tests {
     }
 
     /// `WakeRouterImpl::new` leaves `state` unset; the caller must
-    /// invoke `set_state` before any background task runs that can
-    /// reach `spawn_eager_wake` (review F1 ordering). Renamed from a
-    /// previous misleading name that promised second-call coverage
-    /// (review F28). We can't cheaply construct a real `AppState` in
-    /// this unit test (~25 fields); the second-call panic is covered
-    /// by `OnceCell::set`-returns-Err in std and `set_state`'s own
-    /// `.expect(...)` line.
+    /// invoke `set_state` before any background task that can reach
+    /// `spawn_eager_wake`.
     #[test]
     fn new_leaves_state_unset() {
         let router = WakeRouterImpl::new(ActiveBridges::new());
@@ -734,8 +782,6 @@ mod tests {
         );
     }
 
-    /// After F2, `spawn_eager_wake` panics rather than warn-and-no-op
-    /// when state is unset. Lock that contract: state-unset → panic.
     #[test]
     #[should_panic(expected = "WakeRouter state must be set")]
     fn spawn_eager_wake_panics_when_state_unset() {
@@ -919,6 +965,95 @@ mod tests {
             .await;
     }
 
+    /// The chat subscription for one conversation, as provisioning mints it.
+    fn chat_key(conversation_id: i64) -> SubscriberEntryKind {
+        SubscriberEntryKind::ChatConversation {
+            app_slug: "test-app".to_string(),
+            conversation_id,
+        }
+    }
+
+    /// A chat conversation's binding is derived from its kind, not registered at
+    /// bootstrap — there is no boot at which a per-conversation binding could be
+    /// registered. The boot cross-check has to accept it and the wake pass has to
+    /// price its wake as a subprocess.
+    #[test]
+    fn a_chat_conversation_needs_no_registered_binding() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        assert!(router.has_delivery_binding(&chat_key(7)));
+        assert_eq!(router.delivery_shape(&chat_key(7)), DeliveryShape::Inline);
+    }
+
+    /// A live conversation's chat backlog is a notify to its adapter and nothing
+    /// else. In particular it must not take the app-subscriber path, which
+    /// renders what it finds into the conversation as a system message — a
+    /// command is to be executed, not narrated.
+    #[tokio::test]
+    async fn wake_owed_rings_a_live_conversations_chat_drain_and_renders_nothing() {
+        let (active_bridges, conversation_id, mut broadcast_rx, _cc_rx) =
+            owed_conversation_bridge().await;
+        let notify = Arc::clone(
+            &active_bridges
+                .get(conversation_id)
+                .await
+                .expect("the fixture's bridge is live")
+                .chat_commands,
+        );
+        let router = WakeRouterImpl::new(active_bridges);
+
+        router
+            .wake_owed(
+                &chat_key(conversation_id),
+                &ParticipantId::for_conversation(conversation_id),
+                false,
+            )
+            .await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), notify.notified())
+                .await
+                .is_ok(),
+            "the adapter's drain was rung",
+        );
+        // Yield rounds rather than a wall-clock timeout: the app-subscriber arm
+        // this must not take renders on a task of its own, so the negative half
+        // has to give that task every chance to run — and on a loaded box a
+        // render arriving after a 300 ms deadline would have read as a pass.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            matches!(
+                broadcast_rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "and nothing was rendered into the conversation",
+        );
+    }
+
+    /// Sleeping, the chat wake is the conversation's spawn — reached without any
+    /// registered binding, which the panic message proves: a missing binding
+    /// names itself, and this one asks for the `AppState` a spawn needs.
+    #[tokio::test]
+    #[should_panic(expected = "WakeRouter state must be set")]
+    async fn a_chat_wake_with_no_bridge_buys_a_spawn() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        router
+            .wake_owed(&chat_key(42), &ParticipantId::for_conversation(42), true)
+            .await;
+    }
+
+    /// And below the threshold it buys nothing at all: the pass hands the verdict
+    /// down, and a denied verdict on a sleeping conversation is where it stops.
+    /// State is left unset, so any spawn attempt would panic.
+    #[tokio::test]
+    async fn a_denied_chat_wake_with_no_bridge_does_nothing() {
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        router
+            .wake_owed(&chat_key(42), &ParticipantId::for_conversation(42), false)
+            .await;
+    }
+
     /// The other half of that rule: with no bridge to serve, a denied verdict is
     /// the whole answer. Proven by the absence of the panic its sibling above
     /// gets — reaching the spawn arm without an `AppState` cannot be silent.
@@ -963,7 +1098,7 @@ mod tests {
     }
 
     /// `deliver_ingress` for a parked (`wasm:`) subscriber panics — ingress rows
-    /// are conversation-targeted by invariant (design §2.2).
+    /// are conversation-targeted by invariant.
     #[tokio::test]
     #[should_panic(expected = "WakeRouter::deliver_ingress called for non-conversation subscriber")]
     async fn deliver_ingress_panics_for_wasm_subscriber() {
@@ -987,8 +1122,8 @@ mod tests {
             .await;
     }
 
-    /// `spawn_eager_wake` for a `wasm:` subscriber notifies the registered `Notify`
-    /// (design §2.2). The off-loop dispatch task holds the `Arc` clone; `notify_one`
+    /// `spawn_eager_wake` for a `wasm:` subscriber notifies the registered `Notify`.
+    /// The off-loop dispatch task holds the `Arc` clone; `notify_one`
     /// sets the permit so the task's `notified().await` resolves immediately.
     #[test]
     fn spawn_eager_wake_notifies_wasm_subscriber() {
@@ -1018,7 +1153,7 @@ mod tests {
     }
 
     /// `spawn_eager_wake` for an unregistered `wasm:` slug panics — host-wiring
-    /// invariant violation (design §2.2).
+    /// invariant violation.
     #[test]
     #[should_panic(expected = "no delivery binding registered")]
     fn spawn_eager_wake_panics_for_unregistered_wasm_slug() {
@@ -1457,14 +1592,45 @@ mod tests {
         router.register_delivery_binding(conv_key(), DeliveryBinding::ConversationBridge);
 
         router.spawn_eager_wake(&conv_key(), &ParticipantId::for_conversation(42));
-        assert_eq!(*spawns.lock().unwrap(), vec![42]);
+        assert_eq!(
+            *spawns.lock().unwrap(),
+            vec![(42, crate::state::BusHold::Unheld)],
+            "an app subscriber's wake buys a bridge and decides nothing about its lifetime"
+        );
 
         backoff.record_failure(42);
         router.spawn_eager_wake(&conv_key(), &ParticipantId::for_conversation(42));
         assert_eq!(
-            *spawns.lock().unwrap(),
-            vec![42],
+            spawns.lock().unwrap().len(),
+            1,
             "an armed conversation's bus wake is declined before it reaches a spawn"
+        );
+    }
+
+    /// A chat wake buys the same bridge through the same backoff, and leaves the
+    /// bus door holding it: the peer asked for this conversation by name, and a
+    /// start-up drain that finds nothing owed would otherwise leave the spawned
+    /// bridge held by no door and re-asked about by no timer.
+    #[tokio::test]
+    async fn the_chat_arm_spawns_held_through_the_bus_entrypoint() {
+        let state = AppState::for_test(brenn_lib::db::init_db_memory(), None);
+        let spawns = Arc::clone(&state.wake_spawns);
+        let backoff = state.spawn_backoff.clone();
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        router.set_state(state);
+
+        router.spawn_eager_wake(&chat_key(42), &ParticipantId::for_conversation(42));
+        assert_eq!(
+            *spawns.lock().unwrap(),
+            vec![(42, crate::state::BusHold::Held)],
+        );
+
+        backoff.record_failure(42);
+        router.spawn_eager_wake(&chat_key(42), &ParticipantId::for_conversation(42));
+        assert_eq!(
+            spawns.lock().unwrap().len(),
+            1,
+            "the hold does not exempt a chat wake from the backoff"
         );
     }
 

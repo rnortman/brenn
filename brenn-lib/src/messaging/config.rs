@@ -185,8 +185,9 @@ pub enum Sink {
 ///
 /// The grain is one bucket per publishing principal per channel. A sender's
 /// aggregate budget is therefore (this rate × the channels its ACLs let it
-/// publish to), which is bounded because the channel set is operator-declared
-/// config: no publisher can mint a channel to widen its budget.
+/// publish to), which is bounded because no publisher can mint a channel to
+/// widen its budget: channels come from operator config or from the server's
+/// own provisioning, and no publish reaches a creation path.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SendRate {

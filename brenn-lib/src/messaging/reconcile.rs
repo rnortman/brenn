@@ -100,6 +100,14 @@ impl Messenger {
                     // it echoes at subscribe is its whole delivery state. Any row
                     // under a surface identity is an orphan.
                     SubscriberEntryKind::Surface { .. } => None,
+                    // The subscription names its conversation outright, so
+                    // nothing has to be resolved to know whose row is whose. The
+                    // row is the one this boot's provisioning just re-created,
+                    // and it is what a dormant conversation's commands were
+                    // published against.
+                    SubscriberEntryKind::ChatConversation {
+                        conversation_id, ..
+                    } => Some(ParticipantId::for_conversation(*conversation_id)),
                 };
                 if let Some(participant) = participant {
                     justified.entry(entry.uuid).or_default().insert(participant);

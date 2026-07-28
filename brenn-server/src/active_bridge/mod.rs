@@ -11,11 +11,13 @@ mod approval_dispatch;
 mod brenn_tools;
 mod bridge;
 mod bridge_io;
+mod bus_chat;
 mod cc_event_loop;
 mod cc_spawn_config;
 mod compaction;
 mod idle_hooks;
 mod lifecycle;
+mod lifetime;
 mod mcp_constants;
 mod permission_sync;
 mod registry;
@@ -25,6 +27,7 @@ mod test_fixtures;
 pub mod test_support;
 mod tool_card;
 mod tool_summary;
+mod user_send;
 mod watchdog;
 
 pub(in crate::active_bridge) use brenn_tools::handle_brenn_tools;
@@ -42,4 +45,5 @@ pub(in crate::active_bridge) use tool_summary::{
     PendingToolUse, emit_prerendered_summary, emit_tool_result_summaries,
 };
 pub(crate) use tool_summary::{emit_tool_summary_for_intercept, mark_tool_handled};
+pub(crate) use user_send::{AcceptedSend, Interstitial, SendOrigin, accept_user_send};
 pub(crate) use watchdog::spawn_watchdog;

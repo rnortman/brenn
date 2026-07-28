@@ -1045,6 +1045,7 @@ mod tests {
         let msg = WsServerMessage::AssistantMessage {
             content: "hello".into(),
             seq: Some(42),
+            text: Some("hello".into()),
         };
         assert_eq!(WsConnection::extract_seq(&msg), Some(42));
     }
@@ -1055,6 +1056,7 @@ mod tests {
         let msg = WsServerMessage::AssistantMessage {
             content: "hello".into(),
             seq: None,
+            text: Some("hello".into()),
         };
         assert_eq!(WsConnection::extract_seq(&msg), None);
     }
@@ -1082,22 +1084,26 @@ mod tests {
                 attachments: vec![],
                 selected_tasks: vec![],
                 seq: Some(1),
+                bus_sender: None,
             },
             WsServerMessage::SystemMessageBroadcast {
                 rendered_html: "<p>sys</p>".into(),
                 category: SystemMessageCategory::EventDrain,
                 timestamp: "2026-01-01T00:00:00+00:00".into(),
                 seq: Some(2),
+                text: Some("sys".into()),
             },
             WsServerMessage::AssistantMessage {
                 content: "hello".into(),
                 seq: Some(3),
+                text: Some("hello".into()),
             },
             WsServerMessage::ToolUseSummary {
                 tool_name: "Read".into(),
                 rendered_summary: "<div></div>".into(),
                 detail_html: None,
                 seq: Some(4),
+                summary_text: Some("Read: /etc/hosts".into()),
             },
             WsServerMessage::ArtifactContent {
                 file_path: "f.md".into(),

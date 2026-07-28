@@ -132,17 +132,7 @@ pub fn format_tool_summary(
     }
 
     let denied = matches!(decision, ToolResponseDecision::Deny { .. });
-    let detail = match tool_name {
-        "Bash" => summary_bash(tool_input),
-        "Edit" => summary_edit(tool_input),
-        "Write" => summary_write(tool_input),
-        "Read" => summary_read(tool_input),
-        "Glob" => summary_glob(tool_input),
-        "Grep" => summary_grep(tool_input),
-        "ToolSearch" => summary_toolsearch(tool_input),
-        t if t.contains("DisplayFile") => summary_display_file(tool_input),
-        _ => summary_fallback(tool_name, tool_input),
-    };
+    let detail = summary_html(tool_name, summary_fields(tool_name, tool_input));
     if denied {
         format!(r#"<span class="ts-denied" title="Denied">✘</span> {detail}"#)
     } else {
@@ -275,78 +265,113 @@ fn truncate_detail_json(text: &str) -> String {
     brenn_lib::util::truncate_with_marker(text, DETAIL_JSON_MAX_DISPLAY)
 }
 
-fn summary_bash(input: &serde_json::Value) -> String {
-    let command = input
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("<no command>");
-    let display = truncate_summary(command, 120);
-    format!(r#"<code class="ts-cmd">{}</code>"#, html_escape(&display))
+/// What a compact tool-use summary shows, once, for both renderings.
+///
+/// The chat card and the bus record are two presentations of the same
+/// selection: which fields of a tool's input stand for the call. Keeping the
+/// table here is what stops the HTML and the raw text from describing different
+/// things as tools are added or their fields renamed.
+enum SummaryFields<'a> {
+    /// A shell command line.
+    Command(&'a str),
+    /// A path the tool acts on.
+    File(&'a str),
+    /// A path the browser can open as an artifact.
+    Artifact(&'a str),
+    /// A search pattern or query, unscoped.
+    Pattern(&'a str),
+    /// A search pattern scoped to a path.
+    PatternInPath { pattern: &'a str, path: &'a str },
+    /// No entry for this tool: the whole input stands for itself.
+    Fallback(&'a serde_json::Value),
 }
 
-fn summary_file_field(input: &serde_json::Value, field_name: &str) -> String {
-    let value = input
-        .get(field_name)
-        .and_then(|v| v.as_str())
-        .unwrap_or("<unknown>");
-    format!(r#"<span class="ts-file">{}</span>"#, html_escape(value))
+/// Pick the fields that stand for one tool call.
+fn summary_fields<'a>(tool_name: &str, input: &'a serde_json::Value) -> SummaryFields<'a> {
+    match tool_name {
+        "Bash" => SummaryFields::Command(str_field(input, "command", "<no command>")),
+        "Edit" | "Write" | "Read" => {
+            SummaryFields::File(str_field(input, "file_path", "<unknown>"))
+        }
+        "Glob" => SummaryFields::Pattern(str_field(input, "pattern", "*")),
+        "Grep" => SummaryFields::PatternInPath {
+            pattern: str_field(input, "pattern", ""),
+            path: str_field(input, "path", "."),
+        },
+        "ToolSearch" => SummaryFields::Pattern(str_field(input, "query", "")),
+        t if t.contains("DisplayFile") => {
+            SummaryFields::Artifact(str_field(input, "file_path", "<unknown>"))
+        }
+        _ => SummaryFields::Fallback(input),
+    }
 }
 
-fn summary_edit(input: &serde_json::Value) -> String {
-    summary_file_field(input, "file_path")
+/// One string field of a tool input, or `missing` when it is absent or not a
+/// string.
+fn str_field<'a>(input: &'a serde_json::Value, field: &str, missing: &'a str) -> &'a str {
+    input.get(field).and_then(|v| v.as_str()).unwrap_or(missing)
 }
 
-fn summary_write(input: &serde_json::Value) -> String {
-    summary_file_field(input, "file_path")
+/// Render the selected fields as the chat card's markup.
+fn summary_html(tool_name: &str, fields: SummaryFields<'_>) -> String {
+    match fields {
+        SummaryFields::Command(command) => format!(
+            r#"<code class="ts-cmd">{}</code>"#,
+            html_escape(&truncate_summary(command, 120))
+        ),
+        SummaryFields::File(path) => {
+            format!(r#"<span class="ts-file">{}</span>"#, html_escape(path))
+        }
+        SummaryFields::Artifact(path) => format!(
+            r#"<span class="ts-file ts-artifact" data-artifact-path="{}">{}</span>"#,
+            html_escape(path),
+            html_escape(path),
+        ),
+        SummaryFields::Pattern(pattern) => {
+            format!(
+                r#"<code class="ts-pattern">{}</code>"#,
+                html_escape(pattern)
+            )
+        }
+        SummaryFields::PatternInPath { pattern, path } => format!(
+            r#"<code class="ts-pattern">{}</code> in <span class="ts-file">{}</span>"#,
+            html_escape(pattern),
+            html_escape(path),
+        ),
+        SummaryFields::Fallback(input) => {
+            let json = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
+            format!(
+                r#"<span class="ts-file">{}</span> <code class="ts-pattern">{}</code>"#,
+                html_escape(tool_name),
+                html_escape(&truncate_summary(&json, 200)),
+            )
+        }
+    }
 }
 
-fn summary_read(input: &serde_json::Value) -> String {
-    summary_file_field(input, "file_path")
-}
-
-fn summary_glob(input: &serde_json::Value) -> String {
-    let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("*");
-    format!(
-        r#"<code class="ts-pattern">{}</code>"#,
-        html_escape(pattern)
-    )
-}
-
-fn summary_grep(input: &serde_json::Value) -> String {
-    let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-    let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-    format!(
-        r#"<code class="ts-pattern">{}</code> in <span class="ts-file">{}</span>"#,
-        html_escape(pattern),
-        html_escape(path),
-    )
-}
-
-fn summary_toolsearch(input: &serde_json::Value) -> String {
-    let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
-    format!(r#"<code class="ts-pattern">{}</code>"#, html_escape(query))
-}
-
-fn summary_display_file(input: &serde_json::Value) -> String {
-    let file_path = input
-        .get("file_path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("<unknown>");
-    format!(
-        r#"<span class="ts-file ts-artifact" data-artifact-path="{}">{}</span>"#,
-        html_escape(file_path),
-        html_escape(file_path),
-    )
-}
-
-fn summary_fallback(tool_name: &str, input: &serde_json::Value) -> String {
-    let json = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
-    let display = truncate_summary(&json, 200);
-    format!(
-        r#"<span class="ts-file">{}</span> <code class="ts-pattern">{}</code>"#,
-        html_escape(tool_name),
-        html_escape(&display),
-    )
+/// Summarize a completed tool use as one line of raw text.
+///
+/// The counterpart of [`format_tool_summary`] for consumers that render
+/// themselves: the same [`summary_fields`] selection, no markup, no registry
+/// lookup — a registered tool's custom summary is HTML by signature, so every
+/// tool gets the generic treatment here.
+pub fn format_tool_summary_text(tool_name: &str, tool_input: &serde_json::Value) -> String {
+    let detail = match summary_fields(tool_name, tool_input) {
+        SummaryFields::Command(command) => truncate_summary(command, 120),
+        SummaryFields::File(path) | SummaryFields::Artifact(path) => truncate_summary(path, 200),
+        SummaryFields::Pattern(pattern) => truncate_summary(pattern, 200),
+        SummaryFields::PatternInPath { pattern, path } => format!(
+            "{} in {}",
+            truncate_summary(pattern, 200),
+            truncate_summary(path, 200),
+        ),
+        SummaryFields::Fallback(input) => {
+            // Compact rather than pretty: this is one line, not a block.
+            let json = serde_json::to_string(input).unwrap_or_else(|_| input.to_string());
+            truncate_summary(&json, 200)
+        }
+    };
+    format!("{tool_name}: {detail}")
 }
 
 /// Truncate text for compact summary display (UTF-8 safe).
@@ -542,6 +567,119 @@ mod tests {
         let html = format_tool_summary(&reg, "Bash", &input, &allowed());
         assert!(html.contains("cargo build"), "got: {html}");
         assert!(html.contains("ts-cmd"), "should have cmd class: {html}");
+    }
+
+    /// The chat card and the bus record are two renderings of one selection, so
+    /// whatever field stands for a call appears in both. A tool added to only
+    /// one of them fails here.
+    #[test]
+    fn the_card_and_the_record_summarize_the_same_fields() {
+        let reg = empty_registry();
+        // Per-rendering expectations, because a multi-field tool renders its
+        // fields differently on each side and one shared substring would only
+        // ever prove the first of them.
+        for (tool, input, html_expect, text_expect) in [
+            (
+                "Bash",
+                serde_json::json!({"command": "cargo build"}),
+                "cargo build",
+                "cargo build",
+            ),
+            (
+                "Edit",
+                serde_json::json!({"file_path": "src/main.rs"}),
+                "src/main.rs",
+                "src/main.rs",
+            ),
+            (
+                "Write",
+                serde_json::json!({"file_path": "src/new.rs"}),
+                "src/new.rs",
+                "src/new.rs",
+            ),
+            (
+                "Read",
+                serde_json::json!({"file_path": "/etc/hosts"}),
+                "/etc/hosts",
+                "/etc/hosts",
+            ),
+            (
+                "Glob",
+                serde_json::json!({"pattern": "*.rs"}),
+                "*.rs",
+                "*.rs",
+            ),
+            (
+                "Grep",
+                serde_json::json!({"pattern": "fn main", "path": "src"}),
+                r#"<code class="ts-pattern">fn main</code> in <span class="ts-file">src</span>"#,
+                "fn main in src",
+            ),
+            (
+                "ToolSearch",
+                serde_json::json!({"query": "budget rollover"}),
+                "budget rollover",
+                "budget rollover",
+            ),
+            (
+                "GrafDisplayFile",
+                serde_json::json!({"file_path": "/tmp/report.md"}),
+                "/tmp/report.md",
+                "/tmp/report.md",
+            ),
+            (
+                "SomeToolWithNoEntry",
+                serde_json::json!({"whatever": "matters"}),
+                "matters",
+                "matters",
+            ),
+        ] {
+            let html = format_tool_summary(&reg, tool, &input, &allowed());
+            let text = format_tool_summary_text(tool, &input);
+            assert!(html.contains(html_expect), "{tool} card: {html}");
+            assert!(text.contains(text_expect), "{tool} record: {text}");
+        }
+    }
+
+    struct CustomSummaryTool;
+
+    impl AppTool for CustomSummaryTool {
+        fn name(&self) -> &str {
+            "Reconcile"
+        }
+
+        fn format_summary(
+            &self,
+            _tool_input: &serde_json::Value,
+            _decision: &ToolResponseDecision,
+        ) -> Option<String> {
+            Some(r#"<span class="pf-recon">3 accounts reconciled</span>"#.to_string())
+        }
+    }
+
+    /// The two renderings diverge on purpose for a registered tool: its custom
+    /// summary is HTML by signature, so the card takes it and the record falls
+    /// back to the generic line rather than putting markup on the bus.
+    #[test]
+    fn a_registered_tools_custom_summary_is_the_cards_alone() {
+        let mut reg = empty_registry();
+        reg.insert(
+            "Reconcile".to_string(),
+            Arc::new(CustomSummaryTool) as Arc<dyn AppTool>,
+        );
+        let input = serde_json::json!({"account": "checking"});
+
+        let html = format_tool_summary(&reg, "Reconcile", &input, &allowed());
+        assert_eq!(
+            html, r#"<span class="pf-recon">3 accounts reconciled</span>"#,
+            "the card shows what the tool rendered",
+        );
+
+        let text = format_tool_summary_text("Reconcile", &input);
+        assert_eq!(
+            text, r#"Reconcile: {"account":"checking"}"#,
+            "the record shows the generic line, with no markup",
+        );
     }
 
     #[test]
