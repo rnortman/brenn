@@ -392,6 +392,77 @@ pub(crate) fn fixture_messenger(
         .with_ring_stores(stores)
 }
 
+/// A harness whose surface, channels, and messenger all came out of a real
+/// `build_messaging` boot instead of a hand-built `ResolvedSurface`.
+///
+/// Auto channels exist only because the lowering pass placed them: their
+/// address, their ring depth, and — the whole point — the ACL matchers that
+/// authorize their endpoints are all derived at boot from `[[connection]]` and
+/// io_port declarations. A fixture-built surface would carry a policy the test
+/// wrote itself, which proves nothing about the wiring. So these cases boot the
+/// config and install what boot resolved.
+pub(crate) struct BootedSurfaceHarness {
+    pub state: AppState,
+    pub alerts: Arc<Mutex<Vec<(String, String)>>>,
+    pub flusher: AlertDispatcher,
+    /// The `Messenger` that boot produced, fully configured.
+    pub messenger: Arc<brenn_lib::messaging::Messenger>,
+    pub surfaces: Vec<ResolvedSurface>,
+}
+
+impl BootedSurfaceHarness {
+    /// The channel address boot resolved for the first surface's
+    /// `(instance, port)` subscription. An anonymous auto channel's address is
+    /// a uuid nobody wrote down, so a test reads it back off the resolution
+    /// rather than recomputing it.
+    pub fn surface_sub_address(&self, instance: &str, port: &str) -> String {
+        self.surfaces[0]
+            .subscriptions
+            .iter()
+            .find(|b| b.instance == instance && b.port == port)
+            .unwrap_or_else(|| panic!("boot resolved no subscription on {instance}/{port}"))
+            .channel_address
+            .clone()
+    }
+}
+
+/// Boot `config` with the standard no-op periphery and install its surfaces on a
+/// capturing-alerter `AppState`, over the boot's own messenger.
+pub(crate) async fn booted_surface_harness(
+    db: &db::Db,
+    config: &brenn_lib::config::BrennConfig,
+) -> BootedSurfaceHarness {
+    let (mut state, alerts, _handle) = test_state_with_capturing_alerter(db);
+    let flusher = state.alert_dispatcher.clone();
+    let apps: Arc<indexmap::IndexMap<String, brenn_lib::config::AppConfig>> =
+        Arc::new(indexmap::IndexMap::new());
+    let result = crate::bootstrap::messaging::test_fixtures::boot_messaging_with(
+        config,
+        db.clone(),
+        &apps,
+        flusher.clone(),
+        TEST_ORIGIN,
+    )
+    .await;
+    let messenger = result
+        .messenger
+        .expect("a config with a surface configures messaging");
+    state.surfaces = Arc::new(install_surface_runtimes(
+        result.surfaces.clone(),
+        Some(Arc::clone(&messenger)),
+        TEST_MAX_BODY_BYTES,
+        None,
+        crate::test_support::surface::description_params(),
+    ));
+    BootedSurfaceHarness {
+        state,
+        alerts,
+        flusher,
+        messenger,
+        surfaces: result.surfaces,
+    }
+}
+
 /// The dominant pattern in both suites: a `deskbar_sub` surface over a registry
 /// whose single channel has the given retain depth.
 pub(crate) fn subscribe_harness(db: &db::Db, retain_depth: u64) -> SurfaceTestHarness {

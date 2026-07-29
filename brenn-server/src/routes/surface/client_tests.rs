@@ -1269,3 +1269,116 @@ async fn client_report_path_stays_healthy() {
     // Reporting an error is never a protocol violation.
     assert_no_alerts(&flusher, &alerts, "conformant Log").await;
 }
+
+// ── page-local auto channels ──────────────────────────────────────────────────
+
+const LOOP_PORT: &str = "loop";
+
+/// The io_port's retain depth, which the page ring folds to.
+const LOCAL_RING_DEPTH: u64 = 4;
+
+/// A surface whose `protobar` instance declares one `[[surface.io_port]]` and
+/// nothing else: no `[[channel]]` block, no `[[connection]]`, no ACL entry, no
+/// channel address anywhere. Both halves of the port land on one page-local
+/// channel, which is the zero-config surface self-loop.
+fn page_local_io_port_config() -> brenn_lib::config::BrennConfig {
+    use crate::bootstrap::messaging::test_fixtures::{minimal_surface_raw, surface_io_port_raw};
+    use brenn_lib::messaging::config::{Depth, MessagingGlobalConfig};
+
+    let deskbar = brenn_lib::messaging::config::SurfaceConfigRaw {
+        // push < retain, and both below the global default push depth: the ring
+        // depth this yields distinguishes the retain fold from a push fold and
+        // from inheriting the global default.
+        io_ports: vec![surface_io_port_raw(
+            COMPONENT,
+            LOOP_PORT,
+            None,
+            Depth::Bounded(2),
+            Depth::Bounded(LOCAL_RING_DEPTH),
+        )],
+        ..minimal_surface_raw()
+    };
+    brenn_lib::config::BrennConfig {
+        messaging: MessagingGlobalConfig {
+            default_push_depth: Depth::Bounded(8),
+            ..Default::default()
+        },
+        surfaces: vec![deskbar],
+        ..brenn_lib::config::BrennConfig::default()
+    }
+}
+
+/// The surface self-loop through the real kernel: a component publishes on its
+/// io_port and is activated with its own message on that same port.
+///
+/// Page-local traffic never crosses the wire, so what is under test is the
+/// lowering — boot has to hand the page a `local:` channel, an input binding,
+/// and an output binding that all name the one address, or the publish routes
+/// into a channel the component does not read and the activation never arrives.
+#[tokio::test]
+async fn client_surface_io_port_round_trips_through_the_page_local_router() {
+    let db = db::init_db_memory();
+    let harness =
+        super::test_fixtures::booted_surface_harness(&db, &page_local_io_port_config()).await;
+
+    let surface = &harness.surfaces[0];
+    let [local] = &surface.local_channels[..] else {
+        panic!(
+            "one io_port lowers to exactly one page-local channel, got {:?}",
+            surface.local_channels
+        );
+    };
+    assert!(
+        local.address.starts_with("local:auto."),
+        "an unnamed surface io_port is anonymous and page-local, got {:?}",
+        local.address,
+    );
+    assert_eq!(
+        local.ring_depth, LOCAL_RING_DEPTH,
+        "the page ring folds the io_port's retain depth"
+    );
+    assert_eq!(surface.subscriptions[0].channel_address, local.address);
+    assert_eq!(surface.outputs[0].channel_address, local.address);
+    assert!(
+        surface.policy.acls.local_publish.is_empty()
+            && surface.policy.acls.local_subscribe.is_empty(),
+        "page-local traffic has no bus gate, so nothing is injected for it",
+    );
+
+    let flusher = harness.flusher.clone();
+    let alerts = Arc::clone(&harness.alerts);
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(harness.state).await;
+
+    let (client, mut events, driver_task) = spawn_client(&base, &token);
+    match next_event(&mut events).await {
+        Event::Connected { bindings, .. } => {
+            assert_eq!(bindings.subscriptions.len(), 1);
+            assert_eq!(bindings.subscriptions[0].port, LOOP_PORT);
+            assert_eq!(bindings.outputs.len(), 1);
+            assert_eq!(bindings.outputs[0].port, LOOP_PORT);
+            assert_eq!(
+                bindings.outputs[0].channel, bindings.subscriptions[0].channel,
+                "the page is told one channel for both halves — the self-loop is structural",
+            );
+        }
+        other => panic!("expected Connected, got {other:?}"),
+    }
+
+    let (entry, mut activations) = recorder();
+    client.register_activation(COMPONENT, entry);
+    client
+        .publish(COMPONENT, LOOP_PORT, "tick".to_string())
+        .expect("a bound, in-cap publish is accepted locally");
+
+    expect_new_messages(&mut activations, LOOP_PORT, &["tick"]).await;
+
+    client.close();
+    drop(client);
+    tokio::time::timeout(WAIT, driver_task)
+        .await
+        .expect("the driver task ends after close")
+        .expect("the driver task did not panic");
+
+    assert_no_alerts(&flusher, &alerts, "page-local io_port round trip").await;
+}

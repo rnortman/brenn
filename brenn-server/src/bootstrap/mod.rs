@@ -41,6 +41,109 @@ fn assert_build_id_valid(build_id: &str) {
     );
 }
 
+/// The environment-free half of a `[[wasm_consumer]]`'s `ProcessorLoadSpec`:
+/// everything derivable from the resolved consumer alone. The remaining fields
+/// (alerter, store path, MQTT egress callback, tool host) depend on process-wide
+/// services and stay at the call site.
+pub(crate) struct ConsumerLoadParts {
+    pub output_ports: std::collections::HashMap<String, brenn_wasm::OutputPortSpec>,
+    pub input_amplification_mt: std::collections::HashMap<String, u64>,
+    pub mqtt_sinks: std::collections::HashMap<String, brenn_wasm::SinkBudget>,
+    pub grants: std::collections::BTreeSet<brenn_wasm::Capability>,
+    pub output_acl: brenn_wasm::OutputAclFn,
+}
+
+/// Lower a resolved consumer to the load-spec fields it fully determines.
+pub(crate) fn lower_consumer_load_parts(
+    consumer: &brenn_lib::messaging::config::ResolvedWasmConsumer,
+) -> ConsumerLoadParts {
+    use brenn_lib::messaging::Urgency;
+    use brenn_lib::messaging::config::WasmGrant;
+    use brenn_wasm::{Capability, ProcessorUrgency};
+    use std::collections::{BTreeSet, HashMap};
+
+    let output_ports: HashMap<String, brenn_wasm::OutputPortSpec> = consumer
+        .outputs
+        .iter()
+        .map(|o| {
+            let wu = match o.default_urgency {
+                Urgency::VeryLow => ProcessorUrgency::VeryLow,
+                Urgency::Low => ProcessorUrgency::Low,
+                Urgency::Normal => ProcessorUrgency::Normal,
+                Urgency::High => ProcessorUrgency::High,
+            };
+            (
+                o.port.clone(),
+                brenn_wasm::OutputPortSpec {
+                    channel_address: o.channel_address.clone(),
+                    default_urgency: wu,
+                    budget: brenn_wasm::SinkBudget {
+                        fill_mt: o.budget.fill_mt,
+                        capacity_mt: o.budget.capacity_mt,
+                    },
+                },
+            )
+        })
+        .collect();
+    // Windows are built from the same `inputs`, so every driven window port
+    // is present.
+    let input_amplification_mt: HashMap<String, u64> = consumer
+        .inputs
+        .iter()
+        .map(|i| (i.port.clone(), i.amplification_mt))
+        .collect();
+    let mqtt_sinks: HashMap<String, brenn_wasm::SinkBudget> = consumer
+        .mqtt_sinks
+        .iter()
+        .map(|(client, b)| {
+            (
+                client.clone(),
+                brenn_wasm::SinkBudget {
+                    fill_mt: b.fill_mt,
+                    capacity_mt: b.capacity_mt,
+                },
+            )
+        })
+        .collect();
+    // Exhaustive match: a new variant on either side is a compile error.
+    let mut grants: BTreeSet<Capability> = consumer
+        .grants
+        .iter()
+        .map(|g| match g {
+            WasmGrant::Ports => Capability::Ports,
+            WasmGrant::Store => Capability::Store,
+            WasmGrant::Log => Capability::Log,
+            WasmGrant::Alert => Capability::Alert,
+            WasmGrant::Config => Capability::Config,
+            WasmGrant::Mqtt => Capability::Mqtt,
+        })
+        .collect();
+    // No `WasmGrant::Tools` variant — the `Tools` capability is derived from
+    // the presence of tool grants, not declared. The `tools` WIT interface
+    // links iff this capability is set.
+    if !consumer.policy.tool_grants.is_empty() {
+        grants.insert(Capability::Tools);
+    }
+    // `brenn-wasm` never sees a brenn-lib type; this closure bridges the two.
+    let policy = consumer.policy.clone();
+    let output_acl: brenn_wasm::OutputAclFn = std::sync::Arc::new(move |addr: &str| {
+        match brenn_lib::messaging::ChannelScheme::split(addr) {
+            Some((scheme, name)) => {
+                brenn_lib::messaging::gates::publish_acl_allows(&policy, scheme, name)
+            }
+            None => false,
+        }
+    });
+
+    ConsumerLoadParts {
+        output_ports,
+        input_amplification_mt,
+        mqtt_sinks,
+        grants,
+        output_acl,
+    }
+}
+
 pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build_id: &'static str) {
     assert_build_id_valid(build_id);
 
@@ -551,53 +654,14 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         use std::sync::Arc;
         let mut components: HashMap<String, Arc<brenn_wasm::ProcessorComponent>> = HashMap::new();
         for consumer in &messaging_result.wasm_consumers {
-            // Build the output port map: port name → binding + per-sink budget.
-            let output_ports: HashMap<String, brenn_wasm::OutputPortSpec> = consumer
-                .outputs
-                .iter()
-                .map(|o| {
-                    use brenn_lib::messaging::Urgency;
-                    use brenn_wasm::ProcessorUrgency;
-                    let wu = match o.default_urgency {
-                        Urgency::VeryLow => ProcessorUrgency::VeryLow,
-                        Urgency::Low => ProcessorUrgency::Low,
-                        Urgency::Normal => ProcessorUrgency::Normal,
-                        Urgency::High => ProcessorUrgency::High,
-                    };
-                    (
-                        o.port.clone(),
-                        brenn_wasm::OutputPortSpec {
-                            channel_address: o.channel_address.clone(),
-                            default_urgency: wu,
-                            budget: brenn_wasm::SinkBudget {
-                                fill_mt: o.budget.fill_mt,
-                                capacity_mt: o.budget.capacity_mt,
-                            },
-                        },
-                    )
-                })
-                .collect();
-            // Input port → publish amplification (millitokens). Windows are built
-            // from the same `inputs`, so every driven window port is present.
-            let input_amplification_mt: HashMap<String, u64> = consumer
-                .inputs
-                .iter()
-                .map(|i| (i.port.clone(), i.amplification_mt))
-                .collect();
-            // MQTT egress sinks: ACL-allowed client slug → per-sink budget.
-            let mqtt_sinks: HashMap<String, brenn_wasm::SinkBudget> = consumer
-                .mqtt_sinks
-                .iter()
-                .map(|(client, b)| {
-                    (
-                        client.clone(),
-                        brenn_wasm::SinkBudget {
-                            fill_mt: b.fill_mt,
-                            capacity_mt: b.capacity_mt,
-                        },
-                    )
-                })
-                .collect();
+            let ConsumerLoadParts {
+                output_ports,
+                input_amplification_mt,
+                mqtt_sinks,
+                grants,
+                output_acl,
+            } = lower_consumer_load_parts(consumer);
+            let has_tool_grants = !consumer.policy.tool_grants.is_empty();
             let alerter = std::sync::Arc::new(crate::wasm_dispatch::DispatcherAlerter::new(
                 guard
                     .alert_dispatcher
@@ -605,47 +669,6 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
                     .with_field("wasm_slug", &consumer.slug),
                 consumer.slug.clone(),
             ));
-            // Map WasmGrant → brenn_wasm::Capability (exhaustive match enforces
-            // sync when new variants are added to either type).
-            let mut grants: std::collections::BTreeSet<brenn_wasm::Capability> = consumer
-                .grants
-                .iter()
-                .map(|g| {
-                    use brenn_lib::messaging::config::WasmGrant;
-                    use brenn_wasm::Capability;
-                    match g {
-                        WasmGrant::Ports => Capability::Ports,
-                        WasmGrant::Store => Capability::Store,
-                        WasmGrant::Log => Capability::Log,
-                        WasmGrant::Alert => Capability::Alert,
-                        WasmGrant::Config => Capability::Config,
-                        WasmGrant::Mqtt => Capability::Mqtt,
-                    }
-                })
-                .collect();
-            // Derive the `Tools` capability (grant name `"tools"`) iff the consumer
-            // holds ≥1 tool grant. There is no `WasmGrant::Tools` token — the tool
-            // surface is authorized by `[[wasm_consumer.tool_grant]]` tables, not a
-            // grant line, and the capability presence is derived from them. The
-            // `tools` WIT interface links iff this is present; which tools are
-            // addressable is the per-call `tool_grants` lookup the host does.
-            let has_tool_grants = !consumer.policy.tool_grants.is_empty();
-            if has_tool_grants {
-                grants.insert(brenn_wasm::Capability::Tools);
-            }
-            // Lower the resolved publish ACLs to the brenn-lib-free output-ACL
-            // predicate. `brenn-wasm` never sees a brenn-lib type; this closure
-            // owns the scheme-prefix convention and dispatches to the right
-            // per-scheme ACL.
-            let policy = consumer.policy.clone();
-            let output_acl: brenn_wasm::OutputAclFn = std::sync::Arc::new(move |addr: &str| {
-                match brenn_lib::messaging::ChannelScheme::split(addr) {
-                    Some((scheme, name)) => {
-                        brenn_lib::messaging::gates::publish_acl_allows(&policy, scheme, name)
-                    }
-                    None => false,
-                }
-            });
             // Synchronous MQTT egress callback. Built iff the consumer holds the
             // `Mqtt` grant — the `mqtt` interface is linked iff this is `Some`, and
             // `ProcessorComponent::load` re-asserts that invariant. The constructor

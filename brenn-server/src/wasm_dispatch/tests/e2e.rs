@@ -1182,3 +1182,528 @@ async fn ring_backed_trap_quarantines_without_claim_ids() {
         "the quarantine row names the one retention seq the batch spanned"
     );
 }
+
+/// The trigger channel every auto-channel case fires. The demo component
+/// requires a webhook-typed envelope to produce output, so this channel carries
+/// that shape. The uuid is drawn once so a restart case can reboot the same
+/// config.
+fn trigger_channel() -> brenn_lib::messaging::config::ChannelConfigRaw {
+    brenn_lib::messaging::config::ChannelConfigRaw {
+        send_rate: None,
+        uuid: Some(uuid::Uuid::new_v4().to_string()),
+        address: "brenn:e2e-trigger".to_string(),
+        description: None,
+        push_depth: None,
+        retain_depth: None,
+        standing_retain_depth: None,
+        noise: None,
+        sink: None,
+        wake_min: None,
+    }
+}
+
+/// A `[[wasm_consumer]]` running the demo guest and woken by the trigger
+/// channel. Callers add the output side under test — a free output port, an
+/// io_port — via struct update.
+fn demo_consumer_raw(slug: &str) -> brenn_lib::messaging::config::WasmConsumerConfigRaw {
+    use brenn_lib::access::raw::ChannelMatcherRaw;
+    use brenn_lib::messaging::config::{
+        WasmConsumerConfigRaw, WasmConsumerSubscriptionRaw, WasmGrant,
+    };
+
+    WasmConsumerConfigRaw {
+        slug: slug.to_string(),
+        component_path: std::path::PathBuf::from(DEMO_WASM),
+        grants: vec![WasmGrant::Ports],
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            channel: Some("brenn:e2e-trigger".to_string()),
+            port: "in".to_string(),
+            push_depth: None,
+            retain_depth: None,
+            noise: None,
+            wake_min: None,
+            amplification: None,
+        }],
+        subscribe_acl: vec![ChannelMatcherRaw::Exact("e2e-trigger".to_string())],
+        ..crate::bootstrap::messaging::test_fixtures::minimal_wasm_consumer()
+    }
+}
+
+use crate::bootstrap::messaging::test_fixtures::io_port_raw;
+
+/// A free input port: no channel of its own, tuned here, bound by a
+/// `[[connection]]`.
+fn free_input_raw(port: &str) -> brenn_lib::messaging::config::WasmConsumerSubscriptionRaw {
+    brenn_lib::messaging::config::WasmConsumerSubscriptionRaw {
+        channel: None,
+        port: port.to_string(),
+        push_depth: Some(Depth::Bounded(4)),
+        retain_depth: Some(Depth::Bounded(4)),
+        noise: None,
+        wake_min: None,
+        amplification: None,
+    }
+}
+
+/// Boot the real messaging layer over `config` and load the demo guest against
+/// every resolved consumer, through the same lowering production boot uses.
+/// Hand-building the load spec would test the fixture, not the lowering pass.
+async fn boot_dispatch(
+    config: &brenn_lib::config::BrennConfig,
+    db: brenn_lib::db::Db,
+    apps: &Arc<IndexMap<String, brenn_lib::config::AppConfig>>,
+) -> (
+    crate::bootstrap::messaging::MessagingResult,
+    Vec<WasmConsumerConfig>,
+    tokio::task::JoinHandle<()>,
+) {
+    use crate::bootstrap::{ConsumerLoadParts, lower_consumer_load_parts};
+
+    let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
+    let result = crate::bootstrap::messaging::test_fixtures::boot_messaging_with(
+        config,
+        db,
+        apps,
+        alert_dispatcher.clone(),
+        "brenn://test",
+    )
+    .await;
+
+    let messenger = result
+        .messenger
+        .clone()
+        .expect("a config with a wasm consumer wires a messenger");
+    let configs = result
+        .wasm_consumers
+        .iter()
+        .map(|consumer| {
+            let ConsumerLoadParts {
+                output_ports,
+                input_amplification_mt,
+                mqtt_sinks,
+                grants,
+                output_acl,
+            } = lower_consumer_load_parts(consumer);
+            let component = Arc::new(ProcessorComponent::load(ProcessorLoadSpec {
+                component_path: &consumer.component_path,
+                slug: &consumer.slug,
+                output_ports,
+                input_amplification_mt,
+                mqtt_sinks,
+                config: consumer.config.clone(),
+                grants,
+                store_path: None,
+                max_page_count: consumer.max_page_count,
+                max_payload_bytes: config.messaging.max_body_bytes,
+                alerter: noop_proc_alerter(),
+                output_acl,
+                mqtt_publish: None,
+                tool_host: None,
+            }));
+            WasmConsumerConfig {
+                slug: consumer.slug.clone(),
+                component,
+                notify: Arc::new(Notify::new()),
+                messenger: Arc::clone(&messenger),
+                alert_dispatcher: alert_dispatcher.clone(),
+                inputs: consumer.inputs.clone(),
+                outputs: consumer.outputs.clone(),
+                activation_pacing: unthrottled_pacing(),
+            }
+        })
+        .collect();
+
+    (result, configs, alert_handle)
+}
+
+/// No apps: the default periphery for a case that only wires WASM consumers.
+fn no_apps() -> Arc<IndexMap<String, brenn_lib::config::AppConfig>> {
+    Arc::new(IndexMap::new())
+}
+
+/// Insert one webhook-typed envelope carrying `body` on the trigger channel.
+async fn fire_trigger(messenger: &brenn_lib::messaging::Messenger, body: &str) {
+    let entry = messenger
+        .directory()
+        .resolve("brenn:e2e-trigger")
+        .expect("the trigger channel is declared in every auto-channel config");
+    let envelope = WebhookEnvelope {
+        headers: vec![],
+        key_id: "k".into(),
+        client_ip: "127.0.0.1".into(),
+        received_at: Utc::now(),
+        body: body.into(),
+        endpoint_slug: "e2e-trigger".into(),
+    };
+    testutils::insert_bus_message(
+        messenger,
+        &entry,
+        &serde_json::to_string(&envelope).unwrap(),
+        ChannelScheme::Webhook,
+    )
+    .await;
+}
+
+/// Everything `subscriber` is owed, as `(channel address, body)` pairs.
+async fn owed_pairs(
+    messenger: &brenn_lib::messaging::Messenger,
+    subscriber: &ParticipantId,
+) -> Vec<(String, String)> {
+    brenn_lib::messaging::testutils::owed_everywhere(messenger, subscriber)
+        .await
+        .into_iter()
+        .map(|(address, envelope)| (address, envelope.body.clone()))
+        .collect()
+}
+
+/// The timer idiom, end to end and structural. The config declares one io_port
+/// and nothing else — no `[[channel]]` block for it, no `[[connection]]`, no ACL
+/// entry — and the guest's own `publish-deferred` parks on the channel the
+/// lowering pass placed for that port. When it releases, the port that scheduled
+/// it is the port that receives it: the self-loop cannot be miswired, because
+/// there is only one channel to be wired to.
+#[tokio::test]
+async fn an_io_port_timer_loop_delivers_the_guests_own_deferred_wake() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::config::WasmConsumerConfigRaw;
+
+    let config = BrennConfig {
+        channels: vec![trigger_channel()],
+        wasm_consumers: vec![WasmConsumerConfigRaw {
+            io_ports: vec![io_port_raw(
+                "out",
+                None,
+                Depth::Bounded(4),
+                Depth::Bounded(4),
+            )],
+            ..demo_consumer_raw("ticker")
+        }],
+        ..BrennConfig::default()
+    };
+
+    let (result, cfgs, _alert_handle) = boot_dispatch(&config, init_db_memory(), &no_apps()).await;
+    let messenger = result.messenger.clone().unwrap();
+    let cfg = &cfgs[0];
+    let subscriber = ParticipantId::for_wasm("ticker");
+
+    let auto_address = cfg.outputs[0].channel_address.clone();
+    assert!(
+        auto_address.starts_with("local:auto."),
+        "an io_port with no channel of its own rides an anonymous non-transportable \
+         channel, got {auto_address:?}"
+    );
+
+    fire_trigger(&messenger, "__defer__").await;
+    drain_step(cfg, &subscriber).await;
+
+    assert!(
+        owed_pairs(&messenger, &subscriber).await.is_empty(),
+        "a parked schedule is owed to nobody before it releases"
+    );
+
+    let swept = messenger
+        .release_due_messages(Utc::now() + chrono::Duration::minutes(2))
+        .await;
+    assert_eq!(swept.released, 1, "the guest's own schedule came due");
+
+    assert_eq!(
+        owed_pairs(&messenger, &subscriber).await,
+        vec![(auto_address, "deferred-payload".to_string())],
+        "the released wake is owed to the same port that scheduled it"
+    );
+
+    drain_step(cfg, &subscriber).await;
+    assert!(
+        owed_pairs(&messenger, &subscriber).await.is_empty(),
+        "the component consumed its own wake"
+    );
+}
+
+/// Two consumers and one `[[connection]]`: the producer's output port and the
+/// consumer's input port are both free — no channel is named anywhere in the
+/// config, and neither block carries an ACL entry for the wire. The producer's
+/// publish through the real guest is what the second component is activated on,
+/// payload intact.
+#[tokio::test]
+async fn a_connection_carries_one_components_publish_into_anothers_activation() {
+    let (result, cfgs, _alert_handle) =
+        boot_dispatch(&connection_config(), init_db_memory(), &no_apps()).await;
+    let messenger = result.messenger.clone().unwrap();
+    let producer_sub = ParticipantId::for_wasm("producer");
+    let reader_sub = ParticipantId::for_wasm("reader");
+
+    let auto_address = cfgs[0].outputs[0].channel_address.clone();
+    assert!(
+        auto_address.starts_with("local:auto."),
+        "an all-backend connection lowers to an anonymous server-ring channel, \
+         got {auto_address:?}"
+    );
+    assert_eq!(
+        cfgs[1].inputs[0].sub.channel_address, auto_address,
+        "both endpoints of the connection resolve to the one channel it created"
+    );
+
+    fire_trigger(&messenger, "hand-off-payload").await;
+    drain_step(&cfgs[0], &producer_sub).await;
+
+    assert_eq!(
+        owed_pairs(&messenger, &reader_sub).await,
+        vec![(auto_address, "hand-off-payload".to_string())],
+        "the connection delivered the producer's publish to the reader, body intact"
+    );
+
+    drain_step(&cfgs[1], &reader_sub).await;
+    assert!(
+        owed_pairs(&messenger, &reader_sub).await.is_empty(),
+        "the reader's activation consumed the hand-off"
+    );
+}
+
+/// A producer whose free output port and a reader whose free input port are
+/// wired by one `[[connection]]`, plus the trigger channel that drives the
+/// producer's guest.
+fn connection_config() -> brenn_lib::config::BrennConfig {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::config::{
+        ConnectionConfigRaw, WasmConsumerConfigRaw, WasmConsumerOutputRaw, WasmGrant,
+    };
+
+    let producer = WasmConsumerConfigRaw {
+        outputs: vec![WasmConsumerOutputRaw {
+            port: "out".to_string(),
+            channel: None,
+            urgency: None,
+            publish_per_activation: None,
+            publish_capacity: None,
+        }],
+        ..demo_consumer_raw("producer")
+    };
+    let reader = WasmConsumerConfigRaw {
+        slug: "reader".to_string(),
+        component_path: std::path::PathBuf::from(DEMO_WASM),
+        grants: vec![WasmGrant::Ports],
+        subscriptions: vec![free_input_raw("in")],
+        ..crate::bootstrap::messaging::test_fixtures::minimal_wasm_consumer()
+    };
+    BrennConfig {
+        channels: vec![trigger_channel()],
+        wasm_consumers: vec![producer, reader],
+        connections: vec![ConnectionConfigRaw {
+            endpoints: vec![
+                "wasm:producer/out".to_string(),
+                "wasm:reader/in".to_string(),
+            ],
+            channel: None,
+            uuid: None,
+            description: None,
+        }],
+        ..BrennConfig::default()
+    }
+}
+
+/// Auto-injected grants reach exactly the endpoints of the connection. A
+/// bystander app that holds the transport grant and a `local_publish` allowlist
+/// of its own is still denied on the anonymous address: the connection is the
+/// authorization signal, and nothing else in the config can express reach into
+/// it (an ACL matcher naming the `auto` namespace is a boot panic).
+#[tokio::test]
+async fn a_third_party_publishing_to_an_anonymous_auto_channel_is_denied() {
+    use brenn_lib::access::AppCapability;
+    use brenn_lib::access::acl::ChannelMatcher;
+    use brenn_lib::messaging::Urgency;
+    use brenn_lib::messaging::publish::{PublishOrigin, PublishResult};
+
+    let mut bystander =
+        crate::test_support::app_config::default_test_app_config("graf", "Graf Test");
+    bystander.policy.grants.insert(AppCapability::LocalPublish);
+    bystander
+        .policy
+        .acls
+        .local_publish
+        .push(ChannelMatcher::Exact("graf.scratch".to_string()));
+    let mut apps = IndexMap::new();
+    apps.insert("graf".to_string(), bystander);
+
+    let (result, cfgs, _alert_handle) =
+        boot_dispatch(&connection_config(), init_db_memory(), &Arc::new(apps)).await;
+    let messenger = result.messenger.clone().unwrap();
+    let auto_address = cfgs[0].outputs[0].channel_address.clone();
+    let bare = auto_address.strip_prefix("local:").unwrap();
+
+    // The endpoint's own reach, for contrast: the same address the bystander is
+    // denied on is granted to the component the connection named.
+    assert!(
+        result.wasm_consumers[0].policy.allows_local_publish(bare),
+        "the publishing endpoint holds the injected grant on its own connection"
+    );
+
+    let denied = messenger
+        .publish(
+            PublishOrigin::Conversation { id: 1 },
+            "graf",
+            &auto_address,
+            "intruder",
+            Urgency::Normal,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(&denied, PublishResult::AclDenied(address) if address == &auto_address),
+        "a non-endpoint principal is denied on the anonymous address, got {denied:?}"
+    );
+
+    assert!(
+        owed_pairs(&messenger, &ParticipantId::for_wasm("reader"))
+            .await
+            .is_empty(),
+        "a denied publish put no message on the channel"
+    );
+}
+
+/// Naming an io_port's channel `brenn:` is the one config line that buys
+/// durability, and this is what it buys: a schedule the guest parked before a
+/// restart is still parked after one, and the boot on the other side re-derives
+/// the same channel identity, so the release wakes the same port.
+#[tokio::test]
+async fn a_durable_named_io_port_channel_carries_a_schedule_across_a_restart() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::config::WasmConsumerConfigRaw;
+
+    let config = BrennConfig {
+        channels: vec![trigger_channel()],
+        wasm_consumers: vec![WasmConsumerConfigRaw {
+            io_ports: vec![io_port_raw(
+                "out",
+                Some("brenn:ticker.timer"),
+                Depth::Bounded(4),
+                Depth::Bounded(4),
+            )],
+            ..demo_consumer_raw("ticker")
+        }],
+        ..BrennConfig::default()
+    };
+    let db = init_db_memory();
+    let subscriber = ParticipantId::for_wasm("ticker");
+
+    // Boot 1: the guest schedules its own wake a minute out.
+    {
+        let (result, cfgs, _alert_handle) = boot_dispatch(&config, db.clone(), &no_apps()).await;
+        let messenger = result.messenger.clone().unwrap();
+        assert_eq!(cfgs[0].outputs[0].channel_address, "brenn:ticker.timer");
+
+        fire_trigger(&messenger, "__defer__").await;
+        drain_step(&cfgs[0], &subscriber).await;
+
+        let parked: i64 = {
+            let conn = messenger.db().lock().await;
+            conn.query_row(
+                "SELECT COUNT(*) FROM messaging_messages m \
+                 JOIN messaging_channels c ON c.uuid = m.channel_uuid \
+                 WHERE c.address = 'brenn:ticker.timer' AND m.deliver_after IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(parked, 1, "the schedule is a durable parked row");
+    }
+
+    // Boot 2: a restart over the same store. Nothing carried across in memory —
+    // the channel identity is re-derived from the name.
+    let (result, cfgs, _alert_handle) = boot_dispatch(&config, db.clone(), &no_apps()).await;
+    let messenger = result.messenger.clone().unwrap();
+    let timer_input = cfgs[0]
+        .inputs
+        .iter()
+        .find(|input| input.port == "out")
+        .expect("the io_port's input half is a resolved input port");
+    assert_eq!(
+        timer_input.sub.channel_uuid,
+        brenn_lib::messaging::durable_auto_channel_uuid("ticker.timer"),
+        "the boot after the restart names the same durable row"
+    );
+
+    let swept = messenger
+        .release_due_messages(Utc::now() + chrono::Duration::minutes(2))
+        .await;
+    assert_eq!(
+        swept.released, 1,
+        "the parked schedule survived the restart"
+    );
+    assert_eq!(
+        owed_pairs(&messenger, &subscriber).await,
+        vec![(
+            "brenn:ticker.timer".to_string(),
+            "deferred-payload".to_string()
+        )],
+        "the released wake is owed to the io_port that scheduled it, one process ago"
+    );
+
+    drain_step(&cfgs[0], &subscriber).await;
+    assert!(
+        owed_pairs(&messenger, &subscriber).await.is_empty(),
+        "the component consumed the wake it scheduled before the restart"
+    );
+}
+
+/// Renaming a durable auto channel with no explicit `uuid` re-keys it: the
+/// identity is derived from the name, so the new name is a new row and the old
+/// one is left behind for the operator to delete. That is the existing posture
+/// for a uuid that leaves config, and the `uuid` field on `[[connection]]` is
+/// the opt-out — pinned here so the trade-off cannot drift silently.
+#[tokio::test]
+async fn renaming_a_durable_auto_channel_writes_a_fresh_row() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::config::WasmConsumerConfigRaw;
+
+    let trigger = trigger_channel();
+    let config_for = |address: &str| BrennConfig {
+        channels: vec![trigger.clone()],
+        wasm_consumers: vec![WasmConsumerConfigRaw {
+            io_ports: vec![io_port_raw(
+                "out",
+                Some(address),
+                Depth::Bounded(4),
+                Depth::Bounded(4),
+            )],
+            ..demo_consumer_raw("ticker")
+        }],
+        ..BrennConfig::default()
+    };
+    let db = init_db_memory();
+
+    let _ = boot_dispatch(&config_for("brenn:ticker.timer"), db.clone(), &no_apps()).await;
+    let (result, _cfgs, _alert_handle) =
+        boot_dispatch(&config_for("brenn:ticker.timer2"), db.clone(), &no_apps()).await;
+    let messenger = result.messenger.clone().unwrap();
+
+    let rows: Vec<(String, Vec<u8>)> = {
+        let conn = messenger.db().lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT address, uuid FROM messaging_channels \
+                 WHERE address LIKE 'brenn:ticker.timer%' ORDER BY address",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    let addresses: Vec<&str> = rows.iter().map(|(address, _)| address.as_str()).collect();
+    assert_eq!(
+        addresses,
+        vec!["brenn:ticker.timer", "brenn:ticker.timer2"],
+        "the rename left the old row behind rather than moving it"
+    );
+    for (address, uuid) in &rows {
+        let bare = address.strip_prefix("brenn:").unwrap();
+        assert_eq!(
+            uuid::Uuid::from_slice(uuid).unwrap(),
+            brenn_lib::messaging::durable_auto_channel_uuid(bare),
+            "each row is keyed by the uuid derived from its own name"
+        );
+    }
+}

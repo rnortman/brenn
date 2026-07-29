@@ -5,7 +5,7 @@
 
 use super::test_fixtures::{
     brenn_entry, brenn_entry_with, dir_of, make_brenn_dir, minimal_wasm_consumer,
-    minimal_wasm_consumer_raw, out_raw, resolve, sub_raw,
+    minimal_wasm_consumer_raw, no_auto, out_raw, resolve, sub_raw,
 };
 use super::wasm::{DEFAULT_ACTIVATION_BURST, DEFAULT_ACTIVATION_MIN_PERIOD};
 use super::*;
@@ -1091,7 +1091,13 @@ fn wasm_mqtt_sink_defaults_from_publish_acl() {
     raw.mqtt_publish_acl = vec![MqttClientMatcherRaw {
         client: "home".to_string(),
     }];
-    let resolved = resolve_wasm_consumers(&[raw], &dir, "64MiB", &declared_clients(&["home"]));
+    let resolved = resolve_wasm_consumers(
+        &[raw],
+        &dir,
+        "64MiB",
+        &declared_clients(&["home"]),
+        &no_auto(),
+    );
     assert_eq!(
         resolved[0].mqtt_sinks.get("home"),
         Some(&WasmSinkBudget {
@@ -1117,7 +1123,13 @@ fn wasm_mqtt_output_override_honored() {
         publish_per_activation: Some(5.0),
         publish_capacity: Some(3.0),
     }];
-    let resolved = resolve_wasm_consumers(&[raw], &dir, "64MiB", &declared_clients(&["home"]));
+    let resolved = resolve_wasm_consumers(
+        &[raw],
+        &dir,
+        "64MiB",
+        &declared_clients(&["home"]),
+        &no_auto(),
+    );
     assert_eq!(
         resolved[0].mqtt_sinks.get("home"),
         Some(&WasmSinkBudget {
@@ -1250,7 +1262,13 @@ fn wasm_mqtt_output_unlisted_client_panics() {
         publish_per_activation: None,
         publish_capacity: None,
     }];
-    resolve_wasm_consumers(&[raw], &dir, "64MiB", &declared_clients(&["home", "away"]));
+    resolve_wasm_consumers(
+        &[raw],
+        &dir,
+        "64MiB",
+        &declared_clients(&["home", "away"]),
+        &no_auto(),
+    );
 }
 
 #[test]
@@ -1276,5 +1294,99 @@ fn wasm_mqtt_output_duplicate_client_panics() {
             publish_capacity: None,
         },
     ];
-    resolve_wasm_consumers(&[raw], &dir, "64MiB", &declared_clients(&["home"]));
+    resolve_wasm_consumers(
+        &[raw],
+        &dir,
+        "64MiB",
+        &declared_clients(&["home"]),
+        &no_auto(),
+    );
+}
+
+// --- Free ports and the auto namespace ---
+
+/// A channel-less subscription is a free port; with no `[[connection]]` claiming
+/// it, nothing ever supplies a channel — dead config, same posture as an output
+/// port on a consumer that never activates.
+#[test]
+#[should_panic(expected = "declares no channel and no [[connection]] binds it")]
+fn free_input_port_with_no_connection_panics() {
+    let (dir, chan_addr) = make_brenn_dir("brenn:free-in");
+    let mut raw = minimal_wasm_consumer_raw("orphan", "/tmp/a.wasm", &chan_addr);
+    raw.subscriptions.push(WasmConsumerSubscriptionRaw {
+        channel: None,
+        ..sub_raw(&chan_addr, "loose")
+    });
+    resolve(&raw_vec(raw), &dir);
+}
+
+/// Same for an output port: the free-port contract is direction-blind.
+#[test]
+#[should_panic(expected = "declares no channel and no [[connection]] binds it")]
+fn free_output_port_with_no_connection_panics() {
+    let (dir, chan_addr) = make_brenn_dir("brenn:free-out");
+    let mut raw = minimal_wasm_consumer_raw("orphan-out", "/tmp/a.wasm", &chan_addr);
+    raw.grants = vec![WasmGrant::Ports];
+    raw.outputs.push(WasmConsumerOutputRaw {
+        channel: None,
+        ..out_raw("loose", &chan_addr)
+    });
+    resolve(&raw_vec(raw), &dir);
+}
+
+/// An operator writing a hand-computed `auto.<cid>` on a binding is rejected: an
+/// auto channel's endpoint set is its ACL, so it cannot be joined by address.
+#[test]
+#[should_panic(expected = "reserved auto namespace")]
+fn operator_written_auto_address_on_input_panics() {
+    let (dir, chan_addr) = make_brenn_dir("brenn:auto-ref");
+    let mut raw = minimal_wasm_consumer_raw("snooper", "/tmp/a.wasm", &chan_addr);
+    raw.subscriptions.push(sub_raw(
+        "local:auto.9c1f4a4e-6d38-4a2e-9f1a-2f7c0d5b8e31",
+        "peek",
+    ));
+    resolve(&raw_vec(raw), &dir);
+}
+
+/// The `auto` namespace is reserved on the pub/sub schemes, which are the only
+/// ones an auto channel is ever placed on. An ingress endpoint slug wears its own
+/// charset — `.` included — so `webhook:auto.github` is an ordinary webhook
+/// channel whose name happens to start with a word this machinery uses.
+#[test]
+fn an_ingress_channel_named_auto_resolves() {
+    let wh = ChannelEntry {
+        uuid: webhook_channel_uuid_from_slug("auto.github"),
+        transport_type: ChannelScheme::Webhook,
+        ..brenn_entry("webhook:auto.github")
+    };
+    let dir = dir_of(vec![wh]);
+    let raw = vec![WasmConsumerConfigRaw {
+        slug: "hooks".to_string(),
+        component_path: "/tmp/a.wasm".into(),
+        subscriptions: vec![sub_raw("webhook:auto.github", "in")],
+        webhook_acl: vec![brenn_lib::access::raw::WebhookMatcherRaw {
+            endpoint: "auto.github".to_string(),
+        }],
+        ..minimal_wasm_consumer()
+    }];
+    let resolved = resolve(&raw, &dir);
+    assert_eq!(
+        resolved[0].inputs[0].sub.channel_address,
+        "webhook:auto.github"
+    );
+}
+
+/// The reservation is segment-bounded on binding addresses too: a channel whose
+/// name merely starts with `auto` is an ordinary channel.
+#[test]
+fn auto_namespace_sibling_address_resolves() {
+    let (dir, chan_addr) = make_brenn_dir("brenn:autobahn");
+    let raw = minimal_wasm_consumer_raw("sibling", "/tmp/a.wasm", &chan_addr);
+    let resolved = resolve(&raw_vec(raw), &dir);
+    assert_eq!(resolved[0].inputs[0].sub.channel_address, chan_addr);
+}
+
+/// One-consumer slice for the resolver.
+fn raw_vec(raw: WasmConsumerConfigRaw) -> Vec<WasmConsumerConfigRaw> {
+    vec![raw]
 }

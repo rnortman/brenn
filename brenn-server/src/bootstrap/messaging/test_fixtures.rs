@@ -12,6 +12,76 @@ use brenn_lib::messaging::config::{
 };
 use brenn_lib::webhook::ResolvedWebhookSubscription;
 
+/// Boot `build_messaging` over `config` with an inert periphery: no webhook
+/// endpoints, no active bridges, no dynamic subscriptions, and an empty tool
+/// registry (so no `brenn:tools/*` channels or `system:tool-executor` policy are
+/// derived).
+pub(crate) async fn boot_messaging_with(
+    config: &brenn_lib::config::BrennConfig,
+    db: brenn_lib::db::Db,
+    apps: &Arc<IndexMap<String, AppConfig>>,
+    alert_dispatcher: AlertDispatcher,
+    origin: &str,
+) -> MessagingResult {
+    let webhooks: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IndexMap::new();
+    build_messaging(
+        config,
+        db,
+        apps,
+        ActiveBridges::new(),
+        alert_dispatcher,
+        Some(Arc::from(origin)),
+        &webhooks,
+        &[],
+        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
+        &Arc::new(crate::tool_registry::ToolRegistry::new(vec![])),
+    )
+    .await
+}
+
+/// A `WasmConsumerIoPortRaw` on `port` (`channel` absent ⇒ anonymous auto
+/// channel) at the given depths, every other knob unset.
+pub(crate) fn io_port_raw(
+    port: &str,
+    channel: Option<&str>,
+    push_depth: Depth,
+    retain_depth: Depth,
+) -> brenn_lib::messaging::config::WasmConsumerIoPortRaw {
+    brenn_lib::messaging::config::WasmConsumerIoPortRaw {
+        port: port.to_string(),
+        channel: channel.map(str::to_string),
+        push_depth: Some(push_depth),
+        retain_depth: Some(retain_depth),
+        noise: None,
+        amplification: None,
+        urgency: None,
+        publish_per_activation: None,
+        publish_capacity: None,
+    }
+}
+
+/// A `SurfaceIoPortRaw` on `instance`/`port` (`channel` absent ⇒ anonymous auto
+/// channel) at the given depths, every other knob unset.
+pub(crate) fn surface_io_port_raw(
+    instance: &str,
+    port: &str,
+    channel: Option<&str>,
+    push_depth: Depth,
+    retain_depth: Depth,
+) -> brenn_lib::messaging::config::SurfaceIoPortRaw {
+    brenn_lib::messaging::config::SurfaceIoPortRaw {
+        instance: instance.to_string(),
+        port: port.to_string(),
+        channel: channel.map(str::to_string),
+        push_depth: Some(push_depth),
+        retain_depth: Some(retain_depth),
+        noise: None,
+        urgency: None,
+        publish_per_activation: None,
+        publish_capacity: None,
+    }
+}
+
 /// Build a resolved MQTT ingress subscription for `mqtt:<client>:<topic>`
 /// with push-enabled (Unbounded) depths, mirroring the default resolution.
 pub(super) fn resolved_ingress_sub(
@@ -83,7 +153,7 @@ pub(crate) fn minimal_app_config(
 /// subscriptions/outputs — trips none of `resolve_wasm_consumers`'
 /// validation panics. The single base `WasmConsumerConfigRaw` literal in
 /// this module; other minimal-consumer fixtures build on it via struct update.
-pub(super) fn minimal_wasm_consumer() -> WasmConsumerConfigRaw {
+pub(crate) fn minimal_wasm_consumer() -> WasmConsumerConfigRaw {
     WasmConsumerConfigRaw {
         slug: "probe".to_string(),
         component_path: std::path::PathBuf::from("/nonexistent/probe.wasm"),
@@ -92,6 +162,7 @@ pub(super) fn minimal_wasm_consumer() -> WasmConsumerConfigRaw {
         store_size_limit: None,
         subscriptions: vec![],
         outputs: vec![],
+        io_ports: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
         publish_acl: vec![],
@@ -157,7 +228,7 @@ pub(super) fn make_brenn_dir(chan_addr: &str) -> (MessagingDirectory, String) {
 /// unset; callers set the knob(s) under test via struct-update.
 pub(super) fn sub_raw(channel: &str, port: &str) -> WasmConsumerSubscriptionRaw {
     WasmConsumerSubscriptionRaw {
-        channel: channel.to_string(),
+        channel: Some(channel.to_string()),
         port: port.to_string(),
         push_depth: None,
         retain_depth: None,
@@ -172,7 +243,7 @@ pub(super) fn sub_raw(channel: &str, port: &str) -> WasmConsumerSubscriptionRaw 
 pub(super) fn out_raw(port: &str, channel: &str) -> WasmConsumerOutputRaw {
     WasmConsumerOutputRaw {
         port: port.to_string(),
-        channel: channel.to_string(),
+        channel: Some(channel.to_string()),
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
@@ -203,7 +274,7 @@ pub(super) fn surface_sub_raw(
     port: &str,
 ) -> SurfaceSubscriptionRaw {
     SurfaceSubscriptionRaw {
-        channel: channel.to_string(),
+        channel: Some(channel.to_string()),
         instance: component.to_string(),
         port: port.to_string(),
         push_depth: None,
@@ -217,7 +288,7 @@ pub(super) fn surface_sub_raw(
 /// the required `chrome` singleton, no grants/ACLs/subscriptions/outputs, no
 /// budgets). The single base surface literal; callers add the grants, ACLs, and
 /// bindings under test via struct update.
-pub(super) fn minimal_surface_raw() -> SurfaceConfigRaw {
+pub(crate) fn minimal_surface_raw() -> SurfaceConfigRaw {
     SurfaceConfigRaw {
         slug: "deskbar".to_string(),
         grants: vec![],
@@ -249,6 +320,7 @@ pub(super) fn minimal_surface_raw() -> SurfaceConfigRaw {
         ],
         subscriptions: vec![],
         outputs: vec![],
+        io_ports: vec![],
         skin: None,
         allowed_users: vec![],
         publish_burst: None,
@@ -256,11 +328,27 @@ pub(super) fn minimal_surface_raw() -> SurfaceConfigRaw {
     }
 }
 
-/// Call `resolve_wasm_consumers` with the global default size limit and no
-/// declared MQTT clients (callers exercise no `mqtt_publish` ACL matchers).
+/// An empty auto wiring, for resolver calls whose every binding is address-bound.
+pub(super) fn no_auto() -> super::auto::AutoWiring {
+    super::auto::AutoWiring::default()
+}
+
+/// Call `resolve_wasm_consumers` with the global default size limit, no declared
+/// MQTT clients (callers exercise no `mqtt_publish` ACL matchers), and an empty
+/// auto wiring — every binding carries its own channel address.
 pub(super) fn resolve(
     raw: &[WasmConsumerConfigRaw],
     dir: &MessagingDirectory,
 ) -> Vec<ResolvedWasmConsumer> {
-    resolve_wasm_consumers(raw, dir, "64MiB", &IndexMap::new())
+    resolve_with_auto(raw, dir, &super::auto::AutoWiring::default())
+}
+
+/// Call `resolve_wasm_consumers` against a lowered auto wiring, for the
+/// connection-bound port cases.
+pub(super) fn resolve_with_auto(
+    raw: &[WasmConsumerConfigRaw],
+    dir: &MessagingDirectory,
+    auto: &super::auto::AutoWiring,
+) -> Vec<ResolvedWasmConsumer> {
+    resolve_wasm_consumers(raw, dir, "64MiB", &IndexMap::new(), auto)
 }

@@ -20,6 +20,7 @@ pub(crate) const DEFAULT_ACTIVATION_BURST: u32 = 60;
 /// per second per port — far above any legitimate consumer today.
 pub(crate) const DEFAULT_ACTIVATION_MIN_PERIOD: Duration = Duration::from_millis(1000);
 
+use super::auto::AutoWiring;
 use super::resolve_publish_millitokens;
 
 /// Resolve `[[wasm_consumer]]` blocks against the channel directory,
@@ -33,7 +34,9 @@ use super::resolve_publish_millitokens;
 /// - duplicate subscription for the same channel within one consumer
 /// - duplicate slug across two `[[wasm_consumer]]` blocks
 /// - slug containing `:` or `@` (rejected by `ParticipantId::for_wasm` constructor)
-/// - duplicate port name within a consumer (across inputs and outputs)
+/// - duplicate port name within a consumer (across inputs and outputs; an
+///   io_port registers its one name once, for both of its directions, so
+///   declaring that name again in either split list is the collision)
 /// - empty port name or port name containing non-unreserved chars
 /// - output channel is not a pub/sub scheme (`brenn:`/`ephemeral:`/`local:`) —
 ///   `mqtt:`/`webhook:`/`pwa_push:` egress never rides the buffered path
@@ -53,6 +56,7 @@ pub(crate) fn resolve_wasm_consumers(
     directory: &MessagingDirectory,
     global_store_size_limit: &str,
     resolved_clients: &IndexMap<String, brenn_lib::mqtt::config::MqttClientConfig>,
+    auto_wiring: &AutoWiring,
 ) -> Vec<ResolvedWasmConsumer> {
     use brenn_lib::config::wasm::{byte_size_to_max_page_count, resolve_component_config};
     use brenn_lib::messaging::is_unreserved_char;
@@ -210,15 +214,21 @@ pub(crate) fn resolve_wasm_consumers(
             );
         };
 
-        // Validate: outputs-without-inputs is dead config.
+        // Both halves of each io_port are channel-less and take the one address
+        // the lowering pass assigned — the two directions cannot be wired apart.
+        let (io_subscriptions, io_outputs) = super::auto::wasm_io_bindings(&consumer.io_ports);
+
+        // Validate: outputs-without-inputs is dead config. An io_port carries an
+        // input half, so a consumer whose only subscription is one still activates.
         assert!(
-            !consumer.subscriptions.is_empty() || consumer.outputs.is_empty(),
+            !(consumer.subscriptions.is_empty() && io_subscriptions.is_empty())
+                || consumer.outputs.is_empty(),
             "[[wasm_consumer]] {slug:?}: has output port(s) but no subscriptions — \
              a consumer with no inputs never activates; its outputs are dead config",
         );
 
         // Resolve input ports.
-        let mut inputs = Vec::with_capacity(consumer.subscriptions.len());
+        let mut inputs = Vec::with_capacity(consumer.subscriptions.len() + io_subscriptions.len());
         let mut seen_addresses: HashSet<String> = HashSet::new();
         // Ring delivery has no runtime ACL gate — ephemeral_subscribe /
         // local_subscribe coverage must be asserted at boot (below) or the input
@@ -226,16 +236,26 @@ pub(crate) fn resolve_wasm_consumers(
         let mut ephemeral_inputs: Vec<String> = Vec::new();
         let mut local_inputs: Vec<String> = Vec::new();
 
-        for sub in &consumer.subscriptions {
-            validate_port_name(&sub.port, "subscription");
+        for (sub, kind) in consumer
+            .subscriptions
+            .iter()
+            .map(|sub| (sub, "subscription"))
+            .chain(io_subscriptions.iter().map(|sub| (sub, "io_port")))
+        {
+            validate_port_name(&sub.port, kind);
 
-            let entry = directory.resolve(&sub.channel).unwrap_or_else(|| {
+            let channel = super::bound_channel(
+                &format!("[[wasm_consumer]] {slug:?}"),
+                &format!("{kind} port {:?}", sub.port),
+                sub.channel.as_deref(),
+                auto_wiring.wasm_channel(slug, &sub.port),
+            );
+            let entry = directory.resolve(&channel).unwrap_or_else(|| {
                 panic!(
-                    "[[wasm_consumer]] {slug:?}: subscription.channel {:?} is not a known \
+                    "[[wasm_consumer]] {slug:?}: subscription.channel {channel:?} is not a known \
                      channel address (not a [[channel]] or [[webhook_endpoint]] declaration, \
                      nor an mqtt:<client>:<topic> address derived from a [[wasm_consumer]] or \
                      [[app.mqtt_subscription]] subscription)",
-                    sub.channel,
                 )
             });
 
@@ -268,7 +288,7 @@ pub(crate) fn resolve_wasm_consumers(
             let retain_depth = sub.retain_depth.unwrap_or(ch.retain_depth);
             if sub.noise.is_some() && push_depth == Depth::Bounded(0) {
                 panic!(
-                    "[[wasm_consumer]] {slug:?}: subscription on channel {:?} has noise configured \
+                    "[[wasm_consumer]] {slug:?}: {kind} on channel {:?} has noise configured \
                      but push_depth = 0 (pull-only) — no push-overflow events are possible; \
                      remove the noise setting or set push_depth > 0",
                     entry.address,
@@ -278,7 +298,7 @@ pub(crate) fn resolve_wasm_consumers(
             // trigger and never contributes context; dead config, fail-fast.
             if push_depth == Depth::Bounded(0) && retain_depth == Depth::Bounded(0) {
                 panic!(
-                    "[[wasm_consumer]] {slug:?}: subscription on channel {:?} has \
+                    "[[wasm_consumer]] {slug:?}: {kind} on channel {:?} has \
                      push_depth = 0 AND retain_depth = 0 — this port can never trigger \
                      and never carries context (dead config); \
                      set push_depth > 0 to make it triggering, or retain_depth > 0 to make \
@@ -294,7 +314,7 @@ pub(crate) fn resolve_wasm_consumers(
             // separately; the two sites must stay in step.
             if noise == NoiseLevel::Fatal {
                 panic!(
-                    "[[wasm_consumer]] {slug:?}: subscription on channel {:?} resolves to \
+                    "[[wasm_consumer]] {slug:?}: {kind} on channel {:?} resolves to \
                      noise = fatal, but fatal is surface-only (the backend overflow path has \
                      no kill) — set a backend-valid noise level (silent/metered/alarm)",
                     entry.address,
@@ -308,7 +328,7 @@ pub(crate) fn resolve_wasm_consumers(
             // me" is push_depth = 0 (pull-only).
             if sub.wake_min.is_some() {
                 panic!(
-                    "[[wasm_consumer]] {slug:?}: subscription on channel {:?} sets wake_min, \
+                    "[[wasm_consumer]] {slug:?}: {kind} on channel {:?} sets wake_min, \
                      but WASM consumers are always delivered eagerly — wake_min does not apply. \
                      Remove the wake_min setting; use push_depth = 0 for a pull-only subscription.",
                     entry.address,
@@ -323,7 +343,7 @@ pub(crate) fn resolve_wasm_consumers(
             // fine — inert, like inherited noise.)
             if sub.amplification.is_some() && push_depth == Depth::Bounded(0) {
                 panic!(
-                    "[[wasm_consumer]] {slug:?}: subscription on channel {:?} has \
+                    "[[wasm_consumer]] {slug:?}: {kind} on channel {:?} has \
                      amplification configured but push_depth = 0 (pull-only) — a pull-only \
                      input produces no new envelopes so amplification can never grant a \
                      publish token; remove the amplification setting or set push_depth > 0",
@@ -335,7 +355,7 @@ pub(crate) fn resolve_wasm_consumers(
                 sub.amplification,
                 DEFAULT_WASM_INPUT_AMPLIFICATION,
                 &format!(
-                    "[[wasm_consumer]] {slug:?} subscription port {:?} amplification",
+                    "[[wasm_consumer]] {slug:?} {kind} port {:?} amplification",
                     sub.port
                 ),
             );
@@ -369,16 +389,35 @@ pub(crate) fn resolve_wasm_consumers(
             );
         }
 
-        // Resolve output ports.
-        let mut outputs = Vec::with_capacity(consumer.outputs.len());
-        for out in &consumer.outputs {
-            validate_port_name(&out.port, "output");
+        // Resolve output ports. The addresses of the *address-bound* ones are
+        // collected separately: the per-scheme empty-publish-ACL checks below
+        // speak only about them, because an auto-bound output's coverage comes
+        // from an injected matcher rather than an authored ACL.
+        let mut outputs = Vec::with_capacity(consumer.outputs.len() + io_outputs.len());
+        let mut address_bound_outputs: Vec<String> = Vec::new();
+        // An io_port's name was already registered by its input half, so
+        // `is_io_port` skips the duplicate-name check that would reject the
+        // second direction. `kind` is panic-message text only.
+        for (out, kind, is_io_port) in consumer
+            .outputs
+            .iter()
+            .map(|out| (out, "output", false))
+            .chain(io_outputs.iter().map(|out| (out, "io_port", true)))
+        {
+            if !is_io_port {
+                validate_port_name(&out.port, kind);
+            }
 
-            let entry = directory.resolve(&out.channel).unwrap_or_else(|| {
+            let channel = super::bound_channel(
+                &format!("[[wasm_consumer]] {slug:?}"),
+                &format!("{kind} port {:?}", out.port),
+                out.channel.as_deref(),
+                auto_wiring.wasm_channel(slug, &out.port),
+            );
+            let entry = directory.resolve(&channel).unwrap_or_else(|| {
                 panic!(
-                    "[[wasm_consumer]] {slug:?}: output.channel {:?} is not a known \
+                    "[[wasm_consumer]] {slug:?}: output.channel {channel:?} is not a known \
                      channel address",
-                    out.channel,
                 )
             });
             // The buffered `ports.publish` path serves pub/sub schemes only
@@ -412,7 +451,7 @@ pub(crate) fn resolve_wasm_consumers(
                 out.publish_per_activation,
                 DEFAULT_WASM_PUBLISH_PER_ACTIVATION,
                 &format!(
-                    "[[wasm_consumer]] {slug:?} output port {:?} publish_per_activation",
+                    "[[wasm_consumer]] {slug:?} {kind} port {:?} publish_per_activation",
                     out.port
                 ),
             );
@@ -420,11 +459,14 @@ pub(crate) fn resolve_wasm_consumers(
                 out.publish_capacity,
                 DEFAULT_WASM_PUBLISH_CAPACITY,
                 &format!(
-                    "[[wasm_consumer]] {slug:?} output port {:?} publish_capacity",
+                    "[[wasm_consumer]] {slug:?} {kind} port {:?} publish_capacity",
                     out.port
                 ),
             );
 
+            if out.channel.is_some() {
+                address_bound_outputs.push(entry.address.clone());
+            }
             outputs.push(WasmOutputPort {
                 port: out.port.clone(),
                 channel_uuid: entry.uuid,
@@ -446,16 +488,20 @@ pub(crate) fn resolve_wasm_consumers(
             );
         }
 
-        // 2b. Bound output + empty publish ACL for that scheme ⇒ every publish
-        //      would deny at runtime. Panic now so the operator authors an
+        // 2b. Address-bound output + empty publish ACL for that scheme ⇒ every
+        //      publish would deny at runtime. Panic now so the operator authors an
         //      explicit ACL. One check per pub/sub scheme (brenn:/ephemeral:/local:).
+        //      An *auto-bound* output (bound by a [[connection]] rather than by an
+        //      address on the binding) legitimately leaves the list empty: its
+        //      coverage is the matcher injected from the connection, and the
+        //      downstream coverage asserts still verify it.
         use brenn_lib::messaging::ChannelScheme;
-        let has_brenn_output = outputs
+        let has_brenn_output = address_bound_outputs
             .iter()
-            .any(|o| ChannelScheme::of(&o.channel_address) == Some(ChannelScheme::Brenn));
-        let has_ephemeral_output = outputs
+            .any(|a| ChannelScheme::of(a) == Some(ChannelScheme::Brenn));
+        let has_ephemeral_output = address_bound_outputs
             .iter()
-            .any(|o| ChannelScheme::of(&o.channel_address) == Some(ChannelScheme::Ephemeral));
+            .any(|a| ChannelScheme::of(a) == Some(ChannelScheme::Ephemeral));
         if has_brenn_output && consumer.publish_acl.is_empty() {
             panic!(
                 "[[wasm_consumer]] {slug:?}: has a bound brenn: output port but publish_acl is \
@@ -473,9 +519,9 @@ pub(crate) fn resolve_wasm_consumers(
                  each bound channel (e.g. {{ exact = \"<name>\" }}) or remove the output bindings",
             );
         }
-        let has_local_output = outputs
+        let has_local_output = address_bound_outputs
             .iter()
-            .any(|o| ChannelScheme::of(&o.channel_address) == Some(ChannelScheme::Local));
+            .any(|a| ChannelScheme::of(a) == Some(ChannelScheme::Local));
         if has_local_output && consumer.local_publish_acl.is_empty() {
             panic!(
                 "[[wasm_consumer]] {slug:?}: has a bound local: output port but \
@@ -694,6 +740,11 @@ pub(crate) fn resolve_wasm_consumers(
             &format!("wasm consumer {slug:?}"),
             &consumer.tool_grants,
         );
+        // Auto-channel grants, injected before every coverage assert below so all
+        // of them hold for a consumer whose connections are its only ACL: the
+        // `[[connection]]` declaration is the authorization signal, the way a tool
+        // grant is for the async-tool substrate.
+        auto_wiring.inject_wasm_grants(slug, &mut policy);
 
         // Ring delivery has no runtime ACL gate, so an uncovered ephemeral:
         // subscription would be silently dead. Fail-fast.

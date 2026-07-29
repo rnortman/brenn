@@ -151,6 +151,86 @@ of how state and messages stay consistent. Current state is `retain_depth=1` on
 the channel that carries it. Recent history is `retain_depth=k`. The distinction
 between "a message bus" and "a database" collapses into a single parameter.
 
+### 2.6 Auto channels and in/out ports
+
+Most channels are shared infrastructure and are declared as such: a `[[channel]]`
+block, ACL entries on each participant, a binding per port. Two shapes do not
+want that ceremony — a component's timer loop back to itself, and a private wire
+from one component to one other — and for those the channel is declared *by the
+ports being connected*. Such a channel is an **auto channel**. There is no
+`[[channel]]` block and no operator-written ACL: the declaration that wires the
+ports is the authorization signal, and each endpoint is granted exactly the
+publish or subscribe reach its own role needs.
+
+Two spellings:
+
+- **`[[connection]]`** — a top-level block listing endpoints (`wasm:<slug>/<port>`,
+  or `surface:<slug>#<instance>/<port>`). The ports it names are declared on
+  their own component's block with no `channel` of their own ("free ports"), so
+  the tuning stays with the subscriber it describes and the wire stays with the
+  connection.
+- **`io_port`** — one port name resolving to an input *and* an output on the same
+  channel. This is the sanctioned timer idiom: `deliver_after` on the port is a
+  wake the component is guaranteed to receive, because the two halves
+  structurally cannot be wired to different channels. Wiring a self-loop out of
+  two separately-configured bindings is how it silently fails.
+
+An auto channel with no name is **anonymous**: its address is `auto.<cid>`, where
+the cid is derived from the endpoint set. The `auto` namespace is reserved —
+nothing else may declare, bind, or write an ACL matcher into it — so an anonymous
+channel is reachable *only* through the declaration that created it. Giving the
+channel a name instead makes it an ordinary directory entry that third parties
+may bind with ordinary bindings and ordinary ACLs (naming grants nothing by
+itself; deny-by-default still holds), and a `brenn:` name is what makes it
+durable, which is what makes a parked schedule survive a restart.
+
+Scheme, when the channel is anonymous, follows from where the endpoints live —
+non-transportable while everything sits on one side of a wire, transportable only
+when the wiring spans one:
+
+| Endpoint set | Scheme | Realm |
+|---|---|---|
+| All backend components | `local:` | Server ring |
+| All on one surface | `local:` | Page ring — per session, browser-side |
+| Backend + surface, or two surfaces | `ephemeral:` | Server ring plus the wire |
+
+The two `local:` rows are two different realms that share a scheme, and they
+cannot exchange a message. A page-local channel is per *session*: each open
+session of the surface has its own copy, which is the natural reading of a
+self-loop. Wanting one channel shared across a surface's sessions, or shared with
+the backend, means naming it `ephemeral:`.
+
+Each realm's `local:` namespace is private, so one bare name appearing in both —
+or in the page realms of a dozen surfaces stamped from one config template — is
+legitimate and means nothing. Those are distinct channels that happen to be
+spelled alike. That privacy is what `local:` is for.
+
+An auto channel's depth is folded rather than declared: `retain_depth` is the max
+over subscribing endpoints of `max(push_depth, retain_depth)`, floor 1. Everything
+else — `sink`, `send_rate`, channel-level `noise`, `standing_retain_depth` —
+inherits the global defaults. A channel that needs channel-level tuning has
+outgrown auto declaration; write the `[[channel]]` block.
+
+**The timer-cap coupling.** A channel's `retain_depth` also caps its channel-wide
+deferred set, so on an auto channel the fold above is what bounds how many
+`deliver_after` schedules the port may hold outstanding. A component juggling K
+parked wakes must declare at least K, on top of its actual retention need. Over
+the cap the schedule is refused and host-logged, and the component is not told —
+so this is a number to size deliberately.
+
+Leaving it to the default is not an option in the server realm: the stock global
+depth defaults are unbounded, and an unbounded fold on a non-durable channel
+refuses to boot. Because the fold takes `max(push_depth, retain_depth)` per
+subscribing port, *both* halves have to resolve bounded — bounding one while the
+other inherits the unbounded default still folds unbounded. So the three outs are:
+write both depths on the subscribing port(s), bound both
+`[messaging].default_push_depth` and `[messaging].default_retain_depth`, or give
+the channel a `brenn:` name. A page-local port escapes only the fold, not the
+defaults: it has no server entry, so an unset `retain_depth` never consults the
+globals and silently gives a ring of depth 1 — but its `push_depth` still
+resolves binding → global like every surface binding, and the stock unbounded
+default refuses to boot there too.
+
 ## 3. Signals and facts
 
 The model's real demand on its user is a question it forces at design time:
