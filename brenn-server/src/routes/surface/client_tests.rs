@@ -284,14 +284,15 @@ async fn client_connect_attach_receives_published_message() {
         state,
         alerts,
         flusher,
-        stores,
+        stores: _,
+        messenger,
         ..
     } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
     // Publish before the client connects: the retained ring (depth 4) holds it,
     // so the client's fresh Subscribe replays it deterministically — no
     // subscribe/publish race.
-    publish(&stores, "hello");
+    publish(&messenger, "hello").await;
     let (base, _sd) = spawn_test_server(state).await;
 
     let (client, mut events, driver_task) = spawn_client(&base, &token);
@@ -363,14 +364,15 @@ async fn client_fresh_attach_replays_full_retained_ring() {
         state,
         alerts,
         flusher,
-        stores,
+        stores: _,
+        messenger,
         ..
     } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
 
     let bodies = ["one", "two", "three"];
     for body in bodies {
-        publish(&stores, body);
+        publish(&messenger, body).await;
     }
     let (base, _sd) = spawn_test_server(state).await;
 
@@ -424,12 +426,13 @@ async fn client_reattach_replays_latest_retained_value() {
         state,
         alerts,
         flusher,
-        stores,
+        stores: _,
+        messenger,
         ..
     } = subscribe_harness(&db, 1);
     let (token, _) = setup_authenticated_user(&db).await;
 
-    publish(&stores, "v1");
+    publish(&messenger, "v1").await;
     let (base, _sd) = spawn_test_server(state).await;
 
     let (client, mut events, driver_task) = spawn_client(&base, &token);
@@ -451,7 +454,7 @@ async fn client_reattach_replays_latest_retained_value() {
     // Publish a newer value server-side. Publishing into the in-process store is
     // synchronous, so "v2" is in the (depth-1) ring — displacing "v1" — before
     // the re-registration's Subscribe frame is ever sent.
-    publish(&stores, "v2");
+    publish(&messenger, "v2").await;
 
     // Re-register: a fresh consumer, so the client sends `Subscribe { resume: None }`
     // (not a resume past the old high-water). The server replays the retained
@@ -505,6 +508,7 @@ async fn client_stale_build_reloads_and_does_not_reconnect() {
         state,
         alerts,
         flusher,
+        messenger: _,
         ..
     } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
@@ -688,14 +692,15 @@ async fn client_reconnects_and_resumes_in_ring() {
         state,
         alerts,
         flusher,
-        stores,
+        stores: _,
+        messenger,
         ..
     } = subscribe_harness(&db, 4);
     let (token, _) = setup_authenticated_user(&db).await;
 
     // "m1" into the ring, then start the backend and the severable relay in
     // front of it. The client dials the relay's stable front address.
-    publish(&stores, "m1");
+    publish(&messenger, "m1").await;
     let (backend_base, _sd) = spawn_test_server(state).await;
     let relay = Relay::start_for(&backend_base).await;
 
@@ -717,7 +722,7 @@ async fn client_reconnects_and_resumes_in_ring() {
 
     // Publish "m2" while the client is disconnected: it lands in the retain
     // ring (seq 2) and the client cannot have seen it live.
-    publish(&stores, "m2");
+    publish(&messenger, "m2").await;
 
     expect_disconnected(&mut events).await;
 
@@ -766,13 +771,14 @@ async fn client_reconnect_past_ring_gaps() {
         state,
         alerts,
         flusher,
-        stores,
+        stores: _,
+        messenger,
         ..
     } = subscribe_harness(&db, 1);
     let (token, _) = setup_authenticated_user(&db).await;
 
     // "m1" into the ring, then start the backend and the severable relay.
-    publish(&stores, "m1");
+    publish(&messenger, "m1").await;
     let (backend_base, _sd) = spawn_test_server(state).await;
     let relay = Relay::start_for(&backend_base).await;
 
@@ -792,8 +798,8 @@ async fn client_reconnect_past_ring_gaps() {
     // keeps only the newest ("m3", seq 3); "m2" (seq 2) is evicted, so the
     // resume from seq 1 leaves an unhealable hole at seq 2.
     relay.sever();
-    publish(&stores, "m2");
-    publish(&stores, "m3");
+    publish(&messenger, "m2").await;
+    publish(&messenger, "m3").await;
 
     expect_disconnected(&mut events).await;
 
@@ -859,11 +865,12 @@ async fn client_kiosk_restart_drops_binding_without_violation() {
         state: state1,
         alerts: alerts1,
         flusher: flusher1,
-        stores: stores1,
+        stores: _stores1,
+        messenger,
         ..
     } = subscribe_state_two(&db, 1);
-    publish_as(&stores1, "publisher", EPH_ADDR, "a1", 1);
-    publish_as(&stores1, "publisher", EPH_ADDR_B, "b1", 1);
+    publish_as(&messenger, "publisher", EPH_ADDR, "a1", 1).await;
+    publish_as(&messenger, "publisher", EPH_ADDR_B, "b1", 1).await;
     let (backend1_base, _sd1) = spawn_test_server(state1).await;
     let relay = Relay::start_for(&backend1_base).await;
 
@@ -905,10 +912,11 @@ async fn client_kiosk_restart_drops_binding_without_violation() {
         state: state2,
         alerts: alerts2,
         flusher: flusher2,
-        stores: stores2,
+        stores: _stores2,
+        messenger: messenger2,
         ..
     } = subscribe_harness(&db, 1);
-    publish(&stores2, "a2");
+    publish(&messenger2, "a2").await;
     let (backend2_base, _sd2) = spawn_test_server(state2).await;
 
     // Restart under the auto-reconnecting client: point the relay at backend 2
@@ -1013,6 +1021,7 @@ async fn client_publish_ok_routes_and_oversized_rejected_locally() {
         state,
         alerts,
         flusher,
+        messenger: _,
         ..
     } = publish_state(&db, 60, 1);
     let (token, _) = setup_authenticated_user(&db).await;
@@ -1121,6 +1130,7 @@ async fn client_publish_flood_rate_limited_stays_healthy() {
         state,
         alerts,
         flusher,
+        messenger: _,
         ..
     } = publish_state(&db, 2, 0);
     let (token, _) = setup_authenticated_user(&db).await;
@@ -1221,12 +1231,13 @@ async fn client_report_path_stays_healthy() {
         state,
         alerts,
         flusher,
-        stores,
+        stores: _,
+        messenger,
         ..
     } = subscribe_harness(&db, 1);
     let (token, _) = setup_authenticated_user(&db).await;
     // Seed the ring so the post-report attach confirms the session is live.
-    publish(&stores, "hello");
+    publish(&messenger, "hello").await;
     let (base, _sd) = spawn_test_server(state).await;
 
     let (client, mut events, driver_task) = spawn_client(&base, &token);

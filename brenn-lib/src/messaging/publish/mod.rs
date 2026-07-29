@@ -53,7 +53,8 @@ use super::gates::{
 };
 use super::store::SurfaceFeedTarget;
 use super::{
-    ChannelScheme, Impetus, Messenger, ParticipantId, SubscriberEntryKind, Urgency, store,
+    ChannelEntry, ChannelScheme, Impetus, Messenger, ParticipantId, PrepaidDestination,
+    PrepaidEntry, SubscriberEntryKind, Urgency, store,
 };
 use crate::access::AppCapability;
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
@@ -1146,9 +1147,9 @@ impl Messenger {
             }
         };
 
-        // 7. Durable surface feed: hand the committed envelope to attached
-        //    surface subscriptions as a row-less live delivery. After the
-        //    commit — nothing is owed to a disconnected session.
+        // 7. Surface feed: hand the committed envelope to attached surface
+        //    subscriptions as a row-less live delivery. After the commit —
+        //    nothing is owed to a disconnected session.
         //
         //    A parked message is not fed: the feed is the wire analogue of
         //    publish-time delivery for a message that entered retention, and a
@@ -1160,19 +1161,15 @@ impl Messenger {
         //
         //    The targets are resolved here, under that condition, rather than
         //    before the commit: a parked publish would only walk the subscriber
-        //    list to discard the answer. The feed is the caller's, not the
-        //    store's — a ring-backed channel's live subscribers are served by the
-        //    store's own fan-out, so a non-durable publish resolves none.
+        //    list to discard the answer. Transportability is the whole condition
+        //    on the class side: a confined channel has no wire and reaches no
+        //    session, and every channel that does have one is fed the same way
+        //    whether its retention is a table or a ring.
         if let Some(retained_seq) = retained_seq
-            && capabilities.durable
+            && capabilities.transportable
         {
-            let feed_targets =
-                self.resolve_surface_feed_targets(&channel.address, channel.subscribers.as_slice());
-            if !feed_targets.is_empty()
-                && self
-                    .router
-                    .any_surface_session_subscribed(&channel.address, &feed_targets)
-            {
+            let feed_targets = self.attached_surface_feed_targets(&channel);
+            if !feed_targets.is_empty() {
                 let envelope = Arc::new(surface_feed_envelope(
                     message_id,
                     self.source.as_ref().to_owned(),
@@ -1185,6 +1182,7 @@ impl Messenger {
                     deliver_after,
                     impetus,
                     urgency,
+                    scheme,
                 ));
                 self.fan_out_surface_feed(
                     &feed_targets,
@@ -1218,6 +1216,31 @@ impl Messenger {
     ) -> Vec<SurfaceFeedTarget> {
         self.targets
             .surface_feed_targets(channel_address, subscribers)
+    }
+
+    /// `entry`'s surface feed targets, or empty when no attached session holds a
+    /// subscription for any of them.
+    ///
+    /// The empty answer is the caller's licence to skip building the owned,
+    /// body-copying feed envelope at all, so the two questions are asked
+    /// together: a fan-out with no attached holder does nothing but allocate.
+    /// Callers that fan a whole batch memoize the target resolution themselves
+    /// and re-ask the attachment question per entry, since a session can detach
+    /// mid-batch.
+    pub(crate) fn attached_surface_feed_targets(
+        &self,
+        entry: &ChannelEntry,
+    ) -> Vec<SurfaceFeedTarget> {
+        let targets =
+            self.resolve_surface_feed_targets(&entry.address, entry.subscribers.as_slice());
+        if targets.is_empty()
+            || !self
+                .router
+                .any_surface_session_subscribed(&entry.address, &targets)
+        {
+            return Vec::new();
+        }
+        targets
     }
 
     /// Hand a message that has just entered retention to every attached,
@@ -1266,10 +1289,14 @@ impl Messenger {
     }
 }
 
-/// Build the row-less envelope a just-committed durable message is fanned out
-/// to surface sessions as. Single definition of the envelope shape shared by the
+/// Build the row-less envelope a just-committed message is fanned out to
+/// surface sessions as. Single definition of the envelope shape shared by the
 /// ad-hoc publish and both batch flush paths, so a new envelope field is wired
 /// in one place rather than three.
+///
+/// `scheme` is the channel's own, carried verbatim: a fed envelope is
+/// indistinguishable from the one a subscriber reads back out of retention, and
+/// retention stamps the channel's scheme.
 #[allow(clippy::too_many_arguments)]
 fn surface_feed_envelope(
     message_id: Uuid,
@@ -1283,6 +1310,7 @@ fn surface_feed_envelope(
     deliver_after: Option<DateTime<Utc>>,
     impetus: Option<Impetus>,
     urgency: Urgency,
+    scheme: ChannelScheme,
 ) -> super::MessageEnvelope {
     super::MessageEnvelope {
         message_id,
@@ -1296,7 +1324,7 @@ fn surface_feed_envelope(
         deliver_after,
         impetus,
         urgency,
-        envelope_type: ChannelScheme::Brenn,
+        envelope_type: scheme,
     }
 }
 
@@ -1666,6 +1694,7 @@ impl Messenger {
                             None,
                             None,
                             publish.urgency,
+                            ChannelScheme::Brenn,
                         )),
                         inserted.retained_seq.expect(
                             "publish: an unparked durable message holds a retention position",
@@ -1695,6 +1724,12 @@ impl Messenger {
         //
         // TODO(deferred-flush-drop-signal): surface the drop on the consumer's
         // error-report path rather than only the host log.
+
+        // Surface feed targets are memoized per address as the durable half
+        // above memoizes its own: a surface subscriber list is boot-resolved, so
+        // it cannot change mid-batch, and the dominant case is a batch fanning
+        // one port. Whether a session is attached is still asked per entry.
+        let mut ring_targets_cache: HashMap<String, Vec<SurfaceFeedTarget>> = HashMap::new();
         for (entry, message, release) in nondurable_pending {
             let store = self.store_for(&entry);
             match release {
@@ -1713,8 +1748,52 @@ impl Messenger {
                     }
                 }
                 None => {
+                    let feed_targets = ring_targets_cache
+                        .entry(entry.address.clone())
+                        .or_insert_with(|| {
+                            self.resolve_surface_feed_targets(
+                                &entry.address,
+                                entry.subscribers.as_slice(),
+                            )
+                        });
+                    let attached = !feed_targets.is_empty()
+                        && self
+                            .router
+                            .any_surface_session_subscribed(&entry.address, feed_targets);
+                    let fed = attached.then(|| {
+                        (
+                            message.body.clone(),
+                            message.sender.clone(),
+                            message.publish_ts_ns,
+                            message.urgency,
+                            message.envelope_type,
+                        )
+                    });
                     let outcome = store.append(message).await;
                     self.enact_overflow_events(&entry, &outcome.overflow);
+                    if let Some((body, sender, publish_ts_ns, urgency, scheme)) = fed {
+                        let envelope = Arc::new(surface_feed_envelope(
+                            outcome.committed.message_uuid,
+                            source.to_owned(),
+                            entry.address.clone(),
+                            sender,
+                            publish_ts_ns,
+                            body,
+                            None,
+                            None,
+                            None,
+                            None,
+                            urgency,
+                            scheme,
+                        ));
+                        self.fan_out_surface_feed(
+                            feed_targets,
+                            envelope,
+                            i64::try_from(outcome.committed.seq.0)
+                                .expect("messaging: retention position out of range"),
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -1723,20 +1802,19 @@ impl Messenger {
     }
 }
 
-/// One durable entry of a surface activation's flush. `channel_address` is the
-/// bound output's boot-resolved address (the caller resolved port → channel
-/// against its own declaration set); `urgency` is already the per-call override
-/// or the port's configured default, resolved by the caller from the *server's*
-/// output map.
+/// One entry of a surface activation's flush. `channel_address` is the bound
+/// output's boot-resolved address (the caller resolved port → channel against
+/// its own declaration set); `urgency` is already the per-call override or the
+/// port's configured default, resolved by the caller from the *server's* output
+/// map.
 pub struct SurfaceBatchPublish<'a> {
     pub channel_address: &'a str,
     pub body: &'a str,
     pub urgency: super::Urgency,
     /// This entry's publish timestamp, assigned by the caller in call order
-    /// across the *whole* flush before it was split by substrate — so call order
-    /// stays visible across the class boundary, which a stamp minted per
-    /// substrate could not promise. Nanosecond precision; the durable row
-    /// persists it verbatim as `publish_ts_ns`.
+    /// across the whole flush — so call order is visible across the class
+    /// boundary and not merely within each substrate. Nanosecond precision; the
+    /// durable row persists it verbatim as `publish_ts_ns`.
     pub publish_ts_ns: i64,
     /// When set, park this entry until then instead of committing it into
     /// retention.
@@ -1750,15 +1828,21 @@ pub struct SurfaceBatchPublish<'a> {
 }
 
 impl Messenger {
-    /// Apply the durable entries of one surface activation's flush — all in one
-    /// transaction, in call order, each at its own urgency and its caller-assigned
+    /// Apply one surface activation's flush, whatever mix of channels it names —
+    /// in call order, each entry at its own urgency and its caller-assigned
     /// timestamp.
     ///
+    /// **Where a message lands is decided here, not by the caller.** The batch
+    /// arrives as one list; the channel's own capabilities put each entry in a
+    /// table or a ring, exactly as they do for a single publish. The durable
+    /// entries commit first, as one transaction, then the non-durable ones; call
+    /// order holds within each, and nothing is promised between them beyond the
+    /// stamps below — a shared commit instant was never the guarantee.
+    ///
     /// **Stamps arrive assigned, not minted here.** The caller stamps the whole
-    /// flush monotonically in call order in one pass *before* splitting it by
-    /// substrate, so the ordering contract holds across the class boundary; a
-    /// stamp minted inside this transaction could only order the durable half
-    /// against itself.
+    /// flush monotonically in call order in one pass, so the ordering contract
+    /// holds across the class boundary; a stamp minted inside this transaction
+    /// could only order the durable half against itself.
     ///
     /// The all-or-nothing guarantee is the point: an activation's publishes were
     /// buffered and released together by the kernel's flush-on-ok rule, so a
@@ -1771,12 +1855,12 @@ impl Messenger {
     /// because a per-entry draw could refuse the tail of an atomic flush.
     ///
     /// Every other gate runs, per entry, and **panics rather than returning**: for
-    /// a bound output, address shape, directory existence, the `MessagingPublish`
-    /// grant, the `brenn_publish` ACL, and the body cap are all boot-validated and
-    /// boot-static, and the caller has already answered its client a violation for
-    /// every client-reachable way to name something else. Reaching a failure here
-    /// means the server's own output map disagrees with its directory or its
-    /// policy — publishing anyway would be routing traffic no operator authorized.
+    /// a bound output, address shape, directory existence, the scheme's publish
+    /// grant and ACL, and the body cap are all boot-validated and boot-static, and
+    /// the caller has already answered its client a violation for every
+    /// client-reachable way to name something else. Reaching a failure here means
+    /// the server's own output map disagrees with its directory or its policy —
+    /// publishing anyway would be routing traffic no operator authorized.
     ///
     /// **Caller precondition, unchecked here: `component` must be a declared
     /// instance's name.** It is interpolated straight into the sender identity
@@ -1791,16 +1875,15 @@ impl Messenger {
     /// otherwise; any future caller owes the same check.
     ///
     /// **Deferral is per-entry and its refusal is not an error.** An entry
-    /// carrying a release time is parked inside the same transaction — the row
-    /// goes in without a retention position, so nothing observes it before
-    /// release — under an explicit count-then-insert check against the channel's
-    /// `retain_depth` cap, the discipline [`store::DbStore`]'s own `park` holds.
-    /// An entry the cap refuses has its *schedule* dropped: no row, a warn naming
-    /// the channel and the cap, a counter, and the rest of the batch commits.
-    /// Aborting the transaction instead would discard entries the component
-    /// published unconditionally over one it merely scheduled, and a
-    /// post-activation flush has no error channel back to the guest to carry
-    /// either outcome.
+    /// carrying a release time is parked against the channel's own
+    /// `retain_depth` cap — inside the same transaction for a durable channel,
+    /// at the store for a ring one — and until it releases it holds no retention
+    /// position, so nothing observes it. An entry the cap refuses has its
+    /// *schedule* dropped: nothing stored, a warn naming the channel and the cap,
+    /// a counter, and the rest of the batch carries on. Aborting instead would
+    /// discard entries the component published unconditionally over one it merely
+    /// scheduled, and a post-activation flush has no error channel back to the
+    /// guest to carry either outcome.
     ///
     /// Returns the number of entries whose schedule was refused that way, so the
     /// caller counts as published only what published.
@@ -1817,7 +1900,8 @@ impl Messenger {
         // Layer-1, once per batch: the surface's boot-resolved policy, keyed at
         // the surface grain for a component publish exactly as `publish_core`
         // does — a component's grants *are* its config-declared bindings, which
-        // boot proved covered by the surface's own ACLs.
+        // boot proved covered by the surface's own ACLs. Which grant each entry
+        // needs is its channel's scheme's business, checked per entry below.
         let policy = self
             .targets
             .registration(&SubscriberEntryKind::Surface {
@@ -1825,18 +1909,15 @@ impl Messenger {
                 instance: None,
             })
             .map(|r| r.policy.as_ref())
-            .filter(|p| p.has_grant(AppCapability::MessagingPublish))
             .unwrap_or_else(|| {
                 panic!(
-                    "publish_batch_from_surface: surface {slug:?} has no registered policy with \
-                     MessagingPublish — a bound durable output implies both, so this is a broken \
-                     boot invariant"
+                    "publish_batch_from_surface: surface {slug:?} has no registered policy — a \
+                     bound output implies one, so this is a broken boot invariant"
                 )
             });
 
-        let sender = ParticipantId::for_surface_component(slug, component)
-            .as_str()
-            .to_owned();
+        let sender_id = ParticipantId::for_surface_component(slug, component);
+        let sender = sender_id.as_str().to_owned();
         let source = self.source.as_ref();
 
         info!(
@@ -1845,6 +1926,27 @@ impl Messenger {
             publish_count = publishes.len(),
             "publish_batch_from_surface: applying activation flush"
         );
+
+        // The split is the channel's, not the caller's: a bound output's
+        // capabilities decide whether its entry belongs in the transaction
+        // below or on a ring.
+        let mut durable: Vec<&SurfaceBatchPublish<'_>> = Vec::new();
+        let mut nondurable: Vec<(&SurfaceBatchPublish<'_>, Arc<ChannelEntry>)> = Vec::new();
+        for publish in publishes {
+            let addr = publish.channel_address;
+            let channel = self.directory.resolve(addr).unwrap_or_else(|| {
+                panic!(
+                    "publish_batch_from_surface: bound output {addr:?} of surface {slug:?} is not \
+                     in the directory — boot validation proves every bound output exists, so this \
+                     is a broken boot invariant"
+                )
+            });
+            if channel.capabilities().durable {
+                durable.push(publish);
+            } else {
+                nondurable.push((publish, channel));
+            }
+        }
 
         // Deferred durable surface feeds: built under the lock, fanned out
         // after release. See `publish_from_wasm`.
@@ -1866,7 +1968,7 @@ impl Messenger {
             // case is a batch fanning one port.
             let mut targets_cache: HashMap<&str, ResolvedChannelTargets> = HashMap::new();
 
-            for publish in publishes {
+            for publish in &durable {
                 let addr = publish.channel_address;
                 let (channel, feed_targets) = targets_cache.entry(addr).or_insert_with(|| {
                     let name = well_formed_name(addr, ChannelScheme::Brenn).unwrap_or_else(|| {
@@ -1971,6 +2073,7 @@ impl Messenger {
                             None,
                             None,
                             publish.urgency,
+                            ChannelScheme::Brenn,
                         )),
                         inserted.retained_seq.expect(
                             "publish: an unparked durable message holds a retention position",
@@ -1986,6 +2089,39 @@ impl Messenger {
         // Durable surface feeds, fanned out after the lock is released.
         for (envelope, seq, targets) in surface_feeds {
             self.fan_out_surface_feed(&targets, envelope, seq).await;
+        }
+
+        // The ring half, after the durable lock is gone. Each entry takes the
+        // prepaid entry points — same gates, same envelope mint, same live
+        // feed — because the batch was already paid for as a whole and nothing
+        // downstream may refuse it. Its destination is memoized per address, as
+        // the durable half above memoizes its targets and for the same reason:
+        // the dominant case is a batch fanning one port.
+        let mut destinations: HashMap<&str, PrepaidDestination> = HashMap::new();
+        for (publish, channel) in &nondurable {
+            let destination = destinations
+                .entry(publish.channel_address)
+                .or_insert_with(|| {
+                    self.resolve_prepaid(&sender_id, policy, publish.channel_address)
+                });
+            let prepaid = PrepaidEntry {
+                body: publish.body,
+                urgency: publish.urgency,
+                publish_ts: db::ns_to_utc(publish.publish_ts_ns),
+            };
+            match publish.deliver_after {
+                Some(release_at) => {
+                    if let Err(brenn_queue::QuotaExceeded { cap }) =
+                        self.park_prepaid(destination, prepaid, release_at)
+                    {
+                        refused.push((channel.address.clone(), cap));
+                    }
+                }
+                None => {
+                    let appended = self.publish_prepaid(destination, prepaid).await;
+                    self.enact_overflow_events(channel, &appended.overflow);
+                }
+            }
         }
 
         // A dropped schedule is a component that never wakes when it meant to, so

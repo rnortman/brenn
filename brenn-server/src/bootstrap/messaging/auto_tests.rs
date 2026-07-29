@@ -1029,7 +1029,7 @@ fn surface_free_ports_resolve_onto_a_page_local_channel() {
         .surface_channel("deskbar", "protobar", "tap")
         .unwrap()
         .to_string();
-    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &[], &globals(), &wiring);
+    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &globals(), &wiring);
     let surface = &resolved[0];
     assert_eq!(surface.subscriptions[0].channel_address, address);
     assert_eq!(surface.outputs[0].channel_address, address);
@@ -1076,7 +1076,7 @@ fn wire_spanning_connection_injects_grants_on_both_sides() {
         .filter(|e| e.transport_type == ChannelScheme::Ephemeral)
         .cloned()
         .collect();
-    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &ephemeral, &globals(), &wiring);
+    let resolved = resolve_surfaces(&surfaces, &dir_of(ephemeral.clone()), &globals(), &wiring);
     let surface = &resolved[0];
     assert_eq!(surface.subscriptions[0].channel_address, to_page);
     assert!(surface.policy.allows_ephemeral_delivery(&bare));
@@ -1141,7 +1141,7 @@ fn a_named_ephemeral_channel_lands_on_the_server_ring_not_the_page() {
         brenn_lib::messaging::nondurable_channel_uuid(ChannelScheme::Ephemeral, "page.share"),
     );
 
-    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), entries, &globals(), &wiring);
+    let resolved = resolve_surfaces(&surfaces, &dir_of(entries.to_vec()), &globals(), &wiring);
     let surface = &resolved[0];
     assert_eq!(
         surface.subscriptions[0].channel_address,
@@ -1337,7 +1337,7 @@ fn io_ports_spanning_the_wire_share_one_ephemeral_channel() {
     assert_eq!(entries[0].transport_type, ChannelScheme::Ephemeral);
     let bare = entries[0].address.strip_prefix("ephemeral:").unwrap();
 
-    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), entries, &globals(), &wiring);
+    let resolved = resolve_surfaces(&surfaces, &dir_of(entries.to_vec()), &globals(), &wiring);
     let surface = &resolved[0];
     assert_eq!(surface.subscriptions[0].channel_address, entries[0].address);
     assert_eq!(surface.outputs[0].channel_address, entries[0].address);
@@ -1365,7 +1365,7 @@ fn surface_io_port_resolves_to_both_bindings_on_a_page_local_channel() {
         .to_string();
     assert!(address.starts_with("local:auto."));
 
-    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &[], &globals(), &wiring);
+    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &globals(), &wiring);
     let surface = &resolved[0];
     assert_eq!(surface.subscriptions.len(), 1);
     assert_eq!(surface.outputs.len(), 1);
@@ -1396,7 +1396,7 @@ fn a_page_local_io_port_with_an_unset_retain_depth_silently_gets_a_ring_of_one()
          unbounded global never runs",
     );
 
-    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &[], &stock, &wiring);
+    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &stock, &wiring);
     let surface = &resolved[0];
     assert_eq!(surface.local_channels.len(), 1);
     assert_eq!(surface.local_channels[0].ring_depth, 1);
@@ -1413,7 +1413,7 @@ fn a_page_local_io_port_with_an_unset_push_depth_refuses_to_boot() {
     surfaces[0].io_ports[0].push_depth = None;
     let stock = MessagingGlobalConfig::default();
     let wiring = lower_auto_wiring(&[], &[], &surfaces, &[], &stock);
-    resolve_surfaces(&surfaces, &dir_of(vec![]), &[], &stock, &wiring);
+    resolve_surfaces(&surfaces, &dir_of(vec![]), &stock, &wiring);
 }
 
 /// Naming a page-local auto channel is how a third component in the page reaches
@@ -1432,7 +1432,7 @@ fn a_named_page_local_auto_channel_shares_its_ring_with_an_operator_binding() {
     assert!(wiring.durable_entries().is_empty());
     assert!(wiring.nondurable_entries().is_empty());
 
-    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &[], &globals(), &wiring);
+    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &globals(), &wiring);
     let surface = &resolved[0];
     for sub in &surface.subscriptions {
         assert_eq!(sub.channel_address, "local:bar.loop");
@@ -1548,7 +1548,6 @@ fn surface_io_port_name_colliding_with_an_address_bound_subscription_panics() {
     resolve_surfaces(
         &surfaces,
         &dir_of(vec![brenn_entry("brenn:feed")]),
-        &[],
         &globals(),
         &wiring,
     );
@@ -1569,7 +1568,7 @@ fn surface_io_port_name_colliding_with_a_free_output_panics() {
         publish_capacity: None,
     }];
     let wiring = lower_auto_wiring(&[], &[], &surfaces, &[], &globals());
-    resolve_surfaces(&surfaces, &dir_of(vec![]), &[], &globals(), &wiring);
+    resolve_surfaces(&surfaces, &dir_of(vec![]), &globals(), &wiring);
 }
 
 #[test]
@@ -1593,7 +1592,7 @@ fn a_surface_local_binding_may_share_a_name_with_a_backend_local_channel() {
     surfaces[0].subscriptions = vec![surface_sub_raw("local:etl.tick", "protobar", "snoop")];
     let wiring = lower_auto_wiring(&[], &consumers, &surfaces, &[], &globals());
 
-    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &[], &globals(), &wiring);
+    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &globals(), &wiring);
     assert!(
         resolved[0]
             .local_channels

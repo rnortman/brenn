@@ -62,10 +62,7 @@ pub use ingress::{
     cap_oneline, collapse_repo_sync, format_event_batch, is_repo_sync_source,
     repo_sync_staleness_days, set_repo_sync_staleness_days, split_stale_repo_sync,
 };
-pub use live::{
-    EphemeralDelivery, EphemeralEvent, EphemeralReceiver, EphemeralResume, EphemeralSubscribeError,
-    EphemeralSubscription, GapReason, LiveCounters, PrepaidEntry, Replay,
-};
+pub use live::{GapReason, PrepaidDestination, PrepaidEntry, Replay};
 pub use publish::{
     PublishOrigin, PublishResult, SurfaceBatchPublish, SurfaceSendDraw, SurfaceSendVerdict,
     WasmPublish, is_well_formed_address,
@@ -1460,17 +1457,16 @@ pub struct Messenger {
     pub(crate) router: Arc<dyn WakeRouter>,
     pub(crate) defaults: MessagingGlobalConfig,
     pub(crate) dispatch_kick_notify: Arc<tokio::sync::Notify>,
+    /// The durable store's boot counter, bumped and read once in
+    /// [`Messenger::new`] — a per-process constant for the life of this
+    /// messenger. Held here so a consumer that stamps it onto a position (the
+    /// surface wire's resume token) never pays a database read to learn it.
+    store_incarnation: i64,
     /// Count of `load_activation_snapshot` invocations. Monotonically increasing.
     /// Used in tests to assert exactly one subscriber-wide scan per drain step
     /// (AC 7). Not user-visible surface; test instrumentation only.
     /// Access via the public `pending_bus_pushes_scan_count()` accessor.
     pending_bus_pushes_scan_count: AtomicU64,
-    /// Consumer-side counters for the live streams of transportable non-durable
-    /// channels: fan-out lag and delivery-time denials, per `(channel,
-    /// participant)`. Shared with every receiver [`Messenger::attach_live`]
-    /// hands out, which is why it is an `Arc` where the other counters are
-    /// plain fields.
-    live_counters: Arc<live::LiveCounters>,
     /// Retention stores for the process's non-durable channels, keyed by channel
     /// UUID. Empty on a `Messenger` with no `ephemeral:`/`local:` channels; boot
     /// installs the config-resolved set via [`Messenger::with_ring_stores`].
@@ -1732,12 +1728,12 @@ impl Messenger {
         // the durable analogue of the ephemeral bus minting a fresh per-boot
         // epoch. The `Db` is uniquely owned at boot (no background task holds it
         // yet), so `try_lock` succeeds; a share this early is a boot-ordering bug.
-        {
+        let store_incarnation = {
             let conn = db.try_lock().expect(
                 "Messenger::new: db must be uniquely owned at boot (bump_incarnation would block)",
             );
-            crate::messaging::db::bump_incarnation(&conn);
-        }
+            crate::messaging::db::bump_incarnation(&conn).incarnation
+        };
 
         // Default empty store registry (zero non-durable channels); boot swaps in
         // the config-resolved one via `with_ring_stores`.
@@ -1752,8 +1748,8 @@ impl Messenger {
             router,
             defaults,
             dispatch_kick_notify: Arc::new(tokio::sync::Notify::new()),
+            store_incarnation,
             pending_bus_pushes_scan_count: AtomicU64::new(0),
-            live_counters: Arc::new(live::LiveCounters::default()),
             ring_stores,
             llm_chat: crate::config::LlmChatConfig::default(),
             db_stores: Mutex::new(HashMap::new()),
@@ -2453,24 +2449,19 @@ impl Messenger {
             // is served: it holds no position for anything to walk, so the
             // release is its live fan-out, exactly as the commit is for an
             // unparked publish. Resolved once per releasing channel, after the
-            // store's own lock is gone.
-            if entry.capabilities().durable && !outcome.released.is_empty() {
-                let feed_targets =
-                    self.resolve_surface_feed_targets(&entry.address, entry.subscribers.as_slice());
-                if !feed_targets.is_empty()
-                    && self
-                        .router
-                        .any_surface_session_subscribed(&entry.address, &feed_targets)
-                {
-                    for released in &outcome.released {
-                        self.fan_out_surface_feed(
-                            &feed_targets,
-                            Arc::clone(&released.envelope),
-                            i64::try_from(released.seq.0)
-                                .expect("messaging: retention position out of range"),
-                        )
-                        .await;
-                    }
+            // store's own lock is gone. Transportability is the whole condition:
+            // a confined channel reaches no session, and every channel that does
+            // is fed here whatever its retention is made of.
+            if entry.capabilities().transportable && !outcome.released.is_empty() {
+                let feed_targets = self.attached_surface_feed_targets(&entry);
+                for released in &outcome.released {
+                    self.fan_out_surface_feed(
+                        &feed_targets,
+                        Arc::clone(&released.envelope),
+                        i64::try_from(released.seq.0)
+                            .expect("messaging: retention position out of range"),
+                    )
+                    .await;
                 }
             }
             // A release also changes what the sender still holds parked, and a
@@ -2866,6 +2857,17 @@ impl Messenger {
 
     pub fn db(&self) -> &Db {
         &self.db
+    }
+
+    /// The store's boot counter for this process — bumped once when this
+    /// messenger was constructed and constant thereafter.
+    ///
+    /// It catches the one staleness a store cursor's epoch cannot: a backup
+    /// restore that keeps epochs but rolls positions backwards. A position
+    /// minted under a boot this store never counted carries an incarnation
+    /// above this one.
+    pub fn store_incarnation(&self) -> i64 {
+        self.store_incarnation
     }
 
     pub fn source(&self) -> &str {

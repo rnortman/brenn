@@ -8,7 +8,7 @@ use brenn_lib::messaging::config::{
     ResolvedSubscription, ResolvedSurface, ResolvedSurfaceSubscription, SurfaceBinding,
     SurfaceComponentRaw, SurfaceConfigRaw, SurfaceOutput, SurfaceOutputRaw, SurfaceSendBudget,
 };
-use brenn_lib::messaging::{ChannelEntry, ChannelScheme, MessagingDirectory, Urgency};
+use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Urgency};
 use brenn_surface_proto::Abi;
 use indexmap::IndexMap;
 
@@ -93,57 +93,11 @@ fn local_context_depth(channel: &str, retain_depth: Option<Depth>) -> u64 {
     }
 }
 
-/// Resolve `[[surface]]` blocks against the durable channel
-/// directory and the resolved ephemeral-channel set, applying boot-time
-/// cross-validation. Mirrors `resolve_wasm_consumers` in placement, shape, and
-/// panic style.
-///
-/// Returns `Vec<ResolvedSurface>` in declaration order. The resolved surfaces
-/// are carried on `MessagingResult` for later consumers; boot wires them no
-/// further than boot validation + the boot observability log.
-///
-/// # Panics (all operator-authored config — fail-fast)
-///
-/// 1. `slug` empty / non-unreserved charset / duplicate across `[[surface]]`
-///    blocks. The unreserved charset excludes `:`/`@`/`#`, so a config slug
-///    satisfies `ParticipantId::for_surface`'s asserts by construction — this
-///    *enforces* the charset a wasm-consumer slug only documents.
-/// 2. `component.kind` empty / not matching `^[a-z0-9][a-z0-9-]*$` (the
-///    tightened charset makes the kind a valid custom-element name
-///    (`brenn-<kind>`) and module filename); the resolved `instance` id
-///    (defaults to `kind`) not matching that charset, or duplicate within the
-///    surface. Instances — not kinds — are unique per surface: one kind may
-///    back several instances.
-/// 3. A subscription/output `channel` whose scheme is neither `brenn:` nor
-///    `ephemeral:` — this is the boot-time scheme restriction that makes the
-///    `WakeRouter::deliver_ingress` `Surface` panic arm structurally unreachable.
-/// 4. A `brenn:` binding channel absent from `directory`; an `ephemeral:` binding
-///    channel absent from `ephemeral_channels` (the resolved non-durable
-///    `[[channel]]` entries).
-/// 5. A binding naming an undeclared instance; an empty / non-unreserved port;
-///    a duplicate `(instance, port)` within subscriptions (or within outputs).
-/// 6. A binding the surface's own resolved policy does not authorize
-///    (`allows_channel_access` for subscriptions; `allows_brenn_publish` /
-///    `allows_ephemeral_publish` by scheme for outputs) — dead config.
-/// 7. A surface with zero `[[surface.component]]` blocks — dead config: every
-///    binding must name a declared component (item 5) and subscriptions are
-///    static-only, so a component-less surface can never carry traffic.
-///
-/// Two adjacent cases deliberately do **not** panic (recorded design
-/// decisions): a declared component with no port bindings (a purely presentational
-/// component is live config), and an `ephemeral:` `[[channel]]` referenced by no
-/// surface binding (ephemeral channels are LLM-app publish targets independently
-/// of any surface).
-/// Resolve a surface binding's page-side port-queue depth for the non-durable
-/// classes: `ephemeral:` inherits binding → its `[[channel]]` rung
-/// (already folded over global), and `local:` — with no channel block — collapses
-/// to binding → global. The `channel_default` the caller passes is the resolved
-/// middle rung: the ephemeral channel entry's `push_depth` or the global default.
-///
-/// `brenn:` bindings do not come through here: their depth is the one
-/// `resolve_durable_surface_subscription` already resolved (binding → channel →
-/// global) and asserted, so the server's push-row depth and the page's queue
-/// depth stay one number.
+/// Resolve a surface binding's page-side port-queue depth: the binding's own
+/// `push_depth`, else the `channel_default` the caller passes as the middle rung
+/// — the channel entry's own `push_depth` for a transportable binding (already
+/// folded over global), and the global default for `local:`, which has no
+/// `[[channel]]` block to read.
 ///
 /// # Panics
 ///
@@ -364,35 +318,39 @@ fn resolve_output_budget(slug: &str, out: &SurfaceOutputRaw) -> brenn_budget::Si
     }
 }
 
-/// Resolve one `ephemeral:` binding's context-window depth: how many retained
-/// messages precede `new_from` when the kernel windows this port.
+/// Resolve one transportable binding's retained-context depth: how many retained
+/// messages precede `new_from` when the kernel windows this port, and half of
+/// the bound on every replay the wire serves that subscription.
 ///
-/// The ladder is binding → channel → global, class-uniform with `brenn:`: the
-/// binding's own `retain_depth`, else the `[[channel]]` rung the caller
-/// passes as `channel_default` (itself already resolved channel → global, and
-/// bounded — ephemeral retention is process memory, so the channel build rejects
-/// unbounded and defaults it to 0).
+/// The same shape [`resolve_page_queue_depth`] takes for the port queue, on the
+/// other knob: binding → the `[[channel]]` rung the caller passes as
+/// `channel_default` (itself already resolved channel → global). One ladder for
+/// every transportable channel — the store holding the channel's retention has
+/// no say in it.
 ///
 /// # Panics
 ///
-/// On an unbounded binding value: the retained ring is page memory, the same
-/// class-uniform rule `local:` rings and page queues take.
-fn resolve_context_depth(
+/// On a depth that resolves unbounded: the retained ring is page memory, the
+/// same rule the port queue takes, and every replay the wire serves must be
+/// bounded. No default is invented — the operator states the depth on the
+/// binding, the channel rung, or the global default.
+fn resolve_context_ring_depth(
     slug: &str,
     context: &str,
     channel: &str,
     retain_depth: Option<Depth>,
-    channel_default: u64,
+    channel_default: Depth,
 ) -> u64 {
-    match retain_depth {
-        None => channel_default,
-        Some(Depth::Bounded(n)) => n,
-        Some(Depth::Unbounded) => panic!(
-            "config: [[surface]] {slug:?}: {context} channel {channel:?} sets retain_depth = \
-             \"unbounded\" — a binding's retained context ring lives in page memory and must be \
-             bounded; give it a number"
-        ),
-    }
+    let resolved = retain_depth.unwrap_or(channel_default);
+    let Depth::Bounded(n) = resolved else {
+        panic!(
+            "config: [[surface]] {slug:?}: {context} channel {channel:?} resolves to retain_depth \
+             = {resolved:?} — a binding's retained context ring lives in page memory and its \
+             replays must be bounded; set it on the binding, the channel rung, or the global \
+             default ([messaging].default_retain_depth)"
+        )
+    };
+    n
 }
 
 /// Resolve a declared component's parked-batch depth: how many activation
@@ -465,115 +423,142 @@ fn resolve_component_config(
     map.clone()
 }
 
-/// Per-binding overrides a durable surface subscription may layer on the
-/// channel's resolved defaults (`None` = inherit the channel value).
-struct DurableSubOverrides {
+/// Per-binding overrides a surface input binding may layer on the channel's
+/// resolved rungs (`None` = inherit the channel value).
+struct SubOverrides {
     push_depth: Option<Depth>,
     retain_depth: Option<Depth>,
     noise: Option<NoiseLevel>,
 }
 
-/// Resolve one durable `brenn:` channel a surface binds (a
-/// `[[surface.subscription]]`) into a
-/// [`ResolvedSubscription`]. Callers share this directory lookup, Brenn-transport
-/// assertion, sub → channel depth inheritance, and the bounded-replay invariants
-/// (both depths must be bounded), so the next durable-subscription rule lands on
-/// both at once instead of drifting. What each *depth* is allowed to be beyond
-/// bounded is the caller's call ([`assert_page_queue_deliverable`]), because it
-/// turns on the binding's delivery model, which this resolver cannot see.
+/// Resolve one transportable channel a surface binds (a
+/// `[[surface.subscription]]`) into the wire [`ResolvedSubscription`] the
+/// directory registers and the bridge reads.
 ///
-/// `context` labels the binding in panic messages. `require_retained` adds the
-/// layout-only floor `retain_depth >= 1` (the retained-window snapshot must
-/// survive reload/reboot); a plain subscription only needs retain bounded.
-/// Returns the channel uuid alongside the resolution so the caller runs its own
-/// per-path dedup, plus the **bounded** `push_depth` and `retain_depth` this
-/// function proved: the numbers, not the `Depth`s, so a caller needing the
-/// page-side capacities carries the proof in the type instead of re-destructuring
-/// invariants this function owns.
+/// One resolver for every transportable input binding: one directory lookup,
+/// one ladder per knob (binding → the channel's own rung, itself already
+/// channel → global), one boundedness rule, one gate set. Which store holds the
+/// channel's retention is not a question asked here — the entry answers every
+/// knob the same way whichever it is, and a second per-class arm is how the two
+/// drift apart.
+///
+/// `context` labels the binding in panic messages. Returns the channel uuid
+/// alongside the resolution so the caller runs its own per-path dedup, plus the
+/// **bounded** `push_depth` and `retain_depth` this function proved: the
+/// numbers, not the `Depth`s, so a caller needing the page-side capacities
+/// carries the proof in the type instead of re-destructuring invariants this
+/// function owns. What each depth is allowed to be beyond bounded is the
+/// caller's call ([`assert_page_queue_deliverable`]), because it turns on the
+/// binding's delivery model, which this resolver cannot see.
 ///
 /// # Panics
 ///
-/// On an unknown channel, a non-Brenn transport, or a depth that violates the
-/// invariants above — all boot-time config errors.
-fn resolve_durable_surface_subscription(
+/// On an unknown channel, on a channel whose own `retain_depth` resolves 0 (it
+/// would strand the subscription permanently), or on a depth that resolves
+/// unbounded — all boot-time config errors.
+fn resolve_wire_subscription(
     slug: &str,
     context: &str,
     channel: &str,
     directory: &MessagingDirectory,
-    overrides: DurableSubOverrides,
-    require_retained: bool,
+    overrides: SubOverrides,
 ) -> (uuid::Uuid, ResolvedSubscription, u64, u64) {
     let entry = directory.resolve(channel).unwrap_or_else(|| {
         panic!(
-            "config: [[surface]] {slug:?}: {context} channel {channel:?} is not a known brenn: \
-             channel (not in [[channel]] declarations)"
+            "config: [[surface]] {slug:?}: {context} channel {channel:?} names no declared \
+             [[channel]]"
         )
     });
-    assert!(
-        entry.transport_type == ChannelScheme::Brenn,
-        "config: [[surface]] {slug:?}: {context} channel {channel:?} resolves to a non-Brenn \
-         transport channel — a durable surface subscription binds a Brenn-native channel (the \
-         scheme restriction that keeps surfaces off ingress paths)",
-    );
     let ch = &entry.resolved_channel;
-    let push_depth = overrides.push_depth.unwrap_or(ch.push_depth);
-    let retain_depth = overrides.retain_depth.unwrap_or(ch.retain_depth);
-    // Push must be bounded: a durable projection's per-subscribe parked+retained
-    // replay runs under the global DB lock and must not load unbounded history.
-    let Depth::Bounded(push) = push_depth else {
-        panic!(
-            "config: [[surface]] {slug:?}: {context} channel {channel:?} resolves to push_depth = \
-             {push_depth:?} — a durable surface subscription needs a bounded push_depth \
-             (per-subscribe replay must be bounded); set it on the binding, the channel, or the \
-             global default"
-        )
-    };
-    // Depth 0 is a bus-legal sampled/context-only port, and nothing durable has
-    // an opinion about it: whether this binding may take it is
-    // `assert_page_queue_deliverable`'s call, made by the caller once the
-    // binding's delivery model and retained depth are both in hand.
-    //
-    // Retain must be bounded for the same replay-bound reason; layout additionally
-    // requires it >= 1 so its retained-window snapshot survives reload/reboot.
-    // The bounded number is also this binding's page-side context-window depth.
-    let retain = match retain_depth {
-        Depth::Bounded(n) if !require_retained || n >= 1 => Some(n),
-        _ => None,
-    };
+    // The delivery model's one precondition on the channel itself: a surface
+    // subscription holds its position on the connection and recovers it by
+    // re-reading the channel's retention, so a channel that retains nothing
+    // strands the subscription the moment it misses a message — every later row
+    // arrives non-contiguous, every drain reads an empty window, and the
+    // position never moves again. Silent permanent non-delivery is the wrong
+    // thing, so the config is refused here instead.
     assert!(
-        retain.is_some(),
-        "config: [[surface]] {slug:?}: {context} channel {channel:?} resolves to retain_depth = \
-         {retain_depth:?} — a durable surface subscription needs a bounded retain_depth{} \
-         (per-subscribe replay must be bounded); set it on the binding, the channel, or the \
-         global default",
-        if require_retained {
-            " >= 1 so the layout survives reload/reboot"
-        } else {
-            ""
-        },
+        ch.retain_depth != Depth::Bounded(0),
+        "config: [[surface]] {slug:?}: {context} channel {channel:?} resolves to a channel-level \
+         retain_depth = 0. A surface subscription's delivery position is recovered by re-reading \
+         the channel's retention, so a channel that retains nothing strands the subscription \
+         permanently after its first missed message, with nothing on the wire to say so. Set \
+         retain_depth >= 1 on the [[channel]] block or on [messaging].default_retain_depth",
+    );
+    let push =
+        resolve_page_queue_depth(slug, context, channel, overrides.push_depth, ch.push_depth);
+    let retain = resolve_context_ring_depth(
+        slug,
+        context,
+        channel,
+        overrides.retain_depth,
+        ch.retain_depth,
     );
     // wake_min is meaningless on a surface subscription (always delivered
     // eagerly), rejected class-blind at the one call site in `resolve_surfaces`
-    // before this resolver is reached — no per-class guard here.
+    // before this resolver is reached.
     (
         entry.uuid,
         ResolvedSubscription {
             channel_uuid: entry.uuid,
             channel_address: entry.address.clone(),
-            push_depth,
-            retain_depth,
+            push_depth: Depth::Bounded(push),
+            retain_depth: Depth::Bounded(retain),
             noise: overrides.noise.unwrap_or(ch.noise),
             wake_min: ch.wake_min,
         },
         push,
-        retain.expect("retain_depth bounded — asserted above"),
+        retain,
     )
 }
 
+/// Resolve `[[surface]]` blocks against the channel directory, applying
+/// boot-time cross-validation. Mirrors `resolve_wasm_consumers` in placement,
+/// shape, and panic style — including its directory, whose entry set covers
+/// every declared channel, durable or not, so one lookup answers every binding.
+///
+/// Returns `Vec<ResolvedSurface>` in declaration order. The resolved surfaces
+/// are carried on `MessagingResult` for later consumers; boot wires them no
+/// further than boot validation + the boot observability log.
+///
+/// # Panics (all operator-authored config — fail-fast)
+///
+/// 1. `slug` empty / non-unreserved charset / duplicate across `[[surface]]`
+///    blocks. The unreserved charset excludes `:`/`@`/`#`, so a config slug
+///    satisfies `ParticipantId::for_surface`'s asserts by construction — this
+///    *enforces* the charset a wasm-consumer slug only documents.
+/// 2. `component.kind` empty / not matching `^[a-z0-9][a-z0-9-]*$` (the
+///    tightened charset makes the kind a valid custom-element name
+///    (`brenn-<kind>`) and module filename); the resolved `instance` id
+///    (defaults to `kind`) not matching that charset, or duplicate within the
+///    surface. Instances — not kinds — are unique per surface: one kind may
+///    back several instances.
+/// 3. A subscription/output `channel` whose scheme is none of `brenn:`,
+///    `ephemeral:`, `local:` — this is the boot-time scheme restriction that
+///    makes the `WakeRouter::deliver_ingress` `Surface` panic arm structurally
+///    unreachable.
+/// 4. A transportable binding channel absent from `directory`, or one whose
+///    entry wears a transport its address does not name.
+/// 5. A binding naming an undeclared instance; an empty / non-unreserved port;
+///    a duplicate `(instance, port)` within subscriptions (or within outputs).
+/// 6. A binding the surface's own resolved policy does not authorize
+///    (`allows_channel_access` for subscriptions; `allows_brenn_publish` /
+///    `allows_ephemeral_publish` by scheme for outputs) — dead config.
+/// 7. A surface with zero `[[surface.component]]` blocks — dead config: every
+///    binding must name a declared component (item 5) and subscriptions are
+///    static-only, so a component-less surface can never carry traffic.
+/// 8. An input binding whose channel retains nothing
+///    ([`resolve_wire_subscription`]), or whose resolved depths are not both
+///    bounded.
+///
+/// Two adjacent cases deliberately do **not** panic (recorded design
+/// decisions): a declared component with no port bindings (a purely presentational
+/// component is live config), and an `ephemeral:` `[[channel]]` referenced by no
+/// surface binding (ephemeral channels are LLM-app publish targets independently
+/// of any surface).
 pub(crate) fn resolve_surfaces(
     raw_surfaces: &[SurfaceConfigRaw],
     directory: &MessagingDirectory,
-    ephemeral_channels: &[ChannelEntry],
     globals: &MessagingGlobalConfig,
     auto_wiring: &AutoWiring,
 ) -> Vec<ResolvedSurface> {
@@ -799,10 +784,11 @@ pub(crate) fn resolve_surfaces(
 
         // Items 3–5 shared by both binding directions: component must be
         // declared, port charset valid, channel scheme restricted to
-        // brenn:/ephemeral: and the referenced channel must exist. Returns `()`;
-        // each caller re-derives the binding's scheme for its own coverage check
-        // (item 6) after this validation has guaranteed the scheme is one of the
-        // two accepted ones.
+        // brenn:/ephemeral:/local: and the referenced channel must exist and
+        // wear the transport its address names. Returns `()`; each caller
+        // re-derives the binding's scheme for its own coverage check (item 6)
+        // after this validation has guaranteed the scheme is one of the three
+        // accepted ones.
         let validate_binding = |direction: &str, channel: &str, instance: &str, port: &str| {
             // Item 5: instance must be declared on this surface.
             assert!(
@@ -822,40 +808,34 @@ pub(crate) fn resolve_surfaces(
             );
             // Items 3 + 4: scheme restriction and channel existence.
             match ChannelScheme::split(channel) {
-                Some((ChannelScheme::Ephemeral, name)) => {
+                // Both transportable schemes take one lookup in the one
+                // directory. The transport check is defense-in-depth for the
+                // "surfaces off ingress paths" guarantee: an address must
+                // resolve to a channel of its own transport, never an
+                // ingress-fed one wearing a `brenn:` name — if a future change
+                // ever ingress-feeds one, a surface bound to it fails here at
+                // boot rather than reaching the permanent `deliver_ingress`
+                // Surface panic at runtime.
+                Some((scheme @ (ChannelScheme::Ephemeral | ChannelScheme::Brenn), _)) => {
+                    let entry = directory.resolve(channel).unwrap_or_else(|| {
+                        panic!(
+                            "config: [[surface]] {slug:?}: {direction} channel {channel:?} names \
+                             no declared [[channel]]"
+                        )
+                    });
                     assert!(
-                        ephemeral_channels.iter().any(|e| e.address == channel),
-                        "config: [[surface]] {slug:?}: {direction} channel {channel:?} names no \
-                         declared [[channel]] (ephemeral channel {name:?} absent)",
-                    );
-                }
-                Some((ChannelScheme::Brenn, _)) => {
-                    let entry = directory.resolve(channel);
-                    assert!(
-                        entry.is_some(),
-                        "config: [[surface]] {slug:?}: {direction} channel {channel:?} is not a \
-                         known brenn: channel (not in [[channel]] declarations)",
-                    );
-                    // Defense-in-depth: a brenn:-addressed channel must actually be
-                    // a Brenn-transport channel, never an ingress-fed one. This upholds
-                    // the "surfaces off ingress paths" guarantee at the exact enforcement
-                    // point — if a future change ever ingress-feeds a brenn: address, a
-                    // surface bound to it fails at boot rather than reaching the
-                    // permanent `deliver_ingress` Surface panic at runtime.
-                    assert!(
-                        entry
-                            .map(|e| e.transport_type == ChannelScheme::Brenn)
-                            .unwrap_or(false),
-                        "config: [[surface]] {slug:?}: {direction} channel {channel:?} resolves to a \
-                         non-Brenn transport channel — surfaces bind only Brenn-native channels \
-                         (the scheme restriction that keeps surfaces off ingress paths)",
+                        entry.transport_type == scheme,
+                        "config: [[surface]] {slug:?}: {direction} channel {channel:?} resolves \
+                         to a {:?}-transport channel — a surface binding's address names the \
+                         transport it binds (the scheme restriction that keeps surfaces off \
+                         ingress paths)",
+                        entry.transport_type,
                     );
                 }
                 // `local:` — page-local pub/sub. There is nothing to look up:
                 // local channels are declared per-surface (the binding *is* the
-                // declaration), so the directory and the ephemeral-channel set
-                // both have no opinion. What must be checked is the name, since
-                // no other validator ever sees it.
+                // declaration), so the directory has no opinion. What must be
+                // checked is the name, since no other validator ever sees it.
                 Some((ChannelScheme::Local, name)) => {
                     assert!(
                         !name.is_empty(),
@@ -947,25 +927,27 @@ pub(crate) fn resolve_surfaces(
         let mut local_ring_depths: IndexMap<String, u64> = IndexMap::new();
 
         // Subscriptions (input bindings): item 6 coverage is `allows_channel_access`
-        // over the full address. Every `brenn:` binding additionally resolves a
-        // `ResolvedSubscription` (durable depth/noise/wake inheritance) that
-        // becomes a `SubscriberEntryKind::Surface` directory entry.
+        // over the full address. Every *transportable* binding additionally
+        // resolves a `ResolvedSubscription` (depth/noise/wake inheritance) that
+        // becomes a `SubscriberEntryKind::Surface` directory entry — the one
+        // subscriber shape the live feed resolves, whichever store holds the
+        // channel's retention.
         let mut subscriptions =
             Vec::with_capacity(surface.subscriptions.len() + io_subscriptions.len());
-        let mut durable_subscriptions: Vec<ResolvedSurfaceSubscription> = Vec::new();
+        let mut wire_subscriptions: Vec<ResolvedSurfaceSubscription> = Vec::new();
         let mut seen_sub_ports: HashSet<(&str, &str)> = HashSet::new();
-        // One durable subscription per **(instance, channel)**: the subscribing
+        // One subscription per **(instance, channel)**: the subscribing
         // principal is the instance, so two instances bound to one channel are two
-        // subscriptions with two push windows and two cursors — the same shape two
-        // `[[app]]` blocks on one channel produce, and the reason the
-        // `(channel_uuid, app_slug)` PK does not collide (their keys carry
+        // subscriptions with two delivery windows and two wire positions — the
+        // same shape two `[[app]]` blocks on one channel produce, and the reason
+        // the `(channel_uuid, app_slug)` PK does not collide (their keys carry
         // distinct `#<instance>` tails).
         //
-        // Index into `durable_subscriptions`, so a repeated (instance, channel) —
+        // Index into `wire_subscriptions`, so a repeated (instance, channel) —
         // one instance binding one channel on two ports, the only case where a
         // surface subscription is genuinely shared — folds into the entry already
         // resolved rather than double-installing the subscriber.
-        let mut seen_durable: std::collections::HashMap<(String, uuid::Uuid), usize> =
+        let mut seen_wire: std::collections::HashMap<(String, uuid::Uuid), usize> =
             std::collections::HashMap::new();
         for (sub, direction) in surface
             .subscriptions
@@ -1021,50 +1003,31 @@ pub(crate) fn resolve_surfaces(
                 channel,
             );
 
-            let ephemeral = matches!(ChannelScheme::of(&channel), Some(ChannelScheme::Ephemeral));
-            let context = if ephemeral {
-                "ephemeral subscription"
-            } else if local {
-                "local subscription"
-            } else {
-                "durable subscription"
-            };
-            // Every class resolves the same three page-side facts —
-            // (push_depth, retain_depth, noise) — down one class-uniform
-            // binding → channel → global ladder. Only the middle rung's *source*
-            // differs (durable and ephemeral `[[channel]]` blocks,
-            // local none → straight to global), which is a persistence fact, not
-            // a component-observable one. `push_depth` puts a bounded page queue
-            // in front of the port; `retain_depth` a bounded retained ring behind
-            // it; `noise` is resolved and held for the overflow ladder that lands
-            // in a later phase — no surface path reads it yet, on any class.
-            let (push_depth, retain_depth, noise) = if ephemeral {
-                // The channel's `[[channel]]` block is the middle rung: its
-                // push_depth/retain_depth/noise are already resolved channel →
-                // global at build time.
-                let entry = ephemeral_channels
-                    .iter()
-                    .find(|e| e.address == channel)
-                    .expect("validate_binding proved the ephemeral channel is declared");
-                let ch = &entry.resolved_channel;
-                let retain_depth = match ch.retain_depth {
-                    Depth::Bounded(n) => n,
-                    Depth::Unbounded => unreachable!(
-                        "config rejects unbounded retain_depth on a non-durable channel"
-                    ),
-                };
-                (
-                    resolve_page_queue_depth(
-                        slug,
-                        context,
-                        &channel,
-                        sub.push_depth,
-                        ch.push_depth,
-                    ),
-                    resolve_context_depth(slug, context, &channel, sub.retain_depth, retain_depth),
-                    sub.noise.unwrap_or(ch.noise),
-                )
-            } else if local {
+            // The label every depth resolver and gate below puts in its panic
+            // text. It names the binding the way config spells it: the
+            // direction, because an io_port half is not a
+            // `[[surface.subscription]]` and telling an operator to go look for
+            // one sends them hunting a block they never wrote; plus instance and
+            // port, which for a lowered binding is the only handle they have —
+            // its channel is a computed `auto.` address nothing in their config
+            // names.
+            let context = format!(
+                "{}{direction} instance {:?} port {:?}",
+                if local { "local " } else { "" },
+                sub.instance,
+                sub.port,
+            );
+            // Every binding resolves the same three page-side facts —
+            // (push_depth, retain_depth, noise) — down one binding → channel →
+            // global ladder. The one dispatch here is transportability, the one
+            // channel characteristic the wire ranks: a transportable binding
+            // installs a wire subscription and reads its rungs off the channel
+            // directory; a `local:` one never leaves the page and has no
+            // `[[channel]]` block to read. `push_depth` puts a bounded page
+            // queue in front of the port; `retain_depth` a bounded retained ring
+            // behind it; `noise` is resolved and held for the overflow ladder
+            // that lands in a later phase — no surface path reads it yet.
+            let (push_depth, retain_depth, noise, wire) = if local {
                 validate_local_binding(direction, &channel, false);
                 // A `local:` channel has no `[[channel]]` block, so its noise
                 // ladder is binding → global — the same shape `push_depth` uses on
@@ -1078,7 +1041,7 @@ pub(crate) fn resolve_surfaces(
                 (
                     resolve_page_queue_depth(
                         slug,
-                        context,
+                        &context,
                         &channel,
                         sub.push_depth,
                         globals.default_push_depth,
@@ -1094,51 +1057,60 @@ pub(crate) fn resolve_surfaces(
                     // already keeping.
                     local_context_depth(&channel, sub.retain_depth),
                     sub.noise.unwrap_or(globals.default_noise),
+                    // Page-local traffic never crosses the wire, so it installs
+                    // no subscriber anywhere on the bus.
+                    None,
                 )
             } else {
-                // brenn: — validate_binding guaranteed the channel exists and is
-                // Brenn transport. Resolve the durable subscription with the same
-                // sub → channel → global inheritance the wasm/app paths use.
-                // The resolver hands back the bounded push_depth and retain_depth
-                // it proved; those numbers are this port's page-side queue
-                // capacity and context-window depth, always — both are the port's
-                // own, so both take this binding's numbers. Only the
-                // *subscription* is ever shared, and only between bindings of the
-                // same instance, where its window and ring fold to the max below.
-                let (channel_uuid, resolved, page_depth, context_depth) =
-                    resolve_durable_surface_subscription(
-                        slug,
-                        context,
-                        &channel,
-                        directory,
-                        DurableSubOverrides {
-                            push_depth: sub.push_depth,
-                            retain_depth: sub.retain_depth,
-                            noise: sub.noise,
-                        },
-                        false,
-                    );
+                // Transportable — validate_binding guaranteed the channel is
+                // declared and wears its own transport. The resolver hands back
+                // the bounded push_depth and retain_depth it proved; those
+                // numbers are this port's page-side queue capacity and
+                // context-window depth, always — both are the port's own, so
+                // both take this binding's numbers. Only the *subscription* is
+                // ever shared, and only between bindings of the same instance,
+                // where its window and ring fold to the max below.
+                let (channel_uuid, resolved, page_depth, context_depth) = resolve_wire_subscription(
+                    slug,
+                    &context,
+                    &channel,
+                    directory,
+                    SubOverrides {
+                        push_depth: sub.push_depth,
+                        retain_depth: sub.retain_depth,
+                        noise: sub.noise,
+                    },
+                );
                 // Held for the binding below before `resolved` is folded/moved
-                // into `durable_subscriptions` — the same resolved value the
+                // into `wire_subscriptions` — the same resolved value the
                 // directory subscriber entry already carries unread.
                 let resolved_noise = resolved.noise;
+                (
+                    page_depth,
+                    context_depth,
+                    resolved_noise,
+                    Some((channel_uuid, resolved)),
+                )
+            };
+
+            // One fold for both transportable classes: a repeated (instance,
+            // channel) is one instance binding one channel on two ports — the
+            // only case where a surface subscription is genuinely shared.
+            if let Some((channel_uuid, resolved)) = wire {
                 let key = (sub.instance.clone(), channel_uuid);
-                match seen_durable.get(&key) {
+                match seen_wire.get(&key) {
                     Some(&idx) => {
-                        // One instance, one channel, two ports: a genuinely shared
-                        // subscription. Fold rather than let one binding's number
-                        // win — which binding "wins" would otherwise depend on
-                        // config order, and depth is a capacity, so the fold with
-                        // meaning is max: the window must cover the hungriest port
-                        // on it or that port starves. Same fold `reap_frontier`
-                        // already applies across subscribers, and the local-ring
-                        // resolver applies across bindings. `Depth`'s own ordering
-                        // is that fold: every `Bounded(_)` sorts below `Unbounded`,
-                        // so "no cap" wins over any cap.
+                        // Fold rather than let one binding's number win — which
+                        // binding "wins" would otherwise depend on config order,
+                        // and depth is a capacity, so the fold with meaning is
+                        // max: the window must cover the hungriest port on it or
+                        // that port starves. Same fold `reap_frontier` already
+                        // applies across subscribers, and the local-ring resolver
+                        // applies across bindings.
                         let shared: &mut ResolvedSubscription =
-                            &mut durable_subscriptions[idx].subscription;
-                        shared.push_depth = shared.push_depth.max(resolved.push_depth);
-                        shared.retain_depth = shared.retain_depth.max(resolved.retain_depth);
+                            &mut wire_subscriptions[idx].subscription;
+                        shared.push_depth = shared.push_depth.widened_by(resolved.push_depth);
+                        shared.retain_depth = shared.retain_depth.widened_by(resolved.retain_depth);
                         // Noise is a policy, not a capacity: "max" over a loudness
                         // ladder is a rule nothing in this codebase states, and
                         // picking one binding's would be positional. Require the
@@ -1158,15 +1130,14 @@ pub(crate) fn resolve_surfaces(
                         );
                     }
                     None => {
-                        seen_durable.insert(key, durable_subscriptions.len());
-                        durable_subscriptions.push(ResolvedSurfaceSubscription {
+                        seen_wire.insert(key, wire_subscriptions.len());
+                        wire_subscriptions.push(ResolvedSurfaceSubscription {
                             instance: sub.instance.clone(),
                             subscription: resolved,
                         });
                     }
                 }
-                (page_depth, context_depth, resolved_noise)
-            };
+            }
 
             // A binding that asks to be loud on overflow (`alarm` or `fatal`)
             // needs somewhere to shout: the kernel emits its overflow alert on
@@ -1192,7 +1163,7 @@ pub(crate) fn resolve_surfaces(
             // so the rules over them are stated once.
             assert_page_queue_deliverable(
                 slug,
-                context,
+                &context,
                 &channel,
                 push_depth,
                 retain_depth,
@@ -1301,7 +1272,7 @@ pub(crate) fn resolve_surfaces(
             skin,
             components: resolved_components,
             subscriptions,
-            durable_subscriptions,
+            wire_subscriptions,
             local_channels,
             outputs,
             policy,

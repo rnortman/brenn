@@ -823,21 +823,11 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
                 DeliveryBinding::ConversationBridge,
             );
         }
-        // One binding per surface principal (`ResolvedSurface::principals`),
-        // because the router resolves the route by the *subscriber's*
-        // registration key, and each instance is its own subscriber. Every route
-        // is `SurfaceSessions` regardless of grain: the WS is transport, and one
-        // session carries the whole page's principals.
-        for (slug, runtime) in surface_runtimes.iter() {
-            for instance in runtime.resolved.principals() {
-                router.register_delivery_binding(
-                    SubscriberEntryKind::Surface {
-                        slug: slug.clone(),
-                        instance,
-                    },
-                    DeliveryBinding::SurfaceSessions,
-                );
-            }
+        // One binding per surface principal, through the router's own helper —
+        // the same call the surface test rigs make, so their wiring cannot drift
+        // from this one.
+        for runtime in surface_runtimes.values() {
+            router.register_surface_delivery_routes(&runtime.resolved);
         }
 
         let messenger = messaging_result

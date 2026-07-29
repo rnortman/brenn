@@ -44,6 +44,9 @@ pub(super) struct CountingRouter {
     pub(super) deliveries: tokio::sync::Mutex<Vec<(ParticipantId, String)>>,
     /// `(body, retained_seq)` per row-less fold-0 context feed.
     pub(super) contexts: tokio::sync::Mutex<Vec<(String, i64)>>,
+    /// The envelope of each live delivery, for assertions the formatted payload
+    /// cannot carry — the scheme it was stamped with, above all.
+    pub(super) fed: tokio::sync::Mutex<Vec<Arc<crate::messaging::MessageEnvelope>>>,
     pub(super) deliver_returns: AtomicU64,
     pub(super) eager_wakes: AtomicU64,
     pub(super) alarms: AtomicU64,
@@ -62,6 +65,7 @@ impl WakeRouter for CountingRouter {
             ParticipantId::for_surface(key.slug()),
             format_messaging_event_single(envelope),
         ));
+        self.fed.lock().await.push(Arc::clone(envelope));
         match self.deliver_returns.load(Ordering::SeqCst) {
             0 => Ok(false),
             1 => Ok(true),

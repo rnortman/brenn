@@ -118,6 +118,17 @@ impl Depth {
         }
     }
 
+    /// The looser of two depths — the one that covers both. `Unbounded`
+    /// dominates: it is "no cap", and a cap that bounds one declaration's need
+    /// cannot be the cap of a declaration that named none. Two bounds yield the
+    /// larger.
+    pub fn widened_by(self, other: Depth) -> Depth {
+        match (self, other) {
+            (Depth::Bounded(a), Depth::Bounded(b)) => Depth::Bounded(a.max(b)),
+            _ => Depth::Unbounded,
+        }
+    }
+
     /// Collapses this depth to a concrete count bounded by `max`: `Unbounded`
     /// becomes `max`, a bounded depth is capped at `max`.
     pub fn clamped_to(self, max: u64) -> u64 {
@@ -1541,14 +1552,14 @@ pub struct ResolvedSurface {
     /// Resolved input bindings (channel → component/port). Serves both delivery
     /// classes and the `Welcome` payload.
     pub subscriptions: Vec<SurfaceBinding>,
-    /// Resolved durable (`brenn:`) input subscriptions, one per **(instance,
-    /// channel)** pair the surface's `brenn:` bindings name. Ephemeral and `local:`
-    /// bindings never appear here (they carry no durable knobs and open no push
-    /// window). These become `SubscriberEntryKind::Surface` directory entries so
-    /// the durable path resolves each principal exactly like an App/Wasm
-    /// subscriber — `TargetResolver::surface_feed_targets` finds it on the
-    /// channel and gates it on the same ACLs.
-    pub durable_subscriptions: Vec<ResolvedSurfaceSubscription>,
+    /// Resolved **transportable** input subscriptions, one per (instance,
+    /// channel) pair the surface's `brenn:` and `ephemeral:` bindings name.
+    /// `local:` bindings never appear here — that traffic never crosses the
+    /// wire. These become `SubscriberEntryKind::Surface` directory entries so
+    /// every principal resolves exactly like an App/Wasm subscriber —
+    /// `TargetResolver::surface_feed_targets` finds it on the channel and gates
+    /// it on the same ACLs, whichever store holds the channel's retention.
+    pub wire_subscriptions: Vec<ResolvedSurfaceSubscription>,
     /// Every distinct `local:` channel this surface's bindings name, with the
     /// ring depth resolved from them. Deduped, in first-binding order. Carried
     /// to the client in `Welcome`: the page-local router is the sole source of
@@ -1613,16 +1624,17 @@ impl ResolvedSurface {
     }
 }
 
-/// One durable surface subscription and the principal that owns it.
+/// One transportable surface subscription and the principal that owns it.
 ///
 /// The principal is the subscription's grain: a component instance's bindings
-/// resolve one subscription per (instance, channel) — its own push window, its
-/// own cursor, its own lag. Every durable surface subscription is an instance's;
-/// there is no kernel grain (the bare `surface:<slug>` grain is publisher-only).
+/// resolve one subscription per (instance, channel) — its own delivery window,
+/// its own wire position, its own lag. Every surface subscription is an
+/// instance's; there is no kernel grain (the bare `surface:<slug>` grain is
+/// publisher-only).
 #[derive(Debug, Clone)]
 pub struct ResolvedSurfaceSubscription {
-    /// The subscribing component instance. Every durable surface subscription is
-    /// an instance's; it selects `SubscriberEntryKind::Surface` at that grain.
+    /// The subscribing component instance. Every surface subscription is an
+    /// instance's; it selects `SubscriberEntryKind::Surface` at that grain.
     pub instance: String,
     /// The resolved depth/noise/wake inheritance for this principal's
     /// subscription to this channel.
@@ -2180,7 +2192,7 @@ pub fn resolve_app_messaging(
 /// a subscription, receives no push rows, and reports nothing — silent denial,
 /// indistinguishable at runtime from an idle channel.
 ///
-/// `surfaces` supplies `(surface_slug, durable_subscriptions)` in declaration
+/// `surfaces` supplies `(surface_slug, wire_subscriptions)` in declaration
 /// order, appended after the WASM consumers. Each subscription names its own
 /// principal (a component instance), so a
 /// surface contributes one entry per (principal, channel) rather than one per
@@ -3319,6 +3331,36 @@ publish_capacity = 3.0
         assert_eq!(Depth::Unbounded, Depth::Unbounded);
         assert!(Depth::Unbounded <= Depth::Unbounded);
         assert!(Depth::Bounded(5) <= Depth::Bounded(5));
+    }
+
+    /// Pinned in both orders: a naive numeric `max` rewrite produces a bound
+    /// winning over `Unbounded`, silently narrowing every caller's window.
+    #[test]
+    fn depth_widened_by_takes_the_looser_and_unbounded_dominates() {
+        for (a, b, want) in [
+            (Depth::Bounded(2), Depth::Bounded(5), Depth::Bounded(5)),
+            (Depth::Bounded(5), Depth::Bounded(2), Depth::Bounded(5)),
+            (Depth::Bounded(3), Depth::Bounded(3), Depth::Bounded(3)),
+            (Depth::Bounded(0), Depth::Bounded(0), Depth::Bounded(0)),
+            (Depth::Bounded(2), Depth::Unbounded, Depth::Unbounded),
+            (Depth::Unbounded, Depth::Bounded(2), Depth::Unbounded),
+            (Depth::Unbounded, Depth::Unbounded, Depth::Unbounded),
+        ] {
+            assert_eq!(a.widened_by(b), want, "{a:?}.widened_by({b:?})");
+        }
+    }
+
+    #[test]
+    fn depth_narrowed_by_takes_the_tighter_and_a_bound_wins() {
+        for (a, b, want) in [
+            (Depth::Bounded(2), Depth::Bounded(5), Depth::Bounded(2)),
+            (Depth::Bounded(5), Depth::Bounded(2), Depth::Bounded(2)),
+            (Depth::Bounded(2), Depth::Unbounded, Depth::Bounded(2)),
+            (Depth::Unbounded, Depth::Bounded(2), Depth::Bounded(2)),
+            (Depth::Unbounded, Depth::Unbounded, Depth::Unbounded),
+        ] {
+            assert_eq!(a.narrowed_by(b), want, "{a:?}.narrowed_by({b:?})");
+        }
     }
 
     // -----------------------------------------------------------------------

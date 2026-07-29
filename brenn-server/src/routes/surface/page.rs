@@ -208,7 +208,10 @@ mod tests {
         let mut state = test_state(&db);
         state.surfaces = Arc::new(install_surface_runtimes(
             vec![resolved],
-            None,
+            // The page renders from the resolved bindings alone, but the surface
+            // carries them, and boot gives every wire-binding surface a
+            // messenger.
+            Some(crate::test_support::surface::shape_only_messenger()),
             TEST_MAX_BODY_BYTES,
             None,
             crate::test_support::surface::description_params(),

@@ -3,7 +3,7 @@
 //! surface- and system-participant-coverage checks.
 
 use super::test_fixtures::{
-    brenn_entry_with, dir_of, make_brenn_dir, minimal_surface_raw, surface_sub_raw,
+    brenn_entry, brenn_entry_with, dir_of, make_brenn_dir, minimal_surface_raw, surface_sub_raw,
 };
 use super::*;
 use brenn_lib::config::AppConfig;
@@ -32,13 +32,11 @@ fn test_globals() -> brenn_lib::messaging::config::MessagingGlobalConfig {
 fn resolve_surfaces(
     raw_surfaces: &[brenn_lib::messaging::config::SurfaceConfigRaw],
     directory: &messaging::MessagingDirectory,
-    ephemeral_channels: &[ChannelEntry],
     globals: &brenn_lib::messaging::config::MessagingGlobalConfig,
 ) -> Vec<ResolvedSurface> {
     super::resolve_surfaces(
         raw_surfaces,
         directory,
-        ephemeral_channels,
         globals,
         &super::auto::AutoWiring::default(),
     )
@@ -350,11 +348,17 @@ fn valid_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
     }
 }
 
-/// A directory holding `brenn:alerts` and an ephemeral set holding
-/// `protobar-demo` — the channels the valid surface binds.
-fn surface_dir_and_ephem() -> (MessagingDirectory, Vec<brenn_lib::messaging::ChannelEntry>) {
-    let (dir, _addr) = make_brenn_dir("brenn:alerts");
-    (dir, vec![ephem("protobar-demo")])
+/// The channels the valid surface binds — `brenn:alerts` and
+/// `ephemeral:protobar-demo` — in one directory, the shape boot hands
+/// `resolve_surfaces`.
+fn surface_dir() -> MessagingDirectory {
+    dir_of(vec![brenn_entry("brenn:alerts"), ephem("protobar-demo")])
+}
+
+/// [`surface_dir`] with the ephemeral channel replaced by the caller's own
+/// entry — for the tests about what a binding inherits from its channel rung.
+fn surface_dir_with(ephemeral: brenn_lib::messaging::ChannelEntry) -> MessagingDirectory {
+    dir_of(vec![brenn_entry("brenn:alerts"), ephemeral])
 }
 
 /// A surface with one `brenn:alerts` durable subscription, granted Subscribe
@@ -421,10 +425,10 @@ fn make_bounded_brenn_dir(chan_addr: &str) -> MessagingDirectory {
 /// the assertion cannot tell resolution from a hard-coded constant.
 #[test]
 fn a_configured_output_urgency_resolves_onto_the_output() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.outputs[0].urgency = Some(Urgency::High);
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].outputs[0].default_urgency, Urgency::High);
 }
 
@@ -433,9 +437,9 @@ fn a_configured_output_urgency_resolves_onto_the_output() {
 /// Default false leaves siblings unmarked; setting it on one carries through.
 #[test]
 fn the_chrome_flag_resolves_onto_its_component() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let raw = valid_surface_raw();
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     // The fixture's chrome component is the third one; the two application
     // components must resolve unmarked.
     assert!(
@@ -452,10 +456,10 @@ fn the_chrome_flag_resolves_onto_its_component() {
 /// port → global ladder `[[wasm_consumer]] [[output]]` uses.
 #[test]
 fn an_unset_output_urgency_falls_back_to_normal() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let raw = valid_surface_raw();
     assert_eq!(raw.outputs[0].urgency, None, "fixture leaves it unset");
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].outputs[0].default_urgency, Urgency::Normal);
 }
 
@@ -464,11 +468,11 @@ fn an_unset_output_urgency_falls_back_to_normal() {
 /// otherwise survive.
 #[test]
 fn every_urgency_rung_resolves_onto_the_output() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     for urgency in Urgency::ALL {
         let mut raw = valid_surface_raw();
         raw.outputs[0].urgency = Some(urgency);
-        let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+        let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
         assert_eq!(
             resolved[0].outputs[0].default_urgency, urgency,
             "output urgency {urgency:?} must survive resolution"
@@ -481,8 +485,8 @@ fn every_urgency_rung_resolves_onto_the_output() {
 /// checks used.
 #[test]
 fn surface_resolves_happy_path() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
-    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &ephem_chs, &test_globals());
+    let dir = surface_dir();
+    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
     assert_eq!(resolved.len(), 1);
     let s = &resolved[0];
     assert_eq!(s.slug, "deskbar");
@@ -544,8 +548,8 @@ fn surface_resolves_happy_path() {
 /// channel, leaving the surface's own publish coverage intact.
 #[test]
 fn inject_surface_error_grant_adds_covering_publish_acl() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
-    let mut resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &ephem_chs, &test_globals());
+    let dir = surface_dir();
+    let mut resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
     // Before injection the surface has a publish grant (for brenn:alerts) but no
     // matcher covering the error channel, so it cannot publish there.
     assert!(!resolved[0].policy.allows_brenn_publish("surface-errors"));
@@ -566,8 +570,8 @@ fn inject_surface_error_grant_adds_covering_publish_acl() {
 /// own geometry and status channels only, leaving its own publish coverage intact.
 #[test]
 fn inject_surface_geometry_status_grants_adds_covering_publish_acls() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
-    let mut resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &ephem_chs, &test_globals());
+    let dir = surface_dir();
+    let mut resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
     let slug = resolved[0].slug.clone();
     assert!(
         !resolved[0]
@@ -599,12 +603,12 @@ fn inject_surface_geometry_status_grants_adds_covering_publish_acls() {
 
 #[test]
 fn surface_access_and_budgets_carry_through() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.allowed_users = vec!["alice".to_string()];
     raw.publish_burst = Some(120);
     raw.publish_per_sec = Some(5);
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let s = &resolved[0];
     assert_eq!(s.allowed_users, vec!["alice".to_string()]);
     assert!(s.user_has_access("alice"));
@@ -613,10 +617,10 @@ fn surface_access_and_budgets_carry_through() {
     assert_eq!(s.publish_per_sec, 5);
 }
 
-/// A `brenn:` binding resolves into `durable_subscriptions`, inheriting the
+/// A `brenn:` binding resolves into `wire_subscriptions`, inheriting the
 /// channel's push/retain/noise/wake defaults when the knobs are unset. The
 /// `SurfaceBinding` list still carries it too (it serves the `Welcome`
-/// payload), but ephemeral bindings never enter `durable_subscriptions`.
+/// payload).
 #[test]
 fn surface_durable_subscription_inherits_channel_defaults() {
     use brenn_lib::messaging::config::{Depth, NoiseLevel};
@@ -628,15 +632,15 @@ fn surface_durable_subscription_inherits_channel_defaults() {
     raw.subscriptions[0].retain_depth = None;
     raw.subscriptions[0].noise = None;
     raw.subscriptions[0].wake_min = None;
-    let resolved = resolve_surfaces(&[raw], &dir, &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let s = &resolved[0];
     assert_eq!(
         s.subscriptions.len(),
         1,
         "SurfaceBinding carries the binding"
     );
-    assert_eq!(s.durable_subscriptions.len(), 1);
-    let ds = &s.durable_subscriptions[0].subscription;
+    assert_eq!(s.wire_subscriptions.len(), 1);
+    let ds = &s.wire_subscriptions[0].subscription;
     assert_eq!(ds.channel_address, "brenn:alerts");
     assert_eq!(ds.push_depth, Depth::Bounded(16));
     assert_eq!(ds.retain_depth, Depth::Bounded(8));
@@ -645,10 +649,10 @@ fn surface_durable_subscription_inherits_channel_defaults() {
 }
 
 /// A durable binding whose resolved `push_depth` is unbounded (here: inherited
-/// from an unbounded channel default) is a boot panic — a surface projection's
-/// per-subscribe replay must be bounded.
+/// from an unbounded channel default) is a boot panic — the same one an
+/// ephemeral binding meets, in the same words: the port queue is page memory.
 #[test]
-#[should_panic(expected = "needs a bounded push_depth")]
+#[should_panic(expected = "must resolve to a bounded push_depth")]
 fn surface_durable_push_depth_unbounded_panics() {
     use brenn_lib::messaging::config::Depth;
     let (dir, _addr) = make_brenn_dir("brenn:alerts");
@@ -657,21 +661,21 @@ fn surface_durable_push_depth_unbounded_panics() {
     // bounded so the push check is what trips.
     raw.subscriptions[0].push_depth = None;
     raw.subscriptions[0].retain_depth = Some(Depth::Bounded(4));
-    resolve_surfaces(&[raw], &dir, &[], &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// A durable binding whose resolved `retain_depth` is unbounded (inherited from
 /// an unbounded channel default) is a boot panic — the per-subscribe replay
-/// must be bounded.
+/// must be bounded, in the one text every class meets.
 #[test]
-#[should_panic(expected = "needs a bounded retain_depth")]
+#[should_panic(expected = "retained context ring lives in page memory")]
 fn surface_durable_retain_depth_unbounded_panics() {
     use brenn_lib::messaging::config::Depth;
     let (dir, _addr) = make_brenn_dir("brenn:alerts");
     let mut raw = durable_surface_raw();
     raw.subscriptions[0].push_depth = Some(Depth::Bounded(8));
     raw.subscriptions[0].retain_depth = None;
-    resolve_surfaces(&[raw], &dir, &[], &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// Explicit per-subscription durable knobs override the channel defaults.
@@ -686,8 +690,8 @@ fn surface_durable_subscription_explicit_knobs_carry() {
     raw.subscriptions[0].noise = Some(NoiseLevel::Alarm);
     // `alarm` alerts on overflow, so the surface must hold the alert grant.
     raw.grants.push(SurfaceGrant::Alert);
-    let resolved = resolve_surfaces(&[raw], &dir, &[], &test_globals());
-    let ds = &resolved[0].durable_subscriptions[0].subscription;
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+    let ds = &resolved[0].wire_subscriptions[0].subscription;
     assert_eq!(ds.push_depth, Depth::Bounded(4));
     assert_eq!(ds.retain_depth, Depth::Bounded(2));
     assert_eq!(ds.noise, NoiseLevel::Alarm);
@@ -707,7 +711,7 @@ fn surface_durable_subscription_explicit_wake_min_panics() {
     raw.subscriptions[0].push_depth = Some(Depth::Bounded(4));
     raw.subscriptions[0].retain_depth = Some(Depth::Bounded(2));
     raw.subscriptions[0].wake_min = Some(brenn_lib::messaging::WakeMin::Never);
-    resolve_surfaces(&[raw], &dir, &[], &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// `push_depth` is not a durable knob: every class puts a page queue in front of
@@ -715,10 +719,10 @@ fn surface_durable_subscription_explicit_wake_min_panics() {
 #[test]
 fn surface_ephemeral_binding_honours_push_depth() {
     use brenn_lib::messaging::config::Depth;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.subscriptions[0].push_depth = Some(Depth::Bounded(3));
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].subscriptions[0].push_depth, 3);
 }
 
@@ -727,8 +731,8 @@ fn surface_ephemeral_binding_honours_push_depth() {
 /// `ephem` fixture's channel rung is 8.
 #[test]
 fn surface_ephemeral_binding_inherits_the_channel_push_depth() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
-    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &ephem_chs, &test_globals());
+    let dir = surface_dir();
+    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
     assert_eq!(resolved[0].subscriptions[0].push_depth, 8);
 }
 
@@ -737,14 +741,13 @@ fn surface_ephemeral_binding_inherits_the_channel_push_depth() {
 #[test]
 fn surface_ephemeral_binding_inherits_a_distinct_channel_push_depth() {
     use brenn_lib::messaging::config::{Depth, NoiseLevel};
-    let (dir, _addr) = make_brenn_dir("brenn:alerts");
-    let ephem_chs = vec![ephem_with(
+    let dir = surface_dir_with(ephem_with(
         "protobar-demo",
         Depth::Bounded(5),
         1,
         NoiseLevel::Silent,
-    )];
-    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &ephem_chs, &test_globals());
+    ));
+    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
     assert_eq!(resolved[0].subscriptions[0].push_depth, 5);
 }
 
@@ -755,19 +758,13 @@ fn surface_ephemeral_binding_inherits_a_distinct_channel_push_depth() {
 #[should_panic(expected = "must resolve to a bounded push_depth")]
 fn surface_ephemeral_binding_with_an_unbounded_resolved_push_depth_panics() {
     use brenn_lib::messaging::config::{Depth, NoiseLevel};
-    let (dir, _addr) = make_brenn_dir("brenn:alerts");
-    let ephem_chs = vec![ephem_with(
+    let dir = surface_dir_with(ephem_with(
         "protobar-demo",
         Depth::Unbounded,
         1,
         NoiseLevel::Silent,
-    )];
-    resolve_surfaces(
-        &[valid_surface_raw()],
-        &dir,
-        &ephem_chs,
-        &Default::default(),
-    );
+    ));
+    resolve_surfaces(&[valid_surface_raw()], &dir, &Default::default());
 }
 
 /// Depth 0 is the bus's sampled/context-only port, and it is legal on every
@@ -777,7 +774,7 @@ fn surface_ephemeral_binding_with_an_unbounded_resolved_push_depth_panics() {
 #[test]
 fn surface_ephemeral_binding_push_depth_zero_resolves() {
     use brenn_lib::messaging::config::{Depth, SurfaceSubscriptionRaw};
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     // A sibling triggering port on the same instance: depth-0 ports are read as
     // context when some *other* port activates, so an instance needs one.
@@ -786,7 +783,7 @@ fn surface_ephemeral_binding_push_depth_zero_resolves() {
         retain_depth: Some(Depth::Bounded(4)),
         ..surface_sub_raw("ephemeral:protobar-demo", "protobar", "context")
     });
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let ctx = resolved[0]
         .subscriptions
         .iter()
@@ -802,10 +799,10 @@ fn surface_ephemeral_binding_push_depth_zero_resolves() {
 #[test]
 fn surface_ephemeral_binding_retain_depth_resolves() {
     use brenn_lib::messaging::config::Depth;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.subscriptions[0].retain_depth = Some(Depth::Bounded(3));
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].subscriptions[0].retain_depth, 3);
 }
 
@@ -815,17 +812,24 @@ fn surface_ephemeral_binding_retain_depth_resolves() {
 #[test]
 fn surface_ephemeral_binding_retain_depth_inherits_the_channel_rung() {
     use brenn_lib::messaging::config::{Depth, NoiseLevel};
-    let (dir, _addr) = make_brenn_dir("brenn:alerts");
-    let ephem_chs = vec![ephem_with(
+    let dir = surface_dir_with(ephem_with(
         "protobar-demo",
         Depth::Bounded(8),
         6,
         NoiseLevel::Silent,
-    )];
+    ));
     let raw = valid_surface_raw();
     assert!(raw.subscriptions[0].retain_depth.is_none());
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].subscriptions[0].retain_depth, 6);
+    // The wire subscription inherits the same rung. It is a bounded number, not
+    // "unbounded, the ring is its own bound": in effect the same window — the
+    // clamp is then at least the ring's capacity — but a resolved config value
+    // the operator can read, and the same one `brenn:` resolves.
+    assert_eq!(
+        resolved[0].wire_subscriptions[0].subscription.retain_depth,
+        Depth::Bounded(6),
+    );
 }
 
 /// An unbounded `retain_depth` is a named panic on every class: the retained
@@ -834,10 +838,10 @@ fn surface_ephemeral_binding_retain_depth_inherits_the_channel_rung() {
 #[should_panic(expected = "retained context ring lives in page memory")]
 fn surface_ephemeral_binding_unbounded_retain_depth_panics() {
     use brenn_lib::messaging::config::Depth;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.subscriptions[0].retain_depth = Some(Depth::Unbounded);
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// `noise` on an ephemeral binding no longer panics — the class fork is gone. It
@@ -846,10 +850,10 @@ fn surface_ephemeral_binding_unbounded_retain_depth_panics() {
 #[test]
 fn surface_noise_on_ephemeral_binding_resolves_not_panics() {
     use brenn_lib::messaging::NoiseLevel;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.subscriptions[0].noise = Some(NoiseLevel::Metered);
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].subscriptions[0].noise, NoiseLevel::Metered);
 }
 
@@ -859,18 +863,17 @@ fn surface_noise_on_ephemeral_binding_resolves_not_panics() {
 fn surface_ephemeral_binding_inherits_the_channel_noise() {
     use brenn_lib::messaging::config::SurfaceGrant;
     use brenn_lib::messaging::config::{Depth, NoiseLevel};
-    let (dir, _addr) = make_brenn_dir("brenn:alerts");
-    let ephem_chs = vec![ephem_with(
+    let dir = surface_dir_with(ephem_with(
         "protobar-demo",
         Depth::Bounded(8),
         1,
         NoiseLevel::Alarm,
-    )];
+    ));
     // The inherited `alarm` alerts on overflow, so the surface must hold the
     // alert grant.
     let mut raw = valid_surface_raw();
     raw.grants.push(SurfaceGrant::Alert);
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].subscriptions[0].noise, NoiseLevel::Alarm);
 }
 
@@ -881,10 +884,10 @@ fn surface_ephemeral_binding_inherits_the_channel_noise() {
 #[should_panic(expected = "always delivered eagerly")]
 fn surface_wake_min_on_ephemeral_binding_panics() {
     use brenn_lib::messaging::WakeMin;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.subscriptions[0].wake_min = Some(WakeMin::Normal);
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// A `local:` binding's context depth is its read into the router's ring. An
@@ -894,7 +897,7 @@ fn surface_local_binding_retain_depth_resolves() {
     use brenn_lib::messaging::config::Depth;
     let mut raw = local_surface_raw();
     raw.subscriptions[0].retain_depth = Some(Depth::Bounded(4));
-    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(resolved[0].subscriptions[0].retain_depth, 4);
     // The ring the binding reads is folded from the same number.
     assert_eq!(resolved[0].local_channels[0].ring_depth, 4);
@@ -908,7 +911,7 @@ fn surface_local_binding_retain_depth_resolves() {
 fn surface_local_binding_retain_depth_defaults_to_the_rings_floor() {
     let raw = local_surface_raw();
     assert!(raw.subscriptions[0].retain_depth.is_none());
-    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(resolved[0].subscriptions[0].retain_depth, 1);
     assert_eq!(resolved[0].local_channels[0].ring_depth, 1);
 }
@@ -924,7 +927,7 @@ fn surface_local_binding_explicit_noise_resolves() {
     // `alarm` alerts on overflow, so the surface must hold the alert grant — even
     // on a `local:` binding, whose kernel-side overflow still rides the plane.
     raw.grants.push(SurfaceGrant::Alert);
-    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(resolved[0].subscriptions[0].noise, NoiseLevel::Alarm);
 }
 
@@ -937,7 +940,7 @@ fn surface_loud_noise_without_alert_grant_panics() {
     use brenn_lib::messaging::config::NoiseLevel;
     let mut raw = local_surface_raw();
     raw.subscriptions[0].noise = Some(NoiseLevel::Alarm);
-    resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
 /// The grant gate is stated as covering `fatal` too, but it reaches the assert
@@ -950,7 +953,7 @@ fn surface_fatal_noise_without_alert_grant_panics() {
     use brenn_lib::messaging::config::NoiseLevel;
     let mut raw = local_surface_raw();
     raw.subscriptions[0].noise = Some(NoiseLevel::Fatal);
-    resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
 /// `metered` and `silent` do not alert, so they need no grant — the check gates
@@ -960,7 +963,7 @@ fn surface_metered_noise_needs_no_alert_grant() {
     use brenn_lib::messaging::config::NoiseLevel;
     let mut raw = local_surface_raw();
     raw.subscriptions[0].noise = Some(NoiseLevel::Metered);
-    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(resolved[0].subscriptions[0].noise, NoiseLevel::Metered);
 }
 
@@ -971,7 +974,7 @@ fn surface_local_binding_noise_defaults_to_global() {
     use brenn_lib::messaging::config::NoiseLevel;
     let raw = local_surface_raw();
     assert!(raw.subscriptions[0].noise.is_none());
-    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(resolved[0].subscriptions[0].noise, NoiseLevel::Silent);
 }
 
@@ -982,7 +985,7 @@ fn surface_local_binding_noise_defaults_to_global() {
 fn surface_reserved_plane_binding_reads_the_contract_fixed_depth() {
     let mut raw = local_surface_raw();
     raw.subscriptions[0] = surface_sub_raw("local:brenn/theme", "protobar", "theme-in");
-    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     let fixed = brenn_surface_proto::reserved_local_channel("local:brenn/theme")
         .expect("theme is a reserved plane")
         .ring_depth;
@@ -994,11 +997,11 @@ fn surface_reserved_plane_binding_reads_the_contract_fixed_depth() {
 /// resolves them once and advertises them.
 #[test]
 fn surface_output_budget_resolves_to_millitokens() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.outputs[0].publish_per_activation = Some(2.5);
     raw.outputs[0].publish_capacity = Some(0.5);
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].outputs[0].budget.fill_mt, 2500);
     assert_eq!(resolved[0].outputs[0].budget.capacity_mt, 500);
 }
@@ -1010,10 +1013,10 @@ fn surface_output_budget_defaults_match_the_backend_knobs() {
     use brenn_lib::messaging::config::{
         DEFAULT_WASM_PUBLISH_CAPACITY, DEFAULT_WASM_PUBLISH_PER_ACTIVATION, MILLITOKENS_PER_PUBLISH,
     };
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let raw = valid_surface_raw();
     assert!(raw.outputs[0].publish_per_activation.is_none());
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(
         resolved[0].outputs[0].budget.fill_mt,
         (DEFAULT_WASM_PUBLISH_PER_ACTIVATION * MILLITOKENS_PER_PUBLISH as f64) as u64,
@@ -1028,10 +1031,10 @@ fn surface_output_budget_defaults_match_the_backend_knobs() {
 /// what its inputs grant it. Distinct from a sink that may never publish.
 #[test]
 fn surface_output_zero_fill_is_input_driven_not_rejected() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.outputs[0].publish_per_activation = Some(0.0);
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].outputs[0].budget.fill_mt, 0);
 }
 
@@ -1040,30 +1043,30 @@ fn surface_output_zero_fill_is_input_driven_not_rejected() {
 #[test]
 #[should_panic(expected = "would round to 0")]
 fn surface_output_budget_rounding_to_zero_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.outputs[0].publish_per_activation = Some(0.0001);
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// …and a non-finite knob, on the same shared resolver.
 #[test]
 #[should_panic(expected = "must be finite")]
 fn surface_output_budget_nan_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.outputs[0].publish_capacity = Some(f64::NAN);
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// An unstated `parked_batch_depth` takes the stated default.
 #[test]
 fn surface_parked_batch_depth_defaults() {
     use brenn_lib::messaging::config::DEFAULT_PARKED_BATCH_DEPTH;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let raw = valid_surface_raw();
     assert!(raw.components[0].parked_batch_depth.is_none());
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(
         resolved[0].components[0].parked_batch_depth,
         DEFAULT_PARKED_BATCH_DEPTH
@@ -1074,10 +1077,10 @@ fn surface_parked_batch_depth_defaults() {
 #[test]
 fn surface_parked_batch_depth_override_resolves() {
     use brenn_lib::messaging::config::Depth;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].parked_batch_depth = Some(Depth::Bounded(3));
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].components[0].parked_batch_depth, 3);
     // Per instance: the sibling that stated nothing is untouched.
     assert_eq!(resolved[0].components[1].parked_batch_depth, 8);
@@ -1089,10 +1092,10 @@ fn surface_parked_batch_depth_override_resolves() {
 #[should_panic(expected = "parked_batch_depth = 0")]
 fn surface_parked_batch_depth_zero_panics() {
     use brenn_lib::messaging::config::Depth;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].parked_batch_depth = Some(Depth::Bounded(0));
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// Unbounded is a page queue that grows for the length of the outage.
@@ -1100,10 +1103,10 @@ fn surface_parked_batch_depth_zero_panics() {
 #[should_panic(expected = "parked_batch_depth = \"unbounded\"")]
 fn surface_parked_batch_depth_unbounded_panics() {
     use brenn_lib::messaging::config::Depth;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].parked_batch_depth = Some(Depth::Unbounded);
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// A durable binding's page-queue depth is the same number its subscription
@@ -1115,10 +1118,10 @@ fn surface_durable_binding_carries_its_subscriptions_push_depth() {
     let (dir, _addr) = make_brenn_dir("brenn:alerts");
     let mut raw = durable_surface_raw();
     raw.subscriptions[0].push_depth = Some(Depth::Bounded(5));
-    let resolved = resolve_surfaces(&[raw], &dir, &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].subscriptions[0].push_depth, 5);
     assert_eq!(
-        resolved[0].durable_subscriptions[0].subscription.push_depth,
+        resolved[0].wire_subscriptions[0].subscription.push_depth,
         Depth::Bounded(5)
     );
 }
@@ -1139,15 +1142,15 @@ fn surface_one_instance_two_ports_share_a_subscription_folded_by_max() {
     alt.push_depth = Some(Depth::Bounded(9));
     alt.retain_depth = Some(Depth::Bounded(5));
     raw.subscriptions.push(alt);
-    let resolved = resolve_surfaces(&[raw], &dir, &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
 
     // Each port queue takes its own binding's depth — the queue is the port's.
     assert_eq!(resolved[0].subscriptions[0].push_depth, 6);
     assert_eq!(resolved[0].subscriptions[1].push_depth, 9);
 
     // One subscription, its window covering the hungriest port on it.
-    assert_eq!(resolved[0].durable_subscriptions.len(), 1);
-    let ds = &resolved[0].durable_subscriptions[0];
+    assert_eq!(resolved[0].wire_subscriptions.len(), 1);
+    let ds = &resolved[0].wire_subscriptions[0];
     assert_eq!(ds.instance, "protobar");
     assert_eq!(ds.subscription.push_depth, Depth::Bounded(9));
     // `retain_depth` folds by max alongside it — both are capacities on the one
@@ -1175,8 +1178,8 @@ fn surface_shared_subscription_max_fold_is_order_independent() {
         alt.push_depth = Some(Depth::Bounded(second.0));
         alt.retain_depth = Some(Depth::Bounded(second.1));
         raw.subscriptions.push(alt);
-        let resolved = resolve_surfaces(&[raw], &dir, &[], &test_globals());
-        let ds = &resolved[0].durable_subscriptions[0].subscription;
+        let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+        let ds = &resolved[0].wire_subscriptions[0].subscription;
         (ds.push_depth, ds.retain_depth)
     };
     let expected = (Depth::Bounded(9), Depth::Bounded(5));
@@ -1203,7 +1206,7 @@ fn surface_shared_subscription_conflicting_noise_panics() {
     alt.push_depth = Some(Depth::Bounded(9));
     alt.noise = Some(NoiseLevel::Silent);
     raw.subscriptions.push(alt);
-    resolve_surfaces(&[raw], &dir, &[], &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// The passing twin: agreeing bindings resolve, and the agreed loudness carries
@@ -1222,10 +1225,10 @@ fn surface_shared_subscription_agreeing_noise_carries() {
     alt.push_depth = Some(Depth::Bounded(9));
     alt.noise = Some(NoiseLevel::Alarm);
     raw.subscriptions.push(alt);
-    let resolved = resolve_surfaces(&[raw], &dir, &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
 
-    assert_eq!(resolved[0].durable_subscriptions.len(), 1);
-    let ds = &resolved[0].durable_subscriptions[0];
+    assert_eq!(resolved[0].wire_subscriptions.len(), 1);
+    let ds = &resolved[0].wire_subscriptions[0];
     assert_eq!(ds.subscription.noise, NoiseLevel::Alarm);
 }
 
@@ -1242,15 +1245,15 @@ fn surface_sibling_instances_on_one_channel_are_two_subscriptions() {
     let mut bob = surface_sub_raw("brenn:alerts", "agenda-bob", "in");
     bob.push_depth = Some(Depth::Bounded(9));
     raw.subscriptions.push(bob);
-    let resolved = resolve_surfaces(&[raw], &dir, &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
 
     assert_eq!(
-        resolved[0].durable_subscriptions.len(),
+        resolved[0].wire_subscriptions.len(),
         2,
         "each instance owns its own subscription"
     );
     let mut by_instance: Vec<(&str, Depth)> = resolved[0]
-        .durable_subscriptions
+        .wire_subscriptions
         .iter()
         .map(|d| (d.instance.as_str(), d.subscription.push_depth))
         .collect();
@@ -1278,7 +1281,7 @@ fn surface_durable_push_depth_zero_resolves() {
         retain_depth: Some(Depth::Bounded(4)),
         ..surface_sub_raw("brenn:alerts", "protobar", "context")
     });
-    let resolved = resolve_surfaces(&[raw], &dir, &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let ctx = resolved[0]
         .subscriptions
         .iter()
@@ -1291,10 +1294,10 @@ fn surface_durable_push_depth_zero_resolves() {
 /// An explicit non-default skin resolves through.
 #[test]
 fn surface_skin_carries_through() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.skin = Some("foundry".to_string());
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].skin, "foundry");
 }
 
@@ -1303,59 +1306,59 @@ fn surface_skin_carries_through() {
 #[test]
 #[should_panic(expected = "unknown skin")]
 fn surface_unknown_skin_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.skin = Some("nonesuch".to_string());
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "synchronous startup-attach bound")]
 fn surface_subscription_count_over_startup_attach_bound_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     // One binding per distinct port on the covered ephemeral channel, one
     // past the shell's synchronous startup-attach bound.
     raw.subscriptions = (0..=brenn_surface_proto::MAX_SURFACE_SUBSCRIPTION_BINDINGS)
         .map(|i| surface_sub_raw("ephemeral:protobar-demo", "protobar", &format!("p{i}")))
         .collect();
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "allowed_users entry must be non-empty")]
 fn surface_empty_allowed_user_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.allowed_users = vec!["".to_string()];
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "duplicate allowed_users entry")]
 fn surface_duplicate_allowed_user_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.allowed_users = vec!["alice".to_string(), "alice".to_string()];
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "publish_burst must be >= 1")]
 fn surface_zero_publish_burst_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.publish_burst = Some(0);
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "publish_per_sec must be >= 1")]
 fn surface_zero_publish_per_sec_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.publish_per_sec = Some(0);
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// At-ceiling budgets (exactly the bus per-sender constants) resolve: equal
@@ -1363,11 +1366,11 @@ fn surface_zero_publish_per_sec_panics() {
 /// trips no later than the bus gate.
 #[test]
 fn surface_at_ceiling_publish_budgets_resolve() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.publish_burst = Some(SendRate::default().burst);
     raw.publish_per_sec = Some(SendRate::default().refill);
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_eq!(resolved[0].publish_burst, SendRate::default().burst);
     assert_eq!(resolved[0].publish_per_sec, SendRate::default().refill);
 }
@@ -1375,38 +1378,37 @@ fn surface_at_ceiling_publish_budgets_resolve() {
 #[test]
 #[should_panic(expected = "exceeds the default send-rate burst")]
 fn surface_over_ceiling_publish_burst_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.publish_burst = Some(SendRate::default().burst + 1);
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "exceeds the default send rate")]
 fn surface_over_ceiling_publish_per_sec_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.publish_per_sec = Some(SendRate::default().refill + 1);
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "must consist of RFC 3986 unreserved")]
 fn surface_bad_slug_charset_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.slug = "desk:bar".to_string();
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "duplicate [[surface]] slug")]
 fn surface_duplicate_slug_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     resolve_surfaces(
         &[valid_surface_raw(), valid_surface_raw()],
         &dir,
-        &ephem_chs,
         &test_globals(),
     );
 }
@@ -1418,7 +1420,7 @@ fn surface_duplicate_slug_panics() {
 #[should_panic(expected = "duplicate component instance")]
 fn surface_duplicate_component_instance_panics() {
     use brenn_lib::messaging::config::SurfaceComponentRaw;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components.push(SurfaceComponentRaw {
         kind: "protobar".to_string(),
@@ -1430,7 +1432,7 @@ fn surface_duplicate_component_instance_panics() {
         config: None,
         chrome: false,
     });
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// Exactly one component per surface must carry `chrome = true`. The valid
@@ -1438,8 +1440,8 @@ fn surface_duplicate_component_instance_panics() {
 /// invariant.
 #[test]
 fn surface_exactly_one_chrome_resolves() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
-    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &ephem_chs, &test_globals());
+    let dir = surface_dir();
+    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
     let chrome: Vec<&str> = resolved[0]
         .components
         .iter()
@@ -1454,12 +1456,12 @@ fn surface_exactly_one_chrome_resolves() {
 #[test]
 #[should_panic(expected = "declares 0 components with `chrome = true`")]
 fn surface_zero_chrome_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     for comp in &mut raw.components {
         comp.chrome = false;
     }
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// Two `chrome = true` components is a boot panic: the designation is ambiguous
@@ -1467,11 +1469,11 @@ fn surface_zero_chrome_panics() {
 #[test]
 #[should_panic(expected = "declares 2 components with `chrome = true`")]
 fn surface_two_chrome_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     // The fixture already carries one chrome; mark a second.
     raw.components[0].chrome = true;
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// A second component sharing a kind but with a distinct explicit instance id
@@ -1479,7 +1481,7 @@ fn surface_two_chrome_panics() {
 #[test]
 fn surface_two_instances_of_one_kind_ok() {
     use brenn_lib::messaging::config::SurfaceComponentRaw;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components.push(SurfaceComponentRaw {
         kind: "protobar".to_string(),
@@ -1491,7 +1493,7 @@ fn surface_two_instances_of_one_kind_ok() {
         config: None,
         chrome: false,
     });
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let kinds: Vec<&str> = resolved[0]
         .components
         .iter()
@@ -1511,8 +1513,8 @@ fn surface_two_instances_of_one_kind_ok() {
 #[test]
 fn surface_component_send_budget_defaults_when_undeclared() {
     use brenn_lib::messaging::config::SurfaceSendBudget;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
-    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &ephem_chs, &test_globals());
+    let dir = surface_dir();
+    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
     for comp in &resolved[0].components {
         assert_eq!(comp.send_budget, SurfaceSendBudget::default());
     }
@@ -1533,11 +1535,11 @@ fn surface_component_send_budget_defaults_when_undeclared() {
 #[test]
 fn surface_component_send_budget_knobs_override_independently() {
     use brenn_lib::messaging::config::SurfaceSendBudget;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].send_burst = Some(300);
     raw.components[1].send_refill_secs = Some(90);
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let default = SurfaceSendBudget::default();
     assert_eq!(
         resolved[0].components[0].send_budget,
@@ -1559,7 +1561,7 @@ fn surface_component_send_budget_knobs_override_independently() {
 /// *instance's*, matching the principal it meters.
 #[test]
 fn surface_sibling_instances_carry_their_own_send_budgets() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components
         .push(brenn_lib::messaging::config::SurfaceComponentRaw {
@@ -1572,7 +1574,7 @@ fn surface_sibling_instances_carry_their_own_send_budgets() {
             config: None,
             chrome: false,
         });
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let budgets: Vec<(&str, u32)> = resolved[0]
         .components
         .iter()
@@ -1599,10 +1601,10 @@ fn surface_sibling_instances_carry_their_own_send_budgets() {
 #[test]
 fn surface_principal_send_budgets_cover_every_principal() {
     use brenn_lib::messaging::config::SurfaceSendBudget;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].send_burst = Some(400);
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let budgeted: Vec<(Option<String>, SurfaceSendBudget)> =
         resolved[0].principal_send_budgets().collect();
     let principals: Vec<Option<String>> = resolved[0].principals().collect();
@@ -1617,10 +1619,10 @@ fn surface_principal_send_budgets_cover_every_principal() {
 #[test]
 #[should_panic(expected = "sets send_burst = 0, which admits no publish at all")]
 fn surface_component_zero_send_burst_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].send_burst = Some(0);
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// The sizing invariant: a declared burst below the per-activation cap is a
@@ -1630,11 +1632,11 @@ fn surface_component_zero_send_burst_panics() {
 #[test]
 #[should_panic(expected = "burst of 255, below the 256-publish per-activation cap")]
 fn surface_component_send_burst_below_the_activation_cap_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].send_burst =
         Some(u32::try_from(brenn_budget::MAX_PUBLISHES_PER_ACTIVATION).unwrap() - 1);
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// The default satisfies the invariant it is asserted against — the value every
@@ -1644,8 +1646,8 @@ fn surface_component_send_burst_below_the_activation_cap_panics() {
 /// it and survives the boot assert.
 #[test]
 fn surface_component_default_send_burst_covers_a_maximal_flush() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
-    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &ephem_chs, &test_globals());
+    let dir = surface_dir();
+    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
     assert!(
         resolved[0].components[0].send_budget.burst as usize
             >= brenn_budget::MAX_PUBLISHES_PER_ACTIVATION,
@@ -1656,94 +1658,117 @@ fn surface_component_default_send_burst_covers_a_maximal_flush() {
 #[test]
 #[should_panic(expected = "sets send_refill_secs = 0, which is a budget that never refills")]
 fn surface_component_zero_send_refill_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].send_refill_secs = Some(0);
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "is not declared as a [[surface.component]]")]
 fn surface_unknown_component_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.subscriptions[0].instance = "ghost".to_string();
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "port name")]
 fn surface_bad_port_charset_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.subscriptions[0].port = "bad:port".to_string();
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "must be a brenn:, ephemeral:, or local: address")]
 fn surface_wrong_scheme_channel_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.subscriptions[0].channel = Some("mqtt:client:topic".to_string());
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "names no declared [[channel]]")]
 fn surface_unknown_ephemeral_channel_panics() {
-    let (dir, _ephem_chs) = surface_dir_and_ephem();
-    // Empty ephemeral set → the ephemeral:protobar-demo subscription has no
-    // backing channel.
-    resolve_surfaces(&[valid_surface_raw()], &dir, &[], &test_globals());
+    // The directory holds the output's channel but not the subscription's.
+    let dir = dir_of(vec![brenn_entry("brenn:alerts")]);
+    resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
 }
 
 #[test]
-#[should_panic(expected = "is not a known brenn: channel")]
+#[should_panic(expected = "names no declared [[channel]]")]
 fn surface_unknown_brenn_channel_panics() {
-    // Directory lacks brenn:alerts (the output's channel).
-    let (dir, _addr) = make_brenn_dir("brenn:other");
-    let ephem_chs = vec![ephem("protobar-demo")];
-    resolve_surfaces(&[valid_surface_raw()], &dir, &ephem_chs, &test_globals());
+    // Directory lacks brenn:alerts (the output's channel). One text answers
+    // both schemes: the lookup that fails is the same lookup.
+    let dir = dir_of(vec![brenn_entry("brenn:other"), ephem("protobar-demo")]);
+    resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
+}
+
+/// The other half of the transportable arm: the address names a declared
+/// channel, but that channel wears a transport its scheme does not name. This is
+/// the boot-time enforcement of the "surfaces off ingress paths" guarantee — the
+/// check that makes the `deliver_ingress` `Surface` panic arm unreachable — so it
+/// is pinned per scheme, on the one directory that now holds every scheme's
+/// entries.
+#[test]
+#[should_panic(expected = "-transport channel")]
+fn surface_ephemeral_channel_wearing_another_transport_panics() {
+    let mut eph = ephem("protobar-demo");
+    eph.transport_type = brenn_lib::messaging::ChannelScheme::Mqtt;
+    let dir = dir_of(vec![brenn_entry("brenn:alerts"), eph]);
+    resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
+}
+
+#[test]
+#[should_panic(expected = "-transport channel")]
+fn surface_brenn_channel_wearing_another_transport_panics() {
+    let mut alerts = brenn_entry("brenn:alerts");
+    alerts.transport_type = brenn_lib::messaging::ChannelScheme::Webhook;
+    let dir = dir_of(vec![alerts, ephem("protobar-demo")]);
+    resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "duplicate subscription binding")]
 fn surface_duplicate_subscription_port_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.subscriptions.push(surface_sub_raw(
         "ephemeral:protobar-demo",
         "protobar",
         "messages",
     ));
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "does not authorize delivery there")]
 fn surface_subscription_not_covered_panics() {
     use brenn_lib::messaging::config::SurfaceGrant;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     // Drop EphemeralSubscribe → the ephemeral sub's matcher is present but the
     // grant is gone, so allows_channel_access denies it (dead config).
     raw.grants = vec![SurfaceGrant::Publish];
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "does not authorize publishing there")]
 fn surface_output_not_covered_panics() {
     use brenn_lib::messaging::config::SurfaceGrant;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     // Drop Publish → the brenn output's matcher is present but the grant is
     // gone, so allows_brenn_publish denies it. Coverage is asserted by the
     // post-pass (lifted out of resolve_surfaces so the error-report grant can be
     // injected first), so drive that here.
     raw.grants = vec![SurfaceGrant::EphemeralSubscribe];
-    let resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     assert_output_bindings_covered(&resolved);
 }
 
@@ -1761,8 +1786,8 @@ fn surface_output_to_error_channel_covered_by_injected_grant() {
     let dir = dir_of(vec![
         brenn_entry("brenn:alerts"),
         brenn_entry("brenn:surface-errors"),
+        ephem("protobar-demo"),
     ]);
-    let ephem_chs = vec![ephem("protobar-demo")];
     let mut raw = valid_surface_raw();
     // Only the surface's own publish coverage (brenn:alerts) is operator-granted;
     // the error channel has no publish_acl entry — it must be covered solely by
@@ -1776,7 +1801,7 @@ fn surface_output_to_error_channel_covered_by_injected_grant() {
         publish_per_activation: None,
         publish_capacity: None,
     });
-    let mut resolved = resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    let mut resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     inject_surface_error_grant(&mut resolved, "surface-errors");
     // Must not panic: the injected grant covers the error-channel output.
     assert_output_bindings_covered(&resolved);
@@ -1785,12 +1810,12 @@ fn surface_output_to_error_channel_covered_by_injected_grant() {
 #[test]
 #[should_panic(expected = "declares no [[surface.component]] blocks")]
 fn surface_zero_components_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components = vec![];
     raw.subscriptions = vec![];
     raw.outputs = vec![];
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// The output-side duplicate-`(component, port)` check is a separate code path
@@ -1799,7 +1824,7 @@ fn surface_zero_components_panics() {
 #[should_panic(expected = "duplicate output binding")]
 fn surface_duplicate_output_port_panics() {
     use brenn_lib::messaging::config::SurfaceOutputRaw;
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.outputs.push(SurfaceOutputRaw {
         instance: "protobar".to_string(),
@@ -1809,25 +1834,25 @@ fn surface_duplicate_output_port_panics() {
         publish_per_activation: None,
         publish_capacity: None,
     });
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "kind must be non-empty")]
 fn surface_empty_component_kind_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].kind = String::new();
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "component kind")]
 fn surface_bad_component_kind_charset_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].kind = "bad:kind".to_string();
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// Kinds the general unreserved charset (`A-Za-z0-9._~-`) permitted but the
@@ -1836,28 +1861,28 @@ fn surface_bad_component_kind_charset_panics() {
 #[test]
 #[should_panic(expected = "component kind")]
 fn surface_uppercase_component_kind_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].kind = "Protobar".to_string();
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "component kind")]
 fn surface_underscore_component_kind_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].kind = "echo_stub".to_string();
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 #[test]
 #[should_panic(expected = "component kind")]
 fn surface_leading_hyphen_component_kind_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].kind = "-protobar".to_string();
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// An `ephemeral:` `[[channel]]` no surface binding references is allowed
@@ -1865,9 +1890,12 @@ fn surface_leading_hyphen_component_kind_panics() {
 /// "every channel must be read" cross-check is ever added.
 #[test]
 fn surface_unreferenced_ephemeral_channel_allowed() {
-    let (dir, _ephem_chs) = surface_dir_and_ephem();
-    let ephem_chs = vec![ephem("protobar-demo"), ephem("unused")];
-    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &ephem_chs, &test_globals());
+    let dir = dir_of(vec![
+        brenn_entry("brenn:alerts"),
+        ephem("protobar-demo"),
+        ephem("unused"),
+    ]);
+    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].subscriptions.len(), 1);
 }
@@ -1910,12 +1938,7 @@ fn local_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
 /// channel is looked up server-side.
 #[test]
 fn local_bindings_resolve_without_a_directory_entry_or_acl() {
-    let resolved = resolve_surfaces(
-        &[local_surface_raw()],
-        &dir_of(vec![]),
-        &[],
-        &test_globals(),
-    );
+    let resolved = resolve_surfaces(&[local_surface_raw()], &dir_of(vec![]), &test_globals());
     let s = &resolved[0];
     assert_eq!(s.subscriptions.len(), 1);
     assert_eq!(s.subscriptions[0].channel_address, "local:page-bus");
@@ -1962,7 +1985,7 @@ fn local_ring_depth_is_the_max_over_bindings() {
             ..surface_sub_raw("local:page-bus", "protobar", "in3")
         },
     ];
-    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(resolved[0].local_channels[0].ring_depth, 9);
 }
 
@@ -1976,7 +1999,7 @@ fn local_ring_depth_floors_at_one() {
         retain_depth: Some(Depth::Bounded(0)),
         ..surface_sub_raw("local:page-bus", "protobar", "in")
     }];
-    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(resolved[0].local_channels[0].ring_depth, 1);
 }
 
@@ -1987,7 +2010,7 @@ fn local_ring_depth_floors_at_one() {
 fn local_output_only_channel_is_declared_to_the_router() {
     let mut raw = local_surface_raw();
     raw.subscriptions = vec![];
-    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     let addrs: Vec<&str> = resolved[0]
         .local_channels
         .iter()
@@ -2007,7 +2030,7 @@ fn local_unbounded_retain_depth_panics() {
         retain_depth: Some(Depth::Unbounded),
         ..surface_sub_raw("local:page-bus", "protobar", "in")
     }];
-    resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
 /// A local binding's `push_depth` is honoured: the router's ports are queues
@@ -2020,7 +2043,7 @@ fn local_binding_honours_push_depth() {
         push_depth: Some(Depth::Bounded(2)),
         ..surface_sub_raw("local:page-bus", "protobar", "in")
     }];
-    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(resolved[0].subscriptions[0].push_depth, 2);
     // The ring is a separate knob on a separate axis: `push_depth` bounds the
     // port's queue, `retain_depth` the channel's replay ring. Setting one must
@@ -2032,12 +2055,7 @@ fn local_binding_honours_push_depth() {
 /// global default directly.
 #[test]
 fn local_binding_inherits_the_global_push_depth() {
-    let resolved = resolve_surfaces(
-        &[local_surface_raw()],
-        &dir_of(vec![]),
-        &[],
-        &test_globals(),
-    );
+    let resolved = resolve_surfaces(&[local_surface_raw()], &dir_of(vec![]), &test_globals());
     assert_eq!(resolved[0].subscriptions[0].push_depth, 8);
 }
 
@@ -2052,7 +2070,7 @@ fn local_wake_min_panics() {
         wake_min: Some(brenn_lib::messaging::WakeMin::High),
         ..surface_sub_raw("local:page-bus", "protobar", "in")
     }];
-    resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
 /// Reserved channels carry contract-fixed depths, so an override is not merely
@@ -2066,7 +2084,7 @@ fn local_retain_depth_on_a_reserved_channel_panics() {
         retain_depth: Some(Depth::Bounded(4)),
         ..surface_sub_raw("local:brenn/theme", "protobar", "theme-in")
     }];
-    resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
 /// The contract-fixed depths, pinned end-to-end through resolution: the four
@@ -2086,7 +2104,7 @@ fn reserved_local_channels_carry_their_contract_fixed_ring_depths() {
         surface_sub_raw("local:brenn/surface-state", "protobar", "p4"),
         surface_sub_raw("local:brenn/toast", "protobar", "p5"),
     ];
-    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     let depths: Vec<(&str, u64)> = resolved[0]
         .local_channels
         .iter()
@@ -2111,7 +2129,7 @@ fn reserved_local_channels_carry_their_contract_fixed_ring_depths() {
 fn local_takeover_binding_without_the_grant_panics() {
     let mut raw = local_surface_raw();
     raw.subscriptions = vec![surface_sub_raw("local:brenn/takeover", "protobar", "t")];
-    resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
 /// ...and with the grant it resolves. Pins that the check reads the grant
@@ -2123,7 +2141,7 @@ fn local_takeover_binding_with_the_grant_resolves() {
     raw.grants = vec![SurfaceGrant::Takeover];
     raw.subscriptions = vec![surface_sub_raw("local:brenn/takeover", "protobar", "t")];
     raw.outputs = vec![];
-    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(
         resolved[0].local_channels[0].address,
         "local:brenn/takeover"
@@ -2146,7 +2164,7 @@ fn local_output_to_a_kernel_only_plane_panics() {
         publish_per_activation: None,
         publish_capacity: None,
     }];
-    resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
 /// ...but subscribing one is ordinary: that is how chrome renders the banner.
@@ -2155,7 +2173,7 @@ fn local_subscription_to_a_kernel_only_plane_resolves() {
     let mut raw = local_surface_raw();
     raw.subscriptions = vec![surface_sub_raw("local:brenn/link-state", "protobar", "ls")];
     raw.outputs = vec![];
-    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(
         resolved[0].local_channels[0].address,
         "local:brenn/link-state"
@@ -2169,7 +2187,7 @@ fn local_subscription_to_a_kernel_only_plane_resolves() {
 fn local_undefined_reserved_channel_panics() {
     let mut raw = local_surface_raw();
     raw.subscriptions = vec![surface_sub_raw("local:brenn/nonesuch", "protobar", "in")];
-    resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
 /// The reservation rests on the charset: `/` is outside the operator set, so an
@@ -2181,7 +2199,7 @@ fn local_undefined_reserved_channel_panics() {
 fn local_operator_channel_with_a_slash_panics() {
     let mut raw = local_surface_raw();
     raw.subscriptions = vec![surface_sub_raw("local:mine/own", "protobar", "in")];
-    resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
 #[test]
@@ -2189,7 +2207,7 @@ fn local_operator_channel_with_a_slash_panics() {
 fn local_empty_channel_name_panics() {
     let mut raw = local_surface_raw();
     raw.subscriptions = vec![surface_sub_raw("local:", "protobar", "in")];
-    resolve_surfaces(&[raw], &dir_of(vec![]), &[], &test_globals());
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
 /// A surface whose one component's ABI is `abi`, ready to resolve.
@@ -2201,12 +2219,7 @@ fn surface_with_abi(abi: &str) -> brenn_lib::messaging::config::SurfaceConfigRaw
 
 #[test]
 fn component_abi_dom_resolves() {
-    let resolved = resolve_surfaces(
-        &[surface_with_abi("dom")],
-        &dir_of(vec![]),
-        &[],
-        &test_globals(),
-    );
+    let resolved = resolve_surfaces(&[surface_with_abi("dom")], &dir_of(vec![]), &test_globals());
     // The declared component carries its resolved ABI to the page: the shell is
     // told what it is loading rather than inferring it from the kind.
     assert_eq!(resolved[0].components[0].abi, brenn_surface_proto::Abi::Dom);
@@ -2220,7 +2233,6 @@ fn component_abi_processor_resolves() {
     let resolved = resolve_surfaces(
         &[surface_with_abi("processor")],
         &dir_of(vec![]),
-        &[],
         &test_globals(),
     );
     assert_eq!(
@@ -2237,7 +2249,6 @@ fn component_abi_dom_ts_panics() {
     resolve_surfaces(
         &[surface_with_abi("dom-ts")],
         &dir_of(vec![]),
-        &[],
         &test_globals(),
     );
 }
@@ -2248,7 +2259,6 @@ fn component_abi_html_panics() {
     resolve_surfaces(
         &[surface_with_abi("html")],
         &dir_of(vec![]),
-        &[],
         &test_globals(),
     );
 }
@@ -2262,7 +2272,6 @@ fn component_abi_unknown_panics() {
     resolve_surfaces(
         &[surface_with_abi("wasm")],
         &dir_of(vec![]),
-        &[],
         &test_globals(),
     );
 }
@@ -2272,12 +2281,7 @@ fn component_abi_unknown_panics() {
 fn component_abi_is_case_sensitive() {
     // The ABI set is a fixed vocabulary, not a string the resolver normalizes:
     // accepting "DOM" would mean the config had two spellings of one value.
-    resolve_surfaces(
-        &[surface_with_abi("DOM")],
-        &dir_of(vec![]),
-        &[],
-        &test_globals(),
-    );
+    resolve_surfaces(&[surface_with_abi("DOM")], &dir_of(vec![]), &test_globals());
 }
 
 // --- depth-0: the bus's rule set, one set for every ABI and class ---
@@ -2295,11 +2299,11 @@ fn resolve_with_component_config(
     config: Option<std::collections::BTreeMap<String, String>>,
     abi: &str,
 ) -> Vec<brenn_lib::messaging::config::ResolvedSurface> {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].abi = abi.to_string();
     raw.components[0].config = config;
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals())
+    resolve_surfaces(&[raw], &dir, &test_globals())
 }
 
 /// A `processor` component's declared map resolves through onto its
@@ -2399,6 +2403,118 @@ fn a_triggering_binding_may_declare_noise_and_no_context() {
     );
 }
 
+// --- The channel-grain retention gate ---
+
+/// A surface *input* binding on a channel that retains nothing is refused at
+/// boot: the subscription's position is recovered by re-reading retention, so
+/// after its first missed message it would receive nothing, forever, with
+/// nothing on the wire to say so.
+#[test]
+#[should_panic(expected = "resolves to a channel-level retain_depth = 0")]
+fn surface_input_binding_on_a_retain_zero_ephemeral_channel_panics() {
+    use brenn_lib::messaging::config::{Depth, NoiseLevel};
+    let dir = surface_dir_with(ephem_with(
+        "protobar-demo",
+        Depth::Bounded(8),
+        0,
+        NoiseLevel::Silent,
+    ));
+    resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
+}
+
+/// Class parity for the gate: the same config on a `brenn:` channel is refused
+/// in the same words. The durable reap frontier can pin rows a channel rung of 0
+/// would not, so a durable channel might limp where its ephemeral twin strands —
+/// one config with two class-dependent outcomes, which is what the uniform gate
+/// forbids.
+#[test]
+#[should_panic(expected = "resolves to a channel-level retain_depth = 0")]
+fn surface_input_binding_on_a_retain_zero_durable_channel_panics() {
+    use brenn_lib::messaging::config::Depth;
+    let dir = dir_of(vec![brenn_entry_with(
+        "brenn:alerts",
+        Depth::Bounded(16),
+        Depth::Bounded(0),
+        NoiseLevel::Silent,
+    )]);
+    let mut raw = durable_surface_raw();
+    // Leave the binding's retain unset: the gate is about the channel's rung,
+    // not what the binding asks of it.
+    raw.subscriptions[0].retain_depth = None;
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// The gate reads the channel's *resolved* rung, so a 0 inherited from
+/// `[messaging].default_retain_depth` — with no `[[channel]]` value in sight —
+/// is refused exactly as a stated one is.
+#[test]
+#[should_panic(expected = "resolves to a channel-level retain_depth = 0")]
+fn surface_input_binding_inheriting_a_retain_zero_global_default_panics() {
+    use brenn_lib::messaging::config::{ChannelConfigRaw, Depth, build_channel_entries};
+    let globals = brenn_lib::messaging::config::MessagingGlobalConfig {
+        default_push_depth: Depth::Bounded(8),
+        default_retain_depth: Depth::Bounded(0),
+        ..Default::default()
+    };
+    let entries = build_channel_entries(
+        &[ChannelConfigRaw {
+            send_rate: None,
+            uuid: None,
+            address: "ephemeral:protobar-demo".to_string(),
+            description: None,
+            push_depth: None,
+            retain_depth: None,
+            standing_retain_depth: None,
+            noise: None,
+            sink: None,
+            wake_min: None,
+        }],
+        &globals,
+    );
+    let dir = dir_of(
+        entries
+            .into_iter()
+            .chain([brenn_entry("brenn:alerts")])
+            .collect(),
+    );
+    resolve_surfaces(&[valid_surface_raw()], &dir, &globals);
+}
+
+/// Only *input* bindings pass through the resolver that gates retention, so a
+/// retain-0 channel a surface only publishes onto boots: an output holds no
+/// position and recovers nothing.
+#[test]
+fn surface_output_only_binding_on_a_retain_zero_channel_boots() {
+    use brenn_lib::messaging::config::Depth;
+    let dir = dir_of(vec![
+        brenn_entry_with(
+            "brenn:alerts",
+            Depth::Bounded(16),
+            Depth::Bounded(0),
+            NoiseLevel::Silent,
+        ),
+        ephem("protobar-demo"),
+    ]);
+    // The valid fixture binds `brenn:alerts` as an output only.
+    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
+    assert_eq!(resolved[0].outputs[0].channel_address, "brenn:alerts");
+}
+
+/// A retain-0 channel no surface binds at all is untouched by the gate — the
+/// tightening is scoped to surface-bound channels, and retain-0 channels stay
+/// legal everywhere else on the bus.
+#[test]
+fn a_retain_zero_channel_with_no_surface_binding_boots() {
+    use brenn_lib::messaging::config::{Depth, NoiseLevel};
+    let dir = dir_of(vec![
+        brenn_entry("brenn:alerts"),
+        ephem("protobar-demo"),
+        ephem_with("unbound", Depth::Bounded(8), 0, NoiseLevel::Silent),
+    ]);
+    let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
+    assert_eq!(resolved.len(), 1);
+}
+
 /// An instance every one of whose ports is context-only can never activate, so
 /// its context windows are never read — dead config at the instance grain, the
 /// check `resolve_wasm_consumers` makes at its own principal's.
@@ -2429,20 +2545,20 @@ fn an_instance_with_no_input_bindings_is_not_judged() {
 #[test]
 #[should_panic(expected = "declares no channel and no [[connection]] binds it")]
 fn surface_free_input_port_with_no_connection_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.subscriptions[0].channel = None;
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// Same for a surface output binding.
 #[test]
 #[should_panic(expected = "declares no channel and no [[connection]] binds it")]
 fn surface_free_output_port_with_no_connection_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.outputs[0].channel = None;
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
 /// A hand-written `local:auto.<cid>` on a surface binding is rejected: the page
@@ -2450,9 +2566,9 @@ fn surface_free_output_port_with_no_connection_panics() {
 #[test]
 #[should_panic(expected = "reserved auto namespace")]
 fn surface_operator_written_auto_address_panics() {
-    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.subscriptions[0].channel =
         Some("local:auto.9c1f4a4e-6d38-4a2e-9f1a-2f7c0d5b8e31".to_string());
-    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+    resolve_surfaces(&[raw], &dir, &test_globals());
 }

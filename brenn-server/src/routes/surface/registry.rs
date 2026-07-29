@@ -1,8 +1,8 @@
 //! Registry of attached surface WS sessions, keyed by surface slug.
 //!
 //! Enforces the per-surface session cap and provides per-session attribution
-//! for logging. The attached-session view is also what a durable push router
-//! reads to route wakes to live connections.
+//! for logging. The attached-session view is also what the push router reads to
+//! route wakes to live connections.
 
 // The route handler and session task that call these land in a later
 // increment; the in-crate tests already exercise them.
@@ -33,7 +33,7 @@ pub const PUSH_QUEUE_FRAMES: usize = 256;
 /// deferred-view snapshots it forwards verbatim.
 #[derive(Clone)]
 pub enum SessionPush {
-    Durable(DurableDelivery),
+    Live(LiveDelivery),
     DeferredView(DeferredViewPush),
 }
 
@@ -50,19 +50,19 @@ pub struct DeferredViewPush {
     pub entries: Vec<DeferredViewEntry>,
 }
 
-/// One live durable row handed from the `WakeRouter` fan-out to a subscribed
-/// session's task via its bounded `durable_tx`. The channel is
+/// One live retained row handed from the `WakeRouter` fan-out to a subscribed
+/// session's task via its bounded `push_tx`. The channel is
 /// `envelope.channel`. A session that misses one — queue full, or gone between
 /// the fan-out and the send — resumes past it from its own cursor, so the
 /// hand-off owes nothing and carries no delivery state. The envelope is an `Arc`
 /// so the fan-out shares one allocation across every subscribed session instead
 /// of cloning the body per session.
 #[derive(Clone)]
-pub struct DurableDelivery {
+pub struct LiveDelivery {
     pub envelope: Arc<MessageEnvelope>,
     /// The message's position in its channel's retention order — what the
-    /// session mints the wire cursor's high-water from, and the key its
-    /// duplicate suppression runs on.
+    /// session mints the wire cursor's position from, and the key its duplicate
+    /// suppression runs on.
     pub retained_seq: u64,
     /// The subscription this row is targeted at — the principal the delivery was
     /// resolved for, paired with the row's channel. The session routes the
@@ -102,7 +102,7 @@ pub struct SurfaceRegistry {
 
 /// Per-connection record for one attached session.
 ///
-/// The push fields (`push_tx`, `durable_subs`, `drain_notify`) are shared
+/// The push fields (`push_tx`, `active_subs`, `drain_notify`) are shared
 /// between the registry (where producers write) and the session task (which
 /// drains). Created in the WS handler.
 #[derive(Clone)]
@@ -115,20 +115,20 @@ pub struct SurfaceSessionHandle {
     /// Live rows and deferred-view snapshots to this session's task (bounded,
     /// `try_send`).
     pub push_tx: mpsc::Sender<SessionPush>,
-    /// The durable subscriptions this session currently holds — `(instance,
+    /// The subscriptions this session currently holds — `(instance,
     /// channel)`, not just channel, because the subscription belongs to the
     /// principal that bound it. Written by the session task
     /// (subscribe/unsubscribe), read by the router fan-out. Sync `Mutex`, never
     /// held across `.await` (registry discipline).
-    pub durable_subs: Arc<Mutex<HashSet<SubKey>>>,
+    pub active_subs: Arc<Mutex<HashSet<SubKey>>>,
     /// Eager-wake nudge: the router notifies it so the session runs a drain pass
     /// (flushing quiet/parked rows the live path did not carry).
     pub drain_notify: Arc<Notify>,
 }
 
 impl SurfaceSessionHandle {
-    /// Whether this session currently holds an active durable `Subscribe` for
-    /// `sub`. Confines the `durable_subs` lock scope to this method so the
+    /// Whether this session currently holds an active `Subscribe` for `sub`.
+    /// Confines the `active_subs` lock scope to this method so the
     /// sync-Mutex-never-across-await discipline lives in one place rather than
     /// being re-implemented at every reader.
     ///
@@ -137,9 +137,9 @@ impl SurfaceSessionHandle {
     /// channel happens to be subscribed — they are separate principals with
     /// separate windows, and the row belongs to exactly one of them.
     pub fn is_subscribed(&self, sub: &SubKey) -> bool {
-        self.durable_subs
+        self.active_subs
             .lock()
-            .expect("durable_subs poisoned")
+            .expect("active_subs poisoned")
             .contains(sub)
     }
 
@@ -164,7 +164,7 @@ impl SurfaceSessionHandle {
             client_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             connected_at: Utc::now(),
             push_tx,
-            durable_subs: Arc::new(Mutex::new(HashSet::new())),
+            active_subs: Arc::new(Mutex::new(HashSet::new())),
             drain_notify: Arc::new(Notify::new()),
         }
     }
@@ -226,7 +226,7 @@ impl SurfaceRegistry {
 
     /// Snapshot of the sessions attached to `slug`. Handles are stored behind an
     /// `Arc`, so this clones only refcounts — the router fan-out and eager-wake,
-    /// which run per durable row on the shared dispatch loop, pay a pointer bump
+    /// which run per row on the shared dispatch loop, pay a pointer bump
     /// rather than a deep clone of every handle.
     pub fn sessions(&self, slug: &str) -> Vec<Arc<SurfaceSessionHandle>> {
         let map = self.inner.lock().expect("surface_registry poisoned");

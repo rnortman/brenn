@@ -254,6 +254,29 @@ pub fn retention_frontier<M: Clone, Ep: Copy + PartialEq>(ring: &RetainedRing<M,
     frontier(ring)
 }
 
+/// Cut a gap window to the deliverable suffix above `resume_seq`, and count the
+/// positions lost between the resume point and the suffix's oldest entry.
+///
+/// A gap answer's window is the channel's newest retained entries rather than a
+/// suffix of the resume point, so a resuming consumer cannot take it whole:
+/// entries at or below `resume_seq` are copies of positions it already holds,
+/// and the seqs between `resume_seq` and the oldest surviving entry are gone.
+///
+/// `lost` is the same subtraction [`Advance::dropped`] performs at a cursor
+/// advance — unseen seqs the position stepped past that no window served —
+/// computed at a resume instead of at an advance. An empty suffix loses nothing:
+/// the position never moves, so nothing was stepped past.
+pub fn gap_suffix<M>(window: Vec<Retained<M>>, resume_seq: u64) -> (Vec<Retained<M>>, u64) {
+    let suffix: Vec<Retained<M>> = window
+        .into_iter()
+        .filter(|retained| retained.seq > resume_seq)
+        .collect();
+    let lost = suffix
+        .first()
+        .map_or(0, |retained| retained.seq - resume_seq - 1);
+    (suffix, lost)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +545,51 @@ mod tests {
         let ring = ring_of(8, &["a", "b"]);
         let mut cursor = SubscriberCursor::at_head(&empty(8), 4);
         cursor.advance(&ring, 1, 3);
+    }
+
+    fn window_of(seqs: &[u64]) -> Vec<Retained<&'static str>> {
+        seqs.iter()
+            .map(|seq| Retained {
+                seq: *seq,
+                message: "m",
+            })
+            .collect()
+    }
+
+    fn suffix_seqs(window: Vec<Retained<&'static str>>, resume: u64) -> (Vec<u64>, u64) {
+        let (suffix, lost) = gap_suffix(window, resume);
+        (suffix.into_iter().map(|r| r.seq).collect(), lost)
+    }
+
+    #[test]
+    fn gap_suffix_of_an_empty_window_serves_and_loses_nothing() {
+        assert_eq!(suffix_seqs(window_of(&[]), 7), (vec![], 0));
+    }
+
+    /// Nothing above the resume point means the position does not move, so
+    /// nothing was stepped past — a window entirely of copies the consumer
+    /// already holds is not a loss.
+    #[test]
+    fn a_window_at_or_below_the_resume_serves_and_loses_nothing() {
+        assert_eq!(suffix_seqs(window_of(&[5, 6, 7]), 7), (vec![], 0));
+    }
+
+    #[test]
+    fn an_adjacent_suffix_loses_nothing() {
+        assert_eq!(suffix_seqs(window_of(&[5, 6, 7, 8]), 7), (vec![8], 0));
+    }
+
+    /// The interior span between the resume point and the oldest surviving
+    /// entry is the loss, counted the way an advance counts what it passed
+    /// unserved.
+    #[test]
+    fn an_interior_loss_counts_the_span_below_the_suffix() {
+        assert_eq!(suffix_seqs(window_of(&[12, 13]), 7), (vec![12, 13], 4));
+    }
+
+    #[test]
+    fn a_window_wholly_above_the_resume_is_served_whole() {
+        assert_eq!(suffix_seqs(window_of(&[1, 2, 3]), 0), (vec![1, 2, 3], 0));
     }
 
     /// A sampled cursor is never delivered to, so there is no position for an

@@ -40,10 +40,6 @@ pub struct RingStores {
     /// is a guaranteed gap, which is how restart loss becomes visible on every
     /// non-durable channel at once.
     epoch: Uuid,
-    /// Live-fan-out ring size given to every store, including one registered
-    /// after boot — a runtime-registered channel must behave like a declared
-    /// one, and a test that shrank the capacity means it for the whole process.
-    fan_out_capacity: u32,
     inner: RwLock<StoresInner>,
 }
 
@@ -56,7 +52,6 @@ impl RingStores {
     pub fn empty() -> Self {
         Self {
             epoch: Uuid::new_v4(),
-            fan_out_capacity: super::ring::RING_FAN_OUT_CAPACITY,
             inner: RwLock::new(StoresInner::default()),
         }
     }
@@ -70,18 +65,8 @@ impl RingStores {
     /// its configuration promised otherwise. Also if two entries name the same
     /// channel.
     pub fn build(entries: &[ChannelEntry]) -> Self {
-        Self::build_with_fan_out_capacity(entries, super::ring::RING_FAN_OUT_CAPACITY)
-    }
-
-    /// The same registry with a chosen live-fan-out ring size on every store.
-    ///
-    /// Production always takes the default; a test that wants to overrun a
-    /// consumer's fan-out ring builds a small one here rather than committing
-    /// hundreds of messages.
-    pub fn build_with_fan_out_capacity(entries: &[ChannelEntry], fan_out_capacity: u32) -> Self {
         let stores = Self {
             epoch: Uuid::new_v4(),
-            fan_out_capacity,
             inner: RwLock::new(StoresInner::default()),
         };
         for entry in entries {
@@ -131,12 +116,11 @@ impl RingStores {
                 entry.address, entry.uuid,
             );
         }
-        let store = Arc::new(RingStore::with_fan_out_capacity(
+        let store = Arc::new(RingStore::with_epoch(
             entry.uuid,
             entry.address.clone(),
             entry.resolved_channel.retain_depth,
             self.epoch,
-            self.fan_out_capacity,
         ));
         inner.by_address.insert(entry.address.clone(), entry.uuid);
         inner.by_uuid.insert(entry.uuid, store);

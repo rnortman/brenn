@@ -28,9 +28,8 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use brenn_lib::access::AppPolicy;
 use brenn_lib::auth::session::Session;
-pub use brenn_lib::messaging::DeliveryClass;
 use brenn_lib::messaging::config::{
-    ResolvedSubscription, ResolvedSurface, ResolvedWasmConsumer, SurfaceBinding, SurfaceOutput,
+    Depth, ResolvedSurface, ResolvedWasmConsumer, SurfaceBinding, SurfaceOutput,
 };
 use brenn_lib::messaging::gates::well_formed_name;
 use brenn_lib::messaging::system::SystemParticipantSpec;
@@ -41,7 +40,7 @@ use brenn_surface_contract::{
 };
 use brenn_surface_proto::{
     Binding, ComponentEntry, LocalChannel, LogLevel, NoiseLevel as WireNoiseLevel, OutputBinding,
-    SurfaceBindings, is_local_channel, max_client_frame_bytes, surface_delivery_class,
+    SurfaceBindings, channel_capabilities, is_local_channel, max_client_frame_bytes,
 };
 use chrono::Utc;
 use tracing::warn;
@@ -55,8 +54,8 @@ use crate::state::AppState;
 
 /// Maximum concurrent attached WS sessions per surface, across all users.
 ///
-/// Each attached session costs a broadcast receiver per subscription plus an
-/// outbound queue, so an unbounded attach count is an authenticated-user memory
+/// Each attached session costs a push queue plus an outbound queue, so an
+/// unbounded attach count is an authenticated-user memory
 /// DoS. Exceeding this is answered with `503` (not a security event: a user with
 /// many tabs is not fail2ban signal). The sibling
 /// `MAX_SESSIONS_PER_USER_PER_SURFACE` bounds how much of this any one account
@@ -243,23 +242,48 @@ pub struct SurfaceDescriptionRuntime {
     pub expected_pumps: HashMap<String, u32>,
 }
 
-/// What one declared subscription is, at the grain the session delivers it:
-/// which class routes it, and whether it has a push window at all.
+/// What one declared subscription is, at the grain the session delivers it: its
+/// two boot-resolved depths, both folded across its bindings (one instance may
+/// bind one channel on two ports, and they share one subscription).
 ///
-/// `push_enabled` is the **fold** over the subscription's bindings — one
-/// instance may bind one channel on two ports, and they share one subscription,
-/// so the subscription pushes if any of them does (the max fold the boot
-/// resolver and `reap_frontier` already take over depth). A subscription whose
-/// fold is 0 is a *context feed*: its rows still reach the page — they are the
-/// page's retained-ring diet, and `retain_depth` bounds page memory, not the
-/// wire — but no push window exists behind them, so there is no overflow for
-/// `Deliver.dropped` to account.
+/// Two knobs, not one flattening of them: `push_depth` is what wakes the page,
+/// `retain_depth` is what it can see, and everything the session needs is
+/// derived from the pair rather than stored beside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscriptionFacts {
-    /// Delivery class, derived from the channel address's scheme.
-    pub class: DeliveryClass,
-    /// Whether any binding on this subscription resolves to `push_depth >= 1`.
-    pub push_enabled: bool,
+    /// The subscription's folded push depth — the page queue behind it.
+    pub push_depth: u64,
+    /// The subscription's folded retain depth — the page's retained context
+    /// ring behind it.
+    pub retain_depth: u64,
+}
+
+impl SubscriptionFacts {
+    /// Whether this subscription has a push window at all.
+    ///
+    /// A subscription whose fold is 0 is a *context feed*: its rows still reach
+    /// the page — they are the page's retained-ring diet, and `retain_depth`
+    /// bounds page memory, not the wire — but no push window exists behind them,
+    /// so there is no overflow for `Deliver.dropped` to account.
+    pub(crate) fn push_enabled(self) -> bool {
+        self.push_depth >= 1
+    }
+
+    /// How far back a subscribe or a drain reads into the channel's retention.
+    ///
+    /// The max of the two depths, because that is what the subscription is owed:
+    /// a subscriber with `push = 8, retain = 2` that missed 8 rows would have
+    /// received all 8 had it stayed connected, so the drain may ask for all 8. A
+    /// clamp below the wider knob would starve the push window on recovery.
+    ///
+    /// The clamp is a request, not a promise: if the store retains fewer rows
+    /// than the clamp asks for, the shortfall is reported as `dropped` —
+    /// bounded loss, exactly as `docs/message-bus.md` prescribes. Boot proves
+    /// both depths bounded and refuses a binding that is neither triggering nor
+    /// context-carrying, so this is always a bounded, non-zero window.
+    pub(crate) fn replay_clamp(self) -> Depth {
+        Depth::Bounded(self.push_depth.max(self.retain_depth))
+    }
 }
 
 /// Map one resolved config binding to its wire form for the `Welcome` payload.
@@ -286,8 +310,8 @@ fn wire_noise(n: brenn_lib::messaging::config::NoiseLevel) -> WireNoiseLevel {
     }
 }
 
-/// The identity of one durable subscription on a surface session: the principal
-/// that owns it and the channel it covers.
+/// The identity of one subscription on a surface session: the principal that
+/// owns it and the channel it covers.
 ///
 /// This is the grain the whole subscription is cut at — its own push window, its
 /// own resume cursor, its own lag — so it is what the session's active set, the
@@ -298,34 +322,23 @@ fn wire_noise(n: brenn_lib::messaging::config::NoiseLevel) -> WireNoiseLevel {
 pub struct SubKey {
     /// The owning component instance. Every surface subscription is an
     /// instance's; the bare `surface:<slug>` grain is publisher-only and holds
-    /// no durable subscription.
+    /// no subscription.
     pub instance: String,
     /// Full scheme-qualified channel address.
     pub channel: String,
 }
 
-impl SubKey {
-    /// The subscriber identity this subscription's push rows are targeted at —
-    /// the principal, at the grain it subscribed.
-    pub fn participant(&self, slug: &str) -> ParticipantId {
-        ParticipantId::for_surface_component(slug, &self.instance)
-    }
-}
-
 /// Everything the publish path needs about one bound output port, resolved at
-/// boot: where the message goes, which class routes it, and the urgency to send
-/// it at when the component states none.
+/// boot: where the message goes, and the urgency to send it at when the
+/// component states none.
 ///
-/// A named struct rather than a tuple: the address is a `String` and the class
-/// and urgency are both small enums, so a transposed tuple field would
-/// typecheck — the same argument `PublishRequest` already makes about
-/// `instance`/`subject_instance`.
+/// A named struct rather than a tuple: the address is a `String` and the
+/// urgency a small enum, so a transposed tuple field would typecheck — the same
+/// argument `PublishRequest` already makes about `instance`/`subject_instance`.
 #[derive(Debug, Clone)]
 pub struct OutputPort {
     /// Full scheme-qualified channel address the port publishes onto.
     pub address: String,
-    /// Delivery class, derived from the address's scheme.
-    pub class: DeliveryClass,
     /// The port's configured default urgency. Applies when the client's
     /// `Publish` frame carries no override; the client's override wins.
     ///
@@ -350,64 +363,64 @@ fn wire_output(b: &SurfaceOutput) -> OutputBinding {
     }
 }
 
-/// Classify a surface-bound channel address into its delivery class via the
-/// shared `surface_delivery_class` derivation.
+/// Assert that a channel the wire maps hold is transportable — the one channel
+/// characteristic the surface bridge is allowed to see, because only
+/// transportable channels cross the websocket at all.
 ///
 /// Panics on any scheme not surface-bindable (anything but `brenn:`/
-/// `ephemeral:`/`local:`): `resolve_surfaces` already restricted surface
-/// bindings to exactly those three, so any other prefix here is a broken boot
-/// invariant, not attacker-reachable.
-fn classify(address: &str) -> DeliveryClass {
-    surface_delivery_class(address).unwrap_or_else(|| {
+/// `ephemeral:`/`local:`) and on `local:` itself: `resolve_surfaces` restricted
+/// surface bindings to those three, and the wire maps exclude `local:` by
+/// construction, so either is a broken boot invariant rather than client input.
+fn assert_transportable(address: &str) {
+    let capabilities = channel_capabilities(address).unwrap_or_else(|| {
         panic!(
             "surface binding address {address:?} is not a surface-bindable scheme (brenn:, \
              ephemeral:, or local:) — resolve_surfaces should have rejected it at boot"
         )
-    })
+    });
+    assert!(
+        capabilities.transportable,
+        "surface binding address {address:?} is not transportable — page-local traffic never \
+         crosses the wire, and the wire maps exclude it by construction"
+    );
+}
+
+/// Read one of a wire subscription's resolved depths as the number boot proved
+/// it to be.
+///
+/// # Panics
+///
+/// On an unbounded depth: every replay the wire serves must be bounded, and boot
+/// refuses the config that would leave one otherwise, so this is a broken boot
+/// invariant rather than a condition to handle.
+fn bounded_depth(depth: Depth, knob: &str, slug: &str, sub: &SubKey) -> u64 {
+    let Depth::Bounded(n) = depth else {
+        panic!(
+            "surface {slug:?}: wire subscription {} (instance {:?}) resolves an unbounded {knob} \
+             — boot bounds both depths of every wire subscription",
+            sub.channel, sub.instance,
+        )
+    };
+    n
 }
 
 impl SurfaceRuntime {
-    /// Resolve a durable channel's subscription (channel uuid + retain clamp).
-    /// Boot classified the channel `Durable`, so a miss is a broken boot
-    /// invariant, not attacker-reachable — panic (fail-fast) rather than skip.
-    pub(crate) fn durable_subscription(&self, sub: &SubKey) -> &ResolvedSubscription {
-        self.resolved
-            .durable_subscriptions
-            .iter()
-            .find(|s| s.instance == sub.instance && s.subscription.channel_address == sub.channel)
-            .map(|s| &s.subscription)
-            .unwrap_or_else(|| {
-                panic!(
-                    "surface {}: durable subscription {} (instance {:?}) classified Durable but \
-                     absent from resolved durable_subscriptions — boot invariant violated",
-                    self.resolved.slug, sub.channel, sub.instance
-                )
-            })
-    }
-
-    /// Whether this subscription has a push window — i.e. whether an overflow
-    /// behind it is expressible at all.
-    ///
-    /// A context feed (fold-max `push_depth = 0`) has none: its rows flow, but no
-    /// window exists to overflow, so nothing may be reported as dropped on it.
+    /// The boot-resolved facts for one declared subscription.
     ///
     /// # Panics
     ///
     /// On a subscription this surface does not declare. Every caller holds a
     /// `SubKey` that came out of this same map (an inbound `Subscribe` naming
-    /// anything else was killed as a violation before a stream existed), so a
+    /// anything else was killed as a violation before it was activated), so a
     /// miss here is a broken invariant, not client input.
-    pub(crate) fn push_enabled(&self, sub: &SubKey) -> bool {
-        self.subscription_channels
-            .get(sub)
-            .unwrap_or_else(|| {
-                panic!(
-                    "broken invariant: surface {} delivered on undeclared subscription {} \
-                     (instance {:?})",
-                    self.resolved.slug, sub.channel, sub.instance,
-                )
-            })
-            .push_enabled
+    pub(crate) fn subscription_facts(&self, sub: &SubKey) -> SubscriptionFacts {
+        *self.subscription_channels.get(sub).unwrap_or_else(|| {
+            panic!(
+                "broken invariant: surface {} delivered on undeclared subscription {} \
+                 (instance {:?})",
+                self.resolved.slug, sub.channel, sub.instance,
+            )
+        })
     }
 
     /// Whether `instance` is in this surface's boot-resolved declaration set.
@@ -449,6 +462,20 @@ impl SurfaceRuntime {
         })
     }
 
+    /// The store's boot counter, stamped into every cursor this surface's
+    /// sessions mint.
+    ///
+    /// A per-process constant the messenger resolved at its own boot, so a
+    /// session reads it once at connect rather than querying the database per
+    /// `Subscribe`.
+    ///
+    /// # Panics
+    ///
+    /// If this runtime has no `Messenger`; see [`SurfaceRuntime::messenger`].
+    pub(crate) fn store_incarnation(&self) -> i64 {
+        self.messenger().store_incarnation()
+    }
+
     /// Build the runtime for one resolved surface.
     ///
     /// Does not validate that output channels exist in the directory — that is
@@ -461,24 +488,24 @@ impl SurfaceRuntime {
         max_body_bytes: usize,
         description: SurfaceDescriptionParams,
     ) -> Self {
-        // Durable messaging needs a Messenger (directory + DB + durable queries).
-        // A durable *subscription* with no Messenger is a broken boot invariant —
-        // assert it here (fail-fast) rather than fail later in
-        // `handle_durable_subscribe`. A durable *output* also needs the Messenger
-        // (it publishes via `publish_from_surface`); that direction is enforced
-        // fail-fast at the session publish site instead (`handle_publish` panics
-        // on a `None` messenger). It is deliberately *not* asserted here: the
-        // assert is expressible (it needs only `messenger.is_some()` plus the
-        // output classes computed below), but (a) the combination is unreachable
-        // from real config — a bound `brenn:` output implies a directory channel
-        // implies messaging configured implies `Some` — and (b) asserting it would
-        // force a real Messenger into the ephemeral-only tests that share the
-        // durable-output-carrying `deskbar_pub` fixture, buying no production
-        // coverage. The session-site panic is the fail-fast backstop.
+        // Both wire directions need a Messenger — a subscription reads the
+        // channel's retention through it, an output publishes through it — so a
+        // surface carrying either and built without one is a broken boot
+        // invariant, caught here by whoever starts the server. The session-site
+        // panics (`handle_subscribe`, `handle_publish`) stay as the
+        // defence-in-depth backstop; on their own they are weaker in kind,
+        // because the misconfiguration would ship and surface as a broken page
+        // in front of a user.
+        let carries_wire_binding = resolved
+            .subscriptions
+            .iter()
+            .map(|b| &b.channel_address)
+            .chain(resolved.outputs.iter().map(|b| &b.channel_address))
+            .any(|address| !is_local_channel(address));
         assert!(
-            resolved.durable_subscriptions.is_empty() || messenger.is_some(),
-            "surface {:?} has durable subscriptions but no Messenger — durable projection \
-             requires messaging to be configured",
+            !carries_wire_binding || messenger.is_some(),
+            "surface {:?} has wire bindings but no Messenger — every binding that crosses the \
+             websocket reads or writes the bus through one",
             resolved.slug,
         );
         let participant = ParticipantId::for_surface(&resolved.slug);
@@ -489,37 +516,64 @@ impl SurfaceRuntime {
         // channel is *unbound* as far as the wire is concerned and a `Subscribe`
         // naming one is the ordinary unbound-channel violation. Same for
         // `output_ports` below. That exclusion is what makes the
-        // `DeliveryClass::Local` panic arms downstream (`handle_publish`'s
-        // dispatch) structurally unreachable rather than merely unlikely.
+        // transportability asserts downstream (`handle_subscribe`,
+        // `handle_publish`) structurally unreachable rather than merely unlikely.
         let mut subscription_channels: HashMap<SubKey, SubscriptionFacts> = HashMap::new();
         for b in resolved
             .subscriptions
             .iter()
             .filter(|b| !is_local_channel(&b.channel_address))
         {
-            let facts = subscription_channels
-                .entry(SubKey {
-                    instance: b.instance.clone(),
-                    channel: b.channel_address.clone(),
+            assert_transportable(&b.channel_address);
+            let key = SubKey {
+                instance: b.instance.clone(),
+                channel: b.channel_address.clone(),
+            };
+            // Both depths come off the wire subscription, which boot folded
+            // across this (instance, channel)'s bindings and proved bounded. A
+            // binding in the wire map with no wire subscription means the two
+            // boot paths disagree about which bindings cross the wire — fail
+            // fast.
+            let wire = resolved
+                .wire_subscriptions
+                .iter()
+                .find(|s| {
+                    s.instance == key.instance && s.subscription.channel_address == key.channel
                 })
-                .or_insert(SubscriptionFacts {
-                    class: classify(&b.channel_address),
-                    push_enabled: false,
+                .unwrap_or_else(|| {
+                    panic!(
+                        "surface {:?}: transportable binding {} (instance {:?}) has no resolved \
+                         wire subscription — the binding resolver and the subscription resolver \
+                         disagree about which bindings cross the wire",
+                        resolved.slug, key.channel, key.instance,
+                    )
                 });
-            // Fold: two ports of one instance on one channel share a
-            // subscription, and it pushes if either of them does.
-            facts.push_enabled |= b.push_depth >= 1;
+            let facts = SubscriptionFacts {
+                push_depth: bounded_depth(
+                    wire.subscription.push_depth,
+                    "push_depth",
+                    &resolved.slug,
+                    &key,
+                ),
+                retain_depth: bounded_depth(
+                    wire.subscription.retain_depth,
+                    "retain_depth",
+                    &resolved.slug,
+                    &key,
+                ),
+            };
+            subscription_channels.insert(key, facts);
         }
         let output_ports: HashMap<(String, String), OutputPort> = resolved
             .outputs
             .iter()
             .filter(|b| !is_local_channel(&b.channel_address))
             .map(|b| {
+                assert_transportable(&b.channel_address);
                 (
                     (b.instance.clone(), b.port.clone()),
                     OutputPort {
                         address: b.channel_address.clone(),
-                        class: classify(&b.channel_address),
                         default_urgency: b.default_urgency,
                     },
                 )
@@ -643,7 +697,6 @@ pub fn build_surface_runtimes(
                     ),
                     OutputPort {
                         address: channel_address.clone(),
-                        class: DeliveryClass::Durable,
                         // The reserved port is wired from `surface_error_channel`,
                         // not from an `[[surface.output]]` block, so there is no
                         // operator urgency knob on it to read: it takes the same
@@ -1078,9 +1131,9 @@ pub async fn surface_ws_handler(
     let session_id = Uuid::new_v4();
     // Push handle, shared between the registry (read by the router fan-out and by
     // sibling session tasks) and this session task (which drains it): a bounded
-    // push queue, the active-durable-channel set, and the drain nudge.
+    // push queue, the active-subscription set, and the drain nudge.
     let (push_tx, push_rx) = tokio::sync::mpsc::channel(PUSH_QUEUE_FRAMES);
-    let durable_subs = Arc::new(Mutex::new(HashSet::new()));
+    let active_subs = Arc::new(Mutex::new(HashSet::new()));
     let drain_notify = Arc::new(tokio::sync::Notify::new());
     let handle = SurfaceSessionHandle {
         session_id,
@@ -1088,7 +1141,7 @@ pub async fn surface_ws_handler(
         client_ip: ip,
         connected_at: Utc::now(),
         push_tx,
-        durable_subs: durable_subs.clone(),
+        active_subs: active_subs.clone(),
         drain_notify: drain_notify.clone(),
     };
     let caps = SessionCaps {
@@ -1159,7 +1212,7 @@ pub async fn surface_ws_handler(
                 heartbeat_secs,
                 alert_dispatcher,
                 push_rx,
-                durable_subs,
+                active_subs,
                 drain_notify,
                 socket,
             })
@@ -1169,11 +1222,13 @@ pub async fn surface_ws_handler(
 #[cfg(test)]
 mod tests {
     use brenn_lib::messaging::config::{
-        ResolvedComponent, ResolvedSurface, SurfaceBinding, SurfaceSendBudget,
+        ResolvedComponent, ResolvedSubscription, ResolvedSurface, ResolvedSurfaceSubscription,
+        SurfaceBinding, SurfaceSendBudget,
     };
 
     use super::test_fixtures::{TEST_MAX_BODY_BYTES, directory_with, directory_with_standing};
     use super::*;
+    use crate::test_support::surface::shape_only_messenger;
 
     /// `wire_noise` is a four-arm hand-written match between two same-named,
     /// same-ordered enums: transposing `Alarm` and `Fatal` compiles clean and
@@ -1220,7 +1275,17 @@ mod tests {
                 retain_depth: 0,
                 noise: brenn_lib::messaging::config::NoiseLevel::Silent,
             }],
-            durable_subscriptions: vec![],
+            wire_subscriptions: vec![ResolvedSurfaceSubscription {
+                instance: "protobar".to_string(),
+                subscription: ResolvedSubscription {
+                    channel_uuid: uuid::Uuid::nil(),
+                    channel_address: "ephemeral:protobar-demo".to_string(),
+                    push_depth: brenn_lib::messaging::config::Depth::Bounded(8),
+                    retain_depth: brenn_lib::messaging::config::Depth::Bounded(4),
+                    noise: brenn_lib::messaging::config::NoiseLevel::Silent,
+                    wake_min: brenn_lib::messaging::WakeMin::Normal,
+                },
+            }],
             local_channels: vec![],
             outputs: vec![SurfaceOutput {
                 channel_address: "brenn:writer-out".to_string(),
@@ -1243,7 +1308,7 @@ mod tests {
     fn build_classifies_channels_and_prebuilds_bindings() {
         let rt = SurfaceRuntime::build(
             resolved("deskbar"),
-            None,
+            Some(shape_only_messenger()),
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
         );
@@ -1251,15 +1316,18 @@ mod tests {
         assert_eq!(rt.participant.as_str(), "surface:deskbar");
         assert_eq!(rt.max_body_bytes, TEST_MAX_BODY_BYTES);
 
-        // Subscription keyed by its owning principal, classified by scheme.
+        // Subscription keyed by its owning principal, carrying the boot-resolved
+        // facts the session reads — both of the wire subscription's depths, not
+        // the per-binding numbers (the fixture's binding states retain 0 and its
+        // wire subscription 4).
         assert_eq!(
             rt.subscription_channels.get(&SubKey {
                 instance: "protobar".to_string(),
                 channel: "ephemeral:protobar-demo".to_string(),
             }),
             Some(&SubscriptionFacts {
-                class: DeliveryClass::Ephemeral,
-                push_enabled: true,
+                push_depth: 8,
+                retain_depth: 4,
             })
         );
 
@@ -1269,7 +1337,6 @@ mod tests {
             .get(&("writer".to_string(), "out".to_string()))
             .expect("the writer/out output port");
         assert_eq!(out.address, "brenn:writer-out");
-        assert_eq!(out.class, DeliveryClass::Durable);
         assert_eq!(out.default_urgency, Urgency::Normal);
 
         // Bindings mirror the resolved config for the Welcome payload.
@@ -1308,7 +1375,7 @@ mod tests {
         resolved.components[1].chrome = true;
         let rt = SurfaceRuntime::build(
             resolved,
-            None,
+            Some(shape_only_messenger()),
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
         );
@@ -1354,7 +1421,7 @@ mod tests {
     fn build_advertises_local_bindings_but_keeps_them_out_of_the_wire_maps() {
         let rt = SurfaceRuntime::build(
             resolved_with_local("deskbar"),
-            None,
+            Some(shape_only_messenger()),
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
         );
@@ -1410,7 +1477,7 @@ mod tests {
     fn build_advertises_no_local_channels_when_none_are_declared() {
         let rt = SurfaceRuntime::build(
             resolved("deskbar"),
-            None,
+            Some(shape_only_messenger()),
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
         );
@@ -1421,7 +1488,7 @@ mod tests {
     fn build_surface_runtimes_keys_by_slug() {
         let map = build_surface_runtimes(
             vec![resolved("deskbar"), resolved("kitchen")],
-            None,
+            Some(shape_only_messenger()),
             TEST_MAX_BODY_BYTES,
             None,
             crate::test_support::surface::description_params(),
@@ -1453,7 +1520,7 @@ mod tests {
         // `#brenn`/`error-reports` durable output port and advertises the floor.
         let map = build_surface_runtimes(
             vec![resolved("deskbar")],
-            None,
+            Some(shape_only_messenger()),
             TEST_MAX_BODY_BYTES,
             Some(("brenn:surface-errors".to_string(), LogLevel::Warn)),
             crate::test_support::surface::description_params(),
@@ -1467,7 +1534,6 @@ mod tests {
             ))
             .expect("the reserved error-report output port");
         assert_eq!(reserved.address, "brenn:surface-errors");
-        assert_eq!(reserved.class, DeliveryClass::Durable);
         // Wired from `surface_error_channel`, not an `[[surface.output]]` block,
         // so there is no operator urgency knob on it to read.
         assert_eq!(reserved.default_urgency, Urgency::Normal);
@@ -1479,7 +1545,7 @@ mod tests {
         // Unset error channel: no reserved port, floor `None` (kernel console-only).
         let map = build_surface_runtimes(
             vec![resolved("deskbar")],
-            None,
+            Some(shape_only_messenger()),
             TEST_MAX_BODY_BYTES,
             None,
             crate::test_support::surface::description_params(),
@@ -1937,10 +2003,45 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "is not a surface-bindable scheme (brenn:, ephemeral:, or local:)")]
-    fn build_panics_on_foreign_scheme() {
+    fn the_replay_clamp_is_the_max_of_the_two_depths() {
+        let clamp = |push, retain| {
+            SubscriptionFacts {
+                push_depth: push,
+                retain_depth: retain,
+            }
+            .replay_clamp()
+        };
+        assert_eq!(clamp(8, 0), Depth::Bounded(8));
+        assert_eq!(clamp(0, 4), Depth::Bounded(4));
+        assert_eq!(clamp(2, 9), Depth::Bounded(9));
+        assert_eq!(clamp(9, 2), Depth::Bounded(9));
+    }
+
+    /// `push_enabled` is the push depth's own question: a fold-0 subscription is
+    /// a context feed however deep its retained ring is.
+    #[test]
+    fn push_enabled_reads_the_push_depth_alone() {
+        let facts = |push, retain| SubscriptionFacts {
+            push_depth: push,
+            retain_depth: retain,
+        };
+        assert!(facts(1, 0).push_enabled());
+        assert!(!facts(0, 4).push_enabled());
+    }
+
+    /// A surface carrying a binding that crosses the websocket but built with no
+    /// `Messenger` is a broken boot invariant: the subscription would read
+    /// retention through it and the output would publish through it. Both
+    /// directions, one assert — a boot panic is caught by whoever starts the
+    /// server, where the first-subscribe panic behind it ships and surfaces as a
+    /// broken page in front of a user.
+    #[test]
+    #[should_panic(expected = "has wire bindings but no Messenger")]
+    fn build_panics_on_wire_binding_without_messenger() {
+        // The subscription direction: the fixture's ephemeral input binding,
+        // with the output side removed so only one direction is in play.
         let mut r = resolved("deskbar");
-        r.subscriptions[0].channel_address = "mqtt:sensors".to_string();
+        r.outputs.clear();
         SurfaceRuntime::build(
             r,
             None,
@@ -1949,31 +2050,69 @@ mod tests {
         );
     }
 
-    /// A surface carrying a durable subscription but built with no `Messenger`
-    /// is a broken boot invariant (durable projection needs the directory + DB +
-    /// durable queries): `build` must panic rather than construct a runtime that
-    /// would fail later, deep in `handle_durable_subscribe`.
+    /// The output direction of the same invariant. Split from its twin so
+    /// neither direction can be quietly dropped from the assert and still pass.
     #[test]
-    #[should_panic(expected = "has durable subscriptions but no Messenger")]
-    fn build_panics_on_durable_subscription_without_messenger() {
-        use brenn_lib::messaging::WakeMin;
-        use brenn_lib::messaging::config::{Depth, NoiseLevel};
+    #[should_panic(expected = "has wire bindings but no Messenger")]
+    fn build_panics_on_wire_output_without_messenger() {
         let mut r = resolved("deskbar");
-        use brenn_lib::messaging::config::ResolvedSurfaceSubscription;
-        r.durable_subscriptions = vec![ResolvedSurfaceSubscription {
-            instance: "protobar".to_string(),
-            subscription: ResolvedSubscription {
-                channel_uuid: uuid::Uuid::new_v4(),
-                channel_address: "brenn:alerts".to_string(),
-                push_depth: Depth::Bounded(8),
-                retain_depth: Depth::Bounded(4),
-                noise: NoiseLevel::Silent,
-                wake_min: WakeMin::Normal,
-            },
-        }];
+        r.subscriptions.clear();
+        r.wire_subscriptions.clear();
         SurfaceRuntime::build(
             r,
             None,
+            TEST_MAX_BODY_BYTES,
+            crate::test_support::surface::description_params(),
+        );
+    }
+
+    /// The two boot resolvers must agree about which bindings cross the wire: a
+    /// transportable binding whose `(instance, channel)` resolved no wire
+    /// subscription has no depths to read, and guessing them would ship a replay
+    /// clamp nobody configured. Pinned so the fail-fast cannot be dropped in a
+    /// later refactor with the suite still green — nothing else reaches it,
+    /// because the fixture rigs derive the missing subscription.
+    #[test]
+    #[should_panic(expected = "has no resolved wire subscription")]
+    fn build_panics_on_a_transportable_binding_with_no_wire_subscription() {
+        let mut r = resolved("deskbar");
+        r.wire_subscriptions.clear();
+        SurfaceRuntime::build(
+            r,
+            Some(shape_only_messenger()),
+            TEST_MAX_BODY_BYTES,
+            crate::test_support::surface::description_params(),
+        );
+    }
+
+    /// A surface with no wire binding in either direction owes no `Messenger` —
+    /// a page-local-only surface is live config, and the assert must not demand
+    /// messaging it never touches.
+    #[test]
+    fn build_accepts_no_messenger_when_nothing_crosses_the_wire() {
+        let mut r = resolved_with_local("deskbar");
+        r.subscriptions
+            .retain(|b| is_local_channel(&b.channel_address));
+        r.wire_subscriptions.clear();
+        r.outputs.retain(|b| is_local_channel(&b.channel_address));
+        let rt = SurfaceRuntime::build(
+            r,
+            None,
+            TEST_MAX_BODY_BYTES,
+            crate::test_support::surface::description_params(),
+        );
+        assert!(rt.subscription_channels.is_empty());
+        assert!(rt.output_ports.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a surface-bindable scheme (brenn:, ephemeral:, or local:)")]
+    fn build_panics_on_foreign_scheme() {
+        let mut r = resolved("deskbar");
+        r.subscriptions[0].channel_address = "mqtt:sensors".to_string();
+        SurfaceRuntime::build(
+            r,
+            Some(shape_only_messenger()),
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
         );

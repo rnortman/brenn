@@ -96,6 +96,13 @@ pub struct Parked {
 /// ([`Attached`]), and where it starts when it did not ([`Priming`]).
 pub use brenn_queue::{Attached, Priming};
 
+/// Cut a gap window to the suffix a resuming consumer is owed, and count what
+/// the gap cost it.
+///
+/// Re-exported so a transport answering a resume speaks the same drop
+/// arithmetic a cursor advance does without linking the primitives crate.
+pub use brenn_queue::gap_suffix;
+
 /// Where a subscriber of this kind starts when its queue comes into existence
 /// — the one site that decides priming.
 ///
@@ -104,22 +111,25 @@ pub use brenn_queue::{Attached, Priming};
 /// it. A conversation or a system subscriber is not: it reads channel ambience
 /// on demand and is not woken with old messages presented as new.
 ///
-/// A surface subscription is neither, because it holds no cursor here at all —
-/// the cursor it echoes at subscribe is its whole delivery state, and boot
-/// reconcile deletes any surface-keyed row it finds as an orphan. Answering for
-/// one would hand a caller a default it must decide deliberately.
-// TODO(surface-wire-cursors): re-ground the wire's resume layer in this
-// vocabulary, at which point a surface subscription does hold a cursor and this
-// arm gets a real answer.
+/// A surface subscription is neither, because it holds no cursor here at all.
+/// Its delivery state is per **connection** — two tabs of one surface are two
+/// independent positions — while a cursor here is per participant, and no
+/// surface participant carries a connection identity. The cursor the wire
+/// session echoes at subscribe is that whole state, which is why boot reconcile
+/// deletes any surface-keyed row it finds as an orphan. Answering for one would
+/// hand a caller a default it must decide deliberately.
 pub fn priming_for_kind(kind: &SubscriberEntryKind) -> Priming {
     match kind {
         SubscriberEntryKind::Wasm(_) => Priming::Retained,
+        // TODO(priming-head-audit): adjudicate every `Head` site against the
+        // bus philosophy — messages published while a consumer slept are
+        // unseen, and nothing in the system makes recency guarantees.
         SubscriberEntryKind::App(_)
         | SubscriberEntryKind::System(_)
         | SubscriberEntryKind::ChatConversation { .. } => Priming::Head,
         SubscriberEntryKind::Surface { .. } => panic!(
             "surface subscriptions hold no store cursors; their delivery state is the wire \
-             session's (see TODO(surface-wire-cursors))"
+             session's, per connection, and this grain cannot represent it"
         ),
     }
 }

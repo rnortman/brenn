@@ -46,7 +46,7 @@ fn surface(slug: &str, skin: &str, components: &[(&str, &str)]) -> ResolvedSurfa
             })
             .collect(),
         subscriptions,
-        durable_subscriptions: vec![],
+        wire_subscriptions: vec![],
         local_channels: vec![],
         outputs: vec![],
         policy: AppPolicy::default(),
