@@ -747,6 +747,106 @@ async fn build_wasm_mixed_output_messenger(
     (messenger, durable_addr, ephemeral_addr)
 }
 
+/// A component publishing onto an `ephemeral:` channel that a surface
+/// subscribes, with the mock router kept so the live feed is observable — the
+/// feed writes no row, so nothing else witnesses it.
+async fn build_wasm_ephemeral_surface_messenger(
+    consumer_slug: &str,
+) -> (Arc<Messenger>, String, Arc<CountingRouter>) {
+    use crate::access::acl::ChannelMatcher;
+    use crate::messaging::store::RingStores;
+    use crate::messaging::testutils::ephemeral_channel_entry;
+
+    let db = init_db_memory();
+    let mut ephemeral = ephemeral_channel_entry("wasm-eph-surface", 8);
+    ephemeral.subscribers = vec![SubscriberEntry {
+        kind: SubscriberEntryKind::Surface {
+            slug: "durabar".to_string(),
+            instance: None,
+        },
+        push_depth: Depth::Unbounded,
+        retain_depth: Depth::Unbounded,
+        noise: NoiseLevel::Silent,
+        wake_min: None,
+    }];
+    let addr = ephemeral.address.clone();
+
+    let mut surface_policy = crate::access::AppPolicy::default();
+    surface_policy
+        .grants
+        .insert(crate::access::AppCapability::EphemeralSubscribe);
+    surface_policy
+        .acls
+        .ephemeral_subscribe
+        .push(ChannelMatcher::Prefix(String::new()));
+    let mut surface_policies = std::collections::HashMap::new();
+    surface_policies.insert("durabar".to_string(), surface_policy);
+
+    let mut apps_raw: IndexMap<String, crate::config::AppConfig> = IndexMap::new();
+    apps_raw.insert(
+        consumer_slug.to_string(),
+        test_app_config(
+            consumer_slug,
+            Some(ResolvedMessagingConfig {
+                send_budget: 0,
+                subscriptions: vec![],
+            }),
+            vec![],
+        ),
+    );
+    let stores = Arc::new(RingStores::build(std::slice::from_ref(&ephemeral)));
+    let router = Arc::new(CountingRouter::default());
+    let messenger = Messenger::new(
+        db,
+        Arc::new(MessagingDirectory::with_entries(vec![ephemeral])),
+        Arc::from("test"),
+        Arc::new(apps_raw),
+        Arc::clone(&router) as Arc<dyn WakeRouter>,
+        MessagingGlobalConfig::default(),
+    )
+    .with_subscriber_registrations(crate::messaging::testutils::surface_registrations(
+        surface_policies,
+    ))
+    .with_ring_stores(stores);
+    (messenger, addr, router)
+}
+
+/// A flush's ring entry reaches a subscribing surface. The bridge holds no
+/// position for anything to walk, so this feed is the whole live path from a
+/// component to a page over a non-durable channel.
+#[tokio::test]
+async fn publish_from_wasm_ephemeral_output_feeds_a_subscribing_surface() {
+    let consumer_slug = "wasm-eph-feeder";
+    let (m, addr, router) = build_wasm_ephemeral_surface_messenger(consumer_slug).await;
+
+    m.publish_from_wasm(
+        consumer_slug,
+        &[
+            WasmPublish {
+                channel_address: &addr,
+                body: "fed-now",
+                urgency: Urgency::Normal,
+                reply_to: None,
+                deliver_after: None,
+            },
+            WasmPublish {
+                channel_address: &addr,
+                body: "parked",
+                urgency: Urgency::Normal,
+                reply_to: None,
+                deliver_after: Some(chrono::Utc::now() + chrono::Duration::seconds(600)),
+            },
+        ],
+    )
+    .await;
+
+    let fed = router.fed.lock().await;
+    assert_eq!(fed.len(), 1, "the immediate entry, and only it");
+    assert_eq!(fed[0].body, "fed-now");
+    assert_eq!(fed[0].sender, format!("wasm:{consumer_slug}"));
+    assert_eq!(fed[0].envelope_type, ChannelScheme::Ephemeral);
+}
+
 /// A WASM output port bound to an `ephemeral:` channel publishes through the
 /// unified commit: the message lands in the channel's ring store (no DB row) and
 /// is fanned out to attached wire receivers.

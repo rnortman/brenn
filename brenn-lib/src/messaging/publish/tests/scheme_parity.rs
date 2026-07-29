@@ -679,44 +679,40 @@ async fn a_past_deliver_after_commits_immediately() {
     assert_eq!(store.deferred_len(), 0);
 }
 
-/// A released `ephemeral:` message is fanned out live to an already-attached
-/// receiver — the surface's existing broadcast subscribe path.
+/// A released `ephemeral:` message enters retention at the release, which is
+/// where every consumer of a ring channel reads it from — the same place a
+/// released durable message lands, one sweep for both classes.
 #[tokio::test]
-async fn a_released_ephemeral_message_reaches_a_live_subscriber() {
-    use crate::access::{AppCapability, AppPolicy, acl::ChannelMatcher};
-    use crate::messaging::{EphemeralEvent, ParticipantId};
-
+async fn a_released_ephemeral_message_enters_retention_at_the_release() {
     let m = parity_messenger(SendRate::default()).await;
     let base = chrono::Utc::now();
     let release_at = base + chrono::Duration::seconds(30);
-
-    let mut policy = AppPolicy::with_grants(&[AppCapability::EphemeralSubscribe]);
-    policy.acls.ephemeral_subscribe = vec![ChannelMatcher::Exact("eph-chan".to_string())];
-    let mut receiver = m
-        .attach_live(
-            ParticipantId::for_app("sub-app", SOURCE),
-            Arc::new(policy),
-            "ephemeral:eph-chan",
-            None,
-        )
-        .expect("subscribe")
-        .receiver;
 
     assert!(matches!(
         publish_deferred(&m, "ephemeral:eph-chan", "later", release_at).await,
         PublishResult::Ok { .. }
     ));
+    let store = ring_store(&m, "ephemeral:eph-chan");
+    assert!(
+        store.retained_tail(10).is_empty(),
+        "a parked message is in retention for nobody"
+    );
+
     assert_eq!(
         m.release_due_messages(base + chrono::Duration::seconds(45))
             .await
             .released,
         1
     );
-
-    match receiver.recv().await {
-        Some(EphemeralEvent::Delivery(d)) => assert_eq!(d.envelope.body, "later"),
-        other => panic!("expected the released message, got {other:?}"),
-    }
+    assert_eq!(
+        store
+            .retained_tail(10)
+            .iter()
+            .map(|r| r.envelope.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["later"],
+        "the release is what puts it where a resume can see it"
+    );
 }
 
 /// The deferred set is capped channel-wide by `retain_depth`; beyond it a

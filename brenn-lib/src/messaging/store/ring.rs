@@ -5,9 +5,8 @@
 //! release-time-ordered set of parked messages, composed — is
 //! [`brenn_queue::RingCore`], shared with every other host that owns
 //! non-durable channels. This store is what the backend adds around it: one
-//! lock, participant and application identity, envelope minting, `DateTime`
-//! conversion, and — on a transportable channel — a broadcast fan-out to
-//! consumers that read the channel as a live stream rather than from a cursor.
+//! lock, participant and application identity, envelope minting, and
+//! `DateTime` conversion.
 //!
 //! The store holds no policy. Whether a subscriber's fresh cursor is primed
 //! with the retained tail, whether a publish is allowed at all, and what a
@@ -25,14 +24,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use tokio::sync::broadcast;
 use tracing::debug;
 use uuid::Uuid;
 
 use brenn_envelope::{ChannelCapabilities, ChannelScheme, MessageEnvelope, Urgency};
 use brenn_queue::{
-    Advance, CursorOverflow, Deferred, DeferredId, OwnedDeferred, QuotaExceeded, Replay,
-    ReplayDecision, Resume, RingCore,
+    Advance, CursorOverflow, Deferred, DeferredId, OwnedDeferred, QuotaExceeded, Replay, Resume,
+    RingCore,
 };
 
 /// One subscriber's activation view over this channel's retained ring.
@@ -55,14 +53,6 @@ use crate::messaging::store::{
 /// independently. Worst-case live retention at the cap is
 /// `depth × max_body_bytes` per channel.
 pub const MAX_RING_RETAIN_DEPTH: u64 = 4_096;
-
-/// Per-channel live fan-out capacity.
-///
-/// `tokio::sync::broadcast::channel` pre-allocates its ring, so this is an
-/// allocation: ≈ `capacity × size_of::<slot>` per transportable channel. It
-/// bounds how far a slow live consumer may lag before it is charged a typed
-/// gap; it is not an operator knob.
-pub const RING_FAN_OUT_CAPACITY: u32 = 256;
 
 /// A message that has entered retention, with the sequence number the ring
 /// assigned it.
@@ -90,21 +80,10 @@ pub struct ReleasedBatch {
     pub overflow: Vec<OverflowEvent>,
 }
 
-/// A live consumer's attach point: what it is owed from the retained window,
-/// why (the replay decision), and the stream of everything committed after.
-///
-/// The split between the two halves is exact — a message is either entirely in
-/// `replay` or entirely on `receiver`, never both and never neither.
-pub struct LiveAttach {
-    pub replay: Vec<Arc<RetainedMessage>>,
-    pub decision: ReplayDecision,
-    pub receiver: broadcast::Receiver<Arc<RetainedMessage>>,
-}
-
 /// This channel, plus the identity the backend reports its positions under. One
 /// lock covers both, so seq assignment, ring append, and cursor bookkeeping are
-/// atomic with respect to an attach: for any attach, a message is either
-/// entirely before the cursor's starting position or entirely after it.
+/// atomic with respect to every reader: a replay sees a message either entirely
+/// before its resume position or entirely after it.
 #[derive(Debug)]
 struct RingState {
     core: RingCore<Arc<MessageEnvelope>, Uuid, ParticipantId>,
@@ -131,18 +110,6 @@ pub struct RingStore {
     /// Resolved once from the address scheme at construction: non-durable
     /// either way, transportable only for `ephemeral:`.
     capabilities: ChannelCapabilities,
-    /// Live fan-out to consumers that read this channel as a stream. `None` on
-    /// a confined channel: it never leaves the process, so no receiver is ever
-    /// issued for it and none can be.
-    live: Option<broadcast::Sender<Arc<RetainedMessage>>>,
-    /// Held across a message's entry into retention and its fan-out, and across
-    /// a live attach's `subscribe()` + replay.
-    ///
-    /// The state lock cannot cover the broadcast handle, and the attach
-    /// boundary needs both under one critical section: with this gate a message
-    /// is either entirely in an attaching consumer's replay or entirely on its
-    /// receiver — never lost, never delivered twice.
-    fan_out_gate: Mutex<()>,
     /// Messages that entered retention on this channel, appended or released.
     publishes: AtomicU64,
     state: Mutex<RingState>,
@@ -169,28 +136,6 @@ impl RingStore {
         address: impl Into<String>,
         retain_depth: Depth,
         epoch: Uuid,
-    ) -> Self {
-        Self::with_fan_out_capacity(
-            channel_uuid,
-            address,
-            retain_depth,
-            epoch,
-            RING_FAN_OUT_CAPACITY,
-        )
-    }
-
-    /// The same store with a chosen live-fan-out ring size.
-    ///
-    /// The size is not an operator knob — production always takes
-    /// [`RING_FAN_OUT_CAPACITY`]. It is settable so that a test of
-    /// lag-and-drop behaviour can overrun a small ring instead of committing
-    /// hundreds of messages to overrun the real one.
-    pub fn with_fan_out_capacity(
-        channel_uuid: Uuid,
-        address: impl Into<String>,
-        retain_depth: Depth,
-        epoch: Uuid,
-        fan_out_capacity: u32,
     ) -> Self {
         let address = address.into();
         let capabilities = ChannelScheme::of(&address)
@@ -220,20 +165,11 @@ impl RingStore {
              {MAX_RING_RETAIN_DEPTH}"
         );
 
-        // The initial receiver is dropped: a commit with no live consumer
-        // attached is contract-conformant (the message is retained for a later
-        // attach), so `send` erroring on no-receivers is expected and ignored.
-        let live = capabilities
-            .transportable
-            .then(|| broadcast::channel(fan_out_capacity as usize).0);
-
         Self {
             epoch,
             channel_uuid,
             address,
             capabilities,
-            live,
-            fan_out_gate: Mutex::new(()),
             publishes: AtomicU64::new(0),
             state: Mutex::new(RingState {
                 core: RingCore::new(epoch, depth),
@@ -265,14 +201,7 @@ impl RingStore {
             .unwrap_or_else(|_| panic!("messaging store: {} state lock poisoned", self.address))
     }
 
-    fn fan_out_gate(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.fan_out_gate
-            .lock()
-            .unwrap_or_else(|_| panic!("messaging store: {} fan-out gate poisoned", self.address))
-    }
-
-    /// Count, log, and fan out a message that just entered retention. The
-    /// caller holds the fan-out gate, so an attach cannot split the boundary.
+    /// Count and log a message that just entered retention.
     fn announce(&self, retained: &RetainedMessage) {
         self.publishes.fetch_add(1, Ordering::Relaxed);
         debug!(
@@ -282,12 +211,6 @@ impl RingStore {
             message_id = %retained.envelope.message_id,
             "ring retention entry"
         );
-        if let Some(tx) = &self.live {
-            // `send` errs exactly when no receiver is attached, which is
-            // contract-conformant: the message is retained, so a later attach
-            // still sees it in its replay.
-            let _ = tx.send(Arc::new(retained.clone()));
-        }
     }
 
     /// Messages that have entered this channel's retention — appended
@@ -297,46 +220,10 @@ impl RingStore {
         self.publishes.load(Ordering::Relaxed)
     }
 
-    /// Attach a live consumer: the retained window it is owed at `resume`, the
-    /// decision explaining that window, and the stream of everything committed
-    /// after the attach.
-    ///
-    /// # Panics
-    ///
-    /// If the channel is confined. A `local:` channel never crosses the process
-    /// boundary, so the handle a serializer would need is never issued — asking
-    /// for one is a wiring bug.
-    pub fn subscribe_live(&self, resume: Option<Resume<Uuid>>) -> LiveAttach {
-        let tx = self.live.as_ref().unwrap_or_else(|| {
-            panic!(
-                "messaging store: {} is confined and issues no live receiver",
-                self.address
-            )
-        });
-        let _gate = self.fan_out_gate();
-        let receiver = tx.subscribe();
-        let replay = self.replay(resume);
-        LiveAttach {
-            replay: replay
-                .messages
-                .into_iter()
-                .map(|m| {
-                    Arc::new(RetainedMessage {
-                        seq: m.seq,
-                        envelope: m.message,
-                    })
-                })
-                .collect(),
-            decision: replay.decision,
-            receiver,
-        }
-    }
-
     // ── Retention ─────────────────────────────────────────────────────────
 
-    /// Commit a message into retention, fan it out to attached live consumers,
-    /// and return it with the sequence number the ring assigned plus the
-    /// overflow the append caused.
+    /// Commit a message into retention and return it with the sequence number
+    /// the ring assigned plus the overflow the append caused.
     ///
     /// The returned `Arc` is the retained one, so a caller that reads the
     /// message back shares the store's allocation instead of copying it.
@@ -347,7 +234,6 @@ impl RingStore {
     /// store holds no policy about what they are worth.
     pub fn append(&self, envelope: MessageEnvelope) -> Appended {
         let envelope = Arc::new(envelope);
-        let _gate = self.fan_out_gate();
         let mut state = self.state();
         let report = state.core.append(Arc::clone(&envelope));
         let overflow = Self::overflow_events(&state, report.overflow);
@@ -616,14 +502,9 @@ impl RingStore {
     }
 
     /// Release every message due at or before `now` into retention, in release
-    /// order, fan each out to attached live consumers, and return them with the
-    /// sequence numbers they were assigned plus the overflow the batch caused.
-    ///
-    /// Release and fan-out run under the same gate an append holds, so an
-    /// attaching consumer sees each released message either entirely in its
-    /// replay or entirely on its receiver.
+    /// order, and return them with the sequence numbers they were assigned plus
+    /// the overflow the batch caused.
     pub fn release_due(&self, now: DateTime<Utc>) -> ReleasedBatch {
-        let _gate = self.fan_out_gate();
         let mut state = self.state();
         let report = state.core.release_due(release_time_of(now));
         let overflow = Self::overflow_events(&state, report.overflow);
@@ -1014,6 +895,7 @@ impl RetentionStore for RingStore {
 mod tests {
     use super::*;
     use brenn_envelope::{ChannelScheme, Urgency};
+    use brenn_queue::ReplayDecision;
 
     fn store(retain_depth: u64) -> RingStore {
         RingStore::new(
@@ -1212,119 +1094,69 @@ mod tests {
         assert_eq!(s.newest_seq(), 3);
     }
 
-    // ── Live fan-out ──────────────────────────────────────────────────────
+    // ── Retention as the one delivery surface ─────────────────────────────
 
     fn confined_store(retain_depth: u64) -> RingStore {
         RingStore::new(Uuid::new_v4(), "local:room", Depth::Bounded(retain_depth))
     }
 
-    /// Everything that enters retention reaches an attached live consumer, in
+    /// Everything that enters retention is readable from retention, in
     /// retention order, whether it was appended directly or released from the
-    /// deferred set.
-    #[tokio::test]
-    async fn a_live_consumer_receives_appends_and_releases_in_order() {
+    /// deferred set. A parked message is in neither until it releases.
+    #[test]
+    fn appends_and_releases_enter_retention_in_order() {
         let s = store(8);
-        let mut receiver = s.subscribe_live(None).receiver;
 
         s.append(envelope("alice", "now"));
         s.park(envelope("alice", "later"), at(60_000))
             .expect("park");
-        // Parked is not retained, so nothing is fanned out for it yet.
         s.release_due(at(30_000));
-        s.release_due(at(90_000));
+        assert_eq!(
+            retained_bodies(&s.retained_tail(10)),
+            vec!["now"],
+            "a message not yet due is in retention for nobody"
+        );
 
-        let mut bodies = Vec::new();
-        for _ in 0..2 {
-            bodies.push(
-                receiver
-                    .recv()
-                    .await
-                    .expect("delivery")
-                    .envelope
-                    .body
-                    .clone(),
-            );
-        }
-        assert_eq!(bodies, vec!["now", "later"]);
+        s.release_due(at(90_000));
+        assert_eq!(retained_bodies(&s.retained_tail(10)), vec!["now", "later"]);
+        assert_eq!(
+            s.retained_tail(10)
+                .iter()
+                .map(|m| m.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "the released message takes the next position, not the one it was parked at"
+        );
     }
 
-    /// The retained window and the live stream partition the channel: an attach
-    /// hands over what is already retained and streams only what comes after.
-    #[tokio::test]
-    async fn an_attach_replays_the_window_and_streams_the_rest() {
+    /// A resume reads forward from a position and sees everything committed
+    /// after it.
+    #[test]
+    fn a_resume_reads_everything_committed_after_its_position() {
         let s = store(8);
         publish(&s, "alice", &["a", "b"]);
 
-        let attach = s.subscribe_live(None);
-        let replayed: Vec<u64> = attach.replay.iter().map(|m| m.seq).collect();
-        assert_eq!(replayed, vec![1, 2]);
-        assert_eq!(attach.decision, ReplayDecision::Fresh);
+        let fresh = s.replay(None);
+        assert_eq!(fresh.decision, ReplayDecision::Fresh);
+        assert_eq!(seqs(&fresh), vec![1, 2]);
 
-        let mut receiver = attach.receiver;
         s.append(envelope("alice", "c"));
-        assert_eq!(receiver.recv().await.expect("delivery").seq, 3);
+        let resumed = s.replay(Some(Resume {
+            epoch: s.epoch(),
+            seq: 2,
+        }));
+        assert_eq!(resumed.decision, ReplayDecision::Exact);
+        assert_eq!(seqs(&resumed), vec![3]);
     }
 
-    /// A publisher racing an attach: every seq appears exactly once across
-    /// (replay ∪ live). The fan-out gate covers both the subscribe and the
-    /// replay snapshot, so a message committed at the boundary is neither lost
-    /// between them nor delivered on both sides.
-    #[tokio::test]
-    async fn an_attach_racing_a_publisher_loses_and_duplicates_nothing() {
-        const N: u64 = 200;
-        // Retention and fan-out both exceed N, so nothing is evicted or lagged
-        // out and every seq must be accounted for on one side or the other.
-        let s = Arc::new(RingStore::with_fan_out_capacity(
-            Uuid::new_v4(),
-            "ephemeral:room",
-            Depth::Bounded(256),
-            Uuid::new_v4(),
-            1024,
-        ));
-
-        let publisher = Arc::clone(&s);
-        let handle = std::thread::spawn(move || {
-            for _ in 0..N {
-                publisher.append(envelope("alice", "x"));
-                std::thread::yield_now();
-            }
-        });
-
-        let attach = s.subscribe_live(None);
-        let mut seen: Vec<u64> = attach.replay.iter().map(|m| m.seq).collect();
-        let live_expected = N as usize - seen.len();
-        let mut receiver = attach.receiver;
-        for _ in 0..live_expected {
-            seen.push(receiver.recv().await.expect("delivery").seq);
-        }
-        handle.join().expect("publisher thread");
-
-        seen.sort_unstable();
-        assert_eq!(seen, (1..=N).collect::<Vec<u64>>());
+    /// The bodies of a retained window, oldest first.
+    fn retained_bodies(window: &[RetainedMessage]) -> Vec<String> {
+        window.iter().map(|m| m.envelope.body.clone()).collect()
     }
 
-    /// Fan-out is a fan-out: every attached consumer receives every message, in
-    /// retention order, independently of the others.
-    #[tokio::test]
-    async fn every_live_consumer_receives_every_message_in_order() {
-        const CONSUMERS: usize = 3;
-        const MSGS: u64 = 10;
-        let s = store(4);
-
-        let receivers: Vec<_> = (0..CONSUMERS)
-            .map(|_| s.subscribe_live(None).receiver)
-            .collect();
-        for i in 0..MSGS {
-            s.append(envelope("alice", &format!("m{i}")));
-        }
-
-        for mut receiver in receivers {
-            let mut seqs = Vec::new();
-            for _ in 0..MSGS {
-                seqs.push(receiver.recv().await.expect("delivery").seq);
-            }
-            assert_eq!(seqs, (1..=MSGS).collect::<Vec<u64>>());
-        }
+    /// The sequence numbers a replay answered with, oldest first.
+    fn seqs(replay: &Replay<Arc<MessageEnvelope>>) -> Vec<u64> {
+        replay.messages.iter().map(|m| m.seq).collect()
     }
 
     /// Every entry into retention is counted where it becomes observable: a
@@ -1341,19 +1173,10 @@ mod tests {
         assert_eq!(s.publish_count(), 2);
     }
 
-    /// A confined channel never leaves the process, so the handle a serializer
-    /// would need is never issued — asking for one is a wiring bug, not a
-    /// tolerable no-op.
+    /// A confined channel retains and serves its cursor consumers exactly as a
+    /// transportable one does; the only thing it lacks is a way off the process.
     #[test]
-    #[should_panic(expected = "is confined and issues no live receiver")]
-    fn a_confined_store_issues_no_live_receiver() {
-        confined_store(4).subscribe_live(None);
-    }
-
-    /// A confined channel still retains and still serves its cursor consumers —
-    /// only the live stream is absent.
-    #[test]
-    fn a_confined_store_retains_without_a_fan_out() {
+    fn a_confined_store_retains_like_any_other() {
         let s = confined_store(4);
         assert_eq!(s.append(envelope("alice", "a")).retained.seq, 1);
         assert_eq!(s.retained_tail(10).len(), 1);

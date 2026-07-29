@@ -800,45 +800,26 @@ Code site (`TODO(wasm-durable-park-cap)`):
 
 ---
 
-## `surface-wire-cursors`
+## `priming-head-audit`
 
-The surface wire protocol's resume/replay layer is a parallel, pre-cursor
-implementation of what `brenn_queue::SubscriberCursor` + window/advance already
-express: the opaque client-echoed `Cursor` token is a subscriber position;
-`replay_from`'s five-way `Replay` decision (`Fresh`/`UpToDate`/`Exact`/`Gap{..}`)
-is prime-at-position plus window, with the gap arms re-deriving what
-`Advance.dropped` computes as arithmetic; the session-side `WireSpans` durable
-high-water is a hand-rolled cursor advance; `GapInfo` is the drop report.
+Every `Priming::Head` call site needs adjudicating against the bus philosophy.
+`docs/message-bus.md` never authorizes a head attach — it does not address
+priming at all — and the enum's own doc calls `Retained` "*the* priming for a
+position coming into existence" (`brenn-queue/src/store.rs`). The sites are App
+conversations (`conversations.rs`), system participants (`system.rs`), and chat
+command cursors (`chat_provision.rs`, `bus_chat.rs`); each carries a documented
+rationale, and each must be judged against the unseen-is-unseen principle and
+the fact-channel/state-channel reconcile idiom — messages published while a
+consumer slept *are* unseen, and nothing in the system makes recency guarantees
+(`deliver_after` can legitimately deliver last decade's message as new right
+now).
 
-Correctness does not depend on the refactor — page-side priming is plain
-`Retained` on both classes and every observable satisfies `docs/message-bus.md`;
-the bespoke-ness is server-internal vocabulary. It is a genuine project, not a
-cleanup: it rewires `handle_subscribe`/`handle_durable_subscribe`/
-`drain_durable_channel`, `WireSpans`, `attach_live`, both stores' `replay_from`
-and the token codec under ~250 session tests, and it carries design questions
-that must not be answered in passing:
+Outcomes per site: justify in bus-philosophy terms (and say so in
+`docs/message-bus.md`), or switch to `Retained` and let the consumer judge
+staleness by timestamp. Surfaces are unaffected either way — they never prime.
 
-- **Grain and residence.** Delivery state is per *connection* (two tabs of one
-  surface are two independent delivery states) while store cursors are keyed by
-  participant. The client-held token is what makes the server stateless across
-  disconnects. A cursor-grounded wire either keeps the token as a cursor-shaped
-  position echo, or accepts server-side per-connection cursor rows with a
-  lifetime story.
-- **Page-reload semantics.** A fresh page must receive the retained tail even
-  though the subscription identity saw it before, so any persistent
-  per-(slug, instance, channel) cursor is wrong by construction.
-- **The mirror-lifetime inversion.** A token surviving refcount zero would let a
-  re-acquired subscription *resume* — the page mirror catches up from the unseen
-  suffix instead of being discarded, and wire stores become page-lifetime like
-  confined ones. Design it against the `client_reattach_replays_latest_retained_value`
-  contract and the M ≤ N question (a page window deeper than the server ring's N).
-- `TODO(processor-typed-gaps)` rides the same cycle: gaps become cursor
-  arithmetic on the backend too.
-
-Code sites (`TODO(surface-wire-cursors)`):
-`brenn-lib/src/messaging/store/mod.rs` (`priming_for_kind`'s surface arm, which
-panics because a surface subscription holds no store cursor at all),
-`brenn-server/src/routes/surface/session.rs` (`handle_subscribe`).
+Code site (`TODO(priming-head-audit)`): `brenn-lib/src/messaging/store/mod.rs`,
+`priming_for_kind`'s `Head` arm.
 
 ---
 

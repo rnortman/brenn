@@ -21,6 +21,7 @@ use crate::messaging::config::{
     SurfaceSendBudget,
 };
 use crate::messaging::db::upsert_channels;
+use crate::messaging::store::RingStores;
 use crate::messaging::{
     ChannelEntry, ChannelScheme, MessagingDirectory, ParticipantId, SubscriberEntry,
     SubscriberEntryKind, Urgency, WakeMin, WakeRouter, canonical_address,
@@ -153,7 +154,12 @@ async fn assemble_surface_messenger_router(
             _ => None,
         })
         .collect();
-    {
+    // A durable channel is a row; a non-durable one is a ring built at boot.
+    // Which of the two a fixture wants is the entry's own business, so the
+    // spine wires whichever the entry names rather than taking a flag.
+    let durable = entry.capabilities().durable;
+    let ring_stores = (!durable).then(|| Arc::new(RingStores::build(std::slice::from_ref(&entry))));
+    if durable {
         let conn = db.lock().await;
         upsert_channels(&conn, std::slice::from_ref(&entry));
     }
@@ -164,7 +170,7 @@ async fn assemble_surface_messenger_router(
         .collect();
     let directory = Arc::new(MessagingDirectory::with_entries(vec![entry]));
     let router = Arc::new(CountingRouter::default());
-    let messenger = Messenger::new(
+    let mut messenger = Messenger::new(
         db,
         directory,
         Arc::from("test"),
@@ -174,14 +180,18 @@ async fn assemble_surface_messenger_router(
             max_body_bytes,
             ..Default::default()
         },
-    )
-    .with_subscriber_registrations(crate::messaging::testutils::wasm_registrations(
-        wasm_policies,
-    ))
-    .with_subscriber_registrations(crate::messaging::testutils::surface_registrations(
-        surface_policies,
-    ))
-    .with_surface_send_budgets(budget_principals);
+    );
+    if let Some(stores) = ring_stores {
+        messenger = messenger.with_ring_stores(stores);
+    }
+    let messenger = messenger
+        .with_subscriber_registrations(crate::messaging::testutils::wasm_registrations(
+            wasm_policies,
+        ))
+        .with_subscriber_registrations(crate::messaging::testutils::surface_registrations(
+            surface_policies,
+        ))
+        .with_surface_send_budgets(budget_principals);
     // A subscriber holds a position or it is owed nothing: each WASM receiver
     // attaches exactly as boot does.
     for slug in &wasm_subscribers {
@@ -1027,6 +1037,350 @@ async fn build_surface_feed_messenger() -> (Arc<Messenger>, String, Arc<Counting
         &default_principals(&FIXTURE_INSTANCES),
     )
     .await
+}
+
+/// The `ephemeral:` twin of [`build_surface_feed_messenger`]: same surface, same
+/// subscription, same publisher — a ring behind it instead of a table, and the
+/// `ephemeral:` half of the ACL vocabulary instead of the `brenn:` half.
+///
+/// It exists to hold the two classes against each other. A surface's live feed
+/// is the delivery trigger for every channel that crosses the wire, so whatever
+/// the durable fixture pins here has to hold on the ring too.
+async fn build_ephemeral_surface_feed_messenger() -> (Arc<Messenger>, String, Arc<CountingRouter>) {
+    build_ephemeral_surface_feed_messenger_at(4, None).await
+}
+
+/// [`build_ephemeral_surface_feed_messenger`] over a ring of `retain` messages,
+/// optionally carrying a second, WASM-kind subscriber at `alarm` noise.
+///
+/// Overflow is observable only through a subscriber that holds a cursor; a
+/// surface holds none. Without the extra subscriber, the batch path's overflow
+/// enactment runs silently.
+async fn build_ephemeral_surface_feed_messenger_at(
+    retain: u64,
+    wasm_subscriber: Option<&str>,
+) -> (Arc<Messenger>, String, Arc<CountingRouter>) {
+    let mut entry = crate::messaging::testutils::ephemeral_channel_entry("surface-out-ch", retain);
+    entry.resolved_channel.send_rate = crate::messaging::config::SendRate {
+        burst: u32::MAX,
+        refill_interval_secs: 1,
+        refill: u32::MAX,
+    };
+    entry.subscribers = vec![SubscriberEntry {
+        kind: SubscriberEntryKind::Surface {
+            slug: "durabar".to_string(),
+            instance: None,
+        },
+        push_depth: Depth::Unbounded,
+        retain_depth: Depth::Unbounded,
+        noise: NoiseLevel::Silent,
+        wake_min: None,
+    }];
+    let mut wasm_policies = std::collections::HashMap::new();
+    if let Some(slug) = wasm_subscriber {
+        entry.subscribers.push(SubscriberEntry {
+            kind: SubscriberEntryKind::Wasm(slug.to_string()),
+            push_depth: Depth::Bounded(1),
+            retain_depth: Depth::Bounded(1),
+            noise: NoiseLevel::Alarm,
+            wake_min: None,
+        });
+        wasm_policies.insert(slug.to_string(), wasm_receiver_policy());
+    }
+    let mut surface_policies = std::collections::HashMap::new();
+    surface_policies.insert("durabar".to_string(), ephemeral_surface_policy());
+    assemble_surface_messenger_router(
+        entry,
+        wasm_policies,
+        surface_policies,
+        65_536,
+        &default_principals(&FIXTURE_INSTANCES),
+    )
+    .await
+}
+
+/// The `ephemeral:` half of the ACL vocabulary, universal on both sides: the
+/// fixture surface publishes onto its own subscribed channel, so one policy is
+/// both the publish authority and the delivery gate.
+fn ephemeral_surface_policy() -> AppPolicy {
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::EphemeralPublish);
+    policy.grants.insert(AppCapability::EphemeralSubscribe);
+    policy
+        .acls
+        .ephemeral_publish
+        .push(ChannelMatcher::Prefix(String::new()));
+    policy
+        .acls
+        .ephemeral_subscribe
+        .push(ChannelMatcher::Prefix(String::new()));
+    policy
+}
+
+/// A ring publish reaches the surface through the router, exactly as a table
+/// publish does. Nothing else can carry it: the wire bridge holds no position
+/// for a walk to find, so the feed at commit is the whole live path.
+#[tokio::test]
+async fn an_ephemeral_publish_feeds_the_surface() {
+    let (m, addr, router) = build_ephemeral_surface_feed_messenger().await;
+
+    assert!(matches!(
+        m.publish_from_surface("durabar", None, &addr, "hi", Urgency::Normal)
+            .await,
+        PublishResult::Ok { .. }
+    ));
+
+    let fed = fed_bodies(&router).await;
+    assert_eq!(fed.len(), 1, "the ring publish was fed once: {fed:?}");
+    assert!(
+        fed[0].contains("hi"),
+        "and it is the published body: {fed:?}"
+    );
+}
+
+/// The fed envelope carries the **channel's own** scheme. A surface reads the
+/// same message twice — once live, once out of retention at its next resume —
+/// and the two must be the same message.
+#[tokio::test]
+async fn a_fed_envelope_carries_the_channels_own_scheme() {
+    let (durable, durable_addr, durable_router) = build_surface_feed_messenger().await;
+    assert!(matches!(
+        durable
+            .publish_from_surface("durabar", None, &durable_addr, "hi", Urgency::Normal)
+            .await,
+        PublishResult::Ok { .. }
+    ));
+    assert_eq!(
+        fed_schemes(&durable_router).await,
+        vec![ChannelScheme::Brenn]
+    );
+
+    let (eph, eph_addr, eph_router) = build_ephemeral_surface_feed_messenger().await;
+    assert!(matches!(
+        eph.publish_from_surface("durabar", None, &eph_addr, "hi", Urgency::Normal)
+            .await,
+        PublishResult::Ok { .. }
+    ));
+    assert_eq!(
+        fed_schemes(&eph_router).await,
+        vec![ChannelScheme::Ephemeral]
+    );
+}
+
+/// A parked ring entry is withheld until its release, and the release sweep is
+/// what feeds it — the durable rule, unchanged, on the other substrate. Without
+/// this the schedule would reach the page at a time nobody chose, or never.
+#[tokio::test]
+async fn a_released_ephemeral_message_rides_the_surface_feed() {
+    let (m, addr, router) = build_ephemeral_surface_feed_messenger().await;
+    let sender = ParticipantId::for_surface_component("durabar", "clock");
+    let policy = ephemeral_surface_policy();
+    let later = Utc::now() + Duration::from_secs(600);
+
+    let destination = m.resolve_prepaid(&sender, &policy, &addr);
+    m.park_prepaid(
+        &destination,
+        crate::messaging::PrepaidEntry {
+            body: "later",
+            urgency: Urgency::Normal,
+            publish_ts: Utc::now(),
+        },
+        later,
+    )
+    .expect("the deferred cap admits one schedule");
+    assert!(
+        fed_bodies(&router).await.is_empty(),
+        "a parked entry is not fed at publish time"
+    );
+
+    assert_eq!(m.release_due_messages(later).await.released, 1);
+    let fed = fed_bodies(&router).await;
+    assert_eq!(fed.len(), 1, "the release fed it exactly once: {fed:?}");
+    assert!(fed[0].contains("later"), "and it is the schedule: {fed:?}");
+}
+
+/// The prepaid entry point — the one an activation flush's ring entries take —
+/// feeds the surface too. It bypasses the publish ladder's rate gate, not its
+/// delivery.
+#[tokio::test]
+async fn a_prepaid_ephemeral_publish_feeds_the_surface() {
+    let (m, addr, router) = build_ephemeral_surface_feed_messenger().await;
+    let sender = ParticipantId::for_surface_component("durabar", "clock");
+    let policy = ephemeral_surface_policy();
+
+    let destination = m.resolve_prepaid(&sender, &policy, &addr);
+    let appended = m
+        .publish_prepaid(
+            &destination,
+            crate::messaging::PrepaidEntry {
+                body: "flushed",
+                urgency: Urgency::Normal,
+                publish_ts: Utc::now(),
+            },
+        )
+        .await;
+    assert_eq!(appended.retained.seq, 1);
+
+    let fed = fed_bodies(&router).await;
+    assert_eq!(fed.len(), 1, "the flush entry was fed once: {fed:?}");
+    assert!(fed[0].contains("flushed"), "and it is the entry: {fed:?}");
+}
+
+/// A flush naming a ring channel is applied by the same entry point a flush
+/// naming a table is: the batch is handed over whole and the channel decides
+/// where its entries land. The bodies reach the ring in call order and the
+/// immediate ones are fed.
+#[tokio::test]
+async fn a_batch_of_ephemeral_entries_commits_to_the_ring_and_feeds() {
+    let (m, addr, router) = build_ephemeral_surface_feed_messenger().await;
+    let later = Utc::now() + Duration::from_secs(600);
+
+    let dropped = m
+        .publish_batch_from_surface(
+            "durabar",
+            "clock",
+            &[
+                SurfaceBatchPublish {
+                    channel_address: &addr,
+                    body: "first",
+                    urgency: Urgency::Normal,
+                    publish_ts_ns: stamp(0),
+                    deliver_after: None,
+                },
+                SurfaceBatchPublish {
+                    channel_address: &addr,
+                    body: "second",
+                    urgency: Urgency::Normal,
+                    publish_ts_ns: stamp(1),
+                    deliver_after: None,
+                },
+                deferred(&addr, "scheduled", 2, later),
+            ],
+        )
+        .await;
+
+    assert_eq!(dropped, 0, "the ring's deferred cap admitted the schedule");
+    let store = m
+        .ring_stores()
+        .get_by_address(&addr)
+        .expect("the fixture channel is a ring");
+    let retained: Vec<String> = store
+        .retained_tail(10)
+        .into_iter()
+        .map(|r| r.envelope.body.clone())
+        .collect();
+    assert_eq!(
+        retained,
+        vec!["first".to_string(), "second".to_string()],
+        "the immediate entries entered retention in call order; the schedule did not"
+    );
+    assert_eq!(store.deferred_len(), 1, "the schedule is parked");
+
+    let fed = fed_bodies(&router).await;
+    assert_eq!(fed.len(), 2, "the two immediate entries were fed: {fed:?}");
+}
+
+/// Untested, the batch caller could drop its overflow enactment and the only
+/// symptom would be silence where an operator expected an alert.
+#[tokio::test]
+async fn a_batch_overrunning_the_ring_enacts_its_overflow_events() {
+    let (m, addr, router) =
+        build_ephemeral_surface_feed_messenger_at(1, Some("ring-watcher")).await;
+
+    let dropped = m
+        .publish_batch_from_surface(
+            "durabar",
+            "clock",
+            &(0..3)
+                .map(|i| SurfaceBatchPublish {
+                    channel_address: &addr,
+                    body: "over",
+                    urgency: Urgency::Normal,
+                    publish_ts_ns: stamp(i),
+                    deliver_after: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await;
+
+    assert_eq!(dropped, 0, "nothing was refused; the ring took all three");
+    let store = m
+        .ring_stores()
+        .get_by_address(&addr)
+        .expect("the fixture channel is a ring");
+    assert_eq!(
+        store.retained_tail(10).len(),
+        1,
+        "a ring retaining 1 holds only the newest of the three"
+    );
+    assert!(
+        router.alarms.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the batch's overflow events reached the noise ladder"
+    );
+    assert_eq!(
+        m.drop_counter(
+            &addr,
+            &crate::messaging::ParticipantId::for_wasm("ring-watcher")
+        ),
+        2,
+        "both evicted positions were accounted against the subscriber that lost them"
+    );
+}
+
+/// The ring's own deferred cap refuses a schedule the same way the durable
+/// half's count-then-insert does: the entry publishes nothing, is counted
+/// against the component that asked for it, and the rest of the batch lands.
+#[tokio::test]
+async fn the_rings_deferred_cap_refuses_one_batch_schedule() {
+    let (m, addr, _router) = build_ephemeral_surface_feed_messenger().await;
+    let later = Utc::now() + Duration::from_secs(600);
+
+    // The fixture ring retains 4, so the fifth schedule is refused.
+    let mut batch: Vec<SurfaceBatchPublish<'_>> =
+        (0..5).map(|i| deferred(&addr, "sched", i, later)).collect();
+    batch.push(SurfaceBatchPublish {
+        channel_address: &addr,
+        body: "immediate",
+        urgency: Urgency::Normal,
+        publish_ts_ns: stamp(5),
+        deliver_after: None,
+    });
+
+    let dropped = m
+        .publish_batch_from_surface("durabar", "clock", &batch)
+        .await;
+
+    assert_eq!(dropped, 1, "the cap refused exactly one schedule");
+    let store = m
+        .ring_stores()
+        .get_by_address(&addr)
+        .expect("the fixture channel is a ring");
+    assert_eq!(store.deferred_len(), 4, "the cap held at the retain depth");
+    assert_eq!(
+        store
+            .retained_tail(10)
+            .into_iter()
+            .map(|r| r.envelope.body.clone())
+            .collect::<Vec<_>>(),
+        vec!["immediate".to_string()],
+        "the unconditional entry published anyway"
+    );
+    assert_eq!(
+        m.dropped_deferred_count("surface:durabar#clock", &addr),
+        1,
+        "the drop is counted against the component that asked for it"
+    );
+}
+
+/// The scheme stamped on each fed envelope, in order.
+async fn fed_schemes(router: &CountingRouter) -> Vec<ChannelScheme> {
+    router
+        .fed
+        .lock()
+        .await
+        .iter()
+        .map(|e| e.envelope_type)
+        .collect()
 }
 
 /// The bodies the router was handed as live surface deliveries, in order.

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use brenn_lib::messaging::config::ResolvedSurface;
 use brenn_lib::messaging::store::{DeferredMessage, SurfaceFeedTarget};
 use brenn_lib::messaging::{
     DeliveryShape, MessageEnvelope, ParticipantId, SubscriberEntryKind, WakeRouter,
@@ -18,7 +19,7 @@ use tracing::{debug, warn};
 
 use crate::active_bridge::ActiveBridges;
 use crate::routes::surface::SubKey;
-use crate::routes::surface::registry::{DeferredViewPush, DurableDelivery, SessionPush};
+use crate::routes::surface::registry::{DeferredViewPush, LiveDelivery, SessionPush};
 use crate::routes::surface::session::deferred_view_entries;
 use crate::state::AppState;
 use crate::system_message::render_event_drain;
@@ -123,6 +124,30 @@ impl WakeRouterImpl {
         );
     }
 
+    /// Register the `SurfaceSessions` delivery route for every principal one
+    /// surface declares (`ResolvedSurface::principals` — the kernel identity
+    /// plus one per component instance). This is the whole per-surface half of
+    /// the host's delivery wiring; boot calls it once per installed surface and
+    /// test rigs call it for the same reason, so a fixture cannot register a
+    /// different route set than the running server.
+    ///
+    /// Every principal is its own subscriber and the router resolves a row's
+    /// route by the *subscriber's* registration key, so an unregistered instance
+    /// reaches the no-binding panic in `delivery_route`. The grain does not
+    /// change the route: the websocket is transport, and one session carries the
+    /// whole page's principals.
+    pub(crate) fn register_surface_delivery_routes(&self, surface: &ResolvedSurface) {
+        for instance in surface.principals() {
+            self.register_delivery_binding(
+                SubscriberEntryKind::Surface {
+                    slug: surface.slug.clone(),
+                    instance,
+                },
+                DeliveryBinding::SurfaceSessions,
+            );
+        }
+    }
+
     /// Whether a delivery binding is registered for `key`. Used by the boot
     /// cross-check to assert every directory subscriber has one before any
     /// publish can reach the dispatch path (a missing binding at dispatch time
@@ -181,7 +206,7 @@ fn chat_conversation(key: &SubscriberEntryKind) -> Option<i64> {
 fn retention_position(retained_seq: i64) -> u64 {
     u64::try_from(retained_seq).unwrap_or_else(|_| {
         panic!(
-            "surface durable delivery: retention position {retained_seq} is negative — a \
+            "surface delivery: retention position {retained_seq} is negative — a \
              delivered bus message is always in retention"
         )
     })
@@ -257,16 +282,12 @@ impl WakeRouter for WakeRouterImpl {
         let mut accepted = 0usize;
         let mut rejected = 0usize;
         for handle in &subscribed {
-            let delivery = DurableDelivery {
+            let delivery = LiveDelivery {
                 envelope: envelope.clone(),
                 retained_seq,
                 sub: sub.clone(),
             };
-            if handle
-                .push_tx
-                .try_send(SessionPush::Durable(delivery))
-                .is_ok()
-            {
+            if handle.push_tx.try_send(SessionPush::Live(delivery)).is_ok() {
                 accepted += 1;
             } else {
                 rejected += 1;
@@ -279,7 +300,7 @@ impl WakeRouter for WakeRouterImpl {
                 retained_seq,
                 rejected,
                 accepted,
-                "surface durable live delivery: some session queues full; those \
+                "surface live delivery: some session queues full; those \
                  sessions are served the suffix by the drain nudge below"
             );
         }
@@ -339,27 +360,29 @@ impl WakeRouter for WakeRouterImpl {
         }
 
         for handle in &subscribed {
-            let delivery = DurableDelivery {
+            let delivery = LiveDelivery {
                 envelope: envelope.clone(),
                 retained_seq: retention_position(retained_seq),
                 sub: sub.clone(),
             };
             if handle
                 .push_tx
-                .try_send(SessionPush::Durable(delivery))
+                .try_send(SessionPush::Live(delivery))
                 .is_err()
             {
-                // Full queue: a fold-0 subscription holds no cursor, so nothing
-                // is owed and the loss is real — the wire's silence is the
-                // contract, and recovery is the retained window at the next
-                // subscribe/resume. A push-enabled subscription instead resumes
-                // from its own position and re-reads what the drop skipped.
+                // Full queue: a fold-0 subscription holds a wire position like
+                // any other, but no push window, so the drop is tolerated and
+                // never reported — `Deliver.dropped` describes an overflow of a
+                // window this subscription does not have. Its position is
+                // unmoved, so the row is served by the next drain this session
+                // takes (any nudge drains every active subscription) or by the
+                // next resume.
                 warn!(
                     slug = %slug,
                     channel = %envelope.channel,
                     retained_seq,
-                    "surface durable depth-0 context feed: session queue full; row-less \
-                     delivery dropped (recovered at the next resume)"
+                    "surface depth-0 context feed: session queue full; row-less \
+                     delivery dropped (served by the next drain or resume)"
                 );
             }
         }
@@ -1265,11 +1288,11 @@ mod tests {
         }
     }
 
-    /// The durable row inside a session push, panicking on any other variant —
+    /// The live row inside a session push, panicking on any other variant —
     /// these tests drive the delivery fan-out, so anything else is a wiring bug.
-    fn durable_push(push: SessionPush) -> DurableDelivery {
+    fn durable_push(push: SessionPush) -> LiveDelivery {
         match push {
-            SessionPush::Durable(delivery) => delivery,
+            SessionPush::Live(delivery) => delivery,
             SessionPush::DeferredView(view) => {
                 panic!(
                     "expected a durable row, got a deferred view for {}",
@@ -1298,9 +1321,9 @@ mod tests {
         let mut handle = SurfaceSessionHandle::for_test("dev");
         handle.push_tx = push_tx;
         handle
-            .durable_subs
+            .active_subs
             .lock()
-            .expect("durable_subs poisoned")
+            .expect("active_subs poisoned")
             .insert(SubKey {
                 instance: "protobar".to_string(),
                 channel: channel.to_string(),
@@ -1402,7 +1425,7 @@ mod tests {
         assert!(no_pending_push_rows(&db).await);
     }
 
-    /// `deliver_context` (the durable depth-0 row-less feed) fans an envelope to
+    /// `deliver_context` (the depth-0 row-less feed) fans an envelope to
     /// an attached, subscribed session's live queue with **no** DB claim — it
     /// touches no `messaging_pending_pushes` row at all.
     #[tokio::test]

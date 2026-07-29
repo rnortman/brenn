@@ -208,7 +208,7 @@ pub(crate) fn surface_outputting_to(channel_address: &str) -> ResolvedSurface {
             chrome: false,
         }],
         subscriptions: vec![],
-        durable_subscriptions: vec![],
+        wire_subscriptions: vec![],
         local_channels: vec![],
         outputs: vec![SurfaceOutput {
             channel_address: channel_address.to_string(),
@@ -283,12 +283,23 @@ fn surface_harness_over(
     entries: Vec<ChannelEntry>,
     stores: Arc<RingStores>,
 ) -> SurfaceTestHarness {
+    // Before the messenger: its directory carries the surface's subscribers, so
+    // a subscription derived later would be invisible to the live fan-out. The
+    // uuids come off the entries the directory is built from, as boot's do.
+    let mut surface = surface;
+    crate::test_support::surface::derive_wire_subscriptions(&mut surface);
+    crate::test_support::surface::bind_wire_subscription_uuids(&mut surface, &entries);
     let (mut state, alerts, _handle) = test_state_with_capturing_alerter(db);
     let flusher = state.alert_dispatcher.clone();
     // The surface publishes through the Messenger, so the fixture needs one
     // with the channels, stores, and a subscriber registration carrying the
     // surface's boot-resolved policy.
-    let messenger = fixture_messenger(db, &entries, &surface, Arc::clone(&stores));
+    let router = Arc::new(crate::messaging_router::WakeRouterImpl::new(
+        crate::active_bridge::ActiveBridges::new(),
+    ));
+    router.register_surface_delivery_routes(&surface);
+    let messenger = fixture_messenger(db, &entries, &surface, Arc::clone(&stores), router.clone());
+    state.messenger = Some(Arc::clone(&messenger));
     state.surfaces = Arc::new(install_surface_runtimes(
         vec![surface],
         Some(Arc::clone(&messenger)),
@@ -296,6 +307,7 @@ fn surface_harness_over(
         None,
         crate::test_support::surface::description_params(),
     ));
+    router.set_state(state.clone());
     SurfaceTestHarness {
         state,
         alerts,
@@ -316,12 +328,15 @@ fn surface_harness_over(
 /// sees every surface a rig installs, including second surfaces that no
 /// messenger was built for.
 pub(crate) fn install_surface_runtimes(
-    surfaces: Vec<ResolvedSurface>,
+    mut surfaces: Vec<ResolvedSurface>,
     messenger: Option<Arc<brenn_lib::messaging::Messenger>>,
     max_body_bytes: usize,
     error_report: Option<(String, brenn_surface_proto::LogLevel)>,
     surface_description: SurfaceDescriptionParams,
 ) -> std::collections::HashMap<String, Arc<SurfaceRuntime>> {
+    for surface in &mut surfaces {
+        crate::test_support::surface::derive_wire_subscriptions(surface);
+    }
     crate::bootstrap::messaging::assert_output_bindings_covered(&surfaces);
     build_surface_runtimes(
         surfaces,
@@ -350,6 +365,7 @@ pub(crate) fn fixture_messenger(
     entries: &[ChannelEntry],
     surface: &ResolvedSurface,
     stores: Arc<RingStores>,
+    router: Arc<crate::messaging_router::WakeRouterImpl>,
 ) -> Arc<brenn_lib::messaging::Messenger> {
     use brenn_lib::messaging::{
         SubscriberEntryKind, SubscriberRegistration, WakeEconomics, WakeRouter,
@@ -357,10 +373,12 @@ pub(crate) fn fixture_messenger(
 
     let messenger = brenn_lib::messaging::Messenger::new(
         db.clone(),
-        Arc::new(MessagingDirectory::with_entries(entries.to_vec())),
+        Arc::new(MessagingDirectory::with_entries(
+            project_surface_subscribers(entries, surface),
+        )),
         Arc::from(TEST_ORIGIN),
         Arc::new(indexmap::IndexMap::new()),
-        Arc::new(brenn_lib::messaging::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+        router as Arc<dyn WakeRouter>,
         MessagingGlobalConfig {
             max_body_bytes: TEST_MAX_BODY_BYTES,
             ..Default::default()
@@ -454,6 +472,18 @@ pub(crate) async fn booted_surface_harness(
         None,
         crate::test_support::surface::description_params(),
     ));
+    // The publish path reaches an attached page through the router, so the
+    // router needs the state its session registry lives on and a delivery route
+    // per surface principal — the wiring `bootstrap/mod.rs` does once the real
+    // `AppState` exists.
+    let router = result
+        .router
+        .as_ref()
+        .expect("a config with a surface configures messaging");
+    for surface in &result.surfaces {
+        router.register_surface_delivery_routes(surface);
+    }
+    router.set_state(state.clone());
     BootedSurfaceHarness {
         state,
         alerts,
@@ -473,42 +503,89 @@ pub(crate) fn subscribe_harness(db: &db::Db, retain_depth: u64) -> SurfaceTestHa
     )
 }
 
-/// Publish `n` copies of `body` onto `addr` (bare name `name`) as sender
-/// `surface:{sender}`. Each sender has its own rate bucket, so splitting a flood
-/// across senders keeps every one under the per-sender burst. Asserts each
-/// publish is accepted — a failure means ACL/scheme/rate drift.
-pub(crate) fn publish_as(stores: &RingStores, sender: &str, addr: &str, body: &str, n: usize) {
+/// Project the surface's resolved wire subscriptions onto the channel entries,
+/// as boot's `finalize_directory_with_subscribers` does: the commit's surface
+/// fan-out resolves its targets from the directory, so a subscription the entry
+/// does not carry is fed nothing.
+///
+/// Keyed by uuid, as boot keys it. The caller has already joined each
+/// subscription to its entry (`bind_wire_subscription_uuids`), so this cannot
+/// silently match nothing.
+pub(super) fn project_surface_subscribers(
+    entries: &[ChannelEntry],
+    surface: &ResolvedSurface,
+) -> Vec<ChannelEntry> {
+    entries
+        .iter()
+        .cloned()
+        .map(|mut entry| {
+            entry.subscribers.extend(
+                surface
+                    .wire_subscriptions
+                    .iter()
+                    .filter(|sub| sub.subscription.channel_uuid == entry.uuid)
+                    .map(|sub| brenn_lib::messaging::SubscriberEntry {
+                        kind: brenn_lib::messaging::SubscriberEntryKind::Surface {
+                            slug: surface.slug.clone(),
+                            instance: Some(sub.instance.clone()),
+                        },
+                        push_depth: sub.subscription.push_depth,
+                        retain_depth: sub.subscription.retain_depth,
+                        noise: sub.subscription.noise,
+                        wake_min: None,
+                    }),
+            );
+            entry
+        })
+        .collect()
+}
+
+/// Publish `n` copies of `body` onto `addr` as sender `surface:{sender}`,
+/// through the prepaid entry point: the same commit-and-fan-out the publish
+/// ladder performs, without the per-sender rate gate a flood would trip.
+pub(crate) async fn publish_as(
+    messenger: &brenn_lib::messaging::Messenger,
+    sender: &str,
+    addr: &str,
+    body: &str,
+    n: usize,
+) {
     let participant = ParticipantId::for_surface(sender);
     for _ in 0..n {
-        commit_eph(stores, addr, &participant, body);
+        commit_eph(messenger, addr, &participant, body).await;
     }
 }
 
-/// Commit one message on an `ephemeral:` channel, bypassing the publish gates.
-pub(super) fn commit_eph(stores: &RingStores, addr: &str, sender: &ParticipantId, body: &str) {
-    stores
-        .get_by_address(addr)
-        .unwrap_or_else(|| panic!("channel {addr:?} has no store in this registry"))
-        .append(brenn_lib::messaging::MessageEnvelope {
-            message_id: uuid::Uuid::new_v4(),
-            source: "test".into(),
-            channel: addr.to_string(),
-            sender: sender.as_str().into(),
-            publish_ts: chrono::Utc::now(),
-            body: body.to_string(),
-            reply_to: None,
-            delivery_deadline: None,
-            deliver_after: None,
-            impetus: None,
-            urgency: Urgency::Normal,
-            envelope_type: brenn_lib::messaging::ChannelScheme::Ephemeral,
-        });
+/// Commit one message on an `ephemeral:` channel through the prepaid entry
+/// point — the ladder's own commit and surface fan-out, without its per-sender
+/// rate gate. The policy is synthesized permissive: what these fixtures publish
+/// is the channel's contents, not an authorization question.
+pub(super) async fn commit_eph(
+    messenger: &brenn_lib::messaging::Messenger,
+    addr: &str,
+    sender: &ParticipantId,
+    body: &str,
+) {
+    let (_, name) = brenn_lib::messaging::ChannelScheme::split(addr)
+        .expect("commit_eph: the fixture address carries a scheme");
+    let policy = publish_policy(&[name]);
+    let destination = messenger.resolve_prepaid(sender, &policy, addr);
+    let _ = messenger
+        .publish_prepaid(
+            &destination,
+            brenn_lib::messaging::PrepaidEntry {
+                body,
+                urgency: Urgency::Normal,
+                publish_ts: chrono::Utc::now(),
+            },
+        )
+        .await;
 }
 
 /// Publish one message onto the fixture channel `EPH_ADDR` as a distinct
 /// publisher.
-pub(crate) fn publish(stores: &RingStores, body: &str) {
-    publish_as(stores, "publisher", EPH_ADDR, body, 1);
+pub(crate) async fn publish(messenger: &brenn_lib::messaging::Messenger, body: &str) {
+    publish_as(messenger, "publisher", EPH_ADDR, body, 1).await;
 }
 
 /// Mint the resume cursor a page would hold after receiving the message
@@ -547,7 +624,10 @@ pub(crate) async fn durable_resume_at(
             brenn_lib::messaging::db::channel_resume_epoch(&conn, channel_uuid),
         )
     };
-    super::cursor::mint(incarnation, epoch, seq)
+    super::cursor::mint(
+        incarnation,
+        brenn_lib::messaging::store::ResumeCursor { epoch, seq },
+    )
 }
 
 /// Drain the capturing alerter's channel, then assert no security event was

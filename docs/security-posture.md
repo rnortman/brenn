@@ -284,10 +284,11 @@ a reconnect is a normal close, not a fail2ban signal.
   Subscribe burst → drop → reconnect, sustaining subscribe/replay DB work above
   the 1/sec steady-state the bucket implies.
 - **Why the blast radius is bounded:** the work *per* Subscribe is
-  config-bounded — the resolved `push_depth`/`retain_depth` of a durable surface
-  binding are boot-required to be bounded, so each subscribe's parked load and
-  retained re-send are capped, and the residual per-connection replay-dedup state
-  is hard-capped (`REPLAY_SENT_MAX`). The abuse is therefore sustained
+  config-bounded — the resolved `push_depth`/`retain_depth` of a surface
+  binding are boot-required to be bounded, whatever the channel's class, so
+  each subscribe's parked load and retained re-send are capped, and the residual
+  per-connection replay-dedup state is hard-capped (`REPLAY_SENT_MAX`). The
+  abuse is therefore sustained
   *degradation* (extra contention on the shared DB connection mutex), never
   unbounded resource growth.
 - **Why it is accepted:** the deployment model is single-operator. The only

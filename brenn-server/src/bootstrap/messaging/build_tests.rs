@@ -1687,7 +1687,9 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
             address: "ephemeral:protobar-demo".to_string(),
             description: None,
             push_depth: None,
-            retain_depth: Some(brenn_lib::messaging::config::Depth::Bounded(0)),
+            // A surface-bound channel must retain something: the subscription's
+            // position is recovered by re-reading retention.
+            retain_depth: Some(brenn_lib::messaging::config::Depth::Bounded(1)),
             standing_retain_depth: None,
             noise: None,
             sink: None,

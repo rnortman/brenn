@@ -1,26 +1,20 @@
-//! Live attach: reading a transportable non-durable channel as a stream.
+//! Non-durable channel entry points: resolving a transportable ring-backed
+//! channel, and committing or parking an already-paid-for activation entry on
+//! one.
 //!
-//! A `RingStore` holds retention and a broadcast fan-out; this module is the
-//! consumer half of that fan-out — the receiver a wire transport drives, plus
-//! the two [`Messenger`] entry points that resolve a channel address to it.
-//!
-//! Attach is atomic: every message is either entirely in the replay the attach
-//! returns or entirely on the receiver it hands out — no loss, no duplication
-//! at the boundary. Loss beyond that is detectable via `(epoch, seq)`: a
-//! per-boot epoch and a dense per-channel seq. Delivery is best-effort: a
-//! publish with no attached consumer still enters retention, so a later fresh
-//! attach sees it.
+//! Messages are read back from retention by resume position, through
+//! [`crate::messaging::store::RetentionStore`], so loss is detectable via
+//! `(epoch, seq)`: a per-boot epoch and a dense per-channel seq. Delivery is
+//! best-effort: a publish with no consumer attached still enters retention, so
+//! a later resume sees it.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use tokio::sync::broadcast;
-use tracing::{debug, warn};
 use uuid::Uuid;
 
 use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
-use brenn_queue::{QuotaExceeded, ReplayDecision, Resume};
+use brenn_queue::{QuotaExceeded, ReplayDecision};
 
 /// Why a replay carries a gap (a discontinuity the consumer must be told about).
 pub use brenn_queue::GapReason;
@@ -28,177 +22,47 @@ pub use brenn_queue::GapReason;
 use crate::access::AppPolicy;
 use crate::messaging::gates::{check_body_size, publish_acl_allows};
 use crate::messaging::store::RingStore;
-use crate::messaging::store::ring::{Appended, RetainedMessage};
+use crate::messaging::store::SurfaceFeedTarget;
+use crate::messaging::store::ring::Appended;
 use crate::messaging::{ChannelEntry, Messenger, ParticipantId};
 
-/// A single message on a live stream plus its per-channel sequence number.
-pub type EphemeralDelivery = RetainedMessage;
-
-/// A consumer's resume position: the epoch and last seq it has already seen on
-/// a channel.
-pub type EphemeralResume = Resume<Uuid>;
-
-/// The replay decision for an attach, alongside the replayed messages.
+/// The decision a replay reached, alongside the replayed messages.
 pub type Replay = ReplayDecision;
 
-/// Per-`(channel address, participant)` counters for the live stream, owned by
-/// the [`Messenger`] and shared with every receiver it hands out.
-///
-/// Both counts are consumer-side facts the store cannot see: a lag is measured
-/// against the receiver's own position in the fan-out, and a delivery-time
-/// denial happens after the message has already entered retention.
-#[derive(Debug, Default)]
-pub struct LiveCounters {
-    /// Overflow-dropped message count, summed from fan-out lag events.
-    dropped: Mutex<HashMap<(String, String), u64>>,
-    /// Delivery-time ACL denials. Expected to stay zero (policies are
-    /// boot-static); nonzero signals a wiring bug.
-    delivery_denied: Mutex<HashMap<(String, String), u64>>,
-}
-
-impl LiveCounters {
-    /// Increment a `(channel, participant)`-keyed counter by `n`.
-    fn bump(map: &Mutex<HashMap<(String, String), u64>>, channel: &str, participant: &str, n: u64) {
-        *map.lock()
-            .expect("messaging live: counter lock poisoned")
-            .entry((channel.to_owned(), participant.to_owned()))
-            .or_insert(0) += n;
-    }
-
-    /// Read a `(channel, participant)`-keyed counter (0 if absent).
-    fn get(map: &Mutex<HashMap<(String, String), u64>>, channel: &str, participant: &str) -> u64 {
-        *map.lock()
-            .expect("messaging live: counter lock poisoned")
-            .get(&(channel.to_owned(), participant.to_owned()))
-            .unwrap_or(&0)
-    }
-}
-
-/// Why a live attach was rejected.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EphemeralSubscribeError {
-    /// Address names no channel in the directory.
-    UnknownChannel(String),
-    /// The channel exists but carries no live stream: a durable channel's
-    /// consumers read it through the dispatcher, and a confined (`local:`)
-    /// channel never crosses the process boundary at all.
-    NotLiveAttachable(String),
-    /// Consumer holds no covering grant + ACL matcher for the channel.
-    AclDenied(String),
-}
-
-/// The result of a successful attach: the replay set (oldest-first, seq
-/// ascending), the replay decision, and the live receiver.
-pub struct EphemeralSubscription {
-    pub replay: Vec<Arc<EphemeralDelivery>>,
-    pub decision: Replay,
-    pub receiver: EphemeralReceiver,
-}
-
-/// An event from the live stream after attach.
-#[derive(Debug, Clone)]
-pub enum EphemeralEvent {
-    /// A message delivered on the channel.
-    Delivery(Arc<EphemeralDelivery>),
-    /// `n` messages were lost to fan-out overflow (this consumer lagged).
-    Dropped(u64),
-}
-
-/// The live half of an attach. Wraps the fan-out receiver plus the context
-/// needed for delivery-time ACL re-checks and per-`(channel, participant)`
-/// counters. Dropping it detaches the consumer (receiver drop is the whole
-/// mechanism).
-pub struct EphemeralReceiver {
-    rx: broadcast::Receiver<Arc<EphemeralDelivery>>,
-    subscriber: ParticipantId,
-    policy: Arc<AppPolicy>,
-    /// Full scheme-prefixed channel address, for the ACL re-check, the counter
-    /// keys, and logs.
-    address: String,
-    counters: Arc<LiveCounters>,
-}
-
-impl EphemeralReceiver {
-    /// Block until the next event, or `None` when every sender is gone (process
-    /// shutdown). Delivery-time ACL denials and lag notifications are handled
-    /// internally: a denied delivery is skipped (loop continues), a lag
-    /// surfaces as `Dropped(n)`.
-    pub async fn recv(&mut self) -> Option<EphemeralEvent> {
-        loop {
-            match self.rx.recv().await {
-                Ok(delivery) => {
-                    // Belt-and-suspenders re-check, mirroring durable
-                    // Enforcement point A: on deny, warn + count + skip, never
-                    // panic. Policies are boot-static, so this cannot fire
-                    // differently than the attach check — it is symmetry, not
-                    // revocation.
-                    if !self.policy.allows_channel_access(&self.address) {
-                        warn!(
-                            channel = %self.address,
-                            subscriber = self.subscriber.as_str(),
-                            "live delivery denied — ACL not satisfied"
-                        );
-                        LiveCounters::bump(
-                            &self.counters.delivery_denied,
-                            &self.address,
-                            self.subscriber.as_str(),
-                            1,
-                        );
-                        continue;
-                    }
-                    return Some(EphemeralEvent::Delivery(delivery));
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    LiveCounters::bump(
-                        &self.counters.dropped,
-                        &self.address,
-                        self.subscriber.as_str(),
-                        n,
-                    );
-                    warn!(
-                        channel = %self.address,
-                        subscriber = self.subscriber.as_str(),
-                        dropped = n,
-                        "live consumer lagged — messages dropped"
-                    );
-                    return Some(EphemeralEvent::Dropped(n));
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
-            }
-        }
-    }
-}
-
-impl Drop for EphemeralReceiver {
-    fn drop(&mut self) {
-        debug!(
-            channel = %self.address,
-            subscriber = self.subscriber.as_str(),
-            "live detach"
-        );
-    }
-}
-
-/// One entry of an activation flush the caller has already paid for, resolved
-/// against its own boot-resolved output map: who is publishing, under which
-/// policy, onto which channel, with what body, at which urgency and stamp.
+/// One entry of an activation flush the caller has already paid for: what to
+/// publish, at which urgency and stamp. Where it goes is a
+/// [`PrepaidDestination`], resolved separately.
 ///
 /// A struct rather than a parameter list because the two entry points that take
 /// it — [`Messenger::publish_prepaid`] and [`Messenger::park_prepaid`] — must
-/// take *exactly* the same admitted entry, and because three of its fields are
-/// `&str`-shaped and would typecheck transposed.
-///
-/// Caller invariant: `sender` and `policy` MUST both be derived from the same
-/// config-resolved principal, never from client input.
+/// take *exactly* the same admitted entry.
 pub struct PrepaidEntry<'a> {
-    pub sender: &'a ParticipantId,
-    pub policy: &'a AppPolicy,
-    pub channel_address: &'a str,
     pub body: &'a str,
     pub urgency: Urgency,
     /// Assigned by the caller in call order across the whole flush, before it was
     /// split by class, so call order stays visible across the class boundary.
     pub publish_ts: DateTime<Utc>,
+}
+
+/// Where an activation flush's entries land: the resolved channel, the ring that
+/// takes its messages, and the surface subscribers a committed entry is fanned
+/// out to.
+///
+/// Split out of the entry so a flush resolves its destination **once per
+/// address** rather than once per entry: the directory and the channel's
+/// subscriber list are fixed for the flush's life, and the dominant case is a
+/// flush fanning one port. Whether a session is *attached* is still asked per
+/// entry, at fan-out, since a session can detach mid-flush.
+///
+/// Constructing one runs the whole class and authorization decision
+/// ([`Messenger::resolve_prepaid`]), so holding one is the proof that entries
+/// may be committed onto that channel under that sender.
+pub struct PrepaidDestination {
+    sender: ParticipantId,
+    scheme: ChannelScheme,
+    entry: Arc<ChannelEntry>,
+    store: Arc<RingStore>,
+    feed_targets: Vec<SurfaceFeedTarget>,
 }
 
 impl Messenger {
@@ -209,126 +73,63 @@ impl Messenger {
         self.ring_stores().epoch()
     }
 
-    /// Overflow-dropped message count for a `(channel address, participant)`
-    /// pair on the live stream.
-    pub fn live_drop_count(&self, channel_address: &str, participant: &str) -> u64 {
-        LiveCounters::get(&self.live_counters.dropped, channel_address, participant)
-    }
-
-    /// Delivery-time ACL-denial count for a `(channel address, participant)`
-    /// pair on the live stream.
-    pub fn live_delivery_denied_count(&self, channel_address: &str, participant: &str) -> u64 {
-        LiveCounters::get(
-            &self.live_counters.delivery_denied,
-            channel_address,
-            participant,
-        )
-    }
-
-    /// The ring store behind a channel that carries a live stream.
+    /// Resolve and gate the destination an already-paid-for activation flush's
+    /// entries commit onto.
+    ///
+    /// The capability check is the whole class decision and it is made here,
+    /// once: a durable channel's retention is the database's, and a confined
+    /// channel never crosses the process boundary at all. The publish ACL is
+    /// checked here too, so a destination cannot be held without one.
     ///
     /// # Panics
     ///
-    /// If the entry has no ring. The caller has already established the channel
-    /// is non-durable, so a miss means the directory and the store registry
-    /// disagree about which channels exist.
-    fn live_store(&self, entry: &ChannelEntry) -> Arc<RingStore> {
-        self.ring_stores()
-            .get(&entry.uuid)
-            .unwrap_or_else(|| {
-                panic!(
-                    "messaging live: non-durable channel {:?} is in the directory but has no \
-                     retention store — the directory and the store registry disagree",
-                    entry.address
-                )
-            })
-            .clone()
-    }
-
-    /// Resolve a channel that carries a live stream, or say why it does not.
+    /// If the address names no channel, names one that is not a transportable
+    /// ring, or one the sender holds no publish ACL for. Every client-reachable
+    /// failure was already answered as a violation by the caller's per-entry
+    /// resolve against its boot-resolved output map, so a failure here means
+    /// that map disagrees with the directory or the principal's policy —
+    /// publishing anyway would route traffic no operator authorized.
     ///
-    /// The capability check is the whole class decision and it is made here,
-    /// once: a durable channel's consumers read it through the dispatcher, and a
-    /// confined channel issues no handle a serializer could reach.
-    fn live_channel(
+    /// Caller invariant, as for the ladder: `sender` and `policy` MUST both be
+    /// derived from the same config-resolved principal, never from client input.
+    pub fn resolve_prepaid(
         &self,
+        sender: &ParticipantId,
+        policy: &AppPolicy,
         channel_address: &str,
-    ) -> Result<Arc<ChannelEntry>, EphemeralSubscribeError> {
-        let entry = self
-            .directory
-            .resolve(channel_address)
-            .ok_or_else(|| EphemeralSubscribeError::UnknownChannel(channel_address.to_string()))?;
+    ) -> PrepaidDestination {
+        let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
+            panic!(
+                "prepaid publish: bound output {channel_address:?} is not in the directory — boot \
+                 validation proves every bound output resolves, so this is a broken boot invariant"
+            )
+        });
         let caps = entry.capabilities();
-        if caps.durable || !caps.transportable {
-            return Err(EphemeralSubscribeError::NotLiveAttachable(
-                channel_address.to_string(),
-            ));
-        }
-        Ok(entry)
-    }
-
-    /// Attach a consumer to a channel's live stream. Returns the retained-window
-    /// replay (computed per the resume rules), the replay decision, and a
-    /// receiver for messages that enter retention after the attach.
-    ///
-    /// The consumer arrives already resolved (identity + policy). The ACL is
-    /// checked once here via `allows_channel_access`; the receiver re-checks it
-    /// on each live delivery (belt-and-suspenders symmetry with the durable
-    /// path).
-    ///
-    /// Denial observability: the denial arms are silent — no counter, no log.
-    /// A caller passing an attacker-influenceable address must bring its own
-    /// denial observability, mirroring the publish ladder's.
-    pub fn attach_live(
-        &self,
-        subscriber: ParticipantId,
-        policy: Arc<AppPolicy>,
-        channel_address: &str,
-        resume: Option<EphemeralResume>,
-    ) -> Result<EphemeralSubscription, EphemeralSubscribeError> {
-        let entry = self.live_channel(channel_address)?;
-
-        // Delivery-time ACL (grant + covering matcher, deny-by-default) against
-        // the full stored address, matching the durable delivery gate.
-        if !policy.allows_channel_access(&entry.address) {
-            return Err(EphemeralSubscribeError::AclDenied(
-                channel_address.to_string(),
-            ));
-        }
-
-        let attach = self.live_store(&entry).subscribe_live(resume);
-
-        if let Replay::Gap(GapReason::ResumeAhead) = attach.decision {
-            // Matching epoch but a seq this epoch never assigned: impossible for
-            // an honest consumer. The substrate only warns (fail closed, never
-            // panic); the distinguishable reason lets the transport above it
-            // escalate this as a protocol violation.
-            warn!(
-                channel = %entry.address,
-                subscriber = subscriber.as_str(),
-                "live attach: resume seq ahead of assigned range"
-            );
-        }
-
-        debug!(
-            channel = %entry.address,
-            subscriber = subscriber.as_str(),
-            decision = ?attach.decision,
-            replay_len = attach.replay.len(),
-            "live attach"
+        assert!(
+            !caps.durable && caps.transportable,
+            "prepaid publish: bound output {channel_address:?} is not a transportable ring channel \
+             — the caller splits its flush by class before reaching here, so this is a broken boot \
+             invariant"
         );
-
-        Ok(EphemeralSubscription {
-            replay: attach.replay,
-            decision: attach.decision,
-            receiver: EphemeralReceiver {
-                rx: attach.receiver,
-                subscriber,
-                policy,
-                address: entry.address.clone(),
-                counters: Arc::clone(&self.live_counters),
-            },
-        })
+        let (scheme, name) = ChannelScheme::split(&entry.address)
+            .expect("a directory entry's address always carries its scheme");
+        assert!(
+            publish_acl_allows(policy, scheme, name),
+            "prepaid publish: sender {sender:?} has no publish ACL covering bound output \
+             {channel_address:?} — boot validation proves every bound output is policy-covered, so \
+             this is a broken boot invariant",
+            sender = sender.as_str(),
+        );
+        let store = self.ring_store(&entry.uuid);
+        let feed_targets =
+            self.resolve_surface_feed_targets(&entry.address, entry.subscribers.as_slice());
+        PrepaidDestination {
+            sender: sender.clone(),
+            scheme,
+            entry,
+            store,
+            feed_targets,
+        }
     }
 
     /// Apply one entry of an activation flush that is **already paid for**,
@@ -350,24 +151,46 @@ impl Messenger {
     ///   whole batch in call order in one pass before splitting it by class, so
     ///   call order is visible across the class boundary at ns precision.
     ///
-    /// The gates **panic rather than return**: every client-reachable failure was
-    /// already answered as a violation by the caller's per-entry resolve against
-    /// its boot-resolved output map, so a failure here means the caller's map
-    /// disagrees with the directory or the principal's policy — publishing anyway
-    /// would route traffic no operator authorized.
+    /// The body-size gate **panics rather than returns**: the caller rejects an
+    /// over-cap entry as a violation before drawing against its budget, so a
+    /// breach here means the transport and bus caps disagree. The class and ACL
+    /// gates were run once, at [`resolve_prepaid`].
     ///
-    /// Caller invariant, as for the ladder: `sender` and `policy` MUST both be
-    /// derived from the same config-resolved principal, never from client input.
+    /// The committed entry is fanned out to the channel's attached surface
+    /// subscriptions before this returns: a surface holds no position for
+    /// anything to walk, so the commit is its whole delivery trigger.
     ///
     /// Returns the append's outcome, whose `overflow` names every attached
     /// subscriber whose owed messages this entry evicted. The caller must route
     /// it to the noise ladder: the eviction charge is booked as reported the
     /// moment it happens, so a discarded event is a drop no later take will ever
     /// surface.
+    ///
+    /// [`resolve_prepaid`]: Messenger::resolve_prepaid
     #[must_use]
-    pub fn publish_prepaid(&self, entry: PrepaidEntry<'_>) -> Appended {
-        let (store, envelope) = self.prepaid_envelope(entry);
-        store.append(envelope)
+    pub async fn publish_prepaid(
+        &self,
+        dest: &PrepaidDestination,
+        entry: PrepaidEntry<'_>,
+    ) -> Appended {
+        let envelope = self.prepaid_envelope(dest, entry);
+        let appended = dest.store.append(envelope);
+        // Resolution is the destination's, memoized across the flush; attachment
+        // is asked now, because a session can detach mid-flush.
+        if !dest.feed_targets.is_empty()
+            && self
+                .router
+                .any_surface_session_subscribed(&dest.entry.address, &dest.feed_targets)
+        {
+            self.fan_out_surface_feed(
+                &dest.feed_targets,
+                Arc::clone(&appended.retained.envelope),
+                i64::try_from(appended.retained.seq)
+                    .expect("messaging: retention position out of range"),
+            )
+            .await;
+        }
+        appended
     }
 
     /// Park one entry of an already-paid-for activation flush until `release_at`,
@@ -375,7 +198,7 @@ impl Messenger {
     ///
     /// The gates and the caller invariants are [`publish_prepaid`]'s, whole — this
     /// is the same admitted entry taking the other branch of the same decision.
-    /// Only the destination differs: the message goes to the channel's deferred
+    /// Only where it lands differs: the message goes to the channel's deferred
     /// set, where no retention read can observe it until the release sweep moves
     /// it, and the release time lives in that set rather than on the envelope.
     ///
@@ -388,60 +211,47 @@ impl Messenger {
     /// [`publish_prepaid`]: Messenger::publish_prepaid
     pub fn park_prepaid(
         &self,
+        dest: &PrepaidDestination,
         entry: PrepaidEntry<'_>,
         release_at: DateTime<Utc>,
     ) -> Result<Uuid, QuotaExceeded> {
-        let (store, envelope) = self.prepaid_envelope(entry);
-        store.park(envelope, release_at)
+        let envelope = self.prepaid_envelope(dest, entry);
+        dest.store.park(envelope, release_at)
     }
 
-    /// The gates every prepaid entry passes, plus the envelope it mints and the
-    /// store that takes it. Shared by the immediate and the parking entry points
-    /// so one admitted entry cannot be admitted by two slightly different rules.
+    /// The per-entry gate every prepaid entry passes, and the envelope it mints.
+    /// Shared by the immediate and the parking entry points so one admitted
+    /// entry cannot be admitted by two slightly different rules.
     ///
     /// The mint stamps `deliver_after: None` on both paths: a parked message's
     /// release time belongs to the channel's deferred set, and the envelope a
     /// consumer eventually reads is the one that was minted here.
-    fn prepaid_envelope(&self, prepaid: PrepaidEntry<'_>) -> (Arc<RingStore>, MessageEnvelope) {
+    fn prepaid_envelope(
+        &self,
+        dest: &PrepaidDestination,
+        entry: PrepaidEntry<'_>,
+    ) -> MessageEnvelope {
         let PrepaidEntry {
-            sender,
-            policy,
-            channel_address,
             body,
             urgency,
             publish_ts,
-        } = prepaid;
-        let entry = self.live_channel(channel_address).unwrap_or_else(|err| {
-            panic!(
-                "prepaid publish: bound output {channel_address:?} is not a live-attachable \
-                 channel ({err:?}) — boot validation proves every bound output resolves, so this \
-                 is a broken boot invariant"
-            )
-        });
-        let (scheme, name) = ChannelScheme::split(&entry.address)
-            .expect("a directory entry's address always carries its scheme");
-        assert!(
-            publish_acl_allows(policy, scheme, name),
-            "prepaid publish: sender {sender:?} has no publish ACL covering bound output \
-             {channel_address:?} — boot validation proves every bound output is policy-covered, so \
-             this is a broken boot invariant",
-            sender = sender.as_str(),
-        );
+        } = entry;
         if let Err(e) = check_body_size(body, self.defaults.max_body_bytes) {
             panic!(
-                "prepaid publish: bound output {channel_address:?} carries a {len}-byte body over \
-                 the {max}-byte cap — the caller rejects an over-cap entry as a violation before \
+                "prepaid publish: bound output {addr:?} carries a {len}-byte body over the \
+                 {max}-byte cap — the caller rejects an over-cap entry as a violation before \
                  drawing, so the two caps disagree",
+                addr = dest.entry.address,
                 len = e.len,
                 max = e.max,
             );
         }
 
-        let envelope = MessageEnvelope {
+        MessageEnvelope {
             message_id: Uuid::new_v4(),
             source: self.source().into(),
-            channel: entry.address.clone(),
-            sender: sender.as_str().into(),
+            channel: dest.entry.address.clone(),
+            sender: dest.sender.as_str().into(),
             publish_ts,
             body: body.to_string(),
             reply_to: None,
@@ -449,9 +259,8 @@ impl Messenger {
             deliver_after: None,
             impetus: None,
             urgency,
-            envelope_type: scheme,
-        };
-        (self.live_store(&entry), envelope)
+            envelope_type: dest.scheme,
+        }
     }
 }
 
@@ -462,7 +271,6 @@ mod tests {
     use crate::access::AppCapability;
     use crate::access::acl::ChannelMatcher;
     use crate::messaging::query::NoopWakeRouter;
-    use crate::messaging::store::ring::RING_FAN_OUT_CAPACITY;
     use crate::messaging::store::{OverflowEvent, Priming, RingStores};
     use crate::messaging::testutils::{ephemeral_channel_entry, local_channel_entry};
     use crate::messaging::{MessagingDirectory, MessagingGlobalConfig, WakeRouter};
@@ -476,11 +284,8 @@ mod tests {
 
     /// A `Messenger` over `entries` alone: no durable channels, one ring store
     /// apiece, a noop router.
-    fn messenger_with(entries: &[ChannelEntry], fan_out_capacity: u32) -> Arc<Messenger> {
-        let stores = Arc::new(RingStores::build_with_fan_out_capacity(
-            entries,
-            fan_out_capacity,
-        ));
+    fn messenger_with(entries: &[ChannelEntry]) -> Arc<Messenger> {
+        let stores = Arc::new(RingStores::build(entries));
         Messenger::new(
             crate::db::init_db_memory(),
             Arc::new(MessagingDirectory::with_entries(entries.to_vec())),
@@ -492,219 +297,26 @@ mod tests {
         .with_ring_stores(stores)
     }
 
-    fn subscriber_policy(channel: &str) -> Arc<AppPolicy> {
-        let mut p = AppPolicy::with_grants(&[AppCapability::EphemeralSubscribe]);
-        p.acls.ephemeral_subscribe = vec![ChannelMatcher::Exact(channel.to_string())];
-        Arc::new(p)
-    }
-
     fn publisher_policy(channel: &str) -> AppPolicy {
         let mut p = AppPolicy::with_grants(&[AppCapability::EphemeralPublish]);
         p.acls.ephemeral_publish = vec![ChannelMatcher::Exact(channel.to_string())];
         p
     }
 
-    /// Commit `n` messages onto the fixture channel, bypassing the gates.
-    fn commit_n(messenger: &Messenger, n: usize) {
-        let store = messenger
-            .ring_stores()
-            .get_by_address(CHANNEL)
-            .expect("fixture channel")
-            .clone();
-        for _ in 0..n {
-            store.append(MessageEnvelope {
-                message_id: Uuid::new_v4(),
-                source: "test-source".into(),
-                channel: CHANNEL.into(),
-                sender: "app:pub@test-source".into(),
-                publish_ts: Utc::now(),
-                body: "x".to_string(),
-                reply_to: None,
-                delivery_deadline: None,
-                deliver_after: None,
-                impetus: None,
-                urgency: Urgency::Normal,
-                envelope_type: ChannelScheme::Ephemeral,
-            });
-        }
-    }
-
-    #[tokio::test]
-    async fn attach_rejects_unknown_unattachable_and_denied() {
-        let messenger = messenger_with(
-            &[
-                ephemeral_channel_entry(NAME, 8),
-                local_channel_entry("confined", 8),
-            ],
-            RING_FAN_OUT_CAPACITY,
-        );
-
-        assert_eq!(
-            messenger
-                .attach_live(pid("s"), subscriber_policy(NAME), NAME, None)
-                .err(),
-            Some(EphemeralSubscribeError::UnknownChannel(NAME.to_string())),
-        );
-        // A confined channel exists but issues no live handle.
-        assert_eq!(
-            messenger
-                .attach_live(
-                    pid("s"),
-                    subscriber_policy("confined"),
-                    "local:confined",
-                    None
-                )
-                .err(),
-            Some(EphemeralSubscribeError::NotLiveAttachable(
-                "local:confined".to_string()
-            )),
-        );
-        // Grant but no matcher → deny-by-default.
-        let no_matcher = Arc::new(AppPolicy::with_grants(&[AppCapability::EphemeralSubscribe]));
-        assert_eq!(
-            messenger
-                .attach_live(pid("s"), no_matcher, CHANNEL, None)
-                .err(),
-            Some(EphemeralSubscribeError::AclDenied(CHANNEL.to_string())),
-        );
-        // Matcher but no grant → deny-by-default.
-        let mut p = AppPolicy::with_grants(&[]);
-        p.acls.ephemeral_subscribe = vec![ChannelMatcher::Exact(NAME.to_string())];
-        assert_eq!(
-            messenger
-                .attach_live(pid("s"), Arc::new(p), CHANNEL, None)
-                .err(),
-            Some(EphemeralSubscribeError::AclDenied(CHANNEL.to_string())),
-        );
-    }
-
-    /// The attach hands over the store's replay decision and window untouched,
-    /// and the live half carries everything after it.
-    #[tokio::test]
-    async fn attach_replays_the_window_then_streams_live() {
-        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 8)], RING_FAN_OUT_CAPACITY);
-        commit_n(&messenger, 3);
-
-        let resume = EphemeralResume {
-            epoch: messenger.ring_epoch(),
-            seq: 1,
-        };
-        let sub = messenger
-            .attach_live(pid("s"), subscriber_policy(NAME), CHANNEL, Some(resume))
-            .expect("attach");
-        assert_eq!(sub.decision, Replay::Exact);
-        assert_eq!(
-            sub.replay.iter().map(|d| d.seq).collect::<Vec<_>>(),
-            vec![2, 3]
-        );
-
-        let mut receiver = sub.receiver;
-        commit_n(&messenger, 1);
-        match receiver.recv().await {
-            Some(EphemeralEvent::Delivery(d)) => {
-                assert_eq!(d.seq, 4);
-                assert_eq!(d.envelope.channel, CHANNEL);
-            }
-            other => panic!("expected the live delivery, got {other:?}"),
-        }
-    }
-
-    /// A resume this epoch never assigned is answered, not hidden: the decision
-    /// reaches the caller so the transport above can escalate it.
-    #[tokio::test]
-    async fn attach_reports_a_resume_ahead_of_the_assigned_range() {
-        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 8)], RING_FAN_OUT_CAPACITY);
-        commit_n(&messenger, 2);
-
-        let resume = EphemeralResume {
-            epoch: messenger.ring_epoch(),
-            seq: 99,
-        };
-        let sub = messenger
-            .attach_live(pid("s"), subscriber_policy(NAME), CHANNEL, Some(resume))
-            .expect("attach");
-        assert_eq!(sub.decision, Replay::Gap(GapReason::ResumeAhead));
-        assert_eq!(sub.replay.len(), 2);
-    }
-
-    /// A lagging consumer's loss is counted against it by name and surfaced as
-    /// an exact drop count, then delivery resumes.
-    #[tokio::test]
-    async fn a_lagging_consumer_is_counted_and_told() {
-        const CAPACITY: u32 = 4;
-        const OVERSHOOT: u64 = 3;
-        let flood = CAPACITY as usize + OVERSHOOT as usize;
-        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 0)], CAPACITY);
-
-        let subscriber = pid("s");
-        let mut receiver = messenger
-            .attach_live(subscriber.clone(), subscriber_policy(NAME), CHANNEL, None)
-            .expect("attach")
-            .receiver;
-
-        commit_n(&messenger, flood);
-
-        match receiver.recv().await {
-            Some(EphemeralEvent::Dropped(n)) => assert_eq!(n, OVERSHOOT),
-            other => panic!("expected Dropped({OVERSHOOT}), got {other:?}"),
-        }
-        assert_eq!(
-            messenger.live_drop_count(CHANNEL, subscriber.as_str()),
-            OVERSHOOT
-        );
-
-        let mut resumed = Vec::new();
-        for _ in 0..CAPACITY {
-            match receiver.recv().await {
-                Some(EphemeralEvent::Delivery(d)) => resumed.push(d.seq),
-                other => panic!("expected Delivery, got {other:?}"),
-            }
-        }
-        assert_eq!(resumed, (OVERSHOOT + 1..=flood as u64).collect::<Vec<_>>());
-    }
-
-    /// The delivery-time re-check is exercised by constructing a receiver whose
-    /// policy denies — boot-static policies cannot reach this branch through
-    /// `attach_live`.
-    #[tokio::test]
-    async fn delivery_time_acl_deny_skips_and_counts() {
-        let counters = Arc::new(LiveCounters::default());
-        let (tx, rx) = broadcast::channel(4);
-        let subscriber = pid("s");
-        let mut receiver = EphemeralReceiver {
-            rx,
-            subscriber: subscriber.clone(),
-            policy: Arc::new(AppPolicy::with_grants(&[])),
-            address: CHANNEL.to_string(),
-            counters: Arc::clone(&counters),
-        };
-
-        tx.send(Arc::new(RetainedMessage {
-            seq: 1,
-            envelope: Arc::new(MessageEnvelope {
-                message_id: Uuid::new_v4(),
-                source: "test-source".into(),
-                channel: CHANNEL.into(),
-                sender: "app:pub@test-source".into(),
-                publish_ts: Utc::now(),
-                body: "x".to_string(),
-                reply_to: None,
-                delivery_deadline: None,
-                deliver_after: None,
-                impetus: None,
-                urgency: Urgency::Normal,
-                envelope_type: ChannelScheme::Ephemeral,
-            }),
-        }))
-        .expect("send");
-        drop(tx); // close after the one message
-
-        // The denied delivery is skipped; the loop then sees Closed → None.
-        assert!(receiver.recv().await.is_none());
-        assert_eq!(
-            LiveCounters::get(&counters.delivery_denied, CHANNEL, subscriber.as_str()),
-            1
-        );
+    /// A confined channel is in the directory and holds retention, but nothing
+    /// here may commit onto it: the class decision is made once, at resolution,
+    /// and a caller that reaches it has a broken boot invariant rather than a
+    /// tolerable no-op.
+    #[test]
+    #[should_panic(expected = "not a transportable ring channel")]
+    fn a_confined_channel_is_not_a_prepaid_destination() {
+        let messenger = messenger_with(&[
+            ephemeral_channel_entry(NAME, 8),
+            local_channel_entry("confined", 8),
+        ]);
+        let mut policy = AppPolicy::with_grants(&[AppCapability::EphemeralPublish]);
+        policy.acls.ephemeral_publish = vec![ChannelMatcher::Exact("confined".to_string())];
+        let _ = messenger.resolve_prepaid(&pid("pub"), &policy, "local:confined");
     }
 
     /// A prepaid publish enters retention and hands its overflow back to the
@@ -713,7 +325,7 @@ mod tests {
     /// the only report there will ever be.
     #[tokio::test]
     async fn publish_prepaid_commits_and_reports_its_overflow() {
-        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 2)], RING_FAN_OUT_CAPACITY);
+        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 2)]);
         let sender = pid("pub");
         let policy = publisher_policy(NAME);
         let absent = ParticipantId::for_wasm("absent");
@@ -723,25 +335,29 @@ mod tests {
             .expect("fixture channel")
             .attach(&absent, "absent", 4, Priming::Head);
 
-        let publish = |body: &str| {
-            messenger.publish_prepaid(PrepaidEntry {
-                sender: &sender,
-                policy: &policy,
-                channel_address: CHANNEL,
-                body,
-                urgency: Urgency::Normal,
-                publish_ts: Utc::now(),
-            })
-        };
+        let dest = messenger.resolve_prepaid(&sender, &policy, CHANNEL);
+        async fn prepaid(messenger: &Messenger, dest: &PrepaidDestination, body: &str) -> Appended {
+            messenger
+                .publish_prepaid(
+                    dest,
+                    PrepaidEntry {
+                        body,
+                        urgency: Urgency::Normal,
+                        publish_ts: Utc::now(),
+                    },
+                )
+                .await
+        }
+        let publish = async |body: &str| prepaid(&messenger, &dest, body).await;
 
-        let first = publish("a");
+        let first = publish("a").await;
         assert_eq!(first.retained.seq, 1);
         assert_eq!(first.retained.envelope.channel, CHANNEL);
         assert!(first.overflow.is_empty());
-        assert!(publish("b").overflow.is_empty());
+        assert!(publish("b").await.overflow.is_empty());
 
         assert_eq!(
-            publish("c").overflow,
+            publish("c").await.overflow,
             vec![OverflowEvent {
                 subscriber: absent.clone(),
                 dropped: 1,
@@ -752,7 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn park_prepaid_holds_the_entry_out_of_retention_until_it_is_due() {
-        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 4)], RING_FAN_OUT_CAPACITY);
+        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 4)]);
         let store = messenger
             .ring_stores()
             .get_by_address(CHANNEL)
@@ -760,12 +376,11 @@ mod tests {
         let now = Utc::now();
         let later = now + chrono::Duration::minutes(10);
 
+        let dest = messenger.resolve_prepaid(&pid("pub"), &publisher_policy(NAME), CHANNEL);
         messenger
             .park_prepaid(
+                &dest,
                 PrepaidEntry {
-                    sender: &pid("pub"),
-                    policy: &publisher_policy(NAME),
-                    channel_address: CHANNEL,
                     body: "scheduled",
                     urgency: Urgency::Normal,
                     publish_ts: now,
@@ -802,14 +417,13 @@ mod tests {
     /// work is worse than declining to schedule more.
     #[tokio::test]
     async fn park_prepaid_refuses_at_the_channels_deferred_cap() {
-        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 1)], RING_FAN_OUT_CAPACITY);
+        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 1)]);
         let later = Utc::now() + chrono::Duration::minutes(10);
+        let dest = messenger.resolve_prepaid(&pid("pub"), &publisher_policy(NAME), CHANNEL);
         let park = |body: &str| {
             messenger.park_prepaid(
+                &dest,
                 PrepaidEntry {
-                    sender: &pid("pub"),
-                    policy: &publisher_policy(NAME),
-                    channel_address: CHANNEL,
                     body,
                     urgency: Urgency::Normal,
                     publish_ts: Utc::now(),
@@ -837,31 +451,21 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[should_panic(expected = "not a live-attachable channel")]
-    async fn publish_prepaid_panics_on_a_channel_that_is_not_live_attachable() {
-        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 2)], RING_FAN_OUT_CAPACITY);
-        let _ = messenger.publish_prepaid(PrepaidEntry {
-            sender: &pid("pub"),
-            policy: &publisher_policy(NAME),
-            channel_address: "ephemeral:nope",
-            body: "x",
-            urgency: Urgency::Normal,
-            publish_ts: Utc::now(),
-        });
+    #[test]
+    #[should_panic(expected = "is not in the directory")]
+    fn resolve_prepaid_panics_on_a_channel_that_is_not_in_the_directory() {
+        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 2)]);
+        let _ = messenger.resolve_prepaid(&pid("pub"), &publisher_policy(NAME), "ephemeral:nope");
     }
 
-    #[tokio::test]
+    #[test]
     #[should_panic(expected = "no publish ACL covering bound output")]
-    async fn publish_prepaid_panics_on_an_uncovered_sender() {
-        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 2)], RING_FAN_OUT_CAPACITY);
-        let _ = messenger.publish_prepaid(PrepaidEntry {
-            sender: &pid("pub"),
-            policy: &AppPolicy::with_grants(&[AppCapability::EphemeralPublish]),
-            channel_address: CHANNEL,
-            body: "x",
-            urgency: Urgency::Normal,
-            publish_ts: Utc::now(),
-        });
+    fn resolve_prepaid_panics_on_an_uncovered_sender() {
+        let messenger = messenger_with(&[ephemeral_channel_entry(NAME, 2)]);
+        let _ = messenger.resolve_prepaid(
+            &pid("pub"),
+            &AppPolicy::with_grants(&[AppCapability::EphemeralPublish]),
+            CHANNEL,
+        );
     }
 }

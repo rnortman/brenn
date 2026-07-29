@@ -615,19 +615,19 @@ pub(crate) async fn build_messaging(
     // Build a temporary MessagingDirectory from the raw entries for lookups.
     // `finalize_directory_with_subscribers` then re-uses `all_entries` to build
     // the final directory with subscribers populated.
-    let pre_directory = MessagingDirectory::with_entries(all_entries.clone());
-    // WASM inputs may target non-durable (ephemeral:/local:) channels, so
-    // resolve them against a directory that includes the non-durable set. The
-    // surface pre_directory must stay durable-only (surface binding resolution
-    // takes the ephemeral set as a separate argument).
-    let wasm_pre_directory = {
-        let mut wasm_dir_entries = all_entries.clone();
-        wasm_dir_entries.extend(nondurable_channels.iter().cloned());
-        MessagingDirectory::with_entries(wasm_dir_entries)
+    //
+    // WASM inputs and surface bindings alike may target non-durable
+    // (ephemeral:/local:) channels, so the entry set includes the non-durable
+    // ones: one class-blind lookup answers every binding, whichever store holds
+    // the channel's retention.
+    let pre_directory = {
+        let mut pre_entries = all_entries.clone();
+        pre_entries.extend(nondurable_channels.iter().cloned());
+        MessagingDirectory::with_entries(pre_entries)
     };
     let mut resolved_wasm_consumers = resolve_wasm_consumers(
         &config.wasm_consumers,
-        &wasm_pre_directory,
+        &pre_directory,
         &config.wasm.store_size_limit,
         resolved_mqtt_clients,
         &auto_wiring,
@@ -647,24 +647,19 @@ pub(crate) async fn build_messaging(
             })
             .collect();
 
-    // Resolve the `[[surface]]` blocks *before* finalizing
-    // the directory: a `brenn:` surface subscription resolves to a
-    // `SubscriberEntryKind::Surface` directory entry, so its durable subscriptions
-    // must be ready for `finalize_directory_with_subscribers`. `resolve_surfaces`
-    // cross-validates every binding against `pre_directory` (the same channel set
-    // the final directory is built from — subscribers not yet populated, but
-    // resolution needs only channel identity/transport) and the ephemeral-channel
-    // set (fail-fast on any dead / mis-scheme / policy-uncovered binding), exactly
-    // as `resolve_wasm_consumers` does above.
-    let ephemeral_channels: Vec<ChannelEntry> = nondurable_channels
-        .iter()
-        .filter(|e| e.transport_type == ChannelScheme::Ephemeral)
-        .cloned()
-        .collect();
+    // Resolve the `[[surface]]` blocks *before* finalizing the directory: every
+    // transportable surface subscription resolves to a
+    // `SubscriberEntryKind::Surface` directory entry, so they must be ready for
+    // `finalize_directory_with_subscribers`. `resolve_surfaces` cross-validates
+    // every binding against `pre_directory` (the same channel set the final
+    // directory is built from — subscribers not yet populated, but resolution
+    // needs only channel identity/transport and the channel's resolved rungs),
+    // fail-fast on any dead / mis-scheme / policy-uncovered binding, exactly as
+    // `resolve_wasm_consumers` does above. `auto_wiring` supplies the address for
+    // every free or io port the lowering pass bound.
     let mut resolved_surfaces = resolve_surfaces(
         &config.surfaces,
         &pre_directory,
-        &ephemeral_channels,
         global_defaults,
         &auto_wiring,
     );
@@ -708,7 +703,7 @@ pub(crate) async fn build_messaging(
     // (both need only these), mirroring `wasm_consumers_for_dir`.
     let surfaces_for_dir: Vec<(String, Vec<ResolvedSurfaceSubscription>)> = resolved_surfaces
         .iter()
-        .map(|s| (s.slug.clone(), s.durable_subscriptions.clone()))
+        .map(|s| (s.slug.clone(), s.wire_subscriptions.clone()))
         .collect();
 
     // --- Async tool substrate: request channels, result inboxes, derived grants ---
@@ -793,13 +788,13 @@ pub(crate) async fn build_messaging(
     ));
     brenn_lib::messaging::system::fold_spec_subscriptions(&mut all_entries, &system_participants);
 
-    // The non-durable channels join the one directory here, after the WASM and
-    // surface resolution passes above. Those passes read `pre_directory`, whose
-    // channel set is the durable one they are wired to today; the participants
-    // that reach a ring-backed channel resolve through the final directory
-    // instead. `local:` entries are included: a backend `local:` channel is a
-    // channel of this process, and surface binding resolution never consults the
-    // `[[channel]]` table for `local:` addresses.
+    // The non-durable channels join `all_entries` here, after the WASM and
+    // surface resolution passes above read them off `pre_directory`. This is
+    // the set the final subscriber-carrying directory is built from, and it is
+    // built here rather than reusing `pre_directory` because the async-tool
+    // channels and the system participants' folded subscriptions landed on
+    // `all_entries` in between. `local:` entries are included: a backend
+    // `local:` channel is a channel of this process.
     all_entries.extend(nondurable_channels.iter().cloned());
 
     // All entry sources (declared, webhook/mqtt-derived, auto, tool-substrate)

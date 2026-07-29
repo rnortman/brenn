@@ -10,6 +10,7 @@
 //! kernel never sees inside it, so the encoding can grow server-side with no wire
 //! change — the opacity is what keeps future cursor state additive.
 
+use brenn_lib::messaging::store::ResumeCursor;
 use brenn_surface_proto::Cursor;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,18 +18,19 @@ use uuid::Uuid;
 
 /// A parsed cursor's meaning.
 ///
-/// `epoch` + `seq` are the store cursor: the numbering domain that assigned the
-/// position and the position itself. Both classes share one shape because a
-/// store answers a resume against these two fields alone.
+/// `resume` is the store's own resume position — the numbering domain that
+/// assigned the position and the position itself, carried as the store's type
+/// rather than re-assembled field by field at each subscribe. Every channel
+/// shares one shape because a store answers a resume against those two fields
+/// alone.
 ///
-/// `incarnation` is the session's envelope around the store cursor: the store's
-/// boot counter at mint time, which catches cursors minted under a boot the
-/// current store never counted (e.g. after a backup restore).
+/// `incarnation` is the session's envelope around the store position: the
+/// store's boot counter at mint time, which catches positions minted under a
+/// boot the current store never counted (e.g. after a backup restore).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorState {
     pub incarnation: i64,
-    pub epoch: Uuid,
-    pub seq: u64,
+    pub resume: ResumeCursor,
 }
 
 /// The internal serde shape of a cursor's inner JSON string. Private: only this
@@ -57,13 +59,13 @@ fn wrap(wire: &Wire) -> Cursor {
         .expect("a JSON string always deserializes into a transparent Cursor newtype")
 }
 
-/// Mint a cursor from the store's boot incarnation and the delivered row's
-/// `(epoch, seq)` store position.
-pub fn mint(incarnation: i64, epoch: Uuid, seq: u64) -> Cursor {
+/// Mint a cursor from the store's boot incarnation and the subscription's store
+/// position.
+pub fn mint(incarnation: i64, resume: ResumeCursor) -> Cursor {
     wrap(&Wire {
         incarnation,
-        epoch,
-        seq,
+        epoch: resume.epoch,
+        seq: resume.seq,
     })
 }
 
@@ -89,8 +91,7 @@ pub fn parse(cursor: &Cursor) -> Result<CursorState, String> {
             seq,
         }) => Ok(CursorState {
             incarnation,
-            epoch,
-            seq,
+            resume: ResumeCursor { epoch, seq },
         }),
         Err(e) => Err(format!("malformed cursor encoding: {e}")),
     }
@@ -104,13 +105,12 @@ mod tests {
     fn mint_parse_round_trips() {
         let epoch = Uuid::from_u128(0x1234);
         for (inc, seq) in [(0i64, 0u64), (1, 1), (7, 42), (i64::MAX, u64::MAX)] {
-            let c = mint(inc, epoch, seq);
+            let c = mint(inc, ResumeCursor { epoch, seq });
             assert_eq!(
                 parse(&c),
                 Ok(CursorState {
                     incarnation: inc,
-                    epoch,
-                    seq,
+                    resume: ResumeCursor { epoch, seq },
                 })
             );
         }
@@ -139,9 +139,21 @@ mod tests {
             }
             other => panic!("expected string cursor, got {other:?}"),
         };
-        let ring = mint(3, Uuid::from_u128(0xabcd), 9);
+        let ring = mint(
+            3,
+            ResumeCursor {
+                epoch: Uuid::from_u128(0xabcd),
+                seq: 9,
+            },
+        );
         assert_eq!(shape(&ring), vec!["e", "i", "s"]);
-        let durable = mint(3, Uuid::from_u128(0xbeef), 9);
+        let durable = mint(
+            3,
+            ResumeCursor {
+                epoch: Uuid::from_u128(0xbeef),
+                seq: 9,
+            },
+        );
         assert_eq!(shape(&durable), vec!["e", "i", "s"]);
     }
 
@@ -157,7 +169,13 @@ mod tests {
 
     #[test]
     fn cursor_serializes_transparently_as_a_string() {
-        let c = mint(3, Uuid::from_u128(0x1234), 7);
+        let c = mint(
+            3,
+            ResumeCursor {
+                epoch: Uuid::from_u128(0x1234),
+                seq: 7,
+            },
+        );
         assert!(matches!(serde_json::to_value(&c), Ok(Value::String(_))));
     }
 }
