@@ -848,6 +848,7 @@ fn validate_wasm_consumer_slug_colliding_with_app_panics() {
         store_size_limit: None,
         subscriptions: vec![],
         outputs: vec![],
+        io_ports: vec![],
         subscribe_acl: vec![],
         ephemeral_subscribe_acl: vec![],
         local_subscribe_acl: vec![],

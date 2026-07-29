@@ -25,6 +25,25 @@ fn test_globals() -> brenn_lib::messaging::config::MessagingGlobalConfig {
     }
 }
 
+/// `resolve_surfaces` with an empty auto wiring: every binding in this module
+/// carries its own channel address, so the lowering pass has nothing to supply.
+/// Tests that exercise connection-bound ports call `super::resolve_surfaces`
+/// with a lowered wiring directly.
+fn resolve_surfaces(
+    raw_surfaces: &[brenn_lib::messaging::config::SurfaceConfigRaw],
+    directory: &messaging::MessagingDirectory,
+    ephemeral_channels: &[ChannelEntry],
+    globals: &brenn_lib::messaging::config::MessagingGlobalConfig,
+) -> Vec<ResolvedSurface> {
+    super::resolve_surfaces(
+        raw_surfaces,
+        directory,
+        ephemeral_channels,
+        globals,
+        &super::auto::AutoWiring::default(),
+    )
+}
+
 /// A one-channel directory carrying a single `Surface("deskbar")` subscriber
 /// on `brenn:surface-boot`. Used by both surface deliverability tests below.
 fn surface_boot_directory() -> messaging::MessagingDirectory {
@@ -322,7 +341,7 @@ fn valid_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
         outputs: vec![SurfaceOutputRaw {
             instance: "protobar".to_string(),
             port: "out".to_string(),
-            channel: "brenn:alerts".to_string(),
+            channel: Some("brenn:alerts".to_string()),
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
@@ -1666,7 +1685,7 @@ fn surface_bad_port_charset_panics() {
 fn surface_wrong_scheme_channel_panics() {
     let (dir, ephem_chs) = surface_dir_and_ephem();
     let mut raw = valid_surface_raw();
-    raw.subscriptions[0].channel = "mqtt:client:topic".to_string();
+    raw.subscriptions[0].channel = Some("mqtt:client:topic".to_string());
     resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
 }
 
@@ -1752,7 +1771,7 @@ fn surface_output_to_error_channel_covered_by_injected_grant() {
     raw.outputs.push(SurfaceOutputRaw {
         instance: "protobar".to_string(),
         port: "errors".to_string(),
-        channel: "brenn:surface-errors".to_string(),
+        channel: Some("brenn:surface-errors".to_string()),
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
@@ -1785,7 +1804,7 @@ fn surface_duplicate_output_port_panics() {
     raw.outputs.push(SurfaceOutputRaw {
         instance: "protobar".to_string(),
         port: "out".to_string(),
-        channel: "brenn:alerts".to_string(),
+        channel: Some("brenn:alerts".to_string()),
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
@@ -1867,7 +1886,7 @@ fn local_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
             SurfaceOutputRaw {
                 instance: "protobar".to_string(),
                 port: "out".to_string(),
-                channel: "local:page-bus".to_string(),
+                channel: Some("local:page-bus".to_string()),
                 urgency: None,
                 publish_per_activation: None,
                 publish_capacity: None,
@@ -1875,7 +1894,7 @@ fn local_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
             SurfaceOutputRaw {
                 instance: "protobar".to_string(),
                 port: "theme-out".to_string(),
-                channel: "local:brenn/theme".to_string(),
+                channel: Some("local:brenn/theme".to_string()),
                 urgency: None,
                 publish_per_activation: None,
                 publish_capacity: None,
@@ -2122,7 +2141,7 @@ fn local_output_to_a_kernel_only_plane_panics() {
     raw.outputs = vec![SurfaceOutputRaw {
         instance: "protobar".to_string(),
         port: "out".to_string(),
-        channel: "local:brenn/link-state".to_string(),
+        channel: Some("local:brenn/link-state".to_string()),
         urgency: None,
         publish_per_activation: None,
         publish_capacity: None,
@@ -2401,4 +2420,39 @@ fn an_instance_with_one_triggering_binding_can_activate() {
 #[test]
 fn an_instance_with_no_input_bindings_is_not_judged() {
     surfaces::assert_instance_can_activate("deskbar", "protobar", &[]);
+}
+
+// --- Free ports and the auto namespace ---
+
+/// A channel-less surface subscription is a free port; with no `[[connection]]`
+/// claiming it, nothing supplies a channel — dead config.
+#[test]
+#[should_panic(expected = "declares no channel and no [[connection]] binds it")]
+fn surface_free_input_port_with_no_connection_panics() {
+    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let mut raw = valid_surface_raw();
+    raw.subscriptions[0].channel = None;
+    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+}
+
+/// Same for a surface output binding.
+#[test]
+#[should_panic(expected = "declares no channel and no [[connection]] binds it")]
+fn surface_free_output_port_with_no_connection_panics() {
+    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let mut raw = valid_surface_raw();
+    raw.outputs[0].channel = None;
+    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
+}
+
+/// A hand-written `local:auto.<cid>` on a surface binding is rejected: the page
+/// -local auto channel of some other component is not joinable by address.
+#[test]
+#[should_panic(expected = "reserved auto namespace")]
+fn surface_operator_written_auto_address_panics() {
+    let (dir, ephem_chs) = surface_dir_and_ephem();
+    let mut raw = valid_surface_raw();
+    raw.subscriptions[0].channel =
+        Some("local:auto.9c1f4a4e-6d38-4a2e-9f1a-2f7c0d5b8e31".to_string());
+    resolve_surfaces(&[raw], &dir, &ephem_chs, &test_globals());
 }

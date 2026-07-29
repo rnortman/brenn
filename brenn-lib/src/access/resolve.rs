@@ -582,10 +582,21 @@ fn validate_mqtt_client(
 /// diagnostic embeds it so the panic points the operator at the exact config
 /// block that owns the offending matcher, rather than a hardcoded `app` that
 /// would mislead surface and wasm callers.
+///
+/// Also rejects any matcher reaching into the `auto` namespace, exact or prefix.
+/// An auto channel's endpoint set is its ACL — an operator-written matcher
+/// reaching into the namespace would silently attach a third party. The
+/// sanctioned way to let others in is to give the channel a name.
 fn resolve_channel(owner: &str, list: &str, raw: &ChannelMatcherRaw) -> ChannelMatcher {
     match raw {
         ChannelMatcherRaw::Exact(s) => {
             assert!(!s.is_empty(), "{owner}: {list} exact matcher is empty",);
+            assert!(
+                !crate::messaging::is_auto_channel_name(s),
+                "{owner}: {list} exact matcher {s:?} reaches into the reserved auto \
+                 namespace — an auto channel's endpoints are its ACL; to let another \
+                 participant in, give the channel a name on its [[connection]] or io_port",
+            );
             ChannelMatcher::Exact(s.clone())
         }
         ChannelMatcherRaw::Prefix(p) => {
@@ -597,6 +608,12 @@ fn resolve_channel(owner: &str, list: &str, raw: &ChannelMatcherRaw) -> ChannelM
                 p.ends_with('/') || p.ends_with('.'),
                 "{owner}: {list} prefix matcher {p:?} must end at a segment boundary \
                  (`/` or `.`) so it cannot over-match a sibling namespace",
+            );
+            assert!(
+                !crate::messaging::is_auto_channel_name(p),
+                "{owner}: {list} prefix matcher {p:?} reaches into the reserved auto \
+                 namespace — an auto channel's endpoints are its ACL; to let another \
+                 participant in, give the channel a name on its [[connection]] or io_port",
             );
             ChannelMatcher::Prefix(p.clone())
         }
@@ -939,6 +956,52 @@ mod tests {
             ..AppAclRaw::default()
         };
         build_app_policy("home", &[], &acl, &clients(&[]));
+    }
+
+    #[test]
+    #[should_panic(expected = "reaches into the reserved auto namespace")]
+    fn auto_namespace_exact_matcher_panics() {
+        // Auto cids are deterministic, so a hand-computed `auto.<cid>` would
+        // otherwise attach a third party to a channel whose endpoint set is its
+        // whole ACL.
+        let acl = AppAclRaw {
+            brenn_subscribe: vec![ChannelMatcherRaw::Exact(
+                "auto.9c1f4a4e-6d38-4a2e-9f1a-2f7c0d5b8e31".to_string(),
+            )],
+            ..AppAclRaw::default()
+        };
+        build_app_policy("home", &[], &acl, &clients(&[]));
+    }
+
+    #[test]
+    #[should_panic(expected = "reaches into the reserved auto namespace")]
+    fn auto_namespace_prefix_matcher_panics() {
+        // The boundary-ending prefix that would sweep the whole namespace.
+        let acl = AppAclRaw {
+            brenn_subscribe: vec![ChannelMatcherRaw::Prefix("auto.".to_string())],
+            ..AppAclRaw::default()
+        };
+        build_app_policy("home", &[], &acl, &clients(&[]));
+    }
+
+    #[test]
+    fn auto_namespace_sibling_matchers_resolve() {
+        // The reservation is segment-bounded: names that merely share the prefix
+        // are ordinary channels.
+        let acl = AppAclRaw {
+            brenn_subscribe: vec![ChannelMatcherRaw::Exact("autobahn".to_string())],
+            brenn_publish: vec![ChannelMatcherRaw::Prefix("autopilot.".to_string())],
+            ..AppAclRaw::default()
+        };
+        let policy = build_app_policy("home", &[], &acl, &clients(&[]));
+        assert_eq!(
+            policy.acls.brenn_subscribe,
+            vec![ChannelMatcher::Exact("autobahn".to_string())]
+        );
+        assert_eq!(
+            policy.acls.brenn_publish,
+            vec![ChannelMatcher::Prefix("autopilot.".to_string())]
+        );
     }
 
     #[test]

@@ -938,12 +938,16 @@ pub fn validate_and_resolve(
     // channel entry; here we need only the channel identity.
     for consumer in &config.wasm_consumers {
         for sub in &consumer.subscriptions {
-            if !crate::mqtt::address::is_mqtt_address(&sub.channel) {
+            // A free port rides an auto channel, never `mqtt:`.
+            let Some(channel) = sub.channel.as_deref() else {
+                continue;
+            };
+            if !crate::mqtt::address::is_mqtt_address(channel) {
                 continue;
             }
             let owner_desc = format!("[[wasm_consumer]] {:?}", consumer.slug);
             let ch = crate::mqtt::config::resolve_mqtt_ingress_channel(
-                &sub.channel,
+                channel,
                 &resolved_clients,
                 &owner_desc,
             );

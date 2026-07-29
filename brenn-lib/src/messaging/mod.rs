@@ -158,6 +158,88 @@ pub fn nondurable_channel_uuid(scheme: ChannelScheme, name: &str) -> Uuid {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Auto channels
+// ---------------------------------------------------------------------------
+
+/// Channel-name segment owned by the auto-channel machinery: an anonymous auto
+/// channel's bare name is `auto.<cid>`. Operators may not declare, reference, or
+/// write ACL matchers reaching into it — an anonymous channel is reachable only
+/// through the `[[connection]]` / `io_port` declarations that created it.
+pub const AUTO_CHANNEL_SEGMENT: &str = "auto";
+
+/// Does `name` (a scheme-stripped channel name) fall in a namespace reserved by
+/// the host — the tool substrate's (`tools`, `tool-results`) or the
+/// auto-channel machinery's (`auto`)?
+///
+/// True for an exact segment match or a leading segment followed by a `.`/`/`
+/// boundary, so a sibling name like `autobahn` is not falsely reserved. This is
+/// the gate for every operator-authored channel name: `[[channel]]` addresses,
+/// named auto channels, and surface-declared `local:` names.
+///
+/// Deliberately separate from [`crate::tools::is_reserved_channel`], which keys
+/// the System-principal publish-time well-formedness exemption and must not
+/// widen: an `auto.<cid>` name is charset-clean and needs no exemption.
+pub fn is_reserved_channel_name(name: &str) -> bool {
+    crate::tools::is_reserved_channel(name) || is_auto_channel_name(name)
+}
+
+/// Does `name` (a scheme-stripped channel name) fall in the `auto` namespace?
+///
+/// Same boundary rule as the tool namespaces: an exact segment match, or the
+/// segment followed by `.`/`/`. Used to reject every operator-written *reference*
+/// to the namespace — a binding address, an ACL matcher — not just declarations.
+/// The cid is deterministic, so without that a hand-computed `auto.<cid>` would
+/// attach a third party to an "anonymous" channel with no connection to show for
+/// it.
+pub fn is_auto_channel_name(name: &str) -> bool {
+    name == AUTO_CHANNEL_SEGMENT
+        || name
+            .strip_prefix(AUTO_CHANNEL_SEGMENT)
+            .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('/'))
+}
+
+/// Derive an auto channel's connection id from its canonical endpoint refs.
+///
+/// `endpoint_refs` is the connection's endpoint set; the caller need not sort it
+/// — this function sorts a copy internally, so the cid depends on the *set* and
+/// not on declaration order. It does not deduplicate. Deterministic across
+/// boots, which keeps anonymous addresses stable in logs, tests, and directory
+/// listings even though the rings behind them die with the process.
+///
+/// The namespace seed (`"brenn.auto-channel"`) is distinct from every transport
+/// seed, so an auto address space cannot collide with any other.
+pub fn auto_channel_cid(endpoint_refs: &[String]) -> Uuid {
+    let mut sorted: Vec<&str> = endpoint_refs.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let key = sorted.join("\n");
+    let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.auto-channel");
+    Uuid::new_v5(&ns, key.as_bytes())
+}
+
+/// The bare channel name for an anonymous auto channel with connection id `cid`:
+/// `auto.<cid>`. Hyphenated-lowercase hex and `.` are both in the unreserved
+/// charset, so the name passes ordinary channel-name validation everywhere.
+pub fn auto_channel_name(cid: Uuid) -> String {
+    format!("{AUTO_CHANNEL_SEGMENT}.{cid}")
+}
+
+/// Derive the DB-row identity of a *durable named* auto channel from its bare
+/// name.
+///
+/// Durable auto channels have no operator-written `uuid` by default, so their
+/// identity is derived — which means renaming one re-keys its DB row (fresh
+/// `resume_epoch`, old row kept orphaned). An operator who needs
+/// rename-stability writes the `uuid` field on the `[[connection]]` instead.
+///
+/// The namespace seed (`"brenn.auto-channel-durable"`) is distinct from
+/// [`auto_channel_cid`]'s, so a name and an endpoint-set key can never derive
+/// the same identity.
+pub fn durable_auto_channel_uuid(bare_name: &str) -> Uuid {
+    let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.auto-channel-durable");
+    Uuid::new_v5(&ns, bare_name.as_bytes())
+}
+
 /// Derive a deterministic UUIDv5 for a tool-substrate channel from its full
 /// canonical address (`brenn:tools/<tool>` or `brenn:tool-results/<slug>`).
 ///
@@ -3456,6 +3538,96 @@ mod tests {
     }
 
     #[test]
+    fn auto_namespace_holds_at_segment_boundaries() {
+        assert!(is_auto_channel_name("auto"));
+        assert!(is_auto_channel_name("auto.0f1e"));
+        assert!(is_auto_channel_name("auto/nested"));
+        // Siblings that merely share a prefix are ordinary names.
+        assert!(!is_auto_channel_name("autobahn"));
+        assert!(!is_auto_channel_name("auto-pilot"));
+        assert!(!is_auto_channel_name("my.auto"));
+        assert!(!is_auto_channel_name(""));
+    }
+
+    #[test]
+    fn reserved_channel_names_span_tool_and_auto_namespaces() {
+        assert!(is_reserved_channel_name("tools"));
+        assert!(is_reserved_channel_name("tool-results/probe"));
+        assert!(is_reserved_channel_name("auto.abc"));
+        assert!(!is_reserved_channel_name("alerts.high"));
+        // The tool-scoped predicate must not widen: it keys the publish-time
+        // well-formedness exemption, which auto channels do not need.
+        assert!(!crate::tools::is_reserved_channel("auto.abc"));
+    }
+
+    #[test]
+    fn auto_cid_depends_on_the_endpoint_set_not_its_order() {
+        let a = auto_channel_cid(&[
+            "wasm:etl/out".to_string(),
+            "wasm:indexer/in".to_string(),
+            "surface:bench#monitor/tap".to_string(),
+        ]);
+        let b = auto_channel_cid(&[
+            "surface:bench#monitor/tap".to_string(),
+            "wasm:indexer/in".to_string(),
+            "wasm:etl/out".to_string(),
+        ]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn auto_cid_changes_when_an_endpoint_joins() {
+        let two = auto_channel_cid(&["wasm:etl/out".to_string(), "wasm:indexer/in".to_string()]);
+        let three = auto_channel_cid(&[
+            "wasm:etl/out".to_string(),
+            "wasm:indexer/in".to_string(),
+            "wasm:audit/in".to_string(),
+        ]);
+        assert_ne!(two, three);
+    }
+
+    #[test]
+    fn auto_channel_name_is_charset_clean() {
+        let cid = auto_channel_cid(&["wasm:etl/timer".to_string()]);
+        let name = auto_channel_name(cid);
+        assert!(name.starts_with("auto."));
+        assert!(name.chars().all(is_unreserved_char));
+        assert!(is_auto_channel_name(&name));
+    }
+
+    #[test]
+    fn auto_uuid_seeds_are_distinct_from_each_other_and_from_transports() {
+        // The same string under the two auto seeds and the transport seeds must
+        // never coincide, or an endpoint-set key and a durable name could claim
+        // one identity.
+        let s = "etl.batches";
+        let cid = auto_channel_cid(&[s.to_string()]);
+        let durable = durable_auto_channel_uuid(s);
+        assert_ne!(cid, durable);
+        assert_ne!(durable, ephemeral_channel_uuid_from_name(s));
+        assert_ne!(durable, local_channel_uuid_from_name(s));
+        assert_ne!(durable, tool_channel_uuid_from_address(s));
+        assert_ne!(durable, chat_channel_uuid_from_address(s));
+        // Deterministic across calls.
+        assert_eq!(durable, durable_auto_channel_uuid(s));
+    }
+
+    #[test]
+    fn durable_auto_channel_uuid_is_pinned_to_its_value() {
+        // This uuid is the primary key of a persisted channel row. Changing the
+        // seed string or the input normalization silently re-keys every deployed
+        // durable auto channel on the next boot — the old row is orphaned and
+        // every schedule parked on it stops firing. No other test in the suite
+        // would catch drift, because every other assertion derives its expected
+        // uuid from the same function. If this assertion fails the derivation
+        // changed: fix the derivation, not this test.
+        assert_eq!(
+            durable_auto_channel_uuid("etl.batches"),
+            Uuid::parse_str("8cff7546-d545-5114-8d13-732c3ffb110e").unwrap(),
+        );
+    }
+
+    #[test]
     fn directory_resolve_known_address() {
         let e = entry("pa-alice");
         let addr = e.address.clone();
@@ -5180,6 +5352,22 @@ mod tests {
             webhook_channel_uuid_from_slug("phonebuddy"),
         );
         assert_eq!(u1.get_version(), Some(uuid::Version::Sha1));
+    }
+
+    #[test]
+    fn tool_channel_uuid_from_address_is_pinned_to_its_value() {
+        // This uuid is the primary key of a persisted channel row for every tool
+        // channel in production. Changing the seed string or the input
+        // normalization silently re-keys all of them on the next boot: a fresh
+        // row, the old one orphaned with its history, and every parked
+        // `deliver_after` schedule on it stops firing. The determinism test
+        // above cannot catch that — both sides of its assertions derive from the
+        // function under test. If this assertion fails the derivation changed:
+        // fix the derivation, not this test.
+        assert_eq!(
+            tool_channel_uuid_from_address("brenn:tools/git-repo-pull"),
+            uuid::Uuid::parse_str("3f460148-040b-598e-8812-3440728ddb2e").unwrap(),
+        );
     }
 
     /// `webhook_channel_uuid_from_slug` produces a fixed, documented value for a

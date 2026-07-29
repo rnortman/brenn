@@ -5661,3 +5661,184 @@ async fn surface_ws_non_last_session_close_writes_no_terminal_snapshot() {
     let v: serde_json::Value = serde_json::from_str(body).expect("terminal body is JSON");
     assert_eq!(v["reason"], serde_json::json!("session closed"));
 }
+
+// ── auto channels across the wire ─────────────────────────────────────────────
+
+/// A backend WASM consumer and a surface component, each declaring one io_port,
+/// joined by a single `[[connection]]`. The endpoint set spans the wire, so the
+/// auto channel is `ephemeral:` — and nothing in this config names a channel,
+/// writes an ACL entry, or tunes a depth outside the two port declarations.
+///
+/// Both endpoints are io_ports, so each side both publishes and subscribes on
+/// the one channel: the two directions this suite drives are the same wire read
+/// from either end.
+fn spanning_connection_config() -> brenn_lib::config::BrennConfig {
+    use crate::bootstrap::messaging::test_fixtures::{
+        io_port_raw, minimal_surface_raw, minimal_wasm_consumer, surface_io_port_raw,
+    };
+    use brenn_lib::messaging::config::{ConnectionConfigRaw, WasmConsumerConfigRaw, WasmGrant};
+
+    let worker = WasmConsumerConfigRaw {
+        slug: "worker".to_string(),
+        component_path: "/nonexistent/worker.wasm".into(),
+        grants: vec![WasmGrant::Ports],
+        io_ports: vec![io_port_raw(
+            LINK_PORT,
+            None,
+            Depth::Bounded(4),
+            Depth::Bounded(4),
+        )],
+        ..minimal_wasm_consumer()
+    };
+    let deskbar = brenn_lib::messaging::config::SurfaceConfigRaw {
+        io_ports: vec![surface_io_port_raw(
+            COMPONENT,
+            LINK_PORT,
+            None,
+            Depth::Bounded(4),
+            Depth::Bounded(4),
+        )],
+        ..minimal_surface_raw()
+    };
+    brenn_lib::config::BrennConfig {
+        messaging: MessagingGlobalConfig {
+            // A surface binding's port queue is page memory, so resolution
+            // refuses the stock `Unbounded` default.
+            default_push_depth: Depth::Bounded(8),
+            ..Default::default()
+        },
+        wasm_consumers: vec![worker],
+        surfaces: vec![deskbar],
+        connections: vec![ConnectionConfigRaw {
+            endpoints: vec![
+                "wasm:worker/link".to_string(),
+                format!("surface:deskbar#{COMPONENT}/{LINK_PORT}"),
+            ],
+            channel: None,
+            uuid: None,
+            description: None,
+        }],
+        ..brenn_lib::config::BrennConfig::default()
+    }
+}
+
+const LINK_PORT: &str = "link";
+
+/// The delivery-time ACL is satisfied by the matcher the lowering pass injected
+/// into the surface's policy; the session panics rather than denying, so a
+/// missing injection fails here loudly.
+#[tokio::test]
+async fn surface_ws_auto_channel_delivers_a_backend_publish() {
+    use brenn_lib::messaging::publish::WasmPublish;
+
+    let db = db::init_db_memory();
+    let harness =
+        super::test_fixtures::booted_surface_harness(&db, &spanning_connection_config()).await;
+    let address = harness.surface_sub_address(COMPONENT, LINK_PORT);
+    assert!(
+        address.starts_with("ephemeral:auto."),
+        "a connection spanning the wire needs a transportable channel, got {address:?}",
+    );
+    assert!(
+        harness.surfaces[0].policy.allows_channel_access(&address),
+        "the connection is the authorization signal: boot injected the surface's matcher",
+    );
+
+    let messenger = Arc::clone(&harness.messenger);
+    let flusher = harness.flusher.clone();
+    let alerts = Arc::clone(&harness.alerts);
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(harness.state).await;
+
+    let mut ws = open_deskbar(&base, &token).await;
+    ws.send(subscribe_frame_as(&address, COMPONENT, None))
+        .await
+        .expect("send Subscribe");
+    assert_eq!(
+        next_subscribe_result(&mut ws, &address, COMPONENT).await.0,
+        0,
+        "a fresh ring has nothing to replay"
+    );
+
+    messenger
+        .publish_from_wasm(
+            "worker",
+            &[WasmPublish {
+                channel_address: &address,
+                body: "from-the-backend",
+                urgency: Urgency::Normal,
+                reply_to: None,
+                deliver_after: None,
+            }],
+        )
+        .await;
+
+    match next_server_frame(&mut ws).await {
+        ServerFrame::Deliver {
+            channel,
+            envelope,
+            targets,
+        } => {
+            assert_eq!(channel, address);
+            assert_eq!(envelope.body, "from-the-backend");
+            assert_eq!(sole_target(&targets).instance, COMPONENT);
+        }
+        other => panic!("expected Deliver on the auto channel, got {other:?}"),
+    }
+
+    assert_no_alerts(&flusher, &alerts, "auto channel delivery to a surface").await;
+}
+
+/// Both injected matchers — `ephemeral_publish` on the surface side and
+/// subscribe on the WASM side — with no ACL entry anywhere in config.
+#[tokio::test]
+async fn surface_ws_auto_channel_publish_reaches_the_backend_consumer() {
+    let db = db::init_db_memory();
+    let harness =
+        super::test_fixtures::booted_surface_harness(&db, &spanning_connection_config()).await;
+    let address = harness.surface_sub_address(COMPONENT, LINK_PORT);
+    let consumer = ParticipantId::for_wasm("worker");
+
+    let messenger = Arc::clone(&harness.messenger);
+    let flusher = harness.flusher.clone();
+    let alerts = Arc::clone(&harness.alerts);
+    let (token, _) = setup_authenticated_user(&db).await;
+    let (base, _sd) = spawn_test_server(harness.state).await;
+
+    let mut ws = open_deskbar(&base, &token).await;
+    ws.send(publish_frame(
+        COMPONENT,
+        LINK_PORT,
+        "from-the-page",
+        Some(3),
+    ))
+    .await
+    .expect("send Publish");
+    let outcome = publish_result_outcome(next_server_frame(&mut ws).await, Some(3));
+    assert!(
+        matches!(outcome, PublishOutcome::Ok),
+        "the injected publish matcher covers the auto channel, got {outcome:?}",
+    );
+
+    // The answered publish is already committed, so this reads a settled ring.
+    let store = messenger
+        .ring_stores()
+        .get_by_address(&address)
+        .expect("the auto channel has a ring store");
+    let window = store
+        .window(&consumer, 4, 0)
+        .expect("the consumer's io_port input half is attached at boot");
+    assert_eq!(
+        window.new_len(),
+        1,
+        "the page's publish is owed to the backend consumer"
+    );
+    assert_eq!(window.new_entries()[0].message.body, "from-the-page");
+    assert_eq!(
+        window.new_entries()[0].message.sender.as_ref(),
+        format!("surface:deskbar#{COMPONENT}"),
+        "the publisher is named at the instance grain the connection declared",
+    );
+
+    assert_no_alerts(&flusher, &alerts, "auto channel publish from a surface").await;
+}

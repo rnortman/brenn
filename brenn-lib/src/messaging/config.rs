@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::{
     ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntryKind, WakeMin,
-    is_unreserved_char, nondurable_channel_uuid, publish,
+    is_reserved_channel_name, is_unreserved_char, nondurable_channel_uuid, publish,
 };
 use crate::config::AppConfigRaw;
 
@@ -292,6 +292,82 @@ pub struct ChannelConfigRaw {
     pub send_rate: Option<SendRate>,
 }
 
+/// Top-level `[[connection]]` block — an **auto channel** declared by the ports
+/// it wires together instead of by a `[[channel]]` block.
+///
+/// An auto channel comes into existence because ports are connected. It has no
+/// `[[channel]]` block and no operator-written ACL entries: the transport grants
+/// and channel matchers its endpoints need are injected at boot from this
+/// declaration, because the connection *is* the operator's authorization signal.
+/// Channel-level tuning beyond the derived
+/// `retain_depth` is not available — an auto channel inherits the `[messaging]`
+/// defaults, exactly as webhook/mqtt/tool channels do. A channel that needs
+/// `standing_retain_depth`, `sink`, `send_rate`, `wake_min`, or channel-level
+/// `noise` has outgrown auto declaration; write the `[[channel]]` block.
+///
+/// ```toml
+/// [[connection]]
+/// endpoints = ["wasm:etl/batch-out", "wasm:indexer/batch-in"]
+/// ```
+///
+/// **Direction is inferred, never stated.** An endpoint naming a port declared in
+/// a `subscriptions` list subscribes; one naming a port in an `outputs` list
+/// publishes; one naming an `io_port` does both.
+///
+/// **Anonymous by default.** With `channel` absent the channel's bare name is
+/// `auto.<cid>`, where `cid` is a UUIDv5 of the sorted endpoint set, and its
+/// scheme is decided from where the endpoints live: all-backend ⇒ `local:`,
+/// all-one-surface ⇒ page-local `local:`, anything spanning the wire ⇒
+/// `ephemeral:`. Adding an endpoint changes the address; nothing outlives that,
+/// because an anonymous channel is never durable.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionConfigRaw {
+    /// The ports this connection wires together. Two reference forms:
+    /// `wasm:<slug>/<port>` for a port on a `[[wasm_consumer]]`, and
+    /// `surface:<surface-slug>#<instance>/<port>` for a port on a
+    /// surface-hosted component (the prefix before `/<port>` is exactly the
+    /// component's participant id, so endpoint refs grep against logs and cursor
+    /// rows).
+    ///
+    /// Every referenced port must be *free*: declared without a `channel` of its
+    /// own, and referenced by exactly one connection. The endpoint set must
+    /// contain at least one publisher and at least one subscriber, and must not
+    /// be a single `io_port` (which needs no connection to loop back to itself).
+    pub endpoints: Vec<String>,
+    /// Absent ⇒ anonymous. Present ⇒ a **named** auto channel at this full
+    /// scheme-qualified address, where the scheme picks the capability:
+    /// `brenn:` is durable (the reason to name one at all), `ephemeral:` is
+    /// transportable-only and shared across sessions, `local:` is neither and is
+    /// legal only when every endpoint lives on one side of the wire.
+    ///
+    /// The name wears `[[channel]]`-grade validation and may not fall in a
+    /// reserved namespace. Colliding with a `[[channel]]` block, a
+    /// webhook/mqtt-derived channel, or another connection's or io_port's name is
+    /// a boot panic: that overlap is the seam through which auto-injected ACLs
+    /// could reach a channel other parties legitimately use.
+    ///
+    /// Naming a channel is what lets a third party bind it with ordinary
+    /// bindings and ordinary ACLs — but for `local:` that reach stops at the
+    /// realm boundary. An all-backend `local:` channel is a server ring only
+    /// backend bindings join; an all-one-surface one is a page ring only that
+    /// surface's bindings join. Crossing the two is a boot panic, not a silent
+    /// dead binding. Wiring a page to the backend takes `ephemeral:`.
+    pub channel: Option<String>,
+    /// UUID v4 in canonical hyphenated form, naming the DB row. Legal only on a
+    /// durable (`brenn:`) named channel.
+    ///
+    /// Absent, a durable auto channel's identity is derived from its bare name —
+    /// so renaming it re-keys the DB row (fresh resume epoch; old row kept
+    /// orphaned until manually deleted). Writing this field is the
+    /// rename-stability opt-out.
+    pub uuid: Option<String>,
+    /// Lands in the channel's directory description. Absent, a description is
+    /// generated from the endpoint set, so a uuid-named row in a listing or log
+    /// still explains itself.
+    pub description: Option<String>,
+}
+
 /// `[messaging]` section.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default, deny_unknown_fields)]
@@ -333,7 +409,8 @@ impl Default for MessagingGlobalConfig {
         Self {
             default_send_budget: 100,
             max_body_bytes: 65_536,
-            // Legacy behavior preserved: unbounded everywhere, silent, drop.
+            // TODO(messaging-depth-defaults): the unbounded depth defaults are
+            // wrong and are expected to go away entirely.
             default_push_depth: Depth::Unbounded,
             default_retain_depth: Depth::Unbounded,
             default_standing_retain_depth: Depth::Unbounded,
@@ -477,8 +554,12 @@ pub struct WasmConsumerConfigRaw {
     /// Output port bindings for this component.
     #[serde(default, rename = "output")]
     pub outputs: Vec<WasmConsumerOutputRaw>,
+    /// Combined input+output port declarations for this component — the
+    /// self-loop, made structural. See [`WasmConsumerIoPortRaw`].
+    #[serde(default, rename = "io_port")]
+    pub io_ports: Vec<WasmConsumerIoPortRaw>,
     /// Layer-2 subscribe ACL: channel matchers narrowing which `brenn:`
-    /// channels this component may hold a (static) subscription to (design §2.5.1).
+    /// channels this component may hold a (static) subscription to.
     /// Flat top-level `Vec`, matching the existing flat `grants` authoring
     /// convention (authoring-shape asymmetry vs. the LLM `[app.acl.*]` sub-table is
     /// deliberate — both resolve into the same `AppPolicy`). A non-empty
@@ -618,7 +699,7 @@ impl WasmConsumerConfigRaw {
             subscriptions: channels
                 .iter()
                 .map(|channel| WasmConsumerSubscriptionRaw {
-                    channel: channel.to_string(),
+                    channel: Some(channel.to_string()),
                     port: "in".to_string(),
                     push_depth: None,
                     retain_depth: None,
@@ -628,6 +709,7 @@ impl WasmConsumerConfigRaw {
                 })
                 .collect(),
             outputs: vec![],
+            io_ports: vec![],
             subscribe_acl: vec![],
             ephemeral_subscribe_acl: vec![],
             local_subscribe_acl: vec![],
@@ -669,7 +751,15 @@ pub struct ActivationPacing {
 #[serde(deny_unknown_fields)]
 pub struct WasmConsumerSubscriptionRaw {
     /// Channel address, e.g. `brenn:my-channel` or `webhook:my-endpoint`.
-    pub channel: String,
+    ///
+    /// `None` makes this a **free port**: the binding declares the port and its
+    /// tuning, and exactly one `[[connection]]` must reference it to supply the
+    /// channel. A free port bound by no connection is dead config and a boot
+    /// panic. Addresses in the reserved `auto` namespace are rejected here — an
+    /// anonymous auto channel is reachable only through the declarations that
+    /// created it.
+    #[serde(default)]
+    pub channel: Option<String>,
     /// Logical input port name presented to the guest. Required — no host default.
     /// Must be non-empty and consist of RFC 3986 unreserved characters.
     pub port: String,
@@ -701,8 +791,12 @@ pub struct WasmConsumerSubscriptionRaw {
 pub struct WasmConsumerOutputRaw {
     /// Logical output port name. Must be non-empty and unreserved-charset.
     pub port: String,
-    /// Target channel address (must be a `brenn:` channel, this slice only).
-    pub channel: String,
+    /// Target channel address.
+    ///
+    /// `None` makes this a **free port**, bound by exactly one `[[connection]]`;
+    /// see [`WasmConsumerSubscriptionRaw::channel`].
+    #[serde(default)]
+    pub channel: Option<String>,
     /// Default urgency for messages published on this output port (sub → port →
     /// `normal`). Guests may override per-message via `publish-with-urgency`.
     pub urgency: Option<super::Urgency>,
@@ -714,6 +808,92 @@ pub struct WasmConsumerOutputRaw {
     /// Max tokens carried over between activations for this output sink (the bucket
     /// capacity clamp applied at the *start* of the next activation). `None` ⇒
     /// `DEFAULT_WASM_PUBLISH_CAPACITY` (1.0). Must be finite and `>= 0` when present.
+    pub publish_capacity: Option<f64>,
+}
+
+/// A combined input+output port on a `[[wasm_consumer]]`
+/// (`[[wasm_consumer.io_port]]`).
+///
+/// One port name, registered once, resolving to a `WasmInputPort` **and** a
+/// `WasmOutputPort` on the *same* channel. That is the whole point: whatever
+/// channel serves the port serves both directions as a unit, so "I see my own
+/// publishes here" is structural rather than an operator convention that fails
+/// silently when the two halves are wired to different channels. This is the
+/// sanctioned shape for the timer idiom — `publish-deferred` on the port, woken
+/// by one's own message when it releases.
+///
+/// The consumer's `grants` must still include `"ports"`: that token gates whether
+/// the publish interface is linked into the component at all, so it is not ACL
+/// boilerplate this block can absorb.
+///
+/// ```toml
+/// [[wasm_consumer.io_port]]
+/// port = "timer"
+/// push_depth = 2
+/// retain_depth = 8
+/// ```
+///
+/// With no `channel` and no `[[connection]]` naming it, the port gets its own
+/// anonymous non-transportable channel — no channel-level config at all: no
+/// `[[channel]]` block, no ACLs. The port's depths are not optional though: the
+/// channel's ring depth folds as `max(push_depth, retain_depth)`, and that fold
+/// must come out bounded on a non-durable channel, so under the stock unbounded
+/// global defaults *both* depths must be written here — writing one still leaves
+/// the other inheriting `Unbounded` — or boot refuses. Give it a `channel` to
+/// make it a named auto channel (`brenn:` for schedules that survive restart),
+/// or list it in a `[[connection]]` to let other components see and feed the
+/// same traffic; setting both is a boot panic.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WasmConsumerIoPortRaw {
+    /// Logical port name presented to the guest for both directions. Must be
+    /// non-empty, unreserved-charset, and distinct from every other port name on
+    /// the consumer — this block is the only sanctioned way one name serves both
+    /// directions, because it is what carries the same-channel guarantee.
+    pub port: String,
+    /// Absent ⇒ the port's own anonymous non-transportable channel. Present ⇒ a
+    /// named auto channel at this full scheme-qualified address. Must be absent
+    /// when a `[[connection]]` lists this port.
+    ///
+    /// A `local:` name here is a *server* ring: only backend bindings join it.
+    /// `local:` namespaces are private per realm, so a surface binding on the
+    /// same bare name is an unrelated page ring, by design — the two exchange no
+    /// message and neither knows the other exists. `ephemeral:` is what reaches
+    /// a page.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Push depth for the input half. `None` ⇒ inherit (channel → global). On an
+    /// anonymous or `ephemeral:`/`local:` auto channel the inherited value feeds
+    /// the ring-depth fold, so inheriting the stock `Unbounded` global default is
+    /// a boot refusal rather than an inheritance.
+    pub push_depth: Option<Depth>,
+    /// Retain depth for the input half. `None` ⇒ inherit (channel → global), with
+    /// the same non-durable caveat as [`Self::push_depth`]: an inherited
+    /// `Unbounded` refuses to boot.
+    ///
+    /// On an auto channel this value also *sets* the channel's own
+    /// `retain_depth` (folded as the max over subscribing endpoints of
+    /// `max(push_depth, retain_depth)`, floor 1) — and a channel's `retain_depth`
+    /// caps its channel-wide deferred set. So this knob bounds how many
+    /// `deliver_after` schedules the port may hold outstanding: a component
+    /// juggling K parked wakes must declare at least K here, on top of its actual
+    /// retention need. Over-cap flushes are dropped and host-logged only; the
+    /// per-port `deferred-window` lets a careful component notice.
+    pub retain_depth: Option<Depth>,
+    /// Noise level for push overflow on the input half. `None` ⇒ inherit.
+    pub noise: Option<NoiseLevel>,
+    /// Per-input publish amplification for the input half. `None` ⇒
+    /// [`DEFAULT_WASM_INPUT_AMPLIFICATION`]. Same semantics as
+    /// [`WasmConsumerSubscriptionRaw::amplification`].
+    pub amplification: Option<f64>,
+    /// Default urgency for messages published on the output half. Same semantics
+    /// as [`WasmConsumerOutputRaw::urgency`].
+    pub urgency: Option<super::Urgency>,
+    /// Token-bucket fill per activation for the output half. `None` ⇒
+    /// [`DEFAULT_WASM_PUBLISH_PER_ACTIVATION`].
+    pub publish_per_activation: Option<f64>,
+    /// Max tokens carried between activations for the output half. `None` ⇒
+    /// [`DEFAULT_WASM_PUBLISH_CAPACITY`].
     pub publish_capacity: Option<f64>,
 }
 
@@ -816,6 +996,10 @@ pub struct SurfaceConfigRaw {
     /// Static port→channel output bindings (`[[surface.output]]`).
     #[serde(default, rename = "output")]
     pub outputs: Vec<SurfaceOutputRaw>,
+    /// Combined input+output port declarations (`[[surface.io_port]]`) — the
+    /// self-loop, made structural. See [`SurfaceIoPortRaw`].
+    #[serde(default, rename = "io_port")]
+    pub io_ports: Vec<SurfaceIoPortRaw>,
     /// Skin (CSS pack + vendored fonts) this surface wears. Absent ⇒ `"bench"`.
     /// Validated at resolution against the compiled-in skin registry; an unknown
     /// name is a boot panic.
@@ -975,7 +1159,12 @@ pub type SurfacePrincipalBudgets = Vec<(Option<String>, SurfaceSendBudget)>;
 #[serde(deny_unknown_fields)]
 pub struct SurfaceSubscriptionRaw {
     /// Full scheme-qualified channel address to subscribe.
-    pub channel: String,
+    ///
+    /// `None` makes this a **free port**: exactly one `[[connection]]` must
+    /// reference it (as `surface:<slug>#<instance>/<port>`) to supply the
+    /// channel. Bound by no connection, it is dead config and a boot panic.
+    #[serde(default)]
+    pub channel: Option<String>,
     /// Declared component instance receiving deliveries on this binding.
     pub instance: String,
     /// Logical input port name presented to the component.
@@ -1027,7 +1216,11 @@ pub struct SurfaceOutputRaw {
     /// Logical output port name the component publishes to.
     pub port: String,
     /// Full scheme-qualified channel address the port publishes onto.
-    pub channel: String,
+    ///
+    /// `None` makes this a **free port**, bound by exactly one `[[connection]]`;
+    /// see [`SurfaceSubscriptionRaw::channel`].
+    #[serde(default)]
+    pub channel: Option<String>,
     /// Default urgency for messages published on this port (port → `normal`),
     /// mirroring `[[wasm_consumer]] [[output]] urgency`. Components override it
     /// per-message on the publish call; absent there, this applies.
@@ -1051,6 +1244,74 @@ pub struct SurfaceOutputRaw {
     /// bucket capacity clamp applied at the *start* of the next activation).
     /// `None` ⇒ [`DEFAULT_WASM_PUBLISH_CAPACITY`] (1.0). Must be finite and
     /// `>= 0` when present. Same knob as `[[wasm_consumer.output]]`'s.
+    #[serde(default)]
+    pub publish_capacity: Option<f64>,
+}
+
+/// A combined input+output port on a surface-hosted component
+/// (`[[surface.io_port]]`).
+///
+/// The surface twin of [`WasmConsumerIoPortRaw`]: one port name resolving to one
+/// input binding and one output binding on the *same* channel, so a component
+/// sees its own publishes there by construction.
+///
+/// The default (no `channel`, no `[[connection]]`) is a **page-local** channel —
+/// per-session, browser-side, never on the server ring — riding the same
+/// declared-by-bindings `local:` machinery as any `local:` surface binding.
+///
+/// Caveat, inherited rather than new: `publish-deferred` is backend scope. The
+/// surface kernel hands components no current instant and exposes no deferred
+/// seam, so a surface io_port supports immediate self-signaling but not the timer
+/// idiom. A component that needs deferred publish runs where the host offers it.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceIoPortRaw {
+    /// Declared component instance owning both halves of this port.
+    pub instance: String,
+    /// Logical port name presented to the component for both directions. Must be
+    /// distinct from every other port name the instance declares in either
+    /// direction.
+    pub port: String,
+    /// Absent ⇒ the port's own anonymous page-local channel. Present ⇒ a named
+    /// auto channel at this full scheme-qualified address. Must be absent when a
+    /// `[[connection]]` lists this port.
+    ///
+    /// A `local:` name here stays page-local: other bindings *on this surface*
+    /// join the one page ring, and nothing on the server can. Reaching the
+    /// backend takes `ephemeral:` (shared across this surface's sessions) or
+    /// `brenn:` (durable as well).
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Queue depth for the input half. `None` ⇒ inherit. Same semantics and
+    /// bounds as [`SurfaceSubscriptionRaw::push_depth`], in either realm: the
+    /// port queue lives in page memory and must resolve bounded, so the stock
+    /// `Unbounded` global default refuses to boot here whether the port lands
+    /// page-local or in the server realm. In the server realm — a named
+    /// `ephemeral:`/`brenn:` address, or membership in a wire-spanning
+    /// `[[connection]]` — this value additionally feeds the channel's
+    /// ring-depth fold.
+    pub push_depth: Option<Depth>,
+    /// Retain depth for the input half. `None` ⇒ inherit, with a
+    /// realm-dependent reading. In the server realm it resolves to the global
+    /// default and feeds the auto channel's ring depth via the same fold as
+    /// [`WasmConsumerIoPortRaw::retain_depth`], so the stock `Unbounded`
+    /// refuses to boot on a non-durable channel. Page-local (anonymous on a
+    /// single surface, or a `local:` address) there is no server entry and the
+    /// globals are never consulted: unset gives a page ring of depth 1,
+    /// silently, with no check to catch it.
+    pub retain_depth: Option<Depth>,
+    /// Noise level for push overflow on the input half. `None` ⇒ inherit. Same
+    /// class restrictions as [`SurfaceSubscriptionRaw::noise`].
+    pub noise: Option<NoiseLevel>,
+    /// Default urgency for messages published on the output half. Same semantics
+    /// as [`SurfaceOutputRaw::urgency`].
+    pub urgency: Option<super::Urgency>,
+    /// Token-bucket fill per activation for the output half. `None` ⇒
+    /// [`DEFAULT_WASM_PUBLISH_PER_ACTIVATION`].
+    #[serde(default)]
+    pub publish_per_activation: Option<f64>,
+    /// Max tokens carried between activations for the output half. `None` ⇒
+    /// [`DEFAULT_WASM_PUBLISH_CAPACITY`].
     #[serde(default)]
     pub publish_capacity: Option<f64>,
 }
@@ -1483,9 +1744,10 @@ pub fn build_channel_entries(
             ch.address,
         );
         assert!(
-            !crate::tools::is_reserved_channel(name),
-            "config: [[channel]] address {:?} is in a reserved tool namespace \
-             (tools/tool-results are owned by the tool substrate)",
+            !is_reserved_channel_name(name),
+            "config: [[channel]] address {:?} is in a reserved namespace \
+             (tools/tool-results are owned by the tool substrate; auto is owned by \
+             the auto-channel machinery)",
             ch.address,
         );
 
@@ -2273,7 +2535,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "reserved tool namespace")]
+    #[should_panic(expected = "is in a reserved namespace")]
     fn reserved_tool_namespace_channel_panics() {
         // A user channel whose address falls in the tool substrate's reserved
         // namespace is rejected at load (the `.` boundary form is testable; the
@@ -2641,11 +2903,14 @@ channel = "brenn:alerts.high"
         assert_eq!(raw.components[0].instance, None);
         // subscription.channel is scheme-qualified.
         assert_eq!(raw.subscriptions.len(), 1);
-        assert_eq!(raw.subscriptions[0].channel, "ephemeral:protobar-demo");
+        assert_eq!(
+            raw.subscriptions[0].channel.as_deref(),
+            Some("ephemeral:protobar-demo")
+        );
         assert_eq!(raw.subscriptions[0].instance, "protobar");
         assert_eq!(raw.subscriptions[0].port, "messages");
         assert_eq!(raw.outputs.len(), 1);
-        assert_eq!(raw.outputs[0].channel, "brenn:alerts.high");
+        assert_eq!(raw.outputs[0].channel.as_deref(), Some("brenn:alerts.high"));
         assert_eq!(raw.outputs[0].instance, "protobar");
         assert_eq!(raw.outputs[0].port, "out");
         // Access check + publish-budget caps parse from TOML.
@@ -2671,6 +2936,7 @@ channel = "brenn:alerts.high"
         assert!(raw.components.is_empty());
         assert!(raw.subscriptions.is_empty());
         assert!(raw.outputs.is_empty());
+        assert!(raw.io_ports.is_empty());
         // Access check + publish-budget caps default when omitted.
         assert!(raw.allowed_users.is_empty());
         assert!(raw.publish_burst.is_none());
@@ -2688,6 +2954,159 @@ channel = "brenn:alerts.high"
             result.is_err(),
             "missing grants field must be a serde error"
         );
+    }
+
+    /// A full `[[connection]]`: endpoint refs in both forms, plus the named
+    /// durable channel and its rename-stability uuid.
+    #[test]
+    fn connection_parses_full() {
+        let toml_str = r#"
+endpoints = ["wasm:etl/batch-out", "wasm:indexer/batch-in", "surface:bench#monitor/batch-tap"]
+channel = "brenn:etl.batches"
+uuid = "9c1f4a4e-6d38-4a2e-9f1a-2f7c0d5b8e31"
+description = "ETL batch hand-off"
+"#;
+        let raw: ConnectionConfigRaw =
+            toml::from_str(toml_str).expect("full [[connection]] must parse");
+        assert_eq!(
+            raw.endpoints,
+            vec![
+                "wasm:etl/batch-out".to_string(),
+                "wasm:indexer/batch-in".to_string(),
+                "surface:bench#monitor/batch-tap".to_string(),
+            ]
+        );
+        assert_eq!(raw.channel.as_deref(), Some("brenn:etl.batches"));
+        assert_eq!(
+            raw.uuid.as_deref(),
+            Some("9c1f4a4e-6d38-4a2e-9f1a-2f7c0d5b8e31")
+        );
+        assert_eq!(raw.description.as_deref(), Some("ETL batch hand-off"));
+    }
+
+    /// The anonymous spelling: endpoints alone, all optional fields absent.
+    #[test]
+    fn connection_parses_anonymous() {
+        let raw: ConnectionConfigRaw =
+            toml::from_str("endpoints = [\"wasm:a/out\", \"wasm:b/in\"]\n")
+                .expect("anonymous [[connection]] must parse");
+        assert_eq!(raw.endpoints.len(), 2);
+        assert!(raw.channel.is_none());
+        assert!(raw.uuid.is_none());
+        assert!(raw.description.is_none());
+    }
+
+    /// `endpoints` is required and unknown keys are rejected: a connection with
+    /// no endpoints declares nothing, and a typo'd knob would silently do
+    /// nothing.
+    #[test]
+    fn connection_rejects_missing_endpoints_and_unknown_fields() {
+        let missing: Result<ConnectionConfigRaw, _> = toml::from_str("channel = \"brenn:x\"\n");
+        assert!(missing.is_err(), "endpoints must be required");
+        let unknown: Result<ConnectionConfigRaw, _> =
+            toml::from_str("endpoints = [\"wasm:a/out\"]\nretain_depth = 4\n");
+        assert!(
+            unknown.is_err(),
+            "channel-level tuning is not available on a [[connection]]"
+        );
+    }
+
+    /// A `[[wasm_consumer.io_port]]` carries both directions' tuning under one
+    /// port name, and nests inside `[[wasm_consumer]]` as `io_port`.
+    #[test]
+    fn wasm_consumer_io_port_parses() {
+        let toml_str = r#"
+slug = "etl"
+component_path = "/opt/brenn/etl.wasm"
+grants = ["ports"]
+
+[[io_port]]
+port = "timer"
+push_depth = 2
+retain_depth = 8
+noise = "metered"
+amplification = 0.5
+urgency = "low"
+publish_per_activation = 2.0
+publish_capacity = 4.0
+channel = "brenn:etl.timer"
+"#;
+        let raw: WasmConsumerConfigRaw =
+            toml::from_str(toml_str).expect("[[wasm_consumer.io_port]] must parse");
+        assert_eq!(raw.io_ports.len(), 1);
+        let io = &raw.io_ports[0];
+        assert_eq!(io.port, "timer");
+        assert_eq!(io.push_depth, Some(Depth::Bounded(2)));
+        assert_eq!(io.retain_depth, Some(Depth::Bounded(8)));
+        assert_eq!(io.noise, Some(NoiseLevel::Metered));
+        assert_eq!(io.amplification, Some(0.5));
+        assert_eq!(io.urgency, Some(crate::messaging::Urgency::Low));
+        assert_eq!(io.publish_per_activation, Some(2.0));
+        assert_eq!(io.publish_capacity, Some(4.0));
+        assert_eq!(io.channel.as_deref(), Some("brenn:etl.timer"));
+    }
+
+    /// The zero-config spelling: a port name and nothing else. Also pins that
+    /// `wake_min` is rejected — it has no referent on a WASM subscription.
+    #[test]
+    fn wasm_consumer_io_port_minimal_and_rejects_wake_min() {
+        let raw: WasmConsumerIoPortRaw =
+            toml::from_str("port = \"timer\"\n").expect("bare io_port must parse");
+        assert_eq!(raw.port, "timer");
+        assert!(raw.channel.is_none());
+        assert!(raw.push_depth.is_none());
+        assert!(raw.retain_depth.is_none());
+        let with_wake: Result<WasmConsumerIoPortRaw, _> =
+            toml::from_str("port = \"timer\"\nwake_min = \"normal\"\n");
+        assert!(with_wake.is_err(), "wake_min must not be accepted");
+    }
+
+    /// A `[[surface.io_port]]` names the owning instance and nests inside
+    /// `[[surface]]` as `io_port`; with no channel it is the page-local default.
+    #[test]
+    fn surface_io_port_parses() {
+        let toml_str = r#"
+slug = "bench"
+grants = []
+
+[[io_port]]
+instance = "monitor"
+port = "tick"
+push_depth = 4
+retain_depth = 4
+urgency = "normal"
+publish_capacity = 3.0
+"#;
+        let raw: SurfaceConfigRaw =
+            toml::from_str(toml_str).expect("[[surface.io_port]] must parse");
+        assert_eq!(raw.io_ports.len(), 1);
+        let io = &raw.io_ports[0];
+        assert_eq!(io.instance, "monitor");
+        assert_eq!(io.port, "tick");
+        assert_eq!(io.push_depth, Some(Depth::Bounded(4)));
+        assert_eq!(io.retain_depth, Some(Depth::Bounded(4)));
+        assert_eq!(io.urgency, Some(crate::messaging::Urgency::Normal));
+        assert_eq!(io.publish_capacity, Some(3.0));
+        assert!(io.channel.is_none());
+    }
+
+    /// A binding with no `channel` is a free port: the field is optional on all
+    /// four binding blocks.
+    #[test]
+    fn bindings_parse_as_free_ports() {
+        let sub: WasmConsumerSubscriptionRaw =
+            toml::from_str("port = \"in\"\n").expect("channel-less wasm subscription must parse");
+        assert!(sub.channel.is_none());
+        let out: WasmConsumerOutputRaw =
+            toml::from_str("port = \"out\"\n").expect("channel-less wasm output must parse");
+        assert!(out.channel.is_none());
+        let ssub: SurfaceSubscriptionRaw =
+            toml::from_str("instance = \"monitor\"\nport = \"in\"\n")
+                .expect("channel-less surface subscription must parse");
+        assert!(ssub.channel.is_none());
+        let sout: SurfaceOutputRaw = toml::from_str("instance = \"monitor\"\nport = \"out\"\n")
+            .expect("channel-less surface output must parse");
+        assert!(sout.channel.is_none());
     }
 
     /// The `"alert"` grant token parses to `SurfaceGrant::Alert` — the same

@@ -1,8 +1,8 @@
 //! End-to-end tests for `build_messaging` and `build_apps_with_messaging`.
 
 use super::test_fixtures::{
-    minimal_app_config, minimal_surface_raw, minimal_wasm_consumer, resolved_ingress_sub,
-    surface_sub_raw,
+    boot_messaging_with, io_port_raw, minimal_app_config, minimal_surface_raw,
+    minimal_wasm_consumer, resolved_ingress_sub, surface_sub_raw,
 };
 use super::*;
 use brenn_lib::config::AppConfig;
@@ -17,28 +17,16 @@ fn empty_tool_registry() -> std::sync::Arc<crate::tool_registry::ToolRegistry> {
     std::sync::Arc::new(crate::tool_registry::ToolRegistry::new(vec![]))
 }
 
-/// Boot `build_messaging` with the standard no-op periphery. Tests that need
-/// a non-empty app map or real webhooks call `build_messaging` directly.
+/// Boot `build_messaging` with the standard no-op periphery and no apps. Tests
+/// that need a non-empty app map call `boot_messaging_with`; those that need
+/// real webhooks or bridges call `build_messaging` directly.
 async fn boot_messaging(
     config: &brenn_lib::config::BrennConfig,
     db: brenn_lib::db::Db,
 ) -> MessagingResult {
     let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
-    let webhooks: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IndexMap::new();
     let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IndexMap::new());
-    build_messaging(
-        config,
-        db,
-        &apps,
-        ActiveBridges::new(),
-        alert_dispatcher,
-        Some(Arc::from("brenn://test")),
-        &webhooks,
-        &[],
-        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
-        &empty_tool_registry(),
-    )
-    .await
+    boot_messaging_with(config, db, &apps, alert_dispatcher, "brenn://test").await
 }
 
 /// A webhook-only app (no `[app.messaging]` block, only
@@ -894,7 +882,7 @@ async fn build_messaging_panics_on_static_wasm_sub_without_covering_policy() {
         store_path: None,
         store_size_limit: None,
         subscriptions: vec![WasmConsumerSubscriptionRaw {
-            channel: format!("brenn:{address}"),
+            channel: Some(format!("brenn:{address}")),
             port: "in".to_string(),
             push_depth: Some(Depth::Unbounded),
             retain_depth: None,
@@ -903,6 +891,7 @@ async fn build_messaging_panics_on_static_wasm_sub_without_covering_policy() {
             amplification: None,
         }],
         outputs: vec![],
+        io_ports: vec![],
         config: None,
         activation_burst: None,
         activation_min_period_ms: None,
@@ -966,6 +955,7 @@ async fn build_messaging_panics_on_wasm_mqtt_matcher_undeclared_client() {
         store_size_limit: None,
         subscriptions: vec![],
         outputs: vec![],
+        io_ports: vec![],
         config: None,
         activation_burst: None,
         activation_min_period_ms: None,
@@ -1039,6 +1029,7 @@ async fn build_messaging_panics_on_wasm_mqtt_publish_acl_without_mqtt_grant() {
         store_size_limit: None,
         subscriptions: vec![],
         outputs: vec![],
+        io_ports: vec![],
         config: None,
         activation_burst: None,
         activation_min_period_ms: None,
@@ -1108,7 +1099,7 @@ async fn build_messaging_panics_on_static_wasm_sub_channel_outside_subscribe_acl
         store_path: None,
         store_size_limit: None,
         subscriptions: vec![WasmConsumerSubscriptionRaw {
-            channel: format!("brenn:{subscribed}"),
+            channel: Some(format!("brenn:{subscribed}")),
             port: "in".to_string(),
             push_depth: Some(Depth::Unbounded),
             retain_depth: None,
@@ -1117,6 +1108,7 @@ async fn build_messaging_panics_on_static_wasm_sub_channel_outside_subscribe_acl
             amplification: None,
         }],
         outputs: vec![],
+        io_ports: vec![],
         config: None,
         activation_burst: None,
         activation_min_period_ms: None,
@@ -1178,7 +1170,7 @@ async fn build_messaging_accepts_static_wasm_sub_with_covering_subscribe_acl() {
         store_path: None,
         store_size_limit: None,
         subscriptions: vec![WasmConsumerSubscriptionRaw {
-            channel: format!("brenn:{subscribed}"),
+            channel: Some(format!("brenn:{subscribed}")),
             port: "in".to_string(),
             push_depth: Some(Depth::Unbounded),
             retain_depth: None,
@@ -1187,6 +1179,7 @@ async fn build_messaging_accepts_static_wasm_sub_with_covering_subscribe_acl() {
             amplification: None,
         }],
         outputs: vec![],
+        io_ports: vec![],
         config: None,
         activation_burst: None,
         activation_min_period_ms: None,
@@ -1290,6 +1283,7 @@ async fn build_messaging_panics_on_wasm_mqtt_subscribe_matcher_undeclared_client
         store_size_limit: None,
         subscriptions: vec![],
         outputs: vec![],
+        io_ports: vec![],
         config: None,
         activation_burst: None,
         activation_min_period_ms: None,
@@ -1353,7 +1347,7 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
         store_path: None,
         store_size_limit: None,
         subscriptions: vec![WasmConsumerSubscriptionRaw {
-            channel: format!("webhook:{endpoint_slug}"),
+            channel: Some(format!("webhook:{endpoint_slug}")),
             port: "in".to_string(),
             push_depth: Some(Depth::Bounded(50)),
             retain_depth: Some(Depth::Bounded(10)),
@@ -1363,11 +1357,12 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
         }],
         outputs: vec![brenn_lib::messaging::config::WasmConsumerOutputRaw {
             port: "out".to_string(),
-            channel: "brenn:wasm-demo-out".to_string(),
+            channel: Some("brenn:wasm-demo-out".to_string()),
             urgency: None,
             publish_per_activation: None,
             publish_capacity: None,
         }],
+        io_ports: vec![],
         config: None,
         activation_burst: Some(60),
         activation_min_period_ms: Some(1000),
@@ -1441,7 +1436,7 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
         store_path: None,
         store_size_limit: None,
         subscriptions: vec![WasmConsumerSubscriptionRaw {
-            channel: format!("webhook:{endpoint_slug}"),
+            channel: Some(format!("webhook:{endpoint_slug}")),
             port: "in".to_string(),
             push_depth: Some(Depth::Unbounded),
             retain_depth: None,
@@ -1450,6 +1445,7 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
             amplification: None,
         }],
         outputs: vec![],
+        io_ports: vec![],
         config: None,
         activation_burst: None,
         activation_min_period_ms: None,
@@ -1528,7 +1524,7 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
         store_path: None,
         store_size_limit: None,
         subscriptions: vec![WasmConsumerSubscriptionRaw {
-            channel: address.to_string(),
+            channel: Some(address.to_string()),
             port: "in".to_string(),
             push_depth: Some(Depth::Bounded(10)),
             retain_depth: None,
@@ -1537,6 +1533,7 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
             amplification: None,
         }],
         outputs: vec![],
+        io_ports: vec![],
         config: None,
         activation_burst: None,
         activation_min_period_ms: None,
@@ -1633,7 +1630,7 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
         store_path: None,
         store_size_limit: None,
         subscriptions: vec![WasmConsumerSubscriptionRaw {
-            channel: address.to_string(),
+            channel: Some(address.to_string()),
             port: "in".to_string(),
             push_depth: Some(Depth::Bounded(10)),
             retain_depth: None,
@@ -1642,6 +1639,7 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
             amplification: None,
         }],
         outputs: vec![],
+        io_ports: vec![],
         config: None,
         activation_burst: None,
         activation_min_period_ms: None,
@@ -1917,7 +1915,7 @@ async fn build_messaging_wires_wasm_ephemeral_consumer_to_a_ring_cursor() {
         slug: "watcher".to_string(),
         component_path: "/tmp/watcher.wasm".into(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
-            channel: "ephemeral:sensors".to_string(),
+            channel: Some("ephemeral:sensors".to_string()),
             port: "in".to_string(),
             push_depth: None,
             retain_depth: None,
@@ -1997,7 +1995,7 @@ async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_on
     }
     fn sub(channel: &str, port: &str) -> WasmConsumerSubscriptionRaw {
         WasmConsumerSubscriptionRaw {
-            channel: channel.to_string(),
+            channel: Some(channel.to_string()),
             port: port.to_string(),
             push_depth: None,
             retain_depth: None,
@@ -2100,7 +2098,7 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
         slug: "watcher".to_string(),
         component_path: "/tmp/watcher.wasm".into(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
-            channel: "local:scratch".to_string(),
+            channel: Some("local:scratch".to_string()),
             port: "in".to_string(),
             push_depth: None,
             retain_depth: None,
@@ -2180,6 +2178,371 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
     );
 }
 
+/// The whole io_port story through a real boot: a consumer whose only port is an
+/// io_port, with no `[[channel]]` block, no `[[connection]]`, and no ACL entry in
+/// config. One channel serves both halves, so the component's own publish lands in
+/// its own ring cursor — the self-loop the timer idiom rides, structural rather
+/// than an operator convention.
+#[tokio::test]
+async fn build_messaging_wires_an_io_port_to_its_own_ring_cursor() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::ParticipantId;
+    use brenn_lib::messaging::config::{Depth, WasmConsumerConfigRaw, WasmConsumerIoPortRaw};
+    use brenn_lib::messaging::publish::WasmPublish;
+
+    let consumer = WasmConsumerConfigRaw {
+        slug: "ticker".to_string(),
+        component_path: "/tmp/ticker.wasm".into(),
+        grants: vec![WasmGrant::Ports],
+        io_ports: vec![WasmConsumerIoPortRaw {
+            port: "timer".to_string(),
+            channel: None,
+            push_depth: Some(Depth::Bounded(2)),
+            retain_depth: Some(Depth::Bounded(8)),
+            noise: None,
+            amplification: None,
+            urgency: None,
+            publish_per_activation: None,
+            publish_capacity: None,
+        }],
+        ..minimal_wasm_consumer()
+    };
+    let config = BrennConfig {
+        wasm_consumers: vec![consumer],
+        ..BrennConfig::default()
+    };
+
+    let result = boot_messaging(&config, init_db_memory()).await;
+
+    let resolved = &result.wasm_consumers[0];
+    assert_eq!(resolved.inputs.len(), 1);
+    assert_eq!(resolved.outputs.len(), 1);
+    let address = resolved.outputs[0].channel_address.clone();
+    assert!(
+        address.starts_with("local:auto."),
+        "the default is an anonymous non-transportable channel, got {address:?}",
+    );
+    assert_eq!(
+        resolved.inputs[0].sub.channel_address, address,
+        "both halves of an io_port bind one channel",
+    );
+    let bare = address.strip_prefix("local:").unwrap();
+    assert!(resolved.policy.allows_local_publish(bare));
+    assert!(resolved.policy.allows_local_delivery(bare));
+
+    let messenger = result.messenger.as_ref().unwrap();
+    let store = messenger
+        .ring_stores()
+        .get(&resolved.inputs[0].sub.channel_uuid)
+        .expect("the anonymous auto channel has a ring store");
+    let subscriber = ParticipantId::for_wasm("ticker");
+    assert!(
+        store.is_attached(&subscriber),
+        "the io_port's input half is registered as a ring cursor"
+    );
+
+    messenger
+        .publish_from_wasm(
+            "ticker",
+            &[WasmPublish {
+                channel_address: &address,
+                body: "tick",
+                urgency: brenn_lib::messaging::Urgency::Normal,
+                reply_to: None,
+                deliver_after: None,
+            }],
+        )
+        .await;
+
+    let window = store
+        .window(&subscriber, 2, 0)
+        .expect("the io_port's input half is attached");
+    assert_eq!(
+        window.new_len(),
+        1,
+        "the component's own publish is delivered back to it"
+    );
+    assert_eq!(window.new_entries()[0].message.body, "tick");
+    let first_seq = window.new_entries()[0].seq;
+
+    // The timer idiom itself: a deferred self-publish parks, is invisible until
+    // it comes due, and then lands on the very cursor the io_port's input half
+    // holds. Wired to two channels this is where the wake would vanish.
+    let due = chrono::Utc::now() + chrono::Duration::hours(1);
+    messenger
+        .publish_from_wasm(
+            "ticker",
+            &[WasmPublish {
+                channel_address: &address,
+                body: "wake",
+                urgency: brenn_lib::messaging::Urgency::Normal,
+                reply_to: None,
+                deliver_after: Some(due),
+            }],
+        )
+        .await;
+    store.advance(&subscriber, first_seq, first_seq);
+    assert_eq!(
+        store
+            .window(&subscriber, 2, 0)
+            .expect("the io_port's input half is attached")
+            .new_len(),
+        0,
+        "a parked schedule is observable to nobody before it releases",
+    );
+
+    let released = store.release_due(due + chrono::Duration::seconds(1));
+    assert_eq!(released.messages.len(), 1, "the schedule came due");
+    let window = store
+        .window(&subscriber, 2, 0)
+        .expect("the io_port's input half is attached");
+    assert_eq!(
+        window.new_len(),
+        1,
+        "the released wake reaches the same port that scheduled it"
+    );
+    assert_eq!(window.new_entries()[0].message.body, "wake");
+}
+
+/// Naming an io_port's channel `brenn:` is the one line that buys durability, and
+/// this is the whole path behind it: the synthesized entry reaches
+/// `pre_directory`, the resolvers, and `upsert_channels`, so the channel a timer's
+/// parked schedules live on has a DB row after boot — with no `[[channel]]` block
+/// and no ACL entry in config.
+#[tokio::test]
+async fn build_messaging_gives_a_named_brenn_io_port_channel_a_db_row() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::config::{Depth, WasmConsumerConfigRaw, WasmConsumerIoPortRaw};
+
+    let consumer = WasmConsumerConfigRaw {
+        slug: "ticker".to_string(),
+        component_path: "/tmp/ticker.wasm".into(),
+        grants: vec![WasmGrant::Ports],
+        io_ports: vec![WasmConsumerIoPortRaw {
+            port: "timer".to_string(),
+            channel: Some("brenn:etl.timer".to_string()),
+            push_depth: Some(Depth::Bounded(2)),
+            retain_depth: Some(Depth::Bounded(8)),
+            noise: None,
+            amplification: None,
+            urgency: None,
+            publish_per_activation: None,
+            publish_capacity: None,
+        }],
+        ..minimal_wasm_consumer()
+    };
+    let config = BrennConfig {
+        wasm_consumers: vec![consumer],
+        ..BrennConfig::default()
+    };
+    let db = init_db_memory();
+
+    let result = boot_messaging(&config, db.clone()).await;
+
+    let resolved = &result.wasm_consumers[0];
+    assert_eq!(resolved.inputs[0].sub.channel_address, "brenn:etl.timer");
+    assert_eq!(resolved.outputs[0].channel_address, "brenn:etl.timer");
+    // Both roles, injected from the one io_port declaration.
+    assert!(resolved.policy.allows_brenn_publish("etl.timer"));
+    assert!(resolved.policy.allows_brenn_delivery("etl.timer"));
+
+    let expected_uuid = brenn_lib::messaging::durable_auto_channel_uuid("etl.timer");
+    assert_eq!(resolved.inputs[0].sub.channel_uuid, expected_uuid);
+
+    let conn = db.lock().await;
+    let (address, description): (String, Option<String>) = conn
+        .query_row(
+            "SELECT address, description FROM messaging_channels WHERE uuid = ?1",
+            rusqlite::params![expected_uuid.as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("a durable auto channel is upserted like any other durable channel");
+    assert_eq!(address, "brenn:etl.timer");
+    assert_eq!(
+        description.as_deref(),
+        Some("auto channel: wasm:ticker/timer")
+    );
+}
+
+/// The directory listings with auto channels present. `list_channels` walks the
+/// durable half and panics on a non-durable entry reaching it, so an anonymous
+/// auto channel mis-sorted into the durable set would surface as a runtime panic
+/// in an LLM-facing path rather than a boot failure.
+#[tokio::test]
+async fn auto_channels_list_as_their_durability_says() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::config::{Depth, WasmConsumerConfigRaw, WasmConsumerIoPortRaw};
+
+    let io_port = |port: &str, channel: Option<&str>| WasmConsumerIoPortRaw {
+        port: port.to_string(),
+        channel: channel.map(str::to_string),
+        push_depth: Some(Depth::Bounded(2)),
+        retain_depth: Some(Depth::Bounded(8)),
+        noise: None,
+        amplification: None,
+        urgency: None,
+        publish_per_activation: None,
+        publish_capacity: None,
+    };
+    let consumer = WasmConsumerConfigRaw {
+        slug: "ticker".to_string(),
+        component_path: "/tmp/ticker.wasm".into(),
+        grants: vec![WasmGrant::Ports],
+        io_ports: vec![
+            io_port("anon", None),
+            io_port("named", Some("brenn:etl.timer")),
+        ],
+        ..minimal_wasm_consumer()
+    };
+    let config = BrennConfig {
+        channels: vec![brenn_lib::messaging::config::ChannelConfigRaw {
+            send_rate: None,
+            uuid: Some("5b0e1c9a-2d44-4f18-9a3b-6c7e0d81f204".to_string()),
+            address: "brenn:etl.feed".to_string(),
+            description: None,
+            push_depth: Some(Depth::Bounded(2)),
+            retain_depth: Some(Depth::Bounded(8)),
+            standing_retain_depth: None,
+            noise: None,
+            sink: None,
+            wake_min: None,
+        }],
+        wasm_consumers: vec![consumer],
+        ..BrennConfig::default()
+    };
+
+    // A bystander app holding a real grant on an ordinary declared channel. Its
+    // listing is non-empty, so "neither auto channel is in it" is the policy
+    // filter talking and not an empty vector: naming an auto channel grants
+    // nothing, and an anonymous one is reachable by no policy at all.
+    let mut policy = brenn_lib::access::AppPolicy::default();
+    policy
+        .grants
+        .insert(brenn_lib::access::AppCapability::MessagingSubscribe);
+    policy.acls.brenn_subscribe = vec![brenn_lib::access::acl::ChannelMatcher::Exact(
+        "etl.feed".to_string(),
+    )];
+    let mut apps_map: IndexMap<String, AppConfig> = IndexMap::new();
+    apps_map.insert(
+        "graf".to_string(),
+        AppConfig {
+            policy,
+            ..minimal_app_config("graf", None, vec![])
+        },
+    );
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IndexMap::new();
+    let result = build_messaging(
+        &config,
+        init_db_memory(),
+        &apps,
+        ActiveBridges::new(),
+        alert_dispatcher,
+        Some(Arc::from("brenn://test")),
+        &webhook_endpoints,
+        &[],
+        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
+        &empty_tool_registry(),
+    )
+    .await;
+    let messenger = result.messenger.as_ref().unwrap();
+
+    let accessible: Vec<String> = messenger
+        .list_accessible_channels("graf")
+        .into_iter()
+        .map(|row| row.address)
+        .collect();
+    assert!(
+        accessible.contains(&"brenn:etl.feed".to_string()),
+        "the caller's own grant reaches its own channel, got {accessible:?}",
+    );
+    assert!(
+        !accessible
+            .iter()
+            .any(|address| address.contains("auto.") || address == "brenn:etl.timer"),
+        "this listing is filtered by the caller's own policy, which covers neither \
+         auto channel; an anonymous one is additionally visible to nothing at all, \
+         got {accessible:?}",
+    );
+
+    let listed: Vec<String> = messenger
+        .list_channels()
+        .into_iter()
+        .map(|row| row.address)
+        .collect();
+    assert!(
+        listed.contains(&"brenn:etl.timer".to_string()),
+        "a durable named auto channel is an ordinary durable channel, got {listed:?}",
+    );
+    assert!(
+        !listed.iter().any(|address| address.contains("auto.")),
+        "an anonymous auto channel is non-durable and never reaches this dump, got {listed:?}",
+    );
+}
+
+/// `local:` gives each realm a private namespace, so one bare name may be a
+/// backend server ring and a surface's page ring at once. Nothing in the boot
+/// path may treat that coincidence as a misconfiguration: the two are unrelated
+/// channels sharing only a spelling, which is what lets many surfaces stamped
+/// from one config template carry identical `local:` names. This drives the whole
+/// of `build_messaging`, so any stage that grew a conflict check would fail here.
+#[tokio::test]
+async fn a_shared_local_name_across_the_two_realms_boots() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::config::{Depth, SurfaceConfigRaw};
+
+    let config = BrennConfig {
+        wasm_consumers: vec![brenn_lib::messaging::config::WasmConsumerConfigRaw {
+            slug: "ticker".to_string(),
+            grants: vec![WasmGrant::Ports],
+            io_ports: vec![io_port_raw(
+                "tick",
+                Some("local:etl.tick"),
+                Depth::Bounded(2),
+                Depth::Bounded(8),
+            )],
+            ..minimal_wasm_consumer()
+        }],
+        surfaces: vec![SurfaceConfigRaw {
+            subscriptions: vec![brenn_lib::messaging::config::SurfaceSubscriptionRaw {
+                // The stock global push depth is unbounded, which no page queue
+                // can be, so a surface binding states its own.
+                push_depth: Some(Depth::Bounded(4)),
+                retain_depth: Some(Depth::Bounded(3)),
+                ..surface_sub_raw("local:etl.tick", "protobar", "snoop")
+            }],
+            ..minimal_surface_raw()
+        }],
+        ..BrennConfig::default()
+    };
+
+    let result = boot_messaging(&config, init_db_memory()).await;
+    let messenger = result
+        .messenger
+        .as_ref()
+        .expect("a name coincidence across the two local: realms is not a misconfiguration");
+    let store = messenger
+        .ring_stores()
+        .get_by_address("local:etl.tick")
+        .expect("the backend io_port's server ring is wired into the Messenger");
+    assert_eq!(store.address(), "local:etl.tick");
+    assert_eq!(
+        result.surfaces[0]
+            .local_channels
+            .iter()
+            .filter(|channel| channel.address == "local:etl.tick")
+            .count(),
+        1,
+        "the surface binding declares its own page ring under the same name, got {:?}",
+        result.surfaces[0].local_channels,
+    );
+}
+
 /// A `brenn:<address>` channel config carrying an explicit uuid and push_depth,
 /// plus a WASM consumer "watcher" whose durable input binds it with a covering
 /// `subscribe_acl`. The channel is present in both, so boot 1 (channel only) and
@@ -2218,7 +2581,7 @@ fn warm_brenn_priming_configs(
         slug: "watcher".to_string(),
         component_path: "/tmp/watcher.wasm".into(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
-            channel: format!("brenn:{address}"),
+            channel: Some(format!("brenn:{address}")),
             port: "in".to_string(),
             push_depth: None,
             retain_depth: None,
@@ -2408,7 +2771,7 @@ async fn build_messaging_does_not_seed_db_pushes_for_a_nondurable_wasm_queue() {
         slug: "watcher".to_string(),
         component_path: "/tmp/watcher.wasm".into(),
         subscriptions: vec![WasmConsumerSubscriptionRaw {
-            channel: "ephemeral:sensors".to_string(),
+            channel: Some("ephemeral:sensors".to_string()),
             port: "in".to_string(),
             push_depth: None,
             retain_depth: None,
@@ -2611,6 +2974,77 @@ async fn build_messaging_wires_async_tool_bus_for_granted_consumer() {
     );
     // A different consumer's inbox is not covered (the derivation is per-slug).
     assert!(!policy.allows_channel_access("brenn:tool-results/other"));
+}
+
+/// The uuid uniqueness assert covers tool-substrate entries too. A
+/// `[[connection]] uuid` pasted from a `brenn:tools/<tool>` channel is only
+/// visible once all entry sources have contributed — and nothing downstream
+/// catches the collision.
+#[tokio::test]
+#[should_panic(expected = "both carry uuid")]
+async fn build_messaging_panics_when_a_connection_uuid_collides_with_a_tool_channel() {
+    use super::test_fixtures::{out_raw, sub_raw};
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::config::{
+        ConnectionConfigRaw, WasmConsumerConfigRaw, WasmConsumerOutputRaw,
+        WasmConsumerSubscriptionRaw, WasmGrant,
+    };
+    use indexmap::IndexMap as IM;
+
+    let mut repo_clause = toml::Table::new();
+    repo_clause.insert("repo".to_string(), toml::Value::String("brenn".to_string()));
+    let consumer = WasmConsumerConfigRaw {
+        grants: vec![WasmGrant::Ports],
+        tool_grants: vec![brenn_lib::tools::config::ToolGrantRaw {
+            tool: "apull".to_string(),
+            acl: vec![repo_clause],
+            rate_limit: None,
+        }],
+        subscriptions: vec![WasmConsumerSubscriptionRaw {
+            channel: None,
+            push_depth: Some(Depth::Bounded(2)),
+            retain_depth: Some(Depth::Bounded(2)),
+            ..sub_raw("brenn:unused", "in")
+        }],
+        outputs: vec![WasmConsumerOutputRaw {
+            channel: None,
+            ..out_raw("out", "brenn:unused")
+        }],
+        ..minimal_wasm_consumer()
+    };
+
+    let config = BrennConfig {
+        wasm_consumers: vec![consumer],
+        connections: vec![ConnectionConfigRaw {
+            endpoints: vec!["wasm:probe/out".to_string(), "wasm:probe/in".to_string()],
+            channel: Some("brenn:probe.loop".to_string()),
+            uuid: Some(
+                brenn_lib::messaging::tool_channel_uuid_from_address("brenn:tools/apull")
+                    .to_string(),
+            ),
+            description: None,
+        }],
+        ..BrennConfig::default()
+    };
+    let db = init_db_memory();
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
+
+    build_messaging(
+        &config,
+        db,
+        &apps,
+        ActiveBridges::new(),
+        alert_dispatcher,
+        Some(Arc::from("brenn://test")),
+        &webhook_endpoints,
+        &[],
+        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
+        &async_tool_registry(),
+    )
+    .await;
 }
 
 /// `build_messaging` registers the `system:surface-help` participant, and
@@ -2851,4 +3285,131 @@ async fn boot_disconnected_stamp_written_per_surface_and_pullable() {
     assert_eq!(body["reason"], serde_json::json!("server restart"));
     assert_eq!(body["session"], serde_json::json!(null));
     assert_eq!(body["instances"], serde_json::json!([]));
+}
+
+/// A consumer whose sole port is an io_port on `channel` (absent ⇒ anonymous),
+/// at bounded depths so the fold lands on a legal non-durable ring.
+fn io_port_consumer(
+    slug: &str,
+    ports: &[(&str, Option<&str>)],
+) -> brenn_lib::messaging::config::WasmConsumerConfigRaw {
+    use brenn_lib::messaging::config::{Depth, WasmConsumerConfigRaw};
+
+    WasmConsumerConfigRaw {
+        slug: slug.to_string(),
+        grants: vec![WasmGrant::Ports],
+        io_ports: ports
+            .iter()
+            .map(|(port, channel)| {
+                io_port_raw(port, *channel, Depth::Bounded(2), Depth::Bounded(8))
+            })
+            .collect(),
+        ..minimal_wasm_consumer()
+    }
+}
+
+/// Naming an auto channel is what lets a third party reach it — with an
+/// ordinary binding backed by an ordinary ACL entry, since naming alone grants
+/// nothing. What the third party sees is the generated description: an auto
+/// channel writes no `[[channel]]` block, so without it a listing row would
+/// explain itself to nobody.
+#[tokio::test]
+async fn a_named_auto_channel_lists_to_a_third_party_with_its_description() {
+    use brenn_lib::access::acl::ChannelMatcher;
+    use brenn_lib::access::{AppCapability, AppPolicy};
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+
+    let config = BrennConfig {
+        wasm_consumers: vec![io_port_consumer(
+            "ticker",
+            &[("timer", Some("brenn:etl.batches"))],
+        )],
+        ..BrennConfig::default()
+    };
+
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::MessagingSubscribe);
+    policy.acls.brenn_subscribe = vec![ChannelMatcher::Exact("etl.batches".to_string())];
+    let mut apps_map: IndexMap<String, AppConfig> = IndexMap::new();
+    apps_map.insert(
+        "graf".to_string(),
+        AppConfig {
+            policy,
+            ..minimal_app_config("graf", None, vec![])
+        },
+    );
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+    let result = boot_messaging_with(
+        &config,
+        init_db_memory(),
+        &apps,
+        alert_dispatcher,
+        "brenn://test",
+    )
+    .await;
+
+    let row = result
+        .messenger
+        .as_ref()
+        .unwrap()
+        .list_accessible_channels("graf")
+        .into_iter()
+        .find(|row| row.address == "brenn:etl.batches")
+        .expect("an ordinary ACL entry reaches a named auto channel");
+    assert_eq!(
+        row.description.as_deref(),
+        Some("auto channel: wasm:ticker/timer"),
+        "the generated description is what makes the row self-explaining",
+    );
+}
+
+/// Auto-injection means a principal's ACL lists in config no longer enumerate
+/// its full reach, so the boot log is the accounting a config security review
+/// reads instead: one line per (principal, capability, channel).
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn boot_logs_every_injected_auto_grant() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+
+    let config = BrennConfig {
+        wasm_consumers: vec![io_port_consumer(
+            "ticker",
+            &[("wake", None), ("batches", Some("brenn:etl.batches"))],
+        )],
+        ..BrennConfig::default()
+    };
+
+    let result = boot_messaging(&config, init_db_memory()).await;
+    let anonymous = result.wasm_consumers[0].outputs[0].channel_address.clone();
+    assert!(anonymous.starts_with("local:auto."));
+
+    logs_assert(|lines: &[&str]| {
+        let injected: Vec<&&str> = lines
+            .iter()
+            .filter(|line| line.contains("auto channel grant injected"))
+            .collect();
+        // Two io_ports, each both publisher and subscriber on its own channel.
+        if injected.len() != 4 {
+            return Err(format!("expected 4 injection lines, got {injected:?}"));
+        }
+        for expected in [
+            ("MessagingPublish", "brenn:etl.batches"),
+            ("MessagingSubscribe", "brenn:etl.batches"),
+            ("LocalPublish", anonymous.as_str()),
+            ("LocalSubscribe", anonymous.as_str()),
+        ] {
+            let (capability, channel) = expected;
+            if !injected.iter().any(|line| {
+                line.contains(&format!("capability={capability}"))
+                    && line.contains(&format!("channel={channel}"))
+                    && line.contains("ticker")
+            }) {
+                return Err(format!("no line for {expected:?} in {injected:?}"));
+            }
+        }
+        Ok(())
+    });
 }

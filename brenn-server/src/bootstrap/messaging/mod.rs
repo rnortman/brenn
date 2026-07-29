@@ -19,8 +19,93 @@ use indexmap::IndexMap;
 use crate::active_bridge::ActiveBridges;
 use crate::messaging_router::WakeRouterImpl;
 
+pub(crate) mod auto;
 mod surfaces;
 mod wasm;
+
+/// The channel address a static port binding resolves to.
+///
+/// `declared` is the `channel` the operator wrote on the binding. A binding
+/// without one is a *free port*: it declares the port and its tuning, and expects
+/// exactly one `[[connection]]` to supply the channel — `lowered`, the address the
+/// auto-wiring pass assigned it. Reaching this function with neither means no
+/// connection claimed the port — dead config, and a boot panic in the same posture
+/// as an output port on a consumer that never activates. Both at once means the
+/// port name is claimed twice: by this address and by an auto channel (a
+/// `[[connection]]` endpoint, or an io_port wearing the same name).
+///
+/// An operator-written address is also the one place a hand-computed
+/// `auto.<cid>` could enter: auto cids are deterministic, so without a check here
+/// a third party could bind an "anonymous" channel with no connection to show for
+/// it. A lowered address bypasses the check by construction — the pass placed it.
+/// That check is scoped to the pub/sub schemes, which are the only schemes an
+/// auto channel is ever placed on: ingress/egress slugs live in their own
+/// namespace and wear their own charset, so `webhook:auto.github` names an
+/// endpoint's channel and has nothing to do with this machinery.
+///
+/// `owner` is a pre-formatted config-block label (`[[wasm_consumer]] "filter"`);
+/// `port_label` names the binding within it (`subscription port "in"`).
+fn bound_channel(
+    owner: &str,
+    port_label: &str,
+    declared: Option<&str>,
+    lowered: Option<&str>,
+) -> String {
+    let Some(address) = declared else {
+        return lowered
+            .unwrap_or_else(|| {
+                panic!(
+                    "config: {owner}: {port_label} declares no channel and no [[connection]] \
+                     binds it — a free port must be named by exactly one connection's \
+                     endpoints, or carry its own channel address"
+                )
+            })
+            .to_string();
+    };
+    assert!(
+        lowered.is_none(),
+        "config: {owner}: {port_label} binds channel {address:?}, but the port name is also \
+         claimed by an auto channel — either a [[connection]] lists it as an endpoint, or an \
+         io_port declares the same name. A port binds exactly one channel: drop this address, \
+         or drop the claim.",
+    );
+    let bare = match ChannelScheme::split(address) {
+        Some((ChannelScheme::Brenn | ChannelScheme::Ephemeral | ChannelScheme::Local, name)) => {
+            name
+        }
+        // A bare address defaults to `brenn:`, so it is pub/sub too.
+        None => address,
+        Some((ChannelScheme::Mqtt | ChannelScheme::Webhook | ChannelScheme::PwaPush, _)) => {
+            return address.to_string();
+        }
+    };
+    assert!(
+        !messaging::is_auto_channel_name(bare),
+        "config: {owner}: {port_label} binds channel {address:?}, which is in the reserved \
+         auto namespace — an auto channel's endpoints are its ACL, so it cannot be joined by \
+         address; list this port in the channel's [[connection]], or give that channel a name",
+    );
+    address.to_string()
+}
+
+/// Refuse to start when two channel entries claim one uuid.
+///
+/// The uuid is the channel's identity for cursors, parked messages, and the DB
+/// row. Nothing downstream detects a collision — this is the one check, and it
+/// must run over the merged set (declared, transport-derived, and synthesized).
+fn assert_unique_channel_uuids<'a>(entries: impl Iterator<Item = &'a ChannelEntry>) {
+    let mut seen: std::collections::HashMap<uuid::Uuid, &str> = std::collections::HashMap::new();
+    for entry in entries {
+        if let Some(previous) = seen.insert(entry.uuid, &entry.address) {
+            panic!(
+                "config: channels {previous:?} and {:?} both carry uuid {} — a channel's uuid is \
+                 its identity for cursors, parked messages, and its DB row, so two channels \
+                 sharing one would interleave both; give each its own uuid",
+                entry.address, entry.uuid,
+            );
+        }
+    }
+}
 
 /// Convert an optional `f64` publish-budget knob to integer millitokens, applying
 /// the caller's default and fail-fast validation. `field` names the offending knob
@@ -59,6 +144,8 @@ fn resolve_publish_millitokens(value: Option<f64>, default: f64, field: &str) ->
     (v * MILLITOKENS_PER_PUBLISH as f64).round() as u64
 }
 
+#[cfg(test)]
+mod auto_tests;
 #[cfg(test)]
 mod build_tests;
 #[cfg(test)]
@@ -492,13 +579,33 @@ pub(crate) async fn build_messaging(
     // The `[[channel]]` table declares every pub/sub scheme, so split the
     // non-durable entries off here — they carry no DB row and are wired to the
     // in-memory substrate rather than the durable directory.
-    let (nondurable_channels, durable_channels): (Vec<ChannelEntry>, Vec<ChannelEntry>) =
+    let (mut nondurable_channels, durable_channels): (Vec<ChannelEntry>, Vec<ChannelEntry>) =
         messaging::config::build_channel_entries(&config.channels, global_defaults)
             .into_iter()
             .partition(|e| !e.capabilities().durable);
     let mut all_entries = durable_channels;
     all_entries.extend(webhook_channel_entries);
     all_entries.extend(mqtt_channel_entries);
+
+    // --- Auto channels: lower the [[connection]] blocks ---
+    //
+    // Runs before the pre-directories are built: auto channels are referenced
+    // by config bindings, so their entries and grants must be present when
+    // the resolvers run.
+    let declared_addresses: Vec<&str> = all_entries
+        .iter()
+        .chain(nondurable_channels.iter())
+        .map(|e| e.address.as_str())
+        .collect();
+    let auto_wiring = auto::lower_auto_wiring(
+        &config.connections,
+        &config.wasm_consumers,
+        &config.surfaces,
+        &declared_addresses,
+        global_defaults,
+    );
+    all_entries.extend(auto_wiring.durable_entries().iter().cloned());
+    nondurable_channels.extend(auto_wiring.nondurable_entries().iter().cloned());
 
     // Resolve WASM consumer subscriptions against the built entries before
     // finalizing the directory (the directory itself is built from these same
@@ -523,6 +630,7 @@ pub(crate) async fn build_messaging(
         &wasm_pre_directory,
         &config.wasm.store_size_limit,
         resolved_mqtt_clients,
+        &auto_wiring,
     );
     // Every input registers in the directory, whatever its channel's class: the
     // registration is where a subscription's resolved parameters (push depth,
@@ -558,6 +666,7 @@ pub(crate) async fn build_messaging(
         &pre_directory,
         &ephemeral_channels,
         global_defaults,
+        &auto_wiring,
     );
 
     // Substrate error-reporting grant: scheme-strip the configured error channel
@@ -692,6 +801,11 @@ pub(crate) async fn build_messaging(
     // channel of this process, and surface binding resolution never consults the
     // `[[channel]]` table for `local:` addresses.
     all_entries.extend(nondurable_channels.iter().cloned());
+
+    // All entry sources (declared, webhook/mqtt-derived, auto, tool-substrate)
+    // have contributed. This is the only uuid collision check; nothing
+    // downstream detects one.
+    assert_unique_channel_uuids(all_entries.iter());
 
     let ring_stores = Arc::new(messaging::store::RingStores::build(&nondurable_channels));
 

@@ -12,22 +12,8 @@ use brenn_lib::messaging::{ChannelEntry, ChannelScheme, MessagingDirectory, Urge
 use brenn_surface_proto::Abi;
 use indexmap::IndexMap;
 
+use super::auto::AutoWiring;
 use super::resolve_publish_millitokens;
-
-/// Fold two declared depths of one shared subscription into the depth that
-/// covers both. `Unbounded` dominates — it is "no cap", and a cap that bounds
-/// one binding's need cannot be the cap of a binding that declared none.
-///
-/// Durable surface subscriptions reject `Unbounded` before reaching here, so the
-/// dominant arm is unreachable today; it is written out rather than asserted
-/// away because this is a fold over the shared `Depth` vocabulary and the
-/// answer for `Unbounded` is not in doubt.
-fn max_depth(a: Depth, b: Depth) -> Depth {
-    match (a, b) {
-        (Depth::Bounded(x), Depth::Bounded(y)) => Depth::Bounded(x.max(y)),
-        _ => Depth::Unbounded,
-    }
-}
 
 /// Fold one `local:` binding's `retain_depth` into the channel's resolved ring
 /// depth.
@@ -589,6 +575,7 @@ pub(crate) fn resolve_surfaces(
     directory: &MessagingDirectory,
     ephemeral_channels: &[ChannelEntry],
     globals: &MessagingGlobalConfig,
+    auto_wiring: &AutoWiring,
 ) -> Vec<ResolvedSurface> {
     use brenn_lib::messaging::config::{
         DEFAULT_SURFACE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_PER_SEC,
@@ -796,7 +783,7 @@ pub(crate) fn resolve_surfaces(
 
         // Build the surface's resolved policy up front — the binding
         // coverage check (item 6) consults it.
-        let policy = brenn_lib::access::resolve::build_surface_policy(
+        let mut policy = brenn_lib::access::resolve::build_surface_policy(
             slug,
             surface.grants.iter().copied(),
             &surface.subscribe_acl,
@@ -804,6 +791,11 @@ pub(crate) fn resolve_surfaces(
             &surface.ephemeral_subscribe_acl,
             &surface.ephemeral_publish_acl,
         );
+        // Auto-channel grants, injected before the binding coverage checks read
+        // the policy: a `[[connection]]` is the operator's authorization signal,
+        // so an endpoint needs no authored ACL for the channel it wires.
+        auto_wiring.inject_surface_grants(slug, &mut policy);
+        let policy = policy;
 
         // Items 3–5 shared by both binding directions: component must be
         // declared, port charset valid, channel scheme restricted to
@@ -944,6 +936,10 @@ pub(crate) fn resolve_surfaces(
             );
         };
 
+        // Both halves of each io_port are channel-less and take the one address
+        // the lowering pass assigned — the two directions cannot be wired apart.
+        let (io_subscriptions, io_outputs) = super::auto::surface_io_bindings(&surface.io_ports);
+
         // Ring depth per declared `local:` channel, accumulated across bindings:
         // reserved channels take the contract-fixed depth, operator-declared
         // channels the max over their bindings' `retain_depth` (floor 1). First
@@ -954,7 +950,8 @@ pub(crate) fn resolve_surfaces(
         // over the full address. Every `brenn:` binding additionally resolves a
         // `ResolvedSubscription` (durable depth/noise/wake inheritance) that
         // becomes a `SubscriberEntryKind::Surface` directory entry.
-        let mut subscriptions = Vec::with_capacity(surface.subscriptions.len());
+        let mut subscriptions =
+            Vec::with_capacity(surface.subscriptions.len() + io_subscriptions.len());
         let mut durable_subscriptions: Vec<ResolvedSurfaceSubscription> = Vec::new();
         let mut seen_sub_ports: HashSet<(&str, &str)> = HashSet::new();
         // One durable subscription per **(instance, channel)**: the subscribing
@@ -970,11 +967,25 @@ pub(crate) fn resolve_surfaces(
         // resolved rather than double-installing the subscriber.
         let mut seen_durable: std::collections::HashMap<(String, uuid::Uuid), usize> =
             std::collections::HashMap::new();
-        for sub in &surface.subscriptions {
-            validate_binding("subscription", &sub.channel, &sub.instance, &sub.port);
+        for (sub, direction) in surface
+            .subscriptions
+            .iter()
+            .map(|sub| (sub, "subscription"))
+            .chain(io_subscriptions.iter().map(|sub| (sub, "io_port")))
+        {
+            let channel = super::bound_channel(
+                &format!("[[surface]] {slug:?}"),
+                &format!(
+                    "{direction} instance {:?} port {:?}",
+                    sub.instance, sub.port
+                ),
+                sub.channel.as_deref(),
+                auto_wiring.surface_channel(slug, &sub.instance, &sub.port),
+            );
+            validate_binding(direction, &channel, &sub.instance, &sub.port);
             assert!(
                 seen_sub_ports.insert((sub.instance.as_str(), sub.port.as_str())),
-                "config: [[surface]] {slug:?}: duplicate subscription binding for instance \
+                "config: [[surface]] {slug:?}: duplicate {direction} binding for instance \
                  {:?} port {:?} — one binding per (instance, port) direction",
                 sub.instance,
                 sub.port,
@@ -988,13 +999,13 @@ pub(crate) fn resolve_surfaces(
             // blast radius is the page; what the server polices is the binding
             // declaration, which is `validate_binding` plus the reserved-channel
             // rules below.
-            let local = brenn_surface_proto::is_local_channel(&sub.channel);
+            let local = brenn_surface_proto::is_local_channel(&channel);
             assert!(
-                local || policy.allows_channel_access(&sub.channel),
-                "config: [[surface]] {slug:?}: subscription binds channel {:?} but the \
+                local || policy.allows_channel_access(&channel),
+                "config: [[surface]] {slug:?}: {direction} binds channel {:?} but the \
                  surface's access policy does not authorize delivery there (missing transport \
                  grant and/or a covering ACL matcher) — dead config",
-                sub.channel,
+                channel,
             );
 
             // `wake_min` is rejected on every surface binding, class-blind: a
@@ -1004,16 +1015,13 @@ pub(crate) fn resolve_surfaces(
             // channel's class. One text for all three schemes.
             assert!(
                 sub.wake_min.is_none(),
-                "config: [[surface]] {slug:?}: subscription on channel {:?} sets wake_min, but \
+                "config: [[surface]] {slug:?}: {direction} on channel {:?} sets wake_min, but \
                  surface subscriptions are always delivered eagerly — wake_min gates parked \
                  dispatch and has no referent on a surface binding of any class; remove it",
-                sub.channel,
+                channel,
             );
 
-            let ephemeral = matches!(
-                ChannelScheme::of(&sub.channel),
-                Some(ChannelScheme::Ephemeral)
-            );
+            let ephemeral = matches!(ChannelScheme::of(&channel), Some(ChannelScheme::Ephemeral));
             let context = if ephemeral {
                 "ephemeral subscription"
             } else if local {
@@ -1036,7 +1044,7 @@ pub(crate) fn resolve_surfaces(
                 // global at build time.
                 let entry = ephemeral_channels
                     .iter()
-                    .find(|e| e.address == sub.channel)
+                    .find(|e| e.address == channel)
                     .expect("validate_binding proved the ephemeral channel is declared");
                 let ch = &entry.resolved_channel;
                 let retain_depth = match ch.retain_depth {
@@ -1049,35 +1057,29 @@ pub(crate) fn resolve_surfaces(
                     resolve_page_queue_depth(
                         slug,
                         context,
-                        &sub.channel,
+                        &channel,
                         sub.push_depth,
                         ch.push_depth,
                     ),
-                    resolve_context_depth(
-                        slug,
-                        context,
-                        &sub.channel,
-                        sub.retain_depth,
-                        retain_depth,
-                    ),
+                    resolve_context_depth(slug, context, &channel, sub.retain_depth, retain_depth),
                     sub.noise.unwrap_or(ch.noise),
                 )
             } else if local {
-                validate_local_binding("subscription", &sub.channel, false);
+                validate_local_binding(direction, &channel, false);
                 // A `local:` channel has no `[[channel]]` block, so its noise
                 // ladder is binding → global — the same shape `push_depth` uses on
                 // this class. The kernel enacts the resolved rung on overflow.
                 accumulate_local_ring_depth(
                     slug,
                     &mut local_ring_depths,
-                    &sub.channel,
+                    &channel,
                     sub.retain_depth,
                 );
                 (
                     resolve_page_queue_depth(
                         slug,
                         context,
-                        &sub.channel,
+                        &channel,
                         sub.push_depth,
                         globals.default_push_depth,
                     ),
@@ -1090,7 +1092,7 @@ pub(crate) fn resolve_surfaces(
                     // point is last-value replay on attach, so 0 here would make
                     // every unstated binding blind to a ring the kernel is
                     // already keeping.
-                    local_context_depth(&sub.channel, sub.retain_depth),
+                    local_context_depth(&channel, sub.retain_depth),
                     sub.noise.unwrap_or(globals.default_noise),
                 )
             } else {
@@ -1107,7 +1109,7 @@ pub(crate) fn resolve_surfaces(
                     resolve_durable_surface_subscription(
                         slug,
                         context,
-                        &sub.channel,
+                        &channel,
                         directory,
                         DurableSubOverrides {
                             push_depth: sub.push_depth,
@@ -1130,11 +1132,13 @@ pub(crate) fn resolve_surfaces(
                         // meaning is max: the window must cover the hungriest port
                         // on it or that port starves. Same fold `reap_frontier`
                         // already applies across subscribers, and the local-ring
-                        // resolver applies across bindings.
+                        // resolver applies across bindings. `Depth`'s own ordering
+                        // is that fold: every `Bounded(_)` sorts below `Unbounded`,
+                        // so "no cap" wins over any cap.
                         let shared: &mut ResolvedSubscription =
                             &mut durable_subscriptions[idx].subscription;
-                        shared.push_depth = max_depth(shared.push_depth, resolved.push_depth);
-                        shared.retain_depth = max_depth(shared.retain_depth, resolved.retain_depth);
+                        shared.push_depth = shared.push_depth.max(resolved.push_depth);
+                        shared.retain_depth = shared.retain_depth.max(resolved.retain_depth);
                         // Noise is a policy, not a capacity: "max" over a loudness
                         // ladder is a rule nothing in this codebase states, and
                         // picking one binding's would be positional. Require the
@@ -1148,7 +1152,7 @@ pub(crate) fn resolve_surfaces(
                              both; set the same noise on every binding of this (instance, \
                              channel) or leave them all unset",
                             sub.instance,
-                            sub.channel,
+                            channel,
                             shared.noise,
                             resolved.noise,
                         );
@@ -1180,7 +1184,7 @@ pub(crate) fn resolve_surfaces(
                  which alerts on overflow — that requires the surface's `alert` grant so the \
                  kernel may deliver the alert; add it to [[surface]] grants or lower the noise",
                 sub.instance,
-                sub.channel,
+                channel,
                 noise,
             );
 
@@ -1189,14 +1193,14 @@ pub(crate) fn resolve_surfaces(
             assert_page_queue_deliverable(
                 slug,
                 context,
-                &sub.channel,
+                &channel,
                 push_depth,
                 retain_depth,
                 sub.noise,
             );
 
             subscriptions.push(SurfaceBinding {
-                channel_address: sub.channel.clone(),
+                channel_address: channel.clone(),
                 instance: sub.instance.clone(),
                 port: sub.port.clone(),
                 push_depth,
@@ -1237,26 +1241,40 @@ pub(crate) fn resolve_surfaces(
         // grant is injected — so a `[[surface.output]]` bound to the configured
         // error channel is covered by the injected grant rather than tripping a
         // dead-config panic before that grant exists.
-        let mut outputs = Vec::with_capacity(surface.outputs.len());
+        let mut outputs = Vec::with_capacity(surface.outputs.len() + io_outputs.len());
         let mut seen_out_ports: HashSet<(&str, &str)> = HashSet::new();
-        for out in &surface.outputs {
-            validate_binding("output", &out.channel, &out.instance, &out.port);
+        for (out, direction) in surface
+            .outputs
+            .iter()
+            .map(|out| (out, "output"))
+            .chain(io_outputs.iter().map(|out| (out, "io_port")))
+        {
+            let channel = super::bound_channel(
+                &format!("[[surface]] {slug:?}"),
+                &format!(
+                    "{direction} instance {:?} port {:?}",
+                    out.instance, out.port
+                ),
+                out.channel.as_deref(),
+                auto_wiring.surface_channel(slug, &out.instance, &out.port),
+            );
+            validate_binding(direction, &channel, &out.instance, &out.port);
             assert!(
                 seen_out_ports.insert((out.instance.as_str(), out.port.as_str())),
-                "config: [[surface]] {slug:?}: duplicate output binding for instance {:?} \
+                "config: [[surface]] {slug:?}: duplicate {direction} binding for instance {:?} \
                  port {:?} — one binding per (instance, port) direction",
                 out.instance,
                 out.port,
             );
-            if brenn_surface_proto::is_local_channel(&out.channel) {
-                validate_local_binding("output", &out.channel, true);
+            if brenn_surface_proto::is_local_channel(&channel) {
+                validate_local_binding(direction, &channel, true);
                 // Outputs carry no depth knobs, so an output-only local channel
                 // takes the floor. Registering it here is what makes a
                 // publish-only local channel exist for the router at all.
-                accumulate_local_ring_depth(slug, &mut local_ring_depths, &out.channel, None);
+                accumulate_local_ring_depth(slug, &mut local_ring_depths, &channel, None);
             }
             outputs.push(SurfaceOutput {
-                channel_address: out.channel.clone(),
+                channel_address: channel.clone(),
                 instance: out.instance.clone(),
                 port: out.port.clone(),
                 // Port → global default. A surface output has no `[[channel]]`

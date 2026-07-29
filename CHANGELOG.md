@@ -2,7 +2,21 @@
 
 All notable changes to Brenn are documented here.
 
-## [0.14.4] — 2026-07-28
+## Unreleased
+
+### Added
+
+- Auto and anonymous channels which come into being not with a separate spec and
+  ACLs but because two component ports are connected to one another. ACLs are
+  automatically granted and depth is automatically computed. If a name is given,
+  it's a normal named channel; otherwise it's a private anonymous channel given
+  only a UUID which is not discoverable by any means except to the ports
+  connected to it.
+- In/out ports, for a component that relies on listening to its own outputs
+  (e.g. for timers/scheduling). This is one port that's both an input and an
+  output and must be connected to the same channel. It automatically gets an
+  anonymous local channel there if the operator doesn't connect something
+  different.
 
 ### Fixed
 

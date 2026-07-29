@@ -734,6 +734,53 @@ deferred-view loop in `drain_step`).
 
 ---
 
+## `deferred-flush-drop-signal`
+
+A `publish-deferred` refused at the channel's deferred cap (the channel's
+`retain_depth`) during a WASM activation flush is dropped with a host `warn!` and
+a counter increment, and nothing tells the component. A dropped schedule is a
+timer that never fires — the component believes it parked a wake and simply never
+runs again. That is a silent wrong outcome in the exact idiom the io_port block
+exists to make safe, and the guest's only recourse today is to poll its own
+per-output `deferred-window` and infer the absence.
+
+The flush has no error channel back to the guest, so fixing it is a WIT/substrate
+change (a per-port error report, or making the deferred publish a call whose
+refusal the guest can observe), not a patch at the drop site. Done when an
+over-cap deferred publish reaches the component that issued it.
+
+Code site (`TODO(deferred-flush-drop-signal)`):
+`brenn-lib/src/messaging/publish/mod.rs` (the non-durable park arm of the
+`publish_from_wasm` flush).
+
+---
+
+## `messaging-depth-defaults`
+
+`[messaging].default_push_depth`, `default_retain_depth`, and
+`default_standing_retain_depth` all ship as `Depth::Unbounded`, preserved from
+before depths existed as a knob. Unbounded is the wrong default for a rolling
+window: it silently turns "I didn't think about depth" into "retain everything",
+which is the opposite of the sizing decision the channel model asks an operator
+to make. The expected resolution is no depth defaults at all — every channel and
+every subscribing port states its depth explicitly — rather than a different
+default number.
+
+The bare-`[[wasm_consumer.io_port]]` boot panic is a symptom, not the disease: an
+auto channel folds its ring depth from its subscribing ports, and an unbounded
+fold on a non-durable channel is refused, so the zero-depth spelling of the
+io_port block cannot boot under the stock defaults. When this lands, revisit that
+panic's message — it currently offers "bound `[messaging].default_retain_depth`"
+as one of three outs, which stops being an out if the defaults go away. Done when
+the unbounded stock values are gone and the depth contract is explicit.
+
+Code site (`TODO(messaging-depth-defaults)`):
+`brenn-lib/src/messaging/config.rs`, the `MessagingGlobalConfig` `Default` impl.
+The dependent panic is `fold_retain_depth` in
+`brenn-server/src/bootstrap/messaging/auto.rs`.
+
+---
+
 ## `wasm-durable-park-cap`
 
 The WASM activation flush parks a *durable* deferred publish with a bare

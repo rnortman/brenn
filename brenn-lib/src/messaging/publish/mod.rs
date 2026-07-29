@@ -1692,6 +1692,9 @@ impl Messenger {
         // no error channel back to the guest, so a deferred-cap overflow is
         // logged, counted (a dropped schedule is a component that never wakes
         // again — a health check can read the counter), and the schedule dropped.
+        //
+        // TODO(deferred-flush-drop-signal): surface the drop on the consumer's
+        // error-report path rather than only the host log.
         for (entry, message, release) in nondurable_pending {
             let store = self.store_for(&entry);
             match release {

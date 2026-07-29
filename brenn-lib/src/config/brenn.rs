@@ -154,9 +154,13 @@ pub struct BrennConfig {
     pub wasm_consumers: Vec<crate::messaging::config::WasmConsumerConfigRaw>,
     /// Top-level `[[surface]]` blocks; see
     /// [`crate::messaging::config::SurfaceConfigRaw`] for per-entry fields.
-    /// Boot-time resolution + cross-validation lives in `bootstrap::messaging`.
     #[serde(default, rename = "surface")]
     pub surfaces: Vec<crate::messaging::config::SurfaceConfigRaw>,
+    /// Top-level `[[connection]]` blocks — auto channels declared by the ports
+    /// they wire together rather than by a `[[channel]]` block. See
+    /// [`crate::messaging::config::ConnectionConfigRaw`].
+    #[serde(default, rename = "connection")]
+    pub connections: Vec<crate::messaging::config::ConnectionConfigRaw>,
     /// Global WASM-host policy (`[wasm]` block). Controls defaults such as
     /// store size limits. Omitting the block is equivalent to `WasmConfig::default()`.
     #[serde(default)]

@@ -824,7 +824,12 @@ pub fn resolve_webhook_endpoints(
     let mut endpoint_to_wasm: HashMap<String, Vec<String>> = HashMap::new();
     for consumer in raw_wasm_consumers {
         for sub in &consumer.subscriptions {
-            if let Some(ep_slug) = sub.channel.strip_prefix(WEBHOOK_ADDRESS_PREFIX) {
+            // A free port (no `channel`) rides an auto channel, never `webhook:`.
+            if let Some(ep_slug) = sub
+                .channel
+                .as_deref()
+                .and_then(|c| c.strip_prefix(WEBHOOK_ADDRESS_PREFIX))
+            {
                 let entry = endpoint_to_wasm.entry(ep_slug.to_string()).or_default();
                 if !entry.contains(&consumer.slug) {
                     entry.push(consumer.slug.clone());
