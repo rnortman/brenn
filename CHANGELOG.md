@@ -2,7 +2,7 @@
 
 All notable changes to Brenn are documented here.
 
-## Unreleased
+## [0.15.0] — 2026-07-30
 
 ### Added
 
@@ -17,6 +17,15 @@ All notable changes to Brenn are documented here.
   output and must be connected to the same channel. It automatically gets an
   anonymous local channel there if the operator doesn't connect something
   different.
+
+### Changed
+
+- Unification of ephemeral/durable channels on the messaging substrate resulted
+  in many configuration and default-behavior changes, and many bugs fixed (not
+  individually enumerated here). The tldr is that every channel (other that auto
+  channels) need explicit depth specifications in the config file. Nothing
+  defaults to `unbounded` anymore, but the operator can still use that in a
+  config file explicitly.
 
 ### Fixed
 
