@@ -194,6 +194,32 @@ fn the_send_budget_scope_is_the_slug() {
     assert_eq!(profile().send_budget_scope(), "deskbar");
 }
 
+/// The route's capacity policy reaches the registry through the profile, at the
+/// compiled-in surface caps. Asserted against the constants rather than the
+/// numbers so the test pins the wiring, not a value the operator may retune.
+#[test]
+fn the_session_caps_are_the_surface_caps() {
+    let caps = profile().session_caps();
+    assert_eq!(caps.per_attacher, MAX_SESSIONS_PER_SURFACE);
+    assert_eq!(caps.per_account, MAX_SESSIONS_PER_USER_PER_SURFACE);
+}
+
+/// The burst must cover a boot-valid maximum-size surface's first-connect
+/// reconcile — one `Subscribe` per bound channel in one burst — or a legitimate
+/// connect becomes a violation. Asserted against the binding maximum, so the
+/// property survives a retune of either number.
+#[test]
+fn the_subscribe_burst_covers_a_maximum_size_reconcile() {
+    let burst = profile().subscribe_burst();
+    let max_bindings = brenn_surface_schema::MAX_SURFACE_SUBSCRIPTION_BINDINGS as u32;
+    assert!(
+        burst >= max_bindings,
+        "a burst of {burst} refuses a {max_bindings}-binding surface's reconcile"
+    );
+    // Plus one full detach/re-attach cycle of that surface.
+    assert_eq!(burst, 3 * max_bindings);
+}
+
 /// **Two ports on one channel share one parked set.** The mirror is cut at
 /// `(attribution, channel)`, so chrome's two ports onto `brenn:chrome-out` seed
 /// once; page-local outputs, which the backend parks nothing on, are absent

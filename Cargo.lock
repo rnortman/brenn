@@ -683,6 +683,7 @@ dependencies = [
  "axum",
  "axum-helmet",
  "base64ct",
+ "brenn-attach-proto",
  "brenn-budget",
  "brenn-cal",
  "brenn-cc",

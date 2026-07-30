@@ -1107,9 +1107,13 @@ pub struct SurfaceComponentRaw {
     /// panic, because nothing would ever read it. Keys must not start with
     /// `brenn.`, which is the host-reserved namespace.
     ///
-    /// **Confidentiality:** this map ships to every authenticated page session
-    /// of the surface, in `Welcome`. It is operator configuration, not a secret
-    /// store — never place credentials or secrets in it.
+    /// **Confidentiality:** this map is carried in the surface's bindings
+    /// document, a retained message on the surface's ephemeral config channel.
+    /// It is therefore readable by every authenticated page session of the
+    /// surface *and* by any principal the operator grants an ephemeral-subscribe
+    /// matcher covering that channel — read access is ordinary deny-by-default
+    /// ACL policy, with no further guard. It is operator configuration, not a
+    /// secret store — never place credentials or secrets in it.
     #[serde(default)]
     pub config: Option<BTreeMap<String, String>>,
 }

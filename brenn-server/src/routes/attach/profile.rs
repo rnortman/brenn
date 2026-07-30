@@ -12,6 +12,8 @@
 use brenn_lib::messaging::ParticipantId;
 use brenn_lib::messaging::config::Depth;
 
+use super::registry::SessionCaps;
+
 /// What one subscription is, at the grain the session delivers it: the two
 /// standard bus subscription knobs, folded across everything behind the channel.
 ///
@@ -50,9 +52,9 @@ impl SubscriptionFacts {
     ///
     /// The clamp is a request, not a promise: if the store retains fewer rows
     /// than the clamp asks for, the shortfall is reported as `dropped` —
-    /// bounded loss, exactly as the bus prescribes. Boot proves both depths
-    /// bounded and refuses a binding that is neither triggering nor
-    /// context-carrying, so this is always a bounded, non-zero window.
+    /// bounded loss, exactly as the bus prescribes. Both depths are bounded and
+    /// at least one is non-zero — a subscription that neither wakes nor sees is
+    /// never constructed — so this is always a bounded, non-zero window.
     pub(crate) fn replay_clamp(self) -> Depth {
         Depth::Bounded(self.push_depth.max(self.retain_depth))
     }
@@ -116,4 +118,24 @@ pub trait AttachProfile: Send + Sync {
     /// attachment is seeded with, deduped and in a stable order so the seeding
     /// sequence is the same on every attach.
     fn deferred_view_targets(&self) -> &[DeferredTarget];
+
+    /// How many `Subscribe`/`Unsubscribe` frames this attacher's connection
+    /// bucket admits back to back before the one-token-per-second refill governs.
+    ///
+    /// Route policy, not transport policy: the burst that a *correct* attacher
+    /// produces on connect is the size of its own subscription set, which only
+    /// the route knows. A number below it would turn an honest attacher's
+    /// first-connect reconcile into a deterministic connect → violation →
+    /// fail2ban loop.
+    fn subscribe_burst(&self) -> u32;
+
+    /// How many concurrent attachments this attacher admits, in total and per
+    /// account.
+    ///
+    /// The caps belong to the profile because what an over-cap attempt *costs*
+    /// is the route's judgement: a browser tab beyond the cap is a user with too
+    /// many tabs and is answered `503` with no security event, where a daemon
+    /// reconnecting into a full slot may deserve a different posture entirely.
+    /// The registry only enforces the numbers.
+    fn session_caps(&self) -> SessionCaps;
 }

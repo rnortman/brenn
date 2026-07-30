@@ -51,6 +51,7 @@ use uuid::Uuid;
 
 pub mod bindings;
 pub mod layout;
+pub mod telemetry;
 
 /// Which toolchain artifact backs a component instance, and how the kernel loads
 /// it.

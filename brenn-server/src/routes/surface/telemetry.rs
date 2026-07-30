@@ -1,95 +1,41 @@
 //! Runtime surface telemetry: the geometry and status documents a live surface
-//! session publishes to its derived per-surface channels.
+//! session publishes to its derived per-surface channels, and the server-written
+//! `disconnected` stamp.
 //!
 //! The shell reports raw facts over the `ClientFrame::Geometry` / `Status`
-//! frames; this module validates them (the shell is untrusted even when
-//! authenticated), derives the health summary **server-side** from the reported
-//! instance states, and builds the server-stamped JSON documents (`v: 1`, a
-//! server-clock `ts`, the reporting `session`, the boot `epoch`) the session
-//! publishes via the platform-telemetry publish path. Both documents are
-//! latest-wins on a retained-depth-bounded durable channel.
+//! frames; this module validates them against the surface's configured instance
+//! set (the shell is untrusted even when authenticated), derives the health
+//! summary **server-side** from the reported instance states, and composes the
+//! documents the session publishes via the platform-telemetry publish path. The
+//! document shapes themselves are
+//! [`brenn_surface_schema::telemetry`](brenn_surface_schema::telemetry) — shared
+//! with the kernel, which is where composition ends up. Every document on a
+//! given channel is latest-wins on a retained-depth-bounded channel.
 
 use std::collections::{HashMap, HashSet};
 
 use brenn_lib::messaging::config::ResolvedSurface;
 use brenn_lib::messaging::{Messenger, PublishResult, Urgency};
+/// The health summary this module derives, on its way into a status document.
+pub use brenn_surface_schema::telemetry::Health;
+use brenn_surface_schema::telemetry::{
+    DisconnectedStamp, GeometryDocument, MAX_INSTANCE_REASON_BYTES, StatusDocument,
+    TELEMETRY_DOCUMENT_VERSION, validate_viewport,
+};
 use brenn_surface_schema::{InstanceReport, InstanceState, OverlayReport, StatusCounters};
-use serde::Serialize;
-use serde_json::json;
 
 use super::description::surface_status_channel;
-
-/// Body-schema version stamped on every telemetry document (`v: 1`).
-const SCHEMA_VERSION: u32 = 1;
-
-/// Physically-plausible viewport dimension bounds (CSS pixels), not UX policy: a
-/// generous window a real display could present. Out of range ⇒ protocol
-/// violation (a conforming shell reports the real viewport).
-const MIN_DIMENSION: u32 = 1;
-const MAX_DIMENSION: u32 = 32_768;
-
-/// Device-pixel-ratio bounds: generous physical plausibility, finite required.
-const MIN_DPR: f64 = 0.1;
-const MAX_DPR: f64 = 16.0;
-
-/// Per-instance `reason` cap (bytes) in a status report — bounds the status body
-/// so `BodyTooLarge` stays structurally unreachable for a conforming shell.
-const MAX_REASON_BYTES: usize = 256;
-
-/// Derived surface health, computed server-side from the reported instance
-/// states and pump attachment. Serialized lowercase for the status document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Health {
-    /// Every instance mounted and every bound subscription has an attached pump.
-    Ok,
-    /// At least one instance failed or one binding is pumpless, but the session
-    /// is live.
-    Degraded,
-    /// No session attached (a terminal or boot stamp). Not derivable from a live
-    /// report; produced by the server-written snapshot path.
-    Disconnected,
-}
 
 /// Validate a `ClientFrame::Geometry` report's bounds. `Err` names the violated
 /// rule (never echoing client values) for the protocol-violation log.
 pub fn validate_geometry(width: u32, height: u32, device_pixel_ratio: f64) -> Result<(), String> {
-    if !(MIN_DIMENSION..=MAX_DIMENSION).contains(&width) {
-        return Err(format!(
-            "Geometry width out of bounds {MIN_DIMENSION}..={MAX_DIMENSION}"
-        ));
-    }
-    if !(MIN_DIMENSION..=MAX_DIMENSION).contains(&height) {
-        return Err(format!(
-            "Geometry height out of bounds {MIN_DIMENSION}..={MAX_DIMENSION}"
-        ));
-    }
-    if !device_pixel_ratio.is_finite() || !(MIN_DPR..=MAX_DPR).contains(&device_pixel_ratio) {
-        return Err(format!(
-            "Geometry device_pixel_ratio not finite in {MIN_DPR}..={MAX_DPR}"
-        ));
-    }
-    Ok(())
+    validate_viewport(width, height, device_pixel_ratio)
 }
 
 /// Build the geometry document as a JSON string. Bounds are assumed
 /// already validated by [`validate_geometry`].
-pub fn geometry_body(
-    surface: &str,
-    session: &str,
-    width: u32,
-    height: u32,
-    device_pixel_ratio: f64,
-) -> String {
-    let body = json!({
-        "v": SCHEMA_VERSION,
-        "surface": surface,
-        "session": session,
-        "ts": chrono::Utc::now().to_rfc3339(),
-        "viewport": { "width": width, "height": height },
-        "device_pixel_ratio": device_pixel_ratio,
-    });
-    serde_json::to_string(&body).expect("geometry document serializes to JSON")
+pub fn geometry_body(session: &str, width: u32, height: u32, device_pixel_ratio: f64) -> String {
+    GeometryDocument::new(session.to_string(), width, height, device_pixel_ratio).to_body()
 }
 
 /// The facts one `ClientFrame::Status` frame reports, borrowed for the length of
@@ -174,10 +120,10 @@ pub fn validate_status(
             }
         }
         if let Some(reason) = &report.reason
-            && reason.len() > MAX_REASON_BYTES
+            && reason.len() > MAX_INSTANCE_REASON_BYTES
         {
             return Err(format!(
-                "Status reason for instance {:?} exceeds {MAX_REASON_BYTES} bytes",
+                "Status reason for instance {:?} exceeds {MAX_INSTANCE_REASON_BYTES} bytes",
                 report.instance
             ));
         }
@@ -210,69 +156,58 @@ pub fn derive_health(
 }
 
 /// Build the status document as a JSON string from a live report: the
-/// server-derived `health`, the reporting `session`, the boot `epoch`, and the
-/// shell-reported instances / uptime / counters. `reason` is `null` for a live
-/// report (the server-written stamps carry the closing reason).
-pub fn status_body(
-    surface: &str,
-    session: &str,
-    epoch: uuid::Uuid,
-    health: Health,
-    report: &StatusReport<'_>,
-) -> String {
-    let body = json!({
-        "v": SCHEMA_VERSION,
-        "surface": surface,
-        "session": session,
-        "ts": chrono::Utc::now().to_rfc3339(),
-        "epoch": epoch,
-        "health": health,
-        "reason": serde_json::Value::Null,
-        "uptime_secs": report.uptime_secs,
-        "instances": report.instances,
-        "counters": report.counters,
-        // Reported, not judged: a held overlay is a takeover doing its job as
-        // often as it is a wedge, so `health` does not read it. The field is
-        // what makes the two distinguishable to whoever does.
-        "overlay": report.overlay,
-    });
-    serde_json::to_string(&body).expect("status document serializes to JSON")
+/// server-derived `health`, the reporting `session`, and the shell-reported
+/// instances / uptime / counters.
+///
+/// # Panics
+///
+/// If the composed document fails the schema's own rules. Every rule it checks
+/// is one [`validate_status`] has already enforced on the report, or one
+/// [`derive_health`] cannot violate, so a failure here means the two rule sets
+/// have drifted — a bug in this build, not a bad frame. Running the schema check
+/// on the way out is what makes the published body enforced-by-construction
+/// against the gate every reader will apply.
+pub fn status_body(session: &str, health: Health, report: &StatusReport<'_>) -> String {
+    let doc = StatusDocument {
+        v: TELEMETRY_DOCUMENT_VERSION,
+        session: session.to_string(),
+        health,
+        uptime_secs: report.uptime_secs,
+        instances: report.instances.to_vec(),
+        counters: report.counters.clone(),
+        overlay: report.overlay.cloned(),
+    };
+    doc.validate()
+        .expect("status document composed from a validated report");
+    doc.to_body()
 }
 
-/// Build a server-written `disconnected` status document: the terminal
-/// snapshot when the last session for a slug closes, and the boot stamp. Unlike a
-/// live report, `health` is fixed `disconnected`, `reason` names the cause, and
-/// there is no shell-reported uptime or counters (both `null` — a server-written
-/// stamp has no page uptime and no shell counter totals). `session` is the closing
-/// session for a terminal snapshot and `None` for a boot stamp; `instances`
-/// carries the last-known list for a terminal snapshot or empty for a boot stamp.
-pub fn disconnected_body(
-    surface: &str,
-    session: Option<&str>,
-    epoch: uuid::Uuid,
-    reason: &str,
-    instances: &[InstanceReport],
-) -> String {
-    let body = json!({
-        "v": SCHEMA_VERSION,
-        "surface": surface,
-        "session": session,
-        "ts": chrono::Utc::now().to_rfc3339(),
-        "epoch": epoch,
-        "health": Health::Disconnected,
-        "reason": reason,
-        "uptime_secs": serde_json::Value::Null,
-        "instances": instances,
-        "counters": serde_json::Value::Null,
-        // A surface with no live session holds no overlay, and a server-written
-        // stamp has no page state to report either way.
-        "overlay": serde_json::Value::Null,
-    });
-    serde_json::to_string(&body).expect("disconnected status document serializes to JSON")
+/// Build a server-written `disconnected` stamp: the terminal snapshot when the
+/// last session for a slug closes, and the boot stamp. `session` is the closing
+/// session for a terminal snapshot and `None` for a boot stamp.
+///
+/// # Panics
+///
+/// If the composed stamp fails the schema's own rules — an empty `reason` or an
+/// empty `session`. Every caller passes a literal reason and a minted session
+/// id, so a failure is a broken caller in this build rather than bad input; the
+/// alternative is publishing a retained stamp every reader refuses, which is how
+/// "is this surface down?" would silently stop having an answer.
+pub fn disconnected_body(session: Option<&str>, epoch: uuid::Uuid, reason: &str) -> String {
+    let stamp = DisconnectedStamp::new(
+        session.map(str::to_string),
+        chrono::Utc::now(),
+        epoch,
+        reason.to_string(),
+    );
+    stamp
+        .validate()
+        .expect("disconnected stamp composed from server-held facts");
+    stamp.to_body()
 }
 
 /// Publish a boot `disconnected` stamp (`reason: "server restart"`, the new bus
-/// `epoch`, empty instances) to every configured surface's status channel, once
+/// `epoch`) to every configured surface's status channel, once
 /// at boot after the boot-published documents. A durable status channel's
 /// retained row survives a restart; without this stamp a dead or not-yet-connected
 /// wall would read "healthy as of before the restart" until a reader did timestamp
@@ -292,7 +227,7 @@ pub async fn publish_boot_disconnected_stamps(
 ) {
     for surface in surfaces {
         let channel = surface_status_channel(prefix, &surface.slug);
-        let body = disconnected_body(&surface.slug, None, epoch, "server restart", &[]);
+        let body = disconnected_body(None, epoch, "server restart");
         match messenger
             .publish_from_surface_platform(&surface.slug, &channel, &body, Urgency::Normal)
             .await
@@ -334,16 +269,18 @@ mod tests {
         assert!(validate_geometry(1920, 1080, f64::INFINITY).is_err());
     }
 
+    /// The document shape is pinned in `brenn-surface-schema`; what this side
+    /// owes is that the frame's values reach the body it composes.
     #[test]
-    fn geometry_body_schema() {
-        let s = geometry_body("bar", "sess", 1920, 515, 2.0);
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["v"], json!(1));
-        assert_eq!(v["surface"], json!("bar"));
-        assert_eq!(v["session"], json!("sess"));
-        assert_eq!(v["viewport"], json!({ "width": 1920, "height": 515 }));
-        assert_eq!(v["device_pixel_ratio"], json!(2.0));
-        assert!(v["ts"].is_string());
+    fn geometry_body_carries_the_reported_viewport() {
+        let doc = brenn_surface_schema::telemetry::GeometryDocument::parse(&geometry_body(
+            "sess", 1920, 515, 2.0,
+        ))
+        .expect("the composed body is a valid geometry document");
+        assert_eq!(doc.session, "sess");
+        assert_eq!(doc.viewport.width, 1920);
+        assert_eq!(doc.viewport.height, 515);
+        assert_eq!(doc.device_pixel_ratio, 2.0);
     }
 
     fn configured_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -398,7 +335,7 @@ mod tests {
         assert!(validate_status(&status_report(&wrong, &none, None), &configured).is_err());
         // Over-long reason.
         let mut long = report("p1", "protobar", InstanceState::Failed, 0);
-        long.reason = Some("x".repeat(MAX_REASON_BYTES + 1));
+        long.reason = Some("x".repeat(MAX_INSTANCE_REASON_BYTES + 1));
         let long = vec![long];
         assert!(validate_status(&status_report(&long, &none, None), &configured).is_err());
         // Duplicate instance — a multiset with repeats is not a subset.
@@ -473,9 +410,10 @@ mod tests {
         }
     }
 
+    /// The reported facts and the *server-derived* health both reach the body —
+    /// the report is the shell's, the summary is not.
     #[test]
-    fn status_body_schema() {
-        let epoch = uuid::Uuid::nil();
+    fn status_body_carries_the_report_and_the_derived_health() {
         let instances = vec![report("p1", "protobar", InstanceState::Mounted, 1)];
         let overlay = held_overlay();
         let counters = StatusCounters {
@@ -492,10 +430,8 @@ mod tests {
             .into_iter()
             .collect(),
         };
-        let s = status_body(
-            "bar",
+        let body = status_body(
             "sess",
-            epoch,
             Health::Degraded,
             &StatusReport {
                 instances: &instances,
@@ -504,46 +440,17 @@ mod tests {
                 overlay: Some(&overlay),
             },
         );
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["v"], json!(1));
-        assert_eq!(v["surface"], json!("bar"));
-        assert_eq!(v["health"], json!("degraded"));
-        assert_eq!(v["reason"], json!(null));
-        assert_eq!(v["uptime_secs"], json!(86_400));
-        assert_eq!(v["epoch"], json!("00000000-0000-0000-0000-000000000000"));
-        assert_eq!(v["instances"][0]["instance"], json!("p1"));
-        assert_eq!(v["counters"]["deliveries"], json!(10));
-        // The per-instance breakdown reaches the retained document — the plane
-        // an operator (or the LLM, via MessageChannelGet) actually reads. The
-        // document is where attribution has to land; counting it page-side and
-        // dropping it here would be counting for nobody.
-        assert_eq!(
-            v["counters"]["instances"],
-            json!({ "p1": { "publishes": 2, "drops": 5 } })
-        );
+        let doc = brenn_surface_schema::telemetry::StatusDocument::parse(&body)
+            .expect("the composed body is a valid status document");
+        assert_eq!(doc.session, "sess");
+        assert_eq!(doc.health, Health::Degraded);
+        assert_eq!(doc.uptime_secs, 86_400);
+        assert_eq!(doc.instances, instances);
+        assert_eq!(doc.counters, counters);
         // The held overlay reaches the document, holder and start both: this
         // field is the whole reason a wedged surface is distinguishable from a
         // healthy one in the retained snapshot.
-        assert_eq!(v["overlay"]["holder"], json!("p1"));
-        assert_eq!(v["overlay"]["since"], json!("1970-01-01T00:00:00Z"));
-    }
-
-    #[test]
-    fn status_body_reports_no_overlay_as_null() {
-        // The absent case is `null` rather than a missing key: a reader asking
-        // "what holds the overlay?" gets an answer from every live document,
-        // and "nothing" is an answer.
-        let instances = vec![report("p1", "protobar", InstanceState::Mounted, 1)];
-        let none = StatusCounters::default();
-        let s = status_body(
-            "bar",
-            "sess",
-            uuid::Uuid::nil(),
-            Health::Ok,
-            &status_report(&instances, &none, None),
-        );
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["overlay"], json!(null));
+        assert_eq!(doc.overlay, Some(overlay));
     }
 
     #[test]
@@ -572,40 +479,102 @@ mod tests {
         assert!(err.contains("unconfigured holder"), "unexpected: {err}");
     }
 
+    /// Both stamp flavours: the boot stamp names no session, the terminal one
+    /// names the session that closed. Each carries the bus epoch a reader
+    /// compares against a live document's.
     #[test]
-    fn disconnected_body_boot_stamp_schema() {
-        // Boot stamp: no session, empty instances, null uptime/counters.
-        let s = disconnected_body("bar", None, uuid::Uuid::nil(), "server restart", &[]);
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["v"], json!(1));
-        assert_eq!(v["surface"], json!("bar"));
-        assert_eq!(v["session"], json!(null));
-        assert_eq!(v["health"], json!("disconnected"));
-        assert_eq!(v["reason"], json!("server restart"));
-        assert_eq!(v["uptime_secs"], json!(null));
-        assert_eq!(v["counters"], json!(null));
-        assert_eq!(v["overlay"], json!(null));
-        assert_eq!(v["instances"], json!([]));
-        assert_eq!(v["epoch"], json!("00000000-0000-0000-0000-000000000000"));
-        assert!(v["ts"].is_string());
-    }
+    fn disconnected_body_covers_both_stamp_flavours() {
+        let boot = DisconnectedStamp::parse(&disconnected_body(
+            None,
+            uuid::Uuid::nil(),
+            "server restart",
+        ))
+        .expect("the boot stamp is valid");
+        assert_eq!(boot.session, None);
+        assert_eq!(boot.health, Health::Disconnected);
+        assert_eq!(boot.reason, "server restart");
+        assert_eq!(boot.epoch, uuid::Uuid::nil());
 
-    #[test]
-    fn disconnected_body_terminal_snapshot_carries_session_and_instances() {
-        // Terminal snapshot: the closing session id and the last-known instances.
-        let instances = vec![report("p1", "protobar", InstanceState::Failed, 0)];
-        let s = disconnected_body(
-            "bar",
+        let terminal = DisconnectedStamp::parse(&disconnected_body(
             Some("sess"),
             uuid::Uuid::nil(),
             "session closed",
-            &instances,
+        ))
+        .expect("the terminal stamp is valid");
+        assert_eq!(terminal.session.as_deref(), Some("sess"));
+        assert_eq!(terminal.reason, "session closed");
+    }
+
+    /// A stamp with no reason is one every reader refuses, so the composer
+    /// refuses to publish it instead of leaving the channel's latest-wins row
+    /// unreadable.
+    #[test]
+    #[should_panic(expected = "disconnected stamp composed from server-held facts")]
+    fn a_reasonless_stamp_does_not_compose() {
+        disconnected_body(Some("sess"), uuid::Uuid::nil(), "");
+    }
+
+    /// **The two rule sets must not drift.** `status_body` panics on a document
+    /// its own crate's `validate` refuses, and the input is a client frame — so
+    /// every schema-side rejection has to be one `validate_status` already
+    /// refuses, or the panic becomes reachable from the wire. One case per
+    /// `StatusDocument::validate` rule that a report can express.
+    #[test]
+    fn every_schema_status_rule_is_refused_by_the_frame_validator_first() {
+        let configured = configured_map(&[("p1", "protobar")]);
+        let none = StatusCounters::default();
+
+        // Duplicate instance.
+        let dup = vec![
+            report("p1", "protobar", InstanceState::Mounted, 1),
+            report("p1", "protobar", InstanceState::Failed, 0),
+        ];
+        // Over-long reason.
+        let mut long = report("p1", "protobar", InstanceState::Failed, 0);
+        long.reason = Some("x".repeat(MAX_INSTANCE_REASON_BYTES + 1));
+        let long = vec![long];
+        // An empty instance id is unconfigurable, so the frame validator refuses
+        // it as an unconfigured instance before the schema calls it empty.
+        let empty_id = vec![report("", "protobar", InstanceState::Mounted, 1)];
+
+        for (case, instances) in [("duplicate", dup), ("reason", long), ("empty id", empty_id)] {
+            let refused = validate_status(&status_report(&instances, &none, None), &configured);
+            assert!(refused.is_err(), "{case}: the frame validator must refuse");
+            // And the schema would have refused it too — which is what makes the
+            // pair a covering, not merely an overlapping, rule set.
+            let doc = StatusDocument {
+                v: TELEMETRY_DOCUMENT_VERSION,
+                session: "sess".to_string(),
+                health: Health::Ok,
+                uptime_secs: 1,
+                instances,
+                counters: none.clone(),
+                overlay: None,
+            };
+            assert!(doc.validate().is_err(), "{case}: the schema rule is real");
+        }
+
+        // `health` is the one schema rule no report can express: the derivation
+        // has no `Disconnected` answer.
+        let mounted = vec![report("p1", "protobar", InstanceState::Mounted, 1)];
+        assert_ne!(
+            derive_health(&mounted, &expected_map(&[("p1", 1)])),
+            Health::Disconnected
         );
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["session"], json!("sess"));
-        assert_eq!(v["health"], json!("disconnected"));
-        assert_eq!(v["reason"], json!("session closed"));
-        assert_eq!(v["instances"][0]["instance"], json!("p1"));
-        assert_eq!(v["instances"][0]["state"], json!("failed"));
+
+        // The boundary-valid shape composes: at-cap reason, one report per
+        // configured instance, no overlay — the case most likely to straddle a
+        // future rule.
+        let mut at_cap = report("p1", "protobar", InstanceState::Failed, 0);
+        at_cap.reason = Some("x".repeat(MAX_INSTANCE_REASON_BYTES));
+        let at_cap = vec![at_cap];
+        let boundary = status_report(&at_cap, &none, None);
+        assert!(validate_status(&boundary, &configured).is_ok());
+        let body = status_body(
+            "sess",
+            derive_health(&at_cap, &expected_map(&[("p1", 1)])),
+            &boundary,
+        );
+        assert!(StatusDocument::parse(&body).is_ok());
     }
 }

@@ -757,13 +757,10 @@ pub fn validate_surface_description(
     }
 
     // Config channels: single-writer under `system:surface-config` — a second
-    // writer could hand a surface its whole wiring.
-    //
-    // TODO(surface-config-read-side-acl): the write side is boot-impossible to
-    // forge; the read side is unguarded. Any principal holding an
-    // `ephemeral_subscribe` matcher covering a config address — including the
-    // accidental-broad prefix this sweep exists to catch on the publish family —
-    // can pull a surface's whole wiring, component config maps included.
+    // writer could hand a surface its whole wiring. The guard is write-side
+    // only: reading a config channel is ordinary deny-by-default ACL policy,
+    // and the document's confidentiality bound is the operator contract that
+    // component config maps carry no secrets.
     for surface in surfaces {
         let channel = surface_config_channel(prefix, &surface.slug);
         let Some(bare) =

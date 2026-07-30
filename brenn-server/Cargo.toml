@@ -8,6 +8,7 @@ publish = false
 async-trait = "0.1.89"
 axum = { version = "0.8.8", features = ["ws", "multipart"] }
 axum-helmet = "1.0.1"
+brenn-attach-proto = { version = "0.1.0", path = "../attach/proto" }
 brenn-cc = { version = "0.1.0", path = "../brenn-cc" }
 brenn-common = { version = "0.1.0", path = "../brenn-common" }
 brenn-envelope = { path = "../brenn-envelope" }

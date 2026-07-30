@@ -742,9 +742,8 @@ mod tests {
         use brenn_lib::messaging::{ChannelScheme, Urgency};
         use chrono::{TimeZone, Utc};
 
-        use crate::routes::surface::registry::{
-            PUSH_QUEUE_FRAMES, SessionCaps, SurfaceSessionHandle,
-        };
+        use crate::routes::attach::registry::SessionCaps;
+        use crate::routes::surface::registry::{PUSH_QUEUE_FRAMES, SurfaceSessionHandle};
 
         let db = brenn_lib::db::init_db_memory();
         let state = crate::test_support::state::test_state(&db);
@@ -1314,9 +1313,8 @@ mod tests {
         tokio::sync::mpsc::Receiver<SessionPush>,
         Arc<tokio::sync::Notify>,
     ) {
-        use crate::routes::surface::registry::{
-            PUSH_QUEUE_FRAMES, SessionCaps, SurfaceSessionHandle,
-        };
+        use crate::routes::attach::registry::SessionCaps;
+        use crate::routes::surface::registry::{PUSH_QUEUE_FRAMES, SurfaceSessionHandle};
 
         let (push_tx, push_rx) = tokio::sync::mpsc::channel(PUSH_QUEUE_FRAMES);
         let mut handle = SurfaceSessionHandle::for_test("dev");

@@ -47,12 +47,13 @@ use brenn_common::sanitize_untrusted_str;
 use brenn_surface_schema::{
     AlertSeverity as ProtoAlertSeverity, BatchDeferredOp, BatchEntry, ClientFrame, Cursor,
     DeferredOpKind, DeferredViewEntry, DeliverTarget, GapInfo, GapReason as ProtoGapReason,
-    InstanceReport, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES, PublishBatchOutcome,
-    PublishOutcome, ServerFrame, SubscribeOutcome, SurfaceDescription,
+    MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES, PublishBatchOutcome, PublishOutcome, ServerFrame,
+    SubscribeOutcome, SurfaceDescription,
 };
 
 use super::cursor::{self, CursorState};
 use crate::routes::attach::profile::AttachProfile;
+use crate::routes::attach::subscription::subscribe_bucket;
 use chrono::{DateTime, Utc};
 
 use super::telemetry::{self, Health};
@@ -74,19 +75,6 @@ pub(super) const ALERT_BURST: u32 = 5;
 
 /// One `Alert` token refilled per this interval under sustained load.
 const ALERT_REFILL: Duration = Duration::from_secs(300);
-
-/// `Subscribe`/`Unsubscribe` rate-limit burst, derived — never a literal — from
-/// the boot-enforced maximum binding count so the two can never drift. Parent
-/// D10's reconnect-reconcile sends one `Subscribe` per bound channel in a single
-/// first-connect burst, so any literal below the maximum would turn a boot-valid
-/// 33-plus-binding surface into a deterministic connect → violation → fail2ban
-/// loop. `3×` admits the first-connect reconcile (MAX subscribes) plus one full
-/// detach/re-attach cycle of a maximum-size surface (MAX unsubscribes + MAX
-/// subscribes); churn beyond that is throttled to one token/sec.
-const SUBSCRIBE_BURST: u32 = 3 * brenn_surface_schema::MAX_SURFACE_SUBSCRIPTION_BINDINGS as u32;
-
-/// One `Subscribe`/`Unsubscribe` token refilled per this interval.
-const SUBSCRIBE_REFILL: Duration = Duration::from_secs(1);
 
 /// The Nth transport-side `BodyTooLarge` reject on a connection is a protocol
 /// violation (kill); the first N-1 are answered with `BodyTooLarge` outcome
@@ -232,7 +220,7 @@ async fn session_loop(params: SurfaceSessionParams) {
     //   - `publish` caps from this surface's config and trips before the
     //     bus-level per-sender gate (defense in depth).
     let mut buckets = SessionBuckets {
-        subscribe: TokenBucket::new(SUBSCRIBE_BURST, SUBSCRIBE_REFILL, 1),
+        subscribe: subscribe_bucket(&ctx.runtime.profile),
         alert: TokenBucket::new(ALERT_BURST, ALERT_REFILL, 1),
         publish: TokenBucket::new(
             ctx.runtime.resolved.publish_burst,
@@ -251,11 +239,6 @@ async fn session_loop(params: SurfaceSessionParams) {
     // The store's boot counter is a per-process constant; the connection takes
     // it once here and stamps it into every cursor it mints.
     let mut cursors = WireCursors::new(ctx.runtime.store_incarnation());
-
-    // Most recent shell-reported instance list, retained so the teardown terminal
-    // `disconnected` snapshot can carry the last-known instances (empty if
-    // the shell never reported a status this session).
-    let mut last_status_instances: Vec<InstanceReport> = Vec::new();
 
     let mut violation = false;
     loop {
@@ -308,7 +291,6 @@ async fn session_loop(params: SurfaceSessionParams) {
                             &mut cursors,
                             &mut buckets,
                             &mut counters,
-                            &mut last_status_instances,
                         )
                         .await
                         {
@@ -420,13 +402,7 @@ async fn session_loop(params: SurfaceSessionParams) {
         let description = &ctx.runtime.description;
         let session = ctx.session_id.simple().to_string();
         let epoch = ctx.runtime.messenger().ring_epoch();
-        let body = telemetry::disconnected_body(
-            &slug,
-            Some(&session),
-            epoch,
-            "session closed",
-            &last_status_instances,
-        );
+        let body = telemetry::disconnected_body(Some(&session), epoch, "session closed");
         // Same platform publish + panic discipline as the runtime telemetry path;
         // the connection is being torn down, so a Disconnect outcome is moot.
         publish_platform_telemetry(&ctx, &description.status_channel, &body, "terminal status")
@@ -1015,7 +991,6 @@ async fn handle_client_frame(
     cursors: &mut WireCursors,
     buckets: &mut SessionBuckets,
     counters: &mut SessionCounters,
-    last_status_instances: &mut Vec<InstanceReport>,
 ) -> FrameOutcome {
     let frame = match serde_json::from_str::<ClientFrame>(text) {
         Ok(frame) => frame,
@@ -1115,7 +1090,6 @@ async fn handle_client_frame(
                     counters: &counters,
                     overlay: overlay.as_ref(),
                 },
-                last_status_instances,
             )
             .await
         }
@@ -1150,7 +1124,7 @@ async fn handle_geometry(
         return FrameOutcome::Continue;
     }
     let session = ctx.session_id.simple().to_string();
-    let body = telemetry::geometry_body(slug, &session, width, height, device_pixel_ratio);
+    let body = telemetry::geometry_body(&session, width, height, device_pixel_ratio);
     publish_platform_telemetry(ctx, &description.geometry_channel, &body, "geometry").await
 }
 
@@ -1164,7 +1138,6 @@ async fn handle_status(
     ctx: &SessionCtx,
     publish_bucket: &mut TokenBucket,
     report: &telemetry::StatusReport<'_>,
-    last_status_instances: &mut Vec<InstanceReport>,
 ) -> FrameOutcome {
     let slug = &ctx.runtime.resolved.slug;
     let username = &ctx.username;
@@ -1178,11 +1151,6 @@ async fn handle_status(
             sanitize_client_detail(&rule)
         ));
     }
-    // Retain the validated report so a teardown terminal snapshot can carry
-    // the last-known instances. Recorded even if the publish bucket later denies
-    // this frame — the report itself is a truthful, well-formed observation.
-    *last_status_instances = report.instances.to_vec();
-
     let health = telemetry::derive_health(report.instances, &description.expected_pumps);
     debug_assert!(
         health != Health::Disconnected,
@@ -1193,13 +1161,7 @@ async fn handle_status(
         return FrameOutcome::Continue;
     }
     let session = ctx.session_id.simple().to_string();
-    let body = telemetry::status_body(
-        slug,
-        &session,
-        ctx.runtime.messenger().ring_epoch(),
-        health,
-        report,
-    );
+    let body = telemetry::status_body(&session, health, report);
     publish_platform_telemetry(ctx, &description.status_channel, &body, "status").await
 }
 
@@ -1267,9 +1229,9 @@ async fn publish_platform_telemetry(
 /// a protocol violation, not a silent drop: dropping a Subscribe would desync the
 /// client's subscription state machine, and a subscribe storm is not something a
 /// correct client produces — the posture treats it as fail2ban signal. The bucket
-/// starts full and admits `SUBSCRIBE_BURST` frames (see the constant), so an
-/// honest maximum-size surface's first-connect reconcile plus one detach/re-attach
-/// cycle never trips it.
+/// starts full and admits the profile's `subscribe_burst` frames, so an honest
+/// maximum-size surface's first-connect reconcile plus one detach/re-attach cycle
+/// never trips it.
 fn charge_subscribe_token(
     ctx: &SessionCtx,
     subscribe_bucket: &mut TokenBucket,
@@ -4777,16 +4739,17 @@ mod tests {
 
     // ── Subscribe/Unsubscribe rate bucket ─────────────────────────────────
 
-    /// The Subscribe/Unsubscribe bucket admits exactly `SUBSCRIBE_BURST` frames —
+    /// The Subscribe/Unsubscribe bucket admits exactly the profile's burst —
     /// a maximum-size surface's first-connect reconcile plus one full
     /// detach/re-attach cycle — then trips a protocol violation on the next frame.
     #[tokio::test]
     async fn subscribe_bucket_admits_burst_then_violates() {
         let (dispatcher, _drainer) = brenn_lib::obs::alerting::noop_alert_dispatcher();
         let ctx = alert_ctx(false, dispatcher);
-        let mut bucket = TokenBucket::new(SUBSCRIBE_BURST, SUBSCRIBE_REFILL, 1);
+        let burst = ctx.runtime.profile.subscribe_burst();
+        let mut bucket = subscribe_bucket(&ctx.runtime.profile);
 
-        for _ in 0..SUBSCRIBE_BURST {
+        for _ in 0..burst {
             assert!(charge_subscribe_token(&ctx, &mut bucket).is_ok());
         }
         assert!(matches!(
@@ -5304,9 +5267,8 @@ mod tests {
         crate::routes::surface::registry::SurfaceSessionGuard,
         mpsc::Receiver<SessionPush>,
     ) {
-        use crate::routes::surface::registry::{
-            PUSH_QUEUE_FRAMES, SessionCaps, SurfaceSessionHandle,
-        };
+        use crate::routes::attach::registry::SessionCaps;
+        use crate::routes::surface::registry::{PUSH_QUEUE_FRAMES, SurfaceSessionHandle};
 
         let (push_tx, push_rx) = mpsc::channel(PUSH_QUEUE_FRAMES);
         let mut handle = SurfaceSessionHandle::for_test("dev");

@@ -17,8 +17,12 @@ use brenn_lib::messaging::ParticipantId;
 use brenn_lib::messaging::config::{Depth, ResolvedSurface};
 
 use crate::routes::attach::profile::{AttachProfile, DeferredTarget, SubscriptionFacts};
+use crate::routes::attach::registry::SessionCaps;
 
-use super::{SurfaceDescriptionRuntime, assert_transportable};
+use super::{
+    MAX_SESSIONS_PER_SURFACE, MAX_SESSIONS_PER_USER_PER_SURFACE, SurfaceDescriptionRuntime,
+    assert_transportable,
+};
 
 /// The surface's boot-resolved authority, at attachment grain.
 ///
@@ -221,6 +225,27 @@ impl AttachProfile for SurfaceProfile {
 
     fn deferred_view_targets(&self) -> &[DeferredTarget] {
         &self.deferred_targets
+    }
+
+    fn subscribe_burst(&self) -> u32 {
+        // Derived — never a literal — from the boot-enforced maximum binding
+        // count, so the two can never drift. The kernel's reconnect reconcile
+        // sends one `Subscribe` per bound channel in a single first-connect
+        // burst, so any literal below the maximum would refuse a boot-valid
+        // maximum-size surface. `3×` admits that reconcile plus one full
+        // detach/re-attach cycle of a maximum-size surface (MAX unsubscribes +
+        // MAX subscribes); churn beyond that is throttled to one token/sec.
+        3 * brenn_surface_schema::MAX_SURFACE_SUBSCRIPTION_BINDINGS as u32
+    }
+
+    fn session_caps(&self) -> SessionCaps {
+        // Compiled-in for every surface: the caps bound what an authenticated
+        // account can pin of a shared page, and no surface has a reason to
+        // differ from another yet. Per-surface config is an additive change.
+        SessionCaps {
+            per_attacher: MAX_SESSIONS_PER_SURFACE,
+            per_account: MAX_SESSIONS_PER_USER_PER_SURFACE,
+        }
     }
 }
 

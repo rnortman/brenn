@@ -29,10 +29,9 @@ use brenn_envelope::Urgency;
 use futures_channel::mpsc;
 use futures_util::Stream;
 
-use serde::Serialize;
-
 use crate::core::{CoreConfig, Event, PublishBuffer};
 use crate::driver::Driver;
+use crate::proto::telemetry::ErrorReportDocument;
 use crate::proto::{
     AlertSeverity, InstanceReport, LogLevel, MAX_LOG_MESSAGE_BYTES, MAX_LOG_SOURCE_BYTES,
     StatusCounters, SurfaceBindings,
@@ -44,17 +43,6 @@ use brenn_surface_contract::Activation;
 #[cfg(not(target_arch = "wasm32"))]
 use brenn_surface_contract::ActivationError;
 use brenn_surface_contract::{ERROR_REPORT_INSTANCE, ERROR_REPORT_PORT};
-
-/// The flat error-report body a surface publishes to the reserved
-/// `#brenn`/`error-reports` port: the surface's own claims, honestly attributed
-/// by the envelope sender the server binds. Opaque to the server, which
-/// applies only the ordinary body cap.
-#[derive(Serialize)]
-struct ErrorReportBody<'a> {
-    source: &'a str,
-    message: &'a str,
-    level: LogLevel,
-}
 
 /// EventStream capacity. Control-plane traffic is low-rate by
 /// construction; an overflow is a kernel-not-draining bug the driver panics on.
@@ -700,12 +688,12 @@ impl ClientHandle {
         // complete one. The headroom validator budgets the marker's bytes.
         let source = crate::core::truncate_report_field(source.to_owned(), MAX_LOG_SOURCE_BYTES);
         let message = crate::core::truncate_report_field(message.to_owned(), MAX_LOG_MESSAGE_BYTES);
-        let body = ErrorReportBody {
-            source: &source,
-            message: &message,
+        let body = ErrorReportDocument {
+            source,
+            message,
             level,
-        };
-        let body = serde_json::to_string(&body).expect("error report body serializes to JSON");
+        }
+        .to_body();
         // Best-effort: an unbound reserved port (floor withdrawn on a stale gate),
         // a full publish channel (a component error-loop out-running the driver),
         // or a closed one (the driver is gone) all drop the report. The console
@@ -1201,13 +1189,12 @@ mod tests {
             LogLevel::Warn,
             LogLevel::Error,
         ] {
-            let body = ErrorReportBody {
-                source: &source,
-                message: &message,
+            let serialized = ErrorReportDocument {
+                source: source.clone(),
+                message: message.clone(),
                 level,
-            };
-            let serialized =
-                serde_json::to_string(&body).expect("error report body serializes to JSON");
+            }
+            .to_body();
             assert!(
                 serialized.len() <= bound,
                 "worst-case report body {} exceeds headroom bound {bound} (level {level:?})",

@@ -1,21 +1,23 @@
-//! Registry of attached surface WS sessions, keyed by surface slug.
+//! Registry of live attachment sessions, keyed by attacher.
 //!
-//! Enforces the per-surface session cap and provides per-session attribution
+//! Enforces the per-attacher session caps and provides per-session attribution
 //! for logging. The attached-session view is also what the push router reads to
 //! route wakes to live connections.
+//!
+//! Everything here is at channel grain. An attachment holds at most one
+//! subscription per channel, so "is this session subscribed" is a channel
+//! question and a delivery names no target beyond the envelope it carries —
+//! whatever sits behind the channel on the attacher's side is the attacher's
+//! own bookkeeping.
 
-// The route handler and session task that call these land in a later
-// increment; the in-crate tests already exercise them.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
-use super::SubKey;
-use crate::routes::attach::registry::{RegisterRejection, SessionCaps};
+use brenn_attach_proto::DeferredViewEntry;
 use brenn_lib::messaging::MessageEnvelope;
-use brenn_surface_schema::DeferredViewEntry;
 use chrono::{DateTime, Utc};
 use tokio::sync::{Notify, mpsc};
 use tracing::warn;
@@ -38,7 +40,7 @@ pub enum SessionPush {
     DeferredView(DeferredViewPush),
 }
 
-/// One `(channel, instance)` deferred-view snapshot bound for a session's
+/// One `(channel, attribution)` deferred-view snapshot bound for a session's
 /// `ServerFrame::DeferredView`.
 ///
 /// Carries no delivery state: the frame is a full replacement, so a session that
@@ -47,17 +49,19 @@ pub enum SessionPush {
 #[derive(Clone)]
 pub struct DeferredViewPush {
     pub channel: String,
-    pub instance: String,
+    /// The sub-identity whose parked set this is — a parked set belongs to the
+    /// sender that parked it, and an attacher's sub-identities are distinct
+    /// senders.
+    pub attribution: String,
     pub entries: Vec<DeferredViewEntry>,
 }
 
 /// One live retained row handed from the `WakeRouter` fan-out to a subscribed
-/// session's task via its bounded `push_tx`. The channel is
-/// `envelope.channel`. A session that misses one — queue full, or gone between
-/// the fan-out and the send — resumes past it from its own cursor, so the
-/// hand-off owes nothing and carries no delivery state. The envelope is an `Arc`
-/// so the fan-out shares one allocation across every subscribed session instead
-/// of cloning the body per session.
+/// session's task via its bounded `push_tx`. The channel is `envelope.channel`,
+/// which is the whole address of the subscription it belongs to. A session that
+/// misses one — queue full, or gone between the fan-out and the send — resumes
+/// past it from its own cursor, so the hand-off owes nothing and carries no
+/// delivery state.
 #[derive(Clone)]
 pub struct LiveDelivery {
     pub envelope: Arc<MessageEnvelope>,
@@ -65,64 +69,86 @@ pub struct LiveDelivery {
     /// session mints the wire cursor's position from, and the key its duplicate
     /// suppression runs on.
     pub retained_seq: u64,
-    /// The subscription this row is targeted at — the principal the delivery was
-    /// resolved for, paired with the row's channel. The session routes the
-    /// resulting `Deliver` under it, so a row bound for one instance never
-    /// surfaces on a sibling's ports.
-    pub sub: SubKey,
 }
 
-/// Attached surface WS sessions, keyed by slug.
+/// Session caps enforced by `try_register`. A struct (not two adjacent
+/// `usize` params) so call sites cannot transpose the shared and per-account
+/// caps.
+#[derive(Clone, Copy)]
+pub struct SessionCaps {
+    /// Max attached sessions per attacher, across all accounts.
+    pub per_attacher: usize,
+    /// Max attached sessions per (attacher, account).
+    pub per_account: usize,
+}
+
+/// Why `try_register` refused a registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterRejection {
+    /// The attacher is at `per_attacher` capacity across all accounts.
+    AttacherFull { current: usize },
+    /// This account is at `per_account` capacity on this attacher.
+    AccountCapExceeded { account_current: usize },
+}
+
+impl SessionCaps {
+    /// Caps that never trip, for tests exercising non-capacity paths.
+    #[cfg(test)]
+    pub const UNCAPPED: SessionCaps = SessionCaps {
+        per_attacher: usize::MAX,
+        per_account: usize::MAX,
+    };
+}
+
+/// Live attachment sessions, keyed by attacher — the slug of a surface, and
+/// whatever names a daemon later.
 ///
 /// Sync `Mutex`, never held across `.await` (push-window precedent): every
 /// operation is a brief in-memory map mutation. Poisoning is a broken invariant
 /// and `expect`s per house rules.
 #[derive(Clone, Default)]
-pub struct SurfaceRegistry {
-    inner: Arc<Mutex<HashMap<String, Vec<Arc<SurfaceSessionHandle>>>>>,
+pub struct AttachRegistry {
+    inner: Arc<Mutex<HashMap<String, Vec<Arc<AttachSessionHandle>>>>>,
 }
 
 /// Per-connection record for one attached session.
 ///
-/// The push fields (`push_tx`, `active_subs`, `drain_notify`) are shared
+/// The push fields (`push_tx`, `active_channels`, `drain_notify`) are shared
 /// between the registry (where producers write) and the session task (which
-/// drains). Created in the WS handler.
+/// drains). Created by the route handler at upgrade.
 #[derive(Clone)]
-pub struct SurfaceSessionHandle {
+pub struct AttachSessionHandle {
     /// Per-connection id, for log attribution.
     pub session_id: Uuid,
-    pub username: String,
+    /// The authenticated account behind this attachment — the logged-in user
+    /// for a browser page. Held for the per-account cap and for log
+    /// attribution; the attacher's *authority* comes from its profile, never
+    /// from here.
+    pub account: String,
     pub client_ip: IpAddr,
     pub connected_at: DateTime<Utc>,
     /// Live rows and deferred-view snapshots to this session's task (bounded,
     /// `try_send`).
     pub push_tx: mpsc::Sender<SessionPush>,
-    /// The subscriptions this session currently holds — `(instance,
-    /// channel)`, not just channel, because the subscription belongs to the
-    /// principal that bound it. Written by the session task
-    /// (subscribe/unsubscribe), read by the router fan-out. Sync `Mutex`, never
-    /// held across `.await` (registry discipline).
-    pub active_subs: Arc<Mutex<HashSet<SubKey>>>,
+    /// The channels this session currently holds a subscription on. Written by
+    /// the session task (subscribe/unsubscribe), read by the router fan-out.
+    /// Sync `Mutex`, never held across `.await` (registry discipline).
+    pub active_channels: Arc<Mutex<HashSet<String>>>,
     /// Eager-wake nudge: the router notifies it so the session runs a drain pass
     /// (flushing quiet/parked rows the live path did not carry).
     pub drain_notify: Arc<Notify>,
 }
 
-impl SurfaceSessionHandle {
-    /// Whether this session currently holds an active `Subscribe` for `sub`.
-    /// Confines the `active_subs` lock scope to this method so the
+impl AttachSessionHandle {
+    /// Whether this session currently holds an active subscription on `channel`.
+    /// Confines the `active_channels` lock scope to this method so the
     /// sync-Mutex-never-across-await discipline lives in one place rather than
     /// being re-implemented at every reader.
-    ///
-    /// Keyed on the whole subscription, not the channel: a row targeted at one
-    /// instance must not be delivered because a *sibling* instance on the same
-    /// channel happens to be subscribed — they are separate principals with
-    /// separate windows, and the row belongs to exactly one of them.
-    pub fn is_subscribed(&self, sub: &SubKey) -> bool {
-        self.active_subs
+    pub fn is_subscribed(&self, channel: &str) -> bool {
+        self.active_channels
             .lock()
-            .expect("active_subs poisoned")
-            .contains(sub)
+            .expect("active_channels poisoned")
+            .contains(channel)
     }
 
     /// Push one deferred-view snapshot at this session, reporting whether the
@@ -134,19 +160,19 @@ impl SurfaceSessionHandle {
             .is_ok()
     }
 
-    /// Minimal handle for tests that only care about `username` / capacity:
-    /// fresh id, localhost IP, throwaway push channel, empty subscriptions.
+    /// Minimal handle for tests that only care about `account` / capacity:
+    /// fresh id, localhost IP, throwaway push channel, no subscriptions.
     /// One constructor so a new field lands in one place, not every test file.
     #[cfg(test)]
-    pub fn for_test(username: &str) -> Self {
+    pub fn for_test(account: &str) -> Self {
         let (push_tx, _push_rx) = mpsc::channel(PUSH_QUEUE_FRAMES);
         Self {
             session_id: Uuid::new_v4(),
-            username: username.to_string(),
+            account: account.to_string(),
             client_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             connected_at: Utc::now(),
             push_tx,
-            active_subs: Arc::new(Mutex::new(HashSet::new())),
+            active_channels: Arc::new(Mutex::new(HashSet::new())),
             drain_notify: Arc::new(Notify::new()),
         }
     }
@@ -155,30 +181,30 @@ impl SurfaceSessionHandle {
 /// Unregisters its session on `Drop` — panic-safe, and correct even if the WS
 /// upgrade callback never runs. Travels from the route handler into the session
 /// task, which holds it for the session's lifetime.
-pub struct SurfaceSessionGuard {
-    registry: SurfaceRegistry,
-    slug: String,
+pub struct AttachSessionGuard {
+    registry: AttachRegistry,
+    attacher: String,
     session_id: Uuid,
 }
 
-impl SurfaceRegistry {
+impl AttachRegistry {
     /// Atomic capacity check + insert. Both caps are checked before any map
     /// mutation so a rejected registration (e.g. a zero cap) never leaves a
-    /// phantom empty slug entry — pruning only runs on guard Drop, and no guard
-    /// is issued here. The per-user check runs first so the more specific
-    /// diagnosis wins when both caps are at their limit. The returned guard
-    /// unregisters on `Drop`, which also releases the per-user slot.
+    /// phantom empty attacher entry — pruning only runs on guard Drop, and no
+    /// guard is issued here. The per-account check runs first so the more
+    /// specific diagnosis wins when both caps are at their limit. The returned
+    /// guard unregisters on `Drop`, which also releases the per-account slot.
     pub fn try_register(
         &self,
-        slug: &str,
-        handle: SurfaceSessionHandle,
+        attacher: &str,
+        handle: AttachSessionHandle,
         caps: SessionCaps,
-    ) -> Result<SurfaceSessionGuard, RegisterRejection> {
+    ) -> Result<AttachSessionGuard, RegisterRejection> {
         let session_id = handle.session_id;
-        let mut map = self.inner.lock().expect("surface_registry poisoned");
-        let sessions = map.get(slug);
+        let mut map = self.inner.lock().expect("attach_registry poisoned");
+        let sessions = map.get(attacher);
         let account_current = sessions.map_or(0, |v| {
-            v.iter().filter(|h| h.username == handle.username).count()
+            v.iter().filter(|h| h.account == handle.account).count()
         });
         if account_current >= caps.per_account {
             return Err(RegisterRejection::AccountCapExceeded { account_current });
@@ -187,41 +213,38 @@ impl SurfaceRegistry {
         if current >= caps.per_attacher {
             return Err(RegisterRejection::AttacherFull { current });
         }
-        map.entry(slug.to_string())
+        map.entry(attacher.to_string())
             .or_default()
             .push(Arc::new(handle));
-        Ok(SurfaceSessionGuard {
+        Ok(AttachSessionGuard {
             registry: self.clone(),
-            slug: slug.to_string(),
+            attacher: attacher.to_string(),
             session_id,
         })
     }
 
-    /// Snapshot of the sessions attached to `slug`. Handles are stored behind an
-    /// `Arc`, so this clones only refcounts — the router fan-out and eager-wake,
-    /// which run per row on the shared dispatch loop, pay a pointer bump
-    /// rather than a deep clone of every handle.
-    pub fn sessions(&self, slug: &str) -> Vec<Arc<SurfaceSessionHandle>> {
-        let map = self.inner.lock().expect("surface_registry poisoned");
-        map.get(slug).cloned().unwrap_or_default()
+    /// Snapshot of the sessions attached to `attacher`.
+    pub fn sessions(&self, attacher: &str) -> Vec<Arc<AttachSessionHandle>> {
+        let map = self.inner.lock().expect("attach_registry poisoned");
+        map.get(attacher).cloned().unwrap_or_default()
     }
 
-    /// Hand one deferred-view snapshot to every session attached to `slug`.
+    /// Hand one deferred-view snapshot to every session attached to `attacher`.
     ///
     /// Every session, not just the one whose action changed the set: the parked
-    /// set belongs to `surface:<slug>#<instance>`, which every tab of the
-    /// surface shares, so a view held by only one of them would be a second
-    /// answer to a question that has one.
+    /// set belongs to the sub-identity, which every attachment of the attacher
+    /// shares, so a view held by only one of them would be a second answer to a
+    /// question that has one.
     ///
     /// One place for the fan-out because two producers reach it — the session
     /// task's own park/cancel/edit and the release sweep, which arrives through
     /// the `WakeRouter` seam with no session of its own.
-    pub fn push_deferred_view(&self, slug: &str, view: &DeferredViewPush) {
-        for handle in self.sessions(slug) {
+    pub fn push_deferred_view(&self, attacher: &str, view: &DeferredViewPush) {
+        for handle in self.sessions(attacher) {
             if !handle.try_push_deferred_view(view.clone()) {
                 warn!(
-                    surface = slug,
-                    instance = view.instance,
+                    attacher,
+                    attribution = view.attribution,
                     channel = view.channel,
                     session = %handle.session_id,
                     "deferred view dropped: session push queue full; the next change to this \
@@ -231,33 +254,33 @@ impl SurfaceRegistry {
         }
     }
 
-    /// Count of sessions attached to `slug`.
-    pub fn count(&self, slug: &str) -> usize {
-        let map = self.inner.lock().expect("surface_registry poisoned");
-        map.get(slug).map_or(0, Vec::len)
+    /// Count of sessions attached to `attacher`.
+    pub fn count(&self, attacher: &str) -> usize {
+        let map = self.inner.lock().expect("attach_registry poisoned");
+        map.get(attacher).map_or(0, Vec::len)
     }
 }
 
-impl SurfaceSessionGuard {
+impl AttachSessionGuard {
     /// Atomically remove this guard's session from the registry and return the
-    /// number of sessions still attached to the slug afterward. Teardown calls this
-    /// to decide "am I the last session for this slug" atomically: reading `count()`
-    /// while still registered races two concurrent closers into both observing the
-    /// other and both skipping the terminal action, leaving no last-session decider.
-    /// Idempotent with [`Drop`] — the drop-time removal becomes a no-op once this
-    /// has run.
+    /// number of sessions still attached to the attacher afterward. Teardown
+    /// calls this to decide "am I the last session for this attacher" atomically:
+    /// reading `count()` while still registered races two concurrent closers into
+    /// both observing the other and both skipping the terminal action, leaving no
+    /// last-session decider. Idempotent with [`Drop`] — the drop-time removal
+    /// becomes a no-op once this has run.
     pub fn unregister_returning_remaining(&self) -> usize {
         let mut map = self
             .registry
             .inner
             .lock()
-            .expect("surface_registry poisoned");
-        match map.get_mut(&self.slug) {
+            .expect("attach_registry poisoned");
+        match map.get_mut(&self.attacher) {
             Some(sessions) => {
                 sessions.retain(|h| h.session_id != self.session_id);
                 let remaining = sessions.len();
                 if sessions.is_empty() {
-                    map.remove(&self.slug);
+                    map.remove(&self.attacher);
                 }
                 remaining
             }
@@ -266,7 +289,7 @@ impl SurfaceSessionGuard {
     }
 }
 
-impl Drop for SurfaceSessionGuard {
+impl Drop for AttachSessionGuard {
     fn drop(&mut self) {
         let _ = self.unregister_returning_remaining();
     }
@@ -278,13 +301,21 @@ mod tests {
 
     const UNCAPPED: SessionCaps = SessionCaps::UNCAPPED;
 
-    fn handle_for(username: &str) -> SurfaceSessionHandle {
-        SurfaceSessionHandle::for_test(username)
+    fn handle_for(account: &str) -> AttachSessionHandle {
+        AttachSessionHandle::for_test(account)
+    }
+
+    fn view(channel: &str, attribution: &str) -> DeferredViewPush {
+        DeferredViewPush {
+            channel: channel.to_string(),
+            attribution: attribution.to_string(),
+            entries: Vec::new(),
+        }
     }
 
     #[test]
     fn register_and_guard_drop_lifecycle() {
-        let registry = SurfaceRegistry::default();
+        let registry = AttachRegistry::default();
         assert_eq!(registry.count("deskbar"), 0);
 
         let guard = registry
@@ -295,13 +326,14 @@ mod tests {
 
         drop(guard);
         assert_eq!(registry.count("deskbar"), 0);
-        // Empty surface entry is pruned, so an unknown-slug snapshot is empty.
+        // Empty attacher entry is pruned, so an unknown-attacher snapshot is
+        // empty.
         assert!(registry.sessions("deskbar").is_empty());
     }
 
     #[test]
     fn unregister_returning_remaining_reports_survivors_and_is_idempotent() {
-        let registry = SurfaceRegistry::default();
+        let registry = AttachRegistry::default();
         let g1 = registry
             .try_register("deskbar", handle_for("a"), UNCAPPED)
             .unwrap();
@@ -332,7 +364,7 @@ mod tests {
 
     #[test]
     fn capacity_boundary() {
-        let registry = SurfaceRegistry::default();
+        let registry = AttachRegistry::default();
         // High per-account cap so the shared per-attacher cap is what trips.
         let caps = SessionCaps {
             per_attacher: 2,
@@ -354,8 +386,8 @@ mod tests {
     }
 
     #[test]
-    fn per_user_boundary() {
-        let registry = SurfaceRegistry::default();
+    fn per_account_boundary() {
+        let registry = AttachRegistry::default();
         let caps = SessionCaps {
             per_attacher: 64,
             per_account: 2,
@@ -369,14 +401,14 @@ mod tests {
 
         // Alice is at her per-account cap; the attacher is nowhere near full.
         let Err(rej) = registry.try_register("deskbar", handle_for("alice"), caps) else {
-            panic!("expected alice to be refused at her per-user cap");
+            panic!("expected alice to be refused at her per-account cap");
         };
         assert_eq!(
             rej,
             RegisterRejection::AccountCapExceeded { account_current: 2 }
         );
 
-        // A different user is still admitted.
+        // A different account is still admitted.
         let _b1 = registry
             .try_register("deskbar", handle_for("bob"), caps)
             .unwrap();
@@ -384,8 +416,8 @@ mod tests {
     }
 
     #[test]
-    fn rejection_precedence_user_before_surface() {
-        let registry = SurfaceRegistry::default();
+    fn rejection_precedence_account_before_attacher() {
+        let registry = AttachRegistry::default();
         let caps = SessionCaps {
             per_attacher: 2,
             per_account: 2,
@@ -408,8 +440,8 @@ mod tests {
     }
 
     #[test]
-    fn per_user_slot_release_readmits() {
-        let registry = SurfaceRegistry::default();
+    fn per_account_slot_release_readmits() {
+        let registry = AttachRegistry::default();
         let caps = SessionCaps {
             per_attacher: 64,
             per_account: 2,
@@ -426,7 +458,6 @@ mod tests {
                 .is_err()
         );
 
-        // Dropping one of alice's guards frees her per-account slot.
         drop(a2);
         let _a3 = registry
             .try_register("deskbar", handle_for("alice"), caps)
@@ -435,7 +466,7 @@ mod tests {
 
     #[test]
     fn guard_releases_on_panic() {
-        let registry = SurfaceRegistry::default();
+        let registry = AttachRegistry::default();
         let registry_clone = registry.clone();
 
         let joined = std::thread::spawn(move || {
@@ -454,9 +485,9 @@ mod tests {
 
     #[test]
     fn zero_cap_registration_leaves_no_phantom_entry() {
-        let registry = SurfaceRegistry::default();
-        // A zero per-account cap trips first (the per-account check precedes
-        // the per-attacher check), and still leaves no phantom slug entry.
+        let registry = AttachRegistry::default();
+        // A zero per-account cap trips first (the per-account check precedes the
+        // per-attacher check), and still leaves no phantom attacher entry.
         let caps = SessionCaps {
             per_attacher: 0,
             per_account: 0,
@@ -468,15 +499,16 @@ mod tests {
             rej,
             RegisterRejection::AccountCapExceeded { account_current: 0 }
         );
-        // No empty slug entry was created: the snapshot is empty and the slug
-        // is absent (a guard-drop would have pruned it, but none was issued).
+        // No empty attacher entry was created: the snapshot is empty and the
+        // attacher is absent (a guard-drop would have pruned it, but none was
+        // issued).
         assert!(registry.sessions("deskbar").is_empty());
         assert_eq!(registry.count("deskbar"), 0);
     }
 
     #[test]
     fn snapshot_isolation() {
-        let registry = SurfaceRegistry::default();
+        let registry = AttachRegistry::default();
         let _g = registry
             .try_register("deskbar", handle_for("alice"), UNCAPPED)
             .unwrap();
@@ -493,12 +525,78 @@ mod tests {
     }
 
     #[test]
-    fn slugs_are_independent() {
-        let registry = SurfaceRegistry::default();
+    fn attachers_are_independent() {
+        let registry = AttachRegistry::default();
         let _g = registry
             .try_register("deskbar", handle_for("alice"), UNCAPPED)
             .unwrap();
         assert_eq!(registry.count("deskbar"), 1);
         assert_eq!(registry.count("kitchen"), 0);
+    }
+
+    /// Subscription membership is the channel and nothing else: the attachment
+    /// holds one subscription per channel, so a row on a channel it subscribed
+    /// is its row however many of its own bindings sit behind it.
+    #[test]
+    fn subscription_membership_is_per_channel() {
+        let handle = AttachSessionHandle::for_test("alice");
+        handle
+            .active_channels
+            .lock()
+            .expect("active_channels poisoned")
+            .insert("brenn:home.temp".to_string());
+
+        assert!(handle.is_subscribed("brenn:home.temp"));
+        assert!(!handle.is_subscribed("brenn:home.humidity"));
+    }
+
+    #[tokio::test]
+    async fn a_view_reaches_every_session_of_the_attacher() {
+        let registry = AttachRegistry::default();
+        let mut queues = Vec::new();
+        let mut guards = Vec::new();
+        for account in ["alice", "bob"] {
+            let (push_tx, push_rx) = mpsc::channel(PUSH_QUEUE_FRAMES);
+            let mut handle = AttachSessionHandle::for_test(account);
+            handle.push_tx = push_tx;
+            guards.push(
+                registry
+                    .try_register("deskbar", handle, UNCAPPED)
+                    .expect("registered"),
+            );
+            queues.push(push_rx);
+        }
+
+        registry.push_deferred_view("deskbar", &view("brenn:home.cmd", "clock"));
+
+        for queue in &mut queues {
+            let SessionPush::DeferredView(pushed) = queue.try_recv().expect("view pushed") else {
+                panic!("expected a deferred-view push");
+            };
+            assert_eq!(pushed.channel, "brenn:home.cmd");
+            assert_eq!(pushed.attribution, "clock");
+        }
+    }
+
+    /// A full queue drops the snapshot rather than blocking the shared fan-out:
+    /// the next emission restates the whole set, so nothing is owed.
+    #[tokio::test]
+    async fn a_full_queue_drops_a_view_without_blocking() {
+        let registry = AttachRegistry::default();
+        let (push_tx, mut push_rx) = mpsc::channel(1);
+        let mut handle = AttachSessionHandle::for_test("alice");
+        handle.push_tx = push_tx;
+        let _guard = registry
+            .try_register("deskbar", handle, UNCAPPED)
+            .expect("registered");
+
+        registry.push_deferred_view("deskbar", &view("brenn:home.cmd", "clock"));
+        registry.push_deferred_view("deskbar", &view("brenn:home.cmd", "clock"));
+
+        assert!(push_rx.try_recv().is_ok());
+        assert!(
+            push_rx.try_recv().is_err(),
+            "the second snapshot was dropped by the full queue, not queued behind it"
+        );
     }
 }

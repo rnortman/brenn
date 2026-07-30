@@ -3683,11 +3683,11 @@ async fn boot_disconnected_stamp_written_per_surface_and_pullable() {
         "the boot stamp is written under the surface's own identity, got {:?}",
         env.sender
     );
-    let body: serde_json::Value = serde_json::from_str(&env.body).expect("stamp body is JSON");
-    assert_eq!(body["health"], serde_json::json!("disconnected"));
-    assert_eq!(body["reason"], serde_json::json!("server restart"));
-    assert_eq!(body["session"], serde_json::json!(null));
-    assert_eq!(body["instances"], serde_json::json!([]));
+    let stamp = brenn_surface_schema::telemetry::DisconnectedStamp::parse(&env.body)
+        .expect("the boot stamp is a valid disconnected stamp");
+    assert_eq!(stamp.reason, "server restart");
+    assert_eq!(stamp.session, None, "a boot stamp precedes every session");
+    assert_eq!(stamp.epoch, epoch);
 }
 
 /// A config with one surface plus its bindings channel declared as the operator

@@ -47,7 +47,7 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-use super::registry::{SessionCaps, SurfaceSessionHandle};
+use super::registry::SurfaceSessionHandle;
 use super::session::ALERT_BURST;
 use super::test_fixtures::{
     COMPONENT, EPH_ADDR, EPH_NAME, PORT, SurfaceTestHarness, TEST_MAX_BODY_BYTES, TEST_ORIGIN,
@@ -61,6 +61,7 @@ use crate::bootstrap::messaging::{
     inject_surface_error_grant, inject_surface_geometry_status_grants,
 };
 use crate::messaging_router::WakeRouterImpl;
+use crate::routes::attach::registry::SessionCaps;
 use crate::state::AppState;
 use crate::test_support::http::{
     TEST_USERNAME, TestServer, assert_stale_client_close_and_no_alert, http_to_ws_url,
@@ -156,8 +157,8 @@ fn surface_state_severity(
 /// Production caps, for prefill calls that must reproduce a state the live
 /// handler actually permits.
 const PROD_CAPS: SessionCaps = SessionCaps {
-    per_surface: MAX_SESSIONS_PER_SURFACE,
-    per_user: MAX_SESSIONS_PER_USER_PER_SURFACE,
+    per_attacher: MAX_SESSIONS_PER_SURFACE,
+    per_account: MAX_SESSIONS_PER_USER_PER_SURFACE,
 };
 
 /// Poll `container` until it holds at least `want` elements (or ~2 s), then
@@ -5729,16 +5730,14 @@ async fn surface_ws_geometry_publishes_to_derived_channel_under_surface_identity
         sender, "surface:deskbar",
         "geometry published under the surface identity"
     );
-    let v: serde_json::Value = serde_json::from_str(body).expect("geometry body is JSON");
-    assert_eq!(v["surface"], serde_json::json!("deskbar"));
-    assert_eq!(
-        v["viewport"],
-        serde_json::json!({ "width": 1920, "height": 515 })
-    );
-    assert_eq!(v["device_pixel_ratio"], serde_json::json!(2.0));
+    let doc = brenn_surface_schema::telemetry::GeometryDocument::parse(body)
+        .expect("the published body is a valid geometry document");
+    assert_eq!(doc.viewport.width, 1920);
+    assert_eq!(doc.viewport.height, 515);
+    assert_eq!(doc.device_pixel_ratio, 2.0);
     assert!(
-        v["session"].is_string(),
-        "server stamps the reporting session id"
+        !doc.session.is_empty(),
+        "the document names the reporting session"
     );
 }
 
@@ -6014,8 +6013,8 @@ async fn surface_ws_last_session_close_writes_disconnected_terminal_snapshot() {
     let mut ws = surface_ws_open(&ws_url, &token).await;
     consume_welcome(&mut ws).await;
 
-    // A status report populates the session's last-known instance list so the
-    // terminal snapshot can carry it. protobar failed ⇒ derived `degraded`.
+    // A live status report first, so the terminal stamp lands over a live row
+    // rather than over the boot stamp. protobar failed ⇒ derived `degraded`.
     ws.send(status_frame(
         &[
             instance_report("protobar", "protobar", InstanceState::Failed, 0),
@@ -6025,8 +6024,8 @@ async fn surface_ws_last_session_close_writes_disconnected_terminal_snapshot() {
     ))
     .await
     .expect("send Status");
-    // Wait for the live row: proves the server processed the frame (and set the
-    // last-known instances) before we close — a happens-before for the teardown.
+    // Wait for the live row: proves the server processed the frame before we
+    // close — a happens-before for the teardown.
     let live = wait_for_channel(&db, status_uuid, |r| {
         r.last().is_some_and(|(_, b)| body_health(b) == "degraded")
     })
@@ -6044,19 +6043,13 @@ async fn surface_ws_last_session_close_writes_disconnected_terminal_snapshot() {
     .await;
     let (sender, body) = rows.last().expect("a terminal row");
     assert_eq!(sender, "surface:deskbar");
-    let v: serde_json::Value = serde_json::from_str(body).expect("terminal body is JSON");
-    assert_eq!(v["health"], serde_json::json!("disconnected"));
-    assert_eq!(v["reason"], serde_json::json!("session closed"));
+    let stamp = brenn_surface_schema::telemetry::DisconnectedStamp::parse(body)
+        .expect("the terminal body is a valid disconnected stamp");
+    assert_eq!(stamp.reason, "session closed");
     assert!(
-        v["session"].is_string(),
-        "terminal snapshot carries the closing session id"
+        stamp.session.is_some_and(|s| !s.is_empty()),
+        "the terminal stamp names the session that closed"
     );
-    assert_eq!(
-        v["instances"][0]["instance"],
-        serde_json::json!("protobar"),
-        "terminal snapshot carries the last-known instances"
-    );
-    assert_eq!(v["instances"][0]["state"], serde_json::json!("failed"));
 }
 
 #[tokio::test]

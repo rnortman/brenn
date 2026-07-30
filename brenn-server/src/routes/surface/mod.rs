@@ -50,11 +50,14 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub use crate::routes::attach::profile::SubscriptionFacts;
+pub(crate) use crate::routes::attach::session::sanitize_client_detail;
 
 use self::profile::SurfaceProfile;
-use self::registry::{PUSH_QUEUE_FRAMES, RegisterRejection, SessionCaps, SurfaceSessionHandle};
+use self::registry::{PUSH_QUEUE_FRAMES, SurfaceSessionHandle};
 use self::session::{SurfaceSessionParams, run_surface_session};
 use crate::client_ip::ClientIp;
+use crate::routes::attach::profile::AttachProfile;
+use crate::routes::attach::registry::RegisterRejection;
 use crate::routes::ws::close_with_stale_client;
 use crate::state::AppState;
 
@@ -109,24 +112,6 @@ pub(crate) fn skin_stylesheet_path(name: &str) -> Option<&'static str> {
         .iter()
         .find(|(n, _)| *n == name)
         .map(|(_, path)| *path)
-}
-
-/// Render a client-supplied string for inclusion in a security-event detail.
-///
-/// Truncates to a short prefix and control-character-escapes the result, so a
-/// hostile client cannot inject unbounded length or raw newline/escape bytes
-/// into the security log line or the phone-alert body.
-pub(crate) fn sanitize_client_detail(s: &str) -> String {
-    const MAX_CHARS: usize = 128;
-    let mut rendered: String = s
-        .chars()
-        .take(MAX_CHARS)
-        .flat_map(char::escape_debug)
-        .collect();
-    if s.chars().nth(MAX_CHARS).is_some() {
-        rendered.push_str("...");
-    }
-    rendered
 }
 
 /// Shared pre-serve authorization for the surface page and WS handlers: resolve
@@ -1163,13 +1148,10 @@ pub async fn surface_ws_handler(
         active_subs: active_subs.clone(),
         drain_notify: drain_notify.clone(),
     };
-    let caps = SessionCaps {
-        per_surface: MAX_SESSIONS_PER_SURFACE,
-        per_user: MAX_SESSIONS_PER_USER_PER_SURFACE,
-    };
+    let caps = runtime.profile.session_caps();
     let guard = match state.surface_registry.try_register(&slug, handle, caps) {
         Ok(guard) => guard,
-        Err(RegisterRejection::SurfaceFull { current }) => {
+        Err(RegisterRejection::AttacherFull { current }) => {
             // Not a security event: a user with many tabs is not fail2ban signal.
             warn!(
                 surface = %slug,
@@ -1180,7 +1162,7 @@ pub async fn surface_ws_handler(
             );
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
-        Err(RegisterRejection::UserCapExceeded { user_current }) => {
+        Err(RegisterRejection::AccountCapExceeded { account_current }) => {
             // Not a security event either: a legitimate user with many devices
             // or tabs can trip this, and banning that IP would lock out an
             // authenticated user. The distinct message + user attribution turns
@@ -1189,7 +1171,7 @@ pub async fn surface_ws_handler(
                 surface = %slug,
                 user = %session.user.username,
                 ip = %ip,
-                user_count = user_current,
+                user_count = account_current,
                 "per-user surface session cap reached; rejecting with 503"
             );
             return Err(StatusCode::SERVICE_UNAVAILABLE);

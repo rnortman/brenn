@@ -9,4 +9,8 @@
 //! may act as — reaches the session through [`profile::AttachProfile`], built at
 //! boot by the route that owns the attacher.
 
+pub mod cursor;
 pub mod profile;
+pub mod registry;
+pub mod session;
+pub mod subscription;
