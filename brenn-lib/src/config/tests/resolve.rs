@@ -782,7 +782,7 @@ fn validate_resolves_app_mqtt_subscriptions() {
             mqtt_subscriptions: vec![AppMqttIngressSubscriptionRaw {
                 channel: "mqtt:ha:home/+/state".to_string(),
                 push_depth: Some(crate::messaging::config::Depth::Bounded(0)),
-                retain_depth: None,
+                retain_depth: Some(crate::messaging::config::Depth::Bounded(4)),
                 noise: None,
                 wake_min: None,
             }],
@@ -906,7 +906,7 @@ fn validate_unknown_client_subscription_panics() {
             mqtt_subscriptions: vec![AppMqttIngressSubscriptionRaw {
                 channel: "mqtt:nonexistent:home/+/state".to_string(),
                 push_depth: Some(crate::messaging::config::Depth::Bounded(0)),
-                retain_depth: None,
+                retain_depth: Some(crate::messaging::config::Depth::Bounded(4)),
                 noise: None,
                 wake_min: None,
             }],
@@ -928,7 +928,7 @@ fn pull_only_ingress_sub(channel: &str) -> crate::mqtt::config::AppMqttIngressSu
     crate::mqtt::config::AppMqttIngressSubscriptionRaw {
         channel: channel.to_string(),
         push_depth: Some(crate::messaging::config::Depth::Bounded(0)),
-        retain_depth: None,
+        retain_depth: Some(crate::messaging::config::Depth::Bounded(4)),
         noise: None,
         wake_min: None,
     }

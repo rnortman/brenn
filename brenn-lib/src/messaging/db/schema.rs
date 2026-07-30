@@ -1008,7 +1008,7 @@ mod tests {
                 body: "m3".to_string(),
                 urgency: crate::messaging::Urgency::Low,
                 envelope_type: crate::messaging::ChannelScheme::Brenn,
-                reply_to_uuid: None,
+                reply_to: None,
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: 0,

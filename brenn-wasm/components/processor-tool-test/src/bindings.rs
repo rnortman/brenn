@@ -1920,6 +1920,12 @@ pub mod brenn {
       /// a trapped activation fires no tool calls. `call-id` is a caller-chosen
       /// opaque correlation string (echoed verbatim in the result); the caller owns
       /// its uniqueness and keeps in-flight state in its `store` grant keyed by it.
+      ///
+      /// A result may arrive more than once for the same `call-id`: a request is
+      /// retained for its channel's window, and an executor whose position on that
+      /// channel is re-created re-runs what the window still holds. Async tools
+      /// declare repeat execution harmless, so the caller's side of the contract is
+      /// to ignore a `call-id` it no longer awaits.
       #[allow(async_fn_in_trait)]
       pub fn call_async(tool: &str,args_json: &str,call_id: &str,) -> Result<(),ToolError>{
         unsafe {

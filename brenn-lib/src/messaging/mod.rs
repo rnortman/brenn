@@ -456,45 +456,41 @@ impl ChannelEntry {
     }
 
     /// The reap frontier for this channel: the highest row index that must be
-    /// retained.
+    /// retained. `None` when `standing_retain_depth` is `Unbounded` — the
+    /// operator asked for the channel to be pinned in so many words.
     ///
-    /// Returns `None` if any depth value is `Unbounded` (channel is pinned —
-    /// must not be reaped: an Unbounded subscriber pins the whole channel).
-    /// Otherwise returns `Some(frontier)` =
-    /// `max(standing_retain_depth, all subscribers' push_depth and retain_depth)`.
+    /// `standing_retain_depth` is the ceiling on every depth stated about the
+    /// channel, so it is the frontier outright: no subscriber can be owed a row
+    /// the standing buffer does not already hold. That makes the operator's one
+    /// number the disk truth, readable off the `[[channel]]` block instead of
+    /// emergent from the union of every subscriber's config.
     ///
-    /// Both `push_depth` and `retain_depth` are included: `push_depth` bounds
-    /// undelivered push rows; `retain_depth` bounds pull reads. Omitting either
-    /// could GC bodies before their respective subscriber can consume them.
+    /// # Panics
+    ///
+    /// If any subscriber's `push_depth` or `retain_depth` exceeds standing.
+    /// Config-time validation and the dynamic-subscribe gate both refuse such a
+    /// subscriber, so reaching here means one of them was bypassed and the
+    /// frontier would be a lie — better dead than reaping live rows.
     pub fn reap_frontier(&self) -> Option<u64> {
         use config::Depth;
 
         let standing = self.resolved_channel.standing_retain_depth;
-        if standing == Depth::Unbounded {
-            return None; // standing buffer is unbounded — whole channel pinned
-        }
-
-        let mut frontier: u64 = match standing {
-            Depth::Bounded(n) => n,
-            Depth::Unbounded => unreachable!("checked above"),
-        };
-
         for sub in &self.subscribers {
-            // Both push_depth and retain_depth contribute to the frontier.
-            // An Unbounded in either pins the whole channel.
             for depth in [sub.push_depth, sub.retain_depth] {
-                match depth {
-                    Depth::Unbounded => {
-                        return None; // subscriber pins the whole channel
-                    }
-                    Depth::Bounded(n) => {
-                        frontier = frontier.max(n);
-                    }
-                }
+                assert!(
+                    depth <= standing,
+                    "channel {:?} subscriber {:?} holds depth {depth:?} above the channel's \
+                     standing_retain_depth {standing:?} — the depth ceiling was bypassed",
+                    self.address,
+                    sub.kind,
+                );
             }
         }
 
-        Some(frontier)
+        match standing {
+            Depth::Unbounded => None,
+            Depth::Bounded(n) => Some(n),
+        }
     }
 
     /// The `App`-kind subscriber for `app_slug`, if this app subscribes to the
@@ -896,9 +892,9 @@ impl MessagingDirectory {
 // that lightweight crate without pulling in all of brenn-lib's host dependencies.
 // Re-exporting at the same paths keeps every existing host caller unchanged.
 pub use brenn_envelope::{
-    BRENN_ADDRESS_PREFIX, ChannelScheme, DeliveryClass, EPHEMERAL_ADDRESS_PREFIX, Impetus,
-    LOCAL_ADDRESS_PREFIX, MQTT_ADDRESS_PREFIX, MessageEnvelope, MqttEnvelope, MqttPayloadBody,
-    PWA_PUSH_ADDRESS_PREFIX, Urgency, WEBHOOK_ADDRESS_PREFIX, WebhookEnvelope, utc_from_epoch_ms,
+    BRENN_ADDRESS_PREFIX, ChannelScheme, EPHEMERAL_ADDRESS_PREFIX, Impetus, LOCAL_ADDRESS_PREFIX,
+    MQTT_ADDRESS_PREFIX, MessageEnvelope, MqttEnvelope, MqttPayloadBody, PWA_PUSH_ADDRESS_PREFIX,
+    Urgency, WEBHOOK_ADDRESS_PREFIX, WebhookEnvelope, utc_from_epoch_ms,
 };
 
 /// Per-subscription wake policy set by the subscriber.
@@ -1084,6 +1080,11 @@ pub struct ChannelListing {
 /// `ChannelListing`; for `mqtt:` the runtime-health fields are left `None` by
 /// `Messenger` (filled by the `MessageSubscriptionList` intercept enrichment,
 /// exactly as for `MessageChannelList`).
+///
+/// The depths are optional because an egress target — a `pwa_push:`
+/// registration — is a subscription this app holds but not a queue: nothing
+/// retains for it and nothing pushes from it, so it reports no depths rather
+/// than numbers that describe nothing.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SubscriptionListing {
     /// Protocol family.
@@ -1094,10 +1095,14 @@ pub struct SubscriptionListing {
     /// `true` = runtime (dynamic) subscription, removable via `MessageUnsubscribe`;
     /// `false` = static (config-managed) subscription, not runtime-removable.
     pub dynamic: bool,
-    /// This app's resolved per-subscription push depth.
-    pub push_depth: config::Depth,
-    /// This app's resolved per-subscription retain depth.
-    pub retain_depth: config::Depth,
+    /// This app's resolved per-subscription push depth. `None` for an egress
+    /// target, which holds no queue for a depth to describe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub push_depth: Option<config::Depth>,
+    /// This app's resolved per-subscription retain depth. `None` for an egress
+    /// target, which holds no queue for a depth to describe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retain_depth: Option<config::Depth>,
     /// This app's resolved per-subscription noise level.
     pub noise: config::NoiseLevel,
     /// This app's resolved per-subscription wake-min policy.
@@ -1484,6 +1489,13 @@ pub struct Messenger {
     /// [`Messenger::with_llm_chat`]; a messenger built without it carries the
     /// defaults.
     llm_chat: crate::config::LlmChatConfig,
+    /// The operator's `[[channel]]` tuning blocks for system-minted channels.
+    ///
+    /// Held here because `subscribe_dynamic` mints `mqtt:` channels long after
+    /// boot and must resolve them exactly as boot would. Boot installs the
+    /// parsed table via [`Messenger::with_system_channel_tuning`]; a messenger
+    /// built without it resolves every system channel at its family default.
+    system_channel_tuning: config::SystemChannelTuning,
     /// Durable channels' retention stores, one per channel UUID, constructed on
     /// first request and reused for the process lifetime.
     ///
@@ -1752,6 +1764,7 @@ impl Messenger {
             pending_bus_pushes_scan_count: AtomicU64::new(0),
             ring_stores,
             llm_chat: crate::config::LlmChatConfig::default(),
+            system_channel_tuning: config::SystemChannelTuning::default(),
             db_stores: Mutex::new(HashMap::new()),
             nondurable_dynamic_subs: Mutex::new(HashSet::new()),
             stranded_warned: Mutex::new(HashSet::new()),
@@ -1961,6 +1974,20 @@ impl Messenger {
     /// The chat channel family's shape: prefix, retained window, wake threshold.
     pub fn llm_chat(&self) -> &crate::config::LlmChatConfig {
         &self.llm_chat
+    }
+
+    /// Install the parsed system-channel tuning table before the `Messenger` is
+    /// shared. Same once-at-boot contract as [`Messenger::with_ring_stores`].
+    pub fn with_system_channel_tuning(
+        mut self: Arc<Self>,
+        tuning: config::SystemChannelTuning,
+    ) -> Arc<Self> {
+        let inner = Arc::get_mut(&mut self).expect(
+            "with_system_channel_tuning must run before the Messenger Arc is shared \
+             (boot-ordering bug)",
+        );
+        inner.system_channel_tuning = tuning;
+        self
     }
 
     /// The retention store for a registered channel — where its messages live
@@ -2236,7 +2263,8 @@ impl Messenger {
     ///
     /// `push_depth` bounds how many owed messages one activation takes; the
     /// caller applies any per-participant clamp (e.g. `WASM_WINDOW_MAX_NEW`)
-    /// before calling. `priming` is honored only when the cursor is created.
+    /// before calling. A cursor coming into existence is primed behind the
+    /// retained tail, capped by `push_depth`.
     ///
     /// # Panics
     ///
@@ -2247,7 +2275,6 @@ impl Messenger {
         channel_uuid: &Uuid,
         subscriber: &ParticipantId,
         push_depth: u64,
-        priming: store::Priming,
     ) -> store::Attached {
         // The cursor caches the slug of the registration it is read back
         // through. A participant that names its own registration names that slug
@@ -2255,7 +2282,7 @@ impl Messenger {
         // [`Messenger::attach_conversation`], which resolves the app first.
         let app_slug = registration_key(subscriber, "").slug().to_string();
         self.ring_store(channel_uuid)
-            .attach(subscriber, &app_slug, push_depth, priming)
+            .attach(subscriber, &app_slug, push_depth)
     }
 
     /// Register `subscriber`'s delivery state on the channel at
@@ -2273,7 +2300,6 @@ impl Messenger {
         app_slug: &str,
         subscriber: &ParticipantId,
         push_depth: config::Depth,
-        priming: store::Priming,
     ) -> store::Attached {
         let entry = self.directory.resolve(channel_address).unwrap_or_else(|| {
             panic!(
@@ -2282,7 +2308,7 @@ impl Messenger {
             )
         });
         self.store_for(&entry)
-            .attach(subscriber, app_slug, push_depth, priming)
+            .attach(subscriber, app_slug, push_depth)
             .await
     }
 
@@ -3292,8 +3318,8 @@ impl Messenger {
                     address: entry.address.clone(),
                     description: entry.description.clone(),
                     dynamic,
-                    push_depth: sub.push_depth,
-                    retain_depth: sub.retain_depth,
+                    push_depth: Some(sub.push_depth),
+                    retain_depth: Some(sub.retain_depth),
                     noise: sub.noise,
                     // This row is the app's own `App` subscriber, which is
                     // `UrgencyGated` and so always carries a resolved wake_min.
@@ -4628,7 +4654,7 @@ mod tests {
                 body: body.to_string(),
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
-                reply_to_uuid: None,
+                reply_to: None,
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
@@ -4767,7 +4793,7 @@ mod tests {
                 body: body.to_string(),
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
-                reply_to_uuid: None,
+                reply_to: None,
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
@@ -4846,7 +4872,7 @@ mod tests {
                         body: body.to_string(),
                         urgency: Urgency::Normal,
                         envelope_type: ChannelScheme::Ephemeral,
-                        reply_to_uuid: None,
+                        reply_to: None,
                         delivery_deadline: None,
                         impetus: None,
                         publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
@@ -4906,7 +4932,7 @@ mod tests {
                 body: body.to_string(),
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
-                reply_to_uuid: None,
+                reply_to: None,
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
@@ -5599,7 +5625,7 @@ mod tests {
                     body: "parked".to_string(),
                     urgency: Urgency::Normal,
                     envelope_type: ChannelScheme::Brenn,
-                    reply_to_uuid: None,
+                    reply_to: None,
                     delivery_deadline: None,
                     impetus: None,
                     publish_ts_ns: park_ts,
@@ -5973,13 +5999,7 @@ mod tests {
         let wasm_sub = ParticipantId::for_wasm(slug);
 
         messenger
-            .attach_subscriber(
-                &attached.address,
-                slug,
-                &wasm_sub,
-                Depth::Bounded(4),
-                store::Priming::Head,
-            )
+            .attach_subscriber(&attached.address, slug, &wasm_sub, Depth::Bounded(4))
             .await;
         super::testutils::insert_bus_message(
             &messenger,
@@ -6155,7 +6175,7 @@ mod tests {
         channel.subscribers = vec![crate::messaging::testutils::wasm_subscriber_entry("waker")];
         let (messenger, router) = wake_walk_messenger(std::slice::from_ref(&channel)).await;
         let wasm_sub = ParticipantId::for_wasm("waker");
-        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4);
 
         // Nothing owed yet → no wake.
         messenger.wake_owed_subscribers(Utc::now()).await;
@@ -6195,14 +6215,13 @@ mod tests {
         let (messenger, router) = wake_walk_messenger(&[durable.clone(), ring.clone()]).await;
         let durable_sub = ParticipantId::for_wasm("durable-waker");
         let ring_sub = ParticipantId::for_wasm("ring-waker");
-        messenger.attach_ring_subscriber(&ring.uuid, &ring_sub, 4, store::Priming::Head);
+        messenger.attach_ring_subscriber(&ring.uuid, &ring_sub, 4);
         messenger
             .attach_subscriber(
                 &durable.address,
                 "durable-waker",
                 &durable_sub,
                 Depth::Bounded(4),
-                store::Priming::Head,
             )
             .await;
 
@@ -6313,13 +6332,7 @@ mod tests {
         let system_sub = ParticipantId::for_system("denied-system");
         for (slug, subscriber) in [("denied-waker", &wasm_sub), ("denied-system", &system_sub)] {
             messenger
-                .attach_subscriber(
-                    &channel.address,
-                    slug,
-                    subscriber,
-                    Depth::Bounded(4),
-                    store::Priming::Head,
-                )
+                .attach_subscriber(&channel.address, slug, subscriber, Depth::Bounded(4))
                 .await;
         }
         crate::messaging::testutils::insert_bus_message(
@@ -6445,13 +6458,7 @@ mod tests {
         // dropping a component's input binding leaves behind.
         let ghost = ParticipantId::for_wasm("ghost");
         messenger
-            .attach_subscriber(
-                &channel.address,
-                "ghost",
-                &ghost,
-                Depth::Bounded(4),
-                store::Priming::Head,
-            )
+            .attach_subscriber(&channel.address, "ghost", &ghost, Depth::Bounded(4))
             .await;
         crate::messaging::testutils::insert_bus_message(
             &messenger,
@@ -6487,13 +6494,7 @@ mod tests {
         let (messenger, _router) = wake_walk_messenger(std::slice::from_ref(&channel)).await;
         let conversation = ParticipantId::for_conversation(7);
         messenger
-            .attach_subscriber(
-                &channel.address,
-                "waker",
-                &conversation,
-                Depth::Bounded(4),
-                store::Priming::Head,
-            )
+            .attach_subscriber(&channel.address, "waker", &conversation, Depth::Bounded(4))
             .await;
         crate::messaging::testutils::insert_bus_message(
             &messenger,
@@ -6561,10 +6562,11 @@ mod tests {
 
     /// One app, wired far enough for an `App` subscriber to resolve: the entry
     /// must exist for wake economics, and its policy must cover the channel for
-    /// the walk's delivery gate.
+    /// the walk's delivery gate — on every bus scheme, so a case may point the
+    /// same app at either class of channel.
     fn wake_apps(slug: &str) -> indexmap::IndexMap<String, crate::config::AppConfig> {
         let mut app = test_support::test_app_config(slug, None, vec![]);
-        app.policy = test_support::brenn_delivery_policy(
+        app.policy = crate::messaging::testutils::bus_delivery_policy(
             crate::access::acl::ChannelMatcher::Prefix(String::new()),
         );
         let mut apps = indexmap::IndexMap::new();
@@ -6582,7 +6584,7 @@ mod tests {
                 body: body.to_string(),
                 urgency,
                 envelope_type: ChannelScheme::Brenn,
-                reply_to_uuid: None,
+                reply_to: None,
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: crate::messaging::db::utc_to_ns(Utc::now()),
@@ -6592,6 +6594,9 @@ mod tests {
 
     /// Commit one `Normal` message onto `entry`'s store that must be in front of
     /// its subscriber by `deadline`.
+    ///
+    /// Stamped with the channel's own scheme, so a case may point this at either
+    /// class — a deadline is carried on both.
     async fn publish_by(
         messenger: &Messenger,
         entry: &ChannelEntry,
@@ -6605,8 +6610,8 @@ mod tests {
                 sender: "alice".to_string(),
                 body: body.to_string(),
                 urgency: Urgency::Normal,
-                envelope_type: ChannelScheme::Brenn,
-                reply_to_uuid: None,
+                envelope_type: entry.transport_type,
+                reply_to: None,
                 delivery_deadline: Some(deadline),
                 impetus: None,
                 publish_ts_ns: crate::messaging::db::utc_to_ns(Utc::now()),
@@ -6631,7 +6636,6 @@ mod tests {
                 "assistant",
                 &conversation,
                 Depth::Bounded(8),
-                store::Priming::Head,
             )
             .await;
 
@@ -6671,7 +6675,6 @@ mod tests {
                 "assistant",
                 &conversation,
                 Depth::Bounded(8),
-                store::Priming::Head,
             )
             .await;
 
@@ -6731,7 +6734,6 @@ mod tests {
                 "assistant",
                 &conversation,
                 Depth::Bounded(8),
-                store::Priming::Head,
             )
             .await;
 
@@ -6753,6 +6755,63 @@ mod tests {
         assert!(!sweep.fired_deadline_wake);
     }
 
+    /// The whole deadline mechanism runs on a ring channel too: the wake pass
+    /// reads one owed walk, the ring answers the deadline question from its own
+    /// unseen suffix, and "get this in front of someone by T" costs a signal
+    /// channel nothing a disk would have given it.
+    #[tokio::test]
+    async fn a_due_deadline_on_a_ring_channel_wakes_below_the_threshold() {
+        let mut channel = crate::messaging::testutils::ephemeral_channel_entry("deadline-ring", 8);
+        channel.subscribers = vec![SubscriberEntry {
+            kind: SubscriberEntryKind::App("assistant".to_string()),
+            push_depth: Depth::Bounded(8),
+            retain_depth: Depth::Bounded(8),
+            noise: config::NoiseLevel::Silent,
+            wake_min: Some(WakeMin::High),
+        }];
+        let (messenger, router) =
+            wake_walk_messenger_with_apps(std::slice::from_ref(&channel), wake_apps("assistant"))
+                .await;
+        let conversation = ParticipantId::for_conversation(35);
+        messenger
+            .attach_subscriber(
+                &channel.address,
+                "assistant",
+                &conversation,
+                Depth::Bounded(8),
+            )
+            .await;
+
+        // Ahead of the pass first: below wake_min, so only the deadline can move
+        // it, and it is not due yet.
+        let ahead =
+            DateTime::from_timestamp((Utc::now() + chrono::Duration::minutes(5)).timestamp(), 0)
+                .expect("representable");
+        publish_by(&messenger, &channel, "quiet, due later", ahead).await;
+        let sweep = messenger.wake_owed_subscribers(Utc::now()).await;
+        assert!(
+            router.wakes.lock().unwrap().is_empty(),
+            "a ring message below wake_min with a deadline still ahead wakes nobody"
+        );
+        assert_eq!(
+            sweep.next_deadline,
+            Some(ahead),
+            "the ring's deadline is the dispatcher's sleep target like any other"
+        );
+        assert!(!sweep.fired_deadline_wake);
+
+        // The same pass run after the deadline has come due forces the wake.
+        let sweep = messenger
+            .wake_owed_subscribers(ahead + chrono::Duration::seconds(1))
+            .await;
+        assert_eq!(
+            *router.wakes.lock().unwrap(),
+            vec![SubscriberEntryKind::App("assistant".to_string())],
+            "a due deadline overrides the urgency verdict on a ring channel too"
+        );
+        assert!(sweep.fired_deadline_wake);
+    }
+
     /// A deadline the position has passed leaves the pass's view entirely: no
     /// wake, and no sleep target. Nothing stores "this one was handled" — the
     /// position moving past the message is the whole record.
@@ -6769,7 +6828,6 @@ mod tests {
                 "assistant",
                 &conversation,
                 Depth::Bounded(8),
-                store::Priming::Head,
             )
             .await;
 
@@ -6808,7 +6866,6 @@ mod tests {
                 "assistant",
                 &conversation,
                 Depth::Bounded(8),
-                store::Priming::Head,
             )
             .await;
 
@@ -6823,7 +6880,7 @@ mod tests {
                     body: "quiet, and late".to_string(),
                     urgency: Urgency::Normal,
                     envelope_type: ChannelScheme::Brenn,
-                    reply_to_uuid: None,
+                    reply_to: None,
                     delivery_deadline: Some(deadline),
                     impetus: None,
                     publish_ts_ns: crate::messaging::db::utc_to_ns(now),
@@ -6875,7 +6932,6 @@ mod tests {
                 "assistant",
                 &conversation,
                 Depth::Bounded(8),
-                store::Priming::Head,
             )
             .await;
         publish_by(&messenger, &channel, "quiet but scheduled", deadline).await;
@@ -7007,7 +7063,6 @@ mod tests {
                         "assistant",
                         &conversation,
                         Depth::Bounded(8),
-                        store::Priming::Head,
                     )
                     .await;
 
@@ -7042,7 +7097,6 @@ mod tests {
                 "assistant",
                 &conversation,
                 Depth::Bounded(8),
-                store::Priming::Head,
             )
             .await;
 
@@ -7082,7 +7136,6 @@ mod tests {
                 "assistant",
                 &conversation,
                 Depth::Bounded(8),
-                store::Priming::Head,
             )
             .await;
 
@@ -7139,7 +7192,6 @@ mod tests {
                 "assistant",
                 &conversation,
                 Depth::Bounded(8),
-                store::Priming::Head,
             )
             .await;
 
@@ -7178,7 +7230,6 @@ mod tests {
                 "assistant",
                 &conversation,
                 Depth::Bounded(8),
-                store::Priming::Head,
             )
             .await;
 
@@ -7209,13 +7260,7 @@ mod tests {
         let (messenger, _router) = wake_walk_messenger(std::slice::from_ref(&channel)).await;
         let conversation = ParticipantId::for_conversation(13);
         messenger
-            .attach_subscriber(
-                &channel.address,
-                "ghost",
-                &conversation,
-                Depth::Bounded(8),
-                store::Priming::Head,
-            )
+            .attach_subscriber(&channel.address, "ghost", &conversation, Depth::Bounded(8))
             .await;
 
         publish_at(&messenger, &channel, "unwakeable", Urgency::Normal).await;
@@ -7234,7 +7279,7 @@ mod tests {
         }];
         let (messenger, router) = wake_walk_messenger(std::slice::from_ref(&channel)).await;
         let wasm_sub = ParticipantId::for_wasm("waker");
-        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4);
 
         messenger.ring_store_for(&channel).append(ring_envelope(
             &channel.address,
@@ -7254,7 +7299,7 @@ mod tests {
             "dropme",
             crate::messaging::testutils::ephemeral_channel_entry("detach-ch", 8),
         );
-        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4);
         messenger.ring_store_for(&channel).append(ring_envelope(
             &channel.address,
             ChannelScheme::Ephemeral,
@@ -7293,7 +7338,7 @@ mod tests {
         .with_ring_stores(Arc::new(store::RingStores::build(&entries)));
         let sub = ParticipantId::for_wasm("two-ports");
         for channel in [&noisy, &quiet] {
-            messenger.attach_ring_subscriber(&channel.uuid, &sub, 4, store::Priming::Head);
+            messenger.attach_ring_subscriber(&channel.uuid, &sub, 4);
         }
 
         messenger.enact_overflow_noise(&noisy.address, &sub, config::NoiseLevel::Metered, 2);
@@ -7318,7 +7363,7 @@ mod tests {
     async fn the_fatal_rung_panics_rather_than_metering_a_surface_only_level() {
         let channel = crate::messaging::testutils::ephemeral_channel_entry("fatal-ch", 8);
         let (messenger, channel, wasm_sub) = build_ring_wasm_messenger("burner", channel);
-        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4);
 
         messenger.enact_overflow_noise(&channel.address, &wasm_sub, config::NoiseLevel::Fatal, 1);
     }
@@ -7367,7 +7412,7 @@ mod tests {
         );
         // Attach at head: only messages published after attach are owed.
         assert_eq!(
-            messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 2, store::Priming::Head),
+            messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 2),
             store::Attached::Created
         );
 
@@ -7427,7 +7472,7 @@ mod tests {
             "ring-empty",
             crate::messaging::testutils::local_channel_entry("ring-empty-ch", 8),
         );
-        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4);
 
         let inputs = vec![ring_input(&channel, Depth::Bounded(4), Depth::Bounded(8))];
         assert!(
@@ -7465,7 +7510,7 @@ mod tests {
             "ring-drop",
             crate::messaging::testutils::ephemeral_channel_entry("ring-drop-ch", 2),
         );
-        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 8, store::Priming::Head);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 8);
 
         // Four publishes into a depth-2 ring: the oldest two are evicted before
         // the cursor takes them → two accountable drops.
@@ -7598,7 +7643,7 @@ mod tests {
             "ring-noise",
             crate::messaging::testutils::ephemeral_channel_entry("ring-noise-ch", 8),
         );
-        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 1, store::Priming::Head);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 1);
         let store = messenger.ring_store_for(&channel);
         for i in 0..3 {
             store.append(ring_envelope(
@@ -7811,7 +7856,7 @@ mod tests {
             body: body.to_string(),
             urgency: Urgency::Normal,
             envelope_type: channel.transport_type,
-            reply_to_uuid: None,
+            reply_to: None,
             delivery_deadline: None,
             impetus: None,
             publish_ts_ns: db::utc_to_ns(Utc::now()),
@@ -7855,7 +7900,7 @@ mod tests {
         ));
         let (messenger, channel, wasm_sub, router) =
             build_ring_wasm_messenger_with_alarm("absent", channel);
-        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4);
 
         // Two fit the depth-2 ring; the third and fourth evict the first two out
         // from under a subscriber that has never run.
@@ -7901,13 +7946,7 @@ mod tests {
             config::MessagingGlobalConfig::default(),
         );
         messenger
-            .attach_subscriber(
-                &channel.address,
-                app_slug,
-                participant,
-                Depth::Bounded(4),
-                store::Priming::Head,
-            )
+            .attach_subscriber(&channel.address, app_slug, participant, Depth::Bounded(4))
             .await;
         (messenger, channel)
     }
@@ -8011,7 +8050,7 @@ mod tests {
         ));
         let (messenger, channel, wasm_sub, router) =
             build_ring_wasm_messenger_with_alarm("quiet", channel);
-        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4);
 
         let reported = commit_ring_publishes(&messenger, &channel, 4, &wasm_sub).await;
 
@@ -8038,7 +8077,7 @@ mod tests {
         let (messenger, channel, _unused, router) =
             build_ring_wasm_messenger_with_alarm("dash", channel);
         let surface_sub = ParticipantId::for_surface_component("dash", "main");
-        messenger.attach_ring_subscriber(&channel.uuid, &surface_sub, 4, store::Priming::Head);
+        messenger.attach_ring_subscriber(&channel.uuid, &surface_sub, 4);
 
         let reported = commit_ring_publishes(&messenger, &channel, 4, &surface_sub).await;
 
@@ -8130,7 +8169,7 @@ mod tests {
     async fn ring_release_overflow_enactment(channel: ChannelEntry) -> (u64, u64) {
         let (messenger, channel, wasm_sub, router) =
             build_ring_wasm_messenger_with_alarm("absent", channel);
-        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4, store::Priming::Head);
+        messenger.attach_ring_subscriber(&channel.uuid, &wasm_sub, 4);
 
         commit_ring_publishes(&messenger, &channel, 2, &wasm_sub).await;
         let release_at = Utc::now() + chrono::Duration::seconds(1);
@@ -8219,7 +8258,7 @@ mod tests {
         let wasm_sub = ParticipantId::for_wasm("mixed");
 
         // Ring port: attach + one retained message that is not owed (context only).
-        messenger.attach_ring_subscriber(&ring.uuid, &wasm_sub, 4, store::Priming::Head);
+        messenger.attach_ring_subscriber(&ring.uuid, &wasm_sub, 4);
         let ctx_env = ring_envelope(&ring.address, ChannelScheme::Ephemeral, "ring-ctx");
         let ctx_mid = ctx_env.message_id;
         messenger.ring_store_for(&ring).append(ctx_env);
@@ -8243,13 +8282,7 @@ mod tests {
         // Durable port: attached at head, then one publish → the activation
         // trigger.
         messenger
-            .attach_subscriber(
-                &durable.address,
-                "mixed",
-                &wasm_sub,
-                Depth::Bounded(4),
-                store::Priming::Head,
-            )
+            .attach_subscriber(&durable.address, "mixed", &wasm_sub, Depth::Bounded(4))
             .await;
         let dmid = super::testutils::insert_bus_message(
             &messenger,
@@ -8519,7 +8552,8 @@ mod tests {
         e
     }
 
-    /// All-Unbounded (standing + 0 subscribers): standing is Unbounded → None.
+    /// Unbounded standing: the operator asked for the channel to be pinned, in
+    /// so many words → None.
     #[test]
     fn reap_frontier_unbounded_standing_returns_none() {
         let entry = frontier_entry(config::Depth::Unbounded, vec![]);
@@ -8533,108 +8567,52 @@ mod tests {
         assert_eq!(entry.reap_frontier(), Some(5));
     }
 
-    /// Bounded standing, all bounded subscribers → frontier = max(push_depth, retain_depth, standing).
-    /// Both legs (push_depth-dominates and retain_depth-dominates) are exercised:
-    /// sub0 has push=10, retain=1 (push_depth is the max contribution);
-    /// sub1 has push=3, retain=8 (retain_depth is the max contribution from sub1).
-    /// Overall max = 10 from sub0's push_depth.
+    /// The frontier is the operator's standing number outright: subscribers
+    /// within the ceiling — at it, below it, on either depth — never move it.
     #[test]
-    fn reap_frontier_all_bounded_returns_max() {
+    fn reap_frontier_is_standing_whatever_the_subscribers_ask_for() {
         let entry = frontier_entry(
-            config::Depth::Bounded(2),
+            config::Depth::Bounded(10),
             vec![
-                (config::Depth::Bounded(10), config::Depth::Bounded(1)),
-                (config::Depth::Bounded(3), config::Depth::Bounded(8)),
+                (config::Depth::Bounded(10), config::Depth::Bounded(10)),
+                (config::Depth::Bounded(1), config::Depth::Bounded(0)),
+                (config::Depth::Bounded(0), config::Depth::Bounded(7)),
             ],
         );
         assert_eq!(entry.reap_frontier(), Some(10));
     }
 
-    /// Multi-subscriber where retain_depth is the controlling dimension overall.
-    /// sub0: push=3, retain=10; sub1: push=2, retain=5 → max = 10 (sub0's retain_depth).
+    /// An Unbounded standing admits Unbounded subscribers: the ceiling holds and
+    /// the channel stays pinned.
     #[test]
-    fn reap_frontier_retain_dominates_multi_subscriber() {
+    fn reap_frontier_unbounded_standing_admits_unbounded_subscribers() {
         let entry = frontier_entry(
-            config::Depth::Bounded(2),
-            vec![
-                (config::Depth::Bounded(3), config::Depth::Bounded(10)),
-                (config::Depth::Bounded(2), config::Depth::Bounded(5)),
-            ],
-        );
-        assert_eq!(entry.reap_frontier(), Some(10));
-    }
-
-    /// Any Unbounded push_depth subscriber pins the channel → None.
-    #[test]
-    fn reap_frontier_unbounded_subscriber_returns_none() {
-        let entry = frontier_entry(
-            config::Depth::Bounded(5),
-            vec![
-                (config::Depth::Bounded(3), config::Depth::Bounded(1)),
-                (config::Depth::Unbounded, config::Depth::Bounded(1)),
-            ],
+            config::Depth::Unbounded,
+            vec![(config::Depth::Unbounded, config::Depth::Unbounded)],
         );
         assert_eq!(entry.reap_frontier(), None);
     }
 
-    /// Bounded standing only (no push subscribers) → frontier = standing.
+    /// A subscriber whose push_depth is over the ceiling means the config gate
+    /// or the dynamic-subscribe gate was bypassed; the frontier would be a lie.
     #[test]
-    fn reap_frontier_bounded_standing_only() {
-        let entry = frontier_entry(config::Depth::Bounded(7), vec![]);
-        assert_eq!(entry.reap_frontier(), Some(7));
-    }
-
-    /// Subscriber push_depth smaller than standing → frontier still = standing.
-    #[test]
-    fn reap_frontier_standing_dominates_small_subscribers() {
+    #[should_panic(expected = "above the channel's standing_retain_depth")]
+    fn reap_frontier_panics_on_an_over_ceiling_push_depth() {
         let entry = frontier_entry(
-            config::Depth::Bounded(10),
-            vec![
-                (config::Depth::Bounded(1), config::Depth::Bounded(0)),
-                (config::Depth::Bounded(2), config::Depth::Bounded(0)),
-            ],
+            config::Depth::Bounded(5),
+            vec![(config::Depth::Bounded(6), config::Depth::Bounded(1))],
         );
-        assert_eq!(entry.reap_frontier(), Some(10));
+        let _ = entry.reap_frontier();
     }
 
-    /// retain_depth > push_depth and > standing → frontier rises to retain_depth.
-    /// This is the exact data-loss bug case: pull-only subscriber with a large retain window.
+    /// Same for retain_depth, including the Unbounded-over-bounded case.
     #[test]
-    fn reap_frontier_retain_depth_raises_frontier() {
-        let entry = frontier_entry(
-            config::Depth::Bounded(2),
-            vec![(config::Depth::Bounded(1), config::Depth::Bounded(50))],
-        );
-        assert_eq!(entry.reap_frontier(), Some(50));
-    }
-
-    /// Unbounded retain_depth pins the channel → None.
-    #[test]
-    fn reap_frontier_unbounded_retain_depth_pins_channel() {
+    #[should_panic(expected = "above the channel's standing_retain_depth")]
+    fn reap_frontier_panics_on_an_over_ceiling_retain_depth() {
         let entry = frontier_entry(
             config::Depth::Bounded(5),
             vec![(config::Depth::Bounded(3), config::Depth::Unbounded)],
         );
-        assert_eq!(entry.reap_frontier(), None);
-    }
-
-    /// retain_depth < push_depth → frontier unchanged (= max push/standing).
-    #[test]
-    fn reap_frontier_retain_depth_below_push_no_effect() {
-        let entry = frontier_entry(
-            config::Depth::Bounded(5),
-            vec![(config::Depth::Bounded(20), config::Depth::Bounded(10))],
-        );
-        assert_eq!(entry.reap_frontier(), Some(20));
-    }
-
-    /// Bounded(0) retain_depth → no effect on frontier.
-    #[test]
-    fn reap_frontier_zero_retain_depth_no_effect() {
-        let entry = frontier_entry(
-            config::Depth::Bounded(5),
-            vec![(config::Depth::Bounded(3), config::Depth::Bounded(0))],
-        );
-        assert_eq!(entry.reap_frontier(), Some(5));
+        let _ = entry.reap_frontier();
     }
 }

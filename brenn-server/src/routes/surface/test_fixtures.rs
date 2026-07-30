@@ -151,11 +151,15 @@ fn channel_entry_at(
     let raw = ChannelConfigRaw {
         send_rate: None,
         uuid: Some(uuid.to_string()),
-        address: bare_address.to_string(),
+        address: Some(bare_address.to_string()),
+        address_prefix: None,
         description: None,
-        push_depth: None,
-        retain_depth: None,
-        standing_retain_depth,
+        // The channel's own rungs sit at its standing depth so a fixture channel
+        // never becomes the thing under test: a surface test measures the
+        // binding's window, not the channel's.
+        push_depth: Some(standing_retain_depth.unwrap_or(Depth::Unbounded)),
+        retain_depth: Some(standing_retain_depth.unwrap_or(Depth::Unbounded)),
+        standing_retain_depth: standing_retain_depth.or(Some(Depth::Unbounded)),
         noise: None,
         sink: None,
         wake_min: None,

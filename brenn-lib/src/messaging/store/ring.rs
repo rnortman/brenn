@@ -41,8 +41,8 @@ use crate::messaging::config::Depth;
 use crate::messaging::db::ns_to_utc;
 use crate::messaging::store::{
     AdvanceOutcome, AppendOutcome, Attached, Committed, DeferralOutcome, DeferredMessage,
-    DeliverableSubscriber, MessageSeq, NewMessage, OverflowEvent, Parked, Priming, ReleaseOutcome,
-    Released, ResumeCursor, RetentionStore, StoreReplay, SubscriberWindow, depth_bound, instant_of,
+    DeliverableSubscriber, MessageSeq, NewMessage, OverflowEvent, Parked, ReleaseOutcome, Released,
+    ResumeCursor, RetentionStore, StoreReplay, SubscriberWindow, depth_bound, instant_of,
     release_time_of,
 };
 
@@ -310,24 +310,18 @@ impl RingStore {
     /// Register `subscriber`'s position on this channel, or retune an existing
     /// one's push depth.
     ///
-    /// `priming` applies only when the queue comes into existence; a subscriber
-    /// that is already attached keeps its position, because re-registering the
-    /// same queue is not a new attach. `app_slug` is refreshed either way — the
-    /// registration is its authority, and a re-attach is where a changed one
-    /// arrives.
+    /// A queue coming into existence is primed behind the retained tail, capped
+    /// by `push_depth`; a subscriber that is already attached keeps its
+    /// position, because re-registering the same queue is not a new attach.
+    /// `app_slug` is refreshed either way — the registration is its authority,
+    /// and a re-attach is where a changed one arrives.
     ///
     /// A sampled (`push_depth = 0`) attach holds no position, so it records no
     /// application either: the slug exists to name a charged position, and a
     /// sampled subscriber has none to charge.
-    pub fn attach(
-        &self,
-        subscriber: &ParticipantId,
-        app_slug: &str,
-        push_depth: u64,
-        priming: Priming,
-    ) -> Attached {
+    pub fn attach(&self, subscriber: &ParticipantId, app_slug: &str, push_depth: u64) -> Attached {
         let mut state = self.state();
-        let attached = state.core.attach(subscriber.clone(), push_depth, priming);
+        let attached = state.core.attach(subscriber.clone(), push_depth);
         if state.core.is_attached(subscriber) {
             state
                 .app_slugs
@@ -359,47 +353,60 @@ impl RingStore {
     /// resolved under a single lock hold — the dispatcher's ring-wake source.
     /// Empty when the channel has no attached subscribers or none are owed work.
     ///
-    /// The unseen suffix is scanned for its loudest urgency under that same
-    /// hold, so the wake decision reads a suffix no append can have changed
-    /// between the two questions.
+    /// The unseen suffix is scanned for its loudest urgency and its earliest
+    /// delivery deadline under that same hold, so the wake decision reads a
+    /// suffix no append can have changed between the questions.
     ///
-    /// "Loudest thing I have not seen" is a suffix question, so the whole
-    /// window's suffix maxima are computed once and every cursor indexes into
-    /// them — asking it per cursor would re-walk the retained window per
-    /// subscriber, lock held, on every dispatcher pass.
+    /// "Loudest thing I have not seen" and "soonest deadline I have not passed"
+    /// are both suffix questions, so the whole window's suffix folds are
+    /// computed once and every cursor indexes into them — asking per cursor
+    /// would re-walk the retained window per subscriber, lock held, on every
+    /// dispatcher pass.
     pub fn deliverable_subscribers(&self) -> Vec<DeliverableSubscriber> {
         let state = self.state();
         let ring = state.core.ring();
-        let retained: Vec<(u64, Urgency)> = ring
+        let retained: Vec<(u64, Urgency, Option<DateTime<Utc>>)> = ring
             .tail(u64::MAX)
-            .map(|entry| (entry.seq, entry.message.urgency))
+            .map(|entry| {
+                (
+                    entry.seq,
+                    entry.message.urgency,
+                    entry.message.delivery_deadline,
+                )
+            })
             .collect();
-        // `loudest_from[i]` is the loudest urgency among `retained[i..]`.
+        // `loudest_from[i]` is the loudest urgency among `retained[i..]`;
+        // `earliest_from[i]` the earliest deadline any of them names.
         let mut loudest_from: Vec<Urgency> = Vec::with_capacity(retained.len());
-        for (_, urgency) in retained.iter().rev() {
+        let mut earliest_from: Vec<Option<DateTime<Utc>>> = Vec::with_capacity(retained.len());
+        for (_, urgency, deadline) in retained.iter().rev() {
             let running = loudest_from
                 .last()
                 .map_or(*urgency, |max| (*max).max(*urgency));
             loudest_from.push(running);
+            let soonest = match (earliest_from.last().copied().flatten(), *deadline) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            earliest_from.push(soonest);
         }
         loudest_from.reverse();
+        earliest_from.reverse();
         state
             .core
             .cursors()
             .iter()
             .filter(|(_, cursor)| cursor.has_deliverable(ring))
             .map(|(subscriber, cursor)| {
-                let first_unseen = retained.partition_point(|(seq, _)| *seq < cursor.next_owed());
+                let first_unseen =
+                    retained.partition_point(|(seq, _, _)| *seq < cursor.next_owed());
                 DeliverableSubscriber {
                     subscriber: subscriber.clone(),
                     app_slug: Some(Self::app_slug(&state, subscriber)),
                     max_unseen_urgency: *loudest_from
                         .get(first_unseen)
                         .expect("ring: a deliverable cursor trails a retained message"),
-                    // A non-durable channel refuses a message carrying a
-                    // delivery deadline at commit, so no unseen suffix here can
-                    // hold one.
-                    earliest_unseen_deadline: None,
+                    earliest_unseen_deadline: earliest_from.get(first_unseen).copied().flatten(),
                 }
             })
             .collect()
@@ -662,19 +669,9 @@ impl RingStore {
 
     /// Turn a publish-time record into the envelope the ring retains.
     ///
-    /// The durable-only options are rejected for non-durable channels by the
-    /// publish ladder, so seeing one here means the gate was bypassed.
+    /// The reply address is retained verbatim: there is no join to resolve it
+    /// through, so the consumer reads the address directly.
     fn envelope_of(&self, msg: NewMessage) -> MessageEnvelope {
-        assert!(
-            msg.reply_to_uuid.is_none(),
-            "messaging store: {} is non-durable and cannot carry reply_to",
-            self.address
-        );
-        assert!(
-            msg.delivery_deadline.is_none(),
-            "messaging store: {} is non-durable and cannot carry delivery_deadline",
-            self.address
-        );
         MessageEnvelope {
             message_id: Uuid::new_v4(),
             source: msg.source,
@@ -682,8 +679,8 @@ impl RingStore {
             sender: msg.sender,
             publish_ts: ns_to_utc(msg.publish_ts_ns),
             body: msg.body,
-            reply_to: None,
-            delivery_deadline: None,
+            reply_to: msg.reply_to.map(|target| target.address),
+            delivery_deadline: msg.delivery_deadline,
             deliver_after: None,
             impetus: msg.impetus,
             urgency: msg.urgency,
@@ -777,9 +774,8 @@ impl RetentionStore for RingStore {
         subscriber: &ParticipantId,
         app_slug: &str,
         push_depth: Depth,
-        priming: Priming,
     ) -> Attached {
-        RingStore::attach(self, subscriber, app_slug, depth_bound(push_depth), priming)
+        RingStore::attach(self, subscriber, app_slug, depth_bound(push_depth))
     }
 
     async fn detach(&self, subscriber: &ParticipantId) {
@@ -1197,7 +1193,7 @@ mod tests {
     #[test]
     fn eviction_of_unseen_messages_is_reported_at_the_append() {
         let s = store(2);
-        s.attach(&sub("proc"), "proc", 8, Priming::Head);
+        s.attach(&sub("proc"), "proc", 8);
         for body in ["a", "b"] {
             assert!(
                 s.append(envelope("alice", body)).overflow.is_empty(),
@@ -1235,8 +1231,8 @@ mod tests {
     #[test]
     fn eviction_overflow_names_only_the_subscribers_that_lost_messages() {
         let s = store(2);
-        s.attach(&sub("caught-up"), "caught-up", 8, Priming::Head);
-        s.attach(&sub("absent"), "absent", 8, Priming::Head);
+        s.attach(&sub("caught-up"), "caught-up", 8);
+        s.attach(&sub("absent"), "absent", 8);
         publish(&s, "alice", &["a", "b"]);
         serve(&s, &sub("caught-up"), 8);
 
@@ -1257,8 +1253,8 @@ mod tests {
     #[test]
     fn a_release_batch_reports_its_evictions_merged_per_subscriber() {
         let s = store(2);
-        s.attach(&sub("absent"), "absent", 8, Priming::Head);
-        s.attach(&sub("partial"), "partial", 8, Priming::Head);
+        s.attach(&sub("absent"), "absent", 8);
+        s.attach(&sub("partial"), "partial", 8);
         publish(&s, "alice", &["a", "b"]);
         // `partial` drains, then falls one message behind; `absent` never reads.
         // The two now lag by different amounts, so the batch must name each with
@@ -1293,7 +1289,7 @@ mod tests {
     #[test]
     fn has_deliverable_tracks_owed_work() {
         let s = store(4);
-        s.attach(&sub("proc"), "proc", 4, Priming::Head);
+        s.attach(&sub("proc"), "proc", 4);
         assert!(!s.has_deliverable(&sub("proc")));
         publish(&s, "alice", &["a"]);
         assert!(s.has_deliverable(&sub("proc")));
@@ -1304,8 +1300,8 @@ mod tests {
     #[test]
     fn deliverable_subscribers_lists_only_the_owed() {
         let s = store(4);
-        s.attach(&sub("owed"), "owed", 4, Priming::Head);
-        s.attach(&sub("caught-up"), "caught-up", 4, Priming::Head);
+        s.attach(&sub("owed"), "owed", 4);
+        s.attach(&sub("caught-up"), "caught-up", 4);
         // Nothing published yet: neither is owed.
         assert!(s.deliverable_subscribers().is_empty());
         publish(&s, "alice", &["a"]);
@@ -1321,7 +1317,7 @@ mod tests {
     #[test]
     fn detach_drops_the_queue_but_not_the_messages() {
         let s = store(4);
-        s.attach(&sub("proc"), "proc", 4, Priming::Head);
+        s.attach(&sub("proc"), "proc", 4);
         publish(&s, "alice", &["a"]);
         s.detach(&sub("proc"));
         assert!(!s.is_attached(&sub("proc")));
@@ -1348,7 +1344,7 @@ mod tests {
     #[test]
     fn an_advance_for_an_unattached_subscriber_reports_no_position() {
         let s = store(4);
-        s.attach(&sub("proc"), "proc", 4, Priming::Head);
+        s.attach(&sub("proc"), "proc", 4);
         publish(&s, "alice", &["a"]);
         let window = s
             .window(&sub("proc"), 4, 0)
@@ -1364,7 +1360,7 @@ mod tests {
     #[test]
     fn parked_messages_are_not_observable_before_release() {
         let s = store(4);
-        s.attach(&sub("proc"), "proc", 4, Priming::Head);
+        s.attach(&sub("proc"), "proc", 4);
         s.park(envelope("alice", "later"), at(2_000)).unwrap();
 
         assert_eq!(s.retained_len(), 0);

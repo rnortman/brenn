@@ -242,6 +242,15 @@ TTL) is not built this cycle. The convention (field name, key shape, TTL) is
 fixed so cycle-2+ tools and guests are written against it; only the table is
 deferred. Registering a `RequiresKey` tool panics until it exists.
 
+The table must also cover **cursor-incarnation replay**, not just a caller
+retrying: a request is retained for its channel's window, and an executor
+position that is created fresh — first boot, or a config remove-then-re-add
+cycle that deletes and re-mints the row — re-executes whatever the window still
+holds. Every async tool registrable today declares `Idempotency::Natural`, so
+the replay is harmless now; a `RequiresKey` tool is only safe once dedupe keys
+survive across executor incarnations. `call_id` already rides every request and
+is the correlation a duplicate result carries.
+
 Code site: `brenn-server/src/tool_registry/registry.rs` (`ToolRegistry::new`
 registration panic), `TODO(tool-registry-idempotency-dedupe)`.
 
@@ -749,77 +758,44 @@ change (a per-port error report, or making the deferred publish a call whose
 refusal the guest can observe), not a patch at the drop site. Done when an
 over-cap deferred publish reaches the component that issued it.
 
+Both park arms of the flush refuse this way — the durable one against the row
+count, the non-durable one at the ring's cap — so the fix is one report path, not
+two.
+
 Code site (`TODO(deferred-flush-drop-signal)`):
-`brenn-lib/src/messaging/publish/mod.rs` (the non-durable park arm of the
-`publish_from_wasm` flush).
+`brenn-lib/src/messaging/publish/mod.rs` (the refusal-reporting loop at the end of
+`publish_from_wasm`, which both park arms feed).
 
 ---
 
-## `messaging-depth-defaults`
+## `ring-deferred-recall`
 
-`[messaging].default_push_depth`, `default_retain_depth`, and
-`default_standing_retain_depth` all ship as `Depth::Unbounded`, preserved from
-before depths existed as a knob. Unbounded is the wrong default for a rolling
-window: it silently turns "I didn't think about depth" into "retain everything",
-which is the opposite of the sizing decision the channel model asks an operator
-to make. The expected resolution is no depth defaults at all — every channel and
-every subscribing port states its depth explicitly — rather than a different
-default number.
+The LLM recall tools — `BrennMessageCancel`, `BrennMessageEdit`,
+`BrennPendingList` — reach durable parked messages only. They name a message by
+bare uuid, and `Messenger::cancel` / `edit` / `list_pending` look that uuid up in
+`messaging_messages`, so a deferred publish to a non-durable channel (accepted on
+every scheme, and it returns a message id to its publisher) answers
+`UnknownMessage` and is absent from the pending list. That is a
+publisher-visible difference by channel class, not a consequence of where the
+bytes live: the class-uniform substrate already exists —
+`RetentionStore::cancel_deferred` / `edit_deferred` / `deferred_for_sender` serve
+the WASM ports' `defer-cancel` / `defer-edit` on *both* stores, and the ring's
+parked set is uuid-addressable with sender-scoped cancel and replace.
 
-The bare-`[[wasm_consumer.io_port]]` boot panic is a symptom, not the disease: an
-auto channel folds its ring depth from its subscribing ports, and an unbounded
-fold on a non-durable channel is refused, so the zero-depth spelling of the
-io_port block cannot boot under the stock defaults. When this lands, revisit that
-panic's message — it currently offers "bound `[messaging].default_retain_depth`"
-as one of three outs, which stops being an out if the defaults go away. Done when
-the unbounded stock values are gone and the depth contract is explicit.
+It needs its own small API design, which is why it is not just a patch: the tools
+carry no channel argument, and the only global uuid index is the durable table, so
+unification means either a channel parameter on the tools or messenger-side
+resolution across every ring's deferred set, plus outcome mapping (`NotDeferred`
+vs `UnknownMessage` vs `AlreadyDelivered`) and ring-side coverage of the full
+`EditFields` (urgency, `delivery_deadline`, `reply_to` — the last crossing the
+uuid-vs-address representation split the two stores keep). The scope is disclosed
+in the three tool descriptions meanwhile.
 
-Code site (`TODO(messaging-depth-defaults)`):
-`brenn-lib/src/messaging/config.rs`, the `MessagingGlobalConfig` `Default` impl.
-The dependent panic is `fold_retain_depth` in
-`brenn-server/src/bootstrap/messaging/auto.rs`.
+Done when the LLM recall tools reach ring-parked messages, or the durable-only
+scope is ratified in `docs/message-bus.md`.
 
----
-
-## `wasm-durable-park-cap`
-
-The WASM activation flush parks a *durable* deferred publish with a bare
-`insert_message` — no deferred-cap check — so a backend component can park an
-unbounded number of messages on a `brenn:` channel. Every other park in the
-system enforces the channel-wide cap the WIT states ("bounded channel-wide by the
-channel's retain depth"): `DbStore::park` counts then inserts under one connection
-guard, `RingStore::park` refuses at the store's cap, and the surface batch flush
-checks the cap in-transaction on its durable half. Only this path is exempt, and a
-component that loops `publish-deferred` grows the table without bound. Done when
-the durable WASM deferred flush enforces the retain-depth cap with the same
-count-then-insert-under-one-guard discipline (or the WIT text is amended to say
-durable parks are uncapped, if that is the decision).
-
-Code site (`TODO(wasm-durable-park-cap)`):
-`brenn-lib/src/messaging/publish/mod.rs` (the durable arm of `publish_from_wasm`).
-
----
-
-## `priming-head-audit`
-
-Every `Priming::Head` call site needs adjudicating against the bus philosophy.
-`docs/message-bus.md` never authorizes a head attach — it does not address
-priming at all — and the enum's own doc calls `Retained` "*the* priming for a
-position coming into existence" (`brenn-queue/src/store.rs`). The sites are App
-conversations (`conversations.rs`), system participants (`system.rs`), and chat
-command cursors (`chat_provision.rs`, `bus_chat.rs`); each carries a documented
-rationale, and each must be judged against the unseen-is-unseen principle and
-the fact-channel/state-channel reconcile idiom — messages published while a
-consumer slept *are* unseen, and nothing in the system makes recency guarantees
-(`deliver_after` can legitimately deliver last decade's message as new right
-now).
-
-Outcomes per site: justify in bus-philosophy terms (and say so in
-`docs/message-bus.md`), or switch to `Retained` and let the consumer judge
-staleness by timestamp. Surfaces are unaffected either way — they never prime.
-
-Code site (`TODO(priming-head-audit)`): `brenn-lib/src/messaging/store/mod.rs`,
-`priming_for_kind`'s `Head` arm.
+Code site (`TODO(ring-deferred-recall)`): `brenn-lib/src/messaging/edit.rs`
+(`Messenger::cancel`).
 
 ---
 
@@ -945,3 +921,32 @@ conversation.
 Code site (`TODO(chat-deletion-teardown)`):
 `brenn-lib/src/messaging/chat_provision.rs`, on
 `deprovision_conversation_chat_channels`.
+
+
+## `dormant-missing-app-cursor`
+
+A durable dynamic subscription goes dormant — kept in its table, kept out of the
+directory — whenever config stops standing behind it: a revoked ACL, a standing
+depth tightened below the granted one, an undeclared channel. The boot cursor
+reconcile counts those registrations so the position survives to the boot that
+restores the config. One class cannot: when the missing config is the app's own
+`[[app]]` block, the merge classifies its rows dormant (a missing policy fails
+closed) but the reconcile resolves each dormant row's conversation through the
+same apps map, so it resolves nothing, the position is unjustified, and the
+cursor row is deleted as an orphan — under a warn that calls a revertible
+operator edit a host wiring bug. Restoring the block then re-primes at the
+retained tail: duplicate delivery of what the app already saw, and silent
+uncounted loss of whatever the channel evicted meanwhile.
+
+Needs a decision before code. Either the dormant row's conversation resolves
+without the apps map — the conversations table keys `(user_id, app_slug)` and the
+singleton invariant makes a slug-only lookup unique, but "which user owns this
+conversation when the app config is gone" is a new answer, not a refactor — or
+the loss is ratified for this class, in which case the reconcile says so and the
+`app_owner` warn stops misdiagnosing it. Done when a dormant row for an app
+absent from the apps map either keeps its position or documentedly loses it, with
+a test either way.
+
+Code site (`TODO(dormant-missing-app-cursor)`):
+`brenn-lib/src/messaging/reconcile.rs`, the dormant justification loop in
+`Messenger::reconcile_subscriber_cursors`.

@@ -68,41 +68,57 @@ struct Endpoint {
     /// Whether the port is an io_port — both roles by declaration, and already
     /// entitled to a channel of its own.
     io_port: bool,
-    /// The subscribing half's resolved (binding → global) depths, `None` for a
-    /// publish-only endpoint, which contributes nothing to the fold.
+    /// The subscribing half's declared depths, `None` for a publish-only
+    /// endpoint, which contributes nothing to the fold.
     depths: Option<(Depth, Depth)>,
+}
+
+/// The depths a subscribing endpoint contributes to its channel's fold.
+///
+/// Both are required on the port itself. An auto channel derives every depth it
+/// has from these numbers, so a port that states neither leaves the derivation
+/// with nothing to fold — and a global rung underneath would make that silence
+/// resolve to a window nobody sized. The panic names the port, which is the
+/// handle the operator has: an anonymous auto channel's address is computed and
+/// appears nowhere in their config.
+fn endpoint_depths(
+    reference: &str,
+    push_depth: Option<Depth>,
+    retain_depth: Option<Depth>,
+) -> (Depth, Depth) {
+    let (Some(push), Some(retain)) = (push_depth, retain_depth) else {
+        panic!(
+            "config: port {reference:?} is a subscribing endpoint of an auto channel but does \
+             not state both push_depth and retain_depth — an auto channel's retention is folded \
+             from its subscribing ports, so each one states what it needs to see"
+        )
+    };
+    (push, retain)
 }
 
 /// The endpoint a backend io_port presents: both roles on one port name, with the
 /// input half's depths as its contribution to the ring.
-fn wasm_io_endpoint(
-    slug: &str,
-    io: &WasmConsumerIoPortRaw,
-    defaults: &MessagingGlobalConfig,
-) -> Endpoint {
+fn wasm_io_endpoint(slug: &str, io: &WasmConsumerIoPortRaw) -> Endpoint {
+    let reference = wasm_endpoint_ref(slug, &io.port);
+    let depths = endpoint_depths(&reference, io.push_depth, io.retain_depth);
     Endpoint {
-        reference: wasm_endpoint_ref(slug, &io.port),
+        reference,
         host: EndpointHost::Wasm {
             slug: slug.to_string(),
         },
         publishes: true,
         subscribes: true,
         io_port: true,
-        depths: Some((
-            io.push_depth.unwrap_or(defaults.default_push_depth),
-            io.retain_depth.unwrap_or(defaults.default_retain_depth),
-        )),
+        depths: Some(depths),
     }
 }
 
 /// The endpoint a surface io_port presents. See [`wasm_io_endpoint`].
-fn surface_io_endpoint(
-    slug: &str,
-    io: &SurfaceIoPortRaw,
-    defaults: &MessagingGlobalConfig,
-) -> Endpoint {
+fn surface_io_endpoint(slug: &str, io: &SurfaceIoPortRaw) -> Endpoint {
+    let reference = surface_endpoint_ref(slug, &io.instance, &io.port);
+    let depths = endpoint_depths(&reference, io.push_depth, io.retain_depth);
     Endpoint {
-        reference: surface_endpoint_ref(slug, &io.instance, &io.port),
+        reference,
         host: EndpointHost::Surface {
             slug: slug.to_string(),
             instance: io.instance.clone(),
@@ -110,10 +126,7 @@ fn surface_io_endpoint(
         publishes: true,
         subscribes: true,
         io_port: true,
-        depths: Some((
-            io.push_depth.unwrap_or(defaults.default_push_depth),
-            io.retain_depth.unwrap_or(defaults.default_retain_depth),
-        )),
+        depths: Some(depths),
     }
 }
 
@@ -396,7 +409,7 @@ pub(crate) fn lower_auto_wiring(
 
         let mut endpoints: Vec<Endpoint> = Vec::with_capacity(conn.endpoints.len());
         for reference in &conn.endpoints {
-            let endpoint = resolve_endpoint(&label, reference, consumers, surfaces, defaults);
+            let endpoint = resolve_endpoint(&label, reference, consumers, surfaces);
             if let Some(owner) = claimed.get(&endpoint.reference) {
                 panic!(
                     "config: {label}: endpoint {:?} is already bound by {owner} — a free port \
@@ -577,7 +590,7 @@ fn lower_io_ports(
                 "[[wasm_consumer]] {:?} io_port {:?}",
                 consumer.slug, io.port,
             );
-            let endpoint = wasm_io_endpoint(&consumer.slug, io, defaults);
+            let endpoint = wasm_io_endpoint(&consumer.slug, io);
             if !claimed.contains_key(&endpoint.reference) {
                 place_channel(
                     &label,
@@ -608,7 +621,7 @@ fn lower_io_ports(
                  [[surface.component]] on this surface",
                 io.instance,
             );
-            let endpoint = surface_io_endpoint(&surface.slug, io, defaults);
+            let endpoint = surface_io_endpoint(&surface.slug, io);
             if !claimed.contains_key(&endpoint.reference) {
                 place_channel(
                     &label,
@@ -628,9 +641,18 @@ fn lower_io_ports(
 
 /// Build the synthesized directory entry for one auto channel.
 ///
-/// Every channel-level knob except `retain_depth` comes from the `[messaging]`
-/// defaults: a channel that needs channel-level tuning has outgrown auto
-/// declaration.
+/// Every depth is the fold; every other channel-level knob comes from the
+/// `[messaging]` defaults. A channel that needs channel-level tuning has
+/// outgrown auto declaration.
+///
+/// The fold is the only number the declaration grounded, so it answers all three
+/// depth questions. `push_depth` is a rung nothing on the connection itself
+/// reads — each endpoint carries its own — and is consulted only by a later
+/// third-party binding on a *named* auto channel, which is exactly the case
+/// where "as deep as the ports that declared this channel" is the right answer.
+/// Durable `standing_retain_depth` takes the fold for the same reason the
+/// non-durable arm below has no choice: the standing buffer covers the retained
+/// window, and here that window *is* the fold.
 fn synthesize_entry(
     uuid: Uuid,
     placement: &Placement,
@@ -640,10 +662,7 @@ fn synthesize_entry(
     defaults: &MessagingGlobalConfig,
 ) -> ChannelEntry {
     let (standing_retain_depth, sink) = if placement.durable {
-        (
-            defaults.default_standing_retain_depth,
-            defaults.default_sink,
-        )
+        (retain_depth, defaults.default_sink)
     } else {
         // The standing buffer is the retained window itself: a non-durable
         // channel has no subscriber-independent store off-disk.
@@ -665,7 +684,7 @@ fn synthesize_entry(
         description: Some(description),
         resolved_channel: ResolvedChannel {
             send_rate: defaults.default_send_rate,
-            push_depth: defaults.default_push_depth,
+            push_depth: retain_depth,
             retain_depth,
             standing_retain_depth,
             noise: defaults.default_noise,
@@ -705,9 +724,8 @@ fn fold_retain_depth(label: &str, endpoints: &[Endpoint], durable: bool) -> Dept
         "config: {label}: the connection's subscribing port(s) fold to retain_depth = \
          \"unbounded\", but this channel is non-durable and its retention is process memory; \
          the fold takes max(push_depth, retain_depth) per subscribing port, so both halves \
-         must resolve bounded: write both depths on the subscribing port(s), bound both \
-         [messaging].default_push_depth and [messaging].default_retain_depth, or name the \
-         channel with a brenn: address",
+         must be bounded: give the subscribing port(s) bounded depths, or name the channel \
+         with a brenn: address",
     );
     folded
 }
@@ -850,7 +868,6 @@ fn resolve_endpoint(
     reference: &str,
     consumers: &[WasmConsumerConfigRaw],
     surfaces: &[SurfaceConfigRaw],
-    defaults: &MessagingGlobalConfig,
 ) -> Endpoint {
     let malformed = || -> ! {
         panic!(
@@ -883,7 +900,7 @@ fn resolve_endpoint(
                 });
             if let Some(io) = consumer.io_ports.iter().find(|p| p.port == port) {
                 assert_free(label, reference, io.channel.as_deref());
-                return wasm_io_endpoint(slug, io, defaults);
+                return wasm_io_endpoint(slug, io);
             }
             let subscription = consumer.subscriptions.iter().find(|s| s.port == port);
             let output = consumer.outputs.iter().find(|o| o.port == port);
@@ -908,10 +925,7 @@ fn resolve_endpoint(
                 subscribes: subscription.is_some(),
                 io_port: false,
                 depths: subscription.map(|s| {
-                    (
-                        s.push_depth.unwrap_or(defaults.default_push_depth),
-                        s.retain_depth.unwrap_or(defaults.default_retain_depth),
-                    )
+                    endpoint_depths(&wasm_endpoint_ref(slug, port), s.push_depth, s.retain_depth)
                 }),
             }
         }
@@ -951,7 +965,7 @@ fn resolve_endpoint(
                 .find(|p| p.instance == instance && p.port == port)
             {
                 assert_free(label, reference, io.channel.as_deref());
-                return surface_io_endpoint(slug, io, defaults);
+                return surface_io_endpoint(slug, io);
             }
             let subscription = surface
                 .subscriptions
@@ -983,9 +997,10 @@ fn resolve_endpoint(
                 subscribes: subscription.is_some(),
                 io_port: false,
                 depths: subscription.map(|s| {
-                    (
-                        s.push_depth.unwrap_or(defaults.default_push_depth),
-                        s.retain_depth.unwrap_or(defaults.default_retain_depth),
+                    endpoint_depths(
+                        &surface_endpoint_ref(slug, instance, port),
+                        s.push_depth,
+                        s.retain_depth,
                     )
                 }),
             }

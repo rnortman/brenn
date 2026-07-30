@@ -223,7 +223,6 @@ async fn build_wasm_messenger(
             wasm_slug,
             &crate::messaging::ParticipantId::for_wasm(wasm_slug),
             push_depth,
-            crate::messaging::store::Priming::Head,
         )
         .await;
     (messenger, channel_uuid, router)
@@ -348,7 +347,6 @@ async fn build_wasm_and_app_messenger(
             wasm_slug,
             &crate::messaging::ParticipantId::for_wasm(wasm_slug),
             Depth::Unbounded,
-            crate::messaging::store::Priming::Head,
         )
         .await;
     (messenger, channel_uuid, router)
@@ -574,7 +572,6 @@ async fn build_wasm_output_messenger(
             subscriber_slug,
             &ParticipantId::for_wasm(subscriber_slug),
             Depth::Unbounded,
-            crate::messaging::store::Priming::Head,
         )
         .await;
     (messenger, channel_addr, router)
@@ -671,6 +668,15 @@ async fn publish_from_wasm_two_publishes_correct_fields() {
 async fn build_wasm_mixed_output_messenger(
     consumer_slug: &str,
 ) -> (Arc<Messenger>, String, String) {
+    build_wasm_mixed_output_messenger_at_retain(consumer_slug, Depth::Unbounded).await
+}
+
+/// The same, with the durable channel's `retain_depth` — and so its deferred cap
+/// — set by the caller, for the cases that drive the cap.
+async fn build_wasm_mixed_output_messenger_at_retain(
+    consumer_slug: &str,
+    durable_retain: Depth,
+) -> (Arc<Messenger>, String, String) {
     use crate::messaging::store::RingStores;
     use crate::messaging::testutils::ephemeral_channel_entry;
 
@@ -684,8 +690,8 @@ async fn build_wasm_mixed_output_messenger(
         resolved_channel: ResolvedChannel {
             send_rate: Default::default(),
             push_depth: Depth::Unbounded,
-            retain_depth: Depth::Unbounded,
-            standing_retain_depth: Depth::Unbounded,
+            retain_depth: durable_retain,
+            standing_retain_depth: durable_retain,
             noise: NoiseLevel::Silent,
             sink: Sink::Drop,
             wake_min: WakeMin::Normal,
@@ -741,7 +747,6 @@ async fn build_wasm_mixed_output_messenger(
             subscriber_slug,
             &ParticipantId::for_wasm(subscriber_slug),
             Depth::Unbounded,
-            crate::messaging::store::Priming::Head,
         )
         .await;
     (messenger, durable_addr, ephemeral_addr)
@@ -749,13 +754,15 @@ async fn build_wasm_mixed_output_messenger(
 
 /// A component publishing onto an `ephemeral:` channel that a surface
 /// subscribes, with the mock router kept so the live feed is observable — the
-/// feed writes no row, so nothing else witnesses it.
+/// feed writes no row, so nothing else witnesses it. The returned `brenn:`
+/// address is a reply target and nothing else: it is in the directory so a
+/// `reply_to` naming it resolves, and no publish is ever aimed at it.
 async fn build_wasm_ephemeral_surface_messenger(
     consumer_slug: &str,
-) -> (Arc<Messenger>, String, Arc<CountingRouter>) {
+) -> (Arc<Messenger>, String, String, Arc<CountingRouter>) {
     use crate::access::acl::ChannelMatcher;
     use crate::messaging::store::RingStores;
-    use crate::messaging::testutils::ephemeral_channel_entry;
+    use crate::messaging::testutils::{ephemeral_channel_entry, test_channel_entry};
 
     let db = init_db_memory();
     let mut ephemeral = ephemeral_channel_entry("wasm-eph-surface", 8);
@@ -794,11 +801,16 @@ async fn build_wasm_ephemeral_surface_messenger(
             vec![],
         ),
     );
+    let reply_target = test_channel_entry("wasm-reply-target", vec![]);
+    let reply_addr = reply_target.address.clone();
     let stores = Arc::new(RingStores::build(std::slice::from_ref(&ephemeral)));
     let router = Arc::new(CountingRouter::default());
     let messenger = Messenger::new(
         db,
-        Arc::new(MessagingDirectory::with_entries(vec![ephemeral])),
+        Arc::new(MessagingDirectory::with_entries(vec![
+            ephemeral,
+            reply_target,
+        ])),
         Arc::from("test"),
         Arc::new(apps_raw),
         Arc::clone(&router) as Arc<dyn WakeRouter>,
@@ -808,7 +820,7 @@ async fn build_wasm_ephemeral_surface_messenger(
         surface_policies,
     ))
     .with_ring_stores(stores);
-    (messenger, addr, router)
+    (messenger, addr, reply_addr, router)
 }
 
 /// A flush's ring entry reaches a subscribing surface. The bridge holds no
@@ -817,7 +829,7 @@ async fn build_wasm_ephemeral_surface_messenger(
 #[tokio::test]
 async fn publish_from_wasm_ephemeral_output_feeds_a_subscribing_surface() {
     let consumer_slug = "wasm-eph-feeder";
-    let (m, addr, router) = build_wasm_ephemeral_surface_messenger(consumer_slug).await;
+    let (m, addr, _reply, router) = build_wasm_ephemeral_surface_messenger(consumer_slug).await;
 
     m.publish_from_wasm(
         consumer_slug,
@@ -1069,6 +1081,74 @@ async fn publish_from_wasm_durable_deferred_parks_the_row() {
     assert_eq!(parked, 1, "a deferred durable output parks its message row");
 }
 
+/// A durable park in a WASM flush is admitted against the channel's deferred cap
+/// — the same channel-wide bound every other park in the system enforces, and
+/// the same per-entry answer the batch keeps carrying on from: the refused
+/// schedule leaves no row, the entries around it commit, and the drop is counted
+/// against the component that asked for it.
+#[tokio::test]
+async fn the_durable_deferred_cap_refuses_a_wasm_park_and_the_flush_carries_on() {
+    let consumer_slug = "wasm-dur-cap";
+    let (m, durable_addr, _ephemeral) =
+        build_wasm_mixed_output_messenger_at_retain(consumer_slug, Depth::Bounded(1)).await;
+    let release_at = chrono::Utc::now() + chrono::Duration::seconds(60);
+
+    m.publish_from_wasm(
+        consumer_slug,
+        &[
+            WasmPublish {
+                channel_address: &durable_addr,
+                body: "first",
+                urgency: Urgency::Normal,
+                reply_to: None,
+                deliver_after: Some(release_at),
+            },
+            WasmPublish {
+                channel_address: &durable_addr,
+                body: "refused",
+                urgency: Urgency::Normal,
+                reply_to: None,
+                deliver_after: Some(release_at),
+            },
+            WasmPublish {
+                channel_address: &durable_addr,
+                body: "immediate",
+                urgency: Urgency::Normal,
+                reply_to: None,
+                deliver_after: None,
+            },
+        ],
+    )
+    .await;
+
+    let rows = {
+        let conn = m.db().lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT body, deliver_after IS NOT NULL FROM messaging_messages \
+                 ORDER BY publish_ts_ns",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows,
+        vec![
+            ("first".to_string(), true),
+            ("immediate".to_string(), false)
+        ],
+        "the over-cap schedule wrote no row and the flush committed the rest"
+    );
+    assert_eq!(
+        m.dropped_deferred_count(consumer_slug, &durable_addr),
+        1,
+        "the drop is counted against the component that asked for it"
+    );
+}
+
 /// `publish_from_wasm` with an empty slice is a no-op (no rows, no panic).
 #[tokio::test]
 async fn publish_from_wasm_empty_slice_noop() {
@@ -1158,4 +1238,88 @@ async fn publish_from_wasm_unknown_reply_to_panics() {
         deliver_after: None,
     }];
     m.publish_from_wasm(consumer_slug, &publishes).await;
+}
+
+/// A ring carries the reply address itself rather than the uuid a row joins
+/// through, so the flush resolves it before either substrate sees it and the
+/// consumer of a non-durable channel reads back an address like everyone else.
+#[tokio::test]
+async fn publish_from_wasm_reply_to_reaches_a_ring_channel_as_an_address() {
+    let consumer_slug = "wasm-eph-reply";
+    let (m, durable_addr, ephemeral_addr) = build_wasm_mixed_output_messenger(consumer_slug).await;
+
+    m.publish_from_wasm(
+        consumer_slug,
+        &[WasmPublish {
+            channel_address: &ephemeral_addr,
+            body: "req",
+            urgency: Urgency::Normal,
+            reply_to: Some(&durable_addr),
+            deliver_after: None,
+        }],
+    )
+    .await;
+
+    let store = m
+        .ring_stores()
+        .get_by_address(&ephemeral_addr)
+        .expect("registered ring channel")
+        .clone();
+    let retained = store.retained_tail(10);
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        retained[0].envelope.reply_to.as_deref(),
+        Some(durable_addr.as_str()),
+        "the ring retains the resolved reply address",
+    );
+}
+
+/// And the envelope fed live to a subscribing page carries the same address the
+/// ring just retained — a fed envelope must be indistinguishable from one read
+/// back out of retention.
+#[tokio::test]
+async fn a_fed_ring_envelope_carries_the_resolved_reply_address() {
+    let consumer_slug = "wasm-eph-reply-feeder";
+    let (m, addr, reply_addr, router) = build_wasm_ephemeral_surface_messenger(consumer_slug).await;
+
+    m.publish_from_wasm(
+        consumer_slug,
+        &[WasmPublish {
+            channel_address: &addr,
+            body: "fed-now",
+            urgency: Urgency::Normal,
+            reply_to: Some(&reply_addr),
+            deliver_after: None,
+        }],
+    )
+    .await;
+
+    let fed = router.fed.lock().await;
+    assert_eq!(fed.len(), 1, "the immediate entry");
+    assert_eq!(
+        fed[0].reply_to.as_deref(),
+        Some(reply_addr.as_str()),
+        "the fed envelope carries the reply address, not a hole",
+    );
+}
+
+/// The twin of [`publish_from_wasm_unknown_reply_to_panics`] on the non-durable
+/// arm: a reply address nothing answers to is the same host-wiring bug
+/// whichever substrate carries it.
+#[tokio::test]
+#[should_panic(expected = "reply_to channel")]
+async fn publish_from_wasm_unknown_reply_to_on_a_ring_channel_panics() {
+    let consumer_slug = "wasm-eph-bad-reply";
+    let (m, _durable, ephemeral_addr) = build_wasm_mixed_output_messenger(consumer_slug).await;
+    m.publish_from_wasm(
+        consumer_slug,
+        &[WasmPublish {
+            channel_address: &ephemeral_addr,
+            body: "req",
+            urgency: Urgency::Normal,
+            reply_to: Some("brenn:tool-results/nonexistent"),
+            deliver_after: None,
+        }],
+    )
+    .await;
 }

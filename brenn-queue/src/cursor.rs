@@ -80,15 +80,6 @@ pub struct SubscriberCursor {
 }
 
 impl SubscriberCursor {
-    /// A cursor positioned past everything already published — the position for
-    /// a subscriber that must see only what is published from now on.
-    pub fn at_head<M: Clone, Ep: Copy + PartialEq>(
-        ring: &RetainedRing<M, Ep>,
-        push_depth: u64,
-    ) -> Self {
-        Self::new(ring.newest_seq(), push_depth)
-    }
-
     /// A cursor positioned behind the channel's retained tail, capped at
     /// `push_depth` — the position for a queue that has just come into
     /// existence.
@@ -312,10 +303,14 @@ mod tests {
         (new, advance)
     }
 
+    /// A position that has advanced over everything the ring holds owes
+    /// nothing that already exists: the next append is its next delivery, and
+    /// re-serving in between hands over nothing and drops nothing.
     #[test]
-    fn at_head_passes_everything_already_published() {
+    fn a_caught_up_position_owes_only_what_comes_next() {
         let mut ring = ring_of(8, &["a", "b"]);
-        let mut cursor = SubscriberCursor::at_head(&ring, 4);
+        let mut cursor = SubscriberCursor::primed(&ring, 4);
+        assert_eq!(serve(&mut cursor, &ring, 4, 0).0, vec!["a", "b"]);
         assert!(serve(&mut cursor, &ring, 4, 0).0.is_empty());
         ring.append("c");
         let (new, advance) = serve(&mut cursor, &ring, 4, 0);
@@ -346,7 +341,7 @@ mod tests {
     #[test]
     fn a_window_clamped_by_push_depth_drops_oldest() {
         let ring = ring_of(8, &["a", "b", "c", "d"]);
-        let mut cursor = SubscriberCursor::at_head(&empty(8), 2);
+        let mut cursor = SubscriberCursor::primed(&empty(8), 2);
         let (new, advance) = serve(&mut cursor, &ring, 2, 0);
         assert_eq!(new, vec!["c", "d"]);
         assert_eq!(advance.dropped, 2);
@@ -359,7 +354,7 @@ mod tests {
     #[test]
     fn unseen_entries_served_as_context_are_not_dropped() {
         let ring = ring_of(8, &["a", "b", "c", "d"]);
-        let mut cursor = SubscriberCursor::at_head(&empty(8), 1);
+        let mut cursor = SubscriberCursor::primed(&empty(8), 1);
         let window = cursor.window(&ring, 1, 4);
         assert_eq!(
             window.entries.iter().map(|e| e.message).collect::<Vec<_>>(),
@@ -376,8 +371,10 @@ mod tests {
     /// context up to the window bound.
     #[test]
     fn a_window_back_fills_with_seen_context() {
-        let ring = ring_of(8, &["a", "b", "c", "d"]);
-        let cursor = SubscriberCursor::at_head(&ring_of(8, &["a", "b", "c"]), 4);
+        let mut ring = ring_of(8, &["a", "b", "c"]);
+        let mut cursor = SubscriberCursor::primed(&ring, 4);
+        serve(&mut cursor, &ring, 4, 0);
+        ring.append("d");
         let window = cursor.window(&ring, 4, 0);
         assert_eq!(
             window.entries.iter().map(|e| e.message).collect::<Vec<_>>(),
@@ -390,7 +387,7 @@ mod tests {
     #[test]
     fn eviction_reports_without_moving_the_cursor() {
         let mut ring = ring_of(2, &["a"]);
-        let cursor = SubscriberCursor::at_head(&empty(2), 8);
+        let cursor = SubscriberCursor::primed(&empty(2), 8);
         let before = retention_frontier(&ring);
         for m in ["b", "c", "d"] {
             ring.append(m);
@@ -406,7 +403,7 @@ mod tests {
     #[test]
     fn successive_evictions_do_not_double_report() {
         let mut ring = ring_of(2, &["a", "b"]);
-        let cursor = SubscriberCursor::at_head(&empty(2), 8);
+        let cursor = SubscriberCursor::primed(&empty(2), 8);
         let mut reported = 0;
         for m in ["c", "d", "e"] {
             let before = retention_frontier(&ring);
@@ -421,7 +418,7 @@ mod tests {
     #[test]
     fn a_sampled_cursor_is_never_reported_against() {
         let mut ring = ring_of(1, &["a"]);
-        let cursor = SubscriberCursor::at_head(&empty(1), 0);
+        let cursor = SubscriberCursor::primed(&empty(1), 0);
         let before = retention_frontier(&ring);
         ring.append("b");
         assert_eq!(cursor.evicted_since(&ring, before), 0);
@@ -434,7 +431,7 @@ mod tests {
     #[test]
     fn advance_charges_noise_only_for_still_retained_losses() {
         let mut ring = ring_of(4, &["a"]);
-        let mut cursor = SubscriberCursor::at_head(&empty(4), 1);
+        let mut cursor = SubscriberCursor::primed(&empty(4), 1);
         for m in ["b", "c", "d", "e"] {
             ring.append(m);
         }
@@ -449,7 +446,7 @@ mod tests {
     #[test]
     fn a_window_read_moves_nothing() {
         let ring = ring_of(8, &["a", "b", "c"]);
-        let cursor = SubscriberCursor::at_head(&empty(8), 4);
+        let cursor = SubscriberCursor::primed(&empty(8), 4);
         let window = cursor.window(&ring, 4, 0);
         assert_eq!(window.new_entries().len(), 3);
         assert_eq!(window.entries.first().map(|e| e.seq), Some(1));
@@ -463,7 +460,7 @@ mod tests {
     #[test]
     fn advancing_over_a_prefix_leaves_the_rest_unseen() {
         let ring = ring_of(8, &["a", "b", "c"]);
-        let mut cursor = SubscriberCursor::at_head(&empty(8), 4);
+        let mut cursor = SubscriberCursor::primed(&empty(8), 4);
         let window = cursor.window(&ring, 4, 0);
         let accepted = &window.entries[..2];
         let advance = cursor.advance(&ring, accepted[1].seq, accepted[0].seq);
@@ -476,7 +473,7 @@ mod tests {
     #[test]
     fn a_failed_delivery_advances_nothing() {
         let ring = ring_of(8, &["a", "b"]);
-        let mut cursor = SubscriberCursor::at_head(&empty(8), 4);
+        let mut cursor = SubscriberCursor::primed(&empty(8), 4);
         let before = cursor.clone();
         let advance = cursor.advance(&ring, cursor.next_owed() - 1, cursor.next_owed());
         assert_eq!(advance.dropped, 0);
@@ -488,7 +485,7 @@ mod tests {
     #[test]
     fn advance_is_idempotent() {
         let ring = ring_of(8, &["a", "b", "c"]);
-        let mut cursor = SubscriberCursor::at_head(&empty(8), 1);
+        let mut cursor = SubscriberCursor::primed(&empty(8), 1);
         let (_, first) = serve(&mut cursor, &ring, 1, 0);
         assert_eq!(first.dropped, 2);
         let advance = cursor.advance(&ring, 3, 3);
@@ -499,7 +496,7 @@ mod tests {
     #[test]
     fn has_deliverable_tracks_unseen_and_retained() {
         let mut ring = empty(8);
-        let mut cursor = SubscriberCursor::at_head(&ring, 4);
+        let mut cursor = SubscriberCursor::primed(&ring, 4);
         assert!(!cursor.has_deliverable(&ring));
         ring.append("a");
         assert!(cursor.has_deliverable(&ring));
@@ -510,7 +507,7 @@ mod tests {
     #[test]
     fn push_depth_zero_serves_nothing_and_charges_nothing() {
         let ring = ring_of(8, &["a", "b"]);
-        let cursor = SubscriberCursor::at_head(&empty(8), 0);
+        let cursor = SubscriberCursor::primed(&empty(8), 0);
         assert!(!cursor.has_deliverable(&ring));
         let window = cursor.window(&ring, 0, 0);
         assert!(window.entries.is_empty());
@@ -522,7 +519,7 @@ mod tests {
     #[test]
     fn push_depth_zero_with_retention_is_all_context() {
         let ring = ring_of(8, &["a", "b"]);
-        let cursor = SubscriberCursor::at_head(&empty(8), 0);
+        let cursor = SubscriberCursor::primed(&empty(8), 0);
         let window = cursor.window(&ring, 0, 4);
         assert_eq!(window.entries.len(), 2);
         assert_eq!(window.new_from, 2);
@@ -532,7 +529,7 @@ mod tests {
     #[test]
     fn set_push_depth_applies_from_the_next_window() {
         let ring = ring_of(8, &["a", "b", "c"]);
-        let mut cursor = SubscriberCursor::at_head(&empty(8), 1);
+        let mut cursor = SubscriberCursor::primed(&empty(8), 1);
         cursor.set_push_depth(4);
         let (new, advance) = serve(&mut cursor, &ring, 4, 0);
         assert_eq!(new, vec!["a", "b", "c"]);
@@ -543,7 +540,7 @@ mod tests {
     #[should_panic(expected = "is above the window it came from")]
     fn a_seen_floor_above_its_window_panics() {
         let ring = ring_of(8, &["a", "b"]);
-        let mut cursor = SubscriberCursor::at_head(&empty(8), 4);
+        let mut cursor = SubscriberCursor::primed(&empty(8), 4);
         cursor.advance(&ring, 1, 3);
     }
 
@@ -599,7 +596,7 @@ mod tests {
     #[should_panic(expected = "advance over a sampled subscriber")]
     fn advancing_a_sampled_cursor_panics() {
         let ring = ring_of(8, &["a", "b"]);
-        let mut cursor = SubscriberCursor::at_head(&empty(8), 0);
+        let mut cursor = SubscriberCursor::primed(&empty(8), 0);
         cursor.advance(&ring, 2, 1);
     }
 }

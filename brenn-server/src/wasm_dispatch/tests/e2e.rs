@@ -848,7 +848,7 @@ async fn build_ring_backed_consumer(
     WasmConsumerConfig,
     tokio::task::JoinHandle<()>,
 ) {
-    use brenn_lib::messaging::store::{Priming, RingStores};
+    use brenn_lib::messaging::store::RingStores;
 
     let entry = testutils::ephemeral_channel_entry(channel_name, 8);
     let uuid = entry.uuid;
@@ -873,7 +873,7 @@ async fn build_ring_backed_consumer(
         )]),
     ));
 
-    messenger.attach_ring_subscriber(&uuid, &wasm_sub, u64::MAX, Priming::Head);
+    messenger.attach_ring_subscriber(&uuid, &wasm_sub, u64::MAX);
     let ring = ring_stores.get(&uuid).expect("registered ring store");
 
     let (alert_dispatcher, alert_handle) = noop_alert_dispatcher();
@@ -935,7 +935,7 @@ async fn append_ring_message(
             body,
             urgency: Urgency::Normal,
             envelope_type: ChannelScheme::Ephemeral,
-            reply_to_uuid: None,
+            reply_to: None,
             delivery_deadline: None,
             impetus: None,
             publish_ts_ns: Utc::now().timestamp_nanos_opt().unwrap(),
@@ -958,7 +958,7 @@ async fn build_mixed_class_consumer(
     WasmConsumerConfig,
     tokio::task::JoinHandle<()>,
 ) {
-    use brenn_lib::messaging::store::{Priming, RingStores};
+    use brenn_lib::messaging::store::RingStores;
 
     let durable = testutils::wasm_channel_entry(
         slug,
@@ -995,7 +995,7 @@ async fn build_mixed_class_consumer(
         )]),
     ));
 
-    messenger.attach_ring_subscriber(&ring_entry.uuid, &wasm_sub, u64::MAX, Priming::Head);
+    messenger.attach_ring_subscriber(&ring_entry.uuid, &wasm_sub, u64::MAX);
     super::attach_input_ports(
         &messenger,
         slug,
@@ -1191,11 +1191,12 @@ fn trigger_channel() -> brenn_lib::messaging::config::ChannelConfigRaw {
     brenn_lib::messaging::config::ChannelConfigRaw {
         send_rate: None,
         uuid: Some(uuid::Uuid::new_v4().to_string()),
-        address: "brenn:e2e-trigger".to_string(),
+        address: Some("brenn:e2e-trigger".to_string()),
+        address_prefix: None,
         description: None,
-        push_depth: None,
-        retain_depth: None,
-        standing_retain_depth: None,
+        push_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
+        retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
+        standing_retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
         noise: None,
         sink: None,
         wake_min: None,

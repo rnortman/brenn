@@ -1924,30 +1924,26 @@ async fn handle_publish(
         // The output binding, its publish ACL coverage, and the channel's
         // existence are all boot-validated and boot-static, so a denial here is a
         // broken boot invariant — not attacker-reachable (the only client
-        // influence, an unbound port, was killed above). `UnsupportedOption` joins
-        // them: this call passes no option fields at all, so producing one would
-        // mean the pipeline invented one. For an ordinary bound output that means
-        // panic (a user-visible publish silently failing is doing the wrong
-        // thing). On the reserved error-report port the same outcomes instead
-        // `error!` the full report body and return `Failed`: this branch handles
-        // attacker-adjacent input on a diagnostics channel, so it fails
-        // loud-and-closed rather than trusting the invariant with the process's
-        // life. The report is preserved in the `error!` line (and the shell
-        // console-logged it before publishing).
-        // `DeferredQuotaExceeded` joins them for the same reason as
-        // `UnsupportedOption`: it can only arise from a future `deliver_after`,
-        // an option field this call never passes, so producing one means the
-        // pipeline invented it. Surface deferral rides the batch path — a
-        // component's deferred publish is buffered, and buffered publishes flush
-        // as batches — where a full deferred set is per-entry normal operation
-        // rather than an outcome this ladder could carry.
+        // influence, an unbound port, was killed above). For an ordinary bound
+        // output that means panic (a user-visible publish silently failing is
+        // doing the wrong thing). On the reserved error-report port the same
+        // outcomes instead `error!` the full report body and return `Failed`:
+        // this branch handles attacker-adjacent input on a diagnostics channel,
+        // so it fails loud-and-closed rather than trusting the invariant with the
+        // process's life. The report is preserved in the `error!` line (and the
+        // shell console-logged it before publishing).
+        // `DeferredQuotaExceeded` joins them: it can only arise from a future
+        // `deliver_after`, an option field this call never passes, so producing
+        // one means the pipeline invented it. Surface deferral rides the batch
+        // path — a component's deferred publish is buffered, and buffered
+        // publishes flush as batches — where a full deferred set is per-entry
+        // normal operation rather than an outcome this ladder could carry.
         // `ImpetusUnauthorized` joins them on the same argument: the surface
         // publish frames carry no impetus field, so this call passes none.
         other @ (PublishResult::MissingSender
         | PublishResult::AclDenied(_)
         | PublishResult::UnknownChannel(_)
         | PublishResult::MalformedAddress(_)
-        | PublishResult::UnsupportedOption { .. }
         | PublishResult::DeferredQuotaExceeded { .. }
         | PublishResult::ImpetusUnauthorized) => {
             if is_error_report {
@@ -3217,11 +3213,12 @@ mod tests {
         let raw = ChannelConfigRaw {
             send_rate: None,
             uuid: Some(Uuid::new_v4().to_string()),
-            address: "durable-demo".to_string(),
+            address: Some("durable-demo".to_string()),
+            address_prefix: None,
             description: None,
-            push_depth: None,
-            retain_depth: None,
-            standing_retain_depth: None,
+            push_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
+            retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
+            standing_retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
             noise: None,
             sink: None,
             wake_min: None,
@@ -3315,11 +3312,12 @@ mod tests {
         let raw = ChannelConfigRaw {
             send_rate: None,
             uuid: Some(Uuid::new_v4().to_string()),
-            address: "surface-errors".to_string(),
+            address: Some("surface-errors".to_string()),
+            address_prefix: None,
             description: None,
-            push_depth: None,
-            retain_depth: None,
-            standing_retain_depth: None,
+            push_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
+            retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
+            standing_retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
             noise: None,
             sink: None,
             wake_min: None,
@@ -4867,11 +4865,12 @@ mod tests {
         let raw = ChannelConfigRaw {
             send_rate: None,
             uuid: Some(Uuid::new_v4().to_string()),
-            address: "batch-out".to_string(),
+            address: Some("batch-out".to_string()),
+            address_prefix: None,
             description: None,
-            push_depth: None,
-            retain_depth: durable_retain_depth.map(Depth::Bounded),
-            standing_retain_depth: None,
+            push_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
+            retain_depth: Some(durable_retain_depth.map_or(Depth::Unbounded, Depth::Bounded)),
+            standing_retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
             noise: None,
             sink: None,
             wake_min: None,
@@ -5122,7 +5121,7 @@ mod tests {
     /// backend consumer would be silently starved by a page.
     #[tokio::test]
     async fn publish_batch_enacts_the_ring_overflow_it_causes() {
-        use brenn_lib::messaging::{ParticipantId, store::Priming};
+        use brenn_lib::messaging::ParticipantId;
 
         let db = brenn_lib::db::init_db_memory();
         let (ctx, mut rx) = batch_ctx(&db).await;
@@ -5138,7 +5137,7 @@ mod tests {
             .directory()
             .resolve("ephemeral:batch-eph")
             .expect("the ephemeral channel is a directory member");
-        messenger.attach_ring_subscriber(&channel.uuid, &consumer, 4, Priming::Head);
+        messenger.attach_ring_subscriber(&channel.uuid, &consumer, 4);
 
         // Six into a depth-4 ring: the last two overwrite messages the consumer,
         // which never runs, is still owed.
@@ -5585,7 +5584,7 @@ mod tests {
                     body: "orphaned".to_string(),
                     urgency: Urgency::Normal,
                     envelope_type: brenn_lib::messaging::ChannelScheme::Ephemeral,
-                    reply_to_uuid: None,
+                    reply_to: None,
                     delivery_deadline: None,
                     impetus: None,
                     publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
@@ -5917,7 +5916,7 @@ mod tests {
                     body: "not yours".to_string(),
                     urgency: Urgency::Normal,
                     envelope_type: brenn_lib::messaging::ChannelScheme::Ephemeral,
-                    reply_to_uuid: None,
+                    reply_to: None,
                     delivery_deadline: None,
                     impetus: None,
                     publish_ts_ns: now.timestamp_nanos_opt().unwrap(),
@@ -6000,7 +5999,7 @@ mod tests {
                     body: "not yours".to_string(),
                     urgency: Urgency::Normal,
                     envelope_type: brenn_lib::messaging::ChannelScheme::Ephemeral,
-                    reply_to_uuid: None,
+                    reply_to: None,
                     delivery_deadline: None,
                     impetus: None,
                     publish_ts_ns: now.timestamp_nanos_opt().unwrap(),

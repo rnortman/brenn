@@ -290,14 +290,6 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
             Some(OUTCOME_ACTION_ERROR),
             Some("send rate limit exceeded".to_string()),
         ),
-        // A job's action fields are gated at create/edit time against the same
-        // channel capabilities, so an option the target cannot carry means the
-        // channel changed class under a stored job.
-        PublishResult::UnsupportedOption { field } => (
-            OUTCOME_ACTION_ERROR,
-            Some(OUTCOME_ACTION_ERROR),
-            Some(format!("option `{field}` is not supported on this channel")),
-        ),
         PublishResult::DeferredQuotaExceeded { cap } => (
             OUTCOME_ACTION_ERROR,
             Some(OUTCOME_ACTION_ERROR),

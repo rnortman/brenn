@@ -63,6 +63,27 @@ number" but "pick the outage you intend to survive, then multiply." A channel at
 one message per decade with N=10 holds a century of history, and this is not a
 degenerate case — it is the model working as intended.
 
+A durable channel states a third number, **`standing_retain_depth`** — the
+reaper's disk frontier. It is what the channel keeps for readers that do not
+exist yet: a non-subscriber pull, a subscription that has not been written, a
+subscriber that comes into existence later. It is therefore the **ceiling on
+every depth stated about the channel**. The channel's own `push_depth` and
+`retain_depth` rungs, every static subscriber's depths, and every runtime
+dynamic subscribe are all held at or below it; a config block that exceeds it
+fails boot naming the channel, and a dynamic subscribe that exceeds it is
+refused with a typed error. A depth above the standing buffer would be a
+promise the disk does not keep — the reaper is free to evict anything past the
+frontier — and letting the union of subscribers raise the frontier instead
+would hide the effective retention from the person who wrote the number. One
+number, in one place, is the whole retention story for a channel. A subscriber
+that needs a deeper window means raising the channel's standing depth,
+deliberately, in the block that records the sizing decision.
+
+A non-durable channel has no third number: its retained window *is* its
+standing buffer, so `retain_depth` is both the window and the ceiling. Page-realm
+`local:` bindings have no server-side entry at all; their queue is browser memory
+the kernel bounds with its own contract-fixed rings (§2.6).
+
 Channels are **ephemeral** (in-memory) or **durable** (disk-backed). This is an
 orthogonal axis to depth, and it is a statement about *whether history survives a
 restart*, not about delivery guarantees. Durable + long N is what a transactional
@@ -78,6 +99,19 @@ are not transportable; `brenn:` (durable) and `ephemeral:` channels are. There
 is presently no durable and not-transportable channel type, but in principle
 there could be.
 
+Removing a declared `[[channel]]` block — deleting it, renaming it, or
+commenting it out to debug — does not retire the channel. Its history stays, and
+any dynamic subscriptions on it lie dormant: not delivered to, not deleted, and
+folded back in on the first boot where a block with the same uuid declares the
+channel again. Deleting the channel's row from the database is how an operator
+retires both for good; the next boot then prunes the subscriptions as drift.
+
+The uuid is the identity in all of this, not the address. A block restored under
+a *different* uuid declares a different channel, and the dormant rows go on
+waiting for the old one; if that new block also reuses the old address, the boot
+refuses it rather than leaving a channel with no row of its own. Deleting the old
+row first is the way to start fresh at an address.
+
 ### 2.2 Subscriptions
 
 A subscription carries two independent parameters. Their independence is the
@@ -91,7 +125,10 @@ burst arrived, coalesce the pending activations into one and hand me at most the
 
 **`retain_depth` — what I can see.**
 Purely about *visibility*. A private window of size M ≤ N onto the channel's
-window. Always the most recent M. It does not *cause* activation; a node with
+window, where N is the channel's standing depth (§2.1) and `M ≤ N` is enforced,
+not advisory: boot refuses a static subscription over the ceiling and the
+dynamic-subscribe path refuses a runtime one. Always the most recent M. It does
+not *cause* activation; a node with
 `push_depth=0, retain_depth=50` sees fifty messages and is never woken by any of
 them. (It is bounded by `push_depth` when that is nonzero — see the invariant
 below — but that is a consistency constraint, not a coupling of purpose.)
@@ -109,12 +146,36 @@ Other configurations are valid but pointless. `push_depth=5` with
 are considered "new" or "unseen". It's a meaningless distinction because you
 actually see up to 10 unseen messages.
 
+That last sentence is about *window reads* — what the window holds when the
+subscriber looks. It is not what every subscriber is handed on wake: a
+conversation subscriber is handed only the window's new entries, so a burst
+larger than `push_depth` coalesces to one activation carrying the newest few and
+the rest are visible only to an explicit window read. Nothing counts them as
+lost, either: the drop counter charges only unseen sequences that fell out of the
+retained window, so an under-sized `push_depth` is silent while an under-sized
+`retain_depth` is not. Size `push_depth` by asking whether each message must
+reach the subscriber individually or whether the newest on wake suffices — the
+signal-versus-fact call of §3.
+
 Most frameworks fuse these two ideas into one queue, and the fusion is the source
 of a great deal of pain: you cannot ask to see history without also asking to be
 woken by it, and you cannot ask to be woken without inheriting a delivery
 backlog. Separating them means **activation policy and visibility policy are
 tuned against different pressures** — activation against the node's processing
 cost and coalescing tolerance, visibility against the node's analytic needs.
+
+**Attach is a delivery point.** A subscription coming into existence is owed up
+to `push_depth` of the channel's retained window, immediately, as unseen. There
+is one priming and no parameter to choose another. Nothing in the bus
+distinguishes "old" from "new" beyond seen and unseen: a message published before
+a subscriber existed is unseen *to that subscriber*, and `deliver_after` makes
+any recency assumption false by construction anyway. A consumer whose semantics
+depend on staleness judges by a timestamp inside the message, not by asking the
+bus to hide history from it.
+
+Re-subscribing is not a new attach. An existing subscription keeps its position
+and only retunes its depths, so a restart resumes where it left off rather than
+re-reading the window.
 
 ### 2.3 Coalescing as the default activation semantic
 
@@ -205,11 +266,17 @@ or in the page realms of a dozen surfaces stamped from one config template — i
 legitimate and means nothing. Those are distinct channels that happen to be
 spelled alike. That privacy is what `local:` is for.
 
-An auto channel's depth is folded rather than declared: `retain_depth` is the max
-over subscribing endpoints of `max(push_depth, retain_depth)`, floor 1. Everything
-else — `sink`, `send_rate`, channel-level `noise`, `standing_retain_depth` —
-inherits the global defaults. A channel that needs channel-level tuning has
-outgrown auto declaration; write the `[[channel]]` block.
+An auto channel's depths are folded rather than declared: the fold is the max over
+subscribing endpoints of `max(push_depth, retain_depth)`, floor 1, and it answers
+all three depth questions — `retain_depth`, the channel-level `push_depth` rung a
+later third-party binding reads, and (when durable) `standing_retain_depth`
+(§2.1). One value for all three means an auto channel satisfies the depth
+ceiling by construction. Every
+subscribing port therefore states both of its own depths; an auto channel has
+nothing else to derive from, and boot refuses a port that leaves either unwritten.
+`sink`, `send_rate` and channel-level `noise` inherit the global defaults. A
+channel that needs channel-level tuning has outgrown auto declaration; write the
+`[[channel]]` block.
 
 **The timer-cap coupling.** A channel's `retain_depth` also caps its channel-wide
 deferred set, so on an auto channel the fold above is what bounds how many
@@ -218,18 +285,76 @@ parked wakes must declare at least K, on top of its actual retention need. Over
 the cap the schedule is refused and host-logged, and the component is not told —
 so this is a number to size deliberately.
 
-Leaving it to the default is not an option in the server realm: the stock global
-depth defaults are unbounded, and an unbounded fold on a non-durable channel
-refuses to boot. Because the fold takes `max(push_depth, retain_depth)` per
-subscribing port, *both* halves have to resolve bounded — bounding one while the
-other inherits the unbounded default still folds unbounded. So the three outs are:
-write both depths on the subscribing port(s), bound both
-`[messaging].default_push_depth` and `[messaging].default_retain_depth`, or give
-the channel a `brenn:` name. A page-local port escapes only the fold, not the
-defaults: it has no server entry, so an unset `retain_depth` never consults the
-globals and silently gives a ring of depth 1 — but its `push_depth` still
-resolves binding → global like every surface binding, and the stock unbounded
-default refuses to boot there too.
+There is no default to leave it to. Both halves must also be *bounded* on a
+non-durable channel: the fold takes `max(push_depth, retain_depth)` per subscribing
+port, so an explicit `"unbounded"` on either half folds unbounded and refuses to
+boot in the server realm. The two outs are bounded depths on the subscribing
+port(s), or a `brenn:` name. A page-local port escapes only the fold: it has no
+server entry, so an unset `retain_depth` gives a ring of depth 1 — the one
+structural exception, because the page kernel keeps that ring whether or not a
+binding asks — but its `push_depth` is a page queue nobody else can size, and an
+unstated one refuses to boot.
+
+### 2.7 System-minted channels
+
+Some channels are minted by the system rather than declared by the operator: the
+webhook ingress channels (`webhook:<slug>`), the MQTT ingress channels
+(`mqtt:<client>:<topic>`), and the async-tool substrate's request and result
+channels (`brenn:tools/<tool>`, `brenn:tool-results/<slug>`). Nothing in config
+brings these into existence — an endpoint block, a subscription, or a registered
+tool does — so there is no declaring `[[channel]]` block to carry their depths.
+
+They still have to be *sized*, and the sizing rule is the same one everything
+else obeys: bounded, and visible to whoever ought to be deciding. Each family has
+a bounded in-code default:
+
+| Family | push | retain | standing |
+|---|---|---|---|
+| `webhook:<slug>`, `mqtt:<client>:<topic>` | 1 | 100 | 100 |
+| `brenn:tools/<tool>`, `brenn:tool-results/<slug>` | 1 | 16 | 16 |
+
+Ingress channels are fact channels; at their arrival rates a hundred messages is
+a horizon of days to months, which is what "sized for the outage you intend to
+survive" means for them. The tool channels' executor and consumers are in-process
+and eager, so their window covers a burst arriving while the executor is busy.
+The channel-level push rung is near-inert on all four families — every
+subscriber on them states its own depths — so 1 is the honest floor.
+
+**Tuning them.** A `[[channel]]` block addressing one of these channels does not
+declare it; it *tunes* it. Synthesis still owns creation, identity and
+description, so `uuid` and `description` are rejected on a tuning block, and all
+three depths are required — a block that tunes states every number. `noise`,
+`wake_min`, `sink` and `send_rate` are optional and inherit the `[messaging]`
+globals, exactly as on a declaring block. An explicit `"unbounded"` is legal
+here: unbounded is something an operator asks for in so many words, never
+something a default hands out.
+
+A tuning block may be keyed by `address_prefix` instead of `address`, standing
+for a whole family of dynamically named channels — the MQTT case especially,
+where channels are minted at runtime. A prefix must end at a segment boundary
+(`/`, `.`, or the `mqtt:<client>:` colon) so it cannot reach past the family it
+names. Resolution per concrete address is: the exact block, else the longest
+matching prefix block, else the family default. A key written without a scheme
+names a `brenn:` channel, the same spelling rule declaring blocks follow, so
+`tools/git-repo-pull` and `brenn:tools/git-repo-pull` are one block — writing
+both is a duplicate.
+
+`retain_depth = 0` is refused: the window is also what the channel's system
+participants subscribe at, and zero would leave them without a position at all.
+
+Exact `webhook:` and tool blocks are boot-checked against the endpoints, tools
+and grants that exist, so a typoed address fails to boot rather than silently
+tuning nothing. Exact `mqtt:` blocks and every prefix block are not checked
+against a population: the MQTT population is open-ended and a prefix is a
+standing rule for a family whose membership is dynamic. An exact `mqtt:` key is
+still checked for *shape* — it must be a well-formed `mqtt:<client>:<topic>`
+with a legal filter — since a spelling no mint path can produce would tune
+nothing for the same reason a typo would.
+
+Nothing about a resolved channel is persisted — depths are re-read from config
+each boot — so retuning takes effect on restart with no migration. Lowering
+`standing_retain_depth` lets the next reap pass evict; raising it cannot
+resurrect what was already evicted.
 
 ## 3. Signals and facts
 

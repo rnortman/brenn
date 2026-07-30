@@ -24,8 +24,8 @@ pub mod chat;
 // This section holds the bus **address-prefix** vocabulary (`"brenn:"`,
 // `"ephemeral:"`, …). The prefixes carry a trailing colon; the bare type tags
 // (`ChannelScheme::as_str`) do not. `ChannelScheme::split` (below) is the sole
-// classifier of an address by its prefix; `ChannelScheme::delivery_class`
-// derives the recovery-path class from it.
+// classifier of an address by its prefix; `ChannelScheme::capabilities` derives
+// the two capability axes from it.
 
 /// Transport prefix for Brenn-internal channel addresses.
 ///
@@ -108,8 +108,8 @@ pub fn surface_sub_identity(participant: &str, instance: &str) -> String {
 ///   `local:`).
 /// - **`mqtt:` / `webhook:` — ingress transports.** Durable-class, but not
 ///   surface-bindable.
-/// - **`pwa_push:` — egress-only.** No delivery class: nothing on the bus ever
-///   receives from it (see [`ChannelScheme::delivery_class`]).
+/// - **`pwa_push:` — egress-only.** No capabilities: nothing on the bus ever
+///   receives from it (see [`ChannelScheme::capabilities`]).
 ///
 /// Two further classes exist that are deliberately *not* `ChannelScheme`
 /// variants, named here so the whole class space is visible from one place:
@@ -131,28 +131,6 @@ pub enum ChannelScheme {
     Mqtt,
     Webhook,
     PwaPush,
-}
-
-/// The recovery path a channel's queue overflow takes, derived from the address
-/// scheme. Bus-wide knowledge, not surface semantics — the surface keeps only
-/// the orthogonal question of which schemes bind to a surface at all.
-///
-/// Overflow behaviour is one behaviour per class, never a per-binding policy
-/// choice. `noise` governs *loudness*; it never changes what happens to the
-/// data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliveryClass {
-    /// Persisted before delivery. Overflow is a self-inflicted gap and
-    /// retention is the recovery: discard the queue, signal a typed gap, and
-    /// re-resume from before the hole so the server replays from the retained
-    /// window. Never a silent drop-oldest — a resume token must never advance
-    /// past a message that was dropped.
-    Durable,
-    /// Loss-tolerant, server-mediated. Overflow drops oldest and counts.
-    Ephemeral,
-    /// Loss-tolerant, page-local, never crosses the wire. Takes the same
-    /// drop-oldest-and-count recovery path as [`DeliveryClass::Ephemeral`].
-    Local,
 }
 
 /// The two axes on which channels differ at all, carried on a channel's
@@ -272,40 +250,24 @@ impl ChannelScheme {
         }
     }
 
-    /// The delivery class this scheme's channels take, or `None` for a scheme
-    /// that is never delivered to a bus subscriber.
-    ///
-    /// `None` means egress-only, not "unclassifiable": `pwa_push:` addresses
-    /// name a send target, carry no persisted row, and have no subscriber to
-    /// overflow, so no recovery path applies. Callers that reach this with a
-    /// `pwa_push:` address are asking a question the address cannot answer.
-    ///
-    /// Orthogonal to surface-bindability: `mqtt:`/`webhook:` are `Durable` but
-    /// do not bind to a surface, which is the surface's own predicate to
-    /// answer.
-    pub fn delivery_class(self) -> Option<DeliveryClass> {
-        match self {
-            // Ingress transports persist their rows exactly as brenn: does.
-            ChannelScheme::Brenn | ChannelScheme::Mqtt | ChannelScheme::Webhook => {
-                Some(DeliveryClass::Durable)
-            }
-            ChannelScheme::Ephemeral => Some(DeliveryClass::Ephemeral),
-            ChannelScheme::Local => Some(DeliveryClass::Local),
-            ChannelScheme::PwaPush => None,
-        }
-    }
-
     /// The capability set channels of this scheme carry, or `None` for a scheme
     /// that names no pub/sub channel.
     ///
-    /// `None` is `pwa_push:`, for the same reason `delivery_class` returns none
-    /// there: it is a send target, not a channel, so it holds no retention and
-    /// answers neither capability question.
+    /// `None` means egress-only, not "unclassifiable": `pwa_push:` addresses
+    /// name a send target, carry no persisted row, and have no subscriber, so
+    /// it holds no retention and answers neither capability question. Callers
+    /// that reach this with a `pwa_push:` address are asking a question the
+    /// address cannot answer.
+    ///
+    /// Orthogonal to surface-bindability: `mqtt:`/`webhook:` are durable and
+    /// transportable but do not bind to a surface, which is the surface's own
+    /// predicate to answer.
     ///
     /// Callers must use the returned capabilities rather than re-deriving them
-    /// from the scheme or delivery class at each site.
+    /// from the scheme at each site.
     pub fn capabilities(self) -> Option<ChannelCapabilities> {
         match self {
+            // Ingress transports persist their rows exactly as brenn: does.
             ChannelScheme::Brenn | ChannelScheme::Mqtt | ChannelScheme::Webhook => {
                 Some(ChannelCapabilities::DURABLE_TRANSPORTABLE)
             }
@@ -745,59 +707,11 @@ mod tests {
         }
     }
 
-    // ── DeliveryClass ─────────────────────────────────────────────────────
-
-    /// The scheme → recovery-path mapping. Pinned per scheme rather than
-    /// derived: which class a scheme takes is a design decision, so a change
-    /// here should be a visible edit, not a silent consequence.
-    #[test]
-    fn delivery_class_by_scheme() {
-        // Ingress transports persist their rows exactly as brenn: does, so they
-        // recover by replay like any durable channel.
-        assert_eq!(
-            ChannelScheme::Brenn.delivery_class(),
-            Some(DeliveryClass::Durable)
-        );
-        assert_eq!(
-            ChannelScheme::Mqtt.delivery_class(),
-            Some(DeliveryClass::Durable)
-        );
-        assert_eq!(
-            ChannelScheme::Webhook.delivery_class(),
-            Some(DeliveryClass::Durable)
-        );
-        assert_eq!(
-            ChannelScheme::Ephemeral.delivery_class(),
-            Some(DeliveryClass::Ephemeral)
-        );
-        assert_eq!(
-            ChannelScheme::Local.delivery_class(),
-            Some(DeliveryClass::Local)
-        );
-        // Egress-only: nothing is ever delivered from it, so no recovery path
-        // applies. `None` is the honest answer, not a missing case.
-        assert_eq!(ChannelScheme::PwaPush.delivery_class(), None);
-    }
-
-    /// Every scheme answers the delivery-class question one way or the other —
-    /// driven off `ALL` so a new scheme must decide rather than inherit.
-    #[test]
-    fn every_scheme_decides_its_delivery_class() {
-        for scheme in ChannelScheme::ALL {
-            let class = scheme.delivery_class();
-            assert_eq!(
-                class.is_none(),
-                scheme == ChannelScheme::PwaPush,
-                "{scheme:?}: pwa_push: is the only classless (egress-only) scheme"
-            );
-        }
-    }
-
     // ── ChannelCapabilities ───────────────────────────────────────────────
 
-    /// The scheme → capability mapping, pinned per scheme for the same reason
-    /// the delivery-class mapping is: it is the whole of the class-dependent
-    /// behaviour, so it changes only by a visible edit here.
+    /// The scheme → capability mapping, pinned per scheme rather than derived:
+    /// it is the whole of the class-dependent behaviour, so it changes only by
+    /// a visible edit here.
     #[test]
     fn capabilities_by_scheme() {
         assert_eq!(
@@ -840,24 +754,15 @@ mod tests {
         }
     }
 
-    /// Durability and delivery class are two readings of one decision: a
-    /// `Durable`-class scheme is exactly a durable-capability scheme. Pinned so
-    /// the two mappings cannot drift apart while both exist.
+    /// `pwa_push:` is the only scheme that answers no capability question at
+    /// all — driven off `ALL` so a new scheme must decide rather than inherit.
     #[test]
-    fn durability_agrees_with_delivery_class() {
+    fn pwa_push_is_the_only_scheme_without_capabilities() {
         for scheme in ChannelScheme::ALL {
-            let (Some(caps), Some(class)) = (scheme.capabilities(), scheme.delivery_class()) else {
-                assert_eq!(
-                    scheme.capabilities().is_none(),
-                    scheme.delivery_class().is_none(),
-                    "{scheme:?}: a scheme answers both questions or neither"
-                );
-                continue;
-            };
             assert_eq!(
-                caps.durable,
-                class == DeliveryClass::Durable,
-                "{scheme:?}: durability disagrees with delivery class"
+                scheme.capabilities().is_none(),
+                scheme == ChannelScheme::PwaPush,
+                "{scheme:?}: pwa_push: is the only egress-only scheme"
             );
         }
     }

@@ -28,7 +28,7 @@ use crate::messaging::db::{
 };
 use crate::messaging::store::{
     AdvanceOutcome, Attached, DbStore, DeferralOutcome, MessageSeq, NewMessage, OverflowEvent,
-    Priming, ResumeCursor, RetentionStore, RingStore, StoreReplay, SubscriberWindow,
+    ResumeCursor, RetentionStore, RingStore, StoreReplay, SubscriberWindow,
 };
 use crate::messaging::testutils::test_channel_entry;
 
@@ -137,7 +137,7 @@ fn message(sender: &str, body: &str) -> NewMessage {
         body: body.to_string(),
         urgency: Urgency::Normal,
         envelope_type: ChannelScheme::Brenn,
-        reply_to_uuid: None,
+        reply_to: None,
         delivery_deadline: None,
         impetus: None,
         publish_ts_ns: utc_to_ns(Utc::now()),
@@ -750,19 +750,17 @@ async fn owed_ids(store: &dyn RetentionStore) -> Vec<ParticipantId> {
         .collect()
 }
 
-/// Retained priming on a fresh queue owes the channel's retained tail as
-/// NEW — both stores agree.
+/// A fresh queue is owed the channel's retained tail as NEW — both stores
+/// agree, and there is no other priming to ask for.
 #[tokio::test]
-async fn attach_with_retained_priming_seeds_the_tail_as_owed() {
+async fn a_fresh_attach_seeds_the_retained_tail_as_owed() {
     for store in stores(DEPTH).await {
         for body in ["a", "b", "c"] {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
         }
         let sub = wasm_sub("proc");
-        let attached = store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
-            .await;
+        let attached = store.attach(&sub, "proc", ATTACH_DEPTH).await;
         assert_eq!(attached, Attached::Created, "{}", store.address());
         assert!(store.has_deliverable(&sub).await, "{}", store.address());
         assert_eq!(
@@ -774,66 +772,60 @@ async fn attach_with_retained_priming_seeds_the_tail_as_owed() {
     }
 }
 
-/// Head priming owes nothing at attach: the tail already retained is context,
-/// not new, so a fresh head-primed queue is owed only what publishes next.
+/// A fresh attach on a channel retaining nothing is owed nothing: priming has
+/// no tail to reach back over, so the queue starts owed only what publishes
+/// next. Both stores agree.
 #[tokio::test]
-async fn attach_with_head_priming_owes_nothing() {
+async fn attach_on_an_empty_channel_owes_nothing() {
     for store in stores(DEPTH).await {
-        for body in ["a", "b", "c"] {
-            let msg = message_for(store.as_ref(), "alice", body);
-            store.append(msg).await;
-        }
         let sub = wasm_sub("proc");
-        let attached = store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-            .await;
+        let attached = store.attach(&sub, "proc", ATTACH_DEPTH).await;
         assert_eq!(attached, Attached::Created, "{}", store.address());
         assert!(!store.has_deliverable(&sub).await, "{}", store.address());
+
+        let msg = message_for(store.as_ref(), "alice", "a");
+        store.append(msg).await;
+        assert!(store.has_deliverable(&sub).await, "{}", store.address());
     }
 }
 
 /// A durable queue survives the restart, and the cursor row is what says so: an
-/// attach that finds one is `Existing` and re-primes nothing, however retained
-/// the priming asks for. The subscriber below caught up before the "restart",
-/// so it stays caught up.
+/// attach that finds one is `Existing` and re-primes nothing. The subscriber
+/// below caught up before the "restart", so it stays caught up.
 #[tokio::test]
 async fn durable_attach_does_not_reprime_a_surviving_queue() {
     let (store, _db) = durable_store(DEPTH).await;
     let sub = wasm_sub("proc");
-    RetentionStore::attach(&store, &sub, "proc", ATTACH_DEPTH, Priming::Retained).await;
+    RetentionStore::attach(&store, &sub, "proc", ATTACH_DEPTH).await;
     for body in ["a", "b"] {
         store.append(message("alice", body)).await;
     }
     serve(&store, &sub, DEPTH, 0).await;
 
-    let attached =
-        RetentionStore::attach(&store, &sub, "proc", ATTACH_DEPTH, Priming::Retained).await;
+    let attached = RetentionStore::attach(&store, &sub, "proc", ATTACH_DEPTH).await;
     assert_eq!(attached, Attached::Existing);
     assert!(!store.has_deliverable(&sub).await);
 }
 
-/// Priming positions the new cursor, and the depth it primes at decides how far
-/// back the retained case reaches: two messages for a depth of two, and the
-/// whole retained set for an unbounded one — the system-subscriber shape, where
-/// a bound quietly taken as one would start the queue's life having skipped its
-/// backlog.
+/// A new cursor is primed behind the retained tail, and the push depth decides
+/// how far back that reaches: two messages for a depth of two, and the whole
+/// retained set for an unbounded one — the system-subscriber shape, where a
+/// bound quietly taken as one would start the queue's life having skipped its
+/// backlog. A depth of zero holds no position at all, so it is not a priming
+/// case.
 #[tokio::test]
 async fn durable_attach_creates_a_cursor_at_the_primed_position() {
-    for (priming, depth, expected) in [
-        (Priming::Head, Depth::Bounded(2), 4),
-        (Priming::Retained, Depth::Bounded(2), 2),
-        (Priming::Retained, Depth::Unbounded, 1),
-    ] {
+    for (depth, expected) in [(Depth::Bounded(2), 2), (Depth::Unbounded, 1)] {
         let (store, db) = durable_store(DEPTH).await;
         for body in ["a", "b", "c"] {
             store.append(message("alice", body)).await;
         }
         let sub = wasm_sub("proc");
-        RetentionStore::attach(&store, &sub, "proc", depth, priming).await;
+        RetentionStore::attach(&store, &sub, "proc", depth).await;
 
         let conn = db.lock().await;
         let row = load_subscriber_cursor(&conn, store.channel_uuid(), &sub).expect("cursor row");
-        assert_eq!(row.next_owed_seq, expected, "{priming:?} at {depth:?}");
+        assert_eq!(row.next_owed_seq, expected, "primed at {depth:?}");
         assert_eq!(row.app_slug, "proc");
         assert_eq!(row.push_depth, depth);
     }
@@ -853,16 +845,8 @@ async fn subscribers_of_different_kinds_sharing_a_slug_hold_independent_cursors(
     let component = wasm_sub("proc");
     let conversation = ParticipantId::for_conversation(7);
 
-    RetentionStore::attach(
-        &store,
-        &component,
-        "proc",
-        Depth::Bounded(2),
-        Priming::Retained,
-    )
-    .await;
-    let attached =
-        RetentionStore::attach(&store, &conversation, "proc", ATTACH_DEPTH, Priming::Head).await;
+    RetentionStore::attach(&store, &component, "proc", Depth::Bounded(2)).await;
+    let attached = RetentionStore::attach(&store, &conversation, "proc", ATTACH_DEPTH).await;
     assert_eq!(
         attached,
         Attached::Created,
@@ -883,8 +867,8 @@ async fn subscribers_of_different_kinds_sharing_a_slug_hold_independent_cursors(
             load_subscriber_cursor(&conn, channel, &conversation)
                 .expect("conversation cursor")
                 .next_owed_seq,
-            4,
-            "primed at head"
+            1,
+            "primed over the whole retained tail at its own deeper reach"
         );
     }
 
@@ -896,7 +880,7 @@ async fn subscribers_of_different_kinds_sharing_a_slug_hold_independent_cursors(
         load_subscriber_cursor(&conn, store.channel_uuid(), &conversation)
             .expect("conversation cursor")
             .next_owed_seq,
-        4,
+        1,
         "the component's advance moved only the component"
     );
 }
@@ -909,7 +893,7 @@ async fn subscribers_of_different_kinds_sharing_a_slug_hold_independent_cursors(
 async fn a_durable_unbounded_attach_caches_unbounded() {
     let (store, db) = durable_store(DEPTH).await;
     let sub = wasm_sub("proc");
-    RetentionStore::attach(&store, &sub, "proc", Depth::Unbounded, Priming::Head).await;
+    RetentionStore::attach(&store, &sub, "proc", Depth::Unbounded).await;
 
     let conn = db.lock().await;
     let row = load_subscriber_cursor(&conn, store.channel_uuid(), &sub).expect("cursor row");
@@ -923,8 +907,8 @@ async fn durable_reattach_keeps_the_position_and_detach_removes_it() {
         store.append(message("alice", body)).await;
     }
     let sub = wasm_sub("proc");
-    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(1), Priming::Retained).await;
-    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(4), Priming::Head).await;
+    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(1)).await;
+    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(4)).await;
     {
         let conn = db.lock().await;
         let row = load_subscriber_cursor(&conn, store.channel_uuid(), &sub).expect("cursor row");
@@ -950,9 +934,7 @@ async fn a_sampled_attach_creates_no_queue_on_either_class() {
             store.append(msg).await;
         }
 
-        let attached = store
-            .attach(&sub, "proc", Depth::Bounded(0), Priming::Retained)
-            .await;
+        let attached = store.attach(&sub, "proc", Depth::Bounded(0)).await;
         assert_eq!(attached, Attached::Existing, "{}", store.address());
         assert!(!store.has_deliverable(&sub).await, "{}", store.address());
         assert!(
@@ -961,9 +943,7 @@ async fn a_sampled_attach_creates_no_queue_on_either_class() {
             store.address()
         );
 
-        let attached = store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
-            .await;
+        let attached = store.attach(&sub, "proc", ATTACH_DEPTH).await;
         assert_eq!(
             attached,
             Attached::Created,
@@ -972,9 +952,7 @@ async fn a_sampled_attach_creates_no_queue_on_either_class() {
         );
         assert!(store.has_deliverable(&sub).await, "{}", store.address());
 
-        let attached = store
-            .attach(&sub, "proc", Depth::Bounded(0), Priming::Head)
-            .await;
+        let attached = store.attach(&sub, "proc", Depth::Bounded(0)).await;
         assert_eq!(attached, Attached::Existing, "{}", store.address());
         assert!(
             !store.has_deliverable(&sub).await,
@@ -995,19 +973,19 @@ async fn a_sampled_durable_attach_holds_no_cursor() {
     store.append(message("alice", "a")).await;
     let sub = wasm_sub("proc");
 
-    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(0), Priming::Retained).await;
+    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(0)).await;
     {
         let conn = db.lock().await;
         assert!(load_subscriber_cursor(&conn, store.channel_uuid(), &sub).is_none());
     }
 
-    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(4), Priming::Head).await;
+    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(4)).await;
     {
         let conn = db.lock().await;
         assert!(load_subscriber_cursor(&conn, store.channel_uuid(), &sub).is_some());
     }
 
-    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(0), Priming::Head).await;
+    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(0)).await;
     let conn = db.lock().await;
     assert!(
         load_subscriber_cursor(&conn, store.channel_uuid(), &sub).is_none(),
@@ -1022,7 +1000,7 @@ async fn a_sampled_durable_attach_holds_no_cursor() {
 async fn a_durable_window_retunes_the_stored_depth() {
     let (store, db) = durable_store(DEPTH).await;
     let sub = wasm_sub("proc");
-    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(2), Priming::Head).await;
+    RetentionStore::attach(&store, &sub, "proc", Depth::Bounded(2)).await;
 
     RetentionStore::window(&store, &sub, Depth::Bounded(5), Depth::Bounded(0)).await;
 
@@ -1043,7 +1021,7 @@ async fn a_durable_window_retunes_the_stored_depth() {
 async fn a_position_below_an_emptied_retention_is_not_deliverable() {
     let (store, db) = durable_store_for("proc", DEPTH).await;
     let sub = wasm_sub("proc");
-    RetentionStore::attach(&store, &sub, "proc", ATTACH_DEPTH, Priming::Head).await;
+    RetentionStore::attach(&store, &sub, "proc", ATTACH_DEPTH).await;
     store.append(message("alice", "a")).await;
     assert!(store.has_deliverable(&sub).await);
 
@@ -1073,16 +1051,9 @@ async fn deliverable_subscribers_and_has_deliverable_agree_across_stores() {
     let (db_store, _db) = durable_store_for("proc", DEPTH).await;
     let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH));
 
-    RetentionStore::attach(
-        &db_store,
-        &wasm_sub("proc"),
-        "proc",
-        Depth::Bounded(4),
-        Priming::Head,
-    )
-    .await;
+    RetentionStore::attach(&db_store, &wasm_sub("proc"), "proc", Depth::Bounded(4)).await;
     db_store.append(message("alice", "a")).await;
-    ring.attach(&wasm_sub("proc"), "proc", 4, Priming::Head);
+    ring.attach(&wasm_sub("proc"), "proc", 4);
     RetentionStore::append(&ring, message_for(&ring, "alice", "a")).await;
 
     for store in [
@@ -1136,9 +1107,7 @@ async fn deliverable_subscribers_and_has_deliverable_agree_across_stores() {
 async fn the_owed_walk_reports_the_loudest_unseen_urgency() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
 
         for (body, urgency) in [
             ("shout", Urgency::High),
@@ -1186,9 +1155,7 @@ async fn the_owed_walk_ranks_every_urgency_level() {
     for urgency in Urgency::ALL {
         for store in stores_for_proc(DEPTH).await {
             let sub = wasm_sub("proc");
-            store
-                .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-                .await;
+            store.attach(&sub, "proc", ATTACH_DEPTH).await;
             let mut msg = message_for(store.as_ref(), "alice", "one");
             msg.urgency = urgency;
             store.append(msg).await;
@@ -1211,71 +1178,167 @@ async fn the_owed_walk_ranks_every_urgency_level() {
 /// passed, which is what lets a wake pass serve a message by T without any
 /// per-subscriber copy of T: the figure is read from the unseen suffix, so it
 /// vanishes for a subscriber that has passed the message and stays for one that
-/// has not. Durable-only — a non-durable channel refuses a deadline at commit.
+/// has not.
+///
+/// Both stores answer it — the deadline is an urgency override, and nothing
+/// about it requires a disk.
 #[tokio::test]
 async fn the_owed_walk_reports_the_earliest_unseen_deadline() {
-    let (store, _db) = durable_store_for("proc", DEPTH).await;
-    let sub = wasm_sub("proc");
-    store
-        .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-        .await;
+    for store in stores_for_proc(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
 
-    let mut early = message_for(&store, "alice", "by soon");
-    early.delivery_deadline = Some(soon());
-    RetentionStore::append(&store, early).await;
-    let mut late = message_for(&store, "alice", "by later");
-    late.delivery_deadline = Some(soon() + chrono::Duration::minutes(5));
-    RetentionStore::append(&store, late).await;
-    RetentionStore::append(&store, message_for(&store, "alice", "whenever")).await;
+        let mut early = message_for(store.as_ref(), "alice", "by soon");
+        early.delivery_deadline = Some(soon());
+        store.append(early).await;
+        let mut late = message_for(store.as_ref(), "alice", "by later");
+        late.delivery_deadline = Some(soon() + chrono::Duration::minutes(5));
+        store.append(late).await;
+        store
+            .append(message_for(store.as_ref(), "alice", "whenever"))
+            .await;
 
-    let owed = RetentionStore::deliverable_subscribers(&store).await;
-    assert_eq!(
-        owed.iter()
-            .map(|o| o.earliest_unseen_deadline)
-            .collect::<Vec<_>>(),
-        vec![Some(soon())],
-        "the earliest of the two deadlines in the unseen suffix"
-    );
+        let owed = store.deliverable_subscribers().await;
+        assert_eq!(
+            owed.iter()
+                .map(|o| o.earliest_unseen_deadline)
+                .collect::<Vec<_>>(),
+            vec![Some(soon())],
+            "{}: the earliest of the two deadlines in the unseen suffix",
+            store.address()
+        );
 
-    // Passing the first message leaves the later deadline as the next one owed.
-    RetentionStore::advance(&store, &sub, MessageSeq(1), MessageSeq(1)).await;
-    let owed = RetentionStore::deliverable_subscribers(&store).await;
-    assert_eq!(
-        owed.iter()
-            .map(|o| o.earliest_unseen_deadline)
-            .collect::<Vec<_>>(),
-        vec![Some(soon() + chrono::Duration::minutes(5))]
-    );
+        // Passing the first message leaves the later deadline as the next one
+        // owed.
+        store.advance(&sub, MessageSeq(1), MessageSeq(1)).await;
+        let owed = store.deliverable_subscribers().await;
+        assert_eq!(
+            owed.iter()
+                .map(|o| o.earliest_unseen_deadline)
+                .collect::<Vec<_>>(),
+            vec![Some(soon() + chrono::Duration::minutes(5))],
+            "{}",
+            store.address()
+        );
 
-    // Past both, only the deadline-less message is left: nothing to wake for by
-    // any time in particular.
-    RetentionStore::advance(&store, &sub, MessageSeq(2), MessageSeq(2)).await;
-    let owed = RetentionStore::deliverable_subscribers(&store).await;
-    assert_eq!(
-        owed.iter()
-            .map(|o| o.earliest_unseen_deadline)
-            .collect::<Vec<_>>(),
-        vec![None]
-    );
+        // Past both, only the deadline-less message is left: nothing to wake for
+        // by any time in particular.
+        store.advance(&sub, MessageSeq(2), MessageSeq(2)).await;
+        let owed = store.deliverable_subscribers().await;
+        assert_eq!(
+            owed.iter()
+                .map(|o| o.earliest_unseen_deadline)
+                .collect::<Vec<_>>(),
+            vec![None],
+            "{}",
+            store.address()
+        );
+    }
 }
 
-/// A ring position never carries a deadline to report: the ring refuses a
-/// message that names one, so the walk's deadline arm is durable-only by
-/// construction rather than by the ring choosing not to answer.
+/// The figure is the minimum over the unseen suffix, not the first deadline the
+/// walk meets in it. A deadline is an absolute time each publisher picks for
+/// itself, so nothing makes them ascend with publish order: the message that has
+/// to be in front of someone soonest can be the last one published.
 #[tokio::test]
-async fn a_ring_position_reports_no_deadline() {
-    let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH));
+async fn the_owed_walk_takes_the_minimum_deadline_not_the_first_one_published() {
+    let earliest = soon() - Duration::seconds(30);
+    for store in stores_for_proc(DEPTH).await {
+        let sub = wasm_sub("proc");
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
+
+        let mut later = message_for(store.as_ref(), "alice", "by later");
+        later.delivery_deadline = Some(soon() + Duration::minutes(5));
+        store.append(later).await;
+        store
+            .append(message_for(store.as_ref(), "alice", "whenever"))
+            .await;
+        let mut soonest = message_for(store.as_ref(), "alice", "by soonest");
+        soonest.delivery_deadline = Some(earliest);
+        store.append(soonest).await;
+
+        let owed = store.deliverable_subscribers().await;
+        assert_eq!(
+            owed.iter()
+                .map(|o| o.earliest_unseen_deadline)
+                .collect::<Vec<_>>(),
+            vec![Some(earliest)],
+            "{}: the minimum over the suffix, whatever order the deadlines arrived in",
+            store.address()
+        );
+    }
+}
+
+/// A deadline the retained window has already evicted is nobody's obligation:
+/// the ring folds the minimum over what it still holds, so a position whose
+/// suffix is empty of deadlines reports none however many were published.
+#[tokio::test]
+async fn a_deadline_evicted_from_the_ring_leaves_the_walk() {
+    let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(2));
     let sub = wasm_sub("proc");
-    ring.attach(&sub, "proc", DEPTH, Priming::Head);
-    RetentionStore::append(&ring, message_for(&ring, "alice", "one")).await;
+    ring.attach(&sub, "proc", 2);
+    let mut deadlined = message_for(&ring, "alice", "by soon");
+    deadlined.delivery_deadline = Some(soon());
+    RetentionStore::append(&ring, deadlined).await;
     assert_eq!(
         RetentionStore::deliverable_subscribers(&ring)
             .await
             .iter()
             .map(|o| o.earliest_unseen_deadline)
             .collect::<Vec<_>>(),
-        vec![None]
+        vec![Some(soon())]
     );
+
+    // Two more messages push the deadlined one out of the window entirely.
+    RetentionStore::append(&ring, message_for(&ring, "alice", "two")).await;
+    RetentionStore::append(&ring, message_for(&ring, "alice", "three")).await;
+    assert_eq!(
+        RetentionStore::deliverable_subscribers(&ring)
+            .await
+            .iter()
+            .map(|o| o.earliest_unseen_deadline)
+            .collect::<Vec<_>>(),
+        vec![None],
+        "the message carrying the deadline is gone, and so is the deadline"
+    );
+}
+
+/// A reply address survives the round trip on both stores — retained via
+/// different representations but read back as the same string.
+#[tokio::test]
+async fn a_reply_address_reads_back_the_same_on_both_stores() {
+    let (durable, _db) = durable_store_at_subscribed(Depth::Bounded(DEPTH), vec![]).await;
+    // The parity channel stands in as its own reply target: the durable join
+    // needs a channel row, and this is the row the fixture already wrote.
+    let reply_to = super::ReplyTarget {
+        uuid: durable.channel_uuid(),
+        address: durable.address().to_string(),
+    };
+    let stores: Vec<Arc<dyn RetentionStore>> = vec![
+        Arc::new(durable),
+        Arc::new(RingStore::new(
+            Uuid::new_v4(),
+            "ephemeral:parity",
+            Depth::Bounded(DEPTH),
+        )),
+    ];
+    for store in stores {
+        let mut msg = message_for(store.as_ref(), "alice", "ask me back");
+        msg.reply_to = Some(reply_to.clone());
+        store.append(msg).await;
+        assert_eq!(
+            store
+                .retained_tail(Depth::Bounded(1))
+                .await
+                .first()
+                .expect("the case appended one message")
+                .reply_to
+                .as_deref(),
+            Some(reply_to.address.as_str()),
+            "{}",
+            store.address()
+        );
+    }
 }
 
 /// The ring answers the same question from a table of suffix maxima indexed by
@@ -1287,7 +1350,7 @@ async fn a_ring_position_reports_no_deadline() {
 async fn the_ring_ranks_the_unseen_suffix_of_what_survived() {
     let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(3));
     let sub = wasm_sub("proc");
-    ring.attach(&sub, "proc", DEPTH, Priming::Head);
+    ring.attach(&sub, "proc", DEPTH);
     for (body, urgency) in [
         ("a", Urgency::High),
         ("b", Urgency::High),
@@ -1340,9 +1403,7 @@ async fn the_ring_ranks_the_unseen_suffix_of_what_survived() {
 async fn a_sampled_subscriber_is_never_owed_anything() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store
-            .attach(&sub, "proc", Depth::Bounded(0), Priming::Head)
-            .await;
+        store.attach(&sub, "proc", Depth::Bounded(0)).await;
         store
             .append(message_for(store.as_ref(), "alice", "loud"))
             .await;
@@ -1362,9 +1423,7 @@ async fn detach_tears_down_a_subscribers_delivery_state() {
             store.append(msg).await;
         }
         let sub = wasm_sub("proc");
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
         assert!(store.has_deliverable(&sub).await, "{}", store.address());
 
         // Detaching an unknown subscriber removes nothing and leaves the real
@@ -1447,9 +1506,7 @@ async fn a_window_serves_the_owed_tail_oldest_first() {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
         }
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
 
         let (new, advance) = serve(store.as_ref(), &sub, DEPTH, 0).await;
         assert_eq!(new, vec!["a", "b", "c"], "{}", store.address());
@@ -1469,9 +1526,7 @@ async fn the_push_limit_serves_the_newest_and_reports_the_rest() {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
         }
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
 
         let (new, advance) = serve(store.as_ref(), &sub, 2, 0).await;
         assert_eq!(
@@ -1507,9 +1562,7 @@ async fn unseen_context_inside_the_window_is_not_a_drop() {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
         }
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
 
         let window = store
             .window(&sub, Depth::Bounded(1), Depth::Bounded(4))
@@ -1547,9 +1600,7 @@ async fn a_sampled_window_is_all_context() {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
         }
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
 
         let window = store
             .window(&sub, Depth::Bounded(0), Depth::Bounded(4))
@@ -1577,9 +1628,7 @@ async fn the_window_is_capped_by_the_larger_limit_not_their_sum() {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
         }
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
 
         let window = store
             .window(&sub, Depth::Bounded(2), Depth::Bounded(4))
@@ -1606,9 +1655,7 @@ async fn an_unbounded_push_limit_serves_every_unseen_entry() {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
         }
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
 
         let window = store
             .window(&sub, Depth::Unbounded, Depth::Bounded(0))
@@ -1641,9 +1688,7 @@ async fn an_unbounded_retain_limit_widens_the_window_not_the_new_set() {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
         }
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
 
         let window = store
             .window(&sub, Depth::Bounded(1), Depth::Unbounded)
@@ -1681,9 +1726,7 @@ async fn a_sampled_window_offers_no_advance() {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
         }
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
 
         let window = store
             .window(&sub, Depth::Bounded(0), Depth::Bounded(4))
@@ -1708,7 +1751,7 @@ async fn a_sampled_window_offers_no_advance() {
 async fn advancing_a_sampled_ring_subscriber_reports_no_position() {
     let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(DEPTH));
     let sub = wasm_sub("sampled");
-    RetentionStore::attach(&ring, &sub, "sampled", Depth::Bounded(0), Priming::Head).await;
+    RetentionStore::attach(&ring, &sub, "sampled", Depth::Bounded(0)).await;
     RetentionStore::append(&ring, message_for(&ring, "alice", "a")).await;
     assert!(
         RetentionStore::advance(&ring, &sub, MessageSeq(1), MessageSeq(1))
@@ -1728,7 +1771,7 @@ async fn advancing_a_sampled_ring_subscriber_reports_no_position() {
 async fn advancing_a_sampled_durable_subscriber_reports_no_position() {
     let (store, _db) = durable_store(DEPTH).await;
     let sub = wasm_sub("sampled");
-    RetentionStore::attach(&store, &sub, "sampled", Depth::Bounded(0), Priming::Head).await;
+    RetentionStore::attach(&store, &sub, "sampled", Depth::Bounded(0)).await;
     store.append(message("alice", "a")).await;
     assert!(
         RetentionStore::advance(&store, &sub, MessageSeq(1), MessageSeq(1))
@@ -1767,9 +1810,7 @@ async fn advancing_an_unattached_durable_subscriber_reports_no_position() {
 async fn an_idle_queue_serves_an_empty_window() {
     for store in stores(DEPTH).await {
         let sub = wasm_sub("proc");
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
 
         let window = store
             .window(&sub, Depth::Bounded(DEPTH), Depth::Bounded(0))
@@ -1786,9 +1827,7 @@ async fn an_idle_queue_serves_an_empty_window() {
 async fn a_window_read_moves_nothing() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
         for body in ["a", "b", "c"] {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
@@ -1825,9 +1864,7 @@ async fn a_window_read_moves_nothing() {
 async fn nothing_deliverable_means_nothing_new_in_the_window() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
 
         // Idle: attached, nothing published.
         assert!(!store.has_deliverable(&sub).await, "{}", store.address());
@@ -1880,9 +1917,7 @@ async fn nothing_deliverable_means_nothing_new_in_the_window() {
 async fn advancing_over_a_prefix_leaves_the_remainder_owed() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
         for body in ["a", "b", "c"] {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
@@ -1914,9 +1949,7 @@ async fn advancing_over_a_prefix_leaves_the_remainder_owed() {
 async fn advancing_nothing_keeps_every_obligation() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
         store
             .append(message_for(store.as_ref(), "alice", "a"))
             .await;
@@ -1944,9 +1977,7 @@ async fn advancing_nothing_keeps_every_obligation() {
 async fn advance_is_idempotent() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
         for body in ["a", "b"] {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
@@ -2030,9 +2061,7 @@ async fn a_ring_push_window_reports_no_position_when_unattached() {
 async fn an_advance_over_a_detached_subscribers_window_reports_no_position() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
         for body in ["a", "b"] {
             let msg = message_for(store.as_ref(), "alice", body);
             store.append(msg).await;
@@ -2053,9 +2082,7 @@ async fn an_advance_over_a_detached_subscribers_window_reports_no_position() {
 
         // Re-attaching mints a fresh position at the retained tail: the stale
         // advance marked nothing seen on the way past.
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Retained)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
         let (new, _) = serve(store.as_ref(), &sub, DEPTH, 0).await;
         assert_eq!(new, vec!["a", "b"], "{}", store.address());
     }
@@ -2068,9 +2095,7 @@ async fn an_advance_over_a_detached_subscribers_window_reports_no_position() {
 async fn an_advance_behind_a_sampled_demotion_reports_no_position() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
         let msg = message_for(store.as_ref(), "alice", "a");
         store.append(msg).await;
         let window = store
@@ -2079,9 +2104,7 @@ async fn an_advance_behind_a_sampled_demotion_reports_no_position() {
             .expect("the case attached this subscriber");
         let (through, seen_floor) = window.advance_span().expect("entries were served");
 
-        store
-            .attach(&sub, "proc", Depth::Bounded(0), Priming::Head)
-            .await;
+        store.attach(&sub, "proc", Depth::Bounded(0)).await;
 
         assert!(
             store.advance(&sub, through, seen_floor).await.is_none(),
@@ -2099,7 +2122,7 @@ async fn an_advance_behind_a_sampled_demotion_reports_no_position() {
 async fn ring_eviction_reports_the_loss_without_a_read() {
     let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(2));
     let sub = wasm_sub("absent");
-    ring.attach(&sub, "absent", 8, Priming::Head);
+    ring.attach(&sub, "absent", 8);
     for body in ["a", "b"] {
         assert!(
             RetentionStore::append(&ring, message_for(&ring, "alice", body))
@@ -2130,9 +2153,7 @@ async fn ring_eviction_reports_the_loss_without_a_read() {
 async fn durable_eviction_reports_the_loss_once_per_evicted_span() {
     let (store, db) = durable_store_for("proc", DEPTH).await;
     let sub = wasm_sub("proc");
-    store
-        .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-        .await;
+    store.attach(&sub, "proc", ATTACH_DEPTH).await;
     for body in ["a", "b", "c", "d"] {
         RetentionStore::append(&store, message_for(&store, "alice", body)).await;
     }
@@ -2198,7 +2219,7 @@ async fn eviction_reporting_agrees_across_the_classes() {
     const RETAINED: u64 = 2;
 
     let ring = RingStore::new(Uuid::new_v4(), "ephemeral:parity", Depth::Bounded(RETAINED));
-    ring.attach(&sub, "absent", DEPTH, Priming::Head);
+    ring.attach(&sub, "absent", DEPTH);
     let mut ring_reported = 0;
     for body in HISTORY {
         ring_reported += RetentionStore::append(&ring, message_for(&ring, "alice", body))
@@ -2210,9 +2231,7 @@ async fn eviction_reporting_agrees_across_the_classes() {
     }
 
     let (store, db) = durable_store_for("absent", DEPTH).await;
-    store
-        .attach(&sub, "absent", ATTACH_DEPTH, Priming::Head)
-        .await;
+    store.attach(&sub, "absent", ATTACH_DEPTH).await;
     for body in HISTORY {
         RetentionStore::append(&store, message_for(&store, "alice", body)).await;
     }
@@ -2245,12 +2264,8 @@ async fn durable_eviction_reports_only_positions_it_outran() {
     let (store, db) = durable_store_for("proc", DEPTH).await;
     let caught_up = wasm_sub("proc");
     let sampled = wasm_sub("sampled");
-    store
-        .attach(&caught_up, "proc", ATTACH_DEPTH, Priming::Head)
-        .await;
-    store
-        .attach(&sampled, "sampled", Depth::Bounded(0), Priming::Head)
-        .await;
+    store.attach(&caught_up, "proc", ATTACH_DEPTH).await;
+    store.attach(&sampled, "sampled", Depth::Bounded(0)).await;
     for body in ["a", "b", "c"] {
         RetentionStore::append(&store, message_for(&store, "alice", body)).await;
     }
@@ -2283,9 +2298,7 @@ async fn durable_eviction_reports_only_positions_it_outran() {
 async fn durable_advance_reports_a_loss_gc_already_retired() {
     let (store, db) = durable_store_for("proc", DEPTH).await;
     let sub = wasm_sub("proc");
-    store
-        .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-        .await;
+    store.attach(&sub, "proc", ATTACH_DEPTH).await;
     for body in ["a", "b", "c", "d"] {
         let msg = message_for(&store, "alice", body);
         RetentionStore::append(&store, msg).await;
@@ -2333,9 +2346,7 @@ async fn durable_advance_reports_a_loss_gc_already_retired() {
 async fn durable_advance_charges_only_the_still_retained_half_of_a_loss() {
     let (store, db) = durable_store_for("proc", DEPTH).await;
     let sub = wasm_sub("proc");
-    store
-        .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-        .await;
+    store.attach(&sub, "proc", ATTACH_DEPTH).await;
 
     for body in ["a", "b"] {
         RetentionStore::append(&store, message_for(&store, "alice", body)).await;
@@ -2387,9 +2398,7 @@ async fn durable_advance_charges_only_the_still_retained_half_of_a_loss() {
 async fn a_parked_message_owes_no_subscriber_until_release() {
     for store in stores_for_proc(DEPTH).await {
         let sub = wasm_sub("proc");
-        store
-            .attach(&sub, "proc", ATTACH_DEPTH, Priming::Head)
-            .await;
+        store.attach(&sub, "proc", ATTACH_DEPTH).await;
         store
             .park(message_for(&*store, "alice", "later"), soon())
             .await
@@ -2420,9 +2429,7 @@ async fn a_subscriber_attached_mid_park_receives_the_message_at_release() {
 
         // Attaches after the park, so nothing about it was knowable then.
         let latecomer = wasm_sub("proc");
-        store
-            .attach(&latecomer, "proc", ATTACH_DEPTH, Priming::Head)
-            .await;
+        store.attach(&latecomer, "proc", ATTACH_DEPTH).await;
 
         store.release_due(release_at).await;
 
@@ -2440,9 +2447,7 @@ async fn a_subscriber_attached_mid_park_receives_the_message_at_release() {
 async fn a_released_durable_push_makes_its_target_owed() {
     let (store, _db) =
         durable_store_at_subscribed(Depth::Bounded(DEPTH), vec![wasm_target("proc", None)]).await;
-    store
-        .attach(&wasm_sub("proc"), "proc", ATTACH_DEPTH, Priming::Head)
-        .await;
+    store.attach(&wasm_sub("proc"), "proc", ATTACH_DEPTH).await;
     let release_at = soon();
     store
         .park(message("alice", "later"), release_at)
@@ -2464,9 +2469,7 @@ async fn a_commit_owes_the_message_to_the_channels_registered_subscribers() {
         // The ring's registration is its attached cursor; the durable store's is
         // the directory subscriber the fixture registered. Neither is told by
         // this caller who to deliver to.
-        store
-            .attach(&wasm_sub("proc"), "proc", ATTACH_DEPTH, Priming::Head)
-            .await;
+        store.attach(&wasm_sub("proc"), "proc", ATTACH_DEPTH).await;
         store.append(message_for(&*store, "alice", "a")).await;
 
         assert_eq!(
@@ -3073,9 +3076,7 @@ async fn durable_replay_reports_a_gap_when_an_interior_seq_is_missing() {
 async fn a_durable_commit_past_the_depth_reports_no_overflow() {
     let (store, _db) = durable_store_for("slow", 1).await;
     let sub = wasm_sub("slow");
-    store
-        .attach(&sub, "slow", Depth::Bounded(1), Priming::Head)
-        .await;
+    store.attach(&sub, "slow", Depth::Bounded(1)).await;
 
     for body in ["a", "b", "c"] {
         let outcome = store.append(message("alice", body)).await;

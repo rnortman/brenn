@@ -1297,9 +1297,8 @@ fn page_local_io_port_config() -> brenn_lib::config::BrennConfig {
     use brenn_lib::messaging::config::{Depth, MessagingGlobalConfig};
 
     let deskbar = brenn_lib::messaging::config::SurfaceConfigRaw {
-        // push < retain, and both below the global default push depth: the ring
-        // depth this yields distinguishes the retain fold from a push fold and
-        // from inheriting the global default.
+        // push < retain: the ring depth this yields distinguishes the retain
+        // fold from a push fold.
         io_ports: vec![surface_io_port_raw(
             COMPONENT,
             LOOP_PORT,
@@ -1310,10 +1309,7 @@ fn page_local_io_port_config() -> brenn_lib::config::BrennConfig {
         ..minimal_surface_raw()
     };
     brenn_lib::config::BrennConfig {
-        messaging: MessagingGlobalConfig {
-            default_push_depth: Depth::Bounded(8),
-            ..Default::default()
-        },
+        messaging: MessagingGlobalConfig::default(),
         surfaces: vec![deskbar],
         ..brenn_lib::config::BrennConfig::default()
     }

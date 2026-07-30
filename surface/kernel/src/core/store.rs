@@ -29,7 +29,7 @@ use std::collections::HashMap;
 
 use brenn_envelope::MessageEnvelope;
 use brenn_queue::{
-    Advance, Attached, CursorOverflow, Deferred, DeferredId, OwnedDeferred, Priming, QuotaExceeded,
+    Advance, Attached, CursorOverflow, Deferred, DeferredId, OwnedDeferred, QuotaExceeded,
     ReleaseReport, ReleaseTime, RingCore, Window,
 };
 use brenn_surface_proto::channel_capabilities;
@@ -235,7 +235,7 @@ impl SurfaceChannelStore {
     /// delivered to, so a position kept for it would be one every eviction
     /// charges and no window can serve.
     pub(crate) fn attach(&mut self, binding: BindingKey, push_depth: u64) -> Attached {
-        self.core.attach(binding, push_depth, Priming::Retained)
+        self.core.attach(binding, push_depth)
     }
 
     /// Drop one binding's position and its undelivered server-drop count. The

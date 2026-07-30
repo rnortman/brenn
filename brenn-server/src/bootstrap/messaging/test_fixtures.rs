@@ -7,10 +7,17 @@ use brenn_lib::config::{
 };
 use brenn_lib::messaging::WakeMin;
 use brenn_lib::messaging::config::{
-    ResolvedChannel, Sink, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceSubscriptionRaw,
+    Depth, ResolvedChannel, Sink, SurfaceComponentRaw, SurfaceConfigRaw, SurfaceSubscriptionRaw,
     WasmConsumerConfigRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw,
 };
 use brenn_lib::webhook::ResolvedWebhookSubscription;
+
+/// Builds `SystemChannelTuning` from `config`'s `[[channel]]` blocks.
+pub(crate) fn tuning_for(
+    config: &brenn_lib::config::BrennConfig,
+) -> brenn_lib::messaging::config::SystemChannelTuning {
+    brenn_lib::messaging::config::build_system_channel_tuning(&config.channels, &config.messaging)
+}
 
 /// Boot `build_messaging` over `config` with an inert periphery: no webhook
 /// endpoints, no active bridges, no dynamic subscriptions, and an empty tool
@@ -33,6 +40,7 @@ pub(crate) async fn boot_messaging_with(
         Some(Arc::from(origin)),
         &webhooks,
         &[],
+        &tuning_for(config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &Arc::new(crate::tool_registry::ToolRegistry::new(vec![])),
     )
@@ -268,6 +276,9 @@ pub(super) fn minimal_wasm_consumer_raw(
 
 /// A `SurfaceSubscriptionRaw` on `channel`/`component`/`port` with every
 /// optional knob unset; callers set the knob(s) under test via struct-update.
+///
+/// `push_depth` stays unset, which resolves off the channel's rung. A `local:`
+/// binding has no rung and must state one — [`local_sub_raw`] is that shape.
 pub(super) fn surface_sub_raw(
     channel: &str,
     component: &str,
@@ -281,6 +292,16 @@ pub(super) fn surface_sub_raw(
         retain_depth: None,
         noise: None,
         wake_min: None,
+    }
+}
+
+/// A `local:` surface binding: [`surface_sub_raw`] plus the `push_depth` a
+/// page-local binding has to state for itself, since there is no `[[channel]]`
+/// block behind a `local:` address to carry one.
+pub(super) fn local_sub_raw(channel: &str, component: &str, port: &str) -> SurfaceSubscriptionRaw {
+    SurfaceSubscriptionRaw {
+        push_depth: Some(Depth::Bounded(8)),
+        ..surface_sub_raw(channel, component, port)
     }
 }
 

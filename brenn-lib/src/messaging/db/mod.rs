@@ -26,7 +26,10 @@ pub use budget::{
 };
 
 mod bootstrap;
-pub use bootstrap::{load_channels_by_uuids, prune_dropped_dynamic_subscriptions, upsert_channels};
+pub use bootstrap::{
+    ChannelReconstruction, load_channels_by_uuids, prune_dropped_dynamic_subscriptions,
+    upsert_channels,
+};
 
 mod dynamic;
 pub use dynamic::{
@@ -64,8 +67,8 @@ pub use bus::{
     channel_retention_frontier, insert_message, insert_message_in_tx,
     list_pending_messages_for_sender, load_channel_messages_after_seq, load_channel_retained_tail,
     load_channel_retained_window_seq, load_dispatchable_ingress_pushes, load_envelope_by_uuid,
-    lookup_message_for_authorship, mark_pending_pushes_delivered, retained_tail_floor_seq,
-    update_parked_message, withdraw_parked_message,
+    lookup_message_for_authorship, mark_pending_pushes_delivered, primed_position,
+    retained_tail_floor_seq, update_parked_message, withdraw_parked_message,
 };
 
 mod cursors;
@@ -78,9 +81,9 @@ pub use cursors::{
 
 mod deferral;
 pub use deferral::{
-    DeferredLookup, DeferredRow, ReleasedRow, count_deferred, delete_deferred,
-    earliest_channel_release, edit_deferred, list_deferred_for_sender, list_deferred_senders,
-    lookup_deferred, release_due_for_channel,
+    DeferredLookup, DeferredRow, ReleasedRow, count_deferred, deferred_cap_refusal,
+    delete_deferred, earliest_channel_release, edit_deferred, list_deferred_for_sender,
+    list_deferred_senders, lookup_deferred, release_due_for_channel,
 };
 
 #[cfg(test)]

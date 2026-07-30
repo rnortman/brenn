@@ -25,9 +25,7 @@ mod store;
 pub use cursor::{Advance, SubscriberCursor, Window, gap_suffix, new_boundary, retention_frontier};
 pub use deferred::{Deferred, DeferredId, DeferredSet, NoSuchDeferred, QuotaExceeded, ReleaseTime};
 pub use ring::{Append, GapReason, Replay, ReplayDecision, Resume, Retained, RetainedRing};
-pub use store::{
-    AppendReport, Attached, CursorOverflow, OwnedDeferred, Priming, ReleaseReport, RingCore,
-};
+pub use store::{AppendReport, Attached, CursorOverflow, OwnedDeferred, ReleaseReport, RingCore};
 
 #[cfg(test)]
 mod invariant_tests;

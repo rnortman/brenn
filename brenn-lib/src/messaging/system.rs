@@ -17,7 +17,7 @@ use tokio::sync::Notify;
 use crate::access::acl::ChannelMatcher;
 use crate::access::{AppCapability, AppPolicy};
 
-use super::config::{Depth, NoiseLevel};
+use super::config::NoiseLevel;
 use super::store::MessageSeq;
 use super::{
     ChannelEntry, MessageEnvelope, Messenger, ParticipantId, SubscriberEntry, SubscriberEntryKind,
@@ -104,10 +104,12 @@ pub fn registrations_from_specs(
 /// finalization — so system subscriptions flow through the same
 /// deliverability validation and dispatch as every other subscriber.
 ///
-/// Depths are `Unbounded` and noise `Silent` deliberately: a bounded push
-/// depth would let overflow silently retire substrate messages (e.g. tool
-/// requests) under load — the silent-drop class the substrate must never
-/// have.
+/// Both depths are the channel's own `retain_depth` and noise is `Silent`
+/// deliberately: a drain that sees a window's worth sees everything there is,
+/// so the participant is owed exactly what the channel retains. Sizing the
+/// window is the operator's decision on the channel block; a subscriber that
+/// reached past it would pin the channel against reaping and quietly move the
+/// retention decision out of the operator's hands.
 ///
 /// # Panics
 ///
@@ -118,6 +120,11 @@ pub fn registrations_from_specs(
 /// would emit a second push row per publish and drive the handler to execute the
 /// message twice: the silent-double-delivery class the substrate must never
 /// have, so it fails boot like the sibling duplicate-wiring checks.
+///
+/// Also panics when the channel's `retain_depth` is zero, naming the channel:
+/// the participant would take a `push_depth` of zero, which creates no position,
+/// and the first window read would blame the host for a wiring bug that is
+/// really a channel sized to hold nothing.
 pub fn fold_spec_subscriptions(entries: &mut [ChannelEntry], specs: &[SystemParticipantSpec]) {
     for spec in specs {
         for address in &spec.subscriptions {
@@ -140,10 +147,19 @@ pub fn fold_spec_subscriptions(entries: &mut [ChannelEntry], specs: &[SystemPart
                  subscription would double-deliver; host wiring bug",
                 spec.component,
             );
+            let window = entry.resolved_channel.retain_depth;
+            assert!(
+                window.is_push_enabled(),
+                "system participant {:?} subscribes to {address:?}, whose retain_depth is \
+                 {window:?} — a participant follows its channel's window, and a window of \
+                 zero would leave it with no position at all; size the channel's \
+                 retain_depth to at least one",
+                spec.component,
+            );
             entry.subscribers.push(SubscriberEntry {
                 kind: SubscriberEntryKind::System(spec.component.to_string()),
-                push_depth: Depth::Unbounded,
-                retain_depth: Depth::Unbounded,
+                push_depth: window,
+                retain_depth: window,
                 noise: NoiseLevel::Silent,
                 wake_min: None,
             });
@@ -195,10 +211,19 @@ impl SystemInbox {
 
     /// Create the participant's position on every channel it subscribes to.
     ///
-    /// `Head` priming (`priming_for_kind`): a system participant is not woken
-    /// with messages published before it existed. A position already there —
-    /// seeded by the migration or left by a previous boot — keeps its place, so
-    /// a restart resumes rather than skips.
+    /// A position coming into existence is primed behind the channel's retained
+    /// tail, so a genuinely fresh participant drains what is retained rather
+    /// than silently skipping it. A position already there — seeded by the
+    /// migration or left by a previous boot — keeps its place, so a restart
+    /// resumes rather than re-drains.
+    ///
+    /// The guarantee is bounded, and deliberately so: a message is retained for
+    /// the channel's window, sized for the outage the operator intends to
+    /// survive, not forever. So a fresh position re-runs at most a window's
+    /// worth of already-handled messages, and anything dropped past the window
+    /// is counted, not silent. Handlers must tolerate that repeat — for the tool
+    /// executor it is the `Idempotency::Natural` contract every async tool
+    /// declares.
     ///
     /// Runs before the first window read; a push-enabled window read without a
     /// position panics.
@@ -206,13 +231,7 @@ impl SystemInbox {
         let subscriber = self.subscriber();
         for (entry, sub) in self.subscriptions() {
             self.messenger
-                .attach_subscriber(
-                    &entry.address,
-                    self.component,
-                    &subscriber,
-                    sub.push_depth,
-                    super::store::priming_for_kind(&sub.kind),
-                )
+                .attach_subscriber(&entry.address, self.component, &subscriber, sub.push_depth)
                 .await;
         }
     }
@@ -320,7 +339,7 @@ mod tests {
     use crate::access::acl::{AclSet, ChannelMatcher};
     use crate::access::{AppCapability, GrantSet};
     use crate::db::init_db_memory;
-    use crate::messaging::config::MessagingGlobalConfig;
+    use crate::messaging::config::{Depth, MessagingGlobalConfig};
     use crate::messaging::db::{insert_message, upsert_channels, utc_to_ns};
     use crate::messaging::query::NoopWakeRouter;
     use crate::messaging::testutils::test_channel_entry;
@@ -385,34 +404,65 @@ mod tests {
         harness_with(inbox_sub()).await
     }
 
-    /// [`harness`] with the participant's subscription spelled out, for the
-    /// cases that turn the depth or the noise rung away from the defaults every
-    /// production system subscription uses.
-    async fn harness_with(sub: SubscriberEntry) -> Harness {
+    /// Build a harness from pre-assembled channel entries and a participant
+    /// spec. `entries[0]` becomes `reqs_uuid`, `entries[1]` becomes `alt_uuid`.
+    async fn harness_over(
+        entries: Vec<ChannelEntry>,
+        participant: SystemParticipantSpec,
+    ) -> Harness {
         let db = init_db_memory();
-        let reqs = test_channel_entry("inbox/reqs", vec![sub.clone()]);
-        let alt = test_channel_entry("inbox/alt", vec![sub]);
-        let reqs_uuid = reqs.uuid;
-        let alt_uuid = alt.uuid;
+        let reqs_uuid = entries[0].uuid;
+        let alt_uuid = entries[1].uuid;
         {
             let conn = db.lock().await;
-            upsert_channels(&conn, &[reqs.clone(), alt.clone()]);
+            upsert_channels(&conn, &entries);
         }
-        let directory = Arc::new(MessagingDirectory::with_entries(vec![reqs, alt]));
         let messenger = Messenger::new(
             db,
-            directory,
+            Arc::new(MessagingDirectory::with_entries(entries)),
             Arc::from("test"),
             Arc::new(IndexMap::new()),
             Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
             MessagingGlobalConfig::default(),
         )
-        .with_subscriber_registrations(registrations_from_specs(&[spec(COMPONENT, vec![])]));
+        .with_subscriber_registrations(registrations_from_specs(&[participant]));
         Harness {
             messenger,
             reqs_uuid,
             alt_uuid,
         }
+    }
+
+    /// [`harness`] with the participant's subscription spelled out, for the
+    /// cases that turn the depth or the noise rung away from the defaults every
+    /// production system subscription uses.
+    async fn harness_with(sub: SubscriberEntry) -> Harness {
+        let entries = vec![
+            test_channel_entry("inbox/reqs", vec![sub.clone()]),
+            test_channel_entry("inbox/alt", vec![sub]),
+        ];
+        harness_over(entries, spec(COMPONENT, vec![])).await
+    }
+
+    /// Like [`harness`] but with a bounded channel window. Folds subscriber
+    /// entries from the spec rather than hand-writing them, keeping the test
+    /// honest about what production builds.
+    async fn harness_windowed(window: u64) -> Harness {
+        let mut entries = vec![
+            test_channel_entry("inbox/reqs", vec![]),
+            test_channel_entry("inbox/alt", vec![]),
+        ];
+        for entry in &mut entries {
+            entry.resolved_channel.push_depth = Depth::Bounded(window);
+            entry.resolved_channel.retain_depth = Depth::Bounded(window);
+            entry.resolved_channel.standing_retain_depth = Depth::Bounded(window);
+        }
+        let participant = spec(
+            COMPONENT,
+            entries.iter().map(|e| e.address.clone()).collect(),
+        );
+        fold_spec_subscriptions(&mut entries, std::slice::from_ref(&participant));
+        harness_over(entries, participant).await
     }
 
     fn inbox(h: &Harness) -> SystemInbox {
@@ -510,8 +560,7 @@ mod tests {
         );
     }
 
-    /// Production system subscriptions are unbounded for a reason, but the
-    /// substrate rule still holds under a bounded one: the window serves the
+    /// A subscription narrower than the channel's window: the window serves the
     /// newest `push_depth`, and the seqs it skipped are charged at the
     /// subscription's own rung — not the channel's, and not lost.
     #[tokio::test]
@@ -550,7 +599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_primes_at_head_so_earlier_messages_are_not_served() {
+    async fn a_fresh_position_drains_what_was_retained_before_it_existed() {
         let h = harness().await;
         insert_row(&h, &json!({ "phase": "before-attach" }).to_string()).await;
         let inbox = inbox(&h);
@@ -559,8 +608,69 @@ mod tests {
 
         assert_eq!(
             bodies(&inbox.dequeue_batch().await),
-            vec![json!({ "phase": "after-attach" }).to_string()],
-            "a system participant is not woken with messages published before it attached",
+            vec![
+                json!({ "phase": "before-attach" }).to_string(),
+                json!({ "phase": "after-attach" }).to_string(),
+            ],
+            "a fresh position is owed the whole retained window",
+        );
+    }
+
+    /// Safety of the drain on a long-lived channel: the repeat is bounded by
+    /// the channel's window, not by its history.
+    #[tokio::test]
+    async fn a_fresh_position_primes_at_the_window_floor_not_the_history_floor() {
+        let h = harness_windowed(2).await;
+        for n in 1..=5 {
+            insert_row(&h, &json!({ "n": n }).to_string()).await;
+        }
+        let inbox = inbox(&h);
+        inbox.attach().await;
+
+        assert_eq!(
+            bodies(&inbox.dequeue_batch().await),
+            vec![json!({ "n": 4 }).to_string(), json!({ "n": 5 }).to_string()],
+            "the drain is bounded by the channel's window, not by its history",
+        );
+    }
+
+    /// Complement: rows past the window actually leave the database, so
+    /// history cannot grow into a replay a later fresh position would face.
+    #[tokio::test]
+    async fn the_gc_pass_retires_what_the_window_no_longer_covers() {
+        let h = harness_windowed(2).await;
+        for n in 1..=5 {
+            insert_row(&h, &json!({ "n": n }).to_string()).await;
+        }
+        let inbox = inbox(&h);
+        inbox.attach().await;
+        assert_eq!(inbox.dequeue_batch().await.len(), 2, "the window's worth");
+
+        let entry = h
+            .messenger
+            .directory()
+            .by_uuid(&h.reqs_uuid)
+            .expect("channel in directory");
+        let frontier = entry
+            .reap_frontier()
+            .expect("a bounded standing depth gives the reaper a frontier");
+        assert_eq!(frontier, 2, "the frontier is the channel's standing number");
+
+        let eviction = {
+            let conn = h.messenger.db().lock().await;
+            crate::messaging::db::bus_gc_evict_channel(
+                &conn,
+                entry.uuid,
+                &entry.address,
+                entry.transport_type,
+                frontier,
+                entry.resolved_channel.sink,
+                None,
+            )
+        };
+        assert_eq!(
+            eviction.messages_evicted, 3,
+            "the three past the frontier are gone; the window's two remain",
         );
     }
 
@@ -579,7 +689,7 @@ mod tests {
         assert_eq!(
             bodies(&inbox.dequeue_batch().await),
             vec![json!({ "n": 2 }).to_string()],
-            "re-attach resumes rather than re-priming at head",
+            "re-attach resumes rather than re-priming",
         );
     }
 
@@ -661,8 +771,8 @@ mod tests {
     #[tokio::test]
     async fn run_sweeps_at_startup_then_drains_on_notify() {
         let h = harness().await;
-        // Attach before the row lands so the startup sweep has something unseen
-        // to pick up (the loop's own attach primes at head).
+        // Attach before the row lands so the startup sweep picks it up as the
+        // position's first unseen message rather than as part of its priming.
         inbox(&h).attach().await;
         insert_row(&h, &json!({ "phase": "sweep" }).to_string()).await;
 
@@ -719,6 +829,7 @@ mod tests {
     #[test]
     fn fold_spec_subscriptions_appends_system_subscriber_entries() {
         let mut entries = vec![test_channel_entry("inbox/reqs", vec![])];
+        entries[0].resolved_channel.retain_depth = Depth::Bounded(16);
         fold_spec_subscriptions(
             &mut entries,
             &[spec(COMPONENT, vec!["brenn:inbox/reqs".to_string()])],
@@ -727,8 +838,8 @@ mod tests {
             entries[0].subscribers.as_slice(),
             [SubscriberEntry {
                 kind: SubscriberEntryKind::System(c),
-                push_depth: Depth::Unbounded,
-                retain_depth: Depth::Unbounded,
+                push_depth: Depth::Bounded(16),
+                retain_depth: Depth::Bounded(16),
                 ..
             }] if c == COMPONENT
         ));

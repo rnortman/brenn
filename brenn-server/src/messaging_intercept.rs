@@ -263,7 +263,9 @@ pub async fn try_handle_messaging_tool(
             // Append pwa_push targets: a PWA-push registration IS a subscription
             // this app holds, and `list_targets(app_slug)` is already app-scoped.
             // These are always concrete registrations (no static-vs-dynamic
-            // distinction), reported with `dynamic = false`.
+            // distinction), reported with `dynamic = false`, and with no depths:
+            // an egress target holds no queue, so any number here would be the
+            // listing describing a window that does not exist.
             if let Some(pwa_push_svc) = bridge.pwa_push_service() {
                 let push_targets = pwa_push_svc.list_targets(app_slug).await;
                 for target in push_targets {
@@ -272,8 +274,8 @@ pub async fn try_handle_messaging_tool(
                         address: target.address,
                         description: None,
                         dynamic: false,
-                        push_depth: brenn_lib::messaging::config::Depth::Unbounded,
-                        retain_depth: brenn_lib::messaging::config::Depth::Unbounded,
+                        push_depth: None,
+                        retain_depth: None,
                         noise: brenn_lib::messaging::config::NoiseLevel::Silent,
                         wake_min: brenn_lib::messaging::WakeMin::Normal,
                         details: Some(brenn_lib::messaging::ChannelDetails::PwaPush(
@@ -590,9 +592,6 @@ pub async fn try_handle_messaging_tool(
                 PublishResult::RateLimited => mkerr(Cow::Borrowed(
                     "rate limited: too many publishes to this channel; slow down",
                 )),
-                PublishResult::UnsupportedOption { field } => mkerr(Cow::Owned(format!(
-                    "`{field}` is not supported on this channel"
-                ))),
                 PublishResult::DeferredQuotaExceeded { cap } => mkerr(Cow::Owned(format!(
                     "deferred-message quota exceeded: this channel already holds its cap of {cap} \
                      scheduled messages; retry after some release"
@@ -1527,9 +1526,9 @@ async fn handle_message_subscribe(
             use brenn_lib::messaging::subscribe::RuntimeSubscribeError;
             let denial_reason = match &e {
                 SubscribeActivateError::PolicyDenied { .. } => Some("access policy"),
-                SubscribeActivateError::Core(
-                    RuntimeSubscribeError::RetainDepthExceedsStanding { .. },
-                ) => Some("retain depth exceeds standing"),
+                SubscribeActivateError::Core(RuntimeSubscribeError::DepthExceedsStanding {
+                    ..
+                }) => Some("depth exceeds standing"),
                 _ => None,
             };
             if let Some(reason) = denial_reason {
@@ -2510,6 +2509,12 @@ mod tests {
                     json!(false),
                     "pwa_push registrations report dynamic=false"
                 );
+                for row in &pwa {
+                    assert!(
+                        row.get("push_depth").is_none() && row.get("retain_depth").is_none(),
+                        "pwa_push row must omit both depths: {row:?}"
+                    );
+                }
             }
             other => panic!("unexpected result: {other:?}"),
         }
@@ -3235,6 +3240,14 @@ mod tests {
             testapp_cfg.policy.acls.ephemeral_publish.push(
                 brenn_lib::access::acl::ChannelMatcher::Exact("protobar".to_string()),
             );
+            // Carries the `brenn:` grant with no matcher behind it: inert for
+            // every publish here (layer-1 reads the target scheme's own grant),
+            // and it is what makes the app's messaging identity resolvable, which
+            // the recall tools ask for before they look a message up.
+            testapp_cfg
+                .policy
+                .grants
+                .insert(brenn_lib::access::AppCapability::MessagingPublish);
         }
         apps.insert("testapp".to_string(), testapp_cfg);
         let messenger = brenn_lib::messaging::Messenger::new(
@@ -3296,29 +3309,49 @@ mod tests {
         }
     }
 
-    /// `MessageSend` to an `ephemeral:` channel with a durable-only option
-    /// (`reply_to`) is rejected with a teach-string naming the field.
+    /// Cancelling a message scheduled to an `ephemeral:` channel answers the
+    /// unknown-message error even while it is still parked. Pinned because the
+    /// tool descriptions disclose exactly this scope — a change that widened it
+    /// silently would leave three descriptions lying.
     #[tokio::test]
-    async fn ephemeral_send_reply_to_returns_unsupported_option() {
+    async fn cancel_of_an_ephemeral_scheduled_message_reports_it_unknown() {
         let messenger = ephemeral_intercept_messenger();
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_messenger(messenger).await;
-        let req = post_tool_use_req(
+        let release_at = chrono::Utc::now() + chrono::Duration::minutes(10);
+        let send_req = post_tool_use_req(
             MCP_MESSAGE_SEND_TOOL,
-            json!({ "to": "ephemeral:protobar", "body": "hi", "reply_to": "brenn:x" }),
+            json!({
+                "to": "ephemeral:protobar",
+                "body": "later",
+                "deliver_after": release_at.to_rfc3339(),
+            }),
         );
-        match try_handle_messaging_tool(&bridge, &req).await {
+        let message_id = match try_handle_messaging_tool(&bridge, &send_req).await {
             Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
                 updated_output: Some(out),
             })) => {
                 let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-                assert_eq!(v["ok"], json!(false), "expected ok: false, got: {out}");
+                assert_eq!(v["ok"], json!(true), "the deferred publish parks: {out}");
+                v["message_id"].as_str().expect("message_id").to_string()
+            }
+            other => panic!("publish: unexpected result: {other:?}"),
+        };
+
+        let cancel_req =
+            post_tool_use_req(MCP_MESSAGE_CANCEL_TOOL, json!({ "message_id": message_id }));
+        match try_handle_messaging_tool(&bridge, &cancel_req).await {
+            Some(MessagingHandled::Respond(CcApprovalDecision::Continue {
+                updated_output: Some(out),
+            })) => {
+                let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(v["ok"], json!(false), "expected a refusal: {out}");
                 let err = v["error"].as_str().unwrap_or("");
                 assert!(
-                    err.contains("reply_to"),
-                    "error should name the unsupported field: {err}"
+                    err.starts_with(brenn_lib::integration::UNKNOWN_MESSAGE_ERR),
+                    "the disclosed scope is the unknown-message answer: {err}"
                 );
             }
-            other => panic!("unexpected result: {other:?}"),
+            other => panic!("cancel: unexpected result: {other:?}"),
         }
     }
 
@@ -4265,11 +4298,11 @@ mod tests {
         });
     }
 
-    /// A dynamic subscribe whose `retain_depth` exceeds the channel's standing
-    /// window is an app requesting a read window beyond the operator's baseline —
-    /// the same "app exceeding its grant" signal class as `PolicyDenied`. It emits
-    /// the subscribe-denial WARN with `reason = "retain depth exceeds standing"`; a
-    /// conforming subscribe (at/under standing) does not.
+    /// A dynamic subscribe whose depth exceeds the channel's standing window is
+    /// an app reaching past the operator's ceiling — the same "app exceeding its
+    /// grant" signal class as `PolicyDenied`. It emits the subscribe-denial WARN
+    /// with `reason = "depth exceeds standing"`; a conforming subscribe (at/under
+    /// standing) does not.
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn message_subscribe_over_standing_emits_warn() {
@@ -4278,7 +4311,7 @@ mod tests {
             crate::active_bridge::ActiveBridge::test_new_for_mqtt_subscribe_bounded_standing()
                 .await;
 
-        // (a) Over-standing (retain 5 > standing 2) → error + retain-depth warn.
+        // (a) Over-standing (retain 5 > standing 2) → error + depth warn.
         let over = subscribe_result(
             &bridge,
             json!({ "address": "brenn:test-channel", "push_depth": 0, "retain_depth": 5 }),
@@ -4286,12 +4319,12 @@ mod tests {
         .await;
         assert_eq!(over["ok"], json!(false), "expected denial: {over}");
         assert!(
-            logs_contain("reason=\"retain depth exceeds standing\""),
-            "over-standing subscribe must emit the retain-depth WARN"
+            logs_contain("reason=\"depth exceeds standing\""),
+            "over-standing subscribe must emit the depth-ceiling WARN"
         );
 
         // (b) A conforming subscribe (retain 2 == standing 2) succeeds and adds no
-        // second retain-depth warn.
+        // second depth warn.
         let ok = subscribe_result(
             &bridge,
             json!({ "address": "brenn:test-channel", "push_depth": 0, "retain_depth": 2 }),
@@ -4301,13 +4334,13 @@ mod tests {
         logs_assert(|lines: &[&str]| {
             let count = lines
                 .iter()
-                .filter(|l| l.contains("reason=\"retain depth exceeds standing\""))
+                .filter(|l| l.contains("reason=\"depth exceeds standing\""))
                 .count();
             if count == 1 {
                 Ok(())
             } else {
                 Err(format!(
-                    "expected exactly one retain-depth warn (over-standing only), saw {count}"
+                    "expected exactly one depth-ceiling warn (over-standing only), saw {count}"
                 ))
             }
         });

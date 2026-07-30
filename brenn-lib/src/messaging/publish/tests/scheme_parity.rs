@@ -236,8 +236,10 @@ async fn a_local_publish_without_grant_is_denied() {
 }
 
 /// An unauthorized sender attaching `reply_to` to an existing non-durable
-/// channel must get `MissingSender`, never `UnsupportedOption` — the latter
-/// would confirm the channel exists.
+/// channel must get `MissingSender`, never an outcome about the reply target —
+/// the reply_to arms (`AclDenied`/`UnknownChannel`/`MalformedAddress`) name a
+/// second channel, so reaching one before the target's own grant gate would
+/// confirm that the target channel exists.
 #[tokio::test]
 async fn a_nondurable_option_probe_never_reveals_channel_existence() {
     let m = parity_messenger(SendRate::default()).await;
@@ -257,7 +259,7 @@ async fn a_nondurable_option_probe_never_reveals_channel_existence() {
     assert!(
         matches!(result, PublishResult::MissingSender),
         "an out-of-ACL reply_to probe on an existing ephemeral channel must not \
-         return UnsupportedOption; got {result:?}",
+         reach the reply_to arms; got {result:?}",
     );
 }
 
@@ -399,56 +401,88 @@ async fn every_denial_bumps_the_one_denied_counter() {
 
 // --- Capability-gated option fields ---------------------------------------
 
+/// `reply_to` and `delivery_deadline` are envelope metadata, not substrate
+/// features: the ladder accepts both on every transportable scheme and the
+/// consumer reads them back off the retained envelope whichever store holds it.
 #[tokio::test]
-async fn durable_only_options_are_rejected_on_a_nondurable_channel() {
+async fn the_option_fields_are_carried_on_every_transportable_scheme() {
     let m = parity_messenger(SendRate::default()).await;
-    let now = chrono::Utc::now();
-    struct Case {
-        field: &'static str,
-        reply_to: Option<&'static str>,
-        deliver_after: Option<chrono::DateTime<chrono::Utc>>,
-        delivery_deadline: Option<chrono::DateTime<chrono::Utc>>,
-    }
-    let cases = [
-        Case {
-            field: "reply_to",
-            reply_to: Some("brenn:durable-chan"),
-            deliver_after: None,
-            delivery_deadline: None,
-        },
-        Case {
-            field: "delivery_deadline",
-            reply_to: None,
-            deliver_after: None,
-            delivery_deadline: Some(now),
-        },
-    ];
-    for Case {
-        field,
-        reply_to,
-        deliver_after,
-        delivery_deadline,
-    } in cases
-    {
+    let deadline = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("representable");
+    let reply_to = canonical_address(DURABLE);
+
+    for addr in [canonical_address(DURABLE), "ephemeral:eph-chan".to_string()] {
         let result = m
             .publish(
                 PublishOrigin::Conversation { id: CONVERSATION },
                 "pub-app",
-                "ephemeral:eph-chan",
+                &addr,
                 "hi",
                 Urgency::Normal,
-                reply_to,
-                deliver_after,
-                delivery_deadline,
+                Some(&reply_to),
+                None,
+                Some(deadline),
             )
             .await;
         assert!(
-            matches!(result, PublishResult::UnsupportedOption { field: f } if f == field),
-            "{field}: got {result:?}",
+            matches!(result, PublishResult::Ok { .. }),
+            "{addr}: got {result:?}",
         );
     }
-    // Nothing was committed and no budget was spent.
+
+    let ring = ring_store(&m, "ephemeral:eph-chan");
+    let retained = ring.retained_tail(10);
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        retained[0].envelope.reply_to.as_deref(),
+        Some(reply_to.as_str()),
+        "the ring retains the resolved reply address"
+    );
+    assert_eq!(retained[0].envelope.delivery_deadline, Some(deadline));
+
+    let durable = m
+        .store_for_address(&canonical_address(DURABLE))
+        .retained_tail(Depth::Bounded(10))
+        .await;
+    assert_eq!(durable.len(), 1);
+    assert_eq!(
+        durable[0].reply_to.as_deref(),
+        Some(reply_to.as_str()),
+        "the durable read-back joins the uuid to the same address"
+    );
+    assert_eq!(durable[0].delivery_deadline, Some(deadline));
+}
+
+/// A `reply_to` naming a channel outside the sender's visibility is refused for
+/// the reply target, not for the carrying channel's class — the same arm on
+/// every scheme.
+#[tokio::test]
+async fn an_unresolvable_reply_to_is_refused_on_every_scheme() {
+    let m = parity_messenger(SendRate::default()).await;
+    for addr in [canonical_address(DURABLE), "ephemeral:eph-chan".to_string()] {
+        let result = m
+            .publish(
+                PublishOrigin::Conversation { id: CONVERSATION },
+                "pub-app",
+                &addr,
+                "hi",
+                Urgency::Normal,
+                Some("brenn:no-such-answers"),
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(&result, PublishResult::UnknownChannel(a) if a == "brenn:no-such-answers"),
+            "{addr}: got {result:?}",
+        );
+    }
+    // Nothing was committed on either side.
     assert_eq!(ring_store(&m, "ephemeral:eph-chan").publish_count(), 0);
+    assert!(
+        retained_bodies(&m, &canonical_address(DURABLE))
+            .await
+            .is_empty()
+    );
 }
 
 // --- deliver_after on non-durable channels (park + release) ---------------

@@ -776,7 +776,7 @@ impl ActiveBridge {
     /// Same wiring as [`test_new_for_mqtt_subscribe`] but with the `brenn:`
     /// `test-channel` given a **bounded** `standing_retain_depth` (2), so a dynamic
     /// subscribe requesting a deeper `retain_depth` trips the dynamic-path cap
-    /// (`RetainDepthExceedsStanding`). Used to drive the intercept-site
+    /// (`DepthExceedsStanding`). Used to drive the intercept-site
     /// over-standing warn.
     pub(crate) async fn test_new_for_mqtt_subscribe_bounded_standing() -> Arc<Self> {
         Self::test_new_for_mqtt_subscribe_with_singleton(

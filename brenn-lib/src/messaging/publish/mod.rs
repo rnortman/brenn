@@ -109,10 +109,6 @@ pub enum PublishResult {
     /// The per-`(sender, channel)` send-rate gate refused this publish. No
     /// message was published and no budget was consumed.
     RateLimited,
-    /// A capability-gated option field was supplied for a channel whose
-    /// capabilities do not carry it — `reply_to` or `delivery_deadline` on a
-    /// non-durable channel.
-    UnsupportedOption { field: &'static str },
     /// A deferred (`deliver_after`) publish was refused because the channel's
     /// deferred set is at its channel-wide cap (`retain_depth`). Refusing new
     /// work rather than silently cancelling already-scheduled work; no message
@@ -131,11 +127,9 @@ impl PublishResult {
     /// signal, and the key of the per-`(sender, kind)` denied-publish counter.
     /// A caller that signals denials derives the log `kind` field from here.
     ///
-    /// `Ok`, `BudgetExhausted`, `RateLimited`, and `UnsupportedOption` return
-    /// `None`. The two limit arms are normal operational conditions with their
-    /// own counters and LLM-facing recovery paths, not policy denials;
-    /// `UnsupportedOption` is a caller input error about the option set, not
-    /// about authorization.
+    /// `Ok`, `BudgetExhausted`, `RateLimited`, and `DeferredQuotaExceeded`
+    /// return `None`: the limit arms are normal operational conditions with
+    /// their own counters and LLM-facing recovery paths, not policy denials.
     pub fn signal_kind(&self) -> Option<DenialKind> {
         match self {
             Self::MalformedAddress(_) => Some(DenialKind::MalformedAddress),
@@ -147,7 +141,6 @@ impl PublishResult {
             Self::Ok { .. }
             | Self::BudgetExhausted
             | Self::RateLimited
-            | Self::UnsupportedOption { .. }
             | Self::DeferredQuotaExceeded { .. } => None,
         }
     }
@@ -617,9 +610,10 @@ impl Messenger {
     /// differs by class it is driven by the resolved channel's
     /// [`ChannelCapabilities`](brenn_envelope::ChannelCapabilities), never by
     /// matching on the scheme at a call site: `durable` picks the commit (DB
-    /// rows vs the in-memory ring), admits the durable-only option fields, and
-    /// gates the surface send budget; `transportable` decides whether a commit
-    /// also fans out to attached wire receivers.
+    /// rows vs the in-memory ring) and gates the surface send budget;
+    /// `transportable` decides whether a commit also fans out to attached wire
+    /// receivers. Every option field a publish can carry is carried on both
+    /// classes.
     ///
     /// Records the per-`(sender, kind)` denied-publish counter for every denial
     /// arm that carries a [`DenialKind`], so the counter cannot drift from the
@@ -926,26 +920,7 @@ impl Messenger {
             return PublishResult::AclDenied(addr.to_string());
         }
 
-        // 2a. Option fields the channel's capabilities do not carry. `reply_to`
-        //     and `delivery_deadline` are durable-only; rejected fail-fast rather
-        //     than silently dropped, still before any budget or rate token.
-        //
-        //     MUST run after the layer-1 grant gate and layer-2 publish ACL:
-        //     otherwise an unauthorized sender attaching one of these options
-        //     would receive the distinct `UnsupportedOption` instead of
-        //     `MissingSender`/`AclDenied`, leaking channel existence.
-        if !capabilities.durable {
-            for (present, field) in [
-                (reply_to.is_some(), "reply_to"),
-                (delivery_deadline.is_some(), "delivery_deadline"),
-            ] {
-                if present {
-                    return PublishResult::UnsupportedOption { field };
-                }
-            }
-        }
-
-        // 2a (continued). Impetus is capability-gated, not capability-scoped: it
+        // 2a. Impetus is capability-gated, not capability-scoped: it
         //     is carried authority, meaningful on every scheme, so no channel
         //     class refuses it. What refuses it is a policy without
         //     `MintImpetus` — and the refusal is of the whole publish, never of
@@ -954,10 +929,10 @@ impl Messenger {
         //     redemption side reads the stored field as proof the claim was
         //     authorized when it was made.
         //
-        //     Same placement rule as the option fields above: after layer-1 and
-        //     layer-2, so an unauthorized sender attaching impetus hears about
-        //     its own missing grant or ACL rather than learning the channel
-        //     exists. Validate-only, so it precedes both spending gates.
+        //     Placed after layer-1 and layer-2, so an unauthorized sender
+        //     attaching impetus hears about its own missing grant or ACL rather
+        //     than learning the channel exists. Validate-only, so it precedes
+        //     both spending gates.
         //
         //     Logged here: no caller boundary reports this denial.
         if impetus.is_some() && !policy.has_grant(AppCapability::MintImpetus) {
@@ -994,7 +969,18 @@ impl Messenger {
         //    Validate-only (spends no token), so it runs ahead of both spending
         //    gates below: a publish doomed by a malformed or out-of-scope
         //    reply_to costs no surface-budget and no rate token.
-        let reply_to_uuid = if let Some(rt_addr) = reply_to {
+        //
+        //    Runs after the layer-1 grant gate and the layer-2 publish ACL, and
+        //    that order is load-bearing: these arms name the *reply* address, so
+        //    a sender unauthorized on the publish target must meet
+        //    `MissingSender`/`AclDenied` for the target first rather than an
+        //    outcome that turns on whether some other channel exists.
+        //
+        //    Every scheme runs it. A reply address is metadata the consumer reads
+        //    back — the bus routes nothing with it — so what the carrying channel
+        //    is made of decides nothing here; only the target's own `brenn:`
+        //    shape does.
+        let reply_to_target = if let Some(rt_addr) = reply_to {
             let rt_name = match well_formed_name(rt_addr, ChannelScheme::Brenn) {
                 Some(name) => name,
                 None => return PublishResult::MalformedAddress(rt_addr.to_string()),
@@ -1004,7 +990,10 @@ impl Messenger {
                 return PublishResult::AclDenied(rt_addr.to_string());
             }
             match self.directory.resolve(rt_addr) {
-                Some(c) => Some(c.uuid),
+                Some(c) => Some(store::ReplyTarget {
+                    uuid: c.uuid,
+                    address: c.address.clone(),
+                }),
                 None => return PublishResult::UnknownChannel(rt_addr.to_string()),
             }
         } else {
@@ -1116,7 +1105,7 @@ impl Messenger {
             body: body.to_string(),
             urgency,
             envelope_type: scheme,
-            reply_to_uuid,
+            reply_to: reply_to_target,
             delivery_deadline,
             impetus,
             publish_ts_ns,
@@ -1571,6 +1560,10 @@ impl Messenger {
             store::NewMessage,
             Option<DateTime<Utc>>,
         )> = Vec::new();
+        // Schedules the deferred cap refused, on either substrate. Reported
+        // after the lock is released so the durable transaction is not held
+        // across the logging.
+        let mut refused: Vec<(String, u64)> = Vec::new();
 
         {
             let conn = self.db.lock().await;
@@ -1597,6 +1590,25 @@ impl Messenger {
                     )
                 });
 
+                // Resolve the optional reply_to address to the target it names.
+                // Host-resolved (the guest never named it — `queue_async` derived
+                // the caller's own inbox), so an unresolvable address is a
+                // host-wiring bug, not attacker input: fail fast. Resolved for
+                // both substrates here: a reply address is metadata either
+                // retention carries.
+                let reply_to_target = publish.reply_to.map(|addr| {
+                    let target = self.directory.resolve(addr).unwrap_or_else(|| {
+                        panic!(
+                            "publish_from_wasm: reply_to channel {addr:?} not in directory \
+                             — boot validation should have caught this (slug={consumer_slug})"
+                        )
+                    });
+                    store::ReplyTarget {
+                        uuid: target.uuid,
+                        address: target.address.clone(),
+                    }
+                });
+
                 // Non-durable: skip the durable transaction machinery; ring
                 // append is deferred to after the lock.
                 if !entry.capabilities().durable {
@@ -1613,7 +1625,7 @@ impl Messenger {
                         body: publish.body.to_string(),
                         urgency: publish.urgency,
                         envelope_type: scheme,
-                        reply_to_uuid: None,
+                        reply_to: reply_to_target,
                         delivery_deadline: None,
                         impetus: None,
                         publish_ts_ns: db::utc_to_ns(Utc::now()),
@@ -1638,28 +1650,19 @@ impl Messenger {
                 };
                 prev_ts = Some(publish_ts_ns);
 
-                // Resolve the optional reply_to address to a channel reference.
-                // Host-resolved (the guest never named it — `queue_async` derived
-                // the caller's own inbox), so an unresolvable address is a
-                // host-wiring bug, not attacker input: fail fast.
-                let reply_to_uuid = publish.reply_to.map(|addr| {
-                    self.directory
-                        .resolve(addr)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "publish_from_wasm: reply_to channel {addr:?} not in directory \
-                                 — boot validation should have caught this (slug={consumer_slug})"
-                            )
-                        })
-                        .uuid
-                });
-
                 let release = publish.deliver_after.filter(|da| *da > flush_now);
-                // TODO(wasm-durable-park-cap): this park writes the row with no
-                // deferred-cap check, so a durable channel's parked set is
-                // unbounded here — unlike every other park in the system. The
-                // non-durable arm below and the surface batch flush both check the
-                // cap before inserting.
+                // Refused → the schedule is dropped and the flush carries on, the
+                // same answer the non-durable arm below gives.
+                if release.is_some()
+                    && let Some(cap) = db::deferred_cap_refusal(
+                        &tx,
+                        channel.uuid,
+                        channel.resolved_channel.retain_depth,
+                    )
+                {
+                    refused.push((channel.address.clone(), cap));
+                    continue;
+                }
                 let inserted = self.insert_message(
                     &tx,
                     channel,
@@ -1669,7 +1672,7 @@ impl Messenger {
                     publish.body,
                     publish.urgency,
                     publish_ts_ns,
-                    reply_to_uuid,
+                    reply_to_target.as_ref().map(|target| target.uuid),
                     release,
                     None, // no delivery_deadline
                 );
@@ -1717,14 +1720,6 @@ impl Messenger {
             self.fan_out_surface_feed(&targets, envelope, seq).await;
         }
 
-        // Non-durable commits, after the durable lock is released. A flush has
-        // no error channel back to the guest, so a deferred-cap overflow is
-        // logged, counted (a dropped schedule is a component that never wakes
-        // again — a health check can read the counter), and the schedule dropped.
-        //
-        // TODO(deferred-flush-drop-signal): surface the drop on the consumer's
-        // error-report path rather than only the host log.
-
         // Surface feed targets are memoized per address as the durable half
         // above memoizes its own: a surface subscriber list is boot-resolved, so
         // it cannot change mid-batch, and the dominant case is a batch fanning
@@ -1737,14 +1732,7 @@ impl Messenger {
                     if let Err(brenn_queue::QuotaExceeded { cap }) =
                         store.park(message, release_at).await
                     {
-                        self.record_dropped_deferred(consumer_slug, &entry.address);
-                        warn!(
-                            consumer_slug = consumer_slug,
-                            channel = entry.address.as_str(),
-                            cap,
-                            "publish_from_wasm: deferred publish dropped — channel deferred set \
-                             at its retain_depth cap"
-                        );
+                        refused.push((entry.address.clone(), cap));
                     }
                 }
                 None => {
@@ -1760,6 +1748,9 @@ impl Messenger {
                         && self
                             .router
                             .any_surface_session_subscribed(&entry.address, feed_targets);
+                    // A fed envelope is indistinguishable from the one a
+                    // subscriber reads back out of retention, so it carries the
+                    // reply address the ring is about to retain.
                     let fed = attached.then(|| {
                         (
                             message.body.clone(),
@@ -1767,11 +1758,15 @@ impl Messenger {
                             message.publish_ts_ns,
                             message.urgency,
                             message.envelope_type,
+                            message
+                                .reply_to
+                                .as_ref()
+                                .map(|target| target.address.clone()),
                         )
                     });
                     let outcome = store.append(message).await;
                     self.enact_overflow_events(&entry, &outcome.overflow);
-                    if let Some((body, sender, publish_ts_ns, urgency, scheme)) = fed {
+                    if let Some((body, sender, publish_ts_ns, urgency, scheme, reply_to)) = fed {
                         let envelope = Arc::new(surface_feed_envelope(
                             outcome.committed.message_uuid,
                             source.to_owned(),
@@ -1779,7 +1774,7 @@ impl Messenger {
                             sender,
                             publish_ts_ns,
                             body,
-                            None,
+                            reply_to,
                             None,
                             None,
                             None,
@@ -1796,6 +1791,28 @@ impl Messenger {
                     }
                 }
             }
+        }
+
+        // Deferred-cap refusals from both substrates, reported once the durable
+        // lock is released. A flush has no error channel back to the guest, so a
+        // refused schedule is logged and counted (a dropped schedule is a
+        // component that never wakes again — a health check can read the
+        // counter) and the schedule is gone.
+        //
+        // TODO(deferred-flush-drop-signal): surface the drop on the consumer's
+        // error-report path rather than only the host log. The surface batch
+        // flush ends in the twin of this loop, reporting its own refusals under
+        // its own identity fields; one signal path serves both, so the two loops
+        // move together.
+        for (channel, cap) in refused {
+            self.record_dropped_deferred(consumer_slug, &channel);
+            warn!(
+                consumer_slug = consumer_slug,
+                channel = channel.as_str(),
+                cap,
+                "publish_from_wasm: deferred publish dropped — channel deferred set at its \
+                 retain_depth cap"
+            );
         }
 
         self.dispatch_kick();
@@ -2012,15 +2029,13 @@ impl Messenger {
                     );
                 }
 
-                // A parked entry is admitted against the channel's deferred cap
-                // under the same guard it is inserted under, so the count it was
-                // judged against is the count it joins. Refused → the schedule is
-                // dropped and the batch carries on.
+                // Refused → the schedule is dropped and the batch carries on.
                 if let Some(release_at) = publish.deliver_after {
-                    if let super::config::Depth::Bounded(cap) =
-                        channel.resolved_channel.retain_depth
-                        && db::count_deferred(&tx, channel.uuid) >= cap
-                    {
+                    if let Some(cap) = db::deferred_cap_refusal(
+                        &tx,
+                        channel.uuid,
+                        channel.resolved_channel.retain_depth,
+                    ) {
                         refused.push((channel.address.clone(), cap));
                         continue;
                     }
@@ -2127,6 +2142,10 @@ impl Messenger {
         // A dropped schedule is a component that never wakes when it meant to, so
         // it is loud and counted even though it is not an error — a health check
         // reads the counter, an operator reads the line.
+        //
+        // TODO(deferred-flush-drop-signal): the WASM flush ends in the twin of
+        // this loop; the consumer-visible drop signal that TODO adds serves both,
+        // so the two move together.
         for (channel, cap) in &refused {
             self.record_dropped_deferred(&sender, channel);
             warn!(

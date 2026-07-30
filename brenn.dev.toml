@@ -48,10 +48,17 @@ surface_error_channel = "brenn:surface-errors"
 prefix = "surface"
 status_interval_secs = 60
 
+# Errors are facts, not signals: a report that scrolls out of the window before
+# anyone reads it is the outage the channel exists to describe. The window is
+# sized for a burst of reports, and push_depth = 1 because whoever is watching is
+# woken once and then reads the window.
 [[channel]]
 uuid = "0da727fd-d0f7-414e-98e3-f1fef2ae70ca"
 address = "surface-errors"
 description = "Surface client error reports (trusted republish)"
+push_depth = 1
+retain_depth = 100
+standing_retain_depth = 100
 
 # Surface self-description channels: the boot-published help/schema/index topology
 # derived from prefix "surface". Each is retained latest-wins (standing_retain_depth
@@ -60,90 +67,120 @@ description = "Surface client error reports (trusted republish)"
 uuid = "59ec3b6b-7a9d-4ede-b692-638ed3834963"
 address = "surface.index"
 description = "Surface topology index (system-published, latest-wins)"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "2f36ae2a-fe98-4a89-8299-7c086b94ddec"
 address = "surface.surface.dev-stub.help"
 description = "Surface help: dev-stub"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "d1fcb93f-d598-4e42-86f2-d7a3a123e38d"
 address = "surface.surface.bar.help"
 description = "Surface help: bar"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "0ac01862-9222-4f53-a8cf-36363303c1e5"
 address = "surface.surface.bar-pixel.help"
 description = "Surface help: bar-pixel"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "cd700d1f-9f28-41bf-972b-f7a1df0dc63a"
 address = "surface.surface.bar-feeder.help"
 description = "Surface help: bar-feeder"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "7d8105bc-e267-4602-a151-ec9e7834d761"
 address = "surface.kind.echo-stub.help"
 description = "Kind help: echo-stub"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "4d56962a-ae1b-4bc4-9636-e0c83d5da770"
 address = "surface.kind.echo-stub.schema"
 description = "Kind schema: echo-stub"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "8efaf001-7f73-4c84-bd0a-d205e88044ab"
 address = "surface.kind.protobar.help"
 description = "Kind help: protobar"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "e51fb93c-744d-4c9b-8737-c6541a621761"
 address = "surface.kind.protobar.schema"
 description = "Kind schema: protobar"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "a6d0f882-4c8f-4d5f-91d5-a4ca6fc5f8e5"
 address = "surface.kind.mode-clock.help"
 description = "Kind help: mode-clock"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "c4aa5cba-de5e-46c2-8dc0-bae5970ca65f"
 address = "surface.kind.mode-clock.schema"
 description = "Kind schema: mode-clock"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "5b5b8634-5ac7-47e3-9225-a0e58829ae3e"
 address = "surface.kind.meeting.help"
 description = "Kind help: meeting"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "1f760261-f036-4420-8400-cdffa84b1f13"
 address = "surface.kind.meeting.schema"
 description = "Kind schema: meeting"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "765d89ad-d9b3-4608-80c9-6f26cdbaf689"
 address = "surface.kind.chrome.help"
 description = "Kind help: chrome"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 [[channel]]
 uuid = "c446cdd8-9e9a-4420-a41f-d5c5d21459d2"
 address = "surface.kind.chrome.schema"
 description = "Kind schema: chrome"
+push_depth = 1
+retain_depth = 1
 standing_retain_depth = 1
 
 # Surface self-description runtime channels: geometry + status per surface. These
@@ -154,6 +191,7 @@ standing_retain_depth = 1
 uuid = "c89c02ac-8c6b-40f4-ab75-799b7050cadc"
 address = "surface.surface.dev-stub.geometry"
 description = "Surface geometry: dev-stub"
+push_depth = 1
 retain_depth = 1
 standing_retain_depth = 1
 
@@ -161,6 +199,7 @@ standing_retain_depth = 1
 uuid = "3ea19b6b-1946-44de-a3a4-a9526f804773"
 address = "surface.surface.dev-stub.status"
 description = "Surface status: dev-stub"
+push_depth = 1
 retain_depth = 1
 standing_retain_depth = 1
 
@@ -168,6 +207,7 @@ standing_retain_depth = 1
 uuid = "601968c1-d5dc-4620-9ddf-207ffaebc827"
 address = "surface.surface.bar.geometry"
 description = "Surface geometry: bar"
+push_depth = 1
 retain_depth = 1
 standing_retain_depth = 1
 
@@ -175,6 +215,7 @@ standing_retain_depth = 1
 uuid = "271e790b-0e4d-4409-98f0-9987b265634b"
 address = "surface.surface.bar.status"
 description = "Surface status: bar"
+push_depth = 1
 retain_depth = 1
 standing_retain_depth = 1
 
@@ -182,6 +223,7 @@ standing_retain_depth = 1
 uuid = "c8db3fc8-9417-4736-8a35-ddd592f43ee7"
 address = "surface.surface.bar-pixel.geometry"
 description = "Surface geometry: bar-pixel"
+push_depth = 1
 retain_depth = 1
 standing_retain_depth = 1
 
@@ -189,6 +231,7 @@ standing_retain_depth = 1
 uuid = "32dbf7bf-6e08-45c3-bf47-2cee8bcb60e8"
 address = "surface.surface.bar-pixel.status"
 description = "Surface status: bar-pixel"
+push_depth = 1
 retain_depth = 1
 standing_retain_depth = 1
 
@@ -196,6 +239,7 @@ standing_retain_depth = 1
 uuid = "0f613d4d-cd0a-4c4d-9b7c-7aa040c0eb66"
 address = "surface.surface.bar-feeder.geometry"
 description = "Surface geometry: bar-feeder"
+push_depth = 1
 retain_depth = 1
 standing_retain_depth = 1
 
@@ -203,30 +247,35 @@ standing_retain_depth = 1
 uuid = "35e3ba7e-4bc2-4236-b93a-2f21974ac1e9"
 address = "surface.surface.bar-feeder.status"
 description = "Surface status: bar-feeder"
+push_depth = 1
 retain_depth = 1
 standing_retain_depth = 1
 
 # Bar layout channel: latest-wins layout documents for the `bar` / `bar-pixel`
 # surfaces. Durable so a reload/reboot restores the last-chosen layout snapshot
-# (`retain_depth = 1`); `push_depth = 8` bounds the parked backlog. The `dev`
-# app and the `bar-feeder` surface publish layout docs here; both bar surfaces
-# subscribe.
+# (`retain_depth = 1`); `push_depth = 8` bounds the parked backlog, and
+# `standing_retain_depth = 8` is the ceiling that rung has to sit under. The
+# `dev` app and the `bar-feeder` surface publish layout docs here; both bar
+# surfaces subscribe.
 [[channel]]
 uuid = "81c6ecc1-9694-4f99-8a71-86a38151e9b8"
 address = "bar-layout"
 description = "Bar layout documents (latest-wins)"
 push_depth = 8
 retain_depth = 1
+standing_retain_depth = 8
 
 # Bar content channels: one per panel instance. Durable + `retain_depth = 1` so
 # a reloaded panel restores the last-pushed body from the snapshot path; small
-# `push_depth` bounds the parked backlog.
+# `push_depth` bounds the parked backlog, under a matching
+# `standing_retain_depth` ceiling.
 [[channel]]
 uuid = "95ec41f3-1b8a-4239-a9e1-37af1ea8fa78"
 address = "bar-a"
 description = "Bar panel content channel (slot a / instance p1)"
 push_depth = 8
 retain_depth = 1
+standing_retain_depth = 8
 
 [[channel]]
 uuid = "3120b603-6aee-4c24-b2f5-c60717149e73"
@@ -234,6 +283,7 @@ address = "bar-b"
 description = "Bar panel content channel (slot b / instance p2)"
 push_depth = 8
 retain_depth = 1
+standing_retain_depth = 8
 
 [[channel]]
 uuid = "af865273-2889-4923-9ac4-0caba3abb393"
@@ -241,6 +291,7 @@ address = "bar-c"
 description = "Bar panel content channel (slot c / instance p3)"
 push_depth = 8
 retain_depth = 1
+standing_retain_depth = 8
 
 # Bar mode-clock config channel: the retained (`retain_depth = 1`) config for the
 # `bar` surface's headless `mode-clock` instance. A publisher sends `{mode,
@@ -253,6 +304,7 @@ address = "bar-mode"
 description = "Bar mode-clock config (retained, latest-wins)"
 push_depth = 8
 retain_depth = 1
+standing_retain_depth = 8
 
 # Bar meeting agenda channel: the personal-assistant agent publishes a full
 # upcoming-meetings snapshot here (latest-wins). Durable + `retain_depth = 1` so
@@ -265,6 +317,7 @@ address = "bar-agenda"
 description = "Bar meeting agenda snapshot (retained, latest-wins)"
 push_depth = 8
 retain_depth = 1
+standing_retain_depth = 8
 
 # Bar meeting ack channel: the meeting component publishes dismiss/snooze acks
 # here and subscribes to the same channel so every device converges. Durable +
@@ -276,6 +329,7 @@ address = "bar-acks"
 description = "Bar meeting dismiss/snooze acks (retained)"
 push_depth = 8
 retain_depth = 8
+standing_retain_depth = 8
 
 [[app]]
 slug = "dev"
@@ -350,9 +404,13 @@ csv = [".csv"]
 # loop. Pressing "send" round-trips publish -> bus -> deliver -> rendered text
 # with no external publisher — a self-contained end-to-end check from
 # `make launchdev` alone.
+# `retain_depth = 8` covers the depth-8 surface binding below: on a non-durable
+# channel the retained window *is* the standing buffer, and no depth stated about
+# a channel may exceed it.
 [[channel]]
 address = "ephemeral:dev-stub"
-retain_depth = 1
+push_depth = 1
+retain_depth = 8
 
 [[surface]]
 slug = "dev-stub"

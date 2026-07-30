@@ -271,7 +271,7 @@ mod tests {
     use crate::access::AppCapability;
     use crate::access::acl::ChannelMatcher;
     use crate::messaging::query::NoopWakeRouter;
-    use crate::messaging::store::{OverflowEvent, Priming, RingStores};
+    use crate::messaging::store::{OverflowEvent, RingStores};
     use crate::messaging::testutils::{ephemeral_channel_entry, local_channel_entry};
     use crate::messaging::{MessagingDirectory, MessagingGlobalConfig, WakeRouter};
 
@@ -333,7 +333,7 @@ mod tests {
             .ring_stores()
             .get_by_address(CHANNEL)
             .expect("fixture channel")
-            .attach(&absent, "absent", 4, Priming::Head);
+            .attach(&absent, "absent", 4);
 
         let dest = messenger.resolve_prepaid(&sender, &policy, CHANNEL);
         async fn prepaid(messenger: &Messenger, dest: &PrepaidDestination, body: &str) -> Appended {

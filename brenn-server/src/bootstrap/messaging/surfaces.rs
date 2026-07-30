@@ -94,35 +94,38 @@ fn local_context_depth(channel: &str, retain_depth: Option<Depth>) -> u64 {
 }
 
 /// Resolve a surface binding's page-side port-queue depth: the binding's own
-/// `push_depth`, else the `channel_default` the caller passes as the middle rung
-/// — the channel entry's own `push_depth` for a transportable binding (already
-/// folded over global), and the global default for `local:`, which has no
-/// `[[channel]]` block to read.
+/// `push_depth`, else the `channel_rung` the caller passes — the channel entry's
+/// own `push_depth` for a transportable binding, and `None` for `local:`, which
+/// has no `[[channel]]` block to read and so must state the depth on the binding.
 ///
 /// # Panics
 ///
 /// On a depth that cannot be a page queue: unbounded (the queue is browser
-/// memory — "unbounded" is a tab that grows until it dies). The rule is
-/// class-uniform: every surface binding's port queue is page memory and must
-/// resolve bounded, whatever its class. No default is invented: the operator
-/// states the depth, on the binding, the channel rung, or the global default.
-/// Depth 0 is not judged here — it is legal or not depending on the binding's
-/// retained context and delivery model, which is
+/// memory — "unbounded" is a tab that grows until it dies), or unstated with no
+/// rung to read. The rule is class-uniform: every surface binding's port queue is
+/// page memory and must resolve bounded, whatever its class. No default is
+/// invented. Depth 0 is not judged here — it is legal or not depending on the
+/// binding's retained context and delivery model, which is
 /// [`assert_page_queue_deliverable`]'s call once both are resolved.
 fn resolve_page_queue_depth(
     slug: &str,
     context: &str,
     channel: &str,
     push_depth: Option<Depth>,
-    channel_default: Depth,
+    channel_rung: Option<Depth>,
 ) -> u64 {
-    let resolved = push_depth.unwrap_or(channel_default);
+    let Some(resolved) = push_depth.or(channel_rung) else {
+        panic!(
+            "config: [[surface]] {slug:?}: {context} channel {channel:?} states no push_depth — \
+             a local: channel has no [[channel]] block to inherit one from, so the binding sizes \
+             its own page queue"
+        )
+    };
     let Depth::Bounded(n) = resolved else {
         panic!(
             "config: [[surface]] {slug:?}: {context} channel {channel:?} resolves to push_depth = \
              {resolved:?} — a surface binding's port queue lives in page memory and must resolve \
-             to a bounded push_depth; set it on the binding, the channel rung, or the global \
-             default ([messaging] default_push_depth)"
+             to a bounded push_depth; set it on the binding or on the channel rung"
         )
     };
     n
@@ -324,16 +327,15 @@ fn resolve_output_budget(slug: &str, out: &SurfaceOutputRaw) -> brenn_budget::Si
 ///
 /// The same shape [`resolve_page_queue_depth`] takes for the port queue, on the
 /// other knob: binding → the `[[channel]]` rung the caller passes as
-/// `channel_default` (itself already resolved channel → global). One ladder for
-/// every transportable channel — the store holding the channel's retention has
-/// no say in it.
+/// `channel_default`. One ladder for every transportable channel — the store
+/// holding the channel's retention has no say in it.
 ///
 /// # Panics
 ///
 /// On a depth that resolves unbounded: the retained ring is page memory, the
 /// same rule the port queue takes, and every replay the wire serves must be
 /// bounded. No default is invented — the operator states the depth on the
-/// binding, the channel rung, or the global default.
+/// binding or on the channel rung.
 fn resolve_context_ring_depth(
     slug: &str,
     context: &str,
@@ -346,8 +348,7 @@ fn resolve_context_ring_depth(
         panic!(
             "config: [[surface]] {slug:?}: {context} channel {channel:?} resolves to retain_depth \
              = {resolved:?} — a binding's retained context ring lives in page memory and its \
-             replays must be bounded; set it on the binding, the channel rung, or the global \
-             default ([messaging].default_retain_depth)"
+             replays must be bounded; set it on the binding or on the channel rung"
         )
     };
     n
@@ -436,9 +437,9 @@ struct SubOverrides {
 /// directory registers and the bridge reads.
 ///
 /// One resolver for every transportable input binding: one directory lookup,
-/// one ladder per knob (binding → the channel's own rung, itself already
-/// channel → global), one boundedness rule, one gate set. Which store holds the
-/// channel's retention is not a question asked here — the entry answers every
+/// one ladder per knob (binding → the channel's own rung), one boundedness
+/// rule, one gate set. Which store holds the channel's retention is not a
+/// question asked here — the entry answers every
 /// knob the same way whichever it is, and a second per-class arm is how the two
 /// drift apart.
 ///
@@ -483,10 +484,15 @@ fn resolve_wire_subscription(
          retain_depth = 0. A surface subscription's delivery position is recovered by re-reading \
          the channel's retention, so a channel that retains nothing strands the subscription \
          permanently after its first missed message, with nothing on the wire to say so. Set \
-         retain_depth >= 1 on the [[channel]] block or on [messaging].default_retain_depth",
+         retain_depth >= 1 on the [[channel]] block",
     );
-    let push =
-        resolve_page_queue_depth(slug, context, channel, overrides.push_depth, ch.push_depth);
+    let push = resolve_page_queue_depth(
+        slug,
+        context,
+        channel,
+        overrides.push_depth,
+        Some(ch.push_depth),
+    );
     let retain = resolve_context_ring_depth(
         slug,
         context,
@@ -1018,8 +1024,8 @@ pub(crate) fn resolve_surfaces(
                 sub.port,
             );
             // Every binding resolves the same three page-side facts —
-            // (push_depth, retain_depth, noise) — down one binding → channel →
-            // global ladder. The one dispatch here is transportability, the one
+            // (push_depth, retain_depth, noise) — down one binding → channel
+            // ladder. The one dispatch here is transportability, the one
             // channel characteristic the wire ranks: a transportable binding
             // installs a wire subscription and reads its rungs off the channel
             // directory; a `local:` one never leaves the page and has no
@@ -1030,8 +1036,9 @@ pub(crate) fn resolve_surfaces(
             let (push_depth, retain_depth, noise, wire) = if local {
                 validate_local_binding(direction, &channel, false);
                 // A `local:` channel has no `[[channel]]` block, so its noise
-                // ladder is binding → global — the same shape `push_depth` uses on
-                // this class. The kernel enacts the resolved rung on overflow.
+                // ladder is binding → global. `push_depth` has no such fallback:
+                // a depth is sized, not defaulted, so the binding states it. The
+                // kernel enacts the resolved noise rung on overflow.
                 accumulate_local_ring_depth(
                     slug,
                     &mut local_ring_depths,
@@ -1039,13 +1046,7 @@ pub(crate) fn resolve_surfaces(
                     sub.retain_depth,
                 );
                 (
-                    resolve_page_queue_depth(
-                        slug,
-                        &context,
-                        &channel,
-                        sub.push_depth,
-                        globals.default_push_depth,
-                    ),
+                    resolve_page_queue_depth(slug, &context, &channel, sub.push_depth, None),
                     // The router's ring is the context source for a `local:`
                     // channel, so this binding's own number is only how deep it
                     // reads into that ring — the ring itself is the max fold

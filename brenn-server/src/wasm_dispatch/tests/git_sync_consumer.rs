@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::Mutex as StdMutex;
 
 use brenn_lib::messaging::Messenger;
-use brenn_lib::messaging::config::NoiseLevel;
+use brenn_lib::messaging::config::{NoiseLevel, SystemChannelTuning};
 use brenn_lib::tools::ResolvedToolGrant;
 use tokio::sync::Mutex;
 
@@ -108,12 +108,14 @@ async fn consumer_harness(
     let outcomes_addr = "brenn:git-repo-sync-outcomes".to_string();
     let outcomes_ch = brenn_channel(&outcomes_addr, &outcomes_reader_slug);
 
-    let request_ch = request_channel_entry("git-repo-pull", &defaults);
-    let mut inbox = result_inbox_entry(slug, &defaults);
+    let request_ch =
+        request_channel_entry("git-repo-pull", &SystemChannelTuning::default(), &defaults);
+    let mut inbox = result_inbox_entry(slug, &SystemChannelTuning::default(), &defaults);
+    let inbox_window = inbox.resolved_channel.retain_depth;
     inbox.subscribers.push(SubscriberEntry {
         kind: SubscriberEntryKind::Wasm(slug.to_string()),
-        push_depth: Depth::Unbounded,
-        retain_depth: Depth::Unbounded,
+        push_depth: inbox_window,
+        retain_depth: inbox_window,
         noise: NoiseLevel::Silent,
         wake_min: None,
     });
@@ -239,7 +241,7 @@ async fn consumer_harness(
                 },
                 amplification_mt: 1000,
             },
-            inbox_input_port(slug),
+            inbox_input_port(slug, inbox_window),
         ],
         outputs: vec![],
         activation_pacing: unthrottled_pacing(),

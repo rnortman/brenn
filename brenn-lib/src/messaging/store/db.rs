@@ -24,9 +24,8 @@ use crate::messaging::db;
 
 use super::{
     AdvanceOutcome, AppendOutcome, Attached, Committed, DeferralOutcome, DeferredMessage,
-    DeliverableSubscriber, MessageSeq, NewMessage, Parked, Priming, ReleaseOutcome, Released,
-    ResumeCursor, RetentionStore, StoreReplay, StoreRetained, SubscriberWindow, compose_window,
-    depth_bound,
+    DeliverableSubscriber, MessageSeq, NewMessage, Parked, ReleaseOutcome, Released, ResumeCursor,
+    RetentionStore, StoreReplay, StoreRetained, SubscriberWindow, compose_window, depth_bound,
 };
 
 fn store_retained((seq, envelope): (i64, MessageEnvelope)) -> StoreRetained {
@@ -134,13 +133,12 @@ impl DbStore {
         subscriber: &ParticipantId,
         app_slug: &str,
         push_depth: Depth,
-        priming: Priming,
     ) -> Attached {
         if !push_depth.is_push_enabled() {
             db::delete_subscriber_cursor(conn, self.channel_uuid, subscriber);
             return Attached::Existing;
         }
-        let primed = self.primed_position(conn, push_depth, priming);
+        let primed = db::primed_position(conn, self.channel_uuid, push_depth);
         let created = db::ensure_subscriber_cursor(
             conn,
             self.channel_uuid,
@@ -153,28 +151,6 @@ impl DbStore {
             Attached::Created
         } else {
             Attached::Existing
-        }
-    }
-
-    /// Where a cursor coming into existence starts.
-    ///
-    /// `Head` starts one past every sequence the channel ever assigned — owed
-    /// only what publishes next. `Retained` starts at the oldest of the
-    /// `push_depth` newest retained messages, because attach is a delivery point
-    /// for a component queue: a message published before the component existed
-    /// still reaches it. A channel retaining nothing primes at head either way.
-    fn primed_position(
-        &self,
-        conn: &rusqlite::Connection,
-        push_depth: Depth,
-        priming: Priming,
-    ) -> i64 {
-        let head = db::channel_last_retained_seq(conn, self.channel_uuid) + 1;
-        match priming {
-            Priming::Head => head,
-            Priming::Retained => {
-                db::retained_tail_floor_seq(conn, self.channel_uuid, push_depth).unwrap_or(head)
-            }
         }
     }
 
@@ -320,10 +296,9 @@ impl RetentionStore for DbStore {
         subscriber: &ParticipantId,
         app_slug: &str,
         push_depth: Depth,
-        priming: Priming,
     ) -> Attached {
         let conn = self.db.lock().await;
-        self.maintain_cursor(&conn, subscriber, app_slug, push_depth, priming)
+        self.maintain_cursor(&conn, subscriber, app_slug, push_depth)
     }
 
     async fn detach(&self, subscriber: &ParticipantId) {
@@ -348,7 +323,7 @@ impl RetentionStore for DbStore {
                 &msg.body,
                 msg.urgency,
                 msg.envelope_type,
-                msg.reply_to_uuid,
+                msg.reply_to.as_ref().map(|r| r.uuid),
                 msg.delivery_deadline,
                 None,
                 msg.impetus,
@@ -366,12 +341,10 @@ impl RetentionStore for DbStore {
         release_at: DateTime<Utc>,
     ) -> Result<Parked, QuotaExceeded> {
         let conn = self.db.lock().await;
-        if let Depth::Bounded(cap) = self.deferred_cap {
-            // Cap check and insert share the connection guard, so the count a
-            // publish is admitted against is the count it is added to.
-            if db::count_deferred(&conn, self.channel_uuid) >= cap {
-                return Err(QuotaExceeded { cap });
-            }
+        // Cap check and insert share the connection guard, so the count a publish
+        // is admitted against is the count it is added to.
+        if let Some(cap) = db::deferred_cap_refusal(&conn, self.channel_uuid, self.deferred_cap) {
+            return Err(QuotaExceeded { cap });
         }
         let inserted = db::insert_message(
             &conn,
@@ -381,7 +354,7 @@ impl RetentionStore for DbStore {
             &msg.body,
             msg.urgency,
             msg.envelope_type,
-            msg.reply_to_uuid,
+            msg.reply_to.as_ref().map(|r| r.uuid),
             msg.delivery_deadline,
             Some(release_at),
             // A parked message keeps its impetus and redeems on release: the
