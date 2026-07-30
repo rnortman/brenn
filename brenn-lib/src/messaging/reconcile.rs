@@ -9,10 +9,11 @@
 //!
 //! - a row whose registration is gone wakes nobody (every wake pass resolves
 //!   against the live directory) but is reported against by every eviction pass
-//!   forever — noise attributed to a ghost. It is deleted. A registration that
-//!   is merely *unauthorized* is not gone: a durable dynamic row the boot merge
-//!   held back for a revoked ACL is registration state the operator may restore,
-//!   so its position is justified and kept.
+//!   forever — noise attributed to a ghost. It is deleted. A registration the
+//!   config merely no longer stands behind is not gone: a durable dynamic row
+//!   the boot merge held back — for a revoked ACL, a tightened standing depth,
+//!   or a channel whose declaration was removed — is registration state the
+//!   operator may restore, so its position is justified and kept.
 //! - a row standing above everything its channel ever held is the internal
 //!   analogue of the wire cursor's resume-ahead gap: an operator restored a
 //!   database under a position that outlived it. It is escalated and reset to
@@ -27,6 +28,7 @@ use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
+use super::config::DormantSubscription;
 use super::db;
 use super::{Messenger, ParticipantId, SubscriberEntryKind};
 
@@ -55,15 +57,17 @@ impl Messenger {
     /// the boot attaches: what it judges is the state a *previous* boot left, and
     /// a row this boot's attaches are about to create or reposition is not that.
     ///
-    /// `dormant` carries the `(channel_uuid, app_slug)` of every durable dynamic
-    /// row the boot merge held back as unauthorized. Those rows are deliberately
-    /// kept in their table and deliberately kept out of the directory, so the
-    /// directory alone would read them as ghosts and this pass would delete the
-    /// very positions a restored ACL is supposed to resume from — turning a
-    /// revoke/restore across a restart into silent, unattributed loss.
+    /// `dormant` carries every durable dynamic row the boot merge held back.
+    /// Those rows are deliberately kept in their table and deliberately kept out
+    /// of the directory, so the directory alone would read them as ghosts and
+    /// this pass would delete the very positions a restored ACL is supposed to
+    /// resume from — turning a revoke/restore across a restart into silent,
+    /// unattributed loss. The address travels on each entry because one dormant
+    /// class has no directory entry to read it off: a row whose channel exists
+    /// but whose `[[channel]]` block is gone.
     pub async fn reconcile_subscriber_cursors(
         &self,
-        dormant: &[(Uuid, String)],
+        dormant: &[DormantSubscription],
     ) -> CursorReconcile {
         let conn = self.db.lock().await;
         let rows = db::all_subscriber_cursors(&conn);
@@ -117,18 +121,23 @@ impl Messenger {
         // A dormant dynamic row justifies its conversation's position by the same
         // rule its live sibling does, resolve-only: an app that never had a
         // conversation on the channel has never been a delivery target there.
-        // Its channel is not in the directory as a subscription, but the row's
-        // own `channel_uuid` is the key either way.
-        for (channel_uuid, app_slug) in dormant {
-            let Some(entry) = self.directory.by_uuid(channel_uuid) else {
-                continue;
-            };
+        // The address comes from the caller rather than from the directory: a row
+        // whose channel is undeclared has no directory entry at all, and looking
+        // one up would skip exactly the position a redeclared channel resumes
+        // from. The row's own `channel_uuid` is the key either way.
+        //
+        // TODO(dormant-missing-app-cursor): `app_conversation` resolves through
+        // the apps map, so a dormant row whose `[[app]]` block is the thing that
+        // went missing resolves to nothing and loses its position here — the one
+        // dormant class whose promise is only half-kept, and the class the merge
+        // mints whenever an app has no resolvable policy.
+        for row in dormant {
             if let Some(conversation) =
                 self.targets
-                    .app_conversation(&conn, app_slug, &entry.address)
+                    .app_conversation(&conn, &row.app_slug, &row.channel_address)
             {
                 justified
-                    .entry(*channel_uuid)
+                    .entry(row.channel_uuid)
                     .or_default()
                     .insert(ParticipantId::for_conversation(conversation));
             }
@@ -196,13 +205,15 @@ mod tests {
     };
     use crate::messaging::db::{ensure_subscriber_cursor, load_subscriber_cursor, upsert_channels};
     use crate::messaging::query::NoopWakeRouter;
-    use crate::messaging::store::Priming;
     use crate::messaging::test_support::test_app_config;
     use crate::messaging::{
         ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntry, WakeMin, WakeRouter,
     };
 
     const APP: &str = "chatapp";
+    /// A second app on the same user, so a case can tell "this registration
+    /// justifies this position" from "some registration justifies everything".
+    const PEER_APP: &str = "peerapp";
     const USER: &str = "owner";
 
     /// Records the escalations the reconcile fires, which is the half of the
@@ -294,12 +305,29 @@ mod tests {
         {
             let conn = db.lock().await;
             crate::auth::user::create_user(&conn, USER, "$argon2id$fake");
+        }
+        messenger_over(db, entries, router).await
+    }
+
+    /// A messenger over an existing database, so a case can boot a second one on
+    /// the state the first left — the only way to reach a directory that no
+    /// longer holds a channel whose rows are still there.
+    async fn messenger_over(
+        db: crate::db::Db,
+        entries: Vec<ChannelEntry>,
+        router: std::sync::Arc<dyn WakeRouter>,
+    ) -> std::sync::Arc<Messenger> {
+        {
+            let conn = db.lock().await;
             upsert_channels(&conn, &entries);
         }
         let mut app: AppConfig = test_app_config(APP, None, vec![USER.to_string()]);
         app.singleton = true;
+        let mut peer: AppConfig = test_app_config(PEER_APP, None, vec![USER.to_string()]);
+        peer.singleton = true;
         let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
         apps.insert(APP.to_string(), app);
+        apps.insert(PEER_APP.to_string(), peer);
         Messenger::new(
             db,
             std::sync::Arc::new(MessagingDirectory::with_entries(entries)),
@@ -537,7 +565,11 @@ mod tests {
         };
         let position = ParticipantId::for_conversation(conversation);
         // Left behind by the denied period: a position that has not moved.
-        let dormant = vec![(uuid, APP.to_string())];
+        let dormant = vec![DormantSubscription {
+            channel_uuid: uuid,
+            app_slug: APP.to_string(),
+            channel_address: address.clone(),
+        }];
 
         assert!(m.reconcile_subscriber_cursors(&dormant).await.is_clean());
         assert!(
@@ -548,6 +580,79 @@ mod tests {
         // The same row once the subscription itself is gone — nothing names it.
         assert_eq!(m.reconcile_subscriber_cursors(&[]).await.orphans_removed, 1);
         assert_eq!(cursor_at(&m, uuid, &position).await, None);
+    }
+
+    /// A dormant row whose channel is undeclared has no directory entry at all —
+    /// its `[[channel]]` block was removed or commented out while the channel's
+    /// own row survived. The pass reads the channel off the registration rather
+    /// than looking the uuid up in a directory that cannot answer, so the
+    /// position a redeclaring boot resumes from survives.
+    ///
+    /// Two apps hold positions on the channel and only one is registered dormant,
+    /// which is what makes the pass discriminating: it keys on the registration's
+    /// own `(channel, app)` identity, not on any dormant entry existing.
+    #[tokio::test]
+    async fn a_dormant_row_on_an_undeclared_channel_keeps_its_position() {
+        let ch = channel("chat", vec![]);
+        let uuid = ch.uuid;
+        let address = ch.address.clone();
+        let db = init_db_memory();
+        {
+            let conn = db.lock().await;
+            crate::auth::user::create_user(&conn, USER, "$argon2id$fake");
+        }
+        let declared =
+            messenger_over(db.clone(), vec![ch], std::sync::Arc::new(NoopWakeRouter)).await;
+        let mut positions = Vec::new();
+        for slug in [APP, PEER_APP] {
+            declared
+                .attach_conversation(&address, slug, Depth::Bounded(5))
+                .await;
+            let conn = declared.db.lock().await;
+            positions.push(ParticipantId::for_conversation(
+                declared
+                    .targets
+                    .app_conversation(&conn, slug, &address)
+                    .expect("the attach minted it"),
+            ));
+        }
+        let (position, peer_position) = (positions[0].clone(), positions[1].clone());
+
+        // The next boot, with the block gone: the channel is in no directory, so
+        // only the merge's skip report can name it.
+        let undeclared = messenger_over(db, Vec::new(), std::sync::Arc::new(NoopWakeRouter)).await;
+        let dormant = vec![DormantSubscription {
+            channel_uuid: uuid,
+            app_slug: APP.to_string(),
+            channel_address: address,
+        }];
+        assert_eq!(
+            undeclared
+                .reconcile_subscriber_cursors(&dormant)
+                .await
+                .orphans_removed,
+            1,
+            "the peer holds no dormant registration, so its position is an orphan"
+        );
+        assert!(
+            cursor_at(&undeclared, uuid, &position).await.is_some(),
+            "the position a redeclared channel resumes from must survive"
+        );
+        assert_eq!(
+            cursor_at(&undeclared, uuid, &peer_position).await,
+            None,
+            "one app's dormant registration must not justify another's position"
+        );
+
+        // Without the dormant registration the same row is an orphan — the
+        // address alone justifies nothing.
+        assert_eq!(
+            undeclared
+                .reconcile_subscriber_cursors(&[])
+                .await
+                .orphans_removed,
+            1
+        );
     }
 
     /// The boundary is not a regression: a position at `head + 1` is exactly
@@ -613,18 +718,18 @@ mod tests {
         assert!(m.reconcile_subscriber_cursors(&[]).await.is_clean());
     }
 
-    /// `Priming` is not this pass's business, but the fixture's planted rows must
-    /// agree with what an attach would produce, so the two are pinned together:
-    /// a head-primed attach on an empty channel lands at 1, the value the
+    /// Where a fresh attach lands is not this pass's business, but the fixture's
+    /// planted rows must agree with what an attach would produce, so the two are
+    /// pinned together: an attach on an empty channel lands at 1, the value the
     /// regression boundary uses.
     #[tokio::test]
-    async fn a_head_primed_attach_on_an_empty_channel_sits_at_the_boundary() {
+    async fn a_fresh_attach_on_an_empty_channel_sits_at_the_boundary() {
         let ch = channel("chat", vec![wasm_subscriber("fresh")]);
         let uuid = ch.uuid;
         let address = ch.address.clone();
         let m = messenger(vec![ch], std::sync::Arc::new(NoopWakeRouter)).await;
         let fresh = ParticipantId::for_wasm("fresh");
-        m.attach_subscriber(&address, "fresh", &fresh, Depth::Bounded(5), Priming::Head)
+        m.attach_subscriber(&address, "fresh", &fresh, Depth::Bounded(5))
             .await;
         assert_eq!(cursor_at(&m, uuid, &fresh).await, Some(1));
         assert!(m.reconcile_subscriber_cursors(&[]).await.is_clean());

@@ -1,12 +1,12 @@
 //! End-to-end tests for `build_messaging` and `build_apps_with_messaging`.
 
 use super::test_fixtures::{
-    boot_messaging_with, io_port_raw, minimal_app_config, minimal_surface_raw,
-    minimal_wasm_consumer, resolved_ingress_sub, surface_sub_raw,
+    boot_messaging_with, io_port_raw, local_sub_raw, minimal_app_config, minimal_surface_raw,
+    minimal_wasm_consumer, resolved_ingress_sub, surface_sub_raw, tuning_for,
 };
 use super::*;
 use brenn_lib::config::AppConfig;
-use brenn_lib::messaging::config::{MessagingGlobalConfig, WasmGrant};
+use brenn_lib::messaging::config::{Depth, MessagingGlobalConfig, WasmGrant};
 use brenn_lib::webhook::ResolvedWebhookSubscription;
 
 /// An empty tool registry for `build_messaging` calls that do not exercise the
@@ -15,6 +15,26 @@ use brenn_lib::webhook::ResolvedWebhookSubscription;
 /// the pre-tool-substrate behavior unchanged.
 fn empty_tool_registry() -> std::sync::Arc<crate::tool_registry::ToolRegistry> {
     std::sync::Arc::new(crate::tool_registry::ToolRegistry::new(vec![]))
+}
+
+/// A non-durable `[[channel]]` block at `depth` for both rungs. Standing is the
+/// retained window on a non-durable channel, so it is left unstated. Tests use
+/// it for the inert channel that brings messaging up when the channel under
+/// test is not declared.
+fn nondurable_channel(address: &str, depth: u64) -> brenn_lib::messaging::config::ChannelConfigRaw {
+    brenn_lib::messaging::config::ChannelConfigRaw {
+        send_rate: None,
+        uuid: None,
+        address: Some(address.to_string()),
+        address_prefix: None,
+        description: None,
+        push_depth: Some(Depth::Bounded(depth)),
+        retain_depth: Some(Depth::Bounded(depth)),
+        standing_retain_depth: None,
+        noise: None,
+        sink: None,
+        wake_min: None,
+    }
 }
 
 /// Boot `build_messaging` with the standard no-op periphery and no apps. Tests
@@ -44,6 +64,8 @@ fn webhook_only_app_included_in_apps_with_messaging() {
         None, // no [app.messaging] block
         vec![ResolvedWebhookSubscription {
             endpoint_slug: endpoint_slug.to_string(),
+            push_depth: Depth::Bounded(1),
+            retain_depth: Depth::Bounded(8),
             wake_min: brenn_lib::messaging::WakeMin::Normal,
         }],
     );
@@ -76,14 +98,18 @@ fn webhook_only_app_included_in_apps_with_messaging() {
         brenn_lib::messaging::webhook_channel_uuid_from_slug(endpoint_slug),
         "channel_uuid must be deterministically derived from endpoint slug"
     );
-    // push_depth=Unbounded so Immediate wakes propagate.
-    assert!(
-        sub.push_depth.is_push_enabled(),
-        "push_depth must be push-enabled so Immediate wakes survive"
+    // The block's own depths reach the directory subscriber, in the right
+    // fields — distinct values so a swap is caught.
+    assert_eq!(
+        sub.push_depth,
+        Depth::Bounded(1),
+        "push_depth must be the [[app.webhook_subscription]] block's own"
     );
-    // (The former `!result_cfg.enabled` assertion was removed with the
-    // `ResolvedMessagingConfig::enabled` field — messaging-send authorization
-    // is now decided by the app's `AppPolicy`, not this synthesised config.)
+    assert_eq!(
+        sub.retain_depth,
+        Depth::Bounded(8),
+        "retain_depth must be the [[app.webhook_subscription]] block's own"
+    );
 }
 
 /// An MQTT-bridge-only app (no `[app.messaging]` block, only
@@ -175,6 +201,8 @@ fn a_transport_only_apps_budget_survives_the_unmerged_map() {
         None,
         vec![ResolvedWebhookSubscription {
             endpoint_slug: "pb-events".to_string(),
+            push_depth: Depth::Bounded(1),
+            retain_depth: Depth::Bounded(8),
             wake_min: brenn_lib::messaging::WakeMin::Normal,
         }],
     );
@@ -256,6 +284,7 @@ async fn build_messaging_derives_mqtt_channel_entry() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         std::slice::from_ref(&channel_def),
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -378,6 +407,7 @@ async fn build_messaging_reconstructs_runtime_created_mqtt_channel() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         std::slice::from_ref(&static_channel),
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -417,6 +447,353 @@ async fn build_messaging_reconstructs_runtime_created_mqtt_channel() {
     );
     assert_eq!(result.dynamic_mqtt_ingress[0].channel_uuid, channel_uuid);
     assert_eq!(result.dynamic_mqtt_ingress[0].channel_address, address);
+}
+
+/// A durable dynamic subscription on another conversation's chat record — the
+/// peer cross-subscription pattern — survives a restart.
+///
+/// A chat channel is runtime-created, `brenn:`, and declared by no `[[channel]]`
+/// block, so nothing reconstructs it from its row: its depths come from chat
+/// provisioning. What puts it back in the boot directory is
+/// `backfill_conversation_chat_channels`, and the dynamic merge has to run after
+/// that — under the wrong order the chat rows reach the merge only through the
+/// skip report, which holds the subscription dormant instead of folding it live,
+/// so the peer's cross-subscription is silently dead on every reboot.
+#[tokio::test]
+async fn build_messaging_keeps_a_dynamic_subscription_on_a_chat_channel() {
+    use brenn_lib::config::{BrennConfig, ChatLeaf, chat_address};
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::chat_channel_uuid_from_address;
+    use indexmap::IndexMap as IM;
+
+    // One unrelated channel brings messaging up; the chat family is derived
+    // from the conversation row, never declared.
+    let config = BrennConfig {
+        channels: vec![nondurable_channel("ephemeral:inert", 1)],
+        ..BrennConfig::default()
+    };
+    let owner = "cchost";
+    let peer = "cbpeer";
+    let conversation_id = 1;
+    let record = chat_address(
+        &config.llm_chat.prefix,
+        owner,
+        ChatLeaf::Out,
+        conversation_id,
+    );
+    let record_uuid = chat_channel_uuid_from_address(&record);
+
+    let db = init_db_memory();
+    {
+        let conn = db.lock().await;
+        conn.execute(
+            "INSERT INTO users (id, username, password_hash, created_at) \
+             VALUES (1, 'alice', 'h', '2024-01-01')",
+            [],
+        )
+        .expect("seed user");
+        conn.execute(
+            "INSERT INTO conversations (id, user_id, status, app_slug, created_at, updated_at) \
+             VALUES (?1, 1, 'active', ?2, '2024-01-01', '2024-01-01')",
+            rusqlite::params![conversation_id, owner],
+        )
+        .expect("seed conversation");
+        // The record channel's row as a previous boot's provisioning left it.
+        // Depths are not persisted, so what they say here is irrelevant — the
+        // row exists so the dynamic subscription's FK resolves.
+        let entry = brenn_lib::messaging::ChannelEntry {
+            uuid: record_uuid,
+            address: record.clone(),
+            description: None,
+            transport_type: ChannelScheme::Brenn,
+            resolved_channel: brenn_lib::messaging::config::ResolvedChannel {
+                send_rate: Default::default(),
+                push_depth: Depth::Bounded(8),
+                retain_depth: Depth::Bounded(8),
+                standing_retain_depth: Depth::Bounded(8),
+                noise: NoiseLevel::Silent,
+                sink: brenn_lib::messaging::config::Sink::Drop,
+                wake_min: brenn_lib::messaging::WakeMin::Normal,
+            },
+            subscribers: Vec::new(),
+            mount: None,
+        };
+        brenn_lib::messaging::db::upsert_channels(&conn, std::slice::from_ref(&entry));
+        conn.execute(
+            "INSERT INTO messaging_dynamic_subscriptions \
+             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
+             VALUES (?1, ?2, '8', '0', 'silent', 'normal', NULL, '2026-06-20T00:00:00Z')",
+            rusqlite::params![record_uuid.as_bytes().to_vec(), peer],
+        )
+        .expect("seed the peer's cross-subscription");
+    }
+
+    let mut apps_map: IM<String, AppConfig> = IM::new();
+    apps_map.insert(owner.to_string(), minimal_app_config(owner, None, vec![]));
+    let mut peer_app = minimal_app_config(peer, None, vec![]);
+    peer_app.policy =
+        crate::test_support::app_config::delivery_policy_for_addresses([record.as_str()]);
+    apps_map.insert(peer.to_string(), peer_app);
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+
+    let result = boot_messaging_with(&config, db.clone(), &apps, alert_dispatcher, "brenn://test")
+        .await
+        .messenger
+        .expect("a configured app brings messaging up");
+
+    let channel = result
+        .directory()
+        .by_uuid(&record_uuid)
+        .expect("the backfill must put the conversation's record channel in the directory");
+    assert_eq!(channel.address, record);
+    assert!(
+        channel.app_subscriber(peer).is_some(),
+        "the peer's dynamic subscription must be folded back onto the channel"
+    );
+
+    let conn = db.lock().await;
+    let rows = brenn_lib::messaging::db::load_dynamic_subscriptions(&conn);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the durable cross-subscription row must survive the restart, not be pruned"
+    );
+    assert_eq!(rows[0].app_slug, peer);
+}
+
+/// Removing a `[[channel]]` block does not destroy the durable dynamic
+/// subscriptions on that channel. The channel's row survives, so the boot that
+/// cannot see the block holds the subscription dormant — unfolded, unpruned, its
+/// cursor position untouched — and the boot that restores the block folds it
+/// back onto exactly that position. Commenting a block out to debug is a routine
+/// edit on a single-operator system; it must be revertible.
+#[tokio::test]
+async fn build_messaging_holds_a_dynamic_subscription_dormant_while_its_block_is_gone() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::ParticipantId;
+    use indexmap::IndexMap as IM;
+
+    let app_slug = "graf";
+    let channel_uuid = uuid::uuid!("2c9d7f11-84a2-4f0e-9b31-6f0c5a1d7e42");
+    let address = brenn_lib::messaging::canonical_address("declared");
+    let conversation_id = 1;
+
+    let declared_block = brenn_lib::messaging::config::ChannelConfigRaw {
+        send_rate: None,
+        uuid: Some(channel_uuid.to_string()),
+        address: Some("declared".to_string()),
+        address_prefix: None,
+        description: None,
+        push_depth: Some(Depth::Bounded(2)),
+        retain_depth: Some(Depth::Bounded(4)),
+        standing_retain_depth: Some(Depth::Bounded(4)),
+        noise: None,
+        sink: None,
+        wake_min: None,
+    };
+    // The block that keeps messaging up when the declared one is commented out.
+    let inert_block = nondurable_channel("ephemeral:inert", 1);
+    let with_block = BrennConfig {
+        channels: vec![declared_block, inert_block.clone()],
+        ..BrennConfig::default()
+    };
+    let without_block = BrennConfig {
+        channels: vec![inert_block],
+        ..BrennConfig::default()
+    };
+
+    let db = init_db_memory();
+    {
+        let conn = db.lock().await;
+        conn.execute(
+            "INSERT INTO users (id, username, password_hash, created_at) \
+             VALUES (1, 'alice', 'h', '2024-01-01')",
+            [],
+        )
+        .expect("seed user");
+        conn.execute(
+            "INSERT INTO conversations (id, user_id, status, app_slug, created_at, updated_at) \
+             VALUES (?1, 1, 'active', ?2, '2024-01-01', '2024-01-01')",
+            rusqlite::params![conversation_id, app_slug],
+        )
+        .expect("seed conversation");
+    }
+
+    let mut apps_map: IM<String, AppConfig> = IM::new();
+    let mut app = minimal_app_config(app_slug, None, vec![]);
+    app.policy = crate::test_support::app_config::delivery_policy_for_addresses([address.as_str()]);
+    apps_map.insert(app_slug.to_string(), app);
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
+
+    let boot = async |config: &BrennConfig, db: brenn_lib::db::Db| {
+        let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+        boot_messaging_with(config, db, &apps, alert_dispatcher, "brenn://test")
+            .await
+            .messenger
+            .expect("a configured app brings messaging up")
+    };
+
+    // Boot 1: the block is there. The channel must hold messages with the
+    // position strictly inside them: on an empty channel a preserved position
+    // and one re-primed at head are the same number, and the assertions would
+    // pin nothing.
+    let first = boot(&with_block, db.clone()).await;
+    warm_channel_with_messages(&db, channel_uuid, 5).await;
+    let position = ParticipantId::for_conversation(conversation_id);
+    let seeded_seq = 3;
+    {
+        let conn = db.lock().await;
+        conn.execute(
+            "INSERT INTO messaging_dynamic_subscriptions \
+             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
+             VALUES (?1, ?2, '2', '4', 'silent', 'normal', NULL, '2026-06-20T00:00:00Z')",
+            rusqlite::params![channel_uuid.as_bytes().to_vec(), app_slug],
+        )
+        .expect("seed the dynamic subscription");
+        brenn_lib::messaging::db::ensure_subscriber_cursor(
+            &conn,
+            channel_uuid,
+            &position,
+            app_slug,
+            Depth::Bounded(2),
+            seeded_seq,
+        );
+    }
+    drop(first);
+
+    // Boot 2: the block is commented out. The channel row is still there, so the
+    // subscription is dormant, not drift.
+    let second = boot(&without_block, db.clone()).await;
+    assert!(
+        second.directory().by_uuid(&channel_uuid).is_none(),
+        "an undeclared channel is not conjured back into the directory",
+    );
+    {
+        let conn = db.lock().await;
+        let rows = brenn_lib::messaging::db::load_dynamic_subscriptions(&conn);
+        assert_eq!(rows.len(), 1, "the durable row must not be pruned");
+        assert_eq!(rows[0].app_slug, app_slug);
+        let cursor =
+            brenn_lib::messaging::db::load_subscriber_cursor(&conn, channel_uuid, &position)
+                .expect("the dormant registration justifies the position");
+        assert_eq!(
+            cursor.next_owed_seq, seeded_seq,
+            "a dormant boot must leave the position where it stood, not reset it"
+        );
+    }
+    drop(second);
+
+    // Boot 3: the block is back. The subscription folds again, onto the position
+    // the dormant boots preserved.
+    let third = boot(&with_block, db.clone()).await;
+    let channel = third
+        .directory()
+        .by_uuid(&channel_uuid)
+        .expect("the restored block redeclares the channel");
+    assert!(
+        channel.app_subscriber(app_slug).is_some(),
+        "the dormant subscription folds back once its channel is declared",
+    );
+    let conn = db.lock().await;
+    let cursor = brenn_lib::messaging::db::load_subscriber_cursor(&conn, channel_uuid, &position)
+        .expect("the position survived both boots");
+    assert_eq!(
+        cursor.next_owed_seq, seeded_seq,
+        "the redeclaring boot folds the subscription back onto exactly that position"
+    );
+}
+
+/// Deleting the channel's row from the database is the operator's retirement
+/// path, and it is the case that still counts as drift: with no row to hold the
+/// subscription dormant against, the next boot prunes the durable row instead of
+/// warning about it forever. Pinned end to end, because the merge's `dropped`
+/// condition and the prune that acts on it meet only in the boot path.
+#[tokio::test]
+async fn build_messaging_prunes_a_dynamic_subscription_when_the_channel_row_is_deleted() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use indexmap::IndexMap as IM;
+
+    let app_slug = "graf";
+    let channel_uuid = uuid::uuid!("6b1f0a54-2f47-4a6c-8a1d-9e3b5c7d2f80");
+    let address = brenn_lib::messaging::canonical_address("retired");
+
+    let declared_block = brenn_lib::messaging::config::ChannelConfigRaw {
+        send_rate: None,
+        uuid: Some(channel_uuid.to_string()),
+        address: Some("retired".to_string()),
+        address_prefix: None,
+        description: None,
+        push_depth: Some(Depth::Bounded(2)),
+        retain_depth: Some(Depth::Bounded(4)),
+        standing_retain_depth: Some(Depth::Bounded(4)),
+        noise: None,
+        sink: None,
+        wake_min: None,
+    };
+    let inert_block = nondurable_channel("ephemeral:inert", 1);
+    let with_block = BrennConfig {
+        channels: vec![declared_block, inert_block.clone()],
+        ..BrennConfig::default()
+    };
+    let without_block = BrennConfig {
+        channels: vec![inert_block],
+        ..BrennConfig::default()
+    };
+
+    let mut apps_map: IM<String, AppConfig> = IM::new();
+    let mut app = minimal_app_config(app_slug, None, vec![]);
+    app.policy = crate::test_support::app_config::delivery_policy_for_addresses([address.as_str()]);
+    apps_map.insert(app_slug.to_string(), app);
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
+
+    let boot = async |config: &BrennConfig, db: brenn_lib::db::Db| {
+        let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+        boot_messaging_with(config, db, &apps, alert_dispatcher, "brenn://test")
+            .await
+            .messenger
+            .expect("a configured app brings messaging up")
+    };
+
+    let db = init_db_memory();
+    let first = boot(&with_block, db.clone()).await;
+    {
+        let conn = db.lock().await;
+        conn.execute(
+            "INSERT INTO messaging_dynamic_subscriptions \
+             (channel_uuid, app_slug, push_depth, retain_depth, noise, wake_min, qos, created_at) \
+             VALUES (?1, ?2, '2', '4', 'silent', 'normal', NULL, '2026-06-20T00:00:00Z')",
+            rusqlite::params![channel_uuid.as_bytes().to_vec(), app_slug],
+        )
+        .expect("seed the dynamic subscription");
+        // The retirement is an out-of-band edit, made with whatever tool the
+        // operator has to hand — the sqlite shell leaves foreign keys off by
+        // default, which is what lets the channel row go while the rows that
+        // reference it stay. Modelled literally, since the whole point of the
+        // case is a subscription row outliving its channel.
+        conn.pragma_update(None, "foreign_keys", "OFF")
+            .expect("relax foreign keys for the operator's edit");
+        conn.execute(
+            "DELETE FROM messaging_channels WHERE uuid = ?1",
+            rusqlite::params![channel_uuid.as_bytes().to_vec()],
+        )
+        .expect("retire the channel row");
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .expect("restore foreign keys");
+    }
+    drop(first);
+
+    let second = boot(&without_block, db.clone()).await;
+    {
+        let conn = db.lock().await;
+        assert!(
+            brenn_lib::messaging::db::load_dynamic_subscriptions(&conn).is_empty(),
+            "a subscription whose channel row is gone is drift and must be pruned",
+        );
+    }
+    drop(second);
 }
 
 /// An **orphan** channel — present in `messaging_channels` but with NO
@@ -490,6 +867,7 @@ async fn build_messaging_does_not_reconstruct_orphan_channel() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         std::slice::from_ref(&static_channel),
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -606,6 +984,7 @@ async fn build_messaging_revokes_then_resumes_dynamic_mqtt_subscription_across_r
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         std::slice::from_ref(&static_channel),
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -669,6 +1048,7 @@ async fn build_messaging_revokes_then_resumes_dynamic_mqtt_subscription_across_r
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         std::slice::from_ref(&static_channel),
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -712,11 +1092,12 @@ fn config_with_one_brenn_channel(address: &str) -> (brenn_lib::config::BrennConf
         channels: vec![ChannelConfigRaw {
             send_rate: None,
             uuid: Some(uuid.to_string()),
-            address: address.to_string(),
+            address: Some(address.to_string()),
+            address_prefix: None,
             description: None,
-            push_depth: None,
-            retain_depth: None,
-            standing_retain_depth: None,
+            push_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
+            retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
+            standing_retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
             noise: None,
             sink: None,
             wake_min: None,
@@ -793,6 +1174,7 @@ async fn build_messaging_panics_on_static_app_sub_without_covering_policy() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -837,6 +1219,7 @@ async fn build_messaging_accepts_static_app_sub_with_covering_policy() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -912,6 +1295,7 @@ async fn build_messaging_panics_on_static_wasm_sub_without_covering_policy() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -976,6 +1360,7 @@ async fn build_messaging_panics_on_wasm_mqtt_matcher_undeclared_client() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -1050,6 +1435,7 @@ async fn build_messaging_panics_on_wasm_mqtt_publish_acl_without_mqtt_grant() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -1129,6 +1515,7 @@ async fn build_messaging_panics_on_static_wasm_sub_channel_outside_subscribe_acl
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -1200,6 +1587,7 @@ async fn build_messaging_accepts_static_wasm_sub_with_covering_subscribe_acl() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -1304,6 +1692,7 @@ async fn build_messaging_panics_on_wasm_mqtt_subscribe_matcher_undeclared_client
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -1385,6 +1774,7 @@ async fn build_messaging_accepts_wasm_webhook_sub_prod_block_shape() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -1438,7 +1828,7 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
         subscriptions: vec![WasmConsumerSubscriptionRaw {
             channel: Some(format!("webhook:{endpoint_slug}")),
             port: "in".to_string(),
-            push_depth: Some(Depth::Unbounded),
+            push_depth: Some(Depth::Bounded(8)),
             retain_depth: None,
             noise: None,
             wake_min: None,
@@ -1466,6 +1856,7 @@ async fn build_messaging_panics_on_wasm_webhook_sub_without_covering_acl() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -1554,6 +1945,7 @@ async fn build_messaging_accepts_wasm_mqtt_sub_with_covering_acl() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         std::slice::from_ref(&ingress),
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -1660,6 +2052,7 @@ async fn build_messaging_panics_on_wasm_mqtt_sub_without_covering_acl() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         std::slice::from_ref(&ingress),
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -1684,12 +2077,15 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
         channels: vec![ChannelConfigRaw {
             send_rate: None,
             uuid: None,
-            address: "ephemeral:protobar-demo".to_string(),
+            address: Some("ephemeral:protobar-demo".to_string()),
+            address_prefix: None,
             description: None,
-            push_depth: None,
+            push_depth: Some(brenn_lib::messaging::config::Depth::Bounded(1)),
             // A surface-bound channel must retain something: the subscription's
-            // position is recovered by re-reading retention.
-            retain_depth: Some(brenn_lib::messaging::config::Depth::Bounded(1)),
+            // position is recovered by re-reading retention. On a non-durable
+            // channel the retained window is also the standing buffer, so it is
+            // the ceiling every binding's depth sits under.
+            retain_depth: Some(brenn_lib::messaging::config::Depth::Bounded(8)),
             standing_retain_depth: None,
             noise: None,
             sink: None,
@@ -1698,8 +2094,8 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
         surfaces: vec![SurfaceConfigRaw {
             grants: vec![SurfaceGrant::EphemeralSubscribe],
             ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact("protobar-demo".to_string())],
-            // Stock global defaults leave `default_push_depth` unbounded, which
-            // cannot be a page queue, so a surface binding states its own depth.
+            // The channel rung here is 1, which is not the page queue this
+            // binding wants, so it states its own depth.
             subscriptions: vec![brenn_lib::messaging::config::SurfaceSubscriptionRaw {
                 push_depth: Some(brenn_lib::messaging::config::Depth::Bounded(8)),
                 ..surface_sub_raw("ephemeral:protobar-demo", "protobar", "messages")
@@ -1723,6 +2119,7 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -1765,26 +2162,13 @@ async fn build_messaging_brings_up_surface_and_ephemeral_only_config() {
 async fn build_messaging_registers_nondurable_channels_with_stores() {
     use brenn_lib::config::BrennConfig;
     use brenn_lib::db::init_db_memory;
-    use brenn_lib::messaging::config::{ChannelConfigRaw, Depth};
     use indexmap::IndexMap as IM;
 
-    fn nondurable(address: &str) -> ChannelConfigRaw {
-        ChannelConfigRaw {
-            send_rate: None,
-            uuid: None,
-            address: address.to_string(),
-            description: None,
-            push_depth: None,
-            retain_depth: Some(Depth::Bounded(4)),
-            standing_retain_depth: None,
-            noise: None,
-            sink: None,
-            wake_min: None,
-        }
-    }
-
     let config = BrennConfig {
-        channels: vec![nondurable("ephemeral:wired"), nondurable("local:inert")],
+        channels: vec![
+            nondurable_channel("ephemeral:wired", 4),
+            nondurable_channel("local:inert", 4),
+        ],
         ..BrennConfig::default()
     };
 
@@ -1803,6 +2187,7 @@ async fn build_messaging_registers_nondurable_channels_with_stores() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -1904,7 +2289,8 @@ async fn build_messaging_wires_wasm_ephemeral_consumer_to_a_ring_cursor() {
     let channel = ChannelConfigRaw {
         send_rate: None,
         uuid: None,
-        address: "ephemeral:sensors".to_string(),
+        address: Some("ephemeral:sensors".to_string()),
+        address_prefix: None,
         description: None,
         push_depth: Some(Depth::Bounded(4)),
         retain_depth: Some(Depth::Bounded(8)),
@@ -1985,11 +2371,14 @@ async fn build_messaging_registers_every_wasm_input_but_persists_only_durable_on
         ChannelConfigRaw {
             send_rate: None,
             uuid: uuid.map(str::to_string),
-            address: address.to_string(),
+            address: Some(address.to_string()),
+            address_prefix: None,
             description: None,
             push_depth: Some(Depth::Bounded(4)),
             retain_depth: Some(Depth::Bounded(8)),
-            standing_retain_depth: None,
+            // The durable half of the pair takes the standing frontier; the
+            // non-durable one has no third number to state.
+            standing_retain_depth: uuid.map(|_| Depth::Bounded(8)),
             noise: None,
             sink: None,
             wake_min: None,
@@ -2087,7 +2476,8 @@ async fn build_messaging_wires_wasm_local_consumer_to_a_ring_cursor() {
     let channel = ChannelConfigRaw {
         send_rate: None,
         uuid: None,
-        address: "local:scratch".to_string(),
+        address: Some("local:scratch".to_string()),
+        address_prefix: None,
         description: None,
         push_depth: Some(Depth::Bounded(4)),
         retain_depth: Some(Depth::Bounded(8)),
@@ -2403,11 +2793,12 @@ async fn auto_channels_list_as_their_durability_says() {
         channels: vec![brenn_lib::messaging::config::ChannelConfigRaw {
             send_rate: None,
             uuid: Some("5b0e1c9a-2d44-4f18-9a3b-6c7e0d81f204".to_string()),
-            address: "brenn:etl.feed".to_string(),
+            address: Some("brenn:etl.feed".to_string()),
+            address_prefix: None,
             description: None,
             push_depth: Some(Depth::Bounded(2)),
             retain_depth: Some(Depth::Bounded(8)),
-            standing_retain_depth: None,
+            standing_retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
             noise: None,
             sink: None,
             wake_min: None,
@@ -2447,6 +2838,7 @@ async fn auto_channels_list_as_their_durability_says() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -2516,7 +2908,7 @@ async fn a_shared_local_name_across_the_two_realms_boots() {
                 // can be, so a surface binding states its own.
                 push_depth: Some(Depth::Bounded(4)),
                 retain_depth: Some(Depth::Bounded(3)),
-                ..surface_sub_raw("local:etl.tick", "protobar", "snoop")
+                ..local_sub_raw("local:etl.tick", "protobar", "snoop")
             }],
             ..minimal_surface_raw()
         }],
@@ -2566,11 +2958,12 @@ fn warm_brenn_priming_configs(
     let channel = ChannelConfigRaw {
         send_rate: None,
         uuid: Some(uuid.to_string()),
-        address: format!("brenn:{address}"),
+        address: Some(format!("brenn:{address}")),
+        address_prefix: None,
         description: None,
         push_depth: Some(push_depth),
         retain_depth: Some(brenn_lib::messaging::config::Depth::Bounded(64)),
-        standing_retain_depth: None,
+        standing_retain_depth: Some(brenn_lib::messaging::config::Depth::Unbounded),
         noise: None,
         sink: None,
         wake_min: None,
@@ -2742,9 +3135,9 @@ async fn plant_orphan_message_rows(db: &brenn_lib::db::Db, channel_uuid: uuid::U
         .expect("fk on");
 }
 
-/// A new WASM queue on a *non-durable* channel is primed via the ring
-/// (`Priming::Retained` at attach), never by seeding durable pending-push rows:
-/// the durable priming loop skips non-durable channels. Even with retained
+/// A new WASM queue on a *non-durable* channel is primed via the ring at attach,
+/// never by seeding durable pending-push rows: the durable priming loop skips
+/// non-durable channels. Even with retained
 /// message rows sitting under the channel's uuid — which absent the skip guard
 /// `load_channel_retained_tail` would seed — no pending pushes are written.
 #[tokio::test]
@@ -2760,7 +3153,8 @@ async fn build_messaging_does_not_seed_db_pushes_for_a_nondurable_wasm_queue() {
     let channel = ChannelConfigRaw {
         send_rate: None,
         uuid: None,
-        address: "ephemeral:sensors".to_string(),
+        address: Some("ephemeral:sensors".to_string()),
+        address_prefix: None,
         description: None,
         push_depth: Some(Depth::Bounded(4)),
         retain_depth: Some(Depth::Bounded(8)),
@@ -2863,6 +3257,7 @@ async fn build_messaging_brings_up_wasm_consumer_only_config() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -2956,6 +3351,7 @@ async fn build_messaging_wires_async_tool_bus_for_granted_consumer() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &async_tool_registry(),
     )
@@ -3043,6 +3439,7 @@ async fn build_messaging_panics_when_a_connection_uuid_collides_with_a_tool_chan
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &async_tool_registry(),
     )
@@ -3071,10 +3468,11 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
     let retained_channel = |uuid: &str, address: &str| ChannelConfigRaw {
         send_rate: None,
         uuid: Some(uuid.to_string()),
-        address: address.to_string(),
+        address: Some(address.to_string()),
+        address_prefix: None,
         description: None,
-        push_depth: None,
-        retain_depth: None,
+        push_depth: Some(Depth::Bounded(1)),
+        retain_depth: Some(Depth::Bounded(1)),
         standing_retain_depth: Some(Depth::Bounded(1)),
         noise: None,
         sink: None,
@@ -3111,6 +3509,7 @@ async fn boot_description_publish_is_pullable_by_a_non_subscriber_latest_wins() 
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -3201,9 +3600,10 @@ async fn boot_disconnected_stamp_written_per_surface_and_pullable() {
     let bounded_channel = |uuid: &str, address: &str| ChannelConfigRaw {
         send_rate: None,
         uuid: Some(uuid.to_string()),
-        address: address.to_string(),
+        address: Some(address.to_string()),
+        address_prefix: None,
         description: None,
-        push_depth: None,
+        push_depth: Some(Depth::Bounded(1)),
         retain_depth: Some(Depth::Bounded(1)),
         standing_retain_depth: Some(Depth::Bounded(1)),
         noise: None,
@@ -3246,6 +3646,7 @@ async fn boot_disconnected_stamp_written_per_surface_and_pullable() {
         Some(Arc::from("brenn://test")),
         &webhook_endpoints,
         &[],
+        &tuning_for(&config),
         &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
         &empty_tool_registry(),
     )
@@ -3414,4 +3815,313 @@ async fn boot_logs_every_injected_auto_grant() {
         }
         Ok(())
     });
+}
+
+// ---------------------------------------------------------------------------
+// `[[channel]]` tuning blocks for system-minted channels
+// ---------------------------------------------------------------------------
+
+/// A tuning block naming a webhook endpoint this config never declares is a
+/// typo, not a tuning — boot refuses rather than tuning nothing.
+#[test]
+#[should_panic(expected = "tunes a channel this config never mints")]
+fn a_tuning_block_for_an_undeclared_webhook_panics() {
+    let tuning = tuning_of(&[tuning_raw("webhook:ghost")]);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &IndexMap::new(),
+        &[],
+        &std::collections::HashSet::new(),
+    );
+}
+
+/// Same for a tool that is not registered.
+#[test]
+#[should_panic(expected = "tunes a channel this config never mints")]
+fn a_tuning_block_for_an_unregistered_tool_panics() {
+    let tuning = tuning_of(&[tuning_raw("brenn:tools/nope")]);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &IndexMap::new(),
+        &["apull"],
+        &std::collections::HashSet::new(),
+    );
+}
+
+/// A block written in the bare house spelling is the same block: it reaches the
+/// boot check rather than slipping past it as an unrecognised address.
+#[test]
+#[should_panic(expected = "tunes a channel this config never mints")]
+fn a_bare_tuning_block_for_an_unregistered_tool_panics() {
+    let tuning = tuning_of(&[tuning_raw("tools/nope")]);
+    validate_exact_tuning_blocks(
+        &tuning,
+        &IndexMap::new(),
+        &["apull"],
+        &std::collections::HashSet::new(),
+    );
+}
+
+/// And for a result inbox whose consumer holds no async tool grant.
+#[test]
+#[should_panic(expected = "tunes a channel this config never mints")]
+fn a_tuning_block_for_an_ungranted_inbox_panics() {
+    let tuning = tuning_of(&[tuning_raw("brenn:tool-results/ghost")]);
+    let slugs: std::collections::HashSet<String> = ["sync".to_string()].into_iter().collect();
+    validate_exact_tuning_blocks(&tuning, &IndexMap::new(), &["apull"], &slugs);
+}
+
+/// An exact `mqtt:` block naming a channel nothing has minted yet boots
+/// cleanly: the MQTT population is open-ended, so the block is a standing rule
+/// for a channel a runtime subscribe may mint later. Blocks that do name
+/// existing endpoints, tools and inboxes pass alongside it — the positive case
+/// for each arm, so a lookup that can never succeed (matching the address where
+/// the population is keyed by slug, say) is caught here rather than turning
+/// every real tuning block into a boot refusal.
+#[test]
+fn an_mqtt_block_matching_nothing_boots_and_real_blocks_pass() {
+    let tuning = tuning_of(&[
+        tuning_raw("mqtt:home:sensors/never-seen"),
+        tuning_raw("webhook:gh-events"),
+        tuning_raw("brenn:tools/apull"),
+        tuning_raw("brenn:tool-results/sync"),
+    ]);
+    let slugs: std::collections::HashSet<String> = ["sync".to_string()].into_iter().collect();
+    validate_exact_tuning_blocks(
+        &tuning,
+        &webhook_endpoint_map("gh-events", "someapp"),
+        &["apull"],
+        &slugs,
+    );
+}
+
+/// The tuning table reaches every site that mints a system channel.
+///
+/// Each mint site resolves independently, and each one falls back to the family
+/// default, so an implementation that dropped the table at any one of them would
+/// leave a suite that only ever passes an empty table entirely green — and the
+/// operator's sizing would silently do nothing for that family. Distinct numbers
+/// per family so a crossed wire is caught too.
+#[tokio::test]
+async fn a_tuning_block_reaches_every_system_channel_mint_site() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::config::Depth;
+    use brenn_lib::messaging::mqtt_channel_uuid_from_address;
+    use brenn_lib::mqtt::config::ResolvedMqttIngressChannel;
+    use indexmap::IndexMap as IM;
+
+    let mqtt_address = "mqtt:homeassistant:home/tuned/state";
+    let ingress_channel = ResolvedMqttIngressChannel {
+        channel_address: mqtt_address.to_string(),
+        channel_uuid: mqtt_channel_uuid_from_address(mqtt_address),
+        client_slug: "homeassistant".to_string(),
+        topic: "home/tuned/state".to_string(),
+        qos: 1,
+        urgency: brenn_lib::messaging::Urgency::Normal,
+    };
+
+    let mut repo_clause = toml::Table::new();
+    repo_clause.insert("repo".to_string(), toml::Value::String("brenn".to_string()));
+    let mut consumer = minimal_wasm_consumer();
+    consumer.tool_grants = vec![brenn_lib::tools::config::ToolGrantRaw {
+        tool: "apull".to_string(),
+        acl: vec![repo_clause],
+        rate_limit: None,
+    }];
+
+    // One block per family, each with its own retained window.
+    let tuned = |address: Option<&str>, prefix: Option<&str>, retain: u64| {
+        brenn_lib::messaging::config::ChannelConfigRaw {
+            send_rate: None,
+            uuid: None,
+            address: address.map(str::to_string),
+            address_prefix: prefix.map(str::to_string),
+            description: None,
+            push_depth: Some(Depth::Bounded(1)),
+            retain_depth: Some(Depth::Bounded(retain)),
+            standing_retain_depth: Some(Depth::Bounded(retain)),
+            noise: None,
+            sink: None,
+            wake_min: None,
+        }
+    };
+    let config = BrennConfig {
+        wasm_consumers: vec![consumer],
+        channels: vec![
+            tuned(Some("webhook:gh-events"), None, 30),
+            tuned(Some("brenn:tools/apull"), None, 9),
+            tuned(Some("brenn:tool-results/probe"), None, 7),
+            tuned(None, Some("mqtt:homeassistant:"), 40),
+        ],
+        ..BrennConfig::default()
+    };
+
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+    let result = build_messaging(
+        &config,
+        init_db_memory(),
+        &apps,
+        ActiveBridges::new(),
+        alert_dispatcher,
+        Some(Arc::from("brenn://test")),
+        &webhook_endpoint_map("gh-events", "someapp"),
+        std::slice::from_ref(&ingress_channel),
+        &tuning_for(&config),
+        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
+        &async_tool_registry(),
+    )
+    .await;
+    let directory = result
+        .messenger
+        .expect("a tuned system-channel config boots")
+        .directory()
+        .clone();
+
+    for (address, retain) in [
+        ("webhook:gh-events", 30u64),
+        ("brenn:tools/apull", 9),
+        ("brenn:tool-results/probe", 7),
+        (mqtt_address, 40),
+    ] {
+        let entry = directory
+            .resolve(address)
+            .unwrap_or_else(|| panic!("{address} must be minted into the directory"));
+        assert_eq!(
+            entry.resolved_channel.retain_depth,
+            Depth::Bounded(retain),
+            "{address} must take its tuning block's retain_depth, not the family default",
+        );
+        assert_eq!(
+            entry.resolved_channel.standing_retain_depth,
+            Depth::Bounded(retain),
+            "{address} must take its tuning block's standing_retain_depth",
+        );
+    }
+}
+
+/// The boot ceiling pass is wired into `build_messaging`, not merely callable.
+/// Deleting the call, or moving it above the folds it exists to see, would leave
+/// an over-ceiling config booting and surface the violation hours later as the
+/// `reap_frontier` panic inside the GC pass.
+#[tokio::test]
+#[should_panic(expected = "exceeding the channel's standing_retain_depth")]
+async fn build_messaging_refuses_a_subscriber_above_the_channel_ceiling() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::config::{
+        ChannelConfigRaw, ResolvedMessagingConfig, ResolvedSubscription,
+    };
+    use indexmap::IndexMap as IM;
+
+    let address = "brenn:tight";
+    let uuid = uuid::Uuid::new_v4();
+    let config = BrennConfig {
+        channels: vec![ChannelConfigRaw {
+            send_rate: None,
+            uuid: Some(uuid.to_string()),
+            address: Some(address.to_string()),
+            address_prefix: None,
+            description: None,
+            push_depth: Some(Depth::Bounded(1)),
+            retain_depth: Some(Depth::Bounded(2)),
+            standing_retain_depth: Some(Depth::Bounded(2)),
+            noise: None,
+            sink: None,
+            wake_min: None,
+        }],
+        ..BrennConfig::default()
+    };
+
+    let mut app = minimal_app_config(
+        "deep",
+        Some(ResolvedMessagingConfig {
+            send_budget: 100,
+            subscriptions: vec![ResolvedSubscription {
+                channel_uuid: uuid,
+                channel_address: address.to_string(),
+                push_depth: Depth::Bounded(1),
+                retain_depth: Depth::Bounded(4),
+                noise: NoiseLevel::Silent,
+                wake_min: brenn_lib::messaging::WakeMin::Normal,
+            }],
+        }),
+        vec![],
+    );
+    app.policy = crate::test_support::app_config::delivery_policy_for_addresses([address]);
+    let mut apps_map: IM<String, AppConfig> = IM::new();
+    apps_map.insert("deep".to_string(), app);
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+
+    boot_messaging_with(
+        &config,
+        init_db_memory(),
+        &apps,
+        alert_dispatcher,
+        "brenn://test",
+    )
+    .await;
+}
+
+/// And the tuning-block existence check is wired in too, at a position where
+/// every population it checks against is known.
+#[tokio::test]
+#[should_panic(expected = "tunes a channel this config never mints")]
+async fn build_messaging_refuses_a_tuning_block_that_mints_nothing() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use indexmap::IndexMap as IM;
+
+    let config = BrennConfig {
+        channels: vec![tuning_raw("webhook:githbu")],
+        ..BrennConfig::default()
+    };
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+
+    build_messaging(
+        &config,
+        init_db_memory(),
+        &apps,
+        ActiveBridges::new(),
+        alert_dispatcher,
+        Some(Arc::from("brenn://test")),
+        &webhook_endpoint_map("github", "someapp"),
+        &[],
+        &tuning_for(&config),
+        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
+        &empty_tool_registry(),
+    )
+    .await;
+}
+
+/// Build the tuning table over `raw` against the stock `[messaging]` globals.
+fn tuning_of(
+    raw: &[brenn_lib::messaging::config::ChannelConfigRaw],
+) -> brenn_lib::messaging::config::SystemChannelTuning {
+    brenn_lib::messaging::config::build_system_channel_tuning(
+        raw,
+        &MessagingGlobalConfig::default(),
+    )
+}
+
+/// A `[[channel]]` block addressing a system-minted channel, with the three
+/// depths every tuning block states.
+fn tuning_raw(address: &str) -> brenn_lib::messaging::config::ChannelConfigRaw {
+    use brenn_lib::messaging::config::Depth;
+    brenn_lib::messaging::config::ChannelConfigRaw {
+        send_rate: None,
+        uuid: None,
+        address: Some(address.to_string()),
+        address_prefix: None,
+        description: None,
+        push_depth: Some(Depth::Bounded(1)),
+        retain_depth: Some(Depth::Bounded(8)),
+        standing_retain_depth: Some(Depth::Bounded(8)),
+        noise: None,
+        sink: None,
+        wake_min: None,
+    }
 }

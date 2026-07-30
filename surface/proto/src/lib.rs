@@ -32,7 +32,7 @@
 
 use std::collections::BTreeMap;
 
-use brenn_envelope::{ChannelCapabilities, ChannelScheme, DeliveryClass, MessageEnvelope};
+use brenn_envelope::{ChannelCapabilities, ChannelScheme, MessageEnvelope};
 use chrono::{DateTime, Utc};
 
 /// The RFC 8030 urgency ladder, re-exported from the carrier crate.
@@ -861,11 +861,11 @@ pub struct OutputBinding {
 /// Whether a scheme's channels bind to a surface at all.
 ///
 /// This is the only scheme question that is genuinely surface-local. It is
-/// orthogonal to delivery class ([`ChannelScheme::delivery_class`], which is
-/// bus-wide knowledge): `mqtt:` and `webhook:` are durable-class yet not
-/// surface transports, and `pwa_push:` is egress-only. Deciding both questions
-/// from one enum would be a parallel taxonomy — the exact drift the One True
-/// Enum exists to prevent.
+/// orthogonal to capabilities ([`ChannelScheme::capabilities`], which is
+/// bus-wide knowledge): `mqtt:` and `webhook:` are durable and transportable
+/// yet not surface transports, and `pwa_push:` is egress-only. Deciding both
+/// questions from one enum would be a parallel taxonomy — the exact drift the
+/// One True Enum exists to prevent.
 ///
 /// Exhaustive over [`ChannelScheme`] so a new transport cannot be added without
 /// answering "does this bind to a surface?".
@@ -876,19 +876,6 @@ pub fn surface_bindable(scheme: ChannelScheme) -> bool {
     }
 }
 
-/// The delivery class of a surface-bound channel address, or `None` when the
-/// address carries no recognized prefix, names a scheme that does not bind to a
-/// surface, or has no delivery class at all.
-///
-/// The single derivation both ends of the surface wire share, so the client's
-/// port/resume decisions and the server's binding classification cannot drift.
-pub fn surface_delivery_class(channel: &str) -> Option<DeliveryClass> {
-    let scheme = ChannelScheme::of(channel)?;
-    surface_bindable(scheme)
-        .then(|| scheme.delivery_class())
-        .flatten()
-}
-
 /// The capability set a surface-bound channel address carries, or `None` when
 /// the address carries no recognized prefix, names a scheme that does not bind
 /// to a surface, or names no pub/sub channel at all.
@@ -897,9 +884,9 @@ pub fn surface_delivery_class(channel: &str) -> Option<DeliveryClass> {
 /// of the surface wire may ask what a channel class *does*: retention, delivery
 /// and publish paths all branch on
 /// [`ChannelCapabilities::transportable`](brenn_envelope::ChannelCapabilities)
-/// read from here, never on a scheme or a delivery class. Bindability is the
-/// separate question [`surface_bindable`] answers, which is why this composes
-/// with it rather than replacing it.
+/// read from here, never on a scheme. Bindability is the separate question
+/// [`surface_bindable`] answers, which is why this composes with it rather than
+/// replacing it.
 pub fn channel_capabilities(channel: &str) -> Option<ChannelCapabilities> {
     let scheme = ChannelScheme::of(channel)?;
     surface_bindable(scheme)
@@ -919,7 +906,10 @@ pub fn channel_capabilities(channel: &str) -> Option<ChannelCapabilities> {
 /// to a surface all answer `false`: this is a positive identification, not a
 /// classification, so it never panics and never speaks for the other classes.
 pub fn is_local_channel(channel: &str) -> bool {
-    surface_delivery_class(channel) == Some(DeliveryClass::Local)
+    // Among the surface-bindable schemes, not-transportable is exactly
+    // `local:` — the confined page realm, which is the identity this predicate
+    // wants rather than the scheme's name.
+    channel_capabilities(channel).is_some_and(|caps| !caps.transportable)
 }
 
 // ---------------------------------------------------------------------------
@@ -1500,27 +1490,6 @@ mod tests {
 
     // ── Surface bindability ───────────────────────────────────────────────
 
-    #[test]
-    fn surface_delivery_class_by_scheme() {
-        assert_eq!(
-            surface_delivery_class("brenn:orders"),
-            Some(DeliveryClass::Durable)
-        );
-        assert_eq!(
-            surface_delivery_class("ephemeral:protobar"),
-            Some(DeliveryClass::Ephemeral)
-        );
-        assert_eq!(
-            surface_delivery_class("local:brenn/theme"),
-            Some(DeliveryClass::Local)
-        );
-        // Non-surface schemes and garbage classify as None.
-        assert_eq!(surface_delivery_class("mqtt:topic"), None);
-        assert_eq!(surface_delivery_class("webhook:hook"), None);
-        assert_eq!(surface_delivery_class("pwa_push:target"), None);
-        assert_eq!(surface_delivery_class("bare"), None);
-    }
-
     /// The capability table, row by row. Every retention and delivery decision on
     /// either end of the surface wire branches on `transportable` read from here,
     /// and which store key a channel's retention lands in follows from it — so a
@@ -1542,15 +1511,49 @@ mod tests {
         assert_eq!(caps("bare"), None);
     }
 
-    /// `mqtt:`/`webhook:` are durable-class on the bus yet do not bind to a
-    /// surface: the two questions are independent, which is why the surface
-    /// keeps only the bindability predicate and defers class to the envelope
-    /// crate. A single fused taxonomy could not express this row.
+    /// `mqtt:`/`webhook:` are durable and transportable on the bus yet do not
+    /// bind to a surface: the two questions are independent, which is why the
+    /// surface keeps only the bindability predicate and defers capabilities to
+    /// the envelope crate. A single fused taxonomy could not express this row.
     #[test]
-    fn bindability_is_independent_of_delivery_class() {
+    fn bindability_is_independent_of_capabilities() {
         for scheme in [ChannelScheme::Mqtt, ChannelScheme::Webhook] {
             assert!(!surface_bindable(scheme));
-            assert_eq!(scheme.delivery_class(), Some(DeliveryClass::Durable));
+            assert_eq!(
+                scheme.capabilities(),
+                Some(ChannelCapabilities::DURABLE_TRANSPORTABLE)
+            );
+            // Bindability gates the surface helper, so the same durable scheme
+            // carries no capabilities *here*.
+            assert_eq!(channel_capabilities(scheme.prefix()), None);
+        }
+    }
+
+    /// `is_local_channel` is the confined-capability reading of an address, not
+    /// a scheme-name check: it must answer `true` for exactly the addresses
+    /// whose capabilities are non-transportable, and `false` for every address
+    /// that classifies as nothing here.
+    ///
+    /// Pinned to literals rather than to `channel_capabilities`: re-deriving the
+    /// expectation from the same helper the function calls would assert only
+    /// that the two agree, which is true of a wrong reading of capabilities as
+    /// much as the right one.
+    #[test]
+    fn is_local_channel_tracks_confinement() {
+        for (channel, expected) in [
+            ("brenn:orders", false),
+            ("ephemeral:protobar", false),
+            ("local:brenn/theme", true),
+            ("mqtt:topic", false),
+            ("webhook:hook", false),
+            ("pwa_push:target", false),
+            ("bare", false),
+        ] {
+            assert_eq!(
+                is_local_channel(channel),
+                expected,
+                "{channel}: local-ness must be the confined-capability reading"
+            );
         }
     }
 

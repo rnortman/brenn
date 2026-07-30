@@ -17,6 +17,7 @@ use serde::Deserialize;
 
 use crate::config::wasm::{WasmConfig, byte_size_to_max_page_count, resolve_component_config};
 use crate::config::{AppConfig, AppConfigRaw, load_secret_file};
+use crate::messaging::config::Depth;
 use crate::messaging::{Urgency, WakeMin};
 use crate::webhook::is_valid_key_id;
 use crate::webhook::signature::{HexFormat, SignatureAlgorithm, SignatureScheme};
@@ -175,6 +176,13 @@ pub struct ReplayProtectionConfigRaw {
 pub struct AppWebhookSubscriptionRaw {
     /// References `[[webhook_endpoint]].slug`.
     pub endpoint: String,
+    /// How many unseen requests one activation hands over. Required — there is
+    /// no rung to inherit from, and how much of a backlog the app is handed at
+    /// once is a sizing decision.
+    pub push_depth: Option<Depth>,
+    /// The app's private window onto the endpoint's channel. Required, and must
+    /// not exceed the channel's `standing_retain_depth`.
+    pub retain_depth: Option<Depth>,
     /// Per-subscription wake policy (subscriber side). Absent ⇒ inherit from channel's
     /// resolved `wake_min` (global default `Normal`).
     pub wake_min: Option<WakeMin>,
@@ -275,6 +283,11 @@ pub struct ResolvedWebhookEndpoint {
 #[derive(Debug, Clone)]
 pub struct ResolvedWebhookSubscription {
     pub endpoint_slug: String,
+    /// How many unseen requests one activation hands over. Stated on the block;
+    /// there is no rung to inherit from.
+    pub push_depth: Depth,
+    /// The app's private window onto the endpoint's channel. Stated on the block.
+    pub retain_depth: Depth,
     /// Per-subscription wake policy (subscriber side). Resolved from
     /// sub → channel → global default.
     pub wake_min: WakeMin,
@@ -790,9 +803,12 @@ pub fn resolve_webhook_endpoints(
         return IndexMap::new();
     }
 
-    // Build a map: endpoint_slug → app_slug for each subscription.
+    // Build a map: endpoint_slug → (app_slug, the subscription block) for each
+    // subscription. The block travels with the ownership record because the
+    // stamping below reads its depths: looking it up a second time by slug would
+    // be a second, weaker derivation of the same fact.
     // Also enforce singleton invariant on subscribing apps.
-    let mut endpoint_to_app: HashMap<String, String> = HashMap::new();
+    let mut endpoint_to_app: HashMap<String, (&str, &AppWebhookSubscriptionRaw)> = HashMap::new();
     for raw_app in raw_apps {
         if raw_app.webhook_subscriptions.is_empty() {
             continue;
@@ -805,13 +821,13 @@ pub fn resolve_webhook_endpoints(
             raw_app.slug,
         );
         for sub in &raw_app.webhook_subscriptions {
-            let prev = endpoint_to_app.insert(sub.endpoint.clone(), raw_app.slug.clone());
+            let prev = endpoint_to_app.insert(sub.endpoint.clone(), (&raw_app.slug, sub));
             assert!(
                 prev.is_none(),
                 "endpoint {:?} is subscribed to by both app {:?} and app {:?}; \
                  each endpoint must have exactly one owning app",
                 sub.endpoint,
-                prev.unwrap(),
+                prev.unwrap().0,
                 raw_app.slug,
             );
         }
@@ -888,8 +904,9 @@ pub fn resolve_webhook_endpoints(
         // subscription wins; otherwise a sole WASM consumer subscribing to the
         // `webhook:<slug>` channel owns it. No app + ≥2 wasm subscribers is
         // ambiguous; no subscriber of either kind is an orphan.
-        let owner = match endpoint_to_app.get(slug.as_str()) {
-            Some(app_slug) => WebhookOwner::App(Arc::from(app_slug.as_str())),
+        let app_owner = endpoint_to_app.get(slug.as_str());
+        let owner = match app_owner {
+            Some((app_slug, _)) => WebhookOwner::App(Arc::from(*app_slug)),
             None => {
                 let wasm_owners = endpoint_to_wasm
                     .get(slug.as_str())
@@ -919,22 +936,33 @@ pub fn resolve_webhook_endpoints(
         // wake_min) onto the owning app. WASM-owned endpoints carry no app-side
         // stamping — the consumer's own `[[wasm_consumer.subscription]]` block
         // carries its inherit ladder, resolved where wasm subscriptions resolve.
-        let app_stamp = owner.app_slug().map(|app_slug| {
-            // Look up the app's wake_min for this endpoint (subscriber side).
-            // Absent ⇒ inherit from the global default_wake_min (same three-level ladder as
-            // all other subscription types: sub → channel → global). Webhook channels have no
-            // per-channel wake_min override, so the global default is the direct fallback.
-            let sub_wake_min = raw_apps.iter().find(|a| a.slug == app_slug).and_then(|a| {
-                a.webhook_subscriptions
-                    .iter()
-                    .find(|s| &s.endpoint == slug)
-                    .and_then(|s| s.wake_min)
+        let app_stamp = app_owner.map(|(app_slug, raw_sub)| {
+            // Both depths are stated on the block. A webhook channel is minted by
+            // the substrate, so there is no per-channel rung a subscription could
+            // inherit a depth from, and defaulting one would hide the sizing
+            // decision the operator ought to be making.
+            let push_depth = raw_sub.push_depth.unwrap_or_else(|| {
+                panic!(
+                    "app {app_slug:?}: [[app.webhook_subscription]] for endpoint {slug:?} \
+                     requires push_depth — how many unseen requests one activation hands \
+                     over is a sizing decision, not a default"
+                )
             });
-            // Webhook subscriptions are always push-enabled (enforcement at higher level);
-            // fall back to global default_wake_min so operators setting that field get
-            // consistent behaviour across all subscription types.
-            let wake_min = sub_wake_min.unwrap_or(global_messaging.default_wake_min);
-            (app_slug.to_string(), wake_min)
+            let retain_depth = raw_sub.retain_depth.unwrap_or_else(|| {
+                panic!(
+                    "app {app_slug:?}: [[app.webhook_subscription]] for endpoint {slug:?} \
+                     requires retain_depth — the app's window onto the endpoint's channel \
+                     is sized for the outage it must survive, not defaulted"
+                )
+            });
+            // wake_min absent ⇒ inherit from the global default_wake_min, the same
+            // sub → channel → global ladder wake_min takes everywhere. Webhook
+            // channels have no per-channel wake_min override, so the global
+            // default is the direct fallback.
+            let wake_min = raw_sub
+                .wake_min
+                .unwrap_or(global_messaging.default_wake_min);
+            (app_slug.to_string(), push_depth, retain_depth, wake_min)
         });
 
         // Rule 2 + per-scheme validation (also loads secrets).
@@ -981,11 +1009,13 @@ pub fn resolve_webhook_endpoints(
         result.insert(slug.clone(), endpoint.clone());
 
         // Stamp resolved subscriptions onto the owning AppConfig (app-owned only).
-        if let Some((app_slug, wake_min)) = app_stamp
+        if let Some((app_slug, push_depth, retain_depth, wake_min)) = app_stamp
             && let Some(app) = apps.get_mut(&app_slug)
         {
             app.webhook_subscriptions.push(ResolvedWebhookSubscription {
                 endpoint_slug: slug.clone(),
+                push_depth,
+                retain_depth,
                 wake_min,
             });
         }
@@ -1054,6 +1084,8 @@ mod tests {
             allowed_users: vec!["alice".to_string()],
             webhook_subscriptions: vec![AppWebhookSubscriptionRaw {
                 endpoint: endpoint.to_string(),
+                push_depth: Some(Depth::Bounded(1)),
+                retain_depth: Some(Depth::Bounded(8)),
                 wake_min: None,
             }],
             ..Default::default()
@@ -1196,6 +1228,35 @@ mod tests {
         let mut app = app_raw_with_sub("myapp", "ep");
         app.singleton = true;
         app.allowed_users = vec!["alice".to_string(), "bob".to_string()];
+        resolve(&[ep], &[app]);
+    }
+
+    /// A webhook channel is minted by the substrate, so a subscription has no
+    /// channel rung to inherit a depth from and must state both. The panic names
+    /// app and endpoint.
+    #[test]
+    #[should_panic(
+        expected = "app \"myapp\": [[app.webhook_subscription]] for endpoint \"ep\" \
+                               requires push_depth"
+    )]
+    fn webhook_subscription_without_push_depth_panics() {
+        let secret = secret_file(b"mysecret");
+        let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
+        let mut app = app_raw_with_sub("myapp", "ep");
+        app.webhook_subscriptions[0].push_depth = None;
+        resolve(&[ep], &[app]);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "app \"myapp\": [[app.webhook_subscription]] for endpoint \"ep\" \
+                               requires retain_depth"
+    )]
+    fn webhook_subscription_without_retain_depth_panics() {
+        let secret = secret_file(b"mysecret");
+        let ep = raw_hmac_endpoint("ep", vec![raw_key("k1", &secret)]);
+        let mut app = app_raw_with_sub("myapp", "ep");
+        app.webhook_subscriptions[0].retain_depth = None;
         resolve(&[ep], &[app]);
     }
 
@@ -1398,10 +1459,14 @@ mod tests {
             webhook_subscriptions: vec![
                 AppWebhookSubscriptionRaw {
                     endpoint: "ep1".to_string(),
+                    push_depth: Some(Depth::Bounded(1)),
+                    retain_depth: Some(Depth::Bounded(8)),
                     wake_min: None,
                 },
                 AppWebhookSubscriptionRaw {
                     endpoint: "ep2".to_string(),
+                    push_depth: Some(Depth::Bounded(1)),
+                    retain_depth: Some(Depth::Bounded(8)),
                     wake_min: None,
                 },
             ],

@@ -24,8 +24,8 @@ use super::auto::AutoWiring;
 use super::resolve_publish_millitokens;
 
 /// Resolve `[[wasm_consumer]]` blocks against the channel directory,
-/// applying the three-level depth/noise inheritance (sub → channel → global) and
-/// validating output port bindings.
+/// applying the sub → channel depth/noise inheritance and validating output port
+/// bindings.
 ///
 /// Returns `Vec<ResolvedWasmConsumer>` in declaration order.
 ///
@@ -282,7 +282,7 @@ pub(crate) fn resolve_wasm_consumers(
                 entry.address,
             );
 
-            // Three-level inheritance: sub → channel → global.
+            // The whole ladder: sub → the channel's own rung.
             let ch = &entry.resolved_channel;
             let push_depth = sub.push_depth.unwrap_or(ch.push_depth);
             let retain_depth = sub.retain_depth.unwrap_or(ch.retain_depth);

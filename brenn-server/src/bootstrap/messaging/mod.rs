@@ -5,7 +5,7 @@ use std::sync::Arc;
 use brenn_lib::config::{AppConfig, BrennConfig};
 use brenn_lib::messaging;
 use brenn_lib::messaging::config::{
-    Depth, NoiseLevel, ResolvedMessagingConfig, ResolvedSubscription, ResolvedSurface,
+    NoiseLevel, ResolvedMessagingConfig, ResolvedSubscription, ResolvedSurface,
     ResolvedSurfaceSubscription, ResolvedWasmConsumer,
 };
 use brenn_lib::messaging::{
@@ -185,8 +185,8 @@ pub(crate) fn build_apps_with_messaging(
             .map(|ws| ResolvedSubscription {
                 channel_uuid: webhook_channel_uuid_from_slug(&ws.endpoint_slug),
                 channel_address: format!("webhook:{}", ws.endpoint_slug),
-                push_depth: Depth::Unbounded,
-                retain_depth: Depth::Unbounded,
+                push_depth: ws.push_depth,
+                retain_depth: ws.retain_depth,
                 noise: NoiseLevel::Silent,
                 wake_min: ws.wake_min,
             })
@@ -466,6 +466,73 @@ pub(crate) fn messaging_configured(
         || !config.apps.is_empty()
 }
 
+/// Cross-check every **exact** `[[channel]]` tuning block against the system
+/// channels this config actually mints, so a typoed address fails boot instead
+/// of silently tuning nothing.
+///
+/// `mqtt:` exact blocks and every prefix block are deliberately exempt: the MQTT
+/// channel population is open-ended (a runtime dynamic subscribe mints channels
+/// long after boot), and a prefix is a standing rule for a family whose
+/// membership is dynamic.
+///
+/// # Panics
+///
+/// On a `webhook:` block naming no declared endpoint, a `brenn:tools/` block
+/// naming no registered async tool, or a `brenn:tool-results/` block naming no
+/// consumer that holds an async tool grant. Also on an exact key of any scheme
+/// but `mqtt:` reaching the fall-through, which is a host bug.
+fn validate_exact_tuning_blocks(
+    tuning: &messaging::config::SystemChannelTuning,
+    webhook_endpoints: &IndexMap<String, Arc<ResolvedWebhookEndpoint>>,
+    async_tool_names: &[&'static str],
+    inbox_slugs: &std::collections::HashSet<String>,
+) {
+    use crate::tool_registry::bus_wiring::{TOOL_RESULTS_NAMESPACE, TOOLS_NAMESPACE};
+
+    for address in tuning.exact_addresses() {
+        let (found, what) = if let Some(slug) = address.strip_prefix("webhook:") {
+            (
+                webhook_endpoints.contains_key(slug),
+                "a [[webhook_endpoint]] with that slug",
+            )
+        } else if let Some(name) = address
+            .strip_prefix("brenn:")
+            .and_then(|n| n.strip_prefix(TOOLS_NAMESPACE))
+        {
+            (
+                async_tool_names.contains(&name),
+                "a registered async tool with that name",
+            )
+        } else if let Some(slug) = address
+            .strip_prefix("brenn:")
+            .and_then(|n| n.strip_prefix(TOOL_RESULTS_NAMESPACE))
+        {
+            (
+                inbox_slugs.contains(slug),
+                "a consumer holding an async tool grant with that slug",
+            )
+        } else {
+            // `mqtt:` — open-ended population, not boot-checkable. Nothing else
+            // reaches here: the table admits only system-minted families and
+            // holds their canonical spellings, so an unchecked address of any
+            // other scheme would be a hole in exactly the check this function
+            // is.
+            assert_eq!(
+                ChannelScheme::of(address),
+                Some(ChannelScheme::Mqtt),
+                "messaging: tuning table holds exact address {address:?}, which names no \
+                 boot-checkable system family",
+            );
+            continue;
+        };
+        assert!(
+            found,
+            "config: [[channel]] {address:?} tunes a channel this config never mints — \
+             there is no {what}",
+        );
+    }
+}
+
 /// Build the channel directory, upsert configured channels, rebuild
 /// subscriptions, and construct the messenger + wake router.
 ///
@@ -494,6 +561,7 @@ pub(crate) async fn build_messaging(
     server_origin: Option<Arc<str>>,
     webhook_endpoints: &IndexMap<String, Arc<ResolvedWebhookEndpoint>>,
     mqtt_ingress_channels: &[ResolvedMqttIngressChannel],
+    system_channel_tuning: &messaging::config::SystemChannelTuning,
     resolved_mqtt_clients: &IndexMap<String, brenn_lib::mqtt::config::MqttClientConfig>,
     tool_registry: &Arc<crate::tool_registry::ToolRegistry>,
 ) -> MessagingResult {
@@ -514,28 +582,29 @@ pub(crate) async fn build_messaging(
     // Each endpoint produces one `webhook:` ChannelEntry with:
     //   - UUID derived deterministically from the slug (stable across restarts)
     //   - transport_type = Webhook
-    //   - ResolvedChannel inheriting global messaging defaults (Unbounded depths,
-    //     Silent noise, Drop sink) — guarantees retained until consumed
+    //   - the ResolvedChannel every system-minted channel resolves to: the
+    //     ingress family's bounded default window, or whatever a `[[channel]]`
+    //     tuning block says instead
     //   - mount carried so list_channels() has a single source
     let global_defaults = &config.messaging;
     let webhook_channel_entries: Vec<ChannelEntry> = webhook_endpoints
         .values()
-        .map(|ep| ChannelEntry {
-            uuid: webhook_channel_uuid_from_slug(&ep.slug),
-            address: format!("webhook:{}", ep.slug),
-            description: ep.description.clone(),
-            resolved_channel: messaging::config::ResolvedChannel {
-                send_rate: global_defaults.default_send_rate,
-                push_depth: global_defaults.default_push_depth,
-                retain_depth: global_defaults.default_retain_depth,
-                standing_retain_depth: global_defaults.default_standing_retain_depth,
-                noise: global_defaults.default_noise,
-                sink: global_defaults.default_sink,
-                wake_min: global_defaults.default_wake_min,
-            },
-            subscribers: vec![],
-            transport_type: ChannelScheme::Webhook,
-            mount: Some(ep.mount.clone()),
+        .map(|ep| {
+            let address = format!("webhook:{}", ep.slug);
+            let resolved_channel = messaging::config::resolve_system_channel(
+                &address,
+                system_channel_tuning,
+                global_defaults,
+            );
+            ChannelEntry {
+                uuid: webhook_channel_uuid_from_slug(&ep.slug),
+                address,
+                description: ep.description.clone(),
+                resolved_channel,
+                subscribers: vec![],
+                transport_type: ChannelScheme::Webhook,
+                mount: Some(ep.mount.clone()),
+            }
         })
         .collect();
 
@@ -546,7 +615,7 @@ pub(crate) async fn build_messaging(
     //   - UUID = the resolved-address derivation (stable across restarts,
     //     distinct UUIDv5 namespace from webhook so address spaces never collide)
     //   - transport_type = Mqtt
-    //   - ResolvedChannel inheriting global messaging defaults
+    //   - the same resolved system-channel set the webhook loop above takes
     // Subscribers start empty; they are populated by
     // `finalize_directory_with_subscribers` from each app's resolved
     // `[[app.mqtt_subscription]]` blocks. MQTT channels have no HTTP mount, so
@@ -557,15 +626,11 @@ pub(crate) async fn build_messaging(
             uuid: channel.channel_uuid,
             address: channel.channel_address.clone(),
             description: None,
-            resolved_channel: messaging::config::ResolvedChannel {
-                send_rate: global_defaults.default_send_rate,
-                push_depth: global_defaults.default_push_depth,
-                retain_depth: global_defaults.default_retain_depth,
-                standing_retain_depth: global_defaults.default_standing_retain_depth,
-                noise: global_defaults.default_noise,
-                sink: global_defaults.default_sink,
-                wake_min: global_defaults.default_wake_min,
-            },
+            resolved_channel: messaging::config::resolve_system_channel(
+                &channel.channel_address,
+                system_channel_tuning,
+                global_defaults,
+            ),
             subscribers: vec![],
             transport_type: ChannelScheme::Mqtt,
             mount: None,
@@ -723,6 +788,7 @@ pub(crate) async fn build_messaging(
     for tool in &async_tool_names {
         all_entries.push(crate::tool_registry::bus_wiring::request_channel_entry(
             tool,
+            system_channel_tuning,
             global_defaults,
         ));
     }
@@ -732,6 +798,7 @@ pub(crate) async fn build_messaging(
     // than executing a request against a removed tool. Unreachable today: the
     // async tool set is fixed in code, so a pending row can only name a
     // registered tool.
+    let mut tuned_inbox_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     for consumer in resolved_wasm_consumers.iter_mut() {
         let async_tools =
             crate::tool_registry::bus_wiring::consumer_async_tools(tool_registry, &consumer.policy);
@@ -743,11 +810,17 @@ pub(crate) async fn build_messaging(
             &consumer.slug,
             &async_tools,
         );
-        all_entries.push(crate::tool_registry::bus_wiring::result_inbox_entry(
+        let inbox_entry = crate::tool_registry::bus_wiring::result_inbox_entry(
             &consumer.slug,
+            system_channel_tuning,
             global_defaults,
-        ));
-        let inbox_sub = crate::tool_registry::bus_wiring::inbox_subscription(&consumer.slug);
+        );
+        // The consumer's subscription follows its inbox's window, so the
+        // subscriber never reaches past what the channel block sized.
+        let inbox_window = inbox_entry.resolved_channel.retain_depth;
+        all_entries.push(inbox_entry);
+        let inbox_sub =
+            crate::tool_registry::bus_wiring::inbox_subscription(&consumer.slug, inbox_window);
         let dir_entry = wasm_consumers_for_dir
             .iter_mut()
             .find(|(slug, _)| slug == &consumer.slug)
@@ -757,8 +830,19 @@ pub(crate) async fn build_messaging(
             .inputs
             .push(crate::tool_registry::bus_wiring::inbox_input_port(
                 &consumer.slug,
+                inbox_window,
             ));
+        tuned_inbox_slugs.insert(consumer.slug.clone());
     }
+    // Every exact tuning block must name a system channel that exists — a typoed
+    // address must not silently tune nothing. Runs here because this is the
+    // first point where all three populations are known.
+    validate_exact_tuning_blocks(
+        system_channel_tuning,
+        webhook_endpoints,
+        &async_tool_names,
+        &tuned_inbox_slugs,
+    );
     // System participant specs: every `system:` principal is declared here and
     // everything it needs — its subscriber registration, its (subscriber)
     // directory entries, deliverability validation, and (for subscribers) a
@@ -811,6 +895,13 @@ pub(crate) async fn build_messaging(
         &surfaces_for_dir,
     ));
 
+    // The depth ceiling, checked once over the assembled directory: every
+    // subscriber sits within its channel's standing_retain_depth. Runs here
+    // because this is the first point where every subscriber source — config
+    // blocks, folded system participants, auto synthesis, the tool substrate —
+    // has contributed.
+    messaging::config::validate_subscriber_depth_ceilings(&directory);
+
     // Boot-time fail-fast validation ("Static subscription with no
     // covering ACL matcher"): every operator-declared STATIC subscription must
     // resolve to a policy that actually authorizes delivery on its channel. A
@@ -834,19 +925,10 @@ pub(crate) async fn build_messaging(
         &system_participants,
     );
 
-    // Sync DB state with config: upsert channels, rebuild subscriptions, then
-    // fold the durable dynamic subscriptions back into the directory.
-
-    // `dynamic_mqtt_ingress` collects the surviving dynamic `mqtt:` subscriptions
-    // whose filter has no static ingress channel, so the caller can rebuild their
-    // broker SUBSCRIBE + `IngressRoute` (boot re-activation gap — see
-    // `DynamicMqttIngress`).
-    let mut dynamic_mqtt_ingress: Vec<DynamicMqttIngress> = Vec::new();
-    // `(channel_uuid, app_slug)` of every dynamic row the merge held back as
-    // unauthorized. The rows stay in their table for a later re-grant, so the
-    // cursor reconcile below must count them as registrations — the directory
-    // alone cannot see them.
-    let mut dormant_dynamic: Vec<(uuid::Uuid, String)> = Vec::new();
+    // Sync DB state with config: upsert the configured channels here. The
+    // durable dynamic subscriptions are merged back *after* the chat backfill
+    // below, so the merge judges every row against a directory that already
+    // holds every channel this boot can reconstruct.
     {
         let conn = db.lock().await;
         // Durable channels only: a non-durable channel has no `messaging_channels`
@@ -857,129 +939,6 @@ pub(crate) async fn build_messaging(
             .map(|e| (**e).clone())
             .collect();
         messaging::db::upsert_channels(&conn, &entries);
-        // Boot merge: the directory now holds the static + WASM
-        // subscribers, so collision detection against static subs is accurate.
-        // Re-fold the durable dynamic rows (the table boot never truncates) onto
-        // their channels; rows whose channel is gone or that collide with a
-        // static sub are dropped with a warn.
-        let dynamic_rows = messaging::db::load_dynamic_subscriptions(&conn);
-        // Reconstruct runtime-created channels into the boot directory. The
-        // directory above was built purely from config, so a channel
-        // that exists *only* in `messaging_channels` because a runtime dynamic
-        // subscribe created it (the common `mqtt:` case) is absent — and the merge
-        // below would then classify its surviving durable row as a vanished channel
-        // and prune it, erasing a subscription that was meant to persist. Collect
-        // the distinct `channel_uuid`s referenced by the surviving durable rows and
-        // load *only* those channels (scoped, never a full-table load — orphan
-        // channels are never referenced and so never materialized). Fold each loaded
-        // channel that is not already in the directory (config channels are
-        // authoritative and stay as-is); the merge then resolves its row by_uuid and
-        // keeps it. A referenced UUID absent from `messaging_channels` is left out,
-        // so its row classifies as genuine config drift (`dropped`) — unchanged.
-        let referenced_uuids: Vec<uuid::Uuid> = {
-            let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
-            dynamic_rows
-                .iter()
-                .filter(|row| seen.insert(row.channel_uuid))
-                .map(|row| row.channel_uuid)
-                .collect()
-        };
-        for channel in
-            messaging::db::load_channels_by_uuids(&conn, &referenced_uuids, global_defaults)
-        {
-            if directory.by_uuid(&channel.uuid).is_none() {
-                directory.add_channel(channel);
-            }
-        }
-        // Boot-time delivery ACL gate: the merge re-authorizes each
-        // folded dynamic row against the app's *current* resolved policy. Dynamic
-        // rows only ever fold an `App(slug)` subscriber, so the policy view is the
-        // per-app `AppPolicy` off the resolved `apps` map (no WASM lookup needed
-        // here). A revoked-ACL (or missing-policy) row is classified `revoked` —
-        // neither folded nor pruned — so it lies dormant until the ACL returns.
-        let merge_outcome =
-            messaging::config::merge_dynamic_subscriptions(&directory, &dynamic_rows, &|slug| {
-                apps.get(slug).map(|a| &a.policy)
-            });
-        // Prune the dropped rows from the durable table so the conflict does not
-        // recur next boot. The surviving (`kept`) rows need no write: the merge
-        // folded them into the directory, which is where a subscription is read
-        // from. The `revoked` rows are intentionally left untouched.
-        messaging::db::prune_dropped_dynamic_subscriptions(&conn, &merge_outcome.dropped);
-        for row in &merge_outcome.revoked {
-            dormant_dynamic.push((row.channel_uuid, row.app_slug.clone()));
-            // Surface the channel address, not just the UUID: a
-            // revoked row's channel was reconstructed before the merge (revoked
-            // rows are durable rows, so their UUID is in `referenced_uuids` and
-            // folded above), so `by_uuid` resolves it. Logging the address lets an
-            // on-call engineer see which channel's ACL was revoked without a DB
-            // lookup, and distinguishes the expected dormant state (channel
-            // present, ACL gone) from a secondary bug (channel absent → "<channel
-            // not in directory>", which would indicate a boot-step reordering
-            // regression).
-            let channel_address = directory
-                .by_uuid(&row.channel_uuid)
-                .map(|c| c.address.clone())
-                .unwrap_or_else(|| "<channel not in directory>".to_string());
-            tracing::warn!(
-                channel_uuid = %row.channel_uuid,
-                channel = %channel_address,
-                app = %row.app_slug,
-                "build_messaging: dynamic subscription retained but dormant — no \
-                 longer authorized by the current config (ACL revoked or retain \
-                 depth exceeds the channel's standing depth); durable row left in \
-                 place, not re-activated",
-            );
-        }
-
-        // Boot re-activation of dynamic `mqtt:` subs: the supervisor
-        // SUBSCRIBE union and the router routes are built only from the *static*
-        // `mqtt_ingress_channels`. Any kept dynamic `mqtt:` row whose channel is
-        // NOT one of those static channels needs its broker SUBSCRIBE + route
-        // rebuilt; collect a descriptor per such channel (deduped by channel_uuid,
-        // since two apps can dynamically subscribe to one filter — one channel,
-        // one SUBSCRIBE/route). Each row's stored `qos` is the SUBSCRIBE QoS it
-        // chose; `urgency` is filled by the caller from the client config.
-        let static_mqtt_uuids: std::collections::HashSet<uuid::Uuid> = mqtt_ingress_channels
-            .iter()
-            .map(|c| c.channel_uuid)
-            .collect();
-        let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
-        for row in &merge_outcome.kept {
-            if static_mqtt_uuids.contains(&row.channel_uuid) || !seen.insert(row.channel_uuid) {
-                continue;
-            }
-            let Some(entry) = directory.by_uuid(&row.channel_uuid) else {
-                continue;
-            };
-            if entry.transport_type != ChannelScheme::Mqtt {
-                continue;
-            }
-            // The address is a stored `mqtt:<client>:<topic>` channel the dynamic
-            // subscribe created; a parse failure here is host-state corruption.
-            let parsed = brenn_lib::mqtt::address::parse_mqtt_address(&entry.address)
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "build_messaging: stored dynamic mqtt channel address {:?} does not parse \
-                         — channel-address corruption (host bug)",
-                        entry.address
-                    )
-                });
-            let qos = row.qos.unwrap_or_else(|| {
-                panic!(
-                    "build_messaging: dynamic mqtt subscription on {:?} has no stored qos — \
-                     mqtt dynamic rows always persist a qos (host bug)",
-                    entry.address
-                )
-            });
-            dynamic_mqtt_ingress.push(DynamicMqttIngress {
-                channel_address: entry.address.clone(),
-                channel_uuid: row.channel_uuid,
-                client_slug: parsed.client,
-                topic: parsed.topic,
-                qos,
-            });
-        }
     }
 
     // server_origin is always Some past the messaging_configured early return
@@ -1043,7 +1002,7 @@ pub(crate) async fn build_messaging(
     // stamped on every app at resolve time — so a transport-only app carrying no
     // `[app.messaging]` block reports the same budget a synthesised block would.
     // What each app *subscribes to* is the directory's answer, not this map's.
-    let chat_db = db.clone();
+    let boot_db = db.clone();
     let messenger = messaging::Messenger::new(
         db,
         directory,
@@ -1067,14 +1026,153 @@ pub(crate) async fn build_messaging(
             .map(|s| (s.slug.clone(), s.principal_send_budgets().collect())),
     )
     .with_ring_stores(ring_stores)
-    .with_llm_chat(config.llm_chat.clone());
+    .with_llm_chat(config.llm_chat.clone())
+    .with_system_channel_tuning(system_channel_tuning.clone());
 
     // A dormant conversation must be addressable before anything wakes it — a
     // peer's first command is a publish, and a publish to a name the directory
     // does not hold is refused.
     {
-        let conn = chat_db.lock().await;
+        let conn = boot_db.lock().await;
         messenger.backfill_conversation_chat_channels(&conn);
+    }
+
+    // Fold the durable dynamic subscription rows back onto their channels.
+    //
+    // This runs after the chat backfill deliberately. A durable dynamic
+    // subscription can name a channel no `[[channel]]` block declares — an
+    // `mqtt:` filter a runtime subscribe minted, or another conversation's chat
+    // record. System-minted families are reconstructed from their rows below;
+    // the chat families cannot be, because their depths come from chat
+    // provisioning rather than from a block or a family default. The backfill
+    // above is what puts them in the directory, so the merge has to see it —
+    // otherwise their rows fall to the undeclared-channel arm and go dormant
+    // rather than being folded live.
+    //
+    // `dynamic_mqtt_ingress` collects the surviving dynamic `mqtt:` subscriptions
+    // whose filter has no static ingress channel, so the caller can rebuild their
+    // broker SUBSCRIBE + `IngressRoute` (boot re-activation gap — see
+    // `DynamicMqttIngress`).
+    let mut dynamic_mqtt_ingress: Vec<DynamicMqttIngress> = Vec::new();
+    // Every dynamic row the merge held back. The rows stay in their table for a
+    // later re-grant, so the cursor reconcile below must count them as
+    // registrations — the directory alone cannot see them, and for the
+    // undeclared-channel class it cannot even name their channel.
+    let dormant_dynamic: Vec<messaging::config::DormantSubscription>;
+    {
+        let conn = boot_db.lock().await;
+        let directory = messenger.directory();
+        // Boot merge: the directory now holds the static + WASM
+        // subscribers, so collision detection against static subs is accurate.
+        // Re-fold the durable dynamic rows (the table boot never truncates) onto
+        // their channels; rows whose channel row is gone from the table, or that
+        // collide with a static sub, are dropped with a warn.
+        let dynamic_rows = messaging::db::load_dynamic_subscriptions(&conn);
+        // Reconstruct the remaining runtime-created channels into the boot
+        // directory. The directory holds the config channels and the backfilled
+        // chat families, so a channel that exists *only* in `messaging_channels`
+        // because a runtime dynamic subscribe created it (the common `mqtt:`
+        // case) is still absent — and the merge below would then hold its
+        // surviving durable row dormant instead of folding the subscription live,
+        // leaving a subscription that was meant to be running silent. Collect
+        // the distinct `channel_uuid`s referenced by the surviving durable rows and
+        // load *only* those channels (scoped, never a full-table load — orphan
+        // channels are never referenced and so never materialized). Fold each loaded
+        // channel that is not already in the directory (config channels are
+        // authoritative and stay as-is); the merge then resolves its row by_uuid and
+        // keeps it. A referenced UUID absent from `messaging_channels` is left out,
+        // so its row classifies as genuine config drift (`dropped`) — unchanged.
+        // A row that is present but not reconstructible comes back in the skip
+        // report, which is what lets the merge tell a channel that still exists
+        // from one an operator deleted.
+        let referenced_uuids: Vec<uuid::Uuid> = {
+            let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+            dynamic_rows
+                .iter()
+                .filter(|row| seen.insert(row.channel_uuid))
+                .map(|row| row.channel_uuid)
+                .collect()
+        };
+        let reconstruction = messaging::db::load_channels_by_uuids(
+            &conn,
+            &referenced_uuids,
+            system_channel_tuning,
+            global_defaults,
+        );
+        for channel in reconstruction.entries {
+            if directory.by_uuid(&channel.uuid).is_none() {
+                directory.add_channel(channel);
+            }
+        }
+        let undeclared: std::collections::HashMap<uuid::Uuid, String> =
+            reconstruction.skipped.into_iter().collect();
+        // Boot-time delivery ACL gate: the merge re-authorizes each
+        // folded dynamic row against the app's *current* resolved policy. Dynamic
+        // rows only ever fold an `App(slug)` subscriber, so the policy view is the
+        // per-app `AppPolicy` off the resolved `apps` map (no WASM lookup needed
+        // here). A revoked-ACL (or missing-policy) row is classified `revoked` —
+        // neither folded nor pruned — so it lies dormant until the ACL returns.
+        let merge_outcome = messaging::config::merge_dynamic_subscriptions(
+            directory,
+            &dynamic_rows,
+            &undeclared,
+            &|slug| apps.get(slug).map(|a| &a.policy),
+        );
+        // Prune the dropped rows from the durable table so the conflict does not
+        // recur next boot. The surviving (`kept`) rows need no write: the merge
+        // folded them into the directory, which is where a subscription is read
+        // from. The `revoked` rows are intentionally left untouched.
+        messaging::db::prune_dropped_dynamic_subscriptions(&conn, &merge_outcome.dropped);
+        dormant_dynamic = merge_outcome.revoked;
+
+        // Boot re-activation of dynamic `mqtt:` subs: the supervisor
+        // SUBSCRIBE union and the router routes are built only from the *static*
+        // `mqtt_ingress_channels`. Any kept dynamic `mqtt:` row whose channel is
+        // NOT one of those static channels needs its broker SUBSCRIBE + route
+        // rebuilt; collect a descriptor per such channel (deduped by channel_uuid,
+        // since two apps can dynamically subscribe to one filter — one channel,
+        // one SUBSCRIBE/route). Each row's stored `qos` is the SUBSCRIBE QoS it
+        // chose; `urgency` is filled by the caller from the client config.
+        let static_mqtt_uuids: std::collections::HashSet<uuid::Uuid> = mqtt_ingress_channels
+            .iter()
+            .map(|c| c.channel_uuid)
+            .collect();
+        let mut seen: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
+        for row in &merge_outcome.kept {
+            if static_mqtt_uuids.contains(&row.channel_uuid) || !seen.insert(row.channel_uuid) {
+                continue;
+            }
+            let Some(entry) = directory.by_uuid(&row.channel_uuid) else {
+                continue;
+            };
+            if entry.transport_type != ChannelScheme::Mqtt {
+                continue;
+            }
+            // The address is a stored `mqtt:<client>:<topic>` channel the dynamic
+            // subscribe created; a parse failure here is host-state corruption.
+            let parsed = brenn_lib::mqtt::address::parse_mqtt_address(&entry.address)
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "build_messaging: stored dynamic mqtt channel address {:?} does not parse \
+                         — channel-address corruption (host bug)",
+                        entry.address
+                    )
+                });
+            let qos = row.qos.unwrap_or_else(|| {
+                panic!(
+                    "build_messaging: dynamic mqtt subscription on {:?} has no stored qos — \
+                     mqtt dynamic rows always persist a qos (host bug)",
+                    entry.address
+                )
+            });
+            dynamic_mqtt_ingress.push(DynamicMqttIngress {
+                channel_address: entry.address.clone(),
+                channel_uuid: row.channel_uuid,
+                client_slug: parsed.client,
+                topic: parsed.topic,
+                qos,
+            });
+        }
     }
 
     // The cursor rows the last boot left, judged against the directory just
@@ -1099,9 +1197,6 @@ pub(crate) async fn build_messaging(
     let mut primed_any = false;
     for c in &resolved_wasm_consumers {
         let subscriber = brenn_lib::messaging::ParticipantId::for_wasm(&c.slug);
-        let priming = messaging::store::priming_for_kind(
-            &brenn_lib::messaging::SubscriberEntryKind::Wasm(c.slug.clone()),
-        );
         for inp in &c.inputs {
             // The same spelling the port's window reads at, so the depth the
             // cursor row caches is the one the first read would retune it to.
@@ -1111,21 +1206,14 @@ pub(crate) async fn build_messaging(
                     .clamped_to(brenn_lib::messaging::WASM_WINDOW_MAX_NEW),
             );
             let attached = messenger
-                .attach_subscriber(
-                    &inp.sub.channel_address,
-                    &c.slug,
-                    &subscriber,
-                    push_depth,
-                    priming,
-                )
+                .attach_subscriber(&inp.sub.channel_address, &c.slug, &subscriber, push_depth)
                 .await;
             primed_any |= attached == messaging::store::Attached::Created;
         }
     }
     // Every push-enabled app subscriber gets its conversation's position before
-    // anything can publish. Head priming positions a cursor at the channel's
-    // head *when it is created*, so one created at the app's first drain instead
-    // would sit above the message that woke it.
+    // anything can publish, so the position exists by the time the dispatcher
+    // starts delivering here.
     messenger.attach_conversation_subscribers().await;
     // Kick so primed consumers drain immediately rather than at the next poll.
     if primed_any {

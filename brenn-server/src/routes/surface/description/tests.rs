@@ -76,10 +76,11 @@ fn directory_with_channels(bares: &[String], standing: Depth) -> MessagingDirect
         .map(|(i, b)| ChannelConfigRaw {
             send_rate: None,
             uuid: Some(format!("00000000-0000-4000-8000-{i:012x}")),
-            address: b.clone(),
+            address: Some(b.clone()),
+            address_prefix: None,
             description: None,
-            push_depth: None,
-            retain_depth: None,
+            push_depth: Some(standing),
+            retain_depth: Some(standing),
             standing_retain_depth: Some(standing),
             noise: None,
             sink: None,
@@ -104,25 +105,22 @@ fn runtime_bares(surfaces: &[ResolvedSurface]) -> Vec<String> {
 }
 
 /// A directory declaring the full derived set for `surfaces`: the boot-published
-/// channels at `standing_retain_depth = 1` (retain default), and the runtime
-/// geometry/status channels at `retain_depth = 1` AND `standing_retain_depth = 1`
-/// (the stricter runtime rule). `runtime_retain` lets a test declare the runtime
-/// channels with a non-conforming retain depth to exercise the bounded-retention
-/// panic.
-fn full_directory(
-    surfaces: &[ResolvedSurface],
-    runtime_retain: Option<Depth>,
-) -> MessagingDirectory {
+/// channels at `retain_depth = 1` / `standing_retain_depth = 1`, and the runtime
+/// geometry/status channels at `standing_retain_depth = 1` with the retain depth
+/// the caller names, so a test can declare a non-conforming one and exercise the
+/// bounded-retention panic.
+fn full_directory(surfaces: &[ResolvedSurface], runtime_retain: Depth) -> MessagingDirectory {
     let mut raw: Vec<ChannelConfigRaw> = Vec::new();
     let mut uuid = 0u64;
-    let mut push = |address: String, retain: Option<Depth>, standing: Depth, uuid: &mut u64| {
+    let mut push = |address: String, retain: Depth, standing: Depth, uuid: &mut u64| {
         raw.push(ChannelConfigRaw {
             send_rate: None,
             uuid: Some(format!("00000000-0000-4000-8000-{uuid:012x}")),
-            address,
+            address: Some(address),
+            address_prefix: None,
             description: None,
-            push_depth: None,
-            retain_depth: retain,
+            push_depth: Some(standing),
+            retain_depth: Some(retain),
             standing_retain_depth: Some(standing),
             noise: None,
             sink: None,
@@ -131,10 +129,14 @@ fn full_directory(
         *uuid += 1;
     };
     for bare in boot_published_bare_channels(PREFIX, surfaces) {
-        push(bare, None, Depth::Bounded(1), &mut uuid);
+        push(bare, Depth::Bounded(1), Depth::Bounded(1), &mut uuid);
     }
     for bare in runtime_bares(surfaces) {
-        push(bare, runtime_retain, Depth::Bounded(1), &mut uuid);
+        // Standing stays at or above the retain rung the caller asked for, so the
+        // block itself is legal and the description validator is what refuses an
+        // unbounded runtime window.
+        let standing = runtime_retain.max(Depth::Bounded(1));
+        push(bare, runtime_retain, standing, &mut uuid);
     }
     let entries = build_channel_entries(&raw, &MessagingGlobalConfig::default());
     MessagingDirectory::with_entries(entries)
@@ -491,7 +493,7 @@ fn surface_help_spec_has_exact_publish_acl_per_channel_and_no_subscriptions() {
 #[test]
 fn validate_passes_for_valid_config() {
     let surfaces = multi_surface_config();
-    let dir = full_directory(&surfaces, Some(Depth::Bounded(1)));
+    let dir = full_directory(&surfaces, Depth::Bounded(1));
     validate_surface_description(
         &on_config(),
         &surfaces,
@@ -506,10 +508,10 @@ fn validate_passes_for_valid_config() {
 #[test]
 #[should_panic(expected = "written forever")]
 fn validate_panics_on_unbounded_runtime_retain_depth() {
-    // A geometry/status channel with a default (unbounded) retain_depth is
-    // unbounded DB growth by design — a boot error.
+    // A geometry/status channel with an unbounded retain_depth is unbounded DB
+    // growth by design — a boot error.
     let surfaces = multi_surface_config();
-    let dir = full_directory(&surfaces, None);
+    let dir = full_directory(&surfaces, Depth::Unbounded);
     validate_surface_description(
         &on_config(),
         &surfaces,
@@ -527,7 +529,7 @@ fn validate_panics_on_foreign_writer_of_runtime_channel() {
     // A foreign surface whose output binding targets another surface's status
     // channel breaks the runtime single-writer premise.
     let surfaces = multi_surface_config();
-    let dir = full_directory(&surfaces, Some(Depth::Bounded(1)));
+    let dir = full_directory(&surfaces, Depth::Bounded(1));
     let foreign = surface_outputting_to("brenn:surface.surface.bar.status");
     let principals: Vec<ResolvedSurface> = surfaces
         .iter()
@@ -568,7 +570,7 @@ fn validate_panics_on_owning_surfaces_own_component_writing_runtime_channel() {
             capacity_mt: brenn_budget::MILLITOKENS_PER_PUBLISH,
         },
     });
-    let dir = full_directory(&surfaces, Some(Depth::Bounded(1)));
+    let dir = full_directory(&surfaces, Depth::Bounded(1));
     let principals = surfaces.clone();
     validate_surface_description(
         &on_config(),
@@ -608,7 +610,7 @@ fn validate_accepts_owning_surface_geometry_status_grant() {
                 surface.slug
             )));
     }
-    let dir = full_directory(&surfaces, Some(Depth::Bounded(1)));
+    let dir = full_directory(&surfaces, Depth::Bounded(1));
     validate_surface_description(
         &on_config(),
         &surfaces,

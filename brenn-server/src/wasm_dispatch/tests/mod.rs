@@ -196,9 +196,8 @@ pub(super) async fn attach_input_ports(
     }
 }
 
-/// Prime the tool executor's position on its request channels at head.
-/// Fixtures that insert a request before building the executor need this
-/// to have run first.
+/// Give the tool executor its position on its request channels. Fixtures that
+/// insert a request before building the executor need this to have run first.
 pub(super) async fn attach_tool_executor(messenger: &Arc<brenn_lib::messaging::Messenger>) {
     brenn_lib::messaging::system::SystemInbox::new(
         crate::tool_registry::executor::TOOL_EXECUTOR_COMPONENT,

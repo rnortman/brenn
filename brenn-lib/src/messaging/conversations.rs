@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::config::NoiseLevel;
-use super::store::{MessageSeq, priming_for_kind};
+use super::store::MessageSeq;
 use super::{
     ChannelEntry, MessageEnvelope, Messenger, ParticipantId, SubscriberEntry, SubscriberEntryKind,
 };
@@ -118,9 +118,10 @@ impl Messenger {
     /// directory, on the channel it subscribes to.
     ///
     /// Run at boot, and again whenever an app gains a subscription: a
-    /// push-enabled subscriber with no position is served nothing, and `Head`
-    /// priming means the position must exist before the publish it is meant to
-    /// catch, not after.
+    /// push-enabled subscriber with no position is served nothing. A position
+    /// coming into existence is primed behind the channel's retained tail, so a
+    /// late fold-in is owed the newest `push_depth` messages as unseen rather
+    /// than losing them.
     ///
     /// The conversation itself is minted here when the app has never had one —
     /// an app wired to receive is a delivery target whether or not anything has
@@ -164,7 +165,6 @@ impl Messenger {
             app_slug,
             &ParticipantId::for_conversation(conversation),
             push_depth,
-            priming_for_kind(&SubscriberEntryKind::App(app_slug.to_string())),
         )
         .await;
     }
@@ -421,7 +421,7 @@ mod tests {
     /// Attach mints the conversation and positions it at head: what was
     /// published before the app had a position is not served, what follows is.
     #[tokio::test]
-    async fn attach_primes_the_conversation_at_head() {
+    async fn attach_primes_the_conversation_over_the_retained_tail() {
         let ch = channel("chat", Depth::Bounded(5));
         let uuid = ch.uuid;
         let m = messenger(vec![ch]).await;
@@ -429,10 +429,17 @@ mod tests {
 
         m.attach_conversation_subscribers().await;
         let conversation = conversation_of(&m).await;
-        assert!(
-            m.conversation_delivery(conversation).await.is_empty(),
-            "a message published before the position existed is not owed to it"
+        let delivery = m.conversation_delivery(conversation).await;
+        assert_eq!(
+            delivery
+                .messages
+                .iter()
+                .map(|e| e.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before"],
+            "a message published before the position existed is unseen to it, so it is owed"
         );
+        m.advance_conversation(conversation, delivery).await;
 
         publish(&m, uuid, "after").await;
         let delivery = m.conversation_delivery(conversation).await;

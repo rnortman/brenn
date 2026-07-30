@@ -111,7 +111,6 @@ async fn build_system_publish_messenger(
             RECEIVER,
             &ParticipantId::for_system(RECEIVER),
             Depth::Unbounded,
-            crate::messaging::store::Priming::Head,
         )
         .await;
     (messenger, channel_addr)

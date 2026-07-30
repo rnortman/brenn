@@ -43,10 +43,11 @@ impl ToolRegistry {
     /// # Panics
     ///
     /// Panics (fail-fast at startup) on: a duplicate canonical name or MCP
-    /// name; a `RequiresKey` tool (dedupe table not built this cycle — see
-    /// `TODO(tool-registry-idempotency-dedupe)`); a fast tool whose declared
-    /// budget exceeds `MAX_FAST_BUDGET`; or an async tool with
-    /// `max_concurrency == 0`.
+    /// name; a `RequiresKey` tool (dedupe table not built this cycle, and it
+    /// must cover replay from a re-created executor position as well as a
+    /// retrying caller — see `TODO(tool-registry-idempotency-dedupe)`); a fast
+    /// tool whose declared budget exceeds `MAX_FAST_BUDGET`; or an async tool
+    /// with `max_concurrency == 0`.
     pub fn new(tools: Vec<RegisteredTool>) -> Self {
         let mut map: HashMap<&'static str, RegisteredTool> = HashMap::new();
         let mut by_mcp_name: HashMap<&'static str, &'static str> = HashMap::new();

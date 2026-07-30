@@ -126,7 +126,9 @@ fn default_subscription_qos() -> u8 {
 /// subscribe to the same `(client, topic)` (multi-subscriber fanout via the
 /// bus). The subscriber-side params are the shared generic messaging set —
 /// identical to `[[app.messaging.subscribe]]` (`MessagingSubscriptionRaw`) —
-/// resolved via the same sub → channel → global ladder.
+/// resolved via the same sub → channel ladder, except that both depths are
+/// required here: a synthesized `mqtt:` channel's rung sizes the channel's own
+/// window, not this subscriber's.
 ///
 /// Transport/sender-side feed properties (`qos`/`urgency`) live on
 /// `[[mqtt_client]]`, not here.
@@ -135,14 +137,16 @@ fn default_subscription_qos() -> u8 {
 pub struct AppMqttIngressSubscriptionRaw {
     /// Full channel address `mqtt:<client>:<topic>`; client segment mandatory.
     pub channel: String,
-    /// Per-subscription push depth. `None` ⇒ inherit (channel → global).
+    /// Per-subscription push depth. Required: the `mqtt:` channel's rung sizes
+    /// the channel's window, not this subscriber's activation.
     pub push_depth: Option<Depth>,
-    /// Per-subscription retain depth. `None` ⇒ inherit (channel → global).
+    /// Per-subscription retain depth. Required, same reason as
+    /// [`Self::push_depth`].
     pub retain_depth: Option<Depth>,
     /// Per-subscription noise level for push overflow. `None` ⇒ inherit.
     pub noise: Option<NoiseLevel>,
-    /// Per-subscription wake-min policy (subscriber side). `None` ⇒ inherit
-    /// (channel → global).
+    /// Per-subscription wake-min policy (subscriber side). `None` ⇒ inherit the
+    /// channel rung.
     pub wake_min: Option<WakeMin>,
 }
 
@@ -236,7 +240,7 @@ impl std::fmt::Debug for MqttClientConfig {
 /// Resolved per-app MQTT ingress subscription.
 ///
 /// The channel identity is the full resolved address `mqtt:<client>:<topic>`;
-/// the subscriber-side generic params are resolved sub → channel → global. The
+/// the subscriber-side generic params are resolved sub → channel. The
 /// parsed `client_slug`/`topic` are retained for the router table and ingress
 /// union-set derivation.
 #[derive(Debug, Clone)]
@@ -249,13 +253,13 @@ pub struct ResolvedMqttIngressSubscription {
     pub client_slug: String,
     /// MQTT topic filter (the subscribed pattern, not an actual published topic).
     pub topic: String,
-    /// Resolved push depth (sub → channel → global).
+    /// Resolved push depth (stated on the subscription).
     pub push_depth: Depth,
-    /// Resolved retain depth (sub → channel → global).
+    /// Resolved retain depth (stated on the subscription).
     pub retain_depth: Depth,
-    /// Resolved noise level (sub → channel → global).
+    /// Resolved noise level (sub → channel).
     pub noise: NoiseLevel,
-    /// Resolved wake-min policy (sub → channel → global).
+    /// Resolved wake-min policy (sub → channel).
     pub wake_min: WakeMin,
 }
 
@@ -543,24 +547,22 @@ pub fn resolve_clients(raw_clients: &[MqttClientConfigRaw]) -> IndexMap<String, 
 /// Resolve per-app `[[app.mqtt_subscription]]` (ingress) entries into validated,
 /// fully-resolved ingress subscriptions.
 ///
-/// `app` is the raw app config; `clients` is the global resolved client
-/// map; `global_messaging` supplies the generic-param fallbacks. For each raw
+/// `app` is the raw app config; `clients` is the global resolved client map;
+/// `tuning` + `global_messaging` resolve the target channel's rung. For each raw
 /// subscription this:
 ///
 /// - parses the `channel` address `mqtt:<client>:<topic>` (client mandatory),
 /// - validates the parsed client against the client map,
 /// - validates the topic filter,
-/// - resolves the generic subscriber params (`push_depth`/`retain_depth`/
-///   `noise`/`wake_min`) via sub → channel → global. The `mqtt:` channel is
-///   synthesized from global defaults (no operator-authored `[[channel]]` block),
-///   so the channel rung *is* the global default and the effective ladder is
-///   sub → global — identical resolution to `brenn:`/`webhook:`, no per-channel
-///   override possible.
+/// - requires `push_depth` and `retain_depth` on the block itself: the channel's
+///   rung is its family default (or a `[[channel]]` tuning block) sizing the
+///   channel's own window, not this subscriber's — how much of that window one
+///   activation hands over is the block's own decision.
+/// - resolves `noise`/`wake_min` via sub → channel rung, exactly as `brenn:` does.
 /// - enforces the shared push-enabled constraint: a push-enabled subscription
-///   (`push_depth > 0`, including the push-enabled global default) requires
-///   `singleton = true` with exactly one `allowed_users` entry, exactly as
-///   `brenn:` does. A pull-only (`push_depth = 0`) subscription may be
-///   multi-user / non-singleton.
+///   (`push_depth > 0`) requires `singleton = true` with exactly one
+///   `allowed_users` entry, exactly as `brenn:` does. A pull-only
+///   (`push_depth = 0`) subscription may be multi-user / non-singleton.
 ///
 /// `qos`/`urgency` are NOT per-subscription — they are connection-level on
 /// `[[mqtt_client]]` and applied later from the client config.
@@ -577,6 +579,7 @@ pub fn resolve_clients(raw_clients: &[MqttClientConfigRaw]) -> IndexMap<String, 
 pub fn resolve_app_mqtt_subscriptions(
     app: &AppConfigRaw,
     clients: &IndexMap<String, MqttClientConfig>,
+    tuning: &crate::messaging::config::SystemChannelTuning,
     global_messaging: &crate::messaging::config::MessagingGlobalConfig,
 ) -> Vec<ResolvedMqttIngressSubscription> {
     let mut result = Vec::new();
@@ -607,11 +610,21 @@ pub fn resolve_app_mqtt_subscriptions(
         );
 
         // Generic subscriber params + push-enabled invariants via the shared
-        // resolver. The `mqtt:` channel is synthesized from global defaults (no
-        // operator-authored `[[channel]]` block), so the rung is the global default
-        // and the ladder collapses to sub → global — identical resolution to
-        // `brenn:`/`webhook:`. At boot a violation is an operator-config error, so
-        // `.expect()` preserves today's fail-fast `panic!`.
+        // resolver, against the rung the synthesized `mqtt:` channel carries.
+        // Depths are not inheritable here: the channel's rung is a family
+        // default (or the operator's tuning block) sized for the channel's
+        // window, not for this subscriber, and how much of that window one
+        // activation hands over is the sizing decision this block has to state
+        // for itself. At boot a violation is an operator-config error, so
+        // `.expect()` is the right path.
+        assert!(
+            raw_sub.push_depth.is_some() && raw_sub.retain_depth.is_some(),
+            "app {:?}: [[app.mqtt_subscription]] for channel {:?} requires both push_depth \
+             and retain_depth — an `mqtt:` channel is system-synthesized and has no \
+             [[channel]] block to inherit depths from",
+            app.slug,
+            channel.channel_address,
+        );
         let raw_params = crate::messaging::config::RawSubscriptionParams {
             channel_uuid: channel.channel_uuid,
             channel_address: channel.channel_address.clone(),
@@ -620,8 +633,13 @@ pub fn resolve_app_mqtt_subscriptions(
             noise: raw_sub.noise,
             wake_min: raw_sub.wake_min,
         };
-        let rung =
-            crate::messaging::config::SubscriptionParamDefaults::from_global(global_messaging);
+        let rung = crate::messaging::config::SubscriptionParamDefaults::from_channel(
+            &crate::messaging::config::resolve_system_channel(
+                &channel.channel_address,
+                tuning,
+                global_messaging,
+            ),
+        );
         let resolved = crate::messaging::config::resolve_subscription_params(
             &raw_params,
             &rung,
@@ -1038,13 +1056,15 @@ mod tests {
     // --- resolve_app_mqtt_subscriptions (ingress, channel-address form) ---
 
     use crate::messaging::WakeMin;
-    use crate::messaging::config::{Depth, MessagingGlobalConfig};
+    use crate::messaging::config::{Depth, MessagingGlobalConfig, SystemChannelTuning};
 
+    /// A block with both depths stated — what the resolver requires of every
+    /// `[[app.mqtt_subscription]]`.
     fn ingress_sub(channel: &str) -> AppMqttIngressSubscriptionRaw {
         AppMqttIngressSubscriptionRaw {
             channel: channel.to_string(),
-            push_depth: None,
-            retain_depth: None,
+            push_depth: Some(Depth::Bounded(4)),
+            retain_depth: Some(Depth::Bounded(4)),
             noise: None,
             wake_min: None,
         }
@@ -1053,8 +1073,12 @@ mod tests {
     #[test]
     fn empty_mqtt_subscriptions_returns_empty() {
         let app = minimal_app_raw("myapp", false, vec![]);
-        let result =
-            resolve_app_mqtt_subscriptions(&app, &clients_map(), &MessagingGlobalConfig::default());
+        let result = resolve_app_mqtt_subscriptions(
+            &app,
+            &clients_map(),
+            &SystemChannelTuning::default(),
+            &MessagingGlobalConfig::default(),
+        );
         assert!(result.is_empty());
     }
 
@@ -1062,8 +1086,12 @@ mod tests {
     fn mqtt_subscription_to_known_client_resolves() {
         let mut app = minimal_app_raw("myapp", true, vec!["alice".to_string()]);
         app.mqtt_subscriptions = vec![ingress_sub("mqtt:ha:home/+/state")];
-        let result =
-            resolve_app_mqtt_subscriptions(&app, &clients_map(), &MessagingGlobalConfig::default());
+        let result = resolve_app_mqtt_subscriptions(
+            &app,
+            &clients_map(),
+            &SystemChannelTuning::default(),
+            &MessagingGlobalConfig::default(),
+        );
         assert_eq!(result.len(), 1);
         let sub = &result[0];
         assert_eq!(sub.channel_address, "mqtt:ha:home/+/state");
@@ -1073,10 +1101,10 @@ mod tests {
             sub.channel_uuid,
             mqtt_channel_uuid_from_address("mqtt:ha:home/+/state")
         );
-        // Generic params absent ⇒ inherit global defaults.
+        // Depths are the block's own; the rest inherits the global defaults.
         let g = MessagingGlobalConfig::default();
-        assert_eq!(sub.push_depth, g.default_push_depth);
-        assert_eq!(sub.retain_depth, g.default_retain_depth);
+        assert_eq!(sub.push_depth, Depth::Bounded(4));
+        assert_eq!(sub.retain_depth, Depth::Bounded(4));
         assert_eq!(sub.noise, g.default_noise);
         assert_eq!(sub.wake_min, g.default_wake_min);
     }
@@ -1089,8 +1117,12 @@ mod tests {
         raw.push_depth = Some(Depth::Bounded(8));
         raw.retain_depth = Some(Depth::Bounded(1));
         app.mqtt_subscriptions = vec![raw];
-        let result =
-            resolve_app_mqtt_subscriptions(&app, &clients_map(), &MessagingGlobalConfig::default());
+        let result = resolve_app_mqtt_subscriptions(
+            &app,
+            &clients_map(),
+            &SystemChannelTuning::default(),
+            &MessagingGlobalConfig::default(),
+        );
         assert_eq!(result[0].wake_min, WakeMin::High);
         assert_eq!(result[0].push_depth, Depth::Bounded(8));
         assert_eq!(result[0].retain_depth, Depth::Bounded(1));
@@ -1109,7 +1141,12 @@ mod tests {
         let mut b = ingress_sub("mqtt:ha:home/+/state");
         b.push_depth = Some(Depth::Bounded(0));
         app.mqtt_subscriptions = vec![a, b];
-        resolve_app_mqtt_subscriptions(&app, &clients_map(), &MessagingGlobalConfig::default());
+        resolve_app_mqtt_subscriptions(
+            &app,
+            &clients_map(),
+            &SystemChannelTuning::default(),
+            &MessagingGlobalConfig::default(),
+        );
     }
 
     #[test]
@@ -1117,7 +1154,12 @@ mod tests {
     fn mqtt_subscription_to_unknown_client_panics() {
         let mut app = minimal_app_raw("myapp", true, vec!["alice".to_string()]);
         app.mqtt_subscriptions = vec![ingress_sub("mqtt:nonexistent:home/+/state")];
-        resolve_app_mqtt_subscriptions(&app, &clients_map(), &MessagingGlobalConfig::default());
+        resolve_app_mqtt_subscriptions(
+            &app,
+            &clients_map(),
+            &SystemChannelTuning::default(),
+            &MessagingGlobalConfig::default(),
+        );
     }
 
     #[test]
@@ -1127,7 +1169,12 @@ mod tests {
         // missing. The client is mandatory; this is a parse error.
         let mut app = minimal_app_raw("myapp", true, vec!["alice".to_string()]);
         app.mqtt_subscriptions = vec![ingress_sub("mqtt:home/x")];
-        resolve_app_mqtt_subscriptions(&app, &clients_map(), &MessagingGlobalConfig::default());
+        resolve_app_mqtt_subscriptions(
+            &app,
+            &clients_map(),
+            &SystemChannelTuning::default(),
+            &MessagingGlobalConfig::default(),
+        );
     }
 
     #[test]
@@ -1135,7 +1182,12 @@ mod tests {
     fn mqtt_subscription_not_mqtt_prefixed_panics() {
         let mut app = minimal_app_raw("myapp", true, vec!["alice".to_string()]);
         app.mqtt_subscriptions = vec![ingress_sub("brenn:ha:home/+/state")];
-        resolve_app_mqtt_subscriptions(&app, &clients_map(), &MessagingGlobalConfig::default());
+        resolve_app_mqtt_subscriptions(
+            &app,
+            &clients_map(),
+            &SystemChannelTuning::default(),
+            &MessagingGlobalConfig::default(),
+        );
     }
 
     #[test]
@@ -1143,7 +1195,12 @@ mod tests {
     fn mqtt_subscription_invalid_topic_filter_panics() {
         let mut app = minimal_app_raw("myapp", true, vec!["alice".to_string()]);
         app.mqtt_subscriptions = vec![ingress_sub("mqtt:ha:home/#/extra")]; // # not terminal
-        resolve_app_mqtt_subscriptions(&app, &clients_map(), &MessagingGlobalConfig::default());
+        resolve_app_mqtt_subscriptions(
+            &app,
+            &clients_map(),
+            &SystemChannelTuning::default(),
+            &MessagingGlobalConfig::default(),
+        );
     }
 
     #[test]
@@ -1154,8 +1211,12 @@ mod tests {
         let mut raw = ingress_sub("mqtt:ha:home/+/state");
         raw.push_depth = Some(Depth::Bounded(0));
         app.mqtt_subscriptions = vec![raw];
-        let result =
-            resolve_app_mqtt_subscriptions(&app, &clients_map(), &MessagingGlobalConfig::default());
+        let result = resolve_app_mqtt_subscriptions(
+            &app,
+            &clients_map(),
+            &SystemChannelTuning::default(),
+            &MessagingGlobalConfig::default(),
+        );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].client_slug, "ha");
         assert_eq!(result[0].push_depth, Depth::Bounded(0));
@@ -1164,11 +1225,50 @@ mod tests {
     #[test]
     #[should_panic(expected = "requires `singleton = true`")]
     fn multi_user_app_push_enabled_subscription_panics() {
-        // The default push_depth (Unbounded) is push-enabled, so a multi-user /
-        // non-singleton app subscribing without overriding push_depth must panic
-        // (parity with `brenn:`).
+        // A push-enabled subscription on a multi-user / non-singleton app must
+        // panic (parity with `brenn:`).
         let mut app = minimal_app_raw("myapp", false, vec!["alice".to_string(), "bob".to_string()]);
         app.mqtt_subscriptions = vec![ingress_sub("mqtt:ha:home/+/state")];
-        resolve_app_mqtt_subscriptions(&app, &clients_map(), &MessagingGlobalConfig::default());
+        resolve_app_mqtt_subscriptions(
+            &app,
+            &clients_map(),
+            &SystemChannelTuning::default(),
+            &MessagingGlobalConfig::default(),
+        );
+    }
+
+    /// A synthesized `mqtt:` channel has no `[[channel]]` block, so a
+    /// subscription that states no depth has nothing to inherit and the sizing
+    /// decision would be made by nobody. Boot refuses instead.
+    #[test]
+    #[should_panic(expected = "requires both push_depth and retain_depth")]
+    fn mqtt_subscription_without_depths_panics() {
+        let mut app = minimal_app_raw("myapp", true, vec!["alice".to_string()]);
+        let mut raw = ingress_sub("mqtt:ha:home/+/state");
+        raw.push_depth = None;
+        app.mqtt_subscriptions = vec![raw];
+        resolve_app_mqtt_subscriptions(
+            &app,
+            &clients_map(),
+            &SystemChannelTuning::default(),
+            &MessagingGlobalConfig::default(),
+        );
+    }
+
+    /// The other half of the same rule: retain stated, push missing is equally
+    /// refused — the block states both or neither is trusted.
+    #[test]
+    #[should_panic(expected = "requires both push_depth and retain_depth")]
+    fn mqtt_subscription_without_retain_depth_panics() {
+        let mut app = minimal_app_raw("myapp", true, vec!["alice".to_string()]);
+        let mut raw = ingress_sub("mqtt:ha:home/+/state");
+        raw.retain_depth = None;
+        app.mqtt_subscriptions = vec![raw];
+        resolve_app_mqtt_subscriptions(
+            &app,
+            &clients_map(),
+            &SystemChannelTuning::default(),
+            &MessagingGlobalConfig::default(),
+        );
     }
 }

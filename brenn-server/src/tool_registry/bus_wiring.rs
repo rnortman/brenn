@@ -12,8 +12,8 @@
 use brenn_lib::access::acl::{AclSet, ChannelMatcher};
 use brenn_lib::access::{AppCapability, AppPolicy, GrantSet};
 use brenn_lib::messaging::config::{
-    Depth, MILLITOKENS_PER_PUBLISH, MessagingGlobalConfig, NoiseLevel, ResolvedChannel,
-    ResolvedSubscription, WasmInputPort,
+    Depth, MILLITOKENS_PER_PUBLISH, MessagingGlobalConfig, NoiseLevel, ResolvedSubscription,
+    SystemChannelTuning, WasmInputPort, resolve_system_channel,
 };
 use brenn_lib::messaging::{
     ChannelEntry, ChannelScheme, WakeMin, canonical_address, tool_channel_uuid_from_address,
@@ -38,36 +38,28 @@ pub fn result_inbox_name(slug: &str) -> String {
     format!("{TOOL_RESULTS_NAMESPACE}{slug}")
 }
 
-/// Build the `ResolvedChannel` for a programmatic tool channel from the global
-/// messaging defaults, mirroring how webhook/mqtt channels inherit them. The
-/// channel-level depths follow those operator defaults; the durability guarantee
-/// that a request survives until the executor dequeues it (and a result until its
-/// consumer drains it) is carried by the subscriber entries below, whose
-/// push/retain depths are `Depth::Unbounded` (`eager_subscriber`,
-/// `inbox_subscription`/`inbox_input_port`) — not by these channel-level values.
-fn tool_resolved_channel(defaults: &MessagingGlobalConfig) -> ResolvedChannel {
-    ResolvedChannel {
-        send_rate: Default::default(),
-        push_depth: defaults.default_push_depth,
-        retain_depth: defaults.default_retain_depth,
-        standing_retain_depth: defaults.default_standing_retain_depth,
-        noise: defaults.default_noise,
-        sink: defaults.default_sink,
-        wake_min: defaults.default_wake_min,
-    }
-}
-
 /// The `brenn:tools/<tool>` request channel for one async tool. The
 /// `system:tool-executor` subscriber is not pre-set here: it is folded in from
 /// the executor's [`SystemParticipantSpec`] subscriptions
 /// (`fold_spec_subscriptions`), like every system subscription.
-pub fn request_channel_entry(tool: &str, defaults: &MessagingGlobalConfig) -> ChannelEntry {
+///
+/// Its `ResolvedChannel` comes from the one system-channel resolver, the same
+/// one webhook and MQTT ingress channels go through. A tool channel has no
+/// declaring `[[channel]]` block for the same reason they do not — the tool
+/// substrate owns the `tools/` namespace — but an operator may still tune its
+/// depths with a `[[channel]]` block addressing it.
+pub fn request_channel_entry(
+    tool: &str,
+    tuning: &SystemChannelTuning,
+    defaults: &MessagingGlobalConfig,
+) -> ChannelEntry {
     let address = canonical_address(&request_channel_name(tool));
+    let resolved_channel = resolve_system_channel(&address, tuning, defaults);
     ChannelEntry {
         uuid: tool_channel_uuid_from_address(&address),
         address,
         description: None,
-        resolved_channel: tool_resolved_channel(defaults),
+        resolved_channel,
         subscribers: vec![],
         transport_type: ChannelScheme::Brenn,
         mount: None,
@@ -78,13 +70,18 @@ pub fn request_channel_entry(tool: &str, defaults: &MessagingGlobalConfig) -> Ch
 /// subscriber pre-set: the consumer's `Wasm(slug)` subscription is folded in
 /// through the normal wasm-subscription path (see [`inbox_subscription`]),
 /// exactly like a configured wasm subscription.
-pub fn result_inbox_entry(slug: &str, defaults: &MessagingGlobalConfig) -> ChannelEntry {
+pub fn result_inbox_entry(
+    slug: &str,
+    tuning: &SystemChannelTuning,
+    defaults: &MessagingGlobalConfig,
+) -> ChannelEntry {
     let address = canonical_address(&result_inbox_name(slug));
+    let resolved_channel = resolve_system_channel(&address, tuning, defaults);
     ChannelEntry {
         uuid: tool_channel_uuid_from_address(&address),
         address,
         description: None,
-        resolved_channel: tool_resolved_channel(defaults),
+        resolved_channel,
         subscribers: vec![],
         transport_type: ChannelScheme::Brenn,
         mount: None,
@@ -94,13 +91,19 @@ pub fn result_inbox_entry(slug: &str, defaults: &MessagingGlobalConfig) -> Chann
 /// The synthetic `ResolvedSubscription` for a consumer's own result inbox, folded
 /// into the consumer's directory + DB subscriptions so a result publish reaches it
 /// as an ordinary wasm delivery.
-pub fn inbox_subscription(slug: &str) -> ResolvedSubscription {
+///
+/// `window` is the inbox channel's own `retain_depth`, as
+/// [`result_inbox_entry`] resolved it: the consumer is owed exactly what its
+/// inbox retains, and a deeper subscriber would pin the channel against
+/// reaping and take the sizing decision away from the operator's
+/// `[[channel]]` block.
+pub fn inbox_subscription(slug: &str, window: Depth) -> ResolvedSubscription {
     let address = canonical_address(&result_inbox_name(slug));
     ResolvedSubscription {
         channel_uuid: tool_channel_uuid_from_address(&address),
         channel_address: address,
-        push_depth: Depth::Unbounded,
-        retain_depth: Depth::Unbounded,
+        push_depth: window,
+        retain_depth: window,
         noise: NoiseLevel::Silent,
         wake_min: WakeMin::Normal,
     }
@@ -116,10 +119,10 @@ pub const TOOL_RESULT_INPUT_PORT: &str = "tool-results";
 /// channel is not a current input (`load_activation_snapshot`). Shares its
 /// `ResolvedSubscription` with [`inbox_subscription`]; the default publish
 /// amplification matches an ordinary input port.
-pub fn inbox_input_port(slug: &str) -> WasmInputPort {
+pub fn inbox_input_port(slug: &str, window: Depth) -> WasmInputPort {
     WasmInputPort {
         port: TOOL_RESULT_INPUT_PORT.to_string(),
-        sub: inbox_subscription(slug),
+        sub: inbox_subscription(slug, window),
         amplification_mt: MILLITOKENS_PER_PUBLISH,
     }
 }
@@ -331,7 +334,7 @@ mod tests {
     #[test]
     fn channel_entries_carry_stable_addresses_and_subscribers() {
         let defaults = MessagingGlobalConfig::default();
-        let req = request_channel_entry("apull", &defaults);
+        let req = request_channel_entry("apull", &SystemChannelTuning::default(), &defaults);
         assert_eq!(req.address, "brenn:tools/apull");
         assert_eq!(
             req.uuid,
@@ -339,11 +342,44 @@ mod tests {
         );
         // The executor subscriber is folded in from the spec, not pre-set here.
         assert!(req.subscribers.is_empty());
-        let inbox = result_inbox_entry("sync", &defaults);
+        let inbox = result_inbox_entry("sync", &SystemChannelTuning::default(), &defaults);
         assert_eq!(inbox.address, "brenn:tool-results/sync");
         assert!(inbox.subscribers.is_empty());
-        let sub = inbox_subscription("sync");
+        let sub = inbox_subscription("sync", inbox.resolved_channel.retain_depth);
         assert_eq!(sub.channel_uuid, inbox.uuid);
+        assert_eq!(sub.push_depth, inbox.resolved_channel.retain_depth);
+        assert_eq!(sub.retain_depth, inbox.resolved_channel.retain_depth);
+    }
+
+    /// A tool request channel stays reapable once the executor is folded onto
+    /// it: the subscriber sits at the channel's window, so the reap frontier is
+    /// the operator's standing number rather than `None`. A pinned frontier is
+    /// what let executed requests accumulate forever and be re-executed by a
+    /// re-minted cursor.
+    #[test]
+    fn the_folded_executor_leaves_its_request_channel_reapable() {
+        let defaults = MessagingGlobalConfig::default();
+        let mut entries = vec![request_channel_entry(
+            "apull",
+            &SystemChannelTuning::default(),
+            &defaults,
+        )];
+        let window = entries[0].resolved_channel.retain_depth;
+        brenn_lib::messaging::system::fold_spec_subscriptions(
+            &mut entries,
+            &[tool_executor_spec(&["apull"])],
+        );
+        let sub = &entries[0].subscribers[0];
+        assert_eq!(sub.push_depth, window);
+        assert_eq!(sub.retain_depth, window);
+        assert!(
+            matches!(window, Depth::Bounded(_)),
+            "the family default is bounded: {window:?}"
+        );
+        let Depth::Bounded(n) = entries[0].resolved_channel.standing_retain_depth else {
+            panic!("the family default standing depth is bounded");
+        };
+        assert_eq!(entries[0].reap_frontier(), Some(n));
     }
 
     #[test]
@@ -363,16 +399,16 @@ mod tests {
 
     #[test]
     fn inbox_input_port_is_triggering_on_the_own_inbox_channel() {
-        let port = inbox_input_port("sync");
+        let port = inbox_input_port("sync", Depth::Bounded(16));
         assert_eq!(port.port, TOOL_RESULT_INPUT_PORT);
         assert_eq!(port.sub.channel_address, "brenn:tool-results/sync");
         // A triggering (push_depth > 0) port so a delivered result activates the
         // consumer and is not treated as sampled/context-only.
-        assert!(matches!(port.sub.push_depth, Depth::Unbounded));
+        assert_eq!(port.sub.push_depth, Depth::Bounded(16));
         // Same channel identity as the folded synthetic subscription.
         assert_eq!(
             port.sub.channel_uuid,
-            inbox_subscription("sync").channel_uuid
+            inbox_subscription("sync", Depth::Bounded(16)).channel_uuid
         );
     }
 }

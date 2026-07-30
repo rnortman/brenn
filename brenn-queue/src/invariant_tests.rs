@@ -136,7 +136,7 @@ fn every_published_message_is_delivered_or_reported_exactly_once() {
         let push_depth = 1 + rng.below(4);
         let retain_depth = rng.below(4);
         let mut ring: RetainedRing<u64, u8> = RetainedRing::new(1, ring_depth);
-        let mut cursor = SubscriberCursor::at_head(&ring, push_depth);
+        let mut cursor = SubscriberCursor::primed(&ring, push_depth);
 
         let mut published = 0u64;
         let mut delivered: Vec<u64> = Vec::new();

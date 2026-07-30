@@ -748,7 +748,6 @@ mod tests {
                 TOOL_EXECUTOR_COMPONENT,
                 &ParticipantId::for_system(TOOL_EXECUTOR_COMPONENT),
                 brenn_lib::messaging::config::Depth::Unbounded,
-                brenn_lib::messaging::store::Priming::Head,
             )
             .await;
 
@@ -1175,7 +1174,7 @@ mod tests {
         let caller = ParticipantId::for_wasm(CALLER_SLUG);
         let snapshot = h
             .messenger
-            .load_activation_snapshot(&caller, &[inbox_input_port(CALLER_SLUG)])
+            .load_activation_snapshot(&caller, &[inbox_input_port(CALLER_SLUG, Depth::Unbounded)])
             .await
             .expect("a pending inbox row on a triggering input port yields an activation");
         let port = snapshot

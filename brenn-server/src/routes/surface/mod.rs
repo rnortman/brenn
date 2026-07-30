@@ -900,8 +900,8 @@ pub fn validate_surface_error_channel(
             "boot: [observability] surface_error_channel eviction frontier is at or below the \
              surface send burst — one admitted burst can rotate every earlier report out of \
              the channel, and the budget fully refills within the window. Evicted reports still \
-             survive the kernel's console copy. Raise standing_retain_depth (or a subscriber's \
-             retain/push depth) above the burst to close the window."
+             survive the kernel's console copy. Raise the channel's standing_retain_depth above \
+             the burst to close the window."
         );
     }
 

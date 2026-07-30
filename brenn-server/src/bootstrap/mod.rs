@@ -181,6 +181,7 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         mut mqtt_ingress_channels,
         mqtt_clients,
         pwa_push: resolved_pwa_push,
+        system_channel_tuning,
     } = validate_and_resolve(&config, &integration_registry, runtime_dir.as_deref());
 
     // Auto-clone repos into the directories created above. Runs after
@@ -352,6 +353,7 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         messaging_server_origin.clone(),
         &webhook_endpoints,
         &mqtt_ingress_channels,
+        &system_channel_tuning,
         &mqtt_clients,
         &tool_registry_core,
     )

@@ -331,9 +331,9 @@ pub async fn build_wasm_messenger(
     (messenger, entry, wasm_sub)
 }
 
-/// Give a WASM subscriber its position on `entry`, primed at head — what a real
-/// boot does before any message reaches the port. A sampled port is never
-/// delivered to and holds none.
+/// Give a WASM subscriber its position on `entry` — what a real boot does before
+/// any message reaches the port. A sampled port is never delivered to and holds
+/// none.
 ///
 /// The stored depth is a cache the window read retunes from its own argument, so
 /// a test that reads at a different depth than it attached at gets the depth it
@@ -349,13 +349,7 @@ pub async fn attach_wasm_port(
         return;
     }
     messenger
-        .attach_subscriber(
-            &entry.address,
-            slug,
-            subscriber,
-            push_depth,
-            crate::messaging::store::Priming::Head,
-        )
+        .attach_subscriber(&entry.address, slug, subscriber, push_depth)
         .await;
 }
 

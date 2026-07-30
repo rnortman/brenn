@@ -56,26 +56,12 @@ pub struct ReleaseReport<M, S> {
 /// Whether an attach brought a subscriber's position into existence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attached {
-    /// The position came into existence on this attach, primed as asked.
+    /// The position came into existence on this attach, primed behind the
+    /// retained tail.
     Created,
     /// The subscriber already held a position; it carried over and only its
     /// push depth was retuned.
     Existing,
-}
-
-/// Where a subscriber's position starts when it comes into existence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Priming {
-    /// Behind the retained tail, capped by push depth — attach is a delivery
-    /// point, so what was published before the subscriber existed is new to it.
-    ///
-    /// *The* priming for a position coming into existence. What a ring holds is
-    /// the channel's history, all of it: a channel does not retain messages
-    /// while disavowing that it retains them, so there is no narrower reach for
-    /// a fresh position to be held to.
-    Retained,
-    /// Past everything already published: owed only what comes next.
-    Head,
 }
 
 /// Whether a parked entry named by a payload predicate is the caller's to touch.
@@ -216,7 +202,9 @@ impl<M: Clone, Ep: Copy + PartialEq, S: Eq + Hash + Clone> RingCore<M, Ep, S> {
 
     /// Give `subscriber` a position on this channel, or retune the one it has.
     ///
-    /// `priming` applies only when the position comes into existence:
+    /// A position that comes into existence is primed behind the retained tail,
+    /// capped by push depth: attach is a delivery point, and what a channel
+    /// retains is its history, all of it. Priming applies only then —
     /// re-attaching an existing subscriber is not a new attach, so its position
     /// carries over.
     ///
@@ -224,7 +212,7 @@ impl<M: Clone, Ep: Copy + PartialEq, S: Eq + Hash + Clone> RingCore<M, Ep, S> {
     /// held before the demotion: a sampled subscriber is never delivered to, so
     /// a position kept for it would be one every eviction charges and no window
     /// can ever serve.
-    pub fn attach(&mut self, subscriber: S, push_depth: u64, priming: Priming) -> Attached {
+    pub fn attach(&mut self, subscriber: S, push_depth: u64) -> Attached {
         if push_depth == 0 {
             self.cursors.remove(&subscriber);
             return Attached::Existing;
@@ -233,11 +221,8 @@ impl<M: Clone, Ep: Copy + PartialEq, S: Eq + Hash + Clone> RingCore<M, Ep, S> {
             cursor.set_push_depth(push_depth);
             return Attached::Existing;
         }
-        let cursor = match priming {
-            Priming::Retained => SubscriberCursor::primed(&self.ring, push_depth),
-            Priming::Head => SubscriberCursor::at_head(&self.ring, push_depth),
-        };
-        self.cursors.insert(subscriber, cursor);
+        self.cursors
+            .insert(subscriber, SubscriberCursor::primed(&self.ring, push_depth));
         Attached::Created
     }
 
@@ -502,8 +487,8 @@ mod tests {
     #[test]
     fn append_charges_every_cursor_it_outran_and_nobody_else() {
         let mut c = core(2);
-        c.attach("fast", 8, Priming::Head);
-        c.attach("slow", 8, Priming::Head);
+        c.attach("fast", 8);
+        c.attach("slow", 8);
         publish(&mut c, &["a", "b"]);
         serve(&mut c, "fast", 8);
 
@@ -518,7 +503,7 @@ mod tests {
     #[test]
     fn successive_appends_never_double_charge() {
         let mut c = core(2);
-        c.attach("wedged", 8, Priming::Head);
+        c.attach("wedged", 8);
         publish(&mut c, &["a", "b"]);
 
         let mut charged = 0;
@@ -538,10 +523,7 @@ mod tests {
     #[test]
     fn a_sampled_subscriber_holds_no_position_and_is_never_charged() {
         let mut c = core(1);
-        assert_eq!(
-            c.attach("sampler", 0, Priming::Retained),
-            Attached::Existing
-        );
+        assert_eq!(c.attach("sampler", 0), Attached::Existing);
         assert!(!c.is_attached(&"sampler"));
         publish(&mut c, &["a"]);
         assert!(overflow_of(&c.append("b")).is_empty());
@@ -553,8 +535,8 @@ mod tests {
     #[test]
     fn attaching_sampled_removes_a_position_already_held() {
         let mut c = core(4);
-        assert_eq!(c.attach("proc", 4, Priming::Head), Attached::Created);
-        assert_eq!(c.attach("proc", 0, Priming::Head), Attached::Existing);
+        assert_eq!(c.attach("proc", 4), Attached::Created);
+        assert_eq!(c.attach("proc", 0), Attached::Existing);
         assert!(!c.is_attached(&"proc"));
     }
 
@@ -564,7 +546,7 @@ mod tests {
     fn retained_priming_delivers_the_capped_tail_as_new() {
         let mut c = core(8);
         publish(&mut c, &["a", "b", "c"]);
-        assert_eq!(c.attach("proc", 2, Priming::Retained), Attached::Created);
+        assert_eq!(c.attach("proc", 2), Attached::Created);
         let (new, advance) = serve(&mut c, "proc", 2);
         assert_eq!(new, vec!["b", "c"]);
         assert_eq!(advance.dropped, 0);
@@ -577,18 +559,21 @@ mod tests {
     fn a_push_reach_wider_than_the_tail_primes_the_whole_tail() {
         let mut c = core(8);
         publish(&mut c, &["a", "b", "c"]);
-        c.attach("proc", 8, Priming::Retained);
+        c.attach("proc", 8);
         let (new, advance) = serve(&mut c, "proc", 8);
         assert_eq!(new, vec!["a", "b", "c"]);
         assert_eq!(advance.dropped, 0);
     }
 
+    /// There is one priming: a fresh position is owed the retained tail whether
+    /// it attaches before or after the messages were published. Attach is a
+    /// delivery point, and unseen is unseen however old the message is.
     #[test]
-    fn head_priming_owes_nothing_already_published() {
+    fn a_fresh_position_is_owed_the_tail_it_attached_after() {
         let mut c = core(8);
         publish(&mut c, &["old"]);
-        c.attach("proc", 4, Priming::Head);
-        assert!(serve(&mut c, "proc", 4).0.is_empty());
+        c.attach("proc", 4);
+        assert_eq!(serve(&mut c, "proc", 4).0, vec!["old"]);
         publish(&mut c, &["new"]);
         assert_eq!(serve(&mut c, "proc", 4).0, vec!["new"]);
     }
@@ -596,9 +581,9 @@ mod tests {
     #[test]
     fn reattach_keeps_the_position_and_retunes_the_depth() {
         let mut c = core(8);
-        c.attach("proc", 4, Priming::Head);
+        c.attach("proc", 4);
         publish(&mut c, &["a", "b", "c"]);
-        assert_eq!(c.attach("proc", 1, Priming::Retained), Attached::Existing);
+        assert_eq!(c.attach("proc", 1), Attached::Existing);
         let (new, advance) = serve(&mut c, "proc", 1);
         assert_eq!(new, vec!["c"]);
         assert_eq!(advance.dropped, 2, "the retune clamped the window");
@@ -607,7 +592,7 @@ mod tests {
     #[test]
     fn detach_drops_the_position_and_leaves_retention() {
         let mut c = core(8);
-        c.attach("proc", 4, Priming::Head);
+        c.attach("proc", 4);
         publish(&mut c, &["a"]);
         c.detach(&"proc");
         assert!(!c.has_deliverable(&"proc"));
@@ -648,7 +633,7 @@ mod tests {
     #[test]
     fn retention_above_push_depth_back_fills_as_context() {
         let mut c = core(8);
-        c.attach("proc", 1, Priming::Head);
+        c.attach("proc", 1);
         publish(&mut c, &["a", "b", "c"]);
         let window = c.window(&"proc", 1, 4).expect("attached");
         assert_eq!(window.entries.len(), 3);
@@ -664,8 +649,8 @@ mod tests {
     #[test]
     fn two_subscribers_read_one_ring_at_their_own_depths() {
         let mut c = core(4);
-        c.attach("deep", 4, Priming::Head);
-        c.attach("shallow", 1, Priming::Head);
+        c.attach("deep", 4);
+        c.attach("shallow", 1);
         publish(&mut c, &["a", "b", "c"]);
 
         let (deep_new, deep_advance) = serve(&mut c, "deep", 4);
@@ -710,8 +695,8 @@ mod tests {
     #[test]
     fn a_depth_shrink_charges_the_cursors_it_trimmed_past() {
         let mut c = core(4);
-        c.attach("lagging", 4, Priming::Head);
-        c.attach("caught-up", 4, Priming::Head);
+        c.attach("lagging", 4);
+        c.attach("caught-up", 4);
         publish(&mut c, &["a", "b", "c", "d"]);
         serve(&mut c, "caught-up", 4);
 
@@ -736,7 +721,7 @@ mod tests {
     #[test]
     fn a_depth_grow_charges_nobody() {
         let mut c = core(2);
-        c.attach("lagging", 4, Priming::Head);
+        c.attach("lagging", 4);
         publish(&mut c, &["a", "b"]);
         assert!(c.set_depth(8).is_empty());
         assert_eq!(c.ring().len(), 2);
@@ -758,7 +743,7 @@ mod tests {
     #[test]
     fn release_enters_retention_as_an_ordinary_arrival() {
         let mut c = core(8);
-        c.attach("proc", 4, Priming::Head);
+        c.attach("proc", 4);
         c.append("now");
         c.park("alice", "later", 100).expect("under the cap");
         assert_eq!(serve(&mut c, "proc", 4).0, vec!["now"]);
@@ -780,7 +765,7 @@ mod tests {
     #[test]
     fn a_release_batch_merges_its_charges_per_subscriber() {
         let mut c = core(3);
-        c.attach("wedged", 8, Priming::Head);
+        c.attach("wedged", 8);
         c.park("alice", "third", 300).expect("under the cap");
         c.park("alice", "first", 100).expect("under the cap");
         c.park("alice", "second", 200).expect("under the cap");

@@ -2,6 +2,7 @@ use super::*;
 use crate::config::ResolvedConfig;
 use crate::integration::IntegrationRegistry;
 use crate::messaging::Urgency;
+use crate::messaging::config::Depth;
 use crate::pwa_push::config::AppPwaPushBlock;
 use crate::pwa_push::config::PwaPushGlobalConfig;
 use crate::webhook::config::WebhookSignatureConfigRaw;
@@ -56,6 +57,8 @@ fn resolved_config_webhook_round_trip() {
             compact_soft_pct: Some(75),
             webhook_subscriptions: vec![AppWebhookSubscriptionRaw {
                 endpoint: "test-hook".to_string(),
+                push_depth: Some(Depth::Bounded(1)),
+                retain_depth: Some(Depth::Bounded(8)),
                 wake_min: None,
             }],
             ..Default::default()
@@ -81,6 +84,8 @@ fn resolved_config_webhook_round_trip() {
         "app's webhook_subscriptions must be populated"
     );
     assert_eq!(app.webhook_subscriptions[0].endpoint_slug, "test-hook");
+    assert_eq!(app.webhook_subscriptions[0].push_depth, Depth::Bounded(1));
+    assert_eq!(app.webhook_subscriptions[0].retain_depth, Depth::Bounded(8));
 
     // webhook_endpoints carries the declared endpoint.
     assert_eq!(webhook_endpoints.len(), 1, "one endpoint expected");
@@ -180,10 +185,14 @@ fn app_owned_endpoint_stamps_resolved_wake_min() {
             webhook_subscriptions: vec![
                 AppWebhookSubscriptionRaw {
                     endpoint: "hook-override".to_string(),
+                    push_depth: Some(Depth::Bounded(1)),
+                    retain_depth: Some(Depth::Bounded(8)),
                     wake_min: Some(WakeMin::High),
                 },
                 AppWebhookSubscriptionRaw {
                     endpoint: "hook-default".to_string(),
+                    push_depth: Some(Depth::Bounded(1)),
+                    retain_depth: Some(Depth::Bounded(8)),
                     wake_min: None,
                 },
             ],

@@ -5,9 +5,8 @@
 
 use std::time::Duration;
 
-use brenn_envelope::DeliveryClass;
 use brenn_surface_proto::{
-    OutputBinding, PublishOutcome, ServerFrame, SurfaceBindings, surface_delivery_class,
+    OutputBinding, PublishOutcome, ServerFrame, SurfaceBindings, channel_capabilities,
 };
 
 use super::PublishStatus;
@@ -67,10 +66,7 @@ pub(crate) fn truncate_report_field(value: String, cap: usize) -> String {
 /// client* route it", which is what makes an unroutable `Welcome` binding fatal
 /// here. The two agreeing today is a fact, not an identity.
 pub(super) fn channel_scheme_supported(channel: &str) -> bool {
-    matches!(
-        surface_delivery_class(channel),
-        Some(DeliveryClass::Durable | DeliveryClass::Ephemeral | DeliveryClass::Local)
-    )
+    channel_capabilities(channel).is_some()
 }
 
 /// The output binding wired to `(instance, port)` in the current bindings, if
@@ -203,5 +199,29 @@ mod tests {
         let detail = checked_epoch_ms(before).expect_err("before the epoch");
         assert!(detail.contains("device clock"), "{detail}");
         assert!(detail.contains("1969-12-31"), "{detail}");
+    }
+
+    /// The three schemes a page can be handed a binding on are routable here;
+    /// everything else — the server-side transports, the egress adapter, a
+    /// prefix-less address — is not, and a `Welcome` carrying one is fatal.
+    /// Literal rows, so the predicate is pinned to values rather than to the
+    /// helper it happens to call.
+    #[test]
+    fn every_routable_scheme_is_supported_and_nothing_else_is() {
+        for (channel, expected) in [
+            ("brenn:orders", true),
+            ("ephemeral:protobar", true),
+            ("local:brenn/theme", true),
+            ("mqtt:topic", false),
+            ("webhook:hook", false),
+            ("pwa_push:target", false),
+            ("bare", false),
+        ] {
+            assert_eq!(
+                channel_scheme_supported(channel),
+                expected,
+                "{channel}: routability decides whether a Welcome binding is fatal"
+            );
+        }
     }
 }

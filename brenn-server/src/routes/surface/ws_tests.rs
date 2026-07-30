@@ -5559,9 +5559,10 @@ async fn geometry_status_rig(db: &db::Db) -> GeoStatusRig {
     let bounded = |uuid: Uuid, address: &str| ChannelConfigRaw {
         send_rate: None,
         uuid: Some(uuid.to_string()),
-        address: address.to_string(),
+        address: Some(address.to_string()),
+        address_prefix: None,
         description: None,
-        push_depth: None,
+        push_depth: Some(Depth::Bounded(1)),
         retain_depth: Some(Depth::Bounded(1)),
         standing_retain_depth: Some(Depth::Bounded(1)),
         noise: None,
@@ -6159,12 +6160,7 @@ fn spanning_connection_config() -> brenn_lib::config::BrennConfig {
         ..minimal_surface_raw()
     };
     brenn_lib::config::BrennConfig {
-        messaging: MessagingGlobalConfig {
-            // A surface binding's port queue is page memory, so resolution
-            // refuses the stock `Unbounded` default.
-            default_push_depth: Depth::Bounded(8),
-            ..Default::default()
-        },
+        messaging: MessagingGlobalConfig::default(),
         wasm_consumers: vec![worker],
         surfaces: vec![deskbar],
         connections: vec![ConnectionConfigRaw {

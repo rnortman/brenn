@@ -39,7 +39,6 @@ use brenn_envelope::chat::{
     self, ChatCommand, ChatEvent, ChatStreamEvent, ModelInfo, TokenKind, legacy_ws_sender,
 };
 use brenn_lib::config::{ChatLeaf, chat_address};
-use brenn_lib::messaging::store::Priming;
 use brenn_lib::messaging::{
     Depth, MessageEnvelope, Messenger, ParticipantId, PublishResult, Urgency,
 };
@@ -226,9 +225,8 @@ async fn run_bus_chat_adapter(
     )
     .await;
 
-    // The cursor must exist before the drain reads it, and `Head` is what keeps
-    // a conversation from being handed commands it slept through as if they
-    // were new. Re-attaching a cursor that is already there keeps its position.
+    // The cursor must exist before the drain reads it; draining a window's worth
+    // of commands is this leaf's contract.
     let commands = peer_leaf(&bridge, &bus, ChatLeaf::In);
     messenger
         .attach_subscriber(
@@ -236,7 +234,6 @@ async fn run_bus_chat_adapter(
             &bridge.app_slug,
             &commands.subscriber,
             commands.push_depth,
-            Priming::Head,
         )
         .await;
     // The pre-warm leaf takes no attach here: its cursor lives in the ring,
@@ -1918,7 +1915,6 @@ mod tests {
                 APP,
                 &commands.subscriber,
                 commands.push_depth,
-                Priming::Head,
             )
             .await;
         commands
@@ -2442,8 +2438,8 @@ mod tests {
     async fn the_adapter_drains_the_command_channel_on_the_way_up() {
         let (bridge, messenger, db) = chat_bridge().await;
         let conversation_id = bridge.conversation_id;
-        // Attach first so the command below is unseen rather than pre-history:
-        // the adapter's own attach primes at head.
+        // Attach first, so the drain below reads the position the adapter would
+        // find rather than one this test created after the publish.
         let bus = ChatBus::new(messenger.clone(), &bridge);
         let _commands = command_cursor(&bridge, &bus).await;
         publish_command(
@@ -3939,7 +3935,7 @@ mod tests {
                     slug,
                     address,
                     brenn_lib::messaging::subscribe::DynamicSubscribeParams {
-                        push_depth: brenn_lib::messaging::config::Depth::Unbounded,
+                        push_depth: brenn_lib::messaging::config::Depth::Bounded(8),
                         retain_depth: brenn_lib::messaging::config::Depth::Bounded(0),
                         noise: None,
                         wake_min: None,

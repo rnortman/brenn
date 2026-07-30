@@ -153,6 +153,24 @@ pub fn count_deferred(conn: &Connection, channel_uuid: Uuid) -> u64 {
     u64::try_from(count).expect("messaging: negative deferred count")
 }
 
+/// The cap a park on `channel_uuid` is refused by, or `None` when the park is
+/// admitted.
+///
+/// Every durable park asks here — the single publish, the WASM flush, the
+/// surface batch flush — so one answer bounds them all. Call it on the same
+/// connection or transaction guard the insert runs under: the count a park is
+/// judged against is then the count it joins.
+pub fn deferred_cap_refusal(
+    conn: &Connection,
+    channel_uuid: Uuid,
+    cap: crate::messaging::config::Depth,
+) -> Option<u64> {
+    let crate::messaging::config::Depth::Bounded(cap) = cap else {
+        return None;
+    };
+    (count_deferred(conn, channel_uuid) >= cap).then_some(cap)
+}
+
 /// Identity and owner of one parked message, or `None` when it is no longer
 /// parked — released, cancelled, or never on this channel.
 pub fn lookup_deferred(

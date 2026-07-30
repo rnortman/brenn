@@ -3,26 +3,23 @@
 //! surface- and system-participant-coverage checks.
 
 use super::test_fixtures::{
-    brenn_entry, brenn_entry_with, dir_of, make_brenn_dir, minimal_surface_raw, surface_sub_raw,
+    brenn_entry, brenn_entry_with, dir_of, local_sub_raw, make_brenn_dir, minimal_surface_raw,
+    surface_sub_raw,
 };
 use super::*;
 use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::Urgency;
-use brenn_lib::messaging::config::SendRate;
 use brenn_lib::messaging::config::{
     DEFAULT_SURFACE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_PER_SEC, ResolvedComponent,
     ResolvedLocalChannel, SurfaceSendBudget,
 };
+use brenn_lib::messaging::config::{Depth, SendRate};
 
-/// Global messaging defaults for resolution tests: the stock defaults with a
-/// bounded `default_push_depth`, which is what an operator hosting a surface must
-/// set (a surface binding's port queue is page memory, so resolution rejects the
-/// stock `Unbounded`). Tests that exercise that rejection pass their own globals.
+/// Global messaging defaults for resolution tests. Depths are not among them: a
+/// surface binding's page queue is sized on the binding or on the channel it
+/// binds, never globally.
 fn test_globals() -> brenn_lib::messaging::config::MessagingGlobalConfig {
-    brenn_lib::messaging::config::MessagingGlobalConfig {
-        default_push_depth: brenn_lib::messaging::config::Depth::Bounded(8),
-        ..Default::default()
-    }
+    brenn_lib::messaging::config::MessagingGlobalConfig::default()
 }
 
 /// `resolve_surfaces` with an empty auto wiring: every binding in this module
@@ -249,17 +246,15 @@ fn validate_static_subscriptions_system_uncovered_panics() {
 
 // --- resolve_surfaces fixtures ---
 
-/// An `ephemeral:` `ChannelEntry` whose channel rung is transparent to
-/// `test_globals` — a bounded `push_depth` matching the test global default, so a
-/// binding that states no `push_depth` resolves binding → channel → global to a
-/// legal page-queue depth exactly as `test_globals` intends.
+/// An `ephemeral:` `ChannelEntry` carrying a bounded `push_depth`, so a binding
+/// that states none resolves off this rung to a legal page-queue depth.
 fn ephem(name: &str) -> brenn_lib::messaging::ChannelEntry {
     use brenn_lib::messaging::config::{Depth, NoiseLevel};
     ephem_with(name, Depth::Bounded(8), 1, NoiseLevel::Silent)
 }
 
 /// Like [`ephem`] but with an explicit channel-rung `push_depth`, `retain_depth`,
-/// and `noise` — for the binding → channel → global inheritance tests.
+/// and `noise` — for the binding → channel inheritance tests.
 fn ephem_with(
     name: &str,
     push_depth: brenn_lib::messaging::config::Depth,
@@ -727,7 +722,7 @@ fn surface_ephemeral_binding_honours_push_depth() {
 }
 
 /// An unset ephemeral binding inherits the `[[channel]]` rung's
-/// `push_depth` — binding → channel → global, class-uniform with `brenn:`. The
+/// `push_depth` — binding → channel, class-uniform with `brenn:`. The
 /// `ephem` fixture's channel rung is 8.
 #[test]
 fn surface_ephemeral_binding_inherits_the_channel_push_depth() {
@@ -807,7 +802,7 @@ fn surface_ephemeral_binding_retain_depth_resolves() {
 }
 
 /// An ephemeral binding that states no `retain_depth` inherits the
-/// `[[channel]]` rung — binding → channel → global, class-uniform with
+/// `[[channel]]` rung — binding → channel, class-uniform with
 /// `brenn:`. The `ephem` fixture's channel rung is 1.
 #[test]
 fn surface_ephemeral_binding_retain_depth_inherits_the_channel_rung() {
@@ -844,9 +839,9 @@ fn surface_ephemeral_binding_unbounded_retain_depth_panics() {
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
-/// `noise` on an ephemeral binding no longer panics — the class fork is gone. It
-/// resolves binding → channel → global and is held on the binding, unread until
-/// the surface noise ladder lands, exactly as a durable binding's noise is.
+/// `noise` on an ephemeral binding resolves binding → channel and is held on the
+/// binding, unread until the surface noise ladder lands, exactly as a durable
+/// binding's noise is.
 #[test]
 fn surface_noise_on_ephemeral_binding_resolves_not_panics() {
     use brenn_lib::messaging::NoiseLevel;
@@ -984,7 +979,7 @@ fn surface_local_binding_noise_defaults_to_global() {
 #[test]
 fn surface_reserved_plane_binding_reads_the_contract_fixed_depth() {
     let mut raw = local_surface_raw();
-    raw.subscriptions[0] = surface_sub_raw("local:brenn/theme", "protobar", "theme-in");
+    raw.subscriptions[0] = local_sub_raw("local:brenn/theme", "protobar", "theme-in");
     let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     let fixed = brenn_surface_proto::reserved_local_channel("local:brenn/theme")
         .expect("theme is a reserved plane")
@@ -1110,7 +1105,7 @@ fn surface_parked_batch_depth_unbounded_panics() {
 }
 
 /// A durable binding's page-queue depth is the same number its subscription
-/// resolved (binding → channel → global): one operator knob, applied at the
+/// resolved (binding → channel): one operator knob, applied at the
 /// server's push rows and at the page's queue, so the two cannot drift.
 #[test]
 fn surface_durable_binding_carries_its_subscriptions_push_depth() {
@@ -1909,7 +1904,7 @@ fn surface_unreferenced_ephemeral_channel_allowed() {
 fn local_surface_raw() -> brenn_lib::messaging::config::SurfaceConfigRaw {
     use brenn_lib::messaging::config::{SurfaceConfigRaw, SurfaceOutputRaw};
     SurfaceConfigRaw {
-        subscriptions: vec![surface_sub_raw("local:page-bus", "protobar", "in")],
+        subscriptions: vec![local_sub_raw("local:page-bus", "protobar", "in")],
         outputs: vec![
             SurfaceOutputRaw {
                 instance: "protobar".to_string(),
@@ -1974,15 +1969,15 @@ fn local_ring_depth_is_the_max_over_bindings() {
     raw.subscriptions = vec![
         SurfaceSubscriptionRaw {
             retain_depth: Some(Depth::Bounded(3)),
-            ..surface_sub_raw("local:page-bus", "protobar", "in")
+            ..local_sub_raw("local:page-bus", "protobar", "in")
         },
         SurfaceSubscriptionRaw {
             retain_depth: Some(Depth::Bounded(9)),
-            ..surface_sub_raw("local:page-bus", "protobar", "in2")
+            ..local_sub_raw("local:page-bus", "protobar", "in2")
         },
         SurfaceSubscriptionRaw {
             retain_depth: Some(Depth::Bounded(5)),
-            ..surface_sub_raw("local:page-bus", "protobar", "in3")
+            ..local_sub_raw("local:page-bus", "protobar", "in3")
         },
     ];
     let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
@@ -1997,7 +1992,7 @@ fn local_ring_depth_floors_at_one() {
     let mut raw = local_surface_raw();
     raw.subscriptions = vec![SurfaceSubscriptionRaw {
         retain_depth: Some(Depth::Bounded(0)),
-        ..surface_sub_raw("local:page-bus", "protobar", "in")
+        ..local_sub_raw("local:page-bus", "protobar", "in")
     }];
     let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(resolved[0].local_channels[0].ring_depth, 1);
@@ -2028,7 +2023,7 @@ fn local_unbounded_retain_depth_panics() {
     let mut raw = local_surface_raw();
     raw.subscriptions = vec![SurfaceSubscriptionRaw {
         retain_depth: Some(Depth::Unbounded),
-        ..surface_sub_raw("local:page-bus", "protobar", "in")
+        ..local_sub_raw("local:page-bus", "protobar", "in")
     }];
     resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
@@ -2041,7 +2036,7 @@ fn local_binding_honours_push_depth() {
     let mut raw = local_surface_raw();
     raw.subscriptions = vec![SurfaceSubscriptionRaw {
         push_depth: Some(Depth::Bounded(2)),
-        ..surface_sub_raw("local:page-bus", "protobar", "in")
+        ..local_sub_raw("local:page-bus", "protobar", "in")
     }];
     let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(resolved[0].subscriptions[0].push_depth, 2);
@@ -2051,12 +2046,19 @@ fn local_binding_honours_push_depth() {
     assert_eq!(resolved[0].local_channels[0].ring_depth, 1);
 }
 
-/// A local binding has no `[[channel]]` rung, so an unset depth inherits the
-/// global default directly.
+/// A `local:` channel has no server entry and therefore no rung under the
+/// binding: an unstated page-queue depth is a number nobody chose, so boot
+/// refuses instead of inventing one.
 #[test]
-fn local_binding_inherits_the_global_push_depth() {
-    let resolved = resolve_surfaces(&[local_surface_raw()], &dir_of(vec![]), &test_globals());
-    assert_eq!(resolved[0].subscriptions[0].push_depth, 8);
+#[should_panic(expected = "states no push_depth")]
+fn local_binding_without_a_push_depth_panics() {
+    use brenn_lib::messaging::config::SurfaceSubscriptionRaw;
+    let mut raw = local_surface_raw();
+    raw.subscriptions = vec![SurfaceSubscriptionRaw {
+        push_depth: None,
+        ..local_sub_raw("local:page-bus", "protobar", "in")
+    }];
+    resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
 /// `wake_min` on a `local:` binding is rejected by the one class-blind
@@ -2068,7 +2070,7 @@ fn local_wake_min_panics() {
     let mut raw = local_surface_raw();
     raw.subscriptions = vec![SurfaceSubscriptionRaw {
         wake_min: Some(brenn_lib::messaging::WakeMin::High),
-        ..surface_sub_raw("local:page-bus", "protobar", "in")
+        ..local_sub_raw("local:page-bus", "protobar", "in")
     }];
     resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
@@ -2082,7 +2084,7 @@ fn local_retain_depth_on_a_reserved_channel_panics() {
     let mut raw = local_surface_raw();
     raw.subscriptions = vec![SurfaceSubscriptionRaw {
         retain_depth: Some(Depth::Bounded(4)),
-        ..surface_sub_raw("local:brenn/theme", "protobar", "theme-in")
+        ..local_sub_raw("local:brenn/theme", "protobar", "theme-in")
     }];
     resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
@@ -2098,11 +2100,11 @@ fn reserved_local_channels_carry_their_contract_fixed_ring_depths() {
     raw.grants = vec![SurfaceGrant::Takeover];
     raw.outputs = vec![];
     raw.subscriptions = vec![
-        surface_sub_raw("local:brenn/theme", "protobar", "p1"),
-        surface_sub_raw("local:brenn/takeover", "protobar", "p2"),
-        surface_sub_raw("local:brenn/link-state", "protobar", "p3"),
-        surface_sub_raw("local:brenn/surface-state", "protobar", "p4"),
-        surface_sub_raw("local:brenn/toast", "protobar", "p5"),
+        local_sub_raw("local:brenn/theme", "protobar", "p1"),
+        local_sub_raw("local:brenn/takeover", "protobar", "p2"),
+        local_sub_raw("local:brenn/link-state", "protobar", "p3"),
+        local_sub_raw("local:brenn/surface-state", "protobar", "p4"),
+        local_sub_raw("local:brenn/toast", "protobar", "p5"),
     ];
     let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     let depths: Vec<(&str, u64)> = resolved[0]
@@ -2128,7 +2130,7 @@ fn reserved_local_channels_carry_their_contract_fixed_ring_depths() {
 #[should_panic(expected = "requires the surface's `takeover` grant")]
 fn local_takeover_binding_without_the_grant_panics() {
     let mut raw = local_surface_raw();
-    raw.subscriptions = vec![surface_sub_raw("local:brenn/takeover", "protobar", "t")];
+    raw.subscriptions = vec![local_sub_raw("local:brenn/takeover", "protobar", "t")];
     resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
@@ -2139,7 +2141,7 @@ fn local_takeover_binding_with_the_grant_resolves() {
     use brenn_lib::messaging::config::SurfaceGrant;
     let mut raw = local_surface_raw();
     raw.grants = vec![SurfaceGrant::Takeover];
-    raw.subscriptions = vec![surface_sub_raw("local:brenn/takeover", "protobar", "t")];
+    raw.subscriptions = vec![local_sub_raw("local:brenn/takeover", "protobar", "t")];
     raw.outputs = vec![];
     let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(
@@ -2171,7 +2173,7 @@ fn local_output_to_a_kernel_only_plane_panics() {
 #[test]
 fn local_subscription_to_a_kernel_only_plane_resolves() {
     let mut raw = local_surface_raw();
-    raw.subscriptions = vec![surface_sub_raw("local:brenn/link-state", "protobar", "ls")];
+    raw.subscriptions = vec![local_sub_raw("local:brenn/link-state", "protobar", "ls")];
     raw.outputs = vec![];
     let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
     assert_eq!(
@@ -2186,7 +2188,7 @@ fn local_subscription_to_a_kernel_only_plane_resolves() {
 #[should_panic(expected = "names no control channel the contract defines")]
 fn local_undefined_reserved_channel_panics() {
     let mut raw = local_surface_raw();
-    raw.subscriptions = vec![surface_sub_raw("local:brenn/nonesuch", "protobar", "in")];
+    raw.subscriptions = vec![local_sub_raw("local:brenn/nonesuch", "protobar", "in")];
     resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
@@ -2198,7 +2200,7 @@ fn local_undefined_reserved_channel_panics() {
 #[should_panic(expected = "RFC 3986 unreserved characters only")]
 fn local_operator_channel_with_a_slash_panics() {
     let mut raw = local_surface_raw();
-    raw.subscriptions = vec![surface_sub_raw("local:mine/own", "protobar", "in")];
+    raw.subscriptions = vec![local_sub_raw("local:mine/own", "protobar", "in")];
     resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
@@ -2206,7 +2208,7 @@ fn local_operator_channel_with_a_slash_panics() {
 #[should_panic(expected = "names an empty local channel")]
 fn local_empty_channel_name_panics() {
     let mut raw = local_surface_raw();
-    raw.subscriptions = vec![surface_sub_raw("local:", "protobar", "in")];
+    raw.subscriptions = vec![local_sub_raw("local:", "protobar", "in")];
     resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
 }
 
@@ -2444,26 +2446,23 @@ fn surface_input_binding_on_a_retain_zero_durable_channel_panics() {
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 
-/// The gate reads the channel's *resolved* rung, so a 0 inherited from
-/// `[messaging].default_retain_depth` — with no `[[channel]]` value in sight —
-/// is refused exactly as a stated one is.
+/// The gate reads the channel's *resolved* rung, so a retain 0 that reaches the
+/// binding through `build_channel_entries` — rather than being handed to the
+/// resolver as a synthetic entry — is refused the same way.
 #[test]
 #[should_panic(expected = "resolves to a channel-level retain_depth = 0")]
-fn surface_input_binding_inheriting_a_retain_zero_global_default_panics() {
+fn surface_input_binding_on_a_built_retain_zero_channel_panics() {
     use brenn_lib::messaging::config::{ChannelConfigRaw, Depth, build_channel_entries};
-    let globals = brenn_lib::messaging::config::MessagingGlobalConfig {
-        default_push_depth: Depth::Bounded(8),
-        default_retain_depth: Depth::Bounded(0),
-        ..Default::default()
-    };
+    let globals = brenn_lib::messaging::config::MessagingGlobalConfig::default();
     let entries = build_channel_entries(
         &[ChannelConfigRaw {
             send_rate: None,
             uuid: None,
-            address: "ephemeral:protobar-demo".to_string(),
+            address: Some("ephemeral:protobar-demo".to_string()),
+            address_prefix: None,
             description: None,
-            push_depth: None,
-            retain_depth: None,
+            push_depth: Some(Depth::Bounded(0)),
+            retain_depth: Some(Depth::Bounded(0)),
             standing_retain_depth: None,
             noise: None,
             sink: None,

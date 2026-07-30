@@ -4,25 +4,20 @@
 
 use super::auto::{lower_auto_wiring, wasm_endpoint_ref};
 use super::test_fixtures::{
-    brenn_entry, dir_of, minimal_surface_raw, minimal_wasm_consumer, out_raw, resolve_with_auto,
-    sub_raw, surface_sub_raw,
+    brenn_entry, dir_of, local_sub_raw, minimal_surface_raw, minimal_wasm_consumer, out_raw,
+    resolve_with_auto, sub_raw, surface_sub_raw,
 };
 use super::*;
 use brenn_lib::messaging::config::{
-    ConnectionConfigRaw, MessagingGlobalConfig, SurfaceConfigRaw, SurfaceIoPortRaw,
+    ConnectionConfigRaw, Depth, MessagingGlobalConfig, SurfaceConfigRaw, SurfaceIoPortRaw,
     SurfaceOutputRaw, SurfaceSubscriptionRaw, WasmConsumerConfigRaw, WasmConsumerIoPortRaw,
     WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw, WasmGrant,
 };
 
-/// Bounded global depths: an auto channel's ring is process memory, so the stock
-/// `Unbounded` defaults would fold to a rejected depth on every non-durable
-/// channel. Tests that exercise that rejection use the stock defaults.
+/// Stock globals. Depths are not among them — every auto-channel depth is folded
+/// from the ports, so these tests state their depths on the ports themselves.
 fn globals() -> MessagingGlobalConfig {
-    MessagingGlobalConfig {
-        default_push_depth: Depth::Bounded(4),
-        default_retain_depth: Depth::Bounded(4),
-        ..Default::default()
-    }
+    MessagingGlobalConfig::default()
 }
 
 /// A connection over `endpoints` with no name (anonymous).
@@ -602,6 +597,34 @@ fn fold_takes_the_max_of_maxes_over_subscribers() {
     );
 }
 
+/// The fold answers every depth question on the synthesized entry, not just
+/// retention: the channel-level push rung a later third-party binding reads is
+/// the same number, and on a durable channel so is the standing frontier. There
+/// is no other stated number for either to come from.
+#[test]
+fn the_synthesized_entrys_push_and_standing_depths_are_the_fold() {
+    let consumers = vec![publisher("etl"), subscriber("slow", 2, 3)];
+    let nondurable = lower_auto_wiring(
+        &[conn(&["wasm:etl/out", "wasm:slow/tap"])],
+        &consumers,
+        &[],
+        &[],
+        &globals(),
+    );
+    let rc = &nondurable.nondurable_entries()[0].resolved_channel;
+    assert_eq!(rc.push_depth, Depth::Bounded(3));
+    assert_eq!(rc.retain_depth, Depth::Bounded(3));
+    assert_eq!(rc.standing_retain_depth, Depth::Bounded(3));
+
+    let mut named = conn(&["wasm:etl/out", "wasm:slow/tap"]);
+    named.channel = Some("brenn:etl.feed".to_string());
+    let durable = lower_auto_wiring(&[named], &consumers, &[], &[], &globals());
+    let rc = &durable.durable_entries()[0].resolved_channel;
+    assert_eq!(rc.push_depth, Depth::Bounded(3));
+    assert_eq!(rc.retain_depth, Depth::Bounded(3));
+    assert_eq!(rc.standing_retain_depth, Depth::Bounded(3));
+}
+
 /// A depth-0 port asks for a ring that retains nothing; the floor keeps the
 /// channel able to hold the message it was created to carry.
 #[test]
@@ -620,56 +643,85 @@ fn fold_has_a_floor_of_one() {
     );
 }
 
-/// The stock global defaults are unbounded, which a non-durable ring cannot be.
+/// An explicitly unbounded port depth still folds unbounded, which a non-durable
+/// ring cannot be.
 #[test]
 #[should_panic(expected = "fold to retain_depth = \"unbounded\"")]
 fn unbounded_fold_on_a_nondurable_channel_panics() {
     let mut consumer = subscriber("indexer", 1, 1);
+    consumer.subscriptions[0].retain_depth = Some(Depth::Unbounded);
+    lower_auto_wiring(
+        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
+        &[publisher("etl"), consumer],
+        &[],
+        &[],
+        &globals(),
+    );
+}
+
+/// A subscribing endpoint of an auto channel states both depths. Omitting one is
+/// refused directly, naming the port — not surfaced later as a confusing
+/// unbounded fold on a channel whose address the operator never wrote.
+#[test]
+#[should_panic(expected = "\"wasm:indexer/tap\" is a subscribing endpoint of an auto channel")]
+fn a_subscribing_port_without_a_push_depth_panics() {
+    let mut consumer = subscriber("indexer", 1, 1);
     consumer.subscriptions[0].push_depth = None;
+    lower_auto_wiring(
+        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
+        &[publisher("etl"), consumer],
+        &[],
+        &[],
+        &globals(),
+    );
+}
+
+/// The mirror of [`a_subscribing_port_without_a_push_depth_panics`]: neither
+/// half is privileged.
+#[test]
+#[should_panic(expected = "\"wasm:indexer/tap\" is a subscribing endpoint of an auto channel")]
+fn a_subscribing_port_without_a_retain_depth_panics() {
+    let mut consumer = subscriber("indexer", 1, 1);
     consumer.subscriptions[0].retain_depth = None;
     lower_auto_wiring(
         &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
         &[publisher("etl"), consumer],
         &[],
         &[],
-        &MessagingGlobalConfig::default(),
+        &globals(),
     );
 }
 
-/// The fold takes `max(push_depth, retain_depth)` per subscribing port, so
-/// bounding the retain half alone does not save the channel: the unwritten push
-/// half still inherits the stock unbounded global and dominates the max.
+/// The requirement reaches a surface subscription bound by a connection, the
+/// one endpoint shape whose reference the operator never writes anywhere: the
+/// panic has to name the computed `surface:<slug>#<instance>/<port>` or they are
+/// told a depth is missing with no way to find the port.
 #[test]
-#[should_panic(expected = "fold to retain_depth = \"unbounded\"")]
-fn an_inherited_push_depth_folds_unbounded_despite_a_bounded_retain_depth() {
-    let mut consumer = subscriber("indexer", 1, 1);
-    consumer.subscriptions[0].push_depth = None;
-    consumer.subscriptions[0].retain_depth = Some(Depth::Bounded(4));
+#[should_panic(
+    expected = "\"surface:deskbar#protobar/tap\" is a subscribing endpoint of an auto channel"
+)]
+fn a_connection_bound_surface_subscription_without_a_push_depth_panics() {
+    let mut surfaces = vec![surface_with_free_ports("deskbar")];
+    surfaces[0].subscriptions[0].push_depth = None;
     lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
-        &[publisher("etl"), consumer],
+        &[conn(&["wasm:etl/out", "surface:deskbar#protobar/tap"])],
+        &[publisher("etl")],
+        &surfaces,
         &[],
-        &[],
-        &MessagingGlobalConfig::default(),
+        &globals(),
     );
 }
 
-/// The mirror of
-/// [`an_inherited_push_depth_folds_unbounded_despite_a_bounded_retain_depth`]:
-/// neither half is privileged, so bounding push alone fails the same way.
+/// A bare io_port — the zero-config timer shape — must still state its depths:
+/// it is the only subscribing endpoint on its channel, so its numbers are the
+/// whole fold.
 #[test]
-#[should_panic(expected = "fold to retain_depth = \"unbounded\"")]
-fn an_inherited_retain_depth_folds_unbounded_despite_a_bounded_push_depth() {
-    let mut consumer = subscriber("indexer", 1, 1);
-    consumer.subscriptions[0].push_depth = Some(Depth::Bounded(4));
-    consumer.subscriptions[0].retain_depth = None;
-    lower_auto_wiring(
-        &[conn(&["wasm:etl/out", "wasm:indexer/tap"])],
-        &[publisher("etl"), consumer],
-        &[],
-        &[],
-        &MessagingGlobalConfig::default(),
-    );
+#[should_panic(expected = "\"wasm:tick/timer\" is a subscribing endpoint of an auto channel")]
+fn a_bare_io_port_without_depths_panics() {
+    let mut consumer = timer_consumer("tick");
+    consumer.io_ports[0].push_depth = None;
+    consumer.io_ports[0].retain_depth = None;
+    lower_auto_wiring(&[], &[consumer], &[], &[], &globals());
 }
 
 #[test]
@@ -1378,42 +1430,31 @@ fn surface_io_port_resolves_to_both_bindings_on_a_page_local_channel() {
     assert!(surface.policy.acls.ephemeral_publish.is_empty());
 }
 
-/// An unset `retain_depth` on a page-local io_port is the feature's one silent
-/// path. Placement makes no server entry, so the depth fold — the check that
-/// refuses an unbounded global — never runs, and the ring falls to the
-/// per-binding floor of 1 with nothing to catch it. That 1 is the port's whole
-/// retention and, per the deferred coupling, the cap on its outstanding
-/// self-schedules.
+/// A page-local io_port makes no server entry, so nothing downstream would catch
+/// a missing depth — the fold that refuses an unbounded ring never runs on it.
+/// The port-level requirement is what covers the gap: each half is refused at the
+/// port, by name, before placement.
 #[test]
-fn a_page_local_io_port_with_an_unset_retain_depth_silently_gets_a_ring_of_one() {
+#[should_panic(
+    expected = "\"surface:deskbar#protobar/loop\" is a subscribing endpoint of an auto channel"
+)]
+fn a_page_local_io_port_with_an_unset_retain_depth_refuses_to_boot() {
     let mut surfaces = vec![surface_with_io_port("deskbar")];
     surfaces[0].io_ports[0].retain_depth = None;
     let stock = MessagingGlobalConfig::default();
-    let wiring = lower_auto_wiring(&[], &[], &surfaces, &[], &stock);
-    assert!(
-        wiring.nondurable_entries().is_empty(),
-        "a page-local channel has no server entry, so the fold that refuses an \
-         unbounded global never runs",
-    );
-
-    let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &stock, &wiring);
-    let surface = &resolved[0];
-    assert_eq!(surface.local_channels.len(), 1);
-    assert_eq!(surface.local_channels[0].ring_depth, 1);
+    lower_auto_wiring(&[], &[], &surfaces, &[], &stock);
 }
 
-/// The port queue is the other half, and it is not silent: a page-local binding
-/// resolves `push_depth` binding → global like every surface binding, so the
-/// stock unbounded default refuses to boot. Page-local escapes the ring fold,
-/// not the depth defaults.
+/// The port queue is the other half, refused the same way.
 #[test]
-#[should_panic(expected = "resolves to push_depth = Unbounded")]
+#[should_panic(
+    expected = "\"surface:deskbar#protobar/loop\" is a subscribing endpoint of an auto channel"
+)]
 fn a_page_local_io_port_with_an_unset_push_depth_refuses_to_boot() {
     let mut surfaces = vec![surface_with_io_port("deskbar")];
     surfaces[0].io_ports[0].push_depth = None;
     let stock = MessagingGlobalConfig::default();
-    let wiring = lower_auto_wiring(&[], &[], &surfaces, &[], &stock);
-    resolve_surfaces(&surfaces, &dir_of(vec![]), &stock, &wiring);
+    lower_auto_wiring(&[], &[], &surfaces, &[], &stock);
 }
 
 /// Naming a page-local auto channel is how a third component in the page reaches
@@ -1426,7 +1467,7 @@ fn a_named_page_local_auto_channel_shares_its_ring_with_an_operator_binding() {
     surfaces[0].io_ports[0].channel = Some("local:bar.loop".to_string());
     surfaces[0].subscriptions = vec![SurfaceSubscriptionRaw {
         retain_depth: Some(Depth::Bounded(9)),
-        ..surface_sub_raw("local:bar.loop", "chrome", "snoop")
+        ..local_sub_raw("local:bar.loop", "chrome", "snoop")
     }];
     let wiring = lower_auto_wiring(&[], &[], &surfaces, &[], &globals());
     assert!(wiring.durable_entries().is_empty());
@@ -1589,7 +1630,7 @@ fn a_surface_local_binding_may_share_a_name_with_a_backend_local_channel() {
     let mut consumers = vec![timer_consumer("etl")];
     consumers[0].io_ports[0].channel = Some("local:etl.tick".to_string());
     let mut surfaces = vec![minimal_surface_raw()];
-    surfaces[0].subscriptions = vec![surface_sub_raw("local:etl.tick", "protobar", "snoop")];
+    surfaces[0].subscriptions = vec![local_sub_raw("local:etl.tick", "protobar", "snoop")];
     let wiring = lower_auto_wiring(&[], &consumers, &surfaces, &[], &globals());
 
     let resolved = resolve_surfaces(&surfaces, &dir_of(vec![]), &globals(), &wiring);

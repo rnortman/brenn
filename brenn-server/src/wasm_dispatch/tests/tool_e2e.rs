@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use brenn_lib::messaging::Messenger;
+use brenn_lib::messaging::config::SystemChannelTuning;
 use brenn_lib::tools::ResolvedToolGrant;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -83,16 +84,18 @@ async fn tool_harness(
     let trigger =
         (*testutils::wasm_channel_entry(slug, "trigger", Depth::Unbounded, Depth::Unbounded))
             .clone();
-    let request_ch = request_channel_entry("git-repo-pull", &defaults);
+    let request_ch =
+        request_channel_entry("git-repo-pull", &SystemChannelTuning::default(), &defaults);
     // The inbox: the bus-wiring entry (stable v5 uuid, matches `inbox_input_port`)
     // plus the consumer's own Wasm subscriber, which is what gives the consumer a
     // position on its own result inbox (and what `wasm_policies_from_entries`
     // derives its covering policy from).
-    let mut inbox = result_inbox_entry(slug, &defaults);
+    let mut inbox = result_inbox_entry(slug, &SystemChannelTuning::default(), &defaults);
+    let inbox_window = inbox.resolved_channel.retain_depth;
     inbox.subscribers.push(SubscriberEntry {
         kind: SubscriberEntryKind::Wasm(slug.to_string()),
-        push_depth: Depth::Unbounded,
-        retain_depth: Depth::Unbounded,
+        push_depth: inbox_window,
+        retain_depth: inbox_window,
         noise: NoiseLevel::Silent,
         wake_min: None,
     });
@@ -201,7 +204,7 @@ async fn tool_harness(
                 },
                 amplification_mt: 1000,
             },
-            inbox_input_port(slug),
+            inbox_input_port(slug, inbox_window),
         ],
         outputs: vec![],
         activation_pacing: unthrottled_pacing(),

@@ -201,7 +201,6 @@ async fn assemble_surface_messenger_router(
                 slug,
                 &crate::messaging::ParticipantId::for_wasm(slug),
                 Depth::Unbounded,
-                crate::messaging::store::Priming::Head,
             )
             .await;
     }

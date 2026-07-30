@@ -749,6 +749,26 @@ pub fn retained_tail_floor_seq(
     .expect("query retained_tail_floor_seq")
 }
 
+/// Where a cursor coming into existence on `channel_uuid` starts: the oldest of
+/// the `push_depth` newest retained messages.
+///
+/// Attach is a delivery point — a message published before its consumer existed
+/// is unseen to that consumer and still reaches it. A channel retaining nothing
+/// falls back to head, one past every sequence the channel ever assigned,
+/// because there is nothing older to owe.
+///
+/// The one priming expression: every durable position, whether seeded by the
+/// store's attach or by a provisioning path holding a raw connection, comes into
+/// existence here, so the two cannot drift apart.
+pub fn primed_position(
+    conn: &Connection,
+    channel_uuid: Uuid,
+    push_depth: crate::messaging::config::Depth,
+) -> i64 {
+    retained_tail_floor_seq(conn, channel_uuid, push_depth)
+        .unwrap_or_else(|| channel_last_retained_seq(conn, channel_uuid) + 1)
+}
+
 /// The channel's persisted resume epoch — the identity of its numbering domain,
 /// minted once with the channel row and dying only with it.
 pub fn channel_resume_epoch(conn: &Connection, channel_uuid: Uuid) -> Uuid {

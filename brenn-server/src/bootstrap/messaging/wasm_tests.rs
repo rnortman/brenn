@@ -10,7 +10,7 @@ use super::test_fixtures::{
 use super::wasm::{DEFAULT_ACTIVATION_BURST, DEFAULT_ACTIVATION_MIN_PERIOD};
 use super::*;
 use brenn_lib::messaging::config::{
-    WasmConsumerConfigRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw, WasmGrant,
+    Depth, WasmConsumerConfigRaw, WasmConsumerOutputRaw, WasmConsumerSubscriptionRaw, WasmGrant,
     WasmSinkBudget,
 };
 use std::time::Duration;

@@ -55,6 +55,12 @@ pub enum ToolClass {
 }
 
 /// Idempotency contract of a tool's side effect.
+///
+/// Repeat execution is not only a caller retrying: a request is retained for
+/// its channel's window, so an executor position created fresh — first boot, or
+/// a config remove-then-re-add cycle — re-runs whatever the window still holds,
+/// and its consumer sees a second result under the same `call_id`. That bounded
+/// replay is what makes `Natural` the only idempotency registrable today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Idempotency {
     /// Repeat execution is harmless (e.g. an ff-only pull). No dedupe needed.

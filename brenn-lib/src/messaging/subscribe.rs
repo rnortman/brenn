@@ -29,8 +29,8 @@
 //! resolver's `Err` to a tool-facing error.
 
 use super::config::{
-    self, RawSubscriptionParams, ResolvedChannel, ResolvedSubscription, SubscribeError,
-    SubscriptionParamDefaults,
+    self, RawSubscriptionParams, ResolvedSubscription, SubscribeError, SubscriptionParamDefaults,
+    resolve_system_channel,
 };
 use super::db::{
     DynamicSubscriptionRow, delete_dynamic_subscription, insert_dynamic_subscription,
@@ -97,22 +97,24 @@ pub enum RuntimeSubscribeError {
     /// static and a dynamic sub on one channel). The app already receives this
     /// channel; no dynamic subscription is created.
     StaticSubscriptionExists { address: String },
-    /// The resolved `retain_depth` of a dynamic subscribe exceeds the channel's
-    /// `standing_retain_depth`. A dynamic subscriber's `retain_depth` is its read
-    /// clamp for `MessageChannelGet` history, so allowing it past the operator's
-    /// standing window would let a semi-trusted runtime principal read deeper
-    /// history than the operator's baseline. Rejected (not clamped — silent
-    /// narrowing is banned; the caller must know the depth it actually got). Only
-    /// strictly-greater is rejected; equality is allowed, and an `Unbounded`
-    /// standing caps nothing.
-    RetainDepthExceedsStanding {
+    /// A resolved depth of a dynamic subscribe exceeds the channel's
+    /// `standing_retain_depth`, which is the ceiling on every depth stated about
+    /// a channel: it is what the reaper keeps, so a deeper subscriber would
+    /// either read history the operator's baseline does not cover or force the
+    /// effective retention above what the channel block says. Rejected (not
+    /// clamped — silent narrowing is banned; the caller must know the depth it
+    /// actually got). Only strictly-greater is rejected; equality is allowed,
+    /// and an `Unbounded` standing caps nothing.
+    DepthExceedsStanding {
         address: String,
+        /// Which depth was over the ceiling: `"push_depth"` or `"retain_depth"`.
+        field: &'static str,
         requested: Depth,
         standing: Depth,
     },
     /// A dormant durable dynamic row exists for this `(channel, app)`: a row that
-    /// boot-merge classified `revoked` (ACL no longer authorizes delivery, or its
-    /// retain_depth exceeds the channel's current standing depth), so it is
+    /// boot-merge classified `revoked` (ACL no longer authorizes delivery, or one
+    /// of its depths exceeds the channel's current standing depth), so it is
     /// durable-only — not folded into the directory and invisible to
     /// `MessageSubscriptionList`. A fresh subscribe cannot INSERT over it (the
     /// `(channel_uuid, app_slug)` PK collides); the app must `MessageUnsubscribe`
@@ -149,14 +151,15 @@ impl std::fmt::Display for RuntimeSubscribeError {
                 "{address:?} already has a static (config-managed) subscription for this app; \
                  it cannot be changed at runtime and you already receive this channel"
             ),
-            RuntimeSubscribeError::RetainDepthExceedsStanding {
+            RuntimeSubscribeError::DepthExceedsStanding {
                 address,
+                field,
                 requested,
                 standing,
             } => write!(
                 f,
-                "requested retain_depth {requested:?} for {address:?} exceeds the channel's \
-                 standing retain depth {standing:?}; re-request with retain_depth <= {standing:?}"
+                "requested {field} {requested:?} for {address:?} exceeds the channel's \
+                 standing retain depth {standing:?}; re-request with {field} <= {standing:?}"
             ),
             RuntimeSubscribeError::DormantSubscriptionExists { address } => write!(
                 f,
@@ -279,8 +282,7 @@ pub struct UnsubscribeOutcome {
 }
 
 impl Messenger {
-    /// Create a dynamic subscription for `app_slug` on an **existing** channel
-    /// (design §2.3, transport-agnostic core).
+    /// Create a dynamic subscription for `app_slug` on an **existing** channel.
     ///
     /// Steps: validate `qos` placement → resolve params (shared resolver) →
     /// reject an already-present dynamic sub for this app → persist the durable
@@ -295,18 +297,19 @@ impl Messenger {
     /// Errors (never panics): unknown channel, `qos` on a non-MQTT address, an
     /// existing dynamic sub for this app, or any resolver/invariant violation.
     /// Resolve the channel for `address`, creating it when the address is a
-    /// not-yet-existing `mqtt:` topic filter (design §2.3 step 3).
+    /// not-yet-existing `mqtt:` topic filter.
     ///
     /// - **Existing channel** → returned as-is (any transport).
     /// - **Absent `brenn:`/`webhook:`** → `UnknownChannel` (never auto-created —
-    ///   a channel nobody can publish to is meaningless, design §2.3).
+    ///   a channel nobody can publish to is meaningless).
     /// - **Absent `mqtt:`** → validate the topic filter, derive the canonical
-    ///   address + deterministic UUID, build a `ChannelEntry` inheriting the
-    ///   global messaging defaults (mirroring the boot mqtt-channel derivation in
-    ///   `bootstrap/messaging.rs`), upsert `messaging_channels`, and `add_channel`
+    ///   address + deterministic UUID, build a `ChannelEntry` resolved through
+    ///   [`resolve_system_channel`] (every system-channel creation site calls the
+    ///   same function, so a runtime-minted channel and its DB-reconstructed twin
+    ///   agree by construction), upsert `messaging_channels`, and `add_channel`
     ///   into the directory. The broker SUBSCRIBE / `IngressRoute` add / live
-    ///   configured-client check are the bin-crate activation layer's job (design
-    ///   §2.3 steps 1/5/6), not this generic core.
+    ///   configured-client check are the bin-crate activation layer's job, not
+    ///   this generic core.
     async fn resolve_or_create_channel(
         &self,
         address: &str,
@@ -338,19 +341,13 @@ impl Messenger {
         })?;
         let canonical = parsed.format();
         let uuid = mqtt_channel_uuid_from_address(&canonical);
+        let resolved_channel =
+            resolve_system_channel(&canonical, &self.system_channel_tuning, &self.defaults);
         let entry = ChannelEntry {
             uuid,
             address: canonical,
             description: None,
-            resolved_channel: ResolvedChannel {
-                send_rate: self.defaults.default_send_rate,
-                push_depth: self.defaults.default_push_depth,
-                retain_depth: self.defaults.default_retain_depth,
-                standing_retain_depth: self.defaults.default_standing_retain_depth,
-                noise: self.defaults.default_noise,
-                sink: self.defaults.default_sink,
-                wake_min: self.defaults.default_wake_min,
-            },
+            resolved_channel,
             subscribers: Vec::new(),
             transport_type: ChannelScheme::Mqtt,
             mount: None,
@@ -417,13 +414,12 @@ impl Messenger {
         //    differing comparison is made against the fully-resolved values
         //    (inheritance applied), not the raw request — matching how the
         //    existing subscriber's directory entry already carries resolved
-        //    values. brenn:/webhook: inherit sub → channel → global (channel
-        //    rung); mqtt: has no per-channel layer, so sub → global (global rung).
-        let rung = if is_mqtt {
-            SubscriptionParamDefaults::from_global(&self.defaults)
-        } else {
-            SubscriptionParamDefaults::from_channel(&entry.resolved_channel)
-        };
+        //    values. One rung for every scheme: the channel's own resolved
+        //    config, which for a synthesized `mqtt:` channel is its family
+        //    default or the operator's tuning block. The depths never reach it —
+        //    a dynamic subscribe states both — so what it actually carries here
+        //    is noise and wake_min.
+        let rung = SubscriptionParamDefaults::from_channel(&entry.resolved_channel);
         let (singleton, allowed_users) = match self.apps.get(app_slug) {
             Some(app) => (app.singleton, app.allowed_users.len()),
             // No app config ⇒ not a singleton, zero allowed users. A push-enabled
@@ -441,17 +437,22 @@ impl Messenger {
         };
         let resolved = config::resolve_subscription_params(&raw, &rung, singleton, allowed_users)?;
 
-        // 4. Re-subscribe / existing-subscriber policy + retain-depth cap.
-        //    The dynamic-path cap: a runtime dynamic
-        //    sub's resolved retain_depth may not exceed the channel's standing
-        //    retain depth (its read clamp for MessageChannelGet history — allowing
-        //    it past standing would let a semi-trusted principal read deeper than
-        //    the operator's baseline window). Only strictly-greater is rejected;
-        //    equality and an Unbounded standing are fine. Computed on the resolved
-        //    value so it stays correct if retain_depth ever becomes inheritable.
-        let cap_exceeds = resolved.retain_depth > entry.resolved_channel.standing_retain_depth;
+        // 4. Re-subscribe / existing-subscriber policy + the depth ceiling.
+        //    Neither resolved depth may exceed the channel's standing retain
+        //    depth: standing is what the reaper keeps, so a deeper subscriber
+        //    would read history the operator's baseline does not cover or be owed
+        //    pushes over rows the reaper is free to evict. Only strictly-greater
+        //    is rejected; equality and an Unbounded standing are fine. Computed on
+        //    the resolved values so it stays correct if either becomes inheritable.
+        let standing = entry.resolved_channel.standing_retain_depth;
+        let cap_exceeded = [
+            ("push_depth", resolved.push_depth),
+            ("retain_depth", resolved.retain_depth),
+        ]
+        .into_iter()
+        .find(|(_, depth)| *depth > standing);
 
-        // Existing-subscriber / re-subscribe policy + the dynamic-path retain cap.
+        // Existing-subscriber / re-subscribe policy + the depth ceiling.
         //
         // Two facts classify the state: whether this app holds an `App(app_slug)`
         // directory subscriber, and whether a durable dynamic row exists for
@@ -505,11 +506,12 @@ impl Messenger {
         // never persist (fail-closed defense-in-depth — no live path can fold an
         // over-standing row, but this pins the ordering even for an unsupported
         // state).
-        if cap_exceeds {
-            return Err(RuntimeSubscribeError::RetainDepthExceedsStanding {
+        if let Some((field, requested)) = cap_exceeded {
+            return Err(RuntimeSubscribeError::DepthExceedsStanding {
                 address: address.to_string(),
-                requested: resolved.retain_depth,
-                standing: entry.resolved_channel.standing_retain_depth,
+                field,
+                requested,
+                standing,
             });
         }
         if let (Some(existing), Some(existing_qos)) = (existing_entry, registration) {
@@ -553,11 +555,10 @@ impl Messenger {
         }
         // A push-enabled app delivers to its conversation, and a conversation
         // reads through a position: create it before the directory starts
-        // delivering here. Head priming positions a new cursor at the channel's
-        // head, so a publish landing between the two writes would fall below a
-        // cursor created after the fold-in — served to nobody and reported as
-        // nothing. A cursor on a channel the directory does not yet deliver to
-        // costs nothing; the reverse loses a message.
+        // delivering here. The new cursor is primed behind the retained tail, so
+        // a publish landing between the two writes lands inside its primed
+        // window and is served. A cursor on a channel the directory does not yet
+        // deliver to costs nothing; the reverse loses a message.
         if resolved.push_depth.is_push_enabled() {
             self.attach_conversation(address, app_slug, resolved.push_depth)
                 .await;
@@ -1076,7 +1077,7 @@ mod tests {
                 body: "hello".to_string(),
                 urgency: Urgency::Normal,
                 envelope_type: ChannelScheme::Ephemeral,
-                reply_to_uuid: None,
+                reply_to: None,
                 delivery_deadline: None,
                 impetus: None,
                 publish_ts_ns: crate::messaging::db::utc_to_ns(chrono::Utc::now()),
@@ -1441,7 +1442,7 @@ mod tests {
     /// The dynamic-path cap: on a channel with a **bounded** standing
     /// retain depth, a dynamic subscribe whose resolved `retain_depth` strictly
     /// exceeds standing (`Unbounded`, or `Bounded(standing+1)`) is rejected with
-    /// `RetainDepthExceedsStanding` and persists nothing; equal or lesser depths
+    /// `DepthExceedsStanding` and persists nothing; equal or lesser depths
     /// are `Created`.
     #[tokio::test]
     async fn subscribe_over_standing_retain_depth_rejected() {
@@ -1461,7 +1462,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            RuntimeSubscribeError::RetainDepthExceedsStanding { .. }
+            RuntimeSubscribeError::DepthExceedsStanding { .. }
         ));
         assert!(
             err.to_string().contains("standing"),
@@ -1485,7 +1486,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            RuntimeSubscribeError::RetainDepthExceedsStanding { .. }
+            RuntimeSubscribeError::DepthExceedsStanding { .. }
         ));
         assert_nothing_persisted(&m, "heartbeat", "graf").await;
 
@@ -1522,6 +1523,75 @@ mod tests {
         assert!(outcome.is_created(), "lesser depth creates the sub");
     }
 
+    /// The ceiling covers `push_depth` too: a dynamic subscribe asking to be
+    /// woken over more rows than the reaper keeps is refused with the field
+    /// named, and persists nothing. A single-user singleton app is required
+    /// because the request is push-enabled.
+    #[tokio::test]
+    async fn subscribe_over_standing_push_depth_rejected() {
+        let m = messenger(
+            vec![channel_with_standing(
+                "heartbeat",
+                ChannelScheme::Brenn,
+                Depth::Bounded(4),
+            )],
+            &[("graf", true, &["u"])],
+        )
+        .await;
+        let err = m
+            .subscribe_dynamic(
+                "graf",
+                "heartbeat",
+                DynamicSubscribeParams {
+                    push_depth: Depth::Bounded(5),
+                    retain_depth: Depth::Bounded(4),
+                    noise: None,
+                    wake_min: None,
+                    qos: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeSubscribeError::DepthExceedsStanding {
+                field: "push_depth",
+                ..
+            }
+        ));
+        assert!(
+            err.to_string().contains("push_depth"),
+            "message names the offending field: {err}"
+        );
+        assert_nothing_persisted(&m, "heartbeat", "graf").await;
+
+        // Push depth exactly at the ceiling is fine.
+        let m = messenger(
+            vec![channel_with_standing(
+                "heartbeat",
+                ChannelScheme::Brenn,
+                Depth::Bounded(4),
+            )],
+            &[("graf", true, &["u"])],
+        )
+        .await;
+        let outcome = m
+            .subscribe_dynamic(
+                "graf",
+                "heartbeat",
+                DynamicSubscribeParams {
+                    push_depth: Depth::Bounded(4),
+                    retain_depth: Depth::Bounded(4),
+                    noise: None,
+                    wake_min: None,
+                    qos: None,
+                },
+            )
+            .await
+            .expect("push == standing is allowed");
+        assert!(outcome.is_created(), "equal depth creates the sub");
+    }
+
     /// `Unbounded` standing (the repo-wide default) caps nothing: even an
     /// `Unbounded` requested retain_depth is `Created`.
     #[tokio::test]
@@ -1542,19 +1612,15 @@ mod tests {
         assert!(outcome.is_created());
     }
 
-    /// The cap keys off an auto-created `mqtt:` channel's inherited global standing
-    /// depth: with a bounded `default_standing_retain_depth`, an over-standing
-    /// dynamic mqtt subscribe is rejected and persists **no subscription state** (no
-    /// durable dynamic row, no directory subscriber). The `mqtt:` channel row itself
-    /// is created at step 2 (`resolve_or_create_channel`, before the step-4 cap) — a
-    /// side effect shared by every post-creation rejection on a new filter (e.g.
-    /// resolver `Params` errors), so it is present after the rejected subscribe.
+    /// An auto-created `mqtt:` channel resolves through the same
+    /// `resolve_system_channel` boot uses, so with no tuning block it takes the
+    /// ingress family's bounded default window. A subscriber retain depth inside
+    /// that window is admitted. The channel row is a step-2 side effect
+    /// (`resolve_or_create_channel`), and here the subscribe goes on to succeed,
+    /// so both the channel and its subscriber are present.
     #[tokio::test]
-    async fn subscribe_mqtt_auto_created_channel_honors_global_standing() {
-        let global = MessagingGlobalConfig {
-            default_standing_retain_depth: Depth::Bounded(2),
-            ..MessagingGlobalConfig::default()
-        };
+    async fn subscribe_mqtt_auto_created_channel_takes_the_ingress_family_default() {
+        let global = MessagingGlobalConfig::default();
         let db = init_db_memory();
         let directory = Arc::new(MessagingDirectory::with_entries(vec![]));
         let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
@@ -1572,36 +1638,90 @@ mod tests {
         );
 
         let address = "mqtt:home:sensors/temp";
-        let err = m
+        let outcome = m
             .subscribe_dynamic("graf", address, pull_only_retain(Depth::Bounded(5)))
             .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            RuntimeSubscribeError::RetainDepthExceedsStanding { .. }
-        ));
-        // No subscription state persisted for the rejected subscribe.
-        let rows = {
-            let conn = m.db.lock().await;
-            load_dynamic_subscriptions(&conn)
-        };
-        assert!(rows.is_empty(), "rejected mqtt subscribe persists no row");
-        // The channel row itself IS a step-2 side effect: it was created (and folded
-        // into the directory) before the step-4 cap rejected — with no subscriber.
+            .expect("a retain of 5 is inside the ingress family's default window");
+        assert!(outcome.is_created());
         let entry = m
             .directory
             .resolve(address)
-            .expect("auto-created mqtt channel is a step-2 side effect of the rejected subscribe");
-        assert!(
-            entry.subscribers.is_empty(),
-            "no subscriber folded onto the auto-created channel"
+            .expect("auto-created mqtt channel is a step-2 side effect of the subscribe");
+        assert_eq!(
+            entry.resolved_channel.standing_retain_depth,
+            crate::messaging::config::INGRESS_DEFAULT_RETAIN_DEPTH,
+            "the synthesized ingress channel takes its family's bounded window",
+        );
+        assert_eq!(entry.subscribers.len(), 1);
+    }
+
+    /// And with a tuning block installed, the runtime-minted channel takes the
+    /// operator's numbers — the same ones `resolve_system_channel` answers for
+    /// that address, which is what makes the runtime-minted channel and its
+    /// DB-reconstructed twin agree by construction. A synthesis path that read
+    /// the default table instead would produce exactly the divergence: minted at
+    /// the family default, reconstructed after restart at the tuned depths, with
+    /// the reaper frontier moving under it.
+    #[tokio::test]
+    async fn subscribe_mqtt_auto_created_channel_takes_the_operators_tuning() {
+        use crate::messaging::config::{ChannelConfigRaw, build_system_channel_tuning};
+
+        let global = MessagingGlobalConfig::default();
+        let tuning = build_system_channel_tuning(
+            &[ChannelConfigRaw {
+                send_rate: None,
+                uuid: None,
+                address: None,
+                address_prefix: Some("mqtt:home:".to_string()),
+                description: None,
+                push_depth: Some(Depth::Bounded(2)),
+                retain_depth: Some(Depth::Bounded(37)),
+                standing_retain_depth: Some(Depth::Bounded(37)),
+                noise: None,
+                sink: None,
+                wake_min: None,
+            }],
+            &global,
+        );
+        let db = init_db_memory();
+        let directory = Arc::new(MessagingDirectory::with_entries(vec![]));
+        let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
+        apps.insert(
+            "graf".to_string(),
+            test_app_config("graf", None, vec!["u".to_string()]),
+        );
+        let m = Messenger::new(
+            db,
+            directory,
+            Arc::from("test-source"),
+            Arc::new(apps),
+            Arc::new(NoopRouter) as Arc<dyn WakeRouter>,
+            global.clone(),
+        )
+        .with_system_channel_tuning(tuning.clone());
+
+        let address = "mqtt:home:sensors/temp";
+        m.subscribe_dynamic("graf", address, pull_only_retain(Depth::Bounded(5)))
+            .await
+            .expect("a retain of 5 is inside the tuned window");
+        let entry = m
+            .directory
+            .resolve(address)
+            .expect("auto-created mqtt channel is a step-2 side effect of the subscribe");
+        let expected = crate::messaging::config::resolve_system_channel(address, &tuning, &global);
+        assert_eq!(entry.resolved_channel.push_depth, expected.push_depth);
+        assert_eq!(entry.resolved_channel.retain_depth, Depth::Bounded(37));
+        assert_eq!(
+            entry.resolved_channel.standing_retain_depth,
+            Depth::Bounded(37),
+            "the tuning table installed on the messenger is what the synthesis reads",
         );
     }
 
     /// Cap-before-identity: an over-standing dynamic sub seeded
     /// directly into the directory + durable table (an unsupported state no live
     /// path produces) re-subscribed with identical params yields
-    /// `RetainDepthExceedsStanding`, never `AlreadySubscribedIdentical`.
+    /// `DepthExceedsStanding`, never `AlreadySubscribedIdentical`.
     #[tokio::test]
     async fn subscribe_cap_before_identity() {
         let mut ch = channel_with_standing("heartbeat", ChannelScheme::Brenn, Depth::Bounded(2));
@@ -1624,17 +1744,14 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(
-                err,
-                RuntimeSubscribeError::RetainDepthExceedsStanding { .. }
-            ),
+            matches!(err, RuntimeSubscribeError::DepthExceedsStanding { .. }),
             "cap wins over identity: {err:?}"
         );
     }
 
     /// Error precedence: an app holding a *static* sub that
     /// requests an over-standing dynamic sub gets `StaticSubscriptionExists`, not
-    /// `RetainDepthExceedsStanding` — the static holder can never succeed by
+    /// `DepthExceedsStanding` — the static holder can never succeed by
     /// lowering its depth, so the cap error would be a lie.
     #[tokio::test]
     async fn subscribe_static_precedence_over_cap() {
@@ -1781,6 +1898,67 @@ mod tests {
             .await
             .expect("push-enabled singleton subscribe succeeds");
         assert_eq!(outcome.resolved().push_depth, Depth::Bounded(3));
+    }
+
+    /// The LLM late-joiner path: subscribing with `push_depth = N` to a channel
+    /// that already holds retained messages is owed the newest N of them as
+    /// unseen, straight away. Attach is a delivery point, and what was published
+    /// before the subscription existed is unseen to it however old it is.
+    #[tokio::test]
+    async fn a_dynamic_subscribe_is_owed_the_retained_tail_at_its_push_depth() {
+        let ch = channel("heartbeat", ChannelScheme::Brenn);
+        let uuid = ch.uuid;
+        let m = messenger(vec![ch], &[("graf", true, &["u"])]).await;
+        let conversation = {
+            let conn = m.db.lock().await;
+            let user = crate::auth::user::create_user(&conn, "u", "$argon2id$fake");
+            crate::conversation::get_or_create_singleton_conversation(&conn, user, "graf").id
+        };
+
+        // Three messages land while nobody is subscribed.
+        for body in ["one", "two", "three"] {
+            let conn = m.db.lock().await;
+            insert_message(
+                &conn,
+                uuid,
+                "src",
+                "someone",
+                body,
+                Urgency::Normal,
+                ChannelScheme::Brenn,
+                None,
+                None,
+                None,
+                None,
+                0,
+            );
+        }
+
+        m.subscribe_dynamic(
+            "graf",
+            "heartbeat",
+            DynamicSubscribeParams {
+                push_depth: Depth::Bounded(2),
+                ..push_enabled()
+            },
+        )
+        .await
+        .expect("subscribe succeeds");
+
+        let subscriber = ParticipantId::for_conversation(conversation);
+        {
+            let conn = m.db.lock().await;
+            let row = crate::messaging::db::load_subscriber_cursor(&conn, uuid, &subscriber)
+                .expect("subscribe created the conversation's position");
+            assert_eq!(
+                row.next_owed_seq, 2,
+                "primed behind the newest two of the three retained messages"
+            );
+        }
+        assert!(
+            owed_on(&m, uuid, &subscriber).await,
+            "the late joiner is owed the tail it primed over"
+        );
     }
 
     // --- unsubscribe_dynamic (transport-agnostic core) ---------
@@ -2198,8 +2376,8 @@ mod tests {
         );
         // Per-subscriber params come from graf's own SubscriberEntry, not the
         // channel-wide resolved_channel.
-        assert_eq!(brenn.push_depth, Depth::Unbounded);
-        assert_eq!(brenn.retain_depth, Depth::Bounded(7));
+        assert_eq!(brenn.push_depth, Some(Depth::Unbounded));
+        assert_eq!(brenn.retain_depth, Some(Depth::Bounded(7)));
         assert_eq!(brenn.noise, NoiseLevel::Metered);
         assert_eq!(brenn.wake_min, WakeMin::High);
 
@@ -2276,12 +2454,20 @@ mod tests {
 
         let graf = m.list_subscriptions("graf").await;
         assert_eq!(graf.len(), 1);
-        assert_eq!(graf[0].push_depth, Depth::Bounded(3), "graf's own params");
+        assert_eq!(
+            graf[0].push_depth,
+            Some(Depth::Bounded(3)),
+            "graf's own params"
+        );
         assert_eq!(graf[0].noise, NoiseLevel::Silent);
 
         let pfin = m.list_subscriptions("pfin").await;
         assert_eq!(pfin.len(), 1);
-        assert_eq!(pfin[0].push_depth, Depth::Bounded(9), "pfin's own params");
+        assert_eq!(
+            pfin[0].push_depth,
+            Some(Depth::Bounded(9)),
+            "pfin's own params"
+        );
         assert_eq!(pfin[0].noise, NoiseLevel::Alarm);
     }
 

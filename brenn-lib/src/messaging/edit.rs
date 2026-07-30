@@ -85,6 +85,12 @@ impl Messenger {
     /// A parked message is the only thing there is to cancel: once a message
     /// enters retention every subscriber reads it from its own position, and no
     /// server-side record of who has read it exists to revoke.
+    ///
+    /// TODO(ring-deferred-recall): this reaches durable parked messages only. A
+    /// deferred publish to a non-durable channel parks in that channel's ring
+    /// and returns a message id to its publisher, but there is no
+    /// `messaging_messages` row to look up, so it answers `UnknownMessage`.
+    /// `edit` and `list_pending` have the same scope.
     pub async fn cancel(&self, sender_app_slug: &str, message_uuid: Uuid) -> CancelResult {
         // 1. Resolve sender string.
         let sender = match self.resolve_sender(sender_app_slug) {

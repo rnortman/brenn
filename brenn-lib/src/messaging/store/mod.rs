@@ -39,13 +39,26 @@ use brenn_queue::{GapReason, ReplayDecision, Resume, Retained};
 /// linking the primitives crate.
 pub use brenn_queue::QuotaExceeded;
 
+use crate::messaging::ParticipantId;
 use crate::messaging::config::Depth;
-use crate::messaging::{ParticipantId, SubscriberEntryKind};
 
 pub use db::DbStore;
 pub use registry::RingStores;
 pub use ring::RingStore;
 pub use targets::{SurfaceFeedTarget, TargetResolver};
+
+/// A resolved reply target, carried in both the representations a store may
+/// retain it as.
+///
+/// Both halves are populated: a durable store needs the `uuid`, an in-memory
+/// store needs the `address`. Either way the consumer reads an address.
+#[derive(Debug, Clone)]
+pub struct ReplyTarget {
+    /// Identity of the target channel's persistent row.
+    pub uuid: Uuid,
+    /// Canonical address of the target channel, as the directory resolved it.
+    pub address: String,
+}
 
 /// A message on its way into a channel, before the store has given it an
 /// identity or a position.
@@ -59,10 +72,11 @@ pub struct NewMessage {
     /// The address scheme recorded on the envelope. Follows the channel except
     /// on ingress-bridged channels, where it names the originating transport.
     pub envelope_type: ChannelScheme,
-    /// Durable-only; non-durable channels reject it in the publish ladder, so a
-    /// non-durable store treats a populated value as a gate bug and panics.
-    pub reply_to_uuid: Option<Uuid>,
-    /// Durable-only, same rule as `reply_to_uuid`.
+    /// Where a consumer is invited to reply, already resolved. Advisory
+    /// metadata the bus routes nothing with, so every scheme carries it.
+    pub reply_to: Option<ReplyTarget>,
+    /// Wake this message's subscribers by this time whatever their urgency
+    /// economics say. Carried on every scheme.
     pub delivery_deadline: Option<DateTime<Utc>>,
     /// Carried user-interaction authority, already gated at publish: a store
     /// sees it only after the mint capability check passed, and retains it
@@ -92,9 +106,8 @@ pub struct Parked {
     pub message_uuid: Uuid,
 }
 
-/// Whether a subscriber's delivery state already existed when it attached
-/// ([`Attached`]), and where it starts when it did not ([`Priming`]).
-pub use brenn_queue::{Attached, Priming};
+/// Whether a subscriber's delivery state already existed when it attached.
+pub use brenn_queue::Attached;
 
 /// Cut a gap window to the suffix a resuming consumer is owed, and count what
 /// the gap cost it.
@@ -102,37 +115,6 @@ pub use brenn_queue::{Attached, Priming};
 /// Re-exported so a transport answering a resume speaks the same drop
 /// arithmetic a cursor advance does without linking the primitives crate.
 pub use brenn_queue::gap_suffix;
-
-/// Where a subscriber of this kind starts when its queue comes into existence
-/// — the one site that decides priming.
-///
-/// A component queue is primed because attach is a delivery point for it: a
-/// message published before the component existed still reaches and still wakes
-/// it. A conversation or a system subscriber is not: it reads channel ambience
-/// on demand and is not woken with old messages presented as new.
-///
-/// A surface subscription is neither, because it holds no cursor here at all.
-/// Its delivery state is per **connection** — two tabs of one surface are two
-/// independent positions — while a cursor here is per participant, and no
-/// surface participant carries a connection identity. The cursor the wire
-/// session echoes at subscribe is that whole state, which is why boot reconcile
-/// deletes any surface-keyed row it finds as an orphan. Answering for one would
-/// hand a caller a default it must decide deliberately.
-pub fn priming_for_kind(kind: &SubscriberEntryKind) -> Priming {
-    match kind {
-        SubscriberEntryKind::Wasm(_) => Priming::Retained,
-        // TODO(priming-head-audit): adjudicate every `Head` site against the
-        // bus philosophy — messages published while a consumer slept are
-        // unseen, and nothing in the system makes recency guarantees.
-        SubscriberEntryKind::App(_)
-        | SubscriberEntryKind::System(_)
-        | SubscriberEntryKind::ChatConversation { .. } => Priming::Head,
-        SubscriberEntryKind::Surface { .. } => panic!(
-            "surface subscriptions hold no store cursors; their delivery state is the wire \
-             session's, per connection, and this grain cannot represent it"
-        ),
-    }
-}
 
 /// One subscriber's activation view: the most recent
 /// `max(push_limit, retain_limit)` retained messages, with the boundary where
@@ -535,9 +517,9 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
     ) -> Option<AdvanceOutcome>;
 
     /// Register `subscriber`'s delivery state on this channel, or retune an
-    /// existing one's push depth. Priming positions the queue only when it comes
-    /// into existence; a re-registration keeps its position and returns
-    /// [`Attached::Existing`].
+    /// existing one's push depth. A queue coming into existence is primed behind
+    /// the channel's retained tail, capped by `push_depth`; a re-registration
+    /// keeps its position and returns [`Attached::Existing`].
     ///
     /// Created versus Existing is the store's own determination, made from
     /// whether it already holds a position for this subscriber. No caller
@@ -559,7 +541,6 @@ pub trait RetentionStore: Send + Sync + std::fmt::Debug {
         subscriber: &ParticipantId,
         app_slug: &str,
         push_depth: Depth,
-        priming: Priming,
     ) -> Attached;
 
     /// Tear down `subscriber`'s delivery state on this channel — the inverse of
@@ -735,18 +716,5 @@ mod tests {
     #[should_panic(expected = "precedes the Unix epoch")]
     fn pre_epoch_release_time_panics() {
         release_time_of(DateTime::from_timestamp_millis(-1).unwrap());
-    }
-
-    /// A surface subscription has no priming to ask for, and the question is
-    /// unreachable in production: boot reconcile deletes surface-keyed cursor
-    /// rows as orphans, so nothing here ever attaches one. A future caller must
-    /// decide deliberately rather than inherit a default.
-    #[test]
-    #[should_panic(expected = "hold no store cursors")]
-    fn priming_for_a_surface_subscription_panics() {
-        priming_for_kind(&SubscriberEntryKind::Surface {
-            slug: "kiosk".to_string(),
-            instance: Some("protobar".to_string()),
-        });
     }
 }

@@ -111,18 +111,26 @@ fn chat_channel_entry(
         // TODO(chat-history-on-demand): this window is the entire history a bus
         // peer can reach, so it has to be sized for the deepest read anyone
         // wants rather than for the traffic.
+        //
+        // The push depth on the two output leaves is the rung a later third-party
+        // binding inherits when it states no depth of its own. It is the leaf's
+        // own retained window: this side of a conversation is a record, and a
+        // peer reading it asked for what was said, not for the tail of it — the
+        // record *is* the window, so a window-sized rung hands an attaching peer
+        // all of it, while staying under the standing depth every depth stated
+        // about a channel sits beneath.
         ChatLeaf::Out => (
             OUT_SEND_RATE,
             window,
             defaults.default_wake_min,
-            defaults.default_push_depth,
+            window,
             defaults.default_noise,
         ),
         ChatLeaf::Stream => (
             STREAM_SEND_RATE,
             STREAM_RETAIN_DEPTH,
             defaults.default_wake_min,
-            defaults.default_push_depth,
+            STREAM_RETAIN_DEPTH,
             defaults.default_noise,
         ),
         // Any message at all must wake: the point of the channel is paying the
@@ -373,16 +381,14 @@ impl Messenger {
     }
 }
 
-/// Give the conversation its position on its own command channel, at the head
-/// of that channel as it stands.
+/// Give the conversation its position on its own command channel, primed behind
+/// that channel's retained tail.
 ///
 /// The position is created with the channel rather than at the adapter's first
-/// attach, and that is the difference between a dormant conversation's commands
-/// waiting and vanishing: a position primed at head is owed only what is
-/// published after it exists, so one created at first spawn classifies
-/// everything published while the conversation slept as pre-history. Created
-/// against the empty channel, every command the conversation will ever be sent
-/// is owed to it. Idempotent — an existing position keeps its place.
+/// attach, so it exists before the first command does. Primes through
+/// [`crate::messaging::db::primed_position`], the same function the durable
+/// store's attach seeds from, so this raw-connection path cannot diverge from
+/// it. Idempotent — an existing position keeps its place.
 fn ensure_command_cursor(
     conn: &Connection,
     entries: &[ChannelEntry],
@@ -395,14 +401,15 @@ fn ensure_command_cursor(
         .iter()
         .find(|e| e.address == address)
         .expect("chat provisioning: the command leaf is provisioned");
-    let head = crate::messaging::db::channel_last_retained_seq(conn, entry.uuid) + 1;
+    let push_depth = entry.resolved_channel.push_depth;
+    let primed = crate::messaging::db::primed_position(conn, entry.uuid, push_depth);
     crate::messaging::db::ensure_subscriber_cursor(
         conn,
         entry.uuid,
         &crate::messaging::ParticipantId::for_conversation(conversation_id),
         app_slug,
-        entry.resolved_channel.push_depth,
-        head,
+        push_depth,
+        primed,
     );
 }
 
@@ -413,8 +420,10 @@ fn ensure_command_cursor(
 /// durable half of the same job is [`ensure_command_cursor`], and the split is
 /// only about where the position is kept.
 ///
-/// `Head` for the same reason the command cursor takes it: a pre-warm published
-/// before this process started is not a request to spawn now.
+/// Primed behind the retained tail, as every fresh position is: the wake ring is
+/// process memory recreated empty each boot, so there is normally nothing to be
+/// owed, and a wake found in a re-provision window is a signal the conversation
+/// may act on or find nothing to do about.
 fn ensure_ring_cursor(
     rings: &crate::messaging::store::RingStores,
     entry: &ChannelEntry,
@@ -442,7 +451,6 @@ fn ensure_ring_cursor(
         &crate::messaging::ParticipantId::for_conversation(conversation_id),
         app_slug,
         depth,
-        crate::messaging::store::Priming::Head,
     );
 }
 
@@ -576,7 +584,15 @@ mod tests {
             )
             .unwrap();
         }
+        let (messenger, router) = messenger_over(db.clone()).await;
+        (messenger, db, router)
+    }
 
+    /// A messenger over a database that already has rows — a restart: the durable
+    /// half is whatever a previous process left, and the directory and the rings
+    /// start empty, so boot provisioning runs for real instead of short-circuiting
+    /// on entries already in memory.
+    async fn messenger_over(db: crate::db::Db) -> (Arc<Messenger>, Arc<RecordingRouter>) {
         let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
         let mut app = crate::messaging::test_support::test_app_config(
             APP,
@@ -592,7 +608,7 @@ mod tests {
 
         let router = Arc::new(RecordingRouter::default());
         let messenger = Messenger::new(
-            db.clone(),
+            db,
             Arc::new(MessagingDirectory::with_entries(vec![])),
             Arc::from("test-source"),
             Arc::new(apps),
@@ -601,7 +617,7 @@ mod tests {
         )
         .with_ring_stores(Arc::new(RingStores::empty()))
         .with_llm_chat(LlmChatConfig::default());
-        (messenger, db, router)
+        (messenger, router)
     }
 
     /// Insert a conversation row directly; provisioning is what the tests drive.
@@ -857,7 +873,6 @@ mod tests {
             APP,
             &ParticipantId::for_app(APP, "test-source"),
             Depth::Unbounded,
-            crate::messaging::store::Priming::Head,
         )
         .await;
         for conversation_id in [7, 8] {
@@ -1027,19 +1042,99 @@ mod tests {
         );
     }
 
-    /// The command channel's push depth is what bounds one drain pass, and every
-    /// message on it is a distinct command — so it is pinned to the whole
-    /// retained window, not inherited from an operator's global coalescing
-    /// default. The window and not `Unbounded`: retention holds no more than the
-    /// window anyway, and an unbounded depth would pin the channel against
-    /// reaping.
+    /// The case the shared priming exists for: the position is gone while
+    /// commands are still retained, so head and the retained-tail floor are
+    /// different numbers. Provisioning must seed at the floor — a conversation
+    /// that classified a window's worth of commands as pre-history would drop
+    /// exactly what the `In` leaf's full-window push depth promises to drain —
+    /// and it must land where the durable store's own attach would, which is the
+    /// parity the raw-connection path claims.
     #[tokio::test]
-    async fn the_command_channel_keeps_its_push_depth_when_the_global_default_drops() {
+    async fn a_recreated_command_position_seeds_at_the_retained_tail() {
         let (m, db) = messenger().await;
-        let defaults = MessagingGlobalConfig {
-            default_push_depth: Depth::Bounded(1),
-            ..MessagingGlobalConfig::default()
-        };
+        let address = chat_address("chat", APP, ChatLeaf::In, 7);
+        {
+            let conn = db.lock().await;
+            insert_conversation(&conn, 7, APP);
+            m.provision_conversation_chat_channels(&conn, APP, 7);
+        }
+        for body in ["first", "second", "third"] {
+            m.publish_from_conversation(7, APP, &address, body, Urgency::Normal)
+                .await;
+        }
+        let uuid = leaf_uuid(&m, 7, ChatLeaf::In);
+        let participant = ParticipantId::for_conversation(7);
+        let push_depth = m
+            .directory
+            .resolve(&address)
+            .expect("provisioned")
+            .resolved_channel
+            .push_depth;
+
+        // Orphan state: position deleted while the channel and its commands
+        // survive.
+        {
+            let conn = db.lock().await;
+            assert!(
+                crate::messaging::db::delete_subscriber_cursor(&conn, uuid, &participant),
+                "the position provisioning created was there to remove",
+            );
+        }
+        let (booted, _router) = messenger_over(db.clone()).await;
+        {
+            let conn = db.lock().await;
+            booted.provision_conversation_chat_channels(&conn, APP, 7);
+        }
+        let provisioned = unseen_command_bodies(&booted, &address, push_depth).await;
+        assert_eq!(
+            provisioned,
+            vec!["first", "second", "third"],
+            "a recreated position is owed the retained commands, not seeded past them",
+        );
+
+        // The durable store's own attach, from the same state: the claim is that
+        // the raw-connection provisioning path cannot answer differently.
+        {
+            let conn = db.lock().await;
+            crate::messaging::db::delete_subscriber_cursor(&conn, uuid, &participant);
+        }
+        booted
+            .store_for_address(&address)
+            .attach(&participant, APP, push_depth)
+            .await;
+        assert_eq!(
+            unseen_command_bodies(&booted, &address, push_depth).await,
+            provisioned,
+            "and it is the position the durable store's attach seeds",
+        );
+    }
+
+    /// What the conversation is owed on `address`, oldest first. Reads the window
+    /// without advancing, so a caller can ask twice.
+    async fn unseen_command_bodies(m: &Messenger, address: &str, push_depth: Depth) -> Vec<String> {
+        m.store_for_address(address)
+            .window(
+                &ParticipantId::for_conversation(7),
+                push_depth,
+                Depth::Bounded(0),
+            )
+            .await
+            .expect("the conversation holds a position on its command channel")
+            .new_entries()
+            .iter()
+            .map(|(_, env)| env.body.clone())
+            .collect()
+    }
+
+    /// The command channel's push depth is what bounds one drain pass, and every
+    /// message on it is a distinct command — so it is the whole retained window,
+    /// not the coalescing depth a signal channel would take. The window and not
+    /// `Unbounded`: retention holds no more than the window anyway, and an
+    /// unbounded depth would pin the channel against reaping.
+    #[tokio::test]
+    async fn the_command_channel_pushes_its_whole_window() {
+        let (m, db) = messenger().await;
+        let defaults = MessagingGlobalConfig::default();
         let window = Depth::Bounded(u64::from(LlmChatConfig::default().retained_window));
         let entry = chat_channel_entry(&LlmChatConfig::default(), APP, ChatLeaf::In, 7, &defaults);
         assert_eq!(
@@ -1358,7 +1453,6 @@ mod tests {
             APP,
             &ParticipantId::for_conversation(8),
             Depth::Bounded(10),
-            crate::messaging::store::Priming::Head,
         )
         .await;
         m.publish_from_conversation(7, APP, &address, "a command", Urgency::Normal)

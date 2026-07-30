@@ -36,7 +36,7 @@ use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::middleware as axum_mw;
 use axum::routing::post;
-use brenn_lib::messaging::config::{NoiseLevel, ResolvedChannel, Sink};
+use brenn_lib::messaging::config::{NoiseLevel, ResolvedChannel, Sink, SystemChannelTuning};
 use brenn_lib::messaging::{Messenger, Urgency};
 use brenn_lib::tools::ResolvedToolGrant;
 use brenn_lib::webhook::config::{ResolvedWebhookEndpoint, WebhookOwner};
@@ -208,12 +208,14 @@ async fn build_pipeline() -> Pipeline {
     let sync_ch = brenn_channel("brenn:git-repo-sync", CONSUMER_SLUG);
     let outcomes_addr = "brenn:git-repo-sync-outcomes".to_string();
     let outcomes_ch = brenn_channel(&outcomes_addr, "git-sync-outcomes-reader");
-    let request_ch = request_channel_entry("git-repo-pull", &defaults);
-    let mut inbox = result_inbox_entry(CONSUMER_SLUG, &defaults);
+    let request_ch =
+        request_channel_entry("git-repo-pull", &SystemChannelTuning::default(), &defaults);
+    let mut inbox = result_inbox_entry(CONSUMER_SLUG, &SystemChannelTuning::default(), &defaults);
+    let inbox_window = inbox.resolved_channel.retain_depth;
     inbox.subscribers.push(SubscriberEntry {
         kind: SubscriberEntryKind::Wasm(CONSUMER_SLUG.to_string()),
-        push_depth: Depth::Unbounded,
-        retain_depth: Depth::Unbounded,
+        push_depth: inbox_window,
+        retain_depth: inbox_window,
         noise: NoiseLevel::Silent,
         wake_min: None,
     });
@@ -431,7 +433,7 @@ async fn build_pipeline() -> Pipeline {
                 },
                 amplification_mt: 1000,
             },
-            inbox_input_port(CONSUMER_SLUG),
+            inbox_input_port(CONSUMER_SLUG, inbox_window),
         ],
         outputs: vec![],
         activation_pacing: unthrottled_pacing(),

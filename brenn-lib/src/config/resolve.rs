@@ -66,6 +66,10 @@ pub struct ResolvedConfig {
     pub mqtt_clients: IndexMap<String, crate::mqtt::config::MqttClientConfig>,
     /// Resolved PWA push config. `None` when no app has `pwa_push.enabled = true`.
     pub pwa_push: Option<crate::pwa_push::config::ResolvedPwaPushConfig>,
+    /// Tuning entries from `[[channel]]` blocks that address system-minted
+    /// channels, supplying depths without declaring a channel. All mint sites
+    /// must resolve against the same table.
+    pub system_channel_tuning: crate::messaging::config::SystemChannelTuning,
 }
 
 /// Validate raw config and resolve defaults, producing the final app registry
@@ -854,6 +858,9 @@ pub fn validate_and_resolve(
     // configs carry every fact a hot path needs.
     resolve_messaging_layer(&config.channels, &config.messaging, &config.apps, &mut apps);
 
+    let system_channel_tuning =
+        crate::messaging::config::build_system_channel_tuning(&config.channels, &config.messaging);
+
     // --- Phase 6: MQTT clients ---
     //
     // Resolve `[[mqtt_client]]` entries (validate URLs, load secrets). Panics on
@@ -900,6 +907,7 @@ pub fn validate_and_resolve(
         let subs = crate::mqtt::config::resolve_app_mqtt_subscriptions(
             raw,
             &resolved_clients,
+            &system_channel_tuning,
             &config.messaging,
         );
         for sub in &subs {
@@ -1020,6 +1028,7 @@ pub fn validate_and_resolve(
         mqtt_ingress_channels,
         mqtt_clients: resolved_clients,
         pwa_push,
+        system_channel_tuning,
     }
 }
 
