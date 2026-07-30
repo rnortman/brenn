@@ -3690,6 +3690,138 @@ async fn boot_disconnected_stamp_written_per_surface_and_pullable() {
     assert_eq!(body["instances"], serde_json::json!([]));
 }
 
+/// A config with one surface plus its bindings channel declared as the operator
+/// must declare it: `ephemeral:`, retained, one row wide.
+fn surface_with_config_channel(max_body_bytes: usize) -> brenn_lib::config::BrennConfig {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::messaging::config::SurfaceConfigRaw;
+
+    BrennConfig {
+        channels: vec![nondurable_channel(
+            "ephemeral:surface.surface.deskbar.bindings",
+            1,
+        )],
+        surfaces: vec![SurfaceConfigRaw {
+            ..minimal_surface_raw()
+        }],
+        messaging: MessagingGlobalConfig {
+            max_body_bytes,
+            ..MessagingGlobalConfig::default()
+        },
+        ..BrennConfig::default()
+    }
+}
+
+/// The boot bindings-document path, composed. Every link is unit-tested
+/// apart; a family mismatch between the registration grant and the
+/// publish-gate dispatch is only visible here — and it would panic every
+/// real boot.
+#[tokio::test]
+async fn boot_bindings_document_is_published_and_pullable() {
+    use crate::routes::surface::bindings_doc::{
+        BindingsDocParams, build_bindings_documents, publish_bindings_documents,
+    };
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::query::MessageQuery;
+    use brenn_surface_schema::bindings::BindingsDocument;
+    use indexmap::IndexMap as IM;
+
+    let config = surface_with_config_channel(65_536);
+    // A non-subscriber reader with covering read access: the retained window is
+    // pullable, which is the shape the attaching surface's replay reads.
+    let mut reader = minimal_app_config("some-reader", None, vec![]);
+    reader.policy = crate::test_support::app_config::delivery_policy_for_addresses([
+        "ephemeral:surface.surface.deskbar.bindings",
+    ]);
+    let mut apps_map: IM<String, AppConfig> = IM::new();
+    apps_map.insert("some-reader".to_string(), reader);
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+
+    let result = boot_messaging_with(
+        &config,
+        init_db_memory(),
+        &apps,
+        alert_dispatcher,
+        "brenn://test",
+    )
+    .await;
+    let messenger = result.messenger.as_ref().expect("messaging must be up");
+
+    let params = BindingsDocParams {
+        prefix: "surface",
+        status_interval_secs: 60,
+        error_report: None,
+    };
+    let docs = build_bindings_documents(&result.surfaces, &params);
+    publish_bindings_documents(messenger, &docs).await;
+
+    let envelopes = messenger
+        .query(&MessageQuery {
+            channel: "ephemeral:surface.surface.deskbar.bindings".to_string(),
+            limit: 10,
+            before: None,
+            after: None,
+            sender: None,
+            search: None,
+            calling_app_slug: "some-reader".to_string(),
+        })
+        .await
+        .expect("config channel query succeeds");
+
+    assert_eq!(envelopes.len(), 1, "one document per surface, retained");
+    let env = &envelopes[0];
+    assert_eq!(
+        env.sender, "system:surface-config",
+        "the document is written under the reserved single-writer identity, got {:?}",
+        env.sender
+    );
+    let parsed =
+        BindingsDocument::parse(&env.body).expect("the retained body parses and validates");
+    let expected =
+        crate::routes::surface::bindings_doc::build_bindings_document(&result.surfaces[0], &params);
+    assert_eq!(
+        parsed, expected,
+        "what a surface replays is the document boot built"
+    );
+}
+
+/// The operator-reachable arm of the publish: a `max_body_bytes` below the
+/// document's own size. A surface cannot boot without its wiring, so this is a
+/// boot panic naming the knob to raise rather than a surface that attaches to
+/// nothing.
+#[tokio::test]
+#[should_panic(expected = "max_body_bytes")]
+async fn boot_bindings_document_publish_panics_when_the_body_exceeds_the_cap() {
+    use crate::routes::surface::bindings_doc::{
+        BindingsDocParams, build_bindings_documents, publish_bindings_documents,
+    };
+    use brenn_lib::db::init_db_memory;
+    use indexmap::IndexMap as IM;
+
+    let config = surface_with_config_channel(16);
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+
+    let result = boot_messaging_with(
+        &config,
+        init_db_memory(),
+        &apps,
+        alert_dispatcher,
+        "brenn://test",
+    )
+    .await;
+    let messenger = result.messenger.as_ref().expect("messaging must be up");
+
+    let params = BindingsDocParams {
+        prefix: "surface",
+        status_interval_secs: 60,
+        error_report: None,
+    };
+    let docs = build_bindings_documents(&result.surfaces, &params);
+    publish_bindings_documents(messenger, &docs).await;
+}
+
 /// A consumer whose sole port is an io_port on `channel` (absent ⇒ anonymous),
 /// at bounded depths so the fold lands on a legal non-durable ring.
 fn io_port_consumer(

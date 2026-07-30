@@ -5,10 +5,10 @@
 use super::*;
 use crate::core::publish_buffer::PublishBuffer;
 use crate::test_support::cfg;
-// `GapReason` survives in `surface/proto` as server-interpreted wire encoding;
+// `GapReason` survives in `surface/schema` as server-interpreted wire encoding;
 // these tests play the server, so they construct it. The kernel never matches on
 // it.
-use brenn_surface_proto::{
+use brenn_surface_schema::{
     Binding, GapReason, OutputBinding, PublishOutcome, ServerFrame, SubscribeOutcome,
     SurfaceBindings, Urgency,
 };
@@ -300,7 +300,7 @@ pub(super) fn durable_binding(instance: &str, port: &str) -> Binding {
         port: port.into(),
         push_depth: TEST_PUSH_DEPTH,
         retain_depth: TEST_RETAIN_DEPTH,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
     }
 }
 
@@ -311,7 +311,7 @@ pub(super) fn sub_binding() -> Binding {
         port: "messages".into(),
         push_depth: TEST_PUSH_DEPTH,
         retain_depth: TEST_RETAIN_DEPTH,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
     }
 }
 
@@ -332,7 +332,7 @@ pub(super) fn ephemeral_binding(instance: &str, port: &str) -> Binding {
         port: port.into(),
         push_depth: TEST_PUSH_DEPTH,
         retain_depth: TEST_RETAIN_DEPTH,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
     }
 }
 
@@ -503,7 +503,7 @@ pub(super) fn other_binding() -> Binding {
         port: "other".into(),
         push_depth: TEST_PUSH_DEPTH,
         retain_depth: TEST_RETAIN_DEPTH,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
     }
 }
 
@@ -699,14 +699,14 @@ pub(super) fn active_core_alert_granted() -> ClientCore {
         alert_granted: true,
         takeover_granted: false,
         error_report_floor: None,
-        surface_description: brenn_surface_proto::SurfaceDescription {
+        surface_description: brenn_surface_schema::SurfaceDescription {
             status_interval_secs: 60,
         },
         bindings: SurfaceBindings {
-            components: vec![brenn_surface_proto::ComponentEntry {
+            components: vec![brenn_surface_schema::ComponentEntry {
                 instance: "protobar".into(),
                 kind: "protobar".into(),
-                abi: brenn_surface_proto::Abi::Dom,
+                abi: brenn_surface_schema::Abi::Dom,
                 parked_batch_depth: 8,
                 config: Default::default(),
             }],

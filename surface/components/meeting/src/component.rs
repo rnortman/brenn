@@ -26,7 +26,7 @@ use brenn_surface_component_support::{
     claim_initialized, clamp_timeout_ms, component_log, create_button, create_div, document,
     publish, read_now_utc, register_component,
 };
-use brenn_surface_proto::{CONTROL_PLANE_VERSION, LogLevel, TakeoverAction, TakeoverBody};
+use brenn_surface_schema::{CONTROL_PLANE_VERSION, LogLevel, TakeoverAction, TakeoverBody};
 use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::HtmlElement;
 

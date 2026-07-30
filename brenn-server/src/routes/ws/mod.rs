@@ -36,7 +36,7 @@ use crate::state::AppState;
 /// `frontend/src/ws.ts`.
 pub const STALE_CLIENT_CLOSE_CODE: u16 = 3001;
 
-const _: () = assert!(STALE_CLIENT_CLOSE_CODE == brenn_surface_proto::STALE_BUILD_CLOSE_CODE);
+const _: () = assert!(STALE_CLIENT_CLOSE_CODE == brenn_surface_schema::STALE_BUILD_CLOSE_CODE);
 
 /// Query parameters for the WS endpoint.
 #[derive(serde::Deserialize)]

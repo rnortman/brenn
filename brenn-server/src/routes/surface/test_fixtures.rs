@@ -205,7 +205,7 @@ pub(crate) fn surface_outputting_to(channel_address: &str) -> ResolvedSurface {
         components: vec![ResolvedComponent {
             instance: "writer".to_string(),
             kind: "writer".to_string(),
-            abi: brenn_surface_proto::Abi::Dom,
+            abi: brenn_surface_schema::Abi::Dom,
             send_budget: SurfaceSendBudget::default(),
             parked_batch_depth: 8,
             config: Default::default(),
@@ -335,7 +335,7 @@ pub(crate) fn install_surface_runtimes(
     mut surfaces: Vec<ResolvedSurface>,
     messenger: Option<Arc<brenn_lib::messaging::Messenger>>,
     max_body_bytes: usize,
-    error_report: Option<(String, brenn_surface_proto::LogLevel)>,
+    error_report: Option<(String, brenn_surface_schema::LogLevel)>,
     surface_description: SurfaceDescriptionParams,
 ) -> std::collections::HashMap<String, Arc<SurfaceRuntime>> {
     for surface in &mut surfaces {
@@ -596,7 +596,7 @@ pub(crate) async fn publish(messenger: &brenn_lib::messaging::Messenger, body: &
 /// `message_id`: the message's own channel, epoch, and retention position, under
 /// the store's real incarnation, so it is not caught as stale when echoed back to
 /// a live durable subscribe.
-pub(crate) async fn durable_resume(db: &db::Db, message_id: i64) -> brenn_surface_proto::Cursor {
+pub(crate) async fn durable_resume(db: &db::Db, message_id: i64) -> brenn_surface_schema::Cursor {
     let (channel_uuid, seq) = {
         let conn = db.lock().await;
         conn.query_row(
@@ -620,7 +620,7 @@ pub(crate) async fn durable_resume_at(
     db: &db::Db,
     channel_uuid: uuid::Uuid,
     seq: u64,
-) -> brenn_surface_proto::Cursor {
+) -> brenn_surface_schema::Cursor {
     let (incarnation, epoch) = {
         let conn = db.lock().await;
         (

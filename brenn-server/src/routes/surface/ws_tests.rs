@@ -31,7 +31,7 @@ use brenn_lib::obs::alerting::{
     AlertDispatcher, AlertSeverity as NativeAlertSeverity, make_capturing_alerter_with_severity,
 };
 use brenn_surface_contract::{ERROR_REPORT_INSTANCE, ERROR_REPORT_PORT};
-use brenn_surface_proto::{
+use brenn_surface_schema::{
     AlertSeverity, BatchEntry, ClientFrame, Cursor, DeliverTarget, GapInfo, GapReason,
     InstanceReport, InstanceState, LogLevel, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES,
     OverlayReport, PublishBatchOutcome, PublishOutcome, ServerFrame, StatusCounters,
@@ -1172,7 +1172,7 @@ async fn surface_ws_ephemeral_sibling_instances_each_get_their_own_subscription(
         ["agenda-alice", "agenda-bob"].map(|instance| ResolvedComponent {
             instance: instance.to_string(),
             kind: "agenda".to_string(),
-            abi: brenn_surface_proto::Abi::Dom,
+            abi: brenn_surface_schema::Abi::Dom,
             send_budget: SurfaceSendBudget::default(),
             parked_batch_depth: 8,
             config: Default::default(),
@@ -1271,7 +1271,7 @@ async fn siblings_coalesce_only_at_a_shared_position() {
         ["agenda-alice", "agenda-bob"].map(|instance| ResolvedComponent {
             instance: instance.to_string(),
             kind: "agenda".to_string(),
-            abi: brenn_surface_proto::Abi::Dom,
+            abi: brenn_surface_schema::Abi::Dom,
             send_budget: SurfaceSendBudget::default(),
             parked_batch_depth: 8,
             config: Default::default(),
@@ -1842,7 +1842,7 @@ fn otherbar() -> ResolvedSurface {
         components: vec![ResolvedComponent {
             instance: COMPONENT.to_string(),
             kind: COMPONENT.to_string(),
-            abi: brenn_surface_proto::Abi::Dom,
+            abi: brenn_surface_schema::Abi::Dom,
             send_budget: SurfaceSendBudget::default(),
             parked_batch_depth: 8,
             config: Default::default(),
@@ -2445,7 +2445,7 @@ fn deskbar_pub_fixture(publish_burst: u32, publish_per_sec: u32) -> DeskbarPubFi
             ResolvedComponent {
                 instance: COMPONENT.to_string(),
                 kind: COMPONENT.to_string(),
-                abi: brenn_surface_proto::Abi::Dom,
+                abi: brenn_surface_schema::Abi::Dom,
                 send_budget: SurfaceSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
@@ -2459,7 +2459,7 @@ fn deskbar_pub_fixture(publish_burst: u32, publish_per_sec: u32) -> DeskbarPubFi
                 // With them distinct, every `surface:deskbar#writer` assertion
                 // below is a live proof of which half the server reads.
                 kind: "writer-module".to_string(),
-                abi: brenn_surface_proto::Abi::Dom,
+                abi: brenn_surface_schema::Abi::Dom,
                 send_budget: SurfaceSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
@@ -3290,7 +3290,7 @@ fn durable_surface(
         components: vec![ResolvedComponent {
             instance: COMPONENT.to_string(),
             kind: COMPONENT.to_string(),
-            abi: brenn_surface_proto::Abi::Dom,
+            abi: brenn_surface_schema::Abi::Dom,
             send_budget: SurfaceSendBudget::default(),
             parked_batch_depth: 8,
             config: Default::default(),
@@ -3412,7 +3412,7 @@ fn durable_pubsub_surface(uuid: Uuid) -> ResolvedSurface {
             ResolvedComponent {
                 instance: COMPONENT.to_string(),
                 kind: COMPONENT.to_string(),
-                abi: brenn_surface_proto::Abi::Dom,
+                abi: brenn_surface_schema::Abi::Dom,
                 send_budget: SurfaceSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
@@ -3424,7 +3424,7 @@ fn durable_pubsub_surface(uuid: Uuid) -> ResolvedSurface {
                 // `deskbar_pub`'s: it makes the `surface:deskbar#writer`
                 // self-delivery assertions prove the instance grain.
                 kind: "writer-module".to_string(),
-                abi: brenn_surface_proto::Abi::Dom,
+                abi: brenn_surface_schema::Abi::Dom,
                 send_budget: SurfaceSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
@@ -4039,7 +4039,7 @@ async fn surface_ws_durable_sibling_instances_each_get_their_own_subscription() 
         ["agenda-alice", "agenda-bob"].map(|instance| ResolvedComponent {
             instance: instance.to_string(),
             kind: "agenda".to_string(),
-            abi: brenn_surface_proto::Abi::Dom,
+            abi: brenn_surface_schema::Abi::Dom,
             send_budget: SurfaceSendBudget::default(),
             parked_batch_depth: 8,
             config: Default::default(),
@@ -4178,7 +4178,7 @@ async fn surface_ws_a_row_for_an_unsubscribed_instance_parks_rather_than_being_c
         ["agenda-alice", "agenda-bob"].map(|instance| ResolvedComponent {
             instance: instance.to_string(),
             kind: "agenda".to_string(),
-            abi: brenn_surface_proto::Abi::Dom,
+            abi: brenn_surface_schema::Abi::Dom,
             send_budget: SurfaceSendBudget::default(),
             parked_batch_depth: 8,
             config: Default::default(),
@@ -4824,7 +4824,7 @@ async fn surface_ws_durable_siblings_are_decided_against_their_own_high_waters()
             ["agenda-behind", "agenda-current"].map(|instance| ResolvedComponent {
                 instance: instance.to_string(),
                 kind: "agenda".to_string(),
-                abi: brenn_surface_proto::Abi::Dom,
+                abi: brenn_surface_schema::Abi::Dom,
                 send_budget: SurfaceSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
@@ -5857,7 +5857,7 @@ async fn surface_ws_status_counters_unknown_instance_is_violation() {
             StatusCounters {
                 instances: [(
                     "ghost".to_string(),
-                    brenn_surface_proto::InstanceCounters {
+                    brenn_surface_schema::InstanceCounters {
                         publishes: 1,
                         drops: 0,
                     },
@@ -5975,7 +5975,7 @@ async fn surface_ws_status_counters_per_instance_reach_the_status_document() {
             errors: 0,
             instances: [(
                 "protobar".to_string(),
-                brenn_surface_proto::InstanceCounters {
+                brenn_surface_schema::InstanceCounters {
                     publishes: 4,
                     drops: 2,
                 },

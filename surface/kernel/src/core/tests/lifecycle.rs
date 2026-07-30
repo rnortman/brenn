@@ -1,7 +1,7 @@
 use super::super::*;
 use super::*;
 use crate::test_support::cfg;
-use brenn_surface_proto::{Binding, InstanceState, PublishOutcome, ServerFrame};
+use brenn_surface_schema::{Binding, InstanceState, PublishOutcome, ServerFrame};
 
 #[test]
 fn check_publish_maps_each_single_failure_to_its_variant() {
@@ -402,7 +402,7 @@ fn welcome_with_unsupported_binding_scheme_is_fatal() {
         port: "messages".into(),
         push_depth: TEST_PUSH_DEPTH,
         retain_depth: TEST_RETAIN_DEPTH,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
     };
     let effects = core.on_input(
         Input::TextFrame(welcome_frame(vec![bad], vec![])),

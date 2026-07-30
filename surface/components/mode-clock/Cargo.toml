@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 # the component-support fault helpers, both host-buildable, so they are ungated
 # normal deps. Wasm DOM/timer glue deps belong under the wasm32 target below.
 [dependencies]
-brenn-surface-proto = { version = "0.1.0", path = "../../proto" }
+brenn-surface-schema = { version = "0.1.0", path = "../../schema" }
 brenn-surface-contract = { version = "0.1.0", path = "../../contract" }
 brenn-surface-component-support = { version = "0.1.0", path = "../../component-support" }
 serde = { version = "1.0", features = ["derive"] }

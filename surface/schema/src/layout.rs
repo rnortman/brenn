@@ -2,7 +2,7 @@
 //! writer publishes to pick one of the fixed layouts and place a configured
 //! component instance in each panel slot.
 //!
-//! Lives in `brenn-surface-proto` so the shell, the server, and any publisher
+//! Lives in `brenn-surface-schema` so the shell, the server, and any publisher
 //! share exactly one schema and one validator. The document is untrusted input
 //! (its writer is an LLM that will sometimes emit a bad doc): parsing is strict
 //! (`deny_unknown_fields`) and [`LayoutDoc::validate`] is total — every

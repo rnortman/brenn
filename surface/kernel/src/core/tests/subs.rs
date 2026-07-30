@@ -1,7 +1,7 @@
 use super::super::*;
 use super::*;
 use crate::test_support::cfg;
-use brenn_surface_proto::{Binding, ServerFrame, SubscribeOutcome, SurfaceBindings};
+use brenn_surface_schema::{Binding, ServerFrame, SubscribeOutcome, SurfaceBindings};
 use brenn_surface_test_fixtures::wire_cursor;
 
 // ── Subscription table: registration direction ────────────────────────
@@ -603,14 +603,14 @@ fn welcome_with_zero_heartbeat_is_fatal() {
         alert_granted: false,
         takeover_granted: false,
         error_report_floor: None,
-        surface_description: brenn_surface_proto::SurfaceDescription {
+        surface_description: brenn_surface_schema::SurfaceDescription {
             status_interval_secs: 60,
         },
         bindings: SurfaceBindings {
-            components: vec![brenn_surface_proto::ComponentEntry {
+            components: vec![brenn_surface_schema::ComponentEntry {
                 instance: "protobar".into(),
                 kind: "protobar".into(),
-                abi: brenn_surface_proto::Abi::Dom,
+                abi: brenn_surface_schema::Abi::Dom,
                 parked_batch_depth: 8,
                 config: Default::default(),
             }],
@@ -752,13 +752,13 @@ fn a_depth_zero_binding_is_context_only_and_never_activates() {
         Binding {
             push_depth: 0,
             retain_depth: 4,
-            noise: brenn_surface_proto::NoiseLevel::Silent,
+            noise: brenn_surface_schema::NoiseLevel::Silent,
             ..sub_binding()
         },
         Binding {
             push_depth: 4,
             retain_depth: 4,
-            noise: brenn_surface_proto::NoiseLevel::Silent,
+            noise: brenn_surface_schema::NoiseLevel::Silent,
             ..ephemeral_binding("protobar", "alt")
         },
     ]);
@@ -995,13 +995,23 @@ fn a_wire_port_rebound_to_another_channel_sheds_its_old_position() {
 }
 
 /// Every channel address the kernel routes came from a boot-validated binding or
-/// the reserved table, so one that classifies as nothing is a kernel bug rather
+/// the reserved table, so one the surface cannot bind is a kernel bug rather
 /// than tolerated input. The single capability-derivation point says so out loud
-/// instead of guessing a retention model — a `None` answer routed as either class
-/// would silently put a channel in the wrong store with the wrong lifetime.
+/// instead of guessing a retention model — routing an unbindable address as
+/// either class would silently put a channel in the wrong store with the wrong
+/// lifetime, and `mqtt:` is the dangerous row: durable and transportable on the
+/// bus, so a capabilities-only reading would put it on the wire.
 #[test]
-#[should_panic(expected = "unclassifiable channel address")]
-fn an_unclassifiable_address_panics_at_the_capability_derivation() {
-    // Durable-class on the bus, and deliberately not surface-bindable.
+#[should_panic(expected = "unbindable channel address")]
+fn an_unbindable_address_panics_at_the_capability_derivation() {
     channel_is_transportable("mqtt:topic");
+}
+
+/// An address carrying no recognized prefix is refused by the same gate: it
+/// binds to no surface either, so the kernel never reaches a capability
+/// question it cannot answer.
+#[test]
+#[should_panic(expected = "unbindable channel address")]
+fn an_unprefixed_address_panics_at_the_capability_derivation() {
+    channel_is_transportable("bare-name");
 }

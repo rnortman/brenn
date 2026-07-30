@@ -14,7 +14,7 @@ use super::*;
 use crate::core::publish_buffer::OutputSpec;
 use crate::test_support::welcome_frame_local;
 use brenn_surface_contract::{DeferError, PublishError};
-use brenn_surface_proto::{LocalChannel, NoiseLevel, OutputBinding};
+use brenn_surface_schema::{LocalChannel, NoiseLevel, OutputBinding};
 use brenn_surface_test_fixtures::FIXTURE_MAX_BODY_BYTES;
 
 /// An operator-declared confined channel — nothing about it is contract-fixed, so
@@ -53,7 +53,7 @@ fn output(channel: &str, instance: &str, port: &str) -> OutputBinding {
         channel: channel.into(),
         instance: instance.into(),
         port: port.into(),
-        urgency: brenn_surface_proto::Urgency::Normal,
+        urgency: brenn_surface_schema::Urgency::Normal,
         fill_mt: 10 * brenn_budget::MILLITOKENS_PER_PUBLISH,
         capacity_mt: 10 * brenn_budget::MILLITOKENS_PER_PUBLISH,
     }
@@ -136,7 +136,7 @@ fn shared_channel_core() -> ClientCore {
             takeover_granted: false,
             components: vec!["protobar", "sink"],
             error_report_floor: None,
-            surface_description: brenn_surface_proto::SurfaceDescription {
+            surface_description: brenn_surface_schema::SurfaceDescription {
                 status_interval_secs: 60,
             },
             local_channels: vec![local_channel(EVENTS, 4)],
@@ -427,8 +427,9 @@ fn a_deferred_publish_on_a_transportable_port_rides_the_batch_frame() {
     let sent: Vec<(String, Option<u64>)> = effects
         .iter()
         .find_map(|e| match e {
-            Effect::SendFrame(brenn_surface_proto::ClientFrame::PublishBatch {
-                publishes, ..
+            Effect::SendFrame(brenn_surface_schema::ClientFrame::PublishBatch {
+                publishes,
+                ..
             }) => Some(publishes.clone()),
             _ => None,
         })
@@ -1001,7 +1002,7 @@ fn a_rate_limited_ops_only_flush_is_retried_with_its_ops() {
     let effects = super::activation::answer(
         &mut core,
         correlation,
-        brenn_surface_proto::PublishBatchOutcome::RateLimited,
+        brenn_surface_schema::PublishBatchOutcome::RateLimited,
         Millis(80),
     );
     assert!(
@@ -1559,7 +1560,7 @@ fn parker_and_lagger_core() -> ClientCore {
             takeover_granted: false,
             components: vec!["protobar", "lagger"],
             error_report_floor: None,
-            surface_description: brenn_surface_proto::SurfaceDescription {
+            surface_description: brenn_surface_schema::SurfaceDescription {
                 status_interval_secs: 60,
             },
             local_channels: vec![local_channel(EVENTS, 2)],

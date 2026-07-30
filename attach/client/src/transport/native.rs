@@ -24,7 +24,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::{TransportConnection, TransportConnector, TransportError, TransportEvent};
 
-/// Single source of truth for the surface WS handshake auth header: sets
+/// Single source of truth for the cookie-authenticated WS handshake auth header: sets
 /// `cookie: brenn_session=<token>` on `headers`. Client-side counterpart of
 /// the backend's cookie extraction (`extract_session_cookie` in brenn's
 /// middleware). Errs when the token contains bytes invalid in a header value.
@@ -151,7 +151,7 @@ impl TransportConnection for NativeConnection {
                     // truncated teardown (which the backend would log as a
                     // protocol anomaly).
                     if let Err(err) = self.ws.flush().await {
-                        tracing::debug!(%err, "surface native transport close-reply flush failed");
+                        tracing::debug!(%err, "native transport close-reply flush failed");
                     }
                     let (code, reason) = match frame {
                         Some(frame) => (Some(u16::from(frame.code)), frame.reason.to_string()),
@@ -174,7 +174,7 @@ impl TransportConnection for NativeConnection {
         // Best-effort orderly close; a failure means the peer is already gone,
         // which the driver observes on the next transport event anyway.
         if let Err(err) = self.ws.close(None).await {
-            tracing::debug!(%err, "surface native transport close failed (peer likely gone)");
+            tracing::debug!(%err, "native transport close failed (peer likely gone)");
         }
     }
 }

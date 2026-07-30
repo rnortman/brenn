@@ -1920,7 +1920,7 @@ mod tests {
             port: port.to_string(),
             push_depth: 8,
             retain_depth: 0,
-            noise: brenn_surface_proto::NoiseLevel::Silent,
+            noise: brenn_surface_schema::NoiseLevel::Silent,
         }
     }
 

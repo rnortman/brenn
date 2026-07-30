@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use super::SubKey;
 use brenn_lib::messaging::MessageEnvelope;
-use brenn_surface_proto::DeferredViewEntry;
+use brenn_surface_schema::DeferredViewEntry;
 use chrono::{DateTime, Utc};
 use tokio::sync::{Notify, mpsc};
 use tracing::warn;

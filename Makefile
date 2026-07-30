@@ -350,7 +350,7 @@ clippy:
 #      "wasm32"))`, so --all-targets under the wasm target compiles them out and
 #      never reaches for the native-only dev-deps.
 surface-wasm-check:
-	cargo clippy $(Q) --target wasm32-unknown-unknown -p brenn-queue -p brenn-surface-kernel -p brenn-surface-component-support $(addprefix -p ,$(SURFACE_COMPONENT_CRATES)) --lib -- -D warnings
+	cargo clippy $(Q) --target wasm32-unknown-unknown -p brenn-queue -p brenn-attach-client -p brenn-surface-kernel -p brenn-surface-component-support $(addprefix -p ,$(SURFACE_COMPONENT_CRATES)) --lib -- -D warnings
 	cargo clippy $(Q) --target wasm32-unknown-unknown -p brenn-surface-kernel -p brenn-surface-component-support -p brenn-meeting --all-targets -- -D warnings
 
 # Surface browser bundles: the wasm-bindgen pipeline for the shell and every
@@ -419,7 +419,7 @@ surface-sidecar-prune:
 
 # The full Rust source closure across all built crates, tracked by content
 # (recursive find) so a module nested any depth still dirties the build stamp.
-SURFACE_WASM_SRCS := $(shell find surface/kernel/src surface/proto/src surface/component-support/src brenn-envelope/src surface/components surface/chrome/src -name '*.rs')
+SURFACE_WASM_SRCS := $(shell find attach/client/src surface/kernel/src surface/schema/src surface/component-support/src brenn-envelope/src surface/components surface/chrome/src -name '*.rs')
 
 WASM_COMPONENTS_RELEASE := $(WASM_COMPONENTS_TARGET)/wasm32-unknown-unknown/release
 # One shared cargo build produces every crate's .wasm; a stamp records it so N
@@ -498,7 +498,7 @@ wasm-bindgen-preflight:
 # including a pin bump — retriggers the rebuild instead of silently serving a
 # stale bundle.
 $(SURFACE_WASM_STAMP): $(SURFACE_WASM_SRCS) \
-      surface/kernel/Cargo.toml surface/proto/Cargo.toml surface/component-support/Cargo.toml brenn-envelope/Cargo.toml \
+      attach/client/Cargo.toml surface/kernel/Cargo.toml surface/schema/Cargo.toml surface/component-support/Cargo.toml brenn-envelope/Cargo.toml \
       $(foreach d,$(SURFACE_COMPONENT_DIRS),$(d)/Cargo.toml) \
       Cargo.toml Cargo.lock
 	CARGO_TARGET_DIR=$(WASM_COMPONENTS_TARGET) cargo build --release --target wasm32-unknown-unknown $(addprefix -p ,$(SURFACE_WASM_CRATES))

@@ -1,8 +1,9 @@
 //! Surface HTML page handler: `GET /surface/{slug}`.
 //!
 //! Serves the backend-rendered page a browser tab loads to run a surface: the
-//! two metas the kernel reads (`surface-slug`, `brenn-build-id`), the component
-//! module manifest the TS bootstrap consumes, the kernel stylesheet, the kernel
+//! three metas the kernel reads (`surface-slug`, `brenn-build-id`,
+//! `surface-config-channel`), the component module manifest the TS bootstrap
+//! consumes, the kernel stylesheet, the kernel
 //! DOM root, and the bootstrap script. Pre-render checks (unknown slug → 404,
 //! denied user → 403) mirror the WS handler so the same fail2ban signal flows
 //! from both surface entry points.
@@ -15,7 +16,7 @@ use brenn_lib::auth::session::Session;
 use brenn_surface_contract::{
     KERNEL_ARTIFACT, SURFACE_ROOT_ID, module_artifact, processor_module_path,
 };
-use brenn_surface_proto::Abi;
+use brenn_surface_schema::Abi;
 use serde::Serialize;
 
 use super::authorize_surface;
@@ -59,7 +60,7 @@ struct ManifestComponent {
 /// per instance. Forcing extra evaluations would only duplicate glue.
 ///
 /// The reserved ABIs never reach here — `resolve_abi` panics on them at boot.
-fn module_url(entry: &brenn_surface_proto::ComponentEntry, build_id: &str) -> String {
+fn module_url(entry: &brenn_surface_schema::ComponentEntry, build_id: &str) -> String {
     match entry.abi {
         Abi::Dom => format!(
             "/surface-static/{}?v={build_id}&instance={}",
@@ -146,6 +147,8 @@ pub async fn surface_page(
 
     let slug_escaped = html_escape(&slug);
     let build_id_escaped = html_escape(build_id);
+    // Underivable client-side: the address hangs off the operator's channel prefix.
+    let config_channel_escaped = html_escape(&runtime.description.config_channel);
 
     let mut response = page_html(format!(
         r#"<!DOCTYPE html>
@@ -155,6 +158,7 @@ pub async fn surface_page(
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="surface-slug" content="{slug_escaped}">
     <meta name="brenn-build-id" content="{build_id_escaped}">
+    <meta name="surface-config-channel" content="{config_channel_escaped}">
     <title>Brenn — {slug_escaped}</title>
     <script type="application/json" id="brenn-surface-manifest">{manifest_json}</script>
     <link rel="stylesheet" href="/static/surface.css?v={build_id}">
@@ -289,6 +293,12 @@ mod tests {
                 r#"<meta name="brenn-build-id" content="{TEST_BUILD_ID}">"#
             )),
             "missing brenn-build-id meta: {body}"
+        );
+        assert!(
+            body.contains(
+                r#"<meta name="surface-config-channel" content="ephemeral:surface.surface.deskbar.bindings">"#
+            ),
+            "missing surface-config-channel meta: {body}"
         );
         // Manifest: kernel + the echo-stub module by the naming convention,
         // build-ID-stamped, with the per-instance `?instance=` specifier that

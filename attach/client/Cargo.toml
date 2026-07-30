@@ -1,0 +1,44 @@
+[package]
+name = "brenn-attach-client"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Brenn attachment client — the attacher-generic half of a bus attachment: transport shims, connection machinery, and the time currency the sans-I/O layers are driven with"
+
+[dependencies]
+tracing = "0.1.44"
+futures-util = "0.3.32"
+# Version-unified with brenn-envelope, whose `DateTime<Utc>` the wall clock
+# produces. `clock` (hence `Utc::now`) is enabled natively only; the browser
+# reads `Date.now()` through the wasm shim instead.
+chrono = { version = "0.4.44", default-features = false, features = ["serde", "alloc"] }
+
+# Native transport: tokio-tungstenite must stay version-unified with the
+# backend's tungstenite pin (brenn/Cargo.toml) so the shared WS types agree.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.50.0", features = ["rt", "time", "net", "macros"] }
+tokio-tungstenite = "0.29.0"
+# Powers the native `wall_now()`. Deliberately not enabled for wasm: chrono's
+# `wasmbind` would reach for `Date.now()` behind our back, hiding the browser's
+# wall-clock read from the transport shim that is supposed to own it.
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
+
+# Browser transport: the WebSocket API adapted to the async transport trait,
+# `performance.now()`/`Date.now()` clocks, and `setTimeout` as a future.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+futures-channel = { workspace = true }
+web-sys = { workspace = true, features = [
+    "WebSocket",
+    "MessageEvent",
+    "CloseEvent",
+    "ErrorEvent",
+    "BinaryType",
+    "Window",
+    "Performance",
+] }
+
+# Native transport tests drive a real loopback WebSocket server.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1.50.0", features = ["rt", "time", "net", "macros", "test-util"] }

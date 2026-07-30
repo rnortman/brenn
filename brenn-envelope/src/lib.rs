@@ -278,6 +278,35 @@ impl ChannelScheme {
     }
 }
 
+/// The capability set the channel at `address` carries, or `None` when the
+/// address carries no recognized prefix or names an egress-only target
+/// (`pwa_push:`).
+///
+/// The address-string spelling of [`ChannelScheme::capabilities`], for the many
+/// callers that hold an address rather than a scheme. Every retention, delivery
+/// and publish path branches on the capabilities read from here, never on a
+/// scheme name — one derivation, so a scheme addition has one call shape to
+/// find.
+pub fn channel_capabilities(address: &str) -> Option<ChannelCapabilities> {
+    ChannelScheme::of(address)?.capabilities()
+}
+
+/// Whether `address` names a confined channel — one whose messages never leave
+/// the host that holds them (`local:`).
+///
+/// The single spelling of "does this stay put?", shared by every host of a
+/// confined realm: a page's router, a future daemon's, and the server code that
+/// excludes confined bindings from every wire map. Derived from the address's
+/// capabilities rather than its scheme name, because confinement is the
+/// property being asked about.
+///
+/// A transportable scheme, an unrecognized prefix, and an egress-only target
+/// all answer `false`: this is a positive identification, not a
+/// classification, so it never panics and never speaks for the other classes.
+pub fn is_local_channel(address: &str) -> bool {
+    channel_capabilities(address).is_some_and(|caps| !caps.transportable)
+}
+
 // ---------------------------------------------------------------------------
 // WebhookEnvelope
 // ---------------------------------------------------------------------------
@@ -290,7 +319,7 @@ impl ChannelScheme {
 ///
 /// Credential-bearing header values are masked to `"[redacted]"` at
 /// envelope construction time (after signature verification) so the
-/// LLM-visible JSON never carries live secrets. See design §2.2.
+/// LLM-visible JSON never carries live secrets.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WebhookEnvelope {
     /// HTTP request headers as ordered key-value pairs (header names lowercased).
@@ -763,6 +792,49 @@ mod tests {
                 scheme.capabilities().is_none(),
                 scheme == ChannelScheme::PwaPush,
                 "{scheme:?}: pwa_push: is the only egress-only scheme"
+            );
+        }
+    }
+
+    /// The address-string helper answers exactly what the scheme it classifies
+    /// answers, for every scheme, and `None` for an address carrying no
+    /// recognized prefix.
+    #[test]
+    fn channel_capabilities_follows_the_address_scheme() {
+        for scheme in ChannelScheme::ALL {
+            let address = format!("{}some/name", scheme.prefix());
+            assert_eq!(
+                channel_capabilities(&address),
+                scheme.capabilities(),
+                "{scheme:?}: address helper disagrees with its scheme"
+            );
+        }
+        assert_eq!(channel_capabilities("bare"), None);
+        assert_eq!(channel_capabilities(""), None);
+    }
+
+    /// `is_local_channel` is the confined-capability reading of an address, not
+    /// a scheme-name check.
+    ///
+    /// Pinned to literals rather than re-derived from `channel_capabilities`:
+    /// re-deriving the expectation from the same helper the function calls
+    /// would assert only that the two agree, which a wrong reading of
+    /// capabilities satisfies as well as the right one.
+    #[test]
+    fn is_local_channel_tracks_confinement() {
+        for (address, expected) in [
+            ("brenn:orders", false),
+            ("ephemeral:protobar", false),
+            ("local:brenn/theme", true),
+            ("mqtt:topic", false),
+            ("webhook:hook", false),
+            ("pwa_push:target", false),
+            ("bare", false),
+        ] {
+            assert_eq!(
+                is_local_channel(address),
+                expected,
+                "{address}: unexpected confinement reading"
             );
         }
     }

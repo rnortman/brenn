@@ -1,11 +1,15 @@
 //! Per-target entropy shim: the single `seed()` the handle uses to seed the
 //! core's backoff-jitter PRNG.
 //!
-//! Confined to the transport layer so the core and driver carry no `cfg` logic,
-//! following the same shape as [`clock`](crate::transport::clock). The seed only
-//! needs to be **distinct per client** so a fleet reconnecting in lockstep after
-//! a deploy restart decorrelates its reconnects — it is load-spreading entropy,
-//! never a secret, so neither source needs to be cryptographically strong.
+//! Crate-private and deliberately not part of the attach client's public shim
+//! set: the seed source is non-cryptographic (`Math.random` / `RandomState`
+//! hash), so an inviting `entropy::seed` reachable by out-of-tree kernels is
+//! exactly what a future author would grab for a nonce or token. It is confined
+//! here so the core and driver carry no `cfg` logic, the same shape as the
+//! attach client's clock and timer shims. The seed only needs to be **distinct
+//! per client** so a fleet reconnecting in lockstep after a deploy restart
+//! decorrelates its reconnects — it is load-spreading entropy, never a secret,
+//! so neither source needs to be cryptographically strong.
 
 /// A per-construction seed for the backoff-jitter PRNG. Distinct across clients
 /// (that is the whole requirement); not a secret and not cryptographically

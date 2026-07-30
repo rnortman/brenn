@@ -947,7 +947,7 @@ export function processorStartInstances(
 
 /**
  * The kernel-to-bootstrap seam events, dispatched by the kernel on `window`.
- * Mirrored from the frozen contract (`brenn_surface_proto::contract`); the
+ * Mirrored from the frozen contract (`brenn_surface_schema::contract`); the
  * bootstrap imports no Rust or generated types, so the names live here as
  * literals kept in step with that contract.
  */

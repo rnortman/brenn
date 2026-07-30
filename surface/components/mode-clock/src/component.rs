@@ -20,7 +20,7 @@ use brenn_surface_component_support::{
     Activation, MAX_WAKEUP_MS, PersistentTimer, Publisher, boot, claim_initialized,
     clamp_timeout_ms, component_log, publish, read_now_utc, register_component,
 };
-use brenn_surface_proto::{CONTROL_PLANE_VERSION, LogLevel, ThemeBody};
+use brenn_surface_schema::{CONTROL_PLANE_VERSION, LogLevel, ThemeBody};
 use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::HtmlElement;
 

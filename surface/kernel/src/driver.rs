@@ -39,9 +39,9 @@ use crate::handle::{
     ActivationEntry, AlertCommand, DriverChannels, HandleCommand, PublishCommand, PublishGate,
     TelemetryCommand,
 };
-use crate::transport::clock::{Clock, wall_now};
-use crate::transport::timer;
-use crate::transport::{TransportConnection, TransportConnector, TransportEvent};
+use brenn_attach_client::transport::clock::{Clock, wall_now};
+use brenn_attach_client::transport::timer;
+use brenn_attach_client::{TransportConnection, TransportConnector, TransportEvent};
 
 /// Read the non-deterministic values an envelope needs and hand them to the core
 /// as data — the same move as stamping `Clock::now()` on every input, and for the
@@ -1151,7 +1151,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use brenn_surface_proto::{
+    use brenn_surface_schema::{
         AlertSeverity, Binding, ClientFrame, InstanceReport, InstanceState, LogLevel,
         OutputBinding, StatusCounters, Urgency,
     };
@@ -1159,7 +1159,7 @@ mod tests {
     use crate::test_support::cfg;
     use futures_util::StreamExt;
 
-    use crate::transport::TransportError;
+    use brenn_attach_client::TransportError;
 
     /// The invocation boundary classifies what an entry did *and* recovers what
     /// it said. A panic's message is the operator's only account of a trap — the
@@ -1238,7 +1238,7 @@ mod tests {
                 port: "messages".into(),
                 push_depth: TEST_PUSH_DEPTH,
                 retain_depth: TEST_RETAIN_DEPTH,
-                noise: brenn_surface_proto::NoiseLevel::Silent,
+                noise: brenn_surface_schema::NoiseLevel::Silent,
             }],
             vec![],
         )
@@ -1254,7 +1254,7 @@ mod tests {
             port: "messages".into(),
             push_depth: TEST_PUSH_DEPTH,
             retain_depth: TEST_RETAIN_DEPTH,
-            noise: brenn_surface_proto::NoiseLevel::Silent,
+            noise: brenn_surface_schema::NoiseLevel::Silent,
         }])
     }
 
@@ -1269,7 +1269,7 @@ mod tests {
                 port: "messages".into(),
                 push_depth: TEST_PUSH_DEPTH,
                 retain_depth: TEST_RETAIN_DEPTH,
-                noise: brenn_surface_proto::NoiseLevel::Silent,
+                noise: brenn_surface_schema::NoiseLevel::Silent,
             }],
             components: vec!["protobar"],
             ..Default::default()
@@ -1287,7 +1287,7 @@ mod tests {
                     port: "messages".into(),
                     push_depth: TEST_PUSH_DEPTH,
                     retain_depth: TEST_RETAIN_DEPTH,
-                    noise: brenn_surface_proto::NoiseLevel::Silent,
+                    noise: brenn_surface_schema::NoiseLevel::Silent,
                 },
                 Binding {
                     channel: "ephemeral:demo2".into(),
@@ -1295,7 +1295,7 @@ mod tests {
                     port: "other".into(),
                     push_depth: TEST_PUSH_DEPTH,
                     retain_depth: TEST_RETAIN_DEPTH,
-                    noise: brenn_surface_proto::NoiseLevel::Silent,
+                    noise: brenn_surface_schema::NoiseLevel::Silent,
                 },
             ],
             vec![],
@@ -1330,7 +1330,7 @@ mod tests {
                 port: "messages".into(),
                 push_depth: TEST_PUSH_DEPTH,
                 retain_depth: TEST_RETAIN_DEPTH,
-                noise: brenn_surface_proto::NoiseLevel::Silent,
+                noise: brenn_surface_schema::NoiseLevel::Silent,
             }],
             vec![OutputBinding {
                 channel: "ephemeral:demo".into(),
@@ -1768,7 +1768,7 @@ mod tests {
         // which is terminal — no reconnect.
         server
             .unbounded_send(TransportEvent::Closed {
-                code: Some(brenn_surface_proto::STALE_BUILD_CLOSE_CODE),
+                code: Some(brenn_surface_schema::STALE_BUILD_CLOSE_CODE),
                 reason: "server-build-42".into(),
             })
             .unwrap();
@@ -1847,7 +1847,7 @@ mod tests {
 
         server
             .unbounded_send(TransportEvent::Closed {
-                code: Some(brenn_surface_proto::STALE_BUILD_CLOSE_CODE),
+                code: Some(brenn_surface_schema::STALE_BUILD_CLOSE_CODE),
                 reason: "server-build-42".into(),
             })
             .unwrap();
@@ -1976,7 +1976,7 @@ mod tests {
                     port: "messages".into(),
                     push_depth: 1,
                     retain_depth: 1,
-                    noise: brenn_surface_proto::NoiseLevel::Fatal,
+                    noise: brenn_surface_schema::NoiseLevel::Fatal,
                 }],
                 components: vec!["protobar"],
                 alert_granted: true,
@@ -2068,7 +2068,7 @@ mod tests {
                     port: "in".into(),
                     push_depth: 8,
                     retain_depth: 1,
-                    noise: brenn_surface_proto::NoiseLevel::Silent,
+                    noise: brenn_surface_schema::NoiseLevel::Silent,
                 }],
                 outputs: vec![OutputBinding {
                     channel: "local:boot".into(),
@@ -2079,7 +2079,7 @@ mod tests {
                     capacity_mt: generous,
                 }],
                 components: vec!["protobar"],
-                local_channels: vec![brenn_surface_proto::LocalChannel {
+                local_channels: vec![brenn_surface_schema::LocalChannel {
                     channel: "local:boot".into(),
                     ring_depth: 1,
                 }],
@@ -2173,7 +2173,7 @@ mod tests {
                     port: "in".into(),
                     push_depth: 8,
                     retain_depth: 0,
-                    noise: brenn_surface_proto::NoiseLevel::Silent,
+                    noise: brenn_surface_schema::NoiseLevel::Silent,
                 }],
                 outputs: vec![OutputBinding {
                     channel: "local:loop".into(),
@@ -2184,7 +2184,7 @@ mod tests {
                     capacity_mt: generous,
                 }],
                 components: vec!["protobar"],
-                local_channels: vec![brenn_surface_proto::LocalChannel {
+                local_channels: vec![brenn_surface_schema::LocalChannel {
                     channel: "local:loop".into(),
                     ring_depth: 1,
                 }],
@@ -2268,7 +2268,7 @@ mod tests {
                     port: "in".into(),
                     push_depth: 8,
                     retain_depth: 0,
-                    noise: brenn_surface_proto::NoiseLevel::Silent,
+                    noise: brenn_surface_schema::NoiseLevel::Silent,
                 }],
                 outputs: vec![
                     OutputBinding {
@@ -2290,7 +2290,7 @@ mod tests {
                     },
                 ],
                 components: vec!["protobar"],
-                local_channels: vec![brenn_surface_proto::LocalChannel {
+                local_channels: vec![brenn_surface_schema::LocalChannel {
                     channel: "local:kick".into(),
                     ring_depth: 1,
                 }],
@@ -2333,9 +2333,9 @@ mod tests {
         // Refuse it. Nothing else will ever be fed to this driver.
         server
             .unbounded_send(TransportEvent::Text(
-                serde_json::to_string(&brenn_surface_proto::ServerFrame::PublishBatchResult {
+                serde_json::to_string(&brenn_surface_schema::ServerFrame::PublishBatchResult {
                     correlation: first,
-                    outcome: brenn_surface_proto::PublishBatchOutcome::RateLimited,
+                    outcome: brenn_surface_schema::PublishBatchOutcome::RateLimited,
                 })
                 .unwrap(),
             ))
@@ -2482,7 +2482,7 @@ mod tests {
                 ..
             } => assert_eq!(
                 surface_description,
-                brenn_surface_proto::SurfaceDescription {
+                brenn_surface_schema::SurfaceDescription {
                     status_interval_secs: 60,
                 }
             ),

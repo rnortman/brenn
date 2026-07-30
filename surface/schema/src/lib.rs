@@ -1,16 +1,19 @@
-//! Brenn surface WS wire protocol types.
+//! Brenn surface application schemas.
 //!
-//! This crate holds the frames and shared contract constants for the surface
-//! WebSocket protocol (`/surface/{slug}/ws`). Both ends compile against it: the
-//! Rust/Axum backend and the `brenn-surface-kernel` crate (which builds to
+//! This crate holds the payload schemas of the surface application layer — the
+//! [`bindings`] document a surface learns its wiring from, the reserved
+//! `local:brenn/*` control-plane bodies, the layout document, and the shared
+//! contract constants — plus the surface WebSocket frames
+//! (`/surface/{slug}/ws`). Both ends compile against it: the Rust/Axum backend
+//! and the `brenn-surface-kernel` crate (which builds to
 //! `wasm32-unknown-unknown` for the kernel and to native for tests). It is kept
 //! free of I/O, tokio, and host-only dependencies so the wasm build stays
-//! clean — the only dependencies are `serde`, `uuid`, and `brenn-envelope`
-//! (itself wasm-clean).
+//! clean — the only dependencies are `serde`, `serde_json`, `uuid`, and
+//! `brenn-envelope` (itself wasm-clean).
 //!
 //! **No runtime version skew.** The build-ID handshake rejects any client whose
 //! build differs from the server's, so both ends of a live connection always
-//! compiled the same `brenn-surface-proto`. Frame-shape stability across
+//! compiled the same `brenn-surface-schema`. Frame-shape stability across
 //! development steps protects *sequencing* — clients built against an earlier
 //! step keep compiling as the backend grows — not runtime negotiation. A binary
 //! or negotiated-version encoding, if ever wanted, is a separate protocol
@@ -32,7 +35,7 @@
 
 use std::collections::BTreeMap;
 
-use brenn_envelope::{ChannelCapabilities, ChannelScheme, MessageEnvelope};
+use brenn_envelope::{ChannelScheme, MessageEnvelope};
 use chrono::{DateTime, Utc};
 
 /// The RFC 8030 urgency ladder, re-exported from the carrier crate.
@@ -46,6 +49,7 @@ pub use brenn_envelope::Urgency;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod bindings;
 pub mod layout;
 
 /// Which toolchain artifact backs a component instance, and how the kernel loads
@@ -876,40 +880,18 @@ pub fn surface_bindable(scheme: ChannelScheme) -> bool {
     }
 }
 
-/// The capability set a surface-bound channel address carries, or `None` when
-/// the address carries no recognized prefix, names a scheme that does not bind
-/// to a surface, or names no pub/sub channel at all.
+/// Whether the channel at `channel` binds to a surface: the address-string
+/// spelling of [`surface_bindable`], `false` for an address carrying no
+/// recognized prefix.
 ///
-/// The page's single capability-derivation point, and the only place either end
-/// of the surface wire may ask what a channel class *does*: retention, delivery
-/// and publish paths all branch on
-/// [`ChannelCapabilities::transportable`](brenn_envelope::ChannelCapabilities)
-/// read from here, never on a scheme. Bindability is the separate question
-/// [`surface_bindable`] answers, which is why this composes with it rather than
-/// replacing it.
-pub fn channel_capabilities(channel: &str) -> Option<ChannelCapabilities> {
-    let scheme = ChannelScheme::of(channel)?;
-    surface_bindable(scheme)
-        .then(|| scheme.capabilities())
-        .flatten()
-}
-
-/// Whether `channel` names a page-local (`local:`) channel.
-///
-/// The single spelling of "does this address stay in the page?", shared by both
-/// ends of the surface wire: the client branches its subscribe/publish/resume
-/// paths on it, and the server excludes local bindings from every wire map on
-/// it. One question, one derivation — a scheme addition or a change of answer
-/// has one call shape to find.
-///
-/// A non-local scheme, an unrecognized prefix, and a scheme that does not bind
-/// to a surface all answer `false`: this is a positive identification, not a
-/// classification, so it never panics and never speaks for the other classes.
-pub fn is_local_channel(channel: &str) -> bool {
-    // Among the surface-bindable schemes, not-transportable is exactly
-    // `local:` — the confined page realm, which is the identity this predicate
-    // wants rather than the scheme's name.
-    channel_capabilities(channel).is_some_and(|caps| !caps.transportable)
+/// The gate every surface-side classifier of an address runs first. What a
+/// channel class *does* — retention, transportability — is the bus's question,
+/// answered by [`channel_capabilities`](brenn_envelope::channel_capabilities);
+/// whether a surface may bind it at all is this one, and the two compose rather
+/// than fusing. Fusing them would answer `None` for `mqtt:`, which is a durable
+/// transportable channel that simply is not a surface transport.
+pub fn surface_bindable_address(channel: &str) -> bool {
+    ChannelScheme::of(channel).is_some_and(surface_bindable)
 }
 
 // ---------------------------------------------------------------------------
@@ -1196,7 +1178,7 @@ pub fn is_reserved_local_namespace(address: &str) -> bool {
 /// Value::String(s))`, read via matching `serde_json::to_value(&cursor)` for a
 /// `Value::String`).
 ///
-/// Interpretation code lives in `brenn-server`, never here: `surface/proto`
+/// Interpretation code lives in `brenn-server`, never here: `surface/schema`
 /// links into the wasm surface client, so any code in this crate — even
 /// never-called interpretation code — executes on the surface. Moving a
 /// durable-vs-ephemeral branch into another crate changes which file holds the
@@ -1397,6 +1379,7 @@ pub const MAX_SURFACE_SUBSCRIPTION_BINDINGS: usize = 64;
 
 #[cfg(test)]
 mod tests {
+    use brenn_envelope::ChannelCapabilities;
 
     // ── reserved control-plane payloads ──────────────────────────────────────
 
@@ -1490,25 +1473,28 @@ mod tests {
 
     // ── Surface bindability ───────────────────────────────────────────────
 
-    /// The capability table, row by row. Every retention and delivery decision on
-    /// either end of the surface wire branches on `transportable` read from here,
-    /// and which store key a channel's retention lands in follows from it — so a
-    /// row silently changing its answer would move a channel between retention
-    /// models. `None` is load-bearing too: an address that classifies as nothing
-    /// is a kernel bug the kernel panics on, which only holds while these stay
-    /// `None`.
+    /// The bindability table, row by row, at the address grain the gate sites
+    /// use. A row silently changing its answer would admit a channel class the
+    /// surface cannot route (or refuse one it can), so the literals are the
+    /// pin.
     #[test]
-    fn channel_capabilities_by_scheme() {
-        let caps =
-            |channel: &str| channel_capabilities(channel).map(|c| (c.durable, c.transportable));
-        assert_eq!(caps("brenn:orders"), Some((true, true)));
-        assert_eq!(caps("ephemeral:protobar"), Some((false, true)));
-        assert_eq!(caps("local:brenn/theme"), Some((false, false)));
-        // Non-surface schemes and garbage carry no capabilities here.
-        assert_eq!(caps("mqtt:topic"), None);
-        assert_eq!(caps("webhook:hook"), None);
-        assert_eq!(caps("pwa_push:target"), None);
-        assert_eq!(caps("bare"), None);
+    fn surface_bindable_address_by_scheme() {
+        for (channel, expected) in [
+            ("brenn:orders", true),
+            ("ephemeral:protobar", true),
+            ("local:brenn/theme", true),
+            ("mqtt:topic", false),
+            ("webhook:hook", false),
+            ("pwa_push:target", false),
+            ("bare", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                surface_bindable_address(channel),
+                expected,
+                "{channel}: unexpected surface bindability"
+            );
+        }
     }
 
     /// `mqtt:`/`webhook:` are durable and transportable on the bus yet do not
@@ -1523,36 +1509,12 @@ mod tests {
                 scheme.capabilities(),
                 Some(ChannelCapabilities::DURABLE_TRANSPORTABLE)
             );
-            // Bindability gates the surface helper, so the same durable scheme
-            // carries no capabilities *here*.
-            assert_eq!(channel_capabilities(scheme.prefix()), None);
-        }
-    }
-
-    /// `is_local_channel` is the confined-capability reading of an address, not
-    /// a scheme-name check: it must answer `true` for exactly the addresses
-    /// whose capabilities are non-transportable, and `false` for every address
-    /// that classifies as nothing here.
-    ///
-    /// Pinned to literals rather than to `channel_capabilities`: re-deriving the
-    /// expectation from the same helper the function calls would assert only
-    /// that the two agree, which is true of a wrong reading of capabilities as
-    /// much as the right one.
-    #[test]
-    fn is_local_channel_tracks_confinement() {
-        for (channel, expected) in [
-            ("brenn:orders", false),
-            ("ephemeral:protobar", false),
-            ("local:brenn/theme", true),
-            ("mqtt:topic", false),
-            ("webhook:hook", false),
-            ("pwa_push:target", false),
-            ("bare", false),
-        ] {
+            // The bus answers what the channel does; the surface answers
+            // whether it may bind it. A gate site composes the two.
+            assert!(!surface_bindable_address(scheme.prefix()));
             assert_eq!(
-                is_local_channel(channel),
-                expected,
-                "{channel}: local-ness must be the confined-capability reading"
+                brenn_envelope::channel_capabilities(scheme.prefix()),
+                Some(ChannelCapabilities::DURABLE_TRANSPORTABLE)
             );
         }
     }

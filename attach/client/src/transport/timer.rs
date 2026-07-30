@@ -24,7 +24,7 @@ pub async fn sleep(duration: Duration) {
     use wasm_bindgen::closure::Closure;
 
     let millis = duration.as_millis().min(i32::MAX as u128) as i32;
-    let window = web_sys::window().expect("surface kernel requires a Window global");
+    let window = web_sys::window().expect("browser attacher requires a Window global");
     let (tx, rx) = futures_channel::oneshot::channel::<()>();
     let callback = Closure::once(move || {
         let _ = tx.send(());

@@ -6,7 +6,7 @@
 //! their own crate because they are the seam: contract surface as load-bearing
 //! as the wire frames, which both the kernel and every component crate compile
 //! against, and which out-of-tree component authors depend on directly. The wire
-//! frames themselves are `brenn-surface-proto`; this crate depends on it for the
+//! frames themselves are `brenn-surface-schema`; this crate depends on it for the
 //! types the seam's details carry as JSON strings, never the other way round.
 //!
 //! Envelopes cross the kernel↔component boundary as CustomEvents carrying JSON
@@ -32,7 +32,7 @@
 //! A component instance's `abi` is a **build/loading fact only** — which
 //! toolchain artifact the kernel loads and how. It is never an execution mode and
 //! never a capability statement; hosting eligibility is the import profile
-//! above. The set (`brenn_surface_proto::Abi`):
+//! above. The set (`brenn_surface_schema::Abi`):
 //!
 //! - `dom` — a wasm-bindgen module defining a custom element, speaking the seam
 //!   this crate defines. Imports DOM capability via wasm-bindgen/web-sys, hence
@@ -150,7 +150,7 @@
 //!   from the retargeted `event.target` at the delegated `#surface-root`
 //!   listener. `detail = { level, message }`; `level` is a lowercase log-level
 //!   wire string (`"trace"`…`"error"`, see
-//!   [`brenn_surface_proto::LogLevel::from_wire_str`]) fixed at the component
+//!   [`brenn_surface_schema::LogLevel::from_wire_str`]) fixed at the component
 //!   call site, `message` a string. The kernel stamps `source =
 //!   "component:<kind>"` and forwards a `Log` frame; a missing/non-string field
 //!   or an unrecognized `level` is dropped and reported as malformed rather than
@@ -161,7 +161,7 @@
 //!   component identity from the retargeted `event.target`. `detail =
 //!   { severity, title, body }`; `severity` is a lowercase alert-severity wire
 //!   string (`"info"`/`"warning"`/`"critical"`, see
-//!   [`brenn_surface_proto::AlertSeverity::from_wire_str`]) fixed at the
+//!   [`brenn_surface_schema::AlertSeverity::from_wire_str`]) fixed at the
 //!   component call site, `title`/`body` strings. Forwarded as an `Alert` frame
 //!   **only** on an alert-granted surface; on an ungranted surface the kernel
 //!   drops it and logs a `warn` breadcrumb naming the component, never sending
@@ -237,7 +237,7 @@
 //! machinery behind it lands:
 //!
 //! - **`local:brenn/*` control channels** — exhaustively enumerated by
-//!   [`brenn_surface_proto::RESERVED_LOCAL_CHANNELS`]; a `local:brenn/*` address
+//!   [`brenn_surface_schema::RESERVED_LOCAL_CHANNELS`]; a `local:brenn/*` address
 //!   absent from that table is undefined vocabulary and boot rejects it.
 //! - **`<prefix>.surface.<slug>.instance.<name>.config`** — the future
 //!   per-instance runtime config channel. The address builder exists and its
@@ -594,7 +594,7 @@ pub fn parse_defer_status(status: &str) -> Option<Result<(), DeferError>> {
 ///
 /// `urgency` is optional: a lowercase RFC 8030 urgency wire string
 /// (`"very-low"`/`"low"`/`"normal"`/`"high"`, parsed by
-/// [`brenn_surface_proto::Urgency::parse`]), the component's per-message
+/// [`brenn_surface_schema::Urgency::parse`]), the component's per-message
 /// override. Absent ⇒ the port's configured default applies, which the server
 /// resolves. An unrecognized value is dropped and reported as malformed rather
 /// than coerced — same rule as every other enum-valued detail field on this seam
@@ -638,7 +638,7 @@ pub const PORT_DEFER: &str = "brenn-port-defer";
 /// Component → kernel. Same dispatch rule as [`PORT_PUBLISH`] (`bubbles: true,
 /// composed: true`, on the mounted element or from within its shadow root).
 /// `detail = { level, message }` where `level` is a lowercase log-level wire
-/// string (see [`brenn_surface_proto::LogLevel::from_wire_str`]) and `message` a
+/// string (see [`brenn_surface_schema::LogLevel::from_wire_str`]) and `message` a
 /// string.
 pub const COMPONENT_LOG: &str = "brenn-log";
 
@@ -646,7 +646,7 @@ pub const COMPONENT_LOG: &str = "brenn-log";
 /// composed: true`, on the mounted element or from within its shadow root).
 /// `detail = { severity, title, body }` where `severity` is a lowercase
 /// alert-severity wire string (see
-/// [`brenn_surface_proto::AlertSeverity::from_wire_str`]) and `title`/`body` are
+/// [`brenn_surface_schema::AlertSeverity::from_wire_str`]) and `title`/`body` are
 /// strings. Forwarded as an `Alert` frame only on an alert-granted surface.
 pub const COMPONENT_ALERT: &str = "brenn-alert";
 
@@ -751,7 +751,7 @@ pub fn processor_module_path(kind: &str) -> String {
 
 /// Reserved instance id addressing the kernel's error-report output port. A
 /// surface error report rides an ordinary
-/// [`brenn_surface_proto::ClientFrame::Publish`] to `(ERROR_REPORT_INSTANCE,
+/// [`brenn_surface_schema::ClientFrame::Publish`] to `(ERROR_REPORT_INSTANCE,
 /// ERROR_REPORT_PORT)`. The `#` prefix makes the id operator-unusable — it can
 /// never satisfy [`is_valid_kind`], the charset every configured instance id is
 /// boot-validated against — so the reservation cannot collide with a configured

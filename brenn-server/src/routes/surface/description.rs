@@ -34,6 +34,7 @@ use brenn_lib::messaging::{
     ChannelScheme, MessagingDirectory, Messenger, PublishResult, Urgency, is_unreserved_char,
 };
 use brenn_surface_contract::module_artifact;
+use brenn_surface_schema::bindings::{STATUS_INTERVAL_SECS_MAX, STATUS_INTERVAL_SECS_MIN};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -42,6 +43,13 @@ use super::{ExpectedWriter, SingleWriterPrincipals, assert_channel_single_writer
 /// System-participant component name of the boot description publisher; its
 /// identity is `system:surface-help`.
 pub const SURFACE_HELP_COMPONENT: &str = "surface-help";
+
+/// System-participant component name of the boot bindings-document publisher;
+/// its identity is `system:surface-config`. Separate from the help publisher so
+/// each holds exactly its own channel family: the help identity writes durable
+/// documents an LLM reads, this one writes the ephemeral config document a
+/// surface boots from.
+pub const SURFACE_CONFIG_COMPONENT: &str = "surface-config";
 
 /// Body-schema version stamped on every document (`v: 1`).
 const SCHEMA_VERSION: u32 = 1;
@@ -78,6 +86,12 @@ pub fn surface_status_bare(prefix: &str, slug: &str) -> String {
     format!("{prefix}.surface.{slug}.status")
 }
 
+/// `<prefix>.surface.<slug>.bindings` — the surface's config channel, carrying
+/// its retained bindings document.
+pub fn surface_config_bare(prefix: &str, slug: &str) -> String {
+    format!("{prefix}.surface.{slug}.bindings")
+}
+
 /// `<prefix>.kind.<kind>.help`.
 pub fn kind_help_bare(prefix: &str, kind: &str) -> String {
     format!("{prefix}.kind.{kind}.help")
@@ -90,12 +104,11 @@ pub fn kind_schema_bare(prefix: &str, kind: &str) -> String {
 
 /// `<prefix>.surface.<slug>.instance.<name>.config` — **reserved, unbuilt.**
 ///
-/// The name §9 pins for future runtime per-instance config delivery. Nothing
-/// publishes it, no `[[channel]]` declares it, and no machinery special-cases
-/// it; declaring a binding on this address today takes the ordinary
-/// unknown-channel path. This builder exists so the grammar is fixed (pinned by
-/// test) and cannot collide with any boot-published address for overlapping
-/// slug/name values.
+/// Reserved for future runtime per-instance config delivery. Nothing publishes
+/// it, no `[[channel]]` declares it, and no machinery special-cases it;
+/// declaring a binding on this address today takes the ordinary unknown-channel
+/// path. This builder exists so the grammar is fixed (pinned by test) and cannot
+/// collide with any boot-published address for overlapping slug/name values.
 #[allow(
     dead_code,
     reason = "reserved-unbuilt name (§9); no production caller by design"
@@ -107,6 +120,19 @@ pub fn instance_config_bare(prefix: &str, slug: &str, name: &str) -> String {
 /// Add the `brenn:` scheme to a derived bare name.
 fn with_scheme(bare: String) -> String {
     format!("brenn:{bare}")
+}
+
+/// `ephemeral:<prefix>.surface.<slug>.bindings` — the surface's config channel.
+///
+/// The one `ephemeral:` member of the derived family. The bindings document is
+/// rebuilt from config at every boot, so durable persistence would only preserve
+/// a stale document the next boot is about to overwrite.
+pub fn surface_config_channel(prefix: &str, slug: &str) -> String {
+    format!(
+        "{}{}",
+        ChannelScheme::Ephemeral.prefix(),
+        surface_config_bare(prefix, slug)
+    )
 }
 
 /// `brenn:<prefix>.index`.
@@ -201,7 +227,27 @@ pub fn boot_published_bare_channels(prefix: &str, surfaces: &[ResolvedSurface]) 
 /// `MessagingPublish` + one exact-match `brenn_publish` ACL per derived
 /// boot-published channel, no subscriptions. Code-built; no config produces it.
 pub fn surface_help_spec(bare_channels: &[String]) -> SystemParticipantSpec {
-    SystemParticipantSpec::publish_only(SURFACE_HELP_COMPONENT, bare_channels)
+    SystemParticipantSpec::publish_only(SURFACE_HELP_COMPONENT, ChannelScheme::Brenn, bare_channels)
+}
+
+/// Every surface's config channel, as bare names — the publisher spec's
+/// exact-match `ephemeral_publish` ACL and the single-writer sweep's input.
+pub fn surface_config_bare_channels(prefix: &str, surfaces: &[ResolvedSurface]) -> Vec<String> {
+    surfaces
+        .iter()
+        .map(|s| surface_config_bare(prefix, &s.slug))
+        .collect()
+}
+
+/// The `system:surface-config` participant spec: publish-only, granted exactly
+/// `EphemeralPublish` + one exact-match `ephemeral_publish` ACL per surface
+/// config channel, no subscriptions. Code-built; no config produces it.
+pub fn surface_config_spec(bare_channels: &[String]) -> SystemParticipantSpec {
+    SystemParticipantSpec::publish_only(
+        SURFACE_CONFIG_COMPONENT,
+        ChannelScheme::Ephemeral,
+        bare_channels,
+    )
 }
 
 // ── Document builders ──────────────────────────────────────────────────────
@@ -609,16 +655,21 @@ fn read_dimensions_sidecar(kind: &str, surface_dist_dir: &Path) -> Option<serde_
 ///
 /// - `prefix` must be a non-empty well-formed bare-name segment;
 /// - `status_interval_secs` must be in `5..=3600`;
-/// - every derived channel — the boot-published help/schema/index set plus the
-///   per-surface runtime geometry/status pair — must resolve to a declared
-///   `[[channel]]`; missing declarations are aggregated into one panic naming
-///   *all* of them, so the operator fixes the config in one pass;
+/// - every derived channel — the boot-published help/schema/index set, the
+///   per-surface runtime geometry/status pair, and the per-surface config
+///   channel — must resolve to a declared `[[channel]]`; missing declarations
+///   are aggregated into one panic naming *all* of them, so the operator fixes
+///   the config in one pass;
 /// - boot-published channels need `standing_retain_depth >= 1` (a non-subscriber
 ///   pull is clamped to it, so 0 would retain nothing); geometry/status channels
 ///   need both `retain_depth` and `standing_retain_depth` `Bounded(n >= 1)` —
-///   they are written forever, so unbounded retention is unbounded DB growth; and
+///   they are written forever, so unbounded retention is unbounded DB growth;
+///   a config channel needs `retain_depth >= 1`, which on a non-durable channel
+///   *is* its standing buffer, because the whole point is a retained replay to
+///   a surface that attaches later; and
 /// - each channel is single-writer: `system:surface-help` for the boot-published
-///   set, the owning surface for its geometry/status pair.
+///   set, `system:surface-config` for the config channels, the owning surface for
+///   its geometry/status pair.
 pub fn validate_surface_description(
     config: &SurfaceDescriptionConfig,
     surfaces: &[ResolvedSurface],
@@ -634,10 +685,12 @@ pub fn validate_surface_description(
          to start (fail-fast on invalid config)."
     );
     assert!(
-        (5..=3600).contains(&config.status_interval_secs),
-        "boot: [surface_description] status_interval_secs = {} is out of range 5..=3600 — the \
-         status channel is a heartbeat, not a meter (never high-frequency data on durable \
-         channels). Refusing to start (fail-fast on invalid config).",
+        (STATUS_INTERVAL_SECS_MIN..=STATUS_INTERVAL_SECS_MAX)
+            .contains(&config.status_interval_secs),
+        "boot: [surface_description] status_interval_secs = {} is out of range \
+         {STATUS_INTERVAL_SECS_MIN}..={STATUS_INTERVAL_SECS_MAX} — the status channel is a \
+         heartbeat, not a meter (never high-frequency data on durable channels). Refusing to \
+         start (fail-fast on invalid config).",
         config.status_interval_secs,
     );
 
@@ -703,32 +756,73 @@ pub fn validate_surface_description(
         }
     }
 
+    // Config channels: single-writer under `system:surface-config` — a second
+    // writer could hand a surface its whole wiring.
+    //
+    // TODO(surface-config-read-side-acl): the write side is boot-impossible to
+    // forge; the read side is unguarded. Any principal holding an
+    // `ephemeral_subscribe` matcher covering a config address — including the
+    // accidental-broad prefix this sweep exists to catch on the publish family —
+    // can pull a surface's whole wiring, component config maps included.
+    for surface in surfaces {
+        let channel = surface_config_channel(prefix, &surface.slug);
+        let Some(bare) =
+            resolve_derived_bare_in(directory, &channel, ChannelScheme::Ephemeral, &mut missing)
+        else {
+            continue;
+        };
+        assert_config_retention_at_least_one(&channel, directory);
+        assert_channel_single_writer(
+            &channel,
+            bare,
+            ExpectedWriter::System(SURFACE_CONFIG_COMPONENT),
+            app_policies,
+            wasm_consumers,
+            principal_surfaces,
+            system_participants,
+        );
+    }
+
     assert!(
         missing.is_empty(),
         "boot: [surface_description] derives {} channel(s) with no matching [[channel]] \
          declaration: {missing:?} — every derived address must resolve to an explicit channel; \
          no implicit channel is created. Declare each (address = the bare name; help/schema/index \
          need standing_retain_depth >= 1, geometry/status need bounded retain_depth AND \
-         standing_retain_depth >= 1). Refusing to start (fail-fast on invalid config).",
+         standing_retain_depth >= 1, the ephemeral bindings channel needs retain_depth >= 1). \
+         Refusing to start (fail-fast on invalid config).",
         missing.len(),
     );
 }
 
-/// Scheme-strip a derived channel address and confirm it resolves to a declared
-/// `[[channel]]`. Records an unresolved address in `missing` and returns `None`
-/// so the caller skips it (the aggregate missing-declaration panic fires once at
-/// the end). A derived address that is not a well-formed `brenn:` name is a host
-/// bug (its segments come from validated slugs/kinds) — panic.
+/// Scheme-strip a derived `brenn:` channel address and confirm it resolves to a
+/// declared `[[channel]]`. See [`resolve_derived_bare_in`].
 fn resolve_derived_bare<'a>(
     directory: &MessagingDirectory,
     channel: &'a str,
     missing: &mut Vec<String>,
 ) -> Option<&'a str> {
-    let bare = well_formed_name(channel, ChannelScheme::Brenn).unwrap_or_else(|| {
+    resolve_derived_bare_in(directory, channel, ChannelScheme::Brenn, missing)
+}
+
+/// Scheme-strip a derived channel address under `scheme` and confirm it resolves
+/// to a declared `[[channel]]`. Records an unresolved address in `missing` and
+/// returns `None` so the caller skips it (the aggregate missing-declaration
+/// panic fires once at the end). A derived address that is not a well-formed
+/// name under `scheme` is a host bug (its segments come from validated
+/// slugs/kinds) — panic.
+fn resolve_derived_bare_in<'a>(
+    directory: &MessagingDirectory,
+    channel: &'a str,
+    scheme: ChannelScheme,
+    missing: &mut Vec<String>,
+) -> Option<&'a str> {
+    let bare = well_formed_name(channel, scheme).unwrap_or_else(|| {
         panic!(
-            "boot: derived surface-description channel {channel:?} is not a well-formed brenn: \
+            "boot: derived surface-description channel {channel:?} is not a well-formed {} \
              address — a slug or kind carries a character outside the bare-name charset. Refusing \
-             to start (fail-fast on invalid config)."
+             to start (fail-fast on invalid config).",
+            scheme.prefix(),
         )
     });
     if directory.resolve(channel).is_none() {
@@ -779,6 +873,25 @@ fn assert_runtime_retention_bounded(channel: &str, directory: &MessagingDirector
          Refusing to start (fail-fast on invalid config).",
         rc.retain_depth,
         rc.standing_retain_depth,
+    );
+}
+
+/// Boot-assert a config channel retains at least one row. On a non-durable
+/// channel the retained window *is* the standing buffer, so `retain_depth` is the
+/// only knob; at 0 the retained bindings document would evict the instant it was
+/// written and every attaching surface would find the channel empty. The caller
+/// has already confirmed the channel resolves.
+fn assert_config_retention_at_least_one(channel: &str, directory: &MessagingDirectory) {
+    let entry = directory
+        .resolve(channel)
+        .expect("caller confirmed the channel resolves");
+    assert!(
+        depth_retains_at_least_one(entry.resolved_channel.retain_depth),
+        "boot: surface config channel {channel:?} resolves to retain_depth = {:?} — the bindings \
+         document is a retained latest-wins document a surface replays on every attach, so a \
+         window of zero would leave every surface unconfigurable. Set retain_depth >= 1. Refusing \
+         to start (fail-fast on invalid config).",
+        entry.resolved_channel.retain_depth,
     );
 }
 

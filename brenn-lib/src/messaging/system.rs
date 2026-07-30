@@ -20,8 +20,8 @@ use crate::access::{AppCapability, AppPolicy};
 use super::config::NoiseLevel;
 use super::store::MessageSeq;
 use super::{
-    ChannelEntry, MessageEnvelope, Messenger, ParticipantId, SubscriberEntry, SubscriberEntryKind,
-    SubscriberRegistration, WakeEconomics,
+    ChannelEntry, ChannelScheme, MessageEnvelope, Messenger, ParticipantId, SubscriberEntry,
+    SubscriberEntryKind, SubscriberRegistration, WakeEconomics,
 };
 
 /// A system participant: a bus principal that only Brenn's own code can
@@ -46,21 +46,50 @@ pub struct SystemParticipantSpec {
 }
 
 impl SystemParticipantSpec {
-    /// A publish-only system participant granted exactly `MessagingPublish` plus
-    /// one exact-match `brenn_publish` ACL per bare (scheme-stripped) channel
-    /// name, and no subscriptions. The substrate shape for a code-built boot
-    /// publisher (the surface self-description publisher): code-built, a fixed set
-    /// of channels, no consumer side. An empty slice yields publish authority with
-    /// no channel it may write — a degenerate spec the caller is expected to avoid.
-    pub fn publish_only(component: &'static str, bare_channels: &[String]) -> Self {
+    /// A publish-only system participant granted exactly `scheme`'s publish
+    /// capability plus one exact-match ACL per bare (scheme-stripped) channel
+    /// name in `scheme`'s own matcher family, and no subscriptions. The
+    /// substrate shape for a code-built boot publisher: code-built, a fixed set
+    /// of channels, no consumer side. An empty slice yields publish authority
+    /// with no channel it may write — a degenerate spec the caller is expected
+    /// to avoid.
+    ///
+    /// One scheme per participant: the publish gate dispatches the ACL family by
+    /// the channel's scheme, so a participant granted in the wrong family holds
+    /// authority the gate never reads.
+    ///
+    /// # Panics
+    ///
+    /// On an egress scheme (`mqtt:`, `webhook:`, `pwa_push:`). Those are reached
+    /// through their own adapters with their own client/endpoint-shaped ACLs,
+    /// not as a bare channel set, so a spec naming one is a host wiring bug.
+    pub fn publish_only(
+        component: &'static str,
+        scheme: ChannelScheme,
+        bare_channels: &[String],
+    ) -> Self {
         let mut policy = AppPolicy::default();
-        policy.grants.insert(AppCapability::MessagingPublish);
+        let (capability, family) = match scheme {
+            ChannelScheme::Brenn => (
+                AppCapability::MessagingPublish,
+                &mut policy.acls.brenn_publish,
+            ),
+            ChannelScheme::Ephemeral => (
+                AppCapability::EphemeralPublish,
+                &mut policy.acls.ephemeral_publish,
+            ),
+            ChannelScheme::Local => (AppCapability::LocalPublish, &mut policy.acls.local_publish),
+            ChannelScheme::Mqtt | ChannelScheme::Webhook | ChannelScheme::PwaPush => panic!(
+                "system participant {component:?} declared publish-only on scheme {} — egress \
+                 schemes are reached through their own adapters, never as a bare channel set; \
+                 host wiring bug",
+                scheme.as_str(),
+            ),
+        };
         for bare in bare_channels {
-            policy
-                .acls
-                .brenn_publish
-                .push(ChannelMatcher::Exact(bare.clone()));
+            family.push(ChannelMatcher::Exact(bare.clone()));
         }
+        policy.grants.insert(capability);
         Self {
             component,
             policy,
@@ -808,6 +837,83 @@ mod tests {
         assert_eq!(woken, json!({ "phase": "wake" }).to_string());
 
         task.abort();
+    }
+
+    /// **One scheme per participant, all the way down.** A spec must grant its
+    /// scheme's capability and put its matchers in that scheme's ACL family —
+    /// and leave the other two empty, or the participant holds authority nothing
+    /// reads and the misplacement is invisible until the first publish.
+    #[test]
+    fn publish_only_grants_exactly_its_schemes_capability_and_family() {
+        let bares = vec!["alpha".to_string(), "beta".to_string()];
+        let expected: Vec<ChannelMatcher> = bares
+            .iter()
+            .map(|b| ChannelMatcher::Exact(b.clone()))
+            .collect();
+        for (scheme, capability, family) in [
+            (
+                ChannelScheme::Brenn,
+                AppCapability::MessagingPublish,
+                "brenn_publish",
+            ),
+            (
+                ChannelScheme::Ephemeral,
+                AppCapability::EphemeralPublish,
+                "ephemeral_publish",
+            ),
+            (
+                ChannelScheme::Local,
+                AppCapability::LocalPublish,
+                "local_publish",
+            ),
+        ] {
+            let spec = SystemParticipantSpec::publish_only("pub", scheme, &bares);
+            assert!(spec.subscriptions.is_empty(), "{scheme:?}: publish-only");
+            for other in [
+                AppCapability::MessagingPublish,
+                AppCapability::EphemeralPublish,
+                AppCapability::LocalPublish,
+            ] {
+                assert_eq!(
+                    spec.policy.grants.has(other),
+                    other == capability,
+                    "{scheme:?}: grant {other:?} does not match the scheme's capability",
+                );
+            }
+            let acls = &spec.policy.acls;
+            for (name, matchers) in [
+                ("brenn_publish", &acls.brenn_publish),
+                ("ephemeral_publish", &acls.ephemeral_publish),
+                ("local_publish", &acls.local_publish),
+            ] {
+                if name == family {
+                    assert_eq!(matchers, &expected, "{scheme:?}: {name} holds the matchers");
+                } else {
+                    assert!(
+                        matchers.is_empty(),
+                        "{scheme:?}: {name} must hold nothing, got {matchers:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "egress schemes are reached through their own adapters")]
+    fn publish_only_panics_on_mqtt() {
+        SystemParticipantSpec::publish_only("pub", ChannelScheme::Mqtt, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "egress schemes are reached through their own adapters")]
+    fn publish_only_panics_on_webhook() {
+        SystemParticipantSpec::publish_only("pub", ChannelScheme::Webhook, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "egress schemes are reached through their own adapters")]
+    fn publish_only_panics_on_pwa_push() {
+        SystemParticipantSpec::publish_only("pub", ChannelScheme::PwaPush, &[]);
     }
 
     #[test]

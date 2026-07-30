@@ -77,8 +77,8 @@ mod wasm {
         PORT_DEFER, PORT_PUBLISH, PUBLISH_STATUS_FIELD, PublishError, element_name_for_instance,
         parse_defer_status, parse_publish_status,
     };
-    use brenn_surface_proto::LogLevel;
-    use brenn_surface_proto::Urgency;
+    use brenn_surface_schema::LogLevel;
+    use brenn_surface_schema::Urgency;
     use chrono::{DateTime, Utc};
     use js_sys::{Object, Reflect};
     use std::cell::RefCell;

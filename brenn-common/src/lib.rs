@@ -22,8 +22,9 @@ pub const PAGE_SIZE: u64 = 4096;
 /// hostile input cannot bloat the log stream that feeds alerting. Output is
 /// bounded at `MAX_LOGGED_UNTRUSTED_BYTES + TRUNCATION_MARKER.len()` per field.
 /// Signal paths with a documented reason to diverge declare their own cap (see
-/// `brenn-wasm`'s `PROCESSOR_MAX_*` and `surface-proto`'s alert caps) — this
-/// constant is the default posture, not a mandate.
+/// `brenn-wasm`'s `PROCESSOR_MAX_*` and `brenn-surface-schema`'s `MAX_ALERT_*`,
+/// the pair the surface alert gate enforces) — this constant is the default
+/// posture, not a mandate.
 pub const MAX_LOGGED_UNTRUSTED_BYTES: usize = 256;
 
 /// Sanitize an untrusted string (browser input, WASM guest output, subprocess

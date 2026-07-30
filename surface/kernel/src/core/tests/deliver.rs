@@ -1,6 +1,6 @@
 use super::super::*;
 use super::*;
-use brenn_surface_proto::SubscribeOutcome;
+use brenn_surface_schema::SubscribeOutcome;
 use brenn_surface_test_fixtures::wire_cursor;
 
 // ── Deliver fan-out ───────────────────────────────────────────────────

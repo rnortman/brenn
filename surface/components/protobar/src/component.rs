@@ -29,7 +29,7 @@ use brenn_surface_component_support::{
     clamp_timeout_ms, component_log, create_div, create_element, create_text_node, document,
     read_now_utc, register_component,
 };
-use brenn_surface_proto::LogLevel;
+use brenn_surface_schema::LogLevel;
 use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::{Document, HtmlElement};
 

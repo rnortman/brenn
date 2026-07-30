@@ -57,13 +57,13 @@ const CONDEMNED: &[Condemned] = &[
         scopes: &["surface/component-support", "surface/components"],
         tests_exempt: true,
         why: "gap classification never reaches the component seam; survives \
-              in brenn-lib's resume layer, in surface/proto as the wire \
+              in brenn-lib's resume layer, in surface/schema as the wire \
               encoding the kernel re-resumes on, and in surface/contract's \
               prose saying exactly that",
     },
     Condemned {
         token: "SetBanner",
-        scopes: &["surface/kernel", "surface/proto", "frontend"],
+        scopes: &["surface/kernel", "surface/schema", "frontend"],
         tests_exempt: true,
         why: "shell-side rendering of application state; survives only as \
               chrome's own internal ChromeAction, which is a component's \

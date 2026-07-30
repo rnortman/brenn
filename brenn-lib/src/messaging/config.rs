@@ -1491,7 +1491,7 @@ pub struct ResolvedComponent {
     pub kind: String,
     /// Resolved artifact shape, validated at boot against the ABIs the shell can
     /// actually load. Carried to the page in `Welcome`.
-    pub abi: brenn_surface_proto::Abi,
+    pub abi: brenn_surface_schema::Abi,
     /// This instance's durable send budget: its own declared override, or the
     /// defaults. Server-side only — the page is told nothing about it, because
     /// the server is the authority and a mirrored bucket has no reader yet.

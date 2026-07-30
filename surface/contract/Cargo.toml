@@ -7,7 +7,7 @@ description = "Brenn surface component contract v1 — the DOM-event seam betwee
 
 # The freezable seam, and nothing else: event names, detail shapes, activation
 # shapes, reserved names, and the doctrine that makes them mean something.
-# Depends on `brenn-surface-proto` for the wire types the seam's details carry as
+# Depends on `brenn-surface-schema` for the wire types the seam's details carry as
 # JSON strings (`GapReason`), on `brenn-envelope` for the `MessageEnvelope`
 # an activation window carries — the seam hands components the canonical
 # carrier, never a re-typed copy of it — and on `brenn-activation` for the
@@ -17,4 +17,4 @@ description = "Brenn surface component contract v1 — the DOM-event seam betwee
 [dependencies]
 brenn-activation = { version = "0.1.0", path = "../../brenn-activation", features = ["serde"] }
 brenn-envelope = { version = "0.1.0", path = "../../brenn-envelope" }
-brenn-surface-proto = { version = "0.1.0", path = "../proto" }
+brenn-surface-schema = { version = "0.1.0", path = "../schema" }

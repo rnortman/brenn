@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use brenn_lib::messaging::config::ResolvedSurface;
 use brenn_lib::messaging::{Messenger, PublishResult, Urgency};
-use brenn_surface_proto::{InstanceReport, InstanceState, OverlayReport, StatusCounters};
+use brenn_surface_schema::{InstanceReport, InstanceState, OverlayReport, StatusCounters};
 use serde::Serialize;
 use serde_json::json;
 
@@ -484,7 +484,7 @@ mod tests {
             errors: 1,
             instances: [(
                 "p1".to_string(),
-                brenn_surface_proto::InstanceCounters {
+                brenn_surface_schema::InstanceCounters {
                     publishes: 2,
                     drops: 5,
                 },

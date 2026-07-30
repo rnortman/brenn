@@ -18,9 +18,9 @@
 //! which overlay is up.
 
 use brenn_surface_contract::PortWindow;
-use brenn_surface_proto as proto;
-use brenn_surface_proto::layout::{LayoutDoc, LayoutKind, Panel};
-use brenn_surface_proto::{
+use brenn_surface_schema as proto;
+use brenn_surface_schema::layout::{LayoutDoc, LayoutKind, Panel};
+use brenn_surface_schema::{
     InstanceState, LinkState, LinkStateBody, LogLevel, SurfaceStateBody, TakeoverAction,
     TakeoverBody, ThemeBody, ToastBody, ToastSeverity, ToastSource,
 };
@@ -715,7 +715,7 @@ pub fn fold_window(core: &mut ChromeCore, window: &PortWindow, now_ms: u64) -> V
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use brenn_surface_proto::{CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, SurfaceStateInstance};
+    use brenn_surface_schema::{CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, SurfaceStateInstance};
     use serde_json::json;
 
     /// The monotonic reading every fold in this suite is given. Fixed: only the

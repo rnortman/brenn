@@ -9,7 +9,7 @@
 use super::*;
 use crate::test_support::{TEST_LOCAL_EPOCH, welcome_frame_local};
 use brenn_envelope::{ChannelScheme, Urgency};
-use brenn_surface_proto::{
+use brenn_surface_schema::{
     CONTROL_PLANE_VERSION, ComponentEntry, LocalChannel, OutputBinding, TakeoverAction,
     TakeoverBody,
 };
@@ -36,7 +36,7 @@ fn local_binding(channel: &str, instance: &str, port: &str) -> Binding {
         // A `local:` binding reads its channel's store; the fixtures'
         // stores are depth 1, so this reads the last value.
         retain_depth: 1,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
     }
 }
 
@@ -78,7 +78,7 @@ fn core_wired_to(channel: &str, depth: u64) -> ClientCore {
     // entry.
     let in_binding = Binding {
         retain_depth: depth,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
         ..local_binding(channel, "protobar", "in")
     };
     core.on_input(
@@ -212,7 +212,7 @@ fn a_binding_naming_an_undeclared_instance_is_fatal_not_a_panic() {
             vec![ComponentEntry {
                 instance: "protobar".into(),
                 kind: "protobar".into(),
-                abi: brenn_surface_proto::Abi::Dom,
+                abi: brenn_surface_schema::Abi::Dom,
                 parked_batch_depth: 8,
                 config: Default::default(),
             }],
@@ -477,7 +477,7 @@ fn welcome_with_instance_map(components: Vec<ComponentEntry>) -> String {
         alert_granted: false,
         takeover_granted: false,
         error_report_floor: None,
-        surface_description: brenn_surface_proto::SurfaceDescription {
+        surface_description: brenn_surface_schema::SurfaceDescription {
             status_interval_secs: 60,
         },
         bindings: SurfaceBindings {
@@ -522,7 +522,7 @@ fn the_local_sender_is_instance_level_so_sibling_instances_differ() {
     let entry = |instance: &str, kind: &str| ComponentEntry {
         instance: instance.into(),
         kind: kind.into(),
-        abi: brenn_surface_proto::Abi::Dom,
+        abi: brenn_surface_schema::Abi::Dom,
         parked_batch_depth: 8,
         config: Default::default(),
     };
@@ -1301,7 +1301,7 @@ fn confined_stores_and_seqs_survive_a_reconnect() {
     core.on_input(Input::Opened, Millis(3_006));
     let in_binding = Binding {
         retain_depth: 2,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
         ..local_binding(APP_EVENTS, "protobar", "in")
     };
     core.on_input(
@@ -1784,7 +1784,7 @@ fn welcome_frame_chrome_with(instances: Vec<&str>) -> String {
     let entry = |instance: &str| ComponentEntry {
         instance: instance.into(),
         kind: instance.into(),
-        abi: brenn_surface_proto::Abi::Dom,
+        abi: brenn_surface_schema::Abi::Dom,
         parked_batch_depth: 8,
         config: Default::default(),
     };
@@ -1810,7 +1810,7 @@ fn welcome_frame_chrome_with(instances: Vec<&str>) -> String {
         alert_granted: false,
         takeover_granted: true,
         error_report_floor: None,
-        surface_description: brenn_surface_proto::SurfaceDescription {
+        surface_description: brenn_surface_schema::SurfaceDescription {
             status_interval_secs: 60,
         },
         bindings: SurfaceBindings {
@@ -1837,7 +1837,7 @@ fn core_with_chrome() -> ClientCore {
 
 /// An overlay-state body naming `holder`.
 fn overlay_state_body(holder: Option<&str>) -> String {
-    serde_json::to_string(&brenn_surface_proto::OverlayStateBody {
+    serde_json::to_string(&brenn_surface_schema::OverlayStateBody {
         v: CONTROL_PLANE_VERSION,
         holder: holder.map(|h| h.to_string()),
         since_stamp: 42,

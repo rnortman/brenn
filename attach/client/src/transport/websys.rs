@@ -119,10 +119,7 @@ impl TransportConnection for WebSysConnection {
         // Best-effort orderly close; the socket's own `Drop` also closes, and a
         // failure means the peer is already gone (observed on the next event).
         if let Err(err) = self.socket.ws.close() {
-            tracing::debug!(
-                ?err,
-                "surface websys transport close failed (peer likely gone)"
-            );
+            tracing::debug!(?err, "websys transport close failed (peer likely gone)");
         }
     }
 }
@@ -206,7 +203,7 @@ impl Drop for Socket {
         self.ws.set_onclose(None);
         self.ws.set_onerror(None);
         if let Err(err) = self.ws.close() {
-            tracing::debug!(?err, "surface websys transport close-on-drop failed");
+            tracing::debug!(?err, "websys transport close-on-drop failed");
         }
     }
 }

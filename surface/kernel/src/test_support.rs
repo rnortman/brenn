@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use brenn_surface_proto::{Binding, LocalChannel, OutputBinding};
+use brenn_surface_schema::{Binding, LocalChannel, OutputBinding};
 use uuid::Uuid;
 
 use crate::CoreConfig;
@@ -18,7 +18,7 @@ pub(crate) fn cfg() -> CoreConfig {
         connect_timeout: Duration::from_secs(15),
         liveness_multiplier: 3,
         // Pin the jitter seed so the core stays deterministic in tests; the fleet
-        // gets distinct per-target seeds via `transport::entropy::seed`.
+        // gets distinct per-target seeds via `entropy::seed`.
         backoff_jitter_seed: 0,
         // Pin the page-load epoch for the same reason: a test asserting an exact
         // `LocalPos` needs it fixed. Real pages mint one per load in
@@ -45,7 +45,7 @@ pub(crate) fn welcome_frame(subscriptions: Vec<Binding>, outputs: Vec<OutputBind
         takeover_granted: false,
         components: vec!["protobar"],
         error_report_floor: None,
-        surface_description: brenn_surface_proto::SurfaceDescription {
+        surface_description: brenn_surface_schema::SurfaceDescription {
             status_interval_secs: 60,
         },
         local_channels: Vec::new(),
@@ -67,7 +67,7 @@ pub(crate) fn welcome_frame_local(
         takeover_granted: false,
         components: vec!["protobar"],
         error_report_floor: None,
-        surface_description: brenn_surface_proto::SurfaceDescription {
+        surface_description: brenn_surface_schema::SurfaceDescription {
             status_interval_secs: 60,
         },
         local_channels,
@@ -98,8 +98,8 @@ fn welcome_frame_reports_with_outputs_and_subs(
         alert_granted: false,
         takeover_granted: false,
         components: vec!["protobar"],
-        error_report_floor: Some(brenn_surface_proto::LogLevel::Warn),
-        surface_description: brenn_surface_proto::SurfaceDescription {
+        error_report_floor: Some(brenn_surface_schema::LogLevel::Warn),
+        surface_description: brenn_surface_schema::SurfaceDescription {
             status_interval_secs: 60,
         },
         local_channels: Vec::new(),

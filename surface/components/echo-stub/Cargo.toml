@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 # carries no host-testable logic (a DOM fixture) — so the default target builds
 # under the workspace host clippy/test sweep with nothing to compile.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-brenn-surface-proto = { version = "0.1.0", path = "../../proto" }
+brenn-surface-schema = { version = "0.1.0", path = "../../schema" }
 brenn-surface-contract = { version = "0.1.0", path = "../../contract" }
 brenn-surface-component-support = { version = "0.1.0", path = "../../component-support" }
 wasm-bindgen = { workspace = true }

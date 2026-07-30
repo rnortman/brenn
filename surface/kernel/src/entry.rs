@@ -917,7 +917,7 @@ mod tests {
                     port: "messages".into(),
                     push_depth: 8,
                     retain_depth: 0,
-                    noise: brenn_surface_proto::NoiseLevel::Silent,
+                    noise: brenn_surface_schema::NoiseLevel::Silent,
                 }],
                 components: vec![REG, UNREG],
                 ..Default::default()
@@ -1066,7 +1066,7 @@ mod tests {
                             port: "messages".into(),
                             push_depth: 8,
                             retain_depth: 0,
-                            noise: brenn_surface_proto::NoiseLevel::Silent,
+                            noise: brenn_surface_schema::NoiseLevel::Silent,
                         },
                         Binding {
                             channel: "ephemeral:b".into(),
@@ -1074,7 +1074,7 @@ mod tests {
                             port: "messages".into(),
                             push_depth: 8,
                             retain_depth: 0,
-                            noise: brenn_surface_proto::NoiseLevel::Silent,
+                            noise: brenn_surface_schema::NoiseLevel::Silent,
                         },
                     ],
                     outputs: vec![],

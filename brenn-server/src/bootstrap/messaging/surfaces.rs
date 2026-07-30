@@ -9,7 +9,7 @@ use brenn_lib::messaging::config::{
     SurfaceComponentRaw, SurfaceConfigRaw, SurfaceOutput, SurfaceOutputRaw, SurfaceSendBudget,
 };
 use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Urgency};
-use brenn_surface_proto::Abi;
+use brenn_surface_schema::Abi;
 use indexmap::IndexMap;
 
 use super::auto::AutoWiring;
@@ -38,7 +38,7 @@ fn accumulate_local_ring_depth(
     channel: &str,
     retain_depth: Option<Depth>,
 ) {
-    if let Some(reserved) = brenn_surface_proto::reserved_local_channel(channel) {
+    if let Some(reserved) = brenn_surface_schema::reserved_local_channel(channel) {
         assert!(
             retain_depth.is_none(),
             "config: [[surface]] {slug:?}: binding on reserved control channel {channel:?} sets \
@@ -81,7 +81,7 @@ fn accumulate_local_ring_depth(
 /// Unbounded is not handled here — [`accumulate_local_ring_depth`] panics on it
 /// first, on the same binding.
 fn local_context_depth(channel: &str, retain_depth: Option<Depth>) -> u64 {
-    if let Some(reserved) = brenn_surface_proto::reserved_local_channel(channel) {
+    if let Some(reserved) = brenn_surface_schema::reserved_local_channel(channel) {
         return reserved.ring_depth;
     }
     match retain_depth {
@@ -848,18 +848,18 @@ pub(crate) fn resolve_surfaces(
                         "config: [[surface]] {slug:?}: {direction} channel {channel:?} names an \
                          empty local channel",
                     );
-                    if brenn_surface_proto::is_reserved_local_namespace(channel) {
+                    if brenn_surface_schema::is_reserved_local_namespace(channel) {
                         // Reserved namespace: the name must be one the contract
                         // actually defines. `local:brenn/nonesuch` is reserved
                         // (an operator cannot declare it) but undefined — a
                         // typo'd control plane that would otherwise route as an
                         // ordinary channel and silently never reach chrome.
                         assert!(
-                            brenn_surface_proto::reserved_local_channel(channel).is_some(),
+                            brenn_surface_schema::reserved_local_channel(channel).is_some(),
                             "config: [[surface]] {slug:?}: {direction} channel {channel:?} is in \
                              the reserved local:brenn/ namespace but names no control channel the \
                              contract defines ({:?})",
-                            brenn_surface_proto::RESERVED_LOCAL_CHANNELS
+                            brenn_surface_schema::RESERVED_LOCAL_CHANNELS
                                 .iter()
                                 .map(|c| c.address)
                                 .collect::<Vec<_>>(),
@@ -895,7 +895,7 @@ pub(crate) fn resolve_surfaces(
         // local channels have no rules here: the server mediates no access to
         // page-local traffic, so it polices the *declaration* and nothing else.
         let validate_local_binding = |direction: &str, channel: &str, is_output: bool| {
-            let Some(reserved) = brenn_surface_proto::reserved_local_channel(channel) else {
+            let Some(reserved) = brenn_surface_schema::reserved_local_channel(channel) else {
                 return;
             };
             // Capability-as-binding: the takeover grant gates the wiring itself,
@@ -987,7 +987,7 @@ pub(crate) fn resolve_surfaces(
             // blast radius is the page; what the server polices is the binding
             // declaration, which is `validate_binding` plus the reserved-channel
             // rules below.
-            let local = brenn_surface_proto::is_local_channel(&channel);
+            let local = brenn_envelope::is_local_channel(&channel);
             assert!(
                 local || policy.allows_channel_access(&channel),
                 "config: [[surface]] {slug:?}: {direction} binds channel {:?} but the \
@@ -1200,11 +1200,11 @@ pub(crate) fn resolve_surfaces(
         // rather than bricking the shell (a runtime reload storm) at first connect.
         let startup_attach_burst = subscriptions.len();
         assert!(
-            startup_attach_burst <= brenn_surface_proto::MAX_SURFACE_SUBSCRIPTION_BINDINGS,
+            startup_attach_burst <= brenn_surface_schema::MAX_SURFACE_SUBSCRIPTION_BINDINGS,
             "config: [[surface]] {slug:?}: {startup_attach_burst} first-connect attaches \
              (subscription bindings) exceed the shell's synchronous startup-attach bound ({}); \
              split the surface or reduce its subscriptions",
-            brenn_surface_proto::MAX_SURFACE_SUBSCRIPTION_BINDINGS,
+            brenn_surface_schema::MAX_SURFACE_SUBSCRIPTION_BINDINGS,
         );
 
         // Outputs (publish bindings). The item-6 publish-coverage decision (the
@@ -1238,7 +1238,7 @@ pub(crate) fn resolve_surfaces(
                 out.instance,
                 out.port,
             );
-            if brenn_surface_proto::is_local_channel(&channel) {
+            if brenn_envelope::is_local_channel(&channel) {
                 validate_local_binding(direction, &channel, true);
                 // Outputs carry no depth knobs, so an output-only local channel
                 // takes the floor. Registering it here is what makes a
@@ -1360,6 +1360,39 @@ pub(crate) fn inject_surface_error_grant(surfaces: &mut [ResolvedSurface], bare:
             .acls
             .brenn_publish
             .push(ChannelMatcher::Exact(bare.to_string()));
+    }
+}
+
+/// Inject each surface's config-channel subscribe grant: a surface may subscribe
+/// its own `ephemeral:<prefix>.surface.<slug>.bindings` channel under its own
+/// `surface:<slug>` identity, and no other. Applied immediately after
+/// [`resolve_surfaces`], alongside the geometry/status publish grants, so each
+/// policy is complete everywhere it is read.
+///
+/// A substrate right, not a per-`[[surface]]` operator grant, for the same reason
+/// the telemetry grants are: the channel is derived, not authored, so requiring
+/// the operator to hand-write an ACL for it would let a forgotten entry strand a
+/// surface with no wiring and no error anywhere. Each surface receives an exact
+/// `ephemeral_subscribe` matcher for its own channel only. `prefix` roots the
+/// derived bare names.
+pub(crate) fn inject_surface_config_subscribe_grants(
+    surfaces: &mut [ResolvedSurface],
+    prefix: &str,
+) {
+    use crate::routes::surface::description::surface_config_bare;
+    use brenn_lib::access::AppCapability;
+    use brenn_lib::access::acl::ChannelMatcher;
+    for surface in surfaces {
+        let config = surface_config_bare(prefix, &surface.slug);
+        surface
+            .policy
+            .grants
+            .insert(AppCapability::EphemeralSubscribe);
+        surface
+            .policy
+            .acls
+            .ephemeral_subscribe
+            .push(ChannelMatcher::Exact(config));
     }
 }
 

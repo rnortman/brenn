@@ -13,7 +13,7 @@
 //! recompute derives the theme from the current wall time, so a suspend/resume,
 //! NTP step, or DST transition self-corrects on the next boundary recompute.
 
-use brenn_surface_proto::{THEME_DARK, THEME_LIGHT};
+use brenn_surface_schema::{THEME_DARK, THEME_LIGHT};
 use serde::Deserialize;
 
 use brenn_surface_component_support::parse_delivery;
@@ -310,7 +310,7 @@ mod tests {
     /// glue publishes on `local:brenn/theme` — the exact strings chrome parses.
     #[test]
     fn theme_wire_values_match_the_control_plane_body() {
-        use brenn_surface_proto::{CONTROL_PLANE_VERSION, ThemeBody};
+        use brenn_surface_schema::{CONTROL_PLANE_VERSION, ThemeBody};
         for (theme, wire) in [(Theme::Dark, "dark"), (Theme::Light, "light")] {
             assert_eq!(theme.as_wire_str(), wire);
             let body = ThemeBody {

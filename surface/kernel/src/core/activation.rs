@@ -145,9 +145,9 @@ impl RegisteredInstance {
 pub(crate) struct ParkedBatch {
     /// The durable + ephemeral entries of one flush, in call order — already in
     /// the shape the frame carries, so nothing reinterprets them on the way out.
-    pub entries: Vec<brenn_surface_proto::BatchEntry>,
+    pub entries: Vec<brenn_surface_schema::BatchEntry>,
     /// The flush's control ops against transportable channels, in call order and
     /// already in the frame's shape. Held with the entries because the server
     /// applies both halves of one batch together, ops first.
-    pub ops: Vec<brenn_surface_proto::BatchDeferredOp>,
+    pub ops: Vec<brenn_surface_schema::BatchDeferredOp>,
 }

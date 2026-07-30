@@ -28,11 +28,12 @@
 use std::collections::HashMap;
 
 use brenn_envelope::MessageEnvelope;
+use brenn_envelope::channel_capabilities;
 use brenn_queue::{
     Advance, Attached, CursorOverflow, Deferred, DeferredId, OwnedDeferred, QuotaExceeded,
     ReleaseReport, ReleaseTime, RingCore, Window,
 };
-use brenn_surface_proto::channel_capabilities;
+use brenn_surface_schema::surface_bindable_address;
 use uuid::Uuid;
 
 use super::SubKey;
@@ -78,13 +79,19 @@ pub(crate) enum StoreKey {
 ///
 /// The kernel's single derivation of the only channel-class distinction its
 /// delivery paths are allowed to make. Every channel the kernel routes came
-/// from boot-validated bindings or the reserved table, so an address that
-/// classifies as nothing here is a kernel bug rather than a tolerated input.
+/// from boot-validated bindings or the reserved table, so an address the surface
+/// cannot bind at all is a kernel bug rather than a tolerated input — and that
+/// gate is what keeps a `mqtt:` address (durable and transportable on the bus,
+/// never a surface transport) fatal here instead of silently routed onto the
+/// wire. Past the gate every remaining scheme carries capabilities, so the
+/// derivation itself cannot come up empty.
 pub(crate) fn channel_is_transportable(channel: &str) -> bool {
+    assert!(
+        surface_bindable_address(channel),
+        "surface client: unbindable channel address reached the kernel: {channel:?}"
+    );
     channel_capabilities(channel)
-        .unwrap_or_else(|| {
-            panic!("surface client: unclassifiable channel address reached the kernel: {channel:?}")
-        })
+        .expect("every surface-bindable scheme carries capabilities")
         .transportable
 }
 

@@ -1,15 +1,15 @@
 [package]
-name = "brenn-surface-proto"
+name = "brenn-attach-proto"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Brenn surface WS wire protocol types — shared between backend and the surface client (wasm + native)"
+description = "Brenn attachment protocol wire types — the generic bus-attachment frames, shared by the backend and every attacher client (wasm + native)"
 
 [dependencies]
 brenn-envelope = { path = "../../brenn-envelope" }
-chrono = { version = "0.4.44", default-features = false, features = ["serde", "alloc"] }
 serde = { version = "1.0.228", features = ["derive"] }
 uuid = { version = "1.23.0", features = ["serde"] }
 
 [dev-dependencies]
+chrono = { version = "0.4.44", default-features = false, features = ["serde", "alloc"] }
 serde_json = "1.0.149"

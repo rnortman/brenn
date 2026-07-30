@@ -1,7 +1,7 @@
-//! Transport abstraction: the boundary between the sans-I/O core/driver and
-//! the concrete WebSocket implementations.
+//! Transport abstraction: the boundary between an attacher's sans-I/O
+//! core/driver and the concrete WebSocket implementations.
 //!
-//! The driver is generic over these traits, so no `dyn` is needed and the
+//! A driver is generic over these traits, so no `dyn` is needed and the
 //! futures returned by the async methods need no `Send` bound: native tests
 //! spawn the driver on a current-thread runtime and wasm runs single-threaded.
 //! That is why `async_fn_in_trait` is allowed here rather than reaching for a
@@ -15,12 +15,6 @@
 use std::fmt;
 
 pub mod clock;
-// `pub(crate)`: the seed source is deliberately non-cryptographic
-// (`Math.random` / `RandomState` hash), so it must not be reachable by
-// out-of-tree kernels that build against this crate — an inviting `entropy::seed`
-// is exactly what a future author would grab for a nonce or token. The only
-// caller is `handle::new`, in-crate.
-pub(crate) mod entropy;
 pub mod timer;
 
 #[cfg(not(target_arch = "wasm32"))]

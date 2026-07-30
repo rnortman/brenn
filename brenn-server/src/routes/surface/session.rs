@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 use brenn_budget::{MAX_PUBLISH_BYTES_PER_ACTIVATION, MAX_PUBLISHES_PER_ACTIVATION};
 use brenn_common::sanitize_untrusted_str;
-use brenn_surface_proto::{
+use brenn_surface_schema::{
     AlertSeverity as ProtoAlertSeverity, BatchDeferredOp, BatchEntry, ClientFrame, Cursor,
     DeferredOpKind, DeferredViewEntry, DeliverTarget, GapInfo, GapReason as ProtoGapReason,
     InstanceReport, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES, PublishBatchOutcome,
@@ -52,6 +52,7 @@ use brenn_surface_proto::{
 };
 
 use super::cursor::{self, CursorState};
+use crate::routes::attach::profile::AttachProfile;
 use chrono::{DateTime, Utc};
 
 use super::telemetry::{self, Health};
@@ -82,7 +83,7 @@ const ALERT_REFILL: Duration = Duration::from_secs(300);
 /// loop. `3×` admits the first-connect reconcile (MAX subscribes) plus one full
 /// detach/re-attach cycle of a maximum-size surface (MAX unsubscribes + MAX
 /// subscribes); churn beyond that is throttled to one token/sec.
-const SUBSCRIBE_BURST: u32 = 3 * brenn_surface_proto::MAX_SURFACE_SUBSCRIPTION_BINDINGS as u32;
+const SUBSCRIBE_BURST: u32 = 3 * brenn_surface_schema::MAX_SURFACE_SUBSCRIPTION_BINDINGS as u32;
 
 /// One `Subscribe`/`Unsubscribe` token refilled per this interval.
 const SUBSCRIBE_REFILL: Duration = Duration::from_secs(1);
@@ -2536,14 +2537,14 @@ async fn emit_op_views(
     }
 }
 
-/// Every set a deferred view can be seeded for: each declared instance crossed
-/// with the transportable channels its bound output ports publish onto, deduped
-/// (two ports may share a channel) and sorted so the seeding order is the same on
+/// Every set a deferred view can be seeded for, in the wire's `(instance,
+/// channel)` spelling: the profile's parked-view targets, already deduped (two
+/// ports may share a channel) and ordered so the seeding sequence is the same on
 /// every attach.
 ///
-/// The boot-resolved output map holds no `local:` address — a page-local channel
-/// is the page's own retention authority and the backend parks nothing on it —
-/// so every address here is transportable by construction.
+/// No `local:` address is among them — a page-local channel is the page's own
+/// retention authority and the backend parks nothing on it — so every address
+/// here is transportable by construction.
 ///
 /// Every address here also has a store: boot refuses to start a surface whose
 /// transportable output names an undeclared channel
@@ -2551,18 +2552,15 @@ async fn emit_op_views(
 /// channel. An unresolvable address is a state boot cannot produce; the store
 /// lookup behind the recompute panics on it.
 fn deferred_view_targets(runtime: &SurfaceRuntime) -> Vec<ParkedSet> {
-    let mut targets: Vec<ParkedSet> = runtime
-        .output_ports
+    runtime
+        .profile
+        .deferred_view_targets()
         .iter()
-        .filter(|((instance, _), _)| runtime.is_declared_instance(instance))
-        .map(|((instance, _), out)| ParkedSet {
-            channel: out.address.clone(),
-            instance: instance.clone(),
+        .map(|target| ParkedSet {
+            channel: target.channel.clone(),
+            instance: target.attribution.clone(),
         })
-        .collect();
-    targets.sort();
-    targets.dedup();
-    targets
+        .collect()
 }
 
 /// The wire form of one sender's parked messages: the identity both authorities
@@ -2940,7 +2938,7 @@ mod tests {
             components: vec![brenn_lib::messaging::config::ResolvedComponent {
                 instance: "chrome".to_string(),
                 kind: "chrome".to_string(),
-                abi: brenn_surface_proto::Abi::Dom,
+                abi: brenn_surface_schema::Abi::Dom,
                 send_budget: brenn_lib::messaging::config::SurfaceSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
@@ -3381,7 +3379,7 @@ mod tests {
                 default_urgency: Urgency::Normal,
             },
         );
-        runtime.error_report_floor = Some(brenn_surface_proto::LogLevel::Warn);
+        runtime.error_report_floor = Some(brenn_surface_schema::LogLevel::Warn);
 
         let (alert_dispatcher, _drainer) = brenn_lib::obs::alerting::noop_alert_dispatcher();
         let (tx, rx) = mpsc::channel::<ServerFrame>(64);

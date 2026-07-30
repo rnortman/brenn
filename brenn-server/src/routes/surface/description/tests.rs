@@ -38,7 +38,7 @@ fn surface(slug: &str, skin: &str, components: &[(&str, &str)]) -> ResolvedSurfa
             .map(|(instance, kind)| ResolvedComponent {
                 instance: (*instance).to_string(),
                 kind: (*kind).to_string(),
-                abi: brenn_surface_proto::Abi::Dom,
+                abi: brenn_surface_schema::Abi::Dom,
                 send_budget: SurfaceSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
@@ -104,42 +104,84 @@ fn runtime_bares(surfaces: &[ResolvedSurface]) -> Vec<String> {
         .collect()
 }
 
-/// A directory declaring the full derived set for `surfaces`: the boot-published
-/// channels at `retain_depth = 1` / `standing_retain_depth = 1`, and the runtime
-/// geometry/status channels at `standing_retain_depth = 1` with the retain depth
-/// the caller names, so a test can declare a non-conforming one and exercise the
-/// bounded-retention panic.
-fn full_directory(surfaces: &[ResolvedSurface], runtime_retain: Depth) -> MessagingDirectory {
-    let mut raw: Vec<ChannelConfigRaw> = Vec::new();
-    let mut uuid = 0u64;
-    let mut push = |address: String, retain: Depth, standing: Depth, uuid: &mut u64| {
+/// A directory declaring the full derived set for `surfaces` with the config
+/// channels at the retain depth the caller names, so a test can declare an
+/// empty-window one and exercise the config-retention panic. Everything else is
+/// as [`full_directory`].
+fn full_directory_with_config_retain(
+    surfaces: &[ResolvedSurface],
+    runtime_retain: Depth,
+    config_retain: Depth,
+) -> MessagingDirectory {
+    let mut raw = full_directory_raw(surfaces, runtime_retain);
+    for surface in surfaces {
+        // Ephemeral: no uuid (derived from the address), no standing rung (the
+        // retained window is the standing buffer).
         raw.push(ChannelConfigRaw {
             send_rate: None,
-            uuid: Some(format!("00000000-0000-4000-8000-{uuid:012x}")),
-            address: Some(address),
+            uuid: None,
+            address: Some(surface_config_channel(PREFIX, &surface.slug)),
             address_prefix: None,
             description: None,
-            push_depth: Some(standing),
-            retain_depth: Some(retain),
-            standing_retain_depth: Some(standing),
+            // The retained window is the standing buffer on a non-durable
+            // channel, and standing is the ceiling on every depth stated about a
+            // channel — so an empty-window block must state an empty push depth
+            // too, or the channel layer refuses it before this validator runs.
+            push_depth: Some(config_retain.min(Depth::Bounded(1))),
+            retain_depth: Some(config_retain),
+            standing_retain_depth: None,
             noise: None,
             sink: None,
             wake_min: None,
         });
-        *uuid += 1;
-    };
-    for bare in boot_published_bare_channels(PREFIX, surfaces) {
-        push(bare, Depth::Bounded(1), Depth::Bounded(1), &mut uuid);
-    }
-    for bare in runtime_bares(surfaces) {
-        // Standing stays at or above the retain rung the caller asked for, so the
-        // block itself is legal and the description validator is what refuses an
-        // unbounded runtime window.
-        let standing = runtime_retain.max(Depth::Bounded(1));
-        push(bare, runtime_retain, standing, &mut uuid);
     }
     let entries = build_channel_entries(&raw, &MessagingGlobalConfig::default());
     MessagingDirectory::with_entries(entries)
+}
+
+/// A directory declaring the full derived set for `surfaces`: the boot-published
+/// channels at `retain_depth = 1` / `standing_retain_depth = 1`, the runtime
+/// geometry/status channels at `standing_retain_depth = 1` with the retain depth
+/// the caller names (so a test can declare a non-conforming one and exercise the
+/// bounded-retention panic), and each surface's ephemeral config channel at
+/// `retain_depth = 1`.
+fn full_directory(surfaces: &[ResolvedSurface], runtime_retain: Depth) -> MessagingDirectory {
+    full_directory_with_config_retain(surfaces, runtime_retain, Depth::Bounded(1))
+}
+
+/// The durable half of the derived set as raw channel blocks — the two callers
+/// above differ only in what they add on top.
+fn full_directory_raw(
+    surfaces: &[ResolvedSurface],
+    runtime_retain: Depth,
+) -> Vec<ChannelConfigRaw> {
+    let durable = |address: String, retain: Depth, standing: Depth, uuid: u64| ChannelConfigRaw {
+        send_rate: None,
+        uuid: Some(format!("00000000-0000-4000-8000-{uuid:012x}")),
+        address: Some(address),
+        address_prefix: None,
+        description: None,
+        push_depth: Some(standing),
+        retain_depth: Some(retain),
+        standing_retain_depth: Some(standing),
+        noise: None,
+        sink: None,
+        wake_min: None,
+    };
+    let boot_published = boot_published_bare_channels(PREFIX, surfaces)
+        .into_iter()
+        .map(|bare| (bare, Depth::Bounded(1), Depth::Bounded(1)));
+    let runtime = runtime_bares(surfaces).into_iter().map(|bare| {
+        // Standing stays at or above the retain rung the caller asked for, so the
+        // block itself is legal and the description validator is what refuses an
+        // unbounded runtime window.
+        (bare, runtime_retain, runtime_retain.max(Depth::Bounded(1)))
+    });
+    boot_published
+        .chain(runtime)
+        .enumerate()
+        .map(|(i, (bare, retain, standing))| durable(bare, retain, standing, i as u64))
+        .collect()
 }
 
 fn on_config() -> SurfaceDescriptionConfig {
@@ -721,6 +763,239 @@ fn validate_no_surfaces_still_validates_index() {
         &[],
         Some(&dir),
         SingleWriterPrincipals::default(),
+    );
+}
+
+// ── Config channel ─────────────────────────────────────────────────────────
+
+#[test]
+fn config_channel_is_the_ephemeral_member_of_the_derived_family() {
+    assert_eq!(
+        surface_config_bare(PREFIX, "bar"),
+        "surface.surface.bar.bindings"
+    );
+    assert_eq!(
+        surface_config_channel(PREFIX, "bar"),
+        "ephemeral:surface.surface.bar.bindings"
+    );
+    // Distinct from every boot-published and runtime address for the same slug.
+    let surfaces = multi_surface_config();
+    let derived: Vec<String> = boot_published_bare_channels(PREFIX, &surfaces)
+        .into_iter()
+        .chain(runtime_bares(&surfaces))
+        .collect();
+    for bare in surface_config_bare_channels(PREFIX, &surfaces) {
+        assert!(!derived.contains(&bare), "{bare} collides with the family");
+    }
+}
+
+#[test]
+fn config_spec_grants_exactly_the_ephemeral_publish_family() {
+    let surfaces = multi_surface_config();
+    let bares = surface_config_bare_channels(PREFIX, &surfaces);
+    let spec = surface_config_spec(&bares);
+    assert_eq!(spec.component, SURFACE_CONFIG_COMPONENT);
+    assert!(spec.subscriptions.is_empty(), "publish-only");
+    // The gate dispatches by scheme, so the grant and the matchers must be the
+    // ephemeral family — a `brenn_publish` matcher here would be unread.
+    assert!(spec.policy.grants.has(AppCapability::EphemeralPublish));
+    assert!(!spec.policy.grants.has(AppCapability::MessagingPublish));
+    assert!(spec.policy.acls.brenn_publish.is_empty());
+    assert_eq!(spec.policy.acls.ephemeral_publish.len(), bares.len());
+    for bare in &bares {
+        assert!(
+            spec.policy
+                .acls
+                .ephemeral_publish
+                .contains(&ChannelMatcher::Exact(bare.clone())),
+        );
+        assert!(!bare.contains(':'), "bare names carry no scheme");
+    }
+}
+
+#[test]
+#[should_panic(expected = "no matching [[channel]] declaration")]
+fn validate_panics_when_a_config_channel_is_undeclared() {
+    // Everything else declared; the operator forgot the bindings channels.
+    let surfaces = multi_surface_config();
+    let raw = full_directory_raw(&surfaces, Depth::Bounded(1));
+    let entries = build_channel_entries(&raw, &MessagingGlobalConfig::default());
+    validate_surface_description(
+        &on_config(),
+        &surfaces,
+        Some(&MessagingDirectory::with_entries(entries)),
+        SingleWriterPrincipals {
+            surfaces: &surfaces,
+            ..Default::default()
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "retain_depth = Bounded(0)")]
+fn validate_panics_on_config_channel_that_retains_nothing() {
+    let surfaces = multi_surface_config();
+    let dir = full_directory_with_config_retain(&surfaces, Depth::Bounded(1), Depth::Bounded(0));
+    validate_surface_description(
+        &on_config(),
+        &surfaces,
+        Some(&dir),
+        SingleWriterPrincipals {
+            surfaces: &surfaces,
+            ..Default::default()
+        },
+    );
+}
+
+/// The scheme-matched half of the sweep. A principal holding an
+/// `ephemeral_publish` matcher over a config channel could hand a surface its
+/// entire wiring; a sweep that read only `brenn_publish` would never see it.
+#[test]
+#[should_panic(expected = "ephemeral_publish ACL covering single-writer channel")]
+fn validate_panics_on_ephemeral_publish_coverage_of_a_config_channel() {
+    let surfaces = multi_surface_config();
+    let dir = full_directory(&surfaces, Depth::Bounded(1));
+    let mut foreign = surface("intruder", "bench", &[("w", "protobar")]);
+    foreign
+        .policy
+        .grants
+        .insert(AppCapability::EphemeralPublish);
+    foreign
+        .policy
+        .acls
+        .ephemeral_publish
+        .push(ChannelMatcher::Exact(surface_config_bare(PREFIX, "bar")));
+    let principals: Vec<ResolvedSurface> = surfaces
+        .iter()
+        .cloned()
+        .chain(std::iter::once(foreign))
+        .collect();
+    validate_surface_description(
+        &on_config(),
+        &surfaces,
+        Some(&dir),
+        SingleWriterPrincipals {
+            surfaces: &principals,
+            ..Default::default()
+        },
+    );
+}
+
+/// A `brenn_publish` matcher whose bare name equals the config channel's is not
+/// coverage: the channel is `ephemeral:`, and its gate reads the ephemeral
+/// family. The sweep must not manufacture a violation out of a grant that cannot
+/// reach the channel.
+#[test]
+fn validate_ignores_brenn_publish_coverage_of_a_config_channels_bare_name() {
+    let surfaces = multi_surface_config();
+    let dir = full_directory(&surfaces, Depth::Bounded(1));
+    let mut bystander = surface("bystander", "bench", &[("w", "protobar")]);
+    bystander
+        .policy
+        .grants
+        .insert(AppCapability::MessagingPublish);
+    bystander
+        .policy
+        .acls
+        .brenn_publish
+        .push(ChannelMatcher::Exact(surface_config_bare(PREFIX, "bar")));
+    let principals: Vec<ResolvedSurface> = surfaces
+        .iter()
+        .cloned()
+        .chain(std::iter::once(bystander))
+        .collect();
+    validate_surface_description(
+        &on_config(),
+        &surfaces,
+        Some(&dir),
+        SingleWriterPrincipals {
+            surfaces: &principals,
+            ..Default::default()
+        },
+    );
+}
+
+/// The two code-built publishers boot actually hands the validator, in the two
+/// different ACL families they hold.
+fn boot_system_participants(surfaces: &[ResolvedSurface]) -> Vec<SystemParticipantSpec> {
+    vec![
+        surface_help_spec(&boot_published_bare_channels(PREFIX, surfaces)),
+        surface_config_spec(&surface_config_bare_channels(PREFIX, surfaces)),
+    ]
+}
+
+/// **The real boot shape passes.** Two system participants are swept against
+/// every derived channel, each holding an exact grant on the family it publishes
+/// in — so each must be excluded on its own channels and invisible on the
+/// other's. An inverted exclusion or a family mix-up panics every real boot while
+/// a `system_participants: &[]` suite stays green.
+#[test]
+fn validate_passes_with_the_boot_system_participants_swept() {
+    let surfaces = multi_surface_config();
+    let dir = full_directory(&surfaces, Depth::Bounded(1));
+    validate_surface_description(
+        &on_config(),
+        &surfaces,
+        Some(&dir),
+        SingleWriterPrincipals {
+            surfaces: &surfaces,
+            system_participants: &boot_system_participants(&surfaces),
+            ..Default::default()
+        },
+    );
+}
+
+/// A *third* code-built participant granted in the config channels' own family
+/// is a forgery path into a surface's whole wiring, and the exclusion covers only
+/// the one expected writer.
+#[test]
+#[should_panic(expected = "ephemeral_publish ACL covering single-writer channel")]
+fn validate_panics_on_a_second_system_participant_covering_a_config_channel() {
+    let surfaces = multi_surface_config();
+    let dir = full_directory(&surfaces, Depth::Bounded(1));
+    let mut participants = boot_system_participants(&surfaces);
+    participants.push(SystemParticipantSpec::publish_only(
+        "intruder",
+        ChannelScheme::Ephemeral,
+        &[surface_config_bare(PREFIX, "bar")],
+    ));
+    validate_surface_description(
+        &on_config(),
+        &surfaces,
+        Some(&dir),
+        SingleWriterPrincipals {
+            surfaces: &surfaces,
+            system_participants: &participants,
+            ..Default::default()
+        },
+    );
+}
+
+/// The same guard on the durable half of the family: the boot-published set is
+/// `system:surface-help`'s alone, and a second `brenn_publish` participant over
+/// it is caught too. Paired with the ephemeral case, this pins that the sweep
+/// dispatches by the channel's scheme for system participants rather than
+/// reading one family for all of them.
+#[test]
+#[should_panic(expected = "brenn_publish ACL covering single-writer channel")]
+fn validate_panics_on_a_second_system_participant_covering_a_boot_published_channel() {
+    let surfaces = multi_surface_config();
+    let dir = full_directory(&surfaces, Depth::Bounded(1));
+    let mut participants = boot_system_participants(&surfaces);
+    participants.push(SystemParticipantSpec::publish_only(
+        "intruder",
+        ChannelScheme::Brenn,
+        &[index_bare(PREFIX)],
+    ));
+    validate_surface_description(
+        &on_config(),
+        &surfaces,
+        Some(&dir),
+        SingleWriterPrincipals {
+            surfaces: &surfaces,
+            system_participants: &participants,
+            ..Default::default()
+        },
     );
 }
 

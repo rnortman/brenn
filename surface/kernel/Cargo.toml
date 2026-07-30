@@ -12,7 +12,10 @@ description = "Brenn surface kernel — sans-I/O WS protocol core + async driver
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-brenn-surface-proto = { version = "0.1.0", path = "../proto" }
+# The attacher-generic client half: transport shims and the monotonic time
+# currency the core and driver are driven with.
+brenn-attach-client = { version = "0.1.0", path = "../../attach/client" }
+brenn-surface-schema = { version = "0.1.0", path = "../schema" }
 brenn-surface-contract = { version = "0.1.0", path = "../contract" }
 brenn-envelope = { version = "0.1.0", path = "../../brenn-envelope" }
 # The shared channel mechanics (retained ring, cursors, deferral). Dependency-free
@@ -21,40 +24,25 @@ brenn-queue = { version = "0.1.0", path = "../../brenn-queue" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 uuid = { version = "1.23.0", features = ["v4", "serde", "js"] }
-# `clock` (hence the wasm-incompatible `Utc::now`) is enabled natively only; the
-# browser reads `Date.now()` through the transport shim instead. Version-unified
-# with brenn-envelope, whose `DateTime<Utc>` this crate constructs.
+# No `clock` feature on either target: this crate reads no wall clock of its own
+# — the attach client's shim owns that — and only constructs and compares
+# `DateTime<Utc>`. Version-unified with brenn-envelope, whose values those are.
 chrono = { version = "0.4.44", default-features = false, features = ["serde", "alloc"] }
 futures-util = "0.3.32"
 futures-channel = "0.3.32"
 tracing = "0.1.44"
 brenn-budget = { version = "0.1.0", path = "../../brenn-budget" }
 
-# Native transport: tokio-tungstenite must stay version-unified with the
-# backend's tungstenite pin (brenn/Cargo.toml) so the shared WS types agree.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1.50.0", features = ["rt", "time", "net", "macros"] }
-tokio-tungstenite = "0.29.0"
-# `clock` powers the native `wall_now()`. Deliberately not enabled for wasm:
-# chrono's `wasmbind` would reach for `Date.now()` behind our back, hiding the
-# browser's wall-clock read from the transport shim that is supposed to own it.
-chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
-
-# Browser transport (WebSocket adapted to the async transport trait) plus the
-# platform half's DOM effect executor (`dom.rs`) and wasm-bindgen entry
+# The platform half's DOM effect executor (`dom.rs`) and wasm-bindgen entry
 # (`entry.rs`): DOM creation, text rendering, CustomEvent dispatch/listeners, and
-# the entry that wires the client driver + event loop. Host builds exclude all of
-# this and need none of it.
+# the entry that wires the client driver + event loop, plus the backoff-jitter
+# seed source (`Math.random`). Host builds exclude all of this and need none of
+# it.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = "0.4.75"
 js-sys = "0.3.102"
 web-sys = { version = "0.3.102", features = [
-    "WebSocket",
-    "MessageEvent",
-    "CloseEvent",
-    "ErrorEvent",
-    "BinaryType",
     "Window",
     "Document",
     "Element",

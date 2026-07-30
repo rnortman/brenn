@@ -22,8 +22,8 @@ use brenn_surface_component_support::{
     create_div, document, publish, read_monotonic_ms, register_component,
 };
 use brenn_surface_contract::SURFACE_ROOT_ID;
-use brenn_surface_proto::layout::LayoutKind;
-use brenn_surface_proto::{ToastSeverity, ToastSource};
+use brenn_surface_schema::layout::LayoutKind;
+use brenn_surface_schema::{ToastSeverity, ToastSource};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::{Document, Element, HtmlElement};

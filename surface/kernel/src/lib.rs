@@ -19,13 +19,15 @@
 
 mod core;
 mod driver;
+// The backoff-jitter seed source, crate-private: see the module doc for why it
+// is not part of the attach client's shim set.
+mod entropy;
 mod handle;
 // Native-only test scaffolding: the protocol-core conformance and driver suites
 // run under host `cargo test`; wasm builds (browser bundle + the dom/entry
 // wasm-bindgen-test suites) never pull it.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod test_support;
-pub mod transport;
 
 /// DOM-free platform decision core; host-compiled and natively unit-tested.
 pub mod logic;
@@ -56,24 +58,31 @@ pub use handle::InFlightPublish;
 pub use handle::{
     ActivationEntry, ClientConfig, ClientHandle, EventStream, PublishGate, PublishReject, new,
 };
-pub use transport::{TransportConnection, TransportConnector, TransportError, TransportEvent};
+// The transport seam and its per-target implementations live in
+// `brenn-attach-client` — they are attacher-generic, naming nothing about
+// components, DOM, or pixels. Re-exported here so out-of-tree native kernels
+// keep naming them through this crate rather than restating the dependency.
+pub use brenn_attach_client::transport;
+pub use brenn_attach_client::{
+    TransportConnection, TransportConnector, TransportError, TransportEvent,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use transport::native::{NativeConnection, NativeConnector, insert_session_cookie};
+pub use brenn_attach_client::{NativeConnection, NativeConnector, insert_session_cookie};
 
 // Signature types of `insert_session_cookie`, re-exported so out-of-tree native
-// kernels can name them without guessing this crate's tungstenite pin. The
-// helper's doc comment states the semver coupling to that pin.
+// kernels can name them without guessing the tungstenite pin. The helper's doc
+// comment states the semver coupling to that pin.
 #[cfg(not(target_arch = "wasm32"))]
-pub use tokio_tungstenite::tungstenite::http::{HeaderMap, header::InvalidHeaderValue};
+pub use brenn_attach_client::{HeaderMap, InvalidHeaderValue};
 
 #[cfg(target_arch = "wasm32")]
-pub use transport::websys::{WebSysConnection, WebSysConnector};
+pub use brenn_attach_client::{WebSysConnection, WebSysConnector};
 
 // Wire protocol types are owned by the shared proto crate; re-export it so
 // callers of this crate speak the same vocabulary without a second dependency.
 pub use brenn_envelope::{MessageEnvelope, Urgency};
-pub use brenn_surface_proto as proto;
+pub use brenn_surface_schema as proto;
 
 /// The component contract — the DOM-event seam the kernel and every component
 /// module compile against. Re-exported for the same reason as [`proto`]: a

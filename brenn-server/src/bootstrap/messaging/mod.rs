@@ -156,8 +156,8 @@ pub(crate) mod test_fixtures;
 mod wasm_tests;
 
 pub(crate) use surfaces::{
-    assert_output_bindings_covered, inject_surface_error_grant,
-    inject_surface_geometry_status_grants, resolve_surfaces,
+    assert_output_bindings_covered, inject_surface_config_subscribe_grants,
+    inject_surface_error_grant, inject_surface_geometry_status_grants, resolve_surfaces,
 };
 pub(crate) use wasm::resolve_wasm_consumers;
 
@@ -751,6 +751,15 @@ pub(crate) async fn build_messaging(
         &config.surface_description.prefix,
     );
 
+    // Substrate config-channel grant: each surface may subscribe its own
+    // bindings channel. Injected here for the same reason and at the same point
+    // as the telemetry grants — the runtime's subscribe gate and the registry
+    // both read the finished policy.
+    inject_surface_config_subscribe_grants(
+        &mut resolved_surfaces,
+        &config.surface_description.prefix,
+    );
+
     // Item-6 output publish-coverage, asserted after the substrate error-report
     // grant is injected: an output bound to the configured error channel is
     // covered by that grant (the sanctioned many-writer shape), while any other
@@ -850,7 +859,10 @@ pub(crate) async fn build_messaging(
     //   - the tool executor, present whenever any async tool is registered
     //     (subscriber; it subscribes to every `brenn:tools/<tool>` request channel);
     //   - `system:surface-help`, publish-only — granted an exact-match publish ACL
-    //     on every derived boot-published help/schema/index channel.
+    //     on every derived boot-published help/schema/index channel;
+    //   - `system:surface-config`, publish-only — granted an exact-match
+    //     `ephemeral_publish` ACL on every surface's bindings channel. Separate
+    //     from the help identity so each holds exactly its own family.
     // A publish-only spec carries no subscriptions, so it gets a registry entry
     // (publish authority) but no directory subscriber entry and no delivery
     // binding — it is never a dispatch target. The surface error channel has no
@@ -869,6 +881,13 @@ pub(crate) async fn build_messaging(
     );
     system_participants.push(crate::routes::surface::description::surface_help_spec(
         &boot_published_bares,
+    ));
+    let config_bares = crate::routes::surface::description::surface_config_bare_channels(
+        &config.surface_description.prefix,
+        &resolved_surfaces,
+    );
+    system_participants.push(crate::routes::surface::description::surface_config_spec(
+        &config_bares,
     ));
     brenn_lib::messaging::system::fold_spec_subscriptions(&mut all_entries, &system_participants);
 

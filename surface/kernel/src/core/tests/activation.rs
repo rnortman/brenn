@@ -7,7 +7,7 @@
 
 use super::*;
 use brenn_surface_contract::{ActivationError, PublishError};
-use brenn_surface_proto::{
+use brenn_surface_schema::{
     BatchEntry, LOCAL_THEME_CHANNEL, LOCAL_TOAST_CHANNEL, LocalChannel, PublishBatchOutcome,
 };
 
@@ -33,7 +33,7 @@ fn binding(port: &str, push_depth: u64, retain_depth: u64) -> Binding {
         port: port.into(),
         push_depth,
         retain_depth,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
     }
 }
 
@@ -42,7 +42,7 @@ fn binding_noise(
     port: &str,
     push_depth: u64,
     retain_depth: u64,
-    noise: brenn_surface_proto::NoiseLevel,
+    noise: brenn_surface_schema::NoiseLevel,
 ) -> Binding {
     Binding {
         noise,
@@ -58,7 +58,7 @@ fn binding_on(channel: &str, port: &str, push_depth: u64, retain_depth: u64) -> 
         port: port.into(),
         push_depth,
         retain_depth,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
     }
 }
 
@@ -396,7 +396,7 @@ fn the_dispatch_pick_rotates_so_a_self_feeding_instance_cannot_starve_a_sibling(
         port: "in".into(),
         push_depth: 4,
         retain_depth: 0,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
     };
     let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
     core.on_input(Input::Opened, Millis(1));
@@ -466,7 +466,7 @@ fn two_registered_instances_activate_independently() {
         port: "in".into(),
         push_depth: 4,
         retain_depth: 0,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
     };
     let (mut core, _init) = ClientCore::new(cfg(), Millis(0));
     core.on_input(Input::Opened, Millis(1));
@@ -606,7 +606,7 @@ fn server_reported_drops_count_against_every_binding_on_the_subscription() {
 
 // ── Loudness ladder: metered counters ──────────────────────────────────────
 
-use brenn_surface_proto::NoiseLevel;
+use brenn_surface_schema::NoiseLevel;
 
 /// The `metered` rung counts a message lost past the binding's view: the drop the
 /// window reports at assembly advances the binding's kernel-internal counter.
@@ -665,7 +665,7 @@ fn metered_counter_accumulates_across_activations() {
 
 // ── Loudness ladder: alarm and fatal ─────────────────────────────────────────
 
-use brenn_surface_proto::{AlertSeverity, ToastSeverity, ToastSource};
+use brenn_surface_schema::{AlertSeverity, ToastSeverity, ToastSource};
 
 /// A registered single-instance core on `channel` at the given noise, holding the
 /// alert grant — which the boot check proves present for any `alarm`/`fatal`
@@ -2494,7 +2494,7 @@ fn a_siblings_steady_results_do_not_starve_a_parked_heads_retry() {
         port: "in".into(),
         push_depth: 4,
         retain_depth: 0,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
     };
     let a_in = Binding {
         channel: "ephemeral:demo".into(),
@@ -2502,7 +2502,7 @@ fn a_siblings_steady_results_do_not_starve_a_parked_heads_retry() {
         port: "in".into(),
         push_depth: 4,
         retain_depth: 0,
-        noise: brenn_surface_proto::NoiseLevel::Silent,
+        noise: brenn_surface_schema::NoiseLevel::Silent,
     };
     let b_out = output("out", "ephemeral:sink");
     let a_out = OutputBinding {

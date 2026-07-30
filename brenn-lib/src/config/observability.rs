@@ -1,4 +1,4 @@
-use brenn_surface_proto::LogLevel;
+use brenn_surface_schema::LogLevel;
 use serde::Deserialize;
 
 /// Top-level `[observability]` config section.

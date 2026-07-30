@@ -1,19 +1,19 @@
-//! Per-target clock shims: the monotonic `now()` the driver stamps on every core
-//! input, and the wall clock it stamps on every publish.
+//! Per-target clock shims: the monotonic `now()` a driver stamps on every core
+//! input, and the wall clock it stamps on every locally minted envelope.
 //!
-//! Confined to the transport layer so the core and driver carry no `cfg` logic.
-//! wasm32 has no working `std::time::Instant`, so each target reads its own
-//! monotonic source — `tokio::time::Instant` natively (which honours paused time
-//! under tests), `performance.now()` in the browser — and hands the core a plain
-//! millisecond [`Millis`] it only ever compares.
+//! Confined to the transport layer so the sans-I/O layers above carry no `cfg`
+//! logic. wasm32 has no working `std::time::Instant`, so each target reads its
+//! own monotonic source — `tokio::time::Instant` natively (which honours paused
+//! time under tests), `performance.now()` in the browser — and hands the core a
+//! plain millisecond [`Millis`] it only ever compares.
 //!
 //! [`wall_now`] is the separate, deliberately-distinct concern: [`Clock`] is
-//! monotonic and page-relative, so it can date nothing. The `local:` router
-//! synthesizes real [`MessageEnvelope`](brenn_envelope::MessageEnvelope)s in the
-//! page — the server is not in the loop to stamp `publish_ts` as it does for
-//! `brenn:`/`ephemeral:` — so the driver reads a true wall clock and hands the
-//! result to the core as data. The two must not be conflated: a wall clock steps
-//! (NTP, user clock changes) and `Millis` must not.
+//! monotonic and attachment-relative, so it can date nothing. An attacher that
+//! hosts its own confined channels mints real envelopes locally — the server is
+//! not in the loop to stamp `publish_ts` as it does for a channel that crosses
+//! the wire — so the driver reads a true wall clock and hands the result to the
+//! core as data. The two must not be conflated: a wall clock steps (NTP, user
+//! clock changes) and `Millis` must not.
 
 use chrono::{DateTime, Utc};
 
@@ -43,7 +43,7 @@ pub fn wall_now() -> DateTime<Utc> {
 pub fn wall_now() -> DateTime<Utc> {
     let ms = js_sys::Date::now() as i64;
     DateTime::from_timestamp_millis(ms)
-        .expect("surface client: Date.now() outside representable range")
+        .expect("attach client: Date.now() outside representable range")
 }
 
 /// A monotonic clock. Constructed once per driver; `now()` returns milliseconds
@@ -95,9 +95,9 @@ impl Clock {
 
     pub fn now(&self) -> Millis {
         let perf = web_sys::window()
-            .expect("surface kernel requires a Window global")
+            .expect("browser attacher requires a Window global")
             .performance()
-            .expect("surface kernel requires performance.now()");
+            .expect("browser attacher requires performance.now()");
         Millis(perf.now() as u64)
     }
 }

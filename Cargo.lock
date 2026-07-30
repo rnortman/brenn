@@ -421,6 +421,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-attach-client"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures-channel",
+ "futures-util",
+ "js-sys",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
+name = "brenn-attach-proto"
+version = "0.1.0"
+dependencies = [
+ "brenn-envelope",
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "brenn-budget"
 version = "0.1.0"
 dependencies = [
@@ -452,7 +478,7 @@ version = "0.1.0"
 dependencies = [
  "brenn-surface-component-support",
  "brenn-surface-contract",
- "brenn-surface-proto",
+ "brenn-surface-schema",
  "brenn-surface-test-fixtures",
  "serde",
  "serde_json",
@@ -487,7 +513,7 @@ version = "0.1.0"
 dependencies = [
  "brenn-surface-component-support",
  "brenn-surface-contract",
- "brenn-surface-proto",
+ "brenn-surface-schema",
  "serde_json",
  "wasm-bindgen",
  "web-sys",
@@ -530,7 +556,7 @@ dependencies = [
  "brenn-common",
  "brenn-envelope",
  "brenn-queue",
- "brenn-surface-proto",
+ "brenn-surface-schema",
  "bytes",
  "chrono",
  "chrono-tz",
@@ -588,7 +614,7 @@ dependencies = [
  "brenn-envelope",
  "brenn-surface-component-support",
  "brenn-surface-contract",
- "brenn-surface-proto",
+ "brenn-surface-schema",
  "brenn-surface-test-fixtures",
  "chrono",
  "serde",
@@ -604,7 +630,7 @@ version = "0.1.0"
 dependencies = [
  "brenn-surface-component-support",
  "brenn-surface-contract",
- "brenn-surface-proto",
+ "brenn-surface-schema",
  "brenn-surface-test-fixtures",
  "chrono",
  "js-sys",
@@ -635,7 +661,7 @@ dependencies = [
  "brenn-envelope",
  "brenn-surface-component-support",
  "brenn-surface-contract",
- "brenn-surface-proto",
+ "brenn-surface-schema",
  "brenn-surface-test-fixtures",
  "chrono",
  "pulldown-cmark",
@@ -667,7 +693,7 @@ dependencies = [
  "brenn-pfin",
  "brenn-surface-contract",
  "brenn-surface-kernel",
- "brenn-surface-proto",
+ "brenn-surface-schema",
  "brenn-wasm",
  "chrono",
  "chrono-tz",
@@ -712,7 +738,7 @@ version = "0.1.0"
 dependencies = [
  "brenn-envelope",
  "brenn-surface-contract",
- "brenn-surface-proto",
+ "brenn-surface-schema",
  "brenn-surface-test-fixtures",
  "chrono",
  "js-sys",
@@ -729,19 +755,20 @@ version = "0.1.0"
 dependencies = [
  "brenn-activation",
  "brenn-envelope",
- "brenn-surface-proto",
+ "brenn-surface-schema",
 ]
 
 [[package]]
 name = "brenn-surface-kernel"
 version = "0.1.0"
 dependencies = [
+ "brenn-attach-client",
  "brenn-budget",
  "brenn-envelope",
  "brenn-queue",
  "brenn-surface-component-support",
  "brenn-surface-contract",
- "brenn-surface-proto",
+ "brenn-surface-schema",
  "brenn-surface-test-fixtures",
  "chrono",
  "futures-channel",
@@ -750,7 +777,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tokio-tungstenite",
  "tracing",
  "uuid",
  "wasm-bindgen",
@@ -760,7 +786,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "brenn-surface-proto"
+name = "brenn-surface-schema"
 version = "0.1.0"
 dependencies = [
  "brenn-envelope",
@@ -776,7 +802,7 @@ version = "0.1.0"
 dependencies = [
  "brenn-envelope",
  "brenn-surface-contract",
- "brenn-surface-proto",
+ "brenn-surface-schema",
  "serde_json",
  "uuid",
 ]

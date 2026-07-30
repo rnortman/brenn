@@ -5,8 +5,8 @@
 
 use std::time::Duration;
 
-use brenn_surface_proto::{
-    OutputBinding, PublishOutcome, ServerFrame, SurfaceBindings, channel_capabilities,
+use brenn_surface_schema::{
+    OutputBinding, PublishOutcome, ServerFrame, SurfaceBindings, surface_bindable_address,
 };
 
 use super::PublishStatus;
@@ -61,12 +61,12 @@ pub(crate) fn truncate_report_field(value: String, cap: usize) -> String {
 /// A binding channel scheme this client can route today: every scheme that binds
 /// to a surface at all, now that the page-local router handles `local:`.
 ///
-/// Kept as its own predicate rather than collapsed into
-/// [`brenn_surface_proto::surface_bindable`]: this one answers "can *this
-/// client* route it", which is what makes an unroutable `Welcome` binding fatal
-/// here. The two agreeing today is a fact, not an identity.
+/// Kept as its own named predicate rather than calling the bindability helper at
+/// each site: this one answers "can *this client* route it", which is what makes
+/// an unroutable `Welcome` binding fatal here. That the answer is currently
+/// bindability itself is a fact, not an identity.
 pub(super) fn channel_scheme_supported(channel: &str) -> bool {
-    channel_capabilities(channel).is_some()
+    surface_bindable_address(channel)
 }
 
 /// The output binding wired to `(instance, port)` in the current bindings, if

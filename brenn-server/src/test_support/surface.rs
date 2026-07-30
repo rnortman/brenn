@@ -61,7 +61,7 @@ impl SurfaceFixture {
                 components: vec![ResolvedComponent {
                     instance: component.to_string(),
                     kind: component.to_string(),
-                    abi: brenn_surface_proto::Abi::Dom,
+                    abi: brenn_surface_schema::Abi::Dom,
                     send_budget: SurfaceSendBudget::default(),
                     parked_batch_depth: 8,
                     config: Default::default(),
@@ -90,7 +90,7 @@ impl SurfaceFixture {
         self.inner.components.push(ResolvedComponent {
             instance: instance.to_string(),
             kind: kind.to_string(),
-            abi: brenn_surface_proto::Abi::Processor,
+            abi: brenn_surface_schema::Abi::Processor,
             send_budget: SurfaceSendBudget::default(),
             parked_batch_depth: 8,
             config,
@@ -221,7 +221,7 @@ pub(crate) fn derive_wire_subscriptions(surface: &mut ResolvedSurface) {
     // reaches first — and so the derived entries land in a deterministic order.
     let mut folded: Vec<(String, String, Depth, Depth, NoiseLevel)> = Vec::new();
     for binding in &surface.subscriptions {
-        if brenn_surface_proto::is_local_channel(&binding.channel_address) {
+        if brenn_envelope::is_local_channel(&binding.channel_address) {
             continue;
         }
         let push = Depth::Bounded(binding.push_depth);

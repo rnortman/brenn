@@ -11,7 +11,7 @@
 //! change — the opacity is what keeps future cursor state additive.
 
 use brenn_lib::messaging::store::ResumeCursor;
-use brenn_surface_proto::Cursor;
+use brenn_surface_schema::Cursor;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;

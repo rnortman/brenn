@@ -84,7 +84,7 @@ use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency, surface_sub_identi
 use brenn_surface_contract::{
     Activation, ActivationError, DeferredEntry, DeferredWindow, PortWindow,
 };
-use brenn_surface_proto::{
+use brenn_surface_schema::{
     AlertSeverity, BatchDeferredOp, BatchEntry, CONTROL_PLANE_VERSION, ClientFrame, Cursor,
     DeferredOpKind, DeferredViewEntry, DeliverTarget, GapInfo, InstanceReport,
     LOCAL_OVERLAY_STATE_CHANNEL, LOCAL_TAKEOVER_CHANNEL, LOCAL_TOAST_CHANNEL, LogLevel,
@@ -170,8 +170,8 @@ mod store;
 mod util;
 
 use activation::{ParkedBatch, RegisteredInstance};
+use brenn_envelope::is_local_channel;
 use brenn_queue::CursorOverflow;
-use brenn_surface_proto::is_local_channel;
 pub use publish_buffer::PublishBuffer;
 use publish_buffer::{BufferedDeferOp, BufferedPublish, OutputSpec};
 /// Re-exported so the handle's `PublishGate` asks the same question the core's
@@ -182,18 +182,10 @@ use store::{BindingKey, DeferOp, DeferOpOutcome, StoreKey, SurfaceChannelStore, 
 use util::*;
 pub(crate) use util::{checked_epoch_ms, epoch_ms, truncate_report_field};
 
-/// A monotonic timestamp in milliseconds, supplied by the driver on every
-/// input. wasm32 has no working `std::time::Instant`, so the driver reads the
-/// clock (`performance.now()` on wasm, `tokio::time::Instant` natively) and the
-/// core only ever compares these values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Millis(pub u64);
-
-impl Millis {
-    fn saturating_add_ms(self, ms: u64) -> Millis {
-        Millis(self.0.saturating_add(ms))
-    }
-}
+/// The monotonic timestamp the driver supplies on every input. Owned by the
+/// attach client (the shim that reads the per-target clock produces it);
+/// re-exported so the core's callers name one type.
+pub use brenn_attach_client::Millis;
 
 /// An input to the core, produced by the driver from transport and timer
 /// events. A transport-sourced input arriving in a state that no longer owns

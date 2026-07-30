@@ -251,6 +251,36 @@ push_depth = 1
 retain_depth = 1
 standing_retain_depth = 1
 
+# Surface config channels: one per surface, carrying the retained bindings
+# document boot publishes as `system:surface-config` and the shell replays on
+# every attach. Ephemeral because the document is rebuilt from this file at every
+# boot — a durable copy could only preserve a stale document the next boot
+# overwrites. `retain_depth = 1` is latest-wins; on a non-durable channel the
+# retained window is the standing buffer, so there is no third number.
+[[channel]]
+address = "ephemeral:surface.surface.dev-stub.bindings"
+description = "Surface bindings document: dev-stub"
+push_depth = 1
+retain_depth = 1
+
+[[channel]]
+address = "ephemeral:surface.surface.bar.bindings"
+description = "Surface bindings document: bar"
+push_depth = 1
+retain_depth = 1
+
+[[channel]]
+address = "ephemeral:surface.surface.bar-pixel.bindings"
+description = "Surface bindings document: bar-pixel"
+push_depth = 1
+retain_depth = 1
+
+[[channel]]
+address = "ephemeral:surface.surface.bar-feeder.bindings"
+description = "Surface bindings document: bar-feeder"
+push_depth = 1
+retain_depth = 1
+
 # Bar layout channel: latest-wins layout documents for the `bar` / `bar-pixel`
 # surfaces. Durable so a reload/reboot restores the last-chosen layout snapshot
 # (`retain_depth = 1`); `push_depth = 8` bounds the parked backlog, and

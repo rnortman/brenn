@@ -482,6 +482,25 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         );
         crate::routes::surface::description::publish_description(messenger, &docs).await;
 
+        // Bindings documents: one retained document per surface on its own
+        // ephemeral config channel, published here — before the server accepts
+        // connections — so an attaching surface always finds a retained copy and
+        // an empty replay is a server invariant failure rather than a race.
+        let bindings_docs = crate::routes::surface::bindings_doc::build_bindings_documents(
+            &messaging_result.surfaces,
+            &crate::routes::surface::bindings_doc::BindingsDocParams {
+                prefix,
+                status_interval_secs: config.surface_description.status_interval_secs,
+                error_report: config
+                    .observability
+                    .surface_error_channel
+                    .as_deref()
+                    .map(|addr| (addr, config.observability.surface_error_publish_floor)),
+            },
+        );
+        crate::routes::surface::bindings_doc::publish_bindings_documents(messenger, &bindings_docs)
+            .await;
+
         // Boot disconnected stamps: after the boot-published docs, write a
         // `disconnected` status snapshot (reason "server restart", the new
         // non-durable incarnation epoch, empty instances) per configured surface. A durable status

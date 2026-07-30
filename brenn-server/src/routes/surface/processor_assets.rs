@@ -276,7 +276,7 @@ pub fn assert_alert_grant(slug: &str, kind: &str, manifest: &ProcessorManifest, 
 ///
 /// When one kind appears under more than one ABI.
 pub fn assert_kind_abi_unique(
-    declarations: impl IntoIterator<Item = (String, brenn_surface_proto::Abi)>,
+    declarations: impl IntoIterator<Item = (String, brenn_surface_schema::Abi)>,
 ) {
     let mut seen: std::collections::BTreeMap<String, BTreeSet<&'static str>> =
         std::collections::BTreeMap::new();

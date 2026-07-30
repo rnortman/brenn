@@ -491,7 +491,7 @@ fn surface_resolves_happy_path() {
             ResolvedComponent {
                 instance: "protobar".to_string(),
                 kind: "protobar".to_string(),
-                abi: brenn_surface_proto::Abi::Dom,
+                abi: brenn_surface_schema::Abi::Dom,
                 send_budget: SurfaceSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
@@ -500,7 +500,7 @@ fn surface_resolves_happy_path() {
             ResolvedComponent {
                 instance: "sidecar".to_string(),
                 kind: "sidecar".to_string(),
-                abi: brenn_surface_proto::Abi::Dom,
+                abi: brenn_surface_schema::Abi::Dom,
                 send_budget: SurfaceSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
@@ -509,7 +509,7 @@ fn surface_resolves_happy_path() {
             ResolvedComponent {
                 instance: "chrome".to_string(),
                 kind: "chrome".to_string(),
-                abi: brenn_surface_proto::Abi::Dom,
+                abi: brenn_surface_schema::Abi::Dom,
                 send_budget: SurfaceSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
@@ -594,6 +594,34 @@ fn inject_surface_geometry_status_grants_adds_covering_publish_acls() {
     );
     // The surface's own publish coverage is untouched.
     assert!(s.policy.allows_brenn_publish("alerts"));
+}
+
+/// Injection adds the config-channel subscribe grant: an `EphemeralSubscribe`
+/// grant plus an exact `ephemeral_subscribe` matcher on the surface's own
+/// bindings channel only, leaving its own subscribe coverage intact.
+#[test]
+fn inject_surface_config_subscribe_grants_adds_covering_subscribe_acl() {
+    let dir = surface_dir();
+    let mut resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
+    let slug = resolved[0].slug.clone();
+    let own = format!("surface.surface.{slug}.bindings");
+    assert!(!resolved[0].policy.allows_ephemeral_delivery(&own));
+
+    inject_surface_config_subscribe_grants(&mut resolved, "surface");
+
+    let s = &resolved[0];
+    assert!(
+        s.policy.allows_ephemeral_delivery(&own),
+        "injected grant must authorize the surface's own config channel"
+    );
+    // Scoped to exactly its own channel, not a sibling's.
+    assert!(
+        !s.policy
+            .allows_ephemeral_delivery("surface.surface.other.bindings")
+    );
+    // A subscribe grant is not a publish grant: the config channel stays
+    // single-writer under `system:surface-config`.
+    assert!(!s.policy.allows_ephemeral_publish(&own));
 }
 
 #[test]
@@ -981,7 +1009,7 @@ fn surface_reserved_plane_binding_reads_the_contract_fixed_depth() {
     let mut raw = local_surface_raw();
     raw.subscriptions[0] = local_sub_raw("local:brenn/theme", "protobar", "theme-in");
     let resolved = resolve_surfaces(&[raw], &dir_of(vec![]), &test_globals());
-    let fixed = brenn_surface_proto::reserved_local_channel("local:brenn/theme")
+    let fixed = brenn_surface_schema::reserved_local_channel("local:brenn/theme")
         .expect("theme is a reserved plane")
         .ring_depth;
     assert_eq!(resolved[0].subscriptions[0].retain_depth, fixed);
@@ -1314,7 +1342,7 @@ fn surface_subscription_count_over_startup_attach_bound_panics() {
     let mut raw = valid_surface_raw();
     // One binding per distinct port on the covered ephemeral channel, one
     // past the shell's synchronous startup-attach bound.
-    raw.subscriptions = (0..=brenn_surface_proto::MAX_SURFACE_SUBSCRIPTION_BINDINGS)
+    raw.subscriptions = (0..=brenn_surface_schema::MAX_SURFACE_SUBSCRIPTION_BINDINGS)
         .map(|i| surface_sub_raw("ephemeral:protobar-demo", "protobar", &format!("p{i}")))
         .collect();
     resolve_surfaces(&[raw], &dir, &test_globals());
@@ -2224,7 +2252,10 @@ fn component_abi_dom_resolves() {
     let resolved = resolve_surfaces(&[surface_with_abi("dom")], &dir_of(vec![]), &test_globals());
     // The declared component carries its resolved ABI to the page: the shell is
     // told what it is loading rather than inferring it from the kind.
-    assert_eq!(resolved[0].components[0].abi, brenn_surface_proto::Abi::Dom);
+    assert_eq!(
+        resolved[0].components[0].abi,
+        brenn_surface_schema::Abi::Dom
+    );
 }
 
 #[test]
@@ -2239,7 +2270,7 @@ fn component_abi_processor_resolves() {
     );
     assert_eq!(
         resolved[0].components[0].abi,
-        brenn_surface_proto::Abi::Processor
+        brenn_surface_schema::Abi::Processor
     );
 }
 

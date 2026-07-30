@@ -8,7 +8,7 @@
 //! boundary, so they parse the same bytes the transport would carry.
 
 use brenn_envelope::MessageEnvelope;
-use brenn_surface_proto::{
+use brenn_surface_schema::{
     Abi, Binding, ComponentEntry, Cursor, DeliverTarget, LocalChannel, LogLevel, OutputBinding,
     PublishOutcome, ServerFrame, SubscribeOutcome, SurfaceBindings, SurfaceDescription,
 };

@@ -60,7 +60,7 @@ Done when the planes uniformly either check `v == CONTROL_PLANE_VERSION`
 (drop-and-warn on mismatch) or drop the field until versioning is enforced.
 
 Code site (`TODO(plane-version-check)`):
-`surface/proto/src/lib.rs`, the `CONTROL_PLANE_VERSION` const.
+`surface/schema/src/lib.rs`, the `CONTROL_PLANE_VERSION` const.
 
 ---
 
@@ -950,3 +950,31 @@ a test either way.
 Code site (`TODO(dormant-missing-app-cursor)`):
 `brenn-lib/src/messaging/reconcile.rs`, the dormant justification loop in
 `Messenger::reconcile_subscriber_cursors`.
+
+
+## `surface-config-read-side-acl`
+
+The per-surface bindings document — a surface's whole wiring, including every
+component's operator-written config map — is a retained message on an ordinary
+`ephemeral:` channel. Boot makes forging it impossible: the single-writer sweep
+panics on any principal whose `ephemeral_publish` ACL covers a config address,
+and the argument there is that an accidental-broad prefix grant is a realistic
+operator error worth a boot panic. The read side has no such guard. Any
+principal whose `ephemeral_subscribe` (or delivery) matchers cover the derived
+namespace can pull every surface's wiring and config maps, with no boot signal
+and no log — the same operator error that fails loudly on the write side
+discloses silently on the read side. Before this cycle the data rode only the
+cookie-authenticated socket to the owning surface and no ACL could reach it.
+
+Needs a decision before code. Either a read-side boot sweep mirroring
+`assert_no_covering_publish` (and then: panic, or warn-and-alert? a broad
+subscribe grant for a debugging or observability consumer is a plausible
+deliberate config in a way a broad publish grant is not, so a panic here
+retroactively refuses configs that boot today), or a ratified posture that
+bindings documents are operator-readable bus state and config maps must not
+carry secrets — recorded where an operator writing `[[surface.component.config]]`
+will see it. Done when one of the two exists.
+
+Code site (`TODO(surface-config-read-side-acl)`):
+`brenn-server/src/routes/surface/description.rs`, the config-channel arm of
+`validate_surface_description`.

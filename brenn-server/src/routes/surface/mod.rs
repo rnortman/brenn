@@ -3,10 +3,12 @@
 //! `surface_ws_handler` fronts `GET /surface/{slug}/ws`; `session.rs` owns the
 //! per-connection task; `registry.rs` tracks attached WS sessions per surface.
 
+pub mod bindings_doc;
 pub mod cursor;
 pub mod description;
 pub mod page;
 pub mod processor_assets;
+pub mod profile;
 pub mod registry;
 pub mod session;
 pub mod telemetry;
@@ -26,6 +28,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
+use brenn_envelope::{channel_capabilities, is_local_channel};
 use brenn_lib::access::AppPolicy;
 use brenn_lib::auth::session::Session;
 use brenn_lib::messaging::config::{
@@ -38,14 +41,17 @@ use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
 use brenn_surface_contract::{
     ERROR_REPORT_INSTANCE, ERROR_REPORT_PORT, KERNEL_ARTIFACT, module_artifact,
 };
-use brenn_surface_proto::{
+use brenn_surface_schema::{
     Binding, ComponentEntry, LocalChannel, LogLevel, NoiseLevel as WireNoiseLevel, OutputBinding,
-    SurfaceBindings, channel_capabilities, is_local_channel, max_client_frame_bytes,
+    SurfaceBindings, max_client_frame_bytes, surface_bindable_address,
 };
 use chrono::Utc;
 use tracing::warn;
 use uuid::Uuid;
 
+pub use crate::routes::attach::profile::SubscriptionFacts;
+
+use self::profile::SurfaceProfile;
 use self::registry::{PUSH_QUEUE_FRAMES, RegisterRejection, SessionCaps, SurfaceSessionHandle};
 use self::session::{SurfaceSessionParams, run_surface_session};
 use crate::client_ip::ClientIp;
@@ -207,6 +213,11 @@ pub struct SurfaceRuntime {
     /// geometry/status channel addresses (the platform-telemetry publish
     /// targets). Every surface has one.
     pub description: SurfaceDescriptionRuntime,
+    /// This surface's component structure lowered to the attachment grain: the
+    /// per-channel subscribable fold, the per-attribution publishable sets, the
+    /// declared sub-identities, and the parked-view targets. The authority half
+    /// of an attachment, in the vocabulary the wire speaks.
+    pub profile: SurfaceProfile,
 }
 
 /// The operator's `[surface_description]` parameters, as [`SurfaceRuntime::build`]
@@ -231,6 +242,10 @@ pub struct SurfaceDescriptionRuntime {
     pub geometry_channel: String,
     /// `brenn:<prefix>.surface.<slug>.status` — the status publish target.
     pub status_channel: String,
+    /// `ephemeral:<prefix>.surface.<slug>.bindings` — the config channel this
+    /// surface's retained bindings document sits on. Rendered into the page as a
+    /// meta, because a client cannot derive it: the prefix is the operator's.
+    pub config_channel: String,
     /// Configured instance → kind, precomputed once at boot (a `Status` frame
     /// validates its reported instances against this; it is boot-constant, so it is
     /// not rebuilt per frame).
@@ -242,51 +257,8 @@ pub struct SurfaceDescriptionRuntime {
     pub expected_pumps: HashMap<String, u32>,
 }
 
-/// What one declared subscription is, at the grain the session delivers it: its
-/// two boot-resolved depths, both folded across its bindings (one instance may
-/// bind one channel on two ports, and they share one subscription).
-///
-/// Two knobs, not one flattening of them: `push_depth` is what wakes the page,
-/// `retain_depth` is what it can see, and everything the session needs is
-/// derived from the pair rather than stored beside it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SubscriptionFacts {
-    /// The subscription's folded push depth — the page queue behind it.
-    pub push_depth: u64,
-    /// The subscription's folded retain depth — the page's retained context
-    /// ring behind it.
-    pub retain_depth: u64,
-}
-
-impl SubscriptionFacts {
-    /// Whether this subscription has a push window at all.
-    ///
-    /// A subscription whose fold is 0 is a *context feed*: its rows still reach
-    /// the page — they are the page's retained-ring diet, and `retain_depth`
-    /// bounds page memory, not the wire — but no push window exists behind them,
-    /// so there is no overflow for `Deliver.dropped` to account.
-    pub(crate) fn push_enabled(self) -> bool {
-        self.push_depth >= 1
-    }
-
-    /// How far back a subscribe or a drain reads into the channel's retention.
-    ///
-    /// The max of the two depths, because that is what the subscription is owed:
-    /// a subscriber with `push = 8, retain = 2` that missed 8 rows would have
-    /// received all 8 had it stayed connected, so the drain may ask for all 8. A
-    /// clamp below the wider knob would starve the push window on recovery.
-    ///
-    /// The clamp is a request, not a promise: if the store retains fewer rows
-    /// than the clamp asks for, the shortfall is reported as `dropped` —
-    /// bounded loss, exactly as `docs/message-bus.md` prescribes. Boot proves
-    /// both depths bounded and refuses a binding that is neither triggering nor
-    /// context-carrying, so this is always a bounded, non-zero window.
-    pub(crate) fn replay_clamp(self) -> Depth {
-        Depth::Bounded(self.push_depth.max(self.retain_depth))
-    }
-}
-
-/// Map one resolved config binding to its wire form for the `Welcome` payload.
+/// Map one resolved config binding to the form the surface's lowered wiring
+/// carries.
 fn wire_binding(b: &SurfaceBinding) -> Binding {
     Binding {
         channel: b.channel_address.clone(),
@@ -348,7 +320,7 @@ pub struct OutputPort {
     pub default_urgency: Urgency,
 }
 
-/// The `Welcome` wire form of a resolved output binding. Separate from
+/// The lowered form of a resolved output binding. Separate from
 /// [`wire_binding`] because an output advertises its resolved default urgency —
 /// the page needs it to stamp page-local envelopes, whose router never consults
 /// the server.
@@ -363,6 +335,51 @@ fn wire_output(b: &SurfaceOutput) -> OutputBinding {
     }
 }
 
+/// Lower one resolved surface's component structure to its wire/document form.
+///
+/// The single lowering of a surface's wiring: the `Welcome` payload and the
+/// bindings document carry the same five fields and must agree field for field,
+/// so they are built here once rather than constructed twice.
+///
+/// # Panics
+///
+/// If the surface declares no chrome component. Surface resolution enforces
+/// exactly one per surface, so a miss is a broken boot invariant.
+fn lower_surface_bindings(resolved: &ResolvedSurface) -> SurfaceBindings {
+    SurfaceBindings {
+        components: resolved
+            .components
+            .iter()
+            .map(|c| ComponentEntry {
+                instance: c.instance.clone(),
+                kind: c.kind.clone(),
+                abi: c.abi,
+                parked_batch_depth: c.parked_batch_depth,
+                config: c.config.clone(),
+            })
+            .collect(),
+        subscriptions: resolved.subscriptions.iter().map(wire_binding).collect(),
+        outputs: resolved.outputs.iter().map(wire_output).collect(),
+        // Page-local channels have no `[[channel]]` block and no directory
+        // entry, so this table is the only place their ring depths can come
+        // from.
+        local_channels: resolved
+            .local_channels
+            .iter()
+            .map(|c| LocalChannel {
+                channel: c.address.clone(),
+                ring_depth: c.ring_depth,
+            })
+            .collect(),
+        chrome_instance: resolved
+            .components
+            .iter()
+            .find(|c| c.chrome)
+            .map(|c| c.instance.clone())
+            .expect("resolve_surfaces enforces exactly one chrome component per surface"),
+    }
+}
+
 /// Assert that a channel the wire maps hold is transportable — the one channel
 /// characteristic the surface bridge is allowed to see, because only
 /// transportable channels cross the websocket at all.
@@ -371,13 +388,16 @@ fn wire_output(b: &SurfaceOutput) -> OutputBinding {
 /// `ephemeral:`/`local:`) and on `local:` itself: `resolve_surfaces` restricted
 /// surface bindings to those three, and the wire maps exclude `local:` by
 /// construction, so either is a broken boot invariant rather than client input.
+/// Past the bindability gate every remaining scheme carries capabilities, so the
+/// read itself cannot come up empty.
 fn assert_transportable(address: &str) {
-    let capabilities = channel_capabilities(address).unwrap_or_else(|| {
-        panic!(
-            "surface binding address {address:?} is not a surface-bindable scheme (brenn:, \
-             ephemeral:, or local:) — resolve_surfaces should have rejected it at boot"
-        )
-    });
+    assert!(
+        surface_bindable_address(address),
+        "surface binding address {address:?} is not a surface-bindable scheme (brenn:, \
+         ephemeral:, or local:) — resolve_surfaces should have rejected it at boot"
+    );
+    let capabilities =
+        channel_capabilities(address).expect("every surface-bindable scheme carries capabilities");
     assert!(
         capabilities.transportable,
         "surface binding address {address:?} is not transportable — page-local traffic never \
@@ -435,14 +455,8 @@ impl SurfaceRuntime {
     /// The kind is deliberately not consulted. It is the manifest — a load-time
     /// compatibility fact and an observability decoration — and never holds
     /// authority.
-    ///
-    /// Linear scan over the handful of declared components, matching
-    /// `output_ports`' probe: allocation-free, and the list is config-sized.
     pub(crate) fn is_declared_instance(&self, instance: &str) -> bool {
-        self.resolved
-            .components
-            .iter()
-            .any(|c| c.instance == instance)
+        self.profile.is_declared(instance)
     }
 
     /// The `Messenger` this surface's messaging projects through.
@@ -580,42 +594,7 @@ impl SurfaceRuntime {
             })
             .collect();
 
-        let bindings = SurfaceBindings {
-            components: resolved
-                .components
-                .iter()
-                .map(|c| ComponentEntry {
-                    instance: c.instance.clone(),
-                    kind: c.kind.clone(),
-                    abi: c.abi,
-                    parked_batch_depth: c.parked_batch_depth,
-                    config: c.config.clone(),
-                })
-                .collect(),
-            subscriptions: resolved.subscriptions.iter().map(wire_binding).collect(),
-            outputs: resolved.outputs.iter().map(wire_output).collect(),
-            // Local channels *do* ride `Welcome`: the client learns its wiring
-            // from the backend and hardcodes nothing, page-local traffic
-            // included. The server resolves them and then never touches them
-            // again.
-            local_channels: resolved
-                .local_channels
-                .iter()
-                .map(|c| LocalChannel {
-                    channel: c.address.clone(),
-                    ring_depth: c.ring_depth,
-                })
-                .collect(),
-            // The surface's chrome singleton. Resolution guarantees exactly one
-            // chrome-marked component per surface (boot panics otherwise), so
-            // this find always hits. One field, not a per-entry flag.
-            chrome_instance: resolved
-                .components
-                .iter()
-                .find(|c| c.chrome)
-                .map(|c| c.instance.clone())
-                .expect("resolve_surfaces enforces exactly one chrome component per surface"),
-        };
+        let bindings = lower_surface_bindings(&resolved);
 
         // Every configured instance is an `expected_pumps` key (a zero means no
         // bound subscription), so health derivation can require every configured
@@ -642,9 +621,14 @@ impl SurfaceRuntime {
                 &description.prefix,
                 &resolved.slug,
             ),
+            config_channel: description::surface_config_channel(
+                &description.prefix,
+                &resolved.slug,
+            ),
             configured_kinds,
             expected_pumps,
         };
+        let profile = SurfaceProfile::build(&resolved, &description);
 
         SurfaceRuntime {
             resolved,
@@ -661,6 +645,7 @@ impl SurfaceRuntime {
             // no error channel.
             error_report_floor: None,
             description,
+            profile,
         }
     }
 }
@@ -706,7 +691,9 @@ pub fn build_surface_runtimes(
                     },
                 );
                 runtime.error_report_floor = Some(*floor);
+                runtime.profile.bind_error_channel(channel_address);
             }
+            profile::assert_agrees_with_port_maps(&runtime);
             (slug, Arc::new(runtime))
         })
         .collect()
@@ -750,7 +737,7 @@ pub fn validate_surface_assets(surface_dist_dir: &std::path::Path, surfaces: &[R
     for surface in surfaces {
         for comp in &surface.components {
             match comp.abi {
-                brenn_surface_proto::Abi::Dom => {
+                brenn_surface_schema::Abi::Dom => {
                     if seen_dom.insert(comp.kind.as_str()) {
                         assert_module_pair_exists(
                             surface_dist_dir,
@@ -759,7 +746,7 @@ pub fn validate_surface_assets(surface_dist_dir: &std::path::Path, surfaces: &[R
                         );
                     }
                 }
-                brenn_surface_proto::Abi::Processor => {
+                brenn_surface_schema::Abi::Processor => {
                     if !manifests.contains_key(comp.kind.as_str()) {
                         let manifest =
                             processor_assets::validate_processor_kind(surface_dist_dir, &comp.kind);
@@ -768,7 +755,7 @@ pub fn validate_surface_assets(surface_dist_dir: &std::path::Path, surfaces: &[R
                 }
                 // `resolve_abi` rejects the reserved ABIs at config resolution,
                 // so no resolved component can carry one.
-                brenn_surface_proto::Abi::DomTs | brenn_surface_proto::Abi::Html => unreachable!(
+                brenn_surface_schema::Abi::DomTs | brenn_surface_schema::Abi::Html => unreachable!(
                     "reserved abi {:?} resolved for component {:?} — resolve_abi must reject it",
                     comp.abi, comp.instance,
                 ),
@@ -820,7 +807,7 @@ pub struct SingleWriterPrincipals<'a> {
 /// covers the remaining envelope — the three object keys and the level string,
 /// all genuinely fixed-size.
 pub const SURFACE_ERROR_BODY_MAX_BYTES: usize = 6
-    * (brenn_surface_proto::MAX_LOG_MESSAGE_BYTES + brenn_surface_proto::MAX_LOG_SOURCE_BYTES)
+    * (brenn_surface_schema::MAX_LOG_MESSAGE_BYTES + brenn_surface_schema::MAX_LOG_SOURCE_BYTES)
     + 256;
 
 /// Boot-time validation of `[observability] surface_error_channel`.
@@ -939,20 +926,21 @@ impl ExpectedWriter<'_> {
     }
 }
 
-/// Sweep every durable-publisher class for a covering path onto a single-writer
-/// `brenn:` channel, panicking (boot fail-fast) on any principal other than
-/// `expected` that could write it. Used by the surface self-description
-/// validator, which runs it once per derived channel — the boot-published
-/// help/schema/index channels are single-writer under `system:surface-help`, and
-/// each runtime geometry/status channel is single-writer under its owning
-/// surface — so the "which classes can publish durably" checklist lives in
-/// exactly one place.
+/// Sweep every publisher class for a covering path onto a single-writer channel,
+/// panicking (boot fail-fast) on any principal other than `expected` that could
+/// write it. Used by the surface self-description validator, which runs it once
+/// per derived channel — the boot-published help/schema/index channels are
+/// single-writer under `system:surface-help`, each surface's config channel under
+/// `system:surface-config`, and each runtime geometry/status channel under its
+/// owning surface — so the "which classes can publish" checklist lives in exactly
+/// one place.
 ///
 /// `bare` is the scheme-stripped channel name; `channel` the full address (both
 /// only for the panic messages and the ACL-coverage check). The sweep covers
-/// surface + WASM output bindings (exact-address) and the resolved-policy
-/// `brenn_publish` ACL coverage (Exact or accidental-broad Prefix) over the app
-/// map, WASM consumers, surfaces, and the collected system-participant specs.
+/// surface + WASM output bindings (exact-address) and the resolved-policy ACL
+/// coverage (Exact or accidental-broad Prefix) in the channel scheme's own
+/// publish family over the app map, WASM consumers, surfaces, and the collected
+/// system-participant specs.
 ///
 /// `expected` names the one principal permitted to write the channel; it is
 /// excluded from its own class's sweep (the system participant by component name,
@@ -1006,11 +994,12 @@ pub(super) fn assert_channel_single_writer(
     }
 
     // Resolved-policy sweep: any principal whose policy covers the channel via a
-    // `brenn_publish` matcher (Exact or Prefix — the accidental-broad-prefix
-    // case) is a forgery path. Catches ACL coverage the exact-address binding
-    // checks above never see. The owning surface (for a `Surface` expected
-    // writer) is excluded from the surface sweep — its geometry/status grant is
-    // the sanctioned single-writer coverage; every other principal is swept.
+    // matcher in its scheme's publish family (Exact or Prefix — the
+    // accidental-broad-prefix case) is a forgery path. Catches ACL coverage the
+    // exact-address binding checks above never see. The owning surface (for a
+    // `Surface` expected writer) is excluded from the surface sweep — its
+    // geometry/status grant is the sanctioned single-writer coverage; every other
+    // principal is swept.
     let expected_desc = expected.describe();
     for (slug, policy) in app_policies {
         assert_no_covering_publish("[[app]]", slug, policy, bare, channel, &expected_desc);
@@ -1056,11 +1045,22 @@ pub(super) fn assert_channel_single_writer(
     }
 }
 
-/// Panic if `policy` holds a `brenn_publish` path covering `bare` (the
-/// scheme-stripped channel name) — the single-writer forgery guard. The message
-/// names the offending principal (`kind` + `slug`), the covering matcher list to
-/// narrow, and the channel, so an operator can remediate without reading the
-/// code.
+/// Panic if `policy` holds a publish path covering `bare` (the scheme-stripped
+/// channel name) in the ACL family the channel's own scheme is gated by — the
+/// single-writer forgery guard. The message names the offending principal
+/// (`kind` + `slug`), the covering matcher list to narrow, and the channel, so an
+/// operator can remediate without reading the code.
+///
+/// Scheme-matched rather than `brenn_publish`-only: a channel is gated by the
+/// family its scheme dispatches to, so reading any other family would sweep
+/// grants that cannot reach the channel while missing the ones that can. An
+/// `ephemeral_publish` matcher covering a single-writer `ephemeral:` channel is
+/// exactly the forgery path this guard exists to make boot-impossible.
+///
+/// # Panics
+///
+/// On any scheme but `brenn:` and `ephemeral:`. Single-writer channels are
+/// derived addresses in those two families only; anything else is a host bug.
 fn assert_no_covering_publish(
     kind: &str,
     slug: &str,
@@ -1069,13 +1069,32 @@ fn assert_no_covering_publish(
     channel: &str,
     expected_desc: &str,
 ) {
+    let scheme = ChannelScheme::of(channel).unwrap_or_else(|| {
+        panic!("single-writer channel {channel:?} carries no recognized scheme — host bug")
+    });
+    let (covers, family, matchers) = match scheme {
+        ChannelScheme::Brenn => (
+            policy.allows_brenn_publish(bare),
+            "brenn_publish",
+            format!("{:?}", policy.acls.brenn_publish),
+        ),
+        ChannelScheme::Ephemeral => (
+            policy.allows_ephemeral_publish(bare),
+            "ephemeral_publish",
+            format!("{:?}", policy.acls.ephemeral_publish),
+        ),
+        other => panic!(
+            "single-writer channel {channel:?} is on scheme {} — the derived single-writer \
+             families are brenn: and ephemeral: only; host bug",
+            other.as_str(),
+        ),
+    };
     assert!(
-        !policy.allows_brenn_publish(bare),
-        "boot: {kind} {slug:?} holds a brenn_publish ACL covering single-writer channel \
-         {channel:?} (matchers: {:?}) — only {expected_desc} may write it, so any other covering \
-         grant is a forgery path. Narrow the ACL, drop the MessagingPublish grant, or rename the \
-         channel. Refusing to start (fail-fast on invalid config).",
-        policy.acls.brenn_publish,
+        !covers,
+        "boot: {kind} {slug:?} holds a {family} ACL covering single-writer channel {channel:?} \
+         (matchers: {matchers}) — only {expected_desc} may write it, so any other covering grant \
+         is a forgery path. Narrow the ACL, drop the publish grant, or rename the channel. \
+         Refusing to start (fail-fast on invalid config).",
     );
 }
 
@@ -1251,7 +1270,7 @@ mod tests {
                 ResolvedComponent {
                     instance: "protobar".to_string(),
                     kind: "protobar".to_string(),
-                    abi: brenn_surface_proto::Abi::Dom,
+                    abi: brenn_surface_schema::Abi::Dom,
                     send_budget: SurfaceSendBudget::default(),
                     parked_batch_depth: 8,
                     config: Default::default(),
@@ -1260,7 +1279,7 @@ mod tests {
                 ResolvedComponent {
                     instance: "writer".to_string(),
                     kind: "writer".to_string(),
-                    abi: brenn_surface_proto::Abi::Dom,
+                    abi: brenn_surface_schema::Abi::Dom,
                     send_budget: SurfaceSendBudget::default(),
                     parked_batch_depth: 8,
                     config: Default::default(),
@@ -1631,7 +1650,7 @@ mod tests {
         surface.components = vec![ResolvedComponent {
             instance: format!("{kind}-1"),
             kind: kind.to_string(),
-            abi: brenn_surface_proto::Abi::Processor,
+            abi: brenn_surface_schema::Abi::Processor,
             send_budget: SurfaceSendBudget::default(),
             parked_batch_depth: 8,
             config: Default::default(),

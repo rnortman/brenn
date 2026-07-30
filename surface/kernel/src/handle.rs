@@ -37,7 +37,7 @@ use crate::proto::{
     AlertSeverity, InstanceReport, LogLevel, MAX_LOG_MESSAGE_BYTES, MAX_LOG_SOURCE_BYTES,
     StatusCounters, SurfaceBindings,
 };
-use crate::transport::TransportConnector;
+use brenn_attach_client::TransportConnector;
 use brenn_surface_contract::Activation;
 // Only the native entry names it: the wasm entry hands back an
 // `ActivationOutcome`, which carries the err message itself.
@@ -308,10 +308,10 @@ pub fn new<C: TransportConnector>(
         // decorrelates its reconnects. `ClientConfig` deliberately carries no seed
         // field: a caller-facing seed would be filled with boilerplate and a
         // forgotten constant would silently reintroduce lockstep.
-        backoff_jitter_seed: crate::transport::entropy::seed(),
+        backoff_jitter_seed: crate::entropy::seed(),
         // Mint the page-load epoch here, at the same edge and for the same
         // reason as the jitter seed: the core reads no entropy itself. Not from
-        // `transport::entropy` — that source is deliberately non-cryptographic
+        // `entropy` — that source is deliberately non-cryptographic
         // and documented as unfit for anything but load-spreading. `Uuid::new_v4`
         // reads the platform CSPRNG (`crypto.getRandomValues` on wasm via the
         // `js` feature), which is what a page-lifetime identifier should be. Like

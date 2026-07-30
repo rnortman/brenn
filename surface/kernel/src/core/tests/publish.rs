@@ -1,7 +1,7 @@
 use super::super::*;
 use super::*;
 use crate::test_support::cfg;
-use brenn_surface_proto::PublishOutcome;
+use brenn_surface_schema::PublishOutcome;
 
 // ── Publish path ──────────────────────────────────────────────────────
 
