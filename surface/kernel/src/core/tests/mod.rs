@@ -3,7 +3,7 @@
 //! so the sibling modules can reach them.
 
 use super::*;
-use crate::core::publish_buffer::PublishBuffer;
+use crate::publish_buffer::PublishBuffer;
 use crate::test_support::cfg;
 // `GapReason` survives in `surface/schema` as server-interpreted wire encoding;
 // these tests play the server, so they construct it. The kernel never matches on

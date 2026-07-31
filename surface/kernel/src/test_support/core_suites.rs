@@ -1,5 +1,9 @@
-//! Shared `#[cfg(test)]` fixtures for the core and driver test suites, so a
-//! change to the standard config or `Welcome` shape lands in one place.
+//! The `CoreConfig` and `Welcome` fixtures the core and driver suites are driven
+//! with, so a change to the standard config or `Welcome` shape lands in one
+//! place.
+//!
+//! Native-only, like the suites that use them: they build a `Welcome` frame
+//! through the host-only fixtures crate.
 
 use std::time::Duration;
 

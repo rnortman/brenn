@@ -40,16 +40,31 @@ pub mod outbound;
 /// The geometry and status documents the surface publishes about itself.
 pub mod telemetry;
 
+/// One activation's assembly — input windows, deferred snapshots, the publish
+/// buffer — and the per-instance scheduler state around it.
+pub mod activation;
+
+/// What one activation's completion writes: the buffer committed to both channel
+/// classes, discarded on failure, or the instance taken terminal.
+pub mod flush;
+
+/// Everything one page holds, and the two phases of an attachment over it.
+pub mod page;
+
+/// The per-activation publish buffer: the sole quota authority for the duration
+/// of a component's handler.
+pub(crate) mod publish_buffer;
+
 mod core;
 mod driver;
 // The backoff-jitter seed source, crate-private: see the module doc for why it
 // is not part of the attach client's shim set.
 mod entropy;
 mod handle;
-// Native-only test scaffolding: the protocol-core conformance and driver suites
-// run under host `cargo test`; wasm builds (browser bundle + the dom/entry
-// wasm-bindgen-test suites) never pull it.
-#[cfg(all(test, not(target_arch = "wasm32")))]
+// Test scaffolding shared across suites: the bindings-document builders on every
+// target, and the native-only `CoreConfig`/`Welcome` fixtures the protocol-core
+// conformance and driver suites run under host `cargo test` with.
+#[cfg(test)]
 mod test_support;
 
 /// DOM-free platform decision core; host-compiled and natively unit-tested.

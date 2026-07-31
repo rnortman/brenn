@@ -165,15 +165,16 @@ impl LocalMint {
 }
 
 mod activation;
-mod publish_buffer;
 mod store;
 mod util;
 
 use activation::{ParkedBatch, RegisteredInstance};
+use brenn_attach_client::store::DeferOp as ClientDeferOp;
 use brenn_envelope::is_local_channel;
 use brenn_queue::CursorOverflow;
-pub use publish_buffer::PublishBuffer;
-use publish_buffer::{BufferedDeferOp, BufferedPublish, OutputSpec};
+
+pub use crate::publish_buffer::PublishBuffer;
+use crate::publish_buffer::{BufferedDeferOp, BufferedPublish, OutputSpec};
 /// Re-exported so the handle's `PublishGate` asks the same question the core's
 /// publish paths do: a publish to a confined port must not be pre-rejected as
 /// `NotConnected` while the link is down.
@@ -2752,11 +2753,11 @@ impl ClientCore {
                 "surface client: a transportable channel's op belongs on the batch frame"
             );
             let op = match op {
-                DeferOp::Edit {
+                ClientDeferOp::Edit {
                     body: Some(body),
                     deliver_after,
                 } => match self.guard_local_body(&channel, LocalOrigin::Instance(instance), body) {
-                    GuardedBody::Carry(body) => DeferOp::Edit {
+                    GuardedBody::Carry(body) => ClientDeferOp::Edit {
                         body: Some(body),
                         deliver_after,
                     },
@@ -2766,6 +2767,16 @@ impl ClientCore {
                     }
                 },
                 op => op,
+            };
+            let op = match op {
+                ClientDeferOp::Cancel => DeferOp::Cancel,
+                ClientDeferOp::Edit {
+                    body,
+                    deliver_after,
+                } => DeferOp::Edit {
+                    body,
+                    deliver_after,
+                },
             };
             // The op carries an identity from a confined channel's own deferred
             // set, so that store existed when the component read it and a flush
@@ -2872,8 +2883,8 @@ impl ClientCore {
                 port: op.port,
                 message_id: op.message_id,
                 op: match op.kind {
-                    DeferOp::Cancel => DeferredOpKind::Cancel,
-                    DeferOp::Edit {
+                    ClientDeferOp::Cancel => DeferredOpKind::Cancel,
+                    ClientDeferOp::Edit {
                         body,
                         deliver_after,
                     } => DeferredOpKind::Edit {

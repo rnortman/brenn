@@ -232,17 +232,27 @@ impl<K> Default for OutboxSteps<K> {
     }
 }
 
+/// What [`Outboxes::discard_parked`] took from one registrant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Discarded {
+    /// Whole flushes dropped.
+    pub flushes: u64,
+    /// The retry timer's instruction, when it changed.
+    pub retry_wakeup: Option<TimerChange>,
+}
+
 /// What one `PublishBatchResult` settled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchAnswer<K> {
     pub steps: OutboxSteps<K>,
     /// Whose flush it was.
     pub registrant: K,
-    /// The flush the peer refused after the registrant that composed it was
-    /// gone — deregistered, or deregistered and registered again under the same
-    /// key: ok'd entries that were never applied and have no outbox left to wait
-    /// in. `None` in every other case, including an ordinary refusal (which is
-    /// re-parked) and any answer for the registration that sent it.
+    /// The flush the peer refused after nobody was left to own it: ok'd entries
+    /// that were never applied and have no queue to wait in. Two ways to get
+    /// there — the registrant deregistered (or deregistered and registered again
+    /// under the same key) while its batch was outstanding, or the embedder took
+    /// it terminal and discarded its queue. `None` in every other case, including
+    /// an ordinary refusal, which is re-parked.
     pub lost: Option<FlushBatch>,
 }
 
@@ -273,6 +283,15 @@ struct Outbox {
     /// Whole flushes dropped, lifetime — at the cap or on a re-validation the
     /// embedder refused.
     dropped: u64,
+    /// Whether the embedder has thrown this registrant's queue away, having taken
+    /// it terminal.
+    ///
+    /// What it is for is the answer that is still outstanding when the discard
+    /// happens: a refusal for a flush the discard already renounced must not be
+    /// re-parked into the queue the discard emptied, or the dead registrant's work
+    /// goes back on the wire on the next retry tick. Cleared only by the outbox
+    /// closing — a discard is about the registrant, not about one frame.
+    discarded: bool,
     /// Flushes the peer's budget backstop refused, lifetime. Non-zero means the
     /// attacher's own limiter and the peer's disagree; the attacher is the
     /// primary limiter, so this is evidence of a problem rather than an expected
@@ -372,6 +391,7 @@ impl<K: Clone + Ord> Outboxes<K> {
                 parked: VecDeque::new(),
                 in_flight: None,
                 dropped: 0,
+                discarded: false,
                 rate_limited: 0,
             },
         );
@@ -412,6 +432,46 @@ impl<K: Clone + Ord> Outboxes<K> {
         self.registrants.contains_key(key)
     }
 
+    /// Throw away every flush `key` has queued, answering how many died.
+    ///
+    /// The one path where an ok'd flush is discarded on the embedder's authority
+    /// rather than at the cap: a registrant the embedder has taken terminal
+    /// produced these, and there is nobody left to answer for them. The outbox
+    /// stays open — the registrant is still registered, just dead — and an
+    /// in-flight batch's correlation is deliberately not forgotten, since the peer
+    /// will still answer it and that answer must stay reconcilable. That answer is
+    /// where the discard reaches forward: a refusal for it is handed back as
+    /// [`BatchAnswer::lost`] rather than re-parked, so nothing the discard
+    /// renounced returns to the wire.
+    ///
+    /// The lifetime drop counter is untouched. It accounts for flushes the cap or
+    /// a re-validation took from a *live* registrant, which is evidence about
+    /// provisioning; a discard is the embedder's own decision and is reported to
+    /// it here instead.
+    ///
+    /// # Panics
+    ///
+    /// On a key holding no outbox, like every other bookkeeping mismatch here.
+    pub fn discard_parked<Q>(&mut self, key: &Q, now: Millis) -> Discarded
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let outbox = self
+            .registrants
+            .get_mut(key)
+            .expect("attach client: discarding the queue of an unregistered registrant");
+        let flushes = outbox.parked.len() as u64;
+        outbox.parked.clear();
+        outbox.discarded = true;
+        Discarded {
+            flushes,
+            // Emptying the last blocked queue unblocks the plane, so the timer
+            // that was waiting on it has to be told.
+            retry_wakeup: self.retry_wakeup(now),
+        }
+    }
+
     /// Offer one completed activation's flush to `key`'s outbox.
     ///
     /// Sent straight out only when the wire is free for this registrant: the
@@ -442,6 +502,41 @@ impl<K: Clone + Ord> Outboxes<K> {
             }
         } else {
             self.park(&key, batch, false)
+        };
+        steps.retry_wakeup = self.retry_wakeup(now);
+        steps
+    }
+
+    /// Count and report one flush the embedder refused before it ever reached the
+    /// queue.
+    ///
+    /// The re-validation [`Self::on_attached`] runs over a queued flush is a
+    /// question only the embedder can answer, and it has to be asked again of a
+    /// flush just composed: the contract that authorized the entries can have
+    /// changed while the activation that wrote them was still running. This is
+    /// where that refusal is accounted, so a flush lost to a contract it no longer
+    /// satisfies reads exactly like one lost at the cap or at an attachment.
+    ///
+    /// # Panics
+    ///
+    /// On a key holding no outbox, like every other bookkeeping mismatch here.
+    pub fn refuse_flush<Q>(&mut self, key: &Q, now: Millis) -> OutboxSteps<K>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let key = self
+            .registrants
+            .get_key_value(key)
+            .map(|(key, _)| key.clone())
+            .expect("attach client: refusing a flush for an unregistered registrant");
+        self.registrants
+            .get_mut::<K>(&key)
+            .expect("attach client: the key came from this map")
+            .dropped += 1;
+        let mut steps = OutboxSteps {
+            dropped: vec![key],
+            ..OutboxSteps::default()
         };
         steps.retry_wakeup = self.retry_wakeup(now);
         steps
@@ -530,7 +625,10 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// backstop is for. The flush goes back to the head of its outbox (it is the
     /// oldest un-applied one) and is retried on the timer. Nothing retries
     /// forever without evidence: a head the peer keeps refusing converges to the
-    /// outbox cap, and from there to counted drops.
+    /// outbox cap, and from there to counted drops. The one exception is a
+    /// registrant whose queue the embedder has discarded: it renounced this flush
+    /// too, so the refusal hands it back as [`BatchAnswer::lost`] instead of
+    /// putting a dead registrant's work back on the wire.
     ///
     /// The answer is matched to the *registration* that sent it, not merely to
     /// its key. A key deregistered and registered again while its batch was
@@ -579,20 +677,29 @@ impl<K: Clone + Ord> Outboxes<K> {
             .expect("attach client: the registration just checked live");
         outbox.in_flight = None;
         let mut steps = OutboxSteps::default();
+        let mut lost = None;
         match outcome {
             // The wire is free for this registrant again: anything that queued
             // behind the frame goes out now rather than waiting a tick.
             PublishBatchOutcome::Ok => steps.frames.extend(self.pump(&key)),
             PublishBatchOutcome::RateLimited => {
+                // Counted whatever becomes of the flush: the peer's backstop and
+                // the attacher's own limiter disagreed, which is the same evidence
+                // either way.
                 outbox.rate_limited += 1;
-                steps.dropped.extend(self.park(&key, batch, true).dropped);
+                let discarded = outbox.discarded;
+                if discarded {
+                    lost = Some(batch);
+                } else {
+                    steps.dropped.extend(self.park(&key, batch, true).dropped);
+                }
             }
         }
         steps.retry_wakeup = self.retry_wakeup(now);
         Ok(BatchAnswer {
             steps,
             registrant: key,
-            lost: None,
+            lost,
         })
     }
 

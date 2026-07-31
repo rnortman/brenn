@@ -27,7 +27,7 @@ use brenn_envelope::Urgency;
 use brenn_surface_contract::{DeferError, PublishError};
 use uuid::Uuid;
 
-use super::store::DeferOp;
+use brenn_attach_client::store::DeferOp;
 
 /// A gate verdict as the component sees it on the publish path.
 ///

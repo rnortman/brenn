@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use brenn_attach_proto::{BatchEntry, PublishBatchOutcome};
+use brenn_attach_proto::{BatchDeferredOp, BatchEntry, PublishBatchOutcome};
 use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
@@ -90,6 +90,15 @@ fn wiring() -> AppliedBindings {
     applied(standard_outputs(), Some((ERRORS, LogLevel::Warn)))
 }
 
+/// The standard wiring plus a second output of `p1`'s on `p2`'s channel: the
+/// wiring a flush naming both was composed under, so that what refuses such a
+/// flush later is the attachment-time re-validation rather than the offer.
+fn also_binding_slow() -> AppliedBindings {
+    let mut outputs = standard_outputs();
+    outputs.push(output("p1", "slow", SLOW, Urgency::Low));
+    applied(outputs, Some((ERRORS, LogLevel::Warn)))
+}
+
 /// The standard wiring with `instance` un-wired: its component entry and its
 /// output bindings gone, as a document that stops declaring it leaves them.
 fn un_wired(instance: &str) -> AppliedBindings {
@@ -154,6 +163,14 @@ fn flush_of(entries: Vec<BatchEntry>) -> FlushBatch {
     FlushBatch {
         entries,
         ops: Vec::new(),
+    }
+}
+
+fn op(channel: &str, message_id: u128, op: DeferredOpKind) -> BatchDeferredOp {
+    BatchDeferredOp {
+        channel: channel.to_string(),
+        message_id: Uuid::from_u128(message_id),
+        op,
     }
 }
 
@@ -554,8 +571,20 @@ fn an_outbox_holds_what_its_component_entry_declares() {
     let mut outbound = SurfaceOutbound::new();
     outbound.register("p2", &bindings);
     // Detached, so every flush queues — and `p2` holds one.
-    outbound.flush("p2", flush_of(vec![entry(SLOW, "first")]), NOW);
-    let steps = outbound.flush("p2", flush_of(vec![entry(SLOW, "second")]), NOW);
+    outbound.flush(
+        &bindings,
+        None,
+        "p2",
+        flush_of(vec![entry(SLOW, "first")]),
+        NOW,
+    );
+    let steps = outbound.flush(
+        &bindings,
+        None,
+        "p2",
+        flush_of(vec![entry(SLOW, "second")]),
+        NOW,
+    );
     assert_eq!(steps.dropped, vec!["p2".to_string()]);
     assert_eq!(outbound.dropped_count("p2"), 1);
     assert_eq!(outbound.rate_limited_count("p2"), 0);
@@ -564,11 +593,29 @@ fn an_outbox_holds_what_its_component_entry_declares() {
     // read off anything but the component entry would collapse them.
     let mut outbound = SurfaceOutbound::new();
     outbound.register("p1", &bindings);
-    outbound.flush("p1", flush_of(vec![entry(OUT, "first")]), NOW);
-    let second = outbound.flush("p1", flush_of(vec![entry(OUT, "second")]), NOW);
+    outbound.flush(
+        &bindings,
+        None,
+        "p1",
+        flush_of(vec![entry(OUT, "first")]),
+        NOW,
+    );
+    let second = outbound.flush(
+        &bindings,
+        None,
+        "p1",
+        flush_of(vec![entry(OUT, "second")]),
+        NOW,
+    );
     assert!(second.dropped.is_empty());
     assert_eq!(outbound.dropped_count("p1"), 0);
-    let third = outbound.flush("p1", flush_of(vec![entry(OUT, "third")]), NOW);
+    let third = outbound.flush(
+        &bindings,
+        None,
+        "p1",
+        flush_of(vec![entry(OUT, "third")]),
+        NOW,
+    );
     assert_eq!(third.dropped, vec!["p1".to_string()]);
     assert_eq!(outbound.dropped_count("p1"), 1);
 }
@@ -578,7 +625,13 @@ fn an_open_outbox_keeps_its_queue_when_a_document_redeclares_its_depth() {
     let bindings = wiring();
     let mut outbound = SurfaceOutbound::new();
     outbound.register("p1", &bindings);
-    outbound.flush("p1", flush_of(vec![entry(OUT, "queued")]), NOW);
+    outbound.flush(
+        &bindings,
+        None,
+        "p1",
+        flush_of(vec![entry(OUT, "queued")]),
+        NOW,
+    );
 
     // A document that declares `p1` one flush deep rather than two. Re-opening the
     // outbox to pick that up would discard exactly the queue the depth governs.
@@ -625,7 +678,13 @@ fn an_un_wired_instance_keeps_its_outbox_until_it_deregisters() {
     let bindings = wiring();
     let mut outbound = SurfaceOutbound::new();
     outbound.register("p1", &bindings);
-    outbound.flush("p1", flush_of(vec![entry(OUT, "queued")]), NOW);
+    outbound.flush(
+        &bindings,
+        None,
+        "p1",
+        flush_of(vec![entry(OUT, "queued")]),
+        NOW,
+    );
 
     // The instance is still registered, but a new document no longer declares
     // its component.
@@ -638,15 +697,25 @@ fn an_un_wired_instance_keeps_its_outbox_until_it_deregisters() {
     );
 
     // A completing activation inside the window before the page reloads finds its
-    // outbox, and what it queues is dropped at the next attachment because the
-    // wiring no longer admits the channel it names.
-    outbound.flush("p1", flush_of(vec![entry(OUT, "in flight")]), NOW);
+    // outbox, and what it composed names a channel the wiring in force no longer
+    // admits — so the offer itself refuses it rather than queueing a frame the peer
+    // would answer with a protocol close.
+    let refused = outbound.flush(
+        &un_wired("p1"),
+        None,
+        "p1",
+        flush_of(vec![entry(OUT, "in flight")]),
+        NOW,
+    );
+    assert_eq!(refused.dropped, vec!["p1".to_string()]);
+    assert!(refused.frames.is_empty());
     let steps = outbound.on_attached(&un_wired("p1"), &facts(1_024), NOW);
     assert_eq!(
         steps.dropped,
-        vec!["p1".to_string(), "p1".to_string()],
-        "both queued flushes name a channel the new wiring drops"
+        vec!["p1".to_string()],
+        "and the one queued under the old wiring goes at the attachment"
     );
+    assert_eq!(outbound.dropped_count("p1"), 2);
 
     // And the unmount that follows the reload answers cleanly.
     assert!(outbound.deregister("p1").is_empty());
@@ -679,7 +748,13 @@ fn a_queued_flush_goes_out_at_the_next_attachment() {
     let bindings = wiring();
     let mut outbound = SurfaceOutbound::new();
     outbound.register("p1", &bindings);
-    let queued = outbound.flush("p1", flush_of(vec![entry(OUT, "queued")]), NOW);
+    let queued = outbound.flush(
+        &bindings,
+        None,
+        "p1",
+        flush_of(vec![entry(OUT, "queued")]),
+        NOW,
+    );
     assert!(queued.frames.is_empty());
 
     let steps = outbound.on_attached(&bindings, &facts(1_024), NOW);
@@ -696,7 +771,11 @@ fn a_flush_naming_a_channel_the_new_wiring_drops_is_dropped_whole() {
     let bindings = wiring();
     let mut outbound = SurfaceOutbound::new();
     outbound.register("p1", &bindings);
+    // Composed under a wiring that bound `p1` to both channels, so the offer admits
+    // it and the attachment's own wiring is what drops it.
     outbound.flush(
+        &also_binding_slow(),
+        None,
         "p1",
         flush_of(vec![entry(OUT, "keep"), entry(SLOW, "not mine")]),
         NOW,
@@ -711,7 +790,13 @@ fn a_flush_over_the_new_body_cap_is_dropped_whole() {
     let bindings = wiring();
     let mut outbound = SurfaceOutbound::new();
     outbound.register("p1", &bindings);
-    outbound.flush("p1", flush_of(vec![entry(OUT, "0123456789")]), NOW);
+    outbound.flush(
+        &bindings,
+        None,
+        "p1",
+        flush_of(vec![entry(OUT, "0123456789")]),
+        NOW,
+    );
     let steps = outbound.on_attached(&bindings, &facts(4), NOW);
     assert_eq!(steps.dropped, vec!["p1".to_string()]);
     assert!(steps.frames.is_empty());
@@ -730,7 +815,7 @@ fn a_flush_whose_composed_frame_is_over_the_new_frame_cap_is_dropped_whole() {
     ]);
     let mut shrunk = facts(256);
     shrunk.max_frame_bytes = 300;
-    let steps = outbound.flush("p1", wide, NOW);
+    let steps = outbound.flush(&bindings, None, "p1", wide, NOW);
     assert!(steps.frames.is_empty());
     let steps = outbound.on_attached(&bindings, &shrunk, NOW);
     assert_eq!(steps.dropped, vec!["p1".to_string()]);
@@ -746,30 +831,20 @@ fn a_flushs_legitimate_control_ops_survive_re_validation() {
     let batch = FlushBatch {
         entries: vec![entry(OUT, "keep")],
         ops: vec![
-            batch_op(
-                &bindings,
-                "p1",
-                "out",
-                Uuid::from_u128(1),
-                DeferredOpKind::Cancel,
-            )
-            .expect("the port is bound"),
-            batch_op(
-                &bindings,
-                "p1",
-                "out",
-                Uuid::from_u128(2),
+            op(OUT, 1, DeferredOpKind::Cancel),
+            op(
+                OUT,
+                2,
                 DeferredOpKind::Edit {
                     body: None,
                     deliver_after: Some(9_000),
                 },
-            )
-            .expect("the port is bound"),
+            ),
         ],
     };
     let mut outbound = SurfaceOutbound::new();
     outbound.register("p1", &bindings);
-    outbound.flush("p1", batch.clone(), NOW);
+    outbound.flush(&bindings, None, "p1", batch.clone(), NOW);
 
     let steps = outbound.on_attached(&bindings, &facts(1_024), NOW);
     assert!(steps.dropped.is_empty());
@@ -793,37 +868,26 @@ fn a_flushs_control_ops_are_re_checked_like_its_entries() {
     let bindings = wiring();
     let over_cap = FlushBatch {
         entries: Vec::new(),
-        ops: vec![
-            batch_op(
-                &bindings,
-                "p1",
-                "out",
-                Uuid::from_u128(1),
-                DeferredOpKind::Edit {
-                    body: Some("0123456789".to_string()),
-                    deliver_after: None,
-                },
-            )
-            .expect("the port is bound"),
-        ],
+        ops: vec![op(
+            OUT,
+            1,
+            DeferredOpKind::Edit {
+                body: Some("0123456789".to_string()),
+                deliver_after: None,
+            },
+        )],
     };
+    // `SLOW` is `p2`'s output channel, which the attachment's wiring does not have
+    // `p1` publishing on.
     let unbound_channel = FlushBatch {
         entries: Vec::new(),
-        ops: vec![
-            batch_op(
-                &bindings,
-                "p2",
-                "out",
-                Uuid::from_u128(2),
-                DeferredOpKind::Cancel,
-            )
-            .expect("the port is bound"),
-        ],
+        ops: vec![op(SLOW, 2, DeferredOpKind::Cancel)],
     };
+    let composed_under = also_binding_slow();
     for batch in [over_cap, unbound_channel] {
         let mut outbound = SurfaceOutbound::new();
         outbound.register("p1", &bindings);
-        outbound.flush("p1", batch, NOW);
+        outbound.flush(&composed_under, None, "p1", batch, NOW);
         let steps = outbound.on_attached(&bindings, &facts(4), NOW);
         assert_eq!(steps.dropped, vec!["p1".to_string()]);
     }
@@ -835,11 +899,23 @@ fn a_detach_leaves_the_queue_and_frees_the_wire() {
     let mut outbound = SurfaceOutbound::new();
     outbound.register("p1", &bindings);
     outbound.on_attached(&bindings, &facts(1_024), NOW);
-    outbound.flush("p1", flush_of(vec![entry(OUT, "sent")]), NOW);
+    outbound.flush(
+        &bindings,
+        Some(&facts(1_024)),
+        "p1",
+        flush_of(vec![entry(OUT, "sent")]),
+        NOW,
+    );
     outbound.on_detached();
     // The unanswered flush died with its attachment; the next one queues rather
     // than waiting behind it.
-    outbound.flush("p1", flush_of(vec![entry(OUT, "queued")]), NOW);
+    outbound.flush(
+        &bindings,
+        None,
+        "p1",
+        flush_of(vec![entry(OUT, "queued")]),
+        NOW,
+    );
     let steps = outbound.on_attached(&bindings, &facts(1_024), NOW);
     assert_eq!(steps.frames.len(), 1);
     assert!(steps.dropped.is_empty());
@@ -851,7 +927,13 @@ fn a_metered_flush_is_re_parked_and_re_offered_on_the_tick() {
     let mut outbound = SurfaceOutbound::new();
     outbound.register("p1", &bindings);
     outbound.on_attached(&bindings, &facts(1_024), NOW);
-    let sent = outbound.flush("p1", flush_of(vec![entry(OUT, "sent")]), NOW);
+    let sent = outbound.flush(
+        &bindings,
+        Some(&facts(1_024)),
+        "p1",
+        flush_of(vec![entry(OUT, "sent")]),
+        NOW,
+    );
     let correlation = batch_correlation(&sent.frames[0]);
     outbound
         .on_batch_result(correlation, PublishBatchOutcome::RateLimited, NOW)
@@ -861,70 +943,35 @@ fn a_metered_flush_is_re_parked_and_re_offered_on_the_tick() {
     assert_eq!(retried.frames.len(), 1);
 }
 
-// --- batch composition -----------------------------------------------------
+// --- the embedder's own discard ----------------------------------------------
 
+/// The kill path's half of the outbox: a component taken terminal loses what it
+/// had queued, and its outbox stays open because it is still registered.
 #[test]
-fn a_batch_entry_carries_the_resolved_channel_urgency_and_release_time() {
+fn discarding_a_dead_instances_queue_drops_its_flushes() {
     let bindings = wiring();
-    let composed = batch_entry(
+    let mut outbound = SurfaceOutbound::new();
+    outbound.register("p1", &bindings);
+    outbound.flush(
         &bindings,
-        "p1",
-        "out",
-        "body".to_string(),
         None,
-        Some(4_000),
-    )
-    .expect("the port is bound");
-    assert_eq!(
-        composed,
-        BatchEntry {
-            channel: OUT.to_string(),
-            body: "body".to_string(),
-            urgency: Urgency::High,
-            deliver_after: Some(4_000),
-        }
+        "p1",
+        flush_of(vec![entry(OUT, "one")]),
+        NOW,
     );
-    let overridden = batch_entry(
+    outbound.flush(
         &bindings,
-        "p1",
-        "out",
-        "body".to_string(),
-        Some(Urgency::VeryLow),
         None,
-    )
-    .expect("the port is bound");
-    assert_eq!(overridden.urgency, Urgency::VeryLow);
-    assert_eq!(overridden.deliver_after, None);
-}
+        "p1",
+        flush_of(vec![entry(OUT, "two")]),
+        NOW,
+    );
 
-#[test]
-fn a_batch_op_addresses_its_ports_channel() {
-    let bindings = wiring();
-    let composed = batch_op(
-        &bindings,
-        "p2",
-        "out",
-        Uuid::from_u128(7),
-        DeferredOpKind::Cancel,
-    )
-    .expect("the port is bound");
-    assert_eq!(composed.channel, SLOW);
-    assert_eq!(composed.message_id, Uuid::from_u128(7));
-    assert_eq!(composed.op, DeferredOpKind::Cancel);
-}
-
-#[test]
-fn an_unbound_port_composes_neither_an_entry_nor_an_op() {
-    let bindings = wiring();
-    assert!(batch_entry(&bindings, "p1", "nope", "b".to_string(), None, None).is_none());
+    assert_eq!(outbound.discard_parked("p1", NOW).flushes, 2);
+    assert!(outbound.is_registered("p1"));
+    let steps = outbound.on_attached(&bindings, &facts(1_024), NOW);
     assert!(
-        batch_op(
-            &bindings,
-            "p1",
-            "nope",
-            Uuid::from_u128(1),
-            DeferredOpKind::Cancel,
-        )
-        .is_none()
+        steps.frames.is_empty() && steps.dropped.is_empty(),
+        "there is nothing left to re-validate or send"
     );
 }

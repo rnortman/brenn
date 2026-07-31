@@ -319,6 +319,26 @@ fn an_empty_flush_is_not_a_batch() {
     );
 }
 
+/// The embedder's own refusal of a flush it has just composed: counted on the same
+/// lifetime figure a cap drop is, reported the same way, and never queued.
+#[test]
+fn a_flush_the_embedder_refuses_is_counted_and_reported() {
+    let mut outboxes = attached(4);
+    let steps = outboxes.refuse_flush(&alpha(), now());
+    assert_eq!(steps.dropped, vec![alpha()]);
+    assert!(steps.frames.is_empty());
+    assert_eq!(steps.retry_wakeup, None, "nothing was queued to wait on");
+    assert_eq!(outboxes.dropped_count(&alpha()), 1);
+    assert_eq!(outboxes.parked_len(&alpha()), 0);
+}
+
+#[test]
+#[should_panic(expected = "refusing a flush for an unregistered registrant")]
+fn refusing_a_flush_for_an_unregistered_registrant_panics() {
+    let mut outboxes = attached(4);
+    outboxes.refuse_flush("beta", now());
+}
+
 // --- refusal ----------------------------------------------------------------
 
 #[test]
@@ -429,6 +449,138 @@ fn a_head_the_peer_keeps_refusing_converges_on_counted_drops() {
     );
     assert_eq!(outboxes.dropped_count(&alpha()), 1);
     assert_eq!(outboxes.parked_len(&alpha()), 1);
+}
+
+// --- the embedder's own discard ----------------------------------------------
+
+/// The kill path: an embedder that has taken a registrant terminal throws its
+/// queue away. The refused head is what makes the timer armed beforehand, so the
+/// discard has something to disarm.
+#[test]
+fn discarding_a_queue_drops_every_flush_and_disarms_the_retry() {
+    let mut outboxes = attached(4);
+    let first = outboxes.flush(&alpha(), batch(&["one"]), now());
+    outboxes.flush(&alpha(), batch(&["two"]), now());
+    let armed = outboxes
+        .on_batch_result(
+            correlation_of(&first.frames[0]),
+            PublishBatchOutcome::RateLimited,
+            now(),
+        )
+        .expect("a correlation this attachment sent");
+    assert!(matches!(
+        armed.steps.retry_wakeup,
+        Some(TimerChange::Arm(_))
+    ));
+
+    let discarded = outboxes.discard_parked(&alpha(), Millis(2_000));
+    assert_eq!(discarded.flushes, 2);
+    assert_eq!(discarded.retry_wakeup, Some(TimerChange::Disarm));
+    assert_eq!(outboxes.parked_len(&alpha()), 0);
+    assert!(
+        outboxes.is_registered(&alpha()),
+        "the registrant keeps its outbox — it is dead, not gone"
+    );
+    assert_eq!(
+        outboxes.dropped_count(&alpha()),
+        0,
+        "the lifetime counter accounts for what the cap and the wire took, not for this"
+    );
+    assert_eq!(
+        outboxes.discard_parked(&alpha(), Millis(3_000)).flushes,
+        0,
+        "a second discard finds nothing and changes no timer"
+    );
+}
+
+/// An in-flight batch's answer is still owed and still reconcilable: the peer does
+/// not know the registrant died.
+#[test]
+fn discarding_a_queue_leaves_the_in_flight_correlation_answerable() {
+    let mut outboxes = attached(4);
+    let sent = outboxes.flush(&alpha(), batch(&["one"]), now());
+    outboxes.flush(&alpha(), batch(&["two"]), now());
+
+    assert_eq!(outboxes.discard_parked(&alpha(), now()).flushes, 1);
+    let answer = outboxes
+        .on_batch_result(
+            correlation_of(&sent.frames[0]),
+            PublishBatchOutcome::Ok,
+            now(),
+        )
+        .expect("the outstanding correlation is still known");
+    assert_eq!(answer.registrant, alpha());
+    assert!(
+        answer.steps.frames.is_empty(),
+        "the queue behind it was discarded, so there is nothing to pump"
+    );
+}
+
+/// The order the discard has to survive: the flush is already on the wire when the
+/// embedder takes the registrant terminal, and the answer that comes back is a
+/// refusal. Re-parking it would put a dead registrant's work back on the wire at
+/// the next tick.
+#[test]
+fn a_refusal_after_a_discard_hands_the_flush_back_instead_of_retrying_it() {
+    let mut outboxes = attached(4);
+    let sent = outboxes.flush(&alpha(), batch(&["one"]), now());
+    assert_eq!(outboxes.discard_parked(&alpha(), now()).flushes, 0);
+
+    let answer = outboxes
+        .on_batch_result(
+            correlation_of(&sent.frames[0]),
+            PublishBatchOutcome::RateLimited,
+            now(),
+        )
+        .expect("the outstanding correlation is still known");
+    assert_eq!(answer.lost, Some(batch(&["one"])));
+    assert_eq!(
+        outboxes.parked_len(&alpha()),
+        0,
+        "the discard renounced this flush too"
+    );
+    assert_eq!(
+        outboxes.rate_limited_count(&alpha()),
+        1,
+        "the peer and the attacher's limiter did disagree, whatever became of the flush"
+    );
+    assert_eq!(
+        answer.steps.retry_wakeup, None,
+        "nothing is queued, so no tick is owed"
+    );
+    assert!(outboxes.on_retry_tick(Millis(2_000)).frames.is_empty());
+}
+
+/// A discard is about the registrant, not about one frame: a key registered again
+/// after the discard is a different registrant with a clean outbox.
+#[test]
+fn a_re_registered_key_is_not_still_discarded() {
+    let mut outboxes = attached(4);
+    outboxes.discard_parked(&alpha(), now());
+    outboxes.deregister(&alpha());
+    outboxes.register(alpha(), Some(alpha()), 4);
+    let sent = outboxes.flush(&alpha(), batch(&["fresh"]), now());
+
+    let answer = outboxes
+        .on_batch_result(
+            correlation_of(&sent.frames[0]),
+            PublishBatchOutcome::RateLimited,
+            now(),
+        )
+        .expect("a correlation this attachment sent");
+    assert_eq!(answer.lost, None);
+    assert_eq!(
+        outboxes.parked_len(&alpha()),
+        1,
+        "the successor's refused flush is retried like any other"
+    );
+}
+
+#[test]
+#[should_panic(expected = "discarding the queue of an unregistered registrant")]
+fn discarding_the_queue_of_an_unregistered_registrant_panics() {
+    let mut outboxes = attached(4);
+    outboxes.discard_parked("beta", now());
 }
 
 #[test]

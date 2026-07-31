@@ -33,11 +33,9 @@ mod tests;
 use brenn_attach_client::Millis;
 use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::publish::{
-    BatchAnswer, FlushBatch, OutboxSteps, Outboxes, PendingPublishes, PublishRequest,
+    BatchAnswer, Discarded, FlushBatch, OutboxSteps, Outboxes, PendingPublishes, PublishRequest,
 };
-use brenn_attach_proto::{
-    BatchDeferredOp, BatchEntry, ClientFrame, DeferredOpKind, PublishBatchOutcome, PublishOutcome,
-};
+use brenn_attach_proto::{ClientFrame, DeferredOpKind, PublishBatchOutcome, PublishOutcome};
 use brenn_envelope::Urgency;
 use brenn_surface_schema::telemetry::ErrorReportDocument;
 use brenn_surface_schema::{LogLevel, MAX_LOG_MESSAGE_BYTES, MAX_LOG_SOURCE_BYTES};
@@ -461,15 +459,53 @@ impl SurfaceOutbound {
         lost
     }
 
-    /// Offer one completed activation's flush to its instance's outbox.
+    /// Offer one completed activation's flush to its instance's outbox, unless the
+    /// contract in force refuses it.
+    ///
+    /// The gate is the one [`Self::on_attached`] runs over a queued flush, asked
+    /// here of a flush just composed — because a buffered publish carries the
+    /// channel its port resolved to *when the component published*, and the
+    /// activation that wrote it can outlive that resolution: a reconnect or a
+    /// second document applies new wiring, and an operator can lower the body cap
+    /// across a restart. Without the gate such a flush goes straight to a free
+    /// wire, and the peer answers a channel outside the sender's set with a
+    /// protocol close and a fail2ban signal charged against a legitimate user. A
+    /// refused flush is dropped whole and counted, exactly as an attachment-time
+    /// refusal is.
+    ///
+    /// `facts` is `None` while detached, where the two caps have no value to be
+    /// judged against — the flush queues, and the attachment that eventually
+    /// carries it re-validates it against its own contract.
     ///
     /// # Panics
     ///
     /// If the instance holds no outbox. Every registered instance a document has
     /// ever declared holds one, and an instance no document ever declared has no
     /// bindings — so nothing activates it and it has no flush to offer.
-    pub fn flush(&mut self, instance: &str, batch: FlushBatch, now: Millis) -> OutboxSteps<String> {
+    pub fn flush(
+        &mut self,
+        bindings: &AppliedBindings,
+        facts: Option<&AttachmentFacts>,
+        instance: &str,
+        batch: FlushBatch,
+        now: Millis,
+    ) -> OutboxSteps<String> {
+        if !survives(bindings, instance, &batch, facts) {
+            return self.outboxes.refuse_flush(instance, now);
+        }
         self.outboxes.flush(instance, batch, now)
+    }
+
+    /// Throw away every flush `instance` has queued, answering how many died.
+    ///
+    /// The kill path: a component whose memory is presumed poisoned wrote these,
+    /// and nobody is left to answer for them.
+    ///
+    /// # Panics
+    ///
+    /// If the instance holds no outbox, for the same reason [`Self::flush`] does.
+    pub fn discard_parked(&mut self, instance: &str, now: Millis) -> Discarded {
+        self.outboxes.discard_parked(instance, now)
     }
 
     /// The attachment came up: re-validate every queued flush against the
@@ -501,7 +537,7 @@ impl SurfaceOutbound {
         now: Millis,
     ) -> OutboxSteps<String> {
         self.outboxes.on_attached(now, |instance, batch| {
-            survives(bindings, instance, batch, facts)
+            survives(bindings, instance, batch, Some(facts))
         })
     }
 
@@ -538,76 +574,41 @@ impl SurfaceOutbound {
     }
 }
 
-/// Whether a queued flush still passes every gate the peer answers with a
-/// violation. See [`SurfaceOutbound::on_attached`] for why these three and no
-/// others.
+/// Whether a flush passes every gate the peer answers with a violation. See
+/// [`SurfaceOutbound::on_attached`] for why these three and no others.
+///
+/// `facts` of `None` asks the wiring half alone, which is the only half that has
+/// an answer while detached.
 fn survives(
     bindings: &AppliedBindings,
     instance: &str,
     batch: &FlushBatch,
-    facts: &AttachmentFacts,
+    facts: Option<&AttachmentFacts>,
 ) -> bool {
     let admits = |channel: &str| publishes_on(bindings, instance, channel);
+    batch.entries.iter().all(|entry| admits(&entry.channel))
+        && batch.ops.iter().all(|op| admits(&op.channel))
+        && facts.is_none_or(|facts| fits_the_caps(instance, batch, facts))
+}
+
+/// Whether a flush clears the attachment's two size caps: each entry's body and
+/// each edit's replacement body against `max_body_bytes`, and the whole composed
+/// frame against `max_frame_bytes`.
+fn fits_the_caps(instance: &str, batch: &FlushBatch, facts: &AttachmentFacts) -> bool {
     let max_body_bytes = facts.max_body_bytes;
     batch
         .entries
         .iter()
-        .all(|entry| admits(&entry.channel) && entry.body.len() as u64 <= max_body_bytes)
-        && batch.ops.iter().all(|op| {
-            admits(&op.channel)
-                && match &op.op {
-                    DeferredOpKind::Edit {
-                        body: Some(body), ..
-                    } => body.len() as u64 <= max_body_bytes,
-                    _ => true,
-                }
+        .all(|entry| entry.body.len() as u64 <= max_body_bytes)
+        && batch.ops.iter().all(|op| match &op.op {
+            DeferredOpKind::Edit {
+                body: Some(body), ..
+            } => body.len() as u64 <= max_body_bytes,
+            _ => true,
         })
         // Last, because it is the one gate that has to serialize the flush to
         // answer.
         && batch.frame_bytes(Some(instance)) as u64 <= facts.max_frame_bytes
-}
-
-/// Compose one entry of an activation's flush, or `None` for a port the wiring
-/// does not bind.
-///
-/// The release time rides verbatim: this channel's deferral authority is the
-/// peer, which holds the retention a durable schedule must outlive, so the page
-/// states the time and the peer decides park-vs-immediate against its own clock.
-pub fn batch_entry(
-    bindings: &AppliedBindings,
-    instance: &str,
-    port: &str,
-    body: String,
-    urgency: Option<Urgency>,
-    deliver_after: Option<u64>,
-) -> Option<BatchEntry> {
-    let resolved = resolve_output(bindings, instance, port, urgency)?;
-    Some(BatchEntry {
-        channel: resolved.channel.to_string(),
-        body,
-        urgency: resolved.urgency,
-        deliver_after,
-    })
-}
-
-/// Compose one control op of an activation's flush, or `None` for a port the
-/// wiring does not bind.
-///
-/// An op carries no urgency of its own — it names a message the peer already
-/// holds — so the port resolution here is for its channel alone.
-pub fn batch_op(
-    bindings: &AppliedBindings,
-    instance: &str,
-    port: &str,
-    message_id: uuid::Uuid,
-    op: DeferredOpKind,
-) -> Option<BatchDeferredOp> {
-    let resolved = resolve_output(bindings, instance, port, None)?;
-    Some(BatchDeferredOp {
-        channel: resolved.channel.to_string(),
-        message_id,
-        op,
-    })
 }
 
 /// The caller-facing status of one wire outcome.

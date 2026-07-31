@@ -11,7 +11,7 @@
 //! behind that index doing the work.
 
 use super::*;
-use crate::core::publish_buffer::OutputSpec;
+use crate::publish_buffer::OutputSpec;
 use crate::test_support::welcome_frame_local;
 use brenn_surface_contract::{DeferError, PublishError};
 use brenn_surface_schema::{LocalChannel, NoiseLevel, OutputBinding};
