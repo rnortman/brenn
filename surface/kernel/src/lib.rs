@@ -51,6 +51,18 @@ pub mod flush;
 /// Everything one page holds, and the two phases of an attachment over it.
 pub mod page;
 
+/// The inbound half of a turn: the server frames the connection hands back,
+/// routed into the page's tables.
+pub mod inbound;
+
+/// The outward half of a turn: activation dispatch and completion, the confined
+/// release pass, the outbox retry, and what the page says about a loss.
+pub mod outward;
+
+/// The vocabulary the platform half speaks, and the fold that turns every pass's
+/// answer into it.
+pub mod session;
+
 /// The per-activation publish buffer: the sole quota authority for the duration
 /// of a component's handler.
 pub(crate) mod publish_buffer;

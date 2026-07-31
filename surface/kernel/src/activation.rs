@@ -152,6 +152,11 @@ pub struct ActivationCtx<'a, P> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadyActivation {
     pub instance: String,
+    /// Which registration of that instance it was assembled for. Carried back on
+    /// the completion, so work of a mount that has since gone lands nowhere: an
+    /// instance unmounted and mounted again under the same id is a different
+    /// component with the same spelling.
+    pub generation: u64,
     pub activation: Activation,
     pub buffer: PublishBuffer,
     pub drops: DropVerdicts,
@@ -164,24 +169,35 @@ pub struct DropVerdicts {
     /// One entry per `alarm`-or-louder binding that lost something this window
     /// reports — the coalesced announcement, one per binding per activation.
     pub announce: Vec<DropAnnouncement>,
-    /// The `fatal` rung's kill, naming the first such binding. One kill however
-    /// many of an instance's bindings overflowed together, because the instance
-    /// dies once.
-    pub fatal: Option<DropAnnouncement>,
+    /// The `fatal` rung's kills, at most one per instance and naming the first
+    /// such binding of each. An instance dies once however many of *its* bindings
+    /// overflowed together — but one retirement can evict the positions of
+    /// several instances at once, and each of them was configured to die of it,
+    /// so the kill is a set rather than a slot.
+    pub fatal: Vec<DropAnnouncement>,
 }
 
 impl DropVerdicts {
     /// Whether anything above the `metered` rung fired.
     pub fn is_quiet(&self) -> bool {
-        self.announce.is_empty() && self.fatal.is_none()
+        self.announce.is_empty() && self.fatal.is_empty()
     }
 
-    /// Fold another set of verdicts in: announcements accumulate, and the first
-    /// kill wins — an instance dies once, however many of its bindings overflowed
-    /// in the same pass.
+    /// Fold another set of verdicts in: announcements accumulate, and a kill joins
+    /// the set unless the instance it names is already in it — an instance dies
+    /// once, for the binding that asked first.
     pub fn merge(&mut self, other: Self) {
         self.announce.extend(other.announce);
-        self.fatal = self.fatal.take().or(other.fatal);
+        for kill in other.fatal {
+            if !self.kills(&kill.instance) {
+                self.fatal.push(kill);
+            }
+        }
+    }
+
+    /// Whether the set already holds a kill for `instance`.
+    fn kills(&self, instance: &str) -> bool {
+        self.fatal.iter().any(|held| held.instance == instance)
     }
 }
 
@@ -386,6 +402,9 @@ impl Schedules {
     /// so the next [`Self::ready`] resumes after this instance whether or not the
     /// activation is ultimately invoked.
     ///
+    /// `generation` is the instance's registration at this moment, carried on the
+    /// answer so a completion can be matched to the mount that produced it.
+    ///
     /// # Panics
     ///
     /// On an instance this table does not hold, one already in flight, or a
@@ -396,6 +415,7 @@ impl Schedules {
     pub fn assemble<P: PlanePolicy>(
         &mut self,
         instance: &str,
+        generation: u64,
         ctx: &mut ActivationCtx<'_, P>,
     ) -> ReadyActivation {
         let schedule = self
@@ -415,6 +435,7 @@ impl Schedules {
         let buffer = self.seed_buffer(instance, &ports, deferred_ids, ctx);
         ReadyActivation {
             instance: instance.to_string(),
+            generation,
             activation: Activation {
                 ports,
                 deferred,
@@ -500,8 +521,9 @@ impl Schedules {
                 channel: charge.channel,
                 dropped: charge.announced,
             };
-            if charge.noise >= NoiseLevel::Fatal && charge.counted > 0 && verdicts.fatal.is_none() {
-                verdicts.fatal = Some(announcement.clone());
+            if charge.noise >= NoiseLevel::Fatal && charge.counted > 0 && !verdicts.kills(instance)
+            {
+                verdicts.fatal.push(announcement.clone());
             }
             if charge.noise >= NoiseLevel::Alarm && charge.announced > 0 {
                 verdicts.announce.push(announcement);

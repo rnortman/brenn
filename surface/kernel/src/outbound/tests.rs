@@ -13,6 +13,7 @@ use brenn_surface_schema::{Abi, ComponentEntry, LocalChannel, OutputBinding};
 use uuid::Uuid;
 
 use super::*;
+use crate::test_support::pages;
 
 const OUT: &str = "ephemeral:site.bar.out";
 const SLOW: &str = "brenn:site.bar.slow";
@@ -179,13 +180,9 @@ fn op(channel: &str, message_id: u128, op: DeferredOpKind) -> BatchDeferredOp {
 /// exactly as the peer derives the read cap it advertises.
 fn facts(max_body_bytes: u64) -> AttachmentFacts {
     AttachmentFacts {
-        version: 1,
-        participant_id: "surface:bar".to_string(),
-        session_id: "sess-1".to_string(),
-        heartbeat_secs: 20,
         max_body_bytes,
         max_frame_bytes: brenn_attach_proto::max_client_frame_bytes(max_body_bytes as usize) as u64,
-        alert_granted: false,
+        ..pages::facts()
     }
 }
 

@@ -150,6 +150,11 @@ pub fn reconcile_stores(bindings: &AppliedBindings, stores: &mut SurfaceStores) 
 /// One registered instance's place in the wiring.
 #[derive(Debug)]
 struct Registration {
+    /// Which registration under this instance id this is. An instance
+    /// deregistered and registered again is a *different* mount with the same
+    /// spelling — its own positions, its own scheduler state — so work minted for
+    /// the previous one must not be applied to it.
+    generation: u64,
     /// The transportable channels this instance holds a subscription reference
     /// on, one entry **per input binding** — so two ports of one instance on one
     /// channel hold two references on the one subscription they share.
@@ -169,8 +174,9 @@ struct Registration {
 }
 
 impl Registration {
-    fn new() -> Self {
+    fn new(generation: u64) -> Self {
         Self {
+            generation,
             subs: Vec::new(),
             failed: false,
         }
@@ -186,6 +192,9 @@ impl Registration {
 #[derive(Debug, Default)]
 pub struct Registrations {
     entries: BTreeMap<String, Registration>,
+    /// Stamped onto each entry at registration, so two registrations under one
+    /// instance id are distinguishable for as long as the page lives.
+    next_generation: u64,
 }
 
 impl Registrations {
@@ -202,6 +211,15 @@ impl Registrations {
     /// which is owed nothing either way.
     pub fn is_failed(&self, instance: &str) -> bool {
         self.entries.get(instance).is_some_and(|r| r.failed)
+    }
+
+    /// Which registration under `instance` is in force, or `None` when none is.
+    ///
+    /// What a pass holding work minted for a mount checks before applying it: the
+    /// id alone would name a successor registration that mount's work says nothing
+    /// about.
+    pub fn generation(&self, instance: &str) -> Option<u64> {
+        self.entries.get(instance).map(|r| r.generation)
     }
 
     /// Every registered instance, in id order.
@@ -236,9 +254,11 @@ impl Registrations {
         stores: &mut SurfaceStores,
         subs: &mut Subscriptions,
     ) -> Vec<ClientFrame> {
+        let generation = self.next_generation;
+        self.next_generation += 1;
         let prior = self
             .entries
-            .insert(instance.to_string(), Registration::new());
+            .insert(instance.to_string(), Registration::new(generation));
         assert!(
             prior.is_none(),
             "surface client: instance {instance:?} registered twice"

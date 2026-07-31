@@ -170,7 +170,11 @@ impl Page {
             max_body_bytes: 4_096,
             now_ms: 1_000,
         };
-        self.schedules.assemble(instance, &mut ctx)
+        // Zero for an instance this fixture never registered: the cases that do
+        // that assert an assembly panic, which fires before the generation is read
+        // by anything.
+        let generation = self.registrations.generation(instance).unwrap_or(0);
+        self.schedules.assemble(instance, generation, &mut ctx)
     }
 
     /// Park one message under `instance` on the confined channel, due at
@@ -576,7 +580,7 @@ fn a_bound_channel_with_no_store_panics() {
         max_body_bytes: 4_096,
         now_ms: 0,
     };
-    schedules.assemble("p1", &mut ctx);
+    schedules.assemble("p1", 0, &mut ctx);
 }
 
 // ── The loudness ladder ────────────────────────────────────────────────────
@@ -667,7 +671,7 @@ fn an_alarm_binding_announces_the_whole_delta_once() {
         }],
         "one announcement per binding per activation, naming the coalesced delta"
     );
-    assert!(ready.drops.fatal.is_none());
+    assert!(ready.drops.fatal.is_empty());
     assert_eq!(page.schedules.metered_drops("p1", "in"), 3);
 }
 
@@ -692,12 +696,12 @@ fn a_fatal_binding_asks_for_the_kill_and_announces_too() {
     let ready = page.assemble("p1");
     assert_eq!(
         ready.drops.fatal,
-        Some(DropAnnouncement {
+        vec![DropAnnouncement {
             instance: "p1".to_string(),
             port: "in".to_string(),
             channel: WIRE.to_string(),
             dropped: 1,
-        })
+        }]
     );
     assert_eq!(ready.drops.announce.len(), 1, "the rungs are cumulative");
 }
@@ -714,7 +718,9 @@ fn two_fatal_bindings_ask_for_one_kill() {
     ));
     arrive(&mut page, 3);
     let ready = page.assemble("p1");
-    let fatal = ready.drops.fatal.expect("both bindings overflowed");
+    let [fatal] = &ready.drops.fatal[..] else {
+        panic!("one kill for the one instance: {:?}", ready.drops)
+    };
     assert_eq!(
         fatal.port, "in",
         "the first such binding, in declaration order"
@@ -772,12 +778,12 @@ fn a_fatal_eviction_announces_at_the_retirement_site() {
     let charged = arrive_evicting(&mut page, 2);
     assert_eq!(
         charged.fatal,
-        Some(DropAnnouncement {
+        vec![DropAnnouncement {
             instance: "p1".to_string(),
             port: "in".to_string(),
             channel: WIRE.to_string(),
             dropped: 1,
-        }),
+        }],
         "the kill ends the instance, so there is no next window to wait for"
     );
     assert_eq!(charged.announce.len(), 1);
@@ -818,40 +824,85 @@ fn a_retirement_charges_each_overflowed_binding_in_order_and_kills_once() {
         vec!["aux", "in"],
         "both bindings announce, in binding order"
     );
-    assert_eq!(
-        charged.fatal.expect("both bindings overflowed").port,
-        "aux",
-        "one kill, naming the first of them"
-    );
+    let [kill] = &charged.fatal[..] else {
+        panic!("one kill for the one instance: {:?}", charged)
+    };
+    assert_eq!(kill.port, "aux", "one kill, naming the first of them");
     assert_eq!(page.schedules.metered_drops("p1", "in"), 1);
     assert_eq!(page.schedules.metered_drops("p1", "aux"), 1);
 }
 
 #[test]
-fn merging_verdicts_accumulates_announcements_and_keeps_the_first_kill() {
-    let announcement = |port: &str| DropAnnouncement {
-        instance: "p1".to_string(),
+fn merging_verdicts_accumulates_announcements_and_keeps_one_kill_per_instance() {
+    let announcement = |instance: &str, port: &str| DropAnnouncement {
+        instance: instance.to_string(),
         port: port.to_string(),
         channel: WIRE.to_string(),
         dropped: 1,
     };
     let mut verdicts = DropVerdicts::default();
     verdicts.merge(DropVerdicts {
-        announce: vec![announcement("in")],
-        fatal: Some(announcement("in")),
+        announce: vec![announcement("p1", "in")],
+        fatal: vec![announcement("p1", "in")],
     });
     verdicts.merge(DropVerdicts {
-        announce: vec![announcement("aux")],
-        fatal: Some(announcement("aux")),
+        announce: vec![announcement("p1", "aux")],
+        fatal: vec![announcement("p1", "aux")],
     });
     assert_eq!(
         verdicts.announce,
-        vec![announcement("in"), announcement("aux")]
+        vec![announcement("p1", "in"), announcement("p1", "aux")]
     );
     assert_eq!(
         verdicts.fatal,
-        Some(announcement("in")),
+        vec![announcement("p1", "in")],
         "an instance dies once, for the binding that asked first"
+    );
+
+    // A second instance's kill is not the first one's: it was configured to die of
+    // this loss too, and one retirement can evict both their positions.
+    verdicts.merge(DropVerdicts {
+        announce: vec![announcement("p2", "in")],
+        fatal: vec![announcement("p2", "in")],
+    });
+    assert_eq!(
+        verdicts.fatal,
+        vec![announcement("p1", "in"), announcement("p2", "in")]
+    );
+}
+
+/// One append can push retention past the positions of *several* instances, and each
+/// of them was configured to die of the loss. The kill is a set, not a slot.
+#[test]
+fn a_retirement_evicting_two_instances_kills_both() {
+    let mut page = Page::new(applied(
+        vec![
+            loud(subscription("p1", "in", WIRE, 1, 0), NoiseLevel::Fatal),
+            loud(subscription("p2", "in", WIRE, 1, 0), NoiseLevel::Fatal),
+        ],
+        vec![output("p1", "out", OUT)],
+    ));
+    // The channel retains one, so the second arrival evicts the first out from under
+    // both instances' positions at once.
+    page.arrive(WIRE, &["w0"]);
+    let overflow = page
+        .stores
+        .get_mut(WIRE)
+        .expect("the fixture hosts the channel")
+        .insert(env(WIRE, "w1"));
+
+    let charged = page
+        .schedules
+        .charge_overflow(&page.bindings, WIRE, overflow);
+
+    assert_eq!(
+        charged
+            .fatal
+            .iter()
+            .map(|kill| kill.instance.as_str())
+            .collect::<Vec<_>>(),
+        vec!["p1", "p2"],
+        "one kill each, in binding order"
     );
 }
 
@@ -1097,7 +1148,7 @@ fn the_buffer_carries_the_attachments_body_cap() {
     ctx.max_body_bytes = 8;
     let mut schedules = Schedules::new();
     schedules.track("p1");
-    let mut ready = schedules.assemble("p1", &mut ctx);
+    let mut ready = schedules.assemble("p1", 0, &mut ctx);
     assert_eq!(
         ready.buffer.publish("out", "far too long a body".into()),
         Err(PublishError::InvalidPayload)

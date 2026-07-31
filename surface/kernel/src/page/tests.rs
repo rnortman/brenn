@@ -22,6 +22,8 @@ use crate::outbound::PortPublish;
 use crate::registry::BindingKey;
 use crate::test_support::bindings as fixtures;
 use crate::test_support::bindings::output;
+use crate::test_support::pages;
+use crate::test_support::pages::PRINCIPAL;
 
 use super::*;
 
@@ -30,7 +32,6 @@ const WIRE: &str = "brenn:site.bar.in";
 const OTHER_WIRE: &str = "brenn:site.bar.other";
 const OUT: &str = "ephemeral:site.bar.out";
 const NOTES: &str = "local:app/notes";
-const PRINCIPAL: &str = "surface:bar";
 const EPOCH: Uuid = Uuid::from_u128(0x5107);
 const NOW: Millis = Millis(1_000);
 
@@ -102,18 +103,6 @@ fn body(w: W) -> String {
     doc(w).to_body()
 }
 
-fn facts() -> AttachmentFacts {
-    AttachmentFacts {
-        version: 1,
-        participant_id: PRINCIPAL.to_string(),
-        session_id: "s-1".to_string(),
-        heartbeat_secs: 20,
-        max_body_bytes: 4_096,
-        max_frame_bytes: 65_536,
-        alert_granted: false,
-    }
-}
-
 fn ack(replay_count: u32, gap: Option<GapInfo>) -> SubscribeAck {
     SubscribeAck {
         frames: Vec::new(),
@@ -130,7 +119,7 @@ fn page() -> SurfacePage {
 /// Phase 1 plus the config channel's acknowledgement — the state phase 2 runs
 /// from. Answers the frames phase 1 sent.
 fn attach(page: &mut SurfacePage) -> Vec<ClientFrame> {
-    let frames = page.on_attached(facts());
+    let frames = page.on_attached(pages::facts());
     page.subs
         .on_subscribe_result(CONFIG, SubscribeOutcome::Ok, 1, None)
         .expect("the config channel is pending");
@@ -270,7 +259,7 @@ fn a_fresh_page_holds_the_reserved_planes_and_nothing_else() {
 #[test]
 fn phase_one_subscribes_the_config_channel_and_nothing_else() {
     let mut page = page();
-    let frames = page.on_attached(facts());
+    let frames = page.on_attached(pages::facts());
     assert_eq!(subscribed(&frames), vec![(CONFIG, 1, 1)]);
     assert_eq!(frames.len(), 1);
 }
@@ -279,7 +268,7 @@ fn phase_one_subscribes_the_config_channel_and_nothing_else() {
 fn phase_one_takes_the_attachment_identity() {
     let mut page = page();
     assert_eq!(page.router.principal(), None);
-    page.on_attached(facts());
+    page.on_attached(pages::facts());
     assert_eq!(page.router.principal(), Some(PRINCIPAL));
 }
 
@@ -295,7 +284,7 @@ fn phase_one_clears_the_deferred_view_mirror() {
             deliver_after: 9_000,
         }],
     );
-    page.on_attached(facts());
+    page.on_attached(pages::facts());
     // The peer re-seeds only the nonempty sets behind its `Welcome`, so a retained
     // mirror would show a schedule that released while the page was away.
     assert!(page.views.is_empty());
@@ -304,7 +293,7 @@ fn phase_one_clears_the_deferred_view_mirror() {
 #[test]
 fn the_config_ack_is_the_connect_states_answer() {
     let mut page = page();
-    page.on_attached(facts());
+    page.on_attached(pages::facts());
     assert!(page.on_config_ack(&ack(1, None)).is_ok());
     assert!(page.on_config_ack(&ack(0, None)).is_err());
     assert!(
@@ -383,7 +372,13 @@ fn phase_two_closes_the_outbox_of_an_instance_that_deregistered() {
         .apply_config(&body(W::default()), NOW)
         .expect("the same document applies again");
     assert!(!page.outbound.is_registered("p1"));
-    assert_eq!(applied.lost_flushes.len(), 1);
+    let [lost] = &applied.lost_flushes[..] else {
+        panic!("one flush died with the outbox: {:?}", applied.lost_flushes)
+    };
+    assert_eq!(
+        lost.instance, "p1",
+        "the loss names whose committed writes vanished"
+    );
 }
 
 #[test]
@@ -529,7 +524,7 @@ fn a_shrink_that_retires_a_fatal_bindings_position_asks_for_the_kill() {
     };
     assert_eq!(
         applied.drops.fatal,
-        Some(announcement.clone()),
+        vec![announcement.clone()],
         "the kill ends the instance, so a fatal rung announces at the retirement"
     );
     assert_eq!(applied.drops.announce, vec![announcement]);
