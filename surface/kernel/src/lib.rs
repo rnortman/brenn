@@ -21,6 +21,25 @@
 /// build's limits, and indexed for the surface layer's lookups.
 pub mod bindings;
 
+/// The surface's two-phase connect: the attachment's transport facts, the
+/// config channel that carries its wiring, and when each becomes usable.
+pub mod connect;
+
+/// The surface's registration table and the reconcile passes that put a
+/// bindings document in force over the page's stores and subscriptions.
+pub mod registry;
+
+/// The surface's rules for its own confined planes: who writes where, what a
+/// plane makes of a body, and the overlay holdership the kernel remembers.
+pub mod planes;
+
+/// What the surface writes: port publishes addressed onto channels, the
+/// kernel's own documents, and the per-instance flush outboxes.
+pub mod outbound;
+
+/// The geometry and status documents the surface publishes about itself.
+pub mod telemetry;
+
 mod core;
 mod driver;
 // The backoff-jitter seed source, crate-private: see the module doc for why it

@@ -955,27 +955,71 @@ Code site (`TODO(dormant-missing-app-cursor)`):
 
 ## `attach-cutover`
 
-`brenn-attach-client` holds generalized copies of machinery that is still live in
-`brenn-surface-kernel`: the backoff PRNG and the frame/duration helpers
-(`core/util.rs`), the per-channel ring store (`core/store.rs`), and the
-connection/backoff lifecycle, the wire-subscription refcounts, and the
-outbox/retry plane (`core/mod.rs`). Both copies compile, and nothing links them —
-the compiler cannot tell you when one is fixed and the other is not, so every bug
-found in one has to be found twice until the kernel embeds the crate.
+`brenn-attach-client` and the surface kernel's new channel-keyed modules hold
+generalized copies of machinery that is still live in `ClientCore`
+(`surface/kernel/src/core/`) and in the server's surface route. Both copies
+compile, and nothing links them — the compiler cannot tell you when one is fixed
+and the other is not, so every bug found in one has to be found twice until the
+kernel cuts over.
 
-The two have already diverged deliberately: the crate's retry timer arms only
+The copies have already diverged deliberately: the crate's retry timer arms only
 when a tick could actually send something, where the kernel's arms whenever any
-outbox has a queued flush. The crate is the surviving copy, so the cutover
-deletes the kernel's rather than reconciling them.
+outbox has a queued flush. The generalized copy is the surviving one everywhere,
+so the cutover deletes the live one rather than reconciling them.
 
-Done when the surface kernel embeds `brenn-attach-client`'s types and every
-listed kernel copy is deleted — an explicit inventory, not a best-effort sweep,
-because a piece missed here becomes a permanent silent fork.
+Done when the surface kernel runs on `brenn-attach-client` plus its own
+channel-keyed modules and every doomed copy listed below is deleted — an explicit
+inventory, not a best-effort sweep, because a piece missed here becomes a
+permanent silent fork.
 
-Code sites (`TODO(attach-cutover)`): `surface/kernel/src/core/util.rs`
-(`SplitMix64`, `frame_type_name`, `duration_ms`),
-`surface/kernel/src/core/store.rs` (`SurfaceChannelStore`),
-`surface/kernel/src/core/mod.rs` (`RETRY_INTERVAL_MS` and the outbox/retry plane,
-`enter_backoff` and the connection lifecycle around it, `acquire_channel_ref` and
-the wire-subscription plane).
+Inventory, surviving copy → doomed twin (each twin carries a
+`TODO(attach-cutover)` marker):
 
+- `brenn_attach_client::{conn, subs, store, publish}` → `core/mod.rs`'s
+  connection/backoff lifecycle, wire-subscription refcounts and outbox/retry
+  plane, and `core/store.rs`'s `SurfaceChannelStore`.
+- `brenn_attach_client`'s PRNG and frame/duration helpers → `core/util.rs`'s
+  `SplitMix64`, `frame_type_name`, `duration_ms`.
+- `surface/kernel/src/outbound.rs`'s `publish_status` → `core/util.rs`'s
+  `publish_outcome_to_status` (same table, different outcome type).
+- `surface/kernel/src/connect.rs` + `registry.rs` + `outbound.rs` →
+  `core/mod.rs`'s bindings-application sequence (`on_welcome`,
+  `reconcile_stores`, `reconcile_registered`, `send_parked_batches`) and the
+  registration half of its `registered` table.
+- `surface/kernel/src/planes.rs` → `core/mod.rs`'s plane guard block (overlay
+  validation, the takeover stamp in `guard_local_body`, `record_overlay_state`).
+- `surface/kernel/src/telemetry.rs` → `core/mod.rs`'s `SendGeometry`/`SendStatus`
+  command path and `brenn-server/src/routes/surface/telemetry.rs`'s frame
+  validation, health derivation and document composition (its server-written
+  disconnected stamp stays).
+
+
+
+## `batch-frame-cap`
+
+The websocket read cap and the per-activation publish caps contradict each other
+for batches. `max_client_frame_bytes` (`attach/proto/src/lib.rs`, and the same
+derivation in `brenn-server/src/routes/surface/mod.rs`) sizes the cap at
+`6 × max_body_bytes + 8 KiB` — one worst-case-escaped body plus slack — while an
+activation may buffer `MAX_PUBLISHES_PER_ACTIVATION` = 256 publishes totalling
+`MAX_PUBLISH_BYTES_PER_ACTIVATION` = 4 MiB (`brenn-budget`), and a flush travels
+as one `PublishBatch` frame with no size-based split. At the default 64 KiB body
+cap the frame cap is ~392 KiB, so a component that legally buffers roughly seven
+near-max publishes in one activation composes a frame the server's read cap
+refuses — and an oversized read is a protocol violation with a fail2ban signal,
+against the operator's own browser.
+
+Pre-existing: the live surface route already derives the cap this way. The
+decision is a real one, which is why it is not a patch: sizing the cap for the
+worst config-legal batch raises the bytes the server will read off an
+unauthenticated-until-`Welcome` socket, while splitting or capping flush
+composition breaks the property that one activation's flush is one atomic batch
+judged against a single server clock read.
+
+Done when the two contracts agree — the cap covers every config-legal frame, or
+composition cannot produce one over it — and the comments at both code sites
+state the contract that was chosen rather than the mismatch.
+
+Code sites (`TODO(batch-frame-cap)`): `attach/proto/src/lib.rs`
+(`max_client_frame_bytes`) and `brenn-server/src/routes/attach/socket.rs`
+(`InboundError::Oversized`, which is where the violation is raised).

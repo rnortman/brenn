@@ -15,6 +15,9 @@ crate-type = ["cdylib", "rlib"]
 # The attacher-generic client half: transport shims and the monotonic time
 # currency the core and driver are driven with.
 brenn-attach-client = { version = "0.1.0", path = "../../attach/client" }
+# The attachment protocol's frames, which the surface layer composes and reads
+# directly wherever the generic client hands one back rather than acting on it.
+brenn-attach-proto = { version = "0.1.0", path = "../../attach/proto" }
 brenn-surface-schema = { version = "0.1.0", path = "../schema" }
 brenn-surface-contract = { version = "0.1.0", path = "../contract" }
 brenn-envelope = { version = "0.1.0", path = "../../brenn-envelope" }

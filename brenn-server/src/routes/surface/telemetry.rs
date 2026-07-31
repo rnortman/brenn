@@ -26,6 +26,11 @@ use brenn_surface_schema::{InstanceReport, InstanceState, OverlayReport, StatusC
 
 use super::description::surface_status_channel;
 
+// TODO(attach-cutover): the frame validation, health derivation and document
+// composition here are duplicated by `brenn_surface_kernel::telemetry`, which
+// authors both documents from the wiring the page holds. Everything but the
+// server-written disconnected stamp goes when the telemetry frames go.
+
 /// Validate a `ClientFrame::Geometry` report's bounds. `Err` names the violated
 /// rule (never echoing client values) for the protocol-violation log.
 pub fn validate_geometry(width: u32, height: u32, device_pixel_ratio: f64) -> Result<(), String> {

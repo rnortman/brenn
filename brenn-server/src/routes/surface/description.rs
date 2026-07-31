@@ -763,6 +763,7 @@ pub fn validate_surface_description(
     // component config maps carry no secrets.
     for surface in surfaces {
         let channel = surface_config_channel(prefix, &surface.slug);
+        assert_no_own_config_binding(surface, &channel);
         let Some(bare) =
             resolve_derived_bare_in(directory, &channel, ChannelScheme::Ephemeral, &mut missing)
         else {
@@ -890,6 +891,41 @@ fn assert_config_retention_at_least_one(channel: &str, directory: &MessagingDire
          to start (fail-fast on invalid config).",
         entry.resolved_channel.retain_depth,
     );
+}
+
+/// Boot-assert: no binding targets `surface`'s own config channel.
+///
+/// The kernel owns the sole subscription to this channel for the life of every
+/// attachment. An input binding is a contradictory second subscription no
+/// attacher can hold open; an output binding violates single-writer (the
+/// substrate publishes the document). Either is config the system cannot honour,
+/// so it dies at boot rather than at every page load.
+fn assert_no_own_config_binding(surface: &ResolvedSurface, channel: &str) {
+    for binding in &surface.subscriptions {
+        assert!(
+            binding.channel_address != channel,
+            "boot: surface {:?} binds input port {}/{} to its own config channel {channel:?} — \
+             that channel carries the surface's bindings document and the surface kernel already \
+             subscribes it on its own behalf, so a second subscription on it cannot be opened. \
+             Bind the port to an ordinary channel. Refusing to start (fail-fast on invalid \
+             config).",
+            surface.slug,
+            binding.instance,
+            binding.port,
+        );
+    }
+    for output in &surface.outputs {
+        assert!(
+            output.channel_address != channel,
+            "boot: surface {:?} binds output port {}/{} to its own config channel {channel:?} — \
+             the bindings document has one writer, the reserved system participant that publishes \
+             it at boot. Bind the port to an ordinary channel. Refusing to start (fail-fast on \
+             invalid config).",
+            surface.slug,
+            output.instance,
+            output.port,
+        );
+    }
 }
 
 // ── Boot publish ───────────────────────────────────────────────────────────

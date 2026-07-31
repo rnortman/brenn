@@ -556,6 +556,57 @@ fn deregistration_hands_back_the_flushes_nobody_is_left_to_send() {
     );
 }
 
+/// What an embedder re-checking a queued flush against an attachment's frame cap
+/// reads: the whole composed frame, never less than what goes out.
+#[test]
+fn a_flush_measures_the_frame_it_composes_to() {
+    let batch = batch(&["one", "two"]);
+    let measured = batch.frame_bytes(Some("alpha"));
+
+    let mut outboxes = attached(4);
+    let steps = outboxes.flush(&alpha(), batch, now());
+    let sent = serde_json::to_string(&steps.frames[0])
+        .expect("a PublishBatch frame serializes")
+        .len();
+    assert!(
+        measured >= sent,
+        "measured {measured} understates the {sent}-byte frame"
+    );
+    // The widest correlation the plane can mint is what the slack is: 20 digits
+    // against the one this frame carries.
+    assert!(measured - sent <= 20);
+}
+
+/// The lookups borrow, so an embedder holding `&str` addresses a `String`-keyed
+/// plane without composing an owned key per call.
+#[test]
+fn a_string_keyed_plane_answers_a_borrowed_key() {
+    let mut outboxes = attached(1);
+    outboxes.flush("alpha", batch(&["one"]), now());
+    outboxes.flush("alpha", batch(&["two"]), now());
+    assert!(outboxes.is_registered("alpha"));
+    assert_eq!(outboxes.parked_len("alpha"), 1);
+    assert_eq!(outboxes.dropped_count("alpha"), 0);
+    assert_eq!(outboxes.rate_limited_count("alpha"), 0);
+    assert_eq!(outboxes.deregister("alpha"), vec![batch(&["two"])]);
+}
+
+#[test]
+fn the_open_outboxes_are_answered_in_key_order() {
+    let mut outboxes = Outboxes::new();
+    outboxes.register("zulu".to_string(), None, 4);
+    outboxes.register(alpha(), None, 4);
+    assert_eq!(
+        outboxes.registrants().cloned().collect::<Vec<String>>(),
+        vec![alpha(), "zulu".to_string()]
+    );
+    outboxes.deregister(&alpha());
+    assert_eq!(
+        outboxes.registrants().cloned().collect::<Vec<String>>(),
+        vec!["zulu".to_string()]
+    );
+}
+
 // --- the connection under the outboxes --------------------------------------
 
 #[test]

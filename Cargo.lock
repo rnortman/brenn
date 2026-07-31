@@ -769,6 +769,7 @@ name = "brenn-surface-kernel"
 version = "0.1.0"
 dependencies = [
  "brenn-attach-client",
+ "brenn-attach-proto",
  "brenn-budget",
  "brenn-envelope",
  "brenn-queue",

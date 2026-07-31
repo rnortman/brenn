@@ -12,9 +12,10 @@ use brenn_surface_schema::{
 use super::PublishStatus;
 
 // TODO(attach-cutover): `SplitMix64`, `frame_type_name`, and `duration_ms` are
-// duplicated by `brenn_attach_client`'s copies. Delete them here when the kernel
-// embeds that crate — nothing links the two, so drift between them is invisible
-// to the compiler.
+// duplicated by `brenn_attach_client`'s copies, and `publish_outcome_to_status`
+// by `crate::outbound::publish_status` (same table over the attach crate's
+// outcome type). Delete them here when the kernel embeds that crate — nothing
+// links the copies, so drift between them is invisible to the compiler.
 
 /// A minimal splitmix64 PRNG: one `u64` of state, advanced by the standard
 /// splitmix64 step. Deterministic given its seed, dependency-free (no `rand`,

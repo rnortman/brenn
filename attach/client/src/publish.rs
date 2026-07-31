@@ -26,6 +26,7 @@
 //! caller that asked for it. This layer takes a composed flush and answers where
 //! it went.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use brenn_attach_proto::{
@@ -170,6 +171,28 @@ impl FlushBatch {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.ops.is_empty()
     }
+
+    /// The serialized size of the `PublishBatch` frame this flush composes to
+    /// under `attribution`.
+    ///
+    /// For an embedder re-checking a queued flush against an attachment's frame
+    /// cap: the cap is per-attachment and derived from the body cap, so it shrinks
+    /// when an operator lowers the body cap across a restart, and a frame over the
+    /// peer's read cap is a protocol violation rather than an outcome.
+    ///
+    /// Measured against the widest correlation the plane can mint, so the answer
+    /// never understates the frame that goes out.
+    pub fn frame_bytes(&self, attribution: Option<&str>) -> usize {
+        let frame = ClientFrame::PublishBatch {
+            attribution: attribution.map(str::to_string),
+            correlation: u64::MAX,
+            publishes: self.entries.clone(),
+            deferred_ops: self.ops.clone(),
+        };
+        serde_json::to_string(&frame)
+            .expect("attach client: a PublishBatch frame serializes to JSON")
+            .len()
+    }
 }
 
 /// What to do with the retry timer. Absent — `None` in
@@ -285,6 +308,9 @@ struct PendingBatch<K> {
 /// while detached (page-local delivery and timers need no wire), so the outbox is
 /// a queue like every other and takes the same overflow model: bounded per
 /// registrant, drop-oldest at the cap, counted.
+///
+/// Every lookup borrows the key the std maps' way, so an embedder keying by
+/// `String` addresses its outboxes with the `&str` it already has.
 pub struct Outboxes<K: Ord> {
     /// Ordered, so every sweep over the registrants emits frames in one
     /// deterministic order and no registrant can starve a sibling.
@@ -366,7 +392,11 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// The correlation of an in-flight batch is deliberately *not* forgotten —
     /// the peer will still answer it, and that answer must be reconcilable. It
     /// comes back as a [`BatchAnswer`] with no live registrant.
-    pub fn deregister(&mut self, key: &K) -> Vec<FlushBatch> {
+    pub fn deregister<Q>(&mut self, key: &Q) -> Vec<FlushBatch>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         let outbox = self
             .registrants
             .remove(key)
@@ -374,7 +404,11 @@ impl<K: Clone + Ord> Outboxes<K> {
         outbox.parked.into_iter().collect()
     }
 
-    pub fn is_registered(&self, key: &K) -> bool {
+    pub fn is_registered<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         self.registrants.contains_key(key)
     }
 
@@ -384,18 +418,30 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// attachment is live, nothing of its own is queued, and none of its own
     /// flushes is unanswered. Otherwise it queues, and the outbox drains in
     /// order.
-    pub fn flush(&mut self, key: &K, batch: FlushBatch, now: Millis) -> OutboxSteps<K> {
+    pub fn flush<Q>(&mut self, key: &Q, batch: FlushBatch, now: Millis) -> OutboxSteps<K>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         assert!(
             !batch.is_empty(),
             "attach client: a flush with neither entries nor ops is not a batch"
         );
-        let mut steps = if self.wire_free_for(key) {
+        // The owned key comes off the table rather than from the caller: the
+        // frame and the queue both hold one, and only a registered registrant
+        // has a flush to give.
+        let key = self
+            .registrants
+            .get_key_value(key)
+            .map(|(key, _)| key.clone())
+            .expect("attach client: a flush implies a registered registrant");
+        let mut steps = if self.wire_free_for(&key) {
             OutboxSteps {
-                frames: vec![self.batch_frame(key, batch)],
+                frames: vec![self.batch_frame(&key, batch)],
                 ..OutboxSteps::default()
             }
         } else {
-            self.park(key, batch, false)
+            self.park(&key, batch, false)
         };
         steps.retry_wakeup = self.retry_wakeup(now);
         steps
@@ -571,20 +617,37 @@ impl<K: Clone + Ord> Outboxes<K> {
         steps
     }
 
+    /// Every open outbox's key, in key order.
+    pub fn registrants(&self) -> impl Iterator<Item = &K> {
+        self.registrants.keys()
+    }
+
     /// How many flushes `key` has queued.
-    pub fn parked_len(&self, key: &K) -> usize {
+    pub fn parked_len<Q>(&self, key: &Q) -> usize
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         self.registrants
             .get(key)
             .map_or(0, |outbox| outbox.parked.len())
     }
 
     /// Whole flushes `key` has lost, lifetime.
-    pub fn dropped_count(&self, key: &K) -> u64 {
+    pub fn dropped_count<Q>(&self, key: &Q) -> u64
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         self.registrants.get(key).map_or(0, |outbox| outbox.dropped)
     }
 
     /// Flushes of `key`'s the peer's budget refused, lifetime.
-    pub fn rate_limited_count(&self, key: &K) -> u64 {
+    pub fn rate_limited_count<Q>(&self, key: &Q) -> u64
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
         self.registrants
             .get(key)
             .map_or(0, |outbox| outbox.rate_limited)

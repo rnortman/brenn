@@ -847,6 +847,89 @@ fn validate_panics_on_config_channel_that_retains_nothing() {
     );
 }
 
+/// The kernel owns the sole subscription to its surface's config channel; a
+/// component input on the same address contradicts it. Invalid config panics at
+/// boot.
+#[test]
+#[should_panic(expected = "binds input port p1/wiring to its own config channel")]
+fn validate_panics_on_an_input_bound_to_the_surfaces_own_config_channel() {
+    let mut surfaces = multi_surface_config();
+    surfaces[0].subscriptions.push(SurfaceBinding {
+        channel_address: surface_config_channel(PREFIX, "bar"),
+        instance: "p1".to_string(),
+        port: "wiring".to_string(),
+        push_depth: 4,
+        retain_depth: 2,
+        noise: brenn_lib::messaging::config::NoiseLevel::Silent,
+    });
+    let dir = full_directory(&surfaces, Depth::Bounded(1));
+    let principals = surfaces.clone();
+    validate_surface_description(
+        &on_config(),
+        &surfaces,
+        Some(&dir),
+        SingleWriterPrincipals {
+            surfaces: &principals,
+            ..Default::default()
+        },
+    );
+}
+
+/// The write side of the same exclusion: the bindings document has one writer,
+/// the reserved system participant.
+#[test]
+#[should_panic(expected = "binds output port p1/wiring to its own config channel")]
+fn validate_panics_on_an_output_bound_to_the_surfaces_own_config_channel() {
+    let mut surfaces = multi_surface_config();
+    surfaces[0].outputs.push(SurfaceOutput {
+        channel_address: surface_config_channel(PREFIX, "bar"),
+        instance: "p1".to_string(),
+        port: "wiring".to_string(),
+        default_urgency: Urgency::Normal,
+        budget: brenn_budget::SinkBudget {
+            fill_mt: brenn_budget::MILLITOKENS_PER_PUBLISH,
+            capacity_mt: brenn_budget::MILLITOKENS_PER_PUBLISH,
+        },
+    });
+    let dir = full_directory(&surfaces, Depth::Bounded(1));
+    let principals = surfaces.clone();
+    validate_surface_description(
+        &on_config(),
+        &surfaces,
+        Some(&dir),
+        SingleWriterPrincipals {
+            surfaces: &principals,
+            ..Default::default()
+        },
+    );
+}
+
+/// Another surface's config channel is not excluded — the kernel owns only its
+/// own, so a sibling's is ordinary deny-by-default ACL policy.
+#[test]
+fn validate_admits_an_input_bound_to_another_surfaces_config_channel() {
+    let mut surfaces = multi_surface_config();
+    surfaces[0].subscriptions.push(SurfaceBinding {
+        channel_address: surface_config_channel(PREFIX, "dev-stub"),
+        instance: "p1".to_string(),
+        port: "wiring".to_string(),
+        push_depth: 4,
+        retain_depth: 2,
+        noise: brenn_lib::messaging::config::NoiseLevel::Silent,
+    });
+    let dir = full_directory(&surfaces, Depth::Bounded(1));
+    let principals = surfaces.clone();
+    validate_surface_description(
+        &on_config(),
+        &surfaces,
+        Some(&dir),
+        SingleWriterPrincipals {
+            surfaces: &principals,
+            ..Default::default()
+        },
+    );
+}
+
 /// The scheme-matched half of the sweep. A principal holding an
 /// `ephemeral_publish` matcher over a config channel could hand a surface its
 /// entire wiring; a sweep that read only `brenn_publish` would never see it.

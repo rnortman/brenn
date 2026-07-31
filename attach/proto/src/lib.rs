@@ -578,10 +578,21 @@ pub const PUBLISH_FRAME_OVERHEAD_BYTES: usize = 8 * 1024;
 /// worst-case JSON string escaping expands one body byte to six (`\u00XX` for
 /// control characters), so even a default-config-legal body needs ~6x headroom.
 /// The server computes this from its config and advertises the result as
-/// [`Welcome::max_frame_bytes`], so any config-legal publish fits under the cap
-/// by construction.
+/// [`Welcome::max_frame_bytes`].
+///
+/// The derivation sizes a single [`ClientFrame::Publish`]: one escaped body plus
+/// generous slack. A [`ClientFrame::PublishBatch`] carries a whole activation's
+/// flush in one frame, and the per-activation caps admit far more than six bodies'
+/// worth (`brenn_budget::MAX_PUBLISHES_PER_ACTIVATION`,
+/// `MAX_PUBLISH_BYTES_PER_ACTIVATION`), so a conforming attacher can compose a
+/// batch this cap rejects — and an oversized frame is read as a protocol
+/// violation.
 ///
 /// [`Welcome::max_frame_bytes`]: ServerFrame::Welcome
+// TODO(batch-frame-cap): reconcile the two contracts — either size the cap for the
+// worst config-legal batch, or bound flush composition so no single
+// `PublishBatch` can exceed it. Until then a legitimate multi-publish activation
+// can be read as tampering.
 pub fn max_client_frame_bytes(max_body_bytes: usize) -> usize {
     // Checked, not wrapping: this value gates a fail2ban decision (an oversized
     // frame is a protocol violation), and it must equal the number a 32-bit wasm

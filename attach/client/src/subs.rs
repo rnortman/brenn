@@ -67,10 +67,13 @@ enum WireState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeAck {
     /// Frames the embedder must send — the deferred `Unsubscribe` of a channel
-    /// whose last local subscriber detached while the `Subscribe` was in flight.
+    /// whose last local subscriber detached while the `Subscribe` was in flight,
+    /// and the `Unsubscribe`/`Subscribe` pair that enacts a statement replaced
+    /// while it was in flight.
     pub frames: Vec<ClientFrame>,
-    /// Whether the subscription is live now. False means the deferred
-    /// `Unsubscribe` above just closed it.
+    /// Whether the subscription is live now. False means the frames above closed
+    /// the acknowledged subscription: nobody holds the channel any more, or a new
+    /// statement is on its way in its place.
     pub live: bool,
     /// How many retained messages the server is about to replay. Informational
     /// here: what an empty replay *means* is the embedder's policy, and for a
@@ -131,6 +134,11 @@ struct ChannelSubscription {
     /// window. Caps the diagnostic at one per span: stragglers are peer-paced, so
     /// nothing may ride an unbounded diagnostic channel on them.
     straggler_reported: bool,
+    /// The subscription the outstanding `Subscribe` states, while one is in
+    /// flight. Compared against the entry's current statement when the result
+    /// lands: an entry restated while nobody held it describes a subscription the
+    /// peer has not been told about, and that is where it is told.
+    stated: Option<(SubscriptionDepths, ResumePolicy)>,
 }
 
 impl ChannelSubscription {
@@ -140,6 +148,7 @@ impl ChannelSubscription {
     fn prepare_subscribe(&mut self) -> Option<Cursor> {
         self.wire = WireState::Pending;
         self.span_hw = None;
+        self.stated = Some((self.depths, self.resume_policy));
         match self.resume_policy {
             ResumePolicy::Resume => self.token.clone(),
             ResumePolicy::Cursorless => None,
@@ -199,10 +208,17 @@ impl Subscriptions {
     /// wire), a changed [`ResumePolicy`], and depths of `0/0` (a subscription that
     /// neither wakes nor shows anything, which the peer refuses as a violation).
     ///
-    /// A channel whose last subscriber released it holds no wire subscription —
-    /// its entry survives only to tell stragglers from inexplicable deliveries —
-    /// so the first acquisition after that states the subscription afresh and may
-    /// state it differently.
+    /// A channel nobody holds is owed no subscription — its entry survives only to
+    /// tell stragglers from inexplicable deliveries — so the first acquisition
+    /// after the last release states the subscription afresh and may state it
+    /// differently. That holds while a `Subscribe` is still in flight too: the
+    /// statement recorded here replaces what that frame said, and the replacement
+    /// is enacted when its `SubscribeResult` lands
+    /// ([`on_subscribe_result`](Subscriptions::on_subscribe_result) closes the
+    /// acknowledged subscription and opens the restated one). An embedder whose
+    /// fold is itself state that the peer delivers — a new configuration can arrive
+    /// before the previous one's subscribes are answered — needs that to be a
+    /// reconcile rather than a panic.
     pub fn acquire(
         &mut self,
         channel: &str,
@@ -230,11 +246,13 @@ impl Subscriptions {
                 span_hw: None,
                 has_been_active: false,
                 straggler_reported: false,
+                stated: None,
             });
-        // Nothing holds this channel and nothing is open on it: what the entry
-        // carries is straggler tolerance, not a subscription, so this acquisition
-        // is the one that says what to subscribe.
-        if entry.refcount == 0 && entry.wire == WireState::Unsubscribed {
+        // Nothing holds this channel: what the entry carries is straggler
+        // tolerance and, while a `Subscribe` is in flight, a statement nobody is
+        // owed any more — so this acquisition is the one that says what to
+        // subscribe.
+        if entry.refcount == 0 {
             entry.depths = depths;
             entry.resume_policy = resume_policy;
         }
@@ -288,10 +306,37 @@ impl Subscriptions {
     /// The attachment came up: subscribe every channel that still has a local
     /// subscriber, presenting each one's retained cursor.
     ///
+    /// The composition of [`go_live`](Subscriptions::go_live) and
+    /// [`resubscribe_survivors`](Subscriptions::resubscribe_survivors), for an
+    /// embedder whose subscribable set does not depend on anything the
+    /// attachment is about to deliver.
+    pub fn on_attached(&mut self) -> Vec<ClientFrame> {
+        self.go_live();
+        self.resubscribe_survivors()
+    }
+
+    /// Mark the attachment live, subscribing nothing.
+    ///
+    /// For the embedder that cannot resubscribe at attach time because the set
+    /// it may subscribe is itself state the attachment delivers: a channel the
+    /// peer's current configuration no longer admits is a protocol violation to
+    /// subscribe, so an embedder that resubscribed its previous set first would
+    /// be killed for it on exactly the reconnect that carries the new set. Such
+    /// an embedder goes live, takes its configuration, reconciles its references
+    /// against it, and only then calls
+    /// [`resubscribe_survivors`](Subscriptions::resubscribe_survivors) —
+    /// meanwhile the acquisition of the configuration channel itself emits its
+    /// own `Subscribe`, because the attachment is already live.
+    pub fn go_live(&mut self) {
+        self.live = true;
+    }
+
+    /// Subscribe every channel that has a local subscriber and no open
+    /// subscription, presenting each one's retained cursor.
+    ///
     /// A channel at refcount zero is left alone — it holds no cursor and no
     /// subscriber, so no `Subscribe` is ever emitted for it.
-    pub fn on_attached(&mut self) -> Vec<ClientFrame> {
-        self.live = true;
+    pub fn resubscribe_survivors(&mut self) -> Vec<ClientFrame> {
         let mut frames = Vec::new();
         for (channel, entry) in self.channels.iter_mut() {
             if entry.refcount > 0 && entry.wire == WireState::Unsubscribed {
@@ -322,6 +367,10 @@ impl Subscriptions {
     /// It must answer a `Pending` channel: the peer's writer orders the result
     /// ahead of any replay, so a result for a channel this attacher is not
     /// waiting on is unreconcilable.
+    ///
+    /// This is also where a subscription restated while its `Subscribe` was in
+    /// flight is enacted — the acknowledged subscription is closed and the current
+    /// statement subscribed in its place.
     pub fn on_subscribe_result(
         &mut self,
         channel: &str,
@@ -343,9 +392,19 @@ impl Subscriptions {
         // crossing the `Unsubscribe` a straggler rather than an inexplicable one.
         entry.has_been_active = true;
         entry.straggler_reported = false;
+        let restated = entry.stated != Some((entry.depths, entry.resume_policy));
         let (frames, live) = if entry.refcount == 0 {
             entry.wire = WireState::Unsubscribed;
             (vec![unsubscribe_frame(channel)], false)
+        } else if restated {
+            // Every holder released and a new one acquired while this `Subscribe`
+            // was unanswered, stating the channel differently. What the peer has
+            // just acknowledged is the old statement — one open subscription has
+            // one statement, so it is closed and the restated one sent in its
+            // place. Deliveries from the acknowledged span cross as stragglers and
+            // are replayed under the new subscription.
+            let close = unsubscribe_frame(channel);
+            (vec![close, entry.subscribe_frame(channel)], false)
         } else {
             entry.wire = WireState::Active;
             (Vec::new(), true)
@@ -411,6 +470,17 @@ impl Subscriptions {
     /// How many local subscribers hold `channel` open.
     pub fn refcount(&self, channel: &str) -> u32 {
         self.channels.get(channel).map_or(0, |entry| entry.refcount)
+    }
+
+    /// The depths currently stated for `channel`, or `None` for a channel this
+    /// attacher holds no entry for.
+    ///
+    /// The statement an embedder must match at every further acquisition. An
+    /// embedder whose fold can change — its configuration is itself state the
+    /// peer delivers — reads it to tell a fold that still agrees with the open
+    /// subscription from one that requires closing and reopening it.
+    pub fn depths(&self, channel: &str) -> Option<SubscriptionDepths> {
+        self.channels.get(channel).map(|entry| entry.depths)
     }
 
     /// Every channel with at least one local subscriber, in address order.

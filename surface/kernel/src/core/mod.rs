@@ -1107,6 +1107,11 @@ pub struct ClientCore {
     /// its bindings is owed is a cursor in that channel's store. Every `dom` and
     /// headless instance the page delivers to is in here — it is the only
     /// delivery model there is.
+    ///
+    // TODO(attach-cutover): the registration half of this table and the passes
+    // over it are duplicated by `crate::registry::Registrations` (positions and
+    // subscription references) and `crate::outbound::SurfaceOutbound` (the
+    // parked flushes). Delete them here when the kernel cuts over.
     registered: HashMap<String, RegisteredInstance>,
     /// The page-load epoch stamped on every `LocalPos` (`CoreConfig::local_epoch`).
     local_epoch: Uuid,
@@ -1604,6 +1609,13 @@ impl ClientCore {
             )),
         }
     }
+
+    // TODO(attach-cutover): the bindings-application sequence below — this
+    // `Welcome` intake, `reconcile_stores`, `reconcile_registered`, and
+    // `send_parked_batches` — is duplicated by the two-phase connect in
+    // `crate::connect`, `crate::registry` and `crate::outbound`, which take the
+    // same wiring off the bindings document instead. Delete it here when the
+    // kernel cuts over to them.
 
     /// Process the `Welcome` handshake: validate binding schemes, reset backoff,
     /// enter `Active`, arm the liveness deadline, run the reconnect-reconcile
@@ -3329,6 +3341,12 @@ impl ClientCore {
         .into_effects()
     }
 
+    // TODO(attach-cutover): this plane guard block — overlay validation, the
+    // takeover stamp in `guard_local_body`, and `record_overlay_state` — is
+    // duplicated by `crate::planes::SurfacePlanes`, which states the same rules
+    // as the policy the attach crate's router is constructed with. Delete it
+    // here when the kernel cuts over.
+
     /// Judge a publish on [`LOCAL_OVERLAY_STATE_CHANNEL`] against the plane's
     /// publisher rules, without recording anything.
     ///
@@ -4196,6 +4214,11 @@ impl ClientCore {
             body: truncate_report_field(body, MAX_ALERT_BODY_BYTES),
         })]
     }
+
+    // TODO(attach-cutover): the two telemetry commands below carry the frames
+    // that die with this wire; the documents replacing them are composed by
+    // `crate::telemetry` and sent as ordinary publishes through
+    // `crate::outbound`. Delete this path when the kernel cuts over.
 
     /// Handle a `SendGeometry` telemetry command. Best-effort like `on_alert`:
     /// the frame rides the same WS, so it is sent only while `Active`. The

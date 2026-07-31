@@ -262,6 +262,15 @@ impl AppliedBindings {
             .filter(move |b| b.instance == instance)
     }
 
+    /// Every input binding of one instance, in declaration order — the positions
+    /// and subscription references a registration takes.
+    pub fn inputs_of<'a>(&'a self, instance: &'a str) -> impl Iterator<Item = &'a Binding> {
+        self.doc
+            .subscriptions
+            .iter()
+            .filter(move |b| b.instance == instance)
+    }
+
     /// Every binding on `channel`, in declaration order: the fan-out table for
     /// one arriving envelope. Empty for a channel nothing binds.
     pub fn inputs_on<'a>(&'a self, channel: &'a str) -> impl Iterator<Item = &'a Binding> {

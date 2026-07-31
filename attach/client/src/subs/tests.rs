@@ -58,6 +58,24 @@ fn a_first_acquisition_on_a_live_attachment_subscribes() {
 }
 
 #[test]
+fn a_channel_answers_the_depths_it_was_acquired_with() {
+    let mut subs = attached_with(CHANNEL);
+    assert_eq!(subs.depths(CHANNEL), Some(depths(5, 10)));
+    assert_eq!(
+        subs.depths(OTHER),
+        None,
+        "a channel the attacher holds no entry for states nothing"
+    );
+    subs.release(CHANNEL);
+    subs.acquire(CHANNEL, depths(1, 1), ResumePolicy::Resume);
+    assert_eq!(
+        subs.depths(CHANNEL),
+        Some(depths(1, 1)),
+        "a subscription stated afresh answers the fresh statement"
+    );
+}
+
+#[test]
 fn further_acquisitions_share_the_one_wire_subscription() {
     let mut subs = attached_with(CHANNEL);
     assert!(
@@ -183,17 +201,83 @@ fn a_fresh_acquisition_after_a_full_release_may_state_a_different_subscription()
     assert_eq!(subs.refcount(CHANNEL), 2);
 }
 
-/// While the deferred `Unsubscribe` waits on its `SubscribeResult`, a `Subscribe`
-/// stating the old depths is genuinely in flight — so the channel is still held
-/// to one statement even at refcount zero.
+/// A channel nobody holds may be stated afresh even while its `Subscribe` is
+/// unanswered — the embedder whose fold is itself delivered state can be handed a
+/// new one before the old one's subscribes come back. The peer is told when its
+/// answer arrives: the acknowledged subscription is closed and the new statement
+/// sent in its place.
+#[test]
+fn a_statement_replaced_while_the_subscribe_is_in_flight_is_enacted_at_its_result() {
+    let mut subs = Subscriptions::new();
+    subs.on_attached();
+    assert_eq!(
+        subs.acquire(CHANNEL, depths(5, 10), ResumePolicy::Resume),
+        vec![subscribe(CHANNEL, 5, 10, None)]
+    );
+    subs.release(CHANNEL);
+    // Restated at refcount zero with the old `Subscribe` still in flight: no
+    // frame yet, because the peer has not finished answering the old one.
+    assert!(
+        subs.acquire(CHANNEL, depths(2, 3), ResumePolicy::Resume)
+            .is_empty()
+    );
+    assert_eq!(subs.depths(CHANNEL), Some(depths(2, 3)));
+
+    let ack = subs
+        .on_subscribe_result(CHANNEL, SubscribeOutcome::Ok, 1, None)
+        .expect("the result answers a pending channel");
+    assert_eq!(
+        ack.frames,
+        vec![unsubscribe_frame(CHANNEL), subscribe(CHANNEL, 2, 3, None)]
+    );
+    assert!(!ack.live, "the restated subscription is not open yet");
+    assert!(!subs.is_active(CHANNEL));
+
+    // A delivery from the span that just closed is a straggler, not a fatal.
+    assert_eq!(
+        subs.on_deliver(CHANNEL, 1, cursor("c1"), 0)
+            .expect("a straggler is tolerated"),
+        DeliverDisposition::Discard { first: true }
+    );
+
+    let ack = subs
+        .on_subscribe_result(CHANNEL, SubscribeOutcome::Ok, 1, None)
+        .expect("the restated subscribe is pending");
+    assert!(ack.frames.is_empty());
+    assert!(ack.live);
+    assert!(subs.is_active(CHANNEL));
+    assert_eq!(subs.refcount(CHANNEL), 1);
+}
+
+/// The one-statement rule still holds for a channel somebody holds: two live
+/// local subscribers cannot describe one wire subscription two ways.
 #[test]
 #[should_panic(expected = "re-acquired with a different subscription")]
-fn re_acquiring_a_channel_whose_subscribe_is_in_flight_at_a_different_depth_panics() {
+fn re_acquiring_a_held_channel_whose_subscribe_is_in_flight_at_a_different_depth_panics() {
     let mut subs = Subscriptions::new();
     subs.on_attached();
     subs.acquire(CHANNEL, depths(5, 10), ResumePolicy::Resume);
-    subs.release(CHANNEL);
     subs.acquire(CHANNEL, depths(2, 3), ResumePolicy::Resume);
+}
+
+#[test]
+fn going_live_subscribes_nothing_until_the_survivors_are_asked_for() {
+    let mut subs = attached_with(CHANNEL);
+    subs.on_detached();
+    // The embedder whose subscribable set is state the attachment delivers goes
+    // live first and resubscribes later, so it can reconcile in between.
+    subs.go_live();
+    // A channel acquired while live is subscribed at once, survivors or not.
+    assert_eq!(
+        subs.acquire(OTHER, depths(1, 1), ResumePolicy::Cursorless),
+        vec![subscribe(OTHER, 1, 1, None)]
+    );
+    assert_eq!(
+        subs.resubscribe_survivors(),
+        vec![subscribe(CHANNEL, 5, 10, None)]
+    );
+    // Once open, a second ask leaves it alone.
+    assert!(subs.resubscribe_survivors().is_empty());
 }
 
 #[test]
