@@ -118,6 +118,20 @@ pub struct ErrorReport<'a> {
     pub subject: Option<&'a str>,
 }
 
+/// A flush nobody is left to answer for.
+///
+/// Two paths produce one: a refusal the peer answered after the outbox closed, and
+/// an outbox a bindings document closed with a queue still in it. Either way the
+/// entries were ok'd by the activation that wrote them and never applied, so the
+/// loss is real — and it is reported with the instance it belonged to rather than
+/// counted on a registrant that no longer exists.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LostFlush {
+    /// Whose flush it was, by the instance id its outbox was keyed on.
+    pub instance: String,
+    pub batch: FlushBatch,
+}
+
 /// Which document a telemetry publish carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetryKind {
@@ -439,7 +453,7 @@ impl SurfaceOutbound {
         &mut self,
         bindings: &AppliedBindings,
         registered: impl Iterator<Item = &'a str>,
-    ) -> Vec<FlushBatch> {
+    ) -> Vec<LostFlush> {
         let registered: Vec<String> = registered.map(str::to_string).collect();
         let stale: Vec<String> = self
             .outboxes
@@ -449,7 +463,18 @@ impl SurfaceOutbound {
             .collect();
         let mut lost = Vec::new();
         for instance in stale {
-            lost.extend(self.outboxes.deregister(&instance));
+            // Paired with the instance here, where it is still in hand: the batch
+            // itself carries no attribution, and a report that cannot name whose
+            // committed writes vanished is no use during a config-change incident.
+            lost.extend(
+                self.outboxes
+                    .deregister(&instance)
+                    .into_iter()
+                    .map(|batch| LostFlush {
+                        instance: instance.clone(),
+                        batch,
+                    }),
+            );
         }
         for instance in registered {
             if !self.outboxes.is_registered(&instance) && bindings.is_declared_instance(&instance) {

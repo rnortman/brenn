@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::registry::{Registrations, new_stores, reconcile_stores};
+use crate::test_support::pages;
 
 const CONFIG: &str = "ephemeral:site.surface.bar.bindings";
 const WIRE: &str = "brenn:site.bar.in";
@@ -36,15 +37,16 @@ fn subscribe(channel: &str, push: u64, retain: u64, resume: Option<&str>) -> Cli
     }
 }
 
+/// The shared attachment, with the three knobs this suite varies: the id it asserts
+/// the page took, and the two caps it asserts are the ones a publish is judged
+/// against.
 fn facts() -> AttachmentFacts {
     AttachmentFacts {
-        version: 1,
-        participant_id: "surface:bar".to_string(),
         session_id: "sess-1".to_string(),
-        heartbeat_secs: 20,
         max_body_bytes: 65_536,
         max_frame_bytes: 70_000,
         alert_granted: true,
+        ..pages::facts()
     }
 }
 

@@ -32,7 +32,7 @@ mod tests;
 
 use brenn_attach_client::Millis;
 use brenn_attach_client::conn::AttachmentFacts;
-use brenn_attach_client::publish::{DeferredViews, FlushBatch, OutboxSteps};
+use brenn_attach_client::publish::{DeferredViews, OutboxSteps};
 use brenn_attach_client::router::LocalRouter;
 use brenn_attach_client::subs::{SubscribeAck, Subscriptions};
 use brenn_attach_proto::ClientFrame;
@@ -42,7 +42,7 @@ use uuid::Uuid;
 use crate::activation::{DropVerdicts, Schedules};
 use crate::bindings::AppliedBindings;
 use crate::connect::{ConfigApplied, SurfaceConnect};
-use crate::outbound::{PublishAnswer, SurfaceOutbound};
+use crate::outbound::{LostFlush, PublishAnswer, SurfaceOutbound};
 use crate::planes::SurfacePlanes;
 use crate::registry::{Registrations, StoreReconcile, SurfaceStores, new_stores, reconcile_stores};
 
@@ -76,6 +76,16 @@ pub struct SurfacePage {
     /// The peer's mirror of what each of the page's senders has parked on a
     /// transportable channel.
     pub views: DeferredViews,
+    /// The publish-body cap the most recent attachment stated, `0` before the
+    /// first one.
+    ///
+    /// Retained across a detach, unlike the rest of the attachment's facts: the
+    /// page keeps activating the components that read its confined planes while
+    /// the link is down — chrome drawing the reconnect banner is the case that
+    /// matters — and a component's body-size contract must not change because the
+    /// link dropped. What a *transportable* flush is judged against is the live
+    /// contract, which is why the outbox reads it from the facts instead.
+    pub body_cap: u64,
 }
 
 /// What a detach left to answer for.
@@ -109,8 +119,9 @@ pub struct Configured {
     /// as a burst.
     pub drops: DropVerdicts,
     /// Flushes that died with an outbox this document closed — an instance no
-    /// longer registered, whose queue nobody is left to answer for.
-    pub lost_flushes: Vec<FlushBatch>,
+    /// longer registered, whose queue nobody is left to answer for. Each names the
+    /// instance whose writes vanished.
+    pub lost_flushes: Vec<LostFlush>,
 }
 
 impl SurfacePage {
@@ -136,14 +147,16 @@ impl SurfacePage {
             schedules: Schedules::new(),
             router: LocalRouter::new(SurfacePlanes::new()),
             views: DeferredViews::new(),
+            body_cap: 0,
         }
     }
 
     /// Phase 1: the attachment is live.
     ///
-    /// Three things, and deliberately nothing else. The page takes the
+    /// Four things, and deliberately nothing else. The page takes the
     /// attachment's identity, which is what every confined envelope it mints is
-    /// attributed to. It drops every deferred-view mirror: the peer re-seeds only
+    /// attributed to, and its body cap, which every activation's buffer enforces.
+    /// It drops every deferred-view mirror: the peer re-seeds only
     /// the *nonempty* sets, immediately behind its `Welcome`, so an unmentioned
     /// pair means an empty set — and a retained mirror would show a schedule that
     /// released while the page was away. And it subscribes the config channel,
@@ -159,6 +172,7 @@ impl SurfacePage {
     /// [`SurfaceConnect::on_attached`].
     pub fn on_attached(&mut self, facts: AttachmentFacts) -> Vec<ClientFrame> {
         self.router.set_principal(facts.participant_id.clone());
+        self.body_cap = facts.max_body_bytes;
         self.views.clear();
         self.connect.on_attached(facts, &mut self.subs)
     }
@@ -238,6 +252,7 @@ impl SurfacePage {
             schedules,
             router,
             views: _,
+            body_cap: _,
         } = self;
         let bindings = connect
             .bindings()

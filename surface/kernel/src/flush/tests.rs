@@ -23,13 +23,14 @@ use crate::publish_buffer::OutputSpec;
 use crate::registry::{BindingKey, new_stores, reconcile_stores};
 use crate::test_support::bindings as fixtures;
 use crate::test_support::bindings::{output, output_at};
+use crate::test_support::pages;
+use crate::test_support::pages::PRINCIPAL;
 
 use super::*;
 
 const WIRE: &str = "ephemeral:site.bar.out";
 const NOTES: &str = "local:app/notes";
 const EPOCH: Uuid = Uuid::from_u128(0x5107);
-const PRINCIPAL: &str = "surface:bar";
 const NOW: Millis = Millis(1_000);
 /// The wall clock every completion here is judged at. Ahead of nothing in
 /// particular: the fixture's stamps sit at the Unix epoch, so any release time
@@ -98,18 +99,6 @@ fn without_p1s_wire_output() -> AppliedBindings {
     AppliedBindings::apply(&document.to_body()).expect("the un-wired fixture document applies")
 }
 
-fn facts() -> AttachmentFacts {
-    AttachmentFacts {
-        version: 1,
-        participant_id: PRINCIPAL.to_string(),
-        session_id: "s-1".to_string(),
-        heartbeat_secs: 20,
-        max_body_bytes: 4_096,
-        max_frame_bytes: 65_536,
-        alert_granted: false,
-    }
-}
-
 /// A page with the wiring in force, `p1` and `p2` registered, scheduled and
 /// holding outboxes, and a confined router that has its identity.
 struct Page {
@@ -144,11 +133,11 @@ impl Page {
         }
         outbound.reconcile(&bindings, ["p1", "p2", "chrome"].into_iter());
         if attached {
-            outbound.on_attached(&bindings, &facts(), NOW);
+            outbound.on_attached(&bindings, &pages::facts(), NOW);
         }
         Self {
             bindings,
-            facts: attached.then(facts),
+            facts: attached.then(pages::facts),
             stores,
             registrations,
             schedules,
@@ -380,7 +369,9 @@ fn a_flush_while_detached_queues_and_sends_nothing() {
     assert!(report.steps.frames.is_empty());
     assert!(report.steps.dropped.is_empty());
 
-    let steps = page.outbound.on_attached(&page.bindings, &facts(), NOW);
+    let steps = page
+        .outbound
+        .on_attached(&page.bindings, &pages::facts(), NOW);
     assert_eq!(
         batch_parts(&steps.frames[0]).0[0].body,
         "hello",
@@ -707,19 +698,16 @@ fn a_fatal_binding_evicted_by_a_publish_asks_for_a_kill_naming_its_own_instance(
 
     assert_eq!(
         report.drops.fatal,
-        Some(DropAnnouncement {
+        vec![DropAnnouncement {
             instance: "p2".to_string(),
             port: "notes".to_string(),
             channel: NOTES.to_string(),
             dropped: 1,
-        }),
+        }],
         "the publisher is p1; the instance to kill is the reader that lost the message"
     );
     assert!(
-        report
-            .drops
-            .fatal
-            .expect("just asserted")
+        report.drops.fatal[0]
             .describe()
             .starts_with("p2: dropped 1"),
         "the kill reason names the instance the announcement carries"
