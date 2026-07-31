@@ -952,3 +952,30 @@ Code site (`TODO(dormant-missing-app-cursor)`):
 `brenn-lib/src/messaging/reconcile.rs`, the dormant justification loop in
 `Messenger::reconcile_subscriber_cursors`.
 
+
+## `attach-cutover`
+
+`brenn-attach-client` holds generalized copies of machinery that is still live in
+`brenn-surface-kernel`: the backoff PRNG and the frame/duration helpers
+(`core/util.rs`), the per-channel ring store (`core/store.rs`), and the
+connection/backoff lifecycle, the wire-subscription refcounts, and the
+outbox/retry plane (`core/mod.rs`). Both copies compile, and nothing links them —
+the compiler cannot tell you when one is fixed and the other is not, so every bug
+found in one has to be found twice until the kernel embeds the crate.
+
+The two have already diverged deliberately: the crate's retry timer arms only
+when a tick could actually send something, where the kernel's arms whenever any
+outbox has a queued flush. The crate is the surviving copy, so the cutover
+deletes the kernel's rather than reconciling them.
+
+Done when the surface kernel embeds `brenn-attach-client`'s types and every
+listed kernel copy is deleted — an explicit inventory, not a best-effort sweep,
+because a piece missed here becomes a permanent silent fork.
+
+Code sites (`TODO(attach-cutover)`): `surface/kernel/src/core/util.rs`
+(`SplitMix64`, `frame_type_name`, `duration_ms`),
+`surface/kernel/src/core/store.rs` (`SurfaceChannelStore`),
+`surface/kernel/src/core/mod.rs` (`RETRY_INTERVAL_MS` and the outbox/retry plane,
+`enter_backoff` and the connection lifecycle around it, `acquire_channel_ref` and
+the wire-subscription plane).
+

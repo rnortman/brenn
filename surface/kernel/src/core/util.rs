@@ -11,6 +11,11 @@ use brenn_surface_schema::{
 
 use super::PublishStatus;
 
+// TODO(attach-cutover): `SplitMix64`, `frame_type_name`, and `duration_ms` are
+// duplicated by `brenn_attach_client`'s copies. Delete them here when the kernel
+// embeds that crate — nothing links the two, so drift between them is invisible
+// to the compiler.
+
 /// A minimal splitmix64 PRNG: one `u64` of state, advanced by the standard
 /// splitmix64 step. Deterministic given its seed, dependency-free (no `rand`,
 /// no `getrandom`). Used only to jitter the reconnect backoff, where the whole

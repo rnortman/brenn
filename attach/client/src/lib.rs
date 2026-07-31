@@ -7,16 +7,26 @@
 //! crate. That dependency direction is the purity proof: the compiler refuses a
 //! surface concept that leaks in here.
 //!
-//! What lives here today is the I/O boundary and the time currency the sans-I/O
-//! layers above it are driven with: [`transport`] (the connector/connection
-//! traits and the native + browser implementations) and [`Millis`] (the
-//! monotonic stamp every input carries).
+//! What lives here today is the I/O boundary, the time currency the sans-I/O
+//! layers above it are driven with, and those layers themselves: [`transport`]
+//! (the connector/connection traits and the native + browser implementations),
+//! [`Millis`] (the monotonic stamp every input carries), [`conn`] (the
+//! connection lifecycle — connect, version handshake, liveness, backoff),
+//! [`subs`] (the wire subscription plane — refcounted per-channel
+//! subscriptions, resume cursors, and span continuity), [`store`] (what the
+//! attachment keeps of each channel, and the windows its readers are served
+//! from), and [`publish`] (outstanding publishes, the per-registrant
+//! atomic-flush outboxes, and the parked-set mirror).
 //!
 //! Authentication is the connector's business, not the protocol's: the native
 //! connector injects a cookie header, the browser connector relies on the
 //! same-origin cookie the browser attaches, and a future bearer-token connector
 //! plugs into the same seam without either of them noticing.
 
+pub mod conn;
+pub mod publish;
+pub mod store;
+pub mod subs;
 pub mod transport;
 
 /// A monotonic timestamp in milliseconds, supplied by the driver on every input

@@ -424,13 +424,18 @@ dependencies = [
 name = "brenn-attach-client"
 version = "0.1.0"
 dependencies = [
+ "brenn-attach-proto",
+ "brenn-envelope",
+ "brenn-queue",
  "chrono",
  "futures-channel",
  "futures-util",
  "js-sys",
+ "serde_json",
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "uuid",
  "wasm-bindgen",
  "web-sys",
 ]

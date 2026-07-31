@@ -132,6 +132,10 @@ pub(crate) enum DeferOpOutcome {
     WrongSender { owner: String },
 }
 
+// TODO(attach-cutover): duplicated by `brenn_attach_client::store::ChannelStore`,
+// which is the same store generic over the reader key. Delete this one when the
+// kernel embeds that crate.
+
 /// One channel's page-side state: what it retains, where each binding is in it,
 /// and what the server said was lost before it ever got here.
 pub(crate) struct SurfaceChannelStore {

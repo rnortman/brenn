@@ -532,6 +532,12 @@ struct PendingBatch {
     ops: Vec<BatchDeferredOp>,
 }
 
+// TODO(attach-cutover): this constant and the outbox/retry plane it drives
+// (`pump_outbox`, `retry_wakeup`, `outbox_blocked`, `on_retry_tick`) are
+// duplicated by `brenn_attach_client::publish::Outboxes`, which is the surviving
+// copy and already arms its timer more narrowly. Delete this plane when the
+// kernel embeds that crate.
+
 /// How long the kernel waits before re-offering a refused outbox head.
 ///
 /// A constant, not config. The server's backstop refill — 15s per publish by
@@ -1461,6 +1467,11 @@ impl ClientCore {
         ]
     }
 
+    // TODO(attach-cutover): the connection lifecycle around here — connect,
+    // handshake, `Welcome` intake, liveness, and this backoff schedule — is
+    // duplicated by `brenn_attach_client::conn::Connection`. Delete it when the
+    // kernel embeds that crate.
+
     /// Enter `Backoff`: reset the bus plane, fail any outstanding publishes,
     /// consume one backoff step, and arm the backoff timer.
     fn enter_backoff(&mut self, now: Millis) -> Vec<Effect> {
@@ -2047,6 +2058,11 @@ impl ClientCore {
         }
         effects
     }
+
+    // TODO(attach-cutover): the wire-subscription plane — these refcounts, the
+    // resume custody, span validation, and `resubscribe_survivors` — is
+    // duplicated by `brenn_attach_client::subs::Subscriptions`, keyed by channel
+    // rather than by `SubKey`. Delete it when the kernel embeds that crate.
 
     /// Take one reference on a wire subscription, opening it if this is the
     /// first and the connection is live.
