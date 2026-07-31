@@ -919,9 +919,7 @@ fn fuel_exhausting_guest_traps_not_panics() {
 #[test]
 fn full_size_window_does_not_spuriously_trap_demo() {
     let comp = load_demo_with_out();
-    let n: usize = 8;
-    let _fuel_budget = PROCESSOR_FUEL_MINIMUM.max((n as u64) * PROCESSOR_FUEL_PER_ENVELOPE);
-    let envelopes: Vec<String> = (0..n)
+    let envelopes: Vec<String> = (0..FULL_WINDOW)
         .map(|i| envelope_json("brenn:ch", &format!("msg-{i}")))
         .collect();
     let activation = single_port_activation("in", envelopes, 0);
@@ -929,6 +927,35 @@ fn full_size_window_does_not_spuriously_trap_demo() {
     assert!(
         matches!(outcome, ProcessorOutcome::Ok { .. }),
         "demo component must succeed on a full-size window. got {outcome:?}"
+    );
+}
+
+const FULL_WINDOW: usize = 8;
+
+/// A full-size window costs well under the fuel a real activation is given.
+///
+/// Drives the window on a quarter of the production budget and requires success, so
+/// the assertion is about *headroom*: a codegen change (a wasmtime bump is the usual
+/// cause) that quadruples instructions-retired per envelope fails here, while a
+/// did-it-trap assertion at the full budget would stay green until the margin was
+/// gone entirely.
+#[test]
+fn full_size_window_leaves_fuel_headroom() {
+    let comp = load_demo_with_out();
+    let production_budget =
+        PROCESSOR_FUEL_MINIMUM.max((FULL_WINDOW as u64) * PROCESSOR_FUEL_PER_ENVELOPE);
+    let envelopes: Vec<String> = (0..FULL_WINDOW)
+        .map(|i| envelope_json("brenn:ch", &format!("msg-{i}")))
+        .collect();
+    let activation = single_port_activation("in", envelopes, 0);
+    // Epoch deadline far beyond the ticker's reach for this activation, so fuel is
+    // the only limit under test.
+    let outcome = comp.handle_with_limits(activation, u64::MAX, production_budget / 4);
+    assert!(
+        matches!(outcome, ProcessorOutcome::Ok { .. }),
+        "a full-size window must complete on a quarter of the production fuel budget \
+         ({} of {production_budget}); got {outcome:?}",
+        production_budget / 4
     );
 }
 
@@ -979,7 +1006,7 @@ fn memory_cap_excess_traps_deterministically() {
     let outcome = comp.handle(activation);
     match &outcome {
         ProcessorOutcome::Trap(msg) => {
-            // Assert the exact wasmtime limiter phrase (limits.rs:353), not just a
+            // Assert the exact phrase `StoreLimits::memory_growing` raises, not just a
             // substring, so a {e:#}→e.to_string() revert would cause this to fail
             // (the backtrace outermost context does not repeat the root-cause phrase).
             assert!(
@@ -1025,6 +1052,73 @@ fn processor_resource_cap_constants_are_sensible() {
     const { assert!(PROCESSOR_MAX_INSTANCES <= 64) };
     const { assert!(PROCESSOR_MAX_TABLES >= 1) };
     const { assert!(PROCESSOR_MAX_TABLES <= 256) };
+}
+
+/// wasmtime applies `table_elements` to each table separately, and an over-cap grow
+/// is a trap rather than a refused grow the guest could paper over.
+///
+/// Both properties are asserted against wasmtime's own limiter — the same value
+/// `processor_store_limits` hands every activation — so a wasmtime release that
+/// made the ceiling store-wide, or stopped trapping, fails here instead of leaving
+/// a comment claiming semantics the engine no longer has. Per-table also means the
+/// store-wide worst case is `PROCESSOR_MAX_TABLE_ELEMENTS * PROCESSOR_MAX_TABLES`.
+///
+/// TODO(wasm-table-limit-e2e): this drives the limiter directly; nothing yet drives
+/// it through a guest that actually grows a table.
+#[test]
+fn table_element_cap_is_per_table_and_traps_on_excess() {
+    use wasmtime::ResourceLimiter;
+
+    let mut limits = brenn_wasm::processor_store_limits();
+    assert!(
+        limits
+            .table_growing(0, PROCESSOR_MAX_TABLE_ELEMENTS, None)
+            .expect("growing exactly to the cap must be permitted, not a trap"),
+        "growing exactly to the cap must be permitted"
+    );
+
+    let err = limits
+        .table_growing(0, PROCESSOR_MAX_TABLE_ELEMENTS + 1, None)
+        .expect_err("growing past the cap must trap, not return a refused grow");
+    let diag = format!("{err:#}");
+    assert!(
+        diag.contains("forcing trap when growing table to"),
+        "over-cap table growth must raise the limiter's trap phrase; got: {diag}"
+    );
+
+    // Per-table, not store-wide: a second table may reach the same ceiling after the
+    // first one already has. A store-wide ceiling would refuse this.
+    assert!(
+        limits
+            .table_growing(0, PROCESSOR_MAX_TABLE_ELEMENTS, None)
+            .expect("a second table growing to the cap must be permitted"),
+        "the cap must apply per table, not to the store's running total"
+    );
+}
+
+/// The instance and table-count caps reach the limiter wasmtime consults.
+///
+/// `ResourceLimiter::instances`/`tables` are what the engine calls at
+/// instantiation; asserting them here means dropping either from
+/// `processor_store_limits` fails rather than silently reverting to wasmtime's
+/// defaults (10,000 instances, 10,000 tables).
+///
+/// TODO(wasm-table-limit-e2e): as above — no guest-driven coverage of either cap.
+#[test]
+fn instance_and_table_count_caps_reach_the_limiter() {
+    use wasmtime::ResourceLimiter;
+
+    let limits = brenn_wasm::processor_store_limits();
+    assert_eq!(
+        limits.instances(),
+        PROCESSOR_MAX_INSTANCES,
+        "the instance cap must reach wasmtime's limiter"
+    );
+    assert_eq!(
+        limits.tables(),
+        PROCESSOR_MAX_TABLES,
+        "the table-count cap must reach wasmtime's limiter"
+    );
 }
 
 // ── Store-through-processor ───────────────────────────────────────────────────

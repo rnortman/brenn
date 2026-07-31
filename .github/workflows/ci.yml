@@ -38,8 +38,8 @@ jobs:
       # Makefile's wit-bindgen-cli and wasm-tools pins with no derivation; on
       # drift, CI installs the wrong version and fails later as a bindings
       # diff, not a version error.
-      WIT_BINDGEN_VERSION: 0.58.0
-      WASM_TOOLS_VERSION: 1.249.0
+      WIT_BINDGEN_VERSION: 0.60.0
+      WASM_TOOLS_VERSION: 1.255.0
       # The Makefile leaves nextest unpinned; pin it here for deterministic cache
       # keys and deliberate bumps.
       NEXTEST_VERSION: 0.9.140

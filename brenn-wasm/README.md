@@ -9,15 +9,17 @@ Style note: concise, precise, no padding. Audience: smart human/LLM.
 One-time per workstation (re-run on version bump):
 
 ```sh
-cargo install --locked cargo-component --version 0.21.1
+cargo install --locked wit-bindgen-cli --version 0.60.0
+cargo install --locked wasm-tools --version 1.255.0
 ```
 
-This version is pinned to match wasmtime 26 (the workspace dep). Updating
-either requires updating both — check the cargo-component/wasmtime
-compatibility matrix.
+These two pins are the guest build path; the host runtime is wasmtime 47 (the
+`brenn-wasm` dep). The same literals appear in the Makefile preflights and in
+`.github/workflows/ci.yml`, and all of them move together on a bump.
+cargo-component is retired — not installed, not invoked.
 
-`wasm32-wasip2` is declared in the workspace `rust-toolchain.toml` and pulled
-in automatically by rustup on first build.
+`wasm32-unknown-unknown` is declared in the workspace `rust-toolchain.toml` and
+pulled in automatically by rustup on first build.
 
 ## Building
 
@@ -28,14 +30,15 @@ make test              # runs host tests (depends on wasm-components)
 ```
 
 The WASM component source lives at `components/replay/` (non-workspace crate,
-targets `wasm32-wasip1` via cargo-component). The artifact is copied to
-`target/components/brenn_replay.wasm` as a stable host-resolvable path.
+targets `wasm32-unknown-unknown`, wrapped into a component by `wasm-tools
+component new`). The artifact is copied to `target/components/brenn_replay.wasm`
+as a stable host-resolvable path.
 
 ## WIT
 
 `wit/replay.wit` is the single source of truth for the `brenn:replay` WIT
 world. Both host (via `wasmtime::component::bindgen!`) and guest (via
-cargo-component) reference this file directly.
+`wit-bindgen`) reference this file directly.
 
 ## Architecture note
 

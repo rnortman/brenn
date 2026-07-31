@@ -4,20 +4,17 @@
 // phonebuddy envelope replay protection. Algorithm: envelope parse/validate,
 // ±5-minute skew check (pre-transaction), then monotonicity + nonce-TTL-eviction
 // + N-cap-abuse-signal inside a single BEGIN IMMEDIATE transaction.
-//
-// See design §2.2, §5.2, §5.3 for full specification.
 
+use bindings::Guest;
 use bindings::brenn::replay::store;
 use bindings::brenn::replay::types::{CheckInput, ReplayError};
-use bindings::Guest;
 use brenn_cal::{days_from_epoch, days_in_month};
 
 #[allow(dead_code, clippy::all)]
 mod bindings;
 
 // ±5-minute skew window, in milliseconds. This IS the nonce TTL.
-// Both incoming-envelope check (step 2) and stored-nonce expiry (step 5) use
-// this single constant. Rationale: design §2.2 constants, notes-design-user.md directive 3.
+// Both the incoming-envelope skew check and stored-nonce expiry use this single constant.
 const SKEW_WINDOW_MS: i64 = 5 * 60 * 1000;
 
 // Grace period added on top of SKEW_WINDOW_MS when computing the `last` namespace prune cutoff.
@@ -174,7 +171,8 @@ fn check_filesystem_safe(s: &str, field: &str) -> Result<(), ReplayError> {
 ///
 /// Input guaranteed to be exactly `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z`
 /// by the caller (validate_sent_at + extract). Bespoke parser to stay WASI-free
-/// (chrono pulls std, which imports wasi:* on wasm32-wasip2).
+/// (a datetime crate like chrono pulls in std time support, and with it wasi:*
+/// imports).
 ///
 /// Edge cases covered by unit tests:
 /// - 1970-01-01T00:00:00.000Z → 0
@@ -270,7 +268,7 @@ fn last_ns() -> &'static str {
 /// compares older than `received_at_ms - SKEW_WINDOW_MS - LAST_GRACE_MS`.
 ///
 /// Must run inside the existing write transaction, after the monotonicity read
-/// and before the `last` put for the current envelope. See design §2.3–§2.4.
+/// and before the `last` put for the current envelope.
 fn prune_last_ns(tx: &store::Transaction, received_at_ms: i64) {
     let cutoff_ms_i64 = received_at_ms - SKEW_WINDOW_MS - LAST_GRACE_MS;
     // Negative cutoff implies received_at < SKEW_WINDOW_MS + LAST_GRACE_MS (~6 min past epoch).
@@ -284,12 +282,11 @@ fn prune_last_ns(tx: &store::Transaction, received_at_ms: i64) {
     );
 
     // No >= 4096 panic guard here: a pre-seeded oversized `last` namespace must drain
-    // incrementally, not DoS. See design §2.3 step 4 and requirements §Behavior constraint 6.
+    // incrementally, not DoS.
     //
     // limit=0 means "no limit" per host contract (clamped to MAX_SCAN_LIMIT=4096 by the host).
-    // See store.rs: the component receives no signal when the result is truncated at 4096,
-    // so the namespace drains incrementally across calls rather than in one pass when it
-    // exceeds 4096 rows.
+    // The component receives no signal when the result is truncated at 4096, so the namespace
+    // drains incrementally across calls rather than in one pass when it exceeds 4096 rows.
     let pairs = tx
         .scan(last_ns(), &[], None, 0)
         .unwrap_or_else(|e| panic!("store::scan({}) failed: {e}", last_ns()));
@@ -308,7 +305,7 @@ fn prune_last_ns(tx: &store::Transaction, received_at_ms: i64) {
              for key={key:?}, val={val:?}",
             val.len()
         );
-        // Lex order = chronological order for canonical 24-byte UTC RFC3339 (design §2.3 step 5).
+        // Lex order = chronological order for canonical 24-byte UTC RFC3339.
         if val.as_slice() < cutoff_str.as_bytes() {
             to_delete.push(key.clone());
         }
@@ -325,7 +322,7 @@ fn nonce_ns(client_id: &str) -> String {
 }
 
 /// Encode a nonce key: 8-byte big-endian received_at_ms || b':' || nonce bytes.
-/// Lexicographic order = chronological order on received_at_ms (design §5.2.3).
+/// Lexicographic order = chronological order on received_at_ms.
 ///
 /// `received_at_ms` is stored as `u64` for correct big-endian lex ordering.
 /// The expiry comparison in `check` casts the stored value back to `i64`; for
@@ -402,7 +399,7 @@ impl Guest for Component {
             // Compare sent_at strings lexicographically.
             // Both are canonical fixed-width forms; lex order = chronological order.
             // Phonebuddy rule: sent_at must be strictly greater than last_sent_at
-            // (equal is rejected, matching phonebuddy replay.rs:213 `<=`).
+            // (equal is rejected).
             let last_str = core::str::from_utf8(&last_bytes).unwrap_or_else(|_| {
                 panic!("non-utf8 last_sent_at in store — store integrity violation")
             });
@@ -440,7 +437,6 @@ impl Guest for Component {
         // If the scan returned the full MAX_SCAN_LIMIT (4096), the namespace is
         // larger than the algorithm can make sound decisions on. Trap (fail-fast).
         // This indicates either a bug (cap-hit not failing closed) or misconfiguration.
-        // Design §2.11.
         if pairs.len() >= 4096 {
             panic!(
                 "nonce namespace for client_id={} exceeded MAX_SCAN_LIMIT=4096 (got {}) — \
@@ -456,7 +452,7 @@ impl Guest for Component {
 
         for (key, _val) in &pairs {
             let entry_received_at = nonce_key_received_at(key);
-            // Use absolute-value distance for NTP step-back safety (design §3.8).
+            // Use absolute-value distance for NTP step-back safety.
             let age_abs = (received_at_ms - entry_received_at as i64).unsigned_abs();
             if age_abs > SKEW_WINDOW_MS as u64 {
                 // Expired — queue for deletion.
@@ -491,20 +487,22 @@ impl Guest for Component {
         match tx.put(last_ns(), &last_key, env.sent_at.as_bytes()) {
             Ok(()) => {}
             Err(store::StoreError::QuotaExceeded) => {
-                // Host-enforced per-store size cap reached. Roll back and fail
-                // closed as TooManyRequests (design §2.D, §4.3).
+                // Host-enforced per-store size cap reached. Roll back and fail closed.
                 tx.rollback();
                 return Err(ReplayError::TooManyRequests);
             }
-            Err(e) => panic!("store::put({}, client_id={}) failed: {e}", last_ns(), env.client_id),
+            Err(e) => panic!(
+                "store::put({}, client_id={}) failed: {e}",
+                last_ns(),
+                env.client_id
+            ),
         }
 
         let new_nonce_key = nonce_key(received_at_u64, &env.nonce);
         match tx.put(&ns, &new_nonce_key, &[]) {
             Ok(()) => {}
             Err(store::StoreError::QuotaExceeded) => {
-                // Host-enforced per-store size cap reached. Roll back and fail
-                // closed as TooManyRequests (design §2.D, §4.3).
+                // Host-enforced per-store size cap reached. Roll back and fail closed.
                 tx.rollback();
                 return Err(ReplayError::TooManyRequests);
             }
@@ -528,7 +526,6 @@ impl Guest for Component {
 bindings::export!(Component with_types_in bindings);
 
 // ── Unit tests (native, no WASM roundtrip) ────────────────────────────────────
-// parse_sent_at_ms edge cases from design §4.2.
 
 #[cfg(test)]
 mod tests {
@@ -661,11 +658,17 @@ mod tests {
         // Gate open on multiples of PRUNE_GATE_MODULUS (including 0).
         assert_eq!((0i64).rem_euclid(PRUNE_GATE_MODULUS), 0);
         assert_eq!(PRUNE_GATE_MODULUS.rem_euclid(PRUNE_GATE_MODULUS), 0);
-        assert_eq!((PRUNE_GATE_MODULUS * 12345).rem_euclid(PRUNE_GATE_MODULUS), 0);
+        assert_eq!(
+            (PRUNE_GATE_MODULUS * 12345).rem_euclid(PRUNE_GATE_MODULUS),
+            0
+        );
         // Gate closed on non-multiples.
         assert_ne!((1i64).rem_euclid(PRUNE_GATE_MODULUS), 0);
         assert_ne!((PRUNE_GATE_MODULUS - 1).rem_euclid(PRUNE_GATE_MODULUS), 0);
-        assert_ne!((PRUNE_GATE_MODULUS * 12345 + 17).rem_euclid(PRUNE_GATE_MODULUS), 0);
+        assert_ne!(
+            (PRUNE_GATE_MODULUS * 12345 + 17).rem_euclid(PRUNE_GATE_MODULUS),
+            0
+        );
         // Negative-domain well-defined (rem_euclid, not %): predicate stays a pure function.
         assert_eq!((-PRUNE_GATE_MODULUS).rem_euclid(PRUNE_GATE_MODULUS), 0);
         assert_ne!((-1i64).rem_euclid(PRUNE_GATE_MODULUS), 0);

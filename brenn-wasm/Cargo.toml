@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 brenn-common = { version = "0.1.0", path = "../brenn-common" }
-wasmtime = { version = "45", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
+wasmtime = { version = "47", default-features = false, features = ["cranelift", "component-model", "runtime", "std"] }
 chrono = "0.4.44"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 tracing = "0.1"

@@ -5,14 +5,12 @@
 // written to a tempfile so `ProcessorComponent::load` sees an ordinary `.wasm`
 // path — the production load path is exercised in full.
 //
-// ── wasmtime 45 behavioral note ─────────────────────────────────────────────
+// ── wasmtime 47 behavioral note ─────────────────────────────────────────────
 //
-// wasmtime 26 deferred export type-checking to `processor_pre.instantiate`
-// (inside `handle`). wasmtime 45 moved type-checking into
-// `ProcessorIndices::new`, which is called by `ProcessorPre::new` during
-// `ProcessorComponent::load`. This means:
+// wasmtime does export type-checking in `ProcessorIndices::new`, which
+// `ProcessorPre::new` calls during `ProcessorComponent::load`. This means:
 //
-//   - WIT type mismatches now cause a panic in `ProcessorComponent::load`,
+//   - WIT type mismatches cause a panic in `ProcessorComponent::load`,
 //     NOT a `ProcessorOutcome::Trap` from `handle`.
 //   - The `instantiation failed:` Trap path exists for runtime resource-limit
 //     failures (memory/table limits at core-module instantiation time). It is
@@ -21,8 +19,8 @@
 //     memory allocation to fail during `processor_pre.instantiate`.
 //   - Because constructing correctly-typed WAT that also exceeds resource
 //     limits requires matching the full WIT component-model type structure
-//     (including package imports), Test A is re-framed as a load-time panic
-//     test.
+//     (including package imports), the resource-limit case is covered as a
+//     load-time panic test rather than an instantiation test.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -79,19 +77,16 @@ fn spec_for_test<'a>(component_path: &'a std::path::Path, slug: &'a str) -> Proc
     }
 }
 
-// ── Test: WIT type mismatch — caught at load (wasmtime 45) ──────────────────
+// ── Test: WIT type mismatch — caught at load ────────────────────────────────
 
 /// A component exporting `receive` with the wrong type (func() — zero params,
-/// no return) causes `ProcessorComponent::load` to panic in wasmtime 45.
+/// no return) causes `ProcessorComponent::load` to panic.
 ///
-/// In wasmtime 26, `ProcessorPre::new` only did name-based index lookups,
-/// deferring type-checking to `processor_pre.instantiate` inside `handle`,
-/// which produced a `ProcessorOutcome::Trap`. In wasmtime 45,
-/// `ProcessorIndices::new` (called by `ProcessorPre::new`) now calls
+/// `ProcessorIndices::new` (called by `ProcessorPre::new`) calls
 /// `func.typecheck::<sig>(&_instance_type)` at load time, catching the
 /// mismatch before the component is ever invoked.
 ///
-/// This test pins the new behavior: a type-mismatched component panics at
+/// This test pins that behavior: a type-mismatched component panics at
 /// load, not at invoke, with the expected diagnostic message indicating the
 /// export type-check step (not the import-linker step).
 ///
@@ -108,7 +103,7 @@ fn spec_for_test<'a>(component_path: &'a std::path::Path, slug: &'a str) -> Proc
 fn wit_type_mismatch_panics_at_load() {
     // `receive` exported as func() — zero params, no return — not the WIT
     // signature `receive: func(a: activation) -> result<_, receive-error>`.
-    // In wasmtime 45 this causes ProcessorPre::new to fail; load panics.
+    // This causes ProcessorPre::new to fail; load panics.
     let wat_src = r#"(component
   (core module $m
     (func (export "noop")))

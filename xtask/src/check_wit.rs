@@ -250,9 +250,17 @@ fn wit_path_for_crate(crate_dir: &Path) -> (PathBuf, String) {
 }
 
 /// Bindings-drift gate: regenerate the crate's bindings into an ephemeral scratch dir
-/// via `wit-bindgen-cli` 0.58 and byte-compare against the committed `src/bindings.rs`.
+/// via `wit-bindgen-cli` 0.60 and byte-compare against the committed `src/bindings.rs`.
 /// Never writes into the crate — the working tree is untouched, so this gate is safe to
 /// run concurrently with lanes that walk the tree.
+///
+/// Both sides of the comparison are produced by the pinned generator, so this detects
+/// a hand-edited or stale `bindings.rs` and nothing else: when the pin itself moves,
+/// committed and regenerated bindings move together and the gate passes by construction.
+///
+/// TODO(wasm-world-equivalence-gate): nothing checks the built artifact's embedded
+/// world against `brenn-wasm/wit/*.wit`, so a generator bump that reshapes the
+/// guest-visible contract passes `make check` clean.
 fn check_bindings_drift(crate_dir: &Path, scratch_root: &Path, unit_index: usize) -> bool {
     let bindings_path = crate_dir.join("src").join("bindings.rs");
     assert!(
@@ -304,7 +312,7 @@ fn check_bindings_drift(crate_dir: &Path, scratch_root: &Path, unit_index: usize
         .unwrap_or_else(|e| {
             panic!(
                 "xtask check-wit: failed to run `wit-bindgen rust` for {crate_dir:?}: {e}. \
-                 Install with: cargo install --locked wit-bindgen-cli --version 0.58.0"
+                 Install with: cargo install --locked wit-bindgen-cli --version 0.60.0"
             )
         });
 

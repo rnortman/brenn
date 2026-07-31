@@ -2,7 +2,7 @@
 //
 // The bindgen! macro generates typed Rust bindings from the WIT world at
 // compile time. The generated code may trigger clippy lints; any specific
-// lints that fire at the pinned toolchain (1.95.0) + wasmtime 45 are
+// lints that fire at the pinned toolchain (1.95.0) + wasmtime 47 are
 // suppressed with targeted #[allow(...)]. Blanket -A clippy::all is not used.
 use std::collections::HashMap;
 use std::path::Path;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
 use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable, bindgen};
-use wasmtime::{Config, Engine, EngineWeak, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, EngineWeak, Store, StoreLimits, StoreLimitsBuilder, WasmFeatures};
 
 pub mod store;
 pub use store::KvStore;
@@ -186,6 +186,36 @@ pub struct ReplayComponent {
     slug: Arc<str>,
 }
 
+/// Core-wasm proposals a guest component may not use.
+///
+/// `wasm_features(.., false)` lands in the disabled set, which wasmtime applies
+/// after both its defaults and its crate-feature conditionals, so this holds
+/// regardless of how the `wasmtime` dependency's features are configured.
+const GUEST_DENIED_FEATURES: WasmFeatures = WasmFeatures::FUNCTION_REFERENCES
+    .union(WasmFeatures::GC)
+    .union(WasmFeatures::EXCEPTIONS)
+    .union(WasmFeatures::THREADS);
+
+/// Pin the core-wasm proposal set a guest component is allowed to use.
+///
+/// wasmtime's default feature set is whatever proposals the release in use has
+/// promoted to on-by-default, so an engine built from a bare `Config` accepts
+/// whatever instruction surface upstream currently ships. Every Brenn engine that
+/// compiles guest code calls this so the accepted surface is a host decision
+/// instead: the sandbox exists to contain out-of-tree components, and what a
+/// component may contain is part of the guest-visible contract.
+///
+/// Denied: typed function references (`ref.func` values, `call_ref`), the GC
+/// proposal's type encodings, exception handling, and threads/atomics. None is
+/// needed by any component this build produces, and none is emitted by the
+/// `wasm32-unknown-unknown` Rust guests the toolchain builds. Widening the
+/// envelope is a deliberate act — enable a proposal here rather than inherit it
+/// from an engine upgrade, and treat the widening as a guest-contract change.
+#[doc(hidden)]
+pub fn pin_guest_feature_envelope(cfg: &mut Config) {
+    cfg.wasm_features(GUEST_DENIED_FEATURES, false);
+}
+
 impl ReplayComponent {
     /// Load from a .wasm component artifact at the given path, with a SQLite
     /// KV store at `store_path`.
@@ -199,7 +229,7 @@ impl ReplayComponent {
     /// `brenn.*` keys). Pass an empty map for components that read no config.
     ///
     /// `slug` is the endpoint slug, used for the epoch-ticker thread name and the
-    /// leaked-tx cleanup `warn` (H1046, design §2.3).
+    /// leaked-tx cleanup `warn`.
     ///
     /// Panics on any failure — per backend robustness rules.
     pub fn load(
@@ -211,10 +241,11 @@ impl ReplayComponent {
     ) -> Self {
         // Enable fuel consumption AND epoch interruption so a pathological replay
         // guest traps (bounded) instead of hanging — mirrors the processor engine
-        // config (H1046, design §2.2).
+        // config.
         let mut cfg = Config::new();
         cfg.consume_fuel(true);
         cfg.epoch_interruption(true);
+        pin_guest_feature_envelope(&mut cfg);
         let engine = Engine::new(&cfg)
             .unwrap_or_else(|e| panic!("failed to initialize wasmtime replay engine: {e}"));
         let mut linker: Linker<StoreData> = Linker::new(&engine);
@@ -243,8 +274,8 @@ impl ReplayComponent {
         });
         let kv_store = KvStore::open(store_path, max_page_count);
 
-        // Spawn an epoch ticker thread for this engine, mirroring the processor world
-        // (design §2.3). Uses an EngineWeak so the thread exits naturally when the
+        // Spawn an epoch ticker thread for this engine, mirroring the processor world.
+        // Uses an EngineWeak so the thread exits naturally when the
         // ReplayComponent is dropped (engine is the only strong ref). N replay-protected
         // endpoints = N ticker threads; N is small (single digits), acceptable.
         {
@@ -711,7 +742,7 @@ pub const PROCESSOR_FUEL_MINIMUM: u64 = 50_000_000;
 /// `ProcessorOutcome::Trap` regardless of the guest's allocator behavior.
 pub const PROCESSOR_MAX_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum elements **per table** a processor guest's store may hold. wasmtime's
-/// `table_elements` ceiling is applied to each table individually (wasmtime 45
+/// `table_elements` ceiling is applied to each table individually (wasmtime 47
 /// `StoreLimitsBuilder::table_elements` docs), NOT as a store-wide total.
 pub const PROCESSOR_MAX_TABLE_ELEMENTS: usize = 65_536;
 /// Maximum WASM instances a processor guest's store may hold.
@@ -1927,7 +1958,9 @@ pub fn is_types_import(name: &str) -> bool {
 ///
 /// If the artifact cannot be read or is not a valid component.
 pub fn processor_component_imports(component_path: &Path) -> Vec<String> {
-    let engine = Engine::new(&Config::new())
+    let mut cfg = Config::new();
+    pin_guest_feature_envelope(&mut cfg);
+    let engine = Engine::new(&cfg)
         .unwrap_or_else(|e| panic!("failed to initialize wasmtime engine for import listing: {e}"));
     let component = Component::from_file(&engine, component_path).unwrap_or_else(|e| {
         panic!(
@@ -1969,18 +2002,28 @@ fn strip_import_version(name: &str) -> &str {
 
 /// Return `true` when `actual` is a semver-compatible version of `canonical`.
 ///
-/// Mirrors wasmtime's own linker resolution (vendored wasmtime-45.0.1,
-/// `wasmtime-environ-45.0.1/src/component/names.rs:293-320` — `alternate_lookup_key`):
-/// - For `0.0.z`: must be identical.
+/// Mirrors wasmtime's own linker resolution (`alternate_lookup_key` and
+/// `NameMap::get`):
+/// - For `0.0.z`: only an identical name.
 /// - For `0.minor.*`: same major (0) and same minor.
 /// - For `>=1.x.*`: same major only.
 ///
 /// Package+interface portion (before `@`) must be identical.
 ///
+/// An identical name always matches, whatever the version shape. Past exact
+/// equality, a prerelease on either side matches nothing, and `0.0.z` matches
+/// nothing.
+///
 /// Uses `semver::Version` for parsing; build metadata is explicitly stripped
 /// before parsing because wasmtime's `alternate_lookup_key` ignores it when
-/// resolving imports. Prerelease versions are rejected — wasmtime refuses them.
+/// resolving imports.
+///
+/// `semver_mirror_matches_wasmtime_linker` in `tests/grants.rs` asserts this
+/// function against a real `wasmtime::component::Linker` case by case.
 pub fn semver_compat_match(actual: &str, canonical: &str) -> bool {
+    if actual == canonical {
+        return true;
+    }
     // Split off version suffix: "brenn:processor/ports@0.1.0" → ("brenn:processor/ports", "0.1.0")
     let (actual_iface, actual_ver) = match actual.rsplit_once('@') {
         Some(pair) => pair,
@@ -2027,8 +2070,9 @@ pub fn semver_compat_match(actual: &str, canonical: &str) -> bool {
         // 0.minor.*: same major (must both be 0) and same minor.
         av.major == cv.major && av.minor == cv.minor
     } else {
-        // 0.0.z: exact version.
-        av.major == cv.major && av.minor == cv.minor && av.patch == cv.patch
+        // 0.0.z: nothing is compatible with it. Only the exact-name match above binds,
+        // so two spellings of the same version (`0.0.1` vs `0.0.1+meta`) do not.
+        false
     }
 }
 
@@ -2202,6 +2246,21 @@ pub struct ProcessorComponent {
     tool_host: Option<ToolHostFn>,
 }
 
+/// The store resource limiter every processor activation runs under.
+///
+/// One place, so the caps a test asserts are the caps a guest runs against.
+/// `trap_on_grow_failure` makes an over-cap `memory.grow` / `table.grow` a
+/// deterministic trap instead of a `-1` the guest could paper over.
+pub fn processor_store_limits() -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(PROCESSOR_MAX_MEMORY_BYTES)
+        .table_elements(PROCESSOR_MAX_TABLE_ELEMENTS)
+        .instances(PROCESSOR_MAX_INSTANCES)
+        .tables(PROCESSOR_MAX_TABLES)
+        .trap_on_grow_failure(true)
+        .build()
+}
+
 impl ProcessorComponent {
     /// Load a processor component from a `.wasm` artifact at `spec.component_path`.
     ///
@@ -2218,6 +2277,7 @@ impl ProcessorComponent {
         let mut cfg = Config::new();
         cfg.consume_fuel(true);
         cfg.epoch_interruption(true);
+        pin_guest_feature_envelope(&mut cfg);
         let engine = Engine::new(&cfg)
             .unwrap_or_else(|e| panic!("failed to initialize wasmtime engine for processor: {e}"));
 
@@ -2469,13 +2529,7 @@ impl ProcessorComponent {
         total_envelope_count: usize,
         publish_budget_by_sink: HashMap<SinkKey, u64>,
     ) -> Store<ProcessorData> {
-        let limits = StoreLimitsBuilder::new()
-            .memory_size(PROCESSOR_MAX_MEMORY_BYTES)
-            .table_elements(PROCESSOR_MAX_TABLE_ELEMENTS)
-            .instances(PROCESSOR_MAX_INSTANCES)
-            .tables(PROCESSOR_MAX_TABLES)
-            .trap_on_grow_failure(true)
-            .build();
+        let limits = processor_store_limits();
         let mut store = Store::new(
             &self.engine,
             ProcessorData {
@@ -2542,6 +2596,16 @@ impl ProcessorComponent {
             ),
             std::sync::TryLockError::Poisoned(_) => panic!("publish_carry mutex poisoned"),
         })
+    }
+
+    /// The engine guest code is compiled by — test use only.
+    ///
+    /// Lets a test compile arbitrary wasm against the exact engine a loaded
+    /// processor uses, so the accepted core-wasm feature envelope can be asserted
+    /// on the production configuration rather than a re-derived copy of it.
+    #[doc(hidden)]
+    pub fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     /// `handle` variant with an overridden epoch deadline and fuel limit — test use only.

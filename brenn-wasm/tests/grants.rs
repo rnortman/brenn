@@ -318,10 +318,15 @@ fn superset_grants_loads() {
 /// This test pins the artifact import strings against the Capability table;
 /// a drift between the built components and the table surfaces here first.
 ///
-/// semver_compat_match algorithm (lib.rs `semver_compat_match`) was re-diffed
-/// against wasmtime-environ-45.0.1/src/component/names.rs:293-320
-/// (`alternate_lookup_key`); rules are unchanged vs. wasmtime-26.
-/// Re-diff required at the next major wasmtime bump.
+/// Every fixture import sits at exactly `@0.1.0`, so this test only ever exercises
+/// the exact-match path of `semver_compat_match`. The version rules themselves are
+/// checked against the linker by `semver_mirror_matches_wasmtime_linker`.
+///
+/// Every fixture is also built by the pinned toolchain, so the host-side suite only
+/// ever sees components carrying the current encoded type section.
+///
+/// TODO(wasm-prev-generator-load-coverage): out-of-tree components lag the pin by
+/// definition, and no test loads a component built by the previous generator.
 #[test]
 fn drift_guard_all_fixture_imports_recognized() {
     use wasmtime::{Config, Engine, component::Component};
@@ -488,6 +493,86 @@ fn semver_prerelease_does_not_resolve() {
         result, None,
         "0.1.1-rc.1 must not resolve (prerelease versions are incompatible per wasmtime rule)"
     );
+}
+
+// ── semver mirror vs. the real linker ────────────────────────────────────────
+
+/// Ask wasmtime whether a component importing `actual` links against a host
+/// instance registered at `canonical`.
+///
+/// This is the oracle `semver_compat_match` mirrors: a real
+/// `wasmtime::component::Linker` doing real import resolution. `instantiate_pre`
+/// resolves every import without running the component, so link success is
+/// decided by name resolution alone.
+fn linker_resolves(actual: &str, canonical: &str) -> bool {
+    use wasmtime::component::{Component, Linker};
+    use wasmtime::{Config, Engine};
+
+    let engine = Engine::new(&Config::new())
+        .unwrap_or_else(|e| panic!("failed to create engine for linker oracle: {e}"));
+    let wat = format!(r#"(component (import "{actual}" (instance (export "f" (func)))))"#);
+    let bytes = wat::parse_str(&wat)
+        .unwrap_or_else(|e| panic!("oracle component {actual:?} assembles: {e}"));
+    let component = Component::new(&engine, &bytes)
+        .unwrap_or_else(|e| panic!("oracle component {actual:?} compiles: {e}"));
+
+    let mut linker: Linker<()> = Linker::new(&engine);
+    linker
+        .instance(canonical)
+        .unwrap_or_else(|e| panic!("oracle host instance {canonical:?}: {e}"))
+        .func_new("f", |_, _, _, _| Ok(()))
+        .unwrap_or_else(|e| panic!("oracle host func for {canonical:?}: {e}"));
+
+    linker.instantiate_pre(&component).is_ok()
+}
+
+/// `semver_compat_match` agrees with wasmtime's linker on every version shape.
+///
+/// The grant gate decides whether an import needs a capability grant; wasmtime
+/// decides whether that import binds to the host implementation. If the two ever
+/// disagree, an import can be gated as one thing and bound as another, so the
+/// agreement is asserted rather than kept true by re-reading upstream at each bump.
+#[test]
+fn semver_mirror_matches_wasmtime_linker() {
+    let cases = [
+        ("brenn:x/y@0.1.0", "brenn:x/y@0.1.0", true),
+        ("brenn:x/y@0.1.1", "brenn:x/y@0.1.0", true),
+        ("brenn:x/y@0.1.0", "brenn:x/y@0.1.1", true),
+        ("brenn:x/y@0.2.0", "brenn:x/y@0.1.0", false),
+        ("brenn:x/y@1.0.0", "brenn:x/y@0.1.0", false),
+        ("brenn:x/y@1.1.0", "brenn:x/y@1.0.0", true),
+        ("brenn:x/y@2.0.0", "brenn:x/y@1.0.0", false),
+        // 0.0.z: only the identical name binds, so a different spelling of the same
+        // version (build metadata) does not.
+        ("brenn:x/y@0.0.1", "brenn:x/y@0.0.1", true),
+        ("brenn:x/y@0.0.2", "brenn:x/y@0.0.1", false),
+        ("brenn:x/y@0.0.1+meta", "brenn:x/y@0.0.1", false),
+        // Build metadata is ignored by the alternate-key rules.
+        ("brenn:x/y@0.1.1+meta", "brenn:x/y@0.1.0", true),
+        ("brenn:x/y@1.1.0+meta", "brenn:x/y@1.0.0", true),
+        // Prereleases: nothing but the identical name.
+        ("brenn:x/y@0.1.0-rc.1", "brenn:x/y@0.1.0-rc.1", true),
+        ("brenn:x/y@0.1.0-rc.2", "brenn:x/y@0.1.0-rc.1", false),
+        ("brenn:x/y@0.1.1-rc.1", "brenn:x/y@0.1.0", false),
+        // The package+interface portion is never negotiable.
+        ("brenn:z/y@0.1.0", "brenn:x/y@0.1.0", false),
+        ("brenn:x/w@0.1.0", "brenn:x/y@0.1.0", false),
+    ];
+
+    for (actual, canonical, expected) in cases {
+        let linker = linker_resolves(actual, canonical);
+        assert_eq!(
+            linker, expected,
+            "wasmtime's linker changed its answer for {actual:?} against host {canonical:?}: \
+             expected {expected}, got {linker}. Update semver_compat_match to match it."
+        );
+        let mirror = brenn_wasm::semver_compat_match(actual, canonical);
+        assert_eq!(
+            mirror, linker,
+            "semver_compat_match disagrees with the linker for {actual:?} against host \
+             {canonical:?}: mirror says {mirror}, linker says {linker}"
+        );
+    }
 }
 
 /// The `Tools` capability round-trips through the grant/import name table and is
