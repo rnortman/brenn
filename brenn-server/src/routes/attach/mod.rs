@@ -11,6 +11,8 @@
 
 pub mod cursor;
 pub mod profile;
+pub mod publish;
 pub mod registry;
 pub mod session;
+pub mod socket;
 pub mod subscription;

@@ -6,28 +6,22 @@
 //! here names a component, a port, or an instance.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 
 use brenn_attach_proto::{GapReason as ProtoGapReason, ServerFrame, SubscribeOutcome};
 use brenn_lib::access::acl::ChannelMatcher;
 use brenn_lib::access::{AppCapability, AppPolicy};
 use brenn_lib::db::Db;
-use brenn_lib::messaging::config::{
-    ChannelConfigRaw, Depth, MessagingGlobalConfig, build_channel_entries,
-};
+use brenn_lib::messaging::config::Depth;
 use brenn_lib::messaging::store::{ResumeCursor, StoreRetained};
-use brenn_lib::messaging::{
-    GapReason as BusGapReason, MessagingDirectory, Messenger, ParticipantId, Replay, WakeRouter,
-    query::NoopWakeRouter,
-};
+use brenn_lib::messaging::{GapReason as BusGapReason, Replay};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::*;
-use crate::routes::attach::profile::{AttachProfile, DeferredTarget, SubscriptionFacts};
-use crate::routes::attach::registry::SessionCaps;
+use crate::routes::attach::profile::SubscriptionFacts;
 use crate::routes::attach::session::AttachSessionCtx;
+use crate::test_support::attach::{AttachCtxBuilder, TestProfile, one_channel_messenger};
 
 /// The one channel every fixture declares, scheme-qualified and bare.
 const ADDR: &str = "brenn:durable-demo";
@@ -35,51 +29,6 @@ const BARE: &str = "durable-demo";
 
 /// A channel the fixture's profile never admits — the unsubscribable case.
 const UNBOUND_ADDR: &str = "brenn:nonesuch";
-
-/// The stub route seam: a bare identity, and whatever channels the test wants
-/// subscribable at whatever fold.
-struct TestProfile {
-    attacher: ParticipantId,
-    subscribable: HashMap<String, SubscriptionFacts>,
-    burst: u32,
-}
-
-impl AttachProfile for TestProfile {
-    fn attacher(&self) -> &ParticipantId {
-        &self.attacher
-    }
-
-    fn subscribable(&self, channel: &str) -> Option<SubscriptionFacts> {
-        self.subscribable.get(channel).copied()
-    }
-
-    fn publishable(&self, _attribution: Option<&str>, _channel: &str) -> bool {
-        false
-    }
-
-    fn admit_attribution(&self, attribution: Option<&str>) -> Option<ParticipantId> {
-        match attribution {
-            None => Some(self.attacher.clone()),
-            Some(_) => None,
-        }
-    }
-
-    fn send_budget_scope(&self) -> &str {
-        "deskbar"
-    }
-
-    fn deferred_view_targets(&self) -> &[DeferredTarget] {
-        &[]
-    }
-
-    fn subscribe_burst(&self) -> u32 {
-        self.burst
-    }
-
-    fn session_caps(&self) -> SessionCaps {
-        SessionCaps::UNCAPPED
-    }
-}
 
 /// An attachment whose profile admits [`ADDR`] at the stated fold, backed by a
 /// real `Messenger` over one durable channel. Returns the context, the
@@ -107,35 +56,7 @@ async fn attach_with_floor(
     retain_depth: u64,
     granted: bool,
 ) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
-    let raw = ChannelConfigRaw {
-        send_rate: None,
-        uuid: Some(Uuid::new_v4().to_string()),
-        address: Some(BARE.to_string()),
-        address_prefix: None,
-        description: None,
-        push_depth: Some(Depth::Unbounded),
-        retain_depth: Some(Depth::Unbounded),
-        standing_retain_depth: Some(Depth::Unbounded),
-        noise: None,
-        sink: None,
-        wake_min: None,
-    };
-    let entry = build_channel_entries(&[raw], &MessagingGlobalConfig::default())
-        .pop()
-        .expect("one channel entry");
-    let channel_uuid = entry.uuid;
-    {
-        let conn = db.lock().await;
-        brenn_lib::messaging::db::upsert_channels(&conn, std::slice::from_ref(&entry));
-    }
-    let messenger = Messenger::new(
-        db.clone(),
-        Arc::new(MessagingDirectory::with_entries(vec![entry])),
-        Arc::from("test-origin"),
-        Arc::new(indexmap::IndexMap::new()),
-        Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
-        MessagingGlobalConfig::default(),
-    );
+    let (messenger, channel_uuid) = one_channel_messenger(db, BARE).await;
 
     let mut policy = AppPolicy::default();
     policy.grants.insert(AppCapability::MessagingSubscribe);
@@ -144,7 +65,6 @@ async fn attach_with_floor(
     }
 
     let profile = TestProfile {
-        attacher: ParticipantId::for_surface("deskbar"),
         subscribable: HashMap::from([(
             ADDR.to_string(),
             SubscriptionFacts {
@@ -152,19 +72,14 @@ async fn attach_with_floor(
                 retain_depth,
             },
         )]),
-        burst: 3,
+        subscribe_burst: 3,
+        ..TestProfile::new()
     };
 
-    let (tx, rx) = mpsc::channel::<ServerFrame>(64);
-    let ctx = AttachSessionCtx {
-        profile: Arc::new(profile),
-        messenger,
-        policy: Arc::new(policy),
-        session_id: Uuid::nil(),
-        account: "dev".to_string(),
-        ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        tx,
-    };
+    let (ctx, rx) = AttachCtxBuilder::new(profile)
+        .messenger(messenger)
+        .policy(policy)
+        .build();
     (ctx, rx, channel_uuid)
 }
 
@@ -812,7 +727,7 @@ async fn a_turn_writes_the_rows_first_then_the_views() {
     let window = retained(&ctx).await;
     let view = SessionPush::DeferredView(DeferredViewPush {
         channel: ADDR.to_string(),
-        attribution: "clock".to_string(),
+        attribution: Some("clock".to_string()),
         entries: Vec::new(),
     });
 
@@ -1086,7 +1001,7 @@ async fn a_dead_writer_disconnects_the_deferred_view_path() {
     drop(rx);
     let view = SessionPush::DeferredView(DeferredViewPush {
         channel: ADDR.to_string(),
-        attribution: "clock".to_string(),
+        attribution: Some("clock".to_string()),
         entries: Vec::new(),
     });
 

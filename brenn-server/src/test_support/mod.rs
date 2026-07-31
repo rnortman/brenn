@@ -1,4 +1,5 @@
 pub(crate) mod app_config;
+pub(crate) mod attach;
 pub(crate) mod http;
 pub(crate) mod mqtt;
 pub(crate) mod state;

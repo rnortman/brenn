@@ -2165,7 +2165,7 @@ async fn handle_publish_batch(
     // TODO(surface-op-send-budget): price control ops in the send budget.
     let draw =
         u32::try_from(resolved.len().max(1)).expect("batch length is capped well below u32::MAX");
-    if messenger.draw_surface_send_budget_for_batch(slug, instance, draw)
+    if messenger.draw_surface_send_budget_for_batch(slug, Some(instance), draw)
         == SurfaceSendVerdict::Denied
     {
         // Not a kill and not a retry prompt: the kernel logs, counts, and drops
@@ -2260,7 +2260,7 @@ async fn handle_publish_batch(
     // Entries whose schedule the cap refused published nothing, so they reduce
     // the publish count. No wire error: the guest has no error channel left.
     let schedules_dropped = messenger
-        .publish_batch_from_surface(slug, instance, &batch)
+        .publish_batch_from_surface(slug, Some(instance), &batch)
         .await;
     for _ in 0..(batch.len() - schedules_dropped) {
         counters.publish_ok(Some(instance));
@@ -2520,7 +2520,11 @@ fn deferred_view_targets(runtime: &SurfaceRuntime) -> Vec<ParkedSet> {
         .iter()
         .map(|target| ParkedSet {
             channel: target.channel.clone(),
-            instance: target.attribution.clone(),
+            // A surface's deferred-view targets always carry an attribution.
+            instance: target
+                .attribution
+                .clone()
+                .expect("a surface deferred-view target names a component instance"),
         })
         .collect()
 }

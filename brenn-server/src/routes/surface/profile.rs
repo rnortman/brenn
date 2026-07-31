@@ -13,10 +13,13 @@ mod tests;
 
 use std::collections::{HashMap, HashSet};
 
+use brenn_lib::access::AppCapability;
 use brenn_lib::messaging::ParticipantId;
 use brenn_lib::messaging::config::{Depth, ResolvedSurface};
 
-use crate::routes::attach::profile::{AttachProfile, DeferredTarget, SubscriptionFacts};
+use crate::routes::attach::profile::{
+    AttachProfile, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts,
+};
 use crate::routes::attach::registry::SessionCaps;
 
 use super::{
@@ -54,6 +57,18 @@ pub struct SurfaceProfile {
     /// them; this set is what keeps the surface's own components off them at
     /// runtime, so the property holds all the way down.
     kernel_publishable: HashSet<String>,
+    /// The substrate error channel, when one is configured — the surface's own
+    /// diagnostics path, and the one channel whose publish refusals are reported
+    /// rather than fatal.
+    error_channel: Option<String>,
+    /// Whether this surface's operator-written policy grants the alert plane.
+    /// Read at boot from the same policy the route resolved, so the flag the
+    /// attachment advertises and the one every `Alert` frame is judged against
+    /// are one answer.
+    alert_granted: bool,
+    /// The operator-tuned per-connection publish bucket every session of this
+    /// surface starts full with.
+    publish_rate: PublishRate,
     /// Parked-view seeding targets, sorted and deduped.
     deferred_targets: Vec<DeferredTarget>,
 }
@@ -140,7 +155,7 @@ impl SurfaceProfile {
             channels.insert(output.channel_address.clone());
             deferred_targets.push(DeferredTarget {
                 channel: output.channel_address.clone(),
-                attribution: output.instance.clone(),
+                attribution: Some(output.instance.clone()),
             });
         }
         // Two ports of one instance may share a channel; they share one parked
@@ -161,6 +176,12 @@ impl SurfaceProfile {
             subscribable,
             component_publishable,
             kernel_publishable,
+            error_channel: None,
+            alert_granted: resolved.policy.grants.has(AppCapability::SurfaceAlert),
+            publish_rate: PublishRate {
+                burst: resolved.publish_burst,
+                per_sec: resolved.publish_per_sec,
+            },
             deferred_targets,
         }
     }
@@ -176,6 +197,7 @@ impl SurfaceProfile {
             channels.insert(channel.to_string());
         }
         self.kernel_publishable.insert(channel.to_string());
+        self.error_channel = Some(channel.to_string());
     }
 
     /// Whether `instance` is in this surface's boot-resolved declaration set.
@@ -219,6 +241,18 @@ impl AttachProfile for SurfaceProfile {
         }
     }
 
+    fn publish_posture(&self, channel: &str) -> PublishPosture {
+        // Everything a surface publishes rides an operator allowlist that boot
+        // validated, so a refusal is a broken invariant — except on the error
+        // channel, which is where the shell reports its own failures. A publish
+        // failure there must survive as a log line and an answer, not as a
+        // process death on an attacker-sendable path.
+        match &self.error_channel {
+            Some(error) if error == channel => PublishPosture::Diagnostic,
+            _ => PublishPosture::Invariant,
+        }
+    }
+
     fn send_budget_scope(&self) -> &str {
         &self.slug
     }
@@ -236,6 +270,14 @@ impl AttachProfile for SurfaceProfile {
         // detach/re-attach cycle of a maximum-size surface (MAX unsubscribes +
         // MAX subscribes); churn beyond that is throttled to one token/sec.
         3 * brenn_surface_schema::MAX_SURFACE_SUBSCRIPTION_BINDINGS as u32
+    }
+
+    fn publish_rate(&self) -> PublishRate {
+        self.publish_rate
+    }
+
+    fn alert_granted(&self) -> bool {
+        self.alert_granted
     }
 
     fn session_caps(&self) -> SessionCaps {
@@ -274,6 +316,25 @@ pub fn assert_agrees_with_port_maps(runtime: &super::SurfaceRuntime) {
         profile.send_budget_scope(),
         slug.as_str(),
         "surface {slug:?}: profile send-budget scope is not the surface slug"
+    );
+
+    // The alert grant: what the attachment advertises in `Welcome` and what the
+    // live session gates every `Alert` frame on are the same policy read.
+    assert_eq!(
+        profile.alert_granted(),
+        runtime.policy.grants.has(AppCapability::SurfaceAlert),
+        "surface {slug:?}: profile and runtime policy disagree about the alert grant"
+    );
+
+    // The publish bucket the attachment session builds is the operator's own
+    // per-connection numbers, not a default the lowering substituted.
+    assert_eq!(
+        profile.publish_rate(),
+        PublishRate {
+            burst: runtime.resolved.publish_burst,
+            per_sec: runtime.resolved.publish_per_sec,
+        },
+        "surface {slug:?}: profile publish rate is not the resolved per-connection bucket"
     );
 
     // Subscribe: the profile's per-channel entry is the max fold of every
@@ -328,12 +389,26 @@ pub fn assert_agrees_with_port_maps(runtime: &super::SurfaceRuntime) {
                     declared.instance
                 );
             }
+            assert_eq!(
+                profile.publish_posture(&out.address),
+                PublishPosture::Diagnostic,
+                "surface {slug:?}: the reserved error-report channel {} is not the diagnostics \
+                 posture — a failed report would kill the process",
+                out.address
+            );
             continue;
         }
         assert!(
             profile.publishable(Some(instance), &out.address),
             "surface {slug:?}: bound output {instance}/{port} onto {} is not publishable by its \
              own attribution",
+            out.address
+        );
+        assert_eq!(
+            profile.publish_posture(&out.address),
+            PublishPosture::Invariant,
+            "surface {slug:?}: bound output {instance}/{port} onto {} is not the invariant \
+             posture — boot validated it, so a refusal there is a broken server",
             out.address
         );
     }

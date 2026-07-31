@@ -244,7 +244,7 @@ pub async fn send_deferred_view(
     } = view;
     let frame = ServerFrame::DeferredView {
         channel,
-        attribution: Some(attribution),
+        attribution,
         entries,
     };
     super::session::send_frame(&ctx.tx, frame, counters).await

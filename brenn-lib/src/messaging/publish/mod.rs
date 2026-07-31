@@ -191,6 +191,19 @@ pub enum SurfaceSendVerdict {
     Denied,
 }
 
+/// The principal a surface publish is stamped with: the sub-identity's when the
+/// caller names one, the surface's own bare identity otherwise.
+///
+/// The two-grain key every surface-side gate shares — budget bucket, stored
+/// sender, parked-set ownership — so a flush and a report by the same principal
+/// are the same principal everywhere.
+fn surface_principal(slug: &str, component: Option<&str>) -> ParticipantId {
+    match component {
+        Some(component) => ParticipantId::for_surface_component(slug, component),
+        None => ParticipantId::for_surface(slug),
+    }
+}
+
 /// Identifies the publisher for the send-budget gate.
 #[derive(Debug, Clone, Copy)]
 pub enum PublishOrigin {
@@ -583,17 +596,20 @@ impl Messenger {
     /// again. That split is deliberate: a per-entry draw could admit a prefix of
     /// an atomic flush and refuse the rest, which is the one thing the batch
     /// contract forbids.
+    ///
+    /// `component` is the sub-identity whose activation produced the flush, or
+    /// `None` for the surface's own kernel grain.
     pub fn draw_surface_send_budget_for_batch(
         &self,
         slug: &str,
-        component: &str,
+        component: Option<&str>,
         tokens: u32,
     ) -> SurfaceSendVerdict {
-        let principal = ParticipantId::for_surface_component(slug, component);
+        let principal = surface_principal(slug, component);
         self.draw_surface_send_budget(
             SurfaceSendDraw {
                 slug,
-                component: Some(component),
+                component,
                 principal: principal.as_str(),
                 channel: None,
                 tokens,
@@ -659,15 +675,8 @@ impl Messenger {
         match principal {
             PublishPrincipal::App { slug } => ParticipantId::for_app(slug, &self.source),
             PublishPrincipal::Surface {
-                slug,
-                component: Some(instance),
-                ..
-            } => ParticipantId::for_surface_component(slug, instance),
-            PublishPrincipal::Surface {
-                slug,
-                component: None,
-                ..
-            } => ParticipantId::for_surface(slug),
+                slug, component, ..
+            } => surface_principal(slug, component),
             PublishPrincipal::System { component } => ParticipantId::for_system(component),
             PublishPrincipal::Conversation { id, .. } => ParticipantId::for_conversation(id),
         }
@@ -1879,17 +1888,16 @@ impl Messenger {
     /// the server's own output map disagrees with its directory or its policy —
     /// publishing anyway would be routing traffic no operator authorized.
     ///
-    /// **Caller precondition, unchecked here: `component` must be a declared
-    /// instance's name.** It is interpolated straight into the sender identity
-    /// (`surface:<slug>#<component>`), and nothing below re-derives or re-admits
-    /// it — the single-publish path gets that guarantee for free from its
-    /// budget-map lookup panic, but this entry point deliberately draws no budget
-    /// (see above), so there is no lookup left to catch a fabricated name. A
-    /// caller that skips the declaration check commits durable rows under a
-    /// sub-identity no operator declared, which is the one attribution the surface
-    /// identity model exists to make impossible. `handle_publish_batch` admits it
-    /// against the boot-resolved declaration set and kills the connection
-    /// otherwise; any future caller owes the same check.
+    /// **Caller precondition, unchecked here: `component`, when set, must be a
+    /// declared instance's name.** It is interpolated straight into the sender
+    /// identity (`surface:<slug>#<component>`), and nothing below re-derives or
+    /// re-admits it — this entry point deliberately draws no budget (see above),
+    /// so there is no lookup left to catch a fabricated name. A caller that skips
+    /// the declaration check commits durable rows under a sub-identity no operator
+    /// declared, which is the one attribution the surface identity model exists to
+    /// make impossible. `None` is the surface's own bare identity and needs no
+    /// admission — it is the identity a caller already has. Any caller owes the
+    /// admission check against the boot-resolved declaration set.
     ///
     /// **Deferral is per-entry and its refusal is not an error.** An entry
     /// carrying a release time is parked against the channel's own
@@ -1907,7 +1915,7 @@ impl Messenger {
     pub async fn publish_batch_from_surface(
         &self,
         slug: &str,
-        component: &str,
+        component: Option<&str>,
         publishes: &[SurfaceBatchPublish<'_>],
     ) -> usize {
         if publishes.is_empty() {
@@ -1933,7 +1941,7 @@ impl Messenger {
                 )
             });
 
-        let sender_id = ParticipantId::for_surface_component(slug, component);
+        let sender_id = surface_principal(slug, component);
         let sender = sender_id.as_str().to_owned();
         let source = self.source.as_ref();
 

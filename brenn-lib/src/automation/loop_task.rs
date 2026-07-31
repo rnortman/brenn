@@ -277,14 +277,24 @@ mod tests {
         (engine, ingress_router)
     }
 
+    /// Insert a `0 9 * * *` cron job with the given timestamps.
+    ///
+    /// Takes datetimes rather than pre-formatted strings so a caller cannot
+    /// pin a literal calendar date: `run_startup_catchup` gives up on any
+    /// anchor more than `MAX_CATCHUP_DAYS` behind the wall clock, so a fixed
+    /// `created_at` silently changes which branch the test exercises once the
+    /// clock passes that threshold.
     fn insert_job_due_past(
         conn: &rusqlite::Connection,
         row_id: i64,
         persistent: bool,
-        next_fire_at_str: &str,
-        last_fired_at_str: Option<&str>,
-        created_at_str: &str,
+        next_fire_at: chrono::DateTime<Utc>,
+        last_fired_at: Option<chrono::DateTime<Utc>>,
+        created_at: chrono::DateTime<Utc>,
     ) {
+        let next_fire_at_str = crate::db::format_ts_for_db(next_fire_at);
+        let last_fired_at_str = last_fired_at.map(crate::db::format_ts_for_db);
+        let created_at_str = crate::db::format_ts_for_db(created_at);
         let uuid_bytes = Uuid::new_v4().as_bytes().to_vec();
         let trigger = serde_json::json!({
             "kind": "cron",
@@ -373,17 +383,20 @@ mod tests {
     #[tokio::test]
     async fn restart_persistent_false_advances_without_firing() {
         let db = init_db_memory();
+        // Clock-relative: a 3-day anchor gap stays inside the catchup walk's
+        // 90-day cap on any wall-clock date, and guarantees the daily cron has
+        // at least two occurrences in (anchor, now].
+        let now = Utc::now();
         {
             let conn = db.lock().await;
             insert_test_user(&conn);
-            // Job that was due 3 days ago, persistent=false.
             insert_job_due_past(
                 &conn,
                 1,
                 false,
-                "2026-05-04T09:00:00Z", // past
+                now - chrono::Duration::days(1),
                 None,
-                "2026-05-01T00:00:00Z",
+                now - chrono::Duration::days(3),
             );
         }
         let engine = make_engine_for_catchup(db.clone());
@@ -405,10 +418,20 @@ mod tests {
             "next_fire_at should be in the future after catchup"
         );
 
-        // last_fired_at should have been advanced to a recent past occurrence.
+        // last_fired_at should have been advanced to the *most recent* past
+        // occurrence, which for a daily cron lies within the last 25 hours (an
+        // hour of slack over the walk's `<= now` boundary and the gap between
+        // this test's clock read and the catchup's own).
+        let last_fired_str =
+            last_fired_str.expect("last_fired_at should be set after catchup (past occurrence)");
+        let last_fired: chrono::DateTime<Utc> = last_fired_str.parse().unwrap();
         assert!(
-            last_fired_str.is_some(),
-            "last_fired_at should be set after catchup (most recent past occurrence)"
+            last_fired <= Utc::now(),
+            "last_fired_at should be in the past, got {last_fired}"
+        );
+        assert!(
+            last_fired > now - chrono::Duration::hours(25),
+            "last_fired_at should be the most recent past occurrence, got {last_fired}"
         );
 
         let fire_count: i64 = conn
@@ -427,17 +450,17 @@ mod tests {
     #[tokio::test]
     async fn restart_persistent_true_leaves_job_due_for_loop() {
         let db = init_db_memory();
+        let now = Utc::now();
         {
             let conn = db.lock().await;
             insert_test_user(&conn);
-            // Job that was due 3 days ago, persistent=true.
             insert_job_due_past(
                 &conn,
                 1,
                 true,
-                "2026-05-04T09:00:00Z", // past
+                now - chrono::Duration::days(1),
                 None,
-                "2026-05-01T00:00:00Z",
+                now - chrono::Duration::days(3),
             );
         }
         let engine = make_engine_for_catchup(db.clone());

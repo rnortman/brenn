@@ -840,6 +840,7 @@ gate/dispatcher composition or whether the sweep's gated emission must
 additionally move off the dispatcher loop.
 
 Code sites (`TODO(surface-op-send-budget)`):
+`brenn-server/src/routes/attach/publish.rs` and
 `brenn-server/src/routes/surface/session.rs` (the `draw` in
 `handle_publish_batch`); `brenn-lib/src/messaging/mod.rs`
 (`push_released_surface_views`, the sweep-side gate take on the dispatcher loop).

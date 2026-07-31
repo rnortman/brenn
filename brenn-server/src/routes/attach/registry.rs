@@ -1,5 +1,10 @@
 //! Registry of live attachment sessions, keyed by attacher.
 //!
+//! The key is the attacher's principal — what `AttachProfile::attacher` answers.
+//! The map itself is key-opaque; naming it that way is what lets the route that
+//! registers a session and the planes that fan out to it agree without a second
+//! identifier travelling between them.
+//!
 //! Enforces the per-attacher session caps and provides per-session attribution
 //! for logging. The attached-session view is also what the push router reads to
 //! route wakes to live connections.
@@ -49,10 +54,9 @@ pub enum SessionPush {
 #[derive(Clone)]
 pub struct DeferredViewPush {
     pub channel: String,
-    /// The sub-identity whose parked set this is — a parked set belongs to the
-    /// sender that parked it, and an attacher's sub-identities are distinct
-    /// senders.
-    pub attribution: String,
+    /// The sub-identity whose parked set this is, or `None` for the attacher's
+    /// own bare identity.
+    pub attribution: Option<String>,
     pub entries: Vec<DeferredViewEntry>,
 }
 
@@ -244,7 +248,7 @@ impl AttachRegistry {
             if !handle.try_push_deferred_view(view.clone()) {
                 warn!(
                     attacher,
-                    attribution = view.attribution,
+                    attribution = view.attribution.as_deref().unwrap_or("<attacher>"),
                     channel = view.channel,
                     session = %handle.session_id,
                     "deferred view dropped: session push queue full; the next change to this \
@@ -308,7 +312,7 @@ mod tests {
     fn view(channel: &str, attribution: &str) -> DeferredViewPush {
         DeferredViewPush {
             channel: channel.to_string(),
-            attribution: attribution.to_string(),
+            attribution: Some(attribution.to_string()),
             entries: Vec::new(),
         }
     }
@@ -574,7 +578,7 @@ mod tests {
                 panic!("expected a deferred-view push");
             };
             assert_eq!(pushed.channel, "brenn:home.cmd");
-            assert_eq!(pushed.attribution, "clock");
+            assert_eq!(pushed.attribution.as_deref(), Some("clock"));
         }
     }
 

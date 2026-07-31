@@ -73,8 +73,44 @@ impl SubscriptionFacts {
 pub struct DeferredTarget {
     /// Full scheme-qualified channel address the set is parked on.
     pub channel: String,
-    /// The sub-identity whose parked set this mirrors.
-    pub attribution: String,
+    /// The sub-identity whose parked set this mirrors, or `None` for the
+    /// attacher's own bare identity.
+    pub attribution: Option<String>,
+}
+
+/// What a publish outcome the boot invariants exclude means on one channel.
+///
+/// The transport knows the outcomes; only the route knows what each one costs.
+/// A channel boot proved reachable, existent, and policy-covered cannot honestly
+/// refuse a publish, so a refusal there says the server disagrees with itself —
+/// but the same refusal on the channel an attacher reports its *own* failures to
+/// must not take the process down, because that path is attacker-sendable by
+/// construction and killing the server over its own diagnostics inverts
+/// priorities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishPosture {
+    /// Boot proved this channel reachable and policy-covered, so an
+    /// invariant-excluded refusal is a broken server and the process dies rather
+    /// than let a publish silently fail.
+    Invariant,
+    /// A diagnostics channel. The same refusals are logged loud with the body
+    /// preserved and answered `Failed`, and a success emits an audit record
+    /// correlating the report to the account and session its body cannot carry.
+    Diagnostic,
+}
+
+/// The per-connection publish token bucket's shape.
+///
+/// A struct, not two adjacent `u32` params, because a burst and a refill rate
+/// transpose silently: `(120, 5)` and `(5, 120)` are both plausible numbers and
+/// only one of them is a rate limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishRate {
+    /// Tokens the bucket starts full with — how many publishes back to back an
+    /// attachment may make before the refill governs.
+    pub burst: u32,
+    /// Tokens refilled per second under sustained load.
+    pub per_sec: u32,
 }
 
 /// The authority half of an attachment, boot-built by the route that owns the
@@ -108,6 +144,11 @@ pub trait AttachProfile: Send + Sync {
     /// sub-identity's traffic onto the attacher's own budget.
     fn admit_attribution(&self, attribution: Option<&str>) -> Option<ParticipantId>;
 
+    /// What a publish refusal the boot invariants exclude means on `channel` —
+    /// see [`PublishPosture`]. Answered per channel because one attacher can own
+    /// both kinds at once.
+    fn publish_posture(&self, channel: &str) -> PublishPosture;
+
     /// The scope half of this attacher's send-budget key. The other half is the
     /// attribution the caller already holds, so a budget bucket is
     /// `(scope, attribution)` and a sub-identity's retry loop drains only its
@@ -128,6 +169,26 @@ pub trait AttachProfile: Send + Sync {
     /// first-connect reconcile into a deterministic connect → violation →
     /// fail2ban loop.
     fn subscribe_burst(&self) -> u32;
+
+    /// The per-connection publish bucket this attacher's connections start with.
+    ///
+    /// Route policy for the same reason [`AttachProfile::subscribe_burst`] is:
+    /// what a *correct* attacher publishes back to back is a property of what it
+    /// runs, which only the route knows, and the operator tunes it per attacher.
+    /// The bucket is per connection and trips ahead of the bus-level per-sender
+    /// gate, so it bounds one socket rather than one principal.
+    fn publish_rate(&self) -> PublishRate;
+
+    /// Whether this attacher's policy grants the alert plane, advertised in
+    /// `Welcome` and enforced on every `Alert` frame.
+    ///
+    /// A grant, so it belongs to the route that resolved the attacher's policy:
+    /// the transport knows what an alert *is* — a generic paging frame that
+    /// reaches the operator without touching the bus it may be reporting on — but
+    /// not who is allowed to raise one. Deny-by-default: an attacher whose route
+    /// answers `false` is told so at attach time, and a frame that arrives anyway
+    /// is a violation.
+    fn alert_granted(&self) -> bool;
 
     /// How many concurrent attachments this attacher admits, in total and per
     /// account.

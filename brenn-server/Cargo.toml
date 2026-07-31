@@ -42,9 +42,10 @@ tower-http = { version = "0.6.8", features = ["catch-panic", "fs", "limit", "set
 tower_governor = "0.8.0"
 tracing = "0.1.44"
 ts-rs = { version = "12.0.1", features = ["serde-compat", "serde-json-impl"] }
-# Must stay version-unified with axum's tokio-tungstenite: the surface WS
-# read-error downcast (routes/surface/session.rs) matches on tungstenite::Error
-# by TypeId, which silently stops matching if two tungstenite versions coexist.
+# Must stay version-unified with axum's tokio-tungstenite: the WS read-error
+# downcast matches on tungstenite::Error by TypeId, which silently stops matching
+# if two tungstenite versions coexist. Two sites downcast —
+# routes/attach/socket.rs (classify_read_error) and routes/surface/session.rs.
 # surface_ws_oversized_frame_is_violation_and_kills pins this end-to-end.
 tungstenite = { version = "0.29.0", default-features = false }
 url = "2.5.8"

@@ -1,3 +1,4 @@
+use brenn_lib::access::AppPolicy;
 use brenn_lib::messaging::config::{Depth, ResolvedSurface};
 use brenn_surface_schema::LOCAL_THEME_CHANNEL;
 
@@ -8,6 +9,12 @@ use crate::test_support::surface::{SurfaceFixture, description_params, shape_onl
 
 const ERROR_CHANNEL: &str = "brenn:surface-errors";
 
+/// The fixture's per-connection publish bucket. Deliberately not
+/// `DEFAULT_SURFACE_PUBLISH_BURST`/`_PER_SEC`, so an assertion about the
+/// lowering can tell the operator's numbers from a default substituted for them.
+const FIXTURE_PUBLISH_BURST: u32 = 7;
+const FIXTURE_PUBLISH_PER_SEC: u32 = 3;
+
 /// A surface with two components: chrome, which binds one durable channel and
 /// publishes on two ports (one of them sharing a channel with its other port),
 /// and a headless processor that binds the same durable channel at wider depths
@@ -15,6 +22,7 @@ const ERROR_CHANNEL: &str = "brenn:surface-errors";
 /// and the parked-view dedupe to have something to say.
 fn two_component_surface() -> ResolvedSurface {
     SurfaceFixture::new("deskbar", "chrome")
+        .publish_rate(FIXTURE_PUBLISH_BURST, FIXTURE_PUBLISH_PER_SEC)
         .processor("mode", "mode-clock", Default::default())
         .subscribe_at_depths("brenn:shared", "chrome", "content", 4, 2)
         .subscribe_at_depths("brenn:shared", "mode", "content", 2, 9)
@@ -156,6 +164,35 @@ fn the_error_channel_admits_every_attribution() {
     assert!(!profile.publishable(Some("ghost"), ERROR_CHANNEL));
 }
 
+/// **The error channel is the one channel a publish may fail on without killing
+/// the process.** Everywhere else boot proved reachability and coverage, so a
+/// refusal is a broken server; on the shell's own diagnostics path a refusal must
+/// survive as a log line instead. A surface with no error channel configured has
+/// no diagnostics posture at all.
+#[test]
+fn only_the_error_channel_carries_the_diagnostics_posture() {
+    let mut profile = profile();
+    assert_eq!(
+        profile.publish_posture(ERROR_CHANNEL),
+        PublishPosture::Invariant,
+        "unbound, the error address is just another channel"
+    );
+
+    profile.bind_error_channel(ERROR_CHANNEL);
+    assert_eq!(
+        profile.publish_posture(ERROR_CHANNEL),
+        PublishPosture::Diagnostic
+    );
+    assert_eq!(
+        profile.publish_posture("brenn:chrome-out"),
+        PublishPosture::Invariant
+    );
+    assert_eq!(
+        profile.publish_posture("ephemeral:chrome-eph"),
+        PublishPosture::Invariant
+    );
+}
+
 /// **Minting is admission, not spelling.** The absent attribution is the bare
 /// identity, a declared one is its own sub-identity, and anything else mints
 /// nothing — the caller's cue that the frame is a violation rather than a
@@ -204,6 +241,51 @@ fn the_session_caps_are_the_surface_caps() {
     assert_eq!(caps.per_account, MAX_SESSIONS_PER_USER_PER_SURFACE);
 }
 
+/// **The per-connection publish bucket is the operator's own numbers.** The
+/// fixture tunes both knobs away from the config defaults, so a lowering that
+/// substituted a default — leaving an operator who tightened the bucket with the
+/// stock one on every attachment — fails here.
+#[test]
+fn the_publish_rate_is_the_operators_own_numbers_not_a_default() {
+    use brenn_lib::messaging::config::{
+        DEFAULT_SURFACE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_PER_SEC,
+    };
+    assert_ne!(FIXTURE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_BURST);
+    assert_ne!(FIXTURE_PUBLISH_PER_SEC, DEFAULT_SURFACE_PUBLISH_PER_SEC);
+    assert_eq!(
+        profile().publish_rate(),
+        PublishRate {
+            burst: FIXTURE_PUBLISH_BURST,
+            per_sec: FIXTURE_PUBLISH_PER_SEC,
+        }
+    );
+}
+
+/// A surface whose operator-written policy grants the alert plane.
+fn alert_granted_surface() -> ResolvedSurface {
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::SurfaceAlert);
+    SurfaceFixture::new("deskbar", "chrome")
+        .policy(policy)
+        .build()
+}
+
+/// **The alert grant is lowered, both ways.** An ungranted surface answers
+/// `false` and a granted one `true`: a lowering stuck at `false` leaves a surface
+/// the operator granted paging rights unable to page *and* — since the attachment
+/// treats an ungranted `Alert` as a violation — killed and fail2ban-flagged every
+/// time its shell tries.
+#[test]
+fn the_alert_grant_is_lowered_from_the_resolved_policy() {
+    assert!(
+        !profile().alert_granted(),
+        "the default policy grants no alert"
+    );
+    let granted = runtime(alert_granted_surface());
+    assert!(granted.profile.alert_granted());
+    assert_agrees_with_port_maps(&granted);
+}
+
 /// The burst must cover a boot-valid maximum-size surface's first-connect
 /// reconcile — one `Subscribe` per bound channel in one burst — or a legitimate
 /// connect becomes a violation. Asserted against the binding maximum, so the
@@ -231,11 +313,11 @@ fn parked_view_targets_dedupe_shared_channels_and_exclude_local() {
         &[
             DeferredTarget {
                 channel: "brenn:chrome-out".to_string(),
-                attribution: "chrome".to_string(),
+                attribution: Some("chrome".to_string()),
             },
             DeferredTarget {
                 channel: "ephemeral:chrome-eph".to_string(),
-                attribution: "chrome".to_string(),
+                attribution: Some("chrome".to_string()),
             },
         ]
     );

@@ -956,7 +956,7 @@ async fn a_deferred_batch_entry_parks_and_the_rest_of_the_batch_commits() {
     let dropped = m
         .publish_batch_from_surface(
             "durabar",
-            "clock",
+            Some("clock"),
             &[
                 SurfaceBatchPublish {
                     channel_address: &addr,
@@ -989,8 +989,12 @@ async fn a_parked_batch_entry_enters_retention_when_it_comes_due() {
     let now = Utc::now();
     let later = now + Duration::from_secs(600);
 
-    m.publish_batch_from_surface("durabar", "clock", &[deferred(&addr, "later", 0, later)])
-        .await;
+    m.publish_batch_from_surface(
+        "durabar",
+        Some("clock"),
+        &[deferred(&addr, "later", 0, later)],
+    )
+    .await;
     assert_eq!(
         m.release_due_messages(now).await.released,
         0,
@@ -1237,7 +1241,7 @@ async fn a_batch_of_ephemeral_entries_commits_to_the_ring_and_feeds() {
     let dropped = m
         .publish_batch_from_surface(
             "durabar",
-            "clock",
+            Some("clock"),
             &[
                 SurfaceBatchPublish {
                     channel_address: &addr,
@@ -1289,7 +1293,7 @@ async fn a_batch_overrunning_the_ring_enacts_its_overflow_events() {
     let dropped = m
         .publish_batch_from_surface(
             "durabar",
-            "clock",
+            Some("clock"),
             &(0..3)
                 .map(|i| SurfaceBatchPublish {
                     channel_address: &addr,
@@ -1346,7 +1350,7 @@ async fn the_rings_deferred_cap_refuses_one_batch_schedule() {
     });
 
     let dropped = m
-        .publish_batch_from_surface("durabar", "clock", &batch)
+        .publish_batch_from_surface("durabar", Some("clock"), &batch)
         .await;
 
     assert_eq!(dropped, 1, "the cap refused exactly one schedule");
@@ -1406,7 +1410,7 @@ async fn a_parked_batch_entry_is_fed_only_at_its_release() {
 
     m.publish_batch_from_surface(
         "durabar",
-        "clock",
+        Some("clock"),
         &[
             SurfaceBatchPublish {
                 channel_address: &addr,
@@ -1446,7 +1450,7 @@ async fn the_deferred_cap_refuses_one_schedule_and_the_batch_still_commits() {
     let dropped = m
         .publish_batch_from_surface(
             "durabar",
-            "clock",
+            Some("clock"),
             &[
                 deferred(&addr, "first", 0, later),
                 deferred(&addr, "refused", 1, later),
@@ -1503,7 +1507,7 @@ async fn publish_batch_from_surface_commits_every_entry_in_call_order() {
 
     m.publish_batch_from_surface(
         "durabar",
-        "clock",
+        Some("clock"),
         &batch(&addr, &["a", "b", "c"], Urgency::Normal),
     )
     .await;
@@ -1541,7 +1545,7 @@ async fn publish_batch_from_surface_preserves_per_entry_urgency() {
 
     m.publish_batch_from_surface(
         "durabar",
-        "clock",
+        Some("clock"),
         &[
             SurfaceBatchPublish {
                 channel_address: &addr,
@@ -1614,7 +1618,7 @@ async fn a_mid_batch_failure_leaves_zero_rows() {
                 deliver_after: None,
             },
         ];
-        m2.publish_batch_from_surface("durabar", "clock", &entries)
+        m2.publish_batch_from_surface("durabar", Some("clock"), &entries)
             .await;
     })
     .await;
@@ -1640,8 +1644,12 @@ async fn publish_batch_from_surface_does_not_draw_the_send_budget() {
     // Far more entries than the burst; if the entry point drew per row it would
     // exhaust the bucket mid-batch.
     let bodies: Vec<&str> = vec!["x"; SURFACE_SEND_BURST as usize + 5];
-    m.publish_batch_from_surface("durabar", "clock", &batch(&addr, &bodies, Urgency::Normal))
-        .await;
+    m.publish_batch_from_surface(
+        "durabar",
+        Some("clock"),
+        &batch(&addr, &bodies, Urgency::Normal),
+    )
+    .await;
     assert_eq!(
         stored_bodies(&m).await.len(),
         bodies.len(),
@@ -1669,7 +1677,7 @@ async fn an_oversized_batch_draw_is_refused_and_mints_no_debt() {
     let (m, addr) = build_multi_surface_publish_messenger(&["durabar"]).await;
 
     assert_eq!(
-        m.draw_surface_send_budget_for_batch("durabar", "clock", SURFACE_SEND_BURST + 5),
+        m.draw_surface_send_budget_for_batch("durabar", Some("clock"), SURFACE_SEND_BURST + 5),
         SurfaceSendVerdict::Denied,
         "a batch wider than the burst cannot be covered, so it is refused"
     );
@@ -1687,12 +1695,12 @@ async fn an_oversized_batch_draw_is_refused_and_mints_no_debt() {
     // And the balance is still there for a batch that fits: burst - 1 already
     // spent above, so the rest of the bucket draws whole.
     assert_eq!(
-        m.draw_surface_send_budget_for_batch("durabar", "clock", SURFACE_SEND_BURST - 1),
+        m.draw_surface_send_budget_for_batch("durabar", Some("clock"), SURFACE_SEND_BURST - 1),
         SurfaceSendVerdict::Admitted,
         "a draw the balance covers exactly is admitted"
     );
     assert_eq!(
-        m.draw_surface_send_budget_for_batch("durabar", "clock", 1),
+        m.draw_surface_send_budget_for_batch("durabar", Some("clock"), 1),
         SurfaceSendVerdict::Denied,
         "and it spent exactly its own width — nothing is left"
     );
@@ -1709,7 +1717,7 @@ async fn an_oversized_batch_draw_is_refused_and_mints_no_debt() {
     // Refill restores admission at the rate the interval sets.
     tokio::time::advance(SURFACE_SEND_REFILL).await;
     assert_eq!(
-        m.draw_surface_send_budget_for_batch("durabar", "clock", 1),
+        m.draw_surface_send_budget_for_batch("durabar", Some("clock"), 1),
         SurfaceSendVerdict::Admitted,
         "one interval refills one publish's worth"
     );
@@ -1725,7 +1733,7 @@ async fn a_maximal_conforming_flush_is_admitted_from_a_full_bucket() {
 
     let cap = u32::try_from(brenn_budget::MAX_PUBLISHES_PER_ACTIVATION).unwrap();
     assert_eq!(
-        m.draw_surface_send_budget_for_batch("durabar", "clock", cap),
+        m.draw_surface_send_budget_for_batch("durabar", Some("clock"), cap),
         SurfaceSendVerdict::Admitted,
         "a full default bucket admits exactly one maximal conforming flush"
     );
@@ -1743,6 +1751,6 @@ fn a_batch_draw_for_an_unbudgeted_instance_panics() {
         .unwrap();
     rt.block_on(async {
         let (m, _addr) = build_multi_surface_publish_messenger(&["durabar"]).await;
-        let _ = m.draw_surface_send_budget_for_batch("durabar", "never-declared", 3);
+        let _ = m.draw_surface_send_budget_for_batch("durabar", Some("never-declared"), 3);
     });
 }
