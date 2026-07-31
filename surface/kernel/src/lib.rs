@@ -17,6 +17,10 @@
 //! DOM-free decision core (host-compiled, natively unit-tested); [`dom`] is the
 //! web-sys effect executor; [`entry`] holds the wasm-bindgen exports and wiring.
 
+/// The surface's wiring: the bindings document parsed, checked against this
+/// build's limits, and indexed for the surface layer's lookups.
+pub mod bindings;
+
 mod core;
 mod driver;
 // The backoff-jitter seed source, crate-private: see the module doc for why it

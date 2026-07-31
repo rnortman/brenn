@@ -16,6 +16,8 @@
 //! freshly delivered document against the one it is running on and reload only
 //! on a real difference.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use brenn_envelope::is_local_channel;
@@ -158,6 +160,52 @@ impl BindingsDocument {
     /// belongs to the consumer sizing the queue, not to a shared schema rule
     /// whose verdict would differ per build.
     pub fn validate(&self) -> Result<(), BindingsError> {
+        // The instance id is the mount key and the routing key; two entries
+        // claiming one id leave both meanings ambiguous.
+        let mut instances = BTreeSet::new();
+        for c in &self.components {
+            if !instances.insert(&c.instance) {
+                return Err(format!(
+                    "bindings document declares component instance {} twice",
+                    c.instance
+                ));
+            }
+        }
+        // A port publishes onto one channel. Two entries for one port would make
+        // a component's publish resolve to whichever the reader indexed first,
+        // which is a coin toss dressed as configuration.
+        let mut output_ports = BTreeSet::new();
+        for b in &self.outputs {
+            if !output_ports.insert((&b.instance, &b.port)) {
+                return Err(format!(
+                    "bindings document binds output port {}/{} twice",
+                    b.instance, b.port
+                ));
+            }
+        }
+        // An input port reads one channel; a duplicate entry produces double
+        // activations and double loss accounting.
+        let mut input_ports = BTreeSet::new();
+        for b in &self.subscriptions {
+            if !input_ports.insert((&b.instance, &b.port)) {
+                return Err(format!(
+                    "bindings document binds input port {}/{} twice",
+                    b.instance, b.port
+                ));
+            }
+        }
+        // A confined channel's ring depth is one number. Two entries for one
+        // address state two, and a reader folding them by `max` would resolve the
+        // disagreement by silently picking a winner.
+        let mut local_addresses = BTreeSet::new();
+        for lc in &self.local_channels {
+            if !local_addresses.insert(&lc.channel) {
+                return Err(format!(
+                    "bindings document declares local channel {} twice",
+                    lc.channel
+                ));
+            }
+        }
         // Inputs and outputs are separate structs (an output carries a default
         // urgency an input has nothing to say about), and the channel rules read
         // only the address — so walk the channels, not the bindings.
@@ -433,6 +481,81 @@ mod tests {
     fn rejects_junk() {
         let err = BindingsDocument::parse("not json").expect_err("junk is refused");
         assert!(err.contains("does not parse"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rejects_a_repeated_component_instance() {
+        let mut doc = doc();
+        doc.components.push(component("p1"));
+        let err = doc
+            .validate()
+            .expect_err("an instance id names one component");
+        assert!(err.contains("p1") && err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_repeated_output_port() {
+        let mut doc = doc();
+        doc.outputs.push(output("p1", "brenn:site.bar.out"));
+        let err = doc
+            .validate()
+            .expect_err("a port publishes onto one channel");
+        assert!(err.contains("p1/out") && err.contains("twice"), "{err}");
+    }
+
+    /// A duplicated input row hands one port every arriving message twice, which
+    /// no reader can tell from two messages.
+    #[test]
+    fn rejects_a_repeated_input_port() {
+        let mut doc = doc();
+        doc.subscriptions
+            .push(subscription("p1", "brenn:site.bar.other"));
+        let err = doc.validate().expect_err("a port reads one channel");
+        assert!(err.contains("p1/in") && err.contains("twice"), "{err}");
+    }
+
+    /// Two input ports of one instance may read different channels; only the same
+    /// port twice is ambiguous.
+    #[test]
+    fn admits_a_second_input_port_on_one_instance() {
+        let mut doc = doc();
+        let mut second = subscription("p1", "brenn:site.bar.other");
+        second.port = "alt".to_string();
+        doc.subscriptions.push(second);
+        assert!(doc.validate().is_ok(), "distinct ports are not a conflict");
+    }
+
+    /// One address, one ring depth: two entries state two, and folding them by
+    /// `max` would pick a winner nobody wrote.
+    #[test]
+    fn rejects_a_repeated_local_channel() {
+        let mut doc = doc();
+        doc.local_channels.push(LocalChannel {
+            channel: "local:bar/notes".to_string(),
+            ring_depth: 4,
+        });
+        doc.local_channels.push(LocalChannel {
+            channel: "local:bar/notes".to_string(),
+            ring_depth: 8,
+        });
+        let err = doc
+            .validate()
+            .expect_err("a local channel has one ring depth");
+        assert!(
+            err.contains("local:bar/notes") && err.contains("twice"),
+            "{err}"
+        );
+    }
+
+    /// Two ports of one instance may publish onto different channels; only the
+    /// same port twice is ambiguous.
+    #[test]
+    fn admits_a_second_port_on_one_instance() {
+        let mut doc = doc();
+        let mut second = output("p1", "brenn:site.bar.out");
+        second.port = "alt".to_string();
+        doc.outputs.push(second);
+        assert!(doc.validate().is_ok(), "distinct ports are not a conflict");
     }
 
     #[test]

@@ -30,6 +30,15 @@
 //! [`ChannelStores::detach_matching`] and
 //! [`ChannelStores::any_deliverable`].
 //!
+//! # Parked messages are the store's too
+//!
+//! A channel also holds what is scheduled onto it but not yet on it: the
+//! deferred set. Parked messages are in no reader's owed set and no window
+//! until their release time arrives, when they enter retention as ordinary
+//! arrivals. Only a channel whose retention authority is the attacher itself
+//! ever holds one here — on a channel fed by the wire, the peer parks and the
+//! attacher only mirrors what it is told ([`crate::publish::DeferredViews`]).
+//!
 //! # Depths are the reader's, the store's size is the fold
 //!
 //! A store has one size, and every reader states its own two depths at each
@@ -42,12 +51,43 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 
 use brenn_envelope::MessageEnvelope;
-use brenn_queue::RingCore;
+use brenn_queue::{OwnedDeferred, RingCore};
 use uuid::Uuid;
 
-pub use brenn_queue::{Attached, CursorOverflow};
+pub use brenn_queue::{
+    Attached, CursorOverflow, Deferred, DeferredId, QuotaExceeded, ReleaseReport, ReleaseTime,
+};
 
 use crate::subs::SubscriptionDepths;
+
+/// What to do to one message a sender has parked.
+///
+/// One type shared between acceptance and application: the identity an op names
+/// is resolved once, where the caller still holds the view it was read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferOp {
+    /// Unpark it. Nothing is ever delivered.
+    Cancel,
+    /// Rewrite its body, its release time, or both, keeping its identity.
+    Edit {
+        body: Option<String>,
+        deliver_after: Option<ReleaseTime>,
+    },
+}
+
+/// What became of a control op.
+///
+/// Three outcomes because the two failures mean opposite things about the
+/// caller. [`Self::NotParked`] is the benign race any conforming publisher can
+/// lose: the message released between the view it read and the op it sent. A
+/// [`Self::WrongSender`] is not a race at all — the identity came from a
+/// sender-scoped view, so it can only mean the caller built one wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferOpOutcome {
+    Applied,
+    NotParked,
+    WrongSender { owner: String },
+}
 
 /// One reader's activation view of a channel, with its position already moved
 /// past it.
@@ -273,6 +313,145 @@ impl<K: Eq + Hash + Clone> ChannelStore<K> {
     pub fn retained(&self) -> impl Iterator<Item = (&MessageEnvelope, u64)> {
         self.core.ring().iter().map(|e| (&e.message, e.seq))
     }
+
+    /// Hold `envelope` out of retention until `release_at`, under the channel's
+    /// deferred cap.
+    ///
+    /// A parked message is in no position's owed set and no window, so nothing
+    /// is woken and nothing is charged; it enters retention at
+    /// [`Self::release_due`] as an ordinary arrival. `sender` is the
+    /// authorization key — the identity the envelope itself carries, so a later
+    /// view or op scoped to a sender reaches exactly what that sender parked.
+    ///
+    /// The cap is the store's depth: a channel holds at most as much parked
+    /// future as retained past, so an attacher whose readers ask for deep push
+    /// windows may park correspondingly more.
+    ///
+    /// A full set is refused rather than drop-oldest — silently cancelling
+    /// scheduled work is worse than refusing to schedule more — and refusing is
+    /// normal operation, not an error: the caller counts it.
+    pub fn park(
+        &mut self,
+        sender: &str,
+        envelope: MessageEnvelope,
+        release_at: ReleaseTime,
+    ) -> Result<DeferredId, QuotaExceeded> {
+        self.core.park(sender, envelope, release_at)
+    }
+
+    /// When this channel's next parked message comes due, or `None` when
+    /// nothing is parked — the deadline a release timer arms from.
+    pub fn next_release(&self) -> Option<ReleaseTime> {
+        self.core.next_release()
+    }
+
+    /// Take every message due at or before `now` into retention, in release
+    /// order, reporting what the batch retired.
+    ///
+    /// Each released message takes a fresh tail seq and charges exactly as a
+    /// fresh arrival does, because to every reader of this channel that is what
+    /// it is.
+    pub fn release_due(&mut self, now: ReleaseTime) -> ReleaseReport<MessageEnvelope, K> {
+        self.core.release_due(now)
+    }
+
+    /// One sender's messages still parked at `now`, soonest release first — the
+    /// view a publisher is shown of its own schedule.
+    ///
+    /// Still parked is exactly `release_at > now`: an entry whose time has come
+    /// is out of the view before the release pass takes it, since there is
+    /// nothing left to cancel or edit.
+    ///
+    /// The sender filter is the whole authorization story: a caller scoped to a
+    /// sender can never observe, cancel or edit another's schedule.
+    pub fn deferred_for_sender<'a>(
+        &'a self,
+        sender: &'a str,
+        now: ReleaseTime,
+    ) -> impl Iterator<Item = &'a Deferred<MessageEnvelope>> {
+        self.core.deferred_for_sender(sender, now)
+    }
+
+    /// The identity that parked each message still held here, across senders.
+    ///
+    /// The one read of the deferred set that is not sender-scoped, because its
+    /// caller is not a publisher: a store about to be discarded owes an account
+    /// of every schedule going with it, whoever set it.
+    pub fn parked_senders(&self) -> impl Iterator<Item = &str> {
+        self.core.deferred_at(0).map(|e| e.sender.as_str())
+    }
+
+    /// Every message parked here with its release time, soonest first, across
+    /// senders.
+    ///
+    /// Carries no authorization, so an embedder may serve it only to a caller
+    /// entitled to the whole channel — its own telemetry, not a publisher's
+    /// view.
+    pub fn parked(&self) -> impl Iterator<Item = (&MessageEnvelope, ReleaseTime)> {
+        self.core.deferred_at(0).map(|e| (&e.message, e.release_at))
+    }
+
+    /// What became of a control op against one parked message.
+    ///
+    /// The op names its message by `message_id` — the identity a sender-scoped
+    /// view carried — and is applied only to an entry `sender` owns and only
+    /// while it is still parked at `now`.
+    ///
+    /// `now` is the same cutoff [`Self::deferred_for_sender`] answers against, so
+    /// an op reaches exactly what the view showed: an entry whose release time has
+    /// arrived answers [`DeferOpOutcome::NotParked`] whether or not the release
+    /// pass has taken it yet. The sweep runs on the embedder's turn, so without
+    /// the cutoff a cancel landing in the window between the release time and the
+    /// sweep would retract a message that was already due.
+    pub fn apply_defer_op(
+        &mut self,
+        sender: &str,
+        message_id: Uuid,
+        op: DeferOp,
+        now: ReleaseTime,
+    ) -> DeferOpOutcome {
+        let (id, replacement) =
+            match self
+                .core
+                .owned_deferred(sender, |m| m.message_id == message_id, now)
+            {
+                OwnedDeferred::Owned(id, entry) => (
+                    id,
+                    // The body edit is a field rewrite the shared model cannot do
+                    // for itself: it holds an opaque payload, and which part of one
+                    // is "the message" is this layer's knowledge. The envelope's own
+                    // `deliver_after` stays `None` — a schedule is the channel's,
+                    // held in its deferred set until it releases.
+                    match &op {
+                        DeferOp::Cancel => None,
+                        DeferOp::Edit { body, .. } => body.clone().map(|body| MessageEnvelope {
+                            body,
+                            ..entry.message.clone()
+                        }),
+                    },
+                ),
+                OwnedDeferred::NotFound => return DeferOpOutcome::NotParked,
+                OwnedDeferred::WrongSender { owner } => {
+                    return DeferOpOutcome::WrongSender {
+                        owner: owner.to_string(),
+                    };
+                }
+            };
+        // Both delegations are infallible: the resolution above found the entry
+        // under this very `&mut self`, and nothing between the two can release it.
+        match op {
+            DeferOp::Cancel => {
+                self.core
+                    .cancel_deferred(id)
+                    .expect("attach client: the entry just resolved is still parked");
+            }
+            DeferOp::Edit { deliver_after, .. } => self
+                .core
+                .edit_deferred(id, replacement, deliver_after)
+                .expect("attach client: the entry just resolved is still parked"),
+        }
+        DeferOpOutcome::Applied
+    }
 }
 
 /// Every channel this attachment retains, keyed by channel address.
@@ -381,6 +560,40 @@ impl<K: Eq + Hash + Clone> ChannelStores<K> {
         self.stores
             .values()
             .any(|store| store.any_deliverable(names))
+    }
+
+    /// When the soonest parked message across every channel comes due, or
+    /// `None` when nothing is parked anywhere.
+    ///
+    /// Asked across the whole collection rather than per class: a channel the
+    /// attacher does not park on holds an empty deferred set, and an empty set
+    /// has no deadline, so nothing here has to classify an address to get the
+    /// answer right.
+    pub fn next_release(&self) -> Option<ReleaseTime> {
+        self.stores
+            .values()
+            .filter_map(ChannelStore::next_release)
+            .min()
+    }
+
+    /// Release every channel's due parked messages into retention, in address
+    /// order, reporting per channel what the pass produced.
+    ///
+    /// Address order so an attacher releasing on several channels at one fire
+    /// enacts whatever its reports drive — counters, loudness rungs — in a
+    /// reproducible sequence; the channels are independent, so any total order
+    /// is correct and a stable one keeps the attacher's telemetry
+    /// reproducible. A channel with nothing due is absent from the answer
+    /// rather than present and empty.
+    pub fn release_due(
+        &mut self,
+        now: ReleaseTime,
+    ) -> Vec<(String, ReleaseReport<MessageEnvelope, K>)> {
+        self.stores
+            .iter_mut()
+            .filter(|(_, store)| store.next_release().is_some_and(|at| at <= now))
+            .map(|(channel, store)| (channel.clone(), store.release_due(now)))
+            .collect()
     }
 }
 

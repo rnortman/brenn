@@ -10,9 +10,11 @@ brenn-attach-proto = { path = "../proto" }
 brenn-envelope = { path = "../../brenn-envelope" }
 brenn-queue = { path = "../../brenn-queue" }
 serde_json = "1.0.149"
-# The epoch a store's positions are stamped with, and the envelope identity its
-# dedup reads. Version-unified with brenn-envelope, whose `message_id` that is.
-uuid = { version = "1.23.0", features = ["serde"] }
+# The epoch a store's positions are stamped with, the envelope identity its
+# dedup reads, and the v4 the driver mints one with. Version-unified with
+# brenn-envelope, whose `message_id` that is. `js` supplies the browser's
+# entropy source, which v4 has no other way to reach on wasm.
+uuid = { version = "1.23.0", features = ["serde", "v4", "js"] }
 tracing = "0.1.44"
 futures-util = "0.3.32"
 # Version-unified with brenn-envelope, whose `DateTime<Utc>` the wall clock
@@ -46,6 +48,8 @@ web-sys = { workspace = true, features = [
     "Performance",
 ] }
 
-# Native transport tests drive a real loopback WebSocket server.
+# Native transport tests drive a real loopback WebSocket server; the driver
+# tests script a connector over channels.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1.50.0", features = ["rt", "time", "net", "macros", "test-util"] }
+futures-channel = { workspace = true }

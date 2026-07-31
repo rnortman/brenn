@@ -361,8 +361,8 @@ fn a_transport_drop_while_live_detaches_without_closing_again() {
     let mut conn = attached();
     let step = conn.on_input(
         ConnInput::Disconnected {
-            code: Some(1006),
-            reason: String::new(),
+            code: Some(1011),
+            reason: "publish outside the publishable set".to_string(),
         },
         Millis(1_000),
     );
@@ -370,8 +370,12 @@ fn a_transport_drop_while_live_detaches_without_closing_again() {
     assert_eq!(
         step.effects[0],
         ConnEffect::Emit(ConnEvent::Detached {
-            reason: DetachReason::TransportClosed
-        })
+            reason: DetachReason::TransportClosed {
+                code: Some(1011),
+                reason: "publish outside the publishable set".to_string(),
+            }
+        }),
+        "what the loss said about itself reaches the embedder"
     );
     assert!(!step.effects.contains(&ConnEffect::CloseTransport));
 }

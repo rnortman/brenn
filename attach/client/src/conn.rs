@@ -22,14 +22,22 @@ use brenn_attach_proto::{ClientFrame, SUPPORTED_VERSIONS, ServerFrame, VersionRa
 use crate::Millis;
 
 /// Why a live attachment dropped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetachReason {
     /// No inbound frame arrived within `liveness_multiplier × heartbeat_secs`;
     /// the peer is treated as gone.
     LivenessTimeout,
     /// The transport went away — a peer close or a transport-level failure —
     /// while negotiating or live.
-    TransportClosed,
+    ///
+    /// Carries what the loss said about itself so an embedder can log or alert on
+    /// it at its own policy level: a peer closing 1011 with a diagnostic reason is
+    /// how a server tells an attacher it did something wrong, and a reconnect loop
+    /// with no such text is indistinguishable from a network outage. `code` is
+    /// absent for a transport-level failure, which has none. `reason` is opaque
+    /// peer- or stack-supplied text: render it as text, never interpolate it into
+    /// markup or a URL.
+    TransportClosed { code: Option<u16>, reason: String },
 }
 
 /// The transport contract of one attachment, as stated by
@@ -402,7 +410,7 @@ impl Connection {
         // No `CloseTransport`: the driver already dropped the connection before
         // feeding this input.
         let mut effects = vec![ConnEffect::Emit(ConnEvent::Detached {
-            reason: DetachReason::TransportClosed,
+            reason: DetachReason::TransportClosed { code, reason },
         })];
         effects.extend(self.enter_backoff(now));
         effects

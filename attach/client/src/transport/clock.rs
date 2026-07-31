@@ -15,9 +15,39 @@
 //! core as data. The two must not be conflated: a wall clock steps (NTP, user
 //! clock changes) and `Millis` must not.
 
+use brenn_queue::ReleaseTime;
 use chrono::{DateTime, Utc};
 
 use crate::Millis;
+
+/// Epoch milliseconds UTC of a wall-clock instant, or a diagnosis of why the
+/// reading cannot be used.
+///
+/// A pre-epoch clock poisons every `publish_ts` and release time this currency
+/// carries. Clamping would silently turn every deferred publish into an
+/// immediate one, so the reading is refused rather than repaired; an embedder
+/// that gets `Err` here must not connect.
+pub fn checked_epoch_ms(ts: DateTime<Utc>) -> Result<ReleaseTime, String> {
+    u64::try_from(ts.timestamp_millis()).map_err(|_| {
+        format!(
+            "the clock reads before the Unix epoch ({}); nothing can be timestamped or scheduled \
+             honestly",
+            ts.to_rfc3339()
+        )
+    })
+}
+
+/// Epoch milliseconds UTC of a wall-clock instant — the currency every release
+/// time in the channel model is expressed in, and the one a schedule survives a
+/// restart in.
+///
+/// Panics on an instant before the Unix epoch. The host clock is expected to
+/// have been checked with [`checked_epoch_ms`] before the attachment started, so
+/// this panic fires only if a clock that was sane then is stepped back past 1970
+/// mid-attachment.
+pub fn epoch_ms(ts: DateTime<Utc>) -> ReleaseTime {
+    checked_epoch_ms(ts).unwrap_or_else(|detail| panic!("attach client: {detail}"))
+}
 
 /// The current wall-clock instant, for stamping a synthesized envelope's
 /// `publish_ts`. Read by the driver and passed into the core as data — the core
@@ -44,6 +74,38 @@ pub fn wall_now() -> DateTime<Utc> {
     let ms = js_sys::Date::now() as i64;
     DateTime::from_timestamp_millis(ms)
         .expect("attach client: Date.now() outside representable range")
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_epoch_or_later_reading_is_its_millisecond_value() {
+        let epoch = DateTime::from_timestamp_millis(0).expect("in range");
+        assert_eq!(checked_epoch_ms(epoch), Ok(0));
+        let later = DateTime::from_timestamp_millis(1_700_000_000_123).expect("in range");
+        assert_eq!(checked_epoch_ms(later), Ok(1_700_000_000_123));
+    }
+
+    /// Refused rather than clamped: clamping would turn every deferred publish
+    /// into an immediate one, which is the failure the refusal exists to prevent.
+    #[test]
+    fn a_pre_epoch_reading_is_refused_and_names_the_reading() {
+        let before = DateTime::from_timestamp_millis(-1).expect("in range");
+        let detail = checked_epoch_ms(before).expect_err("before the epoch");
+        assert!(detail.contains("before the Unix epoch"), "{detail}");
+        assert!(detail.contains("1969-12-31"), "{detail}");
+    }
+
+    /// The mid-attachment backstop: the host clock was checked before the
+    /// attachment started, so a reading this bad now is a clock stepped back past
+    /// 1970 under a running attacher.
+    #[test]
+    #[should_panic(expected = "before the Unix epoch")]
+    fn epoch_ms_panics_on_a_pre_epoch_reading() {
+        epoch_ms(DateTime::from_timestamp_millis(-1).expect("in range"));
+    }
 }
 
 /// A monotonic clock. Constructed once per driver; `now()` returns milliseconds

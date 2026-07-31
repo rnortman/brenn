@@ -15,8 +15,13 @@
 //! [`subs`] (the wire subscription plane — refcounted per-channel
 //! subscriptions, resume cursors, and span continuity), [`store`] (what the
 //! attachment keeps of each channel, and the windows its readers are served
-//! from), and [`publish`] (outstanding publishes, the per-registrant
-//! atomic-flush outboxes, and the parked-set mirror).
+//! from), [`publish`] (outstanding publishes, the per-registrant atomic-flush
+//! outboxes, and the parked-set mirror), and [`router`] (the attacher's own
+//! authority over the confined channels that never cross the wire, including
+//! what is scheduled onto them). [`driver`] is where those layers meet the
+//! outside: it owns the connector, the live transport and the armed deadlines,
+//! and executes what they answer — but not the embedder's loop, whose select
+//! arms and their bias are the embedder's own.
 //!
 //! Authentication is the connector's business, not the protocol's: the native
 //! connector injects a cookie header, the browser connector relies on the
@@ -24,7 +29,9 @@
 //! plugs into the same seam without either of them noticing.
 
 pub mod conn;
+pub mod driver;
 pub mod publish;
+pub mod router;
 pub mod store;
 pub mod subs;
 pub mod transport;

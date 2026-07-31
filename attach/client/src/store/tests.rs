@@ -459,3 +459,325 @@ fn the_collections_wake_question_spans_its_channels() {
     assert!(stores.any_deliverable(|r| r == "reader"));
     assert!(!stores.any_deliverable(|r| r == "stranger"));
 }
+
+// ── Deferral ──────────────────────────────────────────────────────────────
+
+const ALICE: &str = "attacher:test#alice";
+const BOB: &str = "attacher:test#bob";
+
+fn park(store: &mut ChannelStore<String>, sender: &str, body: &str, release_at: ReleaseTime) {
+    store
+        .park(sender, env(body), release_at)
+        .expect("the case parks inside the cap");
+}
+
+fn parked_bodies(store: &ChannelStore<String>, sender: &str, now: ReleaseTime) -> Vec<String> {
+    store
+        .deferred_for_sender(sender, now)
+        .map(|e| e.message.body.clone())
+        .collect()
+}
+
+/// The whole point of parking: the message is nowhere a reader can reach until
+/// its time comes.
+#[test]
+fn a_parked_message_is_in_no_window_and_wakes_nobody() {
+    let mut s = store(4);
+    s.attach("reader".to_string(), 4);
+    park(&mut s, ALICE, "later", 5_000);
+    assert!(!s.has_deliverable(&"reader".to_string()));
+    assert_eq!(s.retained().count(), 0);
+    assert_eq!(s.next_release(), Some(5_000));
+}
+
+/// A release is an arrival: fresh tail seq, ordinary charges, every reader owed
+/// it.
+#[test]
+fn a_release_enters_retention_as_an_ordinary_arrival() {
+    let mut s = store(4);
+    s.attach("reader".to_string(), 4);
+    fill(&mut s, &["first"]);
+    park(&mut s, ALICE, "second", 5_000);
+    assert!(s.release_due(4_999).released.is_empty(), "not due yet");
+    let report = s.release_due(5_000);
+    assert_eq!(report.released.len(), 1);
+    assert_eq!(report.released[0].message.body, "second");
+    assert_eq!(
+        report.released[0].seq, 2,
+        "the tail seq, as any arrival takes"
+    );
+    assert_eq!(
+        bodies(&serve(&mut s, "reader", 4, 4)),
+        ["first", "second"],
+        "release order behind what was already retained"
+    );
+    assert_eq!(s.next_release(), None);
+}
+
+#[test]
+fn a_release_that_evicts_charges_the_positions_it_outran() {
+    let mut s = store(1);
+    s.attach("reader".to_string(), 1);
+    fill(&mut s, &["first"]);
+    park(&mut s, ALICE, "second", 5_000);
+    let report = s.release_due(5_000);
+    assert_eq!(report.overflow.len(), 1);
+    assert_eq!(report.overflow[0].subscriber, "reader");
+    assert_eq!(report.overflow[0].evicted, 1);
+}
+
+/// Soonest first, and an already-due deadline reports itself rather than being
+/// skipped — a sweep that computed its wait from a fresher instant still hears
+/// about what matured in between.
+#[test]
+fn next_release_is_the_soonest_deadline_due_or_not() {
+    let mut s = store(4);
+    park(&mut s, ALICE, "late", 9_000);
+    park(&mut s, ALICE, "early", 5_000);
+    assert_eq!(s.next_release(), Some(5_000));
+    assert_eq!(s.release_due(6_000).released.len(), 1);
+    assert_eq!(s.next_release(), Some(9_000));
+}
+
+/// The sender filter is the whole authorization story, and the cutoff is
+/// `release_at > now`: an entry whose time has come is out of the view before
+/// the sweep takes it, since there is nothing left to cancel or edit.
+#[test]
+fn a_senders_view_holds_its_own_still_parked_messages_only() {
+    let mut s = store(4);
+    park(&mut s, ALICE, "mine-late", 9_000);
+    park(&mut s, BOB, "not-mine", 5_000);
+    park(&mut s, ALICE, "mine-due", 5_000);
+    assert_eq!(parked_bodies(&s, ALICE, 0), ["mine-due", "mine-late"]);
+    assert_eq!(parked_bodies(&s, ALICE, 5_000), ["mine-late"]);
+    assert_eq!(parked_bodies(&s, BOB, 0), ["not-mine"]);
+    assert_eq!(
+        parked_bodies(&s, "attacher:test#nobody", 0),
+        Vec::<String>::new()
+    );
+}
+
+/// The one read that spans senders, for a store about to be discarded: whoever
+/// set a schedule is owed an account of it.
+#[test]
+fn the_channel_wide_reads_span_senders() {
+    let mut s = store(4);
+    park(&mut s, ALICE, "mine", 9_000);
+    park(&mut s, BOB, "theirs", 5_000);
+    assert_eq!(s.parked_senders().collect::<Vec<_>>(), [BOB, ALICE]);
+    assert_eq!(
+        s.parked()
+            .map(|(e, at)| (e.body.as_str(), at))
+            .collect::<Vec<_>>(),
+        [("theirs", 5_000), ("mine", 9_000)]
+    );
+}
+
+/// Refused, never drop-oldest: silently cancelling work already scheduled is
+/// worse than refusing to schedule more.
+#[test]
+fn a_full_deferred_set_refuses_the_park_and_names_its_cap() {
+    let mut s = store(2);
+    park(&mut s, ALICE, "one", 5_000);
+    park(&mut s, ALICE, "two", 5_000);
+    let refused = s.park(ALICE, env("three"), 5_000);
+    assert_eq!(refused, Err(QuotaExceeded { cap: 2 }));
+    assert_eq!(parked_bodies(&s, ALICE, 0), ["one", "two"]);
+}
+
+#[test]
+fn a_cancel_unparks_the_entry_and_nothing_is_ever_delivered() {
+    let mut s = store(4);
+    park(&mut s, ALICE, "regret", 5_000);
+    let id = s.parked().next().expect("parked").0.message_id;
+    assert_eq!(
+        s.apply_defer_op(ALICE, id, DeferOp::Cancel, 0),
+        DeferOpOutcome::Applied
+    );
+    assert_eq!(s.next_release(), None);
+    assert!(s.release_due(9_000).released.is_empty());
+}
+
+#[test]
+fn an_edit_rewrites_the_body_the_release_time_or_both() {
+    let mut s = store(4);
+    park(&mut s, ALICE, "draft", 5_000);
+    let id = s.parked().next().expect("parked").0.message_id;
+    assert_eq!(
+        s.apply_defer_op(
+            ALICE,
+            id,
+            DeferOp::Edit {
+                body: Some("final".to_string()),
+                deliver_after: Some(9_000),
+            },
+            0,
+        ),
+        DeferOpOutcome::Applied
+    );
+    assert_eq!(s.next_release(), Some(9_000));
+    let released = s.release_due(9_000).released;
+    assert_eq!(released[0].message.body, "final");
+    assert_eq!(
+        released[0].message.message_id, id,
+        "an edit keeps the identity the caller named it by"
+    );
+}
+
+/// A reschedule states no body, so what was parked is what releases — at the new
+/// time.
+#[test]
+fn an_edit_that_states_no_body_moves_the_release_time_alone() {
+    let mut s = store(4);
+    park(&mut s, ALICE, "draft", 5_000);
+    let id = s.parked().next().expect("parked").0.message_id;
+    assert_eq!(
+        s.apply_defer_op(
+            ALICE,
+            id,
+            DeferOp::Edit {
+                body: None,
+                deliver_after: Some(9_000),
+            },
+            0,
+        ),
+        DeferOpOutcome::Applied
+    );
+    assert_eq!(s.next_release(), Some(9_000));
+    assert!(
+        s.release_due(5_000).released.is_empty(),
+        "the original release time is no longer owed"
+    );
+    let released = s.release_due(9_000).released;
+    assert_eq!(released[0].message.body, "draft");
+}
+
+/// A rewrite states no time, so the schedule the publisher set stands.
+#[test]
+fn an_edit_that_states_no_time_rewrites_the_body_alone() {
+    let mut s = store(4);
+    park(&mut s, ALICE, "draft", 5_000);
+    let id = s.parked().next().expect("parked").0.message_id;
+    assert_eq!(
+        s.apply_defer_op(
+            ALICE,
+            id,
+            DeferOp::Edit {
+                body: Some("final".to_string()),
+                deliver_after: None,
+            },
+            0,
+        ),
+        DeferOpOutcome::Applied
+    );
+    assert_eq!(s.next_release(), Some(5_000));
+    assert!(
+        s.release_due(4_999).released.is_empty(),
+        "the release time was not pulled forward"
+    );
+    let released = s.release_due(5_000).released;
+    assert_eq!(released[0].message.body, "final");
+}
+
+/// The two failures, which mean opposite things: the release race any publisher
+/// can lose, and a view the caller built against the wrong sender.
+#[test]
+fn the_two_op_failures_are_distinguished() {
+    let mut s = store(4);
+    park(&mut s, ALICE, "gone", 5_000);
+    let id = s.parked().next().expect("parked").0.message_id;
+    assert_eq!(
+        s.apply_defer_op(BOB, id, DeferOp::Cancel, 0),
+        DeferOpOutcome::WrongSender {
+            owner: ALICE.to_string()
+        }
+    );
+    s.release_due(5_000);
+    assert_eq!(
+        s.apply_defer_op(ALICE, id, DeferOp::Cancel, 0),
+        DeferOpOutcome::NotParked
+    );
+}
+
+/// The window between a release time arriving and the sweep taking the entry: the
+/// message is due, so it is out of the sender's view and out of an op's reach —
+/// the answer the peer gives for the same op on a channel that crosses the wire.
+#[test]
+fn an_op_on_a_due_but_unswept_message_reaches_nothing() {
+    let mut s = store(4);
+    park(&mut s, ALICE, "due", 5_000);
+    let id = s.parked().next().expect("parked").0.message_id;
+    assert_eq!(
+        parked_bodies(&s, ALICE, 5_000),
+        Vec::<String>::new(),
+        "the view already excluded it"
+    );
+    assert_eq!(
+        s.apply_defer_op(ALICE, id, DeferOp::Cancel, 5_000),
+        DeferOpOutcome::NotParked
+    );
+    let released = s.release_due(5_000).released;
+    assert_eq!(
+        released[0].message.body, "due",
+        "the sweep still owes it, cancel or no cancel"
+    );
+}
+
+#[test]
+fn the_collections_release_deadline_is_the_soonest_across_its_channels() {
+    let mut stores: ChannelStores<String> = ChannelStores::new(epoch());
+    for channel in ["local:a", "local:b"] {
+        stores.ensure(channel, 4);
+    }
+    assert_eq!(stores.next_release(), None, "nothing is parked anywhere");
+    park(
+        stores.get_mut("local:b").expect("hosted"),
+        ALICE,
+        "late",
+        9_000,
+    );
+    park(
+        stores.get_mut("local:a").expect("hosted"),
+        ALICE,
+        "early",
+        5_000,
+    );
+    assert_eq!(stores.next_release(), Some(5_000));
+}
+
+/// Only the channels with something due, in address order.
+#[test]
+fn the_collections_sweep_names_the_due_channels_in_address_order() {
+    let mut stores: ChannelStores<String> = ChannelStores::new(epoch());
+    for channel in ["local:a", "local:b", "local:c"] {
+        stores.ensure(channel, 4);
+    }
+    park(
+        stores.get_mut("local:c").expect("hosted"),
+        ALICE,
+        "c",
+        5_000,
+    );
+    park(
+        stores.get_mut("local:a").expect("hosted"),
+        ALICE,
+        "a",
+        5_000,
+    );
+    park(
+        stores.get_mut("local:b").expect("hosted"),
+        ALICE,
+        "b",
+        9_000,
+    );
+    let swept = stores.release_due(5_000);
+    assert_eq!(
+        swept
+            .iter()
+            .map(|(channel, report)| (channel.as_str(), report.released.len()))
+            .collect::<Vec<_>>(),
+        [("local:a", 1), ("local:c", 1)],
+        "a channel with nothing due is absent, not present and empty"
+    );
+    assert_eq!(stores.next_release(), Some(9_000));
+}
