@@ -5972,6 +5972,7 @@ async fn surface_ws_status_counters_per_instance_reach_the_status_document() {
             deliveries: 9,
             publishes: 4,
             errors: 0,
+            telemetry_dropped: 0,
             instances: [(
                 "protobar".to_string(),
                 brenn_surface_schema::InstanceCounters {

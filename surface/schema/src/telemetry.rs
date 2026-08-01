@@ -448,6 +448,7 @@ mod tests {
                 deliveries: 10,
                 publishes: 2,
                 errors: 1,
+                telemetry_dropped: 3,
                 instances: BTreeMap::from([(
                     "p1".to_string(),
                     InstanceCounters {

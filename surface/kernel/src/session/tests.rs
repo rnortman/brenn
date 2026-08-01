@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::activation::DropAnnouncement;
 use crate::flush::PlaneRefusal;
-use crate::outbound::{PortPublish, TelemetryKind};
+use crate::outbound::{PortPublish, TelemetryKind, resolve_output};
 use crate::test_support::bindings as fixtures;
 use crate::test_support::bindings::output;
 use crate::test_support::pages;
@@ -171,8 +171,9 @@ fn a_detach_reports_the_loss_and_then_what_died_with_it() {
         connect, outbound, ..
     } = &mut page;
     let bindings = connect.bindings().expect("a document is in force");
-    let frame = outbound.publish_port(
-        bindings,
+    let out = resolve_output(bindings, "p1", "out", None).expect("the fixture binds p1/out");
+    outbound.publish_port(
+        out,
         PortPublish {
             instance: "p1".to_string(),
             port: "out".to_string(),
@@ -181,7 +182,6 @@ fn a_detach_reports_the_loss_and_then_what_died_with_it() {
             correlation: 7,
         },
     );
-    assert!(frame.is_some(), "the fixture binds p1/out");
 
     let effects = fold(&mut page, |r, page| {
         r.conn_event(
@@ -287,6 +287,95 @@ fn a_fatal_connection_event_reaches_the_platform_half() {
         vec![&Event::Fatal {
             detail: "unknown correlation".to_string()
         }]
+    );
+}
+
+/// A terminal verdict ends an attachment as finally as a detach does, and the
+/// page is told so: a caller still awaiting a publish is owed `ConnectionLost`
+/// now rather than never, and a page that went on believing itself attached would
+/// compose frames for a socket that is gone.
+///
+/// All three verdicts: the version mismatch and the stale-build close end an
+/// attachment exactly as a diagnosed fatal does.
+#[test]
+fn every_terminal_verdict_leaves_the_page_detached() {
+    for verdict in [
+        ConnEvent::Fatal {
+            detail: "unknown correlation".to_string(),
+        },
+        ConnEvent::Incompatible {
+            ours: VersionRange { min: 1, max: 1 },
+            theirs: VersionRange { min: 2, max: 3 },
+        },
+        ConnEvent::PeerClosedTerminal {
+            code: 4001,
+            reason: "build=deadbeef".to_string(),
+        },
+    ] {
+        let mut page = page();
+        send_one_publish(&mut page);
+        assert!(
+            page.connect.facts().is_some(),
+            "the fixture page is attached"
+        );
+
+        let effects = fold(&mut page, |r, page| {
+            r.conn_event(page, verdict.clone());
+        });
+
+        assert!(page.connect.facts().is_none(), "{verdict:?}");
+        assert!(
+            events(&effects).iter().any(|event| matches!(
+                event,
+                Event::PublishResult {
+                    correlation: 7,
+                    status: PublishStatus::ConnectionLost,
+                    ..
+                }
+            )),
+            "the caller the verdict stranded is answered: {verdict:?} {effects:?}"
+        );
+    }
+}
+
+/// Idempotent: a verdict reached while already detached asks for nothing beyond
+/// reporting itself.
+#[test]
+fn a_terminal_verdict_on_an_already_detached_page_still_reports_itself() {
+    let mut page = detached();
+    let effects = fold(&mut page, |r, page| {
+        r.conn_event(
+            page,
+            ConnEvent::Fatal {
+                detail: "again".into(),
+            },
+        );
+    });
+    assert_eq!(
+        events(&effects),
+        vec![&Event::Fatal {
+            detail: "again".to_string()
+        }]
+    );
+}
+
+/// Put one publish of `p1`'s on the wire, so a terminal verdict has a caller to
+/// strand.
+fn send_one_publish(page: &mut SurfacePage) {
+    let SurfacePage {
+        connect, outbound, ..
+    } = page;
+    let bindings = connect.bindings().expect("a document is in force");
+    let out = resolve_output(bindings, "p1", "out", None).expect("the fixture binds p1/out");
+    outbound.publish_port(
+        out,
+        PortPublish {
+            instance: "p1".to_string(),
+            port: "out".to_string(),
+            body: "{}".to_string(),
+            urgency: None,
+            correlation: 7,
+        },
     );
 }
 

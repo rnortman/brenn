@@ -188,6 +188,11 @@ pub(crate) use util::{checked_epoch_ms, epoch_ms, truncate_report_field};
 /// re-exported so the core's callers name one type.
 pub use brenn_attach_client::Millis;
 
+// TODO(attach-cutover): this vocabulary and the `on_input`/`dispatch_input`
+// routing over it are duplicated by `crate::turn`, whose inputs are the attach
+// driver's rather than the transport's. Delete them here when the kernel cuts
+// over.
+
 /// An input to the core, produced by the driver from transport and timer
 /// events. A transport-sourced input arriving in a state that no longer owns
 /// that transport is a post-close straggler and is absorbed; the core never
@@ -387,6 +392,11 @@ struct DropCharge {
     announced: u64,
 }
 
+// TODO(attach-cutover): this vocabulary and the `on_command` dispatch over it
+// are duplicated by `crate::command`, which resolves a port against the bindings
+// document instead of against `Welcome`. Delete them here when the kernel cuts
+// over.
+
 /// A command to the core, carried on [`Input::Command`], originating from the
 /// client handle.
 ///
@@ -547,6 +557,11 @@ struct PendingBatch {
 /// and costs nothing when no outbox is blocked (the timer is disarmed). A knob
 /// here would be a number nobody can state a requirement for.
 const RETRY_INTERVAL_MS: u64 = 1_000;
+
+// TODO(attach-cutover): this vocabulary is duplicated by
+// `crate::session::Effect`, the half of it a page still asks for once the
+// connection's own effects are the attach driver's business. Delete it here when
+// the kernel cuts over.
 
 /// An effect the driver must execute, in order.
 ///

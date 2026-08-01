@@ -120,6 +120,7 @@ pub fn dispatch(page: &mut SurfacePage, now_ms: u64) -> Option<ReadyActivation> 
 /// A struct rather than a parameter list: the four travel together and the caller
 /// is the invocation boundary, which is the one place that can put them in the
 /// wrong order.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completed {
     pub instance: String,
     /// The [`ReadyActivation::generation`] the assembly handed out — which mount

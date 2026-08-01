@@ -87,6 +87,11 @@ pub struct StatusReport<'a> {
     pub uptime_secs: u64,
     /// Lifetime totals, surface-wide and per instance.
     pub counters: &'a StatusCounters,
+    /// Telemetry documents the peer refused, from the page's own count. Stated
+    /// over whatever [`counters`](Self::counters) carries: only the layer that
+    /// settles a telemetry publish's outcome knows this total, so a reporter's
+    /// value for it is not a fact about anything.
+    pub telemetry_dropped: u64,
     /// The overlay chrome holds, as the plane policy recorded it.
     pub overlay: Option<&'a OverlayReport>,
 }
@@ -129,7 +134,10 @@ pub fn status_body(
         health: derive_health(report.instances, &expected_pumps(bindings)),
         uptime_secs: report.uptime_secs,
         instances: report.instances.to_vec(),
-        counters: report.counters.clone(),
+        counters: StatusCounters {
+            telemetry_dropped: report.telemetry_dropped,
+            ..report.counters.clone()
+        },
         overlay: report.overlay.cloned(),
     };
     doc.validate()?;

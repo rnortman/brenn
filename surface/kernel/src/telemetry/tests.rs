@@ -77,6 +77,7 @@ fn counters() -> StatusCounters {
         deliveries: 7,
         publishes: 3,
         errors: 1,
+        telemetry_dropped: 4,
         instances: BTreeMap::new(),
     }
 }
@@ -90,6 +91,9 @@ fn report<'a>(
         instances,
         uptime_secs: 90,
         counters,
+        // Deliberately not the reporter's `telemetry_dropped` above: the page's
+        // own count is the one the document carries.
+        telemetry_dropped: 9,
         overlay,
     }
 }
@@ -183,7 +187,14 @@ fn the_status_body_carries_the_report_and_the_derived_health() {
     assert_eq!(doc.health, Health::Ok);
     assert_eq!(doc.uptime_secs, 90);
     assert_eq!(doc.instances, instances);
-    assert_eq!(doc.counters, counters);
+    assert_eq!(
+        doc.counters,
+        StatusCounters {
+            telemetry_dropped: 9,
+            ..counters
+        },
+        "the reporter's three totals ride through; the refusal count is the page's"
+    );
     assert_eq!(doc.overlay.as_ref().map(|o| o.holder.as_str()), Some("p1"));
 }
 

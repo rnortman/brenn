@@ -124,6 +124,18 @@ fn port_publish(instance: &str, port: &str, body: &str, correlation: u64) -> Por
     }
 }
 
+fn publish(
+    outbound: &mut SurfaceOutbound,
+    bindings: &AppliedBindings,
+    instance: &str,
+    port: &str,
+    body: &str,
+    correlation: u64,
+) -> ClientFrame {
+    let out = resolve_output(bindings, instance, port, None).expect("the fixture binds the port");
+    outbound.publish_port(out, port_publish(instance, port, body, correlation))
+}
+
 /// The fields of a composed `Publish`, as a tuple the assertions read straight.
 fn publish_parts(frame: &ClientFrame) -> (&str, Option<&str>, &str, Urgency, Option<u64>) {
     match frame {
@@ -225,28 +237,11 @@ fn an_unbound_port_and_an_unknown_instance_resolve_alike() {
 fn a_port_publish_is_channel_addressed_and_attributed_to_its_instance() {
     let bindings = wiring();
     let mut outbound = SurfaceOutbound::new();
-    let frame = outbound
-        .publish_port(&bindings, port_publish("p1", "out", "hello", 77))
-        .expect("the port is bound");
+    let frame = publish(&mut outbound, &bindings, "p1", "out", "hello", 77);
     assert_eq!(
         publish_parts(&frame),
         (OUT, Some("p1"), "hello", Urgency::High, Some(0))
     );
-}
-
-#[test]
-fn an_unbound_port_composes_no_frame_and_spends_no_correlation() {
-    let bindings = wiring();
-    let mut outbound = SurfaceOutbound::new();
-    assert!(
-        outbound
-            .publish_port(&bindings, port_publish("p1", "nope", "hello", 1))
-            .is_none()
-    );
-    let frame = outbound
-        .publish_port(&bindings, port_publish("p1", "out", "hello", 2))
-        .expect("the port is bound");
-    assert_eq!(publish_parts(&frame).4, Some(0));
 }
 
 #[test]
@@ -255,12 +250,8 @@ fn a_result_answers_the_callers_own_token() {
     let mut outbound = SurfaceOutbound::new();
     // Two publishes, so the wire correlation (0, 1) and the caller's (77, 78)
     // cannot be confused by coincidence.
-    outbound
-        .publish_port(&bindings, port_publish("p1", "out", "a", 77))
-        .expect("the port is bound");
-    outbound
-        .publish_port(&bindings, port_publish("p2", "out", "b", 78))
-        .expect("the port is bound");
+    publish(&mut outbound, &bindings, "p1", "out", "a", 77);
+    publish(&mut outbound, &bindings, "p2", "out", "b", 78);
     let answer = outbound
         .on_publish_result(Some(1), PublishOutcome::Ok)
         .expect("a correlation this attachment sent");
@@ -289,9 +280,7 @@ fn every_wire_outcome_maps_to_a_caller_status() {
     ];
     for (outcome, expected) in cases {
         let mut outbound = SurfaceOutbound::new();
-        outbound
-            .publish_port(&bindings, port_publish("p1", "out", "a", 5))
-            .expect("the port is bound");
+        publish(&mut outbound, &bindings, "p1", "out", "a", 5);
         let answer = outbound
             .on_publish_result(Some(0), outcome)
             .expect("a correlation this attachment sent");
@@ -321,9 +310,7 @@ fn a_result_this_attachment_never_asked_for_is_unreconcilable() {
 fn a_lost_attachment_answers_only_the_callers_publishes() {
     let bindings = wiring();
     let mut outbound = SurfaceOutbound::new();
-    outbound
-        .publish_port(&bindings, port_publish("p1", "out", "a", 77))
-        .expect("the port is bound");
+    publish(&mut outbound, &bindings, "p1", "out", "a", 77);
     outbound.report(
         &bindings,
         ErrorReport {
@@ -334,9 +321,7 @@ fn a_lost_attachment_answers_only_the_callers_publishes() {
         },
     );
     outbound.publish_telemetry(&bindings, TelemetryKind::Status, "{}".to_string());
-    outbound
-        .publish_port(&bindings, port_publish("p2", "out", "b", 78))
-        .expect("the port is bound");
+    publish(&mut outbound, &bindings, "p2", "out", "b", 78);
 
     let answers = outbound.fail_pending();
     assert_eq!(

@@ -18,7 +18,7 @@ use brenn_surface_schema::{Binding, LOCAL_OVERLAY_STATE_CHANNEL, NoiseLevel};
 use crate::activation::DropAnnouncement;
 
 use crate::core::PublishStatus;
-use crate::outbound::PortPublish;
+use crate::outbound::{PortPublish, resolve_output};
 use crate::registry::BindingKey;
 use crate::test_support::bindings as fixtures;
 use crate::test_support::bindings::output;
@@ -616,18 +616,17 @@ fn a_detach_answers_the_publishes_the_connection_carried() {
         connect, outbound, ..
     } = &mut page;
     let wiring = connect.bindings().expect("the document is in force");
-    outbound
-        .publish_port(
-            wiring,
-            PortPublish {
-                instance: "p1".to_string(),
-                port: "out".to_string(),
-                body: "{}".to_string(),
-                urgency: None,
-                correlation: 7,
-            },
-        )
-        .expect("p1 binds the port");
+    let out = resolve_output(wiring, "p1", "out", None).expect("p1 binds the port");
+    outbound.publish_port(
+        out,
+        PortPublish {
+            instance: "p1".to_string(),
+            port: "out".to_string(),
+            body: "{}".to_string(),
+            urgency: None,
+            correlation: 7,
+        },
+    );
     let detached = page.on_detached();
     assert_eq!(
         detached.answers,
