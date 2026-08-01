@@ -42,8 +42,7 @@ use brenn_queue::CursorOverflow;
 use brenn_surface_schema::{RESERVED_LOCAL_CHANNELS, reserved_local_channel};
 use uuid::Uuid;
 
-use crate::bindings::AppliedBindings;
-use crate::core::channel_is_transportable;
+use crate::bindings::{AppliedBindings, channel_is_transportable};
 
 /// One input binding as a reader of its channel's store: the instance whose
 /// position it is, and the port it reads through.

@@ -22,17 +22,17 @@ use brenn_envelope::{SURFACE_SUB_IDENTITY_SEP, surface_sub_identity};
 /// acted*, not by which channel was touched:
 ///
 /// - `surface:<slug>` — the platform grain. The page's kernel itself: its
-///   telemetry (geometry, status, boot/terminal stamps), its heartbeats, and
-///   its reports about itself. It holds no durable subscription of its own —
-///   every surface subscription is a component instance's.
+///   telemetry (geometry, status, boot/terminal stamps), its heartbeats, its
+///   reports about itself, and every subscription the page holds — the server
+///   sees one subscriber per channel, whatever binds it behind the socket.
 /// - `surface:<slug>#<instance>` — the component grain. One declared component
 ///   instance acting on its own behalf: its publishes, its send budget, and its
-///   own subscriptions (one per bound channel, each with its own push window and
-///   resume cursor).
+///   own page-side bindings (one per bound channel, each with its own push
+///   window and cursor, enforced by the page).
 ///
 /// The WebSocket is transport, not a principal: one page carries every one of
-/// its instances' subscriptions, exactly as one server carries every
-/// `[[app]]`'s.
+/// its instances' bindings, and which of them a delivered message is for is the
+/// page's own bookkeeping.
 ///
 /// The principal is the *instance*, the exact analog of a backend `[[app]]`
 /// slug: an `[[app]]` block is an instance (its slug names one, its ACLs name
@@ -71,13 +71,14 @@ pub enum SubscriberKind {
     /// A browser surface subscriber. Two grains, exactly as [`ParticipantId`]
     /// has two: `instance: Some(_)` is a component instance
     /// (`surface:<slug>#<instance>`) — the principal that owns a
-    /// `[[surface.subscription]]` binding, one subscription per (channel,
-    /// instance), the analog of a backend `[[app]]`. `instance: None` is the
+    /// `[[surface.subscription]]` binding and publishes under its own
+    /// sub-identity, the analog of a backend `[[app]]`. `instance: None` is the
     /// surface's own kernel (`surface:<slug>`), the platform grain for
-    /// kernel-originated traffic; it holds no durable subscription of its own.
-    /// No surface subscription frame or key carries the None grain; the grain
-    /// exists here only because the bare `surface:<slug>` identity is a live
-    /// *publisher* participant (kernel telemetry and self-reports).
+    /// kernel-originated traffic.
+    ///
+    /// Both grains key to the one `SubscriberEntryKind::Surface(slug)`: the
+    /// directory is cut at (surface, channel), so the distinction here is about
+    /// *who acted*, never about which subscription a delivery is for.
     Surface {
         slug: String,
         instance: Option<String>,
@@ -381,11 +382,6 @@ impl ParticipantId {
         } else if let Some(slug) = self.0.strip_prefix("wasm:") {
             SubscriberKind::Wasm(slug.to_owned())
         } else if self.0.starts_with("surface:") {
-            // Both grains are subscriber keys. A component instance owns its own
-            // subscription, push window, and cursor — twelve instances of one
-            // kind are twelve principals, exactly like twelve `[[app]]` blocks.
-            // The bare form is the kernel's, and subscribes only what no
-            // component owns (the layout channel).
             SubscriberKind::Surface {
                 slug: self.as_surface_slug().to_owned(),
                 instance: self.surface_component().map(str::to_owned),

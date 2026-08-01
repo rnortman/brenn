@@ -21,8 +21,8 @@ use crate::WebSysConnector;
 use crate::contract::{defer_status_str, element_name_for_instance, publish_status_str};
 use crate::front::{self, EventStream, SurfaceHandle};
 use crate::page::SurfacePage;
-use crate::proto::{LogLevel, STALE_BUILD_CLOSE_CODE};
 use crate::runner::SurfaceRunner;
+use crate::schema::{LogLevel, STALE_BUILD_CLOSE_CODE};
 use crate::session::Event;
 
 use crate::dom;
@@ -657,7 +657,7 @@ pub struct KernelHandle {
 impl KernelHandle {
     /// Forward a bootstrap-caught global error at `Error` level: write the
     /// browser-console copy, then hand it to [`SurfaceHandle::report`], which
-    /// publishes it to the reserved error-report port when the advertised floor
+    /// publishes it to the surface's error channel when the configured floor
     /// admits `Error` (best-effort; console-only otherwise or when down).
     ///
     /// No report subject: a global error is caught at the window, which attests
@@ -1014,7 +1014,7 @@ mod tests {
     fn reporting_doc() -> BindingsDocument {
         let mut document = fixtures::doc(vec![], vec![], vec![], vec![]);
         document.platform.error_channel = Some(ERRORS.to_string());
-        document.platform.error_report_floor = Some(crate::proto::LogLevel::Warn);
+        document.platform.error_report_floor = Some(crate::schema::LogLevel::Warn);
         document
     }
 

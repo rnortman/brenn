@@ -60,7 +60,7 @@ struct ManifestComponent {
 /// per instance. Forcing extra evaluations would only duplicate glue.
 ///
 /// The reserved ABIs never reach here — `resolve_abi` panics on them at boot.
-fn module_url(entry: &brenn_surface_schema::ComponentEntry, build_id: &str) -> String {
+fn module_url(entry: &brenn_lib::messaging::config::ResolvedComponent, build_id: &str) -> String {
     match entry.abi {
         Abi::Dom => format!(
             "/surface-static/{}?v={build_id}&instance={}",
@@ -107,7 +107,7 @@ pub async fn surface_page(
     // bought differs by ABI — see `module_url` — so the entry carries the `abi`
     // the bootstrap loader branches on.
     let manifest_components: Vec<ManifestComponent> = runtime
-        .bindings
+        .resolved
         .components
         .iter()
         .map(|entry| ManifestComponent {

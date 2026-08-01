@@ -1021,10 +1021,7 @@ async fn build_surface_feed_messenger() -> (Arc<Messenger>, String, Arc<Counting
         .brenn_subscribe
         .push(ChannelMatcher::Prefix(String::new()));
     let entry = surface_channel_entry(vec![SubscriberEntry {
-        kind: SubscriberEntryKind::Surface {
-            slug: "durabar".to_string(),
-            instance: None,
-        },
+        kind: SubscriberEntryKind::Surface("durabar".to_string()),
         push_depth: Depth::Unbounded,
         retain_depth: Depth::Unbounded,
         noise: NoiseLevel::Silent,
@@ -1070,10 +1067,7 @@ async fn build_ephemeral_surface_feed_messenger_at(
         refill: u32::MAX,
     };
     entry.subscribers = vec![SubscriberEntry {
-        kind: SubscriberEntryKind::Surface {
-            slug: "durabar".to_string(),
-            instance: None,
-        },
+        kind: SubscriberEntryKind::Surface("durabar".to_string()),
         push_depth: Depth::Unbounded,
         retain_depth: Depth::Unbounded,
         noise: NoiseLevel::Silent,

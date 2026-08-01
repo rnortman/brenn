@@ -75,14 +75,12 @@ use brenn_attach_client::driver::{AttachDriver, DriverStep, IoEvent};
 use brenn_attach_client::transport::clock::{checked_epoch_ms, epoch_ms, wall_now};
 use brenn_surface_contract::Activation;
 
-use crate::activation::ReadyActivation;
+use crate::activation::{ActivationOutcome, ReadyActivation};
 use crate::command::Command;
-use crate::core::ActivationOutcome;
 use crate::front::{
-    AlertCommand, FrontChannels, PublishCommand, PublishSlot, ReportCommand, SurfaceGate,
-    TelemetryCommand,
+    ActivationEntry, AlertCommand, FrontChannels, PublishCommand, PublishSlot, ReportCommand,
+    SurfaceGate, TelemetryCommand,
 };
-use crate::handle::ActivationEntry;
 use crate::outbound::PortPublish;
 use crate::outward::{self, Completed};
 use crate::page::SurfacePage;

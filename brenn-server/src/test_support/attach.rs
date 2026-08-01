@@ -187,6 +187,34 @@ pub(crate) async fn one_channel_messenger(db: &Db, bare: &str) -> (Arc<Messenger
     (messenger, channel_uuid)
 }
 
+/// [`one_channel_messenger`]'s ephemeral twin: one declared `ephemeral:`
+/// channel, its retention a ring store rather than the database.
+///
+/// The retained window is `retain_depth`, so a suite that means to exercise the
+/// clamp sizes it here; the durable twin's retention is the database's and is
+/// bounded by the subscription's own depths instead.
+pub(crate) fn one_ephemeral_channel_messenger(
+    db: &Db,
+    bare: &str,
+    retain_depth: u64,
+) -> (Arc<Messenger>, Uuid) {
+    let entry = brenn_lib::messaging::testutils::ephemeral_channel_entry(bare, retain_depth);
+    let channel_uuid = entry.uuid;
+    let stores = Arc::new(brenn_lib::messaging::store::RingStores::build(
+        std::slice::from_ref(&entry),
+    ));
+    let messenger = Messenger::new(
+        db.clone(),
+        Arc::new(MessagingDirectory::with_entries(vec![entry])),
+        Arc::from("test-origin"),
+        Arc::new(indexmap::IndexMap::new()),
+        Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
+        MessagingGlobalConfig::default(),
+    )
+    .with_ring_stores(stores);
+    (messenger, channel_uuid)
+}
+
 /// Builds one attachment's context over a stub profile.
 ///
 /// Defaults are the shape every suite shares — a directory-less messenger, an

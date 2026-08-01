@@ -234,7 +234,7 @@ mod tests {
             automation_engine: None,
             usage_session_gap_secs: 1800,
             surfaces: Arc::new(std::collections::HashMap::new()),
-            surface_registry: Default::default(),
+            attach_registry: Default::default(),
             surface_heartbeat_secs: 1,
             replay_components: Arc::new(std::collections::HashMap::new()),
             replay_locks: Arc::new(std::collections::HashMap::new()),

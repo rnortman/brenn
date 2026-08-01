@@ -66,8 +66,7 @@ use brenn_attach_client::store::DeferOp;
 use brenn_attach_proto::{BatchDeferredOp, BatchEntry, DeferredOpKind};
 
 use crate::activation::{DropVerdicts, Schedules};
-use crate::bindings::AppliedBindings;
-use crate::core::channel_is_transportable;
+use crate::bindings::{AppliedBindings, channel_is_transportable};
 use crate::outbound::SurfaceOutbound;
 use crate::publish_buffer::{BufferedDeferOp, BufferedPublish, PublishBuffer};
 use crate::registry::{Registrations, SurfaceStores};

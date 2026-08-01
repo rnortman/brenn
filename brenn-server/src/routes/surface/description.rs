@@ -5,8 +5,8 @@
 //! durable channels whose addresses are derived by convention (never templated
 //! by consumers): an `index` entry point, a markdown `help` doc per surface, and
 //! a markdown `help` + JSON `schema` pair per component kind. Every document is
-//! built at boot
-//! from the same resolved surfaces that produce `Welcome` bindings (no drift)
+//! built at boot from the same resolved surfaces that produce the bindings
+//! documents (no drift)
 //! and published once under the reserved single-writer `system:surface-help`
 //! identity. Readers (LLM conversations) pull the latest retained value via the
 //! auto-approved `MessageChannelGet` tool; the shell never consumes these.

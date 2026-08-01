@@ -14,14 +14,17 @@ use brenn_attach_proto::{
 };
 use brenn_envelope::Urgency;
 use brenn_surface_schema::bindings::BindingsDocument;
+use brenn_surface_schema::telemetry::{InstanceReport, StatusCounters};
 use brenn_surface_schema::{
-    Binding, CONTROL_PLANE_VERSION, InstanceReport, InstanceState, LOCAL_OVERLAY_STATE_CHANNEL,
-    NoiseLevel, OverlayStateBody, StatusCounters,
+    Binding, CONTROL_PLANE_VERSION, InstanceState, LOCAL_OVERLAY_STATE_CHANNEL, NoiseLevel,
+    OverlayStateBody,
 };
 use uuid::Uuid;
 
-use crate::core::{ActivationOutcome, PublishBuffer, PublishStatus};
+use crate::activation::ActivationOutcome;
+use crate::outbound::PublishStatus;
 use crate::outbound::{PortPublish, resolve_output};
+use crate::publish_buffer::PublishBuffer;
 use crate::registry::BindingKey;
 use crate::session::Event;
 use crate::test_support::bindings as fixtures;

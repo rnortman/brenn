@@ -1,0 +1,17 @@
+[package]
+name = "brenn-attach-conformance"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A non-browser attacher built on brenn-attach-client alone, plus the severable relay its reconnect run needs"
+
+# The dependency set is the point. An attacher needs the attachment protocol,
+# the attacher-generic client, and the bus envelope its deliveries carry —
+# nothing else. No surface crate appears here or anywhere below it, so a surface
+# concept that leaked into the client would fail to compile against this crate.
+[dependencies]
+brenn-attach-client = { path = "../client" }
+brenn-attach-proto = { path = "../proto" }
+brenn-envelope = { path = "../../brenn-envelope" }
+tokio = { version = "1.50.0", features = ["rt", "time", "net", "io-util", "sync", "macros"] }
+tracing = "0.1.44"

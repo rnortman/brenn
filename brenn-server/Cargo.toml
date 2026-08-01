@@ -57,10 +57,13 @@ base64ct = { version = "1.8.3", features = ["alloc"] }
 brenn-cal = { version = "0.1.0", path = "../brenn-cal" }
 brenn-cc = { version = "0.1.0", path = "../brenn-cc", features = ["testutils"] }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
-# Native integration tests drive the real surface client against the real
-# router/session. No cycle: the client depends only on the proto + envelope
-# crates, never on brenn-server.
-brenn-surface-kernel = { version = "0.1.0", path = "../surface/kernel" }
+# The attacher-generic client, for the one handshake-cookie helper the WS test
+# harness shares with a real attacher.
+brenn-attach-client = { version = "0.1.0", path = "../attach/client" }
+# A whole non-browser attacher, driven against the real route over a real
+# socket. No cycle: it depends on the attach crates and the envelope crate,
+# never on brenn-server or any surface crate.
+brenn-attach-conformance = { version = "0.1.0", path = "../attach/conformance" }
 git-fixture = { version = "0.1.0", path = "../git-fixture" }
 tokio = { version = "1.50.0", features = ["full", "test-util"] }
 http-body-util = "0.1.3"

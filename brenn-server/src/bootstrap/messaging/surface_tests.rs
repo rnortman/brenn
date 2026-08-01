@@ -60,10 +60,7 @@ fn surface_boot_directory() -> messaging::MessagingDirectory {
             wake_min: brenn_lib::messaging::WakeMin::Normal,
         },
         subscribers: vec![SubscriberEntry {
-            kind: SubscriberEntryKind::Surface {
-                slug: "deskbar".to_string(),
-                instance: None,
-            },
+            kind: SubscriberEntryKind::Surface("deskbar".to_string()),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             noise: NoiseLevel::Silent,
@@ -642,8 +639,8 @@ fn surface_access_and_budgets_carry_through() {
 
 /// A `brenn:` binding resolves into `wire_subscriptions`, inheriting the
 /// channel's push/retain/noise/wake defaults when the knobs are unset. The
-/// `SurfaceBinding` list still carries it too (it serves the `Welcome`
-/// payload).
+/// `SurfaceBinding` list still carries it too (it serves the bindings
+/// document).
 #[test]
 fn surface_durable_subscription_inherits_channel_defaults() {
     use brenn_lib::messaging::config::{Depth, NoiseLevel};
@@ -1255,9 +1252,9 @@ fn surface_shared_subscription_agreeing_noise_carries() {
     assert_eq!(ds.subscription.noise, NoiseLevel::Alarm);
 }
 
-/// Two *different* instances on one channel are two principals: two
-/// subscriptions, two windows, two cursors — the same shape two `[[app]]`
-/// blocks on one channel produce. Nothing is shared, so nothing folds.
+/// Two *different* instances on one channel resolve two bindings, each keeping
+/// its own declared depths — resolution folds nothing. The directory fold is
+/// tested in [`surface_sibling_bindings_are_one_directory_subscriber`].
 #[test]
 fn surface_sibling_instances_on_one_channel_are_two_subscriptions() {
     use brenn_lib::messaging::config::Depth;
@@ -1289,6 +1286,48 @@ fn surface_sibling_instances_on_one_channel_are_two_subscriptions() {
         ],
         "each keeps its own declared depth — sibling windows never fold together"
     );
+}
+
+/// The boot path's half of the collapse: two sibling bindings on one channel
+/// reach the directory as the one subscriber entry the surface holds there, at
+/// the widest depth either asked for. A second entry would be a second
+/// server-side push window feeding the one socket the page attaches with, and
+/// the router would hand that session every message twice.
+#[test]
+fn surface_sibling_bindings_are_one_directory_subscriber() {
+    use brenn_lib::messaging::SubscriberEntryKind;
+    use brenn_lib::messaging::config::{Depth, finalize_directory_with_subscribers};
+    let dir = make_bounded_brenn_dir("brenn:alerts");
+    let mut raw = durable_surface_raw();
+    // The wider binding first, so a last-wins fold would land on 6.
+    raw.subscriptions[0].push_depth = Some(Depth::Bounded(9));
+    raw.components.push(component_raw("agenda-bob"));
+    let mut bob = surface_sub_raw("brenn:alerts", "agenda-bob", "in");
+    bob.push_depth = Some(Depth::Bounded(6));
+    raw.subscriptions.push(bob);
+    let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
+
+    let entries: Vec<ChannelEntry> = dir.list().iter().map(|e| (**e).clone()).collect();
+    let finalized = finalize_directory_with_subscribers(
+        entries,
+        &[],
+        &[],
+        &[(
+            resolved[0].slug.clone(),
+            resolved[0].wire_subscriptions.clone(),
+        )],
+    );
+    let channel = &finalized.list()[0];
+    assert_eq!(
+        channel.subscribers.len(),
+        1,
+        "two sibling bindings are one directory subscriber"
+    );
+    assert_eq!(
+        channel.subscribers[0].kind,
+        SubscriberEntryKind::Surface(resolved[0].slug.clone())
+    );
+    assert_eq!(channel.subscribers[0].push_depth, Depth::Bounded(9));
 }
 
 /// Depth 0 on a durable binding takes the same rule as every other class: legal,
@@ -1638,8 +1677,8 @@ fn surface_sibling_instances_carry_their_own_send_budgets() {
 
 /// `principal_send_budgets` is what boot installs from: the kernel grain at the
 /// defaults, then every declared instance with its own resolved parameters. It
-/// must cover exactly `principals()` — a drift leaves a live principal
-/// unbudgeted, which the publish gate panics on.
+/// must cover the kernel grain and every declared component — a drift leaves a
+/// live principal unbudgeted, which the publish gate panics on.
 #[test]
 fn surface_principal_send_budgets_cover_every_principal() {
     use brenn_lib::messaging::config::SurfaceSendBudget;
@@ -1649,10 +1688,17 @@ fn surface_principal_send_budgets_cover_every_principal() {
     let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
     let budgeted: Vec<(Option<String>, SurfaceSendBudget)> =
         resolved[0].principal_send_budgets().collect();
-    let principals: Vec<Option<String>> = resolved[0].principals().collect();
+    let declared: Vec<Option<String>> = std::iter::once(None)
+        .chain(
+            resolved[0]
+                .components
+                .iter()
+                .map(|c| Some(c.instance.clone())),
+        )
+        .collect();
     assert_eq!(
         budgeted.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
-        principals,
+        declared,
     );
     assert_eq!(budgeted[0].1, SurfaceSendBudget::default(), "kernel grain");
     assert_eq!(budgeted[1].1.burst, 400, "the declared instance's override");
@@ -2280,8 +2326,8 @@ fn component_abi_dom_resolves() {
 #[test]
 fn component_abi_processor_resolves() {
     // Headless component-model hosting: the kernel loads a jco-transpiled
-    // `brenn:processor` artifact, so the ABI resolves and rides `Welcome` beside
-    // `dom`. What the artifact may import is a separate, asset-level check.
+    // `brenn:processor` artifact, so the ABI resolves and rides the bindings
+    // document beside `dom`. What the artifact may import is a separate, asset-level check.
     let resolved = resolve_surfaces(
         &[surface_with_abi("processor")],
         &dir_of(vec![]),
@@ -2359,7 +2405,8 @@ fn resolve_with_component_config(
 }
 
 /// A `processor` component's declared map resolves through onto its
-/// `ResolvedComponent`, which is what rides `Welcome` as `ComponentEntry.config`.
+/// `ResolvedComponent`, which is what rides the bindings document as
+/// `ComponentEntry.config`.
 #[test]
 fn processor_component_config_resolves() {
     let map = std::collections::BTreeMap::from([

@@ -11,7 +11,7 @@ use crate::contract::{
     SURFACE_RELOAD, SURFACE_ROOT_ID, element_name_for_instance, publish_status_str,
 };
 use crate::front::SurfaceHandle;
-use crate::proto::LogLevel;
+use crate::schema::LogLevel;
 use crate::{ActivationEntry, ActivationOutcome};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -22,7 +22,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{CustomEvent, CustomEventInit, Document, Element, Event, HtmlElement, Window};
 
-use crate::proto::{InstanceCounters, StatusCounters};
+use crate::schema::telemetry::{InstanceCounters, StatusCounters};
 
 use crate::logic::{ConnectIndicatorState, DeferDetail, KernelAction, OptionalField};
 
@@ -32,10 +32,10 @@ const KERNEL_LOG_SOURCE: &str = "kernel";
 /// The `source` prefix the kernel stamps on a component-originated `brenn-log`
 /// before publishing it as an error report: `"component:<instance>"`.
 ///
-/// Human-readable detail only — the machine-readable twin is the report's
-/// `subject_instance`, which the server validates against the declared instance
-/// set and derives the sender sub-identity from. The two are composed from the
-/// same instance id at each call site, but only the latter is trusted.
+/// Human-readable detail only — the machine-readable twin is the report publish's
+/// `attribution`, which the peer validates against the declared set and derives
+/// the sender sub-identity from. The two are composed from the same instance id
+/// at each call site, but only the latter is trusted.
 const COMPONENT_LOG_SOURCE_PREFIX: &str = "component:";
 
 thread_local! {

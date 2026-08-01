@@ -47,9 +47,9 @@ pub const STATUS_INTERVAL_SECS_MAX: u32 = 3600;
 /// of a live surface are built together, so a field this reader does not know
 /// means the document was written by something other than the matching server —
 /// exactly the case where guessing is worse than stopping. The entry structs
-/// ([`ComponentEntry`], [`Binding`], [`OutputBinding`], [`LocalChannel`]) are
-/// shared with the WS frames and carry the frames' variant-level strictness
-/// instead.
+/// ([`ComponentEntry`], [`Binding`], [`OutputBinding`], [`LocalChannel`]) live
+/// at the crate root because the page-local planes name them too; the strictness
+/// is stated once, here, on the document that carries them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BindingsDocument {

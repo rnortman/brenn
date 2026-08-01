@@ -1,5 +1,25 @@
 # TODOs
 
+## `test-task-panic-visibility`
+
+A panic on a connection task spawned by `spawn_test_server`
+(brenn-server/src/test_support/http.rs) is absorbed by tokio and asserted
+against by nothing, so any regression that panics server-side after the last
+frame a test reads — the detach path, the unregistration, a telemetry publish —
+passes green across the whole brenn-server route suite. Found when four surface
+suites were panicking the server on teardown and still reporting `ok`; those
+rigs are fixed, the blindness is not.
+
+Needs a design call before it can be built: a global panic hook is process-wide
+and would have to distinguish a deliberate `#[should_panic]` from a swallowed
+task panic (~2500 tests, some multi-thread, run concurrently in one process),
+and a drop-time assertion aborts on double panic. Done when a connection task
+that panics fails the test that provoked it, without breaking `#[should_panic]`.
+
+Code site (`TODO(test-task-panic-visibility)`):
+brenn-server/src/test_support/http.rs, `spawn_test_server`.
+
+
 ## `scrub-template-drift-cache-skip`
 
 `repo_template_matches_the_tracked_public_config` (scrub/tests/rules.rs) guards
@@ -43,7 +63,8 @@ closed at the trust boundary (router drops what it cannot stamp) or the
 strictness symmetry is pinned structurally.
 
 Code site (`TODO(takeover-parser-symmetry-guard)`):
-`surface/client/src/core/mod.rs`, `inject_takeover_instance`.
+`surface/kernel/src/planes.rs`, `SurfacePlanes::guard` (the takeover plane's
+parse-failure passthrough).
 
 ---
 
@@ -68,7 +89,7 @@ Code site (`TODO(plane-version-check)`):
 
 The kernel's activation-registration gate (`KernelCore.registered`) only ever
 grows: nothing clears it on unmount, error-card teardown, or binding removal,
-and the kernel never calls `ClientHandle::deregister_activation`. Correct today
+and the kernel never calls `SurfaceHandle::deregister_activation`. Correct today
 because an instance id is page-unique-forever — a layout change reloads the
 page, and a failed instance is terminal. If an instance's element is ever torn
 down and a fresh element for the same id remounts within one page life, the gate
@@ -90,7 +111,7 @@ Code site (`TODO(kernel-registration-gate-lifecycle)`):
 
 The buffered-vs-gesture publish split — `try_buffered_publish`
 (instance-match) and the `invoke`'s in-flight-slot install/take
-(`surface/kernel/src/driver.rs`, `surface/kernel/src/runner.rs`) — has no direct
+(`surface/kernel/src/front.rs`, `surface/kernel/src/runner.rs`) — has no direct
 test. Both are wasm-only
 (`cfg(target_arch = "wasm32")`), and the kernel's own state-machine suites run
 *natively* (`cargo test`); the browser suites that do exist
@@ -103,10 +124,8 @@ take-back (entangled with `surface-wasm-test-in-ci`, since a browser suite that
 never runs answers nothing).
 
 Code sites (`TODO(buffered-publish-routing-test)`):
-`surface/kernel/src/front.rs` (`try_buffered_publish`, the surviving copy),
-`surface/kernel/src/runner.rs` (wasm `invoke_wasm`, the surviving copy),
-`surface/kernel/src/handle.rs` and `surface/kernel/src/driver.rs` (the doomed
-twins, `attach-cutover`).
+`surface/kernel/src/front.rs` (`try_buffered_publish`),
+`surface/kernel/src/runner.rs` (wasm `invoke_wasm`).
 
 ---
 
@@ -491,7 +510,7 @@ The surface's resume layer classifies why replay could not cover a requested
 resume point — epoch change, hole past the retained ring, resume beyond the
 retained window — and hands the reason to the page
 (`SubscribeResult.gap`, consumed in
-`surface/client/src/core/mod.rs::on_subscribe_result`). The backend's
+`surface/kernel/src/inbound.rs::on_subscribe_result`). The backend's
 `processor.wit` world has no equivalent: a wasmtime-hosted component cannot
 tell "I resumed cleanly" from "the bus lost my place", so it cannot decide
 whether its own derived state is trustworthy after a restart.
@@ -989,76 +1008,6 @@ sender still alive, and the run terminates.
 
 Code site (`TODO(runner-drain-host-departure)`): `surface/kernel/src/runner.rs`,
 at `run_terminal_drain`.
-
-
-## `attach-cutover`
-
-`brenn-attach-client` and the surface kernel's new channel-keyed modules hold
-generalized copies of machinery that is still live in `ClientCore`
-(`surface/kernel/src/core/`) and in the server's surface route. Both copies
-compile, and nothing links them — the compiler cannot tell you when one is fixed
-and the other is not, so every bug found in one has to be found twice until both
-ends cut over.
-
-The browser has cut over: `entry.rs` builds a `SurfacePage` and a
-`SurfaceRunner`, and `logic.rs`/`dom.rs` run on `session::Event` and
-`front::SurfaceHandle`. What keeps the doomed copies compiled is the *server*
-route: `brenn-server/src/routes/surface/client_tests.rs` drives the old client
-against the old session, so both halves die together when
-`routes/surface/mod.rs` cuts over to `routes/attach`'s session.
-
-The copies have already diverged deliberately: the crate's retry timer arms only
-when a tick could actually send something, where the kernel's arms whenever any
-outbox has a queued flush. The generalized copy is the surviving one everywhere,
-so the cutover deletes the live one rather than reconciling them.
-
-Done when the server route runs on `routes/attach` and every doomed copy listed
-below is deleted — an explicit inventory, not a best-effort sweep, because a
-piece missed here becomes a permanent silent fork.
-
-Inventory, surviving copy → doomed twin (each twin carries a
-`TODO(attach-cutover)` marker):
-
-- `brenn_attach_client::{conn, subs, store, publish}` → `core/mod.rs`'s
-  connection/backoff lifecycle, wire-subscription refcounts and outbox/retry
-  plane, and `core/store.rs`'s `SurfaceChannelStore`.
-- `brenn_attach_client`'s PRNG and frame/duration helpers → `core/util.rs`'s
-  `SplitMix64`, `frame_type_name`, `duration_ms`.
-- `surface/kernel/src/outbound.rs`'s `publish_status` → `core/util.rs`'s
-  `publish_outcome_to_status` (same table, different outcome type).
-- `surface/kernel/src/logic.rs`'s `connect_url` (with its private
-  `encode_query_component`/`hex_upper`) → `core/util.rs`'s `build_connect_url`
-  and its byte-identical copy of that encoder pair. The surviving one composes
-  the whole URL from `location`; the doomed one appends to a URL it is handed.
-- `surface/kernel/src/connect.rs` + `registry.rs` + `outbound.rs` →
-  `core/mod.rs`'s bindings-application sequence (`on_welcome`,
-  `reconcile_stores`, `reconcile_registered`, `send_parked_batches`) and the
-  registration half of its `registered` table.
-- `surface/kernel/src/planes.rs` → `core/mod.rs`'s plane guard block (overlay
-  validation, the takeover stamp in `guard_local_body`, `record_overlay_state`).
-- `surface/kernel/src/telemetry.rs` → `core/mod.rs`'s `SendGeometry`/`SendStatus`
-  command path and `brenn-server/src/routes/surface/telemetry.rs`'s frame
-  validation, health derivation and document composition (its server-written
-  disconnected stamp stays).
-- `surface/kernel/src/turn.rs` plus `session.rs`'s `Reactions` fold →
-  `core/mod.rs`'s `Input` vocabulary, its `on_input`/`dispatch_input` routing,
-  and its `Effect` vocabulary.
-- `surface/kernel/src/command.rs` → `core/mod.rs`'s `Command` vocabulary and its
-  `on_command` dispatch (the telemetry arms of which the row above also names).
-- `surface/kernel/src/runner.rs` → `surface/kernel/src/driver.rs`: `Driver::run`,
-  its three `select_biased!` sites (the handle plane's publish, alert and
-  telemetry arms included), the effect-execution drain, the terminal drain, the
-  `PublishGate` refresh, and the activation dispatch (`drain_activations`,
-  `invoke`, `unwind_message`, `yield_now`, the wasm in-flight slot's
-  install/take-back).
-- `surface/kernel/src/front.rs` → `surface/kernel/src/handle.rs`'s `new`,
-  `ClientHandle`, `PublishGate` and its wasm in-flight publish routing
-  (`try_buffered_publish` and its siblings). One thing in that file has no
-  surviving copy and must not be deleted with it: `ActivationEntry`, which
-  `front.rs` and `runner.rs` both name from there. (`InFlightSlot` and
-  `InFlightPublish` already moved to `front.rs`; `handle.rs` names them from
-  there.)
-
 
 
 ## `batch-frame-cap`

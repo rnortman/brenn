@@ -379,11 +379,7 @@ fn validate_static_subscriptions_deliverable(
                     slug.as_str(),
                     wasm_policy_by_slug.get(slug.as_str()).copied(),
                 ),
-                // Policy is per-surface at either grain (a component's grants are
-                // its config-declared bindings, which the surface's own ACLs
-                // cover), so the instance half decorates the label and never the
-                // lookup.
-                SubscriberEntryKind::Surface { slug, .. } => (
+                SubscriberEntryKind::Surface(slug) => (
                     "surface",
                     slug.as_str(),
                     surface_policy_by_slug.get(slug.as_str()).copied(),
@@ -713,7 +709,7 @@ pub(crate) async fn build_messaging(
             .collect();
 
     // Resolve the `[[surface]]` blocks *before* finalizing the directory: every
-    // transportable surface subscription resolves to a
+    // transportable surface subscription folds into a
     // `SubscriberEntryKind::Surface` directory entry, so they must be ready for
     // `finalize_directory_with_subscribers`. `resolve_surfaces` cross-validates
     // every binding against `pre_directory` (the same channel set the final
@@ -988,30 +984,24 @@ pub(crate) async fn build_messaging(
             },
         );
     }
-    // One registration per surface *principal* (`ResolvedSurface::principals`).
-    // All carry the surface's own policy — authority is per-surface (a
-    // component's grants are its config-declared bindings, which boot proved the
-    // surface's ACLs cover), so the instance grain buys per-principal delivery
-    // gating and lag tracking, not a separate ACL blob.
+    // One registration per surface, carrying its own policy. Authority is
+    // per-surface — a component's grants are its config-declared bindings, which
+    // boot proved the surface's ACLs cover — and so is the subscriber grain: the
+    // directory is cut at (surface, channel), and a publish under a component
+    // attribution resolves its policy here too.
     //
-    // Every instance is registered, not just the ones with a durable binding
-    // today: surface target resolution fails closed on a missing registration, so
-    // deriving this set from the bindings would silently deny delivery the moment
-    // a binding is added anywhere else. The declaration set is the authority.
+    // Every declared surface is registered, not just the ones holding a
+    // transportable binding today: surface target resolution fails closed on a
+    // missing registration, so deriving this set from the bindings would silently
+    // deny delivery the moment a binding is added.
     for s in &resolved_surfaces {
-        let registration = brenn_lib::messaging::SubscriberRegistration {
-            policy: Arc::new(s.policy.clone()),
-            wake: brenn_lib::messaging::WakeEconomics::Eager,
-        };
-        for instance in s.principals() {
-            subscriber_registrations.insert(
-                brenn_lib::messaging::SubscriberEntryKind::Surface {
-                    slug: s.slug.clone(),
-                    instance,
-                },
-                registration.clone(),
-            );
-        }
+        subscriber_registrations.insert(
+            brenn_lib::messaging::SubscriberEntryKind::Surface(s.slug.clone()),
+            brenn_lib::messaging::SubscriberRegistration {
+                policy: Arc::new(s.policy.clone()),
+                wake: brenn_lib::messaging::WakeEconomics::Eager,
+            },
+        );
     }
     subscriber_registrations.extend(brenn_lib::messaging::system::registrations_from_specs(
         &system_participants,

@@ -115,6 +115,27 @@ impl SurfaceProfile {
                 },
             );
         }
+        // The two boot resolvers must agree about which bindings cross the wire.
+        // A transportable binding with no wire subscription reaches the page in
+        // the bindings document (built from `subscriptions`) while being absent
+        // from the attachment's authority, so the page subscribes what it was
+        // told to and is killed for a protocol violation at runtime. Both lists
+        // come off one resolver loop today, which is the argument for keeping the
+        // cheap assert rather than for dropping it.
+        for binding in &resolved.subscriptions {
+            if brenn_envelope::is_local_channel(&binding.channel_address) {
+                continue;
+            }
+            assert!(
+                subscribable.contains_key(&binding.channel_address),
+                "surface {slug:?}: transportable binding {} (instance {:?}) has no resolved wire \
+                 subscription — the binding resolver and the subscription resolver disagree about \
+                 which bindings cross the wire",
+                binding.channel_address,
+                binding.instance,
+            );
+        }
+
         // The config channel carries the surface's own bindings document, which
         // it must read to be configured at all, so the subscribe right is
         // substrate rather than operator config — injected here exactly as boot
@@ -288,169 +309,6 @@ impl AttachProfile for SurfaceProfile {
             per_attacher: MAX_SESSIONS_PER_SURFACE,
             per_account: MAX_SESSIONS_PER_USER_PER_SURFACE,
         }
-    }
-}
-
-/// Boot-time cross-check that the two lowerings of one surface's authority — the
-/// attachment-grain profile and the port-grain maps the session dispatches on —
-/// describe the same thing.
-///
-/// Both are derived from the same resolved config, so a disagreement is a bug in
-/// one of the derivations, not a condition: a channel subscribable at one grain
-/// and not the other, or a bound output no attribution may publish, would show
-/// up as a page that silently loses traffic. Boot is where that dies.
-///
-/// # Panics
-///
-/// On any disagreement, and on a port map naming an instance neither the
-/// component set nor the reserved error-report grain accounts for.
-pub fn assert_agrees_with_port_maps(runtime: &super::SurfaceRuntime) {
-    let profile = &runtime.profile;
-    let slug = &runtime.resolved.slug;
-    assert_eq!(
-        profile.attacher(),
-        &runtime.participant,
-        "surface {slug:?}: profile and runtime disagree about the bare identity"
-    );
-    assert_eq!(
-        profile.send_budget_scope(),
-        slug.as_str(),
-        "surface {slug:?}: profile send-budget scope is not the surface slug"
-    );
-
-    // The alert grant: what the attachment advertises in `Welcome` and what the
-    // live session gates every `Alert` frame on are the same policy read.
-    assert_eq!(
-        profile.alert_granted(),
-        runtime.policy.grants.has(AppCapability::SurfaceAlert),
-        "surface {slug:?}: profile and runtime policy disagree about the alert grant"
-    );
-
-    // The publish bucket the attachment session builds is the operator's own
-    // per-connection numbers, not a default the lowering substituted.
-    assert_eq!(
-        profile.publish_rate(),
-        PublishRate {
-            burst: runtime.resolved.publish_burst,
-            per_sec: runtime.resolved.publish_per_sec,
-        },
-        "surface {slug:?}: profile publish rate is not the resolved per-connection bucket"
-    );
-
-    // Subscribe: the profile's per-channel entry is the max fold of every
-    // instance's entry on that channel, and it covers exactly those channels
-    // plus the injected config channel.
-    // Owned keys: this runs once per surface at boot, where the allocation buys
-    // one fold rule instead of two spellings of it.
-    let mut folded: HashMap<String, SubscriptionFacts> = HashMap::new();
-    for (sub, facts) in &runtime.subscription_channels {
-        fold_subscription(&mut folded, sub.channel.as_str(), *facts);
-    }
-    fold_subscription(
-        &mut folded,
-        runtime.description.config_channel.as_str(),
-        SubscriptionFacts {
-            push_depth: 1,
-            retain_depth: 1,
-        },
-    );
-    assert_eq!(
-        profile.subscribable.len(),
-        folded.len(),
-        "surface {slug:?}: profile subscribable set and the per-instance subscription map cover \
-         different channels"
-    );
-    for (channel, facts) in &folded {
-        assert_eq!(
-            profile.subscribable(channel),
-            Some(*facts),
-            "surface {slug:?}: profile subscribable facts for {channel} do not fold the \
-             per-instance subscriptions"
-        );
-    }
-
-    // Publish: every bound output port is publishable by the attribution that
-    // owns it. The reserved error-report port names no component, so it is the
-    // one port whose attribution is the bare identity.
-    for ((instance, port), out) in &runtime.output_ports {
-        if brenn_surface_contract::is_error_report_port(instance, port) {
-            assert!(
-                profile.publishable(None, &out.address),
-                "surface {slug:?}: reserved error-report channel {} is not publishable by the \
-                 bare identity",
-                out.address
-            );
-            for declared in &runtime.resolved.components {
-                assert!(
-                    profile.publishable(Some(&declared.instance), &out.address),
-                    "surface {slug:?}: error channel {} is not publishable by declared \
-                     attribution {}",
-                    out.address,
-                    declared.instance
-                );
-            }
-            assert_eq!(
-                profile.publish_posture(&out.address),
-                PublishPosture::Diagnostic,
-                "surface {slug:?}: the reserved error-report channel {} is not the diagnostics \
-                 posture — a failed report would kill the process",
-                out.address
-            );
-            continue;
-        }
-        assert!(
-            profile.publishable(Some(instance), &out.address),
-            "surface {slug:?}: bound output {instance}/{port} onto {} is not publishable by its \
-             own attribution",
-            out.address
-        );
-        assert_eq!(
-            profile.publish_posture(&out.address),
-            PublishPosture::Invariant,
-            "surface {slug:?}: bound output {instance}/{port} onto {} is not the invariant \
-             posture — boot validated it, so a refusal there is a broken server",
-            out.address
-        );
-    }
-    // The telemetry pair is the bare identity's alone: a component-attributed
-    // publish onto it must be refused, which is what keeps the single-writer
-    // property the boot sweep proves for every other principal true for this
-    // surface's own components too.
-    for channel in [
-        &runtime.description.geometry_channel,
-        &runtime.description.status_channel,
-    ] {
-        assert!(
-            profile.publishable(None, channel),
-            "surface {slug:?}: telemetry channel {channel} is not publishable by the bare identity"
-        );
-        for declared in &runtime.resolved.components {
-            assert!(
-                !profile.publishable(Some(&declared.instance), channel),
-                "surface {slug:?}: telemetry channel {channel} is publishable by component \
-                 attribution {}",
-                declared.instance
-            );
-        }
-    }
-
-    // Attribution: every declared instance mints its own sub-identity, and
-    // nothing else mints at all.
-    assert_eq!(
-        profile.admit_attribution(None).as_ref(),
-        Some(&runtime.participant),
-        "surface {slug:?}: the absent attribution does not mint the bare identity"
-    );
-    for declared in &runtime.resolved.components {
-        assert_eq!(
-            profile.admit_attribution(Some(&declared.instance)),
-            Some(ParticipantId::for_surface_component(
-                slug,
-                &declared.instance
-            )),
-            "surface {slug:?}: declared instance {} does not mint its own sub-identity",
-            declared.instance
-        );
     }
 }
 

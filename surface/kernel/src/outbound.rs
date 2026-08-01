@@ -41,7 +41,6 @@ use brenn_surface_schema::telemetry::ErrorReportDocument;
 use brenn_surface_schema::{LogLevel, MAX_LOG_MESSAGE_BYTES, MAX_LOG_SOURCE_BYTES};
 
 use crate::bindings::AppliedBindings;
-use crate::core::{PublishStatus, truncate_report_field};
 
 /// The urgency the kernel states on the documents it writes about itself.
 ///
@@ -50,6 +49,120 @@ use crate::core::{PublishStatus, truncate_report_field};
 /// the same `normal` an unset one resolves to. Widening this to a configurable
 /// knob is additive.
 const PLATFORM_URGENCY: Urgency = Urgency::Normal;
+
+/// The disposition of a publish, as its caller is answered. It unifies the
+/// peer's wire [`PublishOutcome`] with the page-side rejections and the
+/// link-drop signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishStatus {
+    /// The peer accepted the publish.
+    Ok,
+    /// The peer rate-limited it (its per-connection token bucket). The page does
+    /// not retry — that is the instance's business.
+    RateLimited,
+    /// The body exceeded the peer's cap. Carries the peer's reported `len`/`max`
+    /// when the peer rejected it, or the page's own view when the page rejected
+    /// it before sending (a stale-snapshot race).
+    BodyTooLarge { len: u64, max: u64 },
+    /// `(instance, port)` is not a bound output in the wiring in force: the page
+    /// refused to send an unbound-port publish (a stale-snapshot race).
+    UnboundPort,
+    /// There was no configured attachment when the command reached the page (a
+    /// stale-snapshot race): the publish was not sent.
+    NotConnected,
+    /// The attachment ended with this publish's answer still outstanding.
+    ConnectionLost,
+    /// The peer accepted the frame but the durable publish failed on a path that
+    /// must not kill the attachment. Client-facing meaning is "it did not land";
+    /// the page does not retry.
+    Failed,
+    /// A `local:` plane guard refused the body: the page-local router minted
+    /// nothing, so the message was neither retained nor delivered. The violation
+    /// itself is reported separately, attributed to the publisher.
+    Refused,
+}
+
+/// The three publish pre-check rejections, in authoritative check order. Single
+/// source of truth shared by the front door's fast gate and the page's
+/// authoritative recheck; each caller converts into its own reject vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishCheckReject {
+    NotConnected,
+    UnboundPort,
+    BodyTooLarge { len: u64, max: u64 },
+}
+
+impl From<PublishCheckReject> for PublishStatus {
+    fn from(reject: PublishCheckReject) -> Self {
+        match reject {
+            PublishCheckReject::NotConnected => PublishStatus::NotConnected,
+            PublishCheckReject::UnboundPort => PublishStatus::UnboundPort,
+            PublishCheckReject::BodyTooLarge { len, max } => {
+                PublishStatus::BodyTooLarge { len, max }
+            }
+        }
+    }
+}
+
+/// The publish pre-check: predicates and their order live here and only here.
+/// `output_bound` is lazy, so a caller may resolve it however it likes.
+///
+/// `reachable` is "there is a configured attachment, **or** the target is a
+/// `local:` port": page-local traffic never touches the wire, so the link being
+/// down is no reason to reject it — that offline-correctness is the whole point
+/// of the class (the kiosk that must still accept a takeover with the network
+/// out). Callers compute it; the distinction cannot be made here, where no
+/// wiring is in scope.
+///
+/// The body cap applies to confined publishes too, deliberately. It is nominally
+/// a peer ingress limit, but ports are ports: a component's body-size contract
+/// must not silently change because an operator rebound its output port from
+/// `brenn:` to `local:`. It also bounds the router's rings, which are page
+/// memory.
+pub fn check_publish(
+    reachable: bool,
+    output_bound: impl FnOnce() -> bool,
+    body_len: u64,
+    max_body_bytes: u64,
+) -> Result<(), PublishCheckReject> {
+    if !reachable {
+        return Err(PublishCheckReject::NotConnected);
+    }
+    if !output_bound() {
+        return Err(PublishCheckReject::UnboundPort);
+    }
+    if body_len > max_body_bytes {
+        return Err(PublishCheckReject::BodyTooLarge {
+            len: body_len,
+            max: max_body_bytes,
+        });
+    }
+    Ok(())
+}
+
+/// Cap a report field (`message` or `source`) at its schema byte limit,
+/// truncating on a UTF-8 boundary and appending a marker so the receiver sees the
+/// value was cut. Asserts `cap` exceeds the marker length rather than trusting it
+/// by prose: a smaller cap would underflow the subtraction below (a release-mode
+/// wrap into a hang), so it dies loudly instead.
+pub fn truncate_report_field(value: String, cap: usize) -> String {
+    const MARKER: &str = "…[truncated]";
+    assert!(
+        cap > MARKER.len(),
+        "surface client: report-field cap {cap} is smaller than the truncation marker"
+    );
+    if value.len() <= cap {
+        return value;
+    }
+    let mut end = cap - MARKER.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = value;
+    out.truncate(end);
+    out.push_str(MARKER);
+    out
+}
 
 /// One caller's publish, at the grain the caller states it.
 #[derive(Debug, Clone, PartialEq, Eq)]

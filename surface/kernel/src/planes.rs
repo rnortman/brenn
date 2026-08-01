@@ -28,9 +28,10 @@ use std::collections::BTreeSet;
 
 use brenn_attach_client::router::{GuardedBody, Origin, PlanePolicy};
 use brenn_envelope::MessageEnvelope;
+use brenn_surface_schema::telemetry::OverlayReport;
 use brenn_surface_schema::{
-    LOCAL_OVERLAY_STATE_CHANNEL, LOCAL_TAKEOVER_CHANNEL, OverlayReport, OverlayStateBody,
-    TakeoverBody, reserved_local_channel,
+    LOCAL_OVERLAY_STATE_CHANNEL, LOCAL_TAKEOVER_CHANNEL, OverlayStateBody, TakeoverBody,
+    reserved_local_channel,
 };
 
 use crate::bindings::AppliedBindings;

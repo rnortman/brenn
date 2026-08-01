@@ -41,8 +41,7 @@ use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::subs::{ResumePolicy, SubscribeAck, SubscriptionDepths, Subscriptions};
 use brenn_attach_proto::ClientFrame;
 
-use crate::bindings::AppliedBindings;
-use crate::core::channel_is_transportable;
+use crate::bindings::{AppliedBindings, channel_is_transportable};
 
 /// What the surface asks for on its config channel.
 ///

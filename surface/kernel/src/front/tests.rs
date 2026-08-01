@@ -9,8 +9,9 @@
 
 use brenn_attach_client::Millis;
 use brenn_attach_client::conn::AttachmentFacts;
+use brenn_surface_schema::InstanceState;
 use brenn_surface_schema::bindings::BindingsDocument;
-use brenn_surface_schema::{InstanceReport, InstanceState, StatusCounters};
+use brenn_surface_schema::telemetry::{InstanceReport, StatusCounters};
 use uuid::Uuid;
 
 use crate::test_support::bindings as fixtures;

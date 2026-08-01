@@ -29,13 +29,32 @@ use crate::messaging::{
 /// retention, and a session that misses it resumes past its own wire cursor.
 #[derive(Debug, Clone)]
 pub struct SurfaceFeedTarget {
-    /// The registration key, which carries the subscribing principal's instance.
+    /// The registration key: the surface, which is the whole grain a channel's
+    /// feed is cut at.
     pub kind: SubscriberEntryKind,
-    /// The subscribing principal as a participant identity.
-    pub subscriber: ParticipantId,
     /// `true` for a push-enabled subscription, whose session can resume the
     /// suffix it missed; `false` for fold-0, which is live-or-nothing.
     pub push_enabled: bool,
+}
+
+impl SurfaceFeedTarget {
+    /// The subscribing surface as a participant identity — the bare
+    /// `surface:<slug>`. Derived from `kind` rather than carried, so the two
+    /// cannot disagree.
+    ///
+    /// # Panics
+    ///
+    /// If the target is keyed by any other subscriber kind. Only surfaces take
+    /// the row-less feed, so the resolver builds no such target.
+    pub fn subscriber(&self) -> ParticipantId {
+        match &self.kind {
+            SubscriberEntryKind::Surface(slug) => ParticipantId::for_surface(slug),
+            other => panic!(
+                "surface feed target keyed by {other:?} — only surface subscribers take the \
+                 row-less live feed"
+            ),
+        }
+    }
 }
 
 /// The participant registry: each subscriber's access policy and wake economics,
@@ -231,7 +250,7 @@ impl TargetResolver {
     ) -> Vec<SurfaceFeedTarget> {
         let mut out = Vec::new();
         for sub in subscribers {
-            let SubscriberEntryKind::Surface { slug, instance } = &sub.kind else {
+            let SubscriberEntryKind::Surface(_) = &sub.kind else {
                 continue;
             };
             let allowed = self
@@ -245,15 +264,8 @@ impl TargetResolver {
                 );
                 continue;
             }
-            // The subscribing principal: a component instance's own sub-identity,
-            // or the bare surface for the kernel's layout subscription.
-            let subscriber = match instance {
-                Some(instance) => ParticipantId::for_surface_component(slug, instance),
-                None => ParticipantId::for_surface(slug),
-            };
             out.push(SurfaceFeedTarget {
                 kind: sub.kind.clone(),
-                subscriber,
                 push_enabled: sub.push_depth.is_push_enabled(),
             });
         }

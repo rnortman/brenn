@@ -200,3 +200,35 @@ pub trait AttachProfile: Send + Sync {
     /// The registry only enforces the numbers.
     fn session_caps(&self) -> SessionCaps;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_replay_clamp_is_the_max_of_the_two_depths() {
+        let clamp = |push, retain| {
+            SubscriptionFacts {
+                push_depth: push,
+                retain_depth: retain,
+            }
+            .replay_clamp()
+        };
+        assert_eq!(clamp(8, 0), Depth::Bounded(8));
+        assert_eq!(clamp(0, 4), Depth::Bounded(4));
+        assert_eq!(clamp(2, 9), Depth::Bounded(9));
+        assert_eq!(clamp(9, 2), Depth::Bounded(9));
+    }
+
+    /// `push_enabled` is the push depth's own question: a fold-0 subscription is
+    /// a context feed however deep its retained ring is.
+    #[test]
+    fn push_enabled_reads_the_push_depth_alone() {
+        let facts = |push, retain| SubscriptionFacts {
+            push_depth: push,
+            retain_depth: retain,
+        };
+        assert!(facts(1, 0).push_enabled());
+        assert!(!facts(0, 4).push_enabled());
+    }
+}

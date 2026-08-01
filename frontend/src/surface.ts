@@ -390,8 +390,9 @@ function readManifest(): SurfaceManifest | null {
  * exists to report over) and return null so the bootstrap aborts rather than
  * loading modules with no wiring.
  *
- * The `surface-slug` / `brenn-build-id` metas are on the page too, but they are
- * the kernel's inputs (it re-reads them in `start()`), not the bootstrap's.
+ * The `surface-slug` / `brenn-build-id` / `surface-config-channel` metas are on
+ * the page too, but they are the kernel's inputs (it re-reads them in
+ * `start()`), not the bootstrap's.
  *
  * Exported for the bootstrap sequence and the unit tests.
  */

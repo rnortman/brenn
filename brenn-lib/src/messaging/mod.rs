@@ -525,33 +525,23 @@ pub enum SubscriberEntryKind {
     /// A WASM processing-component subscriber; the slug is the `[[wasm_consumer]]`
     /// `slug` field and becomes `wasm:<slug>` as the `ParticipantId`.
     Wasm(String),
-    /// A browser-surface subscriber, at one of the two grains
-    /// `SubscriberKind::Surface` names.
+    /// A browser-surface subscriber; the slug is the `[[surface]]` slug and
+    /// becomes `surface:<slug>` as the `ParticipantId`.
     ///
-    /// `instance: Some(_)` is a declared component instance — the principal a
-    /// `[[surface.subscription]]` binding belongs to, resolving to
-    /// `surface:<slug>#<instance>`. One instance bound to a channel is one
-    /// subscription with its own push window and cursor, so N instances of one
-    /// kind on one channel are N entries here, exactly as N `[[app]]` blocks
-    /// would be.
+    /// One entry per (surface, channel): an attachment holds at most one
+    /// subscription per channel, and whatever sits behind it on the attacher's
+    /// side — one component's binding or six — is the attacher's own
+    /// bookkeeping. `finalize_directory_with_subscribers` folds the declared
+    /// bindings on a channel into that single entry, so a channel two components
+    /// bind is one server-side push window rather than two feeding the same
+    /// socket.
     ///
-    /// `instance: None` is the surface's kernel, resolving to `surface:<slug>`.
-    /// It holds no durable subscription of its own — the durable subscriber path
-    /// always constructs the `Some` grain. The `None` arm exists only to mirror
-    /// [`SubscriberKind::Surface`], whose bare `surface:<slug>` grain is a live
-    /// publisher participant.
-    ///
-    /// Constructed by `finalize_directory_with_subscribers`; the durable path
-    /// (`TargetResolver::surface_feed_targets`) treats either grain exactly like
-    /// an App/Wasm subscriber. Policy resolves via
-    /// `Messenger::surface_policies` **at the surface grain for both** — a
-    /// component's grants are its config-declared bindings, which boot already
-    /// proved the surface's own ACLs cover, so the instance grain finer-grains
-    /// attribution, budget, and lag tracking, not authority.
-    Surface {
-        slug: String,
-        instance: Option<String>,
-    },
+    /// Authority is per-surface and always was: a component's grants are its
+    /// config-declared bindings, which boot already proved the surface's own
+    /// ACLs cover, so nothing that resolves policy from this key loses anything
+    /// by not naming a component. Per-component attribution and budgets are cut
+    /// at the sub-identity, not at this key.
+    Surface(String),
     /// An in-process system-substrate subscriber; the component name becomes
     /// `system:<component>` as the `ParticipantId` and resolves its policy via
     /// `Messenger::system_policies`. Created programmatically (not from config),
@@ -585,36 +575,16 @@ pub enum SubscriberEntryKind {
 }
 
 impl SubscriberEntryKind {
-    /// Returns the config slug regardless of kind — for a `Surface` that is the
-    /// `[[surface]]` slug, not the instance. For logging and for the apps-map
-    /// lookups every kind's authority resolves through; it is not a storage key,
-    /// and the pending-push keyspace is not built from it.
+    /// Returns the config slug regardless of kind. For logging and for the
+    /// apps-map lookups every kind's authority resolves through; it is not a
+    /// storage key, and the pending-push keyspace is not built from it.
     pub fn slug(&self) -> &str {
         match self {
             SubscriberEntryKind::App(s)
             | SubscriberEntryKind::Wasm(s)
-            | SubscriberEntryKind::System(s) => s.as_str(),
-            SubscriberEntryKind::Surface { slug, .. } => slug.as_str(),
+            | SubscriberEntryKind::System(s)
+            | SubscriberEntryKind::Surface(s) => s.as_str(),
             SubscriberEntryKind::ChatConversation { app_slug, .. } => app_slug.as_str(),
-        }
-    }
-
-    /// The component instance a surface *subscriber* names. A `Surface`
-    /// subscriber entry always carries `Some`: the bare `surface:<slug>` grain
-    /// is publisher-only and never registers a durable subscription. The single
-    /// place that asserts (and words) that invariant for the dispatch paths that
-    /// rebuild a `SubKey` from a registration key.
-    ///
-    /// Panics if called on a non-`Surface` entry, or on the bare grain.
-    pub fn surface_subscriber_instance(&self) -> &str {
-        match self {
-            SubscriberEntryKind::Surface { instance, .. } => instance.as_deref().expect(
-                "a Surface subscriber that registered a surface session names a component \
-                 instance; the bare surface grain is publisher-only",
-            ),
-            other => panic!(
-                "surface_subscriber_instance called on a non-Surface subscriber key: {other:?}"
-            ),
         }
     }
 }
@@ -1138,9 +1108,10 @@ pub fn registration_key(target: &ParticipantId, target_app_slug: &str) -> Subscr
             SubscriberEntryKind::App(target_app_slug.to_string())
         }
         SubscriberKind::Wasm(slug) => SubscriberEntryKind::Wasm(slug),
-        SubscriberKind::Surface { slug, instance } => {
-            SubscriberEntryKind::Surface { slug, instance }
-        }
+        // Both participant grains key to the one surface entry: the directory
+        // is cut at (surface, channel), so a component's sub-identity names no
+        // entry of its own.
+        SubscriberKind::Surface { slug, .. } => SubscriberEntryKind::Surface(slug),
         SubscriberKind::System(component) => SubscriberEntryKind::System(component),
     }
 }
@@ -1173,7 +1144,7 @@ pub enum DeliveryShape {
 pub fn default_delivery_shape(key: &SubscriberEntryKind) -> DeliveryShape {
     match key {
         SubscriberEntryKind::App(_)
-        | SubscriberEntryKind::Surface { .. }
+        | SubscriberEntryKind::Surface(_)
         | SubscriberEntryKind::ChatConversation { .. } => DeliveryShape::Inline,
         SubscriberEntryKind::Wasm(_) | SubscriberEntryKind::System(_) => DeliveryShape::ParkedWake,
     }
@@ -1652,13 +1623,15 @@ fn registered_subscriber<'a>(
         (SubscriberEntryKind::System(registered), SubscriberKind::System(named)) => {
             *registered == named
         }
+        // The surface entry is per (surface, channel), so the slug is the whole
+        // comparison: either participant grain of a surface resolves to the one
+        // entry its channel carries.
         (
-            SubscriberEntryKind::Surface { slug, instance },
+            SubscriberEntryKind::Surface(registered),
             SubscriberKind::Surface {
-                slug: named_slug,
-                instance: named_instance,
+                slug: named_slug, ..
             },
-        ) => *slug == named_slug && *instance == named_instance,
+        ) => *registered == named_slug,
         // A chat subscription names the one conversation it belongs to, so it
         // matches on the id and never on the app the cursor was written under —
         // which is what stops one conversation of an app from resolving to a
@@ -1704,7 +1677,7 @@ fn overflow_noise_for(
 ) -> Option<config::NoiseLevel> {
     let registration = registered_subscriber(entry, subscriber, app_slug)?;
     match registration.kind {
-        SubscriberEntryKind::Surface { .. } => None,
+        SubscriberEntryKind::Surface(_) => None,
         _ => Some(registration.noise),
     }
 }
@@ -2559,7 +2532,8 @@ impl Messenger {
     ///
     /// The question the sender-scoped view cannot answer: which of this
     /// surface's schedules exist at all. A page is seeded only for the
-    /// instances its `Welcome` declares and the channels their outputs bind, so
+    /// instances its bindings document declares and the channels their outputs
+    /// bind, so
     /// this is what tells the seeding pass about a parked set no frame will
     /// reach — an instance the config no longer declares, or one whose output
     /// binding on that channel is gone. Those entries still release normally;
@@ -3724,11 +3698,22 @@ mod tests {
     /// too (the or-pattern arm added alongside the variant).
     #[test]
     fn subscriber_entry_kind_surface_slug() {
-        let kind = SubscriberEntryKind::Surface {
-            slug: "deskbar".to_string(),
-            instance: None,
-        };
+        let kind = SubscriberEntryKind::Surface("deskbar".to_string());
         assert_eq!(kind.slug(), "deskbar");
+    }
+
+    /// Either surface participant grain keys to the one surface entry: the
+    /// directory is cut at (surface, channel), so a component's sub-identity is
+    /// not a registration key of its own.
+    #[test]
+    fn both_surface_participant_grains_key_to_the_surface_entry() {
+        let bare = registration_key(&ParticipantId::for_surface("deskbar"), "");
+        let component = registration_key(
+            &ParticipantId::for_surface_component("deskbar", "protobar"),
+            "",
+        );
+        assert_eq!(bare, SubscriberEntryKind::Surface("deskbar".to_string()));
+        assert_eq!(component, bare);
     }
 
     /// `add_subscriber` is visible on the next `resolve`, and a snapshot taken
@@ -4432,10 +4417,7 @@ mod tests {
         ));
 
         let pol = messenger
-            .subscriber_policy(&SubscriberEntryKind::Surface {
-                slug: "deskbar".to_string(),
-                instance: None,
-            })
+            .subscriber_policy(&SubscriberEntryKind::Surface("deskbar".to_string()))
             .expect("Surface subscriber must resolve to its installed policy");
         assert!(
             pol.has_grant(crate::access::AppCapability::MessagingSubscribe),
@@ -4444,10 +4426,7 @@ mod tests {
 
         assert!(
             messenger
-                .subscriber_policy(&SubscriberEntryKind::Surface {
-                    slug: "no-such-surface".to_string(),
-                    instance: None,
-                })
+                .subscriber_policy(&SubscriberEntryKind::Surface("no-such-surface".to_string()))
                 .is_none(),
             "unknown Surface slug must return None (fail-closed deny)"
         );
@@ -6520,10 +6499,7 @@ mod tests {
     async fn wake_owed_subscribers_passes_over_inline_subscribers() {
         let mut channel = crate::messaging::testutils::test_channel_entry("inline-wake-ch", vec![]);
         channel.subscribers = vec![SubscriberEntry {
-            kind: SubscriberEntryKind::Surface {
-                slug: "board".to_string(),
-                instance: Some("main".to_string()),
-            },
+            kind: SubscriberEntryKind::Surface("board".to_string()),
             push_depth: Depth::Unbounded,
             retain_depth: Depth::Unbounded,
             noise: config::NoiseLevel::Silent,
@@ -8068,10 +8044,7 @@ mod tests {
     async fn surface_kind_ring_overflow_is_never_enacted_by_the_backend() {
         let mut channel = crate::messaging::testutils::ephemeral_channel_entry("evict-surface", 2);
         channel.subscribers.push(ring_subscriber(
-            SubscriberEntryKind::Surface {
-                slug: "dash".to_string(),
-                instance: Some("main".to_string()),
-            },
+            SubscriberEntryKind::Surface("dash".to_string()),
             config::NoiseLevel::Fatal,
         ));
         let (messenger, channel, _unused, router) =
