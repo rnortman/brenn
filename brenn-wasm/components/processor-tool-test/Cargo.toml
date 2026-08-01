@@ -1,5 +1,5 @@
 # This crate is intentionally not a workspace member:
-# it targets wasm32-unknown-unknown and is built via `wit-bindgen-cli` 0.60
+# it targets wasm32-unknown-unknown and is built via the pinned `wit-bindgen-cli`
 # + plain `cargo build` + `wasm-tools component new` (no cargo-component).
 [workspace]
 
@@ -13,8 +13,8 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-# Runtime crate for the wit-bindgen 0.60 generator. 0.44 is the latest
-# independently-versioned runtime; there is no 0.60 runtime crate.
+# Runtime crate for the pinned wit-bindgen generator. The runtime is versioned
+# independently of the generator and does not track its version.
 wit-bindgen-rt = "0.44"
 
 [package.metadata.component]

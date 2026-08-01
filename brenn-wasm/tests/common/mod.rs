@@ -15,9 +15,25 @@ use brenn_wasm::{
     SinkBudget, ToolCallError, ToolHost, ToolHostFn,
 };
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
+
+/// Absolute path to a built component artifact, by artifact stem
+/// (e.g. `"brenn_replay"` → `brenn-wasm/target/components/brenn_replay.wasm`).
+///
+/// The output directory is named here so a move of the component build output
+/// breaks one line rather than one line per test binary.
+pub fn artifact_path(stem: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/components")
+        .join(format!("{stem}.wasm"))
+}
+
+/// The production replay component artifact path.
+pub fn replay_artifact() -> PathBuf {
+    artifact_path("brenn_replay")
+}
 
 /// Capturing `ProcessorAlerter` for integration tests.
 ///
@@ -128,9 +144,7 @@ pub fn out_spec(channel_address: &str) -> OutputPortSpec {
 /// `ProcessorLoadSpec` directly.
 pub fn load_processor_noop(name: &str, slug: &str) -> brenn_wasm::ProcessorComponent {
     brenn_wasm::ProcessorComponent::load(ProcessorLoadSpec {
-        component_path: &Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target/components")
-            .join(format!("{name}.wasm")),
+        component_path: &artifact_path(name),
         slug,
         output_ports: HashMap::new(),
         input_amplification_mt: amp_in(),

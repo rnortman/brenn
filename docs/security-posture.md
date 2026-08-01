@@ -536,6 +536,23 @@ internally-originated.
   network, clock, randomness, or environment. Every host-exposed function is a
   deliberate, granted capability. A newly exposed host function without a grant
   gate is a finding.
+- **The accepted instruction surface is a host-stated closed allow-list.** Which
+  core-wasm proposals a guest component may contain is part of the guest contract,
+  not an inherited property of whatever the engine release happens to default to.
+  `GUEST_ALLOWED_FEATURES` in `brenn-wasm/src/lib.rs` names every allowed proposal
+  and `pin_guest_feature_envelope` installs it on every engine that compiles guest
+  code; `brenn-wasm/tests/feature_envelope.rs` asserts both halves against the
+  production processor engine — allowed proposals compile *and execute*, denied
+  ones are refused with the proposal named — plus a denied-proposal spot check on
+  the production replay engine, proving the pin is installed on that engine family
+  too. Widening the list is a guest-contract change
+  and follows the procedure recorded on the constant (producer named, execution
+  cargo features enabled, test matrix moved, resource-bounding review, browser
+  co-host verified, this section updated). An engine that compiles guest code
+  without the pin, or a proposal admitted without that procedure, is a finding.
+  The browser co-host is a deliberate asymmetry: it runs whatever the browser
+  accepts and Brenn controls no envelope there. The backend envelope is Brenn's
+  security boundary; the browser's sandbox is the browser's.
 - **Every untrusted-guest execution is resource-bounded.** A guest that runs on
   untrusted or external input must be bounded in CPU, wall-clock, and memory so it
   cannot hang or starve the host or block other work. A path that runs an
@@ -570,7 +587,8 @@ internally-originated.
   that reads a channel without consulting the predicate is a finding.
 
 **What the reviewer verifies:** capabilities are deny-by-default and
-structurally enforced; no ambient access exists; the delivery read consults the
+structurally enforced; no ambient access exists; every engine that compiles guest
+code pins the feature allow-list; the delivery read consults the
 subscribe policy per port; every untrusted-guest execution is
 CPU/wall-clock/memory bounded (or restricted to in-tree only); every WASM
 consumer's activation rate is bounded by the per-component activation pacer (no

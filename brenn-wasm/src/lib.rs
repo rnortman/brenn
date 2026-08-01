@@ -186,15 +186,85 @@ pub struct ReplayComponent {
     slug: Arc<str>,
 }
 
-/// Core-wasm proposals a guest component may not use.
+/// The complete set of core-wasm proposals a guest component may use.
 ///
-/// `wasm_features(.., false)` lands in the disabled set, which wasmtime applies
-/// after both its defaults and its crate-feature conditionals, so this holds
-/// regardless of how the `wasmtime` dependency's features are configured.
-const GUEST_DENIED_FEATURES: WasmFeatures = WasmFeatures::FUNCTION_REFERENCES
-    .union(WasmFeatures::GC)
-    .union(WasmFeatures::EXCEPTIONS)
-    .union(WasmFeatures::THREADS);
+/// This is a closed allow-list, not a deny-list: everything absent is refused.
+/// A deny-list is open at the wrong end — a proposal a future wasmtime promotes
+/// to on-by-default would enter the sandbox's accepted instruction surface with
+/// nobody choosing it.
+///
+/// **Do not collapse this to `WasmFeatures::WASM2`/`WASM3` or any other upstream
+/// aggregate.** Two reasons: the aggregates move with upstream releases, which is
+/// exactly what this constant exists to stop; and `WASM2` contains the `GC_TYPES`
+/// pseudo-feature (via `MVP`), which this build cannot execute — enabling it makes
+/// `Engine::new` fail at boot because wasmtime is compiled without its `gc` cargo
+/// feature. Spell every flag out.
+///
+/// What is in, and why:
+///
+/// - `FLOATS`, `MUTABLE_GLOBAL`, `SIGN_EXTENSION`, `SATURATING_FLOAT_TO_INT`,
+///   `MULTI_VALUE`, `BULK_MEMORY`, `REFERENCE_TYPES`, `SIMD` — the WebAssembly
+///   2.0 set minus `GC_TYPES`. A superset of everything stable Rust emits for
+///   `wasm32-unknown-unknown`, and of what browsers have required for years.
+///   `SIMD` is deterministic per spec, so a `-C target-feature=+simd128` guest is
+///   not gratuitously refused.
+/// - `BULK_MEMORY` and `REFERENCE_TYPES` are bit-supersets of the
+///   `BULK_MEMORY_OPT` and `CALL_INDIRECT_OVERLONG` encodings, so allowing the
+///   parents allows those; LLVM emits overlong `call_indirect` encodings.
+/// - `TAIL_CALL`, `EXTENDED_CONST` — the WebAssembly 3.0 additions that are
+///   deterministic, executable on cranelift with no extra cargo feature,
+///   opt-in-able from stable Rust, and long-shipped in browsers.
+/// - `COMPONENT_MODEL` — required for any component to load at all.
+///
+/// What is out, and why:
+///
+/// - `GC`, `GC_TYPES`, `FUNCTION_REFERENCES`, `EXCEPTIONS` — the GC-language
+///   cluster. Not executable in this build (no `gc` cargo feature), no producer
+///   in the tree, and no verified browser co-host path.
+/// - `THREADS` — breaks activation hermeticity and determinism. An architectural
+///   rejection, not a deferral.
+/// - `RELAXED_SIMD` — specified to give implementation-dependent results, which
+///   is incompatible with byte-identical transcripts across hosts.
+/// - `MULTI_MEMORY`, `MEMORY64` — no producer, no purpose under a per-memory
+///   size cap, and each multiplies a resource bound (address range, memory count).
+/// - `CM_ASYNC` and every other component-model sub-flag — component-model async
+///   would reintroduce mid-activation delivery, which the hermetic activation
+///   model excludes by design. Held out by this allow-list, not by wasmtime's
+///   own build-time errors.
+///
+/// # Widening procedure
+///
+/// Admitting a proposal is a guest-contract change and takes all of the following
+/// in one change:
+///
+/// 1. The flag added here with a rationale naming the real toolchain or component
+///    that needs it — a producer, not a speculation.
+/// 2. Any wasmtime cargo features needed to *execute* it (not merely validate it)
+///    enabled in the same change. `Engine::new` fails loudly on the mismatch, but
+///    the change must not lean on that.
+/// 3. `brenn-wasm/tests/feature_envelope.rs` updated: the proposal moves from the
+///    rejected set to the accepted set with a probe that compiles **and runs** on
+///    the production engine.
+/// 4. A resource-bounding review recorded in the change: which allocation surfaces
+///    the proposal opens and which limiter bounds each. (The GC cluster, for one,
+///    grows its heap through `ResourceLimiter` as an additional per-memory budget,
+///    so admitting it chooses a doubling of the per-store budget.)
+/// 5. The browser co-host verified if the feature can reach surface-hosted
+///    components — the jco pin demonstrably transpiles an artifact containing the
+///    proposal — or the component class confined to backend-only hosting by a
+///    stated decision.
+/// 6. The WASM-guest boundary section of `docs/security-posture.md` updated.
+const GUEST_ALLOWED_FEATURES: WasmFeatures = WasmFeatures::FLOATS
+    .union(WasmFeatures::MUTABLE_GLOBAL)
+    .union(WasmFeatures::SIGN_EXTENSION)
+    .union(WasmFeatures::SATURATING_FLOAT_TO_INT)
+    .union(WasmFeatures::MULTI_VALUE)
+    .union(WasmFeatures::BULK_MEMORY)
+    .union(WasmFeatures::REFERENCE_TYPES)
+    .union(WasmFeatures::SIMD)
+    .union(WasmFeatures::TAIL_CALL)
+    .union(WasmFeatures::EXTENDED_CONST)
+    .union(WasmFeatures::COMPONENT_MODEL);
 
 /// Pin the core-wasm proposal set a guest component is allowed to use.
 ///
@@ -205,15 +275,16 @@ const GUEST_DENIED_FEATURES: WasmFeatures = WasmFeatures::FUNCTION_REFERENCES
 /// instead: the sandbox exists to contain out-of-tree components, and what a
 /// component may contain is part of the guest-visible contract.
 ///
-/// Denied: typed function references (`ref.func` values, `call_ref`), the GC
-/// proposal's type encodings, exception handling, and threads/atomics. None is
-/// needed by any component this build produces, and none is emitted by the
-/// `wasm32-unknown-unknown` Rust guests the toolchain builds. Widening the
-/// envelope is a deliberate act — enable a proposal here rather than inherit it
-/// from an engine upgrade, and treat the widening as a guest-contract change.
+/// The two calls compose to "exactly [`GUEST_ALLOWED_FEATURES`], nothing else":
+/// `Config::wasm_features` writes both the enabled and the disabled set per flag,
+/// later calls override earlier ones for the flags they name, and the embedder's
+/// sets are applied after wasmtime's defaults and its crate-feature conditionals.
+/// So the envelope is independent both of the release's default set and of how the
+/// `wasmtime` dependency's cargo features are configured.
 #[doc(hidden)]
 pub fn pin_guest_feature_envelope(cfg: &mut Config) {
-    cfg.wasm_features(GUEST_DENIED_FEATURES, false);
+    cfg.wasm_features(WasmFeatures::all(), false);
+    cfg.wasm_features(GUEST_ALLOWED_FEATURES, true);
 }
 
 impl ReplayComponent {
@@ -306,17 +377,8 @@ impl ReplayComponent {
     }
 
     fn make_store(&self) -> Store<StoreData> {
-        // Install memory/table/instance caps, per-call fuel, and the epoch deadline,
-        // mirroring the processor world's bounding (H1046, design §2.4).
-        // `trap_on_grow_failure(true)` makes an over-cap `memory.grow` a deterministic
-        // trap rather than a -1 the guest could observe and loop on.
-        let limits = StoreLimitsBuilder::new()
-            .memory_size(REPLAY_MAX_MEMORY_BYTES)
-            .table_elements(REPLAY_MAX_TABLE_ELEMENTS)
-            .instances(REPLAY_MAX_INSTANCES)
-            .tables(REPLAY_MAX_TABLES)
-            .trap_on_grow_failure(true)
-            .build();
+        // Mirrors the processor world's bounding.
+        let limits = replay_store_limits();
         let mut store = Store::new(
             &self.engine,
             StoreData {
@@ -495,23 +557,27 @@ impl ReplayComponent {
         let mut store = self.make_store();
         // StoreLimits is not mutable after construction; replace the whole limits field.
         // The rest of the store settings (fuel, epoch) come from make_store.
-        store.data_mut().limits = StoreLimitsBuilder::new()
-            .memory_size(memory_limit_bytes)
-            .table_elements(REPLAY_MAX_TABLE_ELEMENTS)
-            .instances(REPLAY_MAX_INSTANCES)
-            .tables(REPLAY_MAX_TABLES)
-            .trap_on_grow_failure(true)
-            .build();
+        store.data_mut().limits = replay_store_limits_with_memory(memory_limit_bytes);
         self.run_on_store(store, input)
     }
 
-    /// Expose the underlying KvStore for test assertions (e.g. is_tx_active after a leak-trap).
+    /// The underlying KvStore, for test assertions (e.g. `is_tx_active` after a leak-trap).
     ///
-    /// Integration tests are external linkers so pub(crate) is insufficient — must be pub.
-    /// Matches the `check_raw_for_testing` precedent (design §4.1).
+    /// `pub` because integration tests are external crates; `pub(crate)` would not reach them.
     #[doc(hidden)]
     pub fn kv_store_for_testing(&self) -> &Arc<KvStore> {
         &self.kv_store
+    }
+
+    /// The engine replay guest code is compiled by — test use only.
+    ///
+    /// Twin of `ProcessorComponent::engine`: lets a test compile arbitrary wasm
+    /// against the exact engine a loaded replay component uses, so the accepted
+    /// core-wasm feature envelope is asserted on both engine families that run
+    /// guest code rather than on a re-derived copy of the configuration.
+    #[doc(hidden)]
+    pub fn engine(&self) -> &Engine {
+        &self.engine
     }
 }
 
@@ -749,6 +815,17 @@ pub const PROCESSOR_MAX_TABLE_ELEMENTS: usize = 65_536;
 pub const PROCESSOR_MAX_INSTANCES: usize = 16;
 /// Maximum number of WASM tables a processor guest's store may hold.
 pub const PROCESSOR_MAX_TABLES: usize = 64;
+/// Maximum number of linear memories a processor guest's store may hold.
+///
+/// `PROCESSOR_MAX_MEMORY_BYTES` is a *per-memory* ceiling, so the aggregate linear
+/// memory a store can hold is `memories × memory_size`. Without this cap wasmtime's
+/// default of 10,000 memories applies and that aggregate is nominally 156 GiB.
+/// At 16 (matching `PROCESSOR_MAX_INSTANCES`) the worst case is 16 × 16 MiB =
+/// 256 MiB, transient, per serialized activation. With multi-memory outside the
+/// guest feature envelope a guest gets at most one memory per module instance, so
+/// the instance cap bites first in practice — this states the bound rather than
+/// leaving it emergent.
+pub const PROCESSOR_MAX_MEMORIES: usize = 16;
 /// Maximum length of a guest-supplied port name in the `publish` import.
 ///
 /// Port names from a guest are wholly guest-controlled and must be bounded before
@@ -869,6 +946,35 @@ pub const REPLAY_MAX_INSTANCES: usize = 16;
 
 /// Maximum number of WASM tables a replay guest's store may hold. Same as the processor world.
 pub const REPLAY_MAX_TABLES: usize = 64;
+
+/// Maximum number of linear memories a replay guest's store may hold. Same as the
+/// processor world; see `PROCESSOR_MAX_MEMORIES` for the aggregate-bound reasoning.
+pub const REPLAY_MAX_MEMORIES: usize = 16;
+
+/// The store resource limiter every replay check runs under.
+///
+/// One place, so the caps a test asserts are the caps a guest runs against —
+/// the replay twin of `processor_store_limits`. `trap_on_grow_failure` makes an
+/// over-cap `memory.grow` / `table.grow` a deterministic trap instead of a `-1`
+/// the guest could paper over.
+pub fn replay_store_limits() -> StoreLimits {
+    replay_store_limits_with_memory(REPLAY_MAX_MEMORY_BYTES)
+}
+
+/// `replay_store_limits` with the per-memory ceiling replaced by `memory_size`.
+///
+/// One builder behind both the production limiter and `check_with_memory_limit`,
+/// so every cap but `memory_size` is spelled once.
+fn replay_store_limits_with_memory(memory_size: usize) -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(memory_size)
+        .memories(REPLAY_MAX_MEMORIES)
+        .table_elements(REPLAY_MAX_TABLE_ELEMENTS)
+        .instances(REPLAY_MAX_INSTANCES)
+        .tables(REPLAY_MAX_TABLES)
+        .trap_on_grow_failure(true)
+        .build()
+}
 
 /// One buffered publish from a guest activation.
 #[derive(Debug)]
@@ -2252,8 +2358,18 @@ pub struct ProcessorComponent {
 /// `trap_on_grow_failure` makes an over-cap `memory.grow` / `table.grow` a
 /// deterministic trap instead of a `-1` the guest could paper over.
 pub fn processor_store_limits() -> StoreLimits {
+    processor_store_limits_with_memory(PROCESSOR_MAX_MEMORY_BYTES)
+}
+
+/// `processor_store_limits` with the per-memory ceiling replaced by `memory_size`.
+///
+/// The one builder both the production limiter and `handle_with_memory_limit` go
+/// through: every cap but `memory_size` is spelled once, so a cap added here cannot
+/// reach production while missing the store a memory-override test runs under.
+fn processor_store_limits_with_memory(memory_size: usize) -> StoreLimits {
     StoreLimitsBuilder::new()
-        .memory_size(PROCESSOR_MAX_MEMORY_BYTES)
+        .memory_size(memory_size)
+        .memories(PROCESSOR_MAX_MEMORIES)
         .table_elements(PROCESSOR_MAX_TABLE_ELEMENTS)
         .instances(PROCESSOR_MAX_INSTANCES)
         .tables(PROCESSOR_MAX_TABLES)
@@ -2658,13 +2774,7 @@ impl ProcessorComponent {
         // Override the memory_size limit on the already-constructed store's ProcessorData.
         // StoreLimits is not mutable after construction; instead we replace the entire limits
         // field. The rest of the store settings (fuel, epoch, etc.) come from make_store.
-        store.data_mut().limits = StoreLimitsBuilder::new()
-            .memory_size(memory_limit_bytes)
-            .table_elements(PROCESSOR_MAX_TABLE_ELEMENTS)
-            .instances(PROCESSOR_MAX_INSTANCES)
-            .tables(PROCESSOR_MAX_TABLES)
-            .trap_on_grow_failure(true)
-            .build();
+        store.data_mut().limits = processor_store_limits_with_memory(memory_limit_bytes);
         Self::invoke(store, activation, &self.processor_pre, &mut carry)
     }
 

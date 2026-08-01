@@ -16,22 +16,10 @@ use brenn_wasm::{CheckInput, Header, REPLAY_FUEL, ReplayComponent};
 use std::collections::HashMap;
 use tempfile::NamedTempFile;
 
-const FAULT_ARTIFACT_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/target/components/brenn_replay_fault_test.wasm"
-);
-
-const REPLAY_ARTIFACT_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/target/components/brenn_replay.wasm"
-);
+use common::{artifact_path, replay_artifact};
 
 fn fault_artifact() -> std::path::PathBuf {
-    std::path::PathBuf::from(FAULT_ARTIFACT_PATH)
-}
-
-fn replay_artifact() -> std::path::PathBuf {
-    std::path::PathBuf::from(REPLAY_ARTIFACT_PATH)
+    artifact_path("brenn_replay_fault_test")
 }
 
 fn open_fault() -> (NamedTempFile, ReplayComponent) {
@@ -229,6 +217,58 @@ fn replay_instantiation_time_memory_cap_traps() {
         "an over-cap initial-memory module must fail at instantiation (outer Err), got Ok({:?})",
         result.unwrap()
     );
+}
+
+// ── Store-limit builder ───────────────────────────────────────────────────────
+
+/// The replay store's instance, table-count and memory-count caps reach the
+/// limiter wasmtime consults.
+///
+/// `replay_store_limits()` is the single value `make_store` installs on every
+/// check, so asserting against it means dropping a cap from the builder fails
+/// here rather than silently reverting to wasmtime's defaults (10,000 of each).
+/// Symmetric with `instance_table_and_memory_count_caps_reach_the_limiter` in the
+/// processor world, so builder drift is caught on both engine families.
+#[test]
+fn replay_instance_table_and_memory_count_caps_reach_the_limiter() {
+    use wasmtime::ResourceLimiter;
+
+    let limits = brenn_wasm::replay_store_limits();
+    assert_eq!(
+        limits.instances(),
+        brenn_wasm::REPLAY_MAX_INSTANCES,
+        "the instance cap must reach wasmtime's limiter"
+    );
+    assert_eq!(
+        limits.tables(),
+        brenn_wasm::REPLAY_MAX_TABLES,
+        "the table-count cap must reach wasmtime's limiter"
+    );
+    assert_eq!(
+        limits.memories(),
+        brenn_wasm::REPLAY_MAX_MEMORIES,
+        "the memory-count cap must reach wasmtime's limiter"
+    );
+}
+
+/// The replay caps stay in a sane band, and the aggregate linear-memory worst
+/// case (`memories × memory_size`) cannot be multiplied by moving one factor.
+#[test]
+fn replay_resource_cap_constants_are_sensible() {
+    const { assert!(brenn_wasm::REPLAY_MAX_TABLE_ELEMENTS >= 1024) };
+    const { assert!(brenn_wasm::REPLAY_MAX_TABLE_ELEMENTS <= 1_000_000) };
+    const { assert!(brenn_wasm::REPLAY_MAX_INSTANCES >= 1) };
+    const { assert!(brenn_wasm::REPLAY_MAX_INSTANCES <= 64) };
+    const { assert!(brenn_wasm::REPLAY_MAX_TABLES >= 1) };
+    const { assert!(brenn_wasm::REPLAY_MAX_TABLES <= 256) };
+    const { assert!(brenn_wasm::REPLAY_MAX_MEMORIES >= 1) };
+    const { assert!(brenn_wasm::REPLAY_MAX_MEMORIES <= 64) };
+    const {
+        assert!(
+            brenn_wasm::REPLAY_MAX_MEMORIES * brenn_wasm::REPLAY_MAX_MEMORY_BYTES
+                <= 512 * 1024 * 1024
+        )
+    };
 }
 
 // ── Honest-workload regression ────────────────────────────────────────────────

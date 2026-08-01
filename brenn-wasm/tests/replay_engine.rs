@@ -12,17 +12,10 @@ use brenn_cal::ms_to_sent_at;
 use brenn_wasm::{CheckInput, LAST_GRACE_MS, PRUNE_GATE_MODULUS, ReplayComponent, ReplayError};
 use tempfile::NamedTempFile;
 
-const REPLAY_ARTIFACT_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/target/components/brenn_replay.wasm"
-);
-
 // ±5-minute skew window in milliseconds, matching the component constant.
 const SKEW_WINDOW_MS: u64 = 5 * 60 * 1000;
 
-fn replay_artifact() -> std::path::PathBuf {
-    std::path::PathBuf::from(REPLAY_ARTIFACT_PATH)
-}
+use common::replay_artifact;
 
 fn open_component() -> (NamedTempFile, ReplayComponent) {
     common::open_component(&replay_artifact())

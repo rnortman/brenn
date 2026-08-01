@@ -323,10 +323,14 @@ fn superset_grants_loads() {
 /// checked against the linker by `semver_mirror_matches_wasmtime_linker`.
 ///
 /// Every fixture is also built by the pinned toolchain, so the host-side suite only
-/// ever sees components carrying the current encoded type section.
-///
-/// TODO(wasm-prev-generator-load-coverage): out-of-tree components lag the pin by
-/// definition, and no test loads a component built by the previous generator.
+/// ever sees components carrying the current encoded type section. Loading a
+/// component built by the *previous* generator — the pairing out-of-tree authors
+/// actually ship — is covered by hand at each toolchain bump (the bump procedure in
+/// `brenn-wasm/README.md`), not by this suite. Automating it is deliberately
+/// deferred until an out-of-tree component exists to protect: a committed golden
+/// `.wasm` breaks the no-binaries fixture posture, and a second generator toolchain
+/// doubles the pin-sync surface. The risk is accepted while that population is
+/// empty.
 #[test]
 fn drift_guard_all_fixture_imports_recognized() {
     use wasmtime::{Config, Engine, component::Component};
