@@ -112,6 +112,8 @@ fn read_counters() -> StatusCounters {
         deliveries: DELIVERIES.with(Cell::get),
         publishes: PUBLISHES.with(Cell::get),
         errors: ERRORS.with(Cell::get),
+        // The legacy path has no telemetry-refusal counter of its own.
+        telemetry_dropped: 0,
         instances: INSTANCE_COUNTERS.with(|c| c.borrow().clone()),
     }
 }

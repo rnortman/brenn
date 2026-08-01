@@ -755,6 +755,7 @@ fn telemetry_before_welcome_is_dropped() {
                     deliveries: 0,
                     publishes: 0,
                     errors: 0,
+                    telemetry_dropped: 0,
                     instances: Default::default(),
                 },
             }),
@@ -804,6 +805,7 @@ fn telemetry_on_active_surface_sends_frames() {
                 deliveries: 3,
                 publishes: 1,
                 errors: 0,
+                telemetry_dropped: 0,
                 instances: Default::default(),
             },
         }),
@@ -824,6 +826,7 @@ fn telemetry_on_active_surface_sends_frames() {
                 deliveries: 3,
                 publishes: 1,
                 errors: 0,
+                telemetry_dropped: 0,
                 instances: Default::default(),
             },
             // Nothing published on the overlay-state plane, so the surface

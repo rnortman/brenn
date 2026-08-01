@@ -59,9 +59,21 @@ pub mod inbound;
 /// release pass, the outbox retry, and what the page says about a loss.
 pub mod outward;
 
+/// What the platform half asks of a page: a component's publish, a report, an
+/// alert, a control plane, the two telemetry documents, and the close.
+pub mod command;
+
 /// The vocabulary the platform half speaks, and the fold that turns every pass's
 /// answer into it.
 pub mod session;
+
+/// What reaches the page from outside — the connection, the peer, the deadlines,
+/// the platform half — and the table that routes one of them into a whole turn.
+pub mod turn;
+
+/// The loop that joins a page to an attachment: the layer that waits, reads the
+/// clocks, and performs what a turn asks for.
+pub mod runner;
 
 /// The per-activation publish buffer: the sole quota authority for the duration
 /// of a component's handler.

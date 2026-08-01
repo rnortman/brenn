@@ -52,6 +52,7 @@ use brenn_attach_proto::{ClientFrame, VersionRange};
 use brenn_surface_schema::bindings::BindingsDocument;
 
 use crate::activation::DropVerdicts;
+use crate::command::CommandOutcome;
 use crate::core::{ActivationOutcome, PublishStatus};
 use crate::flush::Killed;
 use crate::inbound::Inbound;
@@ -188,6 +189,10 @@ pub enum Effect {
     /// its own terminal event, which is where [`Event::Fatal`] is minted — a
     /// fatal is one thing however it was diagnosed.
     GoFatal { detail: String },
+    /// Close the attachment for good: the page asked to shut down. Terminal and
+    /// silent — no reconnect, and no event, because the platform half is the party
+    /// that asked. The callers the close stranded are answered beside it.
+    Close,
 }
 
 /// One turn's effects, accumulated in the order the passes produced them.
@@ -245,28 +250,30 @@ impl Reactions {
     pub fn conn_event(&mut self, page: &mut SurfacePage, event: ConnEvent) {
         match event {
             ConnEvent::Attached(facts) => {
-                for frame in page.on_attached(facts) {
-                    self.send_frame(page, frame);
-                }
+                let frames = page.on_attached(facts);
+                self.frames(page, frames);
             }
             // The loss is reported before what died with it: a caller reading
             // `ConnectionLost` off a publish should not be the first thing the
             // platform half hears about a link that is down.
             ConnEvent::Detached { reason } => {
                 self.emit(Event::Disconnected { reason });
-                let Detached { answers, steps } = page.on_detached();
-                self.answers(answers);
-                self.steps(page, steps);
+                self.detach(page);
             }
-            ConnEvent::Fatal { detail } => self.emit(Event::Fatal { detail }),
+            ConnEvent::Fatal { detail } => {
+                self.emit(Event::Fatal { detail });
+                self.detach(page);
+            }
             ConnEvent::Incompatible { ours, theirs } => {
                 self.emit(Event::Incompatible { ours, theirs });
+                self.detach(page);
             }
             ConnEvent::PeerClosedTerminal { code, reason } => {
                 tracing::warn!(code, %reason, "surface client: the peer closed with the terminal code");
                 self.emit(Event::ReloadRequired {
                     server_build: reason,
                 });
+                self.detach(page);
             }
         }
     }
@@ -287,9 +294,7 @@ impl Reactions {
             gap,
             lost_flushes,
         } = inbound;
-        for frame in frames {
-            self.send_frame(page, frame);
-        }
+        self.frames(page, frames);
         if let Some(configured) = configured {
             self.configured(page, configured, now, now_ms);
         }
@@ -357,9 +362,7 @@ impl Reactions {
         if wiring_changed {
             self.emit(Event::WiringChanged);
         }
-        for frame in frames {
-            self.send_frame(page, frame);
-        }
+        self.frames(page, frames);
         self.steps(page, steps);
         self.verdicts(page, drops, now, now_ms);
         for lost in lost_flushes {
@@ -369,6 +372,49 @@ impl Reactions {
                 ops = lost.batch.ops.len(),
                 "surface client: a queued flush died with the outbox this document closed"
             );
+        }
+    }
+
+    /// Fold what one command the platform half asked for produced.
+    ///
+    /// The order is the order a caller needs it in: the frames the command
+    /// composed, then the close it asked for, then the diagnostic for a plane that
+    /// refused it, then the callers it answered, then the losses it caused. A
+    /// refusal is reported ahead of the answer that carries it, so the reason
+    /// reaches the log before the bare status reaches the publisher.
+    pub fn command(
+        &mut self,
+        page: &mut SurfacePage,
+        outcome: CommandOutcome,
+        now: Millis,
+        now_ms: u64,
+    ) {
+        let CommandOutcome {
+            frames,
+            answers,
+            drops,
+            refusal,
+            steps,
+            close,
+            fatal,
+        } = outcome;
+        self.frames(page, frames);
+        if close {
+            self.effects.push(Effect::Close);
+        }
+        if let Some(refused) = refusal {
+            self.emit(Event::PlaneRefused {
+                instance: refused.instance,
+                port: refused.refusal.port,
+                channel: refused.refusal.channel,
+                reason: refused.refusal.reason,
+            });
+        }
+        self.answers(answers);
+        self.steps(page, steps);
+        self.verdicts(page, drops, now, now_ms);
+        if let Some(detail) = fatal {
+            self.go_fatal(detail);
         }
     }
 
@@ -450,9 +496,7 @@ impl Reactions {
             dropped,
             retry_wakeup,
         } = steps;
-        for frame in frames {
-            self.send_frame(page, frame);
-        }
+        self.frames(page, frames);
         for toast in outward::parked_drop_notices(&dropped) {
             self.control(toast);
         }
@@ -530,9 +574,33 @@ impl Reactions {
         }
     }
 
+    /// Send frames a pass composed, in order.
+    ///
+    /// See [`send_frame`](Self::send_frame) for what happens to one composed
+    /// against a dead link.
+    pub fn frames(&mut self, page: &SurfacePage, frames: Vec<ClientFrame>) {
+        for frame in frames {
+            self.send_frame(page, frame);
+        }
+    }
+
     /// Ask the connection to go fatal. The terminal event comes back from it.
     pub fn go_fatal(&mut self, detail: String) {
         self.effects.push(Effect::GoFatal { detail });
+    }
+
+    /// Tear the page's half of an attachment down and answer what died with it.
+    ///
+    /// Shared by the ordinary detach and by each of the three terminal verdicts,
+    /// which end an attachment just as finally: after any of them there is no
+    /// wire, so a caller still awaiting a publish is owed `ConnectionLost` now
+    /// rather than never, and a frame composed against a page that still believed
+    /// itself attached would have nowhere to go. Idempotent — a fatal raised
+    /// while already detached asks for nothing.
+    fn detach(&mut self, page: &mut SurfacePage) {
+        let Detached { answers, steps } = page.on_detached();
+        self.answers(answers);
+        self.steps(page, steps);
     }
 
     /// What a terminal instance asks for: the timer its discarded queue freed,

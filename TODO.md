@@ -961,6 +961,60 @@ Code site (`TODO(dormant-missing-app-cursor)`):
 `Messenger::reconcile_subscriber_cursors`.
 
 
+## `runner-activation-dispatch`
+
+`surface/kernel/src/runner.rs` stores each registered activation entry and never
+calls one. The loop serves the driver, the platform half's control commands and
+the page's own deadlines, but the pass that asks the page for a ready instance,
+assembles its activation, invokes the entry and hands the completion back is not
+wired in — so a page driven by this runner delivers nothing to a component. The
+invocation boundary is also where an entry's panic is classified as a trap rather
+than an err, which nothing else can do for it.
+
+Done when the runner dispatches ready activations on its own select arm — a
+bounded pass per turn, below every other arm in the bias order, so a component
+that republishes what it consumes livelocks itself rather than the page — and
+`entries` is read by it.
+
+Both auxiliary deadlines' round trips through the runner — `Effect::SetRetryWakeup`
+/ `Effect::SetReleaseWakeup` out, the driver arming them, `IoEvent::RetryDue` /
+`IoEvent::ReleaseDue` back, and the turn taken at the fire's own clock — ride on
+this same work and are untested until it lands. Only an activation's flush parks a
+confined message or leaves an outbox head blocked, so no input a runner test can
+drive today arms either deadline. Both deadlines' *turn*-level behaviour is
+covered (`turn/tests.rs`); it is the runner half of the round trip that is owed.
+
+Code site (`TODO(runner-activation-dispatch)`): `surface/kernel/src/runner.rs`,
+the `entries` field of `SurfaceRunner`.
+
+
+## `runner-drain-host-departure`
+
+`SurfaceRunner::run_terminal_drain` (`surface/kernel/src/runner.rs`) awaits the
+control channel and nothing else. Going terminal disarms every deadline and drops
+the transport, so after it the control channel is the drain's only wake source —
+and `host_gone()` (the event sink's `is_closed`, which the run's documented
+lifeline is) is re-read only when a command arrives or the channel closes. A
+platform half that drops its event receiver while holding an idle control sender
+parks the drain forever, leaking the task and the whole page with it. Everywhere
+before terminal the loop re-reads `host_gone` on a bounded cadence, because the
+driver always has an armed deadline or a socket to wake on.
+
+Blocked on the seam the cutover round defines: the fix is either a liveness
+signal the platform half holds (a new parameter on `SurfaceRunner::new`, which
+constrains a platform half that is not written yet) or a stated ordering contract
+on it (drop the control senders before the event receiver). `futures` mpsc offers
+no closed-notification a select arm could take, so there is no third option that
+is purely local to the runner.
+
+Done when the drain's wait resolves on the platform half's departure however it
+happens, and a test pins it: drop the event receiver mid-drain with a control
+sender still alive, and the run terminates.
+
+Code site (`TODO(runner-drain-host-departure)`): `surface/kernel/src/runner.rs`,
+at `run_terminal_drain`.
+
+
 ## `attach-cutover`
 
 `brenn-attach-client` and the surface kernel's new channel-keyed modules hold
@@ -1000,6 +1054,17 @@ Inventory, surviving copy → doomed twin (each twin carries a
   command path and `brenn-server/src/routes/surface/telemetry.rs`'s frame
   validation, health derivation and document composition (its server-written
   disconnected stamp stays).
+- `surface/kernel/src/turn.rs` plus `session.rs`'s `Reactions` fold →
+  `core/mod.rs`'s `Input` vocabulary, its `on_input`/`dispatch_input` routing,
+  and its `Effect` vocabulary.
+- `surface/kernel/src/command.rs` → `core/mod.rs`'s `Command` vocabulary and its
+  `on_command` dispatch (the telemetry arms of which the row above also names).
+- `surface/kernel/src/runner.rs` → `surface/kernel/src/driver.rs`: `Driver::run`,
+  its three `select_biased!` sites, the effect-execution drain and the terminal
+  drain. The handle plane `driver.rs` also selects — publish, alert and log
+  commands, the `PublishGate` refresh, the activation dispatch — has no surviving
+  copy yet; it lands with the runner's own front door and dies with the rest of
+  the file at the cutover.
 
 
 

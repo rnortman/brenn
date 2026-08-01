@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::activation::DropAnnouncement;
 use crate::core::PublishStatus;
-use crate::outbound::PortPublish;
+use crate::outbound::{PortPublish, resolve_output};
 use crate::registry::BindingKey;
 use crate::test_support::bindings as fixtures;
 use crate::test_support::pages;
@@ -447,18 +447,17 @@ fn a_publish_result_answers_its_caller() {
         connect, outbound, ..
     } = &mut page;
     let wiring = connect.bindings().expect("the document is in force");
-    let frame = outbound
-        .publish_port(
-            wiring,
-            PortPublish {
-                instance: "p1".to_string(),
-                port: "out".to_string(),
-                body: "{}".to_string(),
-                urgency: None,
-                correlation: 7,
-            },
-        )
-        .expect("p1 binds the port");
+    let out = resolve_output(wiring, "p1", "out", None).expect("p1 binds the port");
+    let frame = outbound.publish_port(
+        out,
+        PortPublish {
+            instance: "p1".to_string(),
+            port: "out".to_string(),
+            body: "{}".to_string(),
+            urgency: None,
+            correlation: 7,
+        },
+    );
     let ClientFrame::Publish { correlation, .. } = frame else {
         panic!("a port publish composes a Publish frame");
     };

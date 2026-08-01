@@ -425,6 +425,7 @@ mod tests {
             deliveries: 10,
             publishes: 2,
             errors: 1,
+            telemetry_dropped: 0,
             instances: [(
                 "p1".to_string(),
                 brenn_surface_schema::InstanceCounters {

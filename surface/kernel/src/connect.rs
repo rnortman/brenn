@@ -165,6 +165,24 @@ impl SurfaceConnect {
         self.bindings.as_ref()
     }
 
+    /// The wiring the *current* attachment put in force, or `None` until its own
+    /// document has arrived.
+    ///
+    /// The question every wire-bound composition asks, and it is not the same one
+    /// [`bindings`](Self::bindings) answers. Between phase 1 and phase 2 of a
+    /// reconnect the page is live and still holding the previous attachment's
+    /// wiring, and the peer on the other end of the new socket judges a channel
+    /// address and an attribution against its own current configuration — so a
+    /// frame composed from the old wiring is answered with a protocol close and a
+    /// fail2ban strike charged to a legitimate user. Page-local work asks
+    /// `bindings` and keeps running; anything bound for the socket asks this.
+    pub fn configured_bindings(&self) -> Option<&AppliedBindings> {
+        match self.phase {
+            Phase::Configured => self.bindings.as_ref(),
+            Phase::Detached | Phase::AwaitingConfig => None,
+        }
+    }
+
     /// Phase 1: the attachment is live.
     ///
     /// Records its facts and takes the config channel's reference, which the

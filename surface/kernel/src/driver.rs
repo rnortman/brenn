@@ -20,6 +20,14 @@
 //! every connection-state transition. Control is biased ahead of publish and
 //! log, so neither a publish backlog nor a log flood starves attach/detach.
 
+// TODO(attach-cutover): this loop — `Driver::run`, its three `select_biased!`
+// sites, the effect-execution drain and the terminal drain — is duplicated by
+// `crate::runner::SurfaceRunner`, which joins `crate::turn`'s pure pass to
+// `brenn_attach_client::driver::AttachDriver` instead of to `ClientCore`. The
+// handle plane below it (publish, alert and log commands, the `PublishGate`
+// refresh, the activation dispatch) has no surviving copy yet. Delete this file
+// when the kernel cuts over.
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
@@ -2536,6 +2544,7 @@ mod tests {
                 deliveries: 3,
                 publishes: 1,
                 errors: 0,
+                telemetry_dropped: 0,
                 instances: Default::default(),
             },
         );

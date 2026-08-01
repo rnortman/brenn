@@ -426,6 +426,14 @@ pub struct StatusCounters {
     pub publishes: u64,
     /// Component errors/panics the kernel has observed.
     pub errors: u64,
+    /// Telemetry documents the peer refused — rate-limited or over the body cap.
+    ///
+    /// Page-derived, unlike the three totals above: only the layer that settles a
+    /// telemetry publish's outcome knows it, so the page states this field from
+    /// its own count and whatever a reporter put here is discarded. A dropped
+    /// latest-wins document costs staleness only, so this is the sole account of
+    /// how stale the plane has been.
+    pub telemetry_dropped: u64,
     /// Per-instance breakdown, keyed by instance id. The surface's totals above
     /// answer "is the wall working?"; this answers "which component is doing
     /// it?" — the same principal grain the bus meters and attributes publishes
@@ -1819,6 +1827,7 @@ mod tests {
                 deliveries: 1042,
                 publishes: 12,
                 errors: 3,
+                telemetry_dropped: 0,
                 instances: BTreeMap::from([
                     (
                         "p1".to_string(),
@@ -1853,6 +1862,7 @@ mod tests {
                 "deliveries": 1042,
                 "publishes": 12,
                 "errors": 3,
+                "telemetry_dropped": 0,
                 "instances": {
                     "p1": { "publishes": 12, "drops": 7 },
                     "mode-clock": { "publishes": 0, "drops": 0 },

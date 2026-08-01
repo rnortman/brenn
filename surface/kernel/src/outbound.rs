@@ -223,28 +223,25 @@ impl SurfaceOutbound {
 
     /// Compose one component publish and record what its answer is owed to.
     ///
-    /// `None` for a port the wiring does not bind — the caller's own rejection,
-    /// which it answers without a frame. Nothing else here can refuse: the body
-    /// cap and the reachability check are the caller's, made before this layer is
-    /// asked to spend a correlation on the publish.
-    pub fn publish_port(
-        &mut self,
-        bindings: &AppliedBindings,
-        req: PortPublish,
-    ) -> Option<ClientFrame> {
-        let resolved = resolve_output(bindings, &req.instance, &req.port, req.urgency)?;
+    /// Takes the port's resolution rather than resolving it: the caller has
+    /// already asked [`resolve_output`] which channel this port lands on, because
+    /// the channel's class is what decides whether the publish reaches the wire at
+    /// all. Nothing here can refuse — an unbound port, an unreachable one and an
+    /// oversized body are all answered before this layer is asked to spend a
+    /// correlation on the publish.
+    pub fn publish_port(&mut self, out: ResolvedOutput<'_>, req: PortPublish) -> ClientFrame {
         let request = PublishRequest {
-            channel: resolved.channel.to_string(),
+            channel: out.channel.to_string(),
             attribution: Some(req.instance.clone()),
             body: req.body,
-            urgency: resolved.urgency,
+            urgency: out.urgency,
         };
         let tag = PublishTag::Port {
             instance: req.instance,
             port: req.port,
             correlation: req.correlation,
         };
-        Some(self.send(tag, request))
+        self.send(tag, request)
     }
 
     /// Compose one error report, or `None` when the surface publishes none.
