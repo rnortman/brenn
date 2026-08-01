@@ -6,6 +6,8 @@
 use super::*;
 
 use brenn_attach_proto::GapReason;
+use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
+use uuid::Uuid;
 
 const CHANNEL: &str = "brenn:app.events";
 const OTHER: &str = "ephemeral:app.signals";
@@ -20,6 +22,40 @@ fn depths(push_depth: u64, retain_depth: u64) -> SubscriptionDepths {
 fn cursor(token: &str) -> Cursor {
     serde_json::from_value(serde_json::Value::String(token.to_string()))
         .expect("cursor from a JSON string")
+}
+
+/// A whole delivery pass: one row per `(seq, cursor token, dropped)` triple, in
+/// frame order.
+///
+/// The envelopes are filler. This plane reads the span seq, the cursor and the
+/// drop count and nothing else — naming a message's contents here would be the
+/// application concept the crate's purity forbids.
+fn pass(rows: &[(u64, &str, u64)]) -> Vec<DeliverRow> {
+    rows.iter()
+        .map(|&(seq, token, dropped)| DeliverRow {
+            envelope: filler_envelope(),
+            seq,
+            cursor: cursor(token),
+            dropped,
+        })
+        .collect()
+}
+
+fn filler_envelope() -> MessageEnvelope {
+    MessageEnvelope {
+        message_id: Uuid::nil(),
+        source: "test".to_string(),
+        channel: CHANNEL.to_string(),
+        sender: "test".to_string(),
+        publish_ts: chrono::DateTime::from_timestamp(0, 0).expect("a representable instant"),
+        body: String::new(),
+        reply_to: None,
+        delivery_deadline: None,
+        deliver_after: None,
+        impetus: None,
+        urgency: Urgency::Normal,
+        envelope_type: ChannelScheme::Brenn,
+    }
 }
 
 fn subscribe(
@@ -172,7 +208,7 @@ fn a_release_while_the_subscribe_is_in_flight_defers_the_unsubscribe() {
 #[test]
 fn a_fresh_acquisition_after_a_full_release_resumes_from_nothing() {
     let mut subs = attached_with(CHANNEL);
-    subs.on_deliver(CHANNEL, 1, cursor("c1"), 0)
+    subs.on_deliver(CHANNEL, &pass(&[(1, "c1", 0)]))
         .expect("live subscription accepts a delivery");
     subs.release(CHANNEL);
     // The cursor went with the last subscriber: this attach takes the retained
@@ -187,7 +223,7 @@ fn a_fresh_acquisition_after_a_full_release_resumes_from_nothing() {
 #[test]
 fn a_fresh_acquisition_after_a_full_release_may_state_a_different_subscription() {
     let mut subs = attached_with(CHANNEL);
-    subs.on_deliver(CHANNEL, 1, cursor("c1"), 0)
+    subs.on_deliver(CHANNEL, &pass(&[(1, "c1", 0)]))
         .expect("live subscription accepts a delivery");
     subs.release(CHANNEL);
     assert_eq!(
@@ -235,9 +271,12 @@ fn a_statement_replaced_while_the_subscribe_is_in_flight_is_enacted_at_its_resul
 
     // A delivery from the span that just closed is a straggler, not a fatal.
     assert_eq!(
-        subs.on_deliver(CHANNEL, 1, cursor("c1"), 0)
+        subs.on_deliver(CHANNEL, &pass(&[(1, "c1", 0)]))
             .expect("a straggler is tolerated"),
-        DeliverDisposition::Discard { first: true }
+        DeliverDisposition::Discard {
+            first: true,
+            dropped: 0
+        }
     );
 
     let ack = subs
@@ -286,7 +325,7 @@ fn a_reattach_resubscribes_survivors_with_their_cursors() {
     subs.acquire(OTHER, depths(2, 2), ResumePolicy::Resume);
     subs.on_subscribe_result(OTHER, SubscribeOutcome::Ok, 0, None)
         .expect("pending");
-    subs.on_deliver(CHANNEL, 7, cursor("c7"), 0)
+    subs.on_deliver(CHANNEL, &pass(&[(7, "c7", 0)]))
         .expect("accept");
     subs.on_detached();
     assert!(!subs.is_active(CHANNEL));
@@ -307,7 +346,7 @@ fn a_cursorless_channel_never_presents_a_resume_claim() {
     subs.acquire(CHANNEL, depths(1, 1), ResumePolicy::Cursorless);
     subs.on_subscribe_result(CHANNEL, SubscribeOutcome::Ok, 1, None)
         .expect("pending");
-    subs.on_deliver(CHANNEL, 1, cursor("c1"), 0)
+    subs.on_deliver(CHANNEL, &pass(&[(1, "c1", 0)]))
         .expect("accept");
     subs.on_detached();
     assert_eq!(subs.on_attached(), vec![subscribe(CHANNEL, 1, 1, None)]);
@@ -357,11 +396,11 @@ fn a_subscribe_result_for_a_channel_not_pending_is_fatal() {
 fn a_delivery_advances_the_span_and_reports_its_drops() {
     let mut subs = attached_with(CHANNEL);
     assert_eq!(
-        subs.on_deliver(CHANNEL, 1, cursor("c1"), 0),
+        subs.on_deliver(CHANNEL, &pass(&[(1, "c1", 0)])),
         Ok(DeliverDisposition::Accept { dropped: 0 })
     );
     assert_eq!(
-        subs.on_deliver(CHANNEL, 9, cursor("c9"), 4),
+        subs.on_deliver(CHANNEL, &pass(&[(9, "c9", 4)])),
         Ok(DeliverDisposition::Accept { dropped: 4 })
     );
 }
@@ -369,18 +408,127 @@ fn a_delivery_advances_the_span_and_reports_its_drops() {
 #[test]
 fn a_seq_that_does_not_advance_the_span_is_fatal() {
     let mut subs = attached_with(CHANNEL);
-    subs.on_deliver(CHANNEL, 5, cursor("c5"), 0)
+    subs.on_deliver(CHANNEL, &pass(&[(5, "c5", 0)]))
         .expect("accept");
     let err = subs
-        .on_deliver(CHANNEL, 5, cursor("c5-again"), 0)
+        .on_deliver(CHANNEL, &pass(&[(5, "c5-again", 0)]))
         .expect_err("a repeated seq is a peer bug");
     assert!(err.contains("seq regression"), "{err}");
+}
+
+/// A multi-row pass is taken as one: the span crosses every row, the pass's
+/// losses are charged once, and the token the next subscribe presents is the
+/// last row's — the newest position the pass carried.
+///
+/// The loss and the cursor come from opposite ends of the pass, which is the
+/// pairing most at risk of being made symmetric by a later reader: the loss is
+/// the head row's figure, the resume token the tail row's.
+#[test]
+fn a_pass_takes_every_row_and_resumes_from_the_last() {
+    let mut subs = attached_with(CHANNEL);
+
+    assert_eq!(
+        subs.on_deliver(CHANNEL, &pass(&[(1, "c1", 3), (2, "c2", 0), (3, "c3", 0)])),
+        Ok(DeliverDisposition::Accept { dropped: 3 })
+    );
+
+    subs.on_detached();
+    assert_eq!(
+        subs.on_attached(),
+        vec![subscribe(CHANNEL, 5, 10, Some("c3"))]
+    );
+}
+
+/// A loss belongs to the subscription and rides the row that follows it, so a
+/// peer reporting one part-way through a pass is describing something the wire
+/// shape cannot mean. Refused, on every channel state, before the disposition
+/// exists: the straggler tolerance covers a race, not a malformed frame.
+#[test]
+fn a_loss_reported_past_the_first_row_is_fatal() {
+    let mut subs = attached_with(CHANNEL);
+
+    let err = subs
+        .on_deliver(CHANNEL, &pass(&[(1, "c1", 3), (2, "c2", 4)]))
+        .expect_err("a mid-pass loss is a peer bug");
+    assert!(err.contains("past its first row"), "{err}");
+
+    subs.release(CHANNEL);
+    let err = subs
+        .on_deliver(CHANNEL, &pass(&[(2, "c2", 0), (3, "c3", 1)]))
+        .expect_err("a mid-pass loss is a peer bug whatever the channel's state");
+    assert!(err.contains("past its first row"), "{err}");
+}
+
+/// The high-water rises across a pass, not only at its end: a row that repeats
+/// an earlier row's seq inside the same frame is the same peer bug a repeat
+/// across frames is.
+#[test]
+fn a_regression_inside_a_pass_is_fatal() {
+    let mut subs = attached_with(CHANNEL);
+
+    let err = subs
+        .on_deliver(
+            CHANNEL,
+            &pass(&[(1, "c1", 0), (3, "c3", 0), (3, "c3-again", 0)]),
+        )
+        .expect_err("a repeated seq inside a pass is a peer bug");
+
+    assert!(err.contains("seq regression"), "{err}");
+}
+
+/// Nothing is half-taken. A refused pass leaves the span and the cursor where
+/// they stood, so the rows before the offending one are not silently kept.
+#[test]
+fn a_refused_pass_advances_nothing() {
+    let mut subs = attached_with(CHANNEL);
+    subs.on_deliver(CHANNEL, &pass(&[(1, "c1", 0)]))
+        .expect("accept");
+
+    subs.on_deliver(CHANNEL, &pass(&[(2, "c2", 0), (1, "c1-again", 0)]))
+        .expect_err("the interior regression refuses the pass");
+
+    subs.on_detached();
+    assert_eq!(
+        subs.on_attached(),
+        vec![subscribe(CHANNEL, 5, 10, Some("c1"))],
+        "the refused pass's cursor was never taken"
+    );
+}
+
+/// A pass with nothing in it says nothing, and a peer that writes one is not
+/// keeping the contract: a send path with nothing to serve writes no frame.
+#[test]
+fn a_pass_with_no_rows_is_fatal() {
+    let mut subs = attached_with(CHANNEL);
+
+    let err = subs
+        .on_deliver(CHANNEL, &[])
+        .expect_err("an empty pass is a peer bug");
+
+    assert!(err.contains("no rows"), "{err}");
+}
+
+/// Straggler tolerance covers a pass from a span this attacher left, not a frame
+/// the peer should never have written: the empty pass is refused before the
+/// channel's state is consulted, on every channel state.
+#[test]
+fn a_pass_with_no_rows_on_a_straggler_channel_is_fatal() {
+    let mut subs = attached_with(CHANNEL);
+    subs.on_deliver(CHANNEL, &pass(&[(1, "c1", 0)]))
+        .expect("accept");
+    subs.release(CHANNEL);
+
+    let err = subs
+        .on_deliver(CHANNEL, &[])
+        .expect_err("an empty pass is a peer bug whatever the channel's state");
+
+    assert!(err.contains("no rows"), "{err}");
 }
 
 #[test]
 fn a_span_restarts_at_each_subscribe() {
     let mut subs = attached_with(CHANNEL);
-    subs.on_deliver(CHANNEL, 9, cursor("c9"), 0)
+    subs.on_deliver(CHANNEL, &pass(&[(9, "c9", 0)]))
         .expect("accept");
     subs.on_detached();
     subs.on_attached();
@@ -389,7 +537,7 @@ fn a_span_restarts_at_each_subscribe() {
     // The peer's counter restarts at 1 on the new span, which the old
     // high-water would otherwise read as a regression.
     assert_eq!(
-        subs.on_deliver(CHANNEL, 1, cursor("d1"), 0),
+        subs.on_deliver(CHANNEL, &pass(&[(1, "d1", 0)])),
         Ok(DeliverDisposition::Accept { dropped: 0 })
     );
 }
@@ -400,7 +548,7 @@ fn a_delivery_on_a_channel_never_active_is_fatal() {
     subs.on_attached();
     subs.acquire(CHANNEL, depths(5, 10), ResumePolicy::Resume);
     let err = subs
-        .on_deliver(CHANNEL, 1, cursor("c1"), 0)
+        .on_deliver(CHANNEL, &pass(&[(1, "c1", 0)]))
         .expect_err("replay cannot precede the result that opens the span");
     assert!(err.contains("never active"), "{err}");
 }
@@ -408,16 +556,23 @@ fn a_delivery_on_a_channel_never_active_is_fatal() {
 #[test]
 fn a_straggler_after_an_unsubscribe_is_discarded_and_reported_once() {
     let mut subs = attached_with(CHANNEL);
-    subs.on_deliver(CHANNEL, 1, cursor("c1"), 0)
+    subs.on_deliver(CHANNEL, &pass(&[(1, "c1", 0)]))
         .expect("accept");
     subs.release(CHANNEL);
     assert_eq!(
-        subs.on_deliver(CHANNEL, 2, cursor("c2"), 0),
-        Ok(DeliverDisposition::Discard { first: true })
+        subs.on_deliver(CHANNEL, &pass(&[(2, "c2", 0)])),
+        Ok(DeliverDisposition::Discard {
+            first: true,
+            dropped: 0
+        })
     );
     assert_eq!(
-        subs.on_deliver(CHANNEL, 3, cursor("c3"), 7),
-        Ok(DeliverDisposition::Discard { first: false })
+        subs.on_deliver(CHANNEL, &pass(&[(3, "c3", 7), (4, "c4", 0)])),
+        Ok(DeliverDisposition::Discard {
+            first: false,
+            dropped: 7
+        }),
+        "a discarded pass still names what the peer reported it lost"
     );
     // The discards advanced nothing: a re-acquisition resumes from the cursor
     // the last *accepted* delivery left, not from a discarded one — and here
@@ -437,16 +592,22 @@ fn the_straggler_report_re_arms_on_the_next_span() {
     subs.release(CHANNEL);
     subs.release(CHANNEL);
     assert_eq!(
-        subs.on_deliver(CHANNEL, 2, cursor("c2"), 0),
-        Ok(DeliverDisposition::Discard { first: true })
+        subs.on_deliver(CHANNEL, &pass(&[(2, "c2", 0)])),
+        Ok(DeliverDisposition::Discard {
+            first: true,
+            dropped: 0
+        })
     );
     subs.acquire(CHANNEL, depths(5, 10), ResumePolicy::Resume);
     subs.on_subscribe_result(CHANNEL, SubscribeOutcome::Ok, 0, None)
         .expect("pending");
     subs.release(CHANNEL);
     assert_eq!(
-        subs.on_deliver(CHANNEL, 1, cursor("d1"), 0),
-        Ok(DeliverDisposition::Discard { first: true })
+        subs.on_deliver(CHANNEL, &pass(&[(1, "d1", 0)])),
+        Ok(DeliverDisposition::Discard {
+            first: true,
+            dropped: 0
+        })
     );
 }
 
@@ -458,7 +619,7 @@ fn a_detach_ends_straggler_tolerance() {
     // The new attachment has no span open on the channel yet, so a delivery on
     // it is inexplicable rather than a leftover.
     let err = subs
-        .on_deliver(CHANNEL, 1, cursor("c1"), 0)
+        .on_deliver(CHANNEL, &pass(&[(1, "c1", 0)]))
         .expect_err("stragglers cannot cross a connection");
     assert!(err.contains("never active"), "{err}");
 }

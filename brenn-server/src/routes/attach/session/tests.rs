@@ -929,10 +929,11 @@ async fn co_available_pushes_are_coalesced_into_one_batch() {
     assert!(!outcome.violation);
 }
 
-/// **The eager-wake nudge serves every active subscription its suffix.** The
-/// router fires it for rows it did not hand over itself — a quiet channel's, or a
-/// released schedule's — so without this arm wired those rows wait for the next
-/// live message that may never come.
+/// **The eager-wake nudge serves every active subscription its suffix, as one
+/// frame.** The router fires it for rows it did not hand over itself — a quiet
+/// channel's, or a released schedule's — so without this arm wired those rows
+/// wait for the next live message that may never come. The nudge's drain is one
+/// pass, so the whole suffix reaches the attacher as one delivery point.
 #[tokio::test]
 async fn a_drain_nudge_serves_the_retained_suffix() {
     let db = brenn_lib::db::init_db_memory();
@@ -943,14 +944,16 @@ async fn a_drain_nudge_serves_the_retained_suffix() {
     seed(&db, channel_uuid, r#"{"n":2}"#, 200).await;
     attachment.drain_notify.notify_one();
 
-    for expected in 1..=2u64 {
-        match attachment.next_frame().await {
-            ServerFrame::Deliver { channel, seq, .. } => {
-                assert_eq!(channel, CHANNEL);
-                assert_eq!(seq, expected, "the span's seq advances per delivery");
-            }
-            other => panic!("expected a Deliver, got {other:?}"),
+    match attachment.next_frame().await {
+        ServerFrame::Deliver { channel, rows } => {
+            assert_eq!(channel, CHANNEL);
+            assert_eq!(
+                rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+                vec![1, 2],
+                "the span's seq advances per row within the one pass"
+            );
         }
+        other => panic!("expected a Deliver, got {other:?}"),
     }
 
     let (outcome, _frames) = attachment.finish().await;

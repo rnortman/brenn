@@ -498,13 +498,14 @@ async fn surface_ws_a_publish_reaches_the_bus_and_comes_back_on_the_subscription
                 );
                 answered = true;
             }
-            ServerFrame::Deliver {
-                channel, envelope, ..
-            } => {
+            ServerFrame::Deliver { channel, rows } => {
                 assert_eq!(channel, EPH_ADDR);
-                assert_eq!(envelope.body, "round trip");
+                let [row] = rows.as_slice() else {
+                    panic!("one live publish is a one-row pass, got {rows:?}");
+                };
+                assert_eq!(row.envelope.body, "round trip");
                 assert_eq!(
-                    envelope.sender, "surface:deskbar#protobar",
+                    row.envelope.sender, "surface:deskbar#protobar",
                     "the attribution mints the component's own sub-identity"
                 );
                 delivered = true;
@@ -790,11 +791,12 @@ async fn surface_ws_an_auto_channel_carries_a_backend_publish_to_the_page() {
         .await;
 
     match next_server_frame(&mut ws).await {
-        ServerFrame::Deliver {
-            channel, envelope, ..
-        } => {
+        ServerFrame::Deliver { channel, rows } => {
             assert_eq!(channel, address);
-            assert_eq!(envelope.body, "from-the-backend");
+            let [row] = rows.as_slice() else {
+                panic!("one backend publish is a one-row pass, got {rows:?}");
+            };
+            assert_eq!(row.envelope.body, "from-the-backend");
         }
         other => panic!("expected Deliver on the auto channel, got {other:?}"),
     }

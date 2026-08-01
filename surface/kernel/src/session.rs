@@ -294,7 +294,7 @@ impl Reactions {
             lost_flushes,
         } = inbound;
         self.frames(page, frames);
-        if let Some(configured) = configured {
+        for configured in configured {
             self.configured(page, configured, now, now_ms);
         }
         self.answers(answers);

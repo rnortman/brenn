@@ -481,23 +481,30 @@ noise = "alarm"
 # Chrome's control-plane bindings. `local:` channels have no [[channel]] rung, so
 # each carries an explicit page-queue `push_depth`; the retained-ring depth is
 # contract-fixed by the reserved table, not set here.
+#
+# The rule for every binding below: a latest-wins port — one whose newest message
+# fully describes its state — takes `push_depth = 1`, because coalescing to the
+# latest is the subscription's job and a component handed two of them reports the
+# depth as an operator error. `theme`, `link-state` and `surface-state` are
+# latest-wins; `toast` is a stream of distinct events, so it keeps a depth that
+# can carry a burst.
 [[surface.subscription]]
 channel = "local:brenn/theme"
 instance = "chrome"
 port = "theme"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/link-state"
 instance = "chrome"
 port = "link-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/surface-state"
 instance = "chrome"
 port = "surface-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/toast"
@@ -591,35 +598,45 @@ channel = "brenn:bar-c"
 instance = "p3"
 port = "messages"
 
+# `config`, `agenda` and `layout` below are latest-wins ports: the newest message
+# fully describes the state, so each binding states `push_depth = 1` rather than
+# inheriting the rung's 8. The rung's `push_depth` stays 8 for its other job —
+# bounding the parked deferred-publish backlog — and clamps the binding's
+# statement from above, so 1 under a rung of 8 resolves to 1. `retain_depth` is
+# the read-context knob and is untouched. `acks` accumulates per meeting, so it
+# is not latest-wins and inherits the rung.
 [[surface.subscription]]
 channel = "brenn:bar-mode"
 instance = "mode"
 port = "config"
+push_depth = 1
 
 [[surface.subscription]]
 channel = "brenn:bar-agenda"
 instance = "meeting"
 port = "agenda"
+push_depth = 1
 
 [[surface.subscription]]
 channel = "brenn:bar-acks"
 instance = "meeting"
 port = "acks"
 
-# Chrome's layout binding: the layout channel is now an ordinary durable
-# subscription (inheriting the channel rung's push_depth / retain_depth = 1),
-# replacing the retired special-cased [surface.layout] wiring.
+# Chrome's layout binding: the layout channel is an ordinary durable subscription
+# (inheriting the channel rung's retain_depth = 1).
 [[surface.subscription]]
 channel = "brenn:bar-layout"
 instance = "chrome"
 port = "layout"
+push_depth = 1
 
-# Chrome's control-plane bindings (local: — explicit page-queue push_depth each).
+# Chrome's control-plane bindings (local: — explicit page-queue push_depth each,
+# 1 on the latest-wins planes and 8 on the event streams).
 [[surface.subscription]]
 channel = "local:brenn/theme"
 instance = "chrome"
 port = "theme"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/takeover"
@@ -631,13 +648,13 @@ push_depth = 8
 channel = "local:brenn/link-state"
 instance = "chrome"
 port = "link-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/surface-state"
 instance = "chrome"
 port = "surface-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/toast"
@@ -737,10 +754,12 @@ channel = "brenn:bar-c"
 instance = "p3"
 port = "messages"
 
+# Latest-wins bindings state `push_depth = 1`, as on `bar`.
 [[surface.subscription]]
 channel = "brenn:bar-agenda"
 instance = "meeting"
 port = "agenda"
+push_depth = 1
 
 [[surface.subscription]]
 channel = "brenn:bar-acks"
@@ -751,12 +770,13 @@ port = "acks"
 channel = "brenn:bar-layout"
 instance = "chrome"
 port = "layout"
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/theme"
 instance = "chrome"
 port = "theme"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/takeover"
@@ -768,13 +788,13 @@ push_depth = 8
 channel = "local:brenn/link-state"
 instance = "chrome"
 port = "link-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/surface-state"
 instance = "chrome"
 port = "surface-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/toast"
@@ -874,19 +894,19 @@ chrome = true
 channel = "local:brenn/theme"
 instance = "chrome"
 port = "theme"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/link-state"
 instance = "chrome"
 port = "link-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/surface-state"
 instance = "chrome"
 port = "surface-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/toast"

@@ -3,10 +3,17 @@
 //!
 //! Everything here is keyed by channel and nothing else. An attachment holds at
 //! most one subscription per channel, so a delivery is a per-channel fact of the
-//! connection: one `Deliver` per (attachment, channel, message), carrying that
-//! channel's own span seq, resume cursor, and drop count. Whatever sits behind
-//! the channel on the attacher's side — one binding, six bindings, a daemon's
-//! own bookkeeping — is the attacher's fan-out and is invisible here.
+//! connection: one `Deliver` per (attachment, channel, delivery pass), whose rows
+//! carry that channel's own span seqs, resume cursors, and drop count. Whatever
+//! sits behind the channel on the attacher's side — one binding, six bindings, a
+//! daemon's own bookkeeping — is the attacher's fan-out and is invisible here.
+//!
+//! A **pass** is everything one run of one send path produced: a subscribe's
+//! replay, a drain's suffix, a single live row. One pass is one frame, so a
+//! multi-row catch-up reaches the attacher as one delivery point rather than as
+//! N — which is what makes the attacher's window arithmetic cap the whole
+//! catch-up at its `push_depth` instead of presenting every row as its own
+//! arrival.
 //!
 //! One code path serves every transportable channel: the only channel
 //! characteristic this module reads is what the profile's fold says about it,
@@ -23,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use brenn_attach_proto::{
-    Cursor, GapInfo, GapReason as ProtoGapReason, ServerFrame, SubscribeOutcome,
+    Cursor, DeliverRow, GapInfo, GapReason as ProtoGapReason, ServerFrame, SubscribeOutcome,
 };
 use brenn_lib::messaging::store::{ResumeCursor, gap_suffix};
 use brenn_lib::messaging::{GapReason as BusGapReason, MessageEnvelope, Replay};
@@ -206,27 +213,58 @@ impl WireCursors {
     }
 }
 
-/// Mint this channel's span seq and cursor and write the envelope as one
+/// One row of a delivery pass, before its wire facts are minted.
+pub struct PassRow {
+    pub envelope: MessageEnvelope,
+    /// The channel's loss count charged to this row. The loss belongs to the
+    /// subscription rather than to a message, so only the first row that follows
+    /// it carries it and the rest of the pass carries `0`.
+    pub dropped: u64,
+    /// The row's position in the channel's retention, which its cursor is minted
+    /// from.
+    pub retained_seq: u64,
+}
+
+/// Mint each row's span seq and cursor and write the whole pass as one
 /// `Deliver`.
 ///
 /// The single socket-write boundary for deliveries, and the one place span seqs
-/// are assigned, so per-span monotonicity is structural.
-pub async fn send_deliver(
+/// are assigned, so per-span monotonicity is structural — within a pass as well
+/// as across passes.
+///
+/// A pass with no rows writes no frame: the wire's `rows` list is never empty,
+/// and a send path that found nothing to serve has nothing to say.
+pub async fn send_pass(
     ctx: &AttachSessionCtx,
     cursors: &mut WireCursors,
     channel: &str,
-    envelope: MessageEnvelope,
-    dropped: u64,
-    retained_seq: u64,
+    pass: Vec<PassRow>,
     counters: &mut SessionCounters,
 ) -> FrameOutcome {
-    let (seq, cursor) = cursors.next(channel, retained_seq);
+    if pass.is_empty() {
+        return FrameOutcome::Continue;
+    }
+    let rows = pass
+        .into_iter()
+        .map(
+            |PassRow {
+                 envelope,
+                 dropped,
+                 retained_seq,
+             }| {
+                let (seq, cursor) = cursors.next(channel, retained_seq);
+                DeliverRow {
+                    envelope,
+                    seq,
+                    cursor,
+                    dropped,
+                }
+            },
+        )
+        .collect();
     let frame = ServerFrame::Deliver {
         channel: channel.to_string(),
-        envelope,
-        seq,
-        cursor,
-        dropped,
+        rows,
     };
     super::session::send_frame(&ctx.tx, frame, counters).await
 }
@@ -349,16 +387,15 @@ pub async fn send_live(
                 "live delivery at or below the channel position; dropping the duplicate"
             );
         } else if retained_seq == pos + 1 {
-            if let FrameOutcome::Disconnect = send_deliver(
-                ctx,
-                cursors,
-                channel,
-                (*envelope).clone(),
-                0,
+            // A live row is its own pass: distinct live publishes are distinct
+            // delivery points, and coalescing them would merge arrivals the bus
+            // kept apart.
+            let pass = vec![PassRow {
+                envelope: (*envelope).clone(),
+                dropped: 0,
                 retained_seq,
-                counters,
-            )
-            .await
+            }];
+            if let FrameOutcome::Disconnect = send_pass(ctx, cursors, channel, pass, counters).await
             {
                 return FrameOutcome::Disconnect;
             }
@@ -546,7 +583,8 @@ pub struct SubscribeRequest<'a> {
 /// Validates the channel against the profile and the active subscription set,
 /// clamps the client's stated depths to the boot-resolved fold, activates the
 /// subscription, anchors its position at the echoed cursor (0 on a fresh
-/// attach), and replays what retention holds above it. The echoed cursor is the
+/// attach), and replays what retention holds above it as one pass — the attach
+/// is one delivery point, so its replay is one frame. The echoed cursor is the
 /// subscription's whole delivery state, so a live row racing the activation is
 /// either above the anchor — and delivered once, by whichever path reaches the
 /// socket first — or at or below it, and dropped as a duplicate. The FIFO writer
@@ -691,23 +729,17 @@ pub async fn handle_subscribe(
         return FrameOutcome::Continue;
     }
 
-    for retained in window {
-        if let FrameOutcome::Disconnect = send_deliver(
-            ctx,
-            cursors,
-            channel,
-            (*retained.message).clone(),
-            0,
-            retained.seq,
-            counters,
-        )
-        .await
-        {
-            return FrameOutcome::Disconnect;
-        }
-    }
-
-    FrameOutcome::Continue
+    // The whole replay is one pass, hence one frame: the attacher is owed one
+    // delivery point for the attach, not one per retained row.
+    let pass = window
+        .into_iter()
+        .map(|retained| PassRow {
+            envelope: (*retained.message).clone(),
+            dropped: 0,
+            retained_seq: retained.seq,
+        })
+        .collect();
+    send_pass(ctx, cursors, channel, pass, counters).await
 }
 
 /// Drain every active subscription's unseen suffix — the eager-wake nudge path.
@@ -728,8 +760,9 @@ pub async fn drain_all(
     FrameOutcome::Continue
 }
 
-/// Send one channel's unseen suffix in seq order: everything the channel retains
-/// above the position this connection has written. That position is the
+/// Send one channel's unseen suffix in seq order, as one pass: everything the
+/// channel retains above the position this connection has written, in one
+/// frame. That position is the
 /// subscription's whole delivery state, so a drain racing the live fan-out
 /// re-reads what the fan-out already advanced past and finds nothing. A span
 /// retention no longer holds is reported as `dropped` on the first delivery that
@@ -794,20 +827,15 @@ pub async fn drain_channel(
     // The loss belongs to the subscription, not to a message: it rides the first
     // delivery that follows it and is not repeated on the rest.
     let mut dropped = lost;
-    for retained in window {
-        if let FrameOutcome::Disconnect = send_deliver(
-            ctx,
-            cursors,
-            channel,
-            (*retained.message).clone(),
-            std::mem::take(&mut dropped),
-            retained.seq,
-            counters,
-        )
-        .await
-        {
-            return FrameOutcome::Disconnect;
-        }
-    }
-    FrameOutcome::Continue
+    // One drain is one pass, hence one frame: the suffix a behind subscription is
+    // served is one catch-up, not one arrival per row.
+    let pass = window
+        .into_iter()
+        .map(|retained| PassRow {
+            envelope: (*retained.message).clone(),
+            dropped: std::mem::take(&mut dropped),
+            retained_seq: retained.seq,
+        })
+        .collect();
+    send_pass(ctx, cursors, channel, pass, counters).await
 }

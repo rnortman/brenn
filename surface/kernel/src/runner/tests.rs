@@ -31,7 +31,8 @@ use crate::front::{self, EventStream, PublishReject, SurfaceHandle};
 use crate::outbound::PublishStatus;
 use crate::test_support::bindings as fixtures;
 use crate::test_support::frames::{
-    deliver, deliver_at, frame, server_hello, subscribe_result, welcome as welcome_under,
+    deliver, deliver_at, deliver_pass, frame, server_hello, subscribe_result,
+    welcome as welcome_under,
 };
 use crate::test_support::pages;
 
@@ -667,6 +668,36 @@ fn quiet(seen: &Seen) -> ActivationEntry {
     entry(seen, |_, _| Ok(()))
 }
 
+/// What each activation was shown, one vector of new bodies per call.
+///
+/// [`Seen`] flattens every activation into one list, which cannot tell one
+/// activation of three new messages from three activations of one — the
+/// distinction batching must preserve.
+#[derive(Clone, Default)]
+struct Windows(Arc<Mutex<Vec<Vec<String>>>>);
+
+impl Windows {
+    fn activations(&self) -> Vec<Vec<String>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// An entry that records the new slice of every window it is handed, activation
+/// by activation.
+fn windowing(windows: &Windows) -> ActivationEntry {
+    let windows = windows.clone();
+    Box::new(move |activation: &Activation, _: &mut PublishBuffer| {
+        let bodies = activation
+            .ports
+            .iter()
+            .flat_map(|window| window.new_envelopes())
+            .map(|envelope| envelope.body.clone())
+            .collect();
+        windows.0.lock().unwrap().push(bodies);
+        Ok(())
+    })
+}
+
 /// An entry that publishes `body` on its output `port` every time it runs.
 fn publishing(seen: &Seen, port: &str, body: &str) -> ActivationEntry {
     let (port, body) = (port.to_string(), body.to_string());
@@ -1120,6 +1151,74 @@ async fn a_delivered_message_reaches_the_entry_that_reads_it() {
         .unwrap();
 
     wait_until(|| seen.bodies() == ["hello"]).await;
+    running.task.abort();
+}
+
+/// **One catch-up pass is one activation.** The defect the batching exists to
+/// fix is a retained window arriving as N frames and waking the reader N times;
+/// this is the composition that stops it, asserted where "activation" is a real
+/// observable rather than inferred from the window arithmetic.
+///
+/// Three properties compose here and none of them is enough alone: the driver
+/// routes one frame per step, arrival moves no position, and the activation pass
+/// runs once per turn. A change to any one of them — a driver that splits a
+/// frame, a runner that pumps a step per row, an intake that advances a position
+/// mid-pass — restores the burst.
+#[tokio::test(start_paused = true)]
+async fn a_multi_row_pass_wakes_its_reader_once() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    let windows = Windows::default();
+    mount(&mut running, "p1", windowing(&windows));
+    ack(&controls, &feed, WIRE_ONE).await;
+    feed.unbounded_send(TransportEvent::Text(deliver_pass(
+        WIRE_ONE,
+        &[("m1", 1, 0x1), ("m2", 2, 0x2), ("m3", 3, 0x3)],
+    )))
+    .unwrap();
+
+    wait_until(|| !windows.activations().is_empty()).await;
+    settle().await;
+    assert_eq!(
+        windows.activations(),
+        vec![vec!["m1".to_string(), "m2".to_string(), "m3".to_string()]],
+        "one pass, one activation, every row of it in the new slice"
+    );
+    running.task.abort();
+}
+
+/// The contrast, and the half that must stay: three rows the peer wrote as three
+/// frames are three delivery points and wake the reader three times. Coalescing
+/// is the server's statement about one catch-up pass, not something the page
+/// does to distinct live publishes.
+#[tokio::test(start_paused = true)]
+async fn three_separate_frames_wake_their_reader_three_times() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    let windows = Windows::default();
+    mount(&mut running, "p1", windowing(&windows));
+    ack(&controls, &feed, WIRE_ONE).await;
+    for (body, seq, id) in [("m1", 1, 0x1), ("m2", 2, 0x2), ("m3", 3, 0x3)] {
+        feed.unbounded_send(TransportEvent::Text(deliver_at(WIRE_ONE, body, seq, id)))
+            .unwrap();
+    }
+
+    wait_until(|| windows.activations().len() == 3).await;
+    settle().await;
+    assert_eq!(
+        windows.activations(),
+        vec![
+            vec!["m1".to_string()],
+            vec!["m2".to_string()],
+            vec!["m3".to_string()]
+        ]
+    );
     running.task.abort();
 }
 

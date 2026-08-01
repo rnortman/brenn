@@ -8,7 +8,7 @@ use brenn_attach_client::subs::SubscriptionDepths;
 use brenn_attach_proto::{
     BatchEntry, Cursor, DeferredViewEntry, GapReason, Urgency as WireUrgency,
 };
-use brenn_envelope::{ChannelScheme, Urgency};
+use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
 use brenn_surface_schema::bindings::BindingsDocument;
 use brenn_surface_schema::{Binding, NoiseLevel};
 use uuid::Uuid;
@@ -25,6 +25,9 @@ use super::*;
 
 const CONFIG: &str = "ephemeral:site.surface.bar.bindings";
 const WIRE: &str = "brenn:site.bar.in";
+/// A second wire channel, for the document that adds one to what is already in
+/// force.
+const WIRE_TWO: &str = "brenn:site.bar.in2";
 const OUT: &str = "ephemeral:site.bar.out";
 const EPOCH: Uuid = Uuid::from_u128(0x1_11b0);
 const NOW: Millis = Millis(1_000);
@@ -82,14 +85,33 @@ fn subscribe_result(channel: &str, replay_count: u32, gap: Option<GapInfo>) -> S
     }
 }
 
+/// A one-row delivery pass — a live row, which is what most of this suite feeds.
 fn deliver(channel: &str, body: &str, seq: u64, dropped: u64) -> ServerFrame {
+    deliver_pass(channel, &[(body, seq, dropped)])
+}
+
+/// A whole delivery pass in one frame: one row per `(body, seq, dropped)`, in
+/// frame order.
+fn deliver_pass(channel: &str, rows: &[(&str, u64, u64)]) -> ServerFrame {
     ServerFrame::Deliver {
         channel: channel.to_string(),
-        envelope: env(channel, body),
-        seq,
-        cursor: cursor(&format!("c{seq}")),
-        dropped,
+        rows: rows
+            .iter()
+            .map(|&(body, seq, dropped)| DeliverRow {
+                envelope: env(channel, body),
+                seq,
+                cursor: cursor(&format!("c{seq}")),
+                dropped,
+            })
+            .collect(),
     }
+}
+
+/// The one document a config pass carried, asserting it carried exactly one.
+fn only_configured(inbound: Inbound) -> crate::page::Configured {
+    let mut configured = inbound.configured;
+    assert_eq!(configured.len(), 1, "the pass carried one document");
+    configured.remove(0)
 }
 
 fn env(channel: &str, body: &str) -> MessageEnvelope {
@@ -136,7 +158,7 @@ fn attached() -> SurfacePage {
 fn configured(w: W) -> SurfacePage {
     let mut page = attached();
     let inbound = route(&mut page, deliver(CONFIG, &body(w), 1, 0));
-    let configured = inbound.configured.expect("the document applied");
+    let configured = only_configured(inbound);
     for frame in &configured.frames {
         if let ClientFrame::Subscribe { channel, .. } = frame {
             route(&mut page, subscribe_result(channel, 0, None));
@@ -215,12 +237,58 @@ fn serve(page: &mut SurfacePage, w: W) -> brenn_attach_client::store::ServedWind
         .expect("a push-enabled position holding messages is served")
 }
 
+/// A config pass carrying two documents applies both, in frame order, and each
+/// one reconciles against what the one before it left.
+///
+/// Reachable the moment the config channel's rung is anything but `1/1/1`, and
+/// the page's whole wiring comes from that channel — a second document that
+/// re-opened what the first opened, or announced the attachment a second time,
+/// would mis-wire the page in the way that is hardest to diagnose.
+#[test]
+fn a_config_pass_applies_every_document_it_carried_in_order() {
+    let mut page = attached();
+    let narrow = body(W::default());
+    let widened = {
+        let mut document = doc(W::default());
+        document
+            .subscriptions
+            .push(fixtures::subscription("p1", "in2", WIRE_TWO, 4, 2));
+        document.to_body()
+    };
+
+    let inbound = route(
+        &mut page,
+        deliver_pass(CONFIG, &[(&narrow, 1, 0), (&widened, 2, 0)]),
+    );
+
+    let [first, second] = &inbound.configured[..] else {
+        panic!("the pass carried two documents: {inbound:?}")
+    };
+    assert!(
+        first.first_of_attachment,
+        "phase 2 proper is the first document of the attachment"
+    );
+    assert!(
+        !second.first_of_attachment,
+        "the attachment is announced once, not once per document"
+    );
+    assert_eq!(subscribed(&first.frames), vec![WIRE]);
+    assert_eq!(
+        subscribed(&second.frames),
+        vec![WIRE_TWO],
+        "the second document opens only what it added: the first's subscription \
+         stands"
+    );
+    assert!(unsubscribed(&second.frames).is_empty(), "{second:?}");
+    // The wiring in force is the newest document's, and its stores exist.
+    assert!(page.stores.get(WIRE_TWO).is_some());
+    assert!(page.stores.get(WIRE).is_some());
+}
+
 #[test]
 fn a_subscribe_result_puts_the_channel_on_the_wire() {
     let mut page = attached();
-    let configured = route(&mut page, deliver(CONFIG, &body(W::default()), 1, 0))
-        .configured
-        .expect("the document applied");
+    let configured = only_configured(route(&mut page, deliver(CONFIG, &body(W::default()), 1, 0)));
     assert_eq!(subscribed(&configured.frames), vec![WIRE]);
     assert!(!page.subs.is_active(WIRE));
     let inbound = route(&mut page, subscribe_result(WIRE, 0, None));
@@ -298,6 +366,97 @@ fn a_delivery_lands_in_the_channels_store() {
     assert_eq!(inbound, Inbound::default());
     let store = page.stores.get(WIRE).expect("the wire store");
     assert_eq!(store.retained().count(), 1);
+}
+
+/// **A batched replay is one delivery point.** Sixteen retained rows arrive as
+/// one pass, the whole pass lands before anything windows it, and the reader's
+/// one window presents `min(push_depth, 16)` of them as new with the rest as
+/// context. At `push_depth = 1` that is the one new message the binding asked
+/// for — not sixteen arrivals of one new message each.
+#[test]
+fn a_batched_replay_is_one_window_with_a_push_capped_new_slice() {
+    let w = || W {
+        push: 1,
+        retain: 16,
+        ..W::default()
+    };
+    let mut page = configured(w());
+    let bodies: Vec<String> = (1..=16).map(|n| format!("m{n}")).collect();
+    let rows: Vec<(&str, u64, u64)> = bodies
+        .iter()
+        .enumerate()
+        .map(|(i, body)| (body.as_str(), i as u64 + 1, 0))
+        .collect();
+
+    let inbound = route(&mut page, deliver_pass(WIRE, &rows));
+
+    assert_eq!(
+        inbound,
+        Inbound::default(),
+        "arrival moves no position, so the pass charges nothing"
+    );
+    let window = serve(&mut page, w());
+    assert_eq!(window.envelopes.len(), 16, "the whole pass is retained");
+    assert_eq!(
+        window.new_from, 15,
+        "one new — the push cap — and fifteen rows of context behind it"
+    );
+    assert_eq!(
+        window.dropped, 0,
+        "overrunning the push depth into context is not a drop"
+    );
+    assert_eq!(
+        page.schedules.metered_drops("p1", "in"),
+        0,
+        "nothing was evicted from under the position"
+    );
+}
+
+/// The companion, kept deliberately: distinct live publishes arrive as distinct
+/// frames and stay distinct delivery points. Only a server-side catch-up pass
+/// coalesces.
+#[test]
+fn two_separate_frames_remain_two_windows() {
+    let w = || W {
+        push: 1,
+        retain: 16,
+        ..W::default()
+    };
+    let mut page = configured(w());
+
+    route(&mut page, deliver(WIRE, "m1", 1, 0));
+    let first = serve(&mut page, w());
+    route(&mut page, deliver(WIRE, "m2", 2, 0));
+    let second = serve(&mut page, w());
+
+    assert_eq!(first.envelopes.len() - first.new_from, 1);
+    assert_eq!(first.envelopes[first.new_from].body, "m1");
+    assert_eq!(second.envelopes.len() - second.new_from, 1);
+    assert_eq!(second.envelopes[second.new_from].body, "m2");
+}
+
+/// The loss a pass reports is the peer's figure for the whole pass, carried on
+/// the row that follows it, and it reaches the position that missed it whole.
+///
+/// Pinned where the figure is *consumed*: the head row's count is what
+/// `count_server_drops` charges, and reading it off any other row — the last, for
+/// symmetry with the cursor two lines below it — would report nothing on exactly
+/// the path a catch-up after an outage takes.
+#[test]
+fn the_loss_a_pass_reports_reaches_the_position_that_missed_it() {
+    let mut page = configured(W::default());
+
+    let inbound = route(
+        &mut page,
+        deliver_pass(WIRE, &[("m0", 1, 5), ("m1", 2, 0), ("m2", 3, 0)]),
+    );
+
+    assert!(
+        inbound.drops.is_quiet(),
+        "the loss happened upstream, so the page charges nothing of its own"
+    );
+    let window = serve(&mut page, W::default());
+    assert_eq!(window.dropped, 5);
 }
 
 #[test]
@@ -419,11 +578,46 @@ fn a_straggler_is_discarded_and_reported_once_per_span() {
     );
 }
 
+/// Batching widens the straggler race — a whole multi-row drain can be in flight
+/// across an `Unsubscribe` — so a straggling pass is discarded as a unit,
+/// quietly: one report, no fatal, nothing retained, and the span left where the
+/// `Unsubscribe` left it.
+#[test]
+fn a_straggling_pass_is_discarded_whole_and_quietly() {
+    let mut page = configured(W::default());
+    page.registrations
+        .deregister("p1", &mut page.stores, &mut page.subs);
+
+    let inbound = route(
+        &mut page,
+        deliver_pass(WIRE, &[("m0", 1, 2), ("m1", 2, 0), ("m2", 3, 0)]),
+    );
+
+    assert_eq!(
+        inbound.straggler,
+        Some(Straggler {
+            channel: WIRE.to_string(),
+            seq: 1,
+            dropped: 2,
+        }),
+        "one report for the whole pass, naming where it started"
+    );
+    assert_eq!(
+        page.stores
+            .get(WIRE)
+            .expect("the document still names the channel")
+            .retained()
+            .count(),
+        0,
+        "no row of a discarded pass reaches the store"
+    );
+}
+
 #[test]
 fn the_config_channels_delivery_is_phase_two() {
     let mut page = attached();
     let inbound = route(&mut page, deliver(CONFIG, &body(W::default()), 1, 0));
-    let configured = inbound.configured.expect("the document applied");
+    let configured = only_configured(inbound);
     assert!(configured.first_of_attachment);
     assert!(page.bindings().is_some());
     assert_eq!(subscribed(&configured.frames), vec![WIRE]);

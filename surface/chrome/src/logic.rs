@@ -669,6 +669,36 @@ pub const PORT_SURFACE_STATE: &str = "surface-state";
 pub const PORT_TAKEOVER: &str = "takeover";
 pub const PORT_TOAST: &str = "toast";
 
+/// How a chrome port's new slice is folded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldClass {
+    /// A state port: the newest message fully describes the state, so only it is
+    /// folded and a window carrying more than one new message is an operator
+    /// misconfiguration.
+    LatestWins,
+    /// An event port: each message is its own fact, so every new one is folded in
+    /// order.
+    EventStream,
+}
+
+/// Which fold a port's messages get.
+///
+/// `layout`, `theme`, `link-state` and `surface-state` each carry a complete
+/// current value — a layout document replaces the base layout wholesale, a theme
+/// or link state is a single value, a surface-state body is the whole instance
+/// set — so folding an older one before the newest changes nothing but the
+/// number of re-renders and warns. `takeover` (request/release pairing) and
+/// `toast` are streams of distinct facts; dropping any of them loses an event.
+///
+/// An unknown port takes the event-stream path so the unbound-port warn in
+/// [`fold`] fires once per message.
+fn fold_class(port: &str) -> FoldClass {
+    match port {
+        PORT_LAYOUT | PORT_THEME | PORT_LINK_STATE | PORT_SURFACE_STATE => FoldClass::LatestWins,
+        _ => FoldClass::EventStream,
+    }
+}
+
 /// Chrome's one output port: overlay holdership onto
 /// `local:brenn/overlay-state`, where the kernel reads it into the surface's
 /// status report.
@@ -696,16 +726,38 @@ pub fn fold(core: &mut ChromeCore, port: &str, body: &str, now_ms: u64) -> Vec<C
     }
 }
 
-/// Fold one activation window's **new** envelopes into the core, in order, and
-/// return the actions they produced.
+/// Fold one activation window's **new** messages into the core and return the
+/// actions they produced.
 ///
 /// Only the `new_from..` slice is folded; retained context is skipped because
-/// chrome's folds are not idempotent. A component may rely on the new set
-/// alone to catch up on attach.
+/// chrome's folds are not idempotent. A component may rely on the new set alone
+/// to catch up on attach.
+///
+/// How much of that slice is folded is the port's [`FoldClass`]. An event port
+/// folds all of it in order. A latest-wins port folds only the newest message
+/// and reports a window that carried more than one as an operator
+/// misconfiguration — an error, because the binding's `push_depth` is wrong and
+/// only the operator can fix it, and chrome carries on with the latest either
+/// way.
 pub fn fold_window(core: &mut ChromeCore, window: &PortWindow, now_ms: u64) -> Vec<ChromeAction> {
     let mut actions = Vec::new();
-    for envelope in window.new_envelopes() {
-        actions.extend(fold(core, &window.port, &envelope.body, now_ms));
+    match fold_class(&window.port) {
+        FoldClass::LatestWins => {
+            if let Some(message) = window.latest_wins_misconfiguration() {
+                actions.push(ChromeAction::Log {
+                    level: LogLevel::Error,
+                    message,
+                });
+            }
+            if let Some(envelope) = window.latest_new() {
+                actions.extend(fold(core, &window.port, &envelope.body, now_ms));
+            }
+        }
+        FoldClass::EventStream => {
+            for envelope in window.new_envelopes() {
+                actions.extend(fold(core, &window.port, &envelope.body, now_ms));
+            }
+        }
     }
     actions
 }
@@ -1212,8 +1264,104 @@ mod tests {
         );
     }
 
+    /// A layout doc placing `instance` in a `single` layout.
+    fn layout_doc(instance: &str) -> String {
+        json!({
+            "v": 1, "kind": "single", "panels": { "a": { "instance": instance } }
+        })
+        .to_string()
+    }
+
+    /// The instances an `ApplyLayout` placed, slot by slot.
+    fn placed(actions: &[ChromeAction]) -> Vec<Vec<String>> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                ChromeAction::ApplyLayout { panels, .. } => {
+                    Some(panels.iter().map(|p| p.instance.clone()).collect())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The messages of the `Log`s at `level` in `actions`.
+    fn logs_at(actions: &[ChromeAction], want: LogLevel) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                ChromeAction::Log { level, message } if *level == want => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn a_window_folds_its_new_envelopes_in_order() {
+    fn a_latest_wins_window_folds_only_the_newest() {
+        // Latest wins *is* the fold on the layout port: a layout doc is a
+        // complete document, so applying the older two before the newest is
+        // three re-renders for one outcome. One ApplyLayout, from the last doc.
+        let mut c = core();
+        seed_three(&mut c);
+        let window = port_window(
+            PORT_LAYOUT,
+            &[],
+            &[layout_doc("p1"), layout_doc("p2"), layout_doc("p3")],
+        );
+        let actions = fold_window(&mut c, &window, NOW);
+        assert_eq!(placed(&actions), vec![vec!["p3".to_string()]]);
+
+        // And the window itself is the report: three new messages on a
+        // latest-wins port means the binding's push_depth is not 1.
+        let errors = logs_at(&actions, LogLevel::Error);
+        assert_eq!(errors.len(), 1, "{actions:?}");
+        assert!(errors[0].contains("\"layout\""), "{}", errors[0]);
+        assert!(errors[0].contains('3'), "{}", errors[0]);
+        assert!(errors[0].contains("push_depth"), "{}", errors[0]);
+    }
+
+    #[test]
+    fn a_single_new_latest_wins_window_reports_no_misconfiguration() {
+        // The healthy shape under `push_depth = 1`: retained context plus one
+        // new doc. Applied, silently — the error must nag only the operator who
+        // actually set a depth above 1.
+        let mut c = core();
+        seed_three(&mut c);
+        let window = port_window(
+            PORT_LAYOUT,
+            &[layout_doc("p1"), layout_doc("p2")],
+            &[layout_doc("p3")],
+        );
+        let actions = fold_window(&mut c, &window, NOW);
+        assert_eq!(placed(&actions), vec![vec!["p3".to_string()]]);
+        assert_eq!(logs_at(&actions, LogLevel::Error), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_invalid_newest_doc_keeps_last_good_even_over_a_valid_older_new_row() {
+        // The deliberate choice: take-latest applies the newest and only the
+        // newest, so an invalid newest leaves the last-good layout on screen
+        // rather than an older doc from the same window. Stale-presented-as-
+        // current is the worse failure, and a fold-all would produce exactly
+        // that — p1's layout painted as if it were the current one.
+        let mut c = core();
+        seed_three(&mut c);
+        assert_eq!(
+            placed(&c.on_layout(&layout_doc("p2"))),
+            vec![vec!["p2".to_string()]]
+        );
+
+        let window = port_window(PORT_LAYOUT, &[], &[layout_doc("p1"), layout_doc("ghost")]);
+        let actions = fold_window(&mut c, &window, NOW);
+        assert!(placed(&actions).is_empty(), "{actions:?}");
+        assert_eq!(c.base_layout.as_ref().unwrap().panels["a"].instance, "p2");
+        // Two reports: the misconfigured depth and the rejected doc.
+        assert_eq!(logs_at(&actions, LogLevel::Error).len(), 1);
+        assert_eq!(logs_at(&actions, LogLevel::Warn).len(), 1);
+    }
+
+    #[test]
+    fn an_event_port_folds_every_new_envelope_in_order() {
         // Context is skipped, new is folded whole and in order: the Request
         // pushes and the Release that follows it pops, both from one window.
         let mut c = core();
@@ -1246,6 +1394,94 @@ mod tests {
             "the context Release must not be folded: {actions:?}"
         );
         assert!(c.overlay.is_none());
+    }
+
+    #[test]
+    fn every_port_is_classified_by_what_its_messages_mean() {
+        // An arm deleted from the latest-wins side costs re-renders, an arm
+        // added to it silently drops every message of a burst but the newest.
+        // Neither shows up anywhere else — Part C sets `push_depth = 1` on
+        // exactly the latest-wins bindings, so the misconfiguration error will
+        // not fire to reveal it in dev either.
+        for (port, class) in [
+            (PORT_LAYOUT, FoldClass::LatestWins),
+            (PORT_THEME, FoldClass::LatestWins),
+            (PORT_LINK_STATE, FoldClass::LatestWins),
+            (PORT_SURFACE_STATE, FoldClass::LatestWins),
+            (PORT_TAKEOVER, FoldClass::EventStream),
+            (PORT_TOAST, FoldClass::EventStream),
+            ("no-such-port", FoldClass::EventStream),
+        ] {
+            assert_eq!(fold_class(port), class, "port {port:?}");
+        }
+    }
+
+    #[test]
+    fn a_latest_wins_port_other_than_layout_takes_the_newest_too() {
+        // The behavioral half of the table on a port whose fold is a single
+        // value rather than a document: two new themes, one SetTheme, from the
+        // newer — and the same operator error the layout port reports.
+        let mut c = core();
+        let light = json!({ "v": 1, "theme": "light" }).to_string();
+        let dark = json!({ "v": 1, "theme": "dark" }).to_string();
+        // Chrome starts dark, so a fold-all would flip the page light and back:
+        // one SetTheme(Light) this assertion would see.
+        let window = port_window(PORT_THEME, &[], &[light, dark]);
+        let actions = fold_window(&mut c, &window, NOW);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, ChromeAction::SetTheme(_)))
+                .count(),
+            0,
+            "the newest restates the theme chrome already holds: {actions:?}"
+        );
+        assert_eq!(c.theme(), Theme::Dark);
+        assert_eq!(logs_at(&actions, LogLevel::Error).len(), 1, "{actions:?}");
+    }
+
+    #[test]
+    fn an_event_port_burst_loses_nothing_to_the_newest() {
+        // The other direction of the same table. A toast is its own fact, so a
+        // window carrying two shows two — and says nothing about push_depth,
+        // because a depth above 1 is what an event port is for.
+        let mut c = core();
+        let window = port_window(
+            PORT_TOAST,
+            &[],
+            &[
+                toast_body(ToastSeverity::Info, "first"),
+                toast_body(ToastSeverity::Info, "second"),
+            ],
+        );
+        let actions = fold_window(&mut c, &window, NOW);
+        let shown: Vec<String> = actions
+            .iter()
+            .filter_map(|a| match a {
+                ChromeAction::ShowToast { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, vec!["first".to_string(), "second".to_string()]);
+        assert_eq!(logs_at(&actions, LogLevel::Error), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_unknown_port_warns_once_per_message() {
+        // Unknown ports ride the event path deliberately: the unbound-port warn
+        // names every message chrome was handed and could not place, which is
+        // what makes a mis-wired binding legible. Taking the newest would report
+        // one message of a burst and swallow the rest.
+        let mut c = core();
+        let window = port_window(
+            "no-such-port",
+            &[json!({}).to_string()],
+            &[json!({}).to_string(), json!({}).to_string()],
+        );
+        let actions = fold_window(&mut c, &window, NOW);
+        let warns = logs_at(&actions, LogLevel::Warn);
+        assert_eq!(warns.len(), 2, "{actions:?}");
+        assert!(warns[0].contains("unbound port"), "{}", warns[0]);
     }
 
     // ── Overlay-state publishes ─────────────────────────────────────────────

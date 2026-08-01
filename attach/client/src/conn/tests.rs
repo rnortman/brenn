@@ -50,7 +50,7 @@ fn attached() -> Connection {
     let (mut conn, _) = Connection::start(config(), Millis(0));
     conn.on_input(ConnInput::Opened, Millis(0));
     conn.on_input(peer_hello(SUPPORTED_VERSIONS), Millis(0));
-    conn.on_input(frame(welcome_frame(1)), Millis(0));
+    conn.on_input(frame(welcome_frame(SUPPORTED_VERSIONS.max)), Millis(0));
     assert_eq!(conn.state(), ConnState::Active);
     conn
 }
@@ -110,7 +110,7 @@ fn an_overlapping_peer_range_agrees_on_the_highest_both_speak() {
     conn.on_input(ConnInput::Opened, Millis(0));
     let step = conn.on_input(peer_hello(VersionRange { min: 1, max: 9 }), Millis(0));
     assert_eq!(conn.state(), ConnState::AwaitingWelcome);
-    assert_eq!(conn.version(), Some(1));
+    assert_eq!(conn.version(), Some(SUPPORTED_VERSIONS.max));
     assert!(step.effects.is_empty(), "{:?}", step.effects);
     assert_eq!(step.routed, None);
 }
@@ -152,7 +152,7 @@ fn an_empty_peer_range_is_incompatible_rather_than_a_protocol_error() {
 fn a_first_frame_that_is_not_hello_is_fatal_and_names_what_arrived() {
     let (mut conn, _) = Connection::start(config(), Millis(0));
     conn.on_input(ConnInput::Opened, Millis(0));
-    let step = conn.on_input(frame(welcome_frame(1)), Millis(0));
+    let step = conn.on_input(frame(welcome_frame(SUPPORTED_VERSIONS.max)), Millis(0));
     assert_eq!(conn.state(), ConnState::Terminal);
     assert!(fatal_detail(&step.effects).contains("got Welcome"));
 }
@@ -195,13 +195,13 @@ fn welcome_states_the_attachment_contract_and_arms_liveness() {
     let (mut conn, _) = Connection::start(config(), Millis(0));
     conn.on_input(ConnInput::Opened, Millis(0));
     conn.on_input(peer_hello(SUPPORTED_VERSIONS), Millis(0));
-    let step = conn.on_input(frame(welcome_frame(1)), Millis(5_000));
+    let step = conn.on_input(frame(welcome_frame(SUPPORTED_VERSIONS.max)), Millis(5_000));
     assert_eq!(conn.state(), ConnState::Active);
     assert!(conn.is_active());
     assert_eq!(
         step.effects[0],
         ConnEffect::Emit(ConnEvent::Attached(AttachmentFacts {
-            version: 1,
+            version: SUPPORTED_VERSIONS.max,
             participant_id: "surface:console".to_string(),
             session_id: "sess-1".to_string(),
             heartbeat_secs: HEARTBEAT_SECS,
@@ -219,10 +219,14 @@ fn a_welcome_restating_a_version_the_handshake_did_not_agree_is_fatal() {
     let (mut conn, _) = Connection::start(config(), Millis(0));
     conn.on_input(ConnInput::Opened, Millis(0));
     conn.on_input(peer_hello(SUPPORTED_VERSIONS), Millis(0));
-    let step = conn.on_input(frame(welcome_frame(2)), Millis(0));
+    let stated = SUPPORTED_VERSIONS.max + 1;
+    let step = conn.on_input(frame(welcome_frame(stated)), Millis(0));
     let detail = fatal_detail(&step.effects);
-    assert!(detail.contains("version 2"), "{detail}");
-    assert!(detail.contains("agreed 1"), "{detail}");
+    assert!(detail.contains(&format!("version {stated}")), "{detail}");
+    assert!(
+        detail.contains(&format!("agreed {}", SUPPORTED_VERSIONS.max)),
+        "{detail}"
+    );
 }
 
 /// A liveness window of zero would reap the attachment on its first tick and
@@ -233,7 +237,7 @@ fn a_welcome_stating_a_zero_heartbeat_is_fatal() {
     let (mut conn, _) = Connection::start(config(), Millis(0));
     conn.on_input(ConnInput::Opened, Millis(0));
     conn.on_input(peer_hello(SUPPORTED_VERSIONS), Millis(0));
-    let mut welcome = welcome_frame(1);
+    let mut welcome = welcome_frame(SUPPORTED_VERSIONS.max);
     let ServerFrame::Welcome { heartbeat_secs, .. } = &mut welcome else {
         unreachable!("welcome_frame builds a Welcome")
     };
@@ -298,7 +302,10 @@ fn a_frame_of_another_plane_is_routed_and_still_re_arms_liveness() {
 fn a_repeated_handshake_frame_on_a_live_attachment_is_fatal() {
     for (input, expected) in [
         (peer_hello(SUPPORTED_VERSIONS), "second Hello frame"),
-        (frame(welcome_frame(1)), "second Welcome frame"),
+        (
+            frame(welcome_frame(SUPPORTED_VERSIONS.max)),
+            "second Welcome frame",
+        ),
     ] {
         let mut conn = attached();
         let step = conn.on_input(input, Millis(0));
@@ -504,7 +511,7 @@ fn a_completed_handshake_resets_the_backoff_schedule() {
     }
     conn.on_input(ConnInput::Opened, Millis(0));
     conn.on_input(peer_hello(SUPPORTED_VERSIONS), Millis(0));
-    conn.on_input(frame(welcome_frame(1)), Millis(0));
+    conn.on_input(frame(welcome_frame(SUPPORTED_VERSIONS.max)), Millis(0));
     let step = conn.on_input(
         ConnInput::Disconnected {
             code: None,
@@ -611,7 +618,7 @@ fn a_host_fatal_is_terminal_from_any_live_state() {
 #[test]
 fn a_dropped_connection_forgets_the_version_it_negotiated() {
     let mut conn = attached();
-    assert_eq!(conn.version(), Some(1));
+    assert_eq!(conn.version(), Some(SUPPORTED_VERSIONS.max));
     conn.on_input(
         ConnInput::Disconnected {
             code: None,

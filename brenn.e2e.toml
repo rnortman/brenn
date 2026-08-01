@@ -305,28 +305,35 @@ channel = "brenn:bar-c"
 instance = "p3"
 port = "messages"
 
+# `layout` is a latest-wins port — a layout document is complete, never a delta —
+# so the binding states `push_depth = 1` rather than inheriting the rung's 8.
+# The rung keeps 8 to bound the parked deferred-publish backlog and clamps this
+# statement from above; `retain_depth` stays the read-context knob. The `local:`
+# planes below follow the same rule: 1 on latest-wins (theme, link-state,
+# surface-state), 8 on the toast event stream.
 [[surface.subscription]]
 channel = "brenn:bar-layout"
 instance = "chrome"
 port = "layout"
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/theme"
 instance = "chrome"
 port = "theme"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/link-state"
 instance = "chrome"
 port = "link-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/surface-state"
 instance = "chrome"
 port = "surface-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/toast"
@@ -388,24 +395,25 @@ port = "messages"
 channel = "brenn:bar-layout"
 instance = "chrome"
 port = "layout"
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/theme"
 instance = "chrome"
 port = "theme"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/link-state"
 instance = "chrome"
 port = "link-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/surface-state"
 instance = "chrome"
 port = "surface-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/toast"
@@ -463,19 +471,19 @@ chrome = true
 channel = "local:brenn/theme"
 instance = "chrome"
 port = "theme"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/link-state"
 instance = "chrome"
 port = "link-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/surface-state"
 instance = "chrome"
 port = "surface-state"
-push_depth = 8
+push_depth = 1
 
 [[surface.subscription]]
 channel = "local:brenn/toast"

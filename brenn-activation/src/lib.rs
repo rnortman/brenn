@@ -132,6 +132,47 @@ impl<E> PortWindow<E> {
     pub fn new_len(&self) -> u64 {
         (self.envelopes.len() as u64).saturating_sub(self.new_from as u64)
     }
+
+    /// The newest new message, or `None` for a pure-context window.
+    ///
+    /// The whole fold for a **latest-wins** port — one whose state is fully
+    /// described by its most recent message (a config snapshot, a theme, a
+    /// layout document). On such a port message N+1 subsumes message N, so
+    /// folding the older ones is work with no effect on the result, and in the
+    /// failure direction it is worse than nothing: an invalid newest message
+    /// leaves an older still-valid one applied, presenting stale state as
+    /// current. Take the latest, and report a window that carried more than one
+    /// with [`PortWindow::latest_wins_misconfiguration`].
+    ///
+    /// An event-stream port — where each message is its own fact — folds
+    /// [`PortWindow::new_envelopes`] instead. Which one a port is, is the port
+    /// author's decision and nothing here can infer it.
+    pub fn latest_new(&self) -> Option<&E> {
+        self.new_envelopes().last()
+    }
+
+    /// The operator-facing report for a latest-wins port handed more than one
+    /// new message, or `None` when this window carries at most one.
+    ///
+    /// More than one new message on a latest-wins port means the binding's
+    /// `push_depth` exceeds 1: coalescing to the latest is the subscription's
+    /// job, and a binding that declines to do it makes every consumer redo it.
+    /// The component still applies the latest and keeps working, so this is a
+    /// normal error to the operator, never a panic and never an alert — the
+    /// only place the fault is detectable, since latest-wins is component
+    /// semantics no config layer knows.
+    pub fn latest_wins_misconfiguration(&self) -> Option<String> {
+        let new_len = self.new_len();
+        if new_len <= 1 {
+            return None;
+        }
+        Some(format!(
+            "latest-wins port {:?} presented {} new messages; its binding's \
+             push_depth should be 1 — coalescing to the latest is the \
+             subscription's job, not the component's",
+            self.port, new_len
+        ))
+    }
 }
 
 impl<E> Activation<E> {
@@ -248,5 +289,76 @@ mod tests {
             now: None,
         };
         assert_eq!(activation.total_dropped(), 7);
+    }
+
+    /// The latest-wins fold: the newest new message and nothing else, and never a
+    /// context message. Taking the last of `envelopes` instead of the last of the
+    /// new slice would apply a message the component has already folded on every
+    /// pure-context activation — which is every activation of an idle port.
+    #[test]
+    fn latest_new_takes_the_newest_new_message_only() {
+        let with_new = PortWindow {
+            port: "config".to_string(),
+            envelopes: vec!["c-1", "n-1", "n-2"],
+            new_from: 1,
+            dropped: 0,
+        };
+        assert_eq!(with_new.latest_new(), Some(&"n-2"));
+
+        // Pure context: nothing new, so nothing to apply — the `None` an idle
+        // port's activation yields.
+        let context_only = PortWindow {
+            port: "config".to_string(),
+            envelopes: vec!["c-1"],
+            new_from: 1,
+            dropped: 0,
+        };
+        assert_eq!(context_only.latest_new(), None);
+
+        // An empty window is the same answer, without an index panic.
+        let empty: PortWindow<&str> = PortWindow {
+            port: "config".to_string(),
+            envelopes: vec![],
+            new_from: 0,
+            dropped: 0,
+        };
+        assert_eq!(empty.latest_new(), None);
+    }
+
+    /// The misconfiguration report fires on >1 new and only on >1 new: one new
+    /// message is the healthy case on a `push_depth = 1` binding, and a window of
+    /// context plus one new must not be read as a burst.
+    #[test]
+    fn latest_wins_misconfiguration_reports_only_a_multi_new_window() {
+        let one_new = PortWindow {
+            port: "layout".to_string(),
+            envelopes: vec!["c-1", "c-2", "n-1"],
+            new_from: 2,
+            dropped: 0,
+        };
+        assert_eq!(one_new.latest_wins_misconfiguration(), None);
+
+        let context_only = PortWindow {
+            port: "layout".to_string(),
+            envelopes: vec!["c-1"],
+            new_from: 1,
+            dropped: 0,
+        };
+        assert_eq!(context_only.latest_wins_misconfiguration(), None);
+
+        // Three new: the report names the port and the count, so the operator
+        // knows which binding's push_depth to fix.
+        let three_new = PortWindow {
+            port: "layout".to_string(),
+            envelopes: vec!["c-1", "n-1", "n-2", "n-3"],
+            new_from: 1,
+            dropped: 0,
+        };
+        let report = three_new
+            .latest_wins_misconfiguration()
+            .expect("three new messages on a latest-wins port is a misconfiguration");
+        assert!(report.contains("\"layout\""), "{report}");
+        assert!(report.contains('3'), "{report}");
+        assert!(report.contains("push_depth"), "{report}");
     }
 }

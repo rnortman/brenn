@@ -1014,7 +1014,7 @@ fn a_frame_carrying_a_document_announces_the_attachment_within_the_same_turn() {
         r.inbound(
             page,
             Inbound {
-                configured: Some(configured(true, false)),
+                configured: vec![configured(true, false)],
                 answers: vec![PublishAnswer::Port {
                     instance: "p1".to_string(),
                     port: "out".to_string(),
@@ -1033,6 +1033,31 @@ fn a_frame_carrying_a_document_announces_the_attachment_within_the_same_turn() {
         events(&effects)[1],
         Event::PublishResult { correlation: 1, .. }
     ));
+}
+
+#[test]
+fn every_document_a_frame_carried_is_folded_in_frame_order() {
+    // A config pass may carry several documents, and each one's announcement is
+    // its own: the attachment is announced by the first, the wiring change by
+    // whichever document made one. Folding only the last would lose the
+    // announcement; folding them out of order would report the older wiring as
+    // the newer.
+    let mut page = page();
+    let effects = fold(&mut page, |r, page| {
+        r.inbound(
+            page,
+            Inbound {
+                configured: vec![configured(true, false), configured(false, true)],
+                ..Inbound::default()
+            },
+            NOW,
+            NOW_MS,
+        );
+    });
+
+    assert!(matches!(events(&effects)[0], Event::Connected { .. }));
+    assert!(matches!(events(&effects)[1], Event::WiringChanged));
+    assert_eq!(events(&effects).len(), 2, "{effects:?}");
 }
 
 #[test]

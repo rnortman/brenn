@@ -24,7 +24,7 @@ use brenn_surface_schema::{CONTROL_PLANE_VERSION, LogLevel, ThemeBody};
 use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::HtmlElement;
 
-use crate::logic::{ConfigOutcome, ModeClock};
+use crate::logic::{ConfigNote, ModeClock};
 
 /// This component's kind — its config `kind`, its element-tag stem
 /// (`brenn-<kind>`), and the `component` field of its panic events.
@@ -105,15 +105,11 @@ fn on_connected(
     *wiring.borrow_mut() = Some(Wiring { host, tick });
 }
 
-/// Feed each activation's new config messages to the pure state machine, then
-/// recompute once — not once per message. A malformed body is a publisher fault:
-/// log it and carry on with last-good.
-///
-/// A nonzero `dropped` means a retained config update was lost (a device offline
-/// past the channel's queue bound). Nothing to recover locally — the theme
-/// reconverges on the next retained delivery — but the loss must not be silent,
-/// or the theme can sit stale against the last-published config with no evidence
-/// in the operator log.
+/// Feed each activation's newest config message to the pure state machine, then
+/// recompute once — not once per message. Every note the fold returns is an
+/// operator error: a malformed body is a publisher fault, a window of several
+/// new configs is a `push_depth` fault. Both are logged; neither stops the
+/// theme.
 fn on_activation(
     activation: &Activation,
     state: &Rc<RefCell<ModeClock>>,
@@ -127,31 +123,16 @@ fn on_activation(
         return;
     };
     for window in &activation.ports {
-        if window.dropped > 0 {
-            component_log(
-                &wiring.host,
-                LogLevel::Warn,
-                &format!(
-                    "mode-clock port {:?} dropped {} config update(s); theme may be stale \
-                     until the next delivery",
-                    window.port, window.dropped
-                ),
-            );
-        }
-        for envelope in window.new_envelopes() {
-            let envelope_json =
-                serde_json::to_string(envelope).expect("a MessageEnvelope serializes to JSON");
-            let outcome = state
-                .borrow_mut()
-                .on_config(&window.port, &envelope_json)
-                .expect("an activation window satisfies the mode-clock contract");
-            if let ConfigOutcome::Malformed(report) = outcome {
-                component_log(
-                    &wiring.host,
-                    LogLevel::Error,
-                    &report.log_message("mode-clock config"),
-                );
-            }
+        let notes = state
+            .borrow_mut()
+            .on_config_window(window)
+            .expect("an activation window satisfies the mode-clock contract");
+        for note in notes {
+            let message = match note {
+                ConfigNote::Misconfigured(message) => message,
+                ConfigNote::Malformed(report) => report.log_message("mode-clock config"),
+            };
+            component_log(&wiring.host, LogLevel::Error, &message);
         }
     }
     // Once per activation, not once per message: the theme is a pure function of

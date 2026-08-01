@@ -231,22 +231,26 @@ fn live(window: &[StoreRetained], seq: u64) -> SessionPush {
     })
 }
 
-/// A `Deliver`'s wire facts: the channel, its span seq, the retention position
-/// inside its opaque cursor, and the drop count.
-fn deliver(frame: &ServerFrame) -> (String, u64, u64, u64) {
+/// One `Deliver` row's wire facts: the channel, its span seq, the retention
+/// position inside its opaque cursor, and the drop count.
+fn rows_of(frame: &ServerFrame) -> Vec<(String, u64, u64, u64)> {
     match frame {
-        ServerFrame::Deliver {
-            channel,
-            seq,
-            cursor,
-            dropped,
-            ..
-        } => {
-            let state = cursor::parse(cursor).expect("a minted cursor parses");
-            (channel.clone(), *seq, state.resume.seq, *dropped)
-        }
+        ServerFrame::Deliver { channel, rows } => rows
+            .iter()
+            .map(|row| {
+                let state = cursor::parse(&row.cursor).expect("a minted cursor parses");
+                (channel.clone(), row.seq, state.resume.seq, row.dropped)
+            })
+            .collect(),
         other => panic!("expected a Deliver, got {other:?}"),
     }
+}
+
+/// The wire facts of a pass this test expects to hold exactly one row.
+fn deliver(frame: &ServerFrame) -> (String, u64, u64, u64) {
+    let mut rows = rows_of(frame);
+    assert_eq!(rows.len(), 1, "expected a one-row pass, got {rows:?}");
+    rows.remove(0)
 }
 
 /// The `(replay_count, gap)` of a `SubscribeResult`, asserting its outcome and
@@ -311,8 +315,12 @@ async fn duplicate_subscribe_is_a_violation() {
 }
 
 /// A fresh subscribe answers `SubscribeResult{Ok}`, replays the retained window
-/// oldest-first behind it, and activates both the local mirror and the
-/// registry-shared set the router reads.
+/// oldest-first behind it **in one frame**, and activates both the local mirror
+/// and the registry-shared set the router reads.
+///
+/// One frame is the whole point: the attach is one delivery point, so the
+/// attacher windows the replay once and caps its new slice at the binding's
+/// `push_depth` rather than seeing every retained row as its own arrival.
 #[tokio::test]
 async fn a_fresh_subscribe_replays_the_window_and_activates() {
     let db = brenn_lib::db::init_db_memory();
@@ -323,17 +331,66 @@ async fn a_fresh_subscribe_replays_the_window_and_activates() {
     assert!(matches!(wire.open(&ctx, 8).await, FrameOutcome::Continue));
 
     let out = frames(&mut rx);
-    assert_eq!(out.len(), 3, "the result plus its two replay rows");
+    assert_eq!(out.len(), 2, "the result plus one replay frame");
     assert_eq!(subscribe_result(&out[0]), (2, None));
-    // Span seqs start at 1 and increase; the cursor carries each row's own
-    // retention position.
-    assert_eq!(deliver(&out[1]), (ADDR.to_string(), 1, 1, 0));
-    assert_eq!(deliver(&out[2]), (ADDR.to_string(), 2, 2, 0));
+    // Span seqs start at 1 and increase across the pass; the cursor carries each
+    // row's own retention position.
+    assert_eq!(
+        rows_of(&out[1]),
+        vec![(ADDR.to_string(), 1, 1, 0), (ADDR.to_string(), 2, 2, 0),]
+    );
 
     assert!(wire.active.is_active(ADDR));
     assert!(
         wire.shared.lock().unwrap().contains(ADDR),
         "the router sees the activation through the shared set"
+    );
+}
+
+/// An empty replay is the result alone, never an empty pass.
+///
+/// The most common attach shape in a fresh deployment, and the client's answer to
+/// a `Deliver` with no rows in it is a fatal protocol violation — so the guard
+/// that writes nothing is load-bearing, not defensive.
+#[tokio::test]
+async fn a_subscribe_to_an_empty_channel_writes_no_pass() {
+    let db = brenn_lib::db::init_db_memory();
+    let (ctx, mut rx, _uuid) = attach(&db).await;
+    let mut wire = Wire::new(&ctx);
+
+    assert!(matches!(wire.open(&ctx, 8).await, FrameOutcome::Continue));
+
+    let out = frames(&mut rx);
+    assert_eq!(out.len(), 1, "the result alone: {out:?}");
+    assert_eq!(subscribe_result(&out[0]), (0, None));
+    assert!(wire.active.is_active(ADDR));
+}
+
+/// A wide window is still one frame: the count of rows grows, the count of
+/// delivery points does not.
+#[tokio::test]
+async fn a_sixteen_row_replay_is_one_frame() {
+    let db = brenn_lib::db::init_db_memory();
+    let (ctx, mut rx, uuid) = attach_at(&db, 1, 16).await;
+    let bodies: Vec<String> = (1..=16).map(|n| format!("m{n}")).collect();
+    let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
+    seed_all(&db, uuid, &refs).await;
+    let mut wire = Wire::new(&ctx);
+
+    assert!(matches!(
+        wire.subscribe(&ctx, ADDR, 1, 16, None).await,
+        FrameOutcome::Continue
+    ));
+
+    let out = frames(&mut rx);
+    assert_eq!(out.len(), 2, "the result plus one replay frame");
+    assert_eq!(subscribe_result(&out[0]), (16, None));
+    assert_eq!(
+        rows_of(&out[1]),
+        (1..=16u64)
+            .map(|n| (ADDR.to_string(), n, n, 0))
+            .collect::<Vec<_>>(),
+        "sixteen rows, oldest first, seqs 1..=16 — in one frame"
     );
 }
 
@@ -359,7 +416,8 @@ async fn a_wide_claim_clamps_to_the_boot_fold() {
     );
     let out = frames(&mut rx);
     assert_eq!(subscribe_result(&out[0]).0, 2, "clamped to the boot fold");
-    assert_eq!(out.len(), 3);
+    assert_eq!(out.len(), 2);
+    assert_eq!(rows_of(&out[1]).len(), 2);
 }
 
 /// The other direction is the client's own business: a narrower claim than the
@@ -381,11 +439,16 @@ async fn a_narrow_claim_is_honoured_as_stated() {
             retain_depth: 1,
         })
     );
-    assert_eq!(frames(&mut rx).len(), 2, "one row behind the result");
+    assert_eq!(
+        frames(&mut rx).len(),
+        2,
+        "one replay frame behind the result"
+    );
 }
 
-/// A resume cursor replays the suffix above the echoed position, with no gap when
-/// retention covers it, and anchors the span there rather than at 0.
+/// A resume cursor replays the suffix above the echoed position as one frame,
+/// with no gap when retention covers it, and anchors the span there rather than
+/// at 0.
 #[tokio::test]
 async fn a_covered_resume_replays_the_suffix_with_no_gap() {
     let db = brenn_lib::db::init_db_memory();
@@ -410,8 +473,11 @@ async fn a_covered_resume_replays_the_suffix_with_no_gap() {
         (2, None),
         "the two rows above the echoed position, no gap"
     );
-    assert_eq!(deliver(&out[1]), (ADDR.to_string(), 1, 2, 0));
-    assert_eq!(deliver(&out[2]), (ADDR.to_string(), 2, 3, 0));
+    assert_eq!(out.len(), 2, "the result plus one resume-suffix frame");
+    assert_eq!(
+        rows_of(&out[1]),
+        vec![(ADDR.to_string(), 1, 2, 0), (ADDR.to_string(), 2, 3, 0)]
+    );
 }
 
 /// A resume the retained window cannot cover is answered `BeyondRetained`.
@@ -467,7 +533,10 @@ async fn a_cursor_from_an_uncounted_boot_is_a_fresh_attach() {
         "the whole window, as for a fresh attach, behind an epoch gap"
     );
     // Anchored at 0, so the first replayed row is position 1 again.
-    assert_eq!(deliver(&out[1]), (ADDR.to_string(), 1, 1, 0));
+    assert_eq!(
+        rows_of(&out[1]),
+        vec![(ADDR.to_string(), 1, 1, 0), (ADDR.to_string(), 2, 2, 0)]
+    );
 }
 
 /// An unparseable cursor cannot come from a conforming attacher — this server
@@ -688,13 +757,17 @@ async fn a_live_row_is_decided_against_the_channel_position() {
     assert_eq!(deliver(&out[0]), (ADDR.to_string(), 3, 3, 0));
 
     // Above the contiguous next position: the live copy is dropped and the
-    // channel is served its whole suffix from retention instead.
+    // channel is served its whole suffix from retention instead — one drain, one
+    // frame.
     let outcome = wire.push(&ctx, vec![live(&window, 5)]).await;
     assert!(matches!(outcome, FrameOutcome::Continue));
     let out = frames(&mut rx);
-    assert_eq!(out.len(), 2, "the interior row rides along");
-    assert_eq!(deliver(&out[0]), (ADDR.to_string(), 4, 4, 0));
-    assert_eq!(deliver(&out[1]), (ADDR.to_string(), 5, 5, 0));
+    assert_eq!(out.len(), 1, "the drain is one frame");
+    assert_eq!(
+        rows_of(&out[0]),
+        vec![(ADDR.to_string(), 4, 4, 0), (ADDR.to_string(), 5, 5, 0)],
+        "the interior row rides along"
+    );
 }
 
 /// A live row for a channel this connection does not hold is dropped, not
@@ -771,12 +844,11 @@ async fn a_drain_reports_the_lost_interior_span_once() {
 
     assert!(matches!(outcome, FrameOutcome::Continue));
     let out = frames(&mut rx);
-    assert_eq!(out.len(), 2, "the clamped suffix");
-    assert_eq!(deliver(&out[0]), (ADDR.to_string(), 2, 4, 2));
+    assert_eq!(out.len(), 1, "the clamped suffix, in one frame");
     assert_eq!(
-        deliver(&out[1]),
-        (ADDR.to_string(), 3, 5, 0),
-        "the loss rides the first delivery only"
+        rows_of(&out[0]),
+        vec![(ADDR.to_string(), 2, 4, 2), (ADDR.to_string(), 3, 5, 0)],
+        "the loss rides the first row only"
     );
 }
 
@@ -797,13 +869,11 @@ async fn a_context_feed_reports_no_drops() {
 
     assert!(matches!(outcome, FrameOutcome::Continue));
     let out = frames(&mut rx);
-    assert_eq!(out.len(), 2);
-    for frame in &out {
-        assert_eq!(
-            deliver(frame).3,
-            0,
-            "a context feed has no overflow to report"
-        );
+    assert_eq!(out.len(), 1);
+    let rows = rows_of(&out[0]);
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(row.3, 0, "a context feed has no overflow to report");
     }
 }
 
@@ -1149,50 +1219,51 @@ async fn parity_window(rig: &ParityRig) -> Vec<StoreRetained> {
         .messages
 }
 
-/// One frame reduced to what the script pins: everything except the values a
-/// class is entitled to differ in — the address, the epoch its seqs are numbered
-/// in, and the store incarnation stamped beside them.
-fn parity_line(frame: &ServerFrame) -> String {
+/// One frame reduced to what the script pins — one transcript line per row, so
+/// the script reads a stream of deliveries rather than a frame layout:
+/// everything except the values a class is entitled to differ in — the address,
+/// the epoch its seqs are numbered in, and the store incarnation stamped beside
+/// them.
+fn parity_lines(frame: &ServerFrame) -> Vec<String> {
     match frame {
         ServerFrame::SubscribeResult {
             outcome,
             replay_count,
             gap,
             ..
-        } => format!(
+        } => vec![format!(
             "subscribe_result outcome={outcome:?} replay={replay_count} gap={:?}",
             gap.map(|g| g.reason)
-        ),
-        ServerFrame::Deliver {
-            envelope,
-            seq,
-            cursor,
-            dropped,
-            ..
-        } => {
-            let state = cursor::parse(cursor).expect("a server-minted cursor parses");
-            // Both numbers, because they are different numbers and both must
-            // match across classes: `span` is the per-subscribe wire counter the
-            // attacher orders on, `pos` the retention position the cursor
-            // carries.
-            format!(
-                "deliver body={} span={seq} pos={} dropped={dropped}",
-                envelope.body, state.resume.seq
-            )
-        }
+        )],
+        ServerFrame::Deliver { rows, .. } => rows
+            .iter()
+            .map(|row| {
+                let state = cursor::parse(&row.cursor).expect("a server-minted cursor parses");
+                // Both numbers, because they are different numbers and both must
+                // match across classes: `span` is the per-subscribe wire counter
+                // the attacher orders on, `pos` the retention position the cursor
+                // carries.
+                format!(
+                    "deliver body={} span={} pos={} dropped={}",
+                    row.envelope.body, row.seq, state.resume.seq, row.dropped
+                )
+            })
+            .collect(),
         other => panic!("the parity script expects no {other:?}"),
     }
 }
 
 /// Drain what the handlers enqueued into the transcript, returning the cursor the
-/// last `Deliver` among them carried.
+/// last delivered row among them carried.
 fn parity_record(rig: &mut ParityRig, transcript: &mut Vec<String>) -> Option<Cursor> {
     let mut held = None;
     for frame in frames(&mut rig.rx) {
-        if let ServerFrame::Deliver { cursor, .. } = &frame {
-            held = Some(cursor.clone());
+        if let ServerFrame::Deliver { rows, .. } = &frame
+            && let Some(last) = rows.last()
+        {
+            held = Some(last.cursor.clone());
         }
-        transcript.push(parity_line(&frame));
+        transcript.extend(parity_lines(&frame));
     }
     held
 }

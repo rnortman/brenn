@@ -40,7 +40,7 @@ fn server_hello() -> String {
 
 fn welcome() -> String {
     serde_json::to_string(&ServerFrame::Welcome {
-        version: 1,
+        version: SUPPORTED_VERSIONS.max,
         participant_id: "attacher:demo".to_string(),
         session_id: "sess-1".to_string(),
         heartbeat_secs: 20,
@@ -895,7 +895,7 @@ async fn the_attachment_facts_reach_the_embedder_whole() {
     assert_eq!(
         step.events,
         vec![ConnEvent::Attached(AttachmentFacts {
-            version: 1,
+            version: SUPPORTED_VERSIONS.max,
             participant_id: "attacher:demo".to_string(),
             session_id: "sess-1".to_string(),
             heartbeat_secs: 20,
@@ -905,7 +905,7 @@ async fn the_attachment_facts_reach_the_embedder_whole() {
         })]
     );
     assert!(driver.is_active());
-    assert_eq!(driver.version(), Some(1));
+    assert_eq!(driver.version(), Some(SUPPORTED_VERSIONS.max));
 }
 
 /// A connect the connection asked for but the embedder has not run yet is
