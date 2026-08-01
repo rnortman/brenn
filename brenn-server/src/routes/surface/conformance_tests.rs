@@ -120,7 +120,11 @@ async fn a_non_browser_attacher_subscribes_publishes_and_resumes_across_a_severe
         facts.participant_id, "surface:deskbar",
         "the attachment speaks as the principal, before any attribution"
     );
-    assert_eq!(facts.version, 1, "the only version either end speaks");
+    assert_eq!(
+        facts.version,
+        brenn_attach_proto::SUPPORTED_VERSIONS.max,
+        "the only version either end speaks"
+    );
     assert!(
         !facts.alert_granted,
         "the fixture grants no alert plane, and a conforming attacher is told so"

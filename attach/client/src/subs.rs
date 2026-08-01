@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use brenn_attach_proto::{ClientFrame, Cursor, GapInfo, SubscribeOutcome};
+use brenn_attach_proto::{ClientFrame, Cursor, DeliverRow, GapInfo, SubscribeOutcome};
 use brenn_envelope::is_local_channel;
 
 /// The two independent knobs a subscription is defined by.
@@ -85,24 +85,36 @@ pub struct SubscribeAck {
     pub gap: Option<GapInfo>,
 }
 
-/// What to do with the envelope of an accepted `Deliver`.
+/// What to do with the rows of an accepted `Deliver`.
+///
+/// Per frame, not per row: a frame names one channel and the disposition is a
+/// per-channel question, so a pass is taken whole or discarded whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliverDisposition {
-    /// Route it. The subscription advanced its span and took the cursor.
+    /// Route every row, in frame order. The subscription advanced its span
+    /// across them and took the last row's cursor.
     ///
-    /// `dropped` is the server's count of messages this channel lost since the
-    /// previous delivery — the channel's window rolled past this attacher's
-    /// position. It is charged once per channel, and every local subscriber on
-    /// the channel missed exactly those messages.
+    /// `dropped` is the pass's loss, carried on its first row — the server's
+    /// count of messages this channel lost since the previous delivery, which the
+    /// channel's window rolled past this attacher's position. It is charged once
+    /// per channel, and every local subscriber on the channel missed exactly
+    /// those messages.
     Accept { dropped: u64 },
-    /// Discard it: a delivery from a span this attacher has already left, in
-    /// flight when its `Unsubscribe` crossed the wire. It advances nothing — not
-    /// the span, not the cursor — because a discarded delivery must not resume
-    /// past a retained message the next fresh attach is owed.
+    /// Discard the whole frame: a pass from a span this attacher has already
+    /// left, in flight when its `Unsubscribe` crossed the wire. It advances
+    /// nothing — not the span, not the cursor — because a discarded delivery must
+    /// not resume past a retained message the next fresh attach is owed.
     ///
     /// `first` marks the first discard of the current post-`Active` window, so a
     /// diagnostic can be raised once per span rather than once per straggler.
-    Discard { first: bool },
+    /// Batching widens the race — a whole multi-row drain can be in flight across
+    /// an `Unsubscribe` — so a straggling pass discards quietly rather than
+    /// killing the attachment.
+    ///
+    /// `dropped` is the pass's loss, as `Accept` carries it, for the diagnostic
+    /// to name. Nothing is charged with it: a discarded pass advances no position,
+    /// so there is no position for the loss to land on.
+    Discard { first: bool, dropped: u64 },
 }
 
 /// Per-channel wire bookkeeping.
@@ -420,19 +432,43 @@ impl Subscriptions {
         })
     }
 
-    /// Intake one `Deliver`'s wire half, answering what to do with its envelope.
+    /// Intake one `Deliver`'s wire half — a whole delivery pass on one channel —
+    /// answering what to do with its rows.
     ///
-    /// Fatal, rather than tolerated, for a delivery on a channel this attachment
-    /// never had open, and for a `seq` that does not exceed the span's
-    /// high-water. Both say the peer is not keeping the contract this attacher
-    /// takes everything else on faith from.
+    /// The channel is settled once for the frame, then each row's `seq` is taken
+    /// in frame order against the span high-water, so a pass whose interior
+    /// regresses is refused as a whole. The resume token comes from the last row:
+    /// it is the newest position the pass carried.
+    ///
+    /// Fatal, rather than tolerated, for a pass with no rows, for a loss reported
+    /// anywhere but on the pass's first row, for a delivery on a channel this
+    /// attachment never had open, and for a `seq` that does not exceed the span's
+    /// high-water. All four say the peer is not keeping the contract this attacher
+    /// takes everything else on faith from. The two frame-shape refusals come
+    /// first, before the channel is settled, so no disposition ever describes a
+    /// frame the peer should not have written — a straggling pass is tolerated for
+    /// racing an `Unsubscribe`, not for being malformed.
+    ///
+    /// Nothing is half-taken: the span and the cursor move only once every row
+    /// has passed its check, so a refused pass leaves the subscription exactly
+    /// where it stood.
     pub fn on_deliver(
         &mut self,
         channel: &str,
-        seq: u64,
-        cursor: Cursor,
-        dropped: u64,
+        rows: &[DeliverRow],
     ) -> Result<DeliverDisposition, String> {
+        let Some((head, rest)) = rows.split_first() else {
+            return Err(format!("Deliver with no rows on {channel}"));
+        };
+        if let Some(row) = rest.iter().find(|row| row.dropped != 0) {
+            return Err(format!(
+                "Deliver on {channel} reports {} dropped past its first row: a pass's loss \
+                 belongs to the subscription and rides the row that follows it",
+                row.dropped
+            ));
+        }
+        let dropped = head.dropped;
+        let last = rest.last().unwrap_or(head);
         let entry = match self.channels.get_mut(channel) {
             Some(entry) if entry.has_been_active => entry,
             _ => {
@@ -444,18 +480,23 @@ impl Subscriptions {
         if entry.wire != WireState::Active {
             let first = !entry.straggler_reported;
             entry.straggler_reported = true;
-            return Ok(DeliverDisposition::Discard { first });
+            return Ok(DeliverDisposition::Discard { first, dropped });
         }
-        if let Some(hw) = entry.span_hw
-            && seq <= hw
-        {
-            return Err(format!(
-                "Deliver seq regression on {channel}: {seq} not greater than {hw}"
-            ));
+        let mut hw = entry.span_hw;
+        for row in rows {
+            if let Some(seen) = hw
+                && row.seq <= seen
+            {
+                return Err(format!(
+                    "Deliver seq regression on {channel}: {} not greater than {seen}",
+                    row.seq
+                ));
+            }
+            hw = Some(row.seq);
         }
-        entry.span_hw = Some(seq);
+        entry.span_hw = hw;
         if entry.resume_policy == ResumePolicy::Resume {
-            entry.token = Some(cursor);
+            entry.token = Some(last.cursor.clone());
         }
         Ok(DeliverDisposition::Accept { dropped })
     }

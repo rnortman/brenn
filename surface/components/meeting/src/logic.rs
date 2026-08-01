@@ -25,6 +25,7 @@ use serde::Deserialize;
 
 use brenn_surface_component_support::parse_delivery;
 pub use brenn_surface_component_support::{ContractViolation, FaultReport};
+use brenn_surface_contract::PortWindow;
 
 /// The agenda-subscription input port name.
 const AGENDA_PORT: &str = "agenda";
@@ -375,6 +376,72 @@ impl MeetingState {
         };
         self.prune_acks(now);
         Ok(outcome)
+    }
+
+    /// Fold one activation window, returning the notes the glue logs at each
+    /// one's own level.
+    ///
+    /// The two ports fold differently because they *are* different: `agenda` is
+    /// latest-wins — each snapshot replaces the meeting set wholesale, so only
+    /// the newest new one is applied and a window carrying more than one is a
+    /// binding whose `push_depth` exceeds 1 — while `acks` accumulates, keyed by
+    /// meeting id, so every new ack matters and one lost to overflow is a
+    /// dismissal made on another device that this one will keep escalating past.
+    /// Hence the `dropped` warning on `acks` and none on `agenda`, where a
+    /// superseded snapshot passing unserved is coalescing working as intended.
+    ///
+    /// The port is checked first, so a window from a port this component does not
+    /// bind is the contract violation it is whether or not it happens to carry a
+    /// new message — an idle turn must not be the turn that lets the skew through.
+    pub fn on_window(
+        &mut self,
+        window: &PortWindow,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<IngestWarning>, ContractViolation> {
+        if window.port != AGENDA_PORT && window.port != ACKS_PORT {
+            return Err(ContractViolation::WrongPort {
+                port: window.port.clone(),
+            });
+        }
+        let mut notes = Vec::new();
+        if window.port == AGENDA_PORT {
+            if let Some(message) = window.latest_wins_misconfiguration() {
+                notes.push(IngestWarning::error(message));
+            }
+            if let Some(envelope) = window.latest_new() {
+                notes.extend(self.ingest(&window.port, envelope, now)?);
+            }
+            return Ok(notes);
+        }
+        if window.port == ACKS_PORT && window.dropped > 0 {
+            notes.push(IngestWarning::warn(format!(
+                "meeting port {:?} dropped {} ack(s); a dismissal or snooze made \
+                 elsewhere may keep escalating here until its meeting leaves the \
+                 snapshot",
+                window.port, window.dropped
+            )));
+        }
+        for envelope in window.new_envelopes() {
+            notes.extend(self.ingest(&window.port, envelope, now)?);
+        }
+        Ok(notes)
+    }
+
+    /// Fold one delivered envelope, flattening its outcome into log notes.
+    fn ingest(
+        &mut self,
+        port: &str,
+        envelope: &MessageEnvelope,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<IngestWarning>, ContractViolation> {
+        let envelope_json =
+            serde_json::to_string(envelope).expect("a MessageEnvelope serializes to JSON");
+        Ok(match self.on_message(port, &envelope_json, now)? {
+            IngestOutcome::Accepted { warnings } => warnings,
+            IngestOutcome::Malformed(report) => {
+                vec![IngestWarning::error(report.log_message("meeting body"))]
+            }
+        })
     }
 
     /// Apply a Dismiss/Snooze locally (immediately, before the ack echoes back),
@@ -1474,5 +1541,221 @@ mod tests {
             state.on_message("agenda", "not json", at("2026-07-12T14:00:00Z")),
             Err(ContractViolation::BadEnvelope(_))
         ));
+    }
+
+    // ── The activation-window fold ──────────────────────────────────────────
+
+    /// A window on `port` whose first `context.len()` bodies are retained
+    /// context and the rest new.
+    fn window(port: &str, context: &[String], new: &[String]) -> PortWindow {
+        let envelopes = context
+            .iter()
+            .chain(new.iter())
+            .map(|body| {
+                serde_json::from_str(&envelope_json(body, "2026-07-12T00:00:00Z"))
+                    .expect("the fixture envelope parses")
+            })
+            .collect();
+        PortWindow {
+            port: port.to_string(),
+            envelopes,
+            new_from: context.len() as u32,
+            dropped: 0,
+        }
+    }
+
+    /// A dismiss ack body for one occurrence.
+    fn ack_body(meeting_id: &str, start: &str) -> String {
+        serde_json::json!({
+            "v": 1, "meeting_id": meeting_id, "action": "dismiss", "start": start,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn an_agenda_window_applies_only_the_newest_snapshot() {
+        // A snapshot is the whole meeting set, so the older two are already
+        // superseded on arrival: applying them is two discarded replacements of
+        // the same state. The window carrying three of them is itself the
+        // evidence that the binding's push_depth is not 1.
+        let mut state = MeetingState::new();
+        let now = at("2026-07-12T14:00:00Z");
+        let notes = state
+            .on_window(
+                &window(
+                    "agenda",
+                    &[],
+                    &[
+                        snapshot("2026-07-12T15:00:00Z", "First"),
+                        snapshot("2026-07-12T16:00:00Z", "Second"),
+                        snapshot("2026-07-12T17:00:00Z", "Third"),
+                    ],
+                ),
+                now,
+            )
+            .expect("the agenda port satisfies the contract");
+        match notes.as_slice() {
+            [note] => {
+                assert_eq!(note.level, WarningLevel::Error);
+                assert!(note.message.contains("\"agenda\""), "{}", note.message);
+                assert!(note.message.contains('3'), "{}", note.message);
+                assert!(note.message.contains("push_depth"), "{}", note.message);
+            }
+            other => panic!("expected one misconfiguration note, got {other:?}"),
+        }
+        assert_eq!(state.recompute(now).title, "Third");
+    }
+
+    #[test]
+    fn a_single_new_snapshot_is_applied_silently() {
+        // The healthy shape under `push_depth = 1`: context plus one new
+        // snapshot. Applied, with nothing reported and no re-fold of context.
+        let mut state = MeetingState::new();
+        let now = at("2026-07-12T14:00:00Z");
+        let notes = state
+            .on_window(
+                &window(
+                    "agenda",
+                    &[snapshot("2026-07-12T15:00:00Z", "Old")],
+                    &[snapshot("2026-07-12T16:00:00Z", "Current")],
+                ),
+                now,
+            )
+            .expect("the agenda port satisfies the contract");
+        assert_eq!(notes, Vec::new());
+        assert_eq!(state.recompute(now).title, "Current");
+    }
+
+    #[test]
+    fn a_malformed_newest_snapshot_keeps_last_good_over_a_valid_older_one() {
+        // Take-latest applies the newest and only the newest: an older valid
+        // snapshot in the same window is not a fallback, because showing a
+        // superseded agenda as current is the worse failure.
+        let mut state = MeetingState::new();
+        let now = at("2026-07-12T14:00:00Z");
+        feed_agenda(&mut state, &snapshot("2026-07-12T15:00:00Z", "Good"), now);
+        let notes = state
+            .on_window(
+                &window(
+                    "agenda",
+                    &[],
+                    &[
+                        snapshot("2026-07-12T16:00:00Z", "Older"),
+                        "{ not a snapshot }".to_string(),
+                    ],
+                ),
+                now,
+            )
+            .expect("the agenda port satisfies the contract");
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes.iter().all(|n| n.level == WarningLevel::Error));
+        assert!(notes[1].message.contains("malformed meeting body"));
+        assert_eq!(state.faults(), 1);
+        assert_eq!(state.recompute(now).title, "Good");
+    }
+
+    #[test]
+    fn a_dropped_snapshot_is_not_reported() {
+        // Coalescing on a retained latest-wins channel is the subscription
+        // doing its job: the snapshot that passed the position unserved is one
+        // this very window supersedes.
+        let mut state = MeetingState::new();
+        let now = at("2026-07-12T14:00:00Z");
+        let mut w = window("agenda", &[], &[snapshot("2026-07-12T15:00:00Z", "Only")]);
+        w.dropped = 4;
+        let notes = state
+            .on_window(&w, now)
+            .expect("the agenda port satisfies the contract");
+        assert_eq!(notes, Vec::new());
+    }
+
+    #[test]
+    fn an_acks_window_folds_every_new_ack() {
+        // Acks accumulate per meeting id, so two acks for two meetings in one
+        // window are two distinct facts and both must land — this is the port
+        // where latest-wins would silently lose a dismissal.
+        let mut state = MeetingState::new();
+        let now = at("2026-07-12T14:00:00Z");
+        let body = serde_json::json!({
+            "v": 1,
+            "meetings": [
+                { "id": "m1", "start": "2026-07-12T15:00:00Z", "title": "One" },
+                { "id": "m2", "start": "2026-07-12T16:00:00Z", "title": "Two" },
+            ],
+        })
+        .to_string();
+        feed_agenda(&mut state, &body, now);
+        assert_eq!(active_id(&state, now).as_deref(), Some("m1"));
+
+        let notes = state
+            .on_window(
+                &window(
+                    "acks",
+                    &[],
+                    &[
+                        ack_body("m1", "2026-07-12T15:00:00Z"),
+                        ack_body("m2", "2026-07-12T16:00:00Z"),
+                    ],
+                ),
+                now,
+            )
+            .expect("the acks port satisfies the contract");
+        assert_eq!(notes, Vec::new());
+        // Both dismissals landed: nothing is left to escalate.
+        assert_eq!(active_id(&state, now), None);
+    }
+
+    #[test]
+    fn a_dropped_ack_is_reported() {
+        // The one port where a message passing unserved is a real loss: an ack
+        // is a decision made on another device, and nothing later restates it,
+        // so the meeting keeps escalating here with no other evidence.
+        let mut state = MeetingState::new();
+        let now = at("2026-07-12T14:00:00Z");
+        let mut w = window("acks", &[], &[ack_body("m1", "2026-07-12T15:00:00Z")]);
+        w.dropped = 2;
+        let notes = state
+            .on_window(&w, now)
+            .expect("the acks port satisfies the contract");
+        match notes.as_slice() {
+            [note] => {
+                assert_eq!(note.level, WarningLevel::Warn);
+                assert!(note.message.contains("dropped 2 ack"), "{}", note.message);
+            }
+            other => panic!("expected one dropped-ack warning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_window_on_a_wrong_port_is_a_contract_violation() {
+        let mut state = MeetingState::new();
+        assert_eq!(
+            state.on_window(
+                &window("messages", &[], &[snapshot("2026-07-12T15:00:00Z", "X")],),
+                at("2026-07-12T14:00:00Z"),
+            ),
+            Err(ContractViolation::WrongPort {
+                port: "messages".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_wrong_port_window_carrying_nothing_new_is_still_a_contract_violation() {
+        // The port is the contract, not the traffic on it. A window routed here
+        // from a port this component does not bind is skew whichever turn it
+        // lands on, and most turns are idle ones: a check that only fires when
+        // the window happens to carry a new message is a check that lets the
+        // skew through until it does.
+        let mut state = MeetingState::new();
+        assert_eq!(
+            state.on_window(
+                &window("messages", &[snapshot("2026-07-12T15:00:00Z", "X")], &[],),
+                at("2026-07-12T14:00:00Z"),
+            ),
+            Err(ContractViolation::WrongPort {
+                port: "messages".to_string()
+            })
+        );
     }
 }

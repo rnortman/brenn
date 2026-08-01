@@ -480,24 +480,24 @@ impl AttachClient {
                     .push_back(Observation::Subscribed { channel, ack });
                 Ok(frames)
             }
-            ServerFrame::Deliver {
-                channel,
-                envelope,
-                seq,
-                cursor,
-                dropped,
-            } => {
-                match self.subs.on_deliver(&channel, seq, cursor, dropped)? {
-                    DeliverDisposition::Accept { dropped } => {
-                        self.observed.push_back(Observation::Delivered(Delivery {
-                            channel,
-                            sender: envelope.sender,
-                            body: envelope.body,
-                            seq,
-                            dropped,
-                        }));
+            ServerFrame::Deliver { channel, rows } => {
+                match self.subs.on_deliver(&channel, &rows)? {
+                    // The observation queue is delivery-granular, not
+                    // frame-granular: one pass is one delivery point on the wire
+                    // and still N messages a client reads, so each row is its own
+                    // observation carrying its own wire facts.
+                    DeliverDisposition::Accept { .. } => {
+                        for row in rows {
+                            self.observed.push_back(Observation::Delivered(Delivery {
+                                channel: channel.clone(),
+                                sender: row.envelope.sender,
+                                body: row.envelope.body,
+                                seq: row.seq,
+                                dropped: row.dropped,
+                            }));
+                        }
                     }
-                    // A delivery from a span this client has already left. It
+                    // A pass from a span this client has already left. It
                     // advanced nothing below and is nothing to assert on.
                     DeliverDisposition::Discard { .. } => {}
                 }

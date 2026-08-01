@@ -32,8 +32,7 @@ use web_sys::HtmlElement;
 
 use crate::logic::dismiss_body;
 use crate::logic::{
-    AckAction, AckTarget, IngestOutcome, MeetingState, Recompute, SNOOZE_SECS, WarningLevel,
-    snooze_body,
+    AckAction, AckTarget, MeetingState, Recompute, SNOOZE_SECS, WarningLevel, snooze_body,
 };
 
 /// This component's kind — its config `kind`, its element-tag stem
@@ -164,18 +163,8 @@ fn on_connected(
     *wiring.borrow_mut() = Some(Wiring { host, tick });
 }
 
-/// Feed each activation's new messages to the pure state machine, then recompute
-/// once — not once per message. Agenda snapshots and acks arrive on the same
-/// activation, distinguished by the window's port exactly where the dialect used
-/// the event's `port` field. A malformed body (or an invalid per-meeting
-/// override) is a publisher fault: log it and carry on.
-///
-/// A nonzero `dropped` means a snapshot or a dismiss/snooze ack was lost (a
-/// device offline past the channel's queue bound). The pure state machine
-/// reconverges on the next retained delivery, so there is nothing to recover
-/// locally — but the loss must not be silent, or two devices can diverge (a
-/// meeting dismissed elsewhere keeps escalating here) with no evidence in the
-/// operator log.
+/// Feed each activation window to the pure state machine, then recompute once —
+/// not once per message. Errors are logged; none stop the panel.
 fn on_activation(
     activation: &Activation,
     state: &Rc<RefCell<MeetingState>>,
@@ -190,42 +179,16 @@ fn on_activation(
     };
     let now = read_now_utc();
     for window in &activation.ports {
-        if window.dropped > 0 {
-            component_log(
-                &wiring.host,
-                LogLevel::Warn,
-                &format!(
-                    "meeting port {:?} dropped {} message(s); agenda/ack state may lag \
-                     until the next delivery",
-                    window.port, window.dropped
-                ),
-            );
-        }
-        for envelope in window.new_envelopes() {
-            let envelope_json =
-                serde_json::to_string(envelope).expect("a MessageEnvelope serializes to JSON");
-            let outcome = state
-                .borrow_mut()
-                .on_message(&window.port, &envelope_json, now)
-                .expect("an activation window satisfies the meeting contract");
-            match outcome {
-                IngestOutcome::Accepted { warnings } => {
-                    for warning in warnings {
-                        let level = match warning.level {
-                            WarningLevel::Warn => LogLevel::Warn,
-                            WarningLevel::Error => LogLevel::Error,
-                        };
-                        component_log(&wiring.host, level, &warning.message);
-                    }
-                }
-                IngestOutcome::Malformed(report) => {
-                    component_log(
-                        &wiring.host,
-                        LogLevel::Error,
-                        &report.log_message("meeting body"),
-                    );
-                }
-            }
+        let notes = state
+            .borrow_mut()
+            .on_window(window, now)
+            .expect("an activation window satisfies the meeting contract");
+        for note in notes {
+            let level = match note.level {
+                WarningLevel::Warn => LogLevel::Warn,
+                WarningLevel::Error => LogLevel::Error,
+            };
+            component_log(&wiring.host, level, &note.message);
         }
     }
     // Once per activation, not once per message: the render is a pure function of

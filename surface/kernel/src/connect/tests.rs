@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::registry::{Registrations, new_stores, reconcile_stores};
-use crate::test_support::pages;
+use crate::test_support::{frames, pages};
 
 const CONFIG: &str = "ephemeral:site.surface.bar.bindings";
 const WIRE: &str = "brenn:site.bar.in";
@@ -357,7 +357,7 @@ fn the_config_subscription_carries_no_cursor_on_any_reconnect() {
     // The document's own delivery mints a cursor the plane would echo for an
     // ordinary channel.
     assert_eq!(
-        subs.on_deliver(CONFIG, 1, cursor("c1"), 0)
+        subs.on_deliver(CONFIG, &[frames::row(CONFIG, "{}", 1, 0x1)])
             .expect("the config channel is active"),
         DeliverDisposition::Accept { dropped: 0 }
     );
@@ -405,7 +405,8 @@ fn a_detach_leaves_the_application_channels_and_their_cursors_alone() {
     );
     subs.on_subscribe_result(WIRE, SubscribeOutcome::Ok, 0, None)
         .expect("pending");
-    subs.on_deliver(WIRE, 3, cursor("c3"), 0).expect("active");
+    subs.on_deliver(WIRE, &[frames::row(WIRE, "{}", 3, 0x3)])
+        .expect("active");
 
     connect.on_detached(&mut subs);
     connect.on_attached(facts(), &mut subs);

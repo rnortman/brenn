@@ -13,6 +13,7 @@
 //! recompute derives the theme from the current wall time, so a suspend/resume,
 //! NTP step, or DST transition self-corrects on the next boundary recompute.
 
+use brenn_surface_contract::PortWindow;
 use brenn_surface_schema::{THEME_DARK, THEME_LIGHT};
 use serde::Deserialize;
 
@@ -136,6 +137,18 @@ pub enum ConfigOutcome {
     Malformed(FaultReport),
 }
 
+/// What folding one `config` window left for the glue to log. Both are operator
+/// errors: one names a binding whose `push_depth` is wrong, the other a
+/// publisher whose body is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigNote {
+    /// The window presented more than one new config document, which a
+    /// latest-wins port never should. Carries the ready-to-log line.
+    Misconfigured(String),
+    /// The applied document violated the config convention; config untouched.
+    Malformed(FaultReport),
+}
+
 /// The result of a recompute: what to dispatch now and when to wake next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TickPlan {
@@ -220,6 +233,46 @@ impl ModeClock {
                 )))
             }
         }
+    }
+
+    /// Fold one activation window on the `config` port.
+    ///
+    /// The port is latest-wins: a config message is a full snapshot that
+    /// replaces the effective config wholesale, so only the newest new one is
+    /// applied. A window presenting more than one new document is a binding
+    /// whose `push_depth` exceeds 1 — reported, then the latest is applied
+    /// anyway, so a misconfigured depth costs an operator error and nothing
+    /// else.
+    ///
+    /// `dropped` is deliberately not reported here: on a retained latest-wins
+    /// channel a superseded config passing the position unserved is coalescing
+    /// doing its job, and the very next window carries the current value.
+    ///
+    /// The port is checked first, so a window from a port this component does not
+    /// bind is the contract violation it is whether or not it happens to carry a
+    /// new message — an idle turn must not be the turn that lets the skew through.
+    pub fn on_config_window(
+        &mut self,
+        window: &PortWindow,
+    ) -> Result<Vec<ConfigNote>, ContractViolation> {
+        if window.port != CONFIG_PORT {
+            return Err(ContractViolation::WrongPort {
+                port: window.port.clone(),
+            });
+        }
+        let mut notes = Vec::new();
+        if let Some(message) = window.latest_wins_misconfiguration() {
+            notes.push(ConfigNote::Misconfigured(message));
+        }
+        let Some(envelope) = window.latest_new() else {
+            return Ok(notes);
+        };
+        let envelope_json =
+            serde_json::to_string(envelope).expect("a MessageEnvelope serializes to JSON");
+        if let ConfigOutcome::Malformed(report) = self.on_config(&window.port, &envelope_json)? {
+            notes.push(ConfigNote::Malformed(report));
+        }
+        Ok(notes)
     }
 
     /// Recompute the effective theme at `now` (minutes since local midnight),
@@ -517,6 +570,158 @@ mod tests {
                 "messages",
                 &config_msg(serde_json::json!({ "mode": "dark" }))
             ),
+            Err(ContractViolation::WrongPort {
+                port: "messages".to_string()
+            })
+        );
+    }
+
+    // ── The activation-window fold ──────────────────────────────────────────
+
+    /// A `config` window whose first `context.len()` envelopes are retained
+    /// context and the rest new.
+    fn config_window(context: &[serde_json::Value], new: &[serde_json::Value]) -> PortWindow {
+        let envelopes = context
+            .iter()
+            .chain(new.iter())
+            .map(|body| brenn_surface_test_fixtures::sample_envelope(&body.to_string()))
+            .collect();
+        PortWindow {
+            port: CONFIG_PORT.to_string(),
+            envelopes,
+            new_from: context.len() as u32,
+            dropped: 0,
+        }
+    }
+
+    #[test]
+    fn a_config_window_applies_only_the_newest_and_reports_the_rest() {
+        // Latest wins is the fold: a config message is a whole snapshot, so the
+        // older two are already superseded when the window arrives. Applying
+        // them first is two discarded state replacements, and the window itself
+        // is evidence the binding's push_depth is wrong.
+        let mut clock = ModeClock::new();
+        let notes = clock
+            .on_config_window(&config_window(
+                &[],
+                &[
+                    serde_json::json!({ "mode": "light" }),
+                    serde_json::json!({ "mode": "auto" }),
+                    serde_json::json!({ "mode": "dark" }),
+                ],
+            ))
+            .expect("the config port satisfies the contract");
+        match notes.as_slice() {
+            [ConfigNote::Misconfigured(message)] => {
+                assert!(message.contains("\"config\""), "{message}");
+                assert!(message.contains('3'), "{message}");
+                assert!(message.contains("push_depth"), "{message}");
+            }
+            other => panic!("expected one misconfiguration note, got {other:?}"),
+        }
+        // Noon is light under `auto` and under the older `light`; only the
+        // newest `dark` explains this.
+        assert_eq!(clock.tick(m(12, 0)).dispatch, Some(Theme::Dark));
+    }
+
+    #[test]
+    fn a_single_new_config_is_applied_silently() {
+        // The healthy shape under `push_depth = 1`: retained context plus one
+        // new snapshot. The context is not re-applied and nothing is reported.
+        let mut clock = ModeClock::new();
+        let notes = clock
+            .on_config_window(&config_window(
+                &[serde_json::json!({ "mode": "dark" })],
+                &[serde_json::json!({ "mode": "light" })],
+            ))
+            .expect("the config port satisfies the contract");
+        assert_eq!(notes, Vec::new());
+        assert_eq!(clock.tick(m(23, 0)).dispatch, Some(Theme::Light));
+    }
+
+    #[test]
+    fn a_pure_context_config_window_changes_nothing() {
+        let mut clock = ModeClock::new();
+        let notes = clock
+            .on_config_window(&config_window(
+                &[serde_json::json!({ "mode": "dark" })],
+                &[],
+            ))
+            .expect("the config port satisfies the contract");
+        assert_eq!(notes, Vec::new());
+        // Default `auto` still holds: the context config was never applied.
+        assert_eq!(clock.tick(m(12, 0)).dispatch, Some(Theme::Light));
+    }
+
+    #[test]
+    fn a_malformed_newest_config_keeps_last_good_over_a_valid_older_one() {
+        // Take-latest applies the newest and only the newest. An older valid
+        // snapshot in the same window is not a fallback: presenting a
+        // superseded config as current is worse than keeping last-good.
+        let mut clock = ModeClock::new();
+        clock
+            .on_config("config", &config_msg(serde_json::json!({ "mode": "dark" })))
+            .unwrap();
+        let notes = clock
+            .on_config_window(&config_window(
+                &[],
+                &[
+                    serde_json::json!({ "mode": "light" }),
+                    serde_json::json!({ "mode": "sepia" }),
+                ],
+            ))
+            .expect("the config port satisfies the contract");
+        assert!(
+            matches!(
+                notes.as_slice(),
+                [ConfigNote::Misconfigured(_), ConfigNote::Malformed(_)]
+            ),
+            "{notes:?}"
+        );
+        assert_eq!(clock.faults(), 1);
+        // Fixed dark from before the window, not the older `light` row.
+        assert_eq!(clock.tick(m(12, 0)).dispatch, Some(Theme::Dark));
+    }
+
+    #[test]
+    fn a_dropped_config_is_not_reported() {
+        // Coalescing on a retained latest-wins channel is the subscription
+        // doing its job, not a degradation: the superseded config that passed
+        // the position unserved is exactly the one this window supersedes too.
+        let mut clock = ModeClock::new();
+        let mut window = config_window(&[], &[serde_json::json!({ "mode": "dark" })]);
+        window.dropped = 7;
+        let notes = clock
+            .on_config_window(&window)
+            .expect("the config port satisfies the contract");
+        assert_eq!(notes, Vec::new());
+    }
+
+    #[test]
+    fn a_window_on_a_wrong_port_is_a_contract_violation() {
+        let mut clock = ModeClock::new();
+        let mut window = config_window(&[], &[serde_json::json!({ "mode": "dark" })]);
+        window.port = "messages".to_string();
+        assert_eq!(
+            clock.on_config_window(&window),
+            Err(ContractViolation::WrongPort {
+                port: "messages".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_wrong_port_window_carrying_nothing_new_is_still_a_contract_violation() {
+        // The port is the contract, not the traffic on it. A window routed here
+        // from a port this component does not bind is skew whichever turn it
+        // lands on, and most turns are idle ones: a check that only fires when
+        // the window happens to carry a new message is a check that lets the
+        // skew through until it does.
+        let mut clock = ModeClock::new();
+        let mut window = config_window(&[serde_json::json!({ "mode": "dark" })], &[]);
+        window.port = "messages".to_string();
+        assert_eq!(
+            clock.on_config_window(&window),
             Err(ContractViolation::WrongPort {
                 port: "messages".to_string()
             })

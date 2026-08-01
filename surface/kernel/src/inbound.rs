@@ -9,9 +9,10 @@
 //! - **`SubscribeResult`** settles a channel's wire state. On the config channel
 //!   it is also the answer the two-phase connect judges: an empty replay means
 //!   the peer retains no wiring for this surface.
-//! - **`Deliver`** is either a message a component reads — into the channel's
-//!   store, where the next activation windows it — or, on the config channel, the
-//!   bindings document itself, which is phase 2.
+//! - **`Deliver`** is one delivery pass on one channel: rows a component reads —
+//!   into the channel's store, where the turn's single activation windows the
+//!   whole pass at once — or, on the config channel, the bindings document
+//!   itself, which is phase 2.
 //! - **`PublishResult`** settles one single publish: a caller's answer, a
 //!   swallowed error report, or a telemetry document counted and dropped.
 //! - **`PublishBatchResult`** settles one activation's flush, freeing its
@@ -32,13 +33,14 @@
 //!
 //! An `Err` is a peer contract the page cannot reconcile, and the caller's cue to
 //! go fatal on its connection: a delivery on a channel this attachment never had
-//! open, a span sequence that does not advance, a correlation nothing sent, a
-//! config channel with no document on it, a document this build cannot apply. The
-//! page takes its whole configuration from this peer on faith, so a peer that
-//! contradicts the contract is not something to carry on from.
+//! open, a pass with no rows, a span sequence that does not advance, a
+//! correlation nothing sent, a config channel with no document on it, a document
+//! this build cannot apply. The page takes its whole configuration from this peer
+//! on faith, so a peer that contradicts the contract is not something to carry on
+//! from.
 //!
-//! A *straggler* is not fatal and not an error: a delivery from a span the page
-//! has already left, in flight when its `Unsubscribe` crossed. It is discarded,
+//! A *straggler* is not fatal and not an error: a pass from a span the page has
+//! already left, in flight when its `Unsubscribe` crossed. It is discarded whole,
 //! reported once per span, and advances nothing.
 
 #[cfg(test)]
@@ -48,16 +50,15 @@ use brenn_attach_client::Millis;
 use brenn_attach_client::publish::{BatchAnswer, OutboxSteps};
 use brenn_attach_client::subs::DeliverDisposition;
 use brenn_attach_proto::{
-    ClientFrame, DeferredViewEntry, GapInfo, PublishBatchOutcome, PublishOutcome, ServerFrame,
-    SubscribeOutcome,
+    ClientFrame, DeferredViewEntry, DeliverRow, GapInfo, PublishBatchOutcome, PublishOutcome,
+    ServerFrame, SubscribeOutcome,
 };
-use brenn_envelope::MessageEnvelope;
 
 use crate::activation::DropVerdicts;
 use crate::outbound::{LostFlush, PublishAnswer};
 use crate::page::{Configured, SurfacePage};
 
-/// A delivery discarded as a previous span's straggler.
+/// A delivery pass discarded as a previous span's straggler.
 ///
 /// Reported once per post-`Active` window rather than once per straggler:
 /// stragglers are peer-paced, so nothing may ride an unbounded diagnostic on
@@ -65,7 +66,9 @@ use crate::page::{Configured, SurfacePage};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Straggler {
     pub channel: String,
-    /// The discarded delivery's span sequence.
+    /// The span sequence of the pass's first discarded row. The pass is
+    /// discarded whole, so this names where it started rather than everything it
+    /// carried.
     pub seq: u64,
     /// The loss the peer reported with it, which is discarded along with the
     /// delivery: a straggler advances no position, so there is nothing for the
@@ -108,10 +111,10 @@ pub struct Inbound {
     /// The outboxes' answer to a settled flush: what goes out now that the
     /// instance's wire is free again, what its cap dropped, and the retry timer.
     pub steps: OutboxSteps<String>,
-    /// The bindings document this frame carried, applied — phase 2, whose own
-    /// frames, steps and verdicts it carries.
-    pub configured: Option<Configured>,
-    /// A delivery discarded as a straggler, the first of its span.
+    /// The bindings documents this frame carried, applied in frame order —
+    /// phase 2, whose own frames, steps and verdicts each one carries.
+    pub configured: Vec<Configured>,
+    /// A delivery pass discarded as a straggler, the first of its span.
     pub straggler: Option<Straggler>,
     /// A gap on a subscription that presented a resume claim.
     pub gap: Option<ChannelGap>,
@@ -141,23 +144,7 @@ pub fn on_server_frame(
             replay_count,
             gap,
         } => on_subscribe_result(page, channel, outcome, replay_count, gap),
-        ServerFrame::Deliver {
-            channel,
-            envelope,
-            seq,
-            cursor,
-            dropped,
-        } => on_deliver(
-            page,
-            Delivery {
-                channel,
-                envelope,
-                seq,
-            },
-            cursor,
-            dropped,
-            now,
-        ),
+        ServerFrame::Deliver { channel, rows } => on_deliver(page, channel, rows, now),
         ServerFrame::PublishResult {
             correlation,
             outcome,
@@ -179,17 +166,6 @@ pub fn on_server_frame(
 
 fn unreachable_frame(name: &str) -> ! {
     panic!("surface client: the connection consumes {name} itself and routes it to nobody")
-}
-
-/// What a `Deliver` says about the message it carries, minus the resume state.
-///
-/// Bundled because the three travel together and a positional list of a `String`,
-/// an envelope and a `u64` beside a `Cursor` and another `u64` is a transposition
-/// waiting to typecheck.
-struct Delivery {
-    channel: String,
-    envelope: MessageEnvelope,
-    seq: u64,
 }
 
 /// Settle one channel's `SubscribeResult`.
@@ -235,17 +211,20 @@ fn on_subscribe_result(
     })
 }
 
-/// Take one delivered envelope.
+/// Take one delivery pass — every row one `Deliver` carried on one channel.
 ///
-/// Three outcomes. A straggler is discarded and reported. The config channel's
-/// delivery is the page's wiring and runs phase 2. Anything else goes into the
-/// channel's store — for every subscribed channel uniformly, registered readers
-/// or not, because retention is what makes a message recoverable and is not a
-/// fact about who is listening.
+/// Three outcomes. A straggling pass is discarded whole and reported once. The
+/// config channel's rows are the page's wiring and each runs phase 2. Anything
+/// else goes into the channel's store — for every subscribed channel uniformly,
+/// registered readers or not, because retention is what makes a message
+/// recoverable and is not a fact about who is listening.
 ///
-/// Arrival moves no position, which is what coalesces a turn's deliveries into
-/// one activation. A position the arrival outran is charged here, at the arrival
-/// that caused it, rather than at a window the binding may never reach.
+/// **A pass lands before anything windows it.** Arrival moves no position, so
+/// inserting N rows leaves every binding's cursor where it was and the turn's
+/// single activation pass windows the whole pass at once — which is what caps a
+/// catch-up's new slice at the binding's `push_depth` instead of presenting each
+/// row as its own arrival. A position the pass outran is charged here, at the
+/// arrival that caused it, rather than at a window the binding may never reach.
 ///
 /// # Panics
 ///
@@ -255,23 +234,20 @@ fn on_subscribe_result(
 /// pass of the document that named it.
 fn on_deliver(
     page: &mut SurfacePage,
-    delivery: Delivery,
-    cursor: brenn_attach_proto::Cursor,
-    dropped: u64,
+    channel: String,
+    rows: Vec<DeliverRow>,
     now: Millis,
 ) -> Result<Inbound, String> {
-    let Delivery {
-        channel,
-        envelope,
-        seq,
-    } = delivery;
-    let accepted = match page.subs.on_deliver(&channel, seq, cursor, dropped)? {
+    let accepted = match page.subs.on_deliver(&channel, &rows)? {
         DeliverDisposition::Accept { dropped } => dropped,
-        DeliverDisposition::Discard { first } => {
+        DeliverDisposition::Discard { first, dropped } => {
+            let head = rows
+                .first()
+                .expect("attach client: an empty pass is refused before it is dispositioned");
             return Ok(Inbound {
                 straggler: first.then_some(Straggler {
                     channel,
-                    seq,
+                    seq: head.seq,
                     dropped,
                 }),
                 ..Inbound::default()
@@ -281,11 +257,14 @@ fn on_deliver(
     if page.connect.is_config_channel(&channel) {
         // The page's own wiring, not a message any component reads: it has no
         // store and no reader, and a loss the peer reports on it is a superseded
-        // document rolling out of a one-deep retained window — the delivery in
-        // hand is the current one either way.
-        let configured = page.apply_config(&envelope.body, now)?;
+        // document rolling out of a one-deep retained window — the newest
+        // document of the pass is the current one either way.
+        let configured = rows
+            .iter()
+            .map(|row| page.apply_config(&row.envelope.body, now))
+            .collect::<Result<Vec<_>, _>>()?;
         return Ok(Inbound {
-            configured: Some(configured),
+            configured,
             ..Inbound::default()
         });
     }
@@ -300,7 +279,9 @@ fn on_deliver(
         // Idempotent by `message_id`: several legitimate paths re-present what
         // the store already holds, a resubscribed channel replaying into a store
         // the page kept most of all.
-        store.insert(envelope)
+        rows.into_iter()
+            .flat_map(|row| store.insert(row.envelope))
+            .collect()
     };
     let bindings = page
         .connect

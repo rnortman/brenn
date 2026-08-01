@@ -33,7 +33,7 @@ pub(crate) const BODY_CAP: u64 = 4_096;
 /// the contract lands here alone.
 pub(crate) fn facts() -> AttachmentFacts {
     AttachmentFacts {
-        version: 1,
+        version: brenn_attach_proto::SUPPORTED_VERSIONS.max,
         participant_id: PRINCIPAL.to_string(),
         session_id: SESSION_ID.to_string(),
         heartbeat_secs: 20,

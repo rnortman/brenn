@@ -29,10 +29,8 @@
 //! Bus semantics the frames carry, none of them re-invented here: cursors are
 //! server-minted, opaque and client-held; nothing consumes and nothing acks;
 //! there is no backpressure; overflow drops oldest and is reported as
-//! [`Deliver::dropped`]; `push_depth` and `retain_depth` are the two independent
-//! knobs a subscription is defined by. See `docs/message-bus.md`.
-//!
-//! [`Deliver::dropped`]: ServerFrame::Deliver
+//! [`DeliverRow::dropped`]; `push_depth` and `retain_depth` are the two
+//! independent knobs a subscription is defined by. See `docs/message-bus.md`.
 
 use brenn_envelope::MessageEnvelope;
 use serde::{Deserialize, Serialize};
@@ -77,7 +75,7 @@ impl VersionRange {
 /// number on both ends at once. The negotiation *mechanism* exists from the
 /// start regardless, because it is the one thing that cannot be added later
 /// without breaking the frozen [`ClientFrame::Hello`] shell.
-pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exactly(1);
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exactly(2);
 
 /// The version two ends agree on, or `None` when their ranges do not overlap.
 ///
@@ -133,15 +131,13 @@ pub enum ClientFrame {
         /// What the attacher can see: the private window of most-recent messages
         /// it may read. Does not cause activation.
         retain_depth: u64,
-        /// The last [`Deliver::cursor`] this attacher accepted on this channel,
-        /// or `None` to start from the channel's retained tail.
+        /// The last [`DeliverRow::cursor`] this attacher accepted on this
+        /// channel, or `None` to start from the channel's retained tail.
         ///
         /// The server holds no per-attacher position, so resuming is entirely
         /// the client's claim; the server answers it with a
         /// [`SubscribeResult`](ServerFrame::SubscribeResult) that carries a
         /// [`GapInfo`] when the claim could not be covered.
-        ///
-        /// [`Deliver::cursor`]: ServerFrame::Deliver
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resume: Option<Cursor>,
     },
@@ -396,29 +392,25 @@ pub enum ServerFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         gap: Option<GapInfo>,
     },
-    /// One delivered envelope on `channel`.
+    /// One delivery pass on `channel`: every row the server produced in that
+    /// pass, oldest first.
     ///
-    /// Single-target: the wire carries a message once per (attachment, channel),
-    /// and whatever the attacher binds to that channel is the attacher's own
-    /// fan-out. `seq`, `cursor`, and `dropped` are therefore per-channel facts of
-    /// this attachment.
+    /// **One frame is one delivery point.** A subscribe replay, a catch-up
+    /// drain and a single live row are each one pass, so a multi-row frame is
+    /// one delivery point by construction and an attacher that windows what a
+    /// frame delivered sees the pass as one arrival rather than as N. Several
+    /// frames remain legal — they are simply several delivery points, to be
+    /// emitted knowingly.
+    ///
+    /// Single-target: the wire carries a message once per (attachment,
+    /// channel), and whatever the attacher binds to that channel is the
+    /// attacher's own fan-out. The per-row `seq`, `cursor` and `dropped` are
+    /// therefore facts of this attachment's one stream on this channel.
+    ///
+    /// `rows` is never empty: a pass with nothing to deliver writes no frame.
     Deliver {
         channel: String,
-        envelope: MessageEnvelope,
-        /// A delivery-time span sequence, assigned at socket-write time and
-        /// strictly increasing per subscription-span (a span starts at each
-        /// [`SubscribeResult`](ServerFrame::SubscribeResult), the counter
-        /// restarting at 1), for replay and live rows alike. It exists solely for
-        /// the client's continuity check on a peer it must not trust blindly; a
-        /// non-increasing `seq` is a fatal protocol error.
-        seq: u64,
-        /// The resume token for this channel as of this delivery. The client
-        /// stores the latest accepted one and echoes it verbatim on its next
-        /// [`Subscribe`](ClientFrame::Subscribe); it never interprets it.
-        cursor: Cursor,
-        /// Messages lost on this channel since the previous delivery on this
-        /// attachment — the channel's window rolled past the cursor. `0` = none.
-        dropped: u64,
+        rows: Vec<DeliverRow>,
     },
     /// The answer to one [`ClientFrame::Publish`] that asked for one.
     PublishResult {
@@ -450,6 +442,33 @@ pub enum ServerFrame {
         attribution: Option<String>,
         entries: Vec<DeferredViewEntry>,
     },
+}
+
+/// One delivered envelope inside a [`ServerFrame::Deliver`] pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliverRow {
+    pub envelope: MessageEnvelope,
+    /// A delivery-time span sequence, assigned at socket-write time and strictly
+    /// increasing per subscription-span (a span starts at each
+    /// [`SubscribeResult`](ServerFrame::SubscribeResult), the counter restarting
+    /// at 1), across rows within a pass as well as across passes, for replay and
+    /// live rows alike. It exists solely for the client's continuity check on a
+    /// peer it must not trust blindly; a non-increasing `seq` is a fatal protocol
+    /// error.
+    pub seq: u64,
+    /// The resume token for this channel as of this row. The client stores the
+    /// latest accepted one — the last row of the last accepted frame — and echoes
+    /// it verbatim on its next [`Subscribe`](ClientFrame::Subscribe); it never
+    /// interprets it.
+    pub cursor: Cursor,
+    /// Messages lost on this channel since the previous delivery on this
+    /// attachment — the channel's window rolled past the cursor. `0` = none. The
+    /// loss belongs to the subscription rather than to a message, so it rides the
+    /// first row that follows it and the rest of the pass carries `0`; a nonzero
+    /// count on any row but the first is a fatal protocol error, as a
+    /// non-increasing `seq` is.
+    pub dropped: u64,
 }
 
 /// One parked message in a [`ServerFrame::DeferredView`].
@@ -698,6 +717,20 @@ mod tests {
                 assert_eq!(negotiate(a, b), negotiate(b, a), "{a:?} vs {b:?}");
             }
         }
+    }
+
+    /// The tripwire for the crate's own rule: any schema change bumps the number
+    /// on both ends at once.
+    ///
+    /// Every other assertion in the tree states the version symbolically, which
+    /// is right for churn and leaves nothing holding the number itself. Without
+    /// this, a breaking frame change that forgets the bump ships a server
+    /// speaking one v2 and a cached page speaking another, and negotiation — the
+    /// mechanism built to catch exactly that — reports agreement. Editing the
+    /// literal below is the acknowledgement that both ends moved together.
+    #[test]
+    fn the_wire_version_is_pinned_to_this_frame_shape() {
+        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exactly(2));
     }
 
     #[test]
@@ -1021,7 +1054,7 @@ mod tests {
         );
     }
 
-    /// Per-channel, single-target: the position facts sit on the frame, not on a
+    /// Per-channel, single-target: the position facts sit on each row, not on a
     /// list of targets, because the wire carries a message once per attachment
     /// and fan-out is the attacher's own business.
     #[test]
@@ -1029,14 +1062,105 @@ mod tests {
         pin_server(
             &ServerFrame::Deliver {
                 channel: "ephemeral:demo".to_string(),
-                envelope: sample_envelope(),
-                seq: 12,
-                cursor: sample_cursor(),
-                dropped: 2,
+                rows: vec![DeliverRow {
+                    envelope: sample_envelope(),
+                    seq: 12,
+                    cursor: sample_cursor(),
+                    dropped: 2,
+                }],
             },
             json!({
                 "type": "Deliver",
                 "channel": "ephemeral:demo",
+                "rows": [{
+                    "envelope": {
+                        "message_id": "00000000-0000-0000-0000-000000000001",
+                        "source": "src",
+                        "channel": "ephemeral:demo",
+                        "sender": "surface:deskbar",
+                        "publish_ts": "2023-11-14T22:13:20Z",
+                        "body": "hello",
+                        "urgency": "normal",
+                        "envelope_type": "ephemeral",
+                    },
+                    "seq": 12,
+                    "cursor": "opaque-token-7",
+                    "dropped": 2,
+                }],
+            }),
+        );
+    }
+
+    /// A whole catch-up pass in one frame: the rows are oldest first, their
+    /// `seq`s ascend across the pass, and the loss rides only the row that
+    /// follows it.
+    #[test]
+    fn a_multi_row_deliver_pass_is_pinned() {
+        pin_server(
+            &ServerFrame::Deliver {
+                channel: "ephemeral:demo".to_string(),
+                rows: vec![
+                    DeliverRow {
+                        envelope: sample_envelope(),
+                        seq: 1,
+                        cursor: sample_cursor(),
+                        dropped: 3,
+                    },
+                    DeliverRow {
+                        envelope: sample_envelope(),
+                        seq: 2,
+                        cursor: sample_cursor(),
+                        dropped: 0,
+                    },
+                ],
+            },
+            json!({
+                "type": "Deliver",
+                "channel": "ephemeral:demo",
+                "rows": [
+                    {
+                        "envelope": {
+                            "message_id": "00000000-0000-0000-0000-000000000001",
+                            "source": "src",
+                            "channel": "ephemeral:demo",
+                            "sender": "surface:deskbar",
+                            "publish_ts": "2023-11-14T22:13:20Z",
+                            "body": "hello",
+                            "urgency": "normal",
+                            "envelope_type": "ephemeral",
+                        },
+                        "seq": 1,
+                        "cursor": "opaque-token-7",
+                        "dropped": 3,
+                    },
+                    {
+                        "envelope": {
+                            "message_id": "00000000-0000-0000-0000-000000000001",
+                            "source": "src",
+                            "channel": "ephemeral:demo",
+                            "sender": "surface:deskbar",
+                            "publish_ts": "2023-11-14T22:13:20Z",
+                            "body": "hello",
+                            "urgency": "normal",
+                            "envelope_type": "ephemeral",
+                        },
+                        "seq": 2,
+                        "cursor": "opaque-token-7",
+                        "dropped": 0,
+                    },
+                ],
+            }),
+        );
+    }
+
+    /// A row is as strict as a frame: an unknown key inside one is a protocol
+    /// violation, not something to skip past.
+    #[test]
+    fn an_unknown_key_in_a_deliver_row_is_refused() {
+        let json = json!({
+            "type": "Deliver",
+            "channel": "ephemeral:demo",
+            "rows": [{
                 "envelope": {
                     "message_id": "00000000-0000-0000-0000-000000000001",
                     "source": "src",
@@ -1049,9 +1173,11 @@ mod tests {
                 },
                 "seq": 12,
                 "cursor": "opaque-token-7",
-                "dropped": 2,
-            }),
-        );
+                "dropped": 0,
+                "targets": [],
+            }],
+        });
+        assert!(serde_json::from_value::<ServerFrame>(json).is_err());
     }
 
     #[test]
