@@ -1,21 +1,29 @@
 //! wasm-bindgen entry point and kernel-facing handle.
 //!
 //! Browser target only. [`start`] is the bootstrap's single entry into the
-//! kernel: it installs the panic hook, reads the page's surface metas, wires a
-//! client instance to a [`WebSysConnector`], spawns the client
-//! driver and the kernel's event loop, and returns a [`KernelHandle`] the
-//! bootstrap holds for its post-kernel error path.
+//! kernel: it installs the panic hook, reads the page's three surface metas,
+//! builds a page and the front door onto it, spawns the [`SurfaceRunner`] over a
+//! [`WebSysConnector`] and the kernel's event loop, and returns a
+//! [`KernelHandle`] the bootstrap holds for its post-kernel error path.
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
+use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
+use brenn_attach_client::conn::ConnConfig;
+
+use crate::WebSysConnector;
 use crate::contract::{defer_status_str, element_name_for_instance, publish_status_str};
-use crate::proto::LogLevel;
-use crate::{ClientConfig, ClientHandle, Event, EventStream, WebSysConnector, new};
+use crate::front::{self, EventStream, SurfaceHandle};
+use crate::page::SurfacePage;
+use crate::proto::{LogLevel, STALE_BUILD_CLOSE_CODE};
+use crate::runner::SurfaceRunner;
+use crate::session::Event;
 
 use crate::dom;
 use crate::logic::{
@@ -24,15 +32,28 @@ use crate::logic::{
     route_processor_log, route_publish_intent, unbuffered_defer_refused,
 };
 
+const INITIAL_BACKOFF: Duration = Duration::from_secs(3);
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Handshake timeout, covering transport-open through `Welcome`-received.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Multiple of the peer's advertised `heartbeat_secs` of inbound silence that
+/// marks the attachment dead.
+const LIVENESS_MULTIPLIER: u32 = 3;
+
 /// Bring the kernel online and hand the bootstrap a handle to it.
 ///
 /// Installs the kernel's panic hook (which dispatches `brenn-surface-reload` so
-/// the bootstrap's capped reload heals a kernel death), reads `surface-slug` +
-/// `brenn-build-id` from the page metas, derives the WS URL from
-/// `window.location`, constructs the surface client over a [`WebSysConnector`],
+/// the bootstrap's capped reload heals a kernel death), reads `surface-slug`,
+/// `brenn-build-id` and `surface-config-channel` from the page metas, derives
+/// the connect URL from `window.location`, builds the page and its front door,
 /// renders the initial `Connecting` connect indicator, and `spawn_local`s the
-/// client driver and the kernel's event loop. The event loop folds each client `Event` through
-/// [`KernelCore`] and applies the resulting actions to the DOM.
+/// [`SurfaceRunner`] and the kernel's event loop. The event loop folds each
+/// [`Event`] through [`KernelCore`] and applies the resulting actions to the DOM.
+///
+/// The three metas are the page's whole boot identity: which surface this is,
+/// which served-asset build it was rendered by, and the channel its wiring is
+/// retained on. Everything else the kernel runs on arrives as the bindings
+/// document on that third address.
 #[wasm_bindgen]
 pub fn start() -> KernelHandle {
     // The panic hook must be installed before anything can panic: a panic during
@@ -51,6 +72,7 @@ pub fn start() -> KernelHandle {
 
     let slug = meta_content(&document, "surface-slug");
     let build_id = meta_content(&document, "brenn-build-id");
+    let config_channel = meta_content(&document, "surface-config-channel");
 
     let location = window.location();
     let protocol = location
@@ -59,15 +81,29 @@ pub fn start() -> KernelHandle {
     let host = location
         .host()
         .expect("surface kernel: location has no host");
-    let url = crate::logic::ws_url(&protocol, &host, &slug);
 
-    let config = ClientConfig {
-        url,
-        build_id,
-        ..ClientConfig::default()
+    let config = ConnConfig {
+        url: crate::logic::connect_url(&protocol, &host, &slug, &build_id),
+        // The build id doubles as the `Hello` ident: the peer logs it, and it is
+        // the one string that identifies which assets this page was served.
+        ident: build_id,
+        initial_backoff: INITIAL_BACKOFF,
+        max_backoff: MAX_BACKOFF,
+        connect_timeout: CONNECT_TIMEOUT,
+        liveness_multiplier: LIVENESS_MULTIPLIER,
+        // Seeded from per-page entropy so a fleet reconnecting in lockstep after
+        // a deploy restart decorrelates its reconnects.
+        backoff_jitter_seed: crate::entropy::seed(),
+        terminal_close_code: Some(STALE_BUILD_CLOSE_CODE),
     };
-    let (handle, events, driver) = new(config, WebSysConnector::new());
+    // The page's store epoch, minted here for the same reason as the jitter seed:
+    // nothing below this edge reads entropy. `Uuid::new_v4` reads the platform
+    // CSPRNG (`crypto.getRandomValues`), which is what a page-lifetime identity
+    // should be — not the deliberately non-cryptographic backoff seed source.
+    let page = SurfacePage::new(config_channel, Uuid::new_v4());
+    let (handle, events, channels) = front::new();
     let handle = Rc::new(handle);
+    let runner = SurfaceRunner::new(page, config, WebSysConnector::new(), channels);
 
     // The DOM-free decision core is shared: `run_event_loop` folds control-plane
     // events through it, and the delegated alert listener reads its
@@ -77,6 +113,44 @@ pub fn start() -> KernelHandle {
     // re-enter via a component event).
     let core = Rc::new(RefCell::new(KernelCore::new()));
 
+    install_listeners(&handle, &core);
+
+    // Render the pre-chrome connect indicator before any attachment: the one
+    // thing the kernel itself draws, removed the moment chrome first mounts (or,
+    // on a chrome-less surface, once the page is first configured).
+    dom::render_connect_indicator(ConnectIndicatorState::Connecting);
+
+    // Publish the kernel's host seam for headless processor instances. The DOM
+    // seam is delegated events on `#surface-root`; a processor has no element, so
+    // its imports are direct calls from the bootstrap loader's shims into the
+    // free functions below, which read this cell. Set before the driver runs so a
+    // loader that instantiates the moment the kernel is up finds it populated.
+    PROCESSOR_HOST.with(|cell| {
+        *cell.borrow_mut() = Some(ProcessorHost {
+            core: Rc::clone(&core),
+            handle: Rc::clone(&handle),
+        });
+    });
+
+    spawn_local(async move {
+        // The run hands the page back so a caller can keep its rings and its
+        // retained planes; the browser has nothing left to do with them, since
+        // the run only returns once the platform half is gone.
+        let _page = runner.run().await;
+    });
+    spawn_local(run_event_loop(Rc::clone(&core), events, Rc::clone(&handle)));
+
+    KernelHandle { handle }
+}
+
+/// Install the kernel's five delegated DOM listeners on `#surface-root` plus the
+/// window-level component-panic listener.
+///
+/// Split out of [`start`] so the browser suite installs exactly the wiring the
+/// real page runs on: a component that dispatches a registration or a publish is
+/// heard only if these are in place, so a test that stood them up by hand would
+/// be testing its own stand-in.
+fn install_listeners(handle: &Rc<SurfaceHandle>, core: &Rc<RefCell<KernelCore>>) {
     // Route component publish intents. The delegated `#surface-root` listener
     // hands each `brenn-port-publish` event's (retargeted host) tag and its
     // untrusted `{ port, body }` detail to the DOM-free `route_publish_intent`,
@@ -93,7 +167,7 @@ pub fn start() -> KernelHandle {
     // gesture publish and takes the immediate path. No new event, no mode flag,
     // and nothing the component has to know.
     {
-        let handle = Rc::clone(&handle);
+        let handle = Rc::clone(handle);
         dom::install_publish_listener(move |instance, target_tag, port, body, urgency, detail| {
             let action = route_publish_intent(instance, target_tag, port, body, urgency);
             if let KernelAction::Publish {
@@ -120,7 +194,7 @@ pub fn start() -> KernelHandle {
     // schedule staged outside the flush boundary would survive the very activation
     // that failed to stage it.
     {
-        let handle = Rc::clone(&handle);
+        let handle = Rc::clone(handle);
         dom::install_defer_listener(move |instance, target_tag, detail, js_detail| {
             let intent = match route_defer_intent(instance, target_tag, detail) {
                 Ok(intent) => intent,
@@ -180,8 +254,8 @@ pub fn start() -> KernelHandle {
     // reached by a *component* bug — a component's double registration is a
     // contained fault report, not a dead page.
     {
-        let handle = Rc::clone(&handle);
-        let core = Rc::clone(&core);
+        let handle = Rc::clone(handle);
+        let core = Rc::clone(core);
         dom::install_activation_register_listener(move |instance, target_tag, entry| {
             // Checked before the gate, deliberately: the gate *consumes* the
             // instance's one registration, and spending it on a detail carrying no
@@ -209,7 +283,7 @@ pub fn start() -> KernelHandle {
     // emits a `Log` frame; a misrouted or malformed log becomes a `Report`,
     // never a mis-attributed server log line.
     {
-        let handle = Rc::clone(&handle);
+        let handle = Rc::clone(handle);
         dom::install_log_listener(move |instance, target_tag, level, message| {
             let action = route_component_log(instance, target_tag, level, message);
             dom::apply_actions(std::slice::from_ref(&action), &handle);
@@ -224,8 +298,8 @@ pub fn start() -> KernelHandle {
     // suppression breadcrumb, and a misrouted or malformed alert a drop-report. A
     // conforming kernel never sends an ungranted `Alert` (the server kills on one).
     {
-        let handle = Rc::clone(&handle);
-        let core = Rc::clone(&core);
+        let handle = Rc::clone(handle);
+        let core = Rc::clone(core);
         dom::install_alert_listener(move |instance, target_tag, severity, title, body| {
             let action = route_component_alert(
                 instance,
@@ -247,8 +321,8 @@ pub fn start() -> KernelHandle {
     // client-side event that does. The borrow is a short synchronous borrow
     // released before any DOM effect, so it never overlaps the event loop's fold.
     {
-        let handle = Rc::clone(&handle);
-        let core = Rc::clone(&core);
+        let handle = Rc::clone(handle);
+        let core = Rc::clone(core);
         dom::install_component_panic_listener(move |kind, message| {
             let actions = core
                 .borrow_mut()
@@ -256,35 +330,13 @@ pub fn start() -> KernelHandle {
             dom::apply_actions(&actions, &handle);
         });
     }
-
-    // Render the pre-chrome connect indicator before any `Welcome`: the second
-    // kernel-owned pixel class (design §6.1), removed the moment chrome first
-    // mounts (or, on a chrome-less surface, at the first `Connected`).
-    dom::render_connect_indicator(ConnectIndicatorState::Connecting);
-
-    // Publish the kernel's host seam for headless processor instances. The DOM
-    // seam is delegated events on `#surface-root`; a processor has no element, so
-    // its imports are direct calls from the bootstrap loader's shims into the
-    // free functions below, which read this cell. Set before the driver runs so a
-    // loader that instantiates the moment the kernel is up finds it populated.
-    PROCESSOR_HOST.with(|cell| {
-        *cell.borrow_mut() = Some(ProcessorHost {
-            core: Rc::clone(&core),
-            handle: Rc::clone(&handle),
-        });
-    });
-
-    spawn_local(driver.run());
-    spawn_local(run_event_loop(Rc::clone(&core), events, Rc::clone(&handle)));
-
-    KernelHandle { handle }
 }
 
 /// The kernel state the processor host entry points act on, published by
 /// [`start`] for the page's lifetime.
 struct ProcessorHost {
     core: Rc<RefCell<KernelCore>>,
-    handle: Rc<ClientHandle>,
+    handle: Rc<SurfaceHandle>,
 }
 
 thread_local! {
@@ -456,8 +508,9 @@ pub fn brenn_processor_alert(instance: &str, severity: &str, title: &str, body: 
     });
 }
 
-/// A processor instance's `config.get` import. Answers from the instance's map as
-/// it rode `Welcome`; a miss is `None`, which is the import's own `option<string>`.
+/// A processor instance's `config.get` import. Answers from the map the
+/// instance's own component entry carries; a miss is `None`, which is the
+/// import's own `option<string>`.
 #[wasm_bindgen]
 pub fn brenn_processor_config_get(instance: &str, key: &str) -> Option<String> {
     with_processor_host("processor config get", |host| {
@@ -503,23 +556,23 @@ pub fn brenn_processor_load_failed(instance: &str, detail: &str) {
     });
 }
 
-/// Drain the client event stream, folding each `Event` through the DOM-free core
-/// and applying the emitted actions. The `is_element_defined` predicate the core
-/// consults on first connect asks the live `customElements` registry whether the
-/// component's element is registered; a missing registration error-cards that
+/// Drain the page's event stream, folding each [`Event`] through the DOM-free
+/// core and applying the emitted actions. The `is_element_defined` predicate the
+/// core consults on first connect asks the live `customElements` registry whether
+/// the component's element is registered; a missing registration error-cards that
 /// mount (per the core's mount plan).
 async fn run_event_loop(
     core: Rc<RefCell<KernelCore>>,
     mut events: EventStream,
-    handle: Rc<ClientHandle>,
+    handle: Rc<SurfaceHandle>,
 ) {
     let registry = web_sys::window()
         .expect("surface kernel: no window")
         .custom_elements();
-    // The surface-description telemetry listeners (resize + status tick) are
-    // page-lifetime and installed once, the first time a `Welcome` says the
-    // feature is on. Installing after the fold means the core already knows the
-    // feature is on when the startup viewport read fires.
+    // The telemetry listeners (resize + status tick) are page-lifetime and
+    // installed once, off the first bindings document's cadence. Installing after
+    // the fold means the core is already running on that document when the
+    // startup viewport read fires.
     let mut telemetry_installed = false;
     while let Some(event) = events.next().await {
         // Borrow the shared core only for the synchronous fold; the borrow is
@@ -537,15 +590,10 @@ async fn run_event_loop(
         for action in &actions {
             dom::apply_action(action, &handle);
         }
-        if !telemetry_installed
-            && let Event::Connected {
-                surface_description,
-                ..
-            } = &event
-        {
+        if !telemetry_installed && let Event::Connected { bindings, .. } = &event {
             telemetry_installed = true;
             install_telemetry(
-                surface_description.status_interval_secs,
+                bindings.platform.status_interval_secs,
                 Rc::clone(&core),
                 Rc::clone(&handle),
             );
@@ -562,7 +610,7 @@ async fn run_event_loop(
 fn install_telemetry(
     status_interval_secs: u32,
     core: Rc<RefCell<KernelCore>>,
-    handle: Rc<ClientHandle>,
+    handle: Rc<SurfaceHandle>,
 ) {
     {
         let core = Rc::clone(&core);
@@ -602,13 +650,13 @@ fn meta_content(document: &web_sys::Document, name: &str) -> String {
 /// and never pages.
 #[wasm_bindgen]
 pub struct KernelHandle {
-    handle: Rc<ClientHandle>,
+    handle: Rc<SurfaceHandle>,
 }
 
 #[wasm_bindgen]
 impl KernelHandle {
     /// Forward a bootstrap-caught global error at `Error` level: write the
-    /// browser-console copy, then hand it to [`ClientHandle::report`], which
+    /// browser-console copy, then hand it to [`SurfaceHandle::report`], which
     /// publishes it to the reserved error-report port when the advertised floor
     /// admits `Error` (best-effort; console-only otherwise or when down).
     ///
@@ -638,13 +686,15 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::Duration;
 
-    use crate::Event as ClientEvent;
+    use brenn_attach_client::conn::AttachmentFacts;
+    use brenn_attach_proto::{AlertSeverity, ClientFrame};
+    use brenn_surface_schema::bindings::BindingsDocument;
+
     use crate::contract::{ACTIVATION_REGISTER, SURFACE_READY, SURFACE_RELOAD};
-    use crate::proto::{AlertSeverity, Binding, ClientFrame, OutputBinding, Urgency};
+    use crate::test_support::bindings as fixtures;
+    use crate::test_support::frames;
+    use crate::test_support::pages;
     use crate::{TransportConnection, TransportConnector, TransportError, TransportEvent};
-    use brenn_surface_test_fixtures::{
-        WelcomeParams, deliver_frame, subscribe_result_ok, welcome_frame, wire_cursor,
-    };
     use futures_channel::mpsc;
     use js_sys::{Object, Promise, Reflect};
     use wasm_bindgen_futures::JsFuture;
@@ -870,16 +920,113 @@ mod tests {
             .any(|f| pred(&f))
     }
 
-    /// A client config with near-instant backoff so the terminal leg's one
+    /// A connection config with near-instant backoff so the terminal leg's one
     /// scripted reconnect resolves promptly under the poll loop.
-    fn config() -> ClientConfig {
-        ClientConfig {
-            url: "ws://localhost/surface/wbt/ws".into(),
-            build_id: "wbt-build".into(),
+    fn config() -> ConnConfig {
+        ConnConfig {
+            url: "ws://localhost/surface/wbt/ws?build=wbt-build".into(),
+            ident: "wbt-build".into(),
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(10),
-            ..ClientConfig::default()
+            connect_timeout: CONNECT_TIMEOUT,
+            liveness_multiplier: LIVENESS_MULTIPLIER,
+            backoff_jitter_seed: 0,
+            terminal_close_code: Some(STALE_BUILD_CLOSE_CODE),
         }
+    }
+
+    /// The channel this page's wiring is retained on, and the epoch its own
+    /// stores are stamped with — the two boot facts `start()` reads off the page.
+    const CONFIG_CHANNEL: &str = "ephemeral:site.surface.wbt.bindings";
+    const EPOCH: Uuid = Uuid::from_u128(0x000b_0117);
+
+    /// Build a page, its front door and the kernel's event loop over `ctrl`'s
+    /// scripted connector — `start()`'s wiring, minus the DOM listeners each test
+    /// installs for itself. Hands back the handle the executor publishes through.
+    fn spawn_kernel(ctrl: &FakeControls) -> (Rc<SurfaceHandle>, Rc<RefCell<KernelCore>>) {
+        let page = SurfacePage::new(CONFIG_CHANNEL.to_string(), EPOCH);
+        let (handle, events, channels) = front::new();
+        let handle = Rc::new(handle);
+        let runner = SurfaceRunner::new(page, config(), ctrl.connector(), channels);
+        let core = Rc::new(RefCell::new(KernelCore::new()));
+        install_listeners(&handle, &core);
+        spawn_local(async move {
+            let _page = runner.run().await;
+        });
+        spawn_local(run_event_loop(Rc::clone(&core), events, Rc::clone(&handle)));
+        (handle, core)
+    }
+
+    /// Script the peer's whole opening on `server`: `Hello`, `Welcome`, the config
+    /// channel's own `SubscribeResult`, and `document` retained on it. Queued in
+    /// one go — the page's `Subscribe` is composed synchronously in the `Welcome`
+    /// turn, so the acknowledgement behind it is never early.
+    fn open(server: &EventTx, document: &BindingsDocument, facts: AttachmentFacts) {
+        for text in [
+            frames::server_hello(),
+            frames::welcome(facts),
+            frames::subscribe_result(CONFIG_CHANNEL, 1),
+            frames::deliver(CONFIG_CHANNEL, &document.to_body()),
+        ] {
+            server
+                .unbounded_send(TransportEvent::Text(text))
+                .expect("script the opening");
+        }
+    }
+
+    /// A `dom` component of `instance`'s own kind — these tests give each instance
+    /// a kind of its own, because a custom-element registration is page-lifetime
+    /// across the whole wasm test binary.
+    fn component(instance: &str) -> brenn_surface_schema::ComponentEntry {
+        fixtures::component_of_kind(instance, instance)
+    }
+
+    /// Where this page's error reports go when its document declares a channel.
+    const ERRORS: &str = "brenn:site.surface.wbt.errors";
+
+    /// A page and its front door with no kernel event loop over it — for the two
+    /// tests that drive the DOM executor by hand and only need to know when the
+    /// page became usable. The flag is set at the first `Connected`.
+    fn spawn_page(ctrl: &FakeControls) -> (Rc<SurfaceHandle>, Rc<Cell<bool>>) {
+        let page = SurfacePage::new(CONFIG_CHANNEL.to_string(), EPOCH);
+        let (handle, mut events, channels) = front::new();
+        let runner = SurfaceRunner::new(page, config(), ctrl.connector(), channels);
+        spawn_local(async move {
+            let _page = runner.run().await;
+        });
+        let configured = Rc::new(Cell::new(false));
+        {
+            let configured = Rc::clone(&configured);
+            spawn_local(async move {
+                while let Some(event) = events.next().await {
+                    if matches!(event, Event::Connected { .. }) {
+                        configured.set(true);
+                    }
+                }
+            });
+        }
+        (Rc::new(handle), configured)
+    }
+
+    /// The empty wiring with error reports switched on at `warn` — the platform
+    /// section's optional pair, which decides whether the log path publishes at
+    /// all and where.
+    fn reporting_doc() -> BindingsDocument {
+        let mut document = fixtures::doc(vec![], vec![], vec![], vec![]);
+        document.platform.error_channel = Some(ERRORS.to_string());
+        document.platform.error_report_floor = Some(crate::proto::LogLevel::Warn);
+        document
+    }
+
+    /// Declare and define `instance` as this document's chrome singleton.
+    ///
+    /// Every bindings document names one — a chromeless surface is not a document
+    /// the schema admits — and a chrome whose element never registers reloads the
+    /// page instead of mounting anything, so a test that wants to observe a mount
+    /// has to give chrome a real element. It does nothing but exist.
+    fn chrome(instance: &str) -> brenn_surface_schema::ComponentEntry {
+        define_test_element(&element_name_for_instance(instance, instance), |_| {});
+        component(instance)
     }
 
     // ── tests ─────────────────────────────────────────────────────────────
@@ -888,6 +1035,8 @@ mod tests {
     async fn run_event_loop_wires_mount_deliver_and_reconnect() {
         const REG: &str = "wbt-entry-reg";
         const UNREG: &str = "wbt-entry-unreg";
+        const CHROME: &str = "wbt-entry-chrome";
+        const CHANNEL: &str = "ephemeral:demo";
         fresh_root();
 
         // Register the mounted component; its connectedCallback records the host
@@ -898,42 +1047,32 @@ mod tests {
 
         let ctrl = FakeControls::new();
         let server1 = ctrl.add_connection();
-        let (handle, events, driver) = new(config(), ctrl.connector());
-        let handle = Rc::new(handle);
-        let core = Rc::new(RefCell::new(KernelCore::new()));
-        spawn_local(driver.run());
-        spawn_local(run_event_loop(Rc::clone(&core), events, Rc::clone(&handle)));
+        let _kernel = spawn_kernel(&ctrl);
 
         let (ready, _ready_c) = watch_window(SURFACE_READY);
         let (reload, _reload_c) = watch_window(SURFACE_RELOAD);
 
-        // First Welcome: REG bound (one subscription) + a second, unregistered
-        // kind; no outputs; alert granted.
-        server1
-            .unbounded_send(TransportEvent::Text(welcome_frame(WelcomeParams {
-                subscriptions: vec![Binding {
-                    channel: "ephemeral:demo".into(),
-                    instance: REG.into(),
-                    port: "messages".into(),
-                    push_depth: 8,
-                    retain_depth: 0,
-                    noise: brenn_surface_schema::NoiseLevel::Silent,
-                }],
-                components: vec![REG, UNREG],
-                ..Default::default()
-            })))
-            .expect("send welcome");
+        // The first document: REG bound on one channel, plus a second component
+        // whose module never registered its element, plus chrome.
+        let mut first = fixtures::doc(
+            vec![component(REG), component(UNREG), chrome(CHROME)],
+            vec![fixtures::subscription(REG, "messages", CHANNEL, 8, 0)],
+            vec![],
+            vec![],
+        );
+        first.chrome_instance = CHROME.to_string();
+        open(&server1, &first, pages::facts());
 
         // The action-walk mounts REG (connectedCallback fires), error-cards the
-        // unregistered kind, routes AttachPort to a pump that subscribes, and
-        // emits SURFACE_READY last.
+        // component with no element, and emits SURFACE_READY last; the
+        // registration REG's element dispatched subscribes its channel.
         wait_until(
             "REG mounted, UNREG error-carded, Subscribe sent, SURFACE_READY",
             || {
                 !connected.borrow().is_empty()
                     && error_card_text(UNREG).as_deref() == Some("component module missing")
                     && sent_has(&ctrl, |f| {
-                        matches!(f, ClientFrame::Subscribe { channel, .. } if channel == "ephemeral:demo")
+                        matches!(f, ClientFrame::Subscribe { channel, .. } if channel == CHANNEL)
                     })
                     && !ready.borrow().is_empty()
             },
@@ -942,23 +1081,13 @@ mod tests {
 
         // Activate the subscription so the Deliver below is accepted.
         server1
-            .unbounded_send(TransportEvent::Text(subscribe_result_ok(
-                "ephemeral:demo",
-                REG,
-            )))
+            .unbounded_send(TransportEvent::Text(frames::subscribe_result(CHANNEL, 0)))
             .expect("send subscribe result");
 
         // A Deliver reaches the instance's registered activation entry: the
         // recorder captures the activation, whose window carries the message new.
         server1
-            .unbounded_send(TransportEvent::Text(deliver_frame(
-                "ephemeral:demo",
-                REG,
-                "hello",
-                1,
-                wire_cursor("c1"),
-                0,
-            )))
+            .unbounded_send(TransportEvent::Text(frames::deliver(CHANNEL, "hello")))
             .expect("send deliver");
         wait_until("activation delivered to the mounted instance", || {
             !new_bodies_for(&activations, REG).is_empty()
@@ -970,10 +1099,10 @@ mod tests {
             "the instance's activation window carries the delivered message"
         );
 
-        // Terminal leg: close, reconnect, second Welcome drops REG's subscription
-        // (same components + epoch). The instance stops being activated on the
-        // dropped channel (no component-visible binding-removed vocabulary), and
-        // the differing-bindings fold requests a reload.
+        // Terminal leg: close, reconnect, and a second document that drops REG's
+        // subscription. The wiring the page mounted against no longer describes
+        // this surface, so the page reports the change and the platform half asks
+        // the bootstrap for its capped reload.
         let server2 = ctrl.add_connection();
         server1
             .unbounded_send(TransportEvent::Closed {
@@ -981,16 +1110,13 @@ mod tests {
                 reason: "bye".into(),
             })
             .expect("send close");
-        wait_until("driver reconnected after close", || {
+        wait_until("the run reconnected after the close", || {
             ctrl.connect_count() >= 2
         })
         .await;
-        server2
-            .unbounded_send(TransportEvent::Text(welcome_frame(WelcomeParams {
-                components: vec![REG, UNREG],
-                ..Default::default()
-            })))
-            .expect("send second welcome");
+        let mut second = first.clone();
+        second.subscriptions.clear();
+        open(&server2, &second, pages::facts());
         wait_until(
             "SURFACE_RELOAD 'bindings changed' on the dropped binding",
             || {
@@ -1027,75 +1153,27 @@ mod tests {
         define_recording_element("p1", KIND, Rc::clone(&hosts), Rc::clone(&activations));
         define_recording_element("p2", KIND, Rc::clone(&hosts), Rc::clone(&activations));
 
-        let welcome = {
-            use crate::proto::{
-                Abi, ComponentEntry, ServerFrame, SurfaceBindings, SurfaceDescription,
-            };
-            serde_json::to_string(&ServerFrame::Welcome {
-                surface: "deskbar".into(),
-                participant_id: "surface:deskbar".into(),
-                heartbeat_secs: 20,
-                max_body_bytes: 65_536,
-                alert_granted: true,
-                takeover_granted: false,
-                error_report_floor: None,
-                surface_description: SurfaceDescription {
-                    status_interval_secs: 60,
-                },
-                bindings: SurfaceBindings {
-                    components: vec![
-                        ComponentEntry {
-                            instance: "p1".into(),
-                            kind: KIND.into(),
-                            abi: Abi::Dom,
-                            parked_batch_depth: 8,
-                            config: Default::default(),
-                        },
-                        ComponentEntry {
-                            instance: "p2".into(),
-                            kind: KIND.into(),
-                            abi: Abi::Dom,
-                            parked_batch_depth: 8,
-                            config: Default::default(),
-                        },
-                    ],
-                    subscriptions: vec![
-                        Binding {
-                            channel: "ephemeral:a".into(),
-                            instance: "p1".into(),
-                            port: "messages".into(),
-                            push_depth: 8,
-                            retain_depth: 0,
-                            noise: brenn_surface_schema::NoiseLevel::Silent,
-                        },
-                        Binding {
-                            channel: "ephemeral:b".into(),
-                            instance: "p2".into(),
-                            port: "messages".into(),
-                            push_depth: 8,
-                            retain_depth: 0,
-                            noise: brenn_surface_schema::NoiseLevel::Silent,
-                        },
-                    ],
-                    outputs: vec![],
-                    local_channels: vec![],
-                    chrome_instance: String::new(),
-                },
-            })
-            .expect("two-instance welcome serializes")
-        };
+        const CHROME: &str = "wbt-two-e2e-chrome";
+        let mut document = fixtures::doc(
+            vec![
+                fixtures::component_of_kind("p1", KIND),
+                fixtures::component_of_kind("p2", KIND),
+                chrome(CHROME),
+            ],
+            vec![
+                fixtures::subscription("p1", "messages", "ephemeral:a", 8, 0),
+                fixtures::subscription("p2", "messages", "ephemeral:b", 8, 0),
+            ],
+            vec![],
+            vec![],
+        );
+        document.chrome_instance = CHROME.to_string();
 
         let ctrl = FakeControls::new();
         let server = ctrl.add_connection();
-        let (handle, events, driver) = new(config(), ctrl.connector());
-        let handle = Rc::new(handle);
-        let core = Rc::new(RefCell::new(KernelCore::new()));
-        spawn_local(driver.run());
-        spawn_local(run_event_loop(Rc::clone(&core), events, Rc::clone(&handle)));
+        let _kernel = spawn_kernel(&ctrl);
 
-        server
-            .unbounded_send(TransportEvent::Text(welcome))
-            .expect("send welcome");
+        open(&server, &document, pages::facts());
 
         // Both instances mount (two hosts) and both subscriptions are sent.
         wait_until("both instances mounted and both subscriptions sent", || {
@@ -1126,27 +1204,25 @@ mod tests {
         );
 
         server
-            .unbounded_send(TransportEvent::Text(subscribe_result_ok(
+            .unbounded_send(TransportEvent::Text(frames::subscribe_result(
                 "ephemeral:a",
-                "p1",
+                0,
             )))
             .expect("activate a");
         server
-            .unbounded_send(TransportEvent::Text(subscribe_result_ok(
+            .unbounded_send(TransportEvent::Text(frames::subscribe_result(
                 "ephemeral:b",
-                "p2",
+                0,
             )))
             .expect("activate b");
 
         // A deliver on p1's channel activates only p1's instance.
         server
-            .unbounded_send(TransportEvent::Text(deliver_frame(
+            .unbounded_send(TransportEvent::Text(frames::deliver_at(
                 "ephemeral:a",
-                "p1",
                 "for-p1",
                 1,
-                wire_cursor("a1"),
-                0,
+                0xa1,
             )))
             .expect("deliver a");
         wait_until("p1 received its message", || {
@@ -1161,13 +1237,11 @@ mod tests {
 
         // A deliver on p2's channel activates only p2's instance.
         server
-            .unbounded_send(TransportEvent::Text(deliver_frame(
+            .unbounded_send(TransportEvent::Text(frames::deliver_at(
                 "ephemeral:b",
-                "p2",
                 "for-p2",
                 1,
-                wire_cursor("b1"),
-                0,
+                0xb1,
             )))
             .expect("deliver b");
         wait_until("p2 received its message", || {
@@ -1186,35 +1260,28 @@ mod tests {
         const MK: &str = "wbt-apply-mount";
         const EK: &str = "wbt-apply-err";
         const CK: &str = "wbt-apply-clog";
+        const CHROME: &str = "wbt-apply-chrome";
         fresh_root();
 
-        // A granted connection with no output bindings but the error-report floor
-        // advertised at `warn`: a publish to a component port is rejected
-        // UnboundPort by the gate, while warn/error reports become reserved-port
-        // publishes and an Alert frame reaches the wire.
+        // A granted attachment with no output bindings but an error channel
+        // declared at floor `warn`: a publish to a component port is refused
+        // UnboundPort by the gate, while warn/error reports reach that channel and
+        // an Alert frame reaches the wire.
         let ctrl = FakeControls::new();
         let server = ctrl.add_connection();
-        let (handle, events, driver) = new(config(), ctrl.connector());
-        let active = Rc::new(Cell::new(false));
-        {
-            let active = Rc::clone(&active);
-            spawn_local(async move {
-                let mut events = events;
-                while let Some(event) = events.next().await {
-                    if matches!(event, ClientEvent::Connected { .. }) {
-                        active.set(true);
-                    }
-                }
-            });
-        }
-        spawn_local(driver.run());
-        server
-            .unbounded_send(TransportEvent::Text(welcome_frame(WelcomeParams {
-                error_report_floor: Some(LogLevel::Warn),
-                ..Default::default()
-            })))
-            .expect("send welcome");
-        wait_until("client Connected", || active.get()).await;
+        let (handle, active) = spawn_page(&ctrl);
+        let mut document = reporting_doc();
+        document.chrome_instance = CHROME.to_string();
+        document.components.push(chrome(CHROME));
+        open(
+            &server,
+            &document,
+            AttachmentFacts {
+                alert_granted: true,
+                ..pages::facts()
+            },
+        );
+        wait_until("the page is configured", || active.get()).await;
 
         let (ready, _ready_c) = watch_window(SURFACE_READY);
 
@@ -1279,9 +1346,10 @@ mod tests {
             "rejected publish + warn component log each warn once"
         );
 
-        // Both reports become reserved-port publishes — the rejected-publish
-        // report (source "kernel") and the ComponentLog (source
-        // "component:<kind>") — and the ComponentAlert reaches the wire.
+        // Both reports become publishes on the surface's error channel — the
+        // rejected-publish report (source "kernel", unattributed) and the
+        // ComponentLog (source "component:<instance>", attributed to it) — and the
+        // ComponentAlert reaches the wire as its own frame.
         wait_until(
             "kernel report + component report + component Alert on the wire",
             || {
@@ -1309,42 +1377,26 @@ mod tests {
     async fn publishes_count_against_the_publishing_instance_only() {
         const A: &str = "wbt-pub-ctr-a";
         const B: &str = "wbt-pub-ctr-b";
+        const CHROME: &str = "wbt-pub-ctr-chrome";
         fresh_root();
 
         let ctrl = FakeControls::new();
         let server = ctrl.add_connection();
-        let (handle, events, driver) = new(config(), ctrl.connector());
-        let active = Rc::new(Cell::new(false));
-        {
-            let active = Rc::clone(&active);
-            spawn_local(async move {
-                let mut events = events;
-                while let Some(event) = events.next().await {
-                    if matches!(event, ClientEvent::Connected { .. }) {
-                        active.set(true);
-                    }
-                }
-            });
-        }
-        spawn_local(driver.run());
+        let (handle, active) = spawn_page(&ctrl);
         // Both instances get a real bound output port, so the publish under test
-        // takes the accepted path rather than the UnboundPort rejection.
-        let out = |instance: &str| OutputBinding {
-            channel: "ephemeral:pubctr".into(),
-            instance: instance.into(),
-            port: "out".into(),
-            urgency: Urgency::Normal,
-            fill_mt: brenn_budget::MILLITOKENS_PER_PUBLISH,
-            capacity_mt: brenn_budget::MILLITOKENS_PER_PUBLISH,
-        };
-        server
-            .unbounded_send(TransportEvent::Text(welcome_frame(WelcomeParams {
-                outputs: vec![out(A), out(B)],
-                components: vec![A, B],
-                ..Default::default()
-            })))
-            .expect("send welcome");
-        wait_until("client Connected", || active.get()).await;
+        // takes the accepted path rather than the UnboundPort refusal.
+        let mut document = fixtures::doc(
+            vec![component(A), component(B), chrome(CHROME)],
+            vec![],
+            vec![
+                fixtures::output(A, "out", "ephemeral:pubctr"),
+                fixtures::output(B, "out", "ephemeral:pubctr"),
+            ],
+            vec![],
+        );
+        document.chrome_instance = CHROME.to_string();
+        open(&server, &document, pages::facts());
+        wait_until("the page is configured", || active.get()).await;
 
         let (before_a, before_b) = (dom::instance_counters(A), dom::instance_counters(B));
         dom::apply_actions(
@@ -1369,20 +1421,14 @@ mod tests {
         );
     }
 
-    /// Whether some sent frame is a `Publish` to the reserved `#brenn`/
-    /// `error-reports` port whose body carries `source` (and `message`, if given).
+    /// Whether some sent frame is a `Publish` on the surface's error channel whose
+    /// body carries `source` (and `message`, if given).
     fn error_report_has(ctrl: &FakeControls, source: &str, message: Option<&str>) -> bool {
         sent_has(ctrl, |f| {
-            let ClientFrame::Publish {
-                instance,
-                port,
-                body,
-                ..
-            } = f
-            else {
+            let ClientFrame::Publish { channel, body, .. } = f else {
                 return false;
             };
-            if instance != "#brenn" || port != "error-reports" {
+            if channel != ERRORS {
                 return false;
             }
             let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {

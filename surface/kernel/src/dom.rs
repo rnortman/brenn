@@ -10,8 +10,9 @@ use crate::contract::{
     PORT_DEFER, PORT_PUBLISH, PROCESSOR_START, PUBLISH_STATUS_FIELD, PublishError, SURFACE_READY,
     SURFACE_RELOAD, SURFACE_ROOT_ID, element_name_for_instance, publish_status_str,
 };
+use crate::front::SurfaceHandle;
 use crate::proto::LogLevel;
-use crate::{ActivationEntry, ActivationOutcome, ClientHandle};
+use crate::{ActivationEntry, ActivationOutcome};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -126,7 +127,7 @@ fn read_counters() -> StatusCounters {
 /// absolute: an absolute would couple the tests to each other's execution order
 /// and to every other test that happens to publish. Lives here rather than in
 /// this module's test mod because the publish-counting test needs a live
-/// `ClientHandle`, whose rig is in `entry`.
+/// `SurfaceHandle`, whose rig is in `entry`.
 #[cfg(test)]
 pub(crate) fn instance_counters(instance: &str) -> InstanceCounters {
     read_counters()
@@ -180,19 +181,19 @@ pub fn instance_for_target(target: &Element) -> Option<String> {
 ///
 /// `handle` is the surface client handle the two client-touching actions need:
 /// `Publish` resolves the output port and queues the frame via
-/// [`ClientHandle::publish`], mapping a synchronous rejection to the same
+/// [`SurfaceHandle::publish`], mapping a synchronous rejection to the same
 /// console-log + leveled-`log` treatment as a failed `PublishResult`;
 /// `Report` is that treatment for the transient/component-fault class
 /// (non-`Ok` publish outcome, rejected publish, misrouted `brenn-port-publish`)
 /// at `Warn`, and for a component-panic report at `Error`.
-pub fn apply_actions(actions: &[KernelAction], handle: &ClientHandle) {
+pub fn apply_actions(actions: &[KernelAction], handle: &SurfaceHandle) {
     for action in actions {
         apply_action(action, handle);
     }
 }
 
 /// Apply a single [`KernelAction`] by calling its effect primitive.
-pub(crate) fn apply_action(action: &KernelAction, handle: &ClientHandle) {
+pub(crate) fn apply_action(action: &KernelAction, handle: &SurfaceHandle) {
     match action {
         KernelAction::SetConnectIndicator(state) => render_connect_indicator(*state),
         KernelAction::RemoveConnectIndicator => remove_connect_indicator(),
@@ -219,15 +220,14 @@ pub(crate) fn apply_action(action: &KernelAction, handle: &ClientHandle) {
         } => {
             count_publish(instance);
             // A synchronous rejection is contained to the offending component
-            // (never a panic, handle.rs) and gets the non-Ok-publish treatment.
+            // (never a panic, front.rs) and gets the non-Ok-publish treatment.
             let published = match urgency {
                 Some(urgency) => {
                     handle.publish_with_urgency(instance, port, body.clone(), *urgency)
                 }
-                // No override: the port's configured default applies, which the
-                // server resolves. The kernel sends no urgency rather than
-                // substituting its `Welcome` snapshot's copy — that snapshot can
-                // be stale across a reconnect, and the server's is authoritative.
+                // No override: the port's configured default applies, which
+                // the page resolves off the wiring in force. This layer holds no
+                // copy of that wiring to substitute from.
                 None => handle.publish(instance, port, body.clone()),
             };
             if let Err(reject) = published {
@@ -291,13 +291,13 @@ pub(crate) fn apply_action(action: &KernelAction, handle: &ClientHandle) {
 }
 
 /// Write `message` to the browser console at `level` (always, the durable
-/// client-side record) and hand it to [`ClientHandle::report`], which publishes
-/// it to the reserved error-report port when the advertised floor admits `level`
+/// client-side record) and hand it to [`SurfaceHandle::report`], which publishes
+/// it to the surface's error channel when the wiring's floor admits `level`
 /// and otherwise keeps it console-only. `source` attributes the report:
 /// [`KERNEL_LOG_SOURCE`] for the kernel's own breadcrumbs, `"component:<instance>"`
 /// for a forwarded `brenn-log`.
 fn report(
-    handle: &ClientHandle,
+    handle: &SurfaceHandle,
     level: LogLevel,
     source: &str,
     message: &str,
@@ -360,7 +360,7 @@ const CONNECT_INDICATOR_ID: &str = "brenn-connect-indicator";
 
 /// Render (or update the text of) the pre-chrome connect indicator: a single
 /// element under `#surface-root` carrying kernel-owned connection-state text.
-/// Called by the kernel at start (before any `Welcome`) and on each link-state
+/// Called by the kernel at start (before any attachment) and on each link-state
 /// transition until the handoff removes it. A `data-connect-state` attribute
 /// carries the state name for stylesheet targeting.
 pub fn render_connect_indicator(state: ConnectIndicatorState) {

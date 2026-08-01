@@ -19,6 +19,15 @@
 //! the driver holds it as `Arc<Mutex<PublishGate>>` and refreshes it on each
 //! connection-state transition.
 
+// TODO(attach-cutover): `new`, `ClientHandle`, `PublishGate` and the wasm
+// in-flight publish routing (`try_buffered_publish` and its siblings) are
+// duplicated by `crate::front`, whose handle composes `runner::RunnerCommand`s
+// and whose gate the runner refreshes off the page. The browser runs on that
+// copy; this one is live only for the server's `client_tests`, which drive the
+// old client against the old route. What has no surviving copy is
+// `ActivationEntry`, which `crate::front` and `crate::runner` both name from
+// here. Delete the rest of this file when the server route cuts over.
+
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +40,8 @@ use futures_util::Stream;
 
 use crate::core::{CoreConfig, Event, PublishBuffer};
 use crate::driver::Driver;
+#[cfg(target_arch = "wasm32")]
+use crate::front::InFlightSlot;
 use crate::proto::telemetry::ErrorReportDocument;
 use crate::proto::{
     AlertSeverity, InstanceReport, LogLevel, MAX_LOG_MESSAGE_BYTES, MAX_LOG_SOURCE_BYTES,
@@ -147,32 +158,6 @@ pub type ActivationEntry =
 ///   throw the distinction away here and never get it back.
 #[cfg(target_arch = "wasm32")]
 pub type ActivationEntry = Box<dyn Fn(&Activation) -> crate::core::ActivationOutcome>;
-
-/// The buffer of the activation currently on the stack, and whose it is.
-///
-/// Exists only so the kernel's `PORT_PUBLISH` route can tell a buffered publish
-/// from a gesture one and reach the buffer for the former. Activations are
-/// serialized per instance and synchronous on the one JS thread, so at most one
-/// instance is ever mid-activation: a `PORT_PUBLISH` whose resolved instance
-/// **is** this occupant is buffered; anything else is a gesture publish.
-#[cfg(target_arch = "wasm32")]
-pub struct InFlightPublish {
-    /// The instance whose entry is on the stack.
-    pub instance: String,
-    /// That activation's buffer — the sole quota authority for the call.
-    pub buffer: PublishBuffer,
-}
-
-/// The in-flight slot, shared between the driver (which installs the buffer for
-/// exactly the duration of an entry invocation and takes it back on return) and
-/// the handle (which the kernel's publish route asks).
-///
-/// `Rc<RefCell<…>>` and wasm-only: one JS thread, nothing to make `Send` for.
-/// Borrow discipline is safe by construction — the entry is synchronous, and the
-/// kernel's listener runs only via DOM dispatch from inside it, so the driver
-/// never touches the cell while the entry is on the stack.
-#[cfg(target_arch = "wasm32")]
-pub(crate) type InFlightSlot = std::rc::Rc<std::cell::RefCell<Option<InFlightPublish>>>;
 
 /// A command from the client handle to the driver, which resolves anything the
 /// pure core cannot hold (an entry closure, a minted stamp) and then feeds it the

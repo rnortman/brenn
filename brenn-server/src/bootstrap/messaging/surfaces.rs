@@ -1193,18 +1193,25 @@ pub(crate) fn resolve_surfaces(
             assert_instance_can_activate(slug, &comp.instance, &push_depths);
         }
 
-        // The shell attaches one port per subscription binding in a single
-        // synchronous first-connect burst, and the client's control channel
-        // panics if that burst outruns the driver's ability to drain it. Bound the
-        // total at boot so an oversized-but-otherwise-valid config fails fast here
-        // rather than bricking the shell (a runtime reload storm) at first connect.
-        let startup_attach_burst = subscriptions.len();
+        // A subscription count over the burst bound trips the peer's meter at
+        // first connect.
+        let startup_subscribe_burst = subscriptions.len();
         assert!(
-            startup_attach_burst <= brenn_surface_schema::MAX_SURFACE_SUBSCRIPTION_BINDINGS,
-            "config: [[surface]] {slug:?}: {startup_attach_burst} first-connect attaches \
-             (subscription bindings) exceed the shell's synchronous startup-attach bound ({}); \
+            startup_subscribe_burst <= brenn_surface_schema::MAX_SURFACE_SUBSCRIPTION_BINDINGS,
+            "config: [[surface]] {slug:?}: {startup_subscribe_burst} first-connect subscribes \
+             (subscription bindings) exceed the shell's synchronous startup-subscribe bound ({}); \
              split the surface or reduce its subscriptions",
             brenn_surface_schema::MAX_SURFACE_SUBSCRIPTION_BINDINGS,
+        );
+
+        // A component count over the mount bound fills the kernel's control
+        // channel at first connect, which panics it.
+        let startup_mount_burst = resolved_components.len();
+        assert!(
+            startup_mount_burst <= brenn_surface_schema::MAX_SURFACE_COMPONENTS,
+            "config: [[surface]] {slug:?}: {startup_mount_burst} components exceed the shell's \
+             synchronous startup-mount bound ({}); split the surface or reduce its components",
+            brenn_surface_schema::MAX_SURFACE_COMPONENTS,
         );
 
         // Outputs (publish bindings). The item-6 publish-coverage decision (the

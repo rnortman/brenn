@@ -41,11 +41,13 @@ const NOW_MS: u64 = 1_000;
 /// `p1` reads one wire channel and writes another; `p2` and chrome exist because
 /// every surface document declares its cast.
 ///
-/// `p1` also writes the page-local `NOTES` — declared at ring depth 1, so a second
-/// publish evicts what the first left unread — and the overlay plane it has no
-/// business writing, which is the one refusal a single publish can produce.
-/// `reader_noise` is what a loss on `NOTES` costs `p2`.
-fn doc_with(reader_noise: NoiseLevel) -> BindingsDocument {
+/// `p1` also writes the page-local `NOTES` — read by `p2` one message at a time —
+/// and the overlay plane it has no business writing, which is the one refusal a
+/// single publish can produce. `reader_noise` is what a loss on `NOTES` costs
+/// `p2`, and `notes_depth` decides where that loss happens: at depth 1 a second
+/// publish evicts what the first left unread, while a deeper ring retains what
+/// `p2`'s window cannot carry, so the loss is the window's own step-over.
+fn doc_with(reader_noise: NoiseLevel, notes_depth: u64) -> BindingsDocument {
     fixtures::doc(
         vec![
             fixtures::component("p1"),
@@ -66,14 +68,14 @@ fn doc_with(reader_noise: NoiseLevel) -> BindingsDocument {
             output("p1", "over", LOCAL_OVERLAY_STATE_CHANNEL),
         ],
         vec![
-            fixtures::local(NOTES, 1),
+            fixtures::local(NOTES, notes_depth),
             fixtures::local(LOCAL_OVERLAY_STATE_CHANNEL, 1),
         ],
     )
 }
 
 fn doc() -> BindingsDocument {
-    doc_with(NoiseLevel::Metered)
+    doc_with(NoiseLevel::Metered, 1)
 }
 
 fn fresh() -> SurfacePage {
@@ -568,7 +570,7 @@ fn a_status_that_contradicts_the_wiring_takes_the_attachment_fatal() {
 /// toast and to the operator as an alert.
 #[test]
 fn a_fatal_loss_a_command_caused_kills_its_instance_and_says_so() {
-    let mut page = page_with(&doc_with(NoiseLevel::Fatal));
+    let mut page = page_with(&doc_with(NoiseLevel::Fatal, 1));
     feed(&mut page, publish_cmd("p1", "notes", "first", 0x906));
     let effects = feed(&mut page, publish_cmd("p1", "notes", "second", 0x907));
 
@@ -766,4 +768,73 @@ fn unmounting_an_instance_that_never_registered_is_a_bug() {
             instance: "stranger".to_string(),
         },
     );
+}
+
+// ---------------------------------------------------------------------------
+// The dispatch pass
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_page_owed_nothing_dispatches_nothing() {
+    let mut page = page();
+    let (ready, effects) = dispatch(&mut page, NOW, NOW_MS);
+    assert!(ready.is_none());
+    assert!(effects.is_empty(), "{effects:?}");
+}
+
+/// The assembly is handed over whole and its instance is left in flight, so the
+/// caller owes exactly one completion for it and a second ask answers nothing.
+#[test]
+fn a_ready_instance_is_handed_over_in_flight() {
+    let mut page = page();
+    feed(&mut page, publish_cmd("p1", "notes", "one", 0x9a1));
+
+    let (ready, effects) = dispatch(&mut page, NOW, NOW_MS);
+    let ready = ready.expect("p2 reads what p1 just wrote");
+    assert_eq!(ready.instance, "p2");
+    let notes = ready
+        .activation
+        .ports
+        .iter()
+        .find(|window| window.port == "notes")
+        .expect("p2 binds the page-local channel");
+    assert_eq!(
+        notes
+            .new_envelopes()
+            .iter()
+            .map(|envelope| envelope.body.clone())
+            .collect::<Vec<_>>(),
+        ["one"]
+    );
+    assert!(
+        effects.is_empty(),
+        "a quiet window says nothing: {effects:?}"
+    );
+
+    let (again, _) = dispatch(&mut page, NOW, NOW_MS);
+    assert!(again.is_none(), "the instance is in flight");
+}
+
+/// The window's own `fatal` rung: the assembly happened, but the instance is
+/// terminal before its entry could run — so nothing is handed over, and the kill
+/// and its announcement are in the effects.
+#[test]
+fn a_fatal_window_at_assembly_kills_before_the_entry_runs() {
+    let mut page = page_with(&doc_with(NoiseLevel::Fatal, 4));
+    for (nth, seed) in [0x9b1, 0x9b2, 0x9b3].into_iter().enumerate() {
+        feed(
+            &mut page,
+            publish_cmd("p1", "notes", &nth.to_string(), seed),
+        );
+    }
+
+    let (ready, effects) = dispatch(&mut page, NOW, NOW_MS);
+    assert!(ready.is_none(), "there is nothing left to deliver to");
+    assert!(
+        events(&effects).iter().any(
+            |event| matches!(event, Event::InstanceFailed { instance, .. } if instance == "p2")
+        ),
+        "{effects:?}"
+    );
+    assert!(page.registrations.is_failed("p2"));
 }
