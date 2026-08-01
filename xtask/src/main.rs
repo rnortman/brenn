@@ -11,6 +11,7 @@ mod parallel;
 mod policy;
 mod removal_guard;
 mod test_run;
+mod world_sig;
 
 fn main() {
     let mut args = std::env::args().skip(1);

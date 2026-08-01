@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use brenn_wasm::{
     Capability, PROCESSOR_FUEL_MINIMUM, PROCESSOR_FUEL_PER_ENVELOPE, PROCESSOR_MAX_INSTANCES,
-    PROCESSOR_MAX_MEMORY_BYTES, PROCESSOR_MAX_TABLE_ELEMENTS, PROCESSOR_MAX_TABLES,
-    ProcessorActivation, ProcessorComponent, ProcessorLoadSpec, ProcessorOutcome,
-    ProcessorPortWindow, ProcessorUrgency, store::DEFAULT_MAX_PAGE_COUNT,
+    PROCESSOR_MAX_MEMORIES, PROCESSOR_MAX_MEMORY_BYTES, PROCESSOR_MAX_TABLE_ELEMENTS,
+    PROCESSOR_MAX_TABLES, ProcessorActivation, ProcessorComponent, ProcessorLoadSpec,
+    ProcessorOutcome, ProcessorPortWindow, ProcessorUrgency, store::DEFAULT_MAX_PAGE_COUNT,
 };
 use tracing_test::traced_test;
 
@@ -1052,6 +1052,11 @@ fn processor_resource_cap_constants_are_sensible() {
     const { assert!(PROCESSOR_MAX_INSTANCES <= 64) };
     const { assert!(PROCESSOR_MAX_TABLES >= 1) };
     const { assert!(PROCESSOR_MAX_TABLES <= 256) };
+    const { assert!(PROCESSOR_MAX_MEMORIES >= 1) };
+    const { assert!(PROCESSOR_MAX_MEMORIES <= 64) };
+    // The aggregate linear-memory worst case is memories × per-memory size; hold it
+    // to 512 MiB so raising either factor alone cannot quietly multiply the bound.
+    const { assert!(PROCESSOR_MAX_MEMORIES * PROCESSOR_MAX_MEMORY_BYTES <= 512 * 1024 * 1024) };
 }
 
 /// wasmtime applies `table_elements` to each table separately, and an over-cap grow
@@ -1063,8 +1068,8 @@ fn processor_resource_cap_constants_are_sensible() {
 /// a comment claiming semantics the engine no longer has. Per-table also means the
 /// store-wide worst case is `PROCESSOR_MAX_TABLE_ELEMENTS * PROCESSOR_MAX_TABLES`.
 ///
-/// TODO(wasm-table-limit-e2e): this drives the limiter directly; nothing yet drives
-/// it through a guest that actually grows a table.
+/// This drives the limiter directly; `table_cap_excess_traps_through_a_guest`
+/// drives the same cap through guest code.
 #[test]
 fn table_element_cap_is_per_table_and_traps_on_excess() {
     use wasmtime::ResourceLimiter;
@@ -1096,16 +1101,22 @@ fn table_element_cap_is_per_table_and_traps_on_excess() {
     );
 }
 
-/// The instance and table-count caps reach the limiter wasmtime consults.
+/// The instance, table-count and memory-count caps reach the limiter wasmtime
+/// consults.
 ///
-/// `ResourceLimiter::instances`/`tables` are what the engine calls at
-/// instantiation; asserting them here means dropping either from
+/// `ResourceLimiter::instances`/`tables`/`memories` are what the engine calls at
+/// instantiation; asserting them here means dropping any of them from
 /// `processor_store_limits` fails rather than silently reverting to wasmtime's
-/// defaults (10,000 instances, 10,000 tables).
+/// defaults (10,000 of each).
 ///
-/// TODO(wasm-table-limit-e2e): as above — no guest-driven coverage of either cap.
+/// The memory-count assertion is belt-and-braces by construction: multi-memory is
+/// outside the guest feature envelope, so a guest gets at most one memory per
+/// module instance and the instance cap is the reachable bound. It is asserted
+/// anyway because the aggregate linear-memory bound is `memories × memory_size`,
+/// and that product should rest on a stated cap rather than on a second policy
+/// (the envelope) that a later change could widen.
 #[test]
-fn instance_and_table_count_caps_reach_the_limiter() {
+fn instance_table_and_memory_count_caps_reach_the_limiter() {
     use wasmtime::ResourceLimiter;
 
     let limits = brenn_wasm::processor_store_limits();
@@ -1119,6 +1130,219 @@ fn instance_and_table_count_caps_reach_the_limiter() {
         PROCESSOR_MAX_TABLES,
         "the table-count cap must reach wasmtime's limiter"
     );
+    assert_eq!(
+        limits.memories(),
+        PROCESSOR_MAX_MEMORIES,
+        "the memory-count cap must reach wasmtime's limiter"
+    );
+}
+
+// ── Guest-driven structural growth ────────────────────────────────────────────
+//
+// The Rust guests this build produces emit no table-growth instructions at all
+// (`wasm32-unknown-unknown` LLVM never grows a table), so the only way to drive a
+// guest across `PROCESSOR_MAX_TABLE_ELEMENTS` is a hand-written WAT component.
+//
+// The fixture's canonical-ABI surface is minimized on purpose: the lift
+// declarations match the processor world's `receive` exactly, because that is
+// what the load-time typecheck demands, but the core function body accepts the
+// lowered parameters opaquely and never decodes them. The subject under test is
+// the limiter trap, not envelope handling. It is driven with an empty activation
+// so the host has almost nothing to lower into guest memory.
+
+/// A processor-world component in WAT whose `receive` core body is `body`.
+///
+/// Three parts, all of them forced by the load path rather than chosen:
+///
+/// - The `brenn:processor/types` instance type, imported and aliased. An exported
+///   function's type may only name types the component itself imports or exports,
+///   so a structurally-identical set of anonymous component-level types is
+///   rejected at validation ("func not valid to be used as export"). This mirrors
+///   what `wit-component` emits for the Rust fixtures, and the import is
+///   type-only — it needs no grant.
+/// - The core module: the memory and bump `realloc` the canonical ABI needs in
+///   order to lower an activation, plus `receive` whose core signature is the
+///   flattened form of `func(activation) -> result<_, receive-error>` — the
+///   record's three fields flatten to (list ptr, list len) twice and (option
+///   discriminant, u64), and the result exceeds one flat value so it comes back
+///   as a pointer.
+/// - The lift, whose declared type must match the world's `receive` exactly.
+///
+/// The core body accepts those lowered parameters opaquely and never decodes
+/// them; the subject under test is the store limiter, not envelope handling.
+fn wat_processor_component(body: &str) -> String {
+    wat_processor_component_with(body, "")
+}
+
+/// As `wat_processor_component`, plus `extra_core_defs` spliced in after the main
+/// core instance — for fixtures that need additional core instances.
+fn wat_processor_component_with(body: &str, extra_core_defs: &str) -> String {
+    format!(
+        r#"(component
+  (type $types-ty
+    (instance
+      (type $envelope-json string)
+      (export "envelope-json" (type $envelope-json-e (eq $envelope-json)))
+      (type $envelopes (list $envelope-json-e))
+      (type $port-window-t (record
+        (field "port" string)
+        (field "envelopes" $envelopes)
+        (field "new-from" u32)
+        (field "dropped" u32)))
+      (export "port-window" (type $port-window-e (eq $port-window-t)))
+      (type $deferred-entry-t (record
+        (field "index" u32)
+        (field "payload" string)
+        (field "deliver-after" u64)))
+      (export "deferred-entry" (type $deferred-entry-e (eq $deferred-entry-t)))
+      (type $entries (list $deferred-entry-e))
+      (type $deferred-window-t (record
+        (field "port" string)
+        (field "entries" $entries)))
+      (export "deferred-window" (type $deferred-window-e (eq $deferred-window-t)))
+      (type $ports-list (list $port-window-e))
+      (type $deferred-list (list $deferred-window-e))
+      (type $now (option u64))
+      (type $activation-t (record
+        (field "ports" $ports-list)
+        (field "deferred" $deferred-list)
+        (field "now" $now)))
+      (export "activation" (type $activation-e (eq $activation-t)))
+      (type $receive-error-t (variant
+        (case "malformed-envelope" string)
+        (case "processing-failed" string)))
+      (export "receive-error" (type $receive-error-e (eq $receive-error-t)))
+    )
+  )
+  (import "brenn:processor/types@0.1.0" (instance $types (type $types-ty)))
+  (alias export $types "activation" (type $activation))
+  (alias export $types "receive-error" (type $receive-error))
+  (core module $m
+    (memory (export "memory") 1)
+    (table $t 0 funcref)
+    (global $bump (mut i32) (i32.const 1024))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $ret i32)
+      (local.set $ret (global.get $bump))
+      (global.set $bump (i32.add (global.get $bump) (local.get 3)))
+      (local.get $ret))
+    (func (export "receive")
+      (param i32) (param i32) (param i32) (param i32) (param i32) (param i64)
+      (result i32)
+      {body}
+      (i32.const 0))
+  )
+  (core instance $i (instantiate $m))
+  {extra_core_defs}
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+  (alias core export $i "receive" (core func $cf))
+  (type $rt (result (error $receive-error)))
+  (type $ft (func (param "a" $activation) (result $rt)))
+  (func $lifted (type $ft)
+    (canon lift (core func $cf) (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (export "receive" (func $lifted))
+)"#
+    )
+}
+
+/// Load a WAT processor component with no grants and drive it with an empty
+/// activation.
+fn run_wat_processor(slug: &str, wat_src: &str) -> ProcessorOutcome {
+    use std::io::Write;
+
+    let wasm_bytes = wat::parse_str(wat_src)
+        .unwrap_or_else(|e| panic!("WAT fixture for {slug} must assemble: {e}"));
+    let mut wasm_file = tempfile::NamedTempFile::new().expect("tempfile");
+    wasm_file.write_all(&wasm_bytes).expect("write wasm");
+    wasm_file.flush().expect("flush wasm");
+
+    let comp = ProcessorComponent::load(ProcessorLoadSpec {
+        component_path: wasm_file.path(),
+        slug,
+        output_ports: HashMap::new(),
+        input_amplification_mt: common::amp_in(),
+        mqtt_sinks: HashMap::new(),
+        config: HashMap::new(),
+        grants: std::collections::BTreeSet::new(),
+        store_path: None,
+        max_page_count: DEFAULT_MAX_PAGE_COUNT,
+        max_payload_bytes: 1024 * 1024,
+        alerter: noop_alerter(),
+        output_acl: common::allow_all(),
+        mqtt_publish: None,
+        tool_host: None,
+    });
+    comp.handle(ProcessorActivation {
+        ports: vec![],
+        deferred: vec![],
+        now: None,
+    })
+}
+
+/// A guest that grows a table past `PROCESSOR_MAX_TABLE_ELEMENTS` traps, and the
+/// trap surfaces as `ProcessorOutcome::Trap` carrying the limiter's phrase.
+///
+/// This is the table twin of `memory_cap_excess_traps_deterministically`: the
+/// limiter-value tests prove wasmtime enforces the number, this proves the store
+/// actually consults the limiter for tables when guest code grows one. Reverting
+/// `trap_on_grow_failure` turns the `table.grow` into a `-1` the guest ignores and
+/// the activation into `Ok`, failing this test.
+#[test]
+fn table_cap_excess_traps_through_a_guest() {
+    let wat_src = wat_processor_component(&format!(
+        "(drop (table.grow $t (ref.null func) (i32.const {})))",
+        PROCESSOR_MAX_TABLE_ELEMENTS + 1
+    ));
+    let outcome = run_wat_processor("wat-table-grow", &wat_src);
+    match &outcome {
+        ProcessorOutcome::Trap(msg) => assert!(
+            msg.contains("forcing trap when growing table to"),
+            "trap message must carry the limiter's table-growth phrase; got: {msg}"
+        ),
+        other => panic!("expected Trap from an over-cap table.grow, got {other:?}"),
+    }
+}
+
+/// A guest that stays under the cap does not trap, so the test above is pinning
+/// the cap rather than any `table.grow` at all.
+#[test]
+fn table_growth_within_the_cap_does_not_trap() {
+    let wat_src = wat_processor_component(&format!(
+        "(drop (table.grow $t (ref.null func) (i32.const {})))",
+        PROCESSOR_MAX_TABLE_ELEMENTS
+    ));
+    let outcome = run_wat_processor("wat-table-grow-ok", &wat_src);
+    assert!(
+        matches!(outcome, ProcessorOutcome::Ok { .. }),
+        "growing exactly to the cap must not trap; got {outcome:?}"
+    );
+}
+
+/// A component whose core instantiations exceed `PROCESSOR_MAX_INSTANCES` fails
+/// inside `processor_pre.instantiate` and surfaces as `ProcessorOutcome::Trap`.
+///
+/// The filler module declares nothing, so this crosses the instance cap without
+/// also crossing the memory or table caps — the trap is attributable to the
+/// instance limiter alone. Instantiation happens per activation, not at load, so
+/// the component loads fine and fails when driven.
+#[test]
+fn instance_cap_excess_traps_at_instantiation() {
+    let filler_instances: String = (0..=PROCESSOR_MAX_INSTANCES)
+        .map(|n| format!("(core instance $f{n} (instantiate $filler))\n  "))
+        .collect();
+    let wat_src = wat_processor_component_with(
+        "(nop)",
+        &format!("(core module $filler)\n  {filler_instances}"),
+    );
+    let outcome = run_wat_processor("wat-instance-cap", &wat_src);
+    match &outcome {
+        ProcessorOutcome::Trap(msg) => assert!(
+            msg.contains("instantiation failed") && msg.contains("instance"),
+            "trap must name the instantiation failure and the instance limit; got: {msg}"
+        ),
+        other => panic!("expected Trap from exceeding the instance cap, got {other:?}"),
+    }
 }
 
 // ── Store-through-processor ───────────────────────────────────────────────────

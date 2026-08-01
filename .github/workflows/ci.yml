@@ -34,12 +34,6 @@ jobs:
       # removes any stale-skip class entirely.
       BRENN_TEST_CACHE: "0"
       BRENN_MQTT_INTEGRATION: "1"
-      # TODO(ci-wasm-tool-pins-drift): these two literals duplicate the
-      # Makefile's wit-bindgen-cli and wasm-tools pins with no derivation; on
-      # drift, CI installs the wrong version and fails later as a bindings
-      # diff, not a version error.
-      WIT_BINDGEN_VERSION: 0.60.0
-      WASM_TOOLS_VERSION: 1.255.0
       # The Makefile leaves nextest unpinned; pin it here for deterministic cache
       # keys and deliberate bumps.
       NEXTEST_VERSION: 0.9.140
@@ -71,14 +65,21 @@ jobs:
       - name: Install mosquitto
         run: sudo apt-get update && sudo apt-get install -y mosquitto
 
-      # Extract the wasm-bindgen-cli version from the Cargo.toml crate pin with
-      # the same sed expression the Makefile uses, so the workflow cannot drift
-      # from the crate pin. wasm-bindgen-preflight re-verifies at make time.
-      - name: Resolve wasm-bindgen pin
+      # Every toolchain pin is derived, never restated: wasm-bindgen-cli from the
+      # Cargo.toml crate pin (same sed expression the Makefile uses), wit-bindgen-cli
+      # and wasm-tools from the Makefile variables that the build's own preflights
+      # assert against. A literal here could install a version the build then rejects.
+      - name: Resolve toolchain pins
         run: |
           wbg=$(sed -n 's/^wasm-bindgen = "=\(.*\)"/\1/p' Cargo.toml)
           test -n "$wbg" || { echo "could not extract wasm-bindgen pin from Cargo.toml"; exit 1; }
           echo "WASM_BINDGEN_VERSION=$wbg" >> "$GITHUB_ENV"
+          wb=$(sed -n 's/^WIT_BINDGEN_CLI_VERSION := //p' Makefile)
+          test -n "$wb" || { echo "could not extract WIT_BINDGEN_CLI_VERSION from Makefile"; exit 1; }
+          echo "WIT_BINDGEN_VERSION=$wb" >> "$GITHUB_ENV"
+          wt=$(sed -n 's/^WASM_TOOLS_VERSION := //p' Makefile)
+          test -n "$wt" || { echo "could not extract WASM_TOOLS_VERSION from Makefile"; exit 1; }
+          echo "WASM_TOOLS_VERSION=$wt" >> "$GITHUB_ENV"
 
       # A toolchain bump rebuilds the tools (hashFiles on rust-toolchain.toml).
       # Restore/save are split so the tool build (30+ min cold) is banked even

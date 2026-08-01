@@ -14,9 +14,9 @@ description = "Guest-side SDK for Brenn WASM processor components"
 crate-type = ["rlib"]
 
 [dependencies]
-# The whole tree tracks a single wit-bindgen version: the 0.60 macro here
-# for guest crates, `wit-bindgen-cli` 0.60 for raw component crates (via
-# the Makefile wasm_component_rule), and `wit-bindgen-rt` 0.44 in the raw
+# The whole tree tracks a single wit-bindgen version: the macro dependency
+# below for guest crates, `wit-bindgen-cli` at the Makefile pin for raw
+# component crates (via wasm_component_rule), and `wit-bindgen-rt` in the raw
 # crates' Cargo.tomls. All three are updated together; there is no version
 # split. cargo-component is fully retired — not installed, not invoked.
 wit-bindgen = "0.60"
