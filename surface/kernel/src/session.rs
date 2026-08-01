@@ -51,12 +51,11 @@ use brenn_attach_client::router::ReleaseTimer;
 use brenn_attach_proto::{ClientFrame, VersionRange};
 use brenn_surface_schema::bindings::BindingsDocument;
 
-use crate::activation::DropVerdicts;
+use crate::activation::{ActivationOutcome, DropVerdicts};
 use crate::command::CommandOutcome;
-use crate::core::{ActivationOutcome, PublishStatus};
 use crate::flush::Killed;
 use crate::inbound::Inbound;
-use crate::outbound::PublishAnswer;
+use crate::outbound::{PublishAnswer, PublishStatus};
 use crate::outward::{self, Completion, ControlPublish, Released};
 use crate::page::{Configured, Detached, SurfacePage};
 

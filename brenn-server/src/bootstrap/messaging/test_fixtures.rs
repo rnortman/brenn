@@ -90,8 +90,8 @@ pub(crate) fn surface_io_port_raw(
     }
 }
 
-/// Build a resolved MQTT ingress subscription for `mqtt:<client>:<topic>`
-/// with push-enabled (Unbounded) depths, mirroring the default resolution.
+/// A resolved MQTT ingress subscription for `mqtt:<client>:<topic>` with
+/// push-enabled (Unbounded) depths.
 pub(super) fn resolved_ingress_sub(
     address: &str,
 ) -> brenn_lib::mqtt::config::ResolvedMqttIngressSubscription {

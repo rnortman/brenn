@@ -20,6 +20,14 @@ pub struct SurfaceDescriptionConfig {
     pub prefix: String,
     /// Heartbeat cadence handed to shells for the status snapshot, seconds.
     /// Boot-validated to `5..=3600`.
+    ///
+    /// **This cadence draws from the bare-identity send budget**
+    /// ([`crate::messaging::publish::SURFACE_SEND_BURST`] /
+    /// [`crate::messaging::publish::SURFACE_SEND_REFILL`]: 256 burst, 4/min
+    /// refill), shared with geometry and error-report publishes. A cadence
+    /// faster than the refill outruns the budget once the burst is spent;
+    /// refused ticks are dropped, so the cost is staleness. Sizing near the low
+    /// end of the range buys nothing an operator can read.
     pub status_interval_secs: u32,
 }
 

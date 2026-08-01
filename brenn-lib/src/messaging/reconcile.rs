@@ -103,7 +103,7 @@ impl Messenger {
                     // A surface holds no server-side position at all: the cursor
                     // it echoes at subscribe is its whole delivery state. Any row
                     // under a surface identity is an orphan.
-                    SubscriberEntryKind::Surface { .. } => None,
+                    SubscriberEntryKind::Surface(_) => None,
                     // The subscription names its conversation outright, so
                     // nothing has to be resolved to know whose row is whose. The
                     // row is the one this boot's provisioning just re-created,
@@ -394,10 +394,7 @@ mod tests {
         let ch = channel(
             "chat",
             vec![SubscriberEntry {
-                kind: SubscriberEntryKind::Surface {
-                    slug: "dash".to_string(),
-                    instance: Some("one".to_string()),
-                },
+                kind: SubscriberEntryKind::Surface("dash".to_string()),
                 push_depth: Depth::Bounded(5),
                 retain_depth: Depth::Bounded(0),
                 noise: NoiseLevel::Silent,

@@ -13,18 +13,19 @@
 //! a reconnecting surface can compare what it is handed against what it is
 //! running and reload only on a real difference.
 
-use brenn_lib::messaging::config::ResolvedSurface;
+use brenn_lib::messaging::config::{ResolvedSurface, SurfaceBinding, SurfaceOutput};
 use brenn_lib::messaging::{Messenger, PublishResult, Urgency};
 use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
-use brenn_surface_schema::{LogLevel, SurfaceBindings};
+use brenn_surface_schema::{
+    Binding, ComponentEntry, LocalChannel, LogLevel, NoiseLevel as DocNoiseLevel, OutputBinding,
+};
 
 use super::description::{
     SURFACE_CONFIG_COMPONENT, surface_config_channel, surface_geometry_channel,
     surface_status_channel,
 };
-use super::lower_surface_bindings;
 
 /// The parameters the document carries that are not per-surface config: the
 /// derived-channel namespace, the status cadence, and the substrate
@@ -37,6 +38,44 @@ pub struct BindingsDocParams<'a> {
     pub status_interval_secs: u32,
     /// `(channel address, publish floor)` from `[observability]`, or `None`.
     pub error_report: Option<(&'a str, LogLevel)>,
+}
+
+/// Map one resolved input binding to the document's entry form.
+fn doc_binding(b: &SurfaceBinding) -> Binding {
+    Binding {
+        channel: b.channel_address.clone(),
+        instance: b.instance.clone(),
+        port: b.port.clone(),
+        push_depth: b.push_depth,
+        retain_depth: b.retain_depth,
+        noise: doc_noise(b.noise),
+    }
+}
+
+/// Map a resolved `brenn-lib` `NoiseLevel` to the document's form. Exhaustive: a
+/// new rung that fails to map is a compile error, never a runtime fallback.
+fn doc_noise(n: brenn_lib::messaging::config::NoiseLevel) -> DocNoiseLevel {
+    use brenn_lib::messaging::config::NoiseLevel as N;
+    match n {
+        N::Silent => DocNoiseLevel::Silent,
+        N::Metered => DocNoiseLevel::Metered,
+        N::Alarm => DocNoiseLevel::Alarm,
+        N::Fatal => DocNoiseLevel::Fatal,
+    }
+}
+
+/// The document form of a resolved output binding. Separate from [`doc_binding`]
+/// because an output carries its resolved default urgency — the page needs it to
+/// stamp page-local envelopes, whose router never consults the server.
+fn doc_output(b: &SurfaceOutput) -> OutputBinding {
+    OutputBinding {
+        channel: b.channel_address.clone(),
+        instance: b.instance.clone(),
+        port: b.port.clone(),
+        urgency: b.default_urgency,
+        fill_mt: b.budget.fill_mt,
+        capacity_mt: b.budget.capacity_mt,
+    }
 }
 
 /// Build one surface's bindings document from its resolved config.
@@ -57,20 +96,38 @@ pub fn build_bindings_document(
         Some((channel, floor)) => (Some(channel.to_string()), Some(floor)),
         None => (None, None),
     };
-    let SurfaceBindings {
-        components,
-        subscriptions,
-        outputs,
-        local_channels,
-        chrome_instance,
-    } = lower_surface_bindings(resolved);
     BindingsDocument {
         v: BINDINGS_DOCUMENT_VERSION,
-        components,
-        subscriptions,
-        outputs,
-        local_channels,
-        chrome_instance,
+        components: resolved
+            .components
+            .iter()
+            .map(|c| ComponentEntry {
+                instance: c.instance.clone(),
+                kind: c.kind.clone(),
+                abi: c.abi,
+                parked_batch_depth: c.parked_batch_depth,
+                config: c.config.clone(),
+            })
+            .collect(),
+        subscriptions: resolved.subscriptions.iter().map(doc_binding).collect(),
+        outputs: resolved.outputs.iter().map(doc_output).collect(),
+        // Page-local channels have no `[[channel]]` block and no directory
+        // entry, so this table is the only place their ring depths can come
+        // from.
+        local_channels: resolved
+            .local_channels
+            .iter()
+            .map(|c| LocalChannel {
+                channel: c.address.clone(),
+                ring_depth: c.ring_depth,
+            })
+            .collect(),
+        chrome_instance: resolved
+            .components
+            .iter()
+            .find(|c| c.chrome)
+            .map(|c| c.instance.clone())
+            .expect("resolve_surfaces enforces exactly one chrome component per surface"),
         platform: PlatformSection {
             geometry_channel: surface_geometry_channel(params.prefix, &resolved.slug),
             status_channel: surface_status_channel(params.prefix, &resolved.slug),

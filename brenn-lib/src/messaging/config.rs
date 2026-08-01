@@ -1494,7 +1494,7 @@ pub struct ResolvedComponent {
     /// Component module kind: the custom-element tag and wasm module.
     pub kind: String,
     /// Resolved artifact shape, validated at boot against the ABIs the shell can
-    /// actually load. Carried to the page in `Welcome`.
+    /// actually load. Carried to the page in the bindings document.
     pub abi: brenn_surface_schema::Abi,
     /// This instance's durable send budget: its own declared override, or the
     /// defaults. Server-side only — the page is told nothing about it, because
@@ -1502,18 +1502,18 @@ pub struct ResolvedComponent {
     pub send_budget: SurfaceSendBudget,
     /// How many activation flushes the kernel parks for this instance while the
     /// link is down before dropping the oldest whole batch. Bounded and `>= 1`.
-    /// Carried to the page in `Welcome`: the parked queue is the kernel's, so
-    /// unlike `send_budget` this number has a page-side enforcer.
+    /// Carried to the page in the bindings document: the parked queue is the
+    /// kernel's, so unlike `send_budget` this number has a page-side enforcer.
     pub parked_batch_depth: u64,
     /// Whether this instance is the surface's chrome component. Resolved from the
-    /// component's `chrome` flag; the server advertises the chrome instance to
-    /// the page in `SurfaceBindings.chrome_instance`.
+    /// component's `chrome` flag; the server names the chrome instance to the
+    /// page in the bindings document's `chrome_instance`.
     pub chrome: bool,
     /// This instance's static config map, served to the component through its
     /// `config` import. Empty for every non-`processor` ABI.
     ///
-    /// **Confidentiality:** carried to every authenticated page session in
-    /// `Welcome` — operator configuration only, never secrets.
+    /// **Confidentiality:** carried in the surface's retained bindings
+    /// document — operator configuration only, never secrets.
     pub config: BTreeMap<String, String>,
 }
 
@@ -1545,20 +1545,18 @@ pub struct ResolvedSurface {
     /// Declared component instances, in declaration order.
     pub components: Vec<ResolvedComponent>,
     /// Resolved input bindings (channel → component/port). Serves both delivery
-    /// classes and the `Welcome` payload.
+    /// classes and the bindings document.
     pub subscriptions: Vec<SurfaceBinding>,
     /// Resolved **transportable** input subscriptions, one per (instance,
     /// channel) pair the surface's `brenn:` and `ephemeral:` bindings name.
     /// `local:` bindings never appear here — that traffic never crosses the
-    /// wire. These become `SubscriberEntryKind::Surface` directory entries so
-    /// every principal resolves exactly like an App/Wasm subscriber —
-    /// `TargetResolver::surface_feed_targets` finds it on the channel and gates
-    /// it on the same ACLs, whichever store holds the channel's retention.
+    /// wire.
     pub wire_subscriptions: Vec<ResolvedSurfaceSubscription>,
     /// Every distinct `local:` channel this surface's bindings name, with the
     /// ring depth resolved from them. Deduped, in first-binding order. Carried
-    /// to the client in `Welcome`: the page-local router is the sole source of
-    /// truth for this traffic, so these channels exist nowhere else server-side.
+    /// to the client in the bindings document: the page-local router is the sole
+    /// source of truth for this traffic, so these channels exist nowhere else
+    /// server-side.
     pub local_channels: Vec<ResolvedLocalChannel>,
     /// Resolved output bindings (component/port → channel), each carrying its
     /// resolved default publish urgency.
@@ -1582,32 +1580,16 @@ impl ResolvedSurface {
         self.allowed_users.is_empty() || self.allowed_users.iter().any(|u| u == username)
     }
 
-    /// Every principal this surface declares: the kernel grain (`None`) followed
-    /// by one per declared component instance, in declaration order.
-    ///
-    /// This is the single authority for that set. Subscriber registrations,
-    /// delivery-binding routes, and send budgets must each cover exactly it, and
-    /// a site that enumerates it by hand can drift: a missing registration makes
-    /// surface target resolution fail closed, a missing route silently strands
-    /// the principal's traffic, and a missing budget panics the publish gate.
-    /// Adding a grain here lands on every site at once.
-    pub fn principals(&self) -> impl Iterator<Item = Option<String>> + '_ {
-        std::iter::once(None).chain(self.instance_ids().map(Some))
-    }
-
-    /// The declared component instance ids, in declaration order — `principals()`
-    /// without the kernel grain, for the sites whose set is instances-only.
-    pub fn instance_ids(&self) -> impl Iterator<Item = String> + '_ {
-        self.components.iter().map(|c| c.instance.clone())
-    }
-
     /// Every principal's send budget: the kernel grain (`None`, always the
     /// defaults — it has no declaration to override them) followed by one per
-    /// declared component instance, in `principals()` order.
+    /// declared component instance, in declaration order.
     ///
-    /// Boot installs buckets from exactly this, so the budget map covers the
-    /// same principal set the sub-identity derivation admits — the invariant the
-    /// publish gate panics on a miss to protect.
+    /// The single authority for the principal set. Boot installs buckets from
+    /// exactly this, so the budget map covers the same principals the
+    /// sub-identity derivation admits — the invariant the publish gate panics on
+    /// a miss to protect. Subscriber registrations and delivery routes are cut
+    /// at the surface rather than the principal (a component's authority is the
+    /// surface's), so this is the one set that has to be enumerated.
     pub fn principal_send_budgets(
         &self,
     ) -> impl Iterator<Item = (Option<String>, SurfaceSendBudget)> + '_ {
@@ -1619,19 +1601,19 @@ impl ResolvedSurface {
     }
 }
 
-/// One transportable surface subscription and the principal that owns it.
+/// One transportable surface subscription and the component instance that
+/// declared it.
 ///
-/// The principal is the subscription's grain: a component instance's bindings
-/// resolve one subscription per (instance, channel) — its own delivery window,
-/// its own wire position, its own lag. Every surface subscription is an
-/// instance's; there is no kernel grain (the bare `surface:<slug>` grain is
-/// publisher-only).
+/// The instance is the *binding's* grain: a component's bindings resolve one
+/// subscription per (instance, channel), each with its own resolved depths and
+/// noise.
 #[derive(Debug, Clone)]
 pub struct ResolvedSurfaceSubscription {
-    /// The subscribing component instance. Every surface subscription is an
-    /// instance's; it selects `SubscriberEntryKind::Surface` at that grain.
+    /// The component instance that declared this binding. Every surface
+    /// subscription is an instance's; the bare `surface:<slug>` grain is
+    /// publisher-only.
     pub instance: String,
-    /// The resolved depth/noise/wake inheritance for this principal's
+    /// The resolved depth/noise/wake inheritance for this binding's
     /// subscription to this channel.
     pub subscription: ResolvedSubscription,
 }
@@ -1693,7 +1675,8 @@ pub struct SurfaceOutput {
     ///
     /// Enforced by the kernel, not the server: the kernel mints the activations
     /// this bucket refills per, so it is the only party that can meter them. The
-    /// server resolves the numbers and advertises them in `Welcome` — the kernel
+    /// server resolves the numbers and states them in the bindings document — the
+    /// kernel
     /// enforces resolved values and never re-derives config. The server's own
     /// per-instance send bucket ([`SurfaceSendBudget`]) is a separate,
     /// wall-clock tier behind this one.
@@ -2693,10 +2676,10 @@ pub fn resolve_app_messaging(
 /// indistinguishable at runtime from an idle channel.
 ///
 /// `surfaces` supplies `(surface_slug, wire_subscriptions)` in declaration
-/// order, appended after the WASM consumers. Each subscription names its own
-/// principal (a component instance), so a
-/// surface contributes one entry per (principal, channel) rather than one per
-/// channel — the same shape the app loop produces for N apps on one channel.
+/// order, appended after the WASM consumers. A surface contributes exactly one
+/// entry per channel it binds, whatever the component bindings behind it: an
+/// attachment holds one subscription per channel, so the declared bindings fold
+/// into one entry rather than each minting its own.
 pub fn finalize_directory_with_subscribers(
     mut entries: Vec<ChannelEntry>,
     apps_with_messaging: &[(String, ResolvedMessagingConfig)],
@@ -2736,17 +2719,23 @@ pub fn finalize_directory_with_subscribers(
     for (slug, subs) in wasm_consumers {
         append_kind(slug, subs, SubscriberEntryKind::Wasm, false);
     }
-    // Surfaces do not go through `append_kind`: their entry kind carries the
-    // owning principal, which varies per subscription rather than per slug.
+    // Surfaces do not go through `append_kind`: N components of one surface may
+    // bind the same channel, and the directory carries one entry per (surface,
+    // channel) — one attachment holds one subscription per channel, so a second
+    // entry would be a second server-side push window feeding the same socket.
+    // The declared bindings fold into it: depths by max (the widest window any
+    // component asked for is the one that must arrive), noise by max under the
+    // clamp below.
     for (slug, subs) in surfaces {
+        let mut folded: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
         for sub in subs {
             // A surface subscription resolved against a channel the directory
             // does not hold means the two build paths disagree about what
-            // exists. Skipping would drop the principal's subscriber entry, and
+            // exists. Skipping would drop the surface's subscriber entry, and
             // the entry is what every delivery decision reads: no live fan-out
-            // would name the instance and no wake pass would give it a position,
-            // so it would receive nothing forever with no signal at boot or
-            // runtime. Host-state corruption — panic.
+            // would name the surface on that channel, so it would receive
+            // nothing forever with no signal at boot or runtime. Host-state
+            // corruption — panic.
             let entry = by_uuid
                 .get_mut(&sub.subscription.channel_uuid)
                 .unwrap_or_else(|| {
@@ -2759,25 +2748,32 @@ pub fn finalize_directory_with_subscribers(
                         sub.subscription.channel_uuid,
                     )
                 });
-            entry.subscribers.push(crate::messaging::SubscriberEntry {
-                kind: SubscriberEntryKind::Surface {
-                    slug: slug.clone(),
-                    instance: Some(sub.instance.clone()),
-                },
-                push_depth: sub.subscription.push_depth,
-                retain_depth: sub.subscription.retain_depth,
-                // The server-side push window counts, never shouts: a surface
-                // subscription's overflow noise is clamped to `Metered` here so the
-                // shared overflow path's `Alarm`/`Fatal` arms (`router.alarm`, the
-                // fatal panic) are never reached for a surface. The loud half of
-                // the ladder is kernel-enacted only, on the drop delta the page
-                // observes — the one class-blind site. The full resolved rung still
-                // rides `Welcome` to the kernel via the surface binding; this clamp
-                // touches only the server's own window.
-                noise: sub.subscription.noise.min(NoiseLevel::Metered),
-                // Surfaces are `Eager`, like the wasm loop above.
-                wake_min: None,
-            });
+            // Clamp a surface subscription's overflow noise to `Metered`: the
+            // shared overflow path's `Alarm`/`Fatal` arms must never fire for a
+            // surface. The full resolved rung is still carried in the bindings
+            // document for the kernel; this clamp covers only the server's own
+            // push window.
+            let noise = sub.subscription.noise.min(NoiseLevel::Metered);
+            match folded.get(&sub.subscription.channel_uuid) {
+                Some(&at) => {
+                    let existing = &mut entry.subscribers[at];
+                    existing.push_depth = existing.push_depth.max(sub.subscription.push_depth);
+                    existing.retain_depth =
+                        existing.retain_depth.max(sub.subscription.retain_depth);
+                    existing.noise = existing.noise.max(noise);
+                }
+                None => {
+                    folded.insert(sub.subscription.channel_uuid, entry.subscribers.len());
+                    entry.subscribers.push(crate::messaging::SubscriberEntry {
+                        kind: SubscriberEntryKind::Surface(slug.clone()),
+                        push_depth: sub.subscription.push_depth,
+                        retain_depth: sub.subscription.retain_depth,
+                        noise,
+                        // Surfaces are `Eager`, like the wasm loop above.
+                        wake_min: None,
+                    });
+                }
+            }
         }
     }
     MessagingDirectory::with_entries(entries)
@@ -5148,20 +5144,15 @@ publish_capacity = 3.0
         let dir = finalize_directory_with_subscribers(vec![entry], &[], &[], &surface_subs);
         let chan = dir.by_uuid(&chan_uuid).expect("channel must be present");
         assert_eq!(chan.subscribers.len(), 1);
-        assert!(
-            matches!(
-                &chan.subscribers[0].kind,
-                SubscriberEntryKind::Surface { slug, instance }
-                    if slug == "deskbar" && instance.as_deref() == Some("agenda-alice")
-            ),
-            "the directory entry must carry the subscribing *instance*, not just its surface"
+        assert_eq!(
+            chan.subscribers[0].kind,
+            SubscriberEntryKind::Surface("deskbar".to_string()),
+            "the directory entry is cut at the surface, not the binding's instance"
         );
         assert_eq!(chan.subscribers[0].push_depth, Depth::Bounded(8));
-        // The server-side push window is clamped to `Metered` for a surface: the
-        // loud half of the ladder (`router.alarm`, the fatal panic) is kernel-only,
-        // so the resolved `Alarm` lands here as `Metered`. The full rung still
-        // reaches the kernel over the surface binding on `Welcome` — this clamp
-        // touches only the server's own window.
+        // The server-side push window is clamped to `Metered` for a surface:
+        // `Alarm`/`Fatal` must not reach the server's shared overflow path.
+        // The full rung is still carried in the bindings document for the kernel.
         assert_eq!(chan.subscribers[0].noise, NoiseLevel::Metered);
         // Surface subscribers are `Eager`, so the directory carries no threshold.
         assert_eq!(chan.subscribers[0].wake_min, None);
@@ -5208,6 +5199,101 @@ publish_capacity = 3.0
         let dir = finalize_directory_with_subscribers(vec![entry], &[], &[], &surface_subs);
         let chan = dir.by_uuid(&chan_uuid).expect("channel must be present");
         assert_eq!(chan.subscribers[0].noise, NoiseLevel::Metered);
+    }
+
+    /// Two components of one surface binding the same channel fold into the one
+    /// entry the surface holds there, with each knob taking the widest value any
+    /// binding asked for. A second entry would be a second server-side push
+    /// window feeding the one socket the page attaches with.
+    #[test]
+    fn sibling_bindings_on_one_channel_fold_into_one_entry() {
+        use crate::messaging::SubscriberEntryKind;
+        use uuid::Uuid;
+        let chan_uuid = Uuid::new_v4();
+        let other_uuid = Uuid::new_v4();
+        let entries = vec![
+            surface_fold_channel(chan_uuid, "brenn:alerts"),
+            surface_fold_channel(other_uuid, "brenn:ticker"),
+        ];
+        let binding = |uuid, address: &str, instance: &str, push, retain, noise| {
+            ResolvedSurfaceSubscription {
+                instance: instance.to_string(),
+                subscription: ResolvedSubscription {
+                    channel_uuid: uuid,
+                    channel_address: address.to_string(),
+                    push_depth: Depth::Bounded(push),
+                    retain_depth: Depth::Bounded(retain),
+                    noise,
+                    wake_min: WakeMin::Never,
+                },
+            }
+        };
+        let surface_subs = vec![(
+            "deskbar".to_string(),
+            vec![
+                binding(
+                    chan_uuid,
+                    "brenn:alerts",
+                    "agenda",
+                    2,
+                    9,
+                    NoiseLevel::Silent,
+                ),
+                binding(chan_uuid, "brenn:alerts", "ticker", 8, 1, NoiseLevel::Alarm),
+                binding(
+                    other_uuid,
+                    "brenn:ticker",
+                    "ticker",
+                    3,
+                    3,
+                    NoiseLevel::Silent,
+                ),
+            ],
+        )];
+        let dir = finalize_directory_with_subscribers(entries, &[], &[], &surface_subs);
+
+        let chan = dir.by_uuid(&chan_uuid).expect("channel must be present");
+        assert_eq!(
+            chan.subscribers.len(),
+            1,
+            "two bindings on one channel are one directory entry"
+        );
+        assert_eq!(
+            chan.subscribers[0].kind,
+            SubscriberEntryKind::Surface("deskbar".to_string())
+        );
+        assert_eq!(chan.subscribers[0].push_depth, Depth::Bounded(8));
+        assert_eq!(chan.subscribers[0].retain_depth, Depth::Bounded(9));
+        assert_eq!(chan.subscribers[0].noise, NoiseLevel::Metered);
+
+        // The fold is per channel, not per surface: a sibling channel keeps its
+        // own entry with its own depths.
+        let other = dir.by_uuid(&other_uuid).expect("channel must be present");
+        assert_eq!(other.subscribers.len(), 1);
+        assert_eq!(other.subscribers[0].push_depth, Depth::Bounded(3));
+    }
+
+    /// A bare channel entry for the fold tests above: no subscribers, everything
+    /// else at its widest so the resolved binding depths are what land.
+    #[cfg(test)]
+    fn surface_fold_channel(uuid: uuid::Uuid, address: &str) -> crate::messaging::ChannelEntry {
+        crate::messaging::ChannelEntry {
+            uuid,
+            address: address.to_string(),
+            description: None,
+            resolved_channel: ResolvedChannel {
+                send_rate: Default::default(),
+                push_depth: Depth::Unbounded,
+                retain_depth: Depth::Unbounded,
+                standing_retain_depth: Depth::Unbounded,
+                noise: NoiseLevel::Silent,
+                sink: Sink::Drop,
+                wake_min: WakeMin::Normal,
+            },
+            subscribers: vec![],
+            transport_type: crate::messaging::ChannelScheme::Brenn,
+            mount: None,
+        }
     }
 
     /// `finalize_directory_with_subscribers` places a `Wasm(slug)` entry on a

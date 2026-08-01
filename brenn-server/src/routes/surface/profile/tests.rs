@@ -45,7 +45,7 @@ fn runtime(resolved: ResolvedSurface) -> SurfaceRuntime {
 }
 
 fn profile() -> SurfaceProfile {
-    runtime(two_component_surface()).profile
+    build_profile(&two_component_surface())
 }
 
 /// **One channel, one subscription, both knobs at their widest.** Two instances
@@ -283,7 +283,6 @@ fn the_alert_grant_is_lowered_from_the_resolved_policy() {
     );
     let granted = runtime(alert_granted_surface());
     assert!(granted.profile.alert_granted());
-    assert_agrees_with_port_maps(&granted);
 }
 
 /// The burst must cover a boot-valid maximum-size surface's first-connect
@@ -353,6 +352,21 @@ fn an_unbounded_wire_retain_depth_is_a_boot_panic() {
     build_profile(&resolved);
 }
 
+/// **The two boot resolvers must agree about which bindings cross the wire.** A
+/// transportable binding with no wire subscription would reach the page in the
+/// bindings document and be missing from the attachment's authority, so the page
+/// subscribes what it was told to and is killed for a violation — the server
+/// refuses to boot instead. Pinned so the fail-fast cannot be dropped in a later
+/// refactor with the suite still green; nothing else reaches it, because the
+/// fixture rigs derive the missing subscription.
+#[test]
+#[should_panic(expected = "has no resolved wire subscription")]
+fn a_transportable_binding_with_no_wire_subscription_is_a_boot_panic() {
+    let mut resolved = two_component_surface();
+    resolved.wire_subscriptions.clear();
+    build_profile(&resolved);
+}
+
 /// An output naming an instance the component set does not carry has no
 /// attribution to be published under, so the lowering refuses it rather than
 /// silently minting a key for it.
@@ -363,60 +377,4 @@ fn an_output_naming_an_undeclared_instance_is_a_boot_panic() {
         .output("brenn:ghost-out", "ghost", "out")
         .build();
     build_profile(&resolved);
-}
-
-/// The two lowerings of one surface's authority agree on the config every other
-/// test here is written against, error channel bound and all.
-#[test]
-fn the_cross_check_passes_on_a_resolved_surface() {
-    let mut rt = runtime(two_component_surface());
-    rt.profile.bind_error_channel(ERROR_CHANNEL);
-    rt.output_ports.insert(
-        (
-            brenn_surface_contract::ERROR_REPORT_INSTANCE.to_string(),
-            brenn_surface_contract::ERROR_REPORT_PORT.to_string(),
-        ),
-        crate::routes::surface::OutputPort {
-            address: ERROR_CHANNEL.to_string(),
-            default_urgency: brenn_lib::messaging::Urgency::Normal,
-        },
-    );
-    assert_agrees_with_port_maps(&rt);
-}
-
-/// A bound output the profile knows nothing about is exactly the drift the
-/// cross-check exists to kill: the session would dispatch the publish and the
-/// attachment-grain authority would refuse it.
-#[test]
-#[should_panic(expected = "is not publishable by its own attribution")]
-fn the_cross_check_catches_an_output_the_profile_lacks() {
-    let mut rt = runtime(two_component_surface());
-    rt.output_ports.insert(
-        ("chrome".to_string(), "smuggled".to_string()),
-        crate::routes::surface::OutputPort {
-            address: "brenn:smuggled".to_string(),
-            default_urgency: brenn_lib::messaging::Urgency::Normal,
-        },
-    );
-    assert_agrees_with_port_maps(&rt);
-}
-
-/// The subscribe direction of the same drift: a per-instance subscription the
-/// per-channel fold does not cover would be a channel the session admits and the
-/// attachment cannot see.
-#[test]
-#[should_panic(expected = "cover different channels")]
-fn the_cross_check_catches_a_subscription_the_profile_lacks() {
-    let mut rt = runtime(two_component_surface());
-    rt.subscription_channels.insert(
-        crate::routes::surface::SubKey {
-            instance: "chrome".to_string(),
-            channel: "brenn:smuggled".to_string(),
-        },
-        SubscriptionFacts {
-            push_depth: 1,
-            retain_depth: 1,
-        },
-    );
-    assert_agrees_with_port_maps(&rt);
 }

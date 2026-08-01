@@ -38,6 +38,19 @@ fn bar() -> ResolvedSurface {
     surface
 }
 
+/// `doc_noise` is a four-arm hand-written match between two same-named,
+/// same-ordered enums: transposing `Alarm` and `Fatal` compiles clean and ships
+/// an overflow that should toast as one that kills the instance. Each rung is
+/// pinned to its own.
+#[test]
+fn doc_noise_maps_every_rung_to_its_own() {
+    use brenn_lib::messaging::config::NoiseLevel as N;
+    assert_eq!(doc_noise(N::Silent), DocNoiseLevel::Silent);
+    assert_eq!(doc_noise(N::Metered), DocNoiseLevel::Metered);
+    assert_eq!(doc_noise(N::Alarm), DocNoiseLevel::Alarm);
+    assert_eq!(doc_noise(N::Fatal), DocNoiseLevel::Fatal);
+}
+
 #[test]
 fn document_carries_every_resolved_section() {
     let doc = build_bindings_document(&bar(), &params());

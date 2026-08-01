@@ -441,6 +441,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-attach-conformance"
+version = "0.1.0"
+dependencies = [
+ "brenn-attach-client",
+ "brenn-attach-proto",
+ "brenn-envelope",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "brenn-attach-proto"
 version = "0.1.0"
 dependencies = [
@@ -688,6 +699,8 @@ dependencies = [
  "axum",
  "axum-helmet",
  "base64ct",
+ "brenn-attach-client",
+ "brenn-attach-conformance",
  "brenn-attach-proto",
  "brenn-budget",
  "brenn-cal",
@@ -698,7 +711,6 @@ dependencies = [
  "brenn-lib",
  "brenn-pfin",
  "brenn-surface-contract",
- "brenn-surface-kernel",
  "brenn-surface-schema",
  "brenn-wasm",
  "chrono",
@@ -808,8 +820,6 @@ name = "brenn-surface-test-fixtures"
 version = "0.1.0"
 dependencies = [
  "brenn-envelope",
- "brenn-surface-contract",
- "brenn-surface-schema",
  "serde_json",
  "uuid",
 ]

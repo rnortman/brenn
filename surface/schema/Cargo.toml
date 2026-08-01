@@ -3,7 +3,7 @@ name = "brenn-surface-schema"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Brenn surface application payload schemas and WS frames — shared between backend and the surface client (wasm + native)"
+description = "Brenn surface application payload schemas — shared between the backend and the surface kernel (wasm + native)"
 
 [dependencies]
 brenn-envelope = { path = "../../brenn-envelope" }

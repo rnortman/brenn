@@ -54,8 +54,6 @@ async fn surface_feed_targets_cover_both_depths() {
     use crate::access::acl::ChannelMatcher;
     let db = init_db_memory();
     let channel = canonical_address("surface-boot");
-    // Component-instance grain: authority is per-surface, installed at the
-    // instance key the fold-0 subscriber carries.
     let policy = crate::messaging::test_support::brenn_delivery_policy(ChannelMatcher::Prefix(
         String::new(),
     ));
@@ -67,18 +65,11 @@ async fn surface_feed_targets_cover_both_depths() {
         Arc::new(CountingRouter::default()) as Arc<dyn WakeRouter>,
         MessagingGlobalConfig::default(),
     )
-    .with_subscriber_registrations(
-        crate::messaging::testutils::surface_component_registrations(
-            "deskbar",
-            &["protobar"],
-            policy,
-        ),
-    );
+    .with_subscriber_registrations(crate::messaging::testutils::surface_registrations(
+        [("deskbar".to_string(), policy)].into(),
+    ));
     let fold_zero = SubscriberEntry {
-        kind: SubscriberEntryKind::Surface {
-            slug: "deskbar".to_string(),
-            instance: Some("protobar".to_string()),
-        },
+        kind: SubscriberEntryKind::Surface("deskbar".to_string()),
         push_depth: Depth::Bounded(0),
         retain_depth: Depth::Bounded(4),
         noise: NoiseLevel::Silent,
@@ -89,12 +80,9 @@ async fn surface_feed_targets_cover_both_depths() {
     assert_eq!(feed.len(), 1);
     assert_eq!(
         feed[0].kind,
-        SubscriberEntryKind::Surface {
-            slug: "deskbar".to_string(),
-            instance: Some("protobar".to_string()),
-        }
+        SubscriberEntryKind::Surface("deskbar".to_string())
     );
-    assert_eq!(feed[0].subscriber.as_str(), "surface:deskbar#protobar");
+    assert_eq!(feed[0].subscriber().as_str(), "surface:deskbar");
     assert!(!feed[0].push_enabled, "depth-0 is live-or-nothing");
 
     // push-enabled: a feed target that can resume.
@@ -123,10 +111,7 @@ async fn surface_feed_targets_skip_a_revoked_surface_subscriber() {
         MessagingGlobalConfig::default(),
     );
     let sub = SubscriberEntry {
-        kind: SubscriberEntryKind::Surface {
-            slug: "deskbar".to_string(),
-            instance: Some("protobar".to_string()),
-        },
+        kind: SubscriberEntryKind::Surface("deskbar".to_string()),
         push_depth: Depth::Bounded(0),
         retain_depth: Depth::Bounded(4),
         noise: NoiseLevel::Silent,
@@ -767,10 +752,7 @@ async fn build_wasm_ephemeral_surface_messenger(
     let db = init_db_memory();
     let mut ephemeral = ephemeral_channel_entry("wasm-eph-surface", 8);
     ephemeral.subscribers = vec![SubscriberEntry {
-        kind: SubscriberEntryKind::Surface {
-            slug: "durabar".to_string(),
-            instance: None,
-        },
+        kind: SubscriberEntryKind::Surface("durabar".to_string()),
         push_depth: Depth::Unbounded,
         retain_depth: Depth::Unbounded,
         noise: NoiseLevel::Silent,

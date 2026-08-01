@@ -42,6 +42,11 @@ const _: () = assert!(
 /// One durable-send token refilled per this interval, per surface principal
 /// (steady-state 4/min) — far above any legitimate sustained rate while
 /// bounding an attacker.
+///
+/// The surface's bare identity (no `[[surface.component]]` override) runs at
+/// this rate. An operator sizing `status_interval_secs` is therefore sizing
+/// against this refill; a cadence faster than it outruns the budget once the
+/// burst is spent.
 pub const SURFACE_SEND_REFILL: Duration = Duration::from_secs(15);
 
 use super::db::{
@@ -845,19 +850,15 @@ impl Messenger {
                 // lives in the unified `subscribers` registry, the same
                 // authority the delivery-time gate reads via `subscriber_policy`.
                 //
-                // Keyed at the surface grain (`instance: None`) for a component
-                // publish too: a component's grants are its config-declared
-                // bindings, and boot validation already proved each one is covered
-                // by the surface's own ACLs. The sub-identity finer-grains
-                // attribution and budget, not authority — there is no per-instance
-                // policy blob to hand-maintain, so the instance-grain registrations
-                // boot installs for the delivery gate carry this same policy.
+                // Keyed at the surface grain for a component publish too: a
+                // component's grants are its config-declared bindings, and boot
+                // validation already proved each one is covered by the surface's
+                // own ACLs. The sub-identity finer-grains attribution and budget,
+                // not authority — there is no per-instance policy blob to
+                // hand-maintain.
                 let policy = match self
                     .targets
-                    .registration(&SubscriberEntryKind::Surface {
-                        slug: slug.to_string(),
-                        instance: None,
-                    })
+                    .registration(&SubscriberEntryKind::Surface(slug.to_string()))
                     .map(|r| r.policy.as_ref())
                     .filter(|p| p.has_grant(grant))
                 {
@@ -1274,8 +1275,9 @@ impl Messenger {
                 // it resumes to.
                 Ok(_) => {}
                 Err(e) => {
+                    let subscriber = target.subscriber();
                     warn!(
-                        subscriber = %target.subscriber.as_str(),
+                        subscriber = %subscriber.as_str(),
                         channel = %envelope.channel,
                         retained_seq,
                         error = %e,
@@ -1929,10 +1931,7 @@ impl Messenger {
         // needs is its channel's scheme's business, checked per entry below.
         let policy = self
             .targets
-            .registration(&SubscriberEntryKind::Surface {
-                slug: slug.to_string(),
-                instance: None,
-            })
+            .registration(&SubscriberEntryKind::Surface(slug.to_string()))
             .map(|r| r.policy.as_ref())
             .unwrap_or_else(|| {
                 panic!(

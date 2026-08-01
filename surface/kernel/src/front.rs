@@ -55,12 +55,14 @@ use std::task::{Context, Poll};
 
 use brenn_attach_proto::AlertSeverity;
 use brenn_envelope::Urgency;
-use brenn_surface_schema::{InstanceReport, LogLevel, MAX_SURFACE_COMPONENTS, StatusCounters};
+use brenn_surface_schema::telemetry::{InstanceReport, StatusCounters};
+use brenn_surface_schema::{LogLevel, MAX_SURFACE_COMPONENTS};
 use futures_channel::mpsc;
 use futures_util::Stream;
 use serde_json::Number;
 
-use crate::core::{PublishCheckReject, channel_is_transportable, check_publish};
+use crate::bindings::channel_is_transportable;
+use crate::outbound::{PublishCheckReject, check_publish};
 use crate::page::SurfacePage;
 #[cfg(target_arch = "wasm32")]
 use crate::publish_buffer::PublishBuffer;
@@ -246,6 +248,49 @@ pub fn new() -> (SurfaceHandle, EventStream, FrontChannels) {
     )
 }
 
+/// One instance's activation entry: the runner calls this once per activation.
+///
+/// Synchronous by construction, not by convenience. The flush rule is "publishes
+/// commit iff the handler returns ok", and a boundary you can `await` across is
+/// not a boundary — the page would have to decide what a half-finished
+/// activation's buffer means, and there is no honest answer. The backend's guest
+/// call is synchronous for the same reason.
+///
+/// `Send` natively, not on wasm — the bound tracks the executor, not the seam.
+/// The runner is `tokio::spawn`ed on a multi-threaded runtime natively, so
+/// everything it holds must be `Send` (as the rest of it already is); on wasm it
+/// is `spawn_local`ed on the single JS thread, where a DOM-touching closure can
+/// never be `Send` and requiring it would forbid the SDK's entire purpose. Same
+/// seam, two executors, one honest bound each.
+#[cfg(not(target_arch = "wasm32"))]
+pub type ActivationEntry = Box<
+    dyn Fn(
+            &brenn_surface_contract::Activation,
+            &mut crate::publish_buffer::PublishBuffer,
+        ) -> Result<(), brenn_surface_contract::ActivationError>
+        + Send,
+>;
+
+/// The wasm build's entry. See the native definition above for the `Send` split.
+///
+/// Two further differences from the native shape, both forced by the JS boundary
+/// this entry wraps:
+///
+/// - **No `&mut PublishBuffer` argument.** A `dom` component publishes by
+///   dispatching [`brenn_surface_contract::PORT_PUBLISH`] from inside its entry;
+///   that event surfaces on the kernel's root listener, a code path with no way
+///   to reach a buffer sitting on the runner's stack. So the buffer moves into
+///   the shared [`InFlightSlot`] for the duration of the call, and the kernel's
+///   route borrows it from there.
+/// - **`ActivationOutcome`, not `Result`.** The wrapper calls a JS function and
+///   can see what it did: a returned string is an err, a *thrown* exception is a
+///   trap. `catch_unwind` cannot observe a wasm panic, so this boundary is the
+///   only place the two are distinguishable — collapsing them into `Result` would
+///   throw the distinction away here and never get it back.
+#[cfg(target_arch = "wasm32")]
+pub type ActivationEntry =
+    Box<dyn Fn(&brenn_surface_contract::Activation) -> crate::activation::ActivationOutcome>;
+
 /// The platform half's handle on a running page.
 ///
 /// Every sender is one long-lived value behind a mutex rather than a clone per
@@ -283,7 +328,7 @@ impl SurfaceHandle {
     ///
     /// If the control channel is full (an unbounded synchronous burst) or closed
     /// (the run is over).
-    pub fn register_activation(&self, instance: &str, entry: crate::handle::ActivationEntry) {
+    pub fn register_activation(&self, instance: &str, entry: ActivationEntry) {
         self.control(RunnerCommand::RegisterActivation {
             instance: instance.to_owned(),
             entry,

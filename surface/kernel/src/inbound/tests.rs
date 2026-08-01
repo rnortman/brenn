@@ -14,7 +14,7 @@ use brenn_surface_schema::{Binding, NoiseLevel};
 use uuid::Uuid;
 
 use crate::activation::DropAnnouncement;
-use crate::core::PublishStatus;
+use crate::outbound::PublishStatus;
 use crate::outbound::{PortPublish, resolve_output};
 use crate::registry::BindingKey;
 use crate::test_support::bindings as fixtures;

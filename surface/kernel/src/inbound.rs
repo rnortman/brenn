@@ -198,6 +198,16 @@ struct Delivery {
 /// is what tells a peer retaining a document from one retaining none, and an
 /// empty replay on a cursorless subscription is the latter. An application
 /// channel's gap is handed back as a diagnostic.
+///
+/// A gap means replay could not cover the requested resume point (epoch change,
+/// a hole past the retained ring, or a durable resume beyond the retained
+/// window). It is a resume-layer fact and stops here: the page's answer is the
+/// re-resume it already performed, and the component sees at most a
+/// first-window-after-resubscribe, which the contract defines as unremarkable.
+///
+/// TODO(processor-typed-gaps): this classification exists only on the surface's
+/// resume layer. A wasmtime-hosted component gets no equivalent signal; backend
+/// adoption rides the next `processor.wit` world bump.
 fn on_subscribe_result(
     page: &mut SurfacePage,
     channel: String,

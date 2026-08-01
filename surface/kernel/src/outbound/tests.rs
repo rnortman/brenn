@@ -957,3 +957,79 @@ fn discarding_a_dead_instances_queue_drops_its_flushes() {
         "there is nothing left to re-validate or send"
     );
 }
+
+#[test]
+fn check_publish_maps_each_single_failure_to_its_variant() {
+    assert_eq!(
+        check_publish(false, || true, 0, 100),
+        Err(PublishCheckReject::NotConnected)
+    );
+    assert_eq!(
+        check_publish(true, || false, 0, 100),
+        Err(PublishCheckReject::UnboundPort)
+    );
+    assert_eq!(
+        check_publish(true, || true, 101, 100),
+        Err(PublishCheckReject::BodyTooLarge { len: 101, max: 100 })
+    );
+}
+
+#[test]
+fn check_publish_order_is_not_connected_then_unbound_then_too_large() {
+    // All predicates failing → the first (NotConnected) wins.
+    assert_eq!(
+        check_publish(false, || false, 999, 100),
+        Err(PublishCheckReject::NotConnected)
+    );
+    // Reachable but both unbound and oversized → UnboundPort wins over
+    // BodyTooLarge.
+    assert_eq!(
+        check_publish(true, || false, 999, 100),
+        Err(PublishCheckReject::UnboundPort)
+    );
+}
+
+#[test]
+fn check_publish_body_at_cap_is_ok() {
+    assert_eq!(check_publish(true, || true, 100, 100), Ok(()));
+}
+
+#[test]
+fn check_publish_is_lazy_when_unreachable() {
+    // The bound closure must not run when there is no reachable target: the
+    // front door's gate resolves the port against a table it holds only while a
+    // document is in force, so a non-lazy check would look it up on exactly the
+    // reconnect path this pins.
+    let reject = check_publish(
+        false,
+        || panic!("output_bound must not be evaluated when unreachable"),
+        0,
+        100,
+    );
+    assert_eq!(reject, Err(PublishCheckReject::NotConnected));
+}
+
+#[test]
+fn a_report_field_under_its_cap_is_untouched() {
+    assert_eq!(truncate_report_field("short".to_string(), 64), "short");
+}
+
+#[test]
+fn an_oversized_report_field_is_cut_on_a_char_boundary_and_marked() {
+    // 11 ASCII bytes then 16 two-byte code points, and a cap whose naive cut
+    // (32 − the marker's 14 bytes = 18) lands *inside* the fourth `é`. The walk
+    // back to 17 is what this pins: a byte truncation there would panic.
+    let value = format!("{}{}", "a".repeat(11), "é".repeat(16));
+    let out = truncate_report_field(value, 32);
+    assert_eq!(
+        out,
+        format!("{}{}…[truncated]", "a".repeat(11), "é".repeat(3))
+    );
+    assert!(out.len() <= 32, "{} bytes", out.len());
+}
+
+#[test]
+#[should_panic(expected = "smaller than the truncation marker")]
+fn a_cap_under_the_marker_length_dies_loudly() {
+    truncate_report_field("anything at all".to_string(), 4);
+}

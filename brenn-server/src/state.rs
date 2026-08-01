@@ -176,9 +176,9 @@ pub struct AppState {
     /// Boot-resolved surfaces, keyed by slug. Empty when no `[[surface]]`
     /// blocks are configured.
     pub surfaces: Arc<HashMap<String, Arc<crate::routes::surface::SurfaceRuntime>>>,
-    /// Attached surface WS sessions (slug → handles). A durable push router
+    /// Attached attachment sessions (attacher → handles). A durable push router
     /// reads this to route wakes to live connections.
-    pub surface_registry: crate::routes::surface::registry::SurfaceRegistry,
+    pub attach_registry: crate::routes::attach::registry::AttachRegistry,
     /// Idle-heartbeat interval advertised in `Welcome`. `HEARTBEAT_SECS` in
     /// production; test states set 1 for fast integration tests.
     pub surface_heartbeat_secs: u32,
@@ -762,7 +762,7 @@ impl AppState {
             automation_engine: None,
             usage_session_gap_secs: 1800,
             surfaces: Arc::new(HashMap::new()),
-            surface_registry: Default::default(),
+            attach_registry: Default::default(),
             surface_heartbeat_secs: 1,
             replay_components: Arc::new(HashMap::new()),
             replay_locks: Arc::new(HashMap::new()),

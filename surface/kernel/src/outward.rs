@@ -46,9 +46,9 @@ use brenn_surface_schema::{
     CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, ToastBody, ToastSeverity, ToastSource,
 };
 
-use crate::activation::{ActivationCtx, DropVerdicts, ReadyActivation};
-use crate::core::{ActivationOutcome, truncate_report_field};
+use crate::activation::{ActivationCtx, ActivationOutcome, DropVerdicts, ReadyActivation};
 use crate::flush::{self, FlushCtx, Killed, PlaneRefusal};
+use crate::outbound::truncate_report_field;
 use crate::page::SurfacePage;
 use crate::planes::SurfacePlanes;
 use crate::publish_buffer::PublishBuffer;

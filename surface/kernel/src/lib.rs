@@ -1,21 +1,30 @@
 //! `brenn-surface-kernel` — the Brenn surface kernel.
 //!
-//! The kernel owns a browser surface end to end. Its protocol half is a
-//! sans-I/O core (a pure, synchronous state machine) driven by a small async
-//! loop generic over a transport trait; the same core and driver compile to
-//! `wasm32` for the browser and to native for tests, with only the transport
-//! and timer shim `cfg`-gated. A correct kernel structurally cannot commit a
-//! surface protocol violation: every rule the server enforces is made
-//! unrepresentable or pre-validated here.
+//! The kernel owns a browser surface end to end. It is an *application* built on
+//! a bus attachment: `brenn-attach-client` holds the attacher-generic half — the
+//! transport, the connection lifecycle, subscription and cursor state, the ring
+//! stores, the publish and batch machinery, the confined router — and this crate
+//! holds everything that is about components, DOM and pixels. Nothing here is a
+//! second copy of that machinery; the seams it exposes are parameterised with
+//! surface policy instead.
 //!
-//! Its platform half holds a [`front::SurfaceHandle`], applies the wiring the
-//! bindings document carries, mounts the configured component elements, routes
-//! delivered envelopes and component publish intents, publishes the reserved
-//! control planes (link-state, surface-state), writes the surface's own geometry
-//! and status documents, and renders the pre-chrome connect indicator and
-//! per-component error cards. It is split for testability: [`logic`] is a
-//! DOM-free decision core (host-compiled, natively unit-tested); [`dom`] is the
-//! web-sys effect executor; [`entry`] holds the wasm-bindgen exports and wiring.
+//! What the surface layer is, in the order a turn passes through it: the wiring
+//! a [`bindings`] document puts in force over a [`page`], the [`connect`]
+//! sequence's two phases, [`registry`] reconciles, [`inbound`] frames, an
+//! [`activation`]'s assembly and its [`flush`], the [`outward`] passes a page
+//! drives itself, and the [`command`]s the platform half asks for. [`turn`]
+//! routes one input into one ordered effect list, [`session`] is the vocabulary
+//! those effects and events are spoken in, [`runner`] is the loop that performs
+//! them, and [`front`] is the door the platform half holds.
+//!
+//! That platform half applies the wiring, mounts the configured component
+//! elements, routes delivered envelopes and component publish intents, publishes
+//! the reserved control planes (link-state, surface-state), writes the surface's
+//! own geometry and status documents, and renders the pre-chrome connect
+//! indicator and per-component error cards. It is split for testability:
+//! [`logic`] is a DOM-free decision core (host-compiled, natively unit-tested);
+//! [`dom`] is the web-sys effect executor; [`entry`] holds the wasm-bindgen
+//! exports and wiring.
 
 /// The surface's wiring: the bindings document parsed, checked against this
 /// build's limits, and indexed for the surface layer's lookups.
@@ -81,17 +90,16 @@ pub mod front;
 
 /// The per-activation publish buffer: the sole quota authority for the duration
 /// of a component's handler.
-pub(crate) mod publish_buffer;
+pub mod publish_buffer;
 
-mod core;
-mod driver;
 // The backoff-jitter seed source, crate-private: see the module doc for why it
-// is not part of the attach client's shim set.
+// is not part of the attach client's shim set. Its one production caller is the
+// wasm entry; the native arm exists for the native suite that pins distinctness.
+#[cfg(any(target_arch = "wasm32", test))]
 mod entropy;
-mod handle;
-// Test scaffolding shared across suites: the bindings-document builders on every
-// target, and the native-only `CoreConfig`/`Welcome` fixtures the protocol-core
-// conformance and driver suites run under host `cargo test` with.
+// Test scaffolding shared across suites: the bindings-document builders, the
+// page a document is put in force over, and the server frames a scripted peer
+// writes.
 #[cfg(test)]
 mod test_support;
 
@@ -114,16 +122,18 @@ pub use entry::{KernelHandle, start};
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_test_util;
 
-pub use core::{
-    ActivationOutcome, ClientCore, Command, CoreConfig, DisconnectReason, Effect, Event, Input,
-    Millis, PublishBuffer, PublishStatus, ReadyActivation,
-};
-pub use driver::Driver;
+pub use activation::{ActivationOutcome, ReadyActivation};
 #[cfg(target_arch = "wasm32")]
 pub use front::InFlightPublish;
-pub use handle::{
-    ActivationEntry, ClientConfig, ClientHandle, EventStream, PublishGate, PublishReject, new,
-};
+pub use front::{ActivationEntry, EventStream, PublishReject, SurfaceGate, SurfaceHandle, new};
+pub use outbound::PublishStatus;
+pub use publish_buffer::PublishBuffer;
+pub use runner::SurfaceRunner;
+pub use session::{Effect, Event};
+// The monotonic timestamp every turn is stamped with. Owned by the attach client
+// (the shim that reads the per-target clock produces it); re-exported so this
+// crate's callers name one type.
+pub use brenn_attach_client::Millis;
 // The transport seam and its per-target implementations live in
 // `brenn-attach-client` — they are attacher-generic, naming nothing about
 // components, DOM, or pixels. Re-exported here so out-of-tree native kernels
@@ -145,10 +155,13 @@ pub use brenn_attach_client::{HeaderMap, InvalidHeaderValue};
 #[cfg(target_arch = "wasm32")]
 pub use brenn_attach_client::{WebSysConnection, WebSysConnector};
 
-// Wire protocol types are owned by the shared proto crate; re-export it so
-// callers of this crate speak the same vocabulary without a second dependency.
+// Two vocabularies, two re-exports, because they are two contracts: `proto` is
+// the attachment protocol's frames, which name nothing about a surface, and
+// `schema` is the surface application payloads that ride it. Re-exported so
+// callers of this crate speak both without restating either dependency.
+pub use brenn_attach_proto as proto;
 pub use brenn_envelope::{MessageEnvelope, Urgency};
-pub use brenn_surface_schema as proto;
+pub use brenn_surface_schema as schema;
 
 /// The component contract — the DOM-event seam the kernel and every component
 /// module compile against. Re-exported for the same reason as [`proto`]: a

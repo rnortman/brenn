@@ -537,26 +537,14 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
                 "[[surface]] blocks configured but no Messenger: the any_messaging gate \
                  forces messaging on whenever surfaces exist",
             );
-            // Reserved error-report port + Welcome floor, wired when an error
-            // channel is configured. The floor defaults to `warn`.
-            let error_report = config
-                .observability
-                .surface_error_channel
-                .as_ref()
-                .map(|addr| {
-                    (
-                        addr.clone(),
-                        config.observability.surface_error_publish_floor,
-                    )
-                });
+            let error_channel = config.observability.surface_error_channel.clone();
             crate::routes::surface::build_surface_runtimes(
                 surfaces,
                 Some(messenger.clone()),
                 config.messaging.max_body_bytes,
-                error_report,
+                error_channel,
                 crate::routes::surface::SurfaceDescriptionParams {
                     prefix: config.surface_description.prefix.clone(),
-                    status_interval_secs: config.surface_description.status_interval_secs,
                 },
             )
         }
@@ -887,7 +875,7 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         automation_engine: automation_result.engine.clone(),
         usage_session_gap_secs: config.observability.usage.session_gap_minutes * 60,
         surfaces: std::sync::Arc::new(surface_runtimes),
-        surface_registry: crate::routes::surface::registry::SurfaceRegistry::default(),
+        attach_registry: crate::routes::attach::registry::AttachRegistry::default(),
         surface_heartbeat_secs: crate::routes::surface::HEARTBEAT_SECS,
         replay_components,
         replay_locks,

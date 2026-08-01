@@ -1,20 +1,23 @@
-//! Surface WS endpoint: the browser-facing projection of the message bus.
+//! The surface: the browser-facing application built on the attachment
+//! protocol.
 //!
-//! `surface_ws_handler` fronts `GET /surface/{slug}/ws`; `session.rs` owns the
-//! per-connection task; `registry.rs` tracks attached WS sessions per surface.
+//! `surface_ws_handler` fronts `GET /surface/{slug}/ws` — cookie auth, the
+//! capacity gate, and the served-asset build check — and then hands the socket to
+//! the generic attachment session (`routes::attach`) with this surface's
+//! `profile.rs` as its authority half. What stays here is what is genuinely
+//! surface: the page and its assets, the boot-resolved wiring, the bindings
+//! document, the self-description family, and the server-written disconnected
+//! stamp.
 
 pub mod bindings_doc;
-pub mod cursor;
 pub mod description;
 pub mod page;
 pub mod processor_assets;
 pub mod profile;
-pub mod registry;
-pub mod session;
 pub mod telemetry;
 
 #[cfg(test)]
-mod client_tests;
+mod conformance_tests;
 #[cfg(test)]
 mod test_fixtures;
 #[cfg(test)]
@@ -28,36 +31,28 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
+use brenn_attach_proto::max_client_frame_bytes;
 use brenn_envelope::{channel_capabilities, is_local_channel};
 use brenn_lib::access::AppPolicy;
 use brenn_lib::auth::session::Session;
-use brenn_lib::messaging::config::{
-    Depth, ResolvedSurface, ResolvedWasmConsumer, SurfaceBinding, SurfaceOutput,
-};
+use brenn_lib::messaging::config::{ResolvedSurface, ResolvedWasmConsumer};
 use brenn_lib::messaging::gates::well_formed_name;
 use brenn_lib::messaging::system::SystemParticipantSpec;
-use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Messenger, ParticipantId, Urgency};
+use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Messenger};
 use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
-use brenn_surface_contract::{
-    ERROR_REPORT_INSTANCE, ERROR_REPORT_PORT, KERNEL_ARTIFACT, module_artifact,
-};
-use brenn_surface_schema::{
-    Binding, ComponentEntry, LocalChannel, LogLevel, NoiseLevel as WireNoiseLevel, OutputBinding,
-    SurfaceBindings, max_client_frame_bytes, surface_bindable_address,
-};
+use brenn_surface_contract::{KERNEL_ARTIFACT, module_artifact};
+use brenn_surface_schema::surface_bindable_address;
 use chrono::Utc;
 use tracing::warn;
 use uuid::Uuid;
 
-pub use crate::routes::attach::profile::SubscriptionFacts;
 pub(crate) use crate::routes::attach::session::sanitize_client_detail;
 
 use self::profile::SurfaceProfile;
-use self::registry::{PUSH_QUEUE_FRAMES, SurfaceSessionHandle};
-use self::session::{SurfaceSessionParams, run_surface_session};
 use crate::client_ip::ClientIp;
 use crate::routes::attach::profile::AttachProfile;
-use crate::routes::attach::registry::RegisterRejection;
+use crate::routes::attach::registry::{AttachSessionHandle, PUSH_QUEUE_FRAMES, RegisterRejection};
+use crate::routes::attach::session::{AttachSessionParams, run_attach_session};
 use crate::routes::ws::close_with_stale_client;
 use crate::state::AppState;
 
@@ -163,8 +158,6 @@ pub(crate) fn authorize_surface(
 pub struct SurfaceRuntime {
     /// The resolved config block for this surface.
     pub resolved: ResolvedSurface,
-    /// `surface:<slug>` participant identity used for bus publishes/subscribes.
-    pub participant: ParticipantId,
     /// Resolved access policy, `Arc`-wrapped once for cheap per-op cloning.
     pub policy: Arc<AppPolicy>,
     /// The `Messenger` this surface's messaging projects through — the session
@@ -173,196 +166,42 @@ pub struct SurfaceRuntime {
     /// subscription or output (boot invariant); `None` only for test runtimes
     /// that exercise resolution without touching messaging.
     pub messenger: Option<Arc<Messenger>>,
-    /// Subscriptions this surface declares: `(instance, channel)` → the facts
-    /// delivery turns on. The gate an inbound `Subscribe` is validated against,
-    /// keyed at the subscription's own grain — so a client naming a channel some
-    /// *other* instance binds is the same unbound violation as naming a channel
-    /// nobody binds.
-    pub subscription_channels: HashMap<SubKey, SubscriptionFacts>,
-    /// Output ports: `(instance, port)` → the port's resolved dispatch facts.
-    pub output_ports: HashMap<(String, String), OutputPort>,
-    /// Prebuilt `Welcome.bindings` payload.
-    pub bindings: SurfaceBindings,
     /// Server publish-body cap (config `messaging.max_body_bytes`): the
     /// `Welcome` field, the dispatch pre-check, and the derived WS read cap.
     pub max_body_bytes: usize,
-    /// Publish floor for surface error reports, advertised in `Welcome` so the
-    /// kernel knows the reserved `#brenn`/`error-reports` output port is live and
-    /// at what level to start publishing. `Some` when `surface_error_channel` is
-    /// configured (the reserved port is bound in `output_ports`); `None`
-    /// otherwise (kernel console-only). Set by [`build_surface_runtimes`] alongside
-    /// the reserved-port binding, not by [`SurfaceRuntime::build`].
-    pub error_report_floor: Option<LogLevel>,
-    /// Surface self-description runtime telemetry. Carries the status heartbeat
-    /// interval (advertised in `Welcome`) and the surface's derived
-    /// geometry/status channel addresses (the platform-telemetry publish
-    /// targets). Every surface has one.
+    /// Surface self-description runtime telemetry: the surface's derived
+    /// geometry, status and config channel addresses. Every surface has one.
     pub description: SurfaceDescriptionRuntime,
     /// This surface's component structure lowered to the attachment grain: the
     /// per-channel subscribable fold, the per-attribution publishable sets, the
     /// declared sub-identities, and the parked-view targets. The authority half
-    /// of an attachment, in the vocabulary the wire speaks.
-    pub profile: SurfaceProfile,
+    /// of an attachment, in the vocabulary the wire speaks. Behind an `Arc`
+    /// because every attachment session of this surface holds it for its life.
+    pub profile: Arc<SurfaceProfile>,
 }
 
 /// The operator's `[surface_description]` parameters, as [`SurfaceRuntime::build`]
-/// consumes them: the namespace the derived channel addresses hang off and the
-/// heartbeat cadence handed to the kernel.
+/// consumes them: the namespace the derived channel addresses hang off.
 #[derive(Debug, Clone)]
 pub struct SurfaceDescriptionParams {
     /// Bare-name namespace rooting every derived channel address.
     pub prefix: String,
-    /// Status heartbeat cadence, seconds.
-    pub status_interval_secs: u32,
 }
 
-/// Per-surface runtime parameters for the surface self-description telemetry.
-/// Derived once at boot from [`SurfaceDescriptionParams`] and the surface slug;
-/// the addresses are the platform-telemetry publish targets and the interval is
-/// the `Welcome` heartbeat advertisement.
+/// Per-surface derived channel addresses for the surface self-description
+/// family, resolved once at boot from [`SurfaceDescriptionParams`] and the
+/// surface slug. The page authors the documents that ride the first two; the
+/// third is where the server publishes the wiring the page reads.
 pub struct SurfaceDescriptionRuntime {
-    /// Status heartbeat cadence handed to the kernel in `Welcome`.
-    pub status_interval_secs: u32,
     /// `brenn:<prefix>.surface.<slug>.geometry` — the geometry publish target.
     pub geometry_channel: String,
-    /// `brenn:<prefix>.surface.<slug>.status` — the status publish target.
+    /// `brenn:<prefix>.surface.<slug>.status` — the status publish target, and
+    /// where the server writes its `disconnected` stamps.
     pub status_channel: String,
     /// `ephemeral:<prefix>.surface.<slug>.bindings` — the config channel this
     /// surface's retained bindings document sits on. Rendered into the page as a
     /// meta, because a client cannot derive it: the prefix is the operator's.
     pub config_channel: String,
-    /// Configured instance → kind, precomputed once at boot (a `Status` frame
-    /// validates its reported instances against this; it is boot-constant, so it is
-    /// not rebuilt per frame).
-    pub configured_kinds: HashMap<String, String>,
-    /// Configured instance → number of subscription bindings it should have an
-    /// attached pump for, precomputed once at boot for health derivation. Every
-    /// configured instance is a key (a zero means no bound subscription), so health
-    /// derivation can require every configured instance to be reported mounted.
-    pub expected_pumps: HashMap<String, u32>,
-}
-
-/// Map one resolved config binding to the form the surface's lowered wiring
-/// carries.
-fn wire_binding(b: &SurfaceBinding) -> Binding {
-    Binding {
-        channel: b.channel_address.clone(),
-        instance: b.instance.clone(),
-        port: b.port.clone(),
-        push_depth: b.push_depth,
-        retain_depth: b.retain_depth,
-        noise: wire_noise(b.noise),
-    }
-}
-
-/// Map a resolved `brenn-lib` [`NoiseLevel`] to its wire form. Exhaustive: a new
-/// rung that fails to map is a compile error, never a runtime fallback.
-fn wire_noise(n: brenn_lib::messaging::config::NoiseLevel) -> WireNoiseLevel {
-    use brenn_lib::messaging::config::NoiseLevel as N;
-    match n {
-        N::Silent => WireNoiseLevel::Silent,
-        N::Metered => WireNoiseLevel::Metered,
-        N::Alarm => WireNoiseLevel::Alarm,
-        N::Fatal => WireNoiseLevel::Fatal,
-    }
-}
-
-/// The identity of one subscription on a surface session: the principal that
-/// owns it and the channel it covers.
-///
-/// This is the grain the whole subscription is cut at — its own push window, its
-/// own resume cursor, its own lag — so it is what the session's active set, the
-/// registry's shared set, and the router's fan-out filter all key on. Two
-/// instances bound to one channel hold two of these and each is delivered its
-/// own copy, exactly as two backend `[[app]]`s on one channel are.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SubKey {
-    /// The owning component instance. Every surface subscription is an
-    /// instance's; the bare `surface:<slug>` grain is publisher-only and holds
-    /// no subscription.
-    pub instance: String,
-    /// Full scheme-qualified channel address.
-    pub channel: String,
-}
-
-/// Everything the publish path needs about one bound output port, resolved at
-/// boot: where the message goes, and the urgency to send it at when the
-/// component states none.
-///
-/// A named struct rather than a tuple: the address is a `String` and the
-/// urgency a small enum, so a transposed tuple field would typecheck — the same
-/// argument `PublishRequest` already makes about `instance`/`subject_instance`.
-#[derive(Debug, Clone)]
-pub struct OutputPort {
-    /// Full scheme-qualified channel address the port publishes onto.
-    pub address: String,
-    /// The port's configured default urgency. Applies when the client's
-    /// `Publish` frame carries no override; the client's override wins.
-    ///
-    /// Held server-side rather than trusted from the frame: it is operator
-    /// config, and the boot-resolved value is the authoritative one even when a
-    /// client's `Welcome` snapshot has gone stale under a reconnect.
-    pub default_urgency: Urgency,
-}
-
-/// The lowered form of a resolved output binding. Separate from
-/// [`wire_binding`] because an output advertises its resolved default urgency —
-/// the page needs it to stamp page-local envelopes, whose router never consults
-/// the server.
-fn wire_output(b: &SurfaceOutput) -> OutputBinding {
-    OutputBinding {
-        channel: b.channel_address.clone(),
-        instance: b.instance.clone(),
-        port: b.port.clone(),
-        urgency: b.default_urgency,
-        fill_mt: b.budget.fill_mt,
-        capacity_mt: b.budget.capacity_mt,
-    }
-}
-
-/// Lower one resolved surface's component structure to its wire/document form.
-///
-/// The single lowering of a surface's wiring: the `Welcome` payload and the
-/// bindings document carry the same five fields and must agree field for field,
-/// so they are built here once rather than constructed twice.
-///
-/// # Panics
-///
-/// If the surface declares no chrome component. Surface resolution enforces
-/// exactly one per surface, so a miss is a broken boot invariant.
-fn lower_surface_bindings(resolved: &ResolvedSurface) -> SurfaceBindings {
-    SurfaceBindings {
-        components: resolved
-            .components
-            .iter()
-            .map(|c| ComponentEntry {
-                instance: c.instance.clone(),
-                kind: c.kind.clone(),
-                abi: c.abi,
-                parked_batch_depth: c.parked_batch_depth,
-                config: c.config.clone(),
-            })
-            .collect(),
-        subscriptions: resolved.subscriptions.iter().map(wire_binding).collect(),
-        outputs: resolved.outputs.iter().map(wire_output).collect(),
-        // Page-local channels have no `[[channel]]` block and no directory
-        // entry, so this table is the only place their ring depths can come
-        // from.
-        local_channels: resolved
-            .local_channels
-            .iter()
-            .map(|c| LocalChannel {
-                channel: c.address.clone(),
-                ring_depth: c.ring_depth,
-            })
-            .collect(),
-        chrome_instance: resolved
-            .components
-            .iter()
-            .find(|c| c.chrome)
-            .map(|c| c.instance.clone())
-            .expect("resolve_surfaces enforces exactly one chrome component per surface"),
-    }
 }
 
 /// Assert that a channel the wire maps hold is transportable — the one channel
@@ -390,60 +229,7 @@ fn assert_transportable(address: &str) {
     );
 }
 
-/// Read one of a wire subscription's resolved depths as the number boot proved
-/// it to be.
-///
-/// # Panics
-///
-/// On an unbounded depth: every replay the wire serves must be bounded, and boot
-/// refuses the config that would leave one otherwise, so this is a broken boot
-/// invariant rather than a condition to handle.
-fn bounded_depth(depth: Depth, knob: &str, slug: &str, sub: &SubKey) -> u64 {
-    let Depth::Bounded(n) = depth else {
-        panic!(
-            "surface {slug:?}: wire subscription {} (instance {:?}) resolves an unbounded {knob} \
-             — boot bounds both depths of every wire subscription",
-            sub.channel, sub.instance,
-        )
-    };
-    n
-}
-
 impl SurfaceRuntime {
-    /// The boot-resolved facts for one declared subscription.
-    ///
-    /// # Panics
-    ///
-    /// On a subscription this surface does not declare. Every caller holds a
-    /// `SubKey` that came out of this same map (an inbound `Subscribe` naming
-    /// anything else was killed as a violation before it was activated), so a
-    /// miss here is a broken invariant, not client input.
-    pub(crate) fn subscription_facts(&self, sub: &SubKey) -> SubscriptionFacts {
-        *self.subscription_channels.get(sub).unwrap_or_else(|| {
-            panic!(
-                "broken invariant: surface {} delivered on undeclared subscription {} \
-                 (instance {:?})",
-                self.resolved.slug, sub.channel, sub.instance,
-            )
-        })
-    }
-
-    /// Whether `instance` is in this surface's boot-resolved declaration set.
-    ///
-    /// The validity check for the `surface:<slug>#<instance>` publisher
-    /// sub-identity. The principal *is* the instance, so the server derives
-    /// nothing here — it admits or rejects the instance the client's frame
-    /// named. That keeps the client's claim surface to a single field whose only
-    /// legal values are ones the operator wrote: an instance outside this set is
-    /// a protocol violation rather than a fallback identity.
-    ///
-    /// The kind is deliberately not consulted. It is the manifest — a load-time
-    /// compatibility fact and an observability decoration — and never holds
-    /// authority.
-    pub(crate) fn is_declared_instance(&self, instance: &str) -> bool {
-        self.profile.is_declared(instance)
-    }
-
     /// The `Messenger` this surface's messaging projects through.
     ///
     /// # Panics
@@ -507,97 +293,14 @@ impl SurfaceRuntime {
              websocket reads or writes the bus through one",
             resolved.slug,
         );
-        let participant = ParticipantId::for_surface(&resolved.slug);
         let policy = Arc::new(resolved.policy.clone());
 
-        // `local:` bindings are deliberately absent from this gate map: the page
-        // routes that traffic itself and must never `Subscribe` to it, so the
-        // channel is *unbound* as far as the wire is concerned and a `Subscribe`
-        // naming one is the ordinary unbound-channel violation. Same for
-        // `output_ports` below. That exclusion is what makes the
-        // transportability asserts downstream (`handle_subscribe`,
-        // `handle_publish`) structurally unreachable rather than merely unlikely.
-        let mut subscription_channels: HashMap<SubKey, SubscriptionFacts> = HashMap::new();
-        for b in resolved
-            .subscriptions
-            .iter()
-            .filter(|b| !is_local_channel(&b.channel_address))
-        {
-            assert_transportable(&b.channel_address);
-            let key = SubKey {
-                instance: b.instance.clone(),
-                channel: b.channel_address.clone(),
-            };
-            // Both depths come off the wire subscription, which boot folded
-            // across this (instance, channel)'s bindings and proved bounded. A
-            // binding in the wire map with no wire subscription means the two
-            // boot paths disagree about which bindings cross the wire — fail
-            // fast.
-            let wire = resolved
-                .wire_subscriptions
-                .iter()
-                .find(|s| {
-                    s.instance == key.instance && s.subscription.channel_address == key.channel
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "surface {:?}: transportable binding {} (instance {:?}) has no resolved \
-                         wire subscription — the binding resolver and the subscription resolver \
-                         disagree about which bindings cross the wire",
-                        resolved.slug, key.channel, key.instance,
-                    )
-                });
-            let facts = SubscriptionFacts {
-                push_depth: bounded_depth(
-                    wire.subscription.push_depth,
-                    "push_depth",
-                    &resolved.slug,
-                    &key,
-                ),
-                retain_depth: bounded_depth(
-                    wire.subscription.retain_depth,
-                    "retain_depth",
-                    &resolved.slug,
-                    &key,
-                ),
-            };
-            subscription_channels.insert(key, facts);
-        }
-        let output_ports: HashMap<(String, String), OutputPort> = resolved
-            .outputs
-            .iter()
-            .filter(|b| !is_local_channel(&b.channel_address))
-            .map(|b| {
-                assert_transportable(&b.channel_address);
-                (
-                    (b.instance.clone(), b.port.clone()),
-                    OutputPort {
-                        address: b.channel_address.clone(),
-                        default_urgency: b.default_urgency,
-                    },
-                )
-            })
-            .collect();
-
-        let bindings = lower_surface_bindings(&resolved);
-
-        // Every configured instance is an `expected_pumps` key (a zero means no
-        // bound subscription), so health derivation can require every configured
-        // instance to be reported mounted.
-        let configured_kinds: HashMap<String, String> = resolved
-            .components
-            .iter()
-            .map(|c| (c.instance.clone(), c.kind.clone()))
-            .collect();
-        let mut expected_pumps: HashMap<String, u32> =
-            configured_kinds.keys().map(|k| (k.clone(), 0)).collect();
-        for binding in &resolved.subscriptions {
-            if let Some(count) = expected_pumps.get_mut(&binding.instance) {
-                *count += 1;
-            }
-        }
+        // `local:` bindings are deliberately absent from every wire-facing
+        // lowering: the page routes that traffic itself and must never
+        // `Subscribe` to it, so the channel is *unbound* as far as the wire is
+        // concerned and a `Subscribe` naming one is the ordinary unbound-channel
+        // violation.
         let description = SurfaceDescriptionRuntime {
-            status_interval_secs: description.status_interval_secs,
             geometry_channel: description::surface_geometry_channel(
                 &description.prefix,
                 &resolved.slug,
@@ -610,25 +313,14 @@ impl SurfaceRuntime {
                 &description.prefix,
                 &resolved.slug,
             ),
-            configured_kinds,
-            expected_pumps,
         };
-        let profile = SurfaceProfile::build(&resolved, &description);
+        let profile = Arc::new(SurfaceProfile::build(&resolved, &description));
 
         SurfaceRuntime {
             resolved,
-            participant,
             policy,
             messenger,
-            subscription_channels,
-            output_ports,
-            bindings,
             max_body_bytes,
-            // The reserved error-report port + floor are injected by
-            // `build_surface_runtimes` (which holds the channel config), not here:
-            // `build` also constructs the ephemeral-only test runtimes, which have
-            // no error channel.
-            error_report_floor: None,
             description,
             profile,
         }
@@ -641,7 +333,7 @@ pub fn build_surface_runtimes(
     surfaces: Vec<ResolvedSurface>,
     messenger: Option<Arc<Messenger>>,
     max_body_bytes: usize,
-    error_report: Option<(String, LogLevel)>,
+    error_channel: Option<String>,
     surface_description: SurfaceDescriptionParams,
 ) -> HashMap<String, Arc<SurfaceRuntime>> {
     surfaces
@@ -654,31 +346,18 @@ pub fn build_surface_runtimes(
                 max_body_bytes,
                 surface_description.clone(),
             );
-            // Wire the reserved error-report output port + advertise the floor
-            // when an error channel is configured. Addressed via the contract
-            // constants (not `SurfaceBindings.outputs`, which is component wiring
-            // the kernel renders); the reserved instance id can never collide with
-            // a configured component (its `#` prefix fails `is_valid_kind`).
-            if let Some((channel_address, floor)) = &error_report {
-                runtime.output_ports.insert(
-                    (
-                        ERROR_REPORT_INSTANCE.to_string(),
-                        ERROR_REPORT_PORT.to_string(),
-                    ),
-                    OutputPort {
-                        address: channel_address.clone(),
-                        // The reserved port is wired from `surface_error_channel`,
-                        // not from an `[[surface.output]]` block, so there is no
-                        // operator urgency knob on it to read: it takes the same
-                        // `normal` an unset one would resolve to. Widening this to
-                        // a configurable knob is additive.
-                        default_urgency: Urgency::Normal,
-                    },
-                );
-                runtime.error_report_floor = Some(*floor);
-                runtime.profile.bind_error_channel(channel_address);
+            // Admit the substrate error channel when one is configured: every
+            // declared attribution and the bare identity may report onto it, and
+            // it is the one channel whose publish refusals are reported rather
+            // than fatal.
+            if let Some(channel_address) = &error_channel {
+                // The profile is shared with every session of this surface, so it
+                // lives behind an `Arc` — still unique here, before the runtime
+                // reaches the map any session reads.
+                Arc::get_mut(&mut runtime.profile)
+                    .expect("the boot-built profile is not shared until the runtime is published")
+                    .bind_error_channel(channel_address);
             }
-            profile::assert_agrees_with_port_maps(&runtime);
             (slug, Arc::new(runtime))
         })
         .collect()
@@ -1135,21 +814,21 @@ pub async fn surface_ws_handler(
     let session_id = Uuid::new_v4();
     // Push handle, shared between the registry (read by the router fan-out and by
     // sibling session tasks) and this session task (which drains it): a bounded
-    // push queue, the active-subscription set, and the drain nudge.
+    // push queue, the active-channel set, and the drain nudge.
     let (push_tx, push_rx) = tokio::sync::mpsc::channel(PUSH_QUEUE_FRAMES);
-    let active_subs = Arc::new(Mutex::new(HashSet::new()));
+    let active_channels = Arc::new(Mutex::new(HashSet::new()));
     let drain_notify = Arc::new(tokio::sync::Notify::new());
-    let handle = SurfaceSessionHandle {
+    let handle = AttachSessionHandle {
         session_id,
-        username: session.user.username.clone(),
+        account: session.user.username.clone(),
         client_ip: ip,
         connected_at: Utc::now(),
         push_tx,
-        active_subs: active_subs.clone(),
+        active_channels: active_channels.clone(),
         drain_notify: drain_notify.clone(),
     };
     let caps = runtime.profile.session_caps();
-    let guard = match state.surface_registry.try_register(&slug, handle, caps) {
+    let guard = match state.attach_registry.try_register(&slug, handle, caps) {
         Ok(guard) => guard,
         Err(RegisterRejection::AttacherFull { current }) => {
             // Not a security event: a user with many tabs is not fail2ban signal.
@@ -1195,53 +874,64 @@ pub async fn surface_ws_handler(
 
     // 5. Frame cap derived from config, then upgrade into the session task.
     let cap = max_client_frame_bytes(runtime.max_body_bytes);
-    let params_username = session.user.username;
+    let account = session.user.username;
     let heartbeat_secs = state.surface_heartbeat_secs;
     let alert_dispatcher = state.alert_dispatcher.clone();
-    let registry = state.surface_registry.clone();
+    let registry = state.attach_registry.clone();
     Ok(ws
         .max_message_size(cap)
         .max_frame_size(cap)
-        .on_upgrade(move |socket| {
-            run_surface_session(SurfaceSessionParams {
-                runtime,
-                session_id,
-                username: params_username,
-                ip,
-                guard,
+        .on_upgrade(move |socket| async move {
+            let outcome = run_attach_session(AttachSessionParams {
+                profile: runtime.profile.clone(),
+                messenger: runtime.messenger().clone(),
+                policy: runtime.policy.clone(),
                 registry,
+                guard,
+                session_id,
+                account,
+                ip,
+                max_body_bytes: runtime.max_body_bytes,
                 heartbeat_secs,
+                store_incarnation: runtime.store_incarnation(),
+                ident: build_id.to_string(),
                 alert_dispatcher,
                 push_rx,
-                active_subs,
+                active_channels,
                 drain_notify,
                 socket,
             })
+            .await;
+            if outcome.last_detach {
+                telemetry::publish_terminal_disconnected_stamp(&runtime, session_id).await;
+            }
         }))
 }
 
 #[cfg(test)]
 mod tests {
+    use brenn_lib::messaging::Urgency;
     use brenn_lib::messaging::config::{
         ResolvedComponent, ResolvedSubscription, ResolvedSurface, ResolvedSurfaceSubscription,
-        SurfaceBinding, SurfaceSendBudget,
+        SurfaceBinding, SurfaceOutput, SurfaceSendBudget,
     };
 
     use super::test_fixtures::{TEST_MAX_BODY_BYTES, directory_with, directory_with_standing};
     use super::*;
+    use crate::routes::attach::profile::SubscriptionFacts;
     use crate::test_support::surface::shape_only_messenger;
 
-    /// `wire_noise` is a four-arm hand-written match between two same-named,
-    /// same-ordered enums: transposing `Alarm` and `Fatal` compiles clean and
-    /// ships an overflow that should toast as one that kills the instance. Each
-    /// rung is pinned to its port, the same argument `fold` makes in chrome.
-    #[test]
-    fn wire_noise_maps_every_rung_to_its_own() {
-        use brenn_lib::messaging::config::NoiseLevel as N;
-        assert_eq!(wire_noise(N::Silent), WireNoiseLevel::Silent);
-        assert_eq!(wire_noise(N::Metered), WireNoiseLevel::Metered);
-        assert_eq!(wire_noise(N::Alarm), WireNoiseLevel::Alarm);
-        assert_eq!(wire_noise(N::Fatal), WireNoiseLevel::Fatal);
+    /// The bindings document this surface's resolved config lowers to, under the
+    /// boot parameters the disconnected-stamp fixtures already use.
+    fn document(resolved: &ResolvedSurface) -> brenn_surface_schema::bindings::BindingsDocument {
+        super::bindings_doc::build_bindings_document(
+            resolved,
+            &super::bindings_doc::BindingsDocParams {
+                prefix: "surface",
+                status_interval_secs: 60,
+                error_report: None,
+            },
+        )
     }
 
     fn resolved(slug: &str) -> ResolvedSurface {
@@ -1306,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn build_classifies_channels_and_prebuilds_bindings() {
+    fn build_lowers_the_runtime_and_its_wiring() {
         let rt = SurfaceRuntime::build(
             resolved("deskbar"),
             Some(shape_only_messenger()),
@@ -1314,35 +1004,24 @@ mod tests {
             crate::test_support::surface::description_params(),
         );
 
-        assert_eq!(rt.participant.as_str(), "surface:deskbar");
+        assert_eq!(rt.profile.attacher().as_str(), "surface:deskbar");
         assert_eq!(rt.max_body_bytes, TEST_MAX_BODY_BYTES);
-
-        // Subscription keyed by its owning principal, carrying the boot-resolved
-        // facts the session reads — both of the wire subscription's depths, not
-        // the per-binding numbers (the fixture's binding states retain 0 and its
-        // wire subscription 4).
+        // The subscribable fold carries both of the *wire* subscription's depths,
+        // not the per-binding numbers (the fixture's binding states retain 0 and
+        // its wire subscription 4).
         assert_eq!(
-            rt.subscription_channels.get(&SubKey {
-                instance: "protobar".to_string(),
-                channel: "ephemeral:protobar-demo".to_string(),
-            }),
-            Some(&SubscriptionFacts {
+            rt.profile.subscribable("ephemeral:protobar-demo"),
+            Some(SubscriptionFacts {
                 push_depth: 8,
                 retain_depth: 4,
             })
         );
+        assert!(rt.profile.publishable(Some("writer"), "brenn:writer-out"));
 
-        // Output port keyed by (instance, port) → its resolved dispatch facts.
-        let out = rt
-            .output_ports
-            .get(&("writer".to_string(), "out".to_string()))
-            .expect("the writer/out output port");
-        assert_eq!(out.address, "brenn:writer-out");
-        assert_eq!(out.default_urgency, Urgency::Normal);
-
-        // Bindings mirror the resolved config for the Welcome payload.
-        let comp_pairs: Vec<(&str, &str)> = rt
-            .bindings
+        // The lowered wiring mirrors the resolved config: it is what the bindings
+        // document carries, and the page mounts and routes on its word.
+        let bindings = document(&resolved("deskbar"));
+        let comp_pairs: Vec<(&str, &str)> = bindings
             .components
             .iter()
             .map(|c| (c.instance.as_str(), c.kind.as_str()))
@@ -1351,36 +1030,27 @@ mod tests {
             comp_pairs,
             vec![("protobar", "protobar"), ("writer", "writer")]
         );
-        assert_eq!(rt.bindings.subscriptions.len(), 1);
-        assert_eq!(
-            rt.bindings.subscriptions[0].channel,
-            "ephemeral:protobar-demo"
-        );
-        assert_eq!(rt.bindings.subscriptions[0].port, "messages");
-        assert_eq!(rt.bindings.outputs.len(), 1);
-        assert_eq!(rt.bindings.outputs[0].channel, "brenn:writer-out");
+        assert_eq!(bindings.subscriptions.len(), 1);
+        assert_eq!(bindings.subscriptions[0].channel, "ephemeral:protobar-demo");
+        assert_eq!(bindings.subscriptions[0].port, "messages");
+        assert_eq!(bindings.outputs.len(), 1);
+        assert_eq!(bindings.outputs[0].channel, "brenn:writer-out");
         // The fixture's chrome singleton is the `protobar` component.
-        assert_eq!(rt.bindings.chrome_instance, "protobar");
+        assert_eq!(bindings.chrome_instance, "protobar");
     }
 
-    /// The server advertises the resolved chrome instance in
-    /// `SurfaceBindings.chrome_instance` — the singleton the kernel treats
-    /// specially. One field, populated from the component that sets `chrome`.
+    /// The lowering names the resolved chrome instance — the singleton the page
+    /// treats specially. One field, populated from the component that sets
+    /// `chrome`.
     #[test]
-    fn build_advertises_the_chrome_instance() {
+    fn the_lowering_names_the_chrome_instance() {
         let mut resolved = resolved("deskbar");
         // Move the chrome designation off the default (protobar) onto writer, so
         // the assertion proves the field tracks the marked component, not the
         // first one.
         resolved.components[0].chrome = false;
         resolved.components[1].chrome = true;
-        let rt = SurfaceRuntime::build(
-            resolved,
-            Some(shape_only_messenger()),
-            TEST_MAX_BODY_BYTES,
-            crate::test_support::surface::description_params(),
-        );
-        assert_eq!(rt.bindings.chrome_instance, "writer");
+        assert_eq!(document(&resolved).chrome_instance, "writer");
     }
 
     /// A resolved surface wired page-locally in both directions, plus the
@@ -1413,76 +1083,56 @@ mod tests {
         r
     }
 
-    /// The invariant that keeps `local:` off the wire, checked at the only place
-    /// it is enforced: a local binding rides `Welcome` (the page needs its
-    /// wiring) but is absent from both gate maps. That absence is what makes a
-    /// `Subscribe`/`Publish` naming it fall into the existing unbound-channel /
-    /// unbound-port violation arms rather than reaching the bus.
+    /// The invariant that keeps `local:` off the wire, checked at the two places
+    /// it is enforced: a local binding rides the bindings document (the page
+    /// needs its wiring) but is absent from the attachment's own authority. That
+    /// absence is what makes a `Subscribe`/`Publish` naming it fall into the
+    /// unbound-channel violation arms rather than reaching the bus.
     #[test]
-    fn build_advertises_local_bindings_but_keeps_them_out_of_the_wire_maps() {
+    fn local_bindings_are_lowered_but_never_reach_the_attachments_authority() {
+        let resolved = resolved_with_local("deskbar");
+        let bindings = document(&resolved);
         let rt = SurfaceRuntime::build(
-            resolved_with_local("deskbar"),
+            resolved,
             Some(shape_only_messenger()),
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
         );
 
-        // Advertised: the client learns its page-local wiring from the backend.
         assert!(
-            rt.bindings
+            bindings
                 .subscriptions
                 .iter()
                 .any(|b| b.channel == "local:page-bus" && b.port == "local-in")
         );
         assert!(
-            rt.bindings
+            bindings
                 .outputs
                 .iter()
                 .any(|b| b.channel == "local:page-bus" && b.port == "local-out")
         );
         assert_eq!(
-            rt.bindings.local_channels,
-            vec![LocalChannel {
+            bindings.local_channels,
+            vec![brenn_surface_schema::LocalChannel {
                 channel: "local:page-bus".to_string(),
                 ring_depth: 3,
             }]
         );
 
         // Unbound on the wire, in both directions.
-        assert_eq!(
-            rt.subscription_channels.get(&SubKey {
-                instance: "protobar".to_string(),
-                channel: "local:page-bus".to_string(),
-            }),
-            None
-        );
-        assert!(
-            !rt.output_ports
-                .contains_key(&("writer".to_string(), "local-out".to_string()))
-        );
+        assert_eq!(rt.profile.subscribable("local:page-bus"), None);
+        assert!(!rt.profile.publishable(Some("writer"), "local:page-bus"));
         // The non-local bindings on the same surface are unaffected: the filter
         // excludes the scheme, not the surface.
-        assert!(rt.subscription_channels.contains_key(&SubKey {
-            instance: "protobar".to_string(),
-            channel: "ephemeral:protobar-demo".to_string(),
-        }));
-        assert!(
-            rt.output_ports
-                .contains_key(&("writer".to_string(), "out".to_string()))
-        );
+        assert!(rt.profile.subscribable("ephemeral:protobar-demo").is_some());
+        assert!(rt.profile.publishable(Some("writer"), "brenn:writer-out"));
     }
 
-    /// A surface with no local wiring advertises an empty router table — not a
-    /// missing field the client has to treat as unknown.
+    /// A surface with no local wiring lowers an empty router table — not a
+    /// missing field the page has to treat as unknown.
     #[test]
-    fn build_advertises_no_local_channels_when_none_are_declared() {
-        let rt = SurfaceRuntime::build(
-            resolved("deskbar"),
-            Some(shape_only_messenger()),
-            TEST_MAX_BODY_BYTES,
-            crate::test_support::surface::description_params(),
-        );
-        assert!(rt.bindings.local_channels.is_empty());
+    fn the_lowering_carries_no_local_channels_when_none_are_declared() {
+        assert!(document(&resolved("deskbar")).local_channels.is_empty());
     }
 
     #[test]
@@ -1515,35 +1165,33 @@ mod tests {
         assert!(map.is_empty());
     }
 
+    /// With an error channel configured, every surface's attachment authority
+    /// admits it — under the bare identity and under every declared
+    /// sub-identity, since a report carries the identity of whoever failed.
     #[test]
-    fn build_surface_runtimes_wires_reserved_error_port_and_floor() {
-        // With an error channel configured, every runtime gains the reserved
-        // `#brenn`/`error-reports` durable output port and advertises the floor.
+    fn build_surface_runtimes_binds_the_error_channel_to_every_attribution() {
         let map = build_surface_runtimes(
             vec![resolved("deskbar")],
             Some(shape_only_messenger()),
             TEST_MAX_BODY_BYTES,
-            Some(("brenn:surface-errors".to_string(), LogLevel::Warn)),
+            Some("brenn:surface-errors".to_string()),
             crate::test_support::surface::description_params(),
         );
-        let rt = &map["deskbar"];
-        let reserved = rt
-            .output_ports
-            .get(&(
-                ERROR_REPORT_INSTANCE.to_string(),
-                ERROR_REPORT_PORT.to_string(),
-            ))
-            .expect("the reserved error-report output port");
-        assert_eq!(reserved.address, "brenn:surface-errors");
-        // Wired from `surface_error_channel`, not an `[[surface.output]]` block,
-        // so there is no operator urgency knob on it to read.
-        assert_eq!(reserved.default_urgency, Urgency::Normal);
-        assert_eq!(rt.error_report_floor, Some(LogLevel::Warn));
+        let profile = &map["deskbar"].profile;
+        assert!(profile.publishable(None, "brenn:surface-errors"));
+        assert!(profile.publishable(Some("writer"), "brenn:surface-errors"));
+        assert!(profile.publishable(Some("protobar"), "brenn:surface-errors"));
+        // The one channel whose publish refusals are reported rather than fatal.
+        assert_eq!(
+            profile.publish_posture("brenn:surface-errors"),
+            crate::routes::attach::profile::PublishPosture::Diagnostic
+        );
     }
 
+    /// Unset error channel: nothing may report anywhere, and no channel carries
+    /// the diagnostics posture.
     #[test]
-    fn build_surface_runtimes_no_reserved_port_without_error_channel() {
-        // Unset error channel: no reserved port, floor `None` (kernel console-only).
+    fn build_surface_runtimes_binds_no_error_channel_when_none_is_configured() {
         let map = build_surface_runtimes(
             vec![resolved("deskbar")],
             Some(shape_only_messenger()),
@@ -1551,12 +1199,13 @@ mod tests {
             None,
             crate::test_support::surface::description_params(),
         );
-        let rt = &map["deskbar"];
-        assert!(!rt.output_ports.contains_key(&(
-            ERROR_REPORT_INSTANCE.to_string(),
-            ERROR_REPORT_PORT.to_string()
-        )));
-        assert_eq!(rt.error_report_floor, None);
+        let profile = &map["deskbar"].profile;
+        assert!(!profile.publishable(None, "brenn:surface-errors"));
+        assert!(!profile.publishable(Some("writer"), "brenn:surface-errors"));
+        assert_eq!(
+            profile.publish_posture("brenn:surface-errors"),
+            crate::routes::attach::profile::PublishPosture::Invariant
+        );
     }
 
     fn touch(dir: &std::path::Path, name: &str) {
@@ -2003,33 +1652,6 @@ mod tests {
         validate_surface_assets(dir.path(), &[dom, clash]);
     }
 
-    #[test]
-    fn the_replay_clamp_is_the_max_of_the_two_depths() {
-        let clamp = |push, retain| {
-            SubscriptionFacts {
-                push_depth: push,
-                retain_depth: retain,
-            }
-            .replay_clamp()
-        };
-        assert_eq!(clamp(8, 0), Depth::Bounded(8));
-        assert_eq!(clamp(0, 4), Depth::Bounded(4));
-        assert_eq!(clamp(2, 9), Depth::Bounded(9));
-        assert_eq!(clamp(9, 2), Depth::Bounded(9));
-    }
-
-    /// `push_enabled` is the push depth's own question: a fold-0 subscription is
-    /// a context feed however deep its retained ring is.
-    #[test]
-    fn push_enabled_reads_the_push_depth_alone() {
-        let facts = |push, retain| SubscriptionFacts {
-            push_depth: push,
-            retain_depth: retain,
-        };
-        assert!(facts(1, 0).push_enabled());
-        assert!(!facts(0, 4).push_enabled());
-    }
-
     /// A surface carrying a binding that crosses the websocket but built with no
     /// `Messenger` is a broken boot invariant: the subscription would read
     /// retention through it and the output would publish through it. Both
@@ -2067,25 +1689,6 @@ mod tests {
         );
     }
 
-    /// The two boot resolvers must agree about which bindings cross the wire: a
-    /// transportable binding whose `(instance, channel)` resolved no wire
-    /// subscription has no depths to read, and guessing them would ship a replay
-    /// clamp nobody configured. Pinned so the fail-fast cannot be dropped in a
-    /// later refactor with the suite still green — nothing else reaches it,
-    /// because the fixture rigs derive the missing subscription.
-    #[test]
-    #[should_panic(expected = "has no resolved wire subscription")]
-    fn build_panics_on_a_transportable_binding_with_no_wire_subscription() {
-        let mut r = resolved("deskbar");
-        r.wire_subscriptions.clear();
-        SurfaceRuntime::build(
-            r,
-            Some(shape_only_messenger()),
-            TEST_MAX_BODY_BYTES,
-            crate::test_support::surface::description_params(),
-        );
-    }
-
     /// A surface with no wire binding in either direction owes no `Messenger` —
     /// a page-local-only surface is live config, and the assert must not demand
     /// messaging it never touches.
@@ -2102,15 +1705,17 @@ mod tests {
             TEST_MAX_BODY_BYTES,
             crate::test_support::surface::description_params(),
         );
-        assert!(rt.subscription_channels.is_empty());
-        assert!(rt.output_ports.is_empty());
+        assert_eq!(rt.profile.subscribable("local:page-bus"), None);
+        assert!(!rt.profile.publishable(Some("writer"), "local:page-bus"));
     }
 
     #[test]
     #[should_panic(expected = "is not a surface-bindable scheme (brenn:, ephemeral:, or local:)")]
     fn build_panics_on_foreign_scheme() {
         let mut r = resolved("deskbar");
-        r.subscriptions[0].channel_address = "mqtt:sensors".to_string();
+        // On the wire subscription: that is what the attachment's authority is
+        // lowered from, and a scheme the surface cannot bind must not reach it.
+        r.wire_subscriptions[0].subscription.channel_address = "mqtt:sensors".to_string();
         SurfaceRuntime::build(
             r,
             Some(shape_only_messenger()),

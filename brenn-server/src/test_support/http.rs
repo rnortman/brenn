@@ -80,6 +80,12 @@ pub(crate) struct TestServer {
 /// Spin up a real server on a random port. Returns the base URL and a
 /// [`TestServer`]. The server runs in a background task and stops when the
 /// returned handle is dropped.
+///
+/// A panic on a spawned connection task is absorbed by tokio and reaches no
+/// assertion, so a regression that panics after the last frame a test reads
+/// leaves that test green.
+// TODO(test-task-panic-visibility): make a panicking connection task fail the
+// test that provoked it.
 pub(crate) async fn spawn_test_server(state: AppState) -> (String, TestServer) {
     use crate::router::build_router;
     let app =
@@ -140,11 +146,14 @@ pub(crate) fn http_to_ws_url(http_base: &str, path: &str) -> String {
 }
 
 /// Parse a `spawn_test_server` base URL (`http://<addr>`) into its `SocketAddr`.
-/// The reconnect/kiosk relay tests point a `Relay` at the bound backend address;
-/// this is the single site (alongside `http_to_ws_url`) that knows
+/// One of two sites (alongside `http_to_ws_url`) that knows
 /// `spawn_test_server`'s `http://{addr}` shape.
 pub(crate) fn http_base_addr(http_base: &str) -> SocketAddr {
-    http_base.strip_prefix("http://").unwrap().parse().unwrap()
+    http_base
+        .strip_prefix("http://")
+        .expect("the test server hands back an http:// base")
+        .parse()
+        .expect("the base names a socket address")
 }
 
 /// Open a real WebSocket against `url` with the session cookie and
@@ -173,7 +182,7 @@ pub(crate) async fn surface_ws_open(
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut req = url.into_client_request().unwrap();
-    brenn_surface_kernel::insert_session_cookie(req.headers_mut(), session_token).unwrap();
+    brenn_attach_client::insert_session_cookie(req.headers_mut(), session_token).unwrap();
     let (ws, _resp) = tokio_tungstenite::connect_async(req)
         .await
         .expect("WS handshake should succeed (HTTP 101) for this test");

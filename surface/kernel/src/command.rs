@@ -43,15 +43,16 @@ use brenn_attach_client::router::{MessageStamp, Origin, RouteOutcome, RouteReque
 use brenn_attach_proto::{AlertSeverity, ClientFrame, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES};
 use brenn_envelope::Urgency;
 use brenn_queue::CursorOverflow;
-use brenn_surface_schema::{InstanceReport, LogLevel, StatusCounters};
+use brenn_surface_schema::LogLevel;
+use brenn_surface_schema::telemetry::{InstanceReport, StatusCounters};
 use serde_json::Number;
 
 use crate::activation::{DropVerdicts, Schedules};
-use crate::bindings::AppliedBindings;
-use crate::core::{PublishStatus, channel_is_transportable, check_publish, truncate_report_field};
+use crate::bindings::{AppliedBindings, channel_is_transportable};
 use crate::flush::PlaneRefusal;
 use crate::outbound::{
-    ErrorReport, PortPublish, PublishAnswer, ResolvedOutput, TelemetryKind, resolve_output,
+    ErrorReport, PortPublish, PublishAnswer, PublishStatus, ResolvedOutput, TelemetryKind,
+    check_publish, resolve_output, truncate_report_field,
 };
 use crate::page::{Detached, SurfacePage};
 use crate::registry::BindingKey;

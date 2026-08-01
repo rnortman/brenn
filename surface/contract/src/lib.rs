@@ -66,7 +66,8 @@
 //!   `message_id`.
 //! - **Attach is a delivery point.** When a port's queue comes into existence —
 //!   the instance's first registration, a re-registration, a binding added or a
-//!   port rebound at a later `Welcome` — the channel's retained tail, capped at
+//!   port rebound by a later bindings document — the channel's retained tail,
+//!   capped at
 //!   the binding's `push_depth`, arrives as **new**, not as context. So a message
 //!   published on a `local:` channel before its consumer existed still reaches
 //!   that consumer and still wakes it; a component may rely on `new` alone to
@@ -669,9 +670,9 @@ pub const SURFACE_READY: &str = "brenn-surface-ready";
 /// transpiled module of every named headless processor instance.
 ///
 /// Processor instantiation cannot ride the bootstrap's own module-loading pass:
-/// an instance's config map and its bindings row arrive with `Welcome`, i.e.
-/// after `start()`, and both the `config` import and registration admission
-/// resolve against them. The kernel therefore names its processor instances once
+/// an instance's config map and its bindings row arrive in the bindings
+/// document, i.e. after `start()`, and both the `config` import and registration
+/// admission resolve against them. The kernel therefore names its processor instances once
 /// its first bindings land, and the loader answers — kernel-decided, exactly like
 /// every other mount-plan outcome.
 pub const PROCESSOR_START: &str = "brenn-processor-start";
@@ -747,30 +748,6 @@ pub fn module_artifact(kind: &str) -> String {
 /// writes and the page manifest reads.
 pub fn processor_module_path(kind: &str) -> String {
     format!("processor/{kind}/{kind}.js")
-}
-
-/// Reserved instance id addressing the kernel's error-report output port. A
-/// surface error report rides an ordinary
-/// [`brenn_surface_schema::ClientFrame::Publish`] to `(ERROR_REPORT_INSTANCE,
-/// ERROR_REPORT_PORT)`. The `#` prefix makes the id operator-unusable — it can
-/// never satisfy [`is_valid_kind`], the charset every configured instance id is
-/// boot-validated against — so the reservation cannot collide with a configured
-/// component instance.
-pub const ERROR_REPORT_INSTANCE: &str = "#brenn";
-
-/// Reserved port name on [`ERROR_REPORT_INSTANCE`] the kernel publishes surface
-/// error reports to (bound to the operator's `surface_error_channel` when it is
-/// configured; absent otherwise).
-pub const ERROR_REPORT_PORT: &str = "error-reports";
-
-/// Whether `(instance, port)` names the reserved error-report output port. The
-/// single executable definition of that predicate, shared by every site that
-/// keys on the reserved port (the client gate, the core, and the server's
-/// publish handler) so the wire meaning of "the reserved port" has one home and
-/// cannot split across sites. Floor-aware callers gate this behind their
-/// advertised-floor check.
-pub fn is_error_report_port(instance: &str, port: &str) -> bool {
-    instance == ERROR_REPORT_INSTANCE && port == ERROR_REPORT_PORT
 }
 
 /// The kernel's own wasm-bindgen `--target web` module artifact. Unlike component
@@ -896,17 +873,6 @@ mod tests {
     fn module_artifact_maps_dashes_to_underscores() {
         assert_eq!(module_artifact("protobar"), "brenn_protobar.js");
         assert_eq!(module_artifact("echo-stub"), "brenn_echo_stub.js");
-    }
-
-    #[test]
-    fn error_report_instance_is_operator_unusable() {
-        // The reserved error-report instance id must never pass the charset every
-        // configured instance is validated against, so it can never collide with
-        // an operator-configured instance. Pinned so a charset loosening cannot
-        // silently make the reservation collidable.
-        assert!(!is_valid_kind(ERROR_REPORT_INSTANCE));
-        assert_eq!(ERROR_REPORT_INSTANCE, "#brenn");
-        assert_eq!(ERROR_REPORT_PORT, "error-reports");
     }
 
     #[test]

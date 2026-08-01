@@ -27,11 +27,12 @@ mod tests;
 
 use std::collections::BTreeMap;
 
+use brenn_surface_schema::InstanceState;
 use brenn_surface_schema::telemetry::{
     GeometryDocument, Health, StatusDocument, TELEMETRY_DOCUMENT_VERSION, TelemetryError,
     validate_viewport,
 };
-use brenn_surface_schema::{InstanceReport, InstanceState, OverlayReport, StatusCounters};
+use brenn_surface_schema::telemetry::{InstanceReport, OverlayReport, StatusCounters};
 
 use crate::bindings::AppliedBindings;
 

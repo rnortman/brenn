@@ -29,7 +29,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{InstanceReport, LogLevel, OverlayReport, StatusCounters};
+use std::collections::BTreeMap;
+
+use crate::{InstanceState, LogLevel};
 
 /// The body-schema version stamped on every telemetry document. Bumped whenever
 /// a document's shape changes; a reader that does not recognize the value
@@ -165,6 +167,85 @@ pub fn validate_viewport(
         ));
     }
     Ok(())
+}
+
+/// One instance's mount status inside a [`StatusDocument`]. The kernel writes
+/// the raw facts it already tracks at its mount/attach/panic decision points,
+/// and derives [`Health`] over the set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceReport {
+    /// The instance id (routing/mount key), one of the surface's configured
+    /// instances.
+    pub instance: String,
+    /// The component kind backing the instance.
+    pub kind: String,
+    pub state: InstanceState,
+    /// Short failure reason when `state` is `Failed` (module missing, element
+    /// undefined, component panic, terminal port event); `None` otherwise.
+    pub reason: Option<String>,
+    /// Count of delivery pumps attached to this instance's ports.
+    pub ports_attached: u32,
+}
+
+/// Kernel-side lifetime totals carried in a [`StatusDocument`]. The extensible
+/// counters object; v1 ships the kernel's own totals. Server-side drop counters
+/// are a future additive export.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusCounters {
+    /// Deliveries received by the kernel over the connection's lifetime.
+    pub deliveries: u64,
+    /// Publishes the kernel has sent.
+    pub publishes: u64,
+    /// Component errors/panics the kernel has observed.
+    pub errors: u64,
+    /// Telemetry documents the peer refused — rate-limited or over the body cap.
+    ///
+    /// Page-derived, unlike the three totals above: only the layer that settles a
+    /// telemetry publish's outcome knows it, so the page states this field from
+    /// its own count and whatever a reporter put here is discarded. A dropped
+    /// latest-wins document costs staleness only, so this is the sole account of
+    /// how stale the plane has been.
+    pub telemetry_dropped: u64,
+    /// Per-instance breakdown, keyed by instance id. The surface's totals above
+    /// answer "is the wall working?"; this answers "which component is doing
+    /// it?" — the same principal grain the bus meters and attributes publishes
+    /// at, carried onto the plane an operator reads.
+    ///
+    /// An instance that has neither published nor dropped may be absent — the map
+    /// reports what happened, so an absent key reads as zero.
+    pub instances: BTreeMap<String, InstanceCounters>,
+}
+
+/// One instance's lifetime totals within [`StatusCounters`].
+///
+/// Deliberately not a copy of the surface-wide triple. `deliveries` would
+/// duplicate what [`InstanceReport::ports_attached`] already tells an operator
+/// about a live instance, and `errors` is bounded at one per instance (an
+/// error-carded instance is dead and stops counting), so neither earns a
+/// per-instance column. What varies per instance without bound, and so answers
+/// a question the totals cannot, is what it *sent* and what it *lost*.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceCounters {
+    /// Publishes the kernel queued on this instance's behalf. Counted at the seam
+    /// — a publish this instance asked for, whether or not the bus later
+    /// accepted it — so it is the instance's *attempt* rate, which is what
+    /// reads against its send budget.
+    pub publishes: u64,
+    /// Messages dropped from this instance's port queues by push overflow
+    /// (drop-oldest, counted). Sustained non-zero drops mean the component is
+    /// not keeping up with its bindings' `push_depth`.
+    pub drops: u64,
+}
+
+/// The held-overlay fact a [`StatusDocument`] carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayReport {
+    /// The instance holding the overlay — one of the surface's configured
+    /// instances.
+    pub holder: String,
+    /// When the hold began: the publish time of the chrome transition the kernel
+    /// recorded it from.
+    pub since: DateTime<Utc>,
 }
 
 /// A live surface's mount snapshot, published on the status interval and
@@ -425,7 +506,6 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::{InstanceCounters, InstanceState};
 
     fn report(instance: &str, state: InstanceState) -> InstanceReport {
         InstanceReport {

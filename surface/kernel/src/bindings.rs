@@ -31,12 +31,32 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet};
 
 use brenn_attach_client::subs::SubscriptionDepths;
+use brenn_envelope::channel_capabilities;
 use brenn_surface_schema::bindings::{BindingsDocument, BindingsError, PlatformSection};
 use brenn_surface_schema::{
     Binding, ComponentEntry, LocalChannel, OutputBinding, RESERVED_LOCAL_CHANNELS,
+    surface_bindable_address,
 };
 
-use crate::core::channel_is_transportable;
+/// Whether this channel's messages cross the page/backend boundary.
+///
+/// The kernel's single derivation of the only channel-class distinction its
+/// delivery paths are allowed to make. Every channel the kernel routes came
+/// from boot-validated bindings or the reserved table, so an address the surface
+/// cannot bind at all is a kernel bug rather than a tolerated input — and that
+/// gate is what keeps a `mqtt:` address (durable and transportable on the bus,
+/// never a surface transport) fatal here instead of silently routed onto the
+/// wire. Past the gate every remaining scheme carries capabilities, so the
+/// derivation itself cannot come up empty.
+pub(crate) fn channel_is_transportable(channel: &str) -> bool {
+    assert!(
+        surface_bindable_address(channel),
+        "surface client: unbindable channel address reached the kernel: {channel:?}"
+    );
+    channel_capabilities(channel)
+        .expect("every surface-bindable scheme carries capabilities")
+        .transportable
+}
 
 /// One surface's wiring, ready to run on.
 ///

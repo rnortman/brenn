@@ -18,9 +18,8 @@ use chrono_tz::Tz;
 use tracing::{debug, warn};
 
 use crate::active_bridge::ActiveBridges;
-use crate::routes::surface::SubKey;
-use crate::routes::surface::registry::{DeferredViewPush, LiveDelivery, SessionPush};
-use crate::routes::surface::session::deferred_view_entries;
+use crate::routes::attach::publish::deferred_view_entries;
+use crate::routes::attach::registry::{DeferredViewPush, LiveDelivery, SessionPush};
 use crate::state::AppState;
 use crate::system_message::render_event_drain;
 
@@ -124,28 +123,21 @@ impl WakeRouterImpl {
         );
     }
 
-    /// Register the `SurfaceSessions` delivery route for every principal one
-    /// surface declares (`ResolvedSurface::principals` — the kernel identity
-    /// plus one per component instance). This is the whole per-surface half of
-    /// the host's delivery wiring; boot calls it once per installed surface and
-    /// test rigs call it for the same reason, so a fixture cannot register a
-    /// different route set than the running server.
+    /// Register the `SurfaceSessions` delivery route for one surface. This is
+    /// the whole per-surface half of the host's delivery wiring; boot calls it
+    /// once per installed surface and test rigs call it for the same reason, so
+    /// a fixture cannot register a different route set than the running server.
     ///
-    /// Every principal is its own subscriber and the router resolves a row's
-    /// route by the *subscriber's* registration key, so an unregistered instance
-    /// reaches the no-binding panic in `delivery_route`. The grain does not
-    /// change the route: the websocket is transport, and one session carries the
-    /// whole page's principals.
+    /// One binding, because the surface is the whole subscriber grain: the
+    /// websocket is transport, one session carries the whole page, and which
+    /// components sit behind a channel is the page's own bookkeeping. A surface
+    /// with no binding registered reaches the no-binding panic in
+    /// `delivery_route`.
     pub(crate) fn register_surface_delivery_routes(&self, surface: &ResolvedSurface) {
-        for instance in surface.principals() {
-            self.register_delivery_binding(
-                SubscriberEntryKind::Surface {
-                    slug: surface.slug.clone(),
-                    instance,
-                },
-                DeliveryBinding::SurfaceSessions,
-            );
-        }
+        self.register_delivery_binding(
+            SubscriberEntryKind::Surface(surface.slug.clone()),
+            DeliveryBinding::SurfaceSessions,
+        );
     }
 
     /// Whether a delivery binding is registered for `key`. Used by the boot
@@ -239,7 +231,7 @@ impl WakeRouter for WakeRouterImpl {
         // Only surface subscribers reach here: `surface_feed_targets` is the one
         // caller's target set, and every other kind holds a position and is served
         // from it.
-        let SubscriberEntryKind::Surface { slug, .. } = key else {
+        let SubscriberEntryKind::Surface(slug) = key else {
             panic!(
                 "WakeRouter::deliver called for non-surface subscriber {key:?} — only a surface \
                  subscription takes the row-less live feed"
@@ -251,24 +243,16 @@ impl WakeRouter for WakeRouterImpl {
             .expect("WakeRouter state must be set before any Surface deliver call");
         let retained_seq = retention_position(retained_seq);
 
-        // The subscription this delivery belongs to: the principal the feed target
-        // was resolved for, on the message's channel. `key` is the subscriber's
-        // registration key, so its instance half is the principal — never
-        // re-derived from the envelope.
-        let sub = SubKey {
-            instance: key.surface_subscriber_instance().to_owned(),
-            channel: envelope.channel.clone(),
-        };
-
-        // 1. Sessions holding this exact subscription. Filtering on the whole
-        //    subscription and not the channel is what keeps the delivery off a
-        //    sibling instance's ports: siblings are separate principals with
-        //    separate cursors, and this delivery is one principal's.
+        // 1. Sessions subscribed to the message's channel. Channel is the whole
+        //    key: an attachment holds at most one subscription per channel, and
+        //    whatever sits behind it on the attacher's side — one component's
+        //    binding or six — is the attacher's own bookkeeping. The directory
+        //    is cut at the same grain, so one message is one push per session.
         let subscribed: Vec<_> = state
-            .surface_registry
+            .attach_registry
             .sessions(slug)
             .into_iter()
-            .filter(|h| h.is_subscribed(&sub))
+            .filter(|h| h.is_subscribed(&envelope.channel))
             .collect();
 
         // 2. None attached+subscribed → nothing was owed to a disconnected
@@ -285,7 +269,6 @@ impl WakeRouter for WakeRouterImpl {
             let delivery = LiveDelivery {
                 envelope: envelope.clone(),
                 retained_seq,
-                sub: sub.clone(),
             };
             if handle.push_tx.try_send(SessionPush::Live(delivery)).is_ok() {
                 accepted += 1;
@@ -328,7 +311,7 @@ impl WakeRouter for WakeRouterImpl {
         // Row-less deliver-if-attached fan-out for a fold-0 surface subscription.
         // No push row: a fold-0 subscription has no push window, so the message
         // reaches an attached session only here, live.
-        let SubscriberEntryKind::Surface { slug, .. } = key else {
+        let SubscriberEntryKind::Surface(slug) = key else {
             // `resolve_context_targets` filters to Surface subscribers, so any
             // other kind here is a caller-side wiring bug.
             panic!(
@@ -341,19 +324,14 @@ impl WakeRouter for WakeRouterImpl {
             .get()
             .expect("WakeRouter state must be set before any deliver_context call");
 
-        let sub = SubKey {
-            instance: key.surface_subscriber_instance().to_owned(),
-            channel: envelope.channel.clone(),
-        };
-
-        // Sessions holding this exact subscription, per-principal. None attached
-        // → nothing owed to a disconnected session; its retained context arrives
-        // at the next subscribe/resume.
+        // Sessions subscribed to the message's channel. None attached → nothing
+        // owed to a disconnected session; its retained context arrives at the
+        // next subscribe/resume.
         let subscribed: Vec<_> = state
-            .surface_registry
+            .attach_registry
             .sessions(slug)
             .into_iter()
-            .filter(|h| h.is_subscribed(&sub))
+            .filter(|h| h.is_subscribed(&envelope.channel))
             .collect();
         if subscribed.is_empty() {
             return;
@@ -363,7 +341,6 @@ impl WakeRouter for WakeRouterImpl {
             let delivery = LiveDelivery {
                 envelope: envelope.clone(),
                 retained_seq: retention_position(retained_seq),
-                sub: sub.clone(),
             };
             if handle
                 .push_tx
@@ -402,11 +379,11 @@ impl WakeRouter for WakeRouterImpl {
             .state
             .get()
             .expect("WakeRouter state must be set before any deferred-view push");
-        state.surface_registry.push_deferred_view(
+        state.attach_registry.push_deferred_view(
             slug,
             &DeferredViewPush {
                 channel: channel.to_string(),
-                instance: instance.to_string(),
+                attribution: Some(instance.to_string()),
                 entries: deferred_view_entries(view),
             },
         );
@@ -417,7 +394,7 @@ impl WakeRouter for WakeRouterImpl {
             // No state wired yet — no session can be attached.
             return false;
         };
-        state.surface_registry.count(slug) > 0
+        state.attach_registry.count(slug) > 0
     }
 
     fn any_surface_session_subscribed(&self, channel: &str, targets: &[SurfaceFeedTarget]) -> bool {
@@ -427,18 +404,14 @@ impl WakeRouter for WakeRouterImpl {
         };
         targets.iter().any(|target| {
             let key = &target.kind;
-            let SubscriberEntryKind::Surface { slug, .. } = key else {
+            let SubscriberEntryKind::Surface(slug) = key else {
                 return false;
             };
-            let sub = SubKey {
-                instance: key.surface_subscriber_instance().to_owned(),
-                channel: channel.to_owned(),
-            };
             state
-                .surface_registry
+                .attach_registry
                 .sessions(slug)
                 .into_iter()
-                .any(|h| h.is_subscribed(&sub))
+                .any(|h| h.is_subscribed(channel))
         })
     }
 
@@ -538,7 +511,7 @@ impl WakeRouter for WakeRouterImpl {
                     .state
                     .get()
                     .expect("WakeRouter state must be set before any spawn_eager_wake call");
-                for handle in state.surface_registry.sessions(slug) {
+                for handle in state.attach_registry.sessions(slug) {
                     handle.drain_notify.notify_one();
                 }
             }
@@ -703,15 +676,11 @@ mod tests {
         SubscriberEntryKind::App("test-app".to_string())
     }
 
-    /// The registration key for the `deskbar` surface's `protobar` instance —
-    /// the principal these surface tests deliver to. Instance-grained, because
-    /// the router now resolves both the route and the target subscription from
-    /// this key.
+    /// The registration key for the `deskbar` surface — the whole grain these
+    /// surface tests deliver to, since the router resolves both the route and
+    /// the target sessions from the surface and the channel.
     fn surface_key() -> SubscriberEntryKind {
-        SubscriberEntryKind::Surface {
-            slug: "deskbar".to_string(),
-            instance: Some("protobar".to_string()),
-        }
+        SubscriberEntryKind::Surface("deskbar".to_string())
     }
 
     /// The push-enabled feed target for [`surface_key`], as the publish path
@@ -719,7 +688,6 @@ mod tests {
     fn surface_feed_target() -> SurfaceFeedTarget {
         SurfaceFeedTarget {
             kind: surface_key(),
-            subscriber: ParticipantId::for_surface_component("deskbar", "protobar"),
             push_enabled: true,
         }
     }
@@ -742,8 +710,9 @@ mod tests {
         use brenn_lib::messaging::{ChannelScheme, Urgency};
         use chrono::{TimeZone, Utc};
 
-        use crate::routes::attach::registry::SessionCaps;
-        use crate::routes::surface::registry::{PUSH_QUEUE_FRAMES, SurfaceSessionHandle};
+        use crate::routes::attach::registry::{
+            AttachSessionHandle, PUSH_QUEUE_FRAMES, SessionCaps,
+        };
 
         let db = brenn_lib::db::init_db_memory();
         let state = crate::test_support::state::test_state(&db);
@@ -752,10 +721,10 @@ mod tests {
 
         let attach = |slug: &str| {
             let (push_tx, push_rx) = tokio::sync::mpsc::channel(PUSH_QUEUE_FRAMES);
-            let mut handle = SurfaceSessionHandle::for_test("dev");
+            let mut handle = AttachSessionHandle::for_test("dev");
             handle.push_tx = push_tx;
             let guard = state
-                .surface_registry
+                .attach_registry
                 .try_register(slug, handle, SessionCaps::UNCAPPED)
                 .expect("the test registry is uncapped");
             (guard, push_rx)
@@ -791,7 +760,7 @@ mod tests {
                 panic!("expected a deferred view");
             };
             assert_eq!(pushed.channel, "brenn:sched");
-            assert_eq!(pushed.instance, "protobar");
+            assert_eq!(pushed.attribution.as_deref(), Some("protobar"));
             assert_eq!(pushed.entries.len(), 1);
             assert_eq!(pushed.entries[0].body, "wake me");
             assert_eq!(
@@ -1309,27 +1278,25 @@ mod tests {
         slug: &str,
         channel: &str,
     ) -> (
-        crate::routes::surface::registry::SurfaceSessionGuard,
+        crate::routes::attach::registry::AttachSessionGuard,
         tokio::sync::mpsc::Receiver<SessionPush>,
         Arc<tokio::sync::Notify>,
     ) {
-        use crate::routes::attach::registry::SessionCaps;
-        use crate::routes::surface::registry::{PUSH_QUEUE_FRAMES, SurfaceSessionHandle};
+        use crate::routes::attach::registry::{
+            AttachSessionHandle, PUSH_QUEUE_FRAMES, SessionCaps,
+        };
 
         let (push_tx, push_rx) = tokio::sync::mpsc::channel(PUSH_QUEUE_FRAMES);
-        let mut handle = SurfaceSessionHandle::for_test("dev");
+        let mut handle = AttachSessionHandle::for_test("dev");
         handle.push_tx = push_tx;
         handle
-            .active_subs
+            .active_channels
             .lock()
-            .expect("active_subs poisoned")
-            .insert(SubKey {
-                instance: "protobar".to_string(),
-                channel: channel.to_string(),
-            });
+            .expect("active_channels poisoned")
+            .insert(channel.to_string());
         let drain_notify = Arc::clone(&handle.drain_notify);
         let guard = state
-            .surface_registry
+            .attach_registry
             .try_register(slug, handle, SessionCaps::UNCAPPED)
             .expect("register");
         (guard, push_rx, drain_notify)

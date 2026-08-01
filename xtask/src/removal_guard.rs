@@ -350,7 +350,9 @@ mod tests {
     #[test]
     fn test_source_classification_is_component_anchored() {
         assert!(is_test_source(&p("surface/kernel/src/tests.rs")));
-        assert!(is_test_source(&p("surface/kernel/src/core/core_tests.rs")));
+        assert!(is_test_source(&p(
+            "brenn-server/src/routes/surface/ws_tests.rs"
+        )));
         assert!(is_test_source(&p("e2e/tests/bar.spec.ts")));
         assert!(!is_test_source(&p("surface/kernel/src/latests.rs")));
         assert!(!is_test_source(&p("brenn-lib/src/protests/mod.rs")));

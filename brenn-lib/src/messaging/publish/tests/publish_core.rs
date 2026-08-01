@@ -337,10 +337,7 @@ async fn the_fold0_context_feed_skips_a_parked_message_and_feeds_its_retention_p
     let (m, _, _, _, router) = super::build_messenger_with(
         1,
         vec![SubscriberEntry {
-            kind: SubscriberEntryKind::Surface {
-                slug: "deskbar".to_string(),
-                instance: None,
-            },
+            kind: SubscriberEntryKind::Surface("deskbar".to_string()),
             push_depth: Depth::Bounded(0),
             retain_depth: Depth::Unbounded,
             noise: NoiseLevel::Silent,
@@ -397,10 +394,7 @@ fn surface_subscriber(
         .push(ChannelMatcher::Prefix(String::new()));
     (
         SubscriberEntry {
-            kind: SubscriberEntryKind::Surface {
-                slug: "deskbar".to_string(),
-                instance: None,
-            },
+            kind: SubscriberEntryKind::Surface("deskbar".to_string()),
             push_depth,
             retain_depth: Depth::Unbounded,
             noise: NoiseLevel::Silent,

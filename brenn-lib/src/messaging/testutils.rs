@@ -130,45 +130,13 @@ pub fn wasm_registrations(
     registrations_for(policies, SubscriberEntryKind::Wasm, WakeEconomics::Eager)
 }
 
-/// Registrations for surface subscribers (`Eager` wake) at the **kernel grain**,
-/// from a `slug → policy` map. Component instances are separate principals and
-/// register separately; see [`surface_component_registrations`].
+/// Registrations for surface subscribers (`Eager` wake), from a `slug → policy`
+/// map. One per surface: authority is per-surface, and the directory is cut at
+/// (surface, channel), so a component instance names no registration of its own.
 pub fn surface_registrations(
     policies: HashMap<String, AppPolicy>,
 ) -> HashMap<SubscriberEntryKind, SubscriberRegistration> {
-    registrations_for(
-        policies,
-        |slug| SubscriberEntryKind::Surface {
-            slug,
-            instance: None,
-        },
-        WakeEconomics::Eager,
-    )
-}
-
-/// Registrations for one surface's component instances (`Eager` wake), all
-/// carrying `policy` — authority is per-surface, so boot installs the surface's
-/// own policy at every instance grain.
-pub fn surface_component_registrations(
-    slug: &str,
-    instances: &[&str],
-    policy: AppPolicy,
-) -> HashMap<SubscriberEntryKind, SubscriberRegistration> {
-    instances
-        .iter()
-        .map(|instance| {
-            (
-                SubscriberEntryKind::Surface {
-                    slug: slug.to_string(),
-                    instance: Some((*instance).to_string()),
-                },
-                SubscriberRegistration {
-                    policy: std::sync::Arc::new(policy.clone()),
-                    wake: WakeEconomics::Eager,
-                },
-            )
-        })
-        .collect()
+    registrations_for(policies, SubscriberEntryKind::Surface, WakeEconomics::Eager)
 }
 
 /// Registrations for system-substrate subscribers (`Eager` wake), from a

@@ -21,14 +21,14 @@ use brenn_attach_proto::{
 };
 use brenn_surface_contract::ActivationError;
 use brenn_surface_schema::bindings::BindingsDocument;
+use brenn_surface_schema::telemetry::StatusCounters;
 use brenn_surface_schema::{
-    CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, LogLevel, StatusCounters, ToastBody, ToastSeverity,
-    ToastSource,
+    CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, LogLevel, ToastBody, ToastSeverity, ToastSource,
 };
 use uuid::Uuid;
 
-use crate::core::PublishStatus;
 use crate::front::{self, EventStream, PublishReject, SurfaceHandle};
+use crate::outbound::PublishStatus;
 use crate::test_support::bindings as fixtures;
 use crate::test_support::frames::{
     deliver, deliver_at, frame, server_hello, subscribe_result, welcome as welcome_under,

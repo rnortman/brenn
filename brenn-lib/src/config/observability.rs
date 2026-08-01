@@ -15,7 +15,7 @@ pub struct ObservabilityConfig {
 
     /// Minimum level a surface publishes to `surface_error_channel`. A conforming
     /// shell publishes reports at this level and above and keeps lower levels
-    /// console-only; delivered to the shell in the `Welcome` floor field.
+    /// console-only; delivered to the shell in its bindings document.
     /// Only meaningful when `surface_error_channel` is set. Serde-typed as a
     /// [`LogLevel`], so an invalid level string fails config parse. Default
     /// `warn`.

@@ -9,15 +9,15 @@ use std::collections::{HashMap, HashSet};
 
 use brenn_attach_proto::AlertSeverity;
 
-use crate::proto::bindings::BindingsDocument;
-use crate::proto::{
-    CONTROL_PLANE_VERSION, InstanceReport, InstanceState, LOCAL_LINK_STATE_CHANNEL,
-    LOCAL_SURFACE_STATE_CHANNEL, LinkState, LinkStateBody, LogLevel, SurfaceStateBody,
-    SurfaceStateInstance,
+use crate::schema::bindings::BindingsDocument;
+use crate::schema::telemetry::InstanceReport;
+use crate::schema::{
+    CONTROL_PLANE_VERSION, InstanceState, LOCAL_LINK_STATE_CHANNEL, LOCAL_SURFACE_STATE_CHANNEL,
+    LinkState, LinkStateBody, LogLevel, SurfaceStateBody, SurfaceStateInstance,
 };
 use crate::session::Event;
 use crate::{PublishStatus, Urgency};
-use crate::{contract, proto};
+use crate::{contract, schema};
 
 /// Derive the surface's whole connect URL from the page's `location` and its
 /// build id. `https:` is the only secure scheme, so it maps to `wss:`; every
@@ -710,7 +710,7 @@ pub enum KernelAction {
     /// site, never derived.
     ///
     /// `subject` is the instance the report is *about*, which the executor sends
-    /// as the frame's `subject_instance` so the server stamps the report with that
+    /// as the report publish's `attribution` so the peer stamps it with that
     /// component's sub-identity. It is the report's subject, never its author: the
     /// kernel writes every one of these lines. Carrying it matters because a
     /// component looping on rejected publishes is exactly the flood whose reports
@@ -748,8 +748,8 @@ pub enum KernelAction {
         title: String,
         body: String,
     },
-    /// Report the current browser viewport to the server (a best-effort
-    /// `Geometry` telemetry frame via `ClientHandle::send_geometry`). Emitted by
+    /// Report the current browser viewport to the peer (a best-effort geometry
+    /// document via `SurfaceHandle::send_geometry`). Emitted by
     /// [`KernelCore::on_viewport_changed`] only when the viewport actually changed
     /// since the last report. `width`/`height` are CSS pixels;
     /// `device_pixel_ratio` is the display density.
@@ -758,13 +758,12 @@ pub enum KernelAction {
         height: u32,
         device_pixel_ratio: f64,
     },
-    /// Report the current per-instance mount status to the server (a best-effort
-    /// `Status` telemetry snapshot via [`ClientHandle::send_status`]). Emitted on
-    /// the status interval ([`KernelCore::on_status_tick`]) and immediately on any
-    /// transition into `failed`. `instances` is the
-    /// raw per-instance fact set; the DOM executor fills page uptime and the
-    /// lifetime counters it owns before handing the frame to the client via
-    /// `ClientHandle::send_status`.
+    /// Report the current per-instance mount status to the peer (a best-effort
+    /// status document via `SurfaceHandle::send_status`). Emitted on the status
+    /// interval ([`KernelCore::on_status_tick`]) and immediately on any
+    /// transition into `failed`. `instances` is the raw per-instance fact set;
+    /// the DOM executor fills page uptime and the lifetime counters it owns
+    /// before handing the report over.
     SendStatus { instances: Vec<InstanceReport> },
 }
 
@@ -778,7 +777,7 @@ struct Geometry {
 
 /// One instance's mount status, the kernel's own record of what it commanded at
 /// its mount/attach decision points plus the failures it later observed. Mapped
-/// to a [`proto::InstanceReport`](crate::proto::InstanceReport) for
+/// to a [`schema::InstanceReport`](crate::schema::InstanceReport) for
 /// a status report.
 #[derive(Debug, Clone, PartialEq)]
 struct InstanceStatus {
@@ -830,11 +829,11 @@ pub struct KernelCore {
     ///
     /// TODO(kernel-registration-gate-lifecycle): this set only ever grows — no
     /// unmount, error-card teardown, or binding removal clears it, and the kernel
-    /// never calls `ClientHandle::deregister_activation`. Correct while an
+    /// never calls `SurfaceHandle::deregister_activation`. Correct while an
     /// instance id is page-unique-forever (a layout change reloads the page). If
     /// an instance's element is ever torn down and a fresh element for the same
     /// id remounts within one page life, the gate rejects the remount's
-    /// registration as a duplicate while the core still holds the old detached
+    /// registration as a duplicate while the page still holds the old detached
     /// host's entry. Clearing must be wired with the kernel-driven instance-death
     /// path, distinguishing death (deregister + clear) from Phase-3 reparent
     /// (preserve delivery, never deregister).
@@ -1038,7 +1037,7 @@ impl KernelCore {
         self.bindings.as_ref().is_some_and(|b| {
             b.components
                 .iter()
-                .any(|c| c.instance == instance && c.abi == proto::Abi::Processor)
+                .any(|c| c.instance == instance && c.abi == schema::Abi::Processor)
         })
     }
 
@@ -1341,13 +1340,13 @@ impl KernelCore {
             // capped bootstrap path bounds the retry.
             let is_chrome = self.chrome_instance.as_deref() == Some(entry.instance.as_str());
             let mountable =
-                entry.abi == proto::Abi::Dom && is_element_defined(&entry.kind, &entry.instance);
+                entry.abi == schema::Abi::Dom && is_element_defined(&entry.kind, &entry.instance);
             if is_chrome && !mountable {
                 return vec![KernelAction::RequestReload {
                     reason: "chrome mount failed".to_string(),
                 }];
             }
-            let (state, reason) = if entry.abi == proto::Abi::Processor {
+            let (state, reason) = if entry.abi == schema::Abi::Processor {
                 // Headless by construction: no element to check, no wrapper, no
                 // mount. The bootstrap loader instantiates the transpiled module
                 // and registers the instance's `receive`; the row sits `Pending`
@@ -1357,7 +1356,7 @@ impl KernelCore {
                 // so the is_chrome check above can never select this arm.
                 headless.insert(entry.instance.as_str());
                 (InstanceState::Pending, None)
-            } else if entry.abi != proto::Abi::Dom {
+            } else if entry.abi != schema::Abi::Dom {
                 // The remaining ABIs are reserved and unloadable. Boot rejects
                 // them, so this is peer input the server should never send —
                 // error-carded, not panicked, because that is the containment this
@@ -1467,7 +1466,7 @@ impl KernelCore {
         let bound = bindings
             .outputs
             .iter()
-            .any(|b| b.instance == chrome && b.channel == proto::LOCAL_OVERLAY_STATE_CHANNEL);
+            .any(|b| b.instance == chrome && b.channel == schema::LOCAL_OVERLAY_STATE_CHANNEL);
         if bound {
             return None;
         }
@@ -1476,7 +1475,7 @@ impl KernelCore {
             message: format!(
                 "chrome instance {chrome} has no {} output binding: overlay state is \
                  unreportable and the status document will read no-overlay while one is held",
-                proto::LOCAL_OVERLAY_STATE_CHANNEL
+                schema::LOCAL_OVERLAY_STATE_CHANNEL
             ),
             // The surface's own wiring, not a component's conduct: no instance
             // did anything wrong, and the operator who reads it owns the config.
@@ -1954,8 +1953,8 @@ mod tests {
     use brenn_attach_proto::VersionRange;
 
     use crate::PublishStatus;
-    use crate::proto::bindings::{BINDINGS_DOCUMENT_VERSION, PlatformSection};
-    use crate::proto::{Abi, Binding, ComponentEntry};
+    use crate::schema::bindings::{BINDINGS_DOCUMENT_VERSION, PlatformSection};
+    use crate::schema::{Abi, Binding, ComponentEntry};
 
     // ── shared builders ───────────────────────────────────────────────────
 
@@ -3875,7 +3874,7 @@ mod tests {
             &Event::PlaneRefused {
                 instance: "meeting".to_string(),
                 port: "overlay-state".to_string(),
-                channel: proto::LOCAL_OVERLAY_STATE_CHANNEL.to_string(),
+                channel: schema::LOCAL_OVERLAY_STATE_CHANNEL.to_string(),
                 reason: "only the surface's chrome instance may publish it".to_string(),
             },
             |_, _| false,
@@ -3904,7 +3903,7 @@ mod tests {
     /// `connected_event_chrome` with the takeover grant and `outputs`.
     fn connected_event_takeover(
         components: Vec<ComponentEntry>,
-        outputs: Vec<proto::OutputBinding>,
+        outputs: Vec<schema::OutputBinding>,
     ) -> Event {
         let mut bindings = document(components, vec![]);
         bindings.chrome_instance = "chrome".to_string();
@@ -3914,9 +3913,9 @@ mod tests {
     }
 
     /// The chrome output binding that makes the overlay-state plane reportable.
-    fn overlay_state_output() -> proto::OutputBinding {
-        proto::OutputBinding {
-            channel: proto::LOCAL_OVERLAY_STATE_CHANNEL.to_string(),
+    fn overlay_state_output() -> schema::OutputBinding {
+        schema::OutputBinding {
+            channel: schema::LOCAL_OVERLAY_STATE_CHANNEL.to_string(),
             instance: "chrome".to_string(),
             port: "overlay-state".to_string(),
             urgency: Urgency::Normal,

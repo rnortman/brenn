@@ -298,8 +298,8 @@ fn resolve_send_budget(
 /// The knobs, their spelling, their defaults, and their validation are
 /// `[[wasm_consumer.output]]`'s — shared resolver, so the operator meets one
 /// vocabulary on both blocks and a component moved between hostings keeps its
-/// budget. The numbers ride `Welcome`; the kernel enforces them, because the
-/// kernel is what mints this component's activations.
+/// budget. The numbers ride the bindings document; the kernel enforces them
+/// because the kernel is what mints this component's activations.
 fn resolve_output_budget(slug: &str, out: &SurfaceOutputRaw) -> brenn_budget::SinkBudget {
     let field = |knob: &str| {
         format!(
@@ -929,30 +929,26 @@ pub(crate) fn resolve_surfaces(
         // Ring depth per declared `local:` channel, accumulated across bindings:
         // reserved channels take the contract-fixed depth, operator-declared
         // channels the max over their bindings' `retain_depth` (floor 1). First
-        // insertion order is preserved so `Welcome` lists them predictably.
+        // insertion order is preserved so the bindings document lists them
+        // predictably.
         let mut local_ring_depths: IndexMap<String, u64> = IndexMap::new();
 
         // Subscriptions (input bindings): item 6 coverage is `allows_channel_access`
         // over the full address. Every *transportable* binding additionally
         // resolves a `ResolvedSubscription` (depth/noise/wake inheritance) that
-        // becomes a `SubscriberEntryKind::Surface` directory entry — the one
-        // subscriber shape the live feed resolves, whichever store holds the
-        // channel's retention.
+        // folds into the surface's `SubscriberEntryKind::Surface` directory entry
+        // for that channel — the one subscriber shape the live feed resolves,
+        // whichever store holds the channel's retention.
         let mut subscriptions =
             Vec::with_capacity(surface.subscriptions.len() + io_subscriptions.len());
         let mut wire_subscriptions: Vec<ResolvedSurfaceSubscription> = Vec::new();
         let mut seen_sub_ports: HashSet<(&str, &str)> = HashSet::new();
-        // One subscription per **(instance, channel)**: the subscribing
-        // principal is the instance, so two instances bound to one channel are two
-        // subscriptions with two delivery windows and two wire positions — the
-        // same shape two `[[app]]` blocks on one channel produce, and the reason
-        // the `(channel_uuid, app_slug)` PK does not collide (their keys carry
-        // distinct `#<instance>` tails).
+        // One resolved subscription per **(instance, channel)**: each
+        // component's depths and noise on a channel are resolved independently.
         //
         // Index into `wire_subscriptions`, so a repeated (instance, channel) —
-        // one instance binding one channel on two ports, the only case where a
-        // surface subscription is genuinely shared — folds into the entry already
-        // resolved rather than double-installing the subscriber.
+        // one instance binding one channel on two ports — folds into the entry
+        // already resolved rather than resolving a second one.
         let mut seen_wire: std::collections::HashMap<(String, uuid::Uuid), usize> =
             std::collections::HashMap::new();
         for (sub, direction) in surface

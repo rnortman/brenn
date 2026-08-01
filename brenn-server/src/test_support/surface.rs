@@ -7,12 +7,11 @@ use brenn_lib::messaging::config::{
 
 /// The `[surface_description]` parameters a runtime fixture carries. Taken from
 /// the config section's own defaults, so a fixture's derived telemetry channel
-/// addresses and heartbeat cadence read like an operator's who tuned nothing.
+/// addresses read like an operator's who tuned nothing.
 pub(crate) fn description_params() -> crate::routes::surface::SurfaceDescriptionParams {
     let config = brenn_lib::config::SurfaceDescriptionConfig::default();
     crate::routes::surface::SurfaceDescriptionParams {
         prefix: config.prefix,
-        status_interval_secs: config.status_interval_secs,
     }
 }
 
@@ -160,19 +159,6 @@ impl SurfaceFixture {
     pub(crate) fn publish_rate(mut self, burst: u32, per_sec: u32) -> Self {
         self.inner.publish_burst = burst;
         self.inner.publish_per_sec = per_sec;
-        self
-    }
-
-    /// Append a resolved wire input subscription owned by `instance`, stating
-    /// its depths explicitly — for tests about the depths themselves. A binding
-    /// without one gets a derived subscription at [`build`](Self::build) time.
-    pub(crate) fn durable_subscribe(mut self, instance: &str, sub: ResolvedSubscription) -> Self {
-        self.inner
-            .wire_subscriptions
-            .push(ResolvedSurfaceSubscription {
-                instance: instance.to_owned(),
-                subscription: sub,
-            });
         self
     }
 

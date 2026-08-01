@@ -1010,3 +1010,331 @@ async fn a_dead_writer_disconnects_the_deferred_view_path() {
         FrameOutcome::Disconnect
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Class parity
+// ---------------------------------------------------------------------------
+
+/// The ephemeral twin of [`ADDR`], scheme-qualified and bare.
+const EPH_ADDR: &str = "ephemeral:ephemeral-demo";
+const EPH_BARE: &str = "ephemeral-demo";
+
+/// The ephemeral ring's own retention. Sized well above anything the parity
+/// script asks for, so what clamps a replay is the subscription's depth on both
+/// classes rather than the ring on one of them.
+const EPH_RING_DEPTH: u64 = 64;
+
+/// The two channel classes. Durable and ephemeral differ in what a restart
+/// destroys and in nothing a session can observe, which is the property this
+/// section exists to pin: every class-conditional decision the plane makes —
+/// cursor minting against the store's epoch, gap on a hole past retention,
+/// foreign-epoch resume, the drain span the clamp leaves — is the same decision
+/// on both.
+#[derive(Clone, Copy, Debug)]
+enum Class {
+    Durable,
+    Ephemeral,
+}
+
+impl Class {
+    fn addr(self) -> &'static str {
+        match self {
+            Class::Durable => ADDR,
+            Class::Ephemeral => EPH_ADDR,
+        }
+    }
+}
+
+/// One attachment over one channel of the given class, with the profile
+/// admitting it at depth 8 both ways and the policy covering it.
+struct ParityRig {
+    ctx: AttachSessionCtx,
+    rx: mpsc::Receiver<ServerFrame>,
+    class: Class,
+    channel_uuid: Uuid,
+    db: Db,
+    /// Rows committed so far, for the durable seeder's ascending timestamps.
+    committed: i64,
+}
+
+async fn parity_rig(db: &Db, class: Class) -> ParityRig {
+    let (messenger, channel_uuid, policy) = match class {
+        Class::Durable => {
+            let (messenger, uuid) = one_channel_messenger(db, BARE).await;
+            let mut policy = AppPolicy::default();
+            policy.grants.insert(AppCapability::MessagingSubscribe);
+            policy.acls.brenn_subscribe = vec![ChannelMatcher::Exact(BARE.to_string())];
+            (messenger, uuid, policy)
+        }
+        Class::Ephemeral => {
+            let (messenger, uuid) = crate::test_support::attach::one_ephemeral_channel_messenger(
+                db,
+                EPH_BARE,
+                EPH_RING_DEPTH,
+            );
+            let mut policy = AppPolicy::default();
+            policy.grants.insert(AppCapability::EphemeralSubscribe);
+            policy.acls.ephemeral_subscribe = vec![ChannelMatcher::Exact(EPH_BARE.to_string())];
+            (messenger, uuid, policy)
+        }
+    };
+
+    let profile = TestProfile {
+        subscribable: HashMap::from([(
+            class.addr().to_string(),
+            SubscriptionFacts {
+                push_depth: 8,
+                retain_depth: 8,
+            },
+        )]),
+        subscribe_burst: 8,
+        ..TestProfile::new()
+    };
+    let (ctx, rx) = AttachCtxBuilder::new(profile)
+        .messenger(messenger)
+        .policy(policy)
+        .build();
+    ParityRig {
+        ctx,
+        rx,
+        class,
+        channel_uuid,
+        db: db.clone(),
+        committed: 0,
+    }
+}
+
+/// Land one message on the rig's channel without feeding it to the session.
+///
+/// The two arms are the two substrates — a durable channel's retention is the
+/// database's, an ephemeral channel's is a ring — which is exactly the
+/// difference the script exists to prove a session cannot see.
+async fn parity_commit(rig: &mut ParityRig, body: &str) {
+    rig.committed += 1;
+    match rig.class {
+        Class::Durable => seed(&rig.db, rig.channel_uuid, body, 100 * rig.committed).await,
+        Class::Ephemeral => {
+            let sender = brenn_lib::messaging::ParticipantId::for_surface("seed");
+            let mut policy = AppPolicy::default();
+            policy.grants.insert(AppCapability::EphemeralPublish);
+            policy.acls.ephemeral_publish = vec![ChannelMatcher::Exact(EPH_BARE.to_string())];
+            let dest = rig
+                .ctx
+                .messenger
+                .resolve_prepaid(&sender, &policy, EPH_ADDR);
+            let _ = rig
+                .ctx
+                .messenger
+                .publish_prepaid(
+                    &dest,
+                    brenn_lib::messaging::PrepaidEntry {
+                        body,
+                        urgency: brenn_lib::messaging::Urgency::Normal,
+                        publish_ts: chrono::Utc::now(),
+                    },
+                )
+                .await;
+        }
+    }
+}
+
+/// The channel's retained window, for building a live push out of a real
+/// envelope rather than a hand-assembled one.
+async fn parity_window(rig: &ParityRig) -> Vec<StoreRetained> {
+    rig.ctx
+        .messenger
+        .store_for_address(rig.class.addr())
+        .replay_from(None, Depth::Bounded(64))
+        .await
+        .messages
+}
+
+/// One frame reduced to what the script pins: everything except the values a
+/// class is entitled to differ in — the address, the epoch its seqs are numbered
+/// in, and the store incarnation stamped beside them.
+fn parity_line(frame: &ServerFrame) -> String {
+    match frame {
+        ServerFrame::SubscribeResult {
+            outcome,
+            replay_count,
+            gap,
+            ..
+        } => format!(
+            "subscribe_result outcome={outcome:?} replay={replay_count} gap={:?}",
+            gap.map(|g| g.reason)
+        ),
+        ServerFrame::Deliver {
+            envelope,
+            seq,
+            cursor,
+            dropped,
+            ..
+        } => {
+            let state = cursor::parse(cursor).expect("a server-minted cursor parses");
+            // Both numbers, because they are different numbers and both must
+            // match across classes: `span` is the per-subscribe wire counter the
+            // attacher orders on, `pos` the retention position the cursor
+            // carries.
+            format!(
+                "deliver body={} span={seq} pos={} dropped={dropped}",
+                envelope.body, state.resume.seq
+            )
+        }
+        other => panic!("the parity script expects no {other:?}"),
+    }
+}
+
+/// Drain what the handlers enqueued into the transcript, returning the cursor the
+/// last `Deliver` among them carried.
+fn parity_record(rig: &mut ParityRig, transcript: &mut Vec<String>) -> Option<Cursor> {
+    let mut held = None;
+    for frame in frames(&mut rig.rx) {
+        if let ServerFrame::Deliver { cursor, .. } = &frame {
+            held = Some(cursor.clone());
+        }
+        transcript.push(parity_line(&frame));
+    }
+    held
+}
+
+/// Drive the whole scenario against one class and return its transcript.
+async fn run_parity_script(class: Class) -> Vec<String> {
+    let db = brenn_lib::db::init_db_memory();
+    let mut rig = parity_rig(&db, class).await;
+    let addr = class.addr();
+    let mut transcript: Vec<String> = Vec::new();
+
+    // 1. Two rows land with nobody attached; a fresh cursorless subscribe
+    //    replays them.
+    parity_commit(&mut rig, "m1").await;
+    parity_commit(&mut rig, "m2").await;
+    let mut wire = Wire::new(&rig.ctx);
+    assert!(matches!(
+        wire.subscribe(&rig.ctx, addr, 8, 8, None).await,
+        FrameOutcome::Continue
+    ));
+    let mut held = parity_record(&mut rig, &mut transcript);
+
+    // 2. A live row on the attached subscription, contiguous with its position.
+    parity_commit(&mut rig, "m3").await;
+    let window = parity_window(&rig).await;
+    let push = live(&window, 3);
+    assert!(matches!(
+        wire.push(&rig.ctx, vec![push]).await,
+        FrameOutcome::Continue
+    ));
+    held = parity_record(&mut rig, &mut transcript).or(held);
+
+    // 3. Nothing it already holds is served again.
+    assert!(matches!(wire.drain(&rig.ctx).await, FrameOutcome::Continue));
+    assert!(
+        parity_record(&mut rig, &mut transcript).is_none(),
+        "the drain owed nothing"
+    );
+    transcript.push("quiet".to_string());
+
+    // 4. A fresh connection echoing the cursor the attacher holds: caught up.
+    let mut wire = Wire::new(&rig.ctx);
+    assert!(matches!(
+        wire.subscribe(&rig.ctx, addr, 8, 8, held.clone()).await,
+        FrameOutcome::Continue
+    ));
+    held = parity_record(&mut rig, &mut transcript).or(held);
+
+    // 5. A row lands while detached; the next connection resumes exactly onto
+    //    it. A new subscribe opens a new span, so the span counter restarts at 1
+    //    while the position carries on — the two numbers part company here, and
+    //    must part company identically on both classes.
+    parity_commit(&mut rig, "m4").await;
+    let mut wire = Wire::new(&rig.ctx);
+    assert!(matches!(
+        wire.subscribe(&rig.ctx, addr, 8, 8, held.clone()).await,
+        FrameOutcome::Continue
+    ));
+    held = parity_record(&mut rig, &mut transcript).or(held);
+
+    // 6. A resume above everything the channel ever assigned: answered as a
+    //    fresh attach under a gap, on both classes — never as a violation.
+    let echoed = cursor::parse(&held.expect("the script received a cursor")).expect("parses");
+    let ahead = cursor::mint(
+        echoed.incarnation,
+        addr,
+        ResumeCursor {
+            epoch: echoed.resume.epoch,
+            seq: echoed.resume.seq + 500,
+        },
+    );
+    let mut wire = Wire::new(&rig.ctx);
+    assert!(matches!(
+        wire.subscribe(&rig.ctx, addr, 8, 8, Some(ahead)).await,
+        FrameOutcome::Continue
+    ));
+    let held = parity_record(&mut rig, &mut transcript);
+
+    // 7. A cursor stamped with an incarnation the store never reached — what a
+    //    backup restore leaves an attacher holding. The same fresh attach, which
+    //    pins that the cursors this connection minted carry the store's real
+    //    incarnation on both classes.
+    let echoed = cursor::parse(&held.expect("step 6 delivered a cursor")).expect("parses");
+    let stale = cursor::mint(echoed.incarnation + 1, addr, echoed.resume);
+    let mut wire = Wire::new(&rig.ctx);
+    assert!(matches!(
+        wire.subscribe(&rig.ctx, addr, 8, 8, Some(stale)).await,
+        FrameOutcome::Continue
+    ));
+    parity_record(&mut rig, &mut transcript);
+
+    transcript
+}
+
+/// The transcript both classes must produce, spelled out so this pins the
+/// behavior rather than only pinning the two classes to each other.
+const PARITY_TRANSCRIPT: &[&str] = &[
+    // 1. Fresh cursorless subscribe over a two-row window.
+    "subscribe_result outcome=Ok replay=2 gap=None",
+    "deliver body=m1 span=1 pos=1 dropped=0",
+    "deliver body=m2 span=2 pos=2 dropped=0",
+    // 2. The live row.
+    "deliver body=m3 span=3 pos=3 dropped=0",
+    // 3. At most once.
+    "quiet",
+    // 4. Resume at the held cursor: up to date, nothing owed.
+    "subscribe_result outcome=Ok replay=0 gap=None",
+    // 5. Resume onto the one row missed while detached.
+    "subscribe_result outcome=Ok replay=1 gap=None",
+    "deliver body=m4 span=1 pos=4 dropped=0",
+    // 6. Resume ahead: a fresh attach under EpochChanged over the whole window.
+    "subscribe_result outcome=Ok replay=4 gap=Some(EpochChanged)",
+    "deliver body=m1 span=1 pos=1 dropped=0",
+    "deliver body=m2 span=2 pos=2 dropped=0",
+    "deliver body=m3 span=3 pos=3 dropped=0",
+    "deliver body=m4 span=4 pos=4 dropped=0",
+    // 7. A stale incarnation: the same fresh attach.
+    "subscribe_result outcome=Ok replay=4 gap=Some(EpochChanged)",
+    "deliver body=m1 span=1 pos=1 dropped=0",
+    "deliver body=m2 span=2 pos=2 dropped=0",
+    "deliver body=m3 span=3 pos=3 dropped=0",
+    "deliver body=m4 span=4 pos=4 dropped=0",
+];
+
+/// **The maxim's pin.** A durable channel and an ephemeral one are one channel
+/// from a session's point of view; any future re-divergence fails here rather
+/// than reaching production with the suite green.
+#[tokio::test]
+async fn the_two_channel_classes_produce_one_transcript() {
+    let durable = run_parity_script(Class::Durable).await;
+    let ephemeral = run_parity_script(Class::Ephemeral).await;
+
+    assert_eq!(
+        durable, ephemeral,
+        "the session answered a durable channel differently from an ephemeral one"
+    );
+    assert_eq!(
+        durable,
+        PARITY_TRANSCRIPT
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>(),
+        "the transcript both classes agree on is not the one the design specifies"
+    );
+}

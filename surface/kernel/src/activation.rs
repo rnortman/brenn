@@ -51,12 +51,13 @@ use brenn_attach_client::publish::DeferredViews;
 use brenn_attach_client::router::{LocalRouter, Origin, PlanePolicy};
 use brenn_attach_client::subs::SubscriptionDepths;
 use brenn_queue::CursorOverflow;
-use brenn_surface_contract::{Activation, DeferredEntry, DeferredWindow, PortWindow};
+use brenn_surface_contract::{
+    Activation, ActivationError, DeferredEntry, DeferredWindow, PortWindow,
+};
 use brenn_surface_schema::NoiseLevel;
 use uuid::Uuid;
 
-use crate::bindings::AppliedBindings;
-use crate::core::channel_is_transportable;
+use crate::bindings::{AppliedBindings, channel_is_transportable};
 use crate::publish_buffer::{OutputSpec, PublishBuffer};
 use crate::registry::{BindingKey, Registrations, SurfaceStores};
 
@@ -142,6 +143,32 @@ pub struct ActivationCtx<'a, P> {
     /// The wall clock this assembly was read at, epoch milliseconds UTC. A
     /// component gets time only here — an activation stays hermetic.
     pub now_ms: u64,
+}
+
+/// How an invoked activation entry finished.
+///
+/// Three outcomes, not two, because err and trap are different facts about the
+/// component and the design gives them different consequences. The invocation
+/// boundary discriminates them: a returned `Err` is `Err`, an unwind (a JS
+/// exception under wasm, a `catch_unwind` natively) is `Trap`.
+///
+/// The two failure arms carry the component's own account of what went wrong.
+/// The kernel never parses it — every err is treated identically — but it is the
+/// only answer anyone has to "failed *how*?", so it rides through to the
+/// diagnostic event rather than being dropped at the boundary that observed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationOutcome {
+    /// Returned ok. The buffer flushes atomically, in call order.
+    Ok,
+    /// Returned err, with the component's description of why. The buffer is
+    /// discarded and a failure is counted; the instance keeps running and keeps
+    /// being delivered. A failed activation is not a death — backend parity.
+    Err(ActivationError),
+    /// Panicked, with the unwind's message where one could be recovered. The
+    /// buffer is discarded and the instance is terminal: its memory is presumed
+    /// poisoned, so nothing further is delivered to it. Terminal for that one
+    /// instance, never page death.
+    Trap(String),
 }
 
 /// One activation, ready to invoke: which instance, what it sees, the buffer its

@@ -6,10 +6,10 @@ use brenn_surface_schema::bindings::{
 use brenn_surface_schema::telemetry::{
     DEVICE_PIXEL_RATIO_MAX, GeometryDocument, Health, StatusDocument, VIEWPORT_DIMENSION_MAX,
 };
-use brenn_surface_schema::{
-    Abi, Binding, ComponentEntry, InstanceCounters, InstanceReport, InstanceState, NoiseLevel,
-    OverlayReport, StatusCounters,
+use brenn_surface_schema::telemetry::{
+    InstanceCounters, InstanceReport, OverlayReport, StatusCounters,
 };
+use brenn_surface_schema::{Abi, Binding, ComponentEntry, InstanceState, NoiseLevel};
 use chrono::{TimeZone, Utc};
 
 use super::{StatusReport, derive_health, expected_pumps, geometry_body, status_body};
