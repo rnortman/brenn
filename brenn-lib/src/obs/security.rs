@@ -70,17 +70,17 @@ pub enum SecurityEventType {
     /// misconfigured proxy could fire this on every request. Captured by the
     /// existing fail2ban jail without regex changes (`security_event = true`).
     ForwardedHeaderInvalid,
-    /// A surface WebSocket connection sent a frame a correct shell structurally
+    /// An attach WebSocket connection sent a frame a correct attacher structurally
     /// cannot produce: unparseable JSON, an unknown frame type, a binary frame, a
     /// frame larger than the derived read cap (no config-legal frame can exceed
     /// it), a `Subscribe` to an unbound channel, a duplicate or class-mismatched
     /// `Subscribe`, a resume seq the server never assigned, an `Unsubscribe` of a
-    /// non-active channel, or a `Publish` to an unbound port. Either a shell bug
-    /// or tampering; both are reject-and-log per the security posture. The
+    /// non-active channel, or a `Publish` to an unbound port. Either an attacher
+    /// bug or tampering; both are reject-and-log per the security posture. The
     /// connection is killed with no response frame, and the source IP is banned by
     /// fail2ban after repeated hits (same `security_event = true` jail — no regex
     /// changes).
-    SurfaceProtocolViolation,
+    AttachProtocolViolation,
     /// A hosted app's LLM `BrennSend` attempted an `ephemeral:` publish that was
     /// denied (bad address shape, unknown channel, ACL, oversized body, or no
     /// sender grant). CC output is attacker-influenceable, so a denial flood is a
@@ -142,7 +142,7 @@ impl fmt::Display for SecurityEventType {
             Self::ReplayMonotonicity => write!(f, "replay_monotonicity"),
             Self::ReplayMalformed => write!(f, "replay_malformed"),
             Self::ForwardedHeaderInvalid => write!(f, "forwarded_header_invalid"),
-            Self::SurfaceProtocolViolation => write!(f, "surface_protocol_violation"),
+            Self::AttachProtocolViolation => write!(f, "attach_protocol_violation"),
             Self::EphemeralPublishDenied => write!(f, "ephemeral_publish_denied"),
             Self::BrennPublishDenied => write!(f, "brenn_publish_denied"),
             Self::MqttPublishDenied => write!(f, "mqtt_publish_denied"),
@@ -396,8 +396,8 @@ mod tests {
             "forwarded_header_invalid"
         );
         assert_eq!(
-            SecurityEventType::SurfaceProtocolViolation.to_string(),
-            "surface_protocol_violation"
+            SecurityEventType::AttachProtocolViolation.to_string(),
+            "attach_protocol_violation"
         );
         assert_eq!(
             SecurityEventType::EphemeralPublishDenied.to_string(),

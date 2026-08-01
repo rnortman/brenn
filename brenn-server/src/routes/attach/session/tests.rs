@@ -759,7 +759,7 @@ async fn a_violation_ends_the_attachment_and_raises_one_security_event() {
     let alerts = captured.lock().expect("captured");
     assert_eq!(alerts.len(), 1);
     let (_severity, title, body) = &alerts[0];
-    assert!(title.contains("surface_protocol_violation"), "{title}");
+    assert!(title.contains("attach_protocol_violation"), "{title}");
     assert!(body.contains(&format!(
         "attacher surface:{ATTACHER} account dev: unparseable client frame"
     )));

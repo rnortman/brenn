@@ -481,7 +481,7 @@ where
     if let Some(detail) = &violation_detail {
         log_and_alert_security_event(
             &ctx.alert_dispatcher,
-            SecurityEventType::SurfaceProtocolViolation,
+            SecurityEventType::AttachProtocolViolation,
             ctx.ip,
             detail,
         );
