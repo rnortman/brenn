@@ -74,7 +74,14 @@ async function publishVia(
   instance: string,
   body: string,
 ): Promise<void> {
-  const el = feeder.locator(`brenn-echo-stub[data-instance="${instance}"]`);
+  // Tag names follow `brenn-<kind>--<instance>` (canonical source:
+  // `element_name_for_instance` in `surface/contract/src/lib.rs`).
+  // `data-instance` is a second assertion of the same identity.
+  // TODO(e2e-tag-scheme-tie): this literal re-encodes the Rust tag scheme with
+  // nothing mechanical tying the two together.
+  const el = feeder.locator(
+    `brenn-echo-stub--${instance}[data-instance="${instance}"]`,
+  );
   await expect(el).toBeAttached({ timeout: CHAIN_TIMEOUT });
   await el.evaluate((node: Element, b: string) => {
     node.dispatchEvent(

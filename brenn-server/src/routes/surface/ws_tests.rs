@@ -545,7 +545,7 @@ async fn surface_ws_subscribe_to_an_unbound_channel_is_a_violation() {
         drain_until_closed(&mut ws).await,
         "a violation tears the attachment down"
     );
-    assert_single_alert(&flusher, &alerts, "surface_protocol_violation").await;
+    assert_single_alert(&flusher, &alerts, "attach_protocol_violation").await;
 }
 
 /// **No existence oracle.** A channel that exists — declared, on the bus, and
@@ -595,7 +595,7 @@ async fn surface_ws_subscribe_gives_no_existence_oracle_across_surfaces() {
         .collect();
     for text in &texts {
         assert!(
-            text.contains("surface_protocol_violation"),
+            text.contains("attach_protocol_violation"),
             "expected a protocol violation, got {text}"
         );
     }

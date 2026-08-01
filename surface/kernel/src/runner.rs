@@ -1072,3 +1072,60 @@ enum FrontWoke {
     Alert(Option<AlertCommand>),
     Telemetry(Option<TelemetryCommand>),
 }
+
+/// The browser half of the yield contract, executed rather than reasoned about.
+///
+/// The native starvation tests in `runner/tests.rs` pin that the loop yields
+/// between passes and rotates fairly, but they run under tokio and say nothing
+/// about the JS event loop. What remains is the property `yield_now` exists
+/// for: the hop reaches the browser's **task** queue, not just its microtask
+/// queue — the difference between a publish cycle costing the page a turn and
+/// hanging the tab.
+///
+/// Lives in `runner.rs` rather than beside the native suite because `yield_now`
+/// is private to this module.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::yield_now;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// A zero-delay timer armed *before* the yield must have run by the time the
+    /// yield resolves.
+    ///
+    /// Determinism is the HTML timer queue's, not real time's: same-delay timers
+    /// fire in registration order, and `yield_now` arms its own zero-delay timer
+    /// only when it is first polled — i.e. after this one. So if the await ever
+    /// reaches a task, it reaches this task first. A microtask-chained
+    /// implementation resolves at the microtask checkpoint, before the event loop
+    /// returns to tasks at all, and leaves the flag false.
+    #[wasm_bindgen_test]
+    async fn yield_now_reaches_the_browser_task_queue() {
+        let window = web_sys::window().expect("browser test page has a Window");
+        let fired = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&fired);
+        // Held alive across the await: a dropped `Closure` is invalidated, and the
+        // callback would be gone before the timer fired.
+        let callback = Closure::once(move || flag.set(true));
+        window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                callback.as_ref().unchecked_ref(),
+                0,
+            )
+            .expect("setTimeout is available in the browser");
+
+        assert!(!fired.get(), "a timer callback cannot run synchronously");
+        yield_now().await;
+        assert!(
+            fired.get(),
+            "yield_now resolved without the event loop reaching its task queue"
+        );
+
+        drop(callback);
+    }
+}

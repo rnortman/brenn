@@ -71,12 +71,7 @@ pub fn init(config: &ObsConfig) -> ObsGuard {
         .register_signal(libc::SIGHUP)
         .expect("failed to register SIGHUP for security log");
     let (security_writer, security_guard) = tracing_appender::non_blocking(security_file);
-    let security_layer = fmt::layer()
-        .json()
-        .with_ansi(false)
-        .with_target(false)
-        .with_writer(security_writer)
-        .with_filter(SecurityEventFilter);
+    let security_layer = security_log_layer(security_writer);
 
     tracing_subscriber::registry()
         .with(console_layer)
@@ -158,11 +153,23 @@ pub fn init(config: &ObsConfig) -> ObsGuard {
     }
 }
 
+/// The formatter configuration has exactly one definition because the deployed
+/// fail2ban filter (deploy/fail2ban/brenn.conf) parses the bytes it emits, and a
+/// test pins that coupling by building this same layer over an in-memory writer.
+fn security_log_layer<S, W>(writer: W) -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'w> fmt::MakeWriter<'w> + 'static,
+{
+    fmt::layer()
+        .json()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(writer)
+        .with_filter(SecurityEventFilter)
+}
+
 /// Filter that only passes events with `security_event = true`.
-///
-/// This uses the visitor pattern to inspect structured fields on each event.
-/// Only events that explicitly set `security_event = true` pass through to
-/// the security log stream.
 #[derive(Clone)]
 struct SecurityEventFilter;
 
@@ -209,6 +216,8 @@ pub(super) fn open_log_file(path: &Path) -> std::io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use regex::Regex;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     /// A minimal layer that counts events it receives, for testing filters.
@@ -379,5 +388,111 @@ mod tests {
         });
 
         assert_eq!(*count.lock().unwrap(), 0);
+    }
+
+    /// An in-memory `MakeWriter` so a test can read the exact bytes the security
+    /// layer emits.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("security log is UTF-8")
+        }
+    }
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// What fail2ban expands `<HOST>` to, approximated for an IPv4 literal. The
+    /// substitution is the test's, so what the assertion pins is the field
+    /// names, their order, and the single-line JSON shape — not fail2ban's own
+    /// address grammar.
+    const HOST_PATTERN: &str = r"(?P<host>[\w\-.]+)";
+
+    /// Reads the live fail2ban regex so the test breaks when either side of
+    /// the coupling drifts.
+    fn deployed_failregex() -> Regex {
+        let conf_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/fail2ban/brenn.conf");
+        let conf = std::fs::read_to_string(&conf_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", conf_path.display()));
+        let pattern = conf
+            .lines()
+            .find_map(|line| line.strip_prefix("failregex"))
+            .and_then(|rest| rest.split_once('='))
+            .map(|(_, pattern)| pattern.trim().to_string())
+            .unwrap_or_else(|| panic!("no failregex line in {}", conf_path.display()));
+        Regex::new(&pattern.replace("<HOST>", HOST_PATTERN))
+            .unwrap_or_else(|e| panic!("compile failregex {pattern:?}: {e}"))
+    }
+
+    /// The security log's whole reason for existing is that fail2ban can parse a
+    /// bannable IP out of it. Nothing else asserts that: the field order in
+    /// `log_security_event`, the JSON formatter configuration here, and the
+    /// deployed regex are three independently editable things whose agreement is
+    /// otherwise only written down in comments. Emit through the real layer and
+    /// match the real regex.
+    #[test]
+    fn peer_security_log_line_matches_the_deployed_failregex() {
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::registry().with(security_log_layer(buf.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            crate::obs::security::log_security_event(
+                crate::obs::security::SecurityEventType::AttachProtocolViolation,
+                "10.0.0.1".parse().unwrap(),
+                "unparseable frame",
+            );
+        });
+
+        let line = buf.contents();
+        let caps = deployed_failregex()
+            .captures(&line)
+            .unwrap_or_else(|| panic!("failregex does not match the emitted line: {line}"));
+        assert_eq!(&caps["host"], "10.0.0.1", "banned host capture: {line}");
+    }
+
+    /// The other half of the coupling: an app-attributed event reaches the same
+    /// security stream but carries no `ip`, so fail2ban must find nothing to ban
+    /// rather than banning whatever token happens to sit where `ip` would be.
+    #[test]
+    fn app_security_log_line_does_not_match_the_deployed_failregex() {
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::registry().with(security_log_layer(buf.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            crate::obs::security::log_app_security_event(
+                crate::obs::security::SecurityEventType::EphemeralPublishDenied,
+                "app-a",
+                7,
+                "kind=acl_denied address=ephemeral:x",
+            );
+        });
+
+        let line = buf.contents();
+        // The line really is in the security stream — the non-match below is
+        // about the absent `ip`, not about the event being filtered out.
+        assert!(
+            line.contains(r#""security_event":true"#),
+            "app event should reach the security stream: {line}"
+        );
+        assert!(
+            !deployed_failregex().is_match(&line),
+            "failregex must not match an ip-less line: {line}"
+        );
     }
 }

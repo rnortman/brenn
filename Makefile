@@ -644,6 +644,10 @@ E2E_BASE_URL := http://127.0.0.1:3100
 # stops the server (trap), propagating the
 # test exit code. Chromium is the one genuine one-time setup step; a missing
 # browser fails fast with the install command before any server starts.
+#
+# TODO(e2e-in-ci): no gate runs this suite, so it can rot red indefinitely —
+# blocked on chromium provisioning on the runner and on the port-3100 server
+# this target boots.
 e2e: build e2e/node_modules
 	@cd e2e && node -e "const{chromium}=require('@playwright/test');const fs=require('fs');const p=chromium.executablePath();if(!fs.existsSync(p)){console.error('ERROR: Playwright chromium browser not installed. Run: cd e2e && npx playwright install chromium');process.exit(1);}"
 	@rm -rf target/e2e

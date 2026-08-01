@@ -63,8 +63,8 @@ closed at the trust boundary (router drops what it cannot stamp) or the
 strictness symmetry is pinned structurally.
 
 Code site (`TODO(takeover-parser-symmetry-guard)`):
-`surface/kernel/src/planes.rs`, `SurfacePlanes::guard` (the takeover plane's
-parse-failure passthrough).
+`surface/kernel/src/planes.rs`, `inject_takeover_instance` (the router's
+parse-failure passthrough, called by `SurfacePlanes::guard`).
 
 ---
 
@@ -157,6 +157,64 @@ Code site (`TODO(surface-wasm-test-in-ci)`): `Makefile`, the
 `surface-wasm-test` target; `surface/kernel/src/entry.rs`, the buffered-publish
 `None` arm (absent host slot → `"not-permitted"`), which depends on the live
 wasm host slot and can only be pinned by the browser test runner.
+
+---
+
+## `e2e-in-ci`
+
+`make e2e` — the Playwright browser suite in `e2e/tests/` — is run by no gate:
+it is in neither `CARGO_CHECK_STEPS` nor `NONCARGO_CHECK_STEPS`, not in
+`check-ci`, and not in `.github/workflows/ci.yml`. Only an operator running it
+by hand answers anything, and four of its six specs sat red — a stale
+component-element selector — for an unbounded span before anyone noticed. The
+suite covers layout switching, malformed-layout last-good retention,
+per-instance content isolation, and reload/durable-snapshot restore; acceptance
+decisions have already leaned on one of those specs while it was dead, which is
+the specific harm an ungated suite does.
+
+Done when `check-ci` runs `make e2e`. Blocked on two provisioning facts, and
+the ordering is load-bearing the same way `surface-wasm-test-in-ci`'s is: CI is
+a persistent `runs-on: shell` host whose build tools are installed by workflow
+steps, and Playwright's chromium is not one of them (`npx playwright install
+chromium` plus its system libraries); and the target boots the built binary as
+a real server on port 3100, so the runner needs that port free and must
+tolerate a backgrounded server on a capacity-1 runner shared with every
+project's deploys. Landing the `check-ci` step before both hold turns CI red on
+every push to main, which is also the auto-deploy-to-staging path.
+
+Until then the operator-side trigger stands in for the gate: run `make e2e`
+before tagging a release, and after any change under `surface/`.
+
+Code site (`TODO(e2e-in-ci)`): `Makefile`, the `e2e` target.
+
+---
+
+## `e2e-tag-scheme-tie`
+
+`e2e/tests/bar.spec.ts` (`publishVia`) locates a mounted component by its
+custom-element tag, `` `brenn-echo-stub--${instance}` ``, re-encoding in
+TypeScript a scheme whose only home is `element_name_for_instance`
+(`surface/contract/src/lib.rs`). Nothing mechanical ties the two — a comment is
+the whole link, and a comment does not break a build. That drift already
+happened once and cost four specs a 20-second `toBeAttached` timeout each, with
+no diagnosis beyond "it times out".
+
+Selecting on something other than the tag does not fix it. Three elements carry
+`data-instance="<instance>"` for a placed instance — chrome's layout `section`,
+the kernel's wrapper `div`, and the component element itself — and only the
+last routes, because `instance_for_target` (`surface/kernel/src/dom.rs`)
+resolves by node identity over the mounted-element registry, so a publish event
+dispatched from the wrapper reaches nothing. Every selector that picks the right
+one of the three re-encodes some Rust-side literal (the tag, or `wrapper_id`'s
+`brenn-surface-wrapper-` prefix): one unlinked literal traded for another.
+
+Done when a Rust-side change to the tag scheme fails the TypeScript build
+rather than a Playwright wait — the scheme emitted into a generated constant the
+spec imports. Needs a design call first: the e2e/TS side deliberately has no
+bundler and no `ts-rs` bridge, so who emits the constant, when it runs, and
+which gate proves it current is a new seam rather than a local edit.
+
+Code site (`TODO(e2e-tag-scheme-tie)`): `e2e/tests/bar.spec.ts`, `publishVia`.
 
 ---
 
