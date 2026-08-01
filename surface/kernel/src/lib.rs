@@ -8,11 +8,11 @@
 //! surface protocol violation: every rule the server enforces is made
 //! unrepresentable or pre-validated here.
 //!
-//! Its platform half connects the [`ClientHandle`], processes the resolved
-//! `Welcome` bindings, mounts the configured component elements, routes
+//! Its platform half holds a [`front::SurfaceHandle`], applies the wiring the
+//! bindings document carries, mounts the configured component elements, routes
 //! delivered envelopes and component publish intents, publishes the reserved
-//! control planes (link-state, surface-state), generates the surface
-//! self-description telemetry, and renders the pre-chrome connect indicator and
+//! control planes (link-state, surface-state), writes the surface's own geometry
+//! and status documents, and renders the pre-chrome connect indicator and
 //! per-component error cards. It is split for testability: [`logic`] is a
 //! DOM-free decision core (host-compiled, natively unit-tested); [`dom`] is the
 //! web-sys effect executor; [`entry`] holds the wasm-bindgen exports and wiring.
@@ -75,6 +75,10 @@ pub mod turn;
 /// clocks, and performs what a turn asks for.
 pub mod runner;
 
+/// The front door: the handle the platform half holds, the channels it asks
+/// through, and the snapshot that refuses a doomed publish on its own stack.
+pub mod front;
+
 /// The per-activation publish buffer: the sole quota authority for the duration
 /// of a component's handler.
 pub(crate) mod publish_buffer;
@@ -116,7 +120,7 @@ pub use core::{
 };
 pub use driver::Driver;
 #[cfg(target_arch = "wasm32")]
-pub use handle::InFlightPublish;
+pub use front::InFlightPublish;
 pub use handle::{
     ActivationEntry, ClientConfig, ClientHandle, EventStream, PublishGate, PublishReject, new,
 };

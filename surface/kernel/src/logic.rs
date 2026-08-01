@@ -7,22 +7,62 @@
 
 use std::collections::{HashMap, HashSet};
 
+use brenn_attach_proto::AlertSeverity;
+
+use crate::proto::bindings::BindingsDocument;
 use crate::proto::{
-    AlertSeverity, CONTROL_PLANE_VERSION, InstanceReport, InstanceState, LOCAL_LINK_STATE_CHANNEL,
+    CONTROL_PLANE_VERSION, InstanceReport, InstanceState, LOCAL_LINK_STATE_CHANNEL,
     LOCAL_SURFACE_STATE_CHANNEL, LinkState, LinkStateBody, LogLevel, SurfaceStateBody,
     SurfaceStateInstance,
 };
-use crate::{Event, PublishStatus, Urgency};
+use crate::session::Event;
+use crate::{PublishStatus, Urgency};
 use crate::{contract, proto};
 
-/// Derive the surface WebSocket URL from the page's `location`. `https:` is the
-/// only secure scheme, so it maps to `wss:`; every other protocol (`http:`,
-/// `file:`, …) maps to `ws:`. `host` is `location.host` (host + optional port),
-/// `slug` the surface slug. Pure string logic, host-tested; the wasm entry
-/// point feeds it `location.protocol()`/`location.host()`.
-pub fn ws_url(protocol: &str, host: &str, slug: &str) -> String {
+/// Derive the surface's whole connect URL from the page's `location` and its
+/// build id. `https:` is the only secure scheme, so it maps to `wss:`; every
+/// other protocol (`http:`, `file:`, …) maps to `ws:`. `host` is
+/// `location.host` (host + optional port), `slug` the surface slug.
+///
+/// The build id rides as the `build` query parameter: the served-asset lockstep
+/// check is the surface route's own, not the attachment protocol's, so it is
+/// composed into the URL here rather than appended by the connection. Pure
+/// string logic, host-tested; the wasm entry point feeds it
+/// `location.protocol()`/`location.host()`.
+pub fn connect_url(protocol: &str, host: &str, slug: &str, build_id: &str) -> String {
     let scheme = if protocol == "https:" { "wss:" } else { "ws:" };
-    format!("{scheme}//{host}/surface/{slug}/ws")
+    format!(
+        "{scheme}//{host}/surface/{slug}/ws?build={}",
+        encode_query_component(build_id)
+    )
+}
+
+/// Percent-encode a query-string component, encoding everything outside the
+/// RFC 3986 unreserved set. A tiny helper rather than a dependency: build ids
+/// are hex-ish and pass through unchanged, but arbitrary input stays safe.
+fn encode_query_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(hex_upper(b >> 4));
+                out.push(hex_upper(b & 0x0f));
+            }
+        }
+    }
+    out
+}
+
+/// One nibble as an uppercase hex digit.
+fn hex_upper(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        _ => (b'A' + (nibble - 10)) as char,
+    }
 }
 
 /// Resolve the mounted component `instance` a delegated contract event targets,
@@ -444,7 +484,7 @@ pub fn route_component_log(
 /// that does not resolve to a mounted instance element is dropped with `Report`
 /// rather than attributed by guess. `target_tag` is carried for the breadcrumb.
 ///
-/// `alert_granted` is the surface's current grant (from the latest `Welcome`,
+/// `alert_granted` is the surface's current grant (from the latest attachment,
 /// [`KernelCore::alert_granted`]). On an **ungranted** surface a well-formed alert
 /// from a mounted instance is dropped with a `Report` suppression breadcrumb
 /// naming the instance — a conforming kernel never emits an ungranted `Alert`
@@ -454,7 +494,7 @@ pub fn route_component_log(
 /// `severity`/`title`/`body` are `None` when the component's event detail omitted
 /// them or carried a non-string value (untrusted component-supplied detail);
 /// `severity` is additionally the untrusted lowercase severity wire string,
-/// parsed via [`proto::AlertSeverity::from_wire_str`]. On a granted surface a
+/// parsed via [`AlertSeverity::from_wire_str`]. On a granted surface a
 /// missing/non-string field or an unrecognized `severity` is dropped-and-reported
 /// as malformed — never coerced into a well-formed `Alert`.
 pub fn route_component_alert(
@@ -638,11 +678,11 @@ pub enum KernelAction {
     /// Ask the bootstrap loader to bring up the named headless processor
     /// instances (dispatched as the `brenn-processor-start` seam event).
     ///
-    /// Emitted once per page, from the mount plan that first sees bindings: the
-    /// loader needs the config map and the bindings row that arrive with
-    /// `Welcome`, and a second emission would ask it to instantiate instances it
+    /// Emitted once per page, from the mount plan that first sees wiring: the
+    /// loader needs the config map and the component row the bindings document
+    /// carries, and a second emission would ask it to instantiate instances it
     /// already registered (which `on_processor_register` would refuse as
-    /// duplicates). A reconnect whose bindings changed reloads the page instead.
+    /// duplicates). Changed wiring reloads the page instead.
     StartProcessors { instances: Vec<String> },
     /// Dispatch `brenn-surface-ready` on `window` (first successful connect):
     /// the bootstrap resets its capped-reload counter on this signal.
@@ -654,8 +694,8 @@ pub enum KernelAction {
     /// `urgency` is the component's per-message override; `None` sends no urgency
     /// on the frame, which the server reads as "the port's configured default".
     /// The kernel deliberately does not substitute the default itself: the
-    /// authoritative value is the server's, and the kernel's `Welcome` snapshot
-    /// can be stale across a reconnect.
+    /// authoritative value is the wiring the page is running on, which this core
+    /// does not resolve ports against.
     Publish {
         instance: String,
         port: String,
@@ -758,10 +798,10 @@ pub struct KernelCore {
     /// suppression. Chrome renders the connection banner from this plane; the
     /// kernel (this core, the platform half) is the plane's sole producer.
     link_state: LinkState,
-    /// The bindings from the first `Welcome`; `None` until the first connect.
-    /// Set on first-connect, and consulted to distinguish first-connect from a
-    /// reconnect.
-    bindings: Option<proto::SurfaceBindings>,
+    /// The wiring from the first bindings document; `None` until the page is
+    /// first configured. Set then, and consulted to distinguish a first connect
+    /// from a reconnect.
+    bindings: Option<BindingsDocument>,
     /// Whether this surface holds the alert grant, from the latest `Connected`.
     /// `false` until the first connect. A `brenn-alert` from a component is
     /// forwarded as an `Alert` frame only when granted; otherwise the kernel
@@ -799,15 +839,14 @@ pub struct KernelCore {
     /// path, distinguishing death (deregister + clear) from Phase-3 reparent
     /// (preserve delivery, never deregister).
     registered: HashSet<String>,
-    /// The singleton chrome instance from the latest `Welcome`
-    /// (`SurfaceBindings.chrome_instance`), or `None` when the surface declares
-    /// no chrome. Read in exactly two places: the connect
+    /// The singleton chrome instance the bindings document names, or `None` when
+    /// the surface declares no chrome. Read in exactly two places: the connect
     /// indicator handoff (this instance's first mount removes the indicator) and
     /// death-is-fatal (this instance dying reloads the page instead of showing an
     /// error card). No other path branches on it.
     chrome_instance: Option<String>,
     /// Whether the pre-chrome connect indicator is still live. True from
-    /// construction (the kernel renders it at start, before any `Welcome`) until
+    /// construction (the kernel renders it at start, before any attachment) until
     /// the handoff removes it; once false it stays false for the page's life, so
     /// no reconnect ever re-renders it.
     connect_indicator_active: bool,
@@ -994,7 +1033,7 @@ impl KernelCore {
     }
 
     /// Whether `instance` is a declared `processor` component in the stored
-    /// bindings. `false` before the first `Welcome`.
+    /// wiring. `false` before the page is first configured.
     fn is_processor_instance(&self, instance: &str) -> bool {
         self.bindings.as_ref().is_some_and(|b| {
             b.components
@@ -1003,14 +1042,13 @@ impl KernelCore {
         })
     }
 
-    /// Serve one `config.get` for a processor instance from the map that rode
-    /// `Welcome`.
+    /// Serve one `config.get` for a processor instance from the map its component
+    /// entry carries.
     ///
     /// Fixed for the page's lifetime, matching the backend's process-lifetime map:
-    /// a changed map arrives only with a reconnect `Welcome`, which the
-    /// bindings-changed check turns into a reload. A miss — unknown key, or an
-    /// instance with no map — answers `None`, which is `config.get`'s own
-    /// `option<string>` and not an error.
+    /// a changed map arrives only as changed wiring, which reloads the page. A
+    /// miss — unknown key, or an instance with no map — answers `None`, which is
+    /// `config.get`'s own `option<string>` and not an error.
     pub fn processor_config_get(&self, instance: &str, key: &str) -> Option<String> {
         self.bindings
             .as_ref()?
@@ -1112,14 +1150,47 @@ impl KernelCore {
                 }
                 actions
             }
+            // The two ends speak no common transport version. On a page the peer
+            // itself served, that means stale assets, so it takes the capped
+            // reload rather than the fatal banner — the reload is the only thing
+            // that can heal it, and the bootstrap's cap bounds a genuine
+            // incompatibility to a finite number of attempts. Both ranges are
+            // reported first, since after the reload nothing remembers them.
+            Event::Incompatible { ours, theirs } => {
+                let mut actions = vec![KernelAction::Report {
+                    level: LogLevel::Error,
+                    message: format!(
+                        "surface transport version mismatch: this build speaks {}..={}, \
+                         the server speaks {}..={}",
+                        ours.min, ours.max, theirs.min, theirs.max
+                    ),
+                    subject: None,
+                }];
+                actions.extend(self.set_link_state(LinkState::Reloading));
+                actions.push(KernelAction::RequestReload {
+                    reason: "protocol version".to_string(),
+                });
+                actions
+            }
             Event::Connected {
                 bindings,
                 alert_granted,
-                takeover_granted,
                 ..
             } => {
                 self.alert_granted = *alert_granted;
-                self.on_connected(bindings, *takeover_granted, is_element_defined)
+                self.on_connected(bindings, is_element_defined)
+            }
+            // The wiring in force changed under a running page: the components it
+            // mounted and the ports it attached were built against a description
+            // of this surface that no longer holds, and a page cannot re-wire
+            // itself in place. The capped bootstrap reload is the only honest
+            // answer.
+            Event::WiringChanged => {
+                let mut actions = self.set_link_state(LinkState::Reloading);
+                actions.push(KernelAction::RequestReload {
+                    reason: "bindings changed".to_string(),
+                });
+                actions
             }
             // The kernel mounts only `dom` components, and every one of them still
             // rides the condemned per-message dialect — nothing this kernel mounts
@@ -1184,12 +1255,19 @@ impl KernelCore {
                     subject: Some(instance.clone()),
                 }],
             },
-            // Attributed to the publisher: the plane belongs to chrome, so a
-            // publish from anyone else is that component's (or its operator's)
-            // fault and draws down its report budget, not the kernel's.
-            Event::OverlayStateRejected { instance, reason } => vec![KernelAction::Report {
+            // Attributed to the publisher: a confined plane refused a body its
+            // author wrote, so it is that component's (or its operator's) fault
+            // and draws down its report budget, not the kernel's. The publisher
+            // was answered at buffer time and told nothing since, so this is the
+            // only account of the fault anyone gets.
+            Event::PlaneRefused {
+                instance,
+                port,
+                channel,
+                reason,
+            } => vec![KernelAction::Report {
                 level: LogLevel::Error,
-                message: format!("refused overlay-state publish from {instance}: {reason}"),
+                message: format!("refused {instance}/{port} publish to {channel}: {reason}"),
                 subject: Some(instance.clone()),
             }],
             Event::StragglerDiscarded {
@@ -1220,26 +1298,19 @@ impl KernelCore {
     /// deterministic mount panic reloads forever, never converging to the
     /// static failure message the cap guarantees.
     ///
-    /// On a reconnect (bindings already stored), compare the new bindings to the
-    /// stored ones: equal → republish the connected link state (the client core
-    /// has already reconciled and resubscribed with resume); differ →
-    /// `RequestReload { reason: "bindings changed" }`, because a config change
-    /// across a restart may have made the page's manifest stale too, so a fresh
-    /// page is the only state the kernel can trust.
+    /// On a reconnect (a document already stored) the page has already reconciled
+    /// its stores and resubscribed with resume, so this republishes the connected
+    /// link state and nothing else. A document that differs from the one in force
+    /// arrives as its own [`Event::WiringChanged`], which is what reloads.
     fn on_connected(
         &mut self,
-        bindings: &proto::SurfaceBindings,
-        takeover_granted: bool,
+        bindings: &BindingsDocument,
         is_element_defined: impl Fn(&str, &str) -> bool,
     ) -> Vec<KernelAction> {
-        if let Some(stored) = &self.bindings {
-            if stored == bindings {
-                return self.set_link_state(LinkState::Connected);
-            }
-            return vec![KernelAction::RequestReload {
-                reason: "bindings changed".to_string(),
-            }];
+        if self.bindings.is_some() {
+            return self.set_link_state(LinkState::Connected);
         }
+        let takeover_granted = bindings.platform.takeover_granted;
         self.bindings = Some(bindings.clone());
         self.chrome_instance = if bindings.chrome_instance.is_empty() {
             None
@@ -1386,7 +1457,7 @@ impl KernelCore {
     /// the plane requires the grant.
     fn dark_overlay_instrument_report(
         &self,
-        bindings: &proto::SurfaceBindings,
+        bindings: &BindingsDocument,
         takeover_granted: bool,
     ) -> Option<KernelAction> {
         let chrome = self.chrome_instance.as_deref()?;
@@ -1414,8 +1485,8 @@ impl KernelCore {
     }
 
     /// Whether `instance` is a component this surface configured (from the stored
-    /// `Welcome` bindings) — the membership check the panic-subject filter needs.
-    /// `false` before the first `Welcome` (no bindings yet).
+    /// wiring) — the membership check the panic-subject filter needs. `false`
+    /// before the page is first configured.
     fn is_configured_instance(&self, instance: &str) -> bool {
         self.bindings
             .as_ref()
@@ -1667,21 +1738,9 @@ mod tests {
     /// A `Connected` naming `chrome_instance` as the singleton chrome. All
     /// components are otherwise the ordinary defined-element shape.
     fn connected_event_chrome(components: Vec<ComponentEntry>, chrome_instance: &str) -> Event {
-        let Event::Connected { mut bindings, .. } = connected_event(components) else {
-            unreachable!("connected_event builds a Connected");
-        };
+        let mut bindings = document(components, vec![]);
         bindings.chrome_instance = chrome_instance.to_string();
-        Event::Connected {
-            bindings,
-            participant_id: "surface:deskbar".to_string(),
-            max_body_bytes: 65_536,
-            alert_granted: false,
-            takeover_granted: false,
-            error_report_floor: None,
-            surface_description: SurfaceDescription {
-                status_interval_secs: 60,
-            },
-        }
+        connected(bindings, false)
     }
 
     #[test]
@@ -1776,7 +1835,7 @@ mod tests {
         // Live indicator: a drop drives it to Reconnecting.
         let live = core.on_event(
             &Event::Disconnected {
-                reason: DisconnectReason::LivenessTimeout,
+                reason: DetachReason::LivenessTimeout,
             },
             |_, _| true,
         );
@@ -1791,7 +1850,7 @@ mod tests {
         core.on_event(&connected_event(entries(&["protobar"])), |_, _| true);
         let after = core.on_event(
             &Event::Disconnected {
-                reason: DisconnectReason::LivenessTimeout,
+                reason: DetachReason::LivenessTimeout,
             },
             |_, _| true,
         );
@@ -1891,8 +1950,12 @@ mod tests {
         );
     }
 
-    use crate::proto::{Abi, Binding, ComponentEntry, SurfaceBindings, SurfaceDescription};
-    use crate::{DisconnectReason, PublishStatus};
+    use brenn_attach_client::conn::DetachReason;
+    use brenn_attach_proto::VersionRange;
+
+    use crate::PublishStatus;
+    use crate::proto::bindings::{BINDINGS_DOCUMENT_VERSION, PlatformSection};
+    use crate::proto::{Abi, Binding, ComponentEntry};
 
     // ── shared builders ───────────────────────────────────────────────────
 
@@ -1924,6 +1987,40 @@ mod tests {
         }
     }
 
+    /// The document these tests wire a core with. `chrome_instance` is empty by
+    /// default — the chromeless shape most of them want; the chrome fixtures fill
+    /// it in.
+    fn document(components: Vec<ComponentEntry>, subscriptions: Vec<Binding>) -> BindingsDocument {
+        BindingsDocument {
+            v: BINDINGS_DOCUMENT_VERSION,
+            components,
+            subscriptions,
+            outputs: vec![],
+            local_channels: vec![],
+            chrome_instance: String::new(),
+            platform: PlatformSection {
+                geometry_channel: "brenn:site.surface.deskbar.geometry".to_string(),
+                status_channel: "brenn:site.surface.deskbar.status".to_string(),
+                status_interval_secs: 60,
+                error_channel: None,
+                error_report_floor: None,
+                takeover_granted: false,
+            },
+        }
+    }
+
+    /// The attachment facts around a document. Everything the surface layer folds
+    /// from `Connected` other than the wiring itself.
+    fn connected(bindings: BindingsDocument, alert_granted: bool) -> Event {
+        Event::Connected {
+            bindings,
+            participant_id: "surface:deskbar".to_string(),
+            session_id: "sess-1".to_string(),
+            max_body_bytes: 65_536,
+            alert_granted,
+        }
+    }
+
     fn connected_event(components: Vec<ComponentEntry>) -> Event {
         connected_event_full(components, vec![])
     }
@@ -1937,23 +2034,7 @@ mod tests {
         subscriptions: Vec<Binding>,
         alert_granted: bool,
     ) -> Event {
-        Event::Connected {
-            bindings: SurfaceBindings {
-                components,
-                subscriptions,
-                outputs: vec![],
-                local_channels: vec![],
-                chrome_instance: String::new(),
-            },
-            participant_id: "surface:deskbar".to_string(),
-            max_body_bytes: 65_536,
-            alert_granted,
-            takeover_granted: false,
-            error_report_floor: None,
-            surface_description: SurfaceDescription {
-                status_interval_secs: 60,
-            },
-        }
+        connected(document(components, subscriptions), alert_granted)
     }
 
     /// A connected core carrying `components` (element defined for all) and the
@@ -1968,27 +2049,41 @@ mod tests {
         core
     }
 
-    // ── ws_url ────────────────────────────────────────────────────────────
+    // ── connect_url ───────────────────────────────────────────────────────
 
     #[test]
-    fn ws_url_https_maps_to_wss() {
+    fn connect_url_https_maps_to_wss() {
         assert_eq!(
-            ws_url("https:", "example.com:8443", "pfin"),
-            "wss://example.com:8443/surface/pfin/ws"
+            connect_url("https:", "example.com:8443", "pfin", "abc123"),
+            "wss://example.com:8443/surface/pfin/ws?build=abc123"
         );
     }
 
     #[test]
-    fn ws_url_http_maps_to_ws() {
+    fn connect_url_http_maps_to_ws() {
         assert_eq!(
-            ws_url("http:", "localhost:3000", "graf"),
-            "ws://localhost:3000/surface/graf/ws"
+            connect_url("http:", "localhost:3000", "graf", "abc123"),
+            "ws://localhost:3000/surface/graf/ws?build=abc123"
         );
     }
 
     #[test]
-    fn ws_url_non_http_protocol_maps_to_ws() {
-        assert_eq!(ws_url("file:", "host", "slug"), "ws://host/surface/slug/ws");
+    fn connect_url_non_http_protocol_maps_to_ws() {
+        assert_eq!(
+            connect_url("file:", "host", "slug", "abc123"),
+            "ws://host/surface/slug/ws?build=abc123"
+        );
+    }
+
+    #[test]
+    fn connect_url_percent_encodes_the_build_id() {
+        // Build ids are hex-ish in practice, so this pins the escape rather than
+        // a real case: an id carrying a `&` or a space must not be able to add a
+        // query parameter of its own.
+        assert_eq!(
+            connect_url("https:", "host", "slug", "a b&c=d/e~f.g-h_i"),
+            "wss://host/surface/slug/ws?build=a%20b%26c%3Dd%2Fe~f.g-h_i"
+        );
     }
 
     // ── route_publish_intent ──────────────────────────────────────────────
@@ -2810,7 +2905,7 @@ mod tests {
         let mut core = KernelCore::new();
         let actions = core.on_event(
             &Event::Disconnected {
-                reason: DisconnectReason::LivenessTimeout,
+                reason: DetachReason::LivenessTimeout,
             },
             |_, _| false,
         );
@@ -2860,7 +2955,7 @@ mod tests {
         // identical state would be a redelivery to every bound port for no change.
         let mut core = KernelCore::new();
         let event = Event::Disconnected {
-            reason: DisconnectReason::LivenessTimeout,
+            reason: DetachReason::LivenessTimeout,
         };
         assert!(publishes_control(
             &core.on_event(&event, |_, _| false),
@@ -2916,7 +3011,7 @@ mod tests {
         let mut core = KernelCore::new();
         let actions = core.on_event(
             &Event::Disconnected {
-                reason: DisconnectReason::LivenessTimeout,
+                reason: DetachReason::LivenessTimeout,
             },
             |_, _| false,
         );
@@ -3587,7 +3682,7 @@ mod tests {
         );
         core.on_event(
             &Event::Disconnected {
-                reason: DisconnectReason::LivenessTimeout,
+                reason: DetachReason::LivenessTimeout,
             },
             |_, _| true,
         );
@@ -3606,32 +3701,60 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_with_changed_bindings_requests_reload() {
+    fn changed_wiring_requests_reload() {
+        // Which difference made the wiring change is the page's question — it
+        // compares the retained bodies — and this is the whole of the platform
+        // half's answer to one: state the reload on the link plane so chrome can
+        // draw it, then ask the bootstrap for the (capped) reload. A page cannot
+        // re-wire the elements it already mounted.
         let mut core = KernelCore::new();
         core.on_event(&connected_event(entries(&["echo-stub"])), |_, _| true);
-        let actions = core.on_event(&connected_event(entries(&["protobar"])), |_, _| true);
+        let actions = core.on_event(&Event::WiringChanged, |_, _| true);
         assert_eq!(
-            actions,
+            without_platform_planes(&actions),
             vec![KernelAction::RequestReload {
                 reason: "bindings changed".to_string(),
             }]
+        );
+        assert_eq!(
+            control_body(&actions, LOCAL_LINK_STATE_CHANNEL),
+            r#"{"v":1,"state":"reloading"}"#
         );
     }
 
     #[test]
-    fn reconnect_with_changed_subscriptions_requests_reload() {
+    fn an_incompatible_peer_reports_both_ranges_and_reloads() {
+        // A page the peer itself served speaking no version the peer speaks is
+        // stale assets; the reload is the only thing that can heal it, and the
+        // bootstrap's cap bounds a genuine incompatibility. Both ranges are
+        // reported before the reload, since nothing after it remembers them.
         let mut core = KernelCore::new();
-        core.on_event(&connected_event(entries(&["echo-stub"])), |_, _| true);
-        let changed = connected_event_full(
-            entries(&["echo-stub"]),
-            vec![binding("ephemeral:dev-stub", "echo-stub", "messages")],
+        let actions = core.on_event(
+            &Event::Incompatible {
+                ours: VersionRange { min: 2, max: 2 },
+                theirs: VersionRange { min: 1, max: 1 },
+            },
+            |_, _| true,
         );
-        let actions = core.on_event(&changed, |_, _| true);
+        let rest = without_platform_planes(&actions);
+        let [KernelAction::Report { level, message, .. }, reload] = rest.as_slice() else {
+            panic!("expected a report then a reload, got {actions:?}");
+        };
+        assert_eq!(*level, LogLevel::Error);
+        assert!(message.contains("2..=2"), "ours in the message: {message}");
+        assert!(
+            message.contains("1..=1"),
+            "theirs in the message: {message}"
+        );
         assert_eq!(
-            actions,
-            vec![KernelAction::RequestReload {
-                reason: "bindings changed".to_string(),
-            }]
+            *reload,
+            KernelAction::RequestReload {
+                reason: "protocol version".to_string(),
+            }
+        );
+        assert_eq!(
+            control_body(&actions, LOCAL_LINK_STATE_CHANNEL),
+            r#"{"v":1,"state":"reloading"}"#
         );
     }
 
@@ -3741,7 +3864,7 @@ mod tests {
     }
 
     #[test]
-    fn an_overlay_state_rejection_reports_an_error_naming_the_publisher() {
+    fn a_plane_refusal_reports_an_error_naming_the_publisher() {
         // The refusal's only operator-visible trace. Error, so it clears an error
         // channel's report floor — a downgrade would silence a component (or an
         // operator binding) claiming to speak for chrome's screen. Attributed to
@@ -3749,8 +3872,10 @@ mod tests {
         // rather than the kernel's.
         let mut core = KernelCore::new();
         let actions = core.on_event(
-            &Event::OverlayStateRejected {
+            &Event::PlaneRefused {
                 instance: "meeting".to_string(),
+                port: "overlay-state".to_string(),
+                channel: proto::LOCAL_OVERLAY_STATE_CHANNEL.to_string(),
                 reason: "only the surface's chrome instance may publish it".to_string(),
             },
             |_, _| false,
@@ -3781,22 +3906,11 @@ mod tests {
         components: Vec<ComponentEntry>,
         outputs: Vec<proto::OutputBinding>,
     ) -> Event {
-        let Event::Connected { mut bindings, .. } = connected_event_chrome(components, "chrome")
-        else {
-            unreachable!("connected_event_chrome builds a Connected");
-        };
+        let mut bindings = document(components, vec![]);
+        bindings.chrome_instance = "chrome".to_string();
         bindings.outputs = outputs;
-        Event::Connected {
-            bindings,
-            participant_id: "surface:deskbar".to_string(),
-            max_body_bytes: 65_536,
-            alert_granted: false,
-            takeover_granted: true,
-            error_report_floor: None,
-            surface_description: SurfaceDescription {
-                status_interval_secs: 60,
-            },
-        }
+        bindings.platform.takeover_granted = true;
+        connected(bindings, false)
     }
 
     /// The chrome output binding that makes the overlay-state plane reportable.

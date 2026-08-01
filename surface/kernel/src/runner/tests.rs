@@ -4,25 +4,35 @@
 //! the frames written to the socket, the events handed to the platform half, and
 //! whether the socket was closed and re-opened. What the page holds is its own
 //! suites' business, with one exception: the terminal drain's whole job is to
-//! route a confined publish, which produces no frame and no event by design and
-//! would be unobservable in principle under that rule. So the run hands the page
-//! back, and the two drain tests read the plane it wrote.
+//! route a confined publish and activate the readers it wakes, which produces no
+//! frame and no event by design and would be unobservable in principle under that
+//! rule. So the run hands the page back, and the two drain tests read the plane it
+//! wrote and what the reader's entry was shown off it.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::{TransportConnection, TransportError, TransportEvent};
-use brenn_attach_proto::{ClientFrame, SUPPORTED_VERSIONS, ServerFrame, SubscribeOutcome};
-use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
+use brenn_attach_proto::{
+    AlertSeverity, ClientFrame, PublishBatchOutcome, PublishOutcome, ServerFrame,
+};
+use brenn_surface_contract::ActivationError;
 use brenn_surface_schema::bindings::BindingsDocument;
 use brenn_surface_schema::{
-    CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, ToastBody, ToastSeverity, ToastSource,
+    CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, LogLevel, StatusCounters, ToastBody, ToastSeverity,
+    ToastSource,
 };
 use uuid::Uuid;
 
+use crate::core::PublishStatus;
+use crate::front::{self, EventStream, PublishReject, SurfaceHandle};
 use crate::test_support::bindings as fixtures;
+use crate::test_support::frames::{
+    deliver, deliver_at, frame, server_hello, subscribe_result, welcome as welcome_under,
+};
 use crate::test_support::pages;
 
 use super::*;
@@ -31,6 +41,11 @@ const URL: &str = "wss://host/surface/bar/ws?build=b1";
 const CONFIG: &str = "ephemeral:site.surface.bar.bindings";
 const WIRE_ONE: &str = "brenn:site.bar.one";
 const WIRE_TWO: &str = "brenn:site.bar.two";
+const WIRE_OUT: &str = "brenn:site.bar.out";
+const NOTES: &str = "local:app/notes";
+const ERRORS: &str = "brenn:site.surface.bar.errors";
+const GEOMETRY: &str = "brenn:site.surface.bar.geometry";
+const STATUS: &str = "brenn:site.surface.bar.status";
 const EPOCH: Uuid = Uuid::from_u128(0x1_11c0);
 
 fn config() -> ConnConfig {
@@ -49,6 +64,10 @@ fn config() -> ConnConfig {
 /// `p1` and `p2` each read one wire channel, so a document that mounts both opens
 /// two subscriptions in one turn — the batch a mid-batch write failure cuts short.
 ///
+/// `p1` writes both classes: `WIRE_OUT`, which an activation's flush puts on the
+/// wire, and the page-local `NOTES`, which `p2` reads — so one component's
+/// activation is what makes the next one ready.
+///
 /// `p2` also reads the toast plane, which is what gives that plane a store deep
 /// enough to retain: its contract depth is zero (a toast is a signal, delivered at
 /// the append and kept by nobody), and a binding is the only thing that raises it.
@@ -63,82 +82,108 @@ fn doc() -> BindingsDocument {
         vec![
             fixtures::subscription("p1", "in", WIRE_ONE, 4, 0),
             fixtures::subscription("p2", "in", WIRE_TWO, 4, 0),
+            fixtures::subscription("p2", "notes", NOTES, 4, 0),
             fixtures::subscription("p2", "toast", LOCAL_TOAST_CHANNEL, 1, 1),
         ],
-        Vec::new(),
-        vec![fixtures::local(LOCAL_TOAST_CHANNEL, 0)],
+        vec![
+            fixtures::output("p1", "out", WIRE_OUT),
+            fixtures::output("p1", "notes", NOTES),
+        ],
+        vec![
+            fixtures::local(NOTES, 4),
+            fixtures::local(LOCAL_TOAST_CHANNEL, 0),
+        ],
     )
 }
 
-fn server_hello() -> String {
-    frame(&ServerFrame::Hello {
-        versions: SUPPORTED_VERSIONS,
-        ident: "peer".to_string(),
-    })
+/// A document in which `p1` reads the very channel it writes: its own activation
+/// makes it ready again, forever. What a page does under one of those is the
+/// containment question the bounded pass and the bias order exist to answer.
+///
+/// `p2` reads a channel of its own and writes nothing, so it is the sibling the
+/// fairness half of that question is asked about: a spinner must not be able to
+/// take every pass.
+fn spin_doc() -> BindingsDocument {
+    fixtures::doc(
+        vec![
+            fixtures::component("p1"),
+            fixtures::component("p2"),
+            fixtures::component(fixtures::CHROME),
+        ],
+        vec![
+            fixtures::subscription("p1", "in", WIRE_ONE, 4, 0),
+            fixtures::subscription("p1", "notes", NOTES, 4, 0),
+            fixtures::subscription("p2", "in", WIRE_TWO, 4, 0),
+        ],
+        vec![fixtures::output("p1", "notes", NOTES)],
+        vec![fixtures::local(NOTES, 4)],
+    )
+}
+
+/// The wiring above, with error reports switched on at `warn` — the platform
+/// section's other optional pair, which decides whether the log path publishes at
+/// all.
+fn reporting_doc() -> BindingsDocument {
+    let mut document = doc();
+    document.platform.error_channel = Some(ERRORS.to_string());
+    document.platform.error_report_floor = Some(LogLevel::Warn);
+    document
+}
+
+/// [`reporting_doc`] narrowed: `p1`'s wire output is gone and the report floor is
+/// a rung higher. The second document a running page can be handed, and the two
+/// changes are exactly the two things the handle's snapshot answers from.
+fn narrowed_doc() -> BindingsDocument {
+    let mut document = reporting_doc();
+    document.outputs.retain(|binding| binding.port != "out");
+    document.platform.error_report_floor = Some(LogLevel::Error);
+    document
 }
 
 fn welcome() -> String {
-    let facts = pages::facts();
-    frame(&ServerFrame::Welcome {
-        version: facts.version,
-        participant_id: facts.participant_id,
-        session_id: facts.session_id,
-        heartbeat_secs: facts.heartbeat_secs,
-        max_body_bytes: facts.max_body_bytes,
-        max_frame_bytes: facts.max_frame_bytes,
-        alert_granted: facts.alert_granted,
-    })
+    welcome_under(pages::facts())
 }
 
-fn subscribe_result(channel: &str, replay_count: u32) -> String {
-    frame(&ServerFrame::SubscribeResult {
-        channel: channel.to_string(),
-        outcome: SubscribeOutcome::Ok,
-        replay_count,
-        gap: None,
-    })
+/// The attachment's facts, with the alert grant this surface's default fixture
+/// does not carry.
+fn alert_granting_facts() -> AttachmentFacts {
+    AttachmentFacts {
+        alert_granted: true,
+        ..pages::facts()
+    }
 }
 
-fn deliver(channel: &str, body: &str) -> String {
-    frame(&ServerFrame::Deliver {
-        channel: channel.to_string(),
-        envelope: MessageEnvelope {
-            message_id: Uuid::from_u128(0x9001),
-            source: "test".into(),
-            channel: channel.into(),
-            sender: "system:surface-config".into(),
-            publish_ts: chrono::DateTime::from_timestamp(0, 0).expect("a representable instant"),
-            body: body.into(),
-            reply_to: None,
-            delivery_deadline: None,
-            deliver_after: None,
-            impetus: None,
-            urgency: Urgency::Normal,
-            envelope_type: ChannelScheme::Ephemeral,
-        },
-        seq: 1,
-        cursor: serde_json::from_value(serde_json::Value::String("c1".to_string()))
-            .expect("a cursor is a JSON string"),
-        dropped: 0,
+/// The body [`toast`] states, which is also what a reader bound to the plane is
+/// shown.
+fn toast_body() -> String {
+    serde_json::to_string(&ToastBody {
+        v: CONTROL_PLANE_VERSION,
+        severity: ToastSeverity::Warning,
+        text: "hello".to_string(),
+        source: ToastSource::Kernel,
     })
-}
-
-fn frame(frame: &ServerFrame) -> String {
-    serde_json::to_string(frame).expect("a server frame serializes")
+    .expect("a toast body serializes")
 }
 
 /// A toast, which is a plane the kernel may state whether or not it is attached.
 fn toast() -> RunnerCommand {
     RunnerCommand::PublishControl {
         channel: LOCAL_TOAST_CHANNEL.to_string(),
-        body: serde_json::to_string(&ToastBody {
-            v: CONTROL_PLANE_VERSION,
-            severity: ToastSeverity::Warning,
-            text: "hello".to_string(),
-            source: ToastSource::Kernel,
-        })
-        .expect("a toast body serializes"),
+        body: toast_body(),
     }
+}
+
+/// One single publish as it reached the socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Published {
+    channel: String,
+    /// The sub-identity the peer attributes it to: a component for its own port,
+    /// `None` for the documents the surface writes about itself.
+    attribution: Option<String>,
+    body: String,
+    /// The *wire* correlation the page minted, which is what the peer answers —
+    /// never the caller's own.
+    correlation: Option<u64>,
 }
 
 // ── the scripted transport ────────────────────────────────────────────────
@@ -239,6 +284,59 @@ impl Controls {
             .collect()
     }
 
+    /// The single publishes the runner has put on the wire, in write order.
+    fn publishes(&self) -> Vec<Published> {
+        self.frames()
+            .into_iter()
+            .filter_map(|frame| match frame {
+                ClientFrame::Publish {
+                    channel,
+                    attribution,
+                    body,
+                    correlation,
+                    ..
+                } => Some(Published {
+                    channel,
+                    attribution,
+                    body,
+                    correlation,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The alerts the runner has put on the wire, in write order: each one's
+    /// title and body.
+    fn alerts(&self) -> Vec<(String, String)> {
+        self.frames()
+            .into_iter()
+            .filter_map(|frame| match frame {
+                ClientFrame::Alert { title, body, .. } => Some((title, body)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The flushes the runner has put on the wire, in write order: each one's
+    /// correlation and the bodies it carries.
+    fn batches(&self) -> Vec<(u64, Vec<String>)> {
+        self.frames()
+            .into_iter()
+            .filter_map(|frame| match frame {
+                ClientFrame::PublishBatch {
+                    correlation,
+                    publishes,
+                    ..
+                } => Some((
+                    correlation,
+                    publishes.into_iter().map(|entry| entry.body).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn connects(&self) -> usize {
         self.connects.load(Ordering::SeqCst)
     }
@@ -316,11 +414,15 @@ impl TransportConnection for ScriptedConnection {
     }
 }
 
-/// A spawned run and the two ends the test holds: the event sink's receiver and
-/// the control channel's sender.
+/// A spawned run and the two ends the test holds: the front door's handle and the
+/// events it drains.
+///
+/// The handle is the real one, gate and all, so a test that publishes through it
+/// is exercising the pre-check the run keeps current as well as the plane behind
+/// it.
 struct Running {
-    events: mpsc::Receiver<Event>,
-    control: mpsc::Sender<RunnerCommand>,
+    events: EventStream,
+    handle: SurfaceHandle,
     task: tokio::task::JoinHandle<SurfacePage>,
 }
 
@@ -331,18 +433,16 @@ fn spawn(controls: &Controls) -> Running {
 /// As [`spawn`], from a wall-clock reading the caller chose — the one input to the
 /// boot clock check.
 fn spawn_from(controls: &Controls, wall: DateTime<Utc>) -> Running {
-    let (events_tx, events) = mpsc::channel(64);
-    let (control, control_rx) = mpsc::channel(8);
+    let (handle, events, front) = front::new();
     let runner = SurfaceRunner::new(
         SurfacePage::new(CONFIG.to_string(), EPOCH),
         config(),
         controls.connector(),
-        events_tx,
-        control_rx,
+        front,
     );
     Running {
         events,
-        control,
+        handle,
         task: tokio::spawn(runner.run_from(wall)),
     }
 }
@@ -357,31 +457,135 @@ impl Running {
             .expect("the event sink is not closed")
     }
 
+    /// Ask for one lifecycle command through the handle that composes it — the
+    /// control plane as a test states it.
     fn send(&mut self, command: RunnerCommand) {
-        self.control
-            .try_send(command)
-            .expect("the channel has room");
+        match command {
+            RunnerCommand::RegisterActivation { instance, entry } => {
+                self.handle.register_activation(&instance, entry);
+            }
+            RunnerCommand::DeregisterActivation { instance } => {
+                self.handle.deregister_activation(&instance);
+            }
+            RunnerCommand::PublishControl { channel, body } => {
+                self.handle.publish_control(&channel, body);
+            }
+            RunnerCommand::Close => self.handle.close(),
+        }
     }
 
-    /// Drop the control channel and take the page the run hands back, failing
-    /// rather than hanging if the run never ends.
+    /// Drop the handle and take the page the run hands back, failing rather than
+    /// hanging if the run never ends.
     ///
     /// The event sink is held open across the wait: dropping it is the *other*
     /// thing that ends a run, and a test asking what the drain did must leave the
-    /// control channel as the only answer.
+    /// front door's own channels as the only answer.
     async fn end(self) -> SurfacePage {
         let Running {
             events,
-            control,
+            handle,
             task,
         } = self;
-        drop(control);
+        drop(handle);
         let page = tokio::time::timeout(Duration::from_secs(3_600), task)
             .await
             .expect("the run ends within the (virtual) bound")
             .expect("the run does not panic");
         drop(events);
         page
+    }
+}
+
+/// The front door's sending ends, test-owned rather than composed by a handle.
+///
+/// Two things need them. A command the handle's own gate would refuse — a
+/// straggler publish after the run went terminal is the case that matters, since
+/// the gate is refreshed at exactly that edge — and closing one channel alone,
+/// which a handle cannot do because it holds all four.
+struct RawFront {
+    #[expect(
+        dead_code,
+        reason = "held to keep the sink open; the run reads its closure"
+    )]
+    events_tx: mpsc::Sender<Event>,
+    control_tx: mpsc::Sender<RunnerCommand>,
+    publish_tx: mpsc::Sender<PublishSlot>,
+    alert_tx: mpsc::Sender<AlertCommand>,
+    telemetry_tx: mpsc::Sender<TelemetryCommand>,
+}
+
+/// The front door's two halves, with the event sink at the capacity the caller
+/// wants.
+fn raw_front(events: usize) -> (RawFront, mpsc::Receiver<Event>, FrontChannels) {
+    let (events_tx, events_rx) = mpsc::channel(events);
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let (publish_tx, publish_rx) = mpsc::channel(8);
+    let (alert_tx, alert_rx) = mpsc::channel(8);
+    let (telemetry_tx, telemetry_rx) = mpsc::channel(8);
+    (
+        RawFront {
+            events_tx: events_tx.clone(),
+            control_tx,
+            publish_tx,
+            alert_tx,
+            telemetry_tx,
+        },
+        events_rx,
+        FrontChannels {
+            events_tx,
+            control_rx,
+            publish_rx,
+            alert_rx,
+            telemetry_rx,
+            gate: Arc::new(Mutex::new(SurfaceGate::default())),
+        },
+    )
+}
+
+/// A run whose front door the test drives sender by sender.
+struct RawRunning {
+    front: RawFront,
+    events: mpsc::Receiver<Event>,
+    task: tokio::task::JoinHandle<SurfacePage>,
+}
+
+fn spawn_raw(controls: &Controls) -> RawRunning {
+    let (front, events, channels) = raw_front(64);
+    let runner = SurfaceRunner::new(
+        SurfacePage::new(CONFIG.to_string(), EPOCH),
+        config(),
+        controls.connector(),
+        channels,
+    );
+    RawRunning {
+        front,
+        events,
+        task: tokio::spawn(runner.run_from(wall_now())),
+    }
+}
+
+impl RawRunning {
+    /// Await the next event, failing rather than hanging if none arrives.
+    async fn event(&mut self) -> Event {
+        tokio::time::timeout(Duration::from_secs(3_600), self.events.next())
+            .await
+            .expect("an event within the (virtual) bound")
+            .expect("the event sink is not closed")
+    }
+
+    /// Drop every sender and wait for the run to end.
+    async fn end(self) {
+        let RawRunning {
+            front,
+            events,
+            task,
+        } = self;
+        drop(front);
+        tokio::time::timeout(Duration::from_secs(3_600), task)
+            .await
+            .expect("the run ends within the (virtual) bound")
+            .expect("the run does not panic");
+        drop(events);
     }
 }
 
@@ -421,6 +625,102 @@ async fn settle() {
     }
 }
 
+// ── scripted components ───────────────────────────────────────────────────
+
+/// What a component's entry was shown, body by body in call order.
+#[derive(Clone, Default)]
+struct Seen(Arc<Mutex<Vec<String>>>);
+
+impl Seen {
+    fn bodies(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn count(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    fn saw(&self, body: &str) -> bool {
+        self.bodies().iter().any(|seen| seen == body)
+    }
+}
+
+/// An entry that records every new envelope it is shown and then does `act` with
+/// the activation and its buffer.
+fn entry<F>(seen: &Seen, act: F) -> ActivationEntry
+where
+    F: Fn(&Activation, &mut PublishBuffer) -> Result<(), ActivationError> + Send + 'static,
+{
+    let seen = seen.clone();
+    Box::new(move |activation, buffer| {
+        for window in &activation.ports {
+            for envelope in window.new_envelopes() {
+                seen.0.lock().unwrap().push(envelope.body.clone());
+            }
+        }
+        act(activation, buffer)
+    })
+}
+
+/// An entry that reads and publishes nothing.
+fn quiet(seen: &Seen) -> ActivationEntry {
+    entry(seen, |_, _| Ok(()))
+}
+
+/// An entry that publishes `body` on its output `port` every time it runs.
+fn publishing(seen: &Seen, port: &str, body: &str) -> ActivationEntry {
+    let (port, body) = (port.to_string(), body.to_string());
+    entry(seen, move |_, buffer| {
+        buffer
+            .publish(&port, body.clone())
+            .expect("the fixture binds the port it publishes on");
+        Ok(())
+    })
+}
+
+/// An entry that publishes `body` on its output `port`, held until shortly after
+/// the activation's own clock reading.
+///
+/// The offset is generous in wall-clock terms and invisible in virtual ones: it
+/// must outlast the microseconds between the activation's reading and the flush's,
+/// or the flush would publish it immediately and there would be no schedule to
+/// release.
+fn deferring(seen: &Seen, port: &str, body: &str) -> ActivationEntry {
+    let (port, body) = (port.to_string(), body.to_string());
+    entry(seen, move |activation, buffer| {
+        let now = activation.now.expect("the page has a wall clock");
+        buffer
+            .publish_deferred(&port, body.clone(), now + 20)
+            .expect("the fixture binds the port it publishes on");
+        Ok(())
+    })
+}
+
+/// An entry that fails without dying: the instance keeps running.
+fn erring(seen: &Seen) -> ActivationEntry {
+    entry(seen, |_, _| {
+        Err(ActivationError {
+            message: "no thanks".to_string(),
+        })
+    })
+}
+
+/// Register `instance`'s entry.
+fn mount(running: &mut Running, instance: &str, entry: ActivationEntry) {
+    running.send(RunnerCommand::RegisterActivation {
+        instance: instance.to_string(),
+        entry,
+    });
+}
+
+/// Wait for the page to subscribe `channel` and answer it, so a delivery there is
+/// one the page will take.
+async fn ack(controls: &Controls, feed: &mpsc::UnboundedSender<TransportEvent>, channel: &str) {
+    wait_until(|| controls.subscribed().contains(&channel.to_string())).await;
+    feed.unbounded_send(TransportEvent::Text(subscribe_result(channel, 0)))
+        .unwrap();
+}
+
 /// What the page's own toast plane retains, oldest first.
 fn toasts(page: &SurfacePage) -> Vec<String> {
     page.stores
@@ -438,11 +738,31 @@ fn toasts(page: &SurfacePage) -> Vec<String> {
 /// Play the peer's half of a handshake and the config channel's replay, so the
 /// page reaches phase 2 and announces itself.
 async fn attach(running: &mut Running, feed: &mpsc::UnboundedSender<TransportEvent>) {
+    attach_with(running, feed, &doc()).await;
+}
+
+/// As [`attach`], under a document the test chose.
+async fn attach_with(
+    running: &mut Running,
+    feed: &mpsc::UnboundedSender<TransportEvent>,
+    document: &BindingsDocument,
+) {
+    attach_as(running, feed, welcome(), document).await;
+}
+
+/// As [`attach_with`], under attachment facts the test chose — the grants are
+/// stated in the `Welcome`, not in the document.
+async fn attach_as(
+    running: &mut Running,
+    feed: &mpsc::UnboundedSender<TransportEvent>,
+    welcome: String,
+    document: &BindingsDocument,
+) {
     for text in [
         server_hello(),
-        welcome(),
+        welcome,
         subscribe_result(CONFIG, 1),
-        deliver(CONFIG, &doc().to_body()),
+        deliver(CONFIG, &document.to_body()),
     ] {
         feed.unbounded_send(TransportEvent::Text(text)).unwrap();
     }
@@ -644,6 +964,11 @@ async fn a_close_ends_the_attachment_and_the_run_outlives_it() {
     let (feed, closed, _writes) = controls.succeed();
     let mut running = spawn(&controls);
     attach(&mut running, &feed).await;
+    // The plane's reader, mounted before the close and still mounted through the
+    // drain: routing the banner is only half of drawing it.
+    let reader = Seen::default();
+    mount(&mut running, "p2", quiet(&reader));
+    wait_until(|| controls.subscribed().contains(&WIRE_TWO.to_string())).await;
 
     running.send(RunnerCommand::Close);
     wait_until(|| closed.load(Ordering::SeqCst)).await;
@@ -657,6 +982,11 @@ async fn a_close_ends_the_attachment_and_the_run_outlives_it() {
         vec!["hello".to_string()],
         "the drain routed the banner the page draws its own death from"
     );
+    assert_eq!(
+        reader.bodies(),
+        vec![toast_body()],
+        "and activated the reader that draws it"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -665,6 +995,9 @@ async fn a_control_publish_after_a_fatal_still_routes() {
     let (feed, _closed, _writes) = controls.succeed();
     let mut running = spawn(&controls);
     attach(&mut running, &feed).await;
+    let reader = Seen::default();
+    mount(&mut running, "p2", quiet(&reader));
+    wait_until(|| controls.subscribed().contains(&WIRE_TWO.to_string())).await;
 
     feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "{}")))
         .unwrap();
@@ -673,6 +1006,11 @@ async fn a_control_publish_after_a_fatal_still_routes() {
     running.send(toast());
     let page = running.end().await;
     assert_eq!(toasts(&page), vec!["hello".to_string()]);
+    assert_eq!(
+        reader.bodies(),
+        vec![toast_body()],
+        "a post-fatal banner reaches the entry that draws it"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -732,17 +1070,16 @@ fn a_full_event_sink_is_a_platform_half_not_draining_bug() {
     let controls = Controls::new();
     // Zero buffer plus the one slot every sender is guaranteed: the second emit
     // has nowhere to go, with the receiver still very much alive.
-    let (events_tx, _events) = mpsc::channel(0);
-    let (_control, control_rx) = mpsc::channel(8);
+    let (raw, _events, front) = raw_front(0);
     let mut runner = SurfaceRunner::new(
         SurfacePage::new(CONFIG.to_string(), EPOCH),
         config(),
         controls.connector(),
-        events_tx,
-        control_rx,
+        front,
     );
     runner.emit(Event::WiringChanged);
     runner.emit(Event::WiringChanged);
+    drop(raw);
 }
 
 #[tokio::test(start_paused = true)]
@@ -765,4 +1102,636 @@ async fn the_platform_half_leaving_ends_the_run() {
         .await
         .expect("the run ends within the (virtual) bound")
         .expect("the run does not panic");
+}
+
+// ── the activation pass ───────────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn a_delivered_message_reaches_the_entry_that_reads_it() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    let seen = Seen::default();
+    mount(&mut running, "p1", quiet(&seen));
+    ack(&controls, &feed, WIRE_ONE).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+        .unwrap();
+
+    wait_until(|| seen.bodies() == ["hello"]).await;
+    running.task.abort();
+}
+
+/// The other half of an activation: what the entry buffered commits, and a
+/// transportable output's commit is a flush on the wire.
+#[tokio::test(start_paused = true)]
+async fn an_entrys_publish_is_flushed_to_the_peer() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    let seen = Seen::default();
+    mount(&mut running, "p1", publishing(&seen, "out", "made"));
+    ack(&controls, &feed, WIRE_ONE).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+        .unwrap();
+
+    wait_until(|| !controls.batches().is_empty()).await;
+    let [(_, bodies)] = &controls.batches()[..] else {
+        panic!("one activation, one flush: {:?}", controls.batches())
+    };
+    assert_eq!(bodies, &["made".to_string()]);
+    running.task.abort();
+}
+
+/// A confined commit is the delivery, so one component's activation is what makes
+/// the next one ready — and the pass picks that up without waiting for anything to
+/// arrive from the peer.
+#[tokio::test(start_paused = true)]
+async fn a_confined_publish_activates_the_sibling_that_reads_it() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    let (writer, reader) = (Seen::default(), Seen::default());
+    mount(
+        &mut running,
+        "p1",
+        publishing(&writer, "notes", "passed on"),
+    );
+    mount(&mut running, "p2", quiet(&reader));
+    ack(&controls, &feed, WIRE_ONE).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+        .unwrap();
+
+    wait_until(|| reader.bodies() == ["passed on"]).await;
+    running.task.abort();
+}
+
+/// A panicking entry is a trap, which only the invocation boundary can tell from
+/// an err — and a trap is terminal for its instance.
+///
+/// Both payload shapes `panic!` produces are driven, because the message is the
+/// only answer an operator has to "failed *how*?" and recovering it is two
+/// separate downcasts: `p1` panics with a literal (a `&'static str`) and `p2` with
+/// a formatted message (a `String`), which is what a real component's panic
+/// almost always carries.
+#[tokio::test(start_paused = true)]
+async fn a_trapped_entry_takes_its_instance_terminal() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    mount(
+        &mut running,
+        "p1",
+        Box::new(|_, _| panic!("the component fell over")),
+    );
+    ack(&controls, &feed, WIRE_ONE).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+        .unwrap();
+
+    assert!(matches!(
+        running.event().await,
+        Event::InstanceFailed { instance, reason } if instance == "p1" && reason.contains("fell over")
+    ));
+
+    mount(
+        &mut running,
+        "p2",
+        Box::new(|_, _| panic!("the component fell over at rung {}", 7)),
+    );
+    ack(&controls, &feed, WIRE_TWO).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_TWO, "hello")))
+        .unwrap();
+
+    assert!(matches!(
+        running.event().await,
+        Event::InstanceFailed { instance, reason }
+            if instance == "p2" && reason == "the component fell over at rung 7"
+    ));
+    running.task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_erring_entry_is_reported_and_keeps_activating() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    let seen = Seen::default();
+    mount(&mut running, "p1", erring(&seen));
+    ack(&controls, &feed, WIRE_ONE).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "one")))
+        .unwrap();
+
+    assert!(matches!(
+        running.event().await,
+        Event::ActivationFailed { instance, message } if instance == "p1" && message == "no thanks"
+    ));
+    feed.unbounded_send(TransportEvent::Text(deliver_at(WIRE_ONE, "two", 2, 0x9002)))
+        .unwrap();
+    wait_until(|| seen.bodies() == ["one", "two"]).await;
+    running.task.abort();
+}
+
+/// The containment story, driven: a component that republishes what it reads is
+/// ready again the instant its own flush commits, so its arm never stops being
+/// ready. The socket above it must still be read and the platform half's commands
+/// must still be served — a livelock the page survives, not a hang it does not.
+#[tokio::test(start_paused = true)]
+async fn a_component_that_republishes_what_it_reads_does_not_starve_the_page() {
+    let controls = Controls::new();
+    let (feed, closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach_with(&mut running, &feed, &spin_doc()).await;
+
+    let seen = Seen::default();
+    mount(&mut running, "p1", publishing(&seen, "notes", "again"));
+    ack(&controls, &feed, WIRE_ONE).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "kick")))
+        .unwrap();
+    wait_until(|| seen.count() > 20).await;
+
+    // The transport is still read while it spins.
+    feed.unbounded_send(TransportEvent::Text(deliver_at(
+        WIRE_ONE, "arrived", 2, 0x9002,
+    )))
+    .unwrap();
+    wait_until(|| seen.saw("arrived")).await;
+
+    // And so is the control channel.
+    running.send(RunnerCommand::Close);
+    wait_until(|| closed.load(Ordering::SeqCst)).await;
+    running.task.abort();
+}
+
+/// The other half of that story, and the one the pass's budget is written for: a
+/// pass gets one activation per registered instance and the page's pick rotates,
+/// so a component whose own flush re-readies it cannot absorb every pass. A
+/// sibling with a message waiting is activated regardless — otherwise the page
+/// would keep reading its socket and answering commands while quietly delivering
+/// nothing to a mounted, healthy component.
+#[tokio::test(start_paused = true)]
+async fn a_spinning_component_does_not_starve_its_sibling() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach_with(&mut running, &feed, &spin_doc()).await;
+
+    let spinner = Seen::default();
+    let reader = Seen::default();
+    mount(&mut running, "p1", publishing(&spinner, "notes", "again"));
+    mount(&mut running, "p2", quiet(&reader));
+    ack(&controls, &feed, WIRE_ONE).await;
+    ack(&controls, &feed, WIRE_TWO).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "kick")))
+        .unwrap();
+    wait_until(|| spinner.count() > 20).await;
+
+    feed.unbounded_send(TransportEvent::Text(deliver_at(
+        WIRE_TWO,
+        "for the sibling",
+        1,
+        0x9101,
+    )))
+    .unwrap();
+    wait_until(|| reader.saw("for the sibling")).await;
+    running.task.abort();
+}
+
+/// The retry deadline's whole round trip through the runner: an activation's flush
+/// is metered by the peer, its head is re-parked, the deadline the page states is
+/// armed on the driver, and the fire comes back as the turn that re-offers it.
+#[tokio::test(start_paused = true)]
+async fn a_metered_flush_is_re_offered_when_the_retry_deadline_fires() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    let seen = Seen::default();
+    mount(&mut running, "p1", publishing(&seen, "out", "made"));
+    ack(&controls, &feed, WIRE_ONE).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+        .unwrap();
+    wait_until(|| !controls.batches().is_empty()).await;
+
+    let (correlation, _) = controls.batches()[0].clone();
+    feed.unbounded_send(TransportEvent::Text(frame(
+        &ServerFrame::PublishBatchResult {
+            correlation,
+            outcome: PublishBatchOutcome::RateLimited,
+        },
+    )))
+    .unwrap();
+
+    wait_until(|| controls.batches().len() == 2).await;
+    let batches = controls.batches();
+    assert_eq!(batches[1].1, vec!["made".to_string()], "the same flush");
+    assert_ne!(
+        batches[1].0, correlation,
+        "under a correlation of its own, the first one having been answered"
+    );
+    running.task.abort();
+}
+
+/// The release deadline's round trip, and the second half of the page's two clocks:
+/// an activation parks a confined publish, the deadline is armed on the driver, and
+/// the fire releases it into the store its reader is positioned on — which activates
+/// that reader.
+#[tokio::test(start_paused = true)]
+async fn a_deferred_publish_reaches_its_reader_when_the_release_deadline_fires() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    let (writer, reader) = (Seen::default(), Seen::default());
+    mount(&mut running, "p1", deferring(&writer, "notes", "later"));
+    mount(&mut running, "p2", quiet(&reader));
+    ack(&controls, &feed, WIRE_ONE).await;
+    feed.unbounded_send(TransportEvent::Text(deliver(WIRE_ONE, "hello")))
+        .unwrap();
+    wait_until(|| writer.saw("hello")).await;
+
+    // The wall clock the release is judged against is the real one, so what the
+    // fire waits for is real milliseconds passing — virtual time only decides how
+    // often the runner asks.
+    wait_until(|| reader.bodies() == ["later"]).await;
+    running.task.abort();
+}
+
+/// The publish channel's whole round trip: the handle's gate admits it, the runner
+/// mints its stamp and hands it the page, the page puts it on the wire under a
+/// correlation of its own, and the peer's answer comes back to the caller under
+/// *theirs*.
+#[tokio::test(start_paused = true)]
+async fn a_publish_through_the_handle_reaches_the_peer_and_is_answered() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    let correlation = running
+        .handle
+        .publish("p1", "out", "written".to_string())
+        .expect("a configured page admits a bound output port");
+
+    wait_until(|| !controls.publishes().is_empty()).await;
+    let published = controls.publishes().remove(0);
+    assert_eq!(published.channel, WIRE_OUT);
+    assert_eq!(
+        published.attribution,
+        Some("p1".to_string()),
+        "attributed to the component whose port it is"
+    );
+    assert_eq!(published.body, "written");
+
+    feed.unbounded_send(TransportEvent::Text(frame(&ServerFrame::PublishResult {
+        correlation: published.correlation,
+        outcome: PublishOutcome::Ok,
+    })))
+    .unwrap();
+    assert_eq!(
+        running.event().await,
+        Event::PublishResult {
+            instance: "p1".to_string(),
+            port: "out".to_string(),
+            correlation,
+            status: PublishStatus::Ok,
+        }
+    );
+    running.task.abort();
+}
+
+/// The gate is a snapshot of the page, and a run that never refreshed it would
+/// leave it at its default — which refuses everything, so the refusal alone proves
+/// nothing. What it must refuse is a page that has no wiring *yet*, and admit the
+/// same port the moment the document lands.
+#[tokio::test(start_paused = true)]
+async fn the_gate_refuses_a_publish_until_the_document_lands() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+
+    assert_eq!(
+        running.handle.publish("p1", "out", "early".to_string()),
+        Err(PublishReject::NotConnected)
+    );
+    settle().await;
+    assert!(
+        controls.publishes().is_empty(),
+        "a refused publish is answered on the caller's own stack and queues nothing"
+    );
+
+    attach(&mut running, &feed).await;
+    assert!(
+        running
+            .handle
+            .publish("p1", "out", "late".to_string())
+            .is_ok()
+    );
+    running.task.abort();
+}
+
+/// The detach edge, both ways: the wire port stops being publishable the moment the
+/// attachment goes, and the confined one does not — a page whose link is down is
+/// still a page, and its own planes are what chrome draws the outage from.
+#[tokio::test(start_paused = true)]
+async fn a_detach_refreshes_the_gate_without_closing_the_confined_port() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+    let reader = Seen::default();
+    mount(&mut running, "p2", quiet(&reader));
+
+    feed.unbounded_send(TransportEvent::Closed {
+        code: None,
+        reason: String::new(),
+    })
+    .unwrap();
+    assert!(matches!(running.event().await, Event::Disconnected { .. }));
+
+    assert_eq!(
+        running.handle.publish("p1", "out", "gone".to_string()),
+        Err(PublishReject::NotConnected),
+        "the wire port needs an attachment the peer is judging against"
+    );
+    running
+        .handle
+        .publish("p1", "notes", "offline".to_string())
+        .expect("a page-local port never touches the wire");
+    wait_until(|| reader.saw("offline")).await;
+    running.task.abort();
+}
+
+/// The close edge, which is the one that ends an attachment without the
+/// connection reporting anything — every other gate refresh hangs off an event
+/// the connection produced. So this is the only edge whose refresh nothing else
+/// would make, and a run that dropped it would keep admitting wire publishes on a
+/// page that has closed itself: each one queued, each one refused late by the
+/// drain instead of synchronously on the caller's own stack.
+///
+/// The confined port survives the close for the same reason it survives a detach,
+/// and the drain routes it and activates the reader — a terminal page is still a
+/// page.
+#[tokio::test(start_paused = true)]
+async fn a_close_refreshes_the_gate_without_closing_the_confined_port() {
+    let controls = Controls::new();
+    let (feed, closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+    let reader = Seen::default();
+    mount(&mut running, "p2", quiet(&reader));
+    wait_until(|| controls.subscribed().contains(&WIRE_TWO.to_string())).await;
+
+    running.send(RunnerCommand::Close);
+    wait_until(|| closed.load(Ordering::SeqCst)).await;
+    settle().await;
+
+    assert_eq!(
+        running.handle.publish("p1", "out", "gone".to_string()),
+        Err(PublishReject::NotConnected),
+        "a page that closed itself has no wire to admit a publish for"
+    );
+    running
+        .handle
+        .publish("p1", "notes", "still here".to_string())
+        .expect("a page-local port never touches the wire");
+    wait_until(|| reader.saw("still here")).await;
+    running.task.abort();
+}
+
+/// A second document over a running page moves both things the handle's snapshot
+/// answers from, and the run refreshes it off `WiringChanged` for exactly that
+/// reason: a port the new document dropped must stop being admitted, and a floor
+/// it raised must start swallowing the reports below it.
+#[tokio::test(start_paused = true)]
+async fn a_second_document_refreshes_the_gate_and_the_report_floor() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach_with(&mut running, &feed, &reporting_doc()).await;
+    running
+        .handle
+        .publish("p1", "out", "bound".to_string())
+        .expect("the first document binds the port");
+
+    feed.unbounded_send(TransportEvent::Text(deliver_at(
+        CONFIG,
+        &narrowed_doc().to_body(),
+        2,
+        0x9201,
+    )))
+    .unwrap();
+    assert!(matches!(running.event().await, Event::WiringChanged));
+
+    assert_eq!(
+        running.handle.publish("p1", "out", "unbound".to_string()),
+        Err(PublishReject::UnboundPort),
+        "the wiring in force no longer binds the port"
+    );
+    running
+        .handle
+        .report(LogLevel::Warn, "component:protobar", "under", Some("p1"));
+    running
+        .handle
+        .report(LogLevel::Error, "component:protobar", "over", Some("p1"));
+    wait_until(|| {
+        controls
+            .publishes()
+            .iter()
+            .any(|published| published.body.contains("over"))
+    })
+    .await;
+    settle().await;
+    let published = controls.publishes();
+    assert!(
+        !published
+            .iter()
+            .any(|published| published.body.contains("under")),
+        "the raised floor is read off the same refreshed snapshot"
+    );
+    assert!(
+        !published
+            .iter()
+            .any(|published| published.body == "unbound"),
+        "a refused publish is answered on the caller's own stack and queues nothing"
+    );
+    running.task.abort();
+}
+
+/// A report is an ordinary publish on the channel the wiring names, gated by the
+/// floor it states — and the floor is read off the same snapshot the publish gate
+/// is, so a run that never refreshed it would publish nothing at all.
+#[tokio::test(start_paused = true)]
+async fn a_report_clearing_the_floor_reaches_the_error_channel() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach_with(&mut running, &feed, &reporting_doc()).await;
+
+    running
+        .handle
+        .report(LogLevel::Debug, "component:protobar", "noise", Some("p1"));
+    running
+        .handle
+        .report(LogLevel::Error, "component:protobar", "boom", Some("p1"));
+
+    wait_until(|| !controls.publishes().is_empty()).await;
+    settle().await;
+    let published = controls.publishes();
+    assert_eq!(published.len(), 1, "the debug report never left the handle");
+    assert_eq!(published[0].channel, ERRORS);
+    assert_eq!(
+        published[0].attribution,
+        Some("p1".to_string()),
+        "attributed to the component the report is about"
+    );
+    assert!(published[0].body.contains("boom"));
+    running.task.abort();
+}
+
+/// The alert plane end to end. Its own channel, because a paging event must not
+/// queue behind a publish flood, and the grant is the attachment's rather than the
+/// wiring's.
+#[tokio::test(start_paused = true)]
+async fn an_alert_reaches_the_peer_on_a_granted_attachment() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach_as(
+        &mut running,
+        &feed,
+        welcome_under(alert_granting_facts()),
+        &doc(),
+    )
+    .await;
+
+    running
+        .handle
+        .alert(AlertSeverity::Warning, "wall down", "the wall is down");
+
+    wait_until(|| !controls.alerts().is_empty()).await;
+    assert_eq!(
+        controls.alerts(),
+        vec![("wall down".to_string(), "the wall is down".to_string())]
+    );
+    running.task.abort();
+}
+
+/// The telemetry plane: both documents, on the channels the wiring names, published
+/// under the bare identity — the peer admits no component-attributed writer on
+/// them.
+#[tokio::test(start_paused = true)]
+async fn the_two_telemetry_documents_go_out_unattributed() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    running.handle.send_geometry(1_280, 720, 2.0);
+    running
+        .handle
+        .send_status(Vec::new(), 42, StatusCounters::default());
+
+    wait_until(|| controls.publishes().len() == 2).await;
+    let published = controls.publishes();
+    assert_eq!(published[0].channel, GEOMETRY);
+    assert_eq!(published[1].channel, STATUS);
+    assert!(
+        published.iter().all(|p| p.attribution.is_none()),
+        "the surface writes its own documents as itself"
+    );
+    assert!(published[0].body.contains("1280"));
+    assert!(published[1].body.contains("42"));
+    running.task.abort();
+}
+
+/// A publish the gate admitted before the attachment ended is still owed a
+/// disposition: its caller holds a correlation and has nothing else to wait for.
+/// The gate refresh closes the window the moment the run notices, so the queued
+/// one takes the ordinary turn in the drain and comes back with the page's own
+/// answer — the same one the refreshed gate now gives synchronously.
+#[tokio::test(start_paused = true)]
+async fn a_straggler_publish_after_the_attachment_ended_is_answered() {
+    let controls = Controls::new();
+    let (_feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn_raw(&controls);
+
+    running
+        .front
+        .control_tx
+        .try_send(RunnerCommand::Close)
+        .expect("the channel has room");
+    running
+        .front
+        .publish_tx
+        .try_send(PublishSlot::Publish(PublishCommand {
+            correlation: 7,
+            instance: "p1".to_string(),
+            port: "out".to_string(),
+            body: "stranded".to_string(),
+            urgency: None,
+        }))
+        .expect("the channel has room");
+
+    assert_eq!(
+        running.event().await,
+        Event::PublishResult {
+            instance: "p1".to_string(),
+            port: "out".to_string(),
+            correlation: 7,
+            status: PublishStatus::NotConnected,
+        }
+    );
+    running.end().await;
+}
+
+/// The best-effort planes after the attachment ended: absorbed, not answered and
+/// not queued for a wire that is gone — and none of them keeps the drain from
+/// ending once every sender has dropped.
+#[tokio::test(start_paused = true)]
+async fn the_best_effort_planes_are_absorbed_after_the_attachment_ended() {
+    let controls = Controls::new();
+    let (_feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn_raw(&controls);
+
+    running
+        .front
+        .control_tx
+        .try_send(RunnerCommand::Close)
+        .expect("the channel has room");
+    running
+        .front
+        .alert_tx
+        .try_send(AlertCommand {
+            severity: AlertSeverity::Warning,
+            title: "late".to_string(),
+            body: "later".to_string(),
+        })
+        .expect("the channel has room");
+    running
+        .front
+        .telemetry_tx
+        .try_send(TelemetryCommand::Status {
+            instances: Vec::new(),
+            uptime_secs: 1,
+            counters: StatusCounters::default(),
+        })
+        .expect("the channel has room");
+
+    running.end().await;
+    assert!(
+        controls.alerts().is_empty(),
+        "nothing is composed against an attachment that has ended"
+    );
+    assert!(controls.publishes().is_empty());
 }

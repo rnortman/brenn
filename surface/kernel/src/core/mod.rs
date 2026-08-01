@@ -190,7 +190,7 @@ pub use brenn_attach_client::Millis;
 
 // TODO(attach-cutover): this vocabulary and the `on_input`/`dispatch_input`
 // routing over it are duplicated by `crate::turn`, whose inputs are the attach
-// driver's rather than the transport's. Delete them here when the kernel cuts
+// driver's rather than the transport's. Delete them here when the server route cuts
 // over.
 
 /// An input to the core, produced by the driver from transport and timer
@@ -394,7 +394,7 @@ struct DropCharge {
 
 // TODO(attach-cutover): this vocabulary and the `on_command` dispatch over it
 // are duplicated by `crate::command`, which resolves a port against the bindings
-// document instead of against `Welcome`. Delete them here when the kernel cuts
+// document instead of against `Welcome`. Delete them here when the server route cuts
 // over.
 
 /// A command to the core, carried on [`Input::Command`], originating from the
@@ -561,7 +561,7 @@ const RETRY_INTERVAL_MS: u64 = 1_000;
 // TODO(attach-cutover): this vocabulary is duplicated by
 // `crate::session::Effect`, the half of it a page still asks for once the
 // connection's own effects are the attach driver's business. Delete it here when
-// the kernel cuts over.
+// the server route cuts over.
 
 /// An effect the driver must execute, in order.
 ///
@@ -1127,7 +1127,7 @@ pub struct ClientCore {
     // TODO(attach-cutover): the registration half of this table and the passes
     // over it are duplicated by `crate::registry::Registrations` (positions and
     // subscription references) and `crate::outbound::SurfaceOutbound` (the
-    // parked flushes). Delete them here when the kernel cuts over.
+    // parked flushes). Delete them here when the server route cuts over.
     registered: HashMap<String, RegisteredInstance>,
     /// The page-load epoch stamped on every `LocalPos` (`CoreConfig::local_epoch`).
     local_epoch: Uuid,
@@ -1631,7 +1631,7 @@ impl ClientCore {
     // `send_parked_batches` — is duplicated by the two-phase connect in
     // `crate::connect`, `crate::registry` and `crate::outbound`, which take the
     // same wiring off the bindings document instead. Delete it here when the
-    // kernel cuts over to them.
+    // server route cuts over to them.
 
     /// Process the `Welcome` handshake: validate binding schemes, reset backoff,
     /// enter `Active`, arm the liveness deadline, run the reconnect-reconcile
@@ -3371,7 +3371,7 @@ impl ClientCore {
     // takeover stamp in `guard_local_body`, and `record_overlay_state` — is
     // duplicated by `crate::planes::SurfacePlanes`, which states the same rules
     // as the policy the attach crate's router is constructed with. Delete it
-    // here when the kernel cuts over.
+    // here when the server route cuts over.
 
     /// Judge a publish on [`LOCAL_OVERLAY_STATE_CHANNEL`] against the plane's
     /// publisher rules, without recording anything.
@@ -4244,7 +4244,7 @@ impl ClientCore {
     // TODO(attach-cutover): the two telemetry commands below carry the frames
     // that die with this wire; the documents replacing them are composed by
     // `crate::telemetry` and sent as ordinary publishes through
-    // `crate::outbound`. Delete this path when the kernel cuts over.
+    // `crate::outbound`. Delete this path when the server route cuts over.
 
     /// Handle a `SendGeometry` telemetry command. Best-effort like `on_alert`:
     /// the frame rides the same WS, so it is sent only while `Active`. The

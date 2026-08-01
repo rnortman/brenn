@@ -1373,14 +1373,22 @@ pub const STALE_BUILD_CLOSE_CODE: u16 = 3001;
 
 /// Maximum number of subscription bindings a single `[[surface]]` may declare.
 ///
-/// The kernel attaches one port per subscription binding in one synchronous
-/// first-connect burst, and on wasm's single thread the client's driver cannot
-/// drain its bounded control channel until that burst returns. This one shared
-/// bound keeps the two ends from drifting: the client sizes its control channel
-/// to absorb a burst this large, and the backend boot-validates a surface's
-/// subscription count against it so an oversized-but-otherwise-valid config
-/// fails fast at boot rather than bricking the kernel at first connect.
+/// The kernel composes one `Subscribe` per bound channel in a single
+/// first-connect run, and the peer meters subscribe traffic per attachment. This
+/// one shared bound keeps the two ends from drifting: the backend derives the
+/// attachment's subscribe-burst allowance from it and boot-validates a surface's
+/// subscription count against it, so an oversized-but-otherwise-valid config
+/// fails fast at boot rather than tripping the meter at first connect.
 pub const MAX_SURFACE_SUBSCRIPTION_BINDINGS: usize = 64;
+
+/// Maximum number of components a single `[[surface]]` may declare.
+///
+/// The bound under the kernel's control channel, which panics when full. Both
+/// ends derive their limits from this value: the client sizes its control
+/// channel to absorb a mount burst this large, and the backend boot-validates a
+/// surface's component count against it — so an oversized-but-otherwise-valid
+/// config fails fast at boot rather than bricking the kernel at first mount.
+pub const MAX_SURFACE_COMPONENTS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Tests

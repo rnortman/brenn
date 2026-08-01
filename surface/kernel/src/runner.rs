@@ -25,6 +25,20 @@
 //! The starvation a bias order guards against is a *stream*, and no deadline
 //! produces one.
 //!
+//! Within the front door's own four channels the order is the one their contracts
+//! imply: control first, because a mount is what every later delivery depends on
+//! and its channel is the one with a panic bound under it; then the publishes,
+//! which are answered; then the two best-effort planes, which are dropped when
+//! there is nowhere to put them. Neither a publish backlog nor an alert flood can
+//! starve an unmount that way.
+//!
+//! Activations are dead last, and that is the whole point. A component that
+//! republishes onto a confined channel it reads is ready again the instant its own
+//! flush commits, so its arm is permanently ready — anything above it must win
+//! every turn or that one component starves the page. Below the deadlines too: a
+//! wake the page armed is a promise to something, and a spinning component is a
+//! promise to nobody.
+//!
 //! One state is outside that bundle: a connect attempt in flight. The attempt
 //! owns the driver for its whole duration — it is the one thing the driver cannot
 //! hand back half-done — so the outbox retry and the confined release cannot fire
@@ -39,12 +53,17 @@
 //! folds the death one event-loop hop later and states its own terminal
 //! link-state on a confined plane, which is still mounted for chrome to draw the
 //! banner from. So the loop hands off to a drain that keeps routing exactly that
-//! and absorbs the rest, and returns only once the platform half is gone.
+//! — and keeps activating the readers it wakes, or the banner would be routed to
+//! a page that never draws it — absorbs the rest, and returns only once the
+//! platform half is gone.
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
+use std::task::Poll;
 
 use chrono::{DateTime, Utc};
 use futures_channel::mpsc;
@@ -54,10 +73,20 @@ use brenn_attach_client::TransportConnector;
 use brenn_attach_client::conn::ConnConfig;
 use brenn_attach_client::driver::{AttachDriver, DriverStep, IoEvent};
 use brenn_attach_client::transport::clock::{checked_epoch_ms, epoch_ms, wall_now};
+use brenn_surface_contract::Activation;
 
+use crate::activation::ReadyActivation;
 use crate::command::Command;
+use crate::core::ActivationOutcome;
+use crate::front::{
+    AlertCommand, FrontChannels, PublishCommand, PublishSlot, ReportCommand, SurfaceGate,
+    TelemetryCommand,
+};
 use crate::handle::ActivationEntry;
+use crate::outbound::PortPublish;
+use crate::outward::{self, Completed};
 use crate::page::SurfacePage;
+use crate::publish_buffer::PublishBuffer;
 use crate::session::{Effect, Event};
 use crate::turn::{self, Input};
 
@@ -99,10 +128,13 @@ pub struct SurfaceRunner<C: TransportConnector> {
     /// unclonable, undebuggable and uncomparable. The page holds the *identity*
     /// of a registered instance and every scheduling decision about it; this map
     /// holds the one thing it cannot.
-    // TODO(runner-activation-dispatch): nothing invokes these yet — the pass that
-    // assembles a ready instance's activation, calls its entry and hands the
-    // completion back is not wired into the loop.
     entries: HashMap<String, ActivationEntry>,
+    /// The in-flight activation's buffer, shared with the platform half's front
+    /// door. Filled for exactly the duration of an entry invocation; a `dom`
+    /// component's publish reaches it from a DOM listener, which is a code path
+    /// with no way to the buffer on this stack.
+    #[cfg(target_arch = "wasm32")]
+    in_flight: crate::front::InFlightSlot,
     /// The platform half's event sink. Bounded; an overflow is a
     /// platform-half-not-draining bug (this traffic is low-rate by construction)
     /// and panics.
@@ -112,6 +144,17 @@ pub struct SurfaceRunner<C: TransportConnector> {
     /// sender. The loop stops selecting it and carries on: the run's life is tied
     /// to the attachment and the event sink, not to who can command it.
     control_closed: bool,
+    /// The components' publishes and the log path's reports, which share one
+    /// channel because a report is an ordinary publish on an ordinary channel.
+    publish_rx: mpsc::Receiver<PublishSlot>,
+    publish_closed: bool,
+    alert_rx: mpsc::Receiver<AlertCommand>,
+    alert_closed: bool,
+    telemetry_rx: mpsc::Receiver<TelemetryCommand>,
+    telemetry_closed: bool,
+    /// The handle's publish pre-check, refreshed here at every edge that moves
+    /// what it answers. Shared with the platform half, which only reads it.
+    gate: Arc<Mutex<SurfaceGate>>,
     /// Whether the device clock can timestamp at all. False only after the boot
     /// check refused it, which is terminal — the turns that follow the diagnosis
     /// resolve nothing against a clock, and reading a broken one would panic
@@ -126,20 +169,37 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     /// The page carries the boot identity the attachment is about to be measured
     /// against — the channel its wiring is retained on, and the epoch its own
     /// stores are stamped with — because both are the caller's to resolve.
-    pub fn new(
-        page: SurfacePage,
-        config: ConnConfig,
-        connector: C,
-        events_tx: mpsc::Sender<Event>,
-        control_rx: mpsc::Receiver<RunnerCommand>,
-    ) -> Self {
+    ///
+    /// `front` is the receiving half of the front door: the four command channels
+    /// the platform half's handle writes to, its event sink, the publish gate this
+    /// run keeps current, and (on wasm) the in-flight buffer slot it fills.
+    pub fn new(page: SurfacePage, config: ConnConfig, connector: C, front: FrontChannels) -> Self {
+        let FrontChannels {
+            events_tx,
+            control_rx,
+            publish_rx,
+            alert_rx,
+            telemetry_rx,
+            #[cfg(target_arch = "wasm32")]
+            in_flight,
+            gate,
+        } = front;
         Self {
             driver: AttachDriver::new(config, connector),
             page,
             entries: HashMap::new(),
+            #[cfg(target_arch = "wasm32")]
+            in_flight,
             events_tx,
             control_rx,
             control_closed: false,
+            publish_rx,
+            publish_closed: false,
+            alert_rx,
+            alert_closed: false,
+            telemetry_rx,
+            telemetry_closed: false,
+            gate,
             clock_usable: true,
         }
     }
@@ -185,6 +245,10 @@ impl<C: TransportConnector> SurfaceRunner<C> {
                 Some(url) => self.run_connect(url).await,
                 None => self.run_select().await,
             }
+            // After the turn, not inside it: everything that turn delivered is
+            // already in the positions an assembly windows, which is what makes
+            // one turn's deliveries one activation rather than N.
+            self.activation_pass().await;
         }
         if !self.host_gone() {
             self.run_terminal_drain().await;
@@ -209,6 +273,11 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     /// applied in order once it settles; buffering is what keeps a slow trickle
     /// of mounts during a stalled handshake from filling the control channel to
     /// its panic bound.
+    ///
+    /// The other three channels are not served here at all, and need not be: a
+    /// publish backlog answers its own callers `Busy` at the handle, and the two
+    /// best-effort planes drop what they cannot hold. Only the control channel
+    /// panics when it fills, so only the control channel is drained.
     async fn run_connect(&mut self, url: String) {
         let mut buffered: Vec<RunnerCommand> = Vec::new();
         let mut control_open = !self.control_closed;
@@ -223,14 +292,7 @@ impl<C: TransportConnector> SurfaceRunner<C> {
                 // flag without clashing with that future's borrow.
                 let open = control_open;
                 let settled = {
-                    let control = async {
-                        if open {
-                            control_rx.next().await
-                        } else {
-                            future::pending::<Option<RunnerCommand>>().await
-                        }
-                    }
-                    .fuse();
+                    let control = recv_open(control_rx, !open).fuse();
                     pin_mut!(control);
                     select_biased! {
                         input = connect => Some(input),
@@ -266,23 +328,52 @@ impl<C: TransportConnector> SurfaceRunner<C> {
         let woke = {
             let Self {
                 driver,
+                page,
                 control_rx,
                 control_closed,
+                publish_rx,
+                publish_closed,
+                alert_rx,
+                alert_closed,
+                telemetry_rx,
+                telemetry_closed,
                 ..
             } = &mut *self;
             let io = driver.wait().fuse();
-            let control = async {
-                if *control_closed {
-                    future::pending::<Option<RunnerCommand>>().await
+            let control = recv_open(control_rx, *control_closed).fuse();
+            let publish = recv_open(publish_rx, *publish_closed).fuse();
+            let alert = recv_open(alert_rx, *alert_closed).fuse();
+            let telemetry = recv_open(telemetry_rx, *telemetry_closed).fuse();
+            // Ready while an instance is dispatchable, pending forever otherwise,
+            // so work the previous pass's budget left over is picked up here rather
+            // than waiting on an unrelated frame or deadline.
+            //
+            // The yield is not a detail. A component in a publish cycle keeps this
+            // arm ready forever, and an arm that answers ready on its first poll
+            // means this select — and so the whole run — never once returns
+            // `Pending`. The executor would never get control back, and the
+            // executor is the only thing that can hand the socket a frame to make
+            // the transport arm ready in the first place: on wasm it is the JS
+            // event loop the WebSocket callbacks run on. Biasing anything above
+            // this arm buys nothing if the frame can never arrive. Which is also
+            // why the browser's yield is a task hop and not a microtask one — see
+            // `yield_now`.
+            let activations = async {
+                if outward::ready(page).is_some() {
+                    yield_now().await;
                 } else {
-                    control_rx.next().await
+                    future::pending::<()>().await;
                 }
             }
             .fuse();
-            pin_mut!(io, control);
+            pin_mut!(io, control, publish, alert, telemetry, activations);
             select_biased! {
                 event = io => Woke::Io(event),
-                command = control => Woke::Control(command),
+                command = control => Woke::Front(FrontWoke::Control(command)),
+                command = publish => Woke::Front(FrontWoke::Publish(command)),
+                command = alert => Woke::Front(FrontWoke::Alert(command)),
+                command = telemetry => Woke::Front(FrontWoke::Telemetry(command)),
+                () = activations => Woke::Activations,
             }
         };
         match woke {
@@ -297,58 +388,283 @@ impl<C: TransportConnector> SurfaceRunner<C> {
             Woke::Io(IoEvent::ReleaseDue { now_ms }) => {
                 self.turn_at(Input::ReleaseDue, now_ms).await;
             }
-            Woke::Control(Some(command)) => self.control(command).await,
-            Woke::Control(None) => self.control_closed = true,
+            Woke::Front(front) => self.serve(front).await,
+            // Nothing to serve: the readiness and the positions behind it are the
+            // page's already, and the pass at the end of the loop is what takes
+            // them. This arm exists only to be woken by.
+            Woke::Activations => {}
         }
     }
 
-    /// Serve the control channel after the attachment has ended.
+    /// Serve one thing the platform half asked for, or record that the channel it
+    /// would have come on has gone.
+    ///
+    /// A closed channel is not the end of the run: the run's life is tied to the
+    /// attachment and the event sink, not to who can still command it. Each flag
+    /// only stops the loop selecting a channel that would answer `None` forever.
+    async fn serve(&mut self, woke: FrontWoke) {
+        match woke {
+            FrontWoke::Control(Some(command)) => self.control(command).await,
+            FrontWoke::Control(None) => self.control_closed = true,
+            FrontWoke::Publish(Some(slot)) => self.publish(slot).await,
+            FrontWoke::Publish(None) => self.publish_closed = true,
+            FrontWoke::Alert(Some(alert)) => self.turn(Input::Command(alert_command(alert))).await,
+            FrontWoke::Alert(None) => self.alert_closed = true,
+            FrontWoke::Telemetry(Some(document)) => {
+                self.turn(Input::Command(telemetry_command(document))).await;
+            }
+            FrontWoke::Telemetry(None) => self.telemetry_closed = true,
+        }
+    }
+
+    /// Serve one thing off the publish channel: a component's publish on one of
+    /// its own ports, or a report from the kernel's log path.
+    ///
+    /// A publish is minted an envelope identity whatever its port turns out to
+    /// bind. Only the page holds the wiring that says which class the port falls
+    /// on, and this is the layer that reads entropy — so the stamp is minted here
+    /// and spent there, or discarded when the peer is the one that will mint the
+    /// authoritative envelope.
+    async fn publish(&mut self, slot: PublishSlot) {
+        let command = match slot {
+            PublishSlot::Publish(PublishCommand {
+                correlation,
+                instance,
+                port,
+                body,
+                urgency,
+            }) => Command::Publish {
+                publish: PortPublish {
+                    instance,
+                    port,
+                    body,
+                    urgency,
+                    correlation,
+                },
+                stamp: self.driver.new_stamp(),
+            },
+            PublishSlot::Report(ReportCommand {
+                level,
+                source,
+                message,
+                subject,
+            }) => Command::Report {
+                level,
+                source,
+                message,
+                subject,
+            },
+        };
+        self.turn(Input::Command(command)).await;
+    }
+
+    /// Invoke the activations the page has ready — one pass over the ready set,
+    /// not a drain to exhaustion.
+    ///
+    /// **The bound is load-bearing.** An ok flush carrying a confined entry routes
+    /// synchronously, which wakes every reader bound to that channel — the
+    /// publisher itself included, if it reads what it writes — and the input grant
+    /// is deliberately 1:1 solvent, so a component that republishes what it
+    /// consumes never runs out of budget to do it with. Draining until the page has
+    /// nothing ready would then never return: the run would stop reading the
+    /// socket, stop serving deadlines and stop activating every other instance —
+    /// one buggy component hanging the page, which is precisely what the kernel's
+    /// containment story is supposed to bound. So a pass gets one activation per
+    /// registered instance, which the page's rotating pick makes a fair one, and
+    /// whatever is still ready comes back through the select's own activations arm.
+    /// A publish cycle is a livelock the page survives, not a hang it does not.
+    ///
+    /// Invocation is synchronous: wasm is single-threaded and the flush rule needs
+    /// a return value, not a future. So a pass cannot be re-entered mid-entry, and
+    /// the in-flight buffer cannot be observed by anything but the entry itself.
+    async fn activation_pass(&mut self) {
+        let mut budget = self.page.registrations.len();
+        while budget > 0 && outward::ready(&self.page).is_some() {
+            budget -= 1;
+            let now = self.driver.now();
+            let now_ms = self.now_ms();
+            let (ready, effects) = turn::dispatch(&mut self.page, now, now_ms);
+            // The window's own loud rungs — an `alarm` binding's alert and toast, a
+            // `fatal` binding's kill — are enacted before the entry runs, and the
+            // kill is why there may be no entry to run.
+            self.execute(effects).await;
+            let Some(ready) = ready else { continue };
+            let ReadyActivation {
+                instance,
+                generation,
+                activation,
+                buffer,
+                drops: _,
+            } = ready;
+            let (outcome, buffer) = self.invoke(&instance, &activation, buffer);
+            // One stamp per buffered publish: the page is the router for a flush's
+            // confined entries and reads no entropy of its own. Minted for every
+            // entry whatever its class, for the same reason a single publish is —
+            // only the page resolves which channel a port names.
+            let stamps = self.driver.flush_stamps(buffer.len());
+            self.turn(Input::ActivationDone(Completed {
+                instance,
+                generation,
+                outcome,
+                buffer,
+                stamps,
+            }))
+            .await;
+        }
+    }
+
+    /// Call one instance's entry and classify how it finished.
+    ///
+    /// An instance whose entry is gone answers a **trap**. It cannot happen —
+    /// assembly and invocation are one synchronous stretch, and a deregistration
+    /// arrives on the control channel — but the page marked the instance in flight
+    /// and is owed a completion, or it never activates again; and an activation
+    /// whose entry vanished did not return ok. The page absorbs this one anyway
+    /// (the mount is gone, so the generation no longer matches), which is what
+    /// makes reporting it as a trap free of consequence beyond the log.
+    fn invoke(
+        &self,
+        instance: &str,
+        activation: &Activation,
+        buffer: PublishBuffer,
+    ) -> (ActivationOutcome, PublishBuffer) {
+        let Some(entry) = self.entries.get(instance) else {
+            return (
+                ActivationOutcome::Trap(
+                    "activation entry deregistered between assembly and invocation".to_string(),
+                ),
+                buffer,
+            );
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            invoke_native(entry, activation, buffer)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            invoke_wasm(entry, activation, &self.in_flight, instance, buffer)
+        }
+    }
+
+    /// Serve the front door after the attachment has ended.
     ///
     /// Only the kernel's own confined planes are still worth stating — the page's
     /// rings outlive the attachment and their readers are still mounted — so a
     /// `PublishControl` routes and everything else is absorbed: there is no wire
-    /// for a mount to subscribe on, and nothing left to close.
+    /// for a mount to subscribe on, nothing left to close, and no peer to answer
+    /// an alert or take a document.
+    ///
+    /// Routing is only half of what a mounted reader needs, so each turn here is
+    /// followed by the same bounded activation pass the live loop takes: a routed
+    /// body that marks a reader ready draws nothing until that reader's entry
+    /// runs, and the banner chrome draws the page's own death from arrives on
+    /// exactly this path. The pass's precondition holds — the wiring in force
+    /// outlives the attachment, and a ready instance implies it — and a publish
+    /// composed while detached reaches no socket, so the drain writes nothing.
+    /// Unlike the live loop there is no arm to come back through: what a pass's
+    /// budget leaves over waits for the next thing the front door says, which
+    /// keeps a component in a publish cycle from spinning a page that is already
+    /// winding down.
+    ///
+    /// A publish is the one thing that is neither absorbed nor answered here: it
+    /// takes the ordinary turn, exactly as it would have one turn earlier. Its
+    /// caller was handed a correlation and is owed a disposition, and only the page
+    /// knows which class the port falls on — a confined one still routes and still
+    /// wakes its readers, and a transportable one is refused `NotConnected` by the
+    /// same predicate the gate answers with. Answering the whole channel from here
+    /// would refuse page-local work the class is offline-correct for, and would be
+    /// a second copy of a disposition the page already owns.
     // TODO(runner-drain-host-departure): terminal disarms every deadline and drops
-    // the transport, so the wait below has no wake source but the control channel
-    // — a platform half that drops the event receiver while holding an idle
-    // control sender parks this drain, and the page and the task leak with it.
-    // Everywhere else the run re-reads `host_gone` on a bounded cadence.
+    // the transport, so the wait below has no wake source but the front door's own
+    // channels — a platform half that drops the event receiver while holding idle
+    // senders parks this drain, and the page and the task leak with it. Everywhere
+    // else the run re-reads `host_gone` on a bounded cadence.
     async fn run_terminal_drain(&mut self) {
         loop {
             // Nothing consumes what a routed publish would produce, and no
             // command can arrive: either way the run is over.
-            if self.host_gone() || self.control_closed {
+            if self.host_gone() || self.front_closed() {
                 return;
             }
-            let command = {
-                let Self { control_rx, .. } = &mut *self;
-                control_rx.next().await
+            let woke = {
+                let Self {
+                    control_rx,
+                    control_closed,
+                    publish_rx,
+                    publish_closed,
+                    alert_rx,
+                    alert_closed,
+                    telemetry_rx,
+                    telemetry_closed,
+                    ..
+                } = &mut *self;
+                let control = recv_open(control_rx, *control_closed).fuse();
+                let publish = recv_open(publish_rx, *publish_closed).fuse();
+                let alert = recv_open(alert_rx, *alert_closed).fuse();
+                let telemetry = recv_open(telemetry_rx, *telemetry_closed).fuse();
+                pin_mut!(control, publish, alert, telemetry);
+                select_biased! {
+                    command = control => FrontWoke::Control(command),
+                    command = publish => FrontWoke::Publish(command),
+                    command = alert => FrontWoke::Alert(command),
+                    command = telemetry => FrontWoke::Telemetry(command),
+                }
             };
-            match command {
-                None => self.control_closed = true,
-                Some(RunnerCommand::PublishControl { channel, body }) => {
-                    self.publish_control(channel, body).await;
-                }
-                // Named rather than silently swallowed: during an incident a
-                // mount that did nothing reads as a call that never happened
-                // unless the log says it arrived late.
-                Some(RunnerCommand::RegisterActivation { instance, .. }) => {
-                    tracing::debug!(
-                        %instance,
-                        "surface runner: absorbed a mount after the attachment ended"
-                    );
-                }
-                Some(RunnerCommand::DeregisterActivation { instance }) => {
-                    tracing::debug!(
-                        %instance,
-                        "surface runner: absorbed an unmount after the attachment ended"
-                    );
-                }
-                Some(RunnerCommand::Close) => {
-                    tracing::debug!("surface runner: absorbed a close after the attachment ended");
-                }
-            }
+            self.absorb_front(woke).await;
+            self.activation_pass().await;
         }
+    }
+
+    /// Dispose of one thing the platform half asked for after the attachment
+    /// ended.
+    async fn absorb_front(&mut self, woke: FrontWoke) {
+        match woke {
+            FrontWoke::Control(None) => self.control_closed = true,
+            FrontWoke::Control(Some(RunnerCommand::PublishControl { channel, body })) => {
+                self.publish_control(channel, body).await;
+            }
+            // Named rather than silently swallowed: during an incident a mount
+            // that did nothing reads as a call that never happened unless the log
+            // says it arrived late.
+            FrontWoke::Control(Some(RunnerCommand::RegisterActivation { instance, .. })) => {
+                tracing::debug!(
+                    %instance,
+                    "surface runner: absorbed a mount after the attachment ended"
+                );
+            }
+            FrontWoke::Control(Some(RunnerCommand::DeregisterActivation { instance })) => {
+                tracing::debug!(
+                    %instance,
+                    "surface runner: absorbed an unmount after the attachment ended"
+                );
+            }
+            FrontWoke::Control(Some(RunnerCommand::Close)) => {
+                tracing::debug!("surface runner: absorbed a close after the attachment ended");
+            }
+            FrontWoke::Publish(None) => self.publish_closed = true,
+            FrontWoke::Publish(Some(slot @ PublishSlot::Publish(_))) => self.publish(slot).await,
+            // A report is owed nobody an answer, here least of all: the loop a
+            // report about a failed report opens is what the log path's swallow
+            // closes.
+            FrontWoke::Publish(Some(PublishSlot::Report(report))) => {
+                tracing::debug!(
+                    level = ?report.level,
+                    "surface runner: absorbed a report after the attachment ended"
+                );
+            }
+            FrontWoke::Alert(None) => self.alert_closed = true,
+            FrontWoke::Alert(Some(_)) => {
+                tracing::debug!("surface runner: absorbed an alert after the attachment ended");
+            }
+            FrontWoke::Telemetry(None) => self.telemetry_closed = true,
+            FrontWoke::Telemetry(Some(_)) => {}
+        }
+    }
+
+    /// Whether every channel of the front door has closed: the platform half
+    /// dropped its handle, so nothing can ask this run for anything again.
+    fn front_closed(&self) -> bool {
+        self.control_closed && self.publish_closed && self.alert_closed && self.telemetry_closed
     }
 
     /// Serve one control command: resolve what the page cannot hold — a callback,
@@ -370,7 +686,13 @@ impl<C: TransportConnector> SurfaceRunner<C> {
             RunnerCommand::PublishControl { channel, body } => {
                 self.publish_control(channel, body).await;
             }
-            RunnerCommand::Close => self.turn(Input::Command(Command::Close)).await,
+            RunnerCommand::Close => {
+                self.turn(Input::Command(Command::Close)).await;
+                // The one edge that ends an attachment without the connection
+                // reporting anything: the page detached itself, so the gate must
+                // stop admitting what there is no longer a wire for.
+                self.refresh_gate();
+            }
         }
     }
 
@@ -420,6 +742,11 @@ impl<C: TransportConnector> SurfaceRunner<C> {
         for event in events {
             let now_ms = self.now_ms();
             queue.extend(self.compute(Input::Conn(event), now_ms));
+            // Every one of the connection's own events is an edge of the
+            // attachment — it came up, it went away, it ended — and each moves
+            // what a publish is judged against: the body cap a new attachment
+            // states, and whether there is a configured one at all.
+            self.refresh_gate();
         }
         if let Some(frame) = routed {
             let now_ms = self.now_ms();
@@ -462,7 +789,16 @@ impl<C: TransportConnector> SurfaceRunner<C> {
                     wire_lost = !self.driver.is_active();
                     self.fold_step(step, &mut queue);
                 }
-                Effect::EmitEvent(event) => self.emit(event),
+                Effect::EmitEvent(event) => {
+                    // The two events a document produces are the other thing that
+                    // moves the gate: the bound ports it names and the report
+                    // floor it states are read straight off the wiring in force.
+                    let wiring = matches!(event, Event::Connected { .. } | Event::WiringChanged);
+                    self.emit(event);
+                    if wiring {
+                        self.refresh_gate();
+                    }
+                }
                 Effect::PublishControl { channel, body } => {
                     let stamp = self.driver.new_stamp();
                     let now_ms = self.now_ms();
@@ -507,6 +843,21 @@ impl<C: TransportConnector> SurfaceRunner<C> {
         }
     }
 
+    /// Re-take the handle's publish gate from the page.
+    ///
+    /// Called at the edges that move what it answers and nowhere else: every one
+    /// of the connection's own events, the two events a document in force
+    /// produces, and the close the platform half asks for. Refreshing on every
+    /// turn instead would re-copy the bound-port table on every delivery, which is
+    /// the cost the gate exists to avoid — and nothing between those edges changes
+    /// a single answer it gives.
+    fn refresh_gate(&self) {
+        self.gate
+            .lock()
+            .expect("surface runner: the publish gate mutex is poisoned")
+            .refresh(&self.page);
+    }
+
     /// The wall clock in epoch milliseconds, the currency a release time is
     /// stated in.
     ///
@@ -523,8 +874,203 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     }
 }
 
+/// The native build's invocation.
+///
+/// A panic is a **trap**, not an err: the two are different facts with different
+/// consequences — an err keeps the instance running, a trap is terminal for it —
+/// and only the invocation boundary can tell them apart. `catch_unwind` is the
+/// native equivalent of the JS exception a wasm host observes, which is the same
+/// discrimination the backend's wasmtime host gets for free.
+///
+/// Both failure arms carry the component's own account of what happened. The
+/// kernel never parses it, but it is the only answer an operator has to "failed
+/// *how*?", and this boundary is the only place it exists.
+///
+/// Takes the buffer by value and hands it back so both builds' invocations share
+/// one call shape; the wasm build cannot pass `&mut` (see below).
+#[cfg(not(target_arch = "wasm32"))]
+fn invoke_native(
+    entry: &ActivationEntry,
+    activation: &Activation,
+    mut buffer: PublishBuffer,
+) -> (ActivationOutcome, PublishBuffer) {
+    // `AssertUnwindSafe`: the buffer may be left half-filled by a panicking entry,
+    // which is exactly the state the trap path is built for — the page discards it
+    // whole. Nothing observes a partially-published buffer.
+    let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        entry(activation, &mut buffer)
+    }));
+    let outcome = match called {
+        Ok(Ok(())) => ActivationOutcome::Ok,
+        Ok(Err(err)) => ActivationOutcome::Err(err),
+        Err(payload) => ActivationOutcome::Trap(unwind_message(payload)),
+    };
+    (outcome, buffer)
+}
+
+/// The panic message out of a `catch_unwind` payload.
+///
+/// `panic!` produces a `String` (formatted) or a `&'static str` (literal), which
+/// covers every panic a component can raise through the ordinary macro. A payload
+/// of any other type came from `panic_any` and carries no text to recover, so it
+/// is named as such rather than guessed at — the message is diagnostic, and
+/// inventing detail for it would be worse than admitting there is none.
+#[cfg(not(target_arch = "wasm32"))]
+fn unwind_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        "activation entry panicked with a non-string payload".to_string()
+    }
+}
+
+/// The wasm build's invocation.
+///
+/// `catch_unwind` cannot observe a wasm panic, so the outcome discrimination this
+/// build gets comes from the other side: the entry wraps a JS function, and a
+/// thrown exception is a trap where a returned string is an err. The wrapper does
+/// that classification and hands back an [`ActivationOutcome`] already.
+///
+/// The buffer travels through the shared in-flight slot rather than as an argument:
+/// a `dom` entry publishes by dispatching an event, which surfaces on the kernel's
+/// root listener — a code path that cannot reach the buffer on this stack.
+/// Installed for exactly the duration of the call and taken back on return, so no
+/// publish can find a buffer outside an activation.
+// TODO(buffered-publish-routing-test): the slot install/take-back here is wasm-only
+// and untested — the client crate has no browser-test harness yet.
+#[cfg(target_arch = "wasm32")]
+fn invoke_wasm(
+    entry: &ActivationEntry,
+    activation: &Activation,
+    slot: &crate::front::InFlightSlot,
+    instance: &str,
+    buffer: PublishBuffer,
+) -> (ActivationOutcome, PublishBuffer) {
+    *slot.borrow_mut() = Some(crate::front::InFlightPublish {
+        instance: instance.to_string(),
+        buffer,
+    });
+    let outcome = entry(activation);
+    // Taken back unconditionally: the entry returned (a trap here is a JS exception
+    // the wrapper already caught and classified), so leaving the buffer installed
+    // would make the next gesture publish look buffered.
+    let in_flight = slot
+        .borrow_mut()
+        .take()
+        .expect("surface runner: the in-flight buffer vanished during an activation");
+    (outcome, in_flight.buffer)
+}
+
+/// Hand the executor control once, then resolve.
+///
+/// `tokio::task::yield_now`'s job, written out because this loop takes no tokio
+/// dependency. Waking the task before parking re-queues it behind whatever else
+/// the reactor has ready, which is the whole of a yield on a native executor.
+#[cfg(not(target_arch = "wasm32"))]
+async fn yield_now() {
+    let mut yielded = false;
+    future::poll_fn(move |cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            // Reschedule before parking: this is a yield, not a wait. Nothing else
+            // will ever wake us.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+/// Hand the browser control once, then resolve — a **macrotask** hop, not a
+/// microtask one.
+///
+/// The distinction is the whole of the containment story on this target. Under
+/// `spawn_local` a wake re-queues the task with `queueMicrotask`, and the HTML
+/// event loop drains the microtask queue — including microtasks enqueued during
+/// the drain — before it returns to tasks. A permanently-ready activations arm
+/// waking itself therefore chains microtask to microtask forever: the WebSocket's
+/// `message` callback, every `setTimeout` the driver armed and the next paint are
+/// all tasks, and none of them would ever run again. A component in a publish
+/// cycle would hang the tab rather than livelock inside it.
+///
+/// `setTimeout(0)` is a task, so the chain breaks at every hop and the page keeps
+/// being served.
+#[cfg(target_arch = "wasm32")]
+async fn yield_now() {
+    brenn_attach_client::transport::timer::sleep(std::time::Duration::ZERO).await;
+}
+
+/// Receive from a channel, or wait forever once its senders have gone.
+///
+/// A closed `futures` receiver answers `None` on every poll, so a select arm over
+/// one spins the whole loop. Every arm over a front-door channel therefore carries
+/// the flag that says it has already answered `None` once.
+async fn recv_open<T>(rx: &mut mpsc::Receiver<T>, closed: bool) -> Option<T> {
+    if closed {
+        future::pending::<Option<T>>().await
+    } else {
+        rx.next().await
+    }
+}
+
+/// One alert as the page's command vocabulary states it.
+fn alert_command(alert: AlertCommand) -> Command {
+    let AlertCommand {
+        severity,
+        title,
+        body,
+    } = alert;
+    Command::Alert {
+        severity,
+        title,
+        body,
+    }
+}
+
+/// One of the surface's own documents as the page's command vocabulary states it.
+fn telemetry_command(document: TelemetryCommand) -> Command {
+    match document {
+        TelemetryCommand::Geometry {
+            width,
+            height,
+            device_pixel_ratio,
+        } => Command::Geometry {
+            width,
+            height,
+            device_pixel_ratio,
+        },
+        TelemetryCommand::Status {
+            instances,
+            uptime_secs,
+            counters,
+        } => Command::Status {
+            instances,
+            uptime_secs,
+            counters,
+        },
+    }
+}
+
 /// Which arm of the live select fired.
 enum Woke {
     Io(IoEvent),
+    Front(FrontWoke),
+    /// An instance is dispatchable; the pass at the end of the loop takes it.
+    Activations,
+}
+
+/// Which of the front door's four channels spoke, and whether it has closed.
+///
+/// One vocabulary for both selects — the live loop's and the terminal drain's —
+/// because what arrives is the same either way; what differs is only what becomes
+/// of it.
+enum FrontWoke {
     Control(Option<RunnerCommand>),
+    Publish(Option<PublishSlot>),
+    Alert(Option<AlertCommand>),
+    Telemetry(Option<TelemetryCommand>),
 }

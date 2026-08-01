@@ -21,6 +21,14 @@
 //! sans-I/O seam the layers below keep, applied to the layer that drives them, so
 //! a whole turn is reproducible against fixed inputs.
 //!
+//! # The one pass that is not an input
+//!
+//! [`dispatch`] is the exception, and it is one by necessity: assembling an
+//! activation answers with the activation itself, and the caller — which holds the
+//! entry closure the page deliberately does not — is the only party that can
+//! invoke it. It is otherwise an ordinary turn, effects and release restatement
+//! alike, and the completion comes back through [`Input::ActivationDone`].
+//!
 //! # Nothing is enacted
 //!
 //! An effect is a request: send this frame, arm this deadline, emit this event,
@@ -34,6 +42,7 @@ use brenn_attach_client::Millis;
 use brenn_attach_client::conn::ConnEvent;
 use brenn_attach_proto::ServerFrame;
 
+use crate::activation::ReadyActivation;
 use crate::command::{self, Command};
 use crate::inbound;
 use crate::outward::{self, Completed};
@@ -92,6 +101,50 @@ pub fn on_input(page: &mut SurfacePage, input: Input, now: Millis, now_ms: u64) 
     route(page, input, &mut reactions, now, now_ms);
     reactions.end_turn(page);
     reactions.into_effects()
+}
+
+/// Assemble the next ready instance's activation, and answer the turn that took.
+///
+/// The one pass a caller asks for rather than one an [`Input`] brings: an assembly
+/// hands back the activation itself, which no `Effect` list can carry — the caller
+/// owns the entry the page must not hold, and calling it is the whole point of
+/// asking. Everything else about the pass is an ordinary turn: the window's
+/// loudness verdicts are folded like any other pass's, and the release deadline is
+/// restated at the end of it like any other turn's.
+///
+/// `None` means one of two things, and the caller treats them alike — it invokes
+/// nothing:
+///
+/// - nothing was ready, or
+/// - the assembly's own window overflowed past the rung that kills, and the
+///   instance went terminal before its entry could run. The assembly happened and
+///   its buffer exists; discarding it unread is what the kill's account of that
+///   flush is. The kill and its announcement are in the effects.
+///
+/// A returned activation leaves its instance **in flight**, so the caller owes
+/// exactly one [`Input::ActivationDone`] for it, carrying the generation the
+/// assembly was made under.
+///
+/// # Panics
+///
+/// If an instance is ready with no bindings document in force. A position is
+/// created only by the reconcile of a document.
+pub fn dispatch(
+    page: &mut SurfacePage,
+    now: Millis,
+    now_ms: u64,
+) -> (Option<ReadyActivation>, Vec<Effect>) {
+    let mut reactions = Reactions::new();
+    let ready = outward::dispatch(page, now_ms).and_then(|mut ready| {
+        // Taken off the assembly rather than read from it: the verdicts are the
+        // page's to enact, and what the caller receives should carry nothing it is
+        // still owed anything for.
+        let drops = std::mem::take(&mut ready.drops);
+        reactions.verdicts(page, drops, now, now_ms);
+        (!page.registrations.is_failed(&ready.instance)).then_some(ready)
+    });
+    reactions.end_turn(page);
+    (ready, reactions.into_effects())
 }
 
 /// The input's own pass, ahead of the release restatement every turn ends with.

@@ -88,22 +88,25 @@ Code site (`TODO(kernel-registration-gate-lifecycle)`):
 
 ## `buffered-publish-routing-test`
 
-The buffered-vs-gesture publish split — `ClientHandle::try_buffered_publish`
-(instance-match) and the driver `invoke`'s in-flight-slot install/take
-(`surface/client/src/driver.rs`) — has no direct test. Both are wasm-only
-(`cfg(target_arch = "wasm32")`), and the client crate runs its unit tests
-*natively* (`cargo test`); it has no wasm-bindgen-test harness, and
-`make surface-wasm-test` runs only the shell and component-support suites. The
+The buffered-vs-gesture publish split — `try_buffered_publish`
+(instance-match) and the `invoke`'s in-flight-slot install/take
+(`surface/kernel/src/driver.rs`, `surface/kernel/src/runner.rs`) — has no direct
+test. Both are wasm-only
+(`cfg(target_arch = "wasm32")`), and the kernel's own state-machine suites run
+*natively* (`cargo test`); the browser suites that do exist
+(`make surface-wasm-test`) drive the DOM seam, not the slot. The
 routing decision is covered behaviorally through component-support's fake-kernel
-tests, but the real handle/driver slot glue is unverified.
+tests, but the real handle/runner slot glue is unverified.
 
-Done when the client crate is wired into the browser test runner (entangled with
-`surface-wasm-test-in-ci`) and a wasm-bindgen-test drives match / mismatch /
-no-flight and the slot take-back.
+Done when a wasm-bindgen-test drives match / mismatch / no-flight and the slot
+take-back (entangled with `surface-wasm-test-in-ci`, since a browser suite that
+never runs answers nothing).
 
 Code sites (`TODO(buffered-publish-routing-test)`):
-`surface/client/src/handle.rs` (`try_buffered_publish`),
-`surface/client/src/driver.rs` (wasm `invoke`).
+`surface/kernel/src/front.rs` (`try_buffered_publish`, the surviving copy),
+`surface/kernel/src/runner.rs` (wasm `invoke_wasm`, the surviving copy),
+`surface/kernel/src/handle.rs` and `surface/kernel/src/driver.rs` (the doomed
+twins, `attach-cutover`).
 
 ---
 
@@ -961,41 +964,14 @@ Code site (`TODO(dormant-missing-app-cursor)`):
 `Messenger::reconcile_subscriber_cursors`.
 
 
-## `runner-activation-dispatch`
-
-`surface/kernel/src/runner.rs` stores each registered activation entry and never
-calls one. The loop serves the driver, the platform half's control commands and
-the page's own deadlines, but the pass that asks the page for a ready instance,
-assembles its activation, invokes the entry and hands the completion back is not
-wired in — so a page driven by this runner delivers nothing to a component. The
-invocation boundary is also where an entry's panic is classified as a trap rather
-than an err, which nothing else can do for it.
-
-Done when the runner dispatches ready activations on its own select arm — a
-bounded pass per turn, below every other arm in the bias order, so a component
-that republishes what it consumes livelocks itself rather than the page — and
-`entries` is read by it.
-
-Both auxiliary deadlines' round trips through the runner — `Effect::SetRetryWakeup`
-/ `Effect::SetReleaseWakeup` out, the driver arming them, `IoEvent::RetryDue` /
-`IoEvent::ReleaseDue` back, and the turn taken at the fire's own clock — ride on
-this same work and are untested until it lands. Only an activation's flush parks a
-confined message or leaves an outbox head blocked, so no input a runner test can
-drive today arms either deadline. Both deadlines' *turn*-level behaviour is
-covered (`turn/tests.rs`); it is the runner half of the round trip that is owed.
-
-Code site (`TODO(runner-activation-dispatch)`): `surface/kernel/src/runner.rs`,
-the `entries` field of `SurfaceRunner`.
-
-
 ## `runner-drain-host-departure`
 
 `SurfaceRunner::run_terminal_drain` (`surface/kernel/src/runner.rs`) awaits the
-control channel and nothing else. Going terminal disarms every deadline and drops
-the transport, so after it the control channel is the drain's only wake source —
-and `host_gone()` (the event sink's `is_closed`, which the run's documented
-lifeline is) is re-read only when a command arrives or the channel closes. A
-platform half that drops its event receiver while holding an idle control sender
+front door's four channels and nothing else. Going terminal disarms every
+deadline and drops the transport, so after it those channels are the drain's only
+wake sources — and `host_gone()` (the event sink's `is_closed`, which the run's
+documented lifeline is) is re-read only when a command arrives or a channel
+closes. A platform half that drops its event receiver while holding idle senders
 parks the drain forever, leaking the task and the whole page with it. Everywhere
 before terminal the loop re-reads `host_gone` on a bounded cadence, because the
 driver always has an armed deadline or a socket to wake on.
@@ -1021,18 +997,24 @@ at `run_terminal_drain`.
 generalized copies of machinery that is still live in `ClientCore`
 (`surface/kernel/src/core/`) and in the server's surface route. Both copies
 compile, and nothing links them — the compiler cannot tell you when one is fixed
-and the other is not, so every bug found in one has to be found twice until the
-kernel cuts over.
+and the other is not, so every bug found in one has to be found twice until both
+ends cut over.
+
+The browser has cut over: `entry.rs` builds a `SurfacePage` and a
+`SurfaceRunner`, and `logic.rs`/`dom.rs` run on `session::Event` and
+`front::SurfaceHandle`. What keeps the doomed copies compiled is the *server*
+route: `brenn-server/src/routes/surface/client_tests.rs` drives the old client
+against the old session, so both halves die together when
+`routes/surface/mod.rs` cuts over to `routes/attach`'s session.
 
 The copies have already diverged deliberately: the crate's retry timer arms only
 when a tick could actually send something, where the kernel's arms whenever any
 outbox has a queued flush. The generalized copy is the surviving one everywhere,
 so the cutover deletes the live one rather than reconciling them.
 
-Done when the surface kernel runs on `brenn-attach-client` plus its own
-channel-keyed modules and every doomed copy listed below is deleted — an explicit
-inventory, not a best-effort sweep, because a piece missed here becomes a
-permanent silent fork.
+Done when the server route runs on `routes/attach` and every doomed copy listed
+below is deleted — an explicit inventory, not a best-effort sweep, because a
+piece missed here becomes a permanent silent fork.
 
 Inventory, surviving copy → doomed twin (each twin carries a
 `TODO(attach-cutover)` marker):
@@ -1044,6 +1026,10 @@ Inventory, surviving copy → doomed twin (each twin carries a
   `SplitMix64`, `frame_type_name`, `duration_ms`.
 - `surface/kernel/src/outbound.rs`'s `publish_status` → `core/util.rs`'s
   `publish_outcome_to_status` (same table, different outcome type).
+- `surface/kernel/src/logic.rs`'s `connect_url` (with its private
+  `encode_query_component`/`hex_upper`) → `core/util.rs`'s `build_connect_url`
+  and its byte-identical copy of that encoder pair. The surviving one composes
+  the whole URL from `location`; the doomed one appends to a URL it is handed.
 - `surface/kernel/src/connect.rs` + `registry.rs` + `outbound.rs` →
   `core/mod.rs`'s bindings-application sequence (`on_welcome`,
   `reconcile_stores`, `reconcile_registered`, `send_parked_batches`) and the
@@ -1060,11 +1046,18 @@ Inventory, surviving copy → doomed twin (each twin carries a
 - `surface/kernel/src/command.rs` → `core/mod.rs`'s `Command` vocabulary and its
   `on_command` dispatch (the telemetry arms of which the row above also names).
 - `surface/kernel/src/runner.rs` → `surface/kernel/src/driver.rs`: `Driver::run`,
-  its three `select_biased!` sites, the effect-execution drain and the terminal
-  drain. The handle plane `driver.rs` also selects — publish, alert and log
-  commands, the `PublishGate` refresh, the activation dispatch — has no surviving
-  copy yet; it lands with the runner's own front door and dies with the rest of
-  the file at the cutover.
+  its three `select_biased!` sites (the handle plane's publish, alert and
+  telemetry arms included), the effect-execution drain, the terminal drain, the
+  `PublishGate` refresh, and the activation dispatch (`drain_activations`,
+  `invoke`, `unwind_message`, `yield_now`, the wasm in-flight slot's
+  install/take-back).
+- `surface/kernel/src/front.rs` → `surface/kernel/src/handle.rs`'s `new`,
+  `ClientHandle`, `PublishGate` and its wasm in-flight publish routing
+  (`try_buffered_publish` and its siblings). One thing in that file has no
+  surviving copy and must not be deleted with it: `ActivationEntry`, which
+  `front.rs` and `runner.rs` both name from there. (`InFlightSlot` and
+  `InFlightPublish` already moved to `front.rs`; `handle.rs` names them from
+  there.)
 
 
 

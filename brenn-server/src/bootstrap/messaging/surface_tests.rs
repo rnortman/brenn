@@ -1336,15 +1336,34 @@ fn surface_unknown_skin_panics() {
 }
 
 #[test]
-#[should_panic(expected = "synchronous startup-attach bound")]
-fn surface_subscription_count_over_startup_attach_bound_panics() {
+#[should_panic(expected = "synchronous startup-subscribe bound")]
+fn surface_subscription_count_over_startup_subscribe_bound_panics() {
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
     // One binding per distinct port on the covered ephemeral channel, one
-    // past the shell's synchronous startup-attach bound.
+    // past the shell's synchronous startup-subscribe bound.
     raw.subscriptions = (0..=brenn_surface_schema::MAX_SURFACE_SUBSCRIPTION_BINDINGS)
         .map(|i| surface_sub_raw("ephemeral:protobar-demo", "protobar", &format!("p{i}")))
         .collect();
+    resolve_surfaces(&[raw], &dir, &test_globals());
+}
+
+/// A component count over the mount bound panics the kernel at first connect;
+/// boot refuses it here instead.
+#[test]
+#[should_panic(expected = "synchronous startup-mount bound")]
+fn surface_component_count_over_startup_mount_bound_panics() {
+    let dir = surface_dir();
+    let mut raw = valid_surface_raw();
+    let extra = brenn_surface_schema::MAX_SURFACE_COMPONENTS - raw.components.len() + 1;
+    let template = raw.components[0].clone();
+    for i in 0..extra {
+        raw.components
+            .push(brenn_lib::messaging::config::SurfaceComponentRaw {
+                instance: Some(format!("filler{i}")),
+                ..template.clone()
+            });
+    }
     resolve_surfaces(&[raw], &dir, &test_globals());
 }
 

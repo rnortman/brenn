@@ -21,12 +21,13 @@
 //! log, so neither a publish backlog nor a log flood starves attach/detach.
 
 // TODO(attach-cutover): this loop — `Driver::run`, its three `select_biased!`
-// sites, the effect-execution drain and the terminal drain — is duplicated by
-// `crate::runner::SurfaceRunner`, which joins `crate::turn`'s pure pass to
-// `brenn_attach_client::driver::AttachDriver` instead of to `ClientCore`. The
-// handle plane below it (publish, alert and log commands, the `PublishGate`
-// refresh, the activation dispatch) has no surviving copy yet. Delete this file
-// when the kernel cuts over.
+// sites, the effect-execution drain, the terminal drain, the activation dispatch
+// and the handle plane it selects (publish, alert and telemetry commands, the
+// `PublishGate` refresh) — is duplicated by `crate::runner::SurfaceRunner`, which
+// joins `crate::turn`'s pure pass to `brenn_attach_client::driver::AttachDriver`
+// instead of to `ClientCore`. The browser runs on that copy; this one is live
+// only for the server's `client_tests`. Delete this file when the server route
+// cuts over.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -145,7 +146,7 @@ pub struct Driver<C: TransportConnector> {
     /// exactly the duration of an entry invocation; the handle's buffered-publish
     /// route reads it from inside that call.
     #[cfg(target_arch = "wasm32")]
-    in_flight: crate::handle::InFlightSlot,
+    in_flight: crate::front::InFlightSlot,
     clock: Clock,
     /// The core's most recently requested wakeup deadline; the timer is armed
     /// from it each loop iteration. `None` disarms (only in the terminal state).
@@ -244,11 +245,11 @@ fn unwind_message(payload: Box<dyn std::any::Any + Send>) -> String {
 fn invoke(
     entry: &ActivationEntry,
     activation: &Activation,
-    slot: &crate::handle::InFlightSlot,
+    slot: &crate::front::InFlightSlot,
     instance: &str,
     buffer: PublishBuffer,
 ) -> (ActivationOutcome, PublishBuffer) {
-    *slot.borrow_mut() = Some(crate::handle::InFlightPublish {
+    *slot.borrow_mut() = Some(crate::front::InFlightPublish {
         instance: instance.to_string(),
         buffer,
     });
@@ -273,7 +274,7 @@ impl<C: TransportConnector> Driver<C> {
         events_tx: mpsc::Sender<Event>,
         channels: DriverChannels,
         gate: Arc<Mutex<PublishGate>>,
-        #[cfg(target_arch = "wasm32")] in_flight: crate::handle::InFlightSlot,
+        #[cfg(target_arch = "wasm32")] in_flight: crate::front::InFlightSlot,
     ) -> Self {
         let DriverChannels {
             control_rx,
