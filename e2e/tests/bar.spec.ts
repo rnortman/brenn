@@ -59,15 +59,16 @@ function panelMessage(page: Page, instance: string): Locator {
 
 /**
  * Publish `body` verbatim onto the channel bound to the feeder's `instance`
- * output by dispatching the designed component → shell `brenn-port-publish`
- * seam event on that mounted echo-stub element. This is exactly the event the
- * visible "send custom" button dispatches, so no gate is bypassed and no
- * test-only production code exists — the same reasoning the durabar PoC spec
- * used for `brenn-log`. It is used in preference to the button because the
- * feeder's `feed-layout` instance is the fourth echo-stub and thus unassigned
- * in the feeder's own config-default `columns-3` layout — headless and
- * `display:none`, so not clickable — while its output is the only path onto the
- * layout channel.
+ * output by driving that echo-stub's own "send custom" button: fill its
+ * free-form field, then click it. The click is dispatched from page script
+ * rather than through Playwright because the feeder's `feed-layout` instance is
+ * the fourth echo-stub and thus unassigned in the feeder's own config-default
+ * `columns-3` layout — headless and `display:none`, so not clickable by a real
+ * pointer — while its output is the only path onto the layout channel.
+ *
+ * Everything past the click is production: the component's gesture wiring asks
+ * for a sync-call activation, and its entry publishes from inside one. No gate
+ * is bypassed and no test-only production code exists.
  */
 async function publishVia(
   feeder: Page,
@@ -84,13 +85,13 @@ async function publishVia(
   );
   await expect(el).toBeAttached({ timeout: CHAIN_TIMEOUT });
   await el.evaluate((node: Element, b: string) => {
-    node.dispatchEvent(
-      new CustomEvent("brenn-port-publish", {
-        bubbles: true,
-        composed: true,
-        detail: { port: "out", body: b },
-      }),
-    );
+    const field = node.querySelector("[data-echo-input]");
+    const send = node.querySelector("[data-echo-send-custom]");
+    if (!(field instanceof HTMLInputElement) || !(send instanceof HTMLElement)) {
+      throw new Error("the echo-stub's custom-send controls are not rendered");
+    }
+    field.value = b;
+    send.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   }, body);
 }
 

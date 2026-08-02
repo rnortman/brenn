@@ -175,6 +175,7 @@ fn instantiation_fail_trap_arm_fires_on_memory_limit() {
         ports: vec![],
         deferred: vec![],
         now: None,
+        sync: None,
     };
     let outcome = comp.handle_with_memory_limit(activation, 1);
 

@@ -726,6 +726,80 @@ fn parse_ack(body: &str) -> Result<AckParse, String> {
     ))
 }
 
+/// Which button a press came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckKind {
+    Dismiss,
+    Snooze,
+}
+
+impl AckKind {
+    /// The `kind` value this button spells in a request body.
+    fn as_str(self) -> &'static str {
+        match self {
+            AckKind::Dismiss => "dismiss",
+            AckKind::Snooze => "snooze",
+        }
+    }
+}
+
+/// The request body a Dismiss/Snooze press encodes for its sync activation.
+///
+/// The press names the occurrence that was on screen when it happened, not
+/// whatever is on screen when the entry runs: the two are the same task apart,
+/// but a press is an act on what the user saw. `target` is `None` when the panel
+/// showed no meeting — the buttons are hidden then, so this is only reachable
+/// through a programmatic click, and it resolves to a no-op rather than a fault.
+///
+/// A private dialect between this component's wiring and its own entry, and
+/// deliberately not the ack body the `acks` port carries: an ack is a decision
+/// this component publishes, a request is a press it has not acted on yet.
+pub fn ack_request_body(kind: AckKind, target: Option<&AckTarget>) -> String {
+    match target {
+        Some(target) => serde_json::json!({
+            "kind": kind.as_str(),
+            "meeting_id": target.meeting_id,
+            "start": target.start.to_rfc3339(),
+        })
+        .to_string(),
+        None => serde_json::json!({ "kind": kind.as_str() }).to_string(),
+    }
+}
+
+/// Read a press back. `Ok(None)` is a press with no meeting on screen; `Err` is
+/// this component's two halves speaking different dialects, which the glue
+/// panics on rather than dropping a user's dismissal.
+pub fn parse_ack_request(body: &str) -> Result<Option<(AckKind, AckTarget)>, String> {
+    let raw: RawAckRequest =
+        serde_json::from_str(body).map_err(|e| format!("unparseable ack request: {e}"))?;
+    let kind = match raw.kind.as_str() {
+        "dismiss" => AckKind::Dismiss,
+        "snooze" => AckKind::Snooze,
+        other => return Err(format!("unknown ack request kind {other:?}")),
+    };
+    let (Some(meeting_id), Some(start)) = (raw.meeting_id, raw.start) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        kind,
+        AckTarget {
+            meeting_id,
+            start: parse_ts("start", &start)?,
+        },
+    )))
+}
+
+/// A press as serde sees it. Both occurrence fields are absent together for a
+/// press that landed on an idle panel.
+#[derive(Deserialize)]
+struct RawAckRequest {
+    kind: String,
+    #[serde(default)]
+    meeting_id: Option<String>,
+    #[serde(default)]
+    start: Option<String>,
+}
+
 /// The ack body a Dismiss button publishes for `target`.
 pub fn dismiss_body(target: &AckTarget) -> String {
     serde_json::json!({
@@ -957,6 +1031,43 @@ mod tests {
         assert_eq!(
             state.recompute(at("2026-07-12T15:01:00Z")).state,
             DisplayState::Overdue
+        );
+    }
+
+    /// The press dialect round-trips: the wiring encodes what the entry decodes.
+    /// The two halves are written apart — one in a DOM listener, one in the entry
+    /// — and a disagreement would drop every dismissal on the floor.
+    #[test]
+    fn an_ack_request_round_trips_through_its_dialect() {
+        let target = target("m1", "2026-07-12T15:00:00Z");
+        for kind in [AckKind::Dismiss, AckKind::Snooze] {
+            let body = ack_request_body(kind, Some(&target));
+            assert_eq!(
+                parse_ack_request(&body),
+                Ok(Some((kind, target.clone()))),
+                "the press names its kind and the occurrence it was made against"
+            );
+        }
+    }
+
+    /// A press with no meeting on screen names no occurrence, and the entry must
+    /// read it as nothing to ack rather than as a malformed request — the buttons
+    /// are hidden in the idle state, so this is the programmatic-click case.
+    #[test]
+    fn a_press_with_no_active_meeting_names_no_occurrence() {
+        let body = ack_request_body(AckKind::Dismiss, None);
+        assert_eq!(parse_ack_request(&body), Ok(None));
+    }
+
+    /// Anything outside the dialect is an error the glue faults on. Reading an
+    /// unknown kind as a dismiss would turn a snooze into a permanent removal.
+    #[test]
+    fn a_request_outside_the_dialect_is_an_error() {
+        assert!(parse_ack_request("not json").is_err());
+        assert!(parse_ack_request(r#"{"kind":"delete"}"#).is_err());
+        assert!(
+            parse_ack_request(r#"{"kind":"dismiss","meeting_id":"m1","start":"noon"}"#).is_err(),
+            "an unparseable occurrence must not silently become a press on nothing"
         );
     }
 

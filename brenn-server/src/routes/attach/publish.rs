@@ -84,6 +84,11 @@ pub struct PublishRequest<'a> {
 /// reachable and policy-covered an invariant-excluded outcome is a broken
 /// server, and on a diagnostics channel the same outcome is reported instead —
 /// see [`PublishPosture`].
+///
+/// TODO(surface-single-publish-tightening): a surface's component-origin
+/// publishes are all batches now, but its kernel-origin error reports are single
+/// `Publish` frames under a component attribution, so this handler cannot tell a
+/// laundered component publish from a legitimate report.
 pub async fn handle_publish(
     ctx: &AttachSessionCtx,
     publish_bucket: &mut TokenBucket,

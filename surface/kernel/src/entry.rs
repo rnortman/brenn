@@ -18,7 +18,9 @@ use wasm_bindgen_futures::spawn_local;
 use brenn_attach_client::conn::ConnConfig;
 
 use crate::WebSysConnector;
-use crate::contract::{defer_status_str, element_name_for_instance, publish_status_str};
+use crate::contract::{
+    PublishError, SyncStatus, defer_status_str, element_name_for_instance, publish_status_str,
+};
 use crate::front::{self, EventStream, SurfaceHandle};
 use crate::page::SurfacePage;
 use crate::runner::SurfaceRunner;
@@ -27,10 +29,12 @@ use crate::session::Event;
 
 use crate::dom;
 use crate::logic::{
-    ConnectIndicatorState, DeferIntent, KernelAction, KernelCore, malformed_registration,
-    route_component_alert, route_component_log, route_defer_intent, route_processor_alert,
-    route_processor_log, route_publish_intent, unbuffered_defer_refused,
+    ConnectIndicatorState, DeferIntent, KernelAction, KernelCore, SyncIntent,
+    malformed_registration, route_component_alert, route_component_log, route_defer_intent,
+    route_processor_alert, route_processor_log, route_publish_intent, route_sync_intent,
+    sync_refused, unbuffered_defer_refused, unbuffered_publish_refused,
 };
+use crate::sync_door::{SyncAnswer, SyncDoor};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(3);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -104,6 +108,9 @@ pub fn start() -> KernelHandle {
     let (handle, events, channels) = front::new();
     let handle = Rc::new(handle);
     let runner = SurfaceRunner::new(page, config, WebSysConnector::new(), channels);
+    // Taken before the run is spawned, and held for the page's life: a gesture
+    // cannot wait for the loop, so its activation runs through this instead.
+    let door = Rc::new(runner.sync_door());
 
     // The DOM-free decision core is shared: `run_event_loop` folds control-plane
     // events through it, and the delegated alert listener reads its
@@ -113,7 +120,7 @@ pub fn start() -> KernelHandle {
     // re-enter via a component event).
     let core = Rc::new(RefCell::new(KernelCore::new()));
 
-    install_listeners(&handle, &core);
+    install_listeners(&handle, &core, &door);
 
     // Render the pre-chrome connect indicator before any attachment: the one
     // thing the kernel itself draws, removed the moment chrome first mounts (or,
@@ -133,59 +140,76 @@ pub fn start() -> KernelHandle {
     });
 
     spawn_local(async move {
-        // The run hands the page back so a caller can keep its rings and its
-        // retained planes; the browser has nothing left to do with them, since
-        // the run only returns once the platform half is gone.
-        let _page = runner.run().await;
+        // The browser's run hands nothing back: the sync door holds the page cell
+        // for the document's life, and the run only returns once the platform half
+        // is gone anyway.
+        runner.run().await;
     });
     spawn_local(run_event_loop(Rc::clone(&core), events, Rc::clone(&handle)));
 
     KernelHandle { handle }
 }
 
-/// Install the kernel's five delegated DOM listeners on `#surface-root` plus the
+/// Install the kernel's six delegated DOM listeners on `#surface-root` plus the
 /// window-level component-panic listener.
 ///
 /// Split out of [`start`] so the browser suite installs exactly the wiring the
 /// real page runs on: a component that dispatches a registration or a publish is
 /// heard only if these are in place, so a test that stood them up by hand would
 /// be testing its own stand-in.
-fn install_listeners(handle: &Rc<SurfaceHandle>, core: &Rc<RefCell<KernelCore>>) {
+fn install_listeners(
+    handle: &Rc<SurfaceHandle>,
+    core: &Rc<RefCell<KernelCore>>,
+    door: &Rc<SyncDoor>,
+) {
     // Route component publish intents. The delegated `#surface-root` listener
     // hands each `brenn-port-publish` event's (retargeted host) tag and its
     // untrusted `{ port, body }` detail to the DOM-free `route_publish_intent`,
     // which decides route-vs-drop against the mounted-element registry; the
     // single resulting action is applied to the DOM. A misrouted or malformed
-    // publish becomes a `Report`, never a bus message.
+    // publish becomes a `Report`, never a bus message — and is refused on the
+    // detail, so every publish the kernel hears is answered.
     //
     // Well-formed publishes then fork on one question the kernel alone can answer:
     // is this instance the one whose activation entry is on the stack? Activations
     // are serialized per instance and synchronous on the one JS thread, so exactly
     // one instance can be mid-activation — if it is this one, the publish belongs
     // in that activation's buffer (quota-checked inline, flushed only if the entry
-    // returns ok, answered synchronously on the detail). Anything else is a
-    // gesture publish and takes the immediate path. No new event, no mode flag,
-    // and nothing the component has to know.
+    // returns ok, answered synchronously on the detail). Anything else is refused:
+    // a publish outside an activation has no flush boundary to belong to, and the
+    // component is told so on the same detail.
     {
         let handle = Rc::clone(handle);
         dom::install_publish_listener(move |instance, target_tag, port, body, urgency, detail| {
             let action = route_publish_intent(instance, target_tag, port, body, urgency);
-            if let KernelAction::Publish {
+            let KernelAction::Publish {
                 instance,
                 port,
                 body,
                 urgency,
             } = &action
-                && let Some(status) = handle.try_buffered_publish(instance, port, body, *urgency)
-            {
-                // Buffered: counted like any other publish (which route the kernel
-                // took is not something a status reader should have to know), and
-                // answered on the detail before this dispatch returns.
-                dom::count_publish(instance);
-                dom::set_publish_status(detail, status);
+            else {
+                // Misrouted or malformed: a breadcrumb, never a message. Answered
+                // all the same — the SDK reads a *missing* status as a page whose
+                // kernel listener is absent, so a publish the kernel heard and
+                // dropped owes the dispatcher a refusal rather than silence.
+                dom::apply_actions(std::slice::from_ref(&action), &handle);
+                dom::set_publish_status(detail, Err(PublishError::NotPermitted));
                 return;
+            };
+            match handle.try_buffered_publish(instance, port, body, *urgency) {
+                Some(status) => {
+                    dom::count_publish(instance);
+                    dom::set_publish_status(detail, status);
+                }
+                None => {
+                    dom::set_publish_status(detail, Err(PublishError::NotPermitted));
+                    dom::apply_actions(
+                        std::slice::from_ref(&unbuffered_publish_refused(instance, port)),
+                        &handle,
+                    );
+                }
             }
-            dom::apply_actions(std::slice::from_ref(&action), &handle);
         });
     }
 
@@ -242,6 +266,42 @@ fn install_listeners(handle: &Rc<SurfaceHandle>, core: &Rc<RefCell<KernelCore>>)
                     &handle,
                 ),
             }
+        });
+    }
+
+    // Route component sync-call requests. Every path writes a status onto the
+    // detail, including the malformed one: the SDK reads a missing status as a
+    // broken page rather than an outcome.
+    {
+        let handle = Rc::clone(handle);
+        let door = Rc::clone(door);
+        dom::install_sync_listener(move |instance, target_tag, port, body, detail| {
+            let intent = match route_sync_intent(instance, target_tag, port, body) {
+                Ok(intent) => intent,
+                Err(drop) => {
+                    dom::apply_actions(std::slice::from_ref(&drop), &handle);
+                    dom::set_sync_status(detail, SyncStatus::Refused, None, None);
+                    return;
+                }
+            };
+            let SyncIntent {
+                instance,
+                port,
+                body,
+            } = intent;
+            let answer = door.request(&instance, &port, body);
+            if let SyncAnswer::Refused(refusal) = &answer {
+                dom::apply_actions(
+                    std::slice::from_ref(&sync_refused(&instance, &port, refusal)),
+                    &handle,
+                );
+            }
+            let (reply, error) = match &answer {
+                SyncAnswer::Ok(reply) => (reply.as_deref(), None),
+                SyncAnswer::Err(err) => (None, Some(err.message.as_str())),
+                SyncAnswer::Trap | SyncAnswer::Refused(_) => (None, None),
+            };
+            dom::set_sync_status(detail, answer.status(), reply, error);
         });
     }
 
@@ -371,8 +431,7 @@ fn with_processor_host<R>(what: &str, f: impl FnOnce(&ProcessorHost) -> R) -> R 
 /// the WIT `publish-error` string the guest lifts, or the empty string for ok. A
 /// `None` from `try_buffered_publish` means no activation of this instance is in
 /// flight — a component publishing outside `receive`, which its world gives it no
-/// way to do — so it is refused rather than laundered onto the unbuffered gesture
-/// path a headless component has no business taking.
+/// way to do — so it is refused, exactly as the DOM seam refuses one.
 #[wasm_bindgen]
 pub fn brenn_processor_publish(
     instance: &str,
@@ -688,9 +747,13 @@ mod tests {
 
     use brenn_attach_client::conn::AttachmentFacts;
     use brenn_attach_proto::{AlertSeverity, ClientFrame};
+    use brenn_surface_component_support as sdk;
     use brenn_surface_schema::bindings::BindingsDocument;
 
-    use crate::contract::{ACTIVATION_REGISTER, SURFACE_READY, SURFACE_RELOAD};
+    use crate::contract::{
+        ACTIVATION_REGISTER, ACTIVATION_SYNC, ENTRY_REPLY_FIELD, PORT_PUBLISH, SURFACE_READY,
+        SURFACE_RELOAD, SYNC_ERROR_FIELD, SYNC_REPLY_FIELD, SYNC_STATUS_FIELD,
+    };
     use crate::test_support::bindings as fixtures;
     use crate::test_support::frames;
     use crate::test_support::pages;
@@ -948,10 +1011,11 @@ mod tests {
         let (handle, events, channels) = front::new();
         let handle = Rc::new(handle);
         let runner = SurfaceRunner::new(page, config(), ctrl.connector(), channels);
+        let door = Rc::new(runner.sync_door());
         let core = Rc::new(RefCell::new(KernelCore::new()));
-        install_listeners(&handle, &core);
+        install_listeners(&handle, &core, &door);
         spawn_local(async move {
-            let _page = runner.run().await;
+            runner.run().await;
         });
         spawn_local(run_event_loop(Rc::clone(&core), events, Rc::clone(&handle)));
         (handle, core)
@@ -984,15 +1048,15 @@ mod tests {
     /// Where this page's error reports go when its document declares a channel.
     const ERRORS: &str = "brenn:site.surface.wbt.errors";
 
-    /// A page and its front door with no kernel event loop over it — for the two
-    /// tests that drive the DOM executor by hand and only need to know when the
-    /// page became usable. The flag is set at the first `Connected`.
+    /// A page and its front door with no kernel event loop over it — for the test
+    /// that drives the DOM executor by hand and only needs to know when the page
+    /// became usable. The flag is set at the first `Connected`.
     fn spawn_page(ctrl: &FakeControls) -> (Rc<SurfaceHandle>, Rc<Cell<bool>>) {
         let page = SurfacePage::new(CONFIG_CHANNEL.to_string(), EPOCH);
         let (handle, mut events, channels) = front::new();
         let runner = SurfaceRunner::new(page, config(), ctrl.connector(), channels);
         spawn_local(async move {
-            let _page = runner.run().await;
+            runner.run().await;
         });
         let configured = Rc::new(Cell::new(false));
         {
@@ -1018,6 +1082,13 @@ mod tests {
         document
     }
 
+    /// Declare and define `instance` with an element that does nothing: a mounted
+    /// target a test can resolve and dispatch at, registering no entry.
+    fn inert(instance: &str) -> brenn_surface_schema::ComponentEntry {
+        define_test_element(&element_name_for_instance(instance, instance), |_| {});
+        component(instance)
+    }
+
     /// Declare and define `instance` as this document's chrome singleton.
     ///
     /// Every bindings document names one — a chromeless surface is not a document
@@ -1025,8 +1096,778 @@ mod tests {
     /// page instead of mounting anything, so a test that wants to observe a mount
     /// has to give chrome a real element. It does nothing but exist.
     fn chrome(instance: &str) -> brenn_surface_schema::ComponentEntry {
-        define_test_element(&element_name_for_instance(instance, instance), |_| {});
-        component(instance)
+        inert(instance)
+    }
+
+    // ── the sync seam ─────────────────────────────────────────────────────
+
+    /// Define `instance`'s element for the sync seam: as
+    /// [`define_recording_element`], except its entry publishes `body` on `port`
+    /// before returning, so a test can watch a sync activation's buffer reach the
+    /// wire.
+    ///
+    /// It publishes on **sync activations only**, which is what makes the frame
+    /// attributable. The guaranteed mount activation runs this same entry, and an
+    /// outbox holds one flush in flight at a time — so an entry that published on
+    /// both would put the mount's batch on the wire and park the gesture's behind
+    /// an acknowledgement no scripted peer here sends.
+    fn define_sync_element(
+        instance: &str,
+        hosts: Rc<RefCell<Vec<HtmlElement>>>,
+        sink: ActivationSink,
+        port: &'static str,
+        body: &'static str,
+    ) {
+        define_test_element(
+            &element_name_for_instance(instance, instance),
+            move |host: HtmlElement| {
+                if hosts
+                    .borrow()
+                    .iter()
+                    .any(|h| h.is_same_node(Some(host.as_ref())))
+                {
+                    return;
+                }
+                hosts.borrow_mut().push(host.clone());
+                let inst = host.get_attribute("data-instance").unwrap_or_default();
+                let sink = Rc::clone(&sink);
+                let publisher = host.clone();
+                let entry = Closure::<dyn FnMut(JsValue) -> JsValue>::new(move |json: JsValue| {
+                    let json = json.as_string().unwrap_or_default();
+                    let activation: crate::contract::Activation =
+                        serde_json::from_str(&json).expect("the activation JSON decodes");
+                    sink.borrow_mut().push((inst.clone(), json));
+                    if activation.sync.is_some() {
+                        dispatch_detail(
+                            &publisher,
+                            PORT_PUBLISH,
+                            &[("port", port), ("body", body)],
+                        );
+                    }
+                    JsValue::UNDEFINED
+                });
+                let detail = Object::new();
+                Reflect::set(&detail, &JsValue::from_str("entry"), entry.as_ref())
+                    .expect("set entry on the registration detail");
+                let init = CustomEventInit::new();
+                init.set_detail(&detail);
+                init.set_bubbles(true);
+                init.set_composed(true);
+                let event = CustomEvent::new_with_event_init_dict(ACTIVATION_REGISTER, &init)
+                    .expect("construct the registration event");
+                host.dispatch_event(&event)
+                    .expect("dispatch the registration event");
+                entry.forget();
+            },
+        );
+    }
+
+    /// The body of an entry that answers by the sync port it was activated on —
+    /// one of every shape the call convention admits, plus a re-entrant request.
+    ///
+    /// Written in JS because two of the four cannot be written in Rust: a thrown
+    /// exception is what a trap *is* at this boundary, and the re-entrant case has
+    /// to dispatch a second request from inside the first and read the answer back
+    /// off the same detail object. The inner answer rides out on the outer reply —
+    /// legal, because the activation carrying it is itself sync.
+    const ANSWERING_ENTRY: &str = "\
+        const port = JSON.parse(json).sync;\n\
+        if (port === 'reply') { return { __REPLY_KEY__: '{\"cancel\":true}' }; }\n\
+        if (port === 'fail') { return 'the entry declined'; }\n\
+        if (port === 'boom') { throw new Error('the gesture blew up'); }\n\
+        if (port === 'nested') {\n\
+          const detail = { port: 'reply', body: '{}' };\n\
+          document.querySelector('__TAG__').dispatchEvent(\n\
+            new CustomEvent('__SYNC_EVENT__', { detail, bubbles: true, composed: true }));\n\
+          return { __REPLY_KEY__: String(detail.__STATUS_KEY__) };\n\
+        }\n\
+        return undefined;";
+
+    /// Define `instance`'s element with [`ANSWERING_ENTRY`] as its entry, so a test
+    /// can drive every answer the door can write.
+    fn define_answering_element(instance: &str, hosts: Rc<RefCell<Vec<HtmlElement>>>) {
+        let tag = element_name_for_instance(instance, instance);
+        let source = ANSWERING_ENTRY
+            .replace("__TAG__", &tag)
+            .replace("__SYNC_EVENT__", ACTIVATION_SYNC)
+            .replace("__REPLY_KEY__", ENTRY_REPLY_FIELD)
+            .replace("__STATUS_KEY__", SYNC_STATUS_FIELD);
+        define_test_element(&tag, move |host: HtmlElement| {
+            if hosts
+                .borrow()
+                .iter()
+                .any(|h| h.is_same_node(Some(host.as_ref())))
+            {
+                return;
+            }
+            hosts.borrow_mut().push(host.clone());
+            let entry = js_sys::Function::new_with_args("json", &source);
+            let detail = Object::new();
+            Reflect::set(&detail, &JsValue::from_str("entry"), &entry)
+                .expect("set entry on the registration detail");
+            let init = CustomEventInit::new();
+            init.set_detail(&detail);
+            init.set_bubbles(true);
+            init.set_composed(true);
+            let event = CustomEvent::new_with_event_init_dict(ACTIVATION_REGISTER, &init)
+                .expect("construct the registration event");
+            host.dispatch_event(&event)
+                .expect("dispatch the registration event");
+        });
+    }
+
+    /// Request a sync activation on `port` and hand back the detail the kernel
+    /// answered on, retrying while the answer is `refused`.
+    ///
+    /// The retry is for the registration turn alone: it crosses the control
+    /// channel, and a request that beats it is refused. A component would never
+    /// retry a refusal — it is a bug — but how many turns a mount took is not what
+    /// these tests are about.
+    async fn admitted_request(host: &HtmlElement, port: &'static str) -> JsValue {
+        let answered: Rc<RefCell<Option<JsValue>>> = Rc::new(RefCell::new(None));
+        let seen = Rc::clone(&answered);
+        wait_until("the request is admitted", move || {
+            let detail = dispatch_detail(
+                host.as_ref(),
+                ACTIVATION_SYNC,
+                &[("port", port), ("body", "{}")],
+            );
+            if str_field(&detail, SYNC_STATUS_FIELD).as_deref() == Some("refused") {
+                return false;
+            }
+            *seen.borrow_mut() = Some(detail);
+            true
+        })
+        .await;
+        answered.borrow_mut().take().expect("the wait held")
+    }
+
+    /// Every answer the door writes, driven through one live instance: the reply
+    /// on ok, the entry's own account on err, the re-entrancy refusal an entry
+    /// earns by dispatching at itself, and the trap that ends the instance.
+    ///
+    /// Each is a production branch no other test reaches — the harness elsewhere
+    /// returns `undefined` unconditionally, so without this test every answer but
+    /// `status = ok, reply absent` is unexercised. The reply is the whole reason
+    /// the class exists: it is what a gesture wiring reads to decide
+    /// `preventDefault`.
+    #[wasm_bindgen_test]
+    async fn the_door_writes_every_answer_an_entry_can_earn() {
+        const INST: &str = "wbt-sync-answers";
+        const CHROME: &str = "wbt-sync-answers-chrome";
+        fresh_root();
+
+        let hosts: Rc<RefCell<Vec<HtmlElement>>> = Rc::new(RefCell::new(Vec::new()));
+        define_answering_element(INST, Rc::clone(&hosts));
+
+        let ctrl = FakeControls::new();
+        let server = ctrl.add_connection();
+        let _kernel = spawn_kernel(&ctrl);
+
+        let mut document = fixtures::doc(
+            vec![component(INST), chrome(CHROME)],
+            vec![],
+            vec![],
+            vec![],
+        );
+        document.chrome_instance = CHROME.to_string();
+        open(&server, &document, pages::facts());
+        wait_until("the component mounts", || !hosts.borrow().is_empty()).await;
+        let host = hosts.borrow()[0].clone();
+
+        let detail = admitted_request(&host, "reply").await;
+        assert_eq!(str_field(&detail, SYNC_STATUS_FIELD).as_deref(), Some("ok"));
+        assert_eq!(
+            str_field(&detail, SYNC_REPLY_FIELD).as_deref(),
+            Some("{\"cancel\":true}"),
+            "the entry's reply reaches the requester on the detail it dispatched"
+        );
+
+        let detail = dispatch_detail(
+            host.as_ref(),
+            ACTIVATION_SYNC,
+            &[("port", "fail"), ("body", "{}")],
+        );
+        assert_eq!(
+            str_field(&detail, SYNC_STATUS_FIELD).as_deref(),
+            Some("err")
+        );
+        assert_eq!(
+            str_field(&detail, SYNC_ERROR_FIELD).as_deref(),
+            Some("the entry declined"),
+            "an err carries the entry's own account, which is the requester's only \
+             window onto what it said"
+        );
+        assert!(
+            str_field(&detail, SYNC_REPLY_FIELD).is_none(),
+            "an err answers no reply"
+        );
+
+        // The entry dispatches at its own host from inside its activation. An
+        // entry is on the stack, so the door refuses — and the outer activation,
+        // being sync itself, may carry the inner answer out on its reply.
+        let detail = dispatch_detail(
+            host.as_ref(),
+            ACTIVATION_SYNC,
+            &[("port", "nested"), ("body", "{}")],
+        );
+        assert_eq!(str_field(&detail, SYNC_STATUS_FIELD).as_deref(), Some("ok"));
+        assert_eq!(
+            str_field(&detail, SYNC_REPLY_FIELD).as_deref(),
+            Some("refused"),
+            "a request from inside an activation finds the page borrowed"
+        );
+
+        let detail = dispatch_detail(
+            host.as_ref(),
+            ACTIVATION_SYNC,
+            &[("port", "boom"), ("body", "{}")],
+        );
+        assert_eq!(
+            str_field(&detail, SYNC_STATUS_FIELD).as_deref(),
+            Some("trap"),
+            "the requesting closure survives the dispatch and has to be told to stop"
+        );
+
+        // Terminal, and answered as such — the kill was folded inside the same
+        // dispatch: the next request finds no instance the page still activates.
+        let detail = dispatch_detail(
+            host.as_ref(),
+            ACTIVATION_SYNC,
+            &[("port", "reply"), ("body", "{}")],
+        );
+        assert_eq!(
+            str_field(&detail, SYNC_STATUS_FIELD).as_deref(),
+            Some("refused")
+        );
+    }
+
+    /// Dispatch a cancelable, bubbling `click` at `target` and answer whether the
+    /// browser's default action survived it — `false` when a listener called
+    /// `preventDefault`. Built in JS because the answer is `dispatchEvent`'s own
+    /// return value, which is the only witness that the suppression really took.
+    fn click_survived(target: &HtmlElement) -> bool {
+        js_sys::Function::new_with_args(
+            "el",
+            "return el.dispatchEvent(new MouseEvent('click', { cancelable: true, bubbles: true }));",
+        )
+        .call1(&JsValue::NULL, target.as_ref())
+        .expect("dispatch a click")
+        .as_bool()
+        .expect("dispatchEvent answers a boolean")
+    }
+
+    /// The two halves of the sync seam against each other rather than each against
+    /// a stand-in of the other: a real `wire_gesture` wiring on a real SDK-built
+    /// component, the real kernel listener and door, and the browser's own
+    /// `dispatchEvent` return as the witness.
+    ///
+    /// This is the payoff the whole sync class exists for. Everything under it —
+    /// the request's detail keys, the reply's key, the dialect the wiring reads —
+    /// is spelled independently on the two sides, and a drift in any of them stops
+    /// every gesture in the product from cancelling while both suites stay green.
+    #[wasm_bindgen_test]
+    async fn a_real_gesture_wiring_cancels_the_browsers_default_action() {
+        const INST: &str = "wbt-sync-gesture";
+        const CHROME: &str = "wbt-sync-gesture-chrome";
+        fresh_root();
+
+        // What the entry was handed, one entry per activation: the sync port name
+        // and the request body the wiring encoded.
+        type Handed = Rc<RefCell<Vec<(Option<String>, Option<String>)>>>;
+        let seen: Handed = Rc::new(RefCell::new(Vec::new()));
+        sdk::bind_instance(INST);
+        sdk::register_component(
+            INST,
+            |host| {
+                sdk::wire_gesture(&host, host.as_ref(), "click", "gesture", |_event| {
+                    "{\"click\":1}".to_string()
+                });
+            },
+            {
+                let seen = Rc::clone(&seen);
+                move |activation: &crate::contract::Activation, _publisher: &mut sdk::Publisher| {
+                    let port = activation.sync.clone();
+                    let body = port.as_deref().map(|port| {
+                        activation
+                            .ports
+                            .iter()
+                            .find(|window| window.port == port)
+                            .expect("the named sync port is one of the windows")
+                            .envelopes[0]
+                            .body
+                            .clone()
+                    });
+                    seen.borrow_mut().push((port.clone(), body));
+                    match port {
+                        Some(_) => Ok(sdk::gesture_reply(true)),
+                        None => Ok(None),
+                    }
+                }
+            },
+        );
+
+        let ctrl = FakeControls::new();
+        let server = ctrl.add_connection();
+        let _kernel = spawn_kernel(&ctrl);
+
+        let mut document = fixtures::doc(
+            vec![component(INST), chrome(CHROME)],
+            vec![],
+            vec![],
+            vec![],
+        );
+        document.chrome_instance = CHROME.to_string();
+        open(&server, &document, pages::facts());
+
+        let tag = element_name_for_instance(INST, INST);
+        wait_until("the component mounts", || {
+            doc()
+                .query_selector(&tag)
+                .expect("query_selector")
+                .is_some()
+        })
+        .await;
+        let host: HtmlElement = doc()
+            .query_selector(&tag)
+            .expect("query_selector")
+            .expect("the wait held")
+            .dyn_into()
+            .expect("the component's host is an HtmlElement");
+
+        // The mount activation is the registration having landed. Clicking before
+        // it would be refused, and the SDK faults on a refusal rather than
+        // retrying — a component never gets a second chance at one.
+        wait_until("the mount activation runs", || !seen.borrow().is_empty()).await;
+
+        assert!(
+            !click_survived(&host),
+            "the entry's cancel reply reaches the wiring and suppresses the default action"
+        );
+        assert_eq!(
+            seen.borrow().last().expect("the click activated the entry"),
+            &(
+                Some("gesture".to_string()),
+                Some("{\"click\":1}".to_string())
+            ),
+            "the wiring's encoded body reaches the entry through the request window"
+        );
+    }
+
+    /// Dispatch a contract event with a string-valued detail on `target`, the way
+    /// a component's SDK does, and hand the detail back — the kernel writes its
+    /// synchronous answer onto that same object.
+    fn dispatch_detail(
+        target: &web_sys::EventTarget,
+        name: &str,
+        fields: &[(&str, &str)],
+    ) -> JsValue {
+        let detail = Object::new();
+        for (key, value) in fields {
+            Reflect::set(&detail, &JsValue::from_str(key), &JsValue::from_str(value))
+                .expect("set a detail field");
+        }
+        let init = CustomEventInit::new();
+        init.set_detail(&detail);
+        init.set_bubbles(true);
+        init.set_composed(true);
+        let event =
+            CustomEvent::new_with_event_init_dict(name, &init).expect("construct a contract event");
+        target.dispatch_event(&event).expect("dispatch");
+        detail.into()
+    }
+
+    /// The last activation the sink recorded for `instance`, decoded.
+    fn last_activation(sink: &ActivationSink, instance: &str) -> crate::contract::Activation {
+        let json = sink
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(inst, _)| inst == instance)
+            .map(|(_, json)| json.clone())
+            .expect("the instance was activated at least once");
+        serde_json::from_str(&json).expect("recorded activation JSON decodes")
+    }
+
+    /// The whole seam in one dispatch: the kernel resolves the instance from the
+    /// retargeted target, assembles a sync activation around the minted request,
+    /// invokes the entry and writes the answer — all before `dispatchEvent`
+    /// returns. That the answer is readable on the next line *is* the testable
+    /// proxy for same-task execution, which is what gesture-token liveness reduces
+    /// to.
+    ///
+    /// The effects come after, through the loop: the entry's buffered publish
+    /// reaches the fake transport only once the run drains what the door queued.
+    #[wasm_bindgen_test]
+    async fn a_sync_request_runs_a_whole_activation_before_the_dispatch_returns() {
+        const INST: &str = "wbt-sync-ok";
+        const CHROME: &str = "wbt-sync-ok-chrome";
+        const OUT: &str = "ephemeral:demo.sync-ok";
+        fresh_root();
+
+        let hosts: Rc<RefCell<Vec<HtmlElement>>> = Rc::new(RefCell::new(Vec::new()));
+        let activations: ActivationSink = Rc::new(RefCell::new(Vec::new()));
+        define_sync_element(
+            INST,
+            Rc::clone(&hosts),
+            Rc::clone(&activations),
+            "out",
+            "from the gesture",
+        );
+
+        let ctrl = FakeControls::new();
+        let server = ctrl.add_connection();
+        let _kernel = spawn_kernel(&ctrl);
+
+        let mut document = fixtures::doc(
+            vec![component(INST), chrome(CHROME)],
+            vec![],
+            vec![fixtures::output(INST, "out", OUT)],
+            vec![],
+        );
+        document.chrome_instance = CHROME.to_string();
+        open(&server, &document, pages::facts());
+        wait_until("the component mounts", || !hosts.borrow().is_empty()).await;
+
+        // The registration crosses the control channel and is answered by a turn,
+        // so a request dispatched before that turn lands is refused. A component
+        // would never retry a refusal — it is a bug — but a test has to reach the
+        // state the seam is about, and how many turns the mount took is not it.
+        let host = hosts.borrow()[0].clone();
+        wait_until("the request is admitted", || {
+            let detail = dispatch_detail(
+                host.as_ref(),
+                ACTIVATION_SYNC,
+                &[("port", "gesture"), ("body", "{\"click\":1}")],
+            );
+            // Read on the line after the dispatch: the whole activation is over.
+            str_field(&detail, SYNC_STATUS_FIELD).as_deref() == Some("ok")
+        })
+        .await;
+
+        let activation = last_activation(&activations, INST);
+        assert_eq!(activation.sync.as_deref(), Some("gesture"));
+        let window = activation
+            .ports
+            .iter()
+            .find(|w| w.port == "gesture")
+            .expect("the sync port is windowed like any other");
+        assert_eq!(window.new_from, 0);
+        assert_eq!(window.dropped, 0);
+        let [request] = &window.envelopes[..] else {
+            panic!("a sync window is exactly the one live request: {window:?}");
+        };
+        assert_eq!(request.body, "{\"click\":1}");
+        assert_eq!(request.channel, crate::contract::sync_channel("gesture"));
+        assert_eq!(request.sender, INST);
+
+        let batch = || {
+            ctrl.sent()
+                .iter()
+                .filter_map(|f| serde_json::from_str::<ClientFrame>(f).ok())
+                .find(|f| matches!(f, ClientFrame::PublishBatch { .. }))
+        };
+        assert!(
+            batch().is_none(),
+            "the answer returns before the flush reaches the wire"
+        );
+        wait_until("the activation's flush reaches the transport", || {
+            batch().is_some()
+        })
+        .await;
+        let Some(ClientFrame::PublishBatch {
+            attribution,
+            publishes,
+            deferred_ops,
+            ..
+        }) = batch()
+        else {
+            unreachable!("the wait above holds only on a batch")
+        };
+        assert_eq!(attribution.as_deref(), Some(INST));
+        assert!(deferred_ops.is_empty());
+        let [entry] = &publishes[..] else {
+            panic!("the activation buffered exactly one publish: {publishes:?}");
+        };
+        assert_eq!(entry.channel, OUT);
+        assert_eq!(entry.body, "from the gesture");
+    }
+
+    /// A request whose target is not a mounted instance element is answered
+    /// `refused` all the same. The SDK faults on a missing status — it reads one
+    /// as a broken page rather than an outcome — so the drop-and-report path owes
+    /// an answer just as much as the admitted one does.
+    #[wasm_bindgen_test]
+    async fn a_sync_request_from_a_non_component_target_is_refused() {
+        const CHROME: &str = "wbt-sync-stray-chrome";
+        let root = fresh_root();
+
+        let ctrl = FakeControls::new();
+        let server = ctrl.add_connection();
+        let _kernel = spawn_kernel(&ctrl);
+
+        let mut document = fixtures::doc(vec![chrome(CHROME)], vec![], vec![], vec![]);
+        document.chrome_instance = CHROME.to_string();
+        open(&server, &document, pages::facts());
+
+        let stray = doc().create_element("div").expect("create a stray element");
+        root.append_child(&stray).expect("append the stray element");
+        let detail = dispatch_detail(
+            stray.as_ref(),
+            ACTIVATION_SYNC,
+            &[("port", "gesture"), ("body", "{}")],
+        );
+        assert_eq!(
+            str_field(&detail, SYNC_STATUS_FIELD).as_deref(),
+            Some("refused")
+        );
+    }
+
+    /// The body of an entry that publishes at a nominated element and answers with
+    /// the status the kernel wrote back.
+    ///
+    /// Written in JS for the same reason [`ANSWERING_ENTRY`] is: it has to read the
+    /// answer off the very detail object it dispatched, inside the entry, and hand
+    /// it out through the reply.
+    const PUBLISHING_ENTRY: &str = "\
+        const port = JSON.parse(json).sync;\n\
+        if (port === 'own' || port === 'other') {\n\
+          const tag = port === 'own' ? '__TAG__' : '__OTHER_TAG__';\n\
+          const detail = { port: 'out', body: 'from inside an entry' };\n\
+          document.querySelector(tag).dispatchEvent(\n\
+            new CustomEvent('__PUBLISH_EVENT__', { detail, bubbles: true, composed: true }));\n\
+          return { __REPLY_KEY__: String(detail.__PSTATUS_KEY__) };\n\
+        }\n\
+        return undefined;";
+
+    /// Define `instance`'s element with [`PUBLISHING_ENTRY`], aimed at `other`'s
+    /// element for its cross-instance case.
+    fn define_publishing_element(
+        instance: &str,
+        other: &str,
+        hosts: Rc<RefCell<Vec<HtmlElement>>>,
+    ) {
+        let tag = element_name_for_instance(instance, instance);
+        let source = PUBLISHING_ENTRY
+            .replace("__TAG__", &tag)
+            .replace("__OTHER_TAG__", &element_name_for_instance(other, other))
+            .replace("__PUBLISH_EVENT__", PORT_PUBLISH)
+            .replace("__REPLY_KEY__", ENTRY_REPLY_FIELD)
+            .replace("__PSTATUS_KEY__", crate::contract::PUBLISH_STATUS_FIELD);
+        define_test_element(&tag, move |host: HtmlElement| {
+            if hosts
+                .borrow()
+                .iter()
+                .any(|h| h.is_same_node(Some(host.as_ref())))
+            {
+                return;
+            }
+            hosts.borrow_mut().push(host.clone());
+            let entry = js_sys::Function::new_with_args("json", &source);
+            let detail = Object::new();
+            Reflect::set(&detail, &JsValue::from_str("entry"), &entry)
+                .expect("set entry on the registration detail");
+            let init = CustomEventInit::new();
+            init.set_detail(&detail);
+            init.set_bubbles(true);
+            init.set_composed(true);
+            let event = CustomEvent::new_with_event_init_dict(ACTIVATION_REGISTER, &init)
+                .expect("construct the registration event");
+            host.dispatch_event(&event)
+                .expect("dispatch the registration event");
+        });
+    }
+
+    /// The publish route's three cases, through the live slot: the instance whose
+    /// entry is on the stack is buffered, another instance's publish during that
+    /// same entry is refused, and a publish with no entry running at all is refused
+    /// too.
+    ///
+    /// Both refusals are `not-permitted` written on the dispatching detail, which
+    /// is the whole of the routing decision since no publish falls through to a
+    /// path of its own. The third case is also the take-back pin: it is dispatched
+    /// after an activation that *was* buffered, so a slot left installed would
+    /// answer it `ok`. Both ports are bound outputs of their own instances, so
+    /// nothing here can be refused for naming a port its instance lacks.
+    ///
+    /// The last two cases are the router's own drops — a detail the kernel cannot
+    /// attribute, and one it cannot read. They are answered too: the SDK reads a
+    /// *missing* status as "no kernel listener heard it", so leaving these silent
+    /// would tell an out-of-tree component its page is broken when the kernel knew
+    /// exactly what was wrong.
+    #[wasm_bindgen_test]
+    async fn the_publish_route_buffers_the_running_entrys_publish_and_refuses_every_other() {
+        const INST: &str = "wbt-pub-route";
+        const NEIGHBOUR: &str = "wbt-pub-route-neighbour";
+        const CHROME: &str = "wbt-pub-route-chrome";
+        const OUT: &str = "ephemeral:demo.pub-route";
+        const NEIGHBOUR_OUT: &str = "ephemeral:demo.pub-route-neighbour";
+        let root = fresh_root();
+
+        let hosts: Rc<RefCell<Vec<HtmlElement>>> = Rc::new(RefCell::new(Vec::new()));
+        define_publishing_element(INST, NEIGHBOUR, Rc::clone(&hosts));
+
+        let ctrl = FakeControls::new();
+        let server = ctrl.add_connection();
+        let _kernel = spawn_kernel(&ctrl);
+
+        let mut document = fixtures::doc(
+            vec![component(INST), inert(NEIGHBOUR), chrome(CHROME)],
+            vec![],
+            vec![
+                fixtures::output(INST, "out", OUT),
+                fixtures::output(NEIGHBOUR, "out", NEIGHBOUR_OUT),
+            ],
+            vec![],
+        );
+        document.chrome_instance = CHROME.to_string();
+        open(&server, &document, pages::facts());
+        wait_until("the component mounts", || !hosts.borrow().is_empty()).await;
+        let host = hosts.borrow()[0].clone();
+
+        let detail = admitted_request(&host, "own").await;
+        assert_eq!(str_field(&detail, SYNC_STATUS_FIELD).as_deref(), Some("ok"));
+        assert_eq!(
+            str_field(&detail, ENTRY_REPLY_FIELD).as_deref(),
+            Some("ok"),
+            "the instance whose entry is on the stack reaches that activation's buffer"
+        );
+
+        let detail = dispatch_detail(
+            host.as_ref(),
+            ACTIVATION_SYNC,
+            &[("port", "other"), ("body", "{}")],
+        );
+        assert_eq!(str_field(&detail, SYNC_STATUS_FIELD).as_deref(), Some("ok"));
+        assert_eq!(
+            str_field(&detail, ENTRY_REPLY_FIELD).as_deref(),
+            Some("not-permitted"),
+            "a publish attributed to another instance belongs in no buffer, so it is refused"
+        );
+
+        let detail = dispatch_detail(
+            host.as_ref(),
+            PORT_PUBLISH,
+            &[("port", "out"), ("body", "out of the blue")],
+        );
+        assert_eq!(
+            str_field(&detail, crate::contract::PUBLISH_STATUS_FIELD).as_deref(),
+            Some("not-permitted"),
+            "outside every activation there is no buffer to join and no other path"
+        );
+
+        let stray = doc().create_element("div").expect("create a stray element");
+        root.append_child(&stray).expect("append the stray element");
+        let detail = dispatch_detail(
+            stray.as_ref(),
+            PORT_PUBLISH,
+            &[("port", "out"), ("body", "from nobody")],
+        );
+        assert_eq!(
+            str_field(&detail, crate::contract::PUBLISH_STATUS_FIELD).as_deref(),
+            Some("not-permitted"),
+            "a publish the kernel cannot attribute is heard, dropped, and answered"
+        );
+
+        let detail = dispatch_detail(host.as_ref(), PORT_PUBLISH, &[("port", "out")]);
+        assert_eq!(
+            str_field(&detail, crate::contract::PUBLISH_STATUS_FIELD).as_deref(),
+            Some("not-permitted"),
+            "a detail with no body is malformed, and malformed is answered too"
+        );
+
+        // Nothing of the four refusals is on the wire, and the one publish that was
+        // buffered flushed exactly once.
+        wait_until("the buffered publish reaches the transport", || {
+            sent_has(&ctrl, |f| matches!(f, ClientFrame::PublishBatch { .. }))
+        })
+        .await;
+        let batches: Vec<_> = ctrl
+            .sent()
+            .iter()
+            .filter_map(|f| serde_json::from_str::<ClientFrame>(f).ok())
+            .filter_map(|f| match f {
+                ClientFrame::PublishBatch { publishes, .. } => Some(publishes),
+                _ => None,
+            })
+            .collect();
+        let [publishes] = &batches[..] else {
+            panic!("exactly one activation buffered anything: {batches:?}");
+        };
+        let [entry] = &publishes[..] else {
+            panic!("that activation buffered one publish: {publishes:?}");
+        };
+        assert_eq!(entry.channel, OUT);
+    }
+
+    /// A gesture whose flush lands on a confined channel wakes the instance that
+    /// reads it.
+    ///
+    /// The door turns the page inside the browser's dispatch, while the loop is
+    /// parked on a readiness answer it took before it slept. A flush onto a
+    /// page-local ring produces no effect at all — no frame, no verdict, no moved
+    /// release deadline — so the door's hand-back is the only thing that can tell
+    /// the loop to look again. Nothing else is scripted here: no server frame
+    /// arrives and no deadline is due, which is exactly the quiet page the missed
+    /// wake would strand.
+    #[wasm_bindgen_test]
+    async fn a_sync_flush_onto_a_confined_channel_wakes_its_reader() {
+        const INST: &str = "wbt-sync-fanout";
+        const READER: &str = "wbt-sync-fanout-reader";
+        const CHROME: &str = "wbt-sync-fanout-chrome";
+        const LOCAL: &str = "local:demo/fanout";
+        const BODY: &str = "the gesture's own word";
+        fresh_root();
+
+        let hosts: Rc<RefCell<Vec<HtmlElement>>> = Rc::new(RefCell::new(Vec::new()));
+        let activations: ActivationSink = Rc::new(RefCell::new(Vec::new()));
+        define_sync_element(
+            INST,
+            Rc::clone(&hosts),
+            Rc::clone(&activations),
+            "out",
+            BODY,
+        );
+        let readers: Rc<RefCell<Vec<HtmlElement>>> = Rc::new(RefCell::new(Vec::new()));
+        define_recording_element(READER, READER, Rc::clone(&readers), Rc::clone(&activations));
+
+        let ctrl = FakeControls::new();
+        let server = ctrl.add_connection();
+        let _kernel = spawn_kernel(&ctrl);
+
+        let mut document = fixtures::doc(
+            vec![component(INST), component(READER), chrome(CHROME)],
+            vec![fixtures::subscription(READER, "in", LOCAL, 1, 0)],
+            vec![fixtures::output(INST, "out", LOCAL)],
+            vec![fixtures::local(LOCAL, 4)],
+        );
+        document.chrome_instance = CHROME.to_string();
+        open(&server, &document, pages::facts());
+        wait_until("both components mount", || {
+            !hosts.borrow().is_empty() && !readers.borrow().is_empty()
+        })
+        .await;
+
+        // Retried for [`a_sync_request_runs_a_whole_activation_before_the_dispatch_returns`]'s
+        // reason: the registration crosses the control channel, and how many turns
+        // the mount took is not what this is about.
+        let host = hosts.borrow()[0].clone();
+        wait_until("the request is admitted", || {
+            let detail = dispatch_detail(
+                host.as_ref(),
+                ACTIVATION_SYNC,
+                &[("port", "gesture"), ("body", "{}")],
+            );
+            str_field(&detail, SYNC_STATUS_FIELD).as_deref() == Some("ok")
+        })
+        .await;
+
+        wait_until("the reader is activated with the gesture's publish", || {
+            new_bodies_for(&activations, READER)
+                .iter()
+                .any(|body| body == BODY)
+        })
+        .await;
     }
 
     // ── tests ─────────────────────────────────────────────────────────────
@@ -1264,8 +2105,7 @@ mod tests {
         fresh_root();
 
         // A granted attachment with no output bindings but an error channel
-        // declared at floor `warn`: a publish to a component port is refused
-        // UnboundPort by the gate, while warn/error reports reach that channel and
+        // declared at floor `warn`, so warn/error reports reach that channel and
         // an Alert frame reaches the wire.
         let ctrl = FakeControls::new();
         let server = ctrl.add_connection();
@@ -1315,16 +2155,15 @@ mod tests {
         );
         assert_eq!(ready.borrow().len(), 1, "EmitReady fired once");
 
-        // The rejected publish and the warn ComponentLog each console.warn and
+        // The kernel breadcrumb and the warn ComponentLog each console.warn and
         // publish a reserved-port report; the ComponentAlert routes to an Alert.
         let warnings = capture_console_warn(|| {
             dom::apply_actions(
                 &[
-                    KernelAction::Publish {
-                        instance: "nobody".into(),
-                        port: "nowhere".into(),
-                        body: "b".into(),
-                        urgency: None,
+                    KernelAction::Report {
+                        level: LogLevel::Warn,
+                        message: "kernel breadcrumb".into(),
+                        subject: None,
                     },
                     KernelAction::ComponentLog {
                         instance: CK.into(),
@@ -1343,11 +2182,11 @@ mod tests {
         assert_eq!(
             warnings.len(),
             2,
-            "rejected publish + warn component log each warn once"
+            "kernel breadcrumb + warn component log each warn once"
         );
 
         // Both reports become publishes on the surface's error channel — the
-        // rejected-publish report (source "kernel", unattributed) and the
+        // kernel breadcrumb (source "kernel", unattributed) and the
         // ComponentLog (source "component:<instance>", attributed to it) — and the
         // ComponentAlert reaches the wire as its own frame.
         wait_until(
@@ -1364,8 +2203,9 @@ mod tests {
         .await;
     }
 
-    /// A `KernelAction::Publish` counts one against the publishing instance's
-    /// `publishes` column, and against no one else's.
+    /// A buffered publish counts one against the publishing instance's
+    /// `publishes` column, against no one else's, and a refused one counts
+    /// against nobody.
     ///
     /// `publishes` is the half of the per-instance breakdown that reads against a
     /// component's send budget — the column an operator consults to answer "which
@@ -1373,6 +2213,11 @@ mod tests {
     /// column and assert only that `publishes` holds *still*, so without this the
     /// producer line could be deleted or misrouted and every per-instance
     /// `publishes` value would be permanently zero with the suite green.
+    ///
+    /// Driven through the live seam — a real `PORT_PUBLISH` from inside a real
+    /// entry — because that listener holds the only remaining call of
+    /// [`dom::count_publish`] for an immediate publish. A test that constructed a
+    /// [`KernelAction::Publish`] by hand would be pinning a producer no page has.
     #[wasm_bindgen_test]
     async fn publishes_count_against_the_publishing_instance_only() {
         const A: &str = "wbt-pub-ctr-a";
@@ -1380,35 +2225,37 @@ mod tests {
         const CHROME: &str = "wbt-pub-ctr-chrome";
         fresh_root();
 
+        let hosts: Rc<RefCell<Vec<HtmlElement>>> = Rc::new(RefCell::new(Vec::new()));
+        define_publishing_element(A, B, Rc::clone(&hosts));
+
         let ctrl = FakeControls::new();
         let server = ctrl.add_connection();
-        let (handle, active) = spawn_page(&ctrl);
+        let _kernel = spawn_kernel(&ctrl);
         // Both instances get a real bound output port, so the publish under test
         // takes the accepted path rather than the UnboundPort refusal.
         let mut document = fixtures::doc(
-            vec![component(A), component(B), chrome(CHROME)],
+            vec![component(A), inert(B), chrome(CHROME)],
             vec![],
             vec![
                 fixtures::output(A, "out", "ephemeral:pubctr"),
-                fixtures::output(B, "out", "ephemeral:pubctr"),
+                fixtures::output(B, "out", "ephemeral:pubctr-b"),
             ],
             vec![],
         );
         document.chrome_instance = CHROME.to_string();
         open(&server, &document, pages::facts());
-        wait_until("the page is configured", || active.get()).await;
+        wait_until("the component mounts", || !hosts.borrow().is_empty()).await;
+        let host = hosts.borrow()[0].clone();
 
         let (before_a, before_b) = (dom::instance_counters(A), dom::instance_counters(B));
-        dom::apply_actions(
-            &[KernelAction::Publish {
-                instance: A.into(),
-                port: "out".into(),
-                body: "b".into(),
-                urgency: None,
-            }],
-            &handle,
-        );
 
+        // A's entry publishes at its own element: buffered, so it counts.
+        let detail = admitted_request(&host, "own").await;
+        assert_eq!(
+            str_field(&detail, ENTRY_REPLY_FIELD).as_deref(),
+            Some("ok"),
+            "the publish under test reached the buffer"
+        );
         assert_eq!(
             dom::instance_counters(A).publishes - before_a.publishes,
             1,
@@ -1418,6 +2265,28 @@ mod tests {
             dom::instance_counters(B).publishes,
             before_b.publishes,
             "the sibling's column is untouched"
+        );
+
+        // The same entry publishing at B's element: refused, and a refusal is not
+        // a publish either instance made.
+        let detail = dispatch_detail(
+            host.as_ref(),
+            ACTIVATION_SYNC,
+            &[("port", "other"), ("body", "{}")],
+        );
+        assert_eq!(
+            str_field(&detail, ENTRY_REPLY_FIELD).as_deref(),
+            Some("not-permitted"),
+        );
+        assert_eq!(
+            dom::instance_counters(A).publishes - before_a.publishes,
+            1,
+            "a refused publish adds nothing to the dispatcher's column"
+        );
+        assert_eq!(
+            dom::instance_counters(B).publishes,
+            before_b.publishes,
+            "nor to the instance it was attributed to"
         );
     }
 

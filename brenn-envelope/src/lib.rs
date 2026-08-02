@@ -121,7 +121,12 @@ pub fn surface_sub_identity(participant: &str, instance: &str) -> String {
 ///   no queue, no retention, no position, no gap/replay semantics. It shares
 ///   almost nothing with the schemes above beyond the vocabulary (named ports,
 ///   envelopes, the publish error triple), which is why it is a binding-level
-///   property rather than an address scheme. Reserved, not built.
+///   property rather than an address scheme. The kernel-originated form is
+///   built: the surface's sync-call activation names its live port on the
+///   activation itself, and the request envelope it carries is an ordinary
+///   `Local` one on a never-routed address. The general binding-level form —
+///   a sync port a config document can declare between two components — stays
+///   reserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelScheme {

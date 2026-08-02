@@ -650,7 +650,9 @@ impl Seen {
 /// the activation and its buffer.
 fn entry<F>(seen: &Seen, act: F) -> ActivationEntry
 where
-    F: Fn(&Activation, &mut PublishBuffer) -> Result<(), ActivationError> + Send + 'static,
+    F: Fn(&Activation, &mut PublishBuffer) -> Result<Option<String>, ActivationError>
+        + Send
+        + 'static,
 {
     let seen = seen.clone();
     Box::new(move |activation, buffer| {
@@ -665,7 +667,7 @@ where
 
 /// An entry that reads and publishes nothing.
 fn quiet(seen: &Seen) -> ActivationEntry {
-    entry(seen, |_, _| Ok(()))
+    entry(seen, |_, _| Ok(None))
 }
 
 /// What each activation was shown, one vector of new bodies per call.
@@ -694,7 +696,7 @@ fn windowing(windows: &Windows) -> ActivationEntry {
             .map(|envelope| envelope.body.clone())
             .collect();
         windows.0.lock().unwrap().push(bodies);
-        Ok(())
+        Ok(None)
     })
 }
 
@@ -705,7 +707,7 @@ fn publishing(seen: &Seen, port: &str, body: &str) -> ActivationEntry {
         buffer
             .publish(&port, body.clone())
             .expect("the fixture binds the port it publishes on");
-        Ok(())
+        Ok(None)
     })
 }
 
@@ -719,11 +721,17 @@ fn publishing(seen: &Seen, port: &str, body: &str) -> ActivationEntry {
 fn deferring(seen: &Seen, port: &str, body: &str) -> ActivationEntry {
     let (port, body) = (port.to_string(), body.to_string());
     entry(seen, move |activation, buffer| {
+        // Only on an activation carrying something. The guaranteed mount
+        // activation runs with empty windows, and parking a schedule there too
+        // would put two on the channel for one delivery.
+        if activation.ports.iter().all(|window| window.new_len() == 0) {
+            return Ok(None);
+        }
         let now = activation.now.expect("the page has a wall clock");
         buffer
             .publish_deferred(&port, body.clone(), now + 20)
             .expect("the fixture binds the port it publishes on");
-        Ok(())
+        Ok(None)
     })
 }
 
@@ -895,7 +903,7 @@ async fn a_mount_subscribes_its_channel_and_an_unmount_closes_it() {
 
     running.send(RunnerCommand::RegisterActivation {
         instance: "p1".to_string(),
-        entry: Box::new(|_, _| Ok(())),
+        entry: Box::new(|_, _| Ok(None)),
     });
     wait_until(|| controls.subscribed().contains(&WIRE_ONE.to_string())).await;
 
@@ -972,7 +980,7 @@ async fn a_write_failure_mid_batch_drops_the_rest_of_it_and_reconnects() {
     for instance in ["p1", "p2"] {
         running.send(RunnerCommand::RegisterActivation {
             instance: instance.to_string(),
-            entry: Box::new(|_, _| Ok(())),
+            entry: Box::new(|_, _| Ok(None)),
         });
     }
     wait_until(|| controls.connects() == 1).await;
@@ -1184,8 +1192,12 @@ async fn a_multi_row_pass_wakes_its_reader_once() {
     settle().await;
     assert_eq!(
         windows.activations(),
-        vec![vec!["m1".to_string(), "m2".to_string(), "m3".to_string()]],
-        "one pass, one activation, every row of it in the new slice"
+        vec![
+            Vec::<String>::new(),
+            vec!["m1".to_string(), "m2".to_string(), "m3".to_string()]
+        ],
+        "the mount's guaranteed activation, then one pass, one activation, every \
+         row of it in the new slice"
     );
     running.task.abort();
 }
@@ -1209,11 +1221,13 @@ async fn three_separate_frames_wake_their_reader_three_times() {
             .unwrap();
     }
 
-    wait_until(|| windows.activations().len() == 3).await;
+    wait_until(|| windows.activations().len() == 4).await;
     settle().await;
     assert_eq!(
         windows.activations(),
         vec![
+            // The mount's guaranteed activation, ahead of any delivery.
+            Vec::<String>::new(),
             vec!["m1".to_string()],
             vec!["m2".to_string()],
             vec!["m3".to_string()]
@@ -1313,6 +1327,47 @@ async fn a_trapped_entry_takes_its_instance_terminal() {
         Event::InstanceFailed { instance, reason }
             if instance == "p2" && reason == "the component fell over at rung 7"
     ));
+    running.task.abort();
+}
+
+/// A reply answers a question, and an async activation asked none. An entry that
+/// returns one anyway is a trap at the native seam exactly as it is at the
+/// browser's — its buffer was built under a misapprehension, so the one thing that
+/// must not happen is a flush.
+///
+/// The mount activation is the async activation used, because it needs nothing
+/// arranged: it is guaranteed, it carries no sync port, and it runs before any
+/// delivery could.
+#[tokio::test(start_paused = true)]
+async fn a_reply_to_an_async_activation_traps_at_the_native_seam() {
+    let controls = Controls::new();
+    let (feed, _closed, _writes) = controls.succeed();
+    let mut running = spawn(&controls);
+    attach(&mut running, &feed).await;
+
+    mount(
+        &mut running,
+        "p1",
+        Box::new(|_, buffer| {
+            buffer
+                .publish("out", "never flushed".to_string())
+                .expect("the fixture binds the port it publishes on");
+            Ok(Some("{\"cancel\":true}".to_string()))
+        }),
+    );
+
+    assert!(matches!(
+        running.event().await,
+        Event::InstanceFailed { instance, reason }
+            if instance == "p1" && reason.contains("no sync port")
+    ));
+    assert!(
+        !controls
+            .written()
+            .iter()
+            .any(|frame| frame.contains("never flushed")),
+        "the buffer of a trapped activation is discarded, not written"
+    );
     running.task.abort();
 }
 

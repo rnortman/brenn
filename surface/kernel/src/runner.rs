@@ -25,12 +25,23 @@
 //! The starvation a bias order guards against is a *stream*, and no deadline
 //! produces one.
 //!
-//! Within the front door's own four channels the order is the one their contracts
-//! imply: control first, because a mount is what every later delivery depends on
-//! and its channel is the one with a panic bound under it; then the publishes,
-//! which are answered; then the two best-effort planes, which are dropped when
-//! there is nowhere to put them. Neither a publish backlog nor an alert flood can
-//! starve an unmount that way.
+//! The sync door's effects come first among the queued things, ahead even of
+//! control: they are the tail of a turn the page has *already* taken, so the page
+//! state they were composed against is older than anything still queued. Enacting
+//! them first is what makes frame order equal page order — which is why the wait
+//! winning on the socket does not simply proceed: the driver's event is about to
+//! become a *newer* turn, so whatever the door queued is drained and enacted
+//! first. Out of order it is not only frames that invert. A turn states the
+//! confined-release deadline only when it changed, so enacting an older statement
+//! last leaves the timer armed at an instant the page does not think it stated,
+//! and no later turn restates it.
+//!
+//! Within the front door's own four channels the order is then the one their
+//! contracts imply: control first, because a mount is what every later delivery
+//! depends on and its channel is the one with a panic bound under it; then the
+//! publishes, which are answered; then the two best-effort planes, which are
+//! dropped when there is nowhere to put them. Neither a publish backlog nor an
+//! alert flood can starve an unmount that way.
 //!
 //! Activations are dead last, and that is the whole point. A component that
 //! republishes onto a confined channel it reads is ready again the instant its own
@@ -60,6 +71,7 @@
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
@@ -69,6 +81,7 @@ use chrono::{DateTime, Utc};
 use futures_channel::mpsc;
 use futures_util::{FutureExt, StreamExt, future, pin_mut, select_biased};
 
+use brenn_attach_client::Millis;
 use brenn_attach_client::TransportConnector;
 use brenn_attach_client::conn::ConnConfig;
 use brenn_attach_client::driver::{AttachDriver, DriverStep, IoEvent};
@@ -78,8 +91,8 @@ use brenn_surface_contract::Activation;
 use crate::activation::{ActivationOutcome, ReadyActivation};
 use crate::command::Command;
 use crate::front::{
-    ActivationEntry, AlertCommand, FrontChannels, PublishCommand, PublishSlot, ReportCommand,
-    SurfaceGate, TelemetryCommand,
+    ActivationEntry, AlertCommand, EFFECTS_CHANNEL_CAPACITY, FrontChannels, PublishCommand,
+    PublishSlot, ReportCommand, SurfaceGate, TelemetryCommand,
 };
 use crate::outbound::PortPublish;
 use crate::outward::{self, Completed};
@@ -111,6 +124,35 @@ pub enum RunnerCommand {
     Close,
 }
 
+/// The page, at the ownership each target's seams require.
+///
+/// The loop is not the only thing that drives a page on wasm: a component's
+/// `brenn-activation-sync` request runs a whole turn on the browser's own stack,
+/// synchronously, because its caller is blocked on the answer. So the browser
+/// build shares the cell with [`crate::sync_door::SyncDoor`]; natively there is
+/// no such seam and the run owns it outright (an `Rc` would not be `Send`, which
+/// the multi-threaded executor requires).
+///
+/// The cell is a `RefCell` on both targets, so every access spells the same. The
+/// borrow flag is load-bearing on wasm: an activation pass holds it across the
+/// entry call, which is exactly the fact the door reads to answer a re-entrant
+/// request.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type SharedPage = RefCell<SurfacePage>;
+
+/// The browser's page cell. See the native definition above.
+#[cfg(target_arch = "wasm32")]
+pub(crate) type SharedPage = std::rc::Rc<RefCell<SurfacePage>>;
+
+/// The registered entries, at the ownership each target's seams require — the
+/// twin of [`SharedPage`], shared with the sync door for the same reason.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type SharedEntries = RefCell<HashMap<String, ActivationEntry>>;
+
+/// The browser's entry table. See the native definition above.
+#[cfg(target_arch = "wasm32")]
+pub(crate) type SharedEntries = std::rc::Rc<RefCell<HashMap<String, ActivationEntry>>>;
+
 /// A page, the attachment under it, and the loop that drives both.
 ///
 /// Built with [`SurfaceRunner::new`] and run to completion with
@@ -118,7 +160,7 @@ pub enum RunnerCommand {
 /// `spawn_local` on wasm).
 pub struct SurfaceRunner<C: TransportConnector> {
     driver: AttachDriver<C>,
-    page: SurfacePage,
+    page: SharedPage,
     /// Registered activation entries, keyed by instance.
     ///
     /// Runner-side rather than page-side because an entry is a callback and the
@@ -126,7 +168,7 @@ pub struct SurfaceRunner<C: TransportConnector> {
     /// unclonable, undebuggable and uncomparable. The page holds the *identity*
     /// of a registered instance and every scheduling decision about it; this map
     /// holds the one thing it cannot.
-    entries: HashMap<String, ActivationEntry>,
+    entries: SharedEntries,
     /// The in-flight activation's buffer, shared with the platform half's front
     /// door. Filled for exactly the duration of an entry invocation; a `dom`
     /// component's publish reaches it from a DOM listener, which is a code path
@@ -150,6 +192,23 @@ pub struct SurfaceRunner<C: TransportConnector> {
     alert_closed: bool,
     telemetry_rx: mpsc::Receiver<TelemetryCommand>,
     telemetry_closed: bool,
+    /// The effects of turns the sync door already ran on the page, waiting to be
+    /// enacted. Every effect this run performs goes through the loop below,
+    /// whichever turn produced it, which is what keeps frame order equal to page
+    /// order.
+    effects_rx: mpsc::Receiver<Vec<Effect>>,
+    /// Held for the run's whole life so the channel above never closes: on wasm
+    /// it is cloned into the sync door, and natively there is no door to write to
+    /// it and the arm simply never fires.
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        expect(
+            dead_code,
+            reason = "held to keep the effects channel open; the sync door that writes to it is \
+                      the browser build's seam"
+        )
+    )]
+    effects_tx: mpsc::Sender<Vec<Effect>>,
     /// The handle's publish pre-check, refreshed here at every edge that moves
     /// what it answers. Shared with the platform half, which only reads it.
     gate: Arc<Mutex<SurfaceGate>>,
@@ -182,10 +241,19 @@ impl<C: TransportConnector> SurfaceRunner<C> {
             in_flight,
             gate,
         } = front;
+        #[cfg(not(target_arch = "wasm32"))]
+        let page = RefCell::new(page);
+        #[cfg(target_arch = "wasm32")]
+        let page = std::rc::Rc::new(RefCell::new(page));
+        #[cfg(not(target_arch = "wasm32"))]
+        let entries = RefCell::new(HashMap::new());
+        #[cfg(target_arch = "wasm32")]
+        let entries = std::rc::Rc::new(RefCell::new(HashMap::new()));
+        let (effects_tx, effects_rx) = mpsc::channel(EFFECTS_CHANNEL_CAPACITY);
         Self {
             driver: AttachDriver::new(config, connector),
             page,
-            entries: HashMap::new(),
+            entries,
             #[cfg(target_arch = "wasm32")]
             in_flight,
             events_tx,
@@ -197,9 +265,30 @@ impl<C: TransportConnector> SurfaceRunner<C> {
             alert_closed: false,
             telemetry_rx,
             telemetry_closed: false,
+            effects_rx,
+            effects_tx,
             gate,
             clock_usable: true,
         }
+    }
+
+    /// The browser's synchronous side door onto this run's page.
+    ///
+    /// Hands out the cells a `brenn-activation-sync` request needs to assemble,
+    /// invoke and complete an activation on the requester's own stack — plus the
+    /// channel its two turns' effects come back through, so that the loop stays
+    /// the only thing that enacts anything.
+    ///
+    /// Taken before the run is spawned; the door outlives it, which is why the
+    /// browser build's [`SurfaceRunner::run`] hands nothing back.
+    #[cfg(target_arch = "wasm32")]
+    pub fn sync_door(&self) -> crate::sync_door::SyncDoor {
+        crate::sync_door::SyncDoor::new(
+            std::rc::Rc::clone(&self.page),
+            std::rc::Rc::clone(&self.entries),
+            self.in_flight.clone(),
+            self.effects_tx.clone(),
+        )
     }
 
     /// Run to completion: connect, serve turns until the attachment is terminal,
@@ -209,9 +298,21 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     /// Hands the page back. The page outlives the attachment — its rings, its
     /// retained control planes and its registrations are all still there — so the
     /// run gives it up rather than dropping it on the floor.
-    pub async fn run(self) -> SurfacePage {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn run(mut self) -> SurfacePage {
         let wall = wall_now();
-        self.run_from(wall).await
+        self.drive(wall).await;
+        self.page.into_inner()
+    }
+
+    /// The browser's run, which hands nothing back: the sync door holds the page
+    /// cell for the document's life, so there is no sole owner left to give it to.
+    /// Nothing in the browser wanted it — the run only returns once the platform
+    /// half is gone, and the page goes with the document.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn run(mut self) {
+        let wall = wall_now();
+        self.drive(wall).await;
     }
 
     /// [`run`](Self::run) from a wall-clock reading the caller already took, which
@@ -219,8 +320,15 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     ///
     /// Split out because that check is the one branch with no other way in: a
     /// device clock reading before the Unix epoch is not a state a test can put a
-    /// machine into.
+    /// machine into — so the native suite is its only caller.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) async fn run_from(mut self, wall: DateTime<Utc>) -> SurfacePage {
+        self.drive(wall).await;
+        self.page.into_inner()
+    }
+
+    /// Everything a run does, from the boot clock check to the terminal drain.
+    async fn drive(&mut self, wall: DateTime<Utc>) {
         // The device clock is checked once, here, before anything depends on a
         // reading of it: every envelope this page mints, every activation's `now`
         // and every schedule comparison is read from it, so one that reads before
@@ -251,7 +359,6 @@ impl<C: TransportConnector> SurfaceRunner<C> {
         if !self.host_gone() {
             self.run_terminal_drain().await;
         }
-        self.page
     }
 
     /// Whether the platform half has left. One predicate, read live off the sink
@@ -272,16 +379,26 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     /// of mounts during a stalled handshake from filling the control channel to
     /// its panic bound.
     ///
+    /// The sync door's effects are drained the same way and for the same reason:
+    /// the door admits a request whenever the page is wired, so a person clicking
+    /// at a stalled handshake produces one hand-back per gesture, and that channel
+    /// panics when it fills. They are enacted before the settled attempt is folded,
+    /// which is the order the page took the turns in.
+    ///
     /// The other three channels are not served here at all, and need not be: a
     /// publish backlog answers its own callers `Busy` at the handle, and the two
-    /// best-effort planes drop what they cannot hold. Only the control channel
-    /// panics when it fills, so only the control channel is drained.
+    /// best-effort planes drop what they cannot hold. Only control and the door's
+    /// effects panic when they fill, so only those two are drained.
     async fn run_connect(&mut self, url: String) {
         let mut buffered: Vec<RunnerCommand> = Vec::new();
+        let mut buffered_effects: Vec<Vec<Effect>> = Vec::new();
         let mut control_open = !self.control_closed;
         let settled = {
             let Self {
-                driver, control_rx, ..
+                driver,
+                control_rx,
+                effects_rx,
+                ..
             } = &mut *self;
             let connect = driver.connect(&url).fuse();
             pin_mut!(connect);
@@ -291,9 +408,18 @@ impl<C: TransportConnector> SurfaceRunner<C> {
                 let open = control_open;
                 let settled = {
                     let control = recv_open(control_rx, !open).fuse();
-                    pin_mut!(control);
+                    // The door's sender lives as long as the run, so this arm
+                    // never spins on a ready `None`.
+                    let effects = recv_open(effects_rx, false).fuse();
+                    pin_mut!(control, effects);
                     select_biased! {
                         input = connect => Some(input),
+                        effects = effects => {
+                            if let Some(effects) = effects {
+                                buffered_effects.push(effects);
+                            }
+                            None
+                        }
                         command = control => {
                             match command {
                                 Some(command) => buffered.push(command),
@@ -315,6 +441,11 @@ impl<C: TransportConnector> SurfaceRunner<C> {
             self.control_closed = true;
         }
         let step = self.driver.on_input(settled).await;
+        // Before the attempt's own turn: the door took these turns while the
+        // attempt was in flight, so the page state behind them is the older one.
+        for effects in buffered_effects {
+            self.execute(effects).await;
+        }
         self.absorb(step).await;
         for command in buffered {
             self.control(command).await;
@@ -323,10 +454,13 @@ impl<C: TransportConnector> SurfaceRunner<C> {
 
     /// Wait for the next thing that concerns the page and serve it.
     async fn run_select(&mut self) {
+        // Read before the arms are built rather than inside one: the answer is a
+        // borrow of the page cell, and the arm below holds its future across an
+        // await that the sync door can run inside of.
+        let has_ready = self.has_ready();
         let woke = {
             let Self {
                 driver,
-                page,
                 control_rx,
                 control_closed,
                 publish_rx,
@@ -335,9 +469,13 @@ impl<C: TransportConnector> SurfaceRunner<C> {
                 alert_closed,
                 telemetry_rx,
                 telemetry_closed,
+                effects_rx,
                 ..
             } = &mut *self;
             let io = driver.wait().fuse();
+            // The door's sender lives as long as the run, so this channel never
+            // closes and the arm never spins on a ready `None`.
+            let effects = recv_open(effects_rx, false).fuse();
             let control = recv_open(control_rx, *control_closed).fuse();
             let publish = recv_open(publish_rx, *publish_closed).fuse();
             let alert = recv_open(alert_rx, *alert_closed).fuse();
@@ -357,16 +495,17 @@ impl<C: TransportConnector> SurfaceRunner<C> {
             // why the browser's yield is a task hop and not a microtask one — see
             // `yield_now`.
             let activations = async {
-                if outward::ready(page).is_some() {
+                if has_ready {
                     yield_now().await;
                 } else {
                     future::pending::<()>().await;
                 }
             }
             .fuse();
-            pin_mut!(io, control, publish, alert, telemetry, activations);
+            pin_mut!(io, effects, control, publish, alert, telemetry, activations);
             select_biased! {
                 event = io => Woke::Io(event),
+                effects = effects => Woke::Front(FrontWoke::Effects(effects)),
                 command = control => Woke::Front(FrontWoke::Control(command)),
                 command = publish => Woke::Front(FrontWoke::Publish(command)),
                 command = alert => Woke::Front(FrontWoke::Alert(command)),
@@ -374,6 +513,14 @@ impl<C: TransportConnector> SurfaceRunner<C> {
                 () = activations => Woke::Activations,
             }
         };
+        // The bias puts the door's effects above the front door's channels, but
+        // the socket sits above both — and what it woke with is about to become a
+        // turn *newer* than anything the door already took. So its queue is
+        // emptied first, or an older turn's effects would be enacted after a
+        // younger turn's.
+        if matches!(woke, Woke::Io(_)) {
+            self.drain_effects().await;
+        }
         match woke {
             Woke::Io(IoEvent::Conn(input)) => {
                 let step = self.driver.on_input(input).await;
@@ -394,6 +541,15 @@ impl<C: TransportConnector> SurfaceRunner<C> {
         }
     }
 
+    /// Enact everything the sync door has already queued, without waiting for
+    /// more. Empty lists cost nothing: the send is a wake, and the pass at the end
+    /// of the loop is what takes the readiness it announces.
+    async fn drain_effects(&mut self) {
+        while let Ok(effects) = self.effects_rx.try_recv() {
+            self.execute(effects).await;
+        }
+    }
+
     /// Serve one thing the platform half asked for, or record that the channel it
     /// would have come on has gone.
     ///
@@ -402,6 +558,10 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     /// only stops the loop selecting a channel that would answer `None` forever.
     async fn serve(&mut self, woke: FrontWoke) {
         match woke {
+            FrontWoke::Effects(Some(effects)) => self.execute(effects).await,
+            // Unreachable while the run holds its own sender, and harmless if it
+            // ever were not: there is nothing left to enact.
+            FrontWoke::Effects(None) => {}
             FrontWoke::Control(Some(command)) => self.control(command).await,
             FrontWoke::Control(None) => self.control_closed = true,
             FrontWoke::Publish(Some(slot)) => self.publish(slot).await,
@@ -476,71 +636,91 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     /// a return value, not a future. So a pass cannot be re-entered mid-entry, and
     /// the in-flight buffer cannot be observed by anything but the entry itself.
     async fn activation_pass(&mut self) {
-        let mut budget = self.page.registrations.len();
-        while budget > 0 && outward::ready(&self.page).is_some() {
+        let mut budget = self.page.borrow().registrations.len();
+        while budget > 0 && self.has_ready() {
             budget -= 1;
             let now = self.driver.now();
             let now_ms = self.now_ms();
-            let (ready, effects) = turn::dispatch(&mut self.page, now, now_ms);
-            // The window's own loud rungs — an `alarm` binding's alert and toast, a
-            // `fatal` binding's kill — are enacted before the entry runs, and the
-            // kill is why there may be no entry to run.
+            let effects = self.run_activation(now, now_ms);
             self.execute(effects).await;
-            let Some(ready) = ready else { continue };
-            let ReadyActivation {
-                instance,
-                generation,
-                activation,
-                buffer,
-                drops: _,
-            } = ready;
-            let (outcome, buffer) = self.invoke(&instance, &activation, buffer);
-            // One stamp per buffered publish: the page is the router for a flush's
-            // confined entries and reads no entropy of its own. Minted for every
-            // entry whatever its class, for the same reason a single publish is —
-            // only the page resolves which channel a port names.
-            let stamps = self.driver.flush_stamps(buffer.len());
-            self.turn(Input::ActivationDone(Completed {
+        }
+    }
+
+    /// Whether any instance is dispatchable right now.
+    fn has_ready(&self) -> bool {
+        outward::ready(&self.page.borrow()).is_some()
+    }
+
+    /// Assemble, invoke and complete one activation in **one synchronous stretch**,
+    /// answering both turns' effects for the caller to enact.
+    ///
+    /// The stretch is the point. Effects are requests — a frame to write, a
+    /// deadline to restate, an event for the platform half — and every one of them
+    /// is performed asynchronously anyway, so nothing is lost by deferring them
+    /// past the completion. What is *gained* is the dichotomy the browser's sync
+    /// door needs: an entry is on the stack iff an activation is in flight. Enact
+    /// the assembly's effects in between and the page holds an instance in flight
+    /// across an await with nobody's entry running, and a genuine user gesture
+    /// landing in that window would be refused as re-entrant.
+    ///
+    /// One clock reading covers the whole stretch, for the same reason a flush's
+    /// stamps share one: it is one commit, and its parts must agree about when now
+    /// was.
+    fn run_activation(&self, now: Millis, now_ms: u64) -> Vec<Effect> {
+        // Held across the invocation deliberately: on wasm this borrow *is* the
+        // "an entry is on the stack" fact the sync door reads.
+        let mut page = self.page.borrow_mut();
+        let (ready, mut effects) = turn::dispatch(&mut page, now, now_ms);
+        // The window's own loud rungs — an `alarm` binding's alert and toast, a
+        // `fatal` binding's kill — ride in these effects, and the kill is why there
+        // may be no entry to run.
+        let Some(ready) = ready else { return effects };
+        let ReadyActivation {
+            instance,
+            generation,
+            activation,
+            buffer,
+            drops: _,
+        } = ready;
+        let (outcome, buffer) = self.invoke(&instance, &activation, buffer);
+        // One stamp per buffered publish: the page is the router for a flush's
+        // confined entries and reads no entropy of its own. Minted for every
+        // entry whatever its class, for the same reason a single publish is —
+        // only the page resolves which channel a port names.
+        let stamps = self.driver.flush_stamps(buffer.len());
+        effects.extend(turn::on_input(
+            &mut page,
+            Input::ActivationDone(Completed {
                 instance,
                 generation,
                 outcome,
                 buffer,
                 stamps,
-            }))
-            .await;
-        }
+            }),
+            now,
+            now_ms,
+        ));
+        effects
     }
 
     /// Call one instance's entry and classify how it finished.
-    ///
-    /// An instance whose entry is gone answers a **trap**. It cannot happen —
-    /// assembly and invocation are one synchronous stretch, and a deregistration
-    /// arrives on the control channel — but the page marked the instance in flight
-    /// and is owed a completion, or it never activates again; and an activation
-    /// whose entry vanished did not return ok. The page absorbs this one anyway
-    /// (the mount is gone, so the generation no longer matches), which is what
-    /// makes reporting it as a trap free of consequence beyond the log.
     fn invoke(
         &self,
         instance: &str,
         activation: &Activation,
         buffer: PublishBuffer,
     ) -> (ActivationOutcome, PublishBuffer) {
-        let Some(entry) = self.entries.get(instance) else {
-            return (
-                ActivationOutcome::Trap(
-                    "activation entry deregistered between assembly and invocation".to_string(),
-                ),
-                buffer,
-            );
-        };
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let entries = self.entries.borrow();
+            let Some(entry) = entries.get(instance) else {
+                return (missing_entry_trap(), buffer);
+            };
             invoke_native(entry, activation, buffer)
         }
         #[cfg(target_arch = "wasm32")]
         {
-            invoke_wasm(entry, activation, &self.in_flight, instance, buffer)
+            invoke_shared(&self.entries, &self.in_flight, instance, activation, buffer)
         }
     }
 
@@ -577,6 +757,10 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     // channels — a platform half that drops the event receiver while holding idle
     // senders parks this drain, and the page and the task leak with it. Everywhere
     // else the run re-reads `host_gone` on a bounded cadence.
+    // TODO(terminal-drain-release-deadline): the same missing io arm means
+    // `Input::ReleaseDue` never fires here, so a confined message parked before
+    // terminal never releases and every component's tick chain stops. Detached
+    // pages are unaffected; terminal ones freeze.
     async fn run_terminal_drain(&mut self) {
         loop {
             // Nothing consumes what a routed publish would produce, and no
@@ -594,14 +778,17 @@ impl<C: TransportConnector> SurfaceRunner<C> {
                     alert_closed,
                     telemetry_rx,
                     telemetry_closed,
+                    effects_rx,
                     ..
                 } = &mut *self;
+                let effects = recv_open(effects_rx, false).fuse();
                 let control = recv_open(control_rx, *control_closed).fuse();
                 let publish = recv_open(publish_rx, *publish_closed).fuse();
                 let alert = recv_open(alert_rx, *alert_closed).fuse();
                 let telemetry = recv_open(telemetry_rx, *telemetry_closed).fuse();
-                pin_mut!(control, publish, alert, telemetry);
+                pin_mut!(effects, control, publish, alert, telemetry);
                 select_biased! {
+                    effects = effects => FrontWoke::Effects(effects),
                     command = control => FrontWoke::Control(command),
                     command = publish => FrontWoke::Publish(command),
                     command = alert => FrontWoke::Alert(command),
@@ -617,6 +804,12 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     /// ended.
     async fn absorb_front(&mut self, woke: FrontWoke) {
         match woke {
+            // Enacted, not absorbed: the page already took the turn that produced
+            // these, and a mounted reader still draws what its confined planes
+            // say. The transportable half is dropped by `execute` itself, which
+            // knows the wire is gone.
+            FrontWoke::Effects(Some(effects)) => self.execute(effects).await,
+            FrontWoke::Effects(None) => {}
             FrontWoke::Control(None) => self.control_closed = true,
             FrontWoke::Control(Some(RunnerCommand::PublishControl { channel, body })) => {
                 self.publish_control(channel, body).await;
@@ -661,6 +854,10 @@ impl<C: TransportConnector> SurfaceRunner<C> {
 
     /// Whether every channel of the front door has closed: the platform half
     /// dropped its handle, so nothing can ask this run for anything again.
+    ///
+    /// The effects channel is not one of them and deliberately never closes — the
+    /// run holds its own sender — so it is not asked about here: this predicate is
+    /// about who can still command the run, and nobody commands through effects.
     fn front_closed(&self) -> bool {
         self.control_closed && self.publish_closed && self.alert_closed && self.telemetry_closed
     }
@@ -674,11 +871,11 @@ impl<C: TransportConnector> SurfaceRunner<C> {
                 // the strength of this registration always finds its entry. The
                 // page panics on a double registration, so a silent overwrite
                 // here is unreachable.
-                self.entries.insert(instance.clone(), entry);
+                self.entries.borrow_mut().insert(instance.clone(), entry);
                 self.turn(Input::ActivationRegistered { instance }).await;
             }
             RunnerCommand::DeregisterActivation { instance } => {
-                self.entries.remove(&instance);
+                self.entries.borrow_mut().remove(&instance);
                 self.turn(Input::ActivationDeregistered { instance }).await;
             }
             RunnerCommand::PublishControl { channel, body } => {
@@ -722,7 +919,8 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     /// executing an effect can itself produce a turn — a write that fails detaches
     /// the page — and the two must compose into one queue rather than nest.
     fn compute(&mut self, input: Input, now_ms: u64) -> Vec<Effect> {
-        turn::on_input(&mut self.page, input, self.driver.now(), now_ms)
+        let now = self.driver.now();
+        turn::on_input(&mut self.page.borrow_mut(), input, now, now_ms)
     }
 
     /// Feed the page everything one driver step produced, and perform what it
@@ -853,7 +1051,7 @@ impl<C: TransportConnector> SurfaceRunner<C> {
         self.gate
             .lock()
             .expect("surface runner: the publish gate mutex is poisoned")
-            .refresh(&self.page);
+            .refresh(&self.page.borrow());
     }
 
     /// The wall clock in epoch milliseconds, the currency a release time is
@@ -872,6 +1070,37 @@ impl<C: TransportConnector> SurfaceRunner<C> {
     }
 }
 
+/// The outcome for an activation whose entry is gone: a **trap**.
+///
+/// It cannot happen — assembly and invocation are one synchronous stretch, and a
+/// deregistration arrives on the control channel — but the page marked the
+/// instance in flight and is owed a completion, or it never activates again; and
+/// an activation whose entry vanished did not return ok. The page absorbs this
+/// one anyway (the mount is gone, so the generation no longer matches), which is
+/// what makes reporting it as a trap free of consequence beyond the log.
+fn missing_entry_trap() -> ActivationOutcome {
+    ActivationOutcome::Trap(
+        "activation entry deregistered between assembly and invocation".to_string(),
+    )
+}
+
+/// The browser's invocation against the shared entry table, so the run and the
+/// sync door reach a component's entry exactly the same way.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn invoke_shared(
+    entries: &SharedEntries,
+    slot: &crate::front::InFlightSlot,
+    instance: &str,
+    activation: &Activation,
+    buffer: PublishBuffer,
+) -> (ActivationOutcome, PublishBuffer) {
+    let entries = entries.borrow();
+    match entries.get(instance) {
+        Some(entry) => invoke_wasm(entry, activation, slot, instance, buffer),
+        None => (missing_entry_trap(), buffer),
+    }
+}
+
 /// The native build's invocation.
 ///
 /// A panic is a **trap**, not an err: the two are different facts with different
@@ -883,6 +1112,10 @@ impl<C: TransportConnector> SurfaceRunner<C> {
 /// Both failure arms carry the component's own account of what happened. The
 /// kernel never parses it, but it is the only answer an operator has to "failed
 /// *how*?", and this boundary is the only place it exists.
+///
+/// It is also where the reply is judged against the activation that earned it: a
+/// `Result` cannot say "ok, but only if you asked me something", so the check
+/// belongs at the call, where both halves are in hand.
 ///
 /// Takes the buffer by value and hands it back so both builds' invocations share
 /// one call shape; the wasm build cannot pass `&mut` (see below).
@@ -899,7 +1132,15 @@ fn invoke_native(
         entry(activation, &mut buffer)
     }));
     let outcome = match called {
-        Ok(Ok(())) => ActivationOutcome::Ok,
+        // A reply on an activation that asked no question is a trap, not an ok:
+        // the entry answered something other than what it was handed, so its
+        // buffer was built under a misapprehension and must not be flushed. The
+        // browser's return-value classifier rules the same way on the same fact;
+        // this is the other boundary the same rule has to hold at.
+        Ok(Ok(Some(reply))) if activation.sync.is_none() => ActivationOutcome::Trap(format!(
+            "activation entry replied {reply:?} to an activation with no sync port"
+        )),
+        Ok(Ok(reply)) => ActivationOutcome::Ok(reply),
         Ok(Err(err)) => ActivationOutcome::Err(err),
         Err(payload) => ActivationOutcome::Trap(unwind_message(payload)),
     };
@@ -936,8 +1177,6 @@ fn unwind_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// root listener — a code path that cannot reach the buffer on this stack.
 /// Installed for exactly the duration of the call and taken back on return, so no
 /// publish can find a buffer outside an activation.
-// TODO(buffered-publish-routing-test): the slot install/take-back here is wasm-only
-// and untested — the client crate has no browser-test harness yet.
 #[cfg(target_arch = "wasm32")]
 fn invoke_wasm(
     entry: &ActivationEntry,
@@ -953,7 +1192,7 @@ fn invoke_wasm(
     let outcome = entry(activation);
     // Taken back unconditionally: the entry returned (a trap here is a JS exception
     // the wrapper already caught and classified), so leaving the buffer installed
-    // would make the next gesture publish look buffered.
+    // would let a publish made after it join an activation that is over.
     let in_flight = slot
         .borrow_mut()
         .take()
@@ -1061,12 +1300,16 @@ enum Woke {
     Activations,
 }
 
-/// Which of the front door's four channels spoke, and whether it has closed.
+/// Which of the front door's channels spoke — or the sync door's effects — and
+/// whether it has closed.
 ///
 /// One vocabulary for both selects — the live loop's and the terminal drain's —
 /// because what arrives is the same either way; what differs is only what becomes
 /// of it.
 enum FrontWoke {
+    /// The effects of a turn the sync door already ran on the page — not something
+    /// the platform half asked for.
+    Effects(Option<Vec<Effect>>),
     Control(Option<RunnerCommand>),
     Publish(Option<PublishSlot>),
     Alert(Option<AlertCommand>),

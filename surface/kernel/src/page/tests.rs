@@ -133,7 +133,7 @@ fn configured(w: W) -> SurfacePage {
     attach(&mut page);
     page.registrations
         .register("p1", None, &mut page.stores, &mut page.subs);
-    page.schedules.track("p1");
+    page.schedules.track("p1", false);
     let applied = page
         .apply_config(&body(w), NOW)
         .expect("the fixture document applies");

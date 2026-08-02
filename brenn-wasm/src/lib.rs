@@ -2790,6 +2790,15 @@ impl ProcessorComponent {
         carry: &mut HashMap<SinkKey, u64>,
     ) -> ProcessorOutcome {
         let activation_now = activation.now;
+        // The world this host lowers into has no sync vocabulary, and a headless
+        // processor has no cause that could ever be sync — no element, no DOM
+        // event, and a timer is an ordinary deferred self-publish. So a sync-call
+        // activation reaching here is not a shape to degrade into an async one; it
+        // is a caller that built something this host cannot honestly deliver.
+        assert!(
+            activation.sync.is_none(),
+            "wasm host: a sync-call activation cannot be lowered into the processor world"
+        );
         let wit_ports: Vec<_> = activation
             .ports
             .into_iter()
@@ -4238,6 +4247,7 @@ mod processor_store_host_tests {
             }],
             deferred: vec![],
             now: None,
+            sync: None,
         }
     }
 
@@ -4265,6 +4275,7 @@ mod processor_store_host_tests {
             ],
             deferred: vec![],
             now: None,
+            sync: None,
         };
         assert_eq!(compute_grant_input_mt(&amp, &act), 3000 + 2000);
     }

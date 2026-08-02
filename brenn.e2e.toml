@@ -341,6 +341,34 @@ instance = "chrome"
 port = "toast"
 push_depth = 8
 
+# The components' self-wake ports. No `channel` and no `[[connection]]`, so each
+# resolves to an anonymous page-local ring. `push_depth = 1` because a wake
+# subsumes its predecessor; `retain_depth = 2` covers a cancel and its
+# replacement.
+[[surface.io_port]]
+instance = "p1"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "p2"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "p3"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "chrome"
+port = "toast-tick"
+push_depth = 1
+retain_depth = 2
+
 # Second bar surface, identical bindings, `foundry` skin (1c Pixel Foundry) — the
 # config-selectable skin swap proven against the same channel set.
 [[surface]]
@@ -420,6 +448,34 @@ channel = "local:brenn/toast"
 instance = "chrome"
 port = "toast"
 push_depth = 8
+
+# The components' self-wake ports. No `channel` and no `[[connection]]`, so each
+# resolves to an anonymous page-local ring. `push_depth = 1` because a wake
+# subsumes its predecessor; `retain_depth = 2` covers a cancel and its
+# replacement.
+[[surface.io_port]]
+instance = "p1"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "p2"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "p3"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "chrome"
+port = "toast-tick"
+push_depth = 1
+retain_depth = 2
 
 # Bar feeder: browser-driven publisher for the bar — four echo-stub instances,
 # one output each onto the three content channels + the layout channel. The
@@ -510,3 +566,10 @@ channel = "brenn:bar-c"
 instance = "feed-layout"
 port = "out"
 channel = "brenn:bar-layout"
+
+# Chrome's toast-expiry self-wake, as on the bar surfaces.
+[[surface.io_port]]
+instance = "chrome"
+port = "toast-tick"
+push_depth = 1
+retain_depth = 2

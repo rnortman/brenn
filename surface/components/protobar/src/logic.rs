@@ -291,7 +291,7 @@ impl ProtobarState {
     }
 
     /// The earliest future expiry among occupied slots, or `None` if no slot has
-    /// a future expiry. Drives the DOM glue's re-render timer; a past expiry is
+    /// a future expiry. Drives the glue's next expiry wake; a past expiry is
     /// skipped (its slot is already filtered out of `display`).
     pub fn next_expiry(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.slots

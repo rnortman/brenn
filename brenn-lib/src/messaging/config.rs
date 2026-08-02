@@ -1280,10 +1280,11 @@ pub struct SurfaceOutputRaw {
 /// per-session, browser-side, never on the server ring — riding the same
 /// declared-by-bindings `local:` machinery as any `local:` surface binding.
 ///
-/// Caveat, inherited rather than new: `publish-deferred` is backend scope. The
-/// surface kernel hands components no current instant and exposes no deferred
-/// seam, so a surface io_port supports immediate self-signaling but not the timer
-/// idiom. A component that needs deferred publish runs where the host offers it.
+/// The timer idiom runs on these: a component parks its next tick on its own
+/// io_port with a deferred publish, and the tick arrives as an ordinary message
+/// on the port's input half. The activation carries the instant to compute the
+/// release time from, and the standing tick can be cancelled or edited from a
+/// later activation.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct SurfaceIoPortRaw {

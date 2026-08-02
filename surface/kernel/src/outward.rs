@@ -7,9 +7,11 @@
 //! aggregate [`SurfacePage`] holds, and each answers what it produced rather than
 //! enacting it — the same seam every surface-side module answers across.
 //!
-//! # The four passes
+//! # The five passes
 //!
 //! - [`dispatch`] picks the next ready instance and assembles its activation.
+//! - [`dispatch_sync`] assembles a sync-call activation for a *named* instance —
+//!   the one pass a caller's own request drives rather than the rotation.
 //! - [`on_activation_done`] takes the completion back: the buffer committed,
 //!   discarded, or the instance taken terminal.
 //! - [`on_release_due`] takes every confined channel's matured schedules into
@@ -42,6 +44,8 @@ use brenn_attach_client::Millis;
 use brenn_attach_client::publish::OutboxSteps;
 use brenn_attach_client::router::{MessageStamp, ReleaseTimer, ReleasedChannel};
 use brenn_attach_proto::{AlertSeverity, ClientFrame, MAX_ALERT_BODY_BYTES, MAX_ALERT_TITLE_BYTES};
+use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
+use brenn_surface_contract::sync_channel;
 use brenn_surface_schema::{
     CONTROL_PLANE_VERSION, LOCAL_TOAST_CHANNEL, ToastBody, ToastSeverity, ToastSource,
 };
@@ -113,6 +117,156 @@ pub fn dispatch(page: &mut SurfacePage, now_ms: u64) -> Option<ReadyActivation> 
         now_ms,
     };
     Some(schedules.assemble(&instance, generation, &mut ctx))
+}
+
+/// Why a sync-call activation request was not admitted.
+///
+/// Every one of them is a bug — in the component that requested it, or in the
+/// kernel that let the request through — never a configured outcome and never a
+/// state a conforming page reaches. The requester is told, and faults on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncRefusal {
+    /// An activation — of any instance — is already in flight, so an entry is on
+    /// the stack and this request came from inside it. One JS thread means a
+    /// genuine user gesture can never arrive re-entrant; only an event a component
+    /// dispatched programmatically during an activation can.
+    ReEntrant,
+    /// The instance holds no activation entry: never registered, deregistered, or
+    /// still inside the connect-time code that runs *before* its registration
+    /// completes.
+    Unregistered,
+    /// The instance is terminal. It has no next activation of any flavor.
+    Failed,
+    /// No bindings document is in force, so there is no wiring to window against.
+    Unwired,
+    /// The requested sync port name is already a bound input port of the instance.
+    /// Admitting it would put two windows with one name in `ports`.
+    PortCollision,
+}
+
+impl SyncRefusal {
+    /// The operator-facing sentence for this refusal — the breadcrumb the kernel
+    /// leaves next to the answer the requester gets.
+    pub fn describe(&self, instance: &str, port: &str) -> String {
+        match self {
+            Self::ReEntrant => format!(
+                "refused sync activation of {instance} on port {port}: an activation is already \
+                 in flight, so this request came from inside an entry"
+            ),
+            Self::Unregistered => format!(
+                "refused sync activation of {instance} on port {port}: the instance holds no \
+                 activation entry"
+            ),
+            Self::Failed => format!(
+                "refused sync activation of {instance} on port {port}: the instance is terminal"
+            ),
+            Self::Unwired => format!(
+                "refused sync activation of {instance} on port {port}: no bindings document is in \
+                 force"
+            ),
+            Self::PortCollision => format!(
+                "refused sync activation of {instance} on port {port}: that name is already a \
+                 bound input port of the instance"
+            ),
+        }
+    }
+}
+
+/// Assemble a sync-call activation for the named instance, or say why not.
+///
+/// The named-instance sibling of [`dispatch`]: the rotation picks nothing here —
+/// the caller's request names its own subject — and the request rides in as one
+/// more window. The
+/// instance is in flight when this returns `Ok`, so the caller owes exactly one
+/// [`on_activation_done`] for it, with the same `fatal`-verdict caveat
+/// [`dispatch`] carries: an assembly whose own window overflowed past the killing
+/// rung leaves nothing to invoke.
+///
+/// `stamp` is the identity and wall-clock time of the request envelope, read by
+/// the edge that reads clocks and entropy — this layer mints neither. `now_ms` is
+/// the same instant in the currency an activation's `now` and its deferred cutoff
+/// are stated in.
+pub fn dispatch_sync(
+    page: &mut SurfacePage,
+    instance: &str,
+    port: &str,
+    body: String,
+    stamp: MessageStamp,
+    now_ms: u64,
+) -> Result<ReadyActivation, SyncRefusal> {
+    let SurfacePage {
+        connect,
+        stores,
+        registrations,
+        subs: _,
+        outbound: _,
+        schedules,
+        router,
+        views,
+        body_cap,
+    } = page;
+    // Ordered from the page-wide fact to the narrowest one, so a re-entrant
+    // request is named as re-entrant whatever else is also wrong with it.
+    if schedules.any_in_flight() {
+        return Err(SyncRefusal::ReEntrant);
+    }
+    if !registrations.is_registered(instance) || !schedules.is_tracked(instance) {
+        return Err(SyncRefusal::Unregistered);
+    }
+    if registrations.is_failed(instance) {
+        return Err(SyncRefusal::Failed);
+    }
+    let Some(bindings) = connect.bindings() else {
+        return Err(SyncRefusal::Unwired);
+    };
+    if bindings
+        .inputs_of(instance)
+        .any(|binding| binding.port == port)
+    {
+        return Err(SyncRefusal::PortCollision);
+    }
+    let generation = registrations
+        .generation(instance)
+        .expect("surface client: a registered instance holds a generation");
+    let request = sync_request(instance, port, body, stamp);
+    let mut ctx = ActivationCtx {
+        bindings,
+        stores,
+        router,
+        views,
+        max_body_bytes: *body_cap,
+        now_ms,
+    };
+    Ok(schedules.assemble_sync(instance, generation, port, request, &mut ctx))
+}
+
+/// Mint the envelope a sync-call activation's request rides in on.
+///
+/// The address is the never-routed [`sync_channel`] family, and `envelope_type`
+/// is `Local` because that is what this message is on every axis the field
+/// answers: page-local, never on the wire, no durable row. Sync-ness itself is
+/// the activation's `sync` field, not a property of the envelope.
+///
+/// `source` and `sender` are both the requesting instance: the kernel mints this
+/// on the component's behalf and hands it straight back to that same component,
+/// so there is no other honest attribution and no peer identity in play.
+fn sync_request(instance: &str, port: &str, body: String, stamp: MessageStamp) -> MessageEnvelope {
+    MessageEnvelope {
+        message_id: stamp.message_id,
+        source: instance.to_string(),
+        channel: sync_channel(port),
+        sender: instance.to_string(),
+        publish_ts: stamp.publish_ts,
+        body,
+        reply_to: None,
+        delivery_deadline: None,
+        // Never parked: the request is delivered by the activation it causes, and
+        // the activation is assembled around it.
+        deliver_after: None,
+        impetus: None,
+        urgency: Urgency::Normal,
+        envelope_type: ChannelScheme::Local,
+    }
 }
 
 /// One activation's completion, as the caller hands it back.
@@ -242,7 +396,7 @@ pub fn on_activation_done(
     }
     let mut ctx = flush_ctx(page, now, now_ms);
     let flushed = match &outcome {
-        ActivationOutcome::Ok => {
+        ActivationOutcome::Ok(_) => {
             let report = flush::flush_ok(&mut ctx, &instance, buffer, stamps);
             Flushed {
                 steps: report.steps,

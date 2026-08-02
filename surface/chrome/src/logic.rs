@@ -252,17 +252,7 @@ const MAX_TOASTS: usize = 5;
 /// How long a non-`error` toast stays before it auto-dismisses, in wall-clock
 /// milliseconds. `error` toasts are exempt — an operator-attention event must
 /// not evaporate — and persist until manually dismissed.
-const TOAST_TTL_MS: u64 = 8_000;
-
-/// The transition the DOM half's toast-tick timer must make, from
-/// [`ChromeCore::timer_action`]. `None` there means "already correct".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimerAction {
-    /// Schedule the tick: an expiring toast is live and no fire is pending.
-    Arm,
-    /// Cancel the pending tick: no expiring toast remains.
-    Cancel,
-}
+pub(crate) const TOAST_TTL_MS: u64 = 8_000;
 
 /// A rendered toast chrome is tracking for its lifetime: the core's page-lifetime
 /// handle and, for a non-`error` toast, the wall-clock instant it auto-dismisses.
@@ -608,28 +598,36 @@ impl ChromeCore {
         vec![ChromeAction::DismissToast { id }]
     }
 
-    /// Whether any live toast has an expiry. The DOM half arms its tick timer
-    /// only while this holds, so a page with no expiring toast has no periodic
-    /// wakeup at all.
-    pub fn has_expiring_toasts(&self) -> bool {
-        self.toasts.iter().any(|t| t.expires_at.is_some())
+    /// When the soonest-expiring live toast auto-dismisses, on the same clock
+    /// [`Self::tick`] judges against, or `None` when nothing live expires.
+    ///
+    /// The soonest rather than any: a later toast's expiry is re-parked by the
+    /// activation the earlier one's wake causes.
+    fn next_expiry(&self) -> Option<u64> {
+        self.toasts.iter().filter_map(|t| t.expires_at).min()
     }
 
-    /// What the DOM half must do to its toast-tick timer given whether one is
-    /// currently scheduled. The invariant — armed iff an expiring toast is live —
-    /// is load-bearing (it is why an idle page has no periodic wakeup at all), so
-    /// the decision lives here as pure logic where a host `#[test]` pins all four
-    /// cases; the DOM half only calls `reschedule`/`cancel`.
-    pub fn timer_action(&self, armed: bool) -> Option<TimerAction> {
-        match (self.has_expiring_toasts(), armed) {
-            (true, false) => Some(TimerAction::Arm),
-            (false, true) => Some(TimerAction::Cancel),
-            _ => None,
-        }
+    /// The wall-clock instant the DOM half parks its next expiry wake at, given
+    /// this activation's reading of both clocks — or `None` when nothing live
+    /// expires, which is why a page with no expiring toast never wakes.
+    ///
+    /// Two clocks meet here. A toast lifetime is a *duration*, judged on the
+    /// page's monotonic clock so an NTP step or a suspend/resume jump cannot
+    /// expire every live toast at once; the kernel parks against the wall clock.
+    /// So what crosses is the remaining duration, aimed from the wall reading of
+    /// the same activation. A wall-clock jump between park and release then fires
+    /// the wake early or late, and the sweep still judges monotonically: an early
+    /// wake dismisses nothing and re-parks, a late one is a toast that lingered.
+    ///
+    /// An expiry already past yields the activation's own wall instant — a wake
+    /// due immediately, which is what an unswept expiry deserves.
+    pub fn next_wake(&self, now_mono: u64, now_wall: u64) -> Option<u64> {
+        self.next_expiry()
+            .map(|expires_at| now_wall + expires_at.saturating_sub(now_mono))
     }
 
     /// The active toast ids, in show order.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     fn active_toasts(&self) -> Vec<u64> {
         self.toasts.iter().map(|t| t.id).collect()
     }
@@ -1689,31 +1687,60 @@ mod tests {
         assert_eq!(c.active_toasts().len(), MAX_TOASTS);
     }
 
-    /// The DOM half's tick timer must be armed iff an expiring toast is live —
-    /// the reason an idle page has no periodic wakeup. All four cases pinned.
+    /// The wake the DOM half parks is the soonest live expiry, and there is none
+    /// to park while nothing live expires — the reason an idle page never wakes.
     #[test]
-    fn timer_action_arms_only_while_an_expiring_toast_is_live() {
+    fn the_wake_is_the_soonest_live_expiry_and_absent_while_nothing_expires() {
         let mut c = core();
-        // Nothing live: never arm, cancel a stray schedule.
-        assert_eq!(c.timer_action(false), None);
-        assert_eq!(c.timer_action(true), Some(TimerAction::Cancel));
-        // An error toast never expires, so it warrants no timer.
+        // Same instant on both clocks here, so the arithmetic is visible; the
+        // conversion itself is pinned below.
+        let wake = |c: &ChromeCore, now: u64| c.next_wake(now, now);
+        assert_eq!(wake(&c, 0), None, "nothing live, nothing to wake for");
+        // An error toast never expires, so it warrants no wake.
         c.on_toast(&toast_body(ToastSeverity::Error, "e"), 0);
-        assert_eq!(c.timer_action(false), None);
-        assert_eq!(c.timer_action(true), Some(TimerAction::Cancel));
-        // A warning expires: arm if unarmed, leave an armed timer alone.
+        assert_eq!(wake(&c, 0), None);
+        // A warning does. Shown at t=100, so it expires a TTL after that.
         let warn_id = match c
-            .on_toast(&toast_body(ToastSeverity::Warning, "w"), 0)
+            .on_toast(&toast_body(ToastSeverity::Warning, "w"), 100)
             .as_slice()
         {
             [ChromeAction::ShowToast { id, .. }] => *id,
             other => panic!("expected a show, got {other:?}"),
         };
-        assert_eq!(c.timer_action(false), Some(TimerAction::Arm));
-        assert_eq!(c.timer_action(true), None);
-        // Dismissing the last expiring toast disarms it again.
+        assert_eq!(wake(&c, 100), Some(100 + TOAST_TTL_MS));
+        // A second, later toast does not move the wake: the soonest expiry is
+        // what the page must be awake for, and its activation re-parks the rest.
+        c.on_toast(&toast_body(ToastSeverity::Info, "i"), 500);
+        assert_eq!(wake(&c, 500), Some(100 + TOAST_TTL_MS));
+        // Dismissing the soonest hands the wake to the next one.
         c.dismiss_toast(warn_id);
-        assert_eq!(c.timer_action(true), Some(TimerAction::Cancel));
+        assert_eq!(wake(&c, 500), Some(500 + TOAST_TTL_MS));
+    }
+
+    /// The wake is a monotonic *duration* aimed from the activation's wall
+    /// reading. The two clocks share no origin, so treating an expiry instant as
+    /// a wall instant would park every wake decades off with nothing else
+    /// noticing — the page would simply stop expiring toasts.
+    #[test]
+    fn the_wake_carries_the_remaining_duration_onto_the_wall_clock() {
+        let mut c = core();
+        // Page has been up 30 s; the wall clock is an epoch reading that shares
+        // no origin with it.
+        let wall = 1_770_000_000_000;
+        c.on_toast(&toast_body(ToastSeverity::Info, "i"), 30_000);
+        // A second into the toast's life: a TTL less that second remains.
+        assert_eq!(
+            c.next_wake(31_000, wall + 1_000),
+            Some(wall + 1_000 + TOAST_TTL_MS - 1_000)
+        );
+        // An expiry already behind the reading is due now, not in the past: the
+        // saturating floor is what keeps an unswept toast from parking a wake
+        // before the instant it is parked at.
+        assert_eq!(
+            c.next_wake(30_000 + TOAST_TTL_MS * 2, wall),
+            Some(wall),
+            "an overdue expiry wakes immediately"
+        );
     }
 
     #[test]
@@ -1780,18 +1807,16 @@ mod tests {
         assert_eq!(c.active_toasts(), vec![err_id]);
     }
 
+    /// The wake a tick consumes is not re-parked: once the expiring toast is
+    /// gone there is nothing left to wake for, so the chain stops on its own
+    /// rather than re-arming forever.
     #[test]
-    fn has_expiring_toasts_tracks_the_tick_timer_need() {
+    fn an_expired_toast_leaves_no_wake_behind() {
         let mut c = core();
-        assert!(!c.has_expiring_toasts());
-        // An error toast never expires, so it needs no tick.
-        c.on_toast(&toast_body(ToastSeverity::Error, "e"), 0);
-        assert!(!c.has_expiring_toasts());
-        // A warning does, until it expires.
         c.on_toast(&toast_body(ToastSeverity::Warning, "w"), 0);
-        assert!(c.has_expiring_toasts());
+        assert_eq!(c.next_wake(0, 0), Some(TOAST_TTL_MS));
         c.tick(TOAST_TTL_MS);
-        assert!(!c.has_expiring_toasts());
+        assert_eq!(c.next_wake(TOAST_TTL_MS, TOAST_TTL_MS), None);
     }
 
     #[test]

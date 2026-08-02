@@ -27,6 +27,6 @@ fn register_component_before_bind_panics() {
     register_component(
         "prebind-kind",
         |_host| {},
-        |_a, _p| Ok::<(), ActivationError>(()),
+        |_a, _p| Ok::<Option<String>, ActivationError>(None),
     );
 }

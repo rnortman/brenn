@@ -9,6 +9,11 @@
 
 use brenn_envelope::MessageEnvelope;
 
+/// The shared browser-suite harness for the in-tree components. Browser-only:
+/// it drives real DOM seams, so it exists only where those do.
+#[cfg(target_arch = "wasm32")]
+pub mod browser;
+
 /// Re-exported so consumers can name `Uuid` parameter types (page-load epochs,
 /// message ids) without pinning `uuid` themselves.
 pub use uuid::Uuid;

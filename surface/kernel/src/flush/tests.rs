@@ -129,7 +129,7 @@ impl Page {
         router.set_principal(PRINCIPAL.to_string());
         for instance in ["p1", "p2", "chrome"] {
             registrations.register(instance, Some(&bindings), &mut stores, &mut subs);
-            schedules.track(instance);
+            schedules.track(instance, false);
         }
         outbound.reconcile(&bindings, ["p1", "p2", "chrome"].into_iter());
         if attached {

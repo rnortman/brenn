@@ -56,9 +56,9 @@ impl Theme {
 enum Mode {
     /// Day/night switching by [`Schedule`].
     Auto,
-    /// Always dark, timer cancelled.
+    /// Always dark; no boundary, so nothing is scheduled.
     Dark,
-    /// Always light, timer cancelled.
+    /// Always light; no boundary, so nothing is scheduled.
     Light,
 }
 
@@ -156,9 +156,47 @@ pub struct TickPlan {
     /// dispatch. The first recompute always dispatches (so the shell converges
     /// from the page default).
     pub dispatch: Option<Theme>,
-    /// Minutes until the next scheduled recompute, or `None` to cancel the timer
-    /// (fixed dark/light modes have no boundary).
+    /// Minutes until the next scheduled recompute, or `None` when there is no
+    /// next one to schedule (fixed dark/light modes have no boundary).
     pub next_in_minutes: Option<u16>,
+}
+
+/// Milliseconds in a minute — the unit the schedule counts in and the release
+/// instant is stated in.
+const MS_PER_MINUTE: u64 = 60_000;
+
+/// How far ahead a wake is ever parked, in minutes.
+///
+/// A count of local minutes is not a count of elapsed milliseconds: a zone shift
+/// between now and the boundary moves them apart by the whole shift, so a wake
+/// aimed at a boundary hours away over a DST transition lands an hour off. The
+/// horizon bounds how long that arithmetic is trusted — past it the chain wakes,
+/// re-reads the local clock, and re-aims. An intermediate wake dispatches nothing
+/// (the theme is unchanged, and `last_dispatched` says so), so the only cost is
+/// the wake itself.
+const MAX_PARK_MINUTES: u16 = 15;
+
+impl TickPlan {
+    /// When the next recompute is due, epoch milliseconds UTC, given the instant
+    /// this plan was computed at. `None` when there is no next one.
+    ///
+    /// The boundary is a whole number of minutes from the *floored* minute, so the
+    /// release is this minute's start plus that many — targeting the boundary
+    /// instant itself rather than up to 59 seconds past it. Minute boundaries fall
+    /// at the same instant in local time as in UTC (zone offsets are whole
+    /// minutes), so the flooring is done in UTC even though the schedule is local.
+    ///
+    /// A boundary further out than [`MAX_PARK_MINUTES`] is parked at the horizon
+    /// instead; the recompute that wake causes re-derives the rest from a fresh
+    /// local reading.
+    ///
+    /// Always strictly after `now_ms`: both the minute count and the horizon are
+    /// strictly positive, so a recompute *at* a boundary schedules the following
+    /// one rather than a wake at the instant it already woke for.
+    pub fn release_at(&self, now_ms: u64) -> Option<u64> {
+        let minutes = self.next_in_minutes?.min(MAX_PARK_MINUTES);
+        Some(now_ms - now_ms % MS_PER_MINUTE + u64::from(minutes) * MS_PER_MINUTE)
+    }
 }
 
 /// Raw config body as serde sees it. Unknown fields are ignored (no
@@ -416,20 +454,20 @@ mod tests {
     }
 
     #[test]
-    fn fixed_dark_ignores_schedule_and_cancels_timer() {
+    fn fixed_dark_ignores_schedule_and_schedules_nothing() {
         let mut clock = ModeClock::new();
         assert_eq!(
             clock.on_config("config", &config_msg(serde_json::json!({ "mode": "dark" }))),
             Ok(ConfigOutcome::Accepted)
         );
-        // Noon would be light under auto; fixed dark overrides, no timer.
+        // Noon would be light under auto; fixed dark overrides, no boundary.
         let plan = clock.tick(m(12, 0));
         assert_eq!(plan.dispatch, Some(Theme::Dark));
         assert_eq!(plan.next_in_minutes, None);
     }
 
     #[test]
-    fn fixed_light_ignores_schedule_and_cancels_timer() {
+    fn fixed_light_ignores_schedule_and_schedules_nothing() {
         let mut clock = ModeClock::new();
         assert_eq!(
             clock.on_config(
@@ -741,5 +779,75 @@ mod tests {
             .unwrap();
         assert_eq!(clock.tick(m(3, 0)).dispatch, Some(Theme::Light));
         assert_eq!(clock.tick(m(4, 0)).dispatch, None);
+    }
+
+    /// The release instant a plan resolves to is the boundary itself: the current
+    /// minute floored, plus the plan's whole minutes. A recompute part-way through
+    /// a minute must not land the wake that many minutes *later* than the boundary.
+    #[test]
+    fn a_plan_releases_at_the_boundary_not_the_offset() {
+        // 00:00:37.500 UTC, 3 minutes to the boundary → 00:03:00.000 exactly.
+        let plan = TickPlan {
+            dispatch: None,
+            next_in_minutes: Some(3),
+        };
+        assert_eq!(plan.release_at(37_500), Some(180_000));
+        // On the minute already: no rounding to undo.
+        assert_eq!(plan.release_at(60_000), Some(240_000));
+    }
+
+    /// Two properties the ticker chain depends on: a plan with a boundary always
+    /// schedules strictly in the future — so a recompute at a boundary schedules
+    /// the *following* one instead of busy-firing at the instant it woke — and a
+    /// fixed mode schedules nothing at all.
+    #[test]
+    fn a_release_is_always_future_and_a_fixed_mode_has_none() {
+        let now_ms = 1_754_000_123_456;
+        for minutes in [1, 2, 30, MINUTES_PER_DAY] {
+            let plan = TickPlan {
+                dispatch: None,
+                next_in_minutes: Some(minutes),
+            };
+            let release = plan.release_at(now_ms).expect("a boundary schedules");
+            assert!(release > now_ms, "{minutes} minutes ahead of {now_ms}");
+        }
+        assert_eq!(
+            TickPlan {
+                dispatch: None,
+                next_in_minutes: None,
+            }
+            .release_at(now_ms),
+            None
+        );
+    }
+
+    /// A boundary beyond the horizon is parked at the horizon, so the chain
+    /// re-derives its aim from a fresh local reading rather than trusting a count
+    /// of local minutes to also be a count of elapsed milliseconds. Across a DST
+    /// transition those differ by the whole shift, and a ten-hour park would land
+    /// an hour off the boundary it was aimed at.
+    #[test]
+    fn a_distant_boundary_parks_at_the_horizon() {
+        let now_ms = 1_754_000_100_000;
+        let far = TickPlan {
+            dispatch: None,
+            next_in_minutes: Some(10 * 60),
+        };
+        assert_eq!(
+            far.release_at(now_ms),
+            Some(now_ms + u64::from(MAX_PARK_MINUTES) * MS_PER_MINUTE)
+        );
+        // At the horizon exactly, and one minute inside it, the boundary is still
+        // the target: the clamp only ever pulls a wake nearer.
+        for minutes in [MAX_PARK_MINUTES - 1, MAX_PARK_MINUTES] {
+            let plan = TickPlan {
+                dispatch: None,
+                next_in_minutes: Some(minutes),
+            };
+            assert_eq!(
+                plan.release_at(now_ms),
+                Some(now_ms + u64::from(minutes) * MS_PER_MINUTE)
+            );
+        }
     }
 }

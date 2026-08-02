@@ -445,7 +445,7 @@ fn an_ok_completion_commits_both_classes() {
         .publish("notes", "to the page".to_string())
         .expect("bound");
 
-    let completed = done(&page, "p1", ActivationOutcome::Ok, buffer);
+    let completed = done(&page, "p1", ActivationOutcome::Ok(None), buffer);
     let completion = on_activation_done(&mut page, completed, NOW, NOW_MS);
 
     assert_eq!(completion.steps.frames.len(), 1, "one batch frame");
@@ -525,7 +525,7 @@ fn a_completion_for_a_deregistered_instance_is_absorbed() {
     buffer
         .publish("notes", "orphan".to_string())
         .expect("bound");
-    let completed = done(&page, "p1", ActivationOutcome::Ok, buffer);
+    let completed = done(&page, "p1", ActivationOutcome::Ok(None), buffer);
     page.registrations
         .deregister("p1", &mut page.stores, &mut page.subs);
 
@@ -536,7 +536,7 @@ fn a_completion_for_a_deregistered_instance_is_absorbed() {
         completion,
         Completion {
             absorbed: true,
-            ..Completion::nothing("p1".to_string(), ActivationOutcome::Ok)
+            ..Completion::nothing("p1".to_string(), ActivationOutcome::Ok(None))
         }
     );
     assert!(retained(&page, NOTES).is_empty());
@@ -555,7 +555,7 @@ fn a_completion_for_a_reregistered_instance_is_absorbed() {
     buffer
         .publish("notes", "from the previous mount".to_string())
         .expect("bound");
-    let completed = done(&page, "p1", ActivationOutcome::Ok, buffer);
+    let completed = done(&page, "p1", ActivationOutcome::Ok(None), buffer);
     page.registrations
         .deregister("p1", &mut page.stores, &mut page.subs);
     page.registrations.register(
@@ -598,7 +598,7 @@ fn a_completion_for_an_instance_killed_mid_flight_is_absorbed() {
         "a kill fails the instance without deregistering it"
     );
 
-    let completed = done(&page, "p1", ActivationOutcome::Ok, buffer);
+    let completed = done(&page, "p1", ActivationOutcome::Ok(None), buffer);
     let completion = on_activation_done(&mut page, completed, NOW, NOW_MS);
 
     assert!(completion.absorbed);
@@ -631,7 +631,7 @@ fn a_confined_append_charges_the_position_it_evicted() {
         .publish("notes", "evicts it".to_string())
         .expect("bound");
 
-    let completed = done(&page, "p1", ActivationOutcome::Ok, buffer);
+    let completed = done(&page, "p1", ActivationOutcome::Ok(None), buffer);
     let completion = on_activation_done(&mut page, completed, NOW, NOW_MS);
 
     let [fatal] = &completion.drops.fatal[..] else {
@@ -661,7 +661,7 @@ fn a_softer_rung_counts_an_eviction_without_announcing_it() {
         .publish("notes", "evicts it".to_string())
         .expect("bound");
 
-    let completed = done(&page, "p1", ActivationOutcome::Ok, buffer);
+    let completed = done(&page, "p1", ActivationOutcome::Ok(None), buffer);
     let completion = on_activation_done(&mut page, completed, NOW, NOW_MS);
 
     assert!(completion.drops.is_quiet());
@@ -681,7 +681,7 @@ fn a_kill_strips_positions_and_discards_a_queued_flush() {
     page.on_detached();
     let mut buffer = buffer(&page, "p2");
     buffer.publish("out", "queued".to_string()).expect("bound");
-    let completed = done(&page, "p2", ActivationOutcome::Ok, buffer);
+    let completed = done(&page, "p2", ActivationOutcome::Ok(None), buffer);
     on_activation_done(&mut page, completed, NOW, NOW_MS);
     route(&mut page, 0xa1, "unread");
     assert!(has_position(&page, "p2"), "the fixture owes it a message");
@@ -855,7 +855,7 @@ fn the_retry_tick_offers_a_refused_head_again() {
     let mut page = standard();
     let mut buffer = buffer(&page, "p1");
     buffer.publish("out", "metered".to_string()).expect("bound");
-    let completed = done(&page, "p1", ActivationOutcome::Ok, buffer);
+    let completed = done(&page, "p1", ActivationOutcome::Ok(None), buffer);
     let completion = on_activation_done(&mut page, completed, NOW, NOW_MS);
     let correlation = correlation_of(&completion.steps.frames[0]);
     let refused = page
@@ -997,7 +997,7 @@ fn readiness_is_a_question_about_one_bindings_position() {
     // deliverable and advances the rotation past `p2`: neither leaves `p1` ready.
     dispatch(&mut page, NOW_MS).expect("p2 is owed the message");
     let empty = buffer(&page, "p2");
-    let completed = done(&page, "p2", ActivationOutcome::Ok, empty);
+    let completed = done(&page, "p2", ActivationOutcome::Ok(None), empty);
     on_activation_done(&mut page, completed, NOW, NOW_MS);
     assert_eq!(
         ready(&page),

@@ -89,18 +89,111 @@
 //!   everything in the first windows after a reload is new. A fresh attach that
 //!   finds a ring already populated — the priming rule above — is the narrower
 //!   one. Neither is a bug.
+//! - **Every mount gets one activation, guaranteed.** An activation with nothing
+//!   to deliver is otherwise never assembled; the **mount activation** is the
+//!   deliberate, once-per-mount exception. It arrives as soon as the instance is
+//!   both registered and wired (a registration made before the page's first
+//!   bindings document waits for that document), it is an ordinary async
+//!   activation in every respect, and its windows carry whatever retained context
+//!   and new messages exist — possibly nothing at all. It carries no marker: a
+//!   component that needs to know whether this is its first activation tracks that
+//!   itself, and most simply recompute from their windows.
+//!
+//!   It exists so that a component's first output — its first state report, the
+//!   first tick of a deferred self-publish chain — has somewhere to come from
+//!   that is inside an activation, where the buffered publish seam and the
+//!   deferred-message ops live. An activation that only happens when a bound
+//!   channel happens to hold history is not something a component can build on.
+//!   Exactly one is delivered per mount: an instance that deregisters and
+//!   registers again is a new mount and is owed a new one; a second bindings
+//!   document mid-attachment is not.
 //!
 //! Typed gaps (`EpochChanged`, `BeyondRetained`) survive only
 //! at the websocket/resume layer, where the kernel handles them by re-resuming;
 //! the component observes at most a first-window-after-resubscription. `GapReason`
 //! is not part of the component seam.
 //!
-//! One asymmetry stands outside the activation boundary and is **not** a defect: a
-//! gesture
-//! handler (click, input) publishes with no activation in flight — no boundary
-//! to attach a flush rule to — so gesture publishes stay immediate until
-//! sync-call activations land. That is a named, bounded gap, and no SDK surface
-//! may be shaped in a way that assumes immediate gesture publish is permanent.
+//! **Nothing a component sends stands outside the activation boundary.** A
+//! browser event handler — click, input — causes an activation rather than
+//! publishing beside one: it asks for a **sync-call activation** ([the sync port
+//! class](#the-sync-port-class) below), which is assembled and run inside the
+//! handler's own `dispatchEvent`. There is exactly one publish path for a
+//! component, the in-flight activation's buffer, and the only other publisher on
+//! the page is the kernel itself.
+//!
+//! # The sync port class
+//!
+//! A **sync port** carries one live request into one activation and carries a
+//! reply back out of it. That is the whole class: a sync-call activation is the
+//! ordinary activation shape plus a return obligation, which is why a component
+//! reads its request through the same window API as everything else.
+//!
+//! - **One live request, no history.** A sync port has no queue, no retention and
+//!   no position. Its window is exactly the one minted request (`new_from == 0`,
+//!   `dropped == 0`), and it appears in `ports` only on the activation it caused.
+//!   None of the gap/replay/`dropped` vocabulary above applies to it — there is no
+//!   stream to have a view onto.
+//! - **The rest of the activation is ordinary.** Every bound input port windows as
+//!   usual, the deferred windows ride along, `now` is set, publishes buffer and
+//!   flush iff the entry returns ok. A sync activation consumes queued input like
+//!   any other, so no async activation follows it for input it already drained.
+//! - **Kernel-originated, gestures-only in v1.** The one caller is the kernel's own
+//!   DOM seam, on behalf of a component's gesture wiring: the reason the class
+//!   exists is the same-task reply (a live gesture token, and the chance to
+//!   suppress the browser's default action), which nothing but a gesture needs.
+//!   Component-to-component sync bindings are not representable — the bindings
+//!   document has no class field and no sync vocabulary — and are reserved for the
+//!   follow-on that builds them.
+//! - **Port names are the component's, and must not collide.** A component chooses
+//!   a sync port name at request time; it is bound to nothing and configured
+//!   nowhere. A name that collides with one of the instance's bound input ports is
+//!   refused, because the activation's `ports` list must be unambiguous.
+//! - **The request envelope.** Freshly minted by the kernel: sender is the
+//!   requesting instance, `channel` is `local:brenn/sync/<port>` (see
+//!   [`SYNC_CHANNEL_PREFIX`]) and `envelope_type` is `local`. Sync-ness is the
+//!   activation's `sync` field and never a property of the envelope.
+//! - **Ok returns before the wire does.** A sync `ok` says the entry returned and
+//!   its buffer flushed into the page; a transportable publish in that buffer is
+//!   committed by the server later, and while detached it parks until reconnect.
+//!   An author who needs server confirmation waits for its own output channel to
+//!   say so, exactly as in an async activation.
+//!
+//! # The timer idiom
+//!
+//! There is no timer concept on this seam, and no arming API. **A timer is a
+//! deferred self-publish**: a component declares an in/out port
+//! (`[[surface.io_port]]`, whose two halves resolve to one channel by
+//! construction), publishes its next tick to itself with a `deliver_after` computed
+//! from the activation's own `now` ([`PORT_DEFER`]), and the tick arrives as an
+//! ordinary message on an ordinary input port. Rescheduling and cancelling are the
+//! cancel/edit ops against the [`DeferredWindow`] the activation is handed, so they
+//! ride the same flush rule: an entry that errs schedules nothing.
+//!
+//! The behavioral delta worth naming: a tick dispatches as a **normal async
+//! activation** — a later task, subject to the kernel's ordinary pacing — not
+//! synchronously inside a `setTimeout` callback. At the cadences components
+//! actually tick on (a minute boundary, a toast lifetime) that is immaterial, but
+//! it is a difference, and a component that assumed same-task fire would be assuming
+//! something this seam never promised.
+//!
+//! # The context rule
+//!
+//! Exactly three contexts exist in a component, and what may happen in each is
+//! fixed:
+//!
+//! - **Inside an activation entry** (async- or sync-caused): the full worldview,
+//!   the buffered publisher, the deferred ops, and rendering. Every decision that
+//!   sends anything belongs here.
+//! - **Browser event listeners**: encode and request, nothing else. A gesture
+//!   wiring turns an event into a sync request; a non-publishing listener may of
+//!   course just render or read. Publishing from a listener is impossible — no API
+//!   exists — and a listener must not fire during an activation (a programmatic
+//!   `element.click()` from inside an entry is refused as re-entrant).
+//! - **Connect-time (`connectedCallback`)**: render and set up only. Build the UI,
+//!   install listeners, install gesture wirings. **No publish, no deferred op, no
+//!   sync request** — the entry is not registered until connect-time code returns,
+//!   so a sync request from there is refused and the requester faults. The mount
+//!   activation is where a component's first output belongs.
 //!
 //! # The activation seam
 //!
@@ -110,19 +203,23 @@
 //! the [`Activation`] as JSON and reads its return for the flush rule. See
 //! [`ACTIVATION_REGISTER`] for the call convention.
 //!
+//! [`ACTIVATION_SYNC`] is how a browser event becomes an activation of the
+//! instance whose element it fired on — the sync port class above, dispatched
+//! synchronously so the whole activation completes inside the event handler.
+//!
 //! Publishes made from inside an entry are **buffered**: they ride the ordinary
 //! [`PORT_PUBLISH`] event, and the kernel routes one to the in-flight buffer iff
 //! the dispatching instance is the one whose entry is on the stack — activations
 //! are serialized per instance and synchronous on the one JS thread, so exactly
 //! one instance can be mid-activation. A buffered publish is answered
-//! synchronously on the event detail's [`PUBLISH_STATUS_FIELD`]. A publish from
-//! any other context is a **gesture publish**: immediate, unanswered, the named
-//! bounded gap above.
+//! synchronously on the event detail's [`PUBLISH_STATUS_FIELD`]. A publish
+//! dispatched from any other context is answered `not-permitted` there: it is a
+//! publish with no activation to belong to, and there is no second path for it.
 //!
 //! The deferred-message ops — park a message for later, cancel one, edit one —
-//! ride [`PORT_DEFER`] on the same routing rule, and are buffered *only*: they
-//! have no gesture counterpart, because a schedule that escaped the flush-iff-ok
-//! boundary would outlive the activation that failed to stage it.
+//! ride [`PORT_DEFER`] on the same routing rule and are buffered the same way,
+//! because a schedule that escaped the flush-iff-ok boundary would outlive the
+//! activation that failed to stage it.
 //!
 //! # Component-contract events (kernel ↔ component)
 //!
@@ -145,6 +242,10 @@
 //!   cancel or edit one it already parked. Same dispatch rule and same identity
 //!   resolution as [`PORT_PUBLISH`]; `detail = { op, port, index?, body?,
 //!   deliver_after? }`, all strings. Buffered only — see [`PORT_DEFER`].
+//! - [`ACTIVATION_SYNC`] — a component's request for a sync-call activation of
+//!   itself. Same dispatch rule and same identity resolution as [`PORT_PUBLISH`],
+//!   and answered synchronously on the detail. SDK↔kernel internal: a component
+//!   author reaches it through a gesture wiring and never dispatches it by hand.
 //! - [`COMPONENT_LOG`] — a component's intent to log. Same dispatch rule as
 //!   [`PORT_PUBLISH`] (`bubbles: true, composed: true`, on the mounted element
 //!   or from within its shadow root), so the kernel derives component identity
@@ -213,9 +314,20 @@
 //! | Effect | On err/trap |
 //! |---|---|
 //! | Port publishes (buffered during the activation) | Discarded — transactional |
+//! | Deferred-message ops (park / cancel / edit) | Discarded — transactional |
 //! | `store` writes (backend hosting) | Rolled back — transactional |
-//! | `log` / `alert` / `sync` tool imports | Immediate, unrollbackable |
+//! | `log` / `alert` / filesystem-`sync` tool imports | Immediate, unrollbackable |
 //! | DOM mutation (surface hosting) | Immediate, unrollbackable |
+//! | The sync-call reply (surface hosting) | Never sent — err and trap are answered as themselves |
+//!
+//! The `sync` in the third row is the backend's filesystem-sync tool import and
+//! has nothing to do with the sync port class: they share a word and no
+//! machinery.
+//!
+//! A sync-call requester learns the outcome either way — `err` carries the
+//! entry's own account and `trap` says the instance is terminal — so an
+//! unsuccessful activation cannot be read as a silent ok. What it cannot learn is
+//! a reply, because an entry that did not return ok did not answer.
 //!
 //! DOM mutation joins the non-transactional bucket: pixels the entry painted
 //! before it erred stay painted. An author who needs the rendered state to match
@@ -239,7 +351,10 @@
 //!
 //! - **`local:brenn/*` control channels** — exhaustively enumerated by
 //!   [`brenn_surface_schema::RESERVED_LOCAL_CHANNELS`]; a `local:brenn/*` address
-//!   absent from that table is undefined vocabulary and boot rejects it.
+//!   absent from that table is undefined vocabulary and boot rejects it. The
+//!   [`SYNC_CHANNEL_PREFIX`] family is the one address family inside
+//!   `local:brenn/` that is deliberately *not* in the table: it names no routable
+//!   channel, so its absence is what keeps it unbindable and unwritable.
 //! - **`<prefix>.surface.<slug>.instance.<name>.config`** — the future
 //!   per-instance runtime config channel. The address builder exists and its
 //!   grammar is pinned by test; nothing publishes it, no `[[channel]]` block
@@ -384,6 +499,29 @@ pub type Activation = brenn_activation::Activation<MessageEnvelope>;
 /// fields mean — the port is a view, not a pipe.
 pub type PortWindow = brenn_activation::PortWindow<MessageEnvelope>;
 
+/// The address family the kernel mints a sync-call activation's request envelope
+/// on: `local:brenn/sync/<port>`.
+///
+/// **Never routed and never bindable.** The envelope exists only inside the
+/// activation's sync window — it never enters a ring, never passes the router and
+/// never crosses the wire — so these addresses are deliberately absent from
+/// [`brenn_surface_schema::RESERVED_LOCAL_CHANNELS`], which enumerates the
+/// *routable* reserved channels. Absence is the enforcement: boot rejects a
+/// `local:brenn/*` binding the table does not name, and the kernel's plane policy
+/// admits nobody to a reserved-but-undefined address, so a component can neither
+/// bind nor write one and no new check was needed to make that true.
+pub const SYNC_CHANNEL_PREFIX: &str = "local:brenn/sync/";
+
+/// The channel a sync-call activation's request envelope carries for `port` —
+/// [`SYNC_CHANNEL_PREFIX`] plus the port name.
+///
+/// Sync-ness is the activation's own `sync` field, never a property of the
+/// envelope: the envelope's `envelope_type` is `local`, which is truthful on
+/// every axis that field answers (page-local, never on the wire, no durable row).
+pub fn sync_channel(port: &str) -> String {
+    format!("{SYNC_CHANNEL_PREFIX}{port}")
+}
+
 /// One output port's view onto the messages this component itself has parked on
 /// that port's channel, soonest release first.
 ///
@@ -478,10 +616,15 @@ pub struct ActivationError {
 ///
 /// **Call convention.** The kernel invokes `entry` once per activation with one
 /// argument: the serde-JSON string of the [`Activation`]. The return value says
-/// what happened, and the three answers are the three outcomes:
+/// what happened, in four shapes:
 ///
-/// - `undefined`/`null` → **ok**. Every publish the entry buffered is flushed,
-///   in call order.
+/// - `undefined`/`null` → **ok**, with no reply. Every publish the entry
+///   buffered is flushed, in call order.
+/// - an object carrying a string [`ENTRY_REPLY_FIELD`] → **ok** with that reply,
+///   flushed the same way. Legal only on an activation whose `sync` field names
+///   a port: a reply on an async activation is an answer nobody asked for and is
+///   read as a trap, since an entry that answered a question it was not asked
+///   did not tell us it succeeded.
 /// - a string → **err**, the string being the component's own account. The
 ///   buffer is discarded, a failure is counted, the instance keeps running.
 /// - a thrown exception → **trap**. The buffer is discarded and the instance is
@@ -493,13 +636,26 @@ pub struct ActivationError {
 /// per-envelope events this replaces.
 pub const ACTIVATION_REGISTER: &str = "brenn-activation-register";
 
-/// The [`PORT_PUBLISH`] detail field the kernel writes a **buffered** publish's
-/// answer into, synchronously, before the dispatch returns.
+/// The field an activation entry's **return object** carries its sync reply on,
+/// per [`ACTIVATION_REGISTER`]'s call convention.
 ///
-/// Present iff the publish was routed into an in-flight activation's buffer —
-/// i.e. the dispatching instance is the one whose entry is currently on the
-/// stack. Absent means the publish took the immediate gesture path, which has no
-/// synchronous answer (the named, bounded gap until sync-call activations land).
+/// The reply is an opaque string the kernel never parses; it hands it straight
+/// back to the requester on [`SYNC_REPLY_FIELD`]. An object carrying no string
+/// under this key is a non-conformant return and reads as a trap: a returned
+/// object means "here is my answer", and one with no answer in it is gibberish
+/// rather than an ok.
+pub const ENTRY_REPLY_FIELD: &str = "reply";
+
+/// The [`PORT_PUBLISH`] detail field the kernel writes the publish's answer into,
+/// synchronously, before the dispatch returns.
+///
+/// Present on every publish the kernel heard. The dispatching instance is the one
+/// whose entry is currently on the stack ⇒ the publish was routed into that
+/// activation's buffer and this is the buffer's verdict; it is any other instance,
+/// or none ⇒ [`PublishError::NotPermitted`], because a publish outside an
+/// activation has no buffer to join and no path of its own. A *missing* status
+/// means the event never reached the kernel's listener, which is a broken page
+/// rather than an outcome.
 ///
 /// The value is [`publish_status_str`]'s wire string: `"ok"`, or one of the
 /// [`PublishError`] triple's spellings.
@@ -587,6 +743,111 @@ pub fn parse_defer_status(status: &str) -> Option<Result<(), DeferError>> {
     }
 }
 
+// ── The sync-call seam (component → kernel) ─────────────────────────────────
+
+/// Component → kernel, dispatched **synchronously** on the component's mounted
+/// element. Must be `bubbles: true, composed: true`, exactly as
+/// [`PORT_PUBLISH`]. `detail = { port, body }`, both strings: `port` names the
+/// sync port the request arrives on, `body` is the component's own payload.
+///
+/// The kernel resolves *which* instance from the retargeted `event.target` over
+/// its mounted-instance registry, never from the detail — the trust posture
+/// [`ACTIVATION_REGISTER`] takes. A component cannot sync-activate any instance
+/// but itself.
+///
+/// **What it causes.** One ordinary activation of that instance, assembled and
+/// invoked inside this `dispatchEvent` call: every bound input port windowed as
+/// usual, plus the minted request as the window named by
+/// `Activation::sync`. Publishes and deferred-message ops buffer and flush on
+/// the same terms as any other activation. Because the whole activation
+/// completes before the dispatch returns, the browser's gesture token is still
+/// live for the entry, and the caller can still `preventDefault()` on the
+/// originating event afterwards.
+///
+/// **The answer** is written onto the same `detail` object before the dispatch
+/// returns: [`SYNC_STATUS_FIELD`] always, plus [`SYNC_REPLY_FIELD`] on `ok` when
+/// the entry answered with one and [`SYNC_ERROR_FIELD`] on `err`. There is no
+/// second path and no unanswered case — a request the kernel would not admit is
+/// answered [`SyncStatus::Refused`], which is always a bug in the requester or
+/// the kernel.
+///
+/// SDK↔kernel internal: component authors reach this through the SDK's gesture
+/// wiring and never dispatch it themselves.
+pub const ACTIVATION_SYNC: &str = "brenn-activation-sync";
+
+/// The [`ACTIVATION_SYNC`] detail field the kernel writes the request's outcome
+/// into, synchronously, before the dispatch returns.
+///
+/// Always present on a request the kernel heard at all; the value is
+/// [`sync_status_str`]'s wire string. A *missing* one means the event never
+/// reached the kernel's listener, which is a broken page rather than an outcome.
+pub const SYNC_STATUS_FIELD: &str = "status";
+
+/// The [`ACTIVATION_SYNC`] detail field carrying the entry's reply, present only
+/// alongside a [`SyncStatus::Ok`] status and only when the entry answered with
+/// one. An opaque string: the kernel never parses it, and what it means is a
+/// dialect between a component and its own gesture wiring.
+pub const SYNC_REPLY_FIELD: &str = "reply";
+
+/// The [`ACTIVATION_SYNC`] detail field carrying the [`ActivationError`] message,
+/// present only alongside a [`SyncStatus::Err`] status.
+///
+/// Informational: the entry already saw its own error and the kernel already
+/// counted the failed activation. It exists so a requester's diagnostic can name
+/// what the entry said rather than only that it said something.
+pub const SYNC_ERROR_FIELD: &str = "error";
+
+/// How a sync-call request finished, as written on [`SYNC_STATUS_FIELD`].
+///
+/// Four values because the fourth is not an activation outcome at all: `Ok`,
+/// `Err` and `Trap` are the three [`ActivationError`]-adjacent shapes an entry can
+/// finish in, and `Refused` says no entry ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStatus {
+    /// The entry returned ok. Its buffer flushed, and [`SYNC_REPLY_FIELD`] carries
+    /// the reply if it answered with one.
+    Ok,
+    /// The entry returned err. The buffer was discarded, a failure was counted,
+    /// and the instance keeps running; [`SYNC_ERROR_FIELD`] carries its account.
+    Err,
+    /// The instance is terminal without having answered — its entry trapped, or
+    /// the assembly's own loud-rung verdict killed it before the entry could run.
+    ///
+    /// Answered explicitly because the requesting closure survives the dispatch:
+    /// the wasm instance is not torn down mid-stack even though the kernel has
+    /// already marked it dead, so it has to be told to stop.
+    Trap,
+    /// The request was not admissible and nothing was assembled: it arrived from
+    /// inside an activation, or named an instance that is unregistered, terminal
+    /// or unwired, or its port name collides with a bound input port. Every one of
+    /// those is a bug, never a configured outcome.
+    Refused,
+}
+
+/// The [`SYNC_STATUS_FIELD`] wire string. The single executable definition of the
+/// values, shared by the kernel that writes them and the SDK that reads them, so
+/// the seam cannot drift by hand-copied literal.
+pub fn sync_status_str(status: SyncStatus) -> &'static str {
+    match status {
+        SyncStatus::Ok => "ok",
+        SyncStatus::Err => "err",
+        SyncStatus::Trap => "trap",
+        SyncStatus::Refused => "refused",
+    }
+}
+
+/// The inverse of [`sync_status_str`]: parse a [`SYNC_STATUS_FIELD`] value, or
+/// `None` for a string this contract never spells.
+pub fn parse_sync_status(status: &str) -> Option<SyncStatus> {
+    match status {
+        "ok" => Some(SyncStatus::Ok),
+        "err" => Some(SyncStatus::Err),
+        "trap" => Some(SyncStatus::Trap),
+        "refused" => Some(SyncStatus::Refused),
+        _ => None,
+    }
+}
+
 // ── Component-contract events (kernel ↔ component) ──────────────────────────
 
 /// Component → kernel. Must be `bubbles: true, composed: true` and dispatched on
@@ -628,12 +889,16 @@ pub const PORT_PUBLISH: &str = "brenn-port-publish";
 /// malformed detail, dropped and reported like any other.
 ///
 /// **Buffered only, with no second path.** Each op is answered synchronously on
-/// [`DEFER_STATUS_FIELD`] by the in-flight activation's buffer, and there is no
-/// gesture equivalent: a schedule staged outside an activation would escape the
-/// flush-iff-ok rule that makes a failed activation schedule nothing. That is why
-/// the family gets its own event rather than riding [`PORT_PUBLISH`] with an extra
-/// field — an event with an immediate path cannot honor a deferral. Dispatched
-/// with no activation of this instance in flight, the op is dropped and reported.
+/// [`DEFER_STATUS_FIELD`] by the in-flight activation's buffer: a schedule staged
+/// outside an activation would escape the flush-iff-ok rule that makes a failed
+/// activation schedule nothing. Dispatched with no activation of this instance in
+/// flight, the op is dropped and reported.
+///
+/// **The timer idiom lives here.** A component's own periodic wakeup is a
+/// deferred publish to itself on an in/out port, rescheduled or cancelled through
+/// [`DEFER_OP_EDIT`] / [`DEFER_OP_CANCEL`] against the [`DeferredWindow`] the
+/// activation delivered. See the crate-level timer idiom section for what that
+/// buys and the one behavioral difference from a `setTimeout`.
 pub const PORT_DEFER: &str = "brenn-port-defer";
 
 /// Component → kernel. Same dispatch rule as [`PORT_PUBLISH`] (`bubbles: true,
@@ -847,6 +1112,39 @@ mod tests {
         assert_eq!(PUBLISH_STATUS_FIELD, "status");
         assert_eq!(parse_publish_status("nope"), None);
         assert_eq!(parse_publish_status(""), None);
+    }
+
+    #[test]
+    fn sync_channel_addresses_sit_under_the_reserved_prefix() {
+        assert_eq!(SYNC_CHANNEL_PREFIX, "local:brenn/sync/");
+        assert_eq!(sync_channel("ack"), "local:brenn/sync/ack");
+        // The reservation works by *absence*: boot rejects a `local:brenn/*`
+        // binding the routable table does not name, so a sync address staying out
+        // of that table is what makes it unbindable.
+        assert!(
+            !brenn_surface_schema::RESERVED_LOCAL_CHANNELS
+                .iter()
+                .any(|channel| channel.address.starts_with(SYNC_CHANNEL_PREFIX)),
+            "a sync address is never a routable channel"
+        );
+    }
+
+    /// The four values are the seam's whole vocabulary and the SDK panics on a
+    /// string it cannot parse, so writer and reader must agree letter for letter.
+    #[test]
+    fn every_sync_status_round_trips_through_its_wire_string() {
+        for status in [
+            SyncStatus::Ok,
+            SyncStatus::Err,
+            SyncStatus::Trap,
+            SyncStatus::Refused,
+        ] {
+            assert_eq!(parse_sync_status(sync_status_str(status)), Some(status));
+        }
+        assert_eq!(sync_status_str(SyncStatus::Ok), "ok");
+        assert_eq!(sync_status_str(SyncStatus::Refused), "refused");
+        assert_eq!(parse_sync_status("not-permitted"), None);
+        assert_eq!(parse_sync_status(""), None);
     }
 
     #[test]

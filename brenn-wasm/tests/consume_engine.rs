@@ -181,6 +181,7 @@ fn single_port_activation(
         }],
         deferred: vec![],
         now: None,
+        sync: None,
     }
 }
 
@@ -255,6 +256,19 @@ fn handle_no_new_envelopes_does_not_fail() {
         comp.handle(activation),
         ProcessorOutcome::Ok { .. }
     ));
+}
+
+#[test]
+#[should_panic(expected = "cannot be lowered into the processor world")]
+fn handle_panics_on_a_sync_call_activation() {
+    // The processor world has no sync vocabulary, so a sync-call activation
+    // reaching this host is a caller error, not a shape to silently degrade
+    // into an async one.
+    let comp = load_demo_with_out();
+    let mut activation =
+        single_port_activation("in", vec![envelope_json("brenn:test", "hello")], 0);
+    activation.sync = Some("press".to_string());
+    comp.handle(activation);
 }
 
 // ── Webhook publish path ──────────────────────────────────────────────────────
@@ -749,6 +763,7 @@ fn context_envelopes_count_matches_new_from() {
         }],
         deferred: vec![],
         now: None,
+        sync: None,
     };
     match comp.handle(activation) {
         ProcessorOutcome::Ok { publishes, .. } => {
@@ -878,6 +893,7 @@ fn host_invariant_violation_new_from_exceeds_len_returns_labeled_error() {
         }],
         deferred: vec![],
         now: None,
+        sync: None,
     };
     match comp.handle(activation) {
         ProcessorOutcome::Err(e) => {
@@ -1277,6 +1293,7 @@ fn run_wat_processor(slug: &str, wat_src: &str) -> ProcessorOutcome {
         ports: vec![],
         deferred: vec![],
         now: None,
+        sync: None,
     })
 }
 

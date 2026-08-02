@@ -6,9 +6,11 @@
 
 use crate::contract::ActivationError;
 use crate::contract::{
-    ACTIVATION_REGISTER, COMPONENT_ALERT, COMPONENT_LOG, COMPONENT_PANIC, DEFER_STATUS_FIELD,
-    PORT_DEFER, PORT_PUBLISH, PROCESSOR_START, PUBLISH_STATUS_FIELD, PublishError, SURFACE_READY,
-    SURFACE_RELOAD, SURFACE_ROOT_ID, element_name_for_instance, publish_status_str,
+    ACTIVATION_REGISTER, ACTIVATION_SYNC, COMPONENT_ALERT, COMPONENT_LOG, COMPONENT_PANIC,
+    DEFER_STATUS_FIELD, ENTRY_REPLY_FIELD, PORT_DEFER, PORT_PUBLISH, PROCESSOR_START,
+    PUBLISH_STATUS_FIELD, PublishError, SURFACE_READY, SURFACE_RELOAD, SURFACE_ROOT_ID,
+    SYNC_ERROR_FIELD, SYNC_REPLY_FIELD, SYNC_STATUS_FIELD, element_name_for_instance,
+    publish_status_str, sync_status_str,
 };
 use crate::front::SurfaceHandle;
 use crate::schema::LogLevel;
@@ -137,6 +139,19 @@ pub(crate) fn instance_counters(instance: &str) -> InstanceCounters {
         .unwrap_or_default()
 }
 
+/// Forget every instance's counters.
+///
+/// Page-lifetime state, and a page hosts one surface — so nothing outside a test
+/// clears this. The browser suites share one page across every test, where the
+/// accumulated key set outlives the wiring it was counted under: a later test's
+/// status document would then name an instance its own bindings never declared,
+/// which [`crate::telemetry::status_body`] is right to call fatal. Each test
+/// starts from an empty map instead.
+#[cfg(test)]
+pub(crate) fn forget_instance_counters() {
+    INSTANCE_COUNTERS.with(|c| c.borrow_mut().clear());
+}
+
 /// Bump a lifetime counter by one.
 fn bump(counter: &'static std::thread::LocalKey<Cell<u64>>) {
     counter.with(|c| c.set(c.get().saturating_add(1)));
@@ -179,13 +194,17 @@ pub fn instance_for_target(target: &Element) -> Option<String> {
 /// `Vec<KernelAction>` output to the web-sys effects above; the core decides,
 /// this executes.
 ///
-/// `handle` is the surface client handle the two client-touching actions need:
-/// `Publish` resolves the output port and queues the frame via
-/// [`SurfaceHandle::publish`], mapping a synchronous rejection to the same
-/// console-log + leveled-`log` treatment as a failed `PublishResult`;
-/// `Report` is that treatment for the transient/component-fault class
-/// (non-`Ok` publish outcome, rejected publish, misrouted `brenn-port-publish`)
-/// at `Warn`, and for a component-panic report at `Error`.
+/// `handle` is the surface client handle the client-touching actions need:
+/// `PublishControl` queues the kernel's own control-plane statement, and
+/// `Report` is the console-log + leveled-`log` treatment for the
+/// transient/component-fault class (rejected publish, misrouted
+/// `brenn-port-publish`) at `Warn`, and for a component-panic report at `Error`.
+///
+/// Nothing routes a `Publish` here: a component's publishes are all its
+/// activations', and the publish listener consumes the router's `Publish`
+/// itself — buffering it or refusing it — handing this executor only the
+/// drop-and-report arms. The `Publish` arm is `unreachable!` so that stays true
+/// under a future route site rather than resurrecting the unbuffered path.
 pub fn apply_actions(actions: &[KernelAction], handle: &SurfaceHandle) {
     for action in actions {
         apply_action(action, handle);
@@ -212,38 +231,16 @@ pub(crate) fn apply_action(action: &KernelAction, handle: &SurfaceHandle) {
         KernelAction::MountComponent { instance, kind } => mount_component(instance, kind),
         KernelAction::EmitReady => emit_ready(),
         KernelAction::StartProcessors { instances } => start_processors(instances),
-        KernelAction::Publish {
-            instance,
-            port,
-            body,
-            urgency,
-        } => {
-            count_publish(instance);
-            // A synchronous rejection is contained to the offending component
-            // (never a panic, front.rs) and gets the non-Ok-publish treatment.
-            let published = match urgency {
-                Some(urgency) => {
-                    handle.publish_with_urgency(instance, port, body.clone(), *urgency)
-                }
-                // No override: the port's configured default applies, which
-                // the page resolves off the wiring in force. This layer holds no
-                // copy of that wiring to substitute from.
-                None => handle.publish(instance, port, body.clone()),
-            };
-            if let Err(reject) = published {
-                report(
-                    handle,
-                    LogLevel::Warn,
-                    KERNEL_LOG_SOURCE,
-                    &format!("publish of {instance}/{port} rejected: {reject:?}"),
-                    // The kernel writes the line, but the report is *about* the
-                    // component whose publish was rejected — and a component
-                    // looping on rejected publishes is exactly the flood whose
-                    // reports must draw its own budget, not the surface's.
-                    Some(instance),
-                );
-            }
-        }
+        // A component's publishes are all its activations', buffered by the
+        // publish listener or refused there; the listener consumes the router's
+        // `Publish` and never forwards it. Executing one here would be an
+        // unbuffered publish outside every activation — the path this executor
+        // must not offer a way back to — so the impossible state is a panic
+        // rather than a faithfully-served request.
+        KernelAction::Publish { instance, port, .. } => unreachable!(
+            "no caller routes a component publish to the executor: {instance}/{port} must be \
+             buffered by the in-flight activation or refused"
+        ),
         // The kernel writes the line; `subject` names the component it is *about*,
         // which the server stamps the report with. A breadcrumb with no component
         // subject carries the bare surface identity.
@@ -751,14 +748,14 @@ pub fn install_publish_listener(
     });
 }
 
-/// Write a buffered publish's answer onto the dispatching event's `detail`, where
-/// the component's SDK reads it as `publish` returns.
+/// Write a publish's answer onto the dispatching event's `detail`, where the
+/// component's SDK reads it as `publish` returns.
 ///
-/// Only a *buffered* publish gets one: its absence is exactly what tells the SDK
-/// the kernel took the gesture path (which has no synchronous answer). A detail
-/// that refuses the write is a non-conformant dispatcher — some caller sending a
-/// frozen or primitive detail — so the answer is simply dropped rather than
-/// panicking the kernel on a component's malformed event.
+/// Every publish the kernel's listener heard gets one — the buffer's verdict, or
+/// `not-permitted` for a publish made with no activation of that instance in
+/// flight. A detail that refuses the write is a non-conformant dispatcher — some
+/// caller sending a frozen or primitive detail — so the answer is simply dropped
+/// rather than panicking the kernel on a component's malformed event.
 pub fn set_publish_status(detail: &JsValue, status: Result<(), PublishError>) {
     let _ = Reflect::set(
         detail,
@@ -823,10 +820,76 @@ pub fn set_defer_status(detail: &JsValue, status: &str) {
     );
 }
 
+/// Install the delegated `brenn-activation-sync` listener: forwards the resolved
+/// instance, the retargeted tag, the `{ port, body }` detail and the event's
+/// `detail` object to `callback`, wired to
+/// [`crate::logic::route_sync_intent`] and the sync door behind it.
+///
+/// Built on [`install_root_event_listener`] rather than
+/// [`install_root_component_listener`] for the reason the publish listener is:
+/// the answer has to reach back across the module boundary, and the `detail`
+/// object is the only channel a synchronous one can take (see
+/// [`set_sync_status`]).
+///
+/// The whole activation the callback causes runs inside this listener, which runs
+/// inside the component's own `dispatchEvent`. That is what keeps the browser's
+/// user-activation token live for the entry.
+pub fn install_sync_listener(
+    callback: impl Fn(Option<&str>, &str, Option<&str>, Option<&str>, &JsValue) + 'static,
+) {
+    install_root_event_listener(ACTIVATION_SYNC, move |instance, tag, event| {
+        let detail = event
+            .dyn_ref::<CustomEvent>()
+            .map(|ce| ce.detail())
+            .unwrap_or(JsValue::UNDEFINED);
+        let [port, body] = custom_event_string_fields(event, ["port", "body"]);
+        callback(instance, tag, port.as_deref(), body.as_deref(), &detail);
+    });
+}
+
+/// Write a sync-call request's answer onto the dispatching event's `detail`,
+/// where the component's SDK reads it as its `dispatchEvent` returns.
+///
+/// [`SYNC_STATUS_FIELD`] is written for every request the kernel heard, whatever
+/// became of it — a missing status is not an outcome, and the SDK faults on one.
+/// The reply rides alongside on ok when the entry answered with one, and the
+/// entry's own account rides alongside on err.
+///
+/// A detail that refuses the write is a non-conformant dispatcher — a frozen or
+/// primitive detail — so the answer is dropped rather than panicking the kernel
+/// on a component's malformed event. The requester then sees no status and faults
+/// on that, which is the same verdict reached one layer out.
+pub fn set_sync_status(
+    detail: &JsValue,
+    status: crate::contract::SyncStatus,
+    reply: Option<&str>,
+    error: Option<&str>,
+) {
+    let _ = Reflect::set(
+        detail,
+        &JsValue::from_str(SYNC_STATUS_FIELD),
+        &JsValue::from_str(sync_status_str(status)),
+    );
+    if let Some(reply) = reply {
+        let _ = Reflect::set(
+            detail,
+            &JsValue::from_str(SYNC_REPLY_FIELD),
+            &JsValue::from_str(reply),
+        );
+    }
+    if let Some(error) = error {
+        let _ = Reflect::set(
+            detail,
+            &JsValue::from_str(SYNC_ERROR_FIELD),
+            &JsValue::from_str(error),
+        );
+    }
+}
+
 /// Count one publish for `instance` — the lifetime totals a status report carries.
-/// Shared by the immediate path in [`apply_action`] and the buffered path in the
-/// publish listener, so what an operator reads does not depend on which route the
-/// kernel took.
+/// Counted where a publish is admitted: the DOM seam's buffered route, the
+/// deferred family's, and the processor host's, so an operator's total does not
+/// depend on which transport a component reached the buffer through.
 pub(crate) fn count_publish(instance: &str) {
     bump(&PUBLISHES);
     bump_instance(instance, |c| &mut c.publishes, 1);
@@ -837,10 +900,13 @@ pub(crate) fn count_publish(instance: &str) {
 ///
 /// One encode per activation (not per message, which is the whole point): the
 /// activation is serialized to JSON and passed as the single argument. The return
-/// value is the outcome, and the three answers are the three outcomes the model
-/// has:
+/// value is the outcome, in four shapes:
 ///
-/// - `undefined`/`null` → ok; the buffer flushes.
+/// - `undefined`/`null` → ok with no reply; the buffer flushes.
+/// - an object carrying a string [`ENTRY_REPLY_FIELD`] → ok with that reply, the
+///   buffer flushing the same way — but **only** on an activation whose `sync`
+///   field names a port. A reply to a question nobody asked is a contract break,
+///   so on an async activation it is a trap.
 /// - a string → err, carrying the component's own account. The buffer is
 ///   discarded, the instance keeps running.
 /// - a thrown exception → trap. `Function::call1` gives it back as `Err`, which is
@@ -871,16 +937,40 @@ pub fn wrap_activation_entry(instance: &str, entry: js_sys::Function) -> Activat
         let json = serde_json::to_string(activation)
             .expect("surface kernel: an Activation serializes to JSON");
         match entry.call1(&JsValue::NULL, &JsValue::from_str(&json)) {
-            Ok(value) if value.is_undefined() || value.is_null() => ActivationOutcome::Ok,
+            Ok(value) if value.is_undefined() || value.is_null() => ActivationOutcome::Ok(None),
             Ok(value) => match value.as_string() {
                 Some(message) => ActivationOutcome::Err(ActivationError { message }),
-                None => ActivationOutcome::Trap(
-                    "activation entry returned neither undefined nor an error string".to_string(),
-                ),
+                None => classify_reply(&value, activation.sync.is_some()),
             },
             Err(thrown) => ActivationOutcome::Trap(js_error_message(&thrown)),
         }
     })
+}
+
+/// Classify an activation entry's non-string, non-nullish return: an object
+/// carrying a string [`ENTRY_REPLY_FIELD`] is a sync reply, anything else is a
+/// trap.
+///
+/// `is_sync` is the activation's own `sync` field, and it gates the whole shape
+/// rather than merely the reply's usefulness: an entry that answers an async
+/// activation is a component that lost track of why it was called, and reading
+/// its ok would flush a buffer built under a misapprehension.
+fn classify_reply(value: &JsValue, is_sync: bool) -> ActivationOutcome {
+    let reply = value
+        .is_object()
+        .then(|| Reflect::get(value, &JsValue::from_str(ENTRY_REPLY_FIELD)).ok())
+        .flatten()
+        .and_then(|field| field.as_string());
+    match (reply, is_sync) {
+        (Some(reply), true) => ActivationOutcome::Ok(Some(reply)),
+        (Some(_), false) => ActivationOutcome::Trap(
+            "activation entry replied to an activation that asked nothing".to_string(),
+        ),
+        (None, _) => ActivationOutcome::Trap(
+            "activation entry returned neither undefined, an error string, nor a reply object"
+                .to_string(),
+        ),
+    }
 }
 
 /// The operator's account of a thrown activation entry.
@@ -1158,6 +1248,7 @@ mod tests {
             ports,
             deferred: vec![],
             now: None,
+            sync: None,
         });
     }
 
@@ -1239,7 +1330,8 @@ mod tests {
     }
 
     /// A minimal activation to feed the wrapper; its contents are irrelevant to
-    /// the return-value classification these tests pin.
+    /// the return-value classification these tests pin, apart from `sync`, which
+    /// gates the reply shape.
     fn one_port_activation() -> crate::contract::Activation {
         crate::contract::Activation {
             ports: vec![crate::contract::PortWindow {
@@ -1250,6 +1342,16 @@ mod tests {
             }],
             deferred: vec![],
             now: None,
+            sync: None,
+        }
+    }
+
+    /// The same activation, but sync-caused: a reply is an answer someone asked
+    /// for.
+    fn sync_activation() -> crate::contract::Activation {
+        crate::contract::Activation {
+            sync: Some("ack".to_string()),
+            ..one_port_activation()
         }
     }
 
@@ -1261,11 +1363,11 @@ mod tests {
         // undefined / null → ok (buffer flushes).
         assert!(matches!(
             wrap_activation_entry(i, js_entry("return undefined;"))(&activation),
-            ActivationOutcome::Ok
+            ActivationOutcome::Ok(None)
         ));
         assert!(matches!(
             wrap_activation_entry(i, js_entry("return null;"))(&activation),
-            ActivationOutcome::Ok
+            ActivationOutcome::Ok(None)
         ));
 
         // A returned string → err carrying the component's own account.
@@ -1281,6 +1383,37 @@ mod tests {
             wrap_activation_entry(i, js_entry("return 42;"))(&activation),
             ActivationOutcome::Trap(_)
         ));
+
+        // An object carrying a string reply → ok with that reply, but only on the
+        // activation that asked. On an async one it is an answer nobody wanted, and
+        // reading it as ok would flush a buffer built under a misapprehension.
+        match wrap_activation_entry(i, js_entry("return { reply: '{\"cancel\":true}' };"))(
+            &sync_activation(),
+        ) {
+            ActivationOutcome::Ok(Some(reply)) => assert_eq!(reply, "{\"cancel\":true}"),
+            other => panic!("expected Ok with a reply, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                wrap_activation_entry(i, js_entry("return { reply: 'anything' };"))(&activation),
+                ActivationOutcome::Trap(_)
+            ),
+            "a reply to an async activation is a contract break, not an ok"
+        );
+
+        // An object with nothing readable under `reply` is gibberish, whichever
+        // kind of activation it answers: a returned object claims to be an answer.
+        for shape in ["return {};", "return { reply: 7 };"] {
+            for activation in [&activation, &sync_activation()] {
+                assert!(
+                    matches!(
+                        wrap_activation_entry(i, js_entry(shape))(activation),
+                        ActivationOutcome::Trap(_)
+                    ),
+                    "{shape} is not a conformant reply"
+                );
+            }
+        }
 
         // A thrown Error → trap carrying the Error's message.
         match wrap_activation_entry(i, js_entry("throw new Error('boom');"))(&activation) {

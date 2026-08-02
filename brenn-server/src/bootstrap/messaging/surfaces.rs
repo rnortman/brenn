@@ -185,8 +185,8 @@ pub(super) fn assert_page_queue_deliverable(
 /// its own principal's grain.
 ///
 /// An instance with *no* input bindings is untouched — a purely presentational
-/// component is live config (it renders, it may publish on gesture), and has
-/// been since before activations existed.
+/// component is live config. It still publishes: a gesture on it causes an
+/// activation of its own, which is where its publishes are made.
 ///
 /// # Panics
 ///

@@ -619,7 +619,7 @@ fn a_completion_for_an_unmounted_instance_is_absorbed() {
         Input::ActivationDone(Completed {
             instance: "gone".to_string(),
             generation: 0,
-            outcome: ActivationOutcome::Ok,
+            outcome: ActivationOutcome::Ok(None),
             buffer: empty_buffer(),
             stamps: Vec::new(),
         }),
@@ -818,6 +818,329 @@ fn a_ready_instance_is_handed_over_in_flight() {
     assert!(again.is_none(), "the instance is in flight");
 }
 
+// ---------------------------------------------------------------------------
+// The sync door
+// ---------------------------------------------------------------------------
+
+/// One sync request at the fixture's instant, under its own envelope identity.
+fn sync(
+    page: &mut SurfacePage,
+    instance: &str,
+    port: &str,
+    body: &str,
+) -> (SyncDispatch, Vec<Effect>) {
+    dispatch_sync(
+        page,
+        instance,
+        port,
+        body.to_string(),
+        stamp(0x59c),
+        NOW,
+        NOW_MS,
+    )
+}
+
+fn refusal(answer: SyncDispatch) -> SyncRefusal {
+    match answer {
+        SyncDispatch::Refused(refusal) => refusal,
+        other => panic!("the request was admitted: {other:?}"),
+    }
+}
+
+fn admitted(answer: SyncDispatch) -> ReadyActivation {
+    match answer {
+        SyncDispatch::Ready(ready) => *ready,
+        other => panic!("the request was not admitted: {other:?}"),
+    }
+}
+
+/// The whole point of "not something special": the handler sees its full normal
+/// worldview — every bound input port windowed, positions advanced, the deferred
+/// snapshot present — plus the request, as one more ordinary window on a port only
+/// this activation carries.
+#[test]
+fn a_sync_activation_carries_the_full_worldview_and_the_request() {
+    let mut page = page();
+    feed(&mut page, publish_cmd("p1", "notes", "queued", 0x9c1));
+
+    let (answer, effects) = sync(&mut page, "p2", "ack", "{\"kind\":\"dismiss\"}");
+    let ready = admitted(answer);
+    assert!(
+        effects.is_empty(),
+        "a quiet assembly says nothing: {effects:?}"
+    );
+    assert_eq!(ready.instance, "p2");
+    assert_eq!(ready.activation.sync.as_deref(), Some("ack"));
+    assert_eq!(ready.activation.now, Some(NOW_MS));
+    // Every bound port, in wiring order, then the request last.
+    assert_eq!(
+        ready
+            .activation
+            .ports
+            .iter()
+            .map(|window| window.port.as_str())
+            .collect::<Vec<_>>(),
+        ["in", "notes", "ack"]
+    );
+    // The queued input is served by this activation, not held back for a later
+    // async one: the handler's worldview is the real one.
+    let notes = &ready.activation.ports[1];
+    assert_eq!(
+        notes
+            .new_envelopes()
+            .iter()
+            .map(|envelope| envelope.body.as_str())
+            .collect::<Vec<_>>(),
+        ["queued"]
+    );
+
+    let request = &ready.activation.ports[2];
+    assert_eq!(request.new_from, 0, "a sync port has no context");
+    assert_eq!(request.dropped, 0, "a sync port has no position to pass");
+    let [envelope] = &request.envelopes[..] else {
+        panic!("a sync window is exactly the one live request: {request:?}");
+    };
+    assert_eq!(envelope.channel, "local:brenn/sync/ack");
+    assert_eq!(envelope.envelope_type, brenn_envelope::ChannelScheme::Local);
+    assert_eq!(envelope.sender, "p2");
+    assert_eq!(envelope.source, "p2");
+    assert_eq!(envelope.body, "{\"kind\":\"dismiss\"}");
+    assert_eq!(envelope.urgency, Urgency::Normal);
+    assert_eq!(envelope.message_id, stamp(0x59c).message_id);
+    assert_eq!(envelope.deliver_after, None);
+}
+
+/// A sync assembly is a delivery: it advances the positions it served, so the
+/// instance stops being ready and nothing follows it with an empty activation.
+#[test]
+fn a_sync_drain_leaves_no_follow_up_async_activation() {
+    let mut page = page();
+    feed(&mut page, publish_cmd("p1", "notes", "queued", 0x9c2));
+    let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
+    feed(
+        &mut page,
+        Input::ActivationDone(Completed {
+            instance: ready.instance,
+            generation: ready.generation,
+            outcome: ActivationOutcome::Ok(None),
+            buffer: ready.buffer,
+            stamps: Vec::new(),
+        }),
+    );
+
+    let (again, _) = dispatch(&mut page, NOW, NOW_MS);
+    assert!(again.is_none(), "the sync activation already served it");
+}
+
+/// Err consumes here exactly as it does on the async path: the positions advanced
+/// at assembly, so a failed sync activation is never re-driven and what it saw
+/// comes back only as retained context.
+#[test]
+fn a_sync_activation_that_errs_still_consumed_its_input() {
+    let mut page = page();
+    feed(&mut page, publish_cmd("p1", "notes", "queued", 0x9c3));
+    let ready = admitted(sync(&mut page, "p2", "ack", "{}").0);
+    feed(
+        &mut page,
+        Input::ActivationDone(Completed {
+            instance: ready.instance,
+            generation: ready.generation,
+            outcome: ActivationOutcome::Err(brenn_surface_contract::ActivationError {
+                message: "no".to_string(),
+            }),
+            buffer: ready.buffer,
+            stamps: Vec::new(),
+        }),
+    );
+
+    let (again, _) = dispatch(&mut page, NOW, NOW_MS);
+    assert!(again.is_none(), "an err does not redeliver");
+    assert_eq!(
+        retained(&page, NOTES),
+        ["queued"],
+        "retention is the recovery"
+    );
+}
+
+/// The reply rides the ok and changes nothing about the flush: a sync activation's
+/// buffer commits on ok and is discarded on err, verbatim the async rules.
+#[test]
+fn a_sync_reply_commits_the_buffer_and_an_err_discards_it() {
+    let mut page = page();
+    let mut ready = admitted(sync(&mut page, "p1", "ack", "{}").0);
+    ready
+        .buffer
+        .publish("notes", "from the gesture".to_string())
+        .expect("p1 binds the page-local channel");
+    feed(
+        &mut page,
+        Input::ActivationDone(Completed {
+            instance: ready.instance,
+            generation: ready.generation,
+            outcome: ActivationOutcome::Ok(Some("{\"cancel\":true}".to_string())),
+            buffer: ready.buffer,
+            stamps: vec![stamp(0x9c4)],
+        }),
+    );
+    assert_eq!(retained(&page, NOTES), ["from the gesture"]);
+
+    let mut ready = admitted(sync(&mut page, "p1", "ack", "{}").0);
+    ready
+        .buffer
+        .publish("notes", "never routed".to_string())
+        .expect("p1 binds the page-local channel");
+    feed(
+        &mut page,
+        Input::ActivationDone(Completed {
+            instance: ready.instance,
+            generation: ready.generation,
+            outcome: ActivationOutcome::Err(brenn_surface_contract::ActivationError {
+                message: "no".to_string(),
+            }),
+            buffer: ready.buffer,
+            stamps: vec![stamp(0x9c5)],
+        }),
+    );
+    assert_eq!(retained(&page, NOTES), ["from the gesture"]);
+}
+
+/// The request is one new envelope and draws exactly the grant one new envelope
+/// draws — no special budget rule survives for gestures. Read off the unspent
+/// carry of an activation that published nothing, which is the seeded bucket.
+#[test]
+fn the_request_draws_the_ordinary_per_envelope_grant() {
+    let mut page = page();
+    let ready = admitted(sync(&mut page, "p1", "ack", "{}").0);
+    let carry = ready.buffer.into_carry();
+    let expected = brenn_budget::seed_sink_budget(
+        0,
+        brenn_budget::SinkBudget {
+            fill_mt: 1_000,
+            capacity_mt: 4_000,
+        },
+        brenn_budget::grant_input_mt([(brenn_budget::MILLITOKENS_PER_PUBLISH, 1)]),
+    );
+    assert_eq!(carry.get("notes"), Some(&expected));
+}
+
+/// An entry is on the stack iff an activation is in flight, so a request arriving
+/// then came from inside one — a component dispatching an event at itself or at a
+/// sibling mid-activation. Refused whichever instance is running.
+///
+/// Each refusal is checked for an empty effect list, here and in the four below:
+/// the door drops a refusal's effects rather than waking the loop for them, so a
+/// refusal that ever stated something — a moved release deadline is the one that
+/// would silently freeze every parked schedule on the page — must be caught here.
+#[test]
+fn a_request_during_any_activation_is_refused_as_re_entrant() {
+    let mut page = page();
+    feed(&mut page, publish_cmd("p1", "notes", "queued", 0x9c6));
+    let (in_flight, _) = dispatch(&mut page, NOW, NOW_MS);
+    assert!(in_flight.is_some(), "p2 reads what p1 wrote");
+
+    let (own, effects) = sync(&mut page, "p1", "ack", "{}");
+    assert_eq!(refusal(own), SyncRefusal::ReEntrant);
+    assert!(effects.is_empty(), "{effects:?}");
+    let (sibling, effects) = sync(&mut page, "p2", "ack", "{}");
+    assert_eq!(refusal(sibling), SyncRefusal::ReEntrant);
+    assert!(effects.is_empty(), "{effects:?}");
+}
+
+#[test]
+fn a_request_from_an_instance_the_page_does_not_hold_is_refused() {
+    let mut page = page();
+    let (answer, effects) = sync(&mut page, "stranger", "ack", "{}");
+    assert_eq!(refusal(answer), SyncRefusal::Unregistered);
+    assert!(effects.is_empty(), "{effects:?}");
+}
+
+#[test]
+fn a_request_from_a_terminal_instance_is_refused() {
+    let mut page = page();
+    let generation = page
+        .registrations
+        .generation("p1")
+        .expect("the fixture mounted p1");
+    feed(
+        &mut page,
+        Input::ActivationDone(Completed {
+            instance: "p1".to_string(),
+            generation,
+            outcome: ActivationOutcome::Trap("it panicked".to_string()),
+            buffer: empty_buffer(),
+            stamps: Vec::new(),
+        }),
+    );
+    let (answer, effects) = sync(&mut page, "p1", "ack", "{}");
+    assert_eq!(refusal(answer), SyncRefusal::Failed);
+    assert!(effects.is_empty(), "{effects:?}");
+}
+
+/// Registration is admitted before the page's first document, so an instance can
+/// hold an entry with no wiring to window against. There is nothing to assemble.
+#[test]
+fn a_request_before_any_document_is_refused() {
+    let mut page = fresh();
+    pages::mount(&mut page, &["p1"]);
+    let (answer, effects) = sync(&mut page, "p1", "ack", "{}");
+    assert_eq!(refusal(answer), SyncRefusal::Unwired);
+    assert!(effects.is_empty(), "{effects:?}");
+}
+
+/// The `ports` list must be unambiguous: a sync port sharing a name with a bound
+/// input port would put two windows with one name in front of the component.
+#[test]
+fn a_sync_port_colliding_with_a_bound_input_is_refused() {
+    let mut page = page();
+    let (answer, effects) = sync(&mut page, "p1", "in", "{}");
+    assert_eq!(refusal(answer), SyncRefusal::PortCollision);
+    assert!(effects.is_empty(), "{effects:?}");
+}
+
+/// Nothing is assembled and nothing is left in flight by a refusal, so the page is
+/// exactly where it was and the next request is judged on its own merits.
+#[test]
+fn a_refusal_leaves_the_page_untouched() {
+    let mut page = page();
+    let (answer, effects) = sync(&mut page, "p1", "in", "{}");
+    assert!(matches!(answer, SyncDispatch::Refused(_)));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(!page.schedules.any_in_flight());
+    assert!(matches!(
+        sync(&mut page, "p1", "ack", "{}").0,
+        SyncDispatch::Ready(_)
+    ));
+}
+
+/// The assembly's own `fatal` rung, on the sync path: the instance is terminal
+/// before any entry could run. The caller is blocked on an answer, so this comes
+/// back as its own outcome rather than the async pass's silent skip — and no
+/// completion is owed, because nothing is in flight.
+#[test]
+fn a_fatal_window_at_sync_assembly_kills_before_the_entry_runs() {
+    let mut page = page_with(&doc_with(NoiseLevel::Fatal, 4));
+    for (nth, seed) in [0x9d1, 0x9d2, 0x9d3].into_iter().enumerate() {
+        feed(
+            &mut page,
+            publish_cmd("p1", "notes", &nth.to_string(), seed),
+        );
+    }
+
+    let (answer, effects) = sync(&mut page, "p2", "ack", "{}");
+    assert!(matches!(answer, SyncDispatch::Killed), "{answer:?}");
+    assert!(
+        events(&effects).iter().any(
+            |event| matches!(event, Event::InstanceFailed { instance, .. } if instance == "p2")
+        ),
+        "{effects:?}"
+    );
+    assert!(page.registrations.is_failed("p2"));
+    assert!(
+        !page.schedules.any_in_flight(),
+        "nothing is owed a completion"
+    );
+}
+
 /// The window's own `fatal` rung: the assembly happened, but the instance is
 /// terminal before its entry could run — so nothing is handed over, and the kill
 /// and its announcement are in the effects.
@@ -840,4 +1163,183 @@ fn a_fatal_window_at_assembly_kills_before_the_entry_runs() {
         "{effects:?}"
     );
     assert!(page.registrations.is_failed("p2"));
+}
+
+// ---------------------------------------------------------------------------
+// The mount activation
+// ---------------------------------------------------------------------------
+
+/// A page whose mounts still owe their guaranteed first activation — the state
+/// [`page`] deliberately starts past.
+fn mounting() -> SurfacePage {
+    pages::mounting_page(
+        CONFIG,
+        EPOCH,
+        pages::facts(),
+        &["p1", "p2", fixtures::CHROME],
+        &doc(),
+        NOW,
+    )
+}
+
+/// Take the whole ready set one activation at a time, completing each ok, and
+/// answer which instance each was for and what its windows carried.
+fn drain(page: &mut SurfacePage) -> Vec<(String, Vec<String>)> {
+    let mut taken = Vec::new();
+    // Bounded rather than `while`: a page that keeps answering ready is the bug
+    // this helper would otherwise hang on.
+    for _ in 0..16 {
+        let (ready, _) = dispatch(page, NOW, NOW_MS);
+        let Some(ready) = ready else { return taken };
+        let bodies = ready
+            .activation
+            .ports
+            .iter()
+            .flat_map(|window| window.new_envelopes())
+            .map(|envelope| envelope.body.clone())
+            .collect();
+        taken.push((ready.instance.clone(), bodies));
+        feed(
+            page,
+            Input::ActivationDone(Completed {
+                instance: ready.instance,
+                generation: ready.generation,
+                outcome: ActivationOutcome::Ok(None),
+                buffer: ready.buffer,
+                stamps: Vec::new(),
+            }),
+        );
+    }
+    panic!("the page never stopped being ready: {taken:?}");
+}
+
+/// The guarantee itself. Every mount gets exactly one activation with nothing to
+/// deliver, which is the one place the empty-activation elision does not apply —
+/// and it is not followed by a second one.
+#[test]
+fn every_mount_gets_exactly_one_activation_with_empty_windows() {
+    let mut page = mounting();
+    let taken = drain(&mut page);
+    assert_eq!(
+        taken,
+        vec![
+            (fixtures::CHROME.to_string(), Vec::new()),
+            ("p1".to_string(), Vec::new()),
+            ("p2".to_string(), Vec::new()),
+        ],
+        "one per mount, all-empty, and nothing after them"
+    );
+}
+
+/// The debt is incurred by the document, not by the registration: an instance that
+/// mounted before the page's first bindings document is owed its activation from
+/// the moment there is wiring to window against, and not one instant earlier.
+#[test]
+fn a_mount_before_the_first_document_owes_nothing_until_one_lands() {
+    let mut page = pages::attached_page(CONFIG, EPOCH, pages::facts());
+    pages::mount(&mut page, &["p1", "p2", fixtures::CHROME]);
+    assert!(
+        !page.schedules.owes_mount_activation("p1"),
+        "there is no wiring to window against"
+    );
+    let (ready, _) = dispatch(&mut page, NOW, NOW_MS);
+    assert!(ready.is_none());
+
+    page.apply_config(&doc().to_body(), NOW)
+        .expect("the fixture document applies");
+    assert!(page.schedules.owes_mount_activation("p1"));
+    assert_eq!(drain(&mut page).len(), 3);
+}
+
+/// A mount whose channels already hold history gets an ordinary first activation
+/// rather than an extra empty one: the guarantee is *an* activation, and the
+/// retained replay is one.
+#[test]
+fn a_mount_with_history_gets_it_as_its_first_activation() {
+    let mut page = mounting();
+    feed(&mut page, publish_cmd("p1", "notes", "already here", 0x9e1));
+
+    let taken = drain(&mut page);
+    assert_eq!(
+        taken,
+        vec![
+            (fixtures::CHROME.to_string(), Vec::new()),
+            ("p1".to_string(), Vec::new()),
+            ("p2".to_string(), vec!["already here".to_string()]),
+        ],
+        "p2's one activation carries the history; no empty one precedes or follows it"
+    );
+}
+
+/// A sync activation settles the debt too. The guarantee is one activation per
+/// mount, not one of a particular flavor, and a component that has run has had its
+/// chance to schedule.
+#[test]
+fn a_sync_activation_settles_the_mount_debt() {
+    let mut page = mounting();
+    let ready = admitted(sync(&mut page, "p1", "ack", "{}").0);
+    assert!(!page.schedules.owes_mount_activation("p1"));
+    feed(
+        &mut page,
+        Input::ActivationDone(Completed {
+            instance: ready.instance,
+            generation: ready.generation,
+            outcome: ActivationOutcome::Ok(None),
+            buffer: ready.buffer,
+            stamps: Vec::new(),
+        }),
+    );
+
+    let taken = drain(&mut page);
+    assert_eq!(
+        taken
+            .iter()
+            .map(|(who, _)| who.as_str())
+            .collect::<Vec<_>>(),
+        // The rotation resumes after p1, which its sync assembly advanced onto.
+        ["p2", fixtures::CHROME],
+        "p1 already had its activation"
+    );
+}
+
+/// A remount is a new mount and owes a new one. An instance unmounted and mounted
+/// again under the same id is a different component with the same spelling, and it
+/// has never run.
+#[test]
+fn a_re_registration_owes_a_fresh_mount_activation() {
+    let mut page = mounting();
+    drain(&mut page);
+
+    feed(
+        &mut page,
+        Input::ActivationDeregistered {
+            instance: "p1".to_string(),
+        },
+    );
+    feed(
+        &mut page,
+        Input::ActivationRegistered {
+            instance: "p1".to_string(),
+        },
+    );
+    assert!(page.schedules.owes_mount_activation("p1"));
+    assert_eq!(
+        drain(&mut page),
+        vec![("p1".to_string(), Vec::new())],
+        "the new mount's own activation, and only it"
+    );
+}
+
+/// A second document mid-attachment reconciles everything, but it does not hand a
+/// component that has already run a second mount activation: the debt is per
+/// mount, and this mount's was settled.
+#[test]
+fn a_second_document_does_not_revive_a_settled_debt() {
+    let mut page = mounting();
+    drain(&mut page);
+
+    page.apply_config(&doc().to_body(), NOW)
+        .expect("the fixture document applies");
+    assert!(!page.schedules.owes_mount_activation("p1"));
+    assert!(drain(&mut page).is_empty());
 }

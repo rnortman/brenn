@@ -124,7 +124,7 @@ impl Page {
         router.set_principal(PRINCIPAL.to_string());
         for instance in ["p1", "p2"] {
             registrations.register(instance, Some(&bindings), &mut stores, &mut subs);
-            schedules.track(instance);
+            schedules.track(instance, false);
         }
         Self {
             bindings,
@@ -228,7 +228,7 @@ fn bodies(activation: &Activation, port: &str) -> Vec<String> {
 fn tracking_and_forgetting_an_instance() {
     let mut schedules = Schedules::new();
     assert!(schedules.is_empty());
-    schedules.track("p1");
+    schedules.track("p1", false);
     assert!(schedules.is_tracked("p1"));
     assert_eq!(schedules.len(), 1);
     schedules.forget("p1");
@@ -240,8 +240,8 @@ fn tracking_and_forgetting_an_instance() {
 #[should_panic(expected = "already scheduled")]
 fn tracking_an_instance_twice_panics() {
     let mut schedules = Schedules::new();
-    schedules.track("p1");
-    schedules.track("p1");
+    schedules.track("p1", false);
+    schedules.track("p1", false);
 }
 
 #[test]
@@ -263,7 +263,7 @@ fn an_untracked_instance_reports_zero_everywhere() {
 #[test]
 fn the_deferral_counters_accumulate_and_ignore_a_stranger() {
     let mut schedules = Schedules::new();
-    schedules.track("p1");
+    schedules.track("p1", false);
     schedules.count_deferred_drop("p1");
     schedules.count_deferred_drop("p1");
     schedules.count_deferred_race("p1");
@@ -279,10 +279,10 @@ fn the_deferral_counters_accumulate_and_ignore_a_stranger() {
 #[test]
 fn a_forgotten_instance_takes_its_counters_with_it() {
     let mut schedules = Schedules::new();
-    schedules.track("p1");
+    schedules.track("p1", false);
     schedules.count_deferred_race("p1");
     schedules.forget("p1");
-    schedules.track("p1");
+    schedules.track("p1", false);
     assert_eq!(schedules.deferred_races("p1"), 0);
 }
 
@@ -569,7 +569,7 @@ fn a_bound_channel_with_no_store_panics() {
     let bindings = standard();
     let mut stores = new_stores(EPOCH);
     let mut schedules = Schedules::new();
-    schedules.track("p1");
+    schedules.track("p1", false);
     let router = LocalRouter::new(SurfacePlanes::new());
     let views = DeferredViews::new();
     let mut ctx = ActivationCtx {
@@ -1147,7 +1147,7 @@ fn the_buffer_carries_the_attachments_body_cap() {
     let mut ctx = page.ctx(1_000);
     ctx.max_body_bytes = 8;
     let mut schedules = Schedules::new();
-    schedules.track("p1");
+    schedules.track("p1", false);
     let mut ready = schedules.assemble("p1", 0, &mut ctx);
     assert_eq!(
         ready.buffer.publish("out", "far too long a body".into()),
