@@ -8,8 +8,6 @@
 //! alike. The loop is generic over the socket, so the whole lifecycle is
 //! exercised without one.
 
-#![allow(dead_code)]
-
 #[cfg(test)]
 mod tests;
 
@@ -374,7 +372,11 @@ pub struct AttachSessionOutcome {
     /// concurrent closers each reading a count while still registered would both
     /// see the other and neither would be last.
     pub last_detach: bool,
-    /// Whether the attachment ended on a protocol violation.
+    /// Whether the attachment ended on a protocol violation. Part of the
+    /// terminal disposition a route may act on; neither route acts on it, since
+    /// the session already logs the violation as a security event, so only the
+    /// session suite reads it.
+    #[allow(dead_code)]
     pub violation: bool,
 }
 

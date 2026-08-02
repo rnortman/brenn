@@ -6,8 +6,6 @@
 //! halves are deliberately independent: each takes one side of the socket as a
 //! generic stream or sink, so both are exercised without one.
 
-#![allow(dead_code)]
-
 #[cfg(test)]
 mod tests;
 

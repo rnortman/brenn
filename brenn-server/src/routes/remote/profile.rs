@@ -22,7 +22,9 @@ use brenn_envelope::ChannelScheme;
 use brenn_lib::access::{AppCapability, AppPolicy};
 use brenn_lib::messaging::config::{Depth, NoiseLevel};
 use brenn_lib::messaging::remote::{RemoteDepths, RemoteSubscribeAcl, ResolvedRemote};
-use brenn_lib::messaging::{ParticipantId, SubscriberEntry, SubscriberEntryKind};
+use brenn_lib::messaging::{
+    AttachScope, MissingChannelPosture, ParticipantId, SubscriberEntry, SubscriberEntryKind,
+};
 
 use crate::routes::attach::profile::{
     AttachProfile, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts,
@@ -91,12 +93,6 @@ impl RemoteProfile {
             max_sessions: resolved.max_sessions as usize,
             max_subscriptions: resolved.max_subscriptions as usize,
         }
-    }
-
-    /// The remote's resolved policy, for the route to install as the session's
-    /// delivery floor.
-    pub fn policy(&self) -> &Arc<AppPolicy> {
-        &self.policy
     }
 
     /// The depths this remote's ACLs answer a subscribe of `channel` with, or
@@ -177,8 +173,16 @@ impl AttachProfile for RemoteProfile {
         PublishPosture::Diagnostic
     }
 
-    fn send_budget_scope(&self) -> &str {
-        &self.slug
+    fn attach_scope(&self) -> AttachScope<'_> {
+        AttachScope::remote(&self.slug)
+    }
+
+    fn missing_channel_posture(&self) -> MissingChannelPosture {
+        // The same call `publish_posture` makes, at the grain a whole flush is
+        // decided on: a remote's targets are matcher-granted and provisioned at
+        // runtime, so an entry naming one that deprovisioned mid-flush is an
+        // ordinary race the daemon reconciles from.
+        MissingChannelPosture::Race
     }
 
     fn deferred_view_targets(&self) -> &[DeferredTarget] {

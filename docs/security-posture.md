@@ -69,6 +69,7 @@ and the reason.
 | **WASM guest — in-tree** | Sandboxed-trusted. | First-party code, but deliberately sandboxed to contain its *own* bugs. The sandbox is a blast-radius limiter, not a statement that the code is hostile. |
 | **WASM guest — out-of-tree** | **Untrusted. Adversarial.** | Third-party extension code is a first-class extension surface and must be assumed hostile. The sandbox is the security boundary. A guarantee that holds only for a well-behaved guest is **not** a security guarantee. |
 | **Unauthenticated network client** | Untrusted. | Anyone who can reach the listener before authenticating: login/registration traffic, URL probing, inbound webhooks. Adversarial by default. |
+| **Authenticated remote attacher (native daemon)** | Authenticated, bounded — mechanically the browser's posture. | A daemon holding a `[[remote]]` bearer token, acting as the single principal `remote:<slug>`. Operator-owned hardware makes it in practice *more* trustworthy than a browser, which is a reason to expect fewer violations, not to skip the checks: it is held to deny-by-default grants, per-scheme ACLs, budgets, and violation-as-signal exactly as a browser is. An eventual peer server will be too. |
 
 **The key trust asymmetry to internalize:** "we launched it" (CC) and "it's our
 code" (in-tree WASM) do **not** confer trust in the *content* that crosses the
@@ -106,6 +107,7 @@ stable as long as the architecture is.
                        [ Operator config ]  (trust anchor)
                                 |
    Unauth network --(B0)--> [   Backend (TCB)   ] <--(B1)-- Authenticated browser
+                                                   <--(B7)-- Remote attacher (daemon)
                             /   |     ^   \
                       (B2) /(B6)|     |(B3) \(B4)
                           v     v     |      v
@@ -128,6 +130,7 @@ backend is the invoker.)
 | **B4** | Backend ↔ WASM guest | guest untrusted (especially out-of-tree) |
 | **B5** | Inbound webhook → backend → WASM | external party untrusted |
 | **B6** | Backend → hosted-app subprocess | risk is injection through the argument/input vector |
+| **B7** | Authenticated remote attacher (native daemon) → backend | daemon-supplied data untrusted; identity is bounded to the `[[remote]]` principal and its ACLs |
 
 ---
 
@@ -693,6 +696,107 @@ exhaustion via unbounded subprocess output; log corruption via subprocess output
 privileged invocation parameters come only from operator config; option/path
 injection is contained by someone and that someone is identified; subprocess
 output is bounded and log-sanitized.
+
+---
+
+## 9a. Boundary B7 — Authenticated Remote Attacher → Backend
+
+**Who:** a native daemon holding a `[[remote]]` bearer token, attached at
+`/remote/{slug}/ws` and acting as the single principal `remote:<slug>`. The pod
+bridge is the first one. It reaches the backend over the same attachment
+transport the browser surface uses; everything below the route — the wire
+contract, the session, the subscription and publish planes, the retention
+machinery — is shared code, so this boundary is about the four things that are
+*not*: authentication, authority lowering, session-cap posture, and deployment
+coupling.
+
+**Trust decision: mechanically identical to B1.** A hardened LAN daemon on
+operator-controlled hardware is in practice *more* trustworthy than a browser —
+no extensions, no tabs, no user pasting things into a console. That is a reason
+to expect fewer violations from it, not a reason to check for fewer. Deny-by-
+default grants, per-scheme ACLs, budgets, and protocol violations as
+fail2ban-grade signal all apply unchanged, and will apply to an eventual peer
+server too.
+
+**Threats:** token theft or brute force; slug enumeration through differential
+responses; reaching channels outside the operator's ACLs; unbounded
+subscription or publish state from a principal whose grants are *prefixes*
+rather than an enumerated set; log or security-event forgery through the
+client-controlled path segment; resource exhaustion through concurrent sessions.
+
+**Policies the backend must uphold:**
+
+- **The credential is a file-backed bearer token, compared in constant time.**
+  Each `[[remote]]` names a `token_file` loaded at boot through the
+  mode-checked reader: missing, unreadable, empty, or group/world-accessible is
+  a boot refusal, not a warning. Comparison is the crate's single constant-time
+  helper, on every path.
+- **Every authentication failure is one answer and one signal.** Unknown slug,
+  missing header, malformed header, and wrong token all answer a byte-identical
+  `401` and emit one `AuthFailure` carrying the client IP. The comparison runs
+  even for an unknown slug, against a dummy credential, so every refusal walks
+  the same code and no path skips the work — what that does and does not buy
+  against timing is the accepted risk below. Unlike the cookie middleware — which ignores a
+  *missing* cookie because browsers wander — a missing header here is logged: no
+  legitimate anonymous traffic reaches `/remote/`. No redirect; daemons do not
+  log in.
+- **Authority is the operator's ACLs, re-derived per frame.** The profile
+  answers every subscribe and publish from the resolved `[[remote]]` matchers,
+  exhaustively by channel scheme, so a scheme with no remote vocabulary —
+  `local:` most pointedly — is refused rather than defaulted. A remote publishes
+  as itself only: a named attribution is a protocol violation.
+- **Prefix grants are bounded by an explicit cap.** Because a remote's channels
+  are minted at runtime, "how many subscriptions may one session hold" cannot be
+  read off a config enumeration the way a surface's can; `max_subscriptions`
+  answers it, and exceeding it is a violation.
+- **No existence oracle outside the ACLs.** Within a granted matcher, a channel
+  that does not exist answers `Unavailable` — the operator wrote the prefix, so
+  disclosure inside it is authorized by construction. Outside it, "not yours"
+  and "no such channel" are the same violation.
+- **The client-controlled slug is sanitized before it reaches a record.** The
+  path segment is attacker-chosen and lands in a security event; it goes through
+  the same sanitizer every other client-derived log field does, so a probe
+  cannot split or forge an event.
+- **Session count is capped and answered without signal.** At `max_sessions`
+  the route answers `503` with a warning and no security event: a remote at its
+  cap is an operator's topology or a netsplit corpse awaiting the heartbeat
+  watchdog, and banning the pod's IP for either turns a transient into an outage.
+
+**Accepted risks:**
+
+- **Token length is not secret, so timing can distinguish a configured slug
+  from an unconfigured one.** The comparison is constant-time in byte
+  *position* — no byte of a token leaks — but it rejects a length mismatch
+  before reading contents, and the dummy the unknown-slug path compares against
+  is a fixed length the operator's token need not share. A prober measuring the
+  `401` therefore sees a length-class difference between "this slug is
+  configured" and "it is not". The residual is small and the disclosure is
+  cheap: the delta is a memcmp-length return buried under TLS termination, the
+  reverse proxy, and scheduler jitter, and a slug is a name, not a credential —
+  learning it grants nothing without the token. Closing it would mean fixing
+  every token to one length or comparing digests, neither of which buys more
+  than the map lookup ahead of the comparison already gives away.
+- **The token sits at rest on both hosts.** Mitigated by mode-checked `0600`
+  files on each side and by the transport refusing to carry a credential over
+  cleartext to a non-loopback host. Rotation is manual and coordinated: one
+  operator, two files.
+- **Token compromise equals full impersonation of that remote**, bounded by that
+  remote's grants. There is no per-user grain inside a remote — one daemon, one
+  principal — so the blast radius is exactly the ACLs the operator wrote.
+- **mTLS is not used.** The reverse proxy terminates TLS, so client-certificate
+  identity would arrive as trusted headers: more moving parts, no gain against
+  this threat model.
+- **The B1 accepted risks are inherited verbatim** by a second attacher on the
+  same transport: the durable resume seq is the global message rowid (§6.1), the
+  subscribe-op bucket is per-connection (§6.2), and durable publish writes are
+  gated only by that per-connection bucket (§6.3).
+
+**What the reviewer verifies:** the token is file-backed, mode-checked, and
+compared in constant time; every authentication failure is indistinguishable to
+the caller and produces exactly one `AuthFailure`; the profile's scheme match is
+exhaustive and denies by default; the subscription cap is enforced; the slug is
+sanitized wherever it reaches a log or event; the cap rejection emits no security
+event.
 
 ---
 

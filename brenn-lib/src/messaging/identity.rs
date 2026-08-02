@@ -102,6 +102,147 @@ pub enum SubscriberKind {
     System(String),
 }
 
+/// Which application route an attachment speaks for.
+///
+/// The attachment stack is one transport with two doors, and everything below
+/// the session is shared. What is *not* shared is the identity a publish is
+/// stamped with, the registration its authority resolves through, and whether a
+/// sub-identity grain exists at all. This is the discriminant those three
+/// questions are answered from, so no publish path re-derives them from a
+/// prefix literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AttachKind {
+    /// A browser surface: two identity grains, boot-declared channels.
+    Surface,
+    /// An authenticated remote attacher (native daemon): one grain, channels
+    /// granted by matcher and minted at runtime.
+    Remote,
+}
+
+impl AttachKind {
+    /// The route's name, for log fields and panic messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Surface => "surface",
+            Self::Remote => "remote",
+        }
+    }
+
+    /// Whether this route's attachers act under sub-identities at all.
+    ///
+    /// A surface's principal is the component instance; a remote is one daemon
+    /// and one principal. Callers that would otherwise walk the substrate
+    /// looking for sub-identity senders ask here first, because for a kind that
+    /// mints none the answer is empty before the first read.
+    pub fn mints_sub_identities(self) -> bool {
+        match self {
+            Self::Surface => true,
+            Self::Remote => false,
+        }
+    }
+}
+
+/// One attacher, at the grain every publish-side gate is keyed on: which route
+/// it came through and which of that route's blocks it is.
+///
+/// A pair rather than two parameters because both halves are needed together at
+/// every call — the principal, the registration key, and the budget bucket are
+/// all functions of the pair, and a slug carried without its kind is a slug that
+/// can be read against the wrong keyspace (surface and remote slugs may
+/// legitimately collide; only the kind separates them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachScope<'a> {
+    pub kind: AttachKind,
+    pub slug: &'a str,
+}
+
+impl<'a> AttachScope<'a> {
+    /// A surface's scope.
+    pub fn surface(slug: &'a str) -> Self {
+        Self {
+            kind: AttachKind::Surface,
+            slug,
+        }
+    }
+
+    /// A remote's scope.
+    pub fn remote(slug: &'a str) -> Self {
+        Self {
+            kind: AttachKind::Remote,
+            slug,
+        }
+    }
+
+    /// The principal a publish under this scope is stamped with: the
+    /// sub-identity's when the caller names one, the attacher's own bare
+    /// identity otherwise.
+    ///
+    /// The one key every publish-side gate shares — budget bucket, stored
+    /// sender, parked-set ownership — so a flush and a report by the same
+    /// principal are the same principal everywhere.
+    ///
+    /// # Panics
+    ///
+    /// On an attribution under a kind that declares no sub-identity grain. A
+    /// remote is one principal by construction, so a named attribution here is
+    /// a caller that skipped its profile's `admit_attribution` — the one place
+    /// an attribution is ever admitted.
+    pub fn principal(&self, attribution: Option<&str>) -> ParticipantId {
+        match (self.kind, attribution) {
+            (AttachKind::Surface, Some(instance)) => {
+                ParticipantId::for_surface_component(self.slug, instance)
+            }
+            (AttachKind::Surface, None) => ParticipantId::for_surface(self.slug),
+            (AttachKind::Remote, None) => ParticipantId::for_remote(self.slug),
+            (AttachKind::Remote, Some(attribution)) => panic!(
+                "AttachScope::principal: remote {:?} named attribution {attribution:?} — a remote \
+                 declares no sub-identities, so this is an unadmitted attribution reaching the \
+                 publish path",
+                self.slug
+            ),
+        }
+    }
+
+    /// The key this attacher's live sessions are registered under in the shared
+    /// attach registry.
+    ///
+    /// One map, keyed by a bare string, serves both routes, so the two keyspaces
+    /// are kept disjoint here: a surface keys by its bare slug and a remote by
+    /// `remote:<slug>`. Neither slug charset admits a `:`, so no remote key can
+    /// spell a surface slug or the reverse — the participant-id guards, applied
+    /// to the one shared map.
+    ///
+    /// Borrowed for a surface and owned for a remote: this runs per message per
+    /// target on the live fan-out and on the no-listener precheck, so the common
+    /// key costs no allocation. The route that registers a session and the
+    /// delivery path that looks one up both spell the key through here, which is
+    /// what makes a registration findable at all.
+    pub fn registry_key(self) -> std::borrow::Cow<'a, str> {
+        match self.kind {
+            AttachKind::Surface => std::borrow::Cow::Borrowed(self.slug),
+            AttachKind::Remote => {
+                std::borrow::Cow::Owned(format!("{}{}", ParticipantId::REMOTE_PREFIX, self.slug))
+            }
+        }
+    }
+
+    /// The sub-identity `sender` names under this scope, or `None` when it names
+    /// some other principal entirely.
+    ///
+    /// Non-panicking, and takes a stored sender string rather than a
+    /// `ParticipantId`: the caller is walking senders read back off messages,
+    /// where any kind can appear. A `Remote` scope always answers `None` — the
+    /// kind mints no sub-identities, so no stored sender can be one.
+    pub fn sub_identity_of<'s>(&self, sender: &'s str) -> Option<&'s str> {
+        if !self.kind.mints_sub_identities() {
+            return None;
+        }
+        ParticipantId::surface_component_of(sender)
+            .filter(|(slug, _)| *slug == self.slug)
+            .map(|(_, instance)| instance)
+    }
+}
+
 impl ParticipantId {
     /// The scheme a remote attacher's identity carries. Public because the
     /// attach registry keys a remote's sessions by the same spelling, and one

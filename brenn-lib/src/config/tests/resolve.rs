@@ -1147,15 +1147,15 @@ fn validate_resolves_explicit_grants_and_acl_into_policy() {
     assert!(!policy.has_grant(AppCapability::EphemeralPublish));
     assert!(!policy.has_grant(AppCapability::EphemeralSubscribe));
 
+    // One matcher per durable leaf, not one app-wide prefix: the app's roster
+    // channel sits in the leaf position and belongs to a system writer.
     let harness = &apps["home"].chat_harness_policy;
-    assert_eq!(
-        harness.acls.brenn_publish,
-        vec![ChannelMatcher::Prefix("chat.app.home.".to_string())]
-    );
-    assert_eq!(
-        harness.acls.brenn_subscribe,
-        vec![ChannelMatcher::Prefix("chat.app.home.".to_string())]
-    );
+    let durable_leaves: Vec<ChannelMatcher> = ["in", "out", "approvals"]
+        .into_iter()
+        .map(|leaf| ChannelMatcher::Prefix(format!("chat.app.home.{leaf}.")))
+        .collect();
+    assert_eq!(harness.acls.brenn_publish, durable_leaves);
+    assert_eq!(harness.acls.brenn_subscribe, durable_leaves);
     assert!(harness.has_grant(AppCapability::MessagingPublish));
     assert!(harness.acls.mqtt_publish.is_empty());
 }
@@ -1195,7 +1195,7 @@ fn validate_app_without_grants_resolves_default_deny_policy() {
 #[test]
 fn validate_derives_chat_tree_authority_for_every_app() {
     use crate::access::AppCapability;
-    use crate::config::{ChatLeaf, chat_bare_name};
+    use brenn_envelope::chat::{ChatLeaf, chat_bare_name};
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {
@@ -1300,7 +1300,7 @@ fn validate_app_without_authored_grants_gets_no_bus_send_tool() {
 fn validate_dynamic_subscribe_does_not_reach_the_chat_tree() {
     use crate::access::AppCapability;
     use crate::access::raw::{AppAclRaw, ChannelMatcherRaw};
-    use crate::config::{ChatLeaf, chat_bare_name};
+    use brenn_envelope::chat::{ChatLeaf, chat_bare_name};
 
     let dir = tempfile::tempdir().unwrap();
     let config = BrennConfig {

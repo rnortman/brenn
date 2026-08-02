@@ -176,12 +176,16 @@ pub struct AppState {
     /// Boot-resolved surfaces, keyed by slug. Empty when no `[[surface]]`
     /// blocks are configured.
     pub surfaces: Arc<HashMap<String, Arc<crate::routes::surface::SurfaceRuntime>>>,
+    /// Boot-resolved remotes, keyed by slug. Empty when no `[[remote]]` blocks
+    /// are configured.
+    pub remotes: Arc<HashMap<String, Arc<crate::routes::remote::RemoteRuntime>>>,
     /// Attached attachment sessions (attacher → handles). A durable push router
     /// reads this to route wakes to live connections.
     pub attach_registry: crate::routes::attach::registry::AttachRegistry,
-    /// Idle-heartbeat interval advertised in `Welcome`. `HEARTBEAT_SECS` in
-    /// production; test states set 1 for fast integration tests.
-    pub surface_heartbeat_secs: u32,
+    /// Idle-heartbeat interval advertised in `Welcome`, shared by both attach
+    /// routes. `HEARTBEAT_SECS` in production; test states set 1 for fast
+    /// integration tests.
+    pub attach_heartbeat_secs: u32,
     /// Test-only: bridge to return from `wake_conversation`. Consumed on first call.
     #[cfg(test)]
     pub test_wake_bridge: Arc<Mutex<Option<Arc<ActiveBridge>>>>,
@@ -762,8 +766,9 @@ impl AppState {
             automation_engine: None,
             usage_session_gap_secs: 1800,
             surfaces: Arc::new(HashMap::new()),
+            remotes: Arc::new(HashMap::new()),
             attach_registry: Default::default(),
-            surface_heartbeat_secs: 1,
+            attach_heartbeat_secs: 1,
             replay_components: Arc::new(HashMap::new()),
             replay_locks: Arc::new(HashMap::new()),
             test_wake_bridge: Default::default(),

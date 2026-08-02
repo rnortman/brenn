@@ -1,4 +1,4 @@
-//! `Messenger::publish_from_surface` gate + happy-path tests.
+//! `Messenger::publish_from_attacher` gate + happy-path tests.
 //!
 //! The surface durable-publish entry runs the identical `publish_core` gate
 //! sequence as `publish`, differing only in the layer-1 authority source
@@ -17,8 +17,8 @@ use crate::access::acl::ChannelMatcher;
 use crate::access::{AppCapability, AppPolicy};
 use crate::db::init_db_memory;
 use crate::messaging::config::{
-    Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel, Sink, SurfacePrincipalBudgets,
-    SurfaceSendBudget,
+    AttachPrincipalBudgets, AttachSendBudget, Depth, MessagingGlobalConfig, NoiseLevel,
+    ResolvedChannel, Sink,
 };
 use crate::messaging::db::upsert_channels;
 use crate::messaging::store::RingStores;
@@ -34,12 +34,12 @@ use uuid::Uuid;
 /// One surface's principal set at the default budget: the kernel grain plus
 /// `instances`, the shape `ResolvedSurface::principal_send_budgets` produces for
 /// a surface whose components declare no override.
-fn default_principals(instances: &[&str]) -> SurfacePrincipalBudgets {
-    std::iter::once((None, SurfaceSendBudget::default()))
+fn default_principals(instances: &[&str]) -> AttachPrincipalBudgets {
+    std::iter::once((None, AttachSendBudget::default()))
         .chain(
             instances
                 .iter()
-                .map(|i| (Some(i.to_string()), SurfaceSendBudget::default())),
+                .map(|i| (Some(i.to_string()), AttachSendBudget::default())),
         )
         .collect()
 }
@@ -121,7 +121,7 @@ async fn assemble_surface_messenger(
     wasm_policies: std::collections::HashMap<String, AppPolicy>,
     surface_policies: std::collections::HashMap<String, AppPolicy>,
     max_body_bytes: usize,
-    principals: &[(Option<String>, SurfaceSendBudget)],
+    principals: &[(Option<String>, AttachSendBudget)],
 ) -> (Arc<Messenger>, String) {
     let (messenger, addr, _router) = assemble_surface_messenger_router(
         entry,
@@ -142,7 +142,7 @@ async fn assemble_surface_messenger_router(
     wasm_policies: std::collections::HashMap<String, AppPolicy>,
     surface_policies: std::collections::HashMap<String, AppPolicy>,
     max_body_bytes: usize,
-    principals: &[(Option<String>, SurfaceSendBudget)],
+    principals: &[(Option<String>, AttachSendBudget)],
 ) -> (Arc<Messenger>, String, Arc<CountingRouter>) {
     let db = init_db_memory();
     let channel_addr = entry.address.clone();
@@ -163,7 +163,7 @@ async fn assemble_surface_messenger_router(
         let conn = db.lock().await;
         upsert_channels(&conn, std::slice::from_ref(&entry));
     }
-    let budget_principals: Vec<(String, SurfacePrincipalBudgets)> = surface_policies
+    let budget_principals: Vec<(String, AttachPrincipalBudgets)> = surface_policies
         .keys()
         .cloned()
         .map(|slug| (slug, principals.to_vec()))
@@ -191,7 +191,9 @@ async fn assemble_surface_messenger_router(
         .with_subscriber_registrations(crate::messaging::testutils::surface_registrations(
             surface_policies,
         ))
-        .with_surface_send_budgets(budget_principals);
+        .with_attach_send_budgets(budget_principals.into_iter().flat_map(|(slug, ps)| {
+            crate::messaging::attach_principal_budgets(AttachScope::surface(&slug), ps)
+        }));
     // A subscriber holds a position or it is owed nothing: each WASM receiver
     // attaches exactly as boot does.
     for slug in &wasm_subscribers {
@@ -251,7 +253,13 @@ async fn publish_from_surface_ok_stamps_surface_sender_no_budget() {
     .await;
 
     let result = m
-        .publish_from_surface("durabar", None, &addr, "hello", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            None,
+            &addr,
+            "hello",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(
@@ -301,7 +309,13 @@ async fn publish_from_surface_missing_grant_is_missing_sender() {
     let (m, addr) = build_surface_publish_messenger("durabar", policy, 65_536).await;
 
     let result = m
-        .publish_from_surface("durabar", None, &addr, "hello", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            None,
+            &addr,
+            "hello",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(result, PublishResult::MissingSender),
@@ -321,7 +335,13 @@ async fn publish_from_surface_unknown_slug_is_missing_sender() {
     .await;
 
     let result = m
-        .publish_from_surface("ghost", None, &addr, "hello", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("ghost"),
+            None,
+            &addr,
+            "hello",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(result, PublishResult::MissingSender),
@@ -341,7 +361,13 @@ async fn publish_from_surface_out_of_acl_is_acl_denied() {
     .await;
 
     let result = m
-        .publish_from_surface("durabar", None, &addr, "hello", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            None,
+            &addr,
+            "hello",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(result, PublishResult::AclDenied(_)),
@@ -362,7 +388,13 @@ async fn publish_from_surface_body_too_large() {
     .await;
 
     let result = m
-        .publish_from_surface("durabar", None, &addr, "abcde", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            None,
+            &addr,
+            "abcde",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(result, PublishResult::BodyTooLarge { len: 5, max: 4 }),
@@ -393,7 +425,7 @@ async fn build_multi_surface_publish_messenger_with_instances(
 /// rather than which principals exist.
 async fn build_multi_surface_publish_messenger_with_principals(
     slugs: &[&str],
-    principals: &[(Option<String>, SurfaceSendBudget)],
+    principals: &[(Option<String>, AttachSendBudget)],
 ) -> (Arc<Messenger>, String) {
     let mut surface_policies = std::collections::HashMap::new();
     for slug in slugs {
@@ -420,7 +452,13 @@ async fn surface_send_budget_admits_burst_then_exhausts() {
     let (m, addr) = build_multi_surface_publish_messenger(&["durabar"]).await;
     for i in 0..SURFACE_SEND_BURST {
         let r = m
-            .publish_from_surface("durabar", None, &addr, "x", Urgency::Normal)
+            .publish_from_attacher(
+                AttachScope::surface("durabar"),
+                None,
+                &addr,
+                "x",
+                Urgency::Normal,
+            )
             .await;
         assert!(
             matches!(r, PublishResult::Ok { .. }),
@@ -428,7 +466,13 @@ async fn surface_send_budget_admits_burst_then_exhausts() {
         );
     }
     let r = m
-        .publish_from_surface("durabar", None, &addr, "x", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            None,
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(r, PublishResult::BudgetExhausted),
@@ -451,22 +495,28 @@ async fn a_declared_send_burst_override_meters_only_its_own_instance() {
     let (m, addr) = build_multi_surface_publish_messenger_with_principals(
         &["durabar"],
         &[
-            (None, SurfaceSendBudget::default()),
+            (None, AttachSendBudget::default()),
             (
                 Some("clock".to_string()),
-                SurfaceSendBudget {
+                AttachSendBudget {
                     burst: 2,
-                    ..SurfaceSendBudget::default()
+                    ..AttachSendBudget::default()
                 },
             ),
-            (Some("todos".to_string()), SurfaceSendBudget::default()),
+            (Some("todos".to_string()), AttachSendBudget::default()),
         ],
     )
     .await;
 
     for i in 0..2 {
         let r = m
-            .publish_from_surface("durabar", Some("clock"), &addr, "x", Urgency::Normal)
+            .publish_from_attacher(
+                AttachScope::surface("durabar"),
+                Some("clock"),
+                &addr,
+                "x",
+                Urgency::Normal,
+            )
             .await;
         assert!(
             matches!(r, PublishResult::Ok { .. }),
@@ -474,7 +524,13 @@ async fn a_declared_send_burst_override_meters_only_its_own_instance() {
         );
     }
     let r = m
-        .publish_from_surface("durabar", Some("clock"), &addr, "x", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            Some("clock"),
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(r, PublishResult::BudgetExhausted),
@@ -486,7 +542,13 @@ async fn a_declared_send_burst_override_meters_only_its_own_instance() {
     for who in [Some("todos"), None] {
         for i in 0..SURFACE_SEND_BURST {
             let r = m
-                .publish_from_surface("durabar", who, &addr, "x", Urgency::Normal)
+                .publish_from_attacher(
+                    AttachScope::surface("durabar"),
+                    who,
+                    &addr,
+                    "x",
+                    Urgency::Normal,
+                )
                 .await;
             assert!(
                 matches!(r, PublishResult::Ok { .. }),
@@ -518,10 +580,10 @@ async fn a_declared_send_refill_override_reaches_the_bucket() {
     let (m, addr) = build_multi_surface_publish_messenger_with_principals(
         &["durabar"],
         &[
-            (None, SurfaceSendBudget::default()),
+            (None, AttachSendBudget::default()),
             (
                 Some("clock".to_string()),
-                SurfaceSendBudget {
+                AttachSendBudget {
                     burst: 1,
                     refill: Duration::from_secs(1),
                 },
@@ -530,7 +592,15 @@ async fn a_declared_send_refill_override_reaches_the_bucket() {
     )
     .await;
 
-    let publish = || m.publish_from_surface("durabar", Some("clock"), &addr, "x", Urgency::Normal);
+    let publish = || {
+        m.publish_from_attacher(
+            AttachScope::surface("durabar"),
+            Some("clock"),
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
+    };
 
     assert!(
         matches!(publish().await, PublishResult::Ok { .. }),
@@ -563,13 +633,25 @@ async fn platform_publish_is_send_budget_exempt() {
     // Drain the budget with ordinary surface publishes.
     for _ in 0..SURFACE_SEND_BURST {
         let _ = m
-            .publish_from_surface("durabar", None, &addr, "x", Urgency::Normal)
+            .publish_from_attacher(
+                AttachScope::surface("durabar"),
+                None,
+                &addr,
+                "x",
+                Urgency::Normal,
+            )
             .await;
     }
     assert!(
         matches!(
-            m.publish_from_surface("durabar", None, &addr, "x", Urgency::Normal)
-                .await,
+            m.publish_from_attacher(
+                AttachScope::surface("durabar"),
+                None,
+                &addr,
+                "x",
+                Urgency::Normal
+            )
+            .await,
             PublishResult::BudgetExhausted
         ),
         "budget must be drained"
@@ -604,13 +686,25 @@ async fn surface_send_budget_survives_reconnect() {
     let (m, addr) = build_multi_surface_publish_messenger(&["durabar"]).await;
     for _ in 0..SURFACE_SEND_BURST {
         let _ = m
-            .publish_from_surface("durabar", None, &addr, "x", Urgency::Normal)
+            .publish_from_attacher(
+                AttachScope::surface("durabar"),
+                None,
+                &addr,
+                "x",
+                Urgency::Normal,
+            )
             .await;
     }
     // A later publish (a reconnected session would land here) is still denied —
     // the drained budget was not reset by anything connection-scoped.
     let r = m
-        .publish_from_surface("durabar", None, &addr, "x", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            None,
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(r, PublishResult::BudgetExhausted),
@@ -626,17 +720,35 @@ async fn surface_send_budgets_are_per_slug_independent() {
     // Drain durabar's budget completely (burst + one denied).
     for _ in 0..SURFACE_SEND_BURST {
         let _ = m
-            .publish_from_surface("durabar", None, &addr, "x", Urgency::Normal)
+            .publish_from_attacher(
+                AttachScope::surface("durabar"),
+                None,
+                &addr,
+                "x",
+                Urgency::Normal,
+            )
             .await;
     }
     assert!(matches!(
-        m.publish_from_surface("durabar", None, &addr, "x", Urgency::Normal)
-            .await,
+        m.publish_from_attacher(
+            AttachScope::surface("durabar"),
+            None,
+            &addr,
+            "x",
+            Urgency::Normal
+        )
+        .await,
         PublishResult::BudgetExhausted
     ));
     // kitchen's budget is untouched.
     let r = m
-        .publish_from_surface("kitchen", None, &addr, "x", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("kitchen"),
+            None,
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(r, PublishResult::Ok { .. }),
@@ -657,7 +769,13 @@ async fn component_publish_stamps_sub_identity_sender() {
     .await;
 
     let result = m
-        .publish_from_surface("durabar", Some("clock"), &addr, "hello", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            Some("clock"),
+            &addr,
+            "hello",
+            Urgency::Normal,
+        )
         .await;
     assert!(matches!(result, PublishResult::Ok { .. }), "got {result:?}");
 
@@ -681,13 +799,25 @@ async fn component_budgets_are_blast_radius_scoped() {
     // Drain the `clock` component's bucket completely.
     for _ in 0..SURFACE_SEND_BURST {
         let _ = m
-            .publish_from_surface("durabar", Some("clock"), &addr, "x", Urgency::Normal)
+            .publish_from_attacher(
+                AttachScope::surface("durabar"),
+                Some("clock"),
+                &addr,
+                "x",
+                Urgency::Normal,
+            )
             .await;
     }
     assert!(
         matches!(
-            m.publish_from_surface("durabar", Some("clock"), &addr, "x", Urgency::Normal)
-                .await,
+            m.publish_from_attacher(
+                AttachScope::surface("durabar"),
+                Some("clock"),
+                &addr,
+                "x",
+                Urgency::Normal
+            )
+            .await,
             PublishResult::BudgetExhausted
         ),
         "clock's own budget must be drained"
@@ -695,7 +825,13 @@ async fn component_budgets_are_blast_radius_scoped() {
 
     // The sibling kind is untouched.
     let sibling = m
-        .publish_from_surface("durabar", Some("todos"), &addr, "x", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            Some("todos"),
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(sibling, PublishResult::Ok { .. }),
@@ -705,7 +841,13 @@ async fn component_budgets_are_blast_radius_scoped() {
     // And so is the surface's own kernel identity — the grain that carries the
     // kernel's error reports, which a runaway component must never silence.
     let kernel = m
-        .publish_from_surface("durabar", None, &addr, "x", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            None,
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(kernel, PublishResult::Ok { .. }),
@@ -722,7 +864,7 @@ async fn component_budgets_are_blast_radius_scoped() {
 /// Driven straight at the installer: the fixture builders take an instance list
 /// verbatim, so this is the one shape a caller can hand it that boot cannot.
 #[tokio::test]
-#[should_panic(expected = "duplicate budget for surface \"durabar\" principal Some(\"clock\")")]
+#[should_panic(expected = "duplicate budget for attach principal surface:durabar#clock")]
 async fn a_repeated_instance_panics() {
     let _ = build_multi_surface_publish_messenger_with_instances(&["durabar"], &["clock", "clock"])
         .await;
@@ -735,7 +877,7 @@ async fn a_repeated_instance_panics() {
 /// their policy map is keyed by slug, so it folds a repeated slug away before
 /// the installer could ever see one.
 #[tokio::test]
-#[should_panic(expected = "duplicate budget for surface")]
+#[should_panic(expected = "duplicate budget for attach principal surface:durabar")]
 async fn a_repeated_slug_panics() {
     let messenger = Messenger::new(
         init_db_memory(),
@@ -745,10 +887,17 @@ async fn a_repeated_slug_panics() {
         Arc::new(CountingRouter::default()) as Arc<dyn WakeRouter>,
         MessagingGlobalConfig::default(),
     );
-    let _ = messenger.with_surface_send_budgets([
-        ("durabar".to_string(), default_principals(&["clock"])),
-        ("durabar".to_string(), default_principals(&["clock"])),
-    ]);
+    let _ = messenger.with_attach_send_budgets(
+        crate::messaging::attach_principal_budgets(
+            AttachScope::surface("durabar"),
+            default_principals(&["clock"]),
+        )
+        .into_iter()
+        .chain(crate::messaging::attach_principal_budgets(
+            AttachScope::surface("durabar"),
+            default_principals(&["clock"]),
+        )),
+    );
 }
 
 /// The same instance name on two different surfaces is two principals: blast
@@ -758,16 +907,34 @@ async fn same_instance_name_on_two_surfaces_are_distinct_principals() {
     let (m, addr) = build_multi_surface_publish_messenger(&["durabar", "kitchen"]).await;
     for _ in 0..SURFACE_SEND_BURST {
         let _ = m
-            .publish_from_surface("durabar", Some("clock"), &addr, "x", Urgency::Normal)
+            .publish_from_attacher(
+                AttachScope::surface("durabar"),
+                Some("clock"),
+                &addr,
+                "x",
+                Urgency::Normal,
+            )
             .await;
     }
     assert!(matches!(
-        m.publish_from_surface("durabar", Some("clock"), &addr, "x", Urgency::Normal)
-            .await,
+        m.publish_from_attacher(
+            AttachScope::surface("durabar"),
+            Some("clock"),
+            &addr,
+            "x",
+            Urgency::Normal
+        )
+        .await,
         PublishResult::BudgetExhausted
     ));
     let r = m
-        .publish_from_surface("kitchen", Some("clock"), &addr, "x", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("kitchen"),
+            Some("clock"),
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(r, PublishResult::Ok { .. }),
@@ -793,19 +960,37 @@ async fn sibling_instances_of_one_kind_get_independent_buckets() {
     .await;
     for _ in 0..SURFACE_SEND_BURST {
         let _ = m
-            .publish_from_surface("durabar", Some("agenda-alice"), &addr, "x", Urgency::Normal)
+            .publish_from_attacher(
+                AttachScope::surface("durabar"),
+                Some("agenda-alice"),
+                &addr,
+                "x",
+                Urgency::Normal,
+            )
             .await;
     }
     assert!(
         matches!(
-            m.publish_from_surface("durabar", Some("agenda-alice"), &addr, "x", Urgency::Normal)
-                .await,
+            m.publish_from_attacher(
+                AttachScope::surface("durabar"),
+                Some("agenda-alice"),
+                &addr,
+                "x",
+                Urgency::Normal
+            )
+            .await,
             PublishResult::BudgetExhausted
         ),
         "the drained instance must be exhausted"
     );
     let sibling = m
-        .publish_from_surface("durabar", Some("agenda-bob"), &addr, "x", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            Some("agenda-bob"),
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(sibling, PublishResult::Ok { .. }),
@@ -822,8 +1007,8 @@ async fn sibling_instances_of_one_kind_get_independent_buckets() {
 async fn unbudgeted_component_instance_panics() {
     let (m, addr) = build_multi_surface_publish_messenger(&["durabar"]).await;
     let _ = m
-        .publish_from_surface(
-            "durabar",
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
             Some("never-declared"),
             &addr,
             "x",
@@ -848,12 +1033,18 @@ async fn surface_send_budget_missing_panics() {
         p
     }));
     let _ = m
-        .publish_from_surface("ghost", None, &addr, "x", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("ghost"),
+            None,
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
         .await;
 }
 
 // ---------------------------------------------------------------------------
-// `publish_batch_from_surface` — one activation's flush
+// `publish_batch_from_attacher` — one activation's flush
 // ---------------------------------------------------------------------------
 
 /// Batch entries onto the fixture channel, one per body, each at `urgency`,
@@ -863,11 +1054,11 @@ fn batch<'a>(
     addr: &'a str,
     bodies: &'a [&'a str],
     urgency: Urgency,
-) -> Vec<SurfaceBatchPublish<'a>> {
+) -> Vec<AttachBatchPublish<'a>> {
     bodies
         .iter()
         .enumerate()
-        .map(|(i, body)| SurfaceBatchPublish {
+        .map(|(i, body)| AttachBatchPublish {
             channel_address: addr,
             body,
             urgency,
@@ -889,8 +1080,8 @@ fn deferred<'a>(
     body: &'a str,
     i: usize,
     release_at: DateTime<Utc>,
-) -> SurfaceBatchPublish<'a> {
-    SurfaceBatchPublish {
+) -> AttachBatchPublish<'a> {
+    AttachBatchPublish {
         channel_address: addr,
         body,
         urgency: Urgency::Normal,
@@ -954,11 +1145,11 @@ async fn a_deferred_batch_entry_parks_and_the_rest_of_the_batch_commits() {
     let later = Utc::now() + Duration::from_secs(600);
 
     let dropped = m
-        .publish_batch_from_surface(
-            "durabar",
+        .publish_batch_from_attacher(
+            AttachScope::surface("durabar"),
             Some("clock"),
             &[
-                SurfaceBatchPublish {
+                AttachBatchPublish {
                     channel_address: &addr,
                     body: "now",
                     urgency: Urgency::Normal,
@@ -967,6 +1158,7 @@ async fn a_deferred_batch_entry_parks_and_the_rest_of_the_batch_commits() {
                 },
                 deferred(&addr, "later", 1, later),
             ],
+            MissingChannelPosture::Invariant,
         )
         .await;
 
@@ -989,10 +1181,11 @@ async fn a_parked_batch_entry_enters_retention_when_it_comes_due() {
     let now = Utc::now();
     let later = now + Duration::from_secs(600);
 
-    m.publish_batch_from_surface(
-        "durabar",
+    m.publish_batch_from_attacher(
+        AttachScope::surface("durabar"),
         Some("clock"),
         &[deferred(&addr, "later", 0, later)],
+        MissingChannelPosture::Invariant,
     )
     .await;
     assert_eq!(
@@ -1122,8 +1315,14 @@ async fn an_ephemeral_publish_feeds_the_surface() {
     let (m, addr, router) = build_ephemeral_surface_feed_messenger().await;
 
     assert!(matches!(
-        m.publish_from_surface("durabar", None, &addr, "hi", Urgency::Normal)
-            .await,
+        m.publish_from_attacher(
+            AttachScope::surface("durabar"),
+            None,
+            &addr,
+            "hi",
+            Urgency::Normal
+        )
+        .await,
         PublishResult::Ok { .. }
     ));
 
@@ -1143,7 +1342,13 @@ async fn a_fed_envelope_carries_the_channels_own_scheme() {
     let (durable, durable_addr, durable_router) = build_surface_feed_messenger().await;
     assert!(matches!(
         durable
-            .publish_from_surface("durabar", None, &durable_addr, "hi", Urgency::Normal)
+            .publish_from_attacher(
+                AttachScope::surface("durabar"),
+                None,
+                &durable_addr,
+                "hi",
+                Urgency::Normal
+            )
             .await,
         PublishResult::Ok { .. }
     ));
@@ -1154,8 +1359,14 @@ async fn a_fed_envelope_carries_the_channels_own_scheme() {
 
     let (eph, eph_addr, eph_router) = build_ephemeral_surface_feed_messenger().await;
     assert!(matches!(
-        eph.publish_from_surface("durabar", None, &eph_addr, "hi", Urgency::Normal)
-            .await,
+        eph.publish_from_attacher(
+            AttachScope::surface("durabar"),
+            None,
+            &eph_addr,
+            "hi",
+            Urgency::Normal
+        )
+        .await,
         PublishResult::Ok { .. }
     ));
     assert_eq!(
@@ -1233,18 +1444,18 @@ async fn a_batch_of_ephemeral_entries_commits_to_the_ring_and_feeds() {
     let later = Utc::now() + Duration::from_secs(600);
 
     let dropped = m
-        .publish_batch_from_surface(
-            "durabar",
+        .publish_batch_from_attacher(
+            AttachScope::surface("durabar"),
             Some("clock"),
             &[
-                SurfaceBatchPublish {
+                AttachBatchPublish {
                     channel_address: &addr,
                     body: "first",
                     urgency: Urgency::Normal,
                     publish_ts_ns: stamp(0),
                     deliver_after: None,
                 },
-                SurfaceBatchPublish {
+                AttachBatchPublish {
                     channel_address: &addr,
                     body: "second",
                     urgency: Urgency::Normal,
@@ -1253,6 +1464,7 @@ async fn a_batch_of_ephemeral_entries_commits_to_the_ring_and_feeds() {
                 },
                 deferred(&addr, "scheduled", 2, later),
             ],
+            MissingChannelPosture::Invariant,
         )
         .await;
 
@@ -1285,11 +1497,11 @@ async fn a_batch_overrunning_the_ring_enacts_its_overflow_events() {
         build_ephemeral_surface_feed_messenger_at(1, Some("ring-watcher")).await;
 
     let dropped = m
-        .publish_batch_from_surface(
-            "durabar",
+        .publish_batch_from_attacher(
+            AttachScope::surface("durabar"),
             Some("clock"),
             &(0..3)
-                .map(|i| SurfaceBatchPublish {
+                .map(|i| AttachBatchPublish {
                     channel_address: &addr,
                     body: "over",
                     urgency: Urgency::Normal,
@@ -1297,6 +1509,7 @@ async fn a_batch_overrunning_the_ring_enacts_its_overflow_events() {
                     deliver_after: None,
                 })
                 .collect::<Vec<_>>(),
+            MissingChannelPosture::Invariant,
         )
         .await;
 
@@ -1333,9 +1546,9 @@ async fn the_rings_deferred_cap_refuses_one_batch_schedule() {
     let later = Utc::now() + Duration::from_secs(600);
 
     // The fixture ring retains 4, so the fifth schedule is refused.
-    let mut batch: Vec<SurfaceBatchPublish<'_>> =
+    let mut batch: Vec<AttachBatchPublish<'_>> =
         (0..5).map(|i| deferred(&addr, "sched", i, later)).collect();
-    batch.push(SurfaceBatchPublish {
+    batch.push(AttachBatchPublish {
         channel_address: &addr,
         body: "immediate",
         urgency: Urgency::Normal,
@@ -1344,7 +1557,12 @@ async fn the_rings_deferred_cap_refuses_one_batch_schedule() {
     });
 
     let dropped = m
-        .publish_batch_from_surface("durabar", Some("clock"), &batch)
+        .publish_batch_from_attacher(
+            AttachScope::surface("durabar"),
+            Some("clock"),
+            &batch,
+            MissingChannelPosture::Invariant,
+        )
         .await;
 
     assert_eq!(dropped, 1, "the cap refused exactly one schedule");
@@ -1402,11 +1620,11 @@ async fn a_parked_batch_entry_is_fed_only_at_its_release() {
     let now = Utc::now();
     let later = now + Duration::from_secs(600);
 
-    m.publish_batch_from_surface(
-        "durabar",
+    m.publish_batch_from_attacher(
+        AttachScope::surface("durabar"),
         Some("clock"),
         &[
-            SurfaceBatchPublish {
+            AttachBatchPublish {
                 channel_address: &addr,
                 body: "now",
                 urgency: Urgency::Normal,
@@ -1415,6 +1633,7 @@ async fn a_parked_batch_entry_is_fed_only_at_its_release() {
             },
             deferred(&addr, "later", 1, later),
         ],
+        MissingChannelPosture::Invariant,
     )
     .await;
 
@@ -1442,13 +1661,13 @@ async fn the_deferred_cap_refuses_one_schedule_and_the_batch_still_commits() {
     let later = Utc::now() + Duration::from_secs(600);
 
     let dropped = m
-        .publish_batch_from_surface(
-            "durabar",
+        .publish_batch_from_attacher(
+            AttachScope::surface("durabar"),
             Some("clock"),
             &[
                 deferred(&addr, "first", 0, later),
                 deferred(&addr, "refused", 1, later),
-                SurfaceBatchPublish {
+                AttachBatchPublish {
                     channel_address: &addr,
                     body: "immediate",
                     urgency: Urgency::Normal,
@@ -1456,6 +1675,7 @@ async fn the_deferred_cap_refuses_one_schedule_and_the_batch_still_commits() {
                     deliver_after: None,
                 },
             ],
+            MissingChannelPosture::Invariant,
         )
         .await;
 
@@ -1491,7 +1711,7 @@ async fn stored_bodies(m: &Messenger) -> Vec<String> {
 /// The happy path: every entry lands, in call order, stamped with the
 /// **instance** sub-identity — the grain the batch names, not the bare surface.
 #[tokio::test]
-async fn publish_batch_from_surface_commits_every_entry_in_call_order() {
+async fn publish_batch_from_attacher_commits_every_entry_in_call_order() {
     let (m, addr) = build_surface_publish_messenger(
         "durabar",
         surface_publish_policy(ChannelMatcher::Prefix(String::new())),
@@ -1499,10 +1719,11 @@ async fn publish_batch_from_surface_commits_every_entry_in_call_order() {
     )
     .await;
 
-    m.publish_batch_from_surface(
-        "durabar",
+    m.publish_batch_from_attacher(
+        AttachScope::surface("durabar"),
         Some("clock"),
         &batch(&addr, &["a", "b", "c"], Urgency::Normal),
+        MissingChannelPosture::Invariant,
     )
     .await;
 
@@ -1529,7 +1750,7 @@ async fn publish_batch_from_surface_commits_every_entry_in_call_order() {
 /// Per-entry urgency is preserved: the caller resolved override-else-default per
 /// entry, and the batch must not flatten the batch to one rung.
 #[tokio::test]
-async fn publish_batch_from_surface_preserves_per_entry_urgency() {
+async fn publish_batch_from_attacher_preserves_per_entry_urgency() {
     let (m, addr) = build_surface_publish_messenger(
         "durabar",
         surface_publish_policy(ChannelMatcher::Prefix(String::new())),
@@ -1537,18 +1758,18 @@ async fn publish_batch_from_surface_preserves_per_entry_urgency() {
     )
     .await;
 
-    m.publish_batch_from_surface(
-        "durabar",
+    m.publish_batch_from_attacher(
+        AttachScope::surface("durabar"),
         Some("clock"),
         &[
-            SurfaceBatchPublish {
+            AttachBatchPublish {
                 channel_address: &addr,
                 body: "low",
                 urgency: Urgency::Low,
                 publish_ts_ns: stamp(0),
                 deliver_after: None,
             },
-            SurfaceBatchPublish {
+            AttachBatchPublish {
                 channel_address: &addr,
                 body: "high",
                 urgency: Urgency::High,
@@ -1556,6 +1777,7 @@ async fn publish_batch_from_surface_preserves_per_entry_urgency() {
                 deliver_after: None,
             },
         ],
+        MissingChannelPosture::Invariant,
     )
     .await;
 
@@ -1597,14 +1819,14 @@ async fn a_mid_batch_failure_leaves_zero_rows() {
     let addr2 = addr.clone();
     let joined = tokio::spawn(async move {
         let entries = vec![
-            SurfaceBatchPublish {
+            AttachBatchPublish {
                 channel_address: &addr2,
                 body: "first",
                 urgency: Urgency::Normal,
                 publish_ts_ns: stamp(0),
                 deliver_after: None,
             },
-            SurfaceBatchPublish {
+            AttachBatchPublish {
                 channel_address: "brenn:not-in-the-directory",
                 body: "doomed",
                 urgency: Urgency::Normal,
@@ -1612,8 +1834,13 @@ async fn a_mid_batch_failure_leaves_zero_rows() {
                 deliver_after: None,
             },
         ];
-        m2.publish_batch_from_surface("durabar", Some("clock"), &entries)
-            .await;
+        m2.publish_batch_from_attacher(
+            AttachScope::surface("durabar"),
+            Some("clock"),
+            &entries,
+            MissingChannelPosture::Invariant,
+        )
+        .await;
     })
     .await;
     assert!(
@@ -1627,21 +1854,112 @@ async fn a_mid_batch_failure_leaves_zero_rows() {
     );
 }
 
+/// Under `Race`, a target that leaves the directory **while the flush waits on
+/// the database lock** is dropped and counted, not fatal.
+///
+/// The window is the point: admission and application are two directory reads
+/// with the lock wait between them, and deprovisioning happens under that same
+/// lock, so an admitted target can be gone by the time the transaction opens.
+/// The route this posture exists for is the one that must never die of a
+/// deprovision race.
+#[tokio::test]
+async fn a_durable_target_lost_during_the_lock_wait_is_dropped_under_race() {
+    let (m, addr) = build_surface_publish_messenger_at_retain(Depth::Unbounded).await;
+    let uuid = m
+        .directory()
+        .resolve(&addr)
+        .expect("the fixture channel is in the directory")
+        .uuid;
+
+    // Hold the lock the flush needs, so it parks between its admission pre-pass
+    // and its transaction — exactly where a deprovision lands.
+    let guard = m.db().lock().await;
+    let flush = tokio::spawn({
+        let m = m.clone();
+        let addr = addr.clone();
+        async move {
+            m.publish_batch_from_attacher(
+                AttachScope::surface("durabar"),
+                Some("clock"),
+                &batch(&addr, &["dropped"], Urgency::Normal),
+                MissingChannelPosture::Race,
+            )
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
+
+    assert!(
+        m.directory().remove_channel(&uuid),
+        "the channel was there to deprovision"
+    );
+    drop(guard);
+
+    assert_eq!(
+        flush.await.expect("the flush did not panic"),
+        1,
+        "the entry published nothing and the attacher was told so"
+    );
+    assert!(
+        stored_rows(&m).await.is_empty(),
+        "nothing was written onto a channel that no longer exists"
+    );
+}
+
+/// The same window under `Invariant` is what it has always been: a surface's
+/// outputs are boot-declared, so a missing one is the server disagreeing with
+/// itself.
+#[tokio::test]
+#[should_panic(expected = "is not in the directory")]
+async fn a_durable_target_lost_during_the_lock_wait_still_panics_under_invariant() {
+    let (m, addr) = build_surface_publish_messenger_at_retain(Depth::Unbounded).await;
+    let uuid = m
+        .directory()
+        .resolve(&addr)
+        .expect("the fixture channel is in the directory")
+        .uuid;
+
+    let guard = m.db().lock().await;
+    let flush = tokio::spawn({
+        let m = m.clone();
+        let addr = addr.clone();
+        async move {
+            m.publish_batch_from_attacher(
+                AttachScope::surface("durabar"),
+                Some("clock"),
+                &batch(&addr, &["fatal"], Urgency::Normal),
+                MissingChannelPosture::Invariant,
+            )
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
+    m.directory().remove_channel(&uuid);
+    drop(guard);
+
+    // The panic crosses the join, and `should_panic` reads its message.
+    match flush.await {
+        Err(joined) => std::panic::resume_unwind(joined.into_panic()),
+        Ok(_) => unreachable!("the flush must not survive a missing bound output"),
+    }
+}
+
 /// The batch entry point does **not** draw the send budget: the caller draws once
 /// for the whole batch, because a per-entry draw could admit a prefix of an atomic
 /// flush and refuse its tail. Pins that the two are not both drawing (which would
 /// double-charge every batch).
 #[tokio::test]
-async fn publish_batch_from_surface_does_not_draw_the_send_budget() {
+async fn publish_batch_from_attacher_does_not_draw_the_send_budget() {
     let (m, addr) = build_multi_surface_publish_messenger(&["durabar"]).await;
 
     // Far more entries than the burst; if the entry point drew per row it would
     // exhaust the bucket mid-batch.
     let bodies: Vec<&str> = vec!["x"; SURFACE_SEND_BURST as usize + 5];
-    m.publish_batch_from_surface(
-        "durabar",
+    m.publish_batch_from_attacher(
+        AttachScope::surface("durabar"),
         Some("clock"),
         &batch(&addr, &bodies, Urgency::Normal),
+        MissingChannelPosture::Invariant,
     )
     .await;
     assert_eq!(
@@ -1652,7 +1970,13 @@ async fn publish_batch_from_surface_does_not_draw_the_send_budget() {
 
     // And the instance's bucket is untouched: a single publish still lands.
     let r = m
-        .publish_from_surface("durabar", Some("clock"), &addr, "x", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            Some("clock"),
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(r, PublishResult::Ok { .. }),
@@ -1671,15 +1995,25 @@ async fn an_oversized_batch_draw_is_refused_and_mints_no_debt() {
     let (m, addr) = build_multi_surface_publish_messenger(&["durabar"]).await;
 
     assert_eq!(
-        m.draw_surface_send_budget_for_batch("durabar", Some("clock"), SURFACE_SEND_BURST + 5),
-        SurfaceSendVerdict::Denied,
+        m.draw_attach_send_budget_for_batch(
+            AttachScope::surface("durabar"),
+            Some("clock"),
+            SURFACE_SEND_BURST + 5
+        ),
+        AttachSendVerdict::Denied,
         "a batch wider than the burst cannot be covered, so it is refused"
     );
 
     // The refusal deducted nothing: the instance's single publishes are
     // unaffected, which is exactly what a debt would have blocked.
     let r = m
-        .publish_from_surface("durabar", Some("clock"), &addr, "x", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            Some("clock"),
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(r, PublishResult::Ok { .. }),
@@ -1689,19 +2023,29 @@ async fn an_oversized_batch_draw_is_refused_and_mints_no_debt() {
     // And the balance is still there for a batch that fits: burst - 1 already
     // spent above, so the rest of the bucket draws whole.
     assert_eq!(
-        m.draw_surface_send_budget_for_batch("durabar", Some("clock"), SURFACE_SEND_BURST - 1),
-        SurfaceSendVerdict::Admitted,
+        m.draw_attach_send_budget_for_batch(
+            AttachScope::surface("durabar"),
+            Some("clock"),
+            SURFACE_SEND_BURST - 1
+        ),
+        AttachSendVerdict::Admitted,
         "a draw the balance covers exactly is admitted"
     );
     assert_eq!(
-        m.draw_surface_send_budget_for_batch("durabar", Some("clock"), 1),
-        SurfaceSendVerdict::Denied,
+        m.draw_attach_send_budget_for_batch(AttachScope::surface("durabar"), Some("clock"), 1),
+        AttachSendVerdict::Denied,
         "and it spent exactly its own width — nothing is left"
     );
 
     // A sibling instance is untouched: the bucket is per-principal.
     let sibling = m
-        .publish_from_surface("durabar", Some("todos"), &addr, "x", Urgency::Normal)
+        .publish_from_attacher(
+            AttachScope::surface("durabar"),
+            Some("todos"),
+            &addr,
+            "x",
+            Urgency::Normal,
+        )
         .await;
     assert!(
         matches!(sibling, PublishResult::Ok { .. }),
@@ -1711,8 +2055,8 @@ async fn an_oversized_batch_draw_is_refused_and_mints_no_debt() {
     // Refill restores admission at the rate the interval sets.
     tokio::time::advance(SURFACE_SEND_REFILL).await;
     assert_eq!(
-        m.draw_surface_send_budget_for_batch("durabar", Some("clock"), 1),
-        SurfaceSendVerdict::Admitted,
+        m.draw_attach_send_budget_for_batch(AttachScope::surface("durabar"), Some("clock"), 1),
+        AttachSendVerdict::Admitted,
         "one interval refills one publish's worth"
     );
 }
@@ -1727,8 +2071,8 @@ async fn a_maximal_conforming_flush_is_admitted_from_a_full_bucket() {
 
     let cap = u32::try_from(brenn_budget::MAX_PUBLISHES_PER_ACTIVATION).unwrap();
     assert_eq!(
-        m.draw_surface_send_budget_for_batch("durabar", Some("clock"), cap),
-        SurfaceSendVerdict::Admitted,
+        m.draw_attach_send_budget_for_batch(AttachScope::surface("durabar"), Some("clock"), cap),
+        AttachSendVerdict::Admitted,
         "a full default bucket admits exactly one maximal conforming flush"
     );
 }
@@ -1745,6 +2089,10 @@ fn a_batch_draw_for_an_unbudgeted_instance_panics() {
         .unwrap();
     rt.block_on(async {
         let (m, _addr) = build_multi_surface_publish_messenger(&["durabar"]).await;
-        let _ = m.draw_surface_send_budget_for_batch("durabar", Some("never-declared"), 3);
+        let _ = m.draw_attach_send_budget_for_batch(
+            AttachScope::surface("durabar"),
+            Some("never-declared"),
+            3,
+        );
     });
 }

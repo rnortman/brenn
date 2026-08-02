@@ -8,7 +8,9 @@
 
 use super::super::*;
 use super::{CHAT_PREFIX, ChatFixture, test_app_config};
-use crate::config::{ChatLeaf, LlmChatConfig, chat_address, chat_bare_name};
+use brenn_envelope::chat::{ChatLeaf, chat_address, chat_bare_name};
+
+use crate::config::LlmChatConfig;
 use crate::messaging::config::ResolvedMessagingConfig;
 use crate::messaging::testutils::test_channel_entry;
 use indexmap::IndexMap;

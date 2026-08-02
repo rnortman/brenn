@@ -1,12 +1,12 @@
 //! Native WebSocket transport backed by `tokio-tungstenite`.
 //!
 //! Version-unified with the backend's tungstenite pin so the shared WS types
-//! agree. Authentication is the connector's business: it is constructed with
-//! the session cookie and injects it into the handshake via
-//! [`insert_session_cookie`], the single source of truth for the handshake
-//! auth header shape. The backend test helper
-//! `test_support::http::surface_ws_open` calls the same helper, so the
-//! `brenn_session=<token>` shape lives in one place.
+//! agree. Authentication is the connector's business: it is constructed with a
+//! credential and injects it into the handshake through the one helper that
+//! owns that credential's header — [`insert_session_cookie`] for the browser
+//! route's cookie, [`insert_bearer_token`] for the remote route's token. Each
+//! header's shape lives in a single place. Nothing below the connector learns
+//! which was presented.
 //!
 //! Server liveness pings never cross the transport boundary: tungstenite
 //! auto-queues a Pong on every inbound Ping, and this impl flushes it out
@@ -18,7 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::{COOKIE, InvalidHeaderValue};
+use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, COOKIE, InvalidHeaderValue};
 use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, Uri};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -54,10 +54,61 @@ pub fn insert_session_cookie(
     Ok(())
 }
 
-/// Opens native surface WS connections, injecting the session cookie into the
+/// Single source of truth for the token-authenticated WS handshake auth header:
+/// sets `authorization: Bearer <token>` on `headers`. Client-side counterpart of
+/// the backend's remote-route extraction (`bearer_credential`). Errs when the
+/// token contains bytes invalid in a header value.
+///
+/// `headers` must not already carry an `authorization` header: this helper owns
+/// the handshake credential outright and panics on a preexisting one rather than
+/// silently clobbering a caller's data. Same discipline, and same reason, as
+/// [`insert_session_cookie`].
+pub fn insert_bearer_token(headers: &mut HeaderMap, token: &str) -> Result<(), InvalidHeaderValue> {
+    assert!(
+        !headers.contains_key(AUTHORIZATION),
+        "insert_bearer_token: headers already carry an authorization header; \
+         this helper owns the handshake credential and will not clobber it"
+    );
+    let credential = HeaderValue::from_str(&format!("Bearer {token}"))?;
+    headers.insert(AUTHORIZATION, credential);
+    Ok(())
+}
+
+/// Which credential a [`NativeConnector`] presents on the handshake.
+///
+/// The whole of the per-route difference on the client side: the browser route
+/// authenticates a session, the remote route authenticates a daemon, and the
+/// connection core below sees neither.
+enum Credential {
+    /// The raw `brenn_session` token value, sent as a `cookie` header.
+    SessionCookie(String),
+    /// A `[[remote]]` bearer token, sent as an `authorization` header.
+    Bearer(String),
+}
+
+impl Credential {
+    /// Inject this credential into a handshake's headers.
+    fn insert(&self, headers: &mut HeaderMap) -> Result<(), InvalidHeaderValue> {
+        match self {
+            Self::SessionCookie(token) => insert_session_cookie(headers, token),
+            Self::Bearer(token) => insert_bearer_token(headers, token),
+        }
+    }
+
+    /// How the credential is named in the cleartext refusal, so an operator
+    /// reading the error knows which secret was about to cross the wire.
+    fn describe(&self) -> &'static str {
+        match self {
+            Self::SessionCookie(_) => "session cookie",
+            Self::Bearer(_) => "bearer token",
+        }
+    }
+}
+
+/// Opens native WS connections, injecting the connector's credential into the
 /// handshake headers.
 pub struct NativeConnector {
-    session_cookie: String,
+    credential: Credential,
 }
 
 impl NativeConnector {
@@ -65,7 +116,19 @@ impl NativeConnector {
     /// `brenn_session` token value, sent as a `cookie` header on connect).
     pub fn new(session_cookie: impl Into<String>) -> Self {
         Self {
-            session_cookie: session_cookie.into(),
+            credential: Credential::SessionCookie(session_cookie.into()),
+        }
+    }
+
+    /// Construct a connector that authenticates with a bearer `token`, for the
+    /// remote route.
+    ///
+    /// Everything else — the cleartext guard, the connection core, the planes —
+    /// is the cookie connector's, unchanged. That is the whole point of the
+    /// connector seam: the route below the socket differs, nothing above it does.
+    pub fn with_bearer(token: impl Into<String>) -> Self {
+        Self {
+            credential: Credential::Bearer(token.into()),
         }
     }
 }
@@ -77,8 +140,9 @@ impl TransportConnector for NativeConnector {
         let mut req = url
             .into_client_request()
             .map_err(|err| TransportError::new(err.to_string()))?;
-        reject_cleartext_to_remote(req.uri())?;
-        insert_session_cookie(req.headers_mut(), &self.session_cookie)
+        reject_cleartext_to_remote(req.uri(), &self.credential)?;
+        self.credential
+            .insert(req.headers_mut())
             .map_err(|err| TransportError::new(err.to_string()))?;
         let (ws, _resp) = tokio_tungstenite::connect_async(req)
             .await
@@ -87,12 +151,14 @@ impl TransportConnector for NativeConnector {
     }
 }
 
-/// Refuse to attach the session cookie to a cleartext `ws://` handshake bound
-/// for a non-loopback host: the token would transit in the clear and a passive
-/// on-path observer could capture it. `wss://` (encrypted) is always allowed;
-/// the native transport is otherwise for tests against loopback, and this
-/// encodes that scoping structurally rather than leaving it to prose.
-fn reject_cleartext_to_remote(uri: &Uri) -> Result<(), TransportError> {
+/// Refuse to attach a credential to a cleartext `ws://` handshake bound for a
+/// non-loopback host: the secret would transit in the clear and a passive
+/// on-path observer could capture it. Covers both credentials — a bearer token
+/// is a longer-lived secret than a session cookie, so the guard that exists for
+/// the cookie is if anything more load-bearing for it. `wss://` (encrypted) is
+/// always allowed; the native transport is otherwise for tests against loopback,
+/// and this encodes that scoping structurally rather than leaving it to prose.
+fn reject_cleartext_to_remote(uri: &Uri, credential: &Credential) -> Result<(), TransportError> {
     if uri.scheme_str() == Some("ws") {
         let host = uri.host().unwrap_or_default();
         let is_loopback = host == "localhost"
@@ -102,7 +168,8 @@ fn reject_cleartext_to_remote(uri: &Uri) -> Result<(), TransportError> {
                 .unwrap_or(false);
         if !is_loopback {
             return Err(TransportError::new(format!(
-                "refusing to send the session cookie over cleartext ws:// to non-loopback host {host:?}"
+                "refusing to send the {} over cleartext ws:// to non-loopback host {host:?}",
+                credential.describe()
             )));
         }
     }
@@ -215,6 +282,102 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(COOKIE, HeaderValue::from_static("other=1"));
         let _ = insert_session_cookie(&mut headers, "devtoken");
+    }
+
+    /// `insert_bearer_token` writes exactly one `authorization` header whose
+    /// value is `Bearer <token>` — the shape the remote route parses.
+    #[test]
+    fn insert_bearer_token_writes_expected_header() {
+        let mut headers = HeaderMap::new();
+        insert_bearer_token(&mut headers, "s3cret-token").unwrap();
+        let values: Vec<_> = headers.get_all(AUTHORIZATION).iter().collect();
+        assert_eq!(values.len(), 1, "exactly one authorization header expected");
+        assert_eq!(values[0], "Bearer s3cret-token");
+    }
+
+    /// A token carrying bytes invalid in a header value returns `Err` rather
+    /// than panicking or writing a malformed header — a header-splitting token
+    /// is refused before it can reach the wire.
+    #[test]
+    fn insert_bearer_token_rejects_invalid_bytes() {
+        let mut headers = HeaderMap::new();
+        let result = insert_bearer_token(&mut headers, "bad\r\nX-Evil: 1");
+        assert!(result.is_err(), "CRLF in a token should be rejected");
+        assert!(
+            headers.get(AUTHORIZATION).is_none(),
+            "no header written on rejection"
+        );
+    }
+
+    /// A preexisting `authorization` header is unexpected caller input: the
+    /// helper panics rather than silently clobbering it.
+    #[test]
+    #[should_panic(expected = "already carry an authorization header")]
+    fn insert_bearer_token_panics_on_preexisting_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic abc"));
+        let _ = insert_bearer_token(&mut headers, "s3cret-token");
+    }
+
+    /// The bearer connector injects its credential and nothing else: no cookie
+    /// rides along, so a remote presents exactly one credential.
+    // The callback's `Err` variant is tungstenite's own `Response` type, so its
+    // size is not this crate's to reduce.
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn bearer_connector_presents_only_the_bearer_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let seen = std::sync::Arc::new(std::sync::Mutex::new((None, false)));
+            let captured = seen.clone();
+            let _ws = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |req: &tokio_tungstenite::tungstenite::handshake::server::Request, resp| {
+                    let mut slot = captured.lock().unwrap();
+                    slot.0 = req
+                        .headers()
+                        .get(AUTHORIZATION)
+                        .map(|v| v.to_str().unwrap().to_string());
+                    slot.1 = req.headers().contains_key(COOKIE);
+                    Ok(resp)
+                },
+            )
+            .await
+            .unwrap();
+            let observed = seen.lock().unwrap().clone();
+            drop(seen);
+            observed
+        });
+
+        let mut connector = NativeConnector::with_bearer("s3cret-token");
+        let url = format!("ws://{addr}/remote/pod-kitchen/ws");
+        let _conn = connector.connect(&url).await.unwrap();
+
+        let (authorization, had_cookie) = server.await.unwrap();
+        assert_eq!(authorization.as_deref(), Some("Bearer s3cret-token"));
+        assert!(!had_cookie, "the bearer connector sends no cookie");
+    }
+
+    /// The cleartext guard covers the bearer connector too, and names the
+    /// credential it refused to send.
+    #[tokio::test]
+    async fn bearer_connector_refuses_cleartext_to_remote() {
+        let mut connector = NativeConnector::with_bearer("s3cret-token");
+        // TEST-NET-1 (RFC 5737), non-loopback; the guard fires before any
+        // network activity, so this is deterministic and offline.
+        let Err(err) = connector
+            .connect("ws://192.0.2.1/remote/pod-kitchen/ws")
+            .await
+        else {
+            panic!("cleartext remote ws:// should be refused");
+        };
+        assert!(
+            err.to_string().contains("bearer token"),
+            "the refusal names the credential, got {err}"
+        );
     }
 
     /// Connecting to a refused address is a normal retryable outcome: it

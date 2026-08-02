@@ -501,6 +501,113 @@ pub(super) fn test_apps_single_instance() -> Arc<IndexMap<String, AppConfig>> {
     Arc::new(apps)
 }
 
+/// A `WsConnection` whose app is on the bus: the state carries a `Messenger`
+/// holding the app's roster channel and the reserved writer's registration.
+///
+/// This is the rig for the obligations a conversation-creation path owes the
+/// bus — its chat channel family and a roster snapshot naming it — which the
+/// messenger-less fixtures above cannot see at all.
+pub(super) async fn test_ws_conn_on_the_bus(
+    singleton: bool,
+) -> (
+    WsConnection,
+    mpsc::Receiver<WsServerMessage>,
+    brenn_lib::db::Db,
+    Arc<brenn_lib::messaging::Messenger>,
+    i64,
+) {
+    use brenn_lib::config::LlmChatConfig;
+    use brenn_lib::messaging::chat_roster::{CHAT_ROSTER_COMPONENT, chat_roster_entry};
+    use brenn_lib::messaging::config::MessagingGlobalConfig;
+    use brenn_lib::messaging::query::NoopWakeRouter;
+    use brenn_lib::messaging::store::RingStores;
+    use brenn_lib::messaging::system::{SystemParticipantSpec, registrations_from_specs};
+    use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Messenger, WakeRouter};
+
+    let db = init_db_memory();
+    let chat = LlmChatConfig::default();
+    let defaults = MessagingGlobalConfig::default();
+
+    let mut cfg = default_test_app_config(TEST_APP_SLUG, "Test App");
+    cfg.singleton = singleton;
+    cfg.chat_harness_policy = chat.harness_policy(TEST_APP_SLUG);
+    let mut apps = IndexMap::new();
+    apps.insert(TEST_APP_SLUG.to_string(), cfg);
+    let apps = Arc::new(apps);
+
+    let entries = vec![chat_roster_entry(&chat, TEST_APP_SLUG, &defaults)];
+    let roster_writer = SystemParticipantSpec::publish_only(
+        CHAT_ROSTER_COMPONENT,
+        ChannelScheme::Brenn,
+        &entries
+            .iter()
+            .map(|e| {
+                e.address
+                    .strip_prefix(ChannelScheme::Brenn.prefix())
+                    .expect("a roster address is a brenn: address")
+                    .to_string()
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let (user_id, device_id) = {
+        let conn = db.lock().await;
+        let uid = create_user(&conn, TEST_USERNAME, "$argon2id$fake");
+        let did = create_test_device(&conn, uid);
+        brenn_lib::messaging::db::upsert_channels(&conn, &entries);
+        (uid, did)
+    };
+
+    let messenger = Messenger::new(
+        db.clone(),
+        Arc::new(MessagingDirectory::with_entries(entries)),
+        Arc::from("test-source"),
+        apps.clone(),
+        Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
+        defaults,
+    )
+    .with_ring_stores(Arc::new(RingStores::empty()))
+    .with_subscriber_registrations(registrations_from_specs(&[roster_writer]))
+    .with_llm_chat(chat);
+
+    let mut state = AppState::for_test(db.clone(), Some(apps));
+    state.messenger = Some(messenger.clone());
+
+    let (ws_tx, ws_rx) = mpsc::channel(256);
+    let conn = WsConnBuilder::with_defaults(
+        user_id,
+        TEST_USERNAME.to_string(),
+        TEST_APP_SLUG.to_string(),
+        ws_tx,
+        state,
+        device_id,
+    )
+    .build();
+
+    (conn, ws_rx, db, messenger, user_id)
+}
+
+/// Every roster snapshot published for `app_slug`, oldest first.
+pub(super) async fn roster_snapshots(
+    db: &brenn_lib::db::Db,
+    messenger: &brenn_lib::messaging::Messenger,
+    app_slug: &str,
+) -> Vec<String> {
+    let address = brenn_envelope::chat::chat_roster_address(&messenger.llm_chat().prefix, app_slug);
+    let conn = db.lock().await;
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.body FROM messaging_messages m \
+             JOIN messaging_channels c ON c.uuid = m.channel_uuid \
+             WHERE c.address = ?1 ORDER BY m.id",
+        )
+        .expect("prepare roster scan");
+    stmt.query_map([address], |r| r.get::<_, String>(0))
+        .expect("query roster snapshots")
+        .map(|r| r.expect("decode roster row"))
+        .collect()
+}
+
 /// Create a WsConnection with given app config and user.
 pub(super) async fn test_ws_conn_for_app(
     apps: Arc<IndexMap<String, AppConfig>>,

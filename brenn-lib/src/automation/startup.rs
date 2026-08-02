@@ -19,6 +19,10 @@ pub async fn run_startup_consistency_checks(engine: &AutomationEngine) {
     let now = Utc::now();
     let now_str = crate::db::format_ts_for_db(now);
     let conn = engine.db.lock().await;
+    // Apps whose conversation set this pass changed. The roster republish is a
+    // publish, and a publish takes the lock this function holds throughout, so
+    // the apps are collected here and announced once the lock is gone.
+    let mut rebound_apps: Vec<String> = Vec::new();
 
     // --- Fix 1: Rebind stale event conversations ---
 
@@ -98,6 +102,7 @@ pub async fn run_startup_consistency_checks(engine: &AutomationEngine) {
         engine
             .messenger
             .provision_conversation_chat_channels(&conn, &owner_app_slug, new_conv_id);
+        rebound_apps.push(owner_app_slug.clone());
         conn.execute(
             "UPDATE automation_app_event_conversation \
              SET conversation_id = ?1 \
@@ -152,6 +157,11 @@ pub async fn run_startup_consistency_checks(engine: &AutomationEngine) {
             "startup: disabled orphaned jobs for removed app"
         );
     }
+
+    drop(conn);
+    for app_slug in rebound_apps {
+        engine.messenger.republish_chat_roster(&app_slug).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +173,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::automation::test_support::{default_app_cfg, make_engine_with_apps};
+    use crate::automation::test_support::{
+        default_app_cfg, make_engine_on_the_bus, make_engine_with_apps, roster_snapshots,
+    };
     use crate::conversation::get_conversation_opt;
     use crate::db::init_db_memory;
     use rusqlite::OptionalExtension;
@@ -288,6 +300,48 @@ mod tests {
         assert_eq!(
             conv.user_id, user_b_id,
             "new conversation must be owned by user_b"
+        );
+    }
+
+    /// A rebind creates a conversation, so it owes the bus a snapshot naming it.
+    /// Without the announcement the roster keeps advertising the *old* id — which
+    /// the mapping no longer points at — until some unrelated change to the app's
+    /// conversation set republishes.
+    ///
+    /// The announcement is also the one part of the rebind that cannot run under
+    /// the long-held database guard the rest of the pass takes; this drives the
+    /// whole function, so moving it back inside fails here.
+    #[tokio::test]
+    async fn a_rebind_announces_the_conversation_it_creates() {
+        let db = init_db_memory();
+        let user_a_id = insert_user(&db, "user_a").await;
+        let _user_b_id = insert_user(&db, "user_b").await;
+        let old_conv_id = insert_event_conv(&db, "myapp", user_a_id).await;
+
+        let mut apps = indexmap::IndexMap::new();
+        let mut cfg = default_app_cfg("myapp", false);
+        cfg.allowed_users = vec!["user_b".to_string()];
+        apps.insert("myapp".to_string(), cfg);
+        let engine = make_engine_on_the_bus(
+            db.clone(),
+            Arc::new(apps),
+            vec![],
+            crate::automation::test_support::FakeIngressRouter::new(),
+        )
+        .await;
+
+        run_startup_consistency_checks(&engine).await;
+
+        let new_conv_id = read_mapping(&db, "myapp")
+            .await
+            .expect("mapping must exist");
+        assert_ne!(new_conv_id, old_conv_id);
+        assert_eq!(
+            roster_snapshots(&engine, "myapp").await,
+            vec![format!(
+                r#"{{"v":1,"conversations":[{{"id":{old_conv_id}}},{{"id":{new_conv_id}}}]}}"#
+            )],
+            "the snapshot is the app's whole conversation set, including the id the rebind minted"
         );
     }
 

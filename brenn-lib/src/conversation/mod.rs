@@ -154,6 +154,16 @@ pub struct Message {
 /// conversation panics naming the missing channel, and the boot backfill heals
 /// the row at next start — that backfill is recovery from a bug, not license to
 /// skip the call.
+///
+/// **Announcement obligation.** The app's roster channel names every
+/// conversation in this table, so a caller also owes
+/// `Messenger::republish_chat_roster` for the app — outside the database lock,
+/// which the publish takes itself. A row that exists unannounced is invisible to
+/// every bus peer until something else changes the set.
+///
+/// TODO(chat-conversation-provision-chokepoint): both obligations are
+/// convention, discharged by hand at each creation site and already missed
+/// twice. They want one call that creates, provisions and announces.
 pub fn create_conversation(conn: &Connection, user_id: i64, app_slug: &str, shared: bool) -> i64 {
     let now = format_ts_for_db(Utc::now());
     conn.execute(

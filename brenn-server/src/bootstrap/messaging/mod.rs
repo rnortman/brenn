@@ -875,6 +875,10 @@ pub(crate) async fn build_messaging(
     //   - `system:surface-config`, publish-only — granted an exact-match
     //     `ephemeral_publish` ACL on every surface's bindings channel. Separate
     //     from the help identity so each holds exactly its own family.
+    //   - `system:chat-roster`, publish-only — granted an exact-match
+    //     `brenn_publish` ACL on every app's roster channel. Present whenever
+    //     any app is configured; the roster is the only chat address no
+    //     conversation's harness may write.
     // A publish-only spec carries no subscriptions, so it gets a registry entry
     // (publish authority) but no directory subscriber entry and no delivery
     // binding — it is never a dispatch target. The surface error channel has no
@@ -901,6 +905,30 @@ pub(crate) async fn build_messaging(
     system_participants.push(crate::routes::surface::description::surface_config_spec(
         &config_bares,
     ));
+    // One roster channel per configured app, and the single identity that
+    // writes them. Boot-declared rather than provisioned with a conversation:
+    // apps are static config, and an app with no conversations still owes a
+    // peer the snapshot that says so.
+    let roster_bares: Vec<String> = apps
+        .keys()
+        .map(|slug| brenn_envelope::chat::chat_roster_bare_name(&config.llm_chat.prefix, slug))
+        .collect();
+    if !roster_bares.is_empty() {
+        for slug in apps.keys() {
+            all_entries.push(brenn_lib::messaging::chat_roster::chat_roster_entry(
+                &config.llm_chat,
+                slug,
+                global_defaults,
+            ));
+        }
+        system_participants.push(
+            brenn_lib::messaging::system::SystemParticipantSpec::publish_only(
+                brenn_lib::messaging::chat_roster::CHAT_ROSTER_COMPONENT,
+                brenn_lib::messaging::ChannelScheme::Brenn,
+                &roster_bares,
+            ),
+        );
+    }
     brenn_lib::messaging::system::fold_spec_subscriptions(&mut all_entries, &system_participants);
 
     // The non-durable channels join `all_entries` here, after the WASM and
@@ -1055,18 +1083,32 @@ pub(crate) async fn build_messaging(
         config.messaging.clone(),
     )
     .with_subscriber_registrations(subscriber_registrations)
-    // One budget per surface principal: the surface's own kernel identity plus
-    // each component instance it declares, each with its resolved parameters (a
-    // declared override, or the defaults). Both come from
-    // `ResolvedSurface::principal_send_budgets` — built on the same declaration
+    // One budget per attach principal. A surface contributes its own kernel
+    // identity plus each component instance it declares, each with its resolved
+    // parameters (a declared override, or the defaults) — both from
+    // `ResolvedSurface::principal_send_budgets`, built on the same declaration
     // set the sub-identity derivation admits an instance against, so the budget
     // map and the derivation cannot disagree about which principals exist. A
+    // remote contributes one, at the shared defaults: it declares no
+    // sub-identities and no per-remote knob, and this backstop is the same
+    // defense-in-depth bound on the same substrate whoever writes into it. A
     // publish whose principal has no bucket is a boot invariant the publish gate
     // panics on.
-    .with_surface_send_budgets(
+    .with_attach_send_budgets(
         resolved_surfaces
             .iter()
-            .map(|s| (s.slug.clone(), s.principal_send_budgets().collect())),
+            .flat_map(|s| {
+                messaging::attach_principal_budgets(
+                    messaging::AttachScope::surface(&s.slug),
+                    s.principal_send_budgets().collect(),
+                )
+            })
+            .chain(resolved_remotes.iter().flat_map(|r| {
+                messaging::attach_principal_budgets(
+                    messaging::AttachScope::remote(&r.slug),
+                    vec![(None, messaging::config::AttachSendBudget::default())],
+                )
+            })),
     )
     .with_ring_stores(ring_stores)
     .with_llm_chat(config.llm_chat.clone())
@@ -1078,6 +1120,21 @@ pub(crate) async fn build_messaging(
     {
         let conn = boot_db.lock().await;
         messenger.backfill_conversation_chat_channels(&conn);
+    }
+
+    // Announce each app's conversation set, now that the backfill has made
+    // every conversation on it addressable. A peer holding a fleet grant learns
+    // what to subscribe to from here and from nowhere else, so the snapshot goes
+    // out before the server accepts a connection.
+    for slug in apps.keys() {
+        match messenger.publish_chat_roster(slug).await {
+            None | Some(brenn_lib::messaging::PublishResult::Ok { .. }) => {}
+            Some(other) => panic!(
+                "boot: chat roster publish for app {slug:?} did not succeed ({other:?}) — the \
+                 roster channel is boot-declared and its writer's policy is code-built, so a \
+                 failure is a host bug. Refusing to start."
+            ),
+        }
     }
 
     // Fold the durable dynamic subscription rows back onto their channels.

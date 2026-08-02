@@ -323,5 +323,22 @@ publish_acl = [ { prefix = "a." } ]
 fn a_remote_seeds_no_deferred_views() {
     let (profile, _token) = fleet();
     assert!(profile.deferred_view_targets().is_empty());
-    assert_eq!(profile.send_budget_scope(), "pod-kitchen");
+    assert_eq!(
+        profile.attach_scope(),
+        brenn_lib::messaging::AttachScope::remote("pod-kitchen")
+    );
+}
+
+/// **A deprovision race may never take the server down on this route.** A
+/// remote's targets are minted at runtime, so a flush entry naming one that
+/// vanished under it is the operator's own topology moving, not the server
+/// disagreeing with itself. This is the answer the batch path reads to choose
+/// between dropping the entry and panicking.
+#[test]
+fn a_vanished_target_is_a_race_for_a_remote() {
+    let (profile, _token) = fleet();
+    assert_eq!(
+        profile.missing_channel_posture(),
+        MissingChannelPosture::Race
+    );
 }

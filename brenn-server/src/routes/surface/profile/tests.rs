@@ -228,7 +228,22 @@ fn a_malformed_attribution_is_refused_before_minting() {
 /// the caller's, so a sub-identity's retry loop drains only its own bucket.
 #[test]
 fn the_send_budget_scope_is_the_slug() {
-    assert_eq!(profile().send_budget_scope(), "deskbar");
+    assert_eq!(
+        profile().attach_scope(),
+        brenn_lib::messaging::AttachScope::surface("deskbar")
+    );
+}
+
+/// A surface publishes only onto boot-declared outputs that boot validation
+/// proved exist, so a flush entry the server cannot write is the server
+/// disagreeing with itself and must stay fatal. Silently softening this to the
+/// remote's `Race` would swallow a broken boot invariant as a dropped entry.
+#[test]
+fn a_missing_output_stays_a_broken_invariant_for_a_surface() {
+    assert_eq!(
+        profile().missing_channel_posture(),
+        brenn_lib::messaging::MissingChannelPosture::Invariant
+    );
 }
 
 /// The route's capacity policy reaches the registry through the profile, at the

@@ -231,8 +231,18 @@ impl WsConnection {
             if let Some(t) = title_text {
                 conversation::set_title(&conn, cid, &truncate_title(t, 80));
             }
+            // A conversation owes its chat channel family from the moment the row
+            // exists: the bridge spawned just below publishes onto it, and a peer
+            // that reads this id off the roster subscribes to it.
+            if let Some(messenger) = &self.state.messenger {
+                messenger.provision_conversation_chat_channels(&conn, &self.app_slug, cid);
+            }
             cid
         };
+        // Outside the lock the publish needs.
+        if let Some(messenger) = &self.state.messenger {
+            messenger.republish_chat_roster(&self.app_slug).await;
+        }
         self.current_conversation_id = Some(conv_id);
 
         // Show "Starting assistant..." while we wait for CC to spawn.
@@ -665,6 +675,7 @@ impl WsConnection {
 
 #[cfg(test)]
 mod tests {
+    use brenn_envelope::chat::{ChatLeaf, chat_address};
     use brenn_lib::auth::user::create_user;
     use brenn_lib::conversation;
     use brenn_lib::db::init_db_memory;
@@ -724,6 +735,50 @@ mod tests {
             .iter()
             .any(|m| matches!(m, WsServerMessage::ConversationSwitched { .. }));
         assert!(!has_switched, "should not spawn, got: {msgs:?}");
+    }
+
+    /// The send-message create path (`resolve_bridge` case 3) is a conversation
+    /// creation site, so it owes the bus both halves: the chat channel family
+    /// the conversation is addressed by, and a roster snapshot naming it. A
+    /// snapshot naming an unprovisioned id is worse than no snapshot — a fleet
+    /// driver subscribes to it and is refused forever.
+    #[tokio::test]
+    async fn a_conversation_created_by_send_message_is_provisioned_and_announced() {
+        let (mut conn, _ws_rx, db, messenger, _uid) = test_ws_conn_on_the_bus(false).await;
+        assert!(
+            roster_snapshots(&db, &messenger, "test").await.is_empty(),
+            "precondition: nothing has been announced yet"
+        );
+
+        // No bridge is injected, so the spawn behind the create fails and the
+        // send is refused — the creation, and everything it owes, happened first.
+        conn.handle_send_message("hello", vec![], None, vec![])
+            .await;
+        let conv_id = conn
+            .current_conversation_id
+            .expect("case 3 created a conversation");
+
+        let prefix = messenger.llm_chat().prefix.clone();
+        // `Approvals` is a reserved name with no flow behind it, so provisioning
+        // mints no channel for it.
+        for leaf in [
+            ChatLeaf::In,
+            ChatLeaf::Out,
+            ChatLeaf::Stream,
+            ChatLeaf::Wake,
+        ] {
+            let address = chat_address(&prefix, "test", leaf, conv_id);
+            assert!(
+                messenger.directory().resolve(&address).is_some(),
+                "leaf {address} is unprovisioned; a peer publishing on it would be refused"
+            );
+        }
+
+        assert_eq!(
+            roster_snapshots(&db, &messenger, "test").await,
+            vec![format!(r#"{{"v":1,"conversations":[{{"id":{conv_id}}}]}}"#)],
+            "the new conversation was announced exactly once"
+        );
     }
 
     #[test]

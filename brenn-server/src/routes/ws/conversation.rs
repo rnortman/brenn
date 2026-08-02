@@ -140,6 +140,12 @@ impl WsConnection {
                 id
             }
         };
+        // Announce the app's conversation set to the bus, outside the lock the
+        // publish needs. A reused empty conversation changes nothing and is
+        // deduplicated away.
+        if let Some(messenger) = &self.state.messenger {
+            messenger.republish_chat_roster(&self.app_slug).await;
+        }
         self.current_conversation_id = Some(conv_id);
 
         let conv = {
@@ -2130,6 +2136,64 @@ mod tests {
         assert!(
             conn.current_conversation_id.is_some(),
             "should create a new conversation instead"
+        );
+    }
+
+    /// The UI's "New Conversation" button is a conversation-creation site, so it
+    /// owes the bus both halves: the chat channel family the conversation is
+    /// addressed by, and a roster snapshot naming it. Without the announcement a
+    /// fleet driver never learns the id exists — the most common creation path in
+    /// the product, invisible on the bus.
+    ///
+    /// The reuse branch owes nothing: it created nothing, and the dedupe against
+    /// the last published body is what keeps a repeated click from waking every
+    /// subscribed peer to say what it already said.
+    #[tokio::test]
+    async fn a_conversation_created_by_the_new_conversation_button_is_provisioned_and_announced() {
+        use brenn_envelope::chat::{ChatLeaf, chat_address};
+
+        let (mut conn, _ws_rx, db, messenger, _uid) = test_ws_conn_on_the_bus(false).await;
+        assert!(
+            roster_snapshots(&db, &messenger, "test").await.is_empty(),
+            "precondition: nothing has been announced yet"
+        );
+
+        conn.handle_new_conversation().await;
+        let conv_id = conn
+            .current_conversation_id
+            .expect("the button creates a conversation eagerly");
+
+        let prefix = messenger.llm_chat().prefix.clone();
+        for leaf in [
+            ChatLeaf::In,
+            ChatLeaf::Out,
+            ChatLeaf::Stream,
+            ChatLeaf::Wake,
+        ] {
+            let address = chat_address(&prefix, "test", leaf, conv_id);
+            assert!(
+                messenger.directory().resolve(&address).is_some(),
+                "leaf {address} is unprovisioned; a peer publishing on it would be refused"
+            );
+        }
+        assert_eq!(
+            roster_snapshots(&db, &messenger, "test").await,
+            vec![format!(r#"{{"v":1,"conversations":[{{"id":{conv_id}}}]}}"#)],
+            "the new conversation was announced exactly once"
+        );
+
+        // A second click finds the still-empty conversation and reuses it.
+        conn.state.active_bridges.remove(conv_id).await;
+        conn.handle_new_conversation().await;
+        assert_eq!(
+            conn.current_conversation_id,
+            Some(conv_id),
+            "the empty conversation is reused rather than piled onto"
+        );
+        assert_eq!(
+            roster_snapshots(&db, &messenger, "test").await.len(),
+            1,
+            "an unchanged conversation set says nothing new"
         );
     }
 

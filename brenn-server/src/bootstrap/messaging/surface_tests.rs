@@ -10,8 +10,8 @@ use super::*;
 use brenn_lib::config::AppConfig;
 use brenn_lib::messaging::Urgency;
 use brenn_lib::messaging::config::{
-    DEFAULT_SURFACE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_PER_SEC, ResolvedComponent,
-    ResolvedLocalChannel, SurfaceSendBudget,
+    AttachSendBudget, DEFAULT_SURFACE_PUBLISH_BURST, DEFAULT_SURFACE_PUBLISH_PER_SEC,
+    ResolvedComponent, ResolvedLocalChannel,
 };
 use brenn_lib::messaging::config::{Depth, SendRate};
 
@@ -489,7 +489,7 @@ fn surface_resolves_happy_path() {
                 instance: "protobar".to_string(),
                 kind: "protobar".to_string(),
                 abi: brenn_surface_schema::Abi::Dom,
-                send_budget: SurfaceSendBudget::default(),
+                send_budget: AttachSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
                 chrome: false,
@@ -498,7 +498,7 @@ fn surface_resolves_happy_path() {
                 instance: "sidecar".to_string(),
                 kind: "sidecar".to_string(),
                 abi: brenn_surface_schema::Abi::Dom,
-                send_budget: SurfaceSendBudget::default(),
+                send_budget: AttachSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
                 chrome: false,
@@ -507,7 +507,7 @@ fn surface_resolves_happy_path() {
                 instance: "chrome".to_string(),
                 kind: "chrome".to_string(),
                 abi: brenn_surface_schema::Abi::Dom,
-                send_budget: SurfaceSendBudget::default(),
+                send_budget: AttachSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
                 chrome: true,
@@ -1593,19 +1593,19 @@ fn surface_two_instances_of_one_kind_ok() {
 /// per-surface constants, now bounding one instance rather than the whole page.
 #[test]
 fn surface_component_send_budget_defaults_when_undeclared() {
-    use brenn_lib::messaging::config::SurfaceSendBudget;
+    use brenn_lib::messaging::config::AttachSendBudget;
     let dir = surface_dir();
     let resolved = resolve_surfaces(&[valid_surface_raw()], &dir, &test_globals());
     for comp in &resolved[0].components {
-        assert_eq!(comp.send_budget, SurfaceSendBudget::default());
+        assert_eq!(comp.send_budget, AttachSendBudget::default());
     }
     assert_eq!(
-        SurfaceSendBudget::default().burst,
+        AttachSendBudget::default().burst,
         brenn_lib::messaging::publish::SURFACE_SEND_BURST,
         "the default burst is the constant it replaces at the finer grain",
     );
     assert_eq!(
-        SurfaceSendBudget::default().refill,
+        AttachSendBudget::default().refill,
         brenn_lib::messaging::publish::SURFACE_SEND_REFILL,
     );
 }
@@ -1615,23 +1615,23 @@ fn surface_component_send_budget_defaults_when_undeclared() {
 /// the other one along.
 #[test]
 fn surface_component_send_budget_knobs_override_independently() {
-    use brenn_lib::messaging::config::SurfaceSendBudget;
+    use brenn_lib::messaging::config::AttachSendBudget;
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].send_burst = Some(300);
     raw.components[1].send_refill_secs = Some(90);
     let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
-    let default = SurfaceSendBudget::default();
+    let default = AttachSendBudget::default();
     assert_eq!(
         resolved[0].components[0].send_budget,
-        SurfaceSendBudget {
+        AttachSendBudget {
             burst: 300,
             refill: default.refill,
         },
     );
     assert_eq!(
         resolved[0].components[1].send_budget,
-        SurfaceSendBudget {
+        AttachSendBudget {
             burst: default.burst,
             refill: std::time::Duration::from_secs(90),
         },
@@ -1681,12 +1681,12 @@ fn surface_sibling_instances_carry_their_own_send_budgets() {
 /// live principal unbudgeted, which the publish gate panics on.
 #[test]
 fn surface_principal_send_budgets_cover_every_principal() {
-    use brenn_lib::messaging::config::SurfaceSendBudget;
+    use brenn_lib::messaging::config::AttachSendBudget;
     let dir = surface_dir();
     let mut raw = valid_surface_raw();
     raw.components[0].send_burst = Some(400);
     let resolved = resolve_surfaces(&[raw], &dir, &test_globals());
-    let budgeted: Vec<(Option<String>, SurfaceSendBudget)> =
+    let budgeted: Vec<(Option<String>, AttachSendBudget)> =
         resolved[0].principal_send_budgets().collect();
     let declared: Vec<Option<String>> = std::iter::once(None)
         .chain(
@@ -1700,7 +1700,7 @@ fn surface_principal_send_budgets_cover_every_principal() {
         budgeted.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
         declared,
     );
-    assert_eq!(budgeted[0].1, SurfaceSendBudget::default(), "kernel grain");
+    assert_eq!(budgeted[0].1, AttachSendBudget::default(), "kernel grain");
     assert_eq!(budgeted[1].1.burst, 400, "the declared instance's override");
 }
 

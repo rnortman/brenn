@@ -550,6 +550,12 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         }
     };
 
+    let remote_runtimes = crate::routes::remote::build_remote_runtimes(
+        &messaging_result.remotes,
+        messaging_result.messenger.as_ref(),
+        config.messaging.max_body_bytes,
+    );
+
     // PWA push: construct the PwaPushService from the already-resolved config.
     // Returns `None` when no app has `pwa_push.enabled = true`.
     let pwa_push_service = pwa_push::build_pwa_push(
@@ -883,8 +889,9 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         automation_engine: automation_result.engine.clone(),
         usage_session_gap_secs: config.observability.usage.session_gap_minutes * 60,
         surfaces: std::sync::Arc::new(surface_runtimes),
+        remotes: std::sync::Arc::new(remote_runtimes),
         attach_registry: crate::routes::attach::registry::AttachRegistry::default(),
-        surface_heartbeat_secs: crate::routes::surface::HEARTBEAT_SECS,
+        attach_heartbeat_secs: crate::routes::surface::HEARTBEAT_SECS,
         replay_components,
         replay_locks,
         #[cfg(test)]

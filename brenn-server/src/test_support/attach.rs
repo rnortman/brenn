@@ -19,7 +19,8 @@ use brenn_lib::messaging::config::{
 };
 use brenn_lib::messaging::query::NoopWakeRouter;
 use brenn_lib::messaging::{
-    MessagingDirectory, Messenger, ParticipantId, SubscriberEntry, WakeRouter,
+    AttachScope, MessagingDirectory, Messenger, MissingChannelPosture, ParticipantId,
+    SubscriberEntry, WakeRouter,
 };
 use brenn_lib::obs::alerting::AlertDispatcher;
 use tokio::sync::mpsc;
@@ -51,7 +52,7 @@ const OUTBOUND_QUEUE: usize = 64;
 pub(crate) struct TestProfile {
     /// The bare principal, minted from `slug`.
     pub attacher: ParticipantId,
-    /// The send-budget scope half — the attacher's slug.
+    /// The attacher's slug — the scope half of every publish-side key.
     pub slug: String,
     /// The channels this attacher may subscribe, at the fold boot resolved.
     pub subscribable: HashMap<String, SubscriptionFacts>,
@@ -69,6 +70,10 @@ pub(crate) struct TestProfile {
     pub session_caps: SessionCaps,
     /// Concurrent subscriptions one attachment of this attacher may hold.
     pub max_active_subscriptions: usize,
+    /// What a batch entry naming an unpublishable channel means. `Invariant` is
+    /// the surface answer every fixture starts from; a suite exercising the
+    /// runtime-provisioned route sets `Race`.
+    pub missing_channel_posture: MissingChannelPosture,
     /// The directory entry this stub mints on a successful subscribe, if any.
     /// `None` is the boot-declared answer a surface gives; a suite exercising
     /// the runtime-entry hook states the entry it means to see minted, whose
@@ -97,6 +102,7 @@ impl TestProfile {
             alert_granted: false,
             session_caps: SessionCaps::UNCAPPED,
             max_active_subscriptions: usize::MAX,
+            missing_channel_posture: MissingChannelPosture::Invariant,
             runtime_entry: None,
         }
     }
@@ -134,8 +140,12 @@ impl AttachProfile for TestProfile {
         }
     }
 
-    fn send_budget_scope(&self) -> &str {
-        &self.slug
+    fn attach_scope(&self) -> AttachScope<'_> {
+        AttachScope::surface(&self.slug)
+    }
+
+    fn missing_channel_posture(&self) -> MissingChannelPosture {
+        self.missing_channel_posture
     }
 
     fn deferred_view_targets(&self) -> &[DeferredTarget] {

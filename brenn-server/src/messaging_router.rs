@@ -13,7 +13,7 @@ use brenn_lib::messaging::config::ResolvedSurface;
 use brenn_lib::messaging::remote::ResolvedRemote;
 use brenn_lib::messaging::store::{AttachFeedTarget, DeferredMessage};
 use brenn_lib::messaging::{
-    DeliveryShape, MessageEnvelope, ParticipantId, SubscriberEntryKind, WakeRouter,
+    AttachScope, DeliveryShape, MessageEnvelope, ParticipantId, SubscriberEntryKind, WakeRouter,
 };
 use brenn_lib::obs::alerting::{AlertDispatcher, AlertSeverity};
 use chrono_tz::Tz;
@@ -74,25 +74,13 @@ pub(crate) enum DeliveryBinding {
 /// The attach-registry key for an attach-shaped subscriber, or `None` for a kind
 /// that holds a position instead of an attachment.
 ///
-/// The registry is one map keyed by a bare string and shared by both attach
-/// routes, so the keyspaces are kept disjoint here: a surface keys by its bare
-/// slug (the spelling the surface route registers under) and a remote by
-/// `remote:<slug>`. Neither a surface slug nor a remote slug may carry a `:`, so
-/// no remote key can spell a surface slug and vice versa — the participant-id
-/// charset guards, applied to the one shared map.
-///
-/// Borrowed for a surface and owned for a remote: this runs per message per
-/// target on the live fan-out and on the precheck that exists to make the
-/// no-listener publish cheap, so the common key costs nothing. The remote
-/// spelling is the one `ParticipantId::for_remote` mints; its charset guards ran
-/// at boot, and re-running them per message would buy nothing.
+/// The spelling is [`AttachScope::registry_key`]'s, which is also what each
+/// route registers its sessions under; this side only decides which scope a
+/// subscriber kind names.
 fn attach_registry_key(key: &SubscriberEntryKind) -> Option<Cow<'_, str>> {
     match key {
-        SubscriberEntryKind::Surface(slug) => Some(Cow::Borrowed(slug.as_str())),
-        SubscriberEntryKind::Remote(slug) => Some(Cow::Owned(format!(
-            "{}{slug}",
-            ParticipantId::REMOTE_PREFIX
-        ))),
+        SubscriberEntryKind::Surface(slug) => Some(AttachScope::surface(slug).registry_key()),
+        SubscriberEntryKind::Remote(slug) => Some(AttachScope::remote(slug).registry_key()),
         SubscriberEntryKind::App(_)
         | SubscriberEntryKind::Wasm(_)
         | SubscriberEntryKind::System(_)

@@ -23,7 +23,7 @@ use tracing::warn;
 use crate::client_ip;
 use crate::middleware;
 use crate::routes::{
-    app, file, login, logout, redirector, register, statics, surface, upload, webhooks, ws,
+    app, file, login, logout, redirector, register, remote, statics, surface, upload, webhooks, ws,
 };
 use crate::state::AppState;
 
@@ -345,7 +345,14 @@ pub(crate) fn build_router(
             no_cache(tower_http::services::ServeFile::new(
                 state.static_dir.join("nav-on-message.js"),
             )),
-        );
+        )
+        // The remote attach route. Outside `require_auth` because a daemon
+        // carries a bearer token rather than a session cookie and the middleware
+        // would 303 it to a login page; the handler authenticates the token
+        // itself and supplies its own account string. Still inside
+        // `resolve_client_ip` and the global governor, so its uniform 401s are
+        // IP-attributed fail2ban signal like every other pre-auth route's.
+        .route("/remote/{slug}/ws", get(remote::remote_ws_handler));
 
     // Per-endpoint inbound webhook routes. Registered only when a WebhookService
     // is configured. Each endpoint gets its own literal mount path (e.g.

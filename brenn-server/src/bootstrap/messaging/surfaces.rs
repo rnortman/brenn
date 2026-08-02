@@ -3,10 +3,11 @@ use std::time::Duration;
 
 use brenn_budget::MAX_PUBLISHES_PER_ACTIVATION;
 use brenn_lib::messaging::config::{
-    DEFAULT_PARKED_BATCH_DEPTH, DEFAULT_WASM_PUBLISH_CAPACITY, DEFAULT_WASM_PUBLISH_PER_ACTIVATION,
-    Depth, MessagingGlobalConfig, NoiseLevel, ResolvedComponent, ResolvedLocalChannel,
-    ResolvedSubscription, ResolvedSurface, ResolvedSurfaceSubscription, SurfaceBinding,
-    SurfaceComponentRaw, SurfaceConfigRaw, SurfaceOutput, SurfaceOutputRaw, SurfaceSendBudget,
+    AttachSendBudget, DEFAULT_PARKED_BATCH_DEPTH, DEFAULT_WASM_PUBLISH_CAPACITY,
+    DEFAULT_WASM_PUBLISH_PER_ACTIVATION, Depth, MessagingGlobalConfig, NoiseLevel,
+    ResolvedComponent, ResolvedLocalChannel, ResolvedSubscription, ResolvedSurface,
+    ResolvedSurfaceSubscription, SurfaceBinding, SurfaceComponentRaw, SurfaceConfigRaw,
+    SurfaceOutput, SurfaceOutputRaw,
 };
 use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Urgency};
 use brenn_surface_schema::Abi;
@@ -261,14 +262,9 @@ fn assert_backstop_covers_a_maximal_flush(burst: u32, context: &str) {
 /// config, not a rate limit), and a refill of 0 seconds is a bucket that never
 /// binds — and would divide by zero in `TokenBucket`. An operator who wants an
 /// instance silent removes its output bindings; one who wants it unmetered has
-/// no such option by design (§7's whole point is that every component-identity
-/// publish is metered).
-fn resolve_send_budget(
-    slug: &str,
-    instance: &str,
-    comp: &SurfaceComponentRaw,
-) -> SurfaceSendBudget {
-    let default = SurfaceSendBudget::default();
+/// no such option by design.
+fn resolve_send_budget(slug: &str, instance: &str, comp: &SurfaceComponentRaw) -> AttachSendBudget {
+    let default = AttachSendBudget::default();
     let burst = comp.send_burst.unwrap_or(default.burst);
     assert!(
         burst >= 1,
@@ -287,7 +283,7 @@ fn resolve_send_budget(
          a budget that never refills against the clock — i.e. no budget. Every \
          component-identity publish is metered by design; set send_refill_secs >= 1.",
     );
-    SurfaceSendBudget {
+    AttachSendBudget {
         burst,
         refill: Duration::from_secs(refill_secs),
     }

@@ -11,8 +11,10 @@
 //! assumptions, shown by an attacher with no browser to make them from.
 //!
 //! The surface route is the door it comes through because a route is what exists
-//! to be attached to; nothing in the client knows which one it is. A future
-//! token-authenticated route swaps the connector and changes nothing below it.
+//! to be attached to; nothing in the client knows which one it is. The same
+//! attacher runs against the token-authenticated remote route in
+//! `routes::remote`'s conformance suite: a different connector, and nothing
+//! below it differs.
 //!
 //! What this suite is *not*: a second copy of the frame-semantics suites. Cursor
 //! grammar, gap minting, violation handling and the publish authority matrix are
@@ -22,7 +24,8 @@
 
 use brenn_attach_conformance::relay::SeverableRelay;
 use brenn_attach_conformance::{
-    AttachClient, ClientConfig, Observation, PublishRequest, ResumePolicy, SubscriptionDepths,
+    AttachClient, ClientConfig, Credential, Observation, PublishRequest, ResumePolicy,
+    SubscriptionDepths,
 };
 use brenn_attach_proto::{PublishOutcome, Urgency};
 use brenn_lib::db;
@@ -72,7 +75,7 @@ async fn build_rig(db: &db::Db, retain_depth: u64) -> Rig {
             "ws://{}/surface/deskbar/ws?build={TEST_BUILD_ID}",
             relay.addr()
         ),
-        session_cookie: token,
+        credential: Credential::SessionCookie(token),
         ident: "attach-conformance".to_string(),
     });
     Rig {

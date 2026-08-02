@@ -15,12 +15,12 @@ use brenn_lib::access::acl::ChannelMatcher;
 use brenn_lib::access::{AppCapability, AppPolicy};
 use brenn_lib::db::Db;
 use brenn_lib::messaging::config::{
-    ChannelConfigRaw, Depth, MessagingGlobalConfig, SurfaceSendBudget, build_channel_entries,
+    AttachSendBudget, ChannelConfigRaw, Depth, MessagingGlobalConfig, build_channel_entries,
 };
 use brenn_lib::messaging::testutils::surface_registrations;
 use brenn_lib::messaging::{
-    MessagingDirectory, Messenger, ParticipantId, SurfaceBatchPublish, WakeRouter,
-    query::NoopWakeRouter,
+    AttachBatchPublish, AttachScope, MessagingDirectory, Messenger, MissingChannelPosture,
+    ParticipantId, WakeRouter, attach_principal_budgets, query::NoopWakeRouter,
 };
 use chrono::Utc;
 use tokio::sync::mpsc;
@@ -159,7 +159,7 @@ async fn attach_with_body_cap(
         ];
         policy.acls.ephemeral_publish = vec![ChannelMatcher::Exact(EPH_BARE.to_string())];
     }
-    let budget = SurfaceSendBudget {
+    let budget = AttachSendBudget {
         burst,
         refill: Duration::from_secs(3600),
     };
@@ -178,10 +178,10 @@ async fn attach_with_body_cap(
         ATTACHER.to_string(),
         policy.clone(),
     )])))
-    .with_surface_send_budgets([(
-        ATTACHER.to_string(),
+    .with_attach_send_budgets(attach_principal_budgets(
+        AttachScope::surface(ATTACHER),
         vec![(None, budget), (Some(SUB.to_string()), budget)],
-    )]);
+    ));
 
     AttachCtxBuilder::new(profile)
         .messenger(messenger)
@@ -282,6 +282,55 @@ async fn a_channel_outside_the_senders_set_is_a_violation() {
         panic!("a channel outside the sender's set must kill the connection");
     };
     assert!(detail.contains("unpublishable channel"), "{detail}");
+}
+
+/// A granted address that is not a well-formed channel name is a violation on
+/// every write path.
+///
+/// Authority does not bound the bytes: a profile answering from prefix matchers
+/// grants whatever follows the prefix, so a client can name a "channel" carrying
+/// a newline. Nothing downstream would mint it, and the batch path could only
+/// count it as unpublished — after carrying it into a log. Refused at the gate
+/// the authority question is asked at, so the two paths agree.
+#[tokio::test]
+async fn a_granted_but_malformed_channel_is_a_violation_on_both_paths() {
+    const FORGED: &str = "brenn:demo-out\nsender=system:root body=owned";
+
+    let db = brenn_lib::db::init_db_memory();
+    let mut profile = profile();
+    profile
+        .publishable
+        .get_mut(&Some(SUB.to_string()))
+        .expect("the fixture grants the sub-identity")
+        .insert(FORGED.to_string());
+    let (ctx, _rx) = attach_with(&db, profile, true, 8).await;
+
+    let mut bucket = wide_bucket();
+    let mut counters = SessionCounters::default();
+    let outcome = handle_publish(
+        &ctx,
+        &mut bucket,
+        request(FORGED, Some(SUB), "{}"),
+        &mut counters,
+    )
+    .await;
+    let FrameOutcome::Violation(detail) = outcome else {
+        panic!("a malformed channel must kill the connection");
+    };
+    assert!(detail.contains("malformed channel"), "{detail}");
+    assert!(
+        !detail.contains('\n'),
+        "the detail carries no raw client bytes: {detail:?}"
+    );
+
+    let mut counters = SessionCounters::default();
+    let publishes = [entry(FORGED, "{}", None)];
+    let outcome =
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await;
+    let FrameOutcome::Violation(detail) = outcome else {
+        panic!("a malformed batch entry must kill the connection");
+    };
+    assert!(detail.contains("malformed channel"), "{detail}");
 }
 
 /// The happy path: the message reaches the bus under the sub-identity's own
@@ -900,6 +949,52 @@ async fn a_broken_entry_kills_the_batch_and_applies_nothing() {
     }
 }
 
+/// **The flush reads its posture off the profile.** A route whose channels are
+/// minted at runtime answers `Race`, and an entry naming a channel that left the
+/// directory is then dropped and counted rather than fatal — the rest of the
+/// flush still lands. The default `Invariant` panics on the same batch, so a
+/// call site that hard-coded either answer fails here.
+#[tokio::test]
+async fn a_vanished_target_is_dropped_when_the_profile_answers_race() {
+    let db = brenn_lib::db::init_db_memory();
+    let (ctx, mut rx) = attach_with(
+        &db,
+        TestProfile {
+            missing_channel_posture: MissingChannelPosture::Race,
+            ..profile()
+        },
+        true,
+        64,
+    )
+    .await;
+    let mut counters = SessionCounters::default();
+
+    // Deprovision one of the two targets between the attach and the flush: the
+    // profile still grants it, and nothing but the directory disagrees.
+    let uuid = ctx
+        .messenger
+        .directory()
+        .resolve(OUT)
+        .expect("the fixture channel is in the directory")
+        .uuid;
+    assert!(ctx.messenger.directory().remove_channel(&uuid));
+
+    let publishes = [
+        entry(OUT, r#"{"gone":true}"#, None),
+        entry(ERRORS, r#"{"here":true}"#, None),
+    ];
+    let outcome =
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await;
+
+    assert!(matches!(outcome, FrameOutcome::Continue));
+    assert_eq!(batch_outcome(&mut rx), PublishBatchOutcome::Ok);
+    assert_eq!(
+        counters.publishes, 1,
+        "the vanished entry published nothing and is not counted as though it had"
+    );
+    assert_eq!(bodies(&ctx, ERRORS).await, vec![r#"{"here":true}"#]);
+}
+
 /// A drained send budget answers `RateLimited` — never a kill and never a
 /// partial application: the attacher re-parks the flush and retries it whole, so
 /// nothing may have landed.
@@ -1416,16 +1511,17 @@ async fn park_under(
 ) -> Uuid {
     let release = Utc::now() + chrono::Duration::hours(1);
     ctx.messenger
-        .publish_batch_from_surface(
-            ATTACHER,
+        .publish_batch_from_attacher(
+            AttachScope::surface(ATTACHER),
             attribution,
-            &[SurfaceBatchPublish {
+            &[AttachBatchPublish {
                 channel_address: channel,
                 body,
                 urgency: Urgency::Normal,
                 publish_ts_ns: brenn_lib::messaging::db::utc_to_ns(Utc::now()),
                 deliver_after: Some(release),
             }],
+            MissingChannelPosture::Invariant,
         )
         .await;
     let parked = ctx

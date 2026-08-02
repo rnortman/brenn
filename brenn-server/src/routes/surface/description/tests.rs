@@ -5,8 +5,8 @@ use brenn_lib::access::{AppCapability, AppPolicy};
 use brenn_lib::config::SurfaceDescriptionConfig;
 use brenn_lib::messaging::MessagingDirectory;
 use brenn_lib::messaging::config::{
-    ChannelConfigRaw, Depth, MessagingGlobalConfig, ResolvedComponent, ResolvedSurface,
-    SurfaceBinding, SurfaceOutput, SurfaceSendBudget, build_channel_entries,
+    AttachSendBudget, ChannelConfigRaw, Depth, MessagingGlobalConfig, ResolvedComponent,
+    ResolvedSurface, SurfaceBinding, SurfaceOutput, build_channel_entries,
 };
 
 use super::*;
@@ -39,7 +39,7 @@ fn surface(slug: &str, skin: &str, components: &[(&str, &str)]) -> ResolvedSurfa
                 instance: (*instance).to_string(),
                 kind: (*kind).to_string(),
                 abi: brenn_surface_schema::Abi::Dom,
-                send_budget: SurfaceSendBudget::default(),
+                send_budget: AttachSendBudget::default(),
                 parked_batch_depth: 8,
                 config: Default::default(),
                 chrome: false,
