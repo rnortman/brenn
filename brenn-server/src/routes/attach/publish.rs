@@ -20,7 +20,7 @@ mod tests;
 
 use brenn_attach_proto::{
     BatchDeferredOp, BatchEntry, DeferredOpKind, DeferredViewEntry, PublishBatchOutcome,
-    PublishOutcome, ServerFrame, Urgency,
+    PublishOutcome, ServerFrame, Urgency, check_batch_legality,
 };
 use brenn_budget::{MAX_PUBLISH_BYTES_PER_ACTIVATION, MAX_PUBLISHES_PER_ACTIVATION};
 use brenn_lib::messaging::store::{DeferralOutcome, DeferredMessage};
@@ -35,6 +35,13 @@ use uuid::Uuid;
 use super::profile::{DeferredTarget, PublishPosture};
 use super::registry::DeferredViewPush;
 use super::session::{AttachSessionCtx, FrameOutcome, SessionCounters, sanitize_client_detail};
+
+/// The wire's op cap must admit the widest flush an activation can buffer —
+/// `MAX_PUBLISHES_PER_ACTIVATION` publishes and as many control ops. Lower, and
+/// a conforming attacher would compose a batch its buffer-time caps allowed and
+/// the wire refuses. The two numbers live in crates that cannot see each other,
+/// so this is where they are held together.
+const _: () = assert!(brenn_attach_proto::MAX_BATCH_OPS >= 2 * MAX_PUBLISHES_PER_ACTIVATION);
 
 /// Transport-level oversized-body rejections one connection may accumulate
 /// before the next one is a violation.
@@ -401,6 +408,15 @@ pub async fn handle_publish_batch(
              {MAX_PUBLISH_BYTES_PER_ACTIVATION}-byte per-activation cap",
         ));
     }
+    // The wire's own law, which is the tighter of the two and the one the read
+    // cap is derived from: a batch inside it is a frame this server will read,
+    // and a conforming attacher checks it before composing the frame. So an
+    // illegal-but-parseable batch is the same non-conforming signal an oversized
+    // frame is — reported here, where the fields can name what was wrong,
+    // instead of as a bare read failure.
+    if let Err(illegal) = check_batch_legality(publishes, deferred_ops, ctx.max_body_bytes) {
+        return ctx.violation(format!("illegal PublishBatch: {illegal}"));
+    }
 
     // 3. Resolve everything before applying any of it: the batch is atomic, so a
     //    check that ran per entry as it applied could kill the connection with a
@@ -549,6 +565,10 @@ pub async fn handle_publish_batch(
 
 /// Resolve every publish entry of a batch, or the violation that kills the
 /// connection.
+///
+/// No body-size check here: the batch's own legality law spends one budget of
+/// `max_body_bytes` across every body and channel the frame carries, so a single
+/// entry over that cap has already killed the frame.
 fn resolve_batch_entries<'a>(
     ctx: &AttachSessionCtx,
     attribution: Option<&str>,
@@ -558,14 +578,6 @@ fn resolve_batch_entries<'a>(
     let mut resolved = Vec::with_capacity(publishes.len());
     for entry in publishes {
         assert_publishable(ctx, attribution, &entry.channel, "PublishBatch entry")?;
-        if entry.body.len() > ctx.max_body_bytes {
-            return Err(ctx.violation(format!(
-                "PublishBatch entry on channel {} carries a {}-byte body, over the {}-byte cap",
-                sanitize_client_detail(&entry.channel),
-                entry.body.len(),
-                ctx.max_body_bytes,
-            )));
-        }
         // Left unchecked, an unrepresentable release time collapses into an
         // immediate publish, silently turning a schedule into a now.
         let deliver_after = match entry.deliver_after {
@@ -593,6 +605,10 @@ fn resolve_batch_entries<'a>(
 
 /// Resolve every control op of a batch, or the violation that kills the
 /// connection.
+///
+/// An edit body needs no size check of its own, for the reason
+/// [`resolve_batch_entries`] states: the legality law charged it against the
+/// frame's one budget before anything got here.
 fn resolve_deferred_ops<'a>(
     ctx: &AttachSessionCtx,
     attribution: Option<&str>,
@@ -610,17 +626,6 @@ fn resolve_deferred_ops<'a>(
                 body,
                 deliver_after,
             } => {
-                if let Some(body) = body
-                    && body.len() > ctx.max_body_bytes
-                {
-                    return Err(ctx.violation(format!(
-                        "PublishBatch control op on channel {} carries a {}-byte edit body, over \
-                         the {}-byte cap",
-                        sanitize_client_detail(&op.channel),
-                        body.len(),
-                        ctx.max_body_bytes,
-                    )));
-                }
                 let release_at = match deliver_after {
                     None => None,
                     Some(ms) => {

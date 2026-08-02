@@ -819,10 +819,11 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         });
 
     // Register the remaining delivery bindings: every configured app delivers
-    // inline through its conversation bridge, and every surface fans out to its
-    // attached sessions. Together with the WASM/system ParkedNotify bindings
-    // above, this covers every subscriber the dispatcher can target — a missing
-    // binding at dispatch time is a host-wiring invariant violation and panics.
+    // inline through its conversation bridge, and every surface and remote fans
+    // out to its attached sessions. Together with the WASM/system ParkedNotify
+    // bindings above, this covers every subscriber the dispatcher can target — a
+    // missing binding at dispatch time is a host-wiring invariant violation and
+    // panics.
     if let Some(ref router) = messaging_result.router {
         use crate::messaging_router::DeliveryBinding;
         use brenn_lib::messaging::SubscriberEntryKind;
@@ -837,6 +838,13 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
         // from this one.
         for runtime in surface_runtimes.values() {
             router.register_surface_delivery_routes(&runtime.resolved);
+        }
+        // And one per remote. Nothing subscribes on its behalf at boot — its
+        // entries are minted by its own subscribes — so the binding is
+        // registered from the config, which is the only enumeration of remotes
+        // that exists before one attaches.
+        for remote in &messaging_result.remotes {
+            router.register_remote_delivery_routes(remote);
         }
 
         let messenger = messaging_result
@@ -1296,7 +1304,9 @@ mod tests {
         use brenn_lib::db::init_db_memory;
         use brenn_lib::messaging::config::{Depth, MessagingGlobalConfig, NoiseLevel};
         use brenn_lib::messaging::query::NoopWakeRouter;
-        use brenn_lib::messaging::testutils::{test_channel_entry, wasm_registrations};
+        use brenn_lib::messaging::testutils::{
+            remote_registrations, test_channel_entry, wasm_registrations,
+        };
         use brenn_lib::messaging::{
             MessagingDirectory, Messenger, SubscriberEntry, SubscriberEntryKind,
             SubscriberRegistration, WakeRouter,
@@ -1384,6 +1394,80 @@ mod tests {
                 wasm_key(),
                 DeliveryBinding::ParkedNotify(Arc::new(tokio::sync::Notify::new())),
             );
+            assert_every_subscriber_wired(&messenger, &router);
+        }
+
+        const REMOTE_SLUG: &str = "pod-kitchen";
+
+        fn remote_key() -> SubscriberEntryKind {
+            SubscriberEntryKind::Remote(REMOTE_SLUG.to_string())
+        }
+
+        /// A `Messenger` whose directory holds one channel with a
+        /// **runtime-minted** `Remote` subscriber — the shape a remote's
+        /// subscribe leaves behind, which no boot walk over config could have
+        /// produced.
+        fn remote_messenger(registered: bool) -> Arc<Messenger> {
+            let sub = SubscriberEntry {
+                kind: remote_key(),
+                push_depth: Depth::Bounded(8),
+                retain_depth: Depth::Bounded(64),
+                noise: NoiseLevel::Silent,
+                wake_min: None,
+            };
+            let entry = test_channel_entry("chat.app.home.out.42", vec![sub]);
+            let regs = if registered {
+                remote_registrations(HashMap::from([(
+                    REMOTE_SLUG.to_string(),
+                    AppPolicy::default(),
+                )]))
+            } else {
+                HashMap::new()
+            };
+            Messenger::new(
+                init_db_memory(),
+                Arc::new(MessagingDirectory::with_entries(vec![entry])),
+                Arc::from("test"),
+                Arc::new(IndexMap::new()),
+                Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
+                MessagingGlobalConfig::default(),
+            )
+            .with_subscriber_registrations(regs)
+        }
+
+        /// A runtime-minted remote entry — one a subscribe created after boot —
+        /// is judged by the same registrations config put there for it: the
+        /// cross-check walks the *directory*, so an entry that appears later
+        /// meets the same bar.
+        #[test]
+        fn a_runtime_minted_remote_entry_passes_when_its_config_wiring_ran() {
+            let messenger = remote_messenger(true);
+            let router = WakeRouterImpl::new(ActiveBridges::new());
+            router.register_delivery_binding(remote_key(), DeliveryBinding::AttachSessions);
+            assert_every_subscriber_wired(&messenger, &router);
+        }
+
+        /// A dropped `register_remote_delivery_routes` call is invisible at boot —
+        /// a remote's entries do not exist yet for the walk to catch — and shows
+        /// up as a panic on the first delivery. This is the assertion that keeps
+        /// the wiring in place.
+        #[test]
+        #[should_panic(expected = "has no delivery binding")]
+        fn a_runtime_minted_remote_entry_without_its_binding_panics() {
+            let messenger = remote_messenger(true);
+            let router = WakeRouterImpl::new(ActiveBridges::new());
+            assert_every_subscriber_wired(&messenger, &router);
+        }
+
+        /// And a dropped `subscriber_registrations` insert fails *closed* at the
+        /// delivery ACL gate — a silent drop, the failure this check exists to
+        /// turn into a named boot death.
+        #[test]
+        #[should_panic(expected = "has no wake-economics")]
+        fn a_runtime_minted_remote_entry_without_its_registration_panics() {
+            let messenger = remote_messenger(false);
+            let router = WakeRouterImpl::new(ActiveBridges::new());
+            router.register_delivery_binding(remote_key(), DeliveryBinding::AttachSessions);
             assert_every_subscriber_wired(&messenger, &router);
         }
 

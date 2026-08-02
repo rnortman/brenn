@@ -24,6 +24,14 @@ fn cursor(token: &str) -> Cursor {
         .expect("cursor from a JSON string")
 }
 
+/// The ack of a settlement the test states opened a subscription.
+fn opened(settlement: SubscribeSettlement) -> SubscribeAck {
+    match settlement {
+        SubscribeSettlement::Opened(ack) => ack,
+        SubscribeSettlement::Unavailable => panic!("the peer answered Unavailable"),
+    }
+}
+
 /// A whole delivery pass: one row per `(seq, cursor token, dropped)` triple, in
 /// frame order.
 ///
@@ -197,9 +205,10 @@ fn a_release_while_the_subscribe_is_in_flight_defers_the_unsubscribe() {
     // The peer has not acknowledged yet, so there is nothing it would accept an
     // `Unsubscribe` for.
     assert!(subs.release(CHANNEL).is_empty());
-    let ack = subs
-        .on_subscribe_result(CHANNEL, SubscribeOutcome::Ok, 3, None)
-        .expect("the result answers a pending channel");
+    let ack = opened(
+        subs.on_subscribe_result(CHANNEL, SubscribeOutcome::Ok, 3, None)
+            .expect("the result answers a pending channel"),
+    );
     assert_eq!(ack.frames, vec![unsubscribe_frame(CHANNEL)]);
     assert!(!ack.live);
     assert!(!subs.is_active(CHANNEL));
@@ -259,9 +268,10 @@ fn a_statement_replaced_while_the_subscribe_is_in_flight_is_enacted_at_its_resul
     );
     assert_eq!(subs.depths(CHANNEL), Some(depths(2, 3)));
 
-    let ack = subs
-        .on_subscribe_result(CHANNEL, SubscribeOutcome::Ok, 1, None)
-        .expect("the result answers a pending channel");
+    let ack = opened(
+        subs.on_subscribe_result(CHANNEL, SubscribeOutcome::Ok, 1, None)
+            .expect("the result answers a pending channel"),
+    );
     assert_eq!(
         ack.frames,
         vec![unsubscribe_frame(CHANNEL), subscribe(CHANNEL, 2, 3, None)]
@@ -279,9 +289,10 @@ fn a_statement_replaced_while_the_subscribe_is_in_flight_is_enacted_at_its_resul
         }
     );
 
-    let ack = subs
-        .on_subscribe_result(CHANNEL, SubscribeOutcome::Ok, 1, None)
-        .expect("the restated subscribe is pending");
+    let ack = opened(
+        subs.on_subscribe_result(CHANNEL, SubscribeOutcome::Ok, 1, None)
+            .expect("the restated subscribe is pending"),
+    );
     assert!(ack.frames.is_empty());
     assert!(ack.live);
     assert!(subs.is_active(CHANNEL));
@@ -369,14 +380,72 @@ fn a_subscribe_result_reports_the_replay_count_and_gap_without_interpreting_them
     let gap = GapInfo {
         reason: GapReason::BeyondRetained,
     };
-    let ack = subs
-        .on_subscribe_result(CHANNEL, SubscribeOutcome::Ok, 4, Some(gap))
-        .expect("pending");
+    let ack = opened(
+        subs.on_subscribe_result(CHANNEL, SubscribeOutcome::Ok, 4, Some(gap))
+            .expect("pending"),
+    );
     assert_eq!(ack.replay_count, 4);
     assert_eq!(ack.gap, Some(gap));
     assert!(ack.live);
     assert!(ack.frames.is_empty());
     assert!(subs.is_active(CHANNEL));
+}
+
+/// An unavailable channel leaves nothing behind that would put it back on the
+/// wire: no hold, no pending span, and no place in the resubscribe set a
+/// reattach composes.
+#[test]
+fn an_unavailable_channel_is_released_and_never_resubscribed() {
+    let mut subs = Subscriptions::new();
+    subs.on_attached();
+    subs.acquire(CHANNEL, depths(5, 10), ResumePolicy::Resume);
+    subs.acquire(CHANNEL, depths(5, 10), ResumePolicy::Resume);
+    assert_eq!(
+        subs.on_subscribe_result(CHANNEL, SubscribeOutcome::Unavailable, 0, None),
+        Ok(SubscribeSettlement::Unavailable)
+    );
+    assert!(!subs.is_active(CHANNEL));
+    assert_eq!(
+        subs.refcount(CHANNEL),
+        0,
+        "every hold cleared, not just one"
+    );
+    assert!(subs.held_channels().is_empty());
+    assert!(
+        subs.resubscribe_survivors().is_empty(),
+        "nothing holds the channel, so nothing resubscribes it"
+    );
+    // Nothing opened, so a delivery on it is inexplicable rather than a
+    // straggler the plane owes tolerance to.
+    let err = subs
+        .on_deliver(CHANNEL, &pass(&[(1, "c1", 0)]))
+        .expect_err("no span ever started");
+    assert!(err.contains("never active"), "{err}");
+}
+
+/// The cursor outlives the refusal, because the channel's next incarnation is
+/// exactly what the attacher wants to resume into — and whether the token still
+/// means anything is the peer's incarnation guard to answer, not this layer's.
+#[test]
+fn a_re_acquisition_after_unavailable_presents_the_kept_cursor() {
+    let mut subs = attached_with(CHANNEL);
+    subs.on_deliver(CHANNEL, &pass(&[(1, "c1", 0)]))
+        .expect("live subscription accepts a delivery");
+    // The peer deprovisions the channel under the live subscription; the
+    // attacher re-states it and is told it is gone.
+    subs.on_detached();
+    assert_eq!(
+        subs.on_attached(),
+        vec![subscribe(CHANNEL, 5, 10, Some("c1"))]
+    );
+    subs.on_subscribe_result(CHANNEL, SubscribeOutcome::Unavailable, 0, None)
+        .expect("pending");
+    assert_eq!(subs.refcount(CHANNEL), 0);
+    assert_eq!(
+        subs.acquire(CHANNEL, depths(5, 10), ResumePolicy::Resume),
+        vec![subscribe(CHANNEL, 5, 10, Some("c1"))],
+        "the cursor survived the refusal"
+    );
 }
 
 #[test]

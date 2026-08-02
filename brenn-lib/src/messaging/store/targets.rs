@@ -2,7 +2,7 @@
 //! out to live, and on what terms each subscriber is woken.
 //!
 //! One resolver serves every caller that needs the answer — the publish ladder's
-//! surface fan-out, the wake pass's economics lookups, and the conversation
+//! attacher fan-out, the wake pass's economics lookups, and the conversation
 //! family's app→conversation resolution. It holds the participant registry: each
 //! subscriber's access policy and wake economics, read as the registrations stand
 //! at the moment the question is asked, never from a copy made when a message was
@@ -22,14 +22,14 @@ use crate::messaging::{
     WakeEconomics, WakeMin,
 };
 
-/// One surface subscriber a just-retained message is fanned out to live.
+/// One attach-shaped subscriber a just-retained message is fanned out to live.
 ///
-/// Surfaces hold no cursor, so no walk over positions can name them: the
-/// envelope is handed to their attached sessions at the moment it enters
-/// retention, and a session that misses it resumes past its own wire cursor.
+/// Both attach-shaped kinds — a browser surface and a remote daemon — take the
+/// feed on identical terms; which one a target names decides only the
+/// participant identity it answers with.
 #[derive(Debug, Clone)]
-pub struct SurfaceFeedTarget {
-    /// The registration key: the surface, which is the whole grain a channel's
+pub struct AttachFeedTarget {
+    /// The registration key: the attacher, which is the whole grain a channel's
     /// feed is cut at.
     pub kind: SubscriberEntryKind,
     /// `true` for a push-enabled subscription, whose session can resume the
@@ -37,20 +37,22 @@ pub struct SurfaceFeedTarget {
     pub push_enabled: bool,
 }
 
-impl SurfaceFeedTarget {
-    /// The subscribing surface as a participant identity — the bare
-    /// `surface:<slug>`. Derived from `kind` rather than carried, so the two
-    /// cannot disagree.
+impl AttachFeedTarget {
+    /// The subscribing attacher as a participant identity — the bare
+    /// `surface:<slug>` or `remote:<slug>`. Derived from `kind` rather than
+    /// carried, so the two cannot disagree.
     ///
     /// # Panics
     ///
-    /// If the target is keyed by any other subscriber kind. Only surfaces take
-    /// the row-less feed, so the resolver builds no such target.
+    /// If the target is keyed by any other subscriber kind. Only attach-shaped
+    /// subscribers take the row-less feed, so the resolver builds no such
+    /// target.
     pub fn subscriber(&self) -> ParticipantId {
         match &self.kind {
             SubscriberEntryKind::Surface(slug) => ParticipantId::for_surface(slug),
+            SubscriberEntryKind::Remote(slug) => ParticipantId::for_remote(slug),
             other => panic!(
-                "surface feed target keyed by {other:?} — only surface subscribers take the \
+                "attach feed target keyed by {other:?} — only attach-shaped subscribers take the \
                  row-less live feed"
             ),
         }
@@ -61,9 +63,10 @@ impl SurfaceFeedTarget {
 /// plus the apps map its `App` half resolves through.
 pub struct TargetResolver {
     apps: Arc<IndexMap<String, AppConfig>>,
-    /// One entry per registered non-app subscriber (WASM consumer, surface, or
-    /// system component), keyed by its directory [`SubscriberEntryKind`]. App
-    /// subscribers are absent: their policy and economics resolve from `apps`,
+    /// One entry per registered non-app subscriber (WASM consumer, surface,
+    /// remote, or system component), keyed by its directory
+    /// [`SubscriberEntryKind`]. App subscribers are absent: their policy and
+    /// economics resolve from `apps`,
     /// which also carries their non-policy configuration, so the two cannot
     /// diverge from a registry clone.
     subscribers: HashMap<SubscriberEntryKind, SubscriberRegistration>,
@@ -228,31 +231,33 @@ impl TargetResolver {
         get_singleton_conversation_id(conn, owner, slug)
     }
 
-    /// The surface subscribers on a channel that a just-retained message is
-    /// fanned out to live, at whatever depth they subscribe.
+    /// The attach-shaped subscribers on a channel that a just-retained message
+    /// is fanned out to live, at whatever depth they subscribe.
     ///
-    /// A surface holds no server-side delivery state: the client's echoed cursor
-    /// is the whole of it, so both depths take the same row-less
+    /// An attacher holds no server-side delivery state: the client's echoed
+    /// cursor is the whole of it, so both depths take the same row-less
     /// deliver-if-attached fan-out and differ only in what a *detached* session
     /// can recover afterwards — a push-enabled subscription resumes its suffix
     /// from retention, a fold-0 one gets whatever its retained window still
-    /// carries at the next subscribe. Only surface subscribers take the feed: an
-    /// App/Wasm/System subscriber holds a position and is served from it.
+    /// carries at the next subscribe. Only attach-shaped subscribers take the
+    /// feed: an App/Wasm/System subscriber holds a position and is served from
+    /// it.
     ///
     /// Gates each target on the subscribing principal's policy as it stands at
-    /// this moment — a surface whose policy no longer covers the channel is not
-    /// fed, and the denial is re-decided on the next message rather than cached.
-    /// The caller builds the envelope once and hands each target to the router.
-    pub fn surface_feed_targets(
+    /// this moment — an attacher whose policy no longer covers the channel is
+    /// not fed, and the denial is re-decided on the next message rather than
+    /// cached. The caller builds the envelope once and hands each target to the
+    /// router.
+    pub fn attach_feed_targets(
         &self,
         channel_address: &str,
         subscribers: &[SubscriberEntry],
-    ) -> Vec<SurfaceFeedTarget> {
+    ) -> Vec<AttachFeedTarget> {
         let mut out = Vec::new();
         for sub in subscribers {
-            let SubscriberEntryKind::Surface(_) = &sub.kind else {
+            if sub.kind.attach_slug().is_none() {
                 continue;
-            };
+            }
             let allowed = self
                 .policy(&sub.kind)
                 .is_some_and(|p| p.allows_channel_access(channel_address));
@@ -260,11 +265,11 @@ impl TargetResolver {
                 debug!(
                     subscriber = ?sub.kind,
                     channel = %channel_address,
-                    "surface live feed denied — ACL not satisfied"
+                    "attacher live feed denied — ACL not satisfied"
                 );
                 continue;
             }
-            out.push(SurfaceFeedTarget {
+            out.push(AttachFeedTarget {
                 kind: sub.kind.clone(),
                 push_enabled: sub.push_depth.is_push_enabled(),
             });

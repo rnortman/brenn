@@ -42,7 +42,7 @@ fn wasm_delivery_policies(
 }
 
 // -----------------------------------------------------------------------
-// Surface-feed target resolution
+// Attacher-feed target resolution
 // -----------------------------------------------------------------------
 
 /// Every `Surface` subscriber is a live-feed target at whatever depth it
@@ -76,7 +76,7 @@ async fn surface_feed_targets_cover_both_depths() {
         wake_min: None,
     };
     // depth-0: a feed target that is live-or-nothing.
-    let feed = messenger.resolve_surface_feed_targets(&channel, std::slice::from_ref(&fold_zero));
+    let feed = messenger.resolve_attach_feed_targets(&channel, std::slice::from_ref(&fold_zero));
     assert_eq!(feed.len(), 1);
     assert_eq!(
         feed[0].kind,
@@ -90,8 +90,7 @@ async fn surface_feed_targets_cover_both_depths() {
         push_depth: Depth::Bounded(8),
         ..fold_zero.clone()
     };
-    let feed =
-        messenger.resolve_surface_feed_targets(&channel, std::slice::from_ref(&push_enabled));
+    let feed = messenger.resolve_attach_feed_targets(&channel, std::slice::from_ref(&push_enabled));
     assert_eq!(feed.len(), 1);
     assert!(feed[0].push_enabled);
 }
@@ -119,9 +118,191 @@ async fn surface_feed_targets_skip_a_revoked_surface_subscriber() {
     };
     assert!(
         messenger
-            .resolve_surface_feed_targets(&canonical_address("surface-boot"), &[sub])
+            .resolve_attach_feed_targets(&canonical_address("surface-boot"), &[sub])
             .is_empty()
     );
+}
+
+/// A `Remote` subscriber is a live-feed target on the same terms a `Surface` is
+/// — that is what "attach-shaped" buys — and answers its own `remote:<slug>`
+/// participant identity, never a surface one.
+#[tokio::test]
+async fn attach_feed_targets_cover_a_remote_subscriber() {
+    use crate::access::acl::ChannelMatcher;
+    let db = init_db_memory();
+    let channel = canonical_address("remote-feed");
+    let policy = crate::messaging::test_support::brenn_delivery_policy(ChannelMatcher::Prefix(
+        String::new(),
+    ));
+    let messenger = Messenger::new(
+        db.clone(),
+        Arc::new(MessagingDirectory::with_entries(vec![])),
+        Arc::from("test"),
+        Arc::new(IndexMap::new()),
+        Arc::new(CountingRouter::default()) as Arc<dyn WakeRouter>,
+        MessagingGlobalConfig::default(),
+    )
+    .with_subscriber_registrations(crate::messaging::testutils::remote_registrations(
+        [("pod-kitchen".to_string(), policy)].into(),
+    ));
+    let sub = SubscriberEntry {
+        kind: SubscriberEntryKind::Remote("pod-kitchen".to_string()),
+        push_depth: Depth::Bounded(8),
+        retain_depth: Depth::Bounded(64),
+        noise: NoiseLevel::Silent,
+        wake_min: None,
+    };
+    let feed = messenger.resolve_attach_feed_targets(&channel, std::slice::from_ref(&sub));
+    assert_eq!(feed.len(), 1);
+    assert_eq!(
+        feed[0].kind,
+        SubscriberEntryKind::Remote("pod-kitchen".to_string())
+    );
+    assert_eq!(feed[0].subscriber().as_str(), "remote:pod-kitchen");
+    assert!(feed[0].push_enabled);
+}
+
+/// The delivery-time ACL gate is not surface-specific: a remote whose policy
+/// does not cover the channel is no feed target either.
+#[tokio::test]
+async fn attach_feed_targets_skip_a_revoked_remote_subscriber() {
+    let db = init_db_memory();
+    // No remote policy registered → the ACL gate denies (fail-closed).
+    let messenger = Messenger::new(
+        db.clone(),
+        Arc::new(MessagingDirectory::with_entries(vec![])),
+        Arc::from("test"),
+        Arc::new(IndexMap::new()),
+        Arc::new(CountingRouter::default()) as Arc<dyn WakeRouter>,
+        MessagingGlobalConfig::default(),
+    );
+    let sub = SubscriberEntry {
+        kind: SubscriberEntryKind::Remote("pod-kitchen".to_string()),
+        push_depth: Depth::Bounded(8),
+        retain_depth: Depth::Bounded(64),
+        noise: NoiseLevel::Silent,
+        wake_min: None,
+    };
+    assert!(
+        messenger
+            .resolve_attach_feed_targets(&canonical_address("remote-feed"), &[sub])
+            .is_empty()
+    );
+}
+
+/// The fan-out reads the channel's subscriber list from the directory, not from
+/// the entry its caller resolved.
+///
+/// This is what closes the mint race a runtime-provisioned attacher opens. The
+/// directory is copy-on-write, so a publisher's entry is a snapshot taken before
+/// its commit; a remote's first subscribe on a prefix-granted channel can mint
+/// its directory entry after that snapshot and read retention before the commit.
+/// A fan-out off the snapshot would owe the committed row to nobody — not the
+/// replay, which read too early, and not the live feed, which looked at a
+/// subscriber list too old.
+#[tokio::test]
+async fn attached_feed_targets_see_an_entry_minted_after_the_callers_snapshot() {
+    use crate::access::acl::ChannelMatcher;
+    let db = init_db_memory();
+    let policy = crate::messaging::test_support::brenn_delivery_policy(ChannelMatcher::Prefix(
+        String::new(),
+    ));
+    let entry = crate::messaging::testutils::test_channel_entry("late-subscriber", vec![]);
+    let uuid = entry.uuid;
+    let directory = Arc::new(MessagingDirectory::with_entries(vec![entry]));
+    let messenger = Messenger::new(
+        db.clone(),
+        Arc::clone(&directory),
+        Arc::from("test"),
+        Arc::new(IndexMap::new()),
+        Arc::new(CountingRouter::default()) as Arc<dyn WakeRouter>,
+        MessagingGlobalConfig::default(),
+    )
+    .with_subscriber_registrations(crate::messaging::testutils::remote_registrations(
+        [("pod-kitchen".to_string(), policy)].into(),
+    ));
+
+    // The publisher's snapshot, taken before anyone subscribed.
+    let snapshot = directory
+        .resolve(&canonical_address("late-subscriber"))
+        .expect("the fixture channel is in the directory");
+    assert!(snapshot.subscribers.is_empty());
+
+    // The subscribe lands between that snapshot and the commit.
+    assert!(directory.add_subscriber(
+        &uuid,
+        SubscriberEntry {
+            kind: SubscriberEntryKind::Remote("pod-kitchen".to_string()),
+            push_depth: Depth::Bounded(8),
+            retain_depth: Depth::Bounded(64),
+            noise: NoiseLevel::Silent,
+            wake_min: None,
+        },
+    ));
+
+    let feed = messenger.attached_feed_targets(&snapshot);
+    assert_eq!(
+        feed.len(),
+        1,
+        "the stale snapshot must not decide the fan-out"
+    );
+    assert_eq!(feed[0].subscriber().as_str(), "remote:pod-kitchen");
+}
+
+/// The caller's own entry still answers for a channel that deprovisioned between
+/// its commit and this read: nothing is owed on a channel that is gone, and the
+/// subscribers it committed under are the honest ones to name.
+#[tokio::test]
+async fn attached_feed_targets_fall_back_to_the_snapshot_for_a_vanished_channel() {
+    use crate::access::acl::ChannelMatcher;
+    let db = init_db_memory();
+    let policy = crate::messaging::test_support::brenn_delivery_policy(ChannelMatcher::Prefix(
+        String::new(),
+    ));
+    let entry = crate::messaging::testutils::test_channel_entry(
+        "vanishing",
+        vec![SubscriberEntry {
+            kind: SubscriberEntryKind::Remote("pod-kitchen".to_string()),
+            push_depth: Depth::Bounded(8),
+            retain_depth: Depth::Bounded(64),
+            noise: NoiseLevel::Silent,
+            wake_min: None,
+        }],
+    );
+    let uuid = entry.uuid;
+    let directory = Arc::new(MessagingDirectory::with_entries(vec![entry]));
+    let messenger = Messenger::new(
+        db.clone(),
+        Arc::clone(&directory),
+        Arc::from("test"),
+        Arc::new(IndexMap::new()),
+        Arc::new(CountingRouter::default()) as Arc<dyn WakeRouter>,
+        MessagingGlobalConfig::default(),
+    )
+    .with_subscriber_registrations(crate::messaging::testutils::remote_registrations(
+        [("pod-kitchen".to_string(), policy)].into(),
+    ));
+    let snapshot = directory
+        .resolve(&canonical_address("vanishing"))
+        .expect("the fixture channel is in the directory");
+    directory.remove_channel(&uuid);
+
+    let feed = messenger.attached_feed_targets(&snapshot);
+    assert_eq!(feed.len(), 1);
+    assert_eq!(feed[0].subscriber().as_str(), "remote:pod-kitchen");
+}
+
+/// A subscriber that holds a server-side position is never a feed target, and
+/// asking one of *those* targets for its participant identity is a wiring bug —
+/// the resolver builds no such target, so the accessor dies rather than guess.
+#[test]
+#[should_panic(expected = "attach feed target keyed by")]
+fn a_feed_target_keyed_by_a_positional_subscriber_panics() {
+    crate::messaging::store::AttachFeedTarget {
+        kind: SubscriberEntryKind::Wasm("proc".to_string()),
+        push_enabled: true,
+    }
+    .subscriber();
 }
 
 /// Build a `Messenger` whose channel has a `Wasm(slug)` subscriber with the

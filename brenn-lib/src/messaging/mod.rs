@@ -26,6 +26,7 @@ pub mod live;
 pub mod publish;
 pub mod query;
 pub mod reconcile;
+pub mod remote;
 pub mod store;
 pub mod subscribe;
 pub mod system;
@@ -68,6 +69,7 @@ pub use publish::{
     WasmPublish, is_well_formed_address,
 };
 pub use query::{MessageQuery, QueryError};
+pub use remote::{RemoteConfigRaw, RemoteDepths, RemoteGrant, RemoteToken, ResolvedRemote};
 
 // ---------------------------------------------------------------------------
 // Address protocol
@@ -542,6 +544,16 @@ pub enum SubscriberEntryKind {
     /// by not naming a component. Per-component attribution and budgets are cut
     /// at the sub-identity, not at this key.
     Surface(String),
+    /// An authenticated remote attacher; the slug is the `[[remote]]` slug and
+    /// becomes `remote:<slug>` as the `ParticipantId`.
+    ///
+    /// Attach-shaped like [`SubscriberEntryKind::Surface`] — one entry per
+    /// (remote, channel), no server-side position — and a distinct kind for the
+    /// two reasons that matter: its authority lowers from a `[[remote]]` block
+    /// rather than a `[[surface]]` one, and its entries are minted at runtime
+    /// (the first successful `Subscribe` on a granted prefix) rather than folded
+    /// from boot-declared bindings.
+    Remote(String),
     /// An in-process system-substrate subscriber; the component name becomes
     /// `system:<component>` as the `ParticipantId` and resolves its policy via
     /// `Messenger::system_policies`. Created programmatically (not from config),
@@ -583,9 +595,45 @@ impl SubscriberEntryKind {
             SubscriberEntryKind::App(s)
             | SubscriberEntryKind::Wasm(s)
             | SubscriberEntryKind::System(s)
-            | SubscriberEntryKind::Surface(s) => s.as_str(),
+            | SubscriberEntryKind::Surface(s)
+            | SubscriberEntryKind::Remote(s) => s.as_str(),
             SubscriberEntryKind::ChatConversation { app_slug, .. } => app_slug.as_str(),
         }
+    }
+
+    /// The attacher slug this kind names, or `None` for a subscriber that holds
+    /// a server-side position instead of an attachment.
+    ///
+    /// The single definition of "attach-shaped": every caller that needs to
+    /// distinguish the two families asks here, so a third attach-shaped kind
+    /// joins in one place.
+    pub fn attach_slug(&self) -> Option<&str> {
+        match self {
+            SubscriberEntryKind::Surface(slug) | SubscriberEntryKind::Remote(slug) => {
+                Some(slug.as_str())
+            }
+            SubscriberEntryKind::App(_)
+            | SubscriberEntryKind::Wasm(_)
+            | SubscriberEntryKind::System(_)
+            | SubscriberEntryKind::ChatConversation { .. } => None,
+        }
+    }
+
+    /// Whether two kinds name the same subscriber on one channel: same variant,
+    /// same [`slug`](Self::slug).
+    ///
+    /// The single definition of subscriber identity: it is what
+    /// [`MessagingDirectory::add_subscriber`] replaces by, so any caller
+    /// predicting that replacement asks here rather than restating the rule.
+    /// Deliberately not the derived `PartialEq`, which also compares depths and
+    /// noise — a re-registration at new depths is the same subscriber.
+    ///
+    /// `ChatConversation` compares by its app slug, so two conversations of one
+    /// app read as the same principal here. That is the rule `add_subscriber`
+    /// has always applied; nothing registers a per-conversation entry through
+    /// it today, and the day something does, this is the one place to sharpen.
+    pub fn same_principal(&self, other: &SubscriberEntryKind) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other) && self.slug() == other.slug()
     }
 }
 
@@ -766,10 +814,11 @@ impl MessagingDirectory {
         };
         let mut entry = ChannelEntry::clone(existing);
         // Replace an existing same-kind+slug subscriber, else append.
-        if let Some(slot) = entry.subscribers.iter_mut().find(|s| {
-            std::mem::discriminant(&s.kind) == std::mem::discriminant(&subscriber.kind)
-                && s.kind.slug() == subscriber.kind.slug()
-        }) {
+        if let Some(slot) = entry
+            .subscribers
+            .iter_mut()
+            .find(|s| s.kind.same_principal(&subscriber.kind))
+        {
             *slot = subscriber;
         } else {
             entry.subscribers.push(subscriber);
@@ -1112,6 +1161,7 @@ pub fn registration_key(target: &ParticipantId, target_app_slug: &str) -> Subscr
         // is cut at (surface, channel), so a component's sub-identity names no
         // entry of its own.
         SubscriberKind::Surface { slug, .. } => SubscriberEntryKind::Surface(slug),
+        SubscriberKind::Remote(slug) => SubscriberEntryKind::Remote(slug),
         SubscriberKind::System(component) => SubscriberEntryKind::System(component),
     }
 }
@@ -1132,8 +1182,8 @@ pub enum DeliveryShape {
 }
 
 /// The default [`DeliveryShape`] for a subscriber kind, mirroring the
-/// kind→binding choices bootstrap makes by hand: `App` and `Surface`
-/// subscribers deliver inline; `Wasm`/`System` subscribers are
+/// kind→binding choices bootstrap makes by hand: `App` and the attach-shaped
+/// kinds (`Surface`, `Remote`) deliver inline; `Wasm`/`System` subscribers are
 /// parked-and-woken.
 ///
 /// Bootstrap is authoritative: it registers each real binding directly (see
@@ -1145,6 +1195,7 @@ pub fn default_delivery_shape(key: &SubscriberEntryKind) -> DeliveryShape {
     match key {
         SubscriberEntryKind::App(_)
         | SubscriberEntryKind::Surface(_)
+        | SubscriberEntryKind::Remote(_)
         | SubscriberEntryKind::ChatConversation { .. } => DeliveryShape::Inline,
         SubscriberEntryKind::Wasm(_) | SubscriberEntryKind::System(_) => DeliveryShape::ParkedWake,
     }
@@ -1167,8 +1218,8 @@ pub fn default_delivery_shape(key: &SubscriberEntryKind) -> DeliveryShape {
 /// behavior from the identity prefix.
 #[async_trait::async_trait]
 pub trait WakeRouter: Send + Sync + 'static {
-    /// Hand a just-retained envelope to a push-enabled surface subscription's
-    /// attached sessions, live.
+    /// Hand a just-retained envelope to a push-enabled attach-shaped
+    /// subscription's attached sessions, live.
     ///
     /// - `Ok(true)` when at least one session accepted it.
     /// - `Ok(false)` when no session of that subscription is attached — nothing
@@ -1186,17 +1237,17 @@ pub trait WakeRouter: Send + Sync + 'static {
         retained_seq: i64,
     ) -> Result<bool, String>;
 
-    /// Row-less deliver-if-attached context feed for a depth-0 (fold-0) surface
-    /// subscription. A fold-0 subscription is live-or-nothing: it holds no
-    /// resume position, so a durable message reaches an attached session only as
-    /// a live fan-out at publish time. A session not attached is owed nothing —
-    /// its retained context arrives at the next subscribe. `key` is the surface
-    /// subscriber's `SubscriberEntryKind::Surface`; `envelope` and
-    /// `retained_seq` (the message's position in its channel's retention order)
-    /// are the just-committed message.
+    /// Row-less deliver-if-attached context feed for a depth-0 (fold-0)
+    /// attach-shaped subscription. A fold-0 subscription is live-or-nothing: it
+    /// holds no resume position, so a durable message reaches an attached
+    /// session only as a live fan-out at publish time. A session not attached is
+    /// owed nothing — its retained context arrives at the next subscribe. `key`
+    /// is the attacher's `SubscriberEntryKind::{Surface, Remote}`; `envelope`
+    /// and `retained_seq` (the message's position in its channel's retention
+    /// order) are the just-committed message.
     ///
-    /// Default no-op: only the surface router impl fans out. Test doubles that
-    /// never host surface sessions inherit the no-op.
+    /// Default no-op: only the attach router impl fans out. Test doubles that
+    /// never host attacher sessions inherit the no-op.
     async fn deliver_context(
         &self,
         key: &SubscriberEntryKind,
@@ -1253,19 +1304,19 @@ pub trait WakeRouter: Send + Sync + 'static {
         true
     }
 
-    /// Cheap precheck for the surface live feed: does any currently-attached
+    /// Cheap precheck for the attacher live feed: does any currently-attached
     /// session hold a subscription on `channel` for one of `targets`? A `false`
     /// answer lets the publish path skip building the owned, body-copying feed
-    /// envelope entirely when no page is open — a deliver-if-attached fan-out
-    /// owes a disconnected session nothing, and a push-enabled one resumes past
-    /// its own cursor when it comes back.
+    /// envelope entirely when nothing is attached — a deliver-if-attached
+    /// fan-out owes a disconnected session nothing, and a push-enabled one
+    /// resumes past its own cursor when it comes back.
     ///
-    /// Default `true`: a router that hosts no surface sessions never reaches the
-    /// build guard with non-empty targets, so the default costs it nothing.
-    fn any_surface_session_subscribed(
+    /// Default `true`: a router that hosts no attacher sessions never reaches
+    /// the build guard with non-empty targets, so the default costs it nothing.
+    fn any_attach_session_subscribed(
         &self,
         channel: &str,
-        targets: &[store::targets::SurfaceFeedTarget],
+        targets: &[store::targets::AttachFeedTarget],
     ) -> bool {
         let _ = (channel, targets);
         true
@@ -1632,6 +1683,11 @@ fn registered_subscriber<'a>(
                 slug: named_slug, ..
             },
         ) => *registered == named_slug,
+        // A remote has one grain, so the slug is the whole comparison and there
+        // is no sub-identity half to fold away.
+        (SubscriberEntryKind::Remote(registered), SubscriberKind::Remote(named)) => {
+            *registered == named
+        }
         // A chat subscription names the one conversation it belongs to, so it
         // matches on the id and never on the app the cursor was written under —
         // which is what stops one conversation of an app from resolving to a
@@ -1647,38 +1703,49 @@ fn registered_subscriber<'a>(
     entry.subscribers.iter().find(|sub| matches_kind(&sub.kind))
 }
 
-/// The noise level to enact for `subscriber`'s overflow on `entry`, or `None`
-/// when the backend must not enact for it.
+/// What the backend does with one subscriber's reported overflow.
+///
+/// Three-valued rather than `Option<NoiseLevel>` so the exemption is decided
+/// exactly where `attach_slug` is consulted: a caller cannot re-derive "was that
+/// an exemption or an unregistered subscriber?" from an absent noise level, and
+/// a third attach-shaped kind therefore needs no second edit here.
+enum OverflowNoise {
+    /// Enact the resolved rung.
+    Noise(config::NoiseLevel),
+    /// An attach-shaped subscriber: say nothing.
+    AttachExempt,
+    /// No registration resolved for this subscriber on this channel.
+    Unregistered,
+}
+
+/// How to answer `subscriber`'s overflow on `entry`.
 ///
 /// The registration is the authority: a subscriber's noise rung is resolved
 /// once, at registration, and carried on the channel's subscriber list, so an
 /// overflow reported by a store at any later moment reads the same rung the
 /// delivery path would.
 ///
-/// Three `None` cases, all deliberate:
-/// - **Surface-kind** — the loud half of the ladder is kernel-enacted, on the
-///   drop delta the page observes. `fatal` is legal on a surface registration
-///   and would panic the backend sink, so surface events never go there.
-/// - **Conversation-kind with no named app** — an `App(slug)` registration's
-///   delivery participant is a `conversation:` identity, so its rung resolves
-///   only through the app whose slug the report carries. Both classes' cursors
-///   cache that slug and every store report names it, so this arm is not
-///   reachable from them; the caller panics on one rather than mis-reporting
-///   it, so a future reporter that names no app cannot quietly bypass the
-///   ladder.
-/// - **No matching registration** — delivery state that outlives its
-///   registration, which the caller reports. The drop is still accounted on the
-///   store; there is simply no resolved rung to be loud at, and inventing one
-///   would be a guess.
+/// The two non-enacting answers:
+/// - **Attach-shaped kinds** (`AttachExempt`) — the loud half of the ladder is
+///   client-enacted, on the drop delta the attacher observes in its `Deliver`
+///   frames. `fatal` is legal on such a registration and would panic the backend
+///   sink, so their events never go there.
+/// - **No matching registration** (`Unregistered`) — delivery state that
+///   outlives its registration, or a `conversation:` identity reported without
+///   the app slug its rung hangs on. The caller separates those two: the drop is
+///   still accounted on the store, but there is no resolved rung to be loud at
+///   and inventing one would be a guess.
 fn overflow_noise_for(
     entry: &ChannelEntry,
     subscriber: &ParticipantId,
     app_slug: Option<&str>,
-) -> Option<config::NoiseLevel> {
-    let registration = registered_subscriber(entry, subscriber, app_slug)?;
-    match registration.kind {
-        SubscriberEntryKind::Surface(_) => None,
-        _ => Some(registration.noise),
+) -> OverflowNoise {
+    let Some(registration) = registered_subscriber(entry, subscriber, app_slug) else {
+        return OverflowNoise::Unregistered;
+    };
+    match registration.kind.attach_slug() {
+        Some(_) => OverflowNoise::AttachExempt,
+        None => OverflowNoise::Noise(registration.noise),
     }
 }
 
@@ -2174,8 +2241,8 @@ impl Messenger {
     /// per named subscriber.
     ///
     /// The store reported the drops; the resolved subscription decides how loud
-    /// they are. A Surface-kind subscriber is deliberately never routed here:
-    /// its drops stay on its delivery state and reach the page kernel, which is
+    /// they are. An attach-shaped subscriber is deliberately never routed to the
+    /// sink: its drops stay on its delivery state and reach the attacher itself,
     /// the only enactor allowed to see `fatal`.
     fn enact_overflow_events(&self, entry: &ChannelEntry, events: &[store::OverflowEvent]) {
         if events.is_empty() {
@@ -2183,7 +2250,7 @@ impl Messenger {
         }
         for event in events {
             match overflow_noise_for(entry, &event.subscriber, event.app_slug.as_deref()) {
-                Some(noise) => {
+                OverflowNoise::Noise(noise) => {
                     self.enact_overflow_noise(
                         &entry.address,
                         &event.subscriber,
@@ -2191,8 +2258,9 @@ impl Messenger {
                         event.dropped,
                     );
                 }
-                // Surface-kind is the designed exemption and says nothing.
-                None if matches!(event.subscriber.kind(), SubscriberKind::Surface { .. }) => {}
+                // The attach-shaped kinds are the designed exemption and say
+                // nothing: their drop delta rides the client's own frames.
+                OverflowNoise::AttachExempt => {}
                 // A conversation's rung is unresolvable, not merely unregistered:
                 // it lives on an `App(slug)` registration, and the event named
                 // no app to key it by. Reaching here means delivery to an
@@ -2200,7 +2268,9 @@ impl Messenger {
                 // per subscriber — silently skipping the ladder for every such
                 // drop, under a log line blaming a missing registration. Die
                 // instead.
-                None if matches!(event.subscriber.kind(), SubscriberKind::Conversation(_)) => {
+                OverflowNoise::Unregistered
+                    if matches!(event.subscriber.kind(), SubscriberKind::Conversation(_)) =>
+                {
                     panic!(
                         "messaging: channel {} reported overflow for conversation subscriber {} \
                          under app {:?} — a conversation's noise rung lives on an App \
@@ -2214,7 +2284,7 @@ impl Messenger {
                 // Delivery state that outlived its registration: the drop is
                 // accounted but nothing resolves its noise rung, so the ladder
                 // cannot escalate it. Surface it rather than losing it.
-                None => tracing::warn!(
+                OverflowNoise::Unregistered => tracing::warn!(
                     channel = %entry.address,
                     subscriber = %event.subscriber.as_str(),
                     dropped = event.dropped,
@@ -2452,9 +2522,9 @@ impl Messenger {
             // a confined channel reaches no session, and every channel that does
             // is fed here whatever its retention is made of.
             if entry.capabilities().transportable && !outcome.released.is_empty() {
-                let feed_targets = self.attached_surface_feed_targets(&entry);
+                let feed_targets = self.attached_feed_targets(&entry);
                 for released in &outcome.released {
-                    self.fan_out_surface_feed(
+                    self.fan_out_attach_feed(
                         &feed_targets,
                         Arc::clone(&released.envelope),
                         i64::try_from(released.seq.0)
@@ -3702,6 +3772,76 @@ mod tests {
         assert_eq!(kind.slug(), "deskbar");
     }
 
+    /// A remote participant keys to its own entry kind — not a reused `Surface`
+    /// one, which would put the two principals' authority in the same slot.
+    #[test]
+    fn a_remote_participant_keys_to_a_remote_entry() {
+        assert_eq!(
+            registration_key(&ParticipantId::for_remote("pod-kitchen"), ""),
+            SubscriberEntryKind::Remote("pod-kitchen".to_string())
+        );
+        assert_eq!(
+            SubscriberEntryKind::Remote("pod-kitchen".to_string()).slug(),
+            "pod-kitchen"
+        );
+    }
+
+    /// `attach_slug` is the single definition of "attach-shaped", so pin the
+    /// whole partition: the two kinds whose delivery state is their client's
+    /// cursor answer, and every kind that holds a server-side position does not.
+    #[test]
+    fn attach_slug_names_exactly_the_two_attach_shaped_kinds() {
+        assert_eq!(
+            SubscriberEntryKind::Surface("deskbar".to_string()).attach_slug(),
+            Some("deskbar")
+        );
+        assert_eq!(
+            SubscriberEntryKind::Remote("pod-kitchen".to_string()).attach_slug(),
+            Some("pod-kitchen")
+        );
+        for positional in [
+            SubscriberEntryKind::App("pa".to_string()),
+            SubscriberEntryKind::Wasm("proc".to_string()),
+            SubscriberEntryKind::System("tool-executor".to_string()),
+            SubscriberEntryKind::ChatConversation {
+                app_slug: "pa".to_string(),
+                conversation_id: 7,
+            },
+        ] {
+            assert_eq!(
+                positional.attach_slug(),
+                None,
+                "{positional:?} holds a position and is served from it"
+            );
+        }
+    }
+
+    /// `same_principal` is the predicate `add_subscriber` replaces by, so pin
+    /// what it separates: the variant and the slug, and neither more nor less.
+    /// A remote and a surface of one operator's name are two subscribers.
+    #[test]
+    fn same_principal_separates_the_variant_and_the_slug() {
+        let remote = SubscriberEntryKind::Remote("kitchen".to_string());
+        let surface = SubscriberEntryKind::Surface("kitchen".to_string());
+        assert!(remote.same_principal(&SubscriberEntryKind::Remote("kitchen".to_string())));
+        assert!(
+            !remote.same_principal(&surface),
+            "a remote and a surface sharing a name are distinct principals"
+        );
+        assert!(!remote.same_principal(&SubscriberEntryKind::Remote("hall".to_string())));
+        assert!(!surface.same_principal(&SubscriberEntryKind::App("kitchen".to_string())));
+    }
+
+    /// An attach-shaped kind delivers inline — it is served where it stands
+    /// rather than parked for an off-loop task.
+    #[test]
+    fn a_remote_defaults_to_inline_delivery() {
+        assert_eq!(
+            default_delivery_shape(&SubscriberEntryKind::Remote("pod-kitchen".to_string())),
+            DeliveryShape::Inline
+        );
+    }
+
     /// Either surface participant grain keys to the one surface entry: the
     /// directory is cut at (surface, channel), so a component's sub-identity is
     /// not a registration key of its own.
@@ -4595,6 +4735,63 @@ mod tests {
             .collect();
         assert_eq!(durable_addresses, vec![durable.address.clone()]);
         assert_eq!(messenger.directory().list().len(), 2);
+    }
+
+    /// A resolved entry keeps answering a store after its channel leaves the
+    /// directory, where the address does not. This is what lets a caller holding
+    /// an entry — the attach subscribe path, which resolves once and then reads
+    /// retention — survive a deprovision landing mid-flight: a race it answers
+    /// as an ordinary outcome, not a panic.
+    #[tokio::test]
+    async fn a_resolved_entry_outlives_its_channels_removal_from_the_directory() {
+        use std::sync::Arc;
+
+        let durable = crate::messaging::testutils::test_channel_entry("heartbeat", vec![]);
+        let ephemeral = crate::messaging::testutils::ephemeral_channel_entry("chatter", 4);
+        let ring_stores = Arc::new(store::RingStores::build(std::slice::from_ref(&ephemeral)));
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![
+                durable.clone(),
+                ephemeral.clone(),
+            ])),
+            Arc::from("test-source"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            crate::messaging::config::MessagingGlobalConfig::default(),
+        )
+        .with_ring_stores(ring_stores);
+
+        assert!(messenger.directory().remove_channel(&durable.uuid));
+        assert!(messenger.directory().remove_channel(&ephemeral.uuid));
+
+        assert_eq!(messenger.store_for(&durable).channel_uuid(), durable.uuid);
+        assert_eq!(
+            messenger.store_for(&ephemeral).channel_uuid(),
+            ephemeral.uuid
+        );
+    }
+
+    /// The address is the half that dies with the directory entry: naming a
+    /// removed channel by address panics, which is why a caller that already
+    /// resolved holds on to what it resolved.
+    #[tokio::test]
+    #[should_panic(expected = "not in the directory")]
+    async fn store_for_address_panics_once_the_channel_is_gone() {
+        use std::sync::Arc;
+
+        let durable = crate::messaging::testutils::test_channel_entry("heartbeat", vec![]);
+        let messenger = Messenger::new(
+            crate::db::init_db_memory(),
+            Arc::new(MessagingDirectory::with_entries(vec![durable.clone()])),
+            Arc::from("test-source"),
+            Arc::new(indexmap::IndexMap::new()),
+            Arc::new(super::query::NoopWakeRouter) as Arc<dyn WakeRouter>,
+            crate::messaging::config::MessagingGlobalConfig::default(),
+        );
+
+        assert!(messenger.directory().remove_channel(&durable.uuid));
+        let _ = messenger.store_for_address(&durable.address);
     }
 
     /// The deferred view a WASM output port draws from: it shows one sender its

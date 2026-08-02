@@ -29,6 +29,8 @@ use uuid::Uuid;
 
 use brenn_attach_client::store::DeferOp;
 
+use crate::bindings::channel_is_transportable;
+
 /// A gate verdict as the component sees it on the publish path.
 ///
 /// An oversize body and an impossible release time are facts about the
@@ -193,6 +195,56 @@ impl PublishBuffer {
         }
     }
 
+    /// What this activation's *transportable* work has already spent of the wire
+    /// batch budget: every channel address and body it will carry, charged
+    /// exactly as `brenn_attach_proto::batch_charged_bytes` charges the frame it
+    /// composes into. Summed from the buffered work rather than accumulated, so
+    /// the two cannot drift.
+    ///
+    /// Confined publishes are not charged: they never join a batch.
+    fn batch_charge(&self) -> usize {
+        let entries: usize = self
+            .entries
+            .iter()
+            .filter(|entry| channel_is_transportable(&entry.channel))
+            .map(|entry| entry.channel.len() + entry.body.len())
+            .sum();
+        let ops: usize = self
+            .defer_ops
+            .iter()
+            .filter(|op| channel_is_transportable(&op.channel))
+            .map(|op| {
+                op.channel.len()
+                    + match &op.kind {
+                        DeferOp::Edit {
+                            body: Some(body), ..
+                        } => body.len(),
+                        _ => 0,
+                    }
+            })
+            .sum();
+        entries + ops
+    }
+
+    /// Whether adding `charge` more charged bytes on `channel` would overrun the
+    /// wire batch budget.
+    ///
+    /// The whole flush travels as one `PublishBatch`, and the protocol's legality
+    /// law gives that frame one `max_body_bytes` budget across all of it. Without
+    /// this check an activation the per-body and per-activation gates admit
+    /// composes a flush the law refuses, and the refusal lands at the wire — the
+    /// entire atomic flush dropped against a counter after every publish in it
+    /// was answered ok. Asked here so the answer reaches the component that can
+    /// act on it.
+    ///
+    /// Asked only of a transportable channel, and only of a body already inside
+    /// the per-body cap, so the gate's `BodyTooLarge` still names an oversize
+    /// argument rather than a budget.
+    fn overruns_batch_budget(&self, channel: &str, charge: usize) -> bool {
+        channel_is_transportable(channel)
+            && self.batch_charge() + charge > self.gate.max_body_bytes()
+    }
+
     /// Publish `body` from this instance's output `port`, at the port's
     /// configured default urgency. Buffered, not sent: it reaches the router or
     /// the wire only if this activation returns ok.
@@ -249,6 +301,15 @@ impl PublishBuffer {
             return Err(PublishError::NotPermitted);
         };
         let urgency = urgency_override.unwrap_or(spec.default_urgency);
+        // The wire batch budget, before the gate charges anything: the gate
+        // charges on acceptance and `take` asserts its count against this
+        // buffer's, so a refusal after it would leave the two disagreeing.
+        let charge = spec.channel.len() + body.len();
+        if body.len() <= self.gate.max_body_bytes()
+            && self.overruns_batch_budget(&spec.channel, charge)
+        {
+            return Err(PublishError::QuotaExceeded);
+        }
         // A bound port always has a seeded bucket — the core seeds one per entry
         // of the same `outputs` map this resolved against — so the gate's miss
         // panic is a broken kernel invariant, not a component's problem.
@@ -339,6 +400,14 @@ impl PublishBuffer {
             } => Some(body.len()),
             _ => None,
         };
+        // The wire batch budget, as on the publish path: an op names a channel
+        // and an edit carries a body, and the legality law charges both.
+        let charge = spec.channel.len() + edit_body_len.unwrap_or(0);
+        if edit_body_len.is_none_or(|len| len <= self.gate.max_body_bytes())
+            && self.overruns_batch_budget(&spec.channel, charge)
+        {
+            return Err(DeferError::QuotaExceeded);
+        }
         self.gate.admit_op(edit_body_len).map_err(defer_error)?;
         self.defer_ops.push(BufferedDeferOp {
             port: port.to_string(),
@@ -385,5 +454,138 @@ impl PublishBuffer {
     /// where the buffer is discarded but the spending still happened.
     pub(crate) fn into_carry(self) -> HashMap<String, u64> {
         self.gate.into_sinks()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use brenn_attach_proto::{BatchEntry, check_batch_legality};
+
+    use super::*;
+
+    const WIRE: &str = "brenn:site.bar.out";
+    const LOCAL: &str = "local:page/notes";
+
+    fn spec(channel: &str) -> OutputSpec {
+        OutputSpec {
+            channel: channel.to_string(),
+            default_urgency: Urgency::Normal,
+        }
+    }
+
+    /// A buffer bound to one wire port and one confined one, with sink budgets
+    /// wide enough that only the rules under test can refuse anything.
+    fn buffer(max_body_bytes: u64) -> PublishBuffer {
+        let outputs = HashMap::from([
+            ("out".to_string(), spec(WIRE)),
+            ("notes".to_string(), spec(LOCAL)),
+        ]);
+        let sink_mt = HashMap::from([
+            ("out".to_string(), 1_000_000),
+            ("notes".to_string(), 1_000_000),
+        ]);
+        PublishBuffer::new(outputs, sink_mt, max_body_bytes, HashMap::new())
+    }
+
+    /// The whole point of the buffer-time rule: entries each well inside the body
+    /// cap that together overrun the batch budget are refused *here*, where the
+    /// component gets an answer, instead of at the wire where the entire atomic
+    /// flush would be dropped against a counter after every publish was told ok.
+    #[test]
+    fn a_publish_that_would_overrun_the_batch_budget_is_refused_at_the_call() {
+        let mut buf = buffer(64);
+        assert_eq!(buf.publish("out", "a".repeat(20)), Ok(()));
+        assert_eq!(
+            buf.publish("out", "b".repeat(20)),
+            Err(PublishError::QuotaExceeded),
+            "18 channel bytes + 20 body bytes, twice, is 76 against a 64-byte budget"
+        );
+        assert_eq!(buf.len(), 1, "the refused publish buffers nothing");
+    }
+
+    /// What the buffer accepted must compose a batch the protocol's law admits.
+    /// This is the contract the rule exists to hold; asserting it against the law
+    /// itself is what keeps the two from drifting.
+    #[test]
+    fn everything_the_buffer_accepts_composes_a_legal_batch() {
+        let cap = 128;
+        let mut buf = buffer(cap as u64);
+        // Publish until refused, then check the survivors against the law.
+        for i in 0..64 {
+            if buf.publish("out", format!("body-{i}")).is_err() {
+                break;
+            }
+        }
+        assert!(buf.len() > 1, "the fixture must admit more than one entry");
+        let flushed = buf.take();
+        let entries: Vec<BatchEntry> = flushed
+            .publishes
+            .into_iter()
+            .map(|p| BatchEntry {
+                channel: p.channel,
+                body: p.body,
+                urgency: p.urgency,
+                deliver_after: p.deliver_after,
+            })
+            .collect();
+        assert_eq!(check_batch_legality(&entries, &[], cap), Ok(()));
+    }
+
+    /// A body at exactly the advertised cap cannot survive a batch, because the
+    /// channel address is charged beside it. The component learns that at the
+    /// call rather than from a drop counter.
+    #[test]
+    fn a_body_at_the_cap_on_a_wire_port_is_refused_for_the_channel_bytes() {
+        let mut buf = buffer(64);
+        assert_eq!(
+            buf.publish("out", "a".repeat(64)),
+            Err(PublishError::QuotaExceeded)
+        );
+    }
+
+    /// An oversize body is still the gate's answer, not the budget's: it is a
+    /// fact about the argument, and `invalid-payload` says so where
+    /// `quota-exceeded` would tell the component to retry later.
+    #[test]
+    fn an_oversize_body_is_still_an_invalid_payload() {
+        let mut buf = buffer(64);
+        assert_eq!(
+            buf.publish("out", "a".repeat(65)),
+            Err(PublishError::InvalidPayload)
+        );
+    }
+
+    /// A confined publish never joins a batch, so it is charged nothing and
+    /// refuses nothing.
+    #[test]
+    fn confined_publishes_are_not_charged_against_the_batch_budget() {
+        let mut buf = buffer(64);
+        for i in 0..8 {
+            assert_eq!(buf.publish("notes", format!("note-{i}")), Ok(()));
+        }
+        assert_eq!(buf.len(), 8);
+        // And the wire port still has its whole budget.
+        assert_eq!(buf.publish("out", "a".repeat(40)), Ok(()));
+    }
+
+    /// A control op names a channel and an edit carries a body; the law charges
+    /// both, so this gate must too.
+    #[test]
+    fn control_ops_spend_the_same_budget_as_publishes() {
+        let mut buf = PublishBuffer::new(
+            HashMap::from([("out".to_string(), spec(WIRE))]),
+            HashMap::from([("out".to_string(), 1_000_000)]),
+            64,
+            HashMap::from([(
+                "out".to_string(),
+                vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+            )]),
+        );
+        assert_eq!(buf.defer_cancel("out", 0), Ok(()));
+        assert_eq!(
+            buf.defer_edit("out", 1, Some("x".repeat(30)), None),
+            Err(DeferError::QuotaExceeded),
+            "18 + 18 + 30 charged bytes against a 64-byte budget"
+        );
     }
 }

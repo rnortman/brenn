@@ -8,6 +8,7 @@ use brenn_lib::messaging::config::{
     NoiseLevel, ResolvedMessagingConfig, ResolvedSubscription, ResolvedSurface,
     ResolvedSurfaceSubscription, ResolvedWasmConsumer,
 };
+use brenn_lib::messaging::remote::{ResolvedRemote, resolve_remotes};
 use brenn_lib::messaging::{
     ChannelEntry, ChannelScheme, MessagingDirectory, webhook_channel_uuid_from_slug,
 };
@@ -291,6 +292,10 @@ pub(crate) struct MessagingResult {
     /// endpoint); the only reader today is the boot-time observability log in
     /// `bootstrap/mod.rs`. Empty when no `[[surface]]` blocks are configured.
     pub(crate) surfaces: Vec<ResolvedSurface>,
+    /// Fully resolved `[[remote]]` blocks, in declaration order, each carrying
+    /// its loaded bearer token and lowered policy. Empty when no `[[remote]]`
+    /// blocks are configured.
+    pub(crate) remotes: Vec<ResolvedRemote>,
     /// Resolved non-durable `[[channel]]` entries (`ephemeral:` and `local:`),
     /// in declaration order. Carried for the store registry the `Messenger` is
     /// built with; the only other reader today is the boot log.
@@ -389,6 +394,10 @@ fn validate_static_subscriptions_deliverable(
                     component.as_str(),
                     system_policy_by_component.get(component.as_str()).copied(),
                 ),
+                // A remote's entries are minted at runtime; one in the static
+                // directory is a wiring bug (the unresolvable-policy violation
+                // below names it).
+                SubscriberEntryKind::Remote(slug) => ("remote", slug.as_str(), None),
                 // A conversation reads its command channel under its app's
                 // derived harness policy, so that is the policy the check has to
                 // read — the same one the runtime read and wake gates consult.
@@ -455,6 +464,10 @@ pub(crate) fn messaging_configured(
         || !mqtt_ingress_channels.is_empty()
         || !config.wasm_consumers.is_empty()
         || !config.surfaces.is_empty()
+        // A remote attaches to the bus and nothing else; declaring one without
+        // the subsystem it bridges onto would leave its every subscribe
+        // refused.
+        || !config.remotes.is_empty()
         // Every LLM app's conversations carry a chat channel family, and those
         // channels are messaging like any other. A deployment that declares an
         // app has therefore activated the subsystem whether or not it declared a
@@ -568,6 +581,7 @@ pub(crate) async fn build_messaging(
             wasm_consumers: vec![],
             dynamic_mqtt_ingress: vec![],
             surfaces: vec![],
+            remotes: vec![],
             nondurable_channels: vec![],
             system_participants: vec![],
         };
@@ -724,6 +738,8 @@ pub(crate) async fn build_messaging(
         global_defaults,
         &auto_wiring,
     );
+
+    let resolved_remotes = resolve_remotes(&config.remotes, global_defaults);
 
     // Substrate error-reporting grant: scheme-strip the configured error channel
     // once and inject a `MessagingPublish` grant + exact `brenn_publish` ACL onto
@@ -1003,6 +1019,24 @@ pub(crate) async fn build_messaging(
             },
         );
     }
+    // One registration per remote, carrying its lowered policy. A remote is a
+    // single principal with no finer grain — no instances, no per-user split —
+    // and its wake economics are the attacher's: eager, because a session
+    // waiting on a socket is not a subprocess to be spared a wake.
+    //
+    // Registered here even though a remote holds no boot directory entry: the
+    // entries its subscribes mint at runtime resolve their policy through this
+    // map, and a runtime-minted entry with no registration would fail closed at
+    // the delivery gate with nothing to point at.
+    for r in &resolved_remotes {
+        subscriber_registrations.insert(
+            brenn_lib::messaging::SubscriberEntryKind::Remote(r.slug.clone()),
+            brenn_lib::messaging::SubscriberRegistration {
+                policy: Arc::new(r.policy.clone()),
+                wake: brenn_lib::messaging::WakeEconomics::Eager,
+            },
+        );
+    }
     subscriber_registrations.extend(brenn_lib::messaging::system::registrations_from_specs(
         &system_participants,
     ));
@@ -1235,6 +1269,7 @@ pub(crate) async fn build_messaging(
         wasm_consumers: resolved_wasm_consumers,
         dynamic_mqtt_ingress,
         surfaces: resolved_surfaces,
+        remotes: resolved_remotes,
         nondurable_channels,
         system_participants,
     }

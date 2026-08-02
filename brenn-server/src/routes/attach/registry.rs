@@ -78,7 +78,7 @@ pub struct LiveDelivery {
 /// Session caps enforced by `try_register`. A struct (not two adjacent
 /// `usize` params) so call sites cannot transpose the shared and per-account
 /// caps.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionCaps {
     /// Max attached sessions per attacher, across all accounts.
     pub per_attacher: usize,

@@ -35,7 +35,7 @@ use brenn_attach_client::conn::AttachmentFacts;
 use brenn_attach_client::publish::{
     BatchAnswer, Discarded, FlushBatch, OutboxSteps, Outboxes, PendingPublishes, PublishRequest,
 };
-use brenn_attach_proto::{ClientFrame, DeferredOpKind, PublishBatchOutcome, PublishOutcome};
+use brenn_attach_proto::{ClientFrame, PublishBatchOutcome, PublishOutcome, check_batch_legality};
 use brenn_envelope::Urgency;
 use brenn_surface_schema::telemetry::ErrorReportDocument;
 use brenn_surface_schema::{LogLevel, MAX_LOG_MESSAGE_BYTES, MAX_LOG_SOURCE_BYTES};
@@ -649,16 +649,16 @@ impl SurfaceOutbound {
     /// A queued flush was composed under the previous attachment's contract, and a
     /// reconnect can hand the page a different one. Every gate the peer answers
     /// with a violation rather than an outcome is re-checked here, and there are
-    /// three: a channel the new wiring no longer binds to this instance, a body
-    /// over the new `max_body_bytes`, and the composed frame over the new
-    /// `max_frame_bytes`. The two caps are one operator knob — the frame cap is
-    /// derived from the body cap — which an operator can lower on a restart with no
-    /// build change and so no forced reload, and the frame cap binds a whole flush
-    /// where the body cap binds one entry. The channel and body gates apply to the
-    /// flush's control ops as well: an op names a channel, and an edit carries a
-    /// body. A flush that fails any of them is dropped whole rather than sent into
-    /// a protocol death for honestly replaying what the page buffered under the
-    /// contract in force when it buffered it.
+    /// three: a channel the new wiring no longer binds to this instance, the
+    /// batch legality law against the new `max_body_bytes`, and the composed
+    /// frame against the new `max_frame_bytes`. The caps are one operator knob —
+    /// the frame cap is derived from the body cap — which an operator can lower on
+    /// a restart with no build change and so no forced reload. The channel gate
+    /// applies to the flush's control ops as well, and the legality law charges
+    /// them: an op names a channel, and an edit carries a body. A flush that fails
+    /// any of them is dropped whole rather than sent into a protocol death for
+    /// honestly replaying what the page buffered under the contract in force when
+    /// it buffered it.
     ///
     /// A held op's `message_id` needs no re-validation. It came from a view scoped
     /// to this instance's own sender, and that identity does not depend on the
@@ -671,9 +671,10 @@ impl SurfaceOutbound {
         facts: &AttachmentFacts,
         now: Millis,
     ) -> OutboxSteps<String> {
-        self.outboxes.on_attached(now, |instance, batch| {
-            survives(bindings, instance, batch, Some(facts))
-        })
+        self.outboxes
+            .on_attached(facts.max_body_bytes as usize, now, |instance, batch| {
+                survives(bindings, instance, batch, Some(facts))
+            })
     }
 
     /// The attachment went away: outstanding flushes die with it, queued ones
@@ -726,21 +727,17 @@ fn survives(
         && facts.is_none_or(|facts| fits_the_caps(instance, batch, facts))
 }
 
-/// Whether a flush clears the attachment's two size caps: each entry's body and
-/// each edit's replacement body against `max_body_bytes`, and the whole composed
-/// frame against `max_frame_bytes`.
+/// Whether a flush clears the attachment's two size caps: the protocol's batch
+/// legality law against `max_body_bytes`, which charges every channel and body
+/// the flush carries, and the composed frame against the `max_frame_bytes` the
+/// peer advertised.
+///
+/// The measured frame is checked as well as the law, though the law is derived
+/// to bound it: the number that governs is the one the peer stated on this
+/// attachment, and a peer built against a different derivation would state a
+/// different one.
 fn fits_the_caps(instance: &str, batch: &FlushBatch, facts: &AttachmentFacts) -> bool {
-    let max_body_bytes = facts.max_body_bytes;
-    batch
-        .entries
-        .iter()
-        .all(|entry| entry.body.len() as u64 <= max_body_bytes)
-        && batch.ops.iter().all(|op| match &op.op {
-            DeferredOpKind::Edit {
-                body: Some(body), ..
-            } => body.len() as u64 <= max_body_bytes,
-            _ => true,
-        })
+    check_batch_legality(&batch.entries, &batch.ops, facts.max_body_bytes as usize).is_ok()
         // Last, because it is the one gate that has to serialize the flush to
         // answer.
         && batch.frame_bytes(Some(instance)) as u64 <= facts.max_frame_bytes

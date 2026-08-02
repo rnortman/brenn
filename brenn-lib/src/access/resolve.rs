@@ -493,55 +493,143 @@ pub fn build_surface_policy(
 ) -> AppPolicy {
     use crate::messaging::config::SurfaceGrant;
 
+    build_attach_policy(
+        &format!("surface {slug:?}"),
+        grants.into_iter().map(|grant| {
+            let cap = match grant {
+                SurfaceGrant::Subscribe => AppCapability::MessagingSubscribe,
+                SurfaceGrant::Publish => AppCapability::MessagingPublish,
+                SurfaceGrant::EphemeralSubscribe => AppCapability::EphemeralSubscribe,
+                SurfaceGrant::EphemeralPublish => AppCapability::EphemeralPublish,
+                SurfaceGrant::Alert => AppCapability::SurfaceAlert,
+                SurfaceGrant::Takeover => AppCapability::SurfaceTakeover,
+            };
+            (cap, format!("SurfaceGrant {grant:?}"))
+        }),
+        AttachAclsRaw {
+            subscribe: subscribe_acl,
+            publish: publish_acl,
+            ephemeral_subscribe: ephemeral_subscribe_acl,
+            ephemeral_publish: ephemeral_publish_acl,
+        },
+    )
+}
+
+/// Build the resolved `AppPolicy` for a `[[remote]]` bus participant from its
+/// authored `RemoteGrant` set and its four channel-matcher ACL lists.
+///
+/// The remote grant vocabulary is the surface's minus `Takeover` (a
+/// rendering-application right no daemon can exercise), and the lowering is
+/// otherwise identical — both are attach-route principals holding transport
+/// rights over the same two schemes, so they share [`build_attach_policy`]
+/// rather than each carrying a copy of the ACL construction.
+///
+/// Unlike a surface's, a remote's grant/ACL consistency **is** checked, but at
+/// boot resolution (`messaging::remote::resolve_remotes`), not here: this
+/// function is the lowering, and the policy shape alone cannot say which
+/// direction an operator meant to authorize.
+///
+/// # Panics
+///
+/// Same two families as [`build_surface_policy`]: a duplicate grant in the
+/// supplied iterator, or a matcher `resolve_channel` rejects.
+///
+/// `slug` is used only for diagnostic messages on panic.
+pub fn build_remote_policy(
+    slug: &str,
+    grants: impl IntoIterator<Item = crate::messaging::remote::RemoteGrant>,
+    subscribe_acl: &[ChannelMatcherRaw],
+    publish_acl: &[ChannelMatcherRaw],
+    ephemeral_subscribe_acl: &[ChannelMatcherRaw],
+    ephemeral_publish_acl: &[ChannelMatcherRaw],
+) -> AppPolicy {
+    use crate::messaging::remote::RemoteGrant;
+
+    build_attach_policy(
+        &format!("remote {slug:?}"),
+        grants.into_iter().map(|grant| {
+            let cap = match grant {
+                RemoteGrant::Subscribe => AppCapability::MessagingSubscribe,
+                RemoteGrant::Publish => AppCapability::MessagingPublish,
+                RemoteGrant::EphemeralSubscribe => AppCapability::EphemeralSubscribe,
+                RemoteGrant::EphemeralPublish => AppCapability::EphemeralPublish,
+                RemoteGrant::Alert => AppCapability::SurfaceAlert,
+            };
+            (cap, format!("RemoteGrant {grant:?}"))
+        }),
+        AttachAclsRaw {
+            subscribe: subscribe_acl,
+            publish: publish_acl,
+            ephemeral_subscribe: ephemeral_subscribe_acl,
+            ephemeral_publish: ephemeral_publish_acl,
+        },
+    )
+}
+
+/// The four ACL matcher lists an attach-route principal authors, named so the
+/// two same-typed subscribe/publish slices cannot be transposed at a call site.
+struct AttachAclsRaw<'a> {
+    subscribe: &'a [ChannelMatcherRaw],
+    publish: &'a [ChannelMatcherRaw],
+    ephemeral_subscribe: &'a [ChannelMatcherRaw],
+    ephemeral_publish: &'a [ChannelMatcherRaw],
+}
+
+/// The lowering both attach-route principals share: capabilities already mapped
+/// from the route's own grant vocabulary, plus the four channel-matcher lists.
+///
+/// `caps` yields `(capability, authoring token)` pairs; the token appears only
+/// in the duplicate-grant panic, so each route's diagnostics name the enum the
+/// operator actually wrote. `owner` prefixes every panic
+/// (`surface "deskbar"` / `remote "pod-kitchen"`).
+fn build_attach_policy(
+    owner: &str,
+    caps: impl IntoIterator<Item = (AppCapability, String)>,
+    acls: AttachAclsRaw<'_>,
+) -> AppPolicy {
     let mut grant_set = GrantSet::default();
-    for grant in grants {
-        let cap = match grant {
-            SurfaceGrant::Subscribe => AppCapability::MessagingSubscribe,
-            SurfaceGrant::Publish => AppCapability::MessagingPublish,
-            SurfaceGrant::EphemeralSubscribe => AppCapability::EphemeralSubscribe,
-            SurfaceGrant::EphemeralPublish => AppCapability::EphemeralPublish,
-            SurfaceGrant::Alert => AppCapability::SurfaceAlert,
-            SurfaceGrant::Takeover => AppCapability::SurfaceTakeover,
-        };
+    for (cap, token) in caps {
         // Fail-fast on a duplicate grant, mirroring `build_wasm_policy`. The
         // grant→capability map is injective, so a resolved (deduplicated) grant
-        // set never trips this on the in-tree path; it exists because this is a
-        // `pub` `brenn-lib` API taking `impl IntoIterator` — an out-of-tree
+        // set never trips this on the in-tree path; it exists because these are
+        // `pub` `brenn-lib` APIs taking `impl IntoIterator` — an out-of-tree
         // caller could pass a non-deduplicated iterator, and silent absorption
         // would violate the project's fail-fast posture.
         let newly_inserted = grant_set.insert(cap);
         assert!(
             newly_inserted,
-            "surface {slug:?}: duplicate SurfaceGrant {grant:?} (maps to {cap:?}) \
-             in grants iterator",
+            "{owner}: duplicate {token} (maps to {cap:?}) in grants iterator",
         );
     }
 
-    let owner = format!("surface {slug:?}");
-    let acls = AclSet {
-        brenn_subscribe: subscribe_acl
+    let resolved = AclSet {
+        brenn_subscribe: acls
+            .subscribe
             .iter()
-            .map(|m| resolve_channel(&owner, "subscribe_acl", m))
+            .map(|m| resolve_channel(owner, "subscribe_acl", m))
             .collect(),
-        brenn_publish: publish_acl
+        brenn_publish: acls
+            .publish
             .iter()
-            .map(|m| resolve_channel(&owner, "publish_acl", m))
+            .map(|m| resolve_channel(owner, "publish_acl", m))
             .collect(),
-        ephemeral_subscribe: ephemeral_subscribe_acl
+        ephemeral_subscribe: acls
+            .ephemeral_subscribe
             .iter()
-            .map(|m| resolve_channel(&owner, "ephemeral_subscribe_acl", m))
+            .map(|m| resolve_channel(owner, "ephemeral_subscribe_acl", m))
             .collect(),
-        ephemeral_publish: ephemeral_publish_acl
+        ephemeral_publish: acls
+            .ephemeral_publish
             .iter()
-            .map(|m| resolve_channel(&owner, "ephemeral_publish_acl", m))
+            .map(|m| resolve_channel(owner, "ephemeral_publish_acl", m))
             .collect(),
-        // A surface has no MQTT or webhook transports.
+        // An attach-route principal has no MQTT or webhook transports.
         ..AclSet::default()
     };
 
     AppPolicy {
         grants: grant_set,
-        acls,
+        acls: resolved,
         tool_grants: Default::default(),
     }
 }
@@ -1775,6 +1863,64 @@ mod tests {
             &[],
             &[],
             &[ChannelMatcherRaw::Exact(String::new())],
+        );
+    }
+
+    // ---- build_remote_policy -----------------------------------------------
+
+    use crate::messaging::remote::RemoteGrant;
+
+    #[test]
+    fn remote_grants_map_to_the_same_attach_capabilities() {
+        let policy = build_remote_policy(
+            "pod-kitchen",
+            [
+                RemoteGrant::Subscribe,
+                RemoteGrant::Publish,
+                RemoteGrant::EphemeralSubscribe,
+                RemoteGrant::EphemeralPublish,
+                RemoteGrant::Alert,
+            ],
+            &[ChannelMatcherRaw::Prefix("chat.app.home.out.".to_string())],
+            &[ChannelMatcherRaw::Prefix("chat.app.home.in.".to_string())],
+            &[],
+            &[],
+        );
+        assert!(policy.has_grant(AppCapability::MessagingSubscribe));
+        assert!(policy.has_grant(AppCapability::MessagingPublish));
+        assert!(policy.has_grant(AppCapability::EphemeralSubscribe));
+        assert!(policy.has_grant(AppCapability::EphemeralPublish));
+        assert!(policy.has_grant(AppCapability::SurfaceAlert));
+        assert!(!policy.has_grant(AppCapability::SurfaceTakeover));
+        assert!(policy.allows_channel_access("brenn:chat.app.home.out.42"));
+        assert!(policy.allows_brenn_publish("chat.app.home.in.42"));
+        // Directions do not leak into each other.
+        assert!(!policy.allows_brenn_publish("chat.app.home.out.42"));
+    }
+
+    #[test]
+    #[should_panic(expected = "remote \"pod-kitchen\": duplicate RemoteGrant Publish")]
+    fn remote_duplicate_grant_panics_naming_the_remote() {
+        build_remote_policy(
+            "pod-kitchen",
+            [RemoteGrant::Publish, RemoteGrant::Publish],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "remote \"pod-kitchen\": subscribe_acl prefix matcher")]
+    fn remote_non_boundary_subscribe_prefix_panics() {
+        build_remote_policy(
+            "pod-kitchen",
+            [],
+            &[ChannelMatcherRaw::Prefix("chat".to_string())],
+            &[],
+            &[],
+            &[],
         );
     }
 }

@@ -121,7 +121,7 @@ async fn attach_with(
 }
 
 /// [`attach_with`], with the transport's own body cap as a parameter — for the
-/// one test that must set it above the bus's.
+/// tests that must set it above the bus's or above what a whole batch charges.
 async fn attach_with_body_cap(
     db: &Db,
     profile: TestProfile,
@@ -803,9 +803,9 @@ async fn the_batch_shape_gates_are_violations() {
     let over_ops: Vec<BatchDeferredOp> = (0..MAX_PUBLISHES_PER_ACTIVATION + 1)
         .map(|_| cancel(OUT, Uuid::new_v4()))
         .collect();
-    // Wide enough that the byte cap trips inside the count cap. The per-entry
-    // body cap is deliberately not what answers here: the shape gates run first,
-    // so the work the per-entry pass would do is bounded before it starts.
+    // Wide enough that the byte cap trips inside the count cap. The batch
+    // legality law is deliberately not what answers here: the shape gates run
+    // first, so the work the resolvers would do is bounded before it starts.
     let wide = MAX_PUBLISH_BYTES_PER_ACTIVATION / MAX_PUBLISHES_PER_ACTIVATION + 1;
     let over_bytes: Vec<BatchEntry> = (0..MAX_PUBLISHES_PER_ACTIVATION)
         .map(|_| entry(OUT, &"x".repeat(wide), None))
@@ -839,6 +839,27 @@ async fn the_batch_shape_gates_are_violations() {
         };
         assert!(detail.contains(expected), "{detail}");
     }
+    assert!(bodies(&ctx, OUT).await.is_empty(), "nothing was applied");
+}
+
+/// The wire's own legality law, which is tighter than the per-activation caps
+/// and is the one the read cap is derived from: a batch whose channels and
+/// bodies together outspend the attachment's body cap is a frame no conforming
+/// attacher composes.
+#[tokio::test]
+async fn an_illegal_batch_is_a_violation() {
+    let db = brenn_lib::db::init_db_memory();
+    let (ctx, _rx) = attach(&db).await;
+    let mut counters = SessionCounters::default();
+    // Each entry is inside the body cap on its own; together they are not.
+    let publishes: Vec<BatchEntry> = (0..4).map(|_| entry(OUT, r#"{"n":1}"#, None)).collect();
+
+    let outcome =
+        handle_publish_batch(&ctx, batch(Some(SUB), &publishes, &[]), &mut counters).await;
+    let FrameOutcome::Violation(detail) = outcome else {
+        panic!("an illegal batch must kill the connection");
+    };
+    assert!(detail.contains("illegal PublishBatch"), "{detail}");
     assert!(bodies(&ctx, OUT).await.is_empty(), "nothing was applied");
 }
 
@@ -1074,8 +1095,9 @@ async fn an_edit_op_rewrites_the_parked_body() {
     assert_eq!(parked[0].envelope.body, r#"{"v":2}"#);
 }
 
-/// An edit body over the cap is a violation like every other per-entry check,
-/// and it kills before any op applies.
+/// An edit body is charged against the frame's byte budget like a published
+/// one, so an oversize edit is an illegal batch — and it kills before any op
+/// applies.
 #[tokio::test]
 async fn an_oversized_edit_body_kills_the_batch() {
     let db = brenn_lib::db::init_db_memory();
@@ -1096,7 +1118,7 @@ async fn an_oversized_edit_body_kills_the_batch() {
     else {
         panic!("an oversized edit body must kill the connection");
     };
-    assert!(detail.contains("edit body"), "{detail}");
+    assert!(detail.contains("illegal PublishBatch"), "{detail}");
     let parked = ctx
         .messenger
         .deferred_view_for_sender(
@@ -1324,7 +1346,10 @@ async fn one_flush_restates_a_channel_once_across_a_park_and_an_op() {
 #[tokio::test]
 async fn batch_stamps_order_across_the_substrate_split() {
     let db = brenn_lib::db::init_db_memory();
-    let (ctx, mut rx) = attach(&db).await;
+    // A body cap the four entries' channels and bodies fit under together: the
+    // batch spends one budget across the frame, and the fixture's usual cap is
+    // deliberately tiny.
+    let (ctx, mut rx) = attach_with_body_cap(&db, profile(), true, 64, 256).await;
     let mut counters = SessionCounters::default();
     let publishes = [
         entry(OUT, r#"{"n":1}"#, None),

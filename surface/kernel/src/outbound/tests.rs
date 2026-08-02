@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use brenn_attach_proto::{BatchDeferredOp, BatchEntry, PublishBatchOutcome};
+use brenn_attach_proto::{BatchDeferredOp, BatchEntry, DeferredOpKind, PublishBatchOutcome};
 use brenn_surface_schema::bindings::{
     BINDINGS_DOCUMENT_VERSION, BindingsDocument, PlatformSection,
 };
@@ -784,24 +784,129 @@ fn a_flush_over_the_new_body_cap_is_dropped_whole() {
     assert!(steps.frames.is_empty());
 }
 
+/// The gate spends **one** body-cap budget across the whole flush, so entries
+/// that each clear the cap alone can still lose the flush together. This is the
+/// case the legality law was written for, and the only one that tells the
+/// aggregate rule apart from the per-entry rule it replaced.
+#[test]
+fn a_flush_whose_entries_only_sum_over_the_body_cap_is_dropped_whole() {
+    let bindings = wiring();
+    let mut outbound = SurfaceOutbound::new();
+    outbound.register("p1", &bindings);
+    // 2 × (60 + 22) = 164 charged against a 128-byte cap; 82 each on its own.
+    outbound.flush(
+        &bindings,
+        None,
+        "p1",
+        flush_of(vec![
+            entry(OUT, &"a".repeat(60)),
+            entry(OUT, &"b".repeat(60)),
+        ]),
+        NOW,
+    );
+    let steps = outbound.on_attached(&bindings, &facts(128), NOW);
+    assert_eq!(steps.dropped, vec!["p1".to_string()]);
+    assert!(steps.frames.is_empty());
+}
+
+/// One byte under the same budget goes out — an inverted or off-by-one
+/// comparison would drop this too, and the test above would still pass.
+#[test]
+fn a_flush_one_byte_inside_the_aggregate_budget_is_sent() {
+    let bindings = wiring();
+    let mut outbound = SurfaceOutbound::new();
+    outbound.register("p1", &bindings);
+    // 2 × (41 + 22) = 126, one under the 127-byte cap.
+    outbound.flush(
+        &bindings,
+        None,
+        "p1",
+        flush_of(vec![
+            entry(OUT, &"a".repeat(41)),
+            entry(OUT, &"b".repeat(41)),
+        ]),
+        NOW,
+    );
+    let steps = outbound.on_attached(&bindings, &facts(127), NOW);
+    assert!(steps.dropped.is_empty(), "{steps:?}");
+    assert_eq!(steps.frames.len(), 1);
+}
+
+/// The channel address is charged alongside the body. That is what makes the
+/// frame-cap derivation a bound rather than an estimate, and it is invisible to
+/// any fixture whose bodies alone decide the verdict: this body clears the cap
+/// by a wide margin and the flush still dies.
+#[test]
+fn a_flush_refused_only_for_its_channel_bytes_is_dropped_whole() {
+    let bindings = wiring();
+    let mut outbound = SurfaceOutbound::new();
+    outbound.register("p1", &bindings);
+    outbound.flush(&bindings, None, "p1", flush_of(vec![entry(OUT, "ab")]), NOW);
+    // The body is 2 bytes against a 16-byte cap; the 22-byte channel is what
+    // overruns it.
+    assert!(OUT.len() > 16);
+    let steps = outbound.on_attached(&bindings, &facts(16), NOW);
+    assert_eq!(steps.dropped, vec!["p1".to_string()]);
+    assert!(steps.frames.is_empty());
+}
+
+/// A control op charges its channel at this gate too, so a flush of ops alone
+/// answers to the same budget as one of entries.
+#[test]
+fn a_flush_of_control_ops_alone_answers_to_the_aggregate_budget() {
+    let bindings = wiring();
+    let mut outbound = SurfaceOutbound::new();
+    outbound.register("p1", &bindings);
+    outbound.flush(
+        &bindings,
+        None,
+        "p1",
+        FlushBatch {
+            entries: Vec::new(),
+            ops: vec![
+                op(OUT, 1, DeferredOpKind::Cancel),
+                op(OUT, 2, DeferredOpKind::Cancel),
+            ],
+        },
+        NOW,
+    );
+    // 2 × 22 channel bytes against a 32-byte cap.
+    let steps = outbound.on_attached(&bindings, &facts(32), NOW);
+    assert_eq!(steps.dropped, vec!["p1".to_string()]);
+    assert!(steps.frames.is_empty());
+}
+
 #[test]
 fn a_flush_whose_composed_frame_is_over_the_new_frame_cap_is_dropped_whole() {
     let bindings = wiring();
     let mut outbound = SurfaceOutbound::new();
     outbound.register("p1", &bindings);
-    // Every entry clears the body cap on its own; the composed batch does not
-    // clear the frame cap the same contract derives.
-    let wide = flush_of(vec![
-        entry(OUT, &"a".repeat(200)),
-        entry(OUT, &"b".repeat(200)),
-    ]);
-    let mut shrunk = facts(256);
+    // The batch clears the legality law with room to spare — the body cap is
+    // 4 KiB against 444 charged bytes — so the frame cap is the only gate left
+    // to decide it. Anything tighter and the law short-circuits the `&&` and
+    // this clause is never asked.
+    let wide = || {
+        flush_of(vec![
+            entry(OUT, &"a".repeat(200)),
+            entry(OUT, &"b".repeat(200)),
+        ])
+    };
+    let mut shrunk = facts(4_096);
     shrunk.max_frame_bytes = 300;
-    let steps = outbound.flush(&bindings, None, "p1", wide, NOW);
+    let steps = outbound.flush(&bindings, None, "p1", wide(), NOW);
     assert!(steps.frames.is_empty());
     let steps = outbound.on_attached(&bindings, &shrunk, NOW);
     assert_eq!(steps.dropped, vec!["p1".to_string()]);
     assert!(steps.frames.is_empty());
+
+    // The same flush at the frame cap the peer actually derives is sent, so an
+    // inverted comparison cannot hide behind the refusal above.
+    let mut fresh = SurfaceOutbound::new();
+    fresh.register("p1", &bindings);
+    fresh.flush(&bindings, None, "p1", wide(), NOW);
+    let steps = fresh.on_attached(&bindings, &facts(4_096), NOW);
+    assert!(steps.dropped.is_empty(), "{steps:?}");
+    assert_eq!(steps.frames.len(), 1);
 }
 
 /// The op half of the re-validation has to admit a legitimate op, not only refuse

@@ -156,6 +156,11 @@ pub struct BrennConfig {
     /// [`crate::messaging::config::SurfaceConfigRaw`] for per-entry fields.
     #[serde(default, rename = "surface")]
     pub surfaces: Vec<crate::messaging::config::SurfaceConfigRaw>,
+    /// Top-level `[[remote]]` blocks — authenticated native-daemon attachers on
+    /// the same attach transport the browser surfaces use; see
+    /// [`crate::messaging::remote::RemoteConfigRaw`] for per-entry fields.
+    #[serde(default, rename = "remote")]
+    pub remotes: Vec<crate::messaging::remote::RemoteConfigRaw>,
     /// Top-level `[[connection]]` blocks — auto channels declared by the ports
     /// they wire together rather than by a `[[channel]]` block. See
     /// [`crate::messaging::config::ConnectionConfigRaw`].

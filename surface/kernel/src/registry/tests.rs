@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use brenn_attach_client::subs::SubscriptionDepths;
+use brenn_attach_client::subs::{SubscribeSettlement, SubscriptionDepths};
 use brenn_attach_proto::SubscribeOutcome;
 use brenn_envelope::{ChannelScheme, MessageEnvelope, Urgency};
 use brenn_surface_schema::bindings::{
@@ -555,9 +555,12 @@ fn a_changed_fold_restates_a_subscription_still_awaiting_its_result() {
     );
 
     // The plane enacts it when the outstanding result lands.
-    let ack = subs
+    let SubscribeSettlement::Opened(ack) = subs
         .on_subscribe_result(WIRE, SubscribeOutcome::Ok, 0, None)
-        .expect("the channel is pending");
+        .expect("the channel is pending")
+    else {
+        panic!("the peer acknowledged the subscription");
+    };
     assert_eq!(unsubscribed(&ack.frames), vec![WIRE]);
     assert_eq!(subscribed(&ack.frames), vec![(WIRE, 4, 6)]);
 }

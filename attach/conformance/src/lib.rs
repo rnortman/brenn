@@ -41,7 +41,9 @@ use brenn_attach_proto::{
 // names it through the crate it is calling rather than reaching past it.
 pub use brenn_attach_client::conn::{AttachmentFacts, DetachReason};
 pub use brenn_attach_client::publish::PublishRequest;
-pub use brenn_attach_client::subs::{ResumePolicy, SubscribeAck, SubscriptionDepths};
+pub use brenn_attach_client::subs::{
+    ResumePolicy, SubscribeAck, SubscribeSettlement, SubscriptionDepths,
+};
 
 /// How long any awaited helper will pump before it gives up and panics.
 ///
@@ -99,6 +101,10 @@ pub enum Observation {
     Terminal(TerminalCause),
     /// A subscription was acknowledged.
     Subscribed { channel: String, ack: SubscribeAck },
+    /// A subscribe was answered `Unavailable`: the channel is granted but not
+    /// there. The plane has dropped this client's hold on it, so a later
+    /// [`AttachClient::subscribe`] is what asks again.
+    SubscribeUnavailable { channel: String },
     /// An envelope arrived and the subscription plane accepted it.
     Delivered(Delivery),
     /// A single publish was answered.
@@ -217,9 +223,28 @@ impl AttachClient {
         depths: SubscriptionDepths,
         resume_policy: ResumePolicy,
     ) -> SubscribeAck {
+        match self
+            .subscribe_settlement(channel, depths, resume_policy)
+            .await
+        {
+            SubscribeSettlement::Opened(ack) => ack,
+            SubscribeSettlement::Unavailable => {
+                panic!("the peer answered Unavailable on {channel}")
+            }
+        }
+    }
+
+    /// Subscribe `channel` and return whatever the peer settled it as, including
+    /// a refusal — for a caller asserting on the refusal itself.
+    pub async fn subscribe_settlement(
+        &mut self,
+        channel: &str,
+        depths: SubscriptionDepths,
+        resume_policy: ResumePolicy,
+    ) -> SubscribeSettlement {
         let frames = self.subs.acquire(channel, depths, resume_policy);
         self.write(frames).await;
-        self.next_subscribe_ack(channel).await
+        self.next_subscribe_settlement(channel).await
     }
 
     /// The next acknowledgement for `channel`, pumping until one arrives.
@@ -228,17 +253,29 @@ impl AttachClient {
     /// survived were re-sent before [`AttachClient::attach`] returned, and this
     /// is the answer to one of them.
     pub async fn next_subscribe_ack(&mut self, channel: &str) -> SubscribeAck {
+        match self.next_subscribe_settlement(channel).await {
+            SubscribeSettlement::Opened(ack) => ack,
+            SubscribeSettlement::Unavailable => {
+                panic!("the peer answered Unavailable on {channel}")
+            }
+        }
+    }
+
+    /// The next settlement for `channel` — an acknowledgement or a refusal —
+    /// pumping until one arrives.
+    pub async fn next_subscribe_settlement(&mut self, channel: &str) -> SubscribeSettlement {
         let channel = channel.to_string();
         match self
-            .take_first(
-                "a subscribe answer",
-                true,
-                |o| matches!(o, Observation::Subscribed { channel: c, .. } if *c == channel),
-            )
+            .take_first("a subscribe answer", true, |o| match o {
+                Observation::Subscribed { channel: c, .. }
+                | Observation::SubscribeUnavailable { channel: c } => *c == channel,
+                _ => false,
+            })
             .await
         {
-            Observation::Subscribed { ack, .. } => ack,
-            other => unreachable!("the predicate admits only Subscribed, got {other:?}"),
+            Observation::Subscribed { ack, .. } => SubscribeSettlement::Opened(ack),
+            Observation::SubscribeUnavailable { .. } => SubscribeSettlement::Unavailable,
+            other => unreachable!("the predicate admits only subscribe answers, got {other:?}"),
         }
     }
 
@@ -472,13 +509,22 @@ impl AttachClient {
                 replay_count,
                 gap,
             } => {
-                let ack = self
+                match self
                     .subs
-                    .on_subscribe_result(&channel, outcome, replay_count, gap)?;
-                let frames = ack.frames.clone();
-                self.observed
-                    .push_back(Observation::Subscribed { channel, ack });
-                Ok(frames)
+                    .on_subscribe_result(&channel, outcome, replay_count, gap)?
+                {
+                    SubscribeSettlement::Opened(ack) => {
+                        let frames = ack.frames.clone();
+                        self.observed
+                            .push_back(Observation::Subscribed { channel, ack });
+                        Ok(frames)
+                    }
+                    SubscribeSettlement::Unavailable => {
+                        self.observed
+                            .push_back(Observation::SubscribeUnavailable { channel });
+                        Ok(Vec::new())
+                    }
+                }
             }
             ServerFrame::Deliver { channel, rows } => {
                 match self.subs.on_deliver(&channel, &rows)? {

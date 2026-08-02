@@ -162,13 +162,10 @@ pub fn welcome(ctx: &AttachSessionCtx, version: u32, heartbeat_secs: u32) -> Ser
 /// What an inbound websocket read error was.
 pub enum InboundError {
     /// The read cap fired: the peer sent a frame larger than
-    /// [`max_client_frame_bytes`] of the attachment's body cap. No config-legal
-    /// *single* publish can exceed it, so this is tampering or a serious client
-    /// bug — a protocol violation, and fail2ban signal.
-    // TODO(batch-frame-cap): a `PublishBatch` carrying a whole activation's flush
-    // is the one frame a conforming attacher can legally compose over this cap, so
-    // until the two contracts are reconciled a legitimate multi-publish activation
-    // reaches here and is banned for it.
+    /// [`max_client_frame_bytes`] of the attachment's body cap. Every legal
+    /// frame fits under it — a single publish by the body cap, a batch by the
+    /// legality law the cap is derived from — so this is tampering or a serious
+    /// client bug, a protocol violation and fail2ban signal.
     Oversized,
     /// Anything else — TCP resets, proxy framing, a half-open connection. Tear
     /// down, no security event. Carries the rendered error for the log.

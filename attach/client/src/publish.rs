@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use brenn_attach_proto::{
     BatchDeferredOp, BatchEntry, ClientFrame, DeferredViewEntry, PublishBatchOutcome,
+    check_batch_legality,
 };
 use brenn_envelope::Urgency;
 
@@ -344,9 +345,11 @@ pub struct Outboxes<K: Ord> {
     /// Stamped onto each outbox at registration, so two registrations under one
     /// key are distinguishable for as long as the attachment lives.
     next_generation: u64,
-    /// Whether an attachment is live. Off it there is no wire to carry a flush,
-    /// so everything queues.
-    live: bool,
+    /// The live attachment's publish-body cap, or `None` while detached. Off an
+    /// attachment there is no wire to carry a flush, so everything queues — and
+    /// no cap to judge a batch against, since the cap is a fact of the
+    /// attachment and the next one may state a different number.
+    body_cap: Option<usize>,
     retry_armed: bool,
 }
 
@@ -357,7 +360,7 @@ impl<K: Clone + Ord> Default for Outboxes<K> {
             pending: HashMap::new(),
             next_correlation: 0,
             next_generation: 0,
-            live: false,
+            body_cap: None,
             retry_armed: false,
         }
     }
@@ -556,12 +559,17 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// Only the surviving head of each outbox goes out here: the queue is ordered
     /// and carries at most one flush on the wire, so the rest leave as each
     /// result comes back.
+    ///
+    /// `body_cap` is the attachment's advertised publish-body cap, which is also
+    /// the budget batch legality spends: every frame this plane composes until
+    /// the next detach is asserted against it.
     pub fn on_attached(
         &mut self,
+        body_cap: usize,
         now: Millis,
         survives: impl Fn(&K, &FlushBatch) -> bool,
     ) -> OutboxSteps<K> {
-        self.live = true;
+        self.body_cap = Some(body_cap);
         let mut steps = OutboxSteps::default();
         let keys: Vec<K> = self.registrants.keys().cloned().collect();
         for key in keys {
@@ -600,7 +608,7 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// wire — and each registrant's in-flight marker clears with the frame it
     /// named, so the next attachment starts free.
     pub fn on_detached(&mut self) -> OutboxSteps<K> {
-        self.live = false;
+        self.body_cap = None;
         self.pending.clear();
         for outbox in self.registrants.values_mut() {
             outbox.in_flight = None;
@@ -762,7 +770,7 @@ impl<K: Clone + Ord> Outboxes<K> {
 
     /// Whether a flush for `key` may go straight to the wire.
     fn wire_free_for(&self, key: &K) -> bool {
-        if !self.live {
+        if self.body_cap.is_none() {
             return false;
         }
         let outbox = self
@@ -802,7 +810,7 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// Send `key`'s outbox head if the wire is free for it. The one place a
     /// queued flush leaves the attacher.
     fn pump(&mut self, key: &K) -> Vec<ClientFrame> {
-        if !self.live {
+        if self.body_cap.is_none() {
             return Vec::new();
         }
         let outbox = self
@@ -821,7 +829,21 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// Compose one `PublishBatch` frame and record it as outstanding — both in
     /// the correlation table (which answers "whose result is this?") and on the
     /// outbox (which answers "is this registrant's wire free?").
+    ///
+    /// # Panics
+    ///
+    /// On a batch the protocol's legality law refuses. A batch is atomic, so
+    /// there is no honest smaller version of one to send instead, and the peer
+    /// answers an illegal batch by killing the attachment — so the embedder's
+    /// buffer-time gates exist to make this unreachable, and reaching it is a
+    /// bug in them rather than anything the wire should see.
     fn batch_frame(&mut self, key: &K, batch: FlushBatch) -> ClientFrame {
+        let body_cap = self
+            .body_cap
+            .expect("attach client: composing a batch off an attachment");
+        if let Err(illegal) = check_batch_legality(&batch.entries, &batch.ops, body_cap) {
+            panic!("attach client: illegal PublishBatch — {illegal}");
+        }
         let correlation = self.next_correlation;
         self.next_correlation += 1;
         let outbox = self
@@ -876,7 +898,7 @@ impl<K: Clone + Ord> Outboxes<K> {
     /// armed for it would only wake to sweep every registrant and do nothing —
     /// idle work at exactly the loaded moment that produced the queue.
     fn blocked(&self) -> bool {
-        self.live
+        self.body_cap.is_some()
             && self
                 .registrants
                 .values()

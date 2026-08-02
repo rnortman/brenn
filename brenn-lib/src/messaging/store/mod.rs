@@ -45,7 +45,7 @@ use crate::messaging::config::Depth;
 pub use db::DbStore;
 pub use registry::RingStores;
 pub use ring::RingStore;
-pub use targets::{SurfaceFeedTarget, TargetResolver};
+pub use targets::{AttachFeedTarget, TargetResolver};
 
 /// A resolved reply target, carried in both the representations a store may
 /// retain it as.

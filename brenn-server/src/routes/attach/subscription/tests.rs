@@ -14,7 +14,9 @@ use brenn_lib::access::{AppCapability, AppPolicy};
 use brenn_lib::db::Db;
 use brenn_lib::messaging::config::Depth;
 use brenn_lib::messaging::store::{ResumeCursor, StoreRetained};
-use brenn_lib::messaging::{GapReason as BusGapReason, Replay};
+use brenn_lib::messaging::{
+    GapReason as BusGapReason, Replay, SubscriberEntry, SubscriberEntryKind,
+};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -1408,4 +1410,284 @@ async fn the_two_channel_classes_produce_one_transcript() {
             .collect::<Vec<_>>(),
         "the transcript both classes agree on is not the one the design specifies"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Runtime-provisioned channels: the cap, the absent-channel answer, and the
+// directory entry a profile with no boot-declared bindings has to mint.
+// ---------------------------------------------------------------------------
+
+/// A second channel the profile admits and the directory does not hold — the
+/// granted-but-absent case a runtime-provisioning route races.
+const ABSENT_ADDR: &str = "brenn:vanished";
+
+/// An attachment over one real channel whose profile also admits
+/// [`ABSENT_ADDR`], with the subscription cap and the minted entry as
+/// parameters.
+///
+/// The messenger holds exactly one channel, so the profile admitting two is the
+/// whole fixture: everything a route with runtime-provisioned channels does
+/// differently happens between those two answers.
+async fn attach_runtime(
+    db: &Db,
+    max_active_subscriptions: usize,
+    runtime_entry: Option<SubscriberEntry>,
+    standing: Depth,
+) -> (AttachSessionCtx, mpsc::Receiver<ServerFrame>, Uuid) {
+    let (messenger, channel_uuid) =
+        crate::test_support::attach::one_channel_messenger_at_standing(db, BARE, standing).await;
+
+    let mut policy = AppPolicy::default();
+    policy.grants.insert(AppCapability::MessagingSubscribe);
+    policy.acls.brenn_subscribe = vec![
+        ChannelMatcher::Exact(BARE.to_string()),
+        ChannelMatcher::Exact("vanished".to_string()),
+    ];
+
+    let facts = SubscriptionFacts {
+        push_depth: 8,
+        retain_depth: 8,
+    };
+    let profile = TestProfile {
+        subscribable: HashMap::from([(ADDR.to_string(), facts), (ABSENT_ADDR.to_string(), facts)]),
+        subscribe_burst: 16,
+        max_active_subscriptions,
+        runtime_entry,
+        ..TestProfile::new()
+    };
+
+    let (ctx, rx) = AttachCtxBuilder::new(profile)
+        .messenger(messenger)
+        .policy(policy)
+        .build();
+    (ctx, rx, channel_uuid)
+}
+
+/// The entry a runtime-provisioning profile mints, at the depths its ACL
+/// ceilings state.
+fn minted_entry(push_depth: u64, retain_depth: u64) -> SubscriberEntry {
+    SubscriberEntry {
+        kind: SubscriberEntryKind::Remote("pod-kitchen".to_string()),
+        push_depth: Depth::Bounded(push_depth),
+        retain_depth: Depth::Bounded(retain_depth),
+        noise: brenn_lib::messaging::config::NoiseLevel::Metered,
+        wake_min: None,
+    }
+}
+
+/// The channel's subscriber entries, as `(slug, push, retain)`.
+fn directory_subscribers(ctx: &AttachSessionCtx, address: &str) -> Vec<(String, Depth, Depth)> {
+    ctx.messenger
+        .directory()
+        .resolve(address)
+        .expect("the fixture channel is in the directory")
+        .subscribers
+        .iter()
+        .map(|s| (s.kind.slug().to_string(), s.push_depth, s.retain_depth))
+        .collect()
+}
+
+/// **A granted channel that is not there is an answer, not a kill.** The
+/// operator's own grant is what authorizes the disclosure; outside the grants
+/// the address never gets this far. Nothing opens: no span, no active
+/// subscription, no replay.
+#[tokio::test]
+async fn a_granted_but_absent_channel_answers_unavailable() {
+    let db = brenn_lib::db::init_db_memory();
+    let (ctx, mut rx, _uuid) = attach_runtime(&db, usize::MAX, None, Depth::Unbounded).await;
+    let mut wire = Wire::new(&ctx);
+
+    let outcome = wire.subscribe(&ctx, ABSENT_ADDR, 4, 4, None).await;
+
+    assert!(matches!(outcome, FrameOutcome::Continue));
+    let written = frames(&mut rx);
+    assert_eq!(written.len(), 1, "one frame, and it is the refusal");
+    match &written[0] {
+        ServerFrame::SubscribeResult {
+            channel,
+            outcome,
+            replay_count,
+            gap,
+        } => {
+            assert_eq!(channel, ABSENT_ADDR);
+            assert!(matches!(outcome, SubscribeOutcome::Unavailable));
+            assert_eq!(*replay_count, 0);
+            assert!(gap.is_none(), "nothing was resumed, so nothing gapped");
+        }
+        other => panic!("expected a SubscribeResult, got {other:?}"),
+    }
+    assert!(!wire.active.is_active(ABSENT_ADDR), "nothing was opened");
+    assert_eq!(wire.position(ABSENT_ADDR), None, "no span was anchored");
+    assert!(
+        wire.shared.lock().unwrap().is_empty(),
+        "the router was never told to queue for it"
+    );
+}
+
+/// **A malformed cursor still kills, absent channel or not.** The existence
+/// answer is the last thing a Subscribe can earn: every violation the frame
+/// carries is decided first, so a hostile client cannot launder one behind a
+/// channel it knows is gone.
+#[tokio::test]
+async fn a_violation_outranks_the_unavailable_answer() {
+    let db = brenn_lib::db::init_db_memory();
+    let (ctx, mut rx, _uuid) = attach_runtime(&db, usize::MAX, None, Depth::Unbounded).await;
+    let mut wire = Wire::new(&ctx);
+
+    let junk: Cursor = serde_json::from_value(serde_json::Value::String("not-a-cursor".into()))
+        .expect("a cursor is a transparent string");
+    let outcome = wire.subscribe(&ctx, ABSENT_ADDR, 4, 4, Some(junk)).await;
+
+    let FrameOutcome::Violation(detail) = outcome else {
+        panic!("an unparseable cursor must violate whatever the channel's state");
+    };
+    assert!(
+        detail.contains("unparseable resume cursor"),
+        "detail: {detail}"
+    );
+    assert!(frames(&mut rx).is_empty(), "no frame is written");
+}
+
+/// **The subscription cap is a violation, and it names no channel.** A
+/// prefix-granted attacher's active-subscription state is otherwise bounded only
+/// by how many channels its ACL ever matches; the cap is the bound, and a
+/// correct attacher never reaches it.
+#[tokio::test]
+async fn subscribing_beyond_the_cap_is_a_violation() {
+    let db = brenn_lib::db::init_db_memory();
+    let (ctx, mut rx, _uuid) = attach_runtime(&db, 1, None, Depth::Unbounded).await;
+    let mut wire = Wire::new(&ctx);
+
+    assert!(matches!(wire.open(&ctx, 4).await, FrameOutcome::Continue));
+    let _ = frames(&mut rx);
+
+    let outcome = wire.subscribe(&ctx, ABSENT_ADDR, 4, 4, None).await;
+
+    let FrameOutcome::Violation(detail) = outcome else {
+        panic!("the second subscription is over a cap of one");
+    };
+    assert!(
+        detail.contains("active-subscription cap"),
+        "detail: {detail}"
+    );
+    assert!(
+        !detail.contains("vanished"),
+        "the cap is a fact about the attacher, not the channel: {detail}"
+    );
+    assert!(frames(&mut rx).is_empty(), "no frame is written");
+
+    // The cap counts what is held, so releasing one frees the slot.
+    assert!(matches!(
+        wire.unsubscribe(&ctx, ADDR),
+        FrameOutcome::Continue
+    ));
+    assert!(matches!(
+        wire.subscribe(&ctx, ABSENT_ADDR, 4, 4, None).await,
+        FrameOutcome::Continue
+    ));
+}
+
+/// **The first subscribe mints the directory entry the fan-out reads.** A
+/// profile with no boot-declared bindings has nothing to fold from, so without
+/// this the subscription is legal and receives nothing forever.
+#[tokio::test]
+async fn a_first_subscribe_mints_the_profiles_directory_entry() {
+    let db = brenn_lib::db::init_db_memory();
+    let (ctx, _rx, _uuid) =
+        attach_runtime(&db, usize::MAX, Some(minted_entry(8, 64)), Depth::Unbounded).await;
+    let mut wire = Wire::new(&ctx);
+
+    assert!(directory_subscribers(&ctx, ADDR).is_empty());
+    assert!(matches!(wire.open(&ctx, 2).await, FrameOutcome::Continue));
+
+    assert_eq!(
+        directory_subscribers(&ctx, ADDR),
+        vec![(
+            "pod-kitchen".to_string(),
+            Depth::Bounded(8),
+            Depth::Bounded(64)
+        )],
+        "the entry carries the profile's ceilings, not the depths the client stated",
+    );
+}
+
+/// **The entry is cut to what the channel retains.** `reap_frontier` asserts
+/// every subscriber depth is at or below the channel's standing retention and
+/// the reaper trusts the frontier, so an entry above it would panic the process
+/// on the next sweep.
+#[tokio::test]
+async fn the_minted_entry_is_clamped_to_the_channels_standing_retention() {
+    let db = brenn_lib::db::init_db_memory();
+    let (ctx, _rx, _uuid) = attach_runtime(
+        &db,
+        usize::MAX,
+        Some(minted_entry(8, 64)),
+        Depth::Bounded(4),
+    )
+    .await;
+    let mut wire = Wire::new(&ctx);
+
+    assert!(matches!(wire.open(&ctx, 2).await, FrameOutcome::Continue));
+
+    assert_eq!(
+        directory_subscribers(&ctx, ADDR),
+        vec![(
+            "pod-kitchen".to_string(),
+            Depth::Bounded(4),
+            Depth::Bounded(4)
+        )],
+    );
+    ctx.messenger
+        .directory()
+        .resolve(ADDR)
+        .expect("the fixture channel is in the directory")
+        .reap_frontier();
+}
+
+/// **Re-subscribing mints nothing new.** Another session of the same attacher
+/// may already hold the channel, and a second entry would be a second
+/// server-side push window feeding the same principal. Unsubscribe leaves the
+/// entry alone for the same reason.
+#[tokio::test]
+async fn re_subscribing_neither_duplicates_the_entry_nor_removes_it() {
+    let db = brenn_lib::db::init_db_memory();
+    let (ctx, _rx, _uuid) =
+        attach_runtime(&db, usize::MAX, Some(minted_entry(8, 8)), Depth::Unbounded).await;
+    let mut wire = Wire::new(&ctx);
+
+    assert!(matches!(wire.open(&ctx, 2).await, FrameOutcome::Continue));
+    assert!(matches!(
+        wire.unsubscribe(&ctx, ADDR),
+        FrameOutcome::Continue
+    ));
+    assert_eq!(
+        directory_subscribers(&ctx, ADDR).len(),
+        1,
+        "the entry outlives the subscription that minted it",
+    );
+
+    assert!(matches!(wire.open(&ctx, 2).await, FrameOutcome::Continue));
+    assert_eq!(
+        directory_subscribers(&ctx, ADDR),
+        vec![(
+            "pod-kitchen".to_string(),
+            Depth::Bounded(8),
+            Depth::Bounded(8)
+        )],
+        "a re-subscribe replaces rather than appends",
+    );
+}
+
+/// **A profile whose entries are boot-declared mints none.** The hook is the
+/// runtime-provisioning route's, and every other route's directory is untouched
+/// by a subscribe.
+#[tokio::test]
+async fn a_profile_with_boot_declared_entries_touches_the_directory_not_at_all() {
+    let db = brenn_lib::db::init_db_memory();
+    let (ctx, _rx, _uuid) = attach_runtime(&db, usize::MAX, None, Depth::Unbounded).await;
+    let mut wire = Wire::new(&ctx);
+
+    assert!(matches!(wire.open(&ctx, 2).await, FrameOutcome::Continue));
+
+    assert!(directory_subscribers(&ctx, ADDR).is_empty());
 }

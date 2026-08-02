@@ -41,7 +41,7 @@ pub use repo::*;
 #[cfg(test)]
 pub(crate) use resolve::shallow_merge_toml;
 pub use resolve::{ResolvedConfig, validate_and_resolve};
-pub(crate) use secret::load_secret_file;
+pub(crate) use secret::{load_secret_file, load_secret_file_private};
 pub use security::*;
 pub use server::*;
 pub use surface_description::*;

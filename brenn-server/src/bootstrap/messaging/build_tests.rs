@@ -3271,6 +3271,103 @@ async fn build_messaging_brings_up_wasm_consumer_only_config() {
     assert_eq!(result.wasm_consumers[0].slug, "probe");
 }
 
+/// One `[[remote]]` block plus the mode-0600 token file it names, returned
+/// together so the file outlives the resolve that reads it.
+fn minimal_remote(
+    slug: &str,
+) -> (
+    brenn_lib::messaging::RemoteConfigRaw,
+    tempfile::NamedTempFile,
+) {
+    use std::io::Write as _;
+    let mut token = tempfile::NamedTempFile::new().expect("a temp token file");
+    token.write_all(b"s3cret-token\n").expect("write the token");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(token.path(), std::fs::Permissions::from_mode(0o600))
+            .expect("tighten the token file");
+    }
+    let raw = toml::from_str(&format!(
+        "slug = {slug:?}\ntoken_file = {:?}\ngrants = [\"alert\"]\n",
+        token.path().display().to_string(),
+    ))
+    .expect("the [[remote]] block parses");
+    (raw, token)
+}
+
+/// `messaging_configured` must fire on a config whose only messaging content is
+/// one `[[remote]]`. Without it a remote-only deployment boots with the
+/// subsystem off and every subscribe refused — the exact failure the clause
+/// exists to prevent.
+#[test]
+fn messaging_configured_covers_remote_only() {
+    use brenn_lib::config::BrennConfig;
+    let empty_webhooks: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IndexMap::new();
+    let (remote, _token) = minimal_remote("pod-kitchen");
+    let config = BrennConfig {
+        remotes: vec![remote],
+        ..BrennConfig::default()
+    };
+    assert!(
+        messaging_configured(&config, &empty_webhooks, &[]),
+        "a remote-only config must activate messaging"
+    );
+}
+
+/// A remote-only config brings messaging up, resolves its `[[remote]]` blocks,
+/// and registers the wake economics a runtime-minted `Remote` entry is
+/// cross-checked against at boot. A dropped `subscriber_registrations` insert
+/// would fail *closed* at the delivery ACL gate — a silent drop — so it is
+/// asserted here rather than left to the first delivery.
+#[tokio::test]
+async fn build_messaging_brings_up_remote_only_config() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::{SubscriberEntryKind, WakeEconomics};
+    use indexmap::IndexMap as IM;
+
+    let (remote, _token) = minimal_remote("pod-kitchen");
+    let config = BrennConfig {
+        remotes: vec![remote],
+        ..BrennConfig::default()
+    };
+
+    let db = init_db_memory();
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(IM::new());
+    let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+    let webhook_endpoints: IndexMap<String, Arc<ResolvedWebhookEndpoint>> = IM::new();
+
+    let result = build_messaging(
+        &config,
+        db,
+        &apps,
+        ActiveBridges::new(),
+        alert_dispatcher,
+        Some(Arc::from("brenn://test")),
+        &webhook_endpoints,
+        &[],
+        &tuning_for(&config),
+        &brenn_lib::mqtt::config::resolve_clients(&config.mqtt_clients),
+        &empty_tool_registry(),
+    )
+    .await;
+
+    let messenger = result
+        .messenger
+        .as_ref()
+        .expect("a remote-only config must bring messaging up");
+    assert_eq!(result.remotes.len(), 1);
+    assert_eq!(result.remotes[0].slug, "pod-kitchen");
+    assert_eq!(
+        messenger
+            .subscriber_wake_economics(&SubscriberEntryKind::Remote("pod-kitchen".to_string())),
+        Some(WakeEconomics::Eager),
+        "a remote's entries are runtime-minted and never in the boot directory, so this \
+         config-driven registration is all that stands between them and a fail-closed ACL gate"
+    );
+}
+
 /// A registry holding one async tool `apull` (acl key `repo`), matching the
 /// git-repo-pull shape without needing the real repo-sync handles.
 fn async_tool_registry() -> std::sync::Arc<crate::tool_registry::ToolRegistry> {
