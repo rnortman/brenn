@@ -56,7 +56,7 @@ use super::db::{
 use super::gates::{
     check_body_size, publish_acl_allows, reply_to_visible, resolve_publish_sender, well_formed_name,
 };
-use super::store::SurfaceFeedTarget;
+use super::store::AttachFeedTarget;
 use super::{
     ChannelEntry, ChannelScheme, Impetus, Messenger, ParticipantId, PrepaidDestination,
     PrepaidEntry, SubscriberEntryKind, Urgency, store,
@@ -67,8 +67,8 @@ use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
 use crate::obs::security::{DenialKind, SecurityEventType, log_component_security_event};
 
 /// Per-channel memoized resolution for a batch flush: the channel entry and its
-/// live surface-feed targets.
-type ResolvedChannelTargets = (Arc<super::ChannelEntry>, Vec<SurfaceFeedTarget>);
+/// live attacher-feed targets.
+type ResolvedChannelTargets = (Arc<super::ChannelEntry>, Vec<AttachFeedTarget>);
 
 /// Outcome of a publish, on any pub/sub scheme. Maps directly to the success /
 /// failure JSON returned to CC by the `MessageSend` PostToolUse intercept.
@@ -1167,7 +1167,7 @@ impl Messenger {
         if let Some(retained_seq) = retained_seq
             && capabilities.transportable
         {
-            let feed_targets = self.attached_surface_feed_targets(&channel);
+            let feed_targets = self.attached_feed_targets(&channel);
             if !feed_targets.is_empty() {
                 let envelope = Arc::new(surface_feed_envelope(
                     message_id,
@@ -1183,7 +1183,7 @@ impl Messenger {
                     urgency,
                     scheme,
                 ));
-                self.fan_out_surface_feed(
+                self.fan_out_attach_feed(
                     &feed_targets,
                     envelope,
                     i64::try_from(retained_seq)
@@ -1205,37 +1205,44 @@ impl Messenger {
         }
     }
 
-    /// The surface subscribers on a channel that a retained message is fanned
-    /// out to live, resolved through the same registry and the same
+    /// The attach-shaped subscribers on a channel that a retained message is
+    /// fanned out to live, resolved through the same registry and the same
     /// delivery-time ACL gate as the push targets.
-    pub(crate) fn resolve_surface_feed_targets(
+    pub(crate) fn resolve_attach_feed_targets(
         &self,
         channel_address: &str,
         subscribers: &[crate::messaging::SubscriberEntry],
-    ) -> Vec<SurfaceFeedTarget> {
+    ) -> Vec<AttachFeedTarget> {
         self.targets
-            .surface_feed_targets(channel_address, subscribers)
+            .attach_feed_targets(channel_address, subscribers)
     }
 
-    /// `entry`'s surface feed targets, or empty when no attached session holds a
-    /// subscription for any of them.
+    /// `entry`'s attacher feed targets, or empty when no attached session holds
+    /// a subscription for any of them.
     ///
     /// The empty answer is the caller's licence to skip building the owned,
     /// body-copying feed envelope at all, so the two questions are asked
     /// together: a fan-out with no attached holder does nothing but allocate.
-    /// Callers that fan a whole batch memoize the target resolution themselves
-    /// and re-ask the attachment question per entry, since a session can detach
-    /// mid-batch.
-    pub(crate) fn attached_surface_feed_targets(
-        &self,
-        entry: &ChannelEntry,
-    ) -> Vec<SurfaceFeedTarget> {
-        let targets =
-            self.resolve_surface_feed_targets(&entry.address, entry.subscribers.as_slice());
+    ///
+    /// The subscriber list is read from the directory here rather than taken from
+    /// `entry`, and callers must ask **after** their commit. The directory is
+    /// copy-on-write, so an entry resolved before a commit is a snapshot, and an
+    /// attach-shaped subscriber minted between the two — a remote's first
+    /// subscribe on a prefix-granted channel — is absent from it. Reading after
+    /// the commit pairs with the subscribe path's mint-then-replay order and
+    /// leaves no hole in either direction: an entry minted before this read is
+    /// fed here, and one minted after it reads the committed row out of retention
+    /// in its own replay. `entry` still answers for a channel that deprovisioned
+    /// in the meantime — nothing is owed on one, and its snapshot names the
+    /// subscribers the caller committed under.
+    pub(crate) fn attached_feed_targets(&self, entry: &ChannelEntry) -> Vec<AttachFeedTarget> {
+        let current = self.directory.resolve(&entry.address);
+        let subscribers = current.as_deref().unwrap_or(entry).subscribers.as_slice();
+        let targets = self.resolve_attach_feed_targets(&entry.address, subscribers);
         if targets.is_empty()
             || !self
                 .router
-                .any_surface_session_subscribed(&entry.address, &targets)
+                .any_attach_session_subscribed(&entry.address, &targets)
         {
             return Vec::new();
         }
@@ -1243,18 +1250,18 @@ impl Messenger {
     }
 
     /// Hand a message that has just entered retention to every attached,
-    /// subscribed surface session, as a row-less live fan-out.
+    /// subscribed attacher session, as a row-less live fan-out.
     ///
-    /// This is the whole of a surface's delivery trigger. A surface holds no
+    /// This is the whole of an attacher's delivery trigger. An attacher holds no
     /// position, so nothing that walks positions can name it; what reaches an
     /// attached session reaches it here, and what a detached (or queue-full)
     /// session missed it recovers from its own wire cursor at the next resume.
     ///
     /// Runs after the commit transaction's lock is released: the router touches
     /// no DB and only enqueues onto attached sessions.
-    pub(crate) async fn fan_out_surface_feed(
+    pub(crate) async fn fan_out_attach_feed(
         &self,
-        targets: &[SurfaceFeedTarget],
+        targets: &[AttachFeedTarget],
         envelope: Arc<super::MessageEnvelope>,
         retained_seq: i64,
     ) {
@@ -1270,7 +1277,7 @@ impl Messenger {
                 .deliver(&target.kind, &envelope, retained_seq)
                 .await
             {
-                // Delivered, or nothing attached and subscribed. A surface is
+                // Delivered, or nothing attached and subscribed. An attacher is
                 // owed nothing while away; the suffix above its cursor is what
                 // it resumes to.
                 Ok(_) => {}
@@ -1281,7 +1288,7 @@ impl Messenger {
                         channel = %envelope.channel,
                         retained_seq,
                         error = %e,
-                        "surface live fan-out failed; sessions recover at their next resume"
+                        "attacher live fan-out failed; sessions recover at their next resume"
                     );
                 }
             }
@@ -1558,9 +1565,9 @@ impl Messenger {
         // every entry in the batch is judged against the same instant.
         let flush_now = Utc::now();
 
-        // Deferred durable surface feeds: built under the lock, fanned out
+        // Deferred durable attacher feeds: built under the lock, fanned out
         // after it is released.
-        let mut surface_feeds: Vec<(Arc<super::MessageEnvelope>, i64, Vec<SurfaceFeedTarget>)> =
+        let mut surface_feeds: Vec<(Arc<super::MessageEnvelope>, i64, Vec<AttachFeedTarget>)> =
             Vec::new();
         // Non-durable outputs: recorded in call order, committed to their stores
         // after the durable transaction commits and its lock is released. The
@@ -1582,9 +1589,14 @@ impl Messenger {
                 .unchecked_transaction()
                 .expect("publish_from_wasm: begin tx");
 
-            // Per-flush memoization of the surface-feed resolution: the directory is
-            // immutable and the lock is held throughout, so targets cannot change
-            // mid-flush. The dominant case is all publishes targeting one channel.
+            // Per-flush memoization of the attacher-feed resolution, resolved and
+            // committed under one held DB lock. That is what makes a snapshot safe
+            // here where it is not on the single-publish path: a durable replay
+            // read takes the same lock, so a subscriber minting its directory
+            // entry either finishes its replay before this lock is taken — and is
+            // in the resolution below — or starts it after the commit, and reads
+            // the committed rows itself. The dominant case is all publishes
+            // targeting one channel.
             let mut targets_cache: HashMap<&str, ResolvedChannelTargets> = HashMap::new();
 
             // Monotonic publish_ts_ns assignment: each message gets
@@ -1647,7 +1659,7 @@ impl Messenger {
 
                 let (channel, feed_targets) =
                     targets_cache.entry(channel_addr).or_insert_with(|| {
-                        let feed = self.resolve_surface_feed_targets(
+                        let feed = self.resolve_attach_feed_targets(
                             &entry.address,
                             entry.subscribers.as_slice(),
                         );
@@ -1693,7 +1705,7 @@ impl Messenger {
                     && !feed_targets.is_empty()
                     && self
                         .router
-                        .any_surface_session_subscribed(&channel.address, feed_targets)
+                        .any_attach_session_subscribed(&channel.address, feed_targets)
                 {
                     surface_feeds.push((
                         Arc::new(surface_feed_envelope(
@@ -1726,16 +1738,18 @@ impl Messenger {
             );
         }
 
-        // Durable surface feeds, fanned out after the lock is released.
+        // Durable attacher feeds, fanned out after the lock is released.
         for (envelope, seq, targets) in surface_feeds {
-            self.fan_out_surface_feed(&targets, envelope, seq).await;
+            self.fan_out_attach_feed(&targets, envelope, seq).await;
         }
 
-        // Surface feed targets are memoized per address as the durable half
-        // above memoizes its own: a surface subscriber list is boot-resolved, so
-        // it cannot change mid-batch, and the dominant case is a batch fanning
-        // one port. Whether a session is attached is still asked per entry.
-        let mut ring_targets_cache: HashMap<String, Vec<SurfaceFeedTarget>> = HashMap::new();
+        // No memoized targets on this half, unlike the durable one above: the
+        // ring append holds no DB lock, so a resolution taken before it can miss
+        // a directory entry minted in between and owe the row to nobody. Targets
+        // are asked after each append instead, which is the ordering
+        // `attached_feed_targets` documents — at the price of copying the fed
+        // fields before the append whether or not anyone turns out to hold the
+        // channel, since the append consumes the message.
         for (entry, message, release) in nondurable_pending {
             let store = self.store_for(&entry);
             match release {
@@ -1747,37 +1761,22 @@ impl Messenger {
                     }
                 }
                 None => {
-                    let feed_targets = ring_targets_cache
-                        .entry(entry.address.clone())
-                        .or_insert_with(|| {
-                            self.resolve_surface_feed_targets(
-                                &entry.address,
-                                entry.subscribers.as_slice(),
-                            )
-                        });
-                    let attached = !feed_targets.is_empty()
-                        && self
-                            .router
-                            .any_surface_session_subscribed(&entry.address, feed_targets);
                     // A fed envelope is indistinguishable from the one a
                     // subscriber reads back out of retention, so it carries the
                     // reply address the ring is about to retain.
-                    let fed = attached.then(|| {
-                        (
-                            message.body.clone(),
-                            message.sender.clone(),
-                            message.publish_ts_ns,
-                            message.urgency,
-                            message.envelope_type,
-                            message
-                                .reply_to
-                                .as_ref()
-                                .map(|target| target.address.clone()),
-                        )
-                    });
+                    let body = message.body.clone();
+                    let sender = message.sender.clone();
+                    let publish_ts_ns = message.publish_ts_ns;
+                    let urgency = message.urgency;
+                    let scheme = message.envelope_type;
+                    let reply_to = message
+                        .reply_to
+                        .as_ref()
+                        .map(|target| target.address.clone());
                     let outcome = store.append(message).await;
                     self.enact_overflow_events(&entry, &outcome.overflow);
-                    if let Some((body, sender, publish_ts_ns, urgency, scheme, reply_to)) = fed {
+                    let feed_targets = self.attached_feed_targets(&entry);
+                    if !feed_targets.is_empty() {
                         let envelope = Arc::new(surface_feed_envelope(
                             outcome.committed.message_uuid,
                             source.to_owned(),
@@ -1792,8 +1791,8 @@ impl Messenger {
                             urgency,
                             scheme,
                         ));
-                        self.fan_out_surface_feed(
-                            feed_targets,
+                        self.fan_out_attach_feed(
+                            &feed_targets,
                             envelope,
                             i64::try_from(outcome.committed.seq.0)
                                 .expect("messaging: retention position out of range"),
@@ -1972,9 +1971,9 @@ impl Messenger {
             }
         }
 
-        // Deferred durable surface feeds: built under the lock, fanned out
+        // Deferred durable attacher feeds: built under the lock, fanned out
         // after release. See `publish_from_wasm`.
-        let mut surface_feeds: Vec<(Arc<super::MessageEnvelope>, i64, Vec<SurfaceFeedTarget>)> =
+        let mut surface_feeds: Vec<(Arc<super::MessageEnvelope>, i64, Vec<AttachFeedTarget>)> =
             Vec::new();
         // Schedules the deferred cap refused, warned about after the lock is
         // released so the transaction is not held across the logging.
@@ -1987,9 +1986,9 @@ impl Messenger {
                 .expect("publish_batch_from_surface: begin tx");
 
             // Per-batch memoization of the surface-feed resolution, as in
-            // `publish_from_wasm`: the directory is immutable and the lock is held
-            // throughout, so targets cannot change mid-batch, and the dominant
-            // case is a batch fanning one port.
+            // `publish_from_wasm` and safe for the reason stated there: resolution
+            // and commit share one held DB lock, which a durable replay read also
+            // takes. The dominant case is a batch fanning one port.
             let mut targets_cache: HashMap<&str, ResolvedChannelTargets> = HashMap::new();
 
             for publish in &durable {
@@ -2016,7 +2015,7 @@ impl Messenger {
                         )
                     });
                     let feed =
-                        self.resolve_surface_feed_targets(&ch.address, ch.subscribers.as_slice());
+                        self.resolve_attach_feed_targets(&ch.address, ch.subscribers.as_slice());
                     (ch, feed)
                 });
 
@@ -2080,7 +2079,7 @@ impl Messenger {
                 if !feed_targets.is_empty()
                     && self
                         .router
-                        .any_surface_session_subscribed(&channel.address, feed_targets)
+                        .any_attach_session_subscribed(&channel.address, feed_targets)
                 {
                     surface_feeds.push((
                         Arc::new(surface_feed_envelope(
@@ -2108,9 +2107,9 @@ impl Messenger {
             tx.commit().expect("publish_batch_from_surface: commit tx");
         }
 
-        // Durable surface feeds, fanned out after the lock is released.
+        // Durable attacher feeds, fanned out after the lock is released.
         for (envelope, seq, targets) in surface_feeds {
-            self.fan_out_surface_feed(&targets, envelope, seq).await;
+            self.fan_out_attach_feed(&targets, envelope, seq).await;
         }
 
         // The ring half, after the durable lock is gone. Each entry takes the

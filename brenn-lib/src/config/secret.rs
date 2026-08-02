@@ -25,6 +25,49 @@ pub(crate) fn load_secret_file(label: &str, path: &Path) -> String {
     trimmed.to_string()
 }
 
+/// Read a secret from a file that must also be unreadable to every other local
+/// account: [`load_secret_file`] plus a Unix mode check, matching ssh's posture
+/// on private keys.
+///
+/// Used for credentials that authenticate a network principal, where the file
+/// *is* the identity and a group- or world-readable copy silently hands that
+/// identity to any local process. The other secret-file callers keep the
+/// unchecked reader; widening the check to them is a separate decision with its
+/// own migration.
+///
+/// # Panics
+///
+/// Everything [`load_secret_file`] panics on, plus a mode with any group or
+/// other bit set. Non-Unix targets have no mode to check and get the plain read.
+pub(crate) fn load_secret_file_private(label: &str, path: &Path) -> String {
+    if let Some(problem) = private_mode_error(path) {
+        panic!(
+            "config: {label} — secret file at {}: {problem}",
+            path.display(),
+        );
+    }
+    load_secret_file(label, path)
+}
+
+#[cfg(unix)]
+fn private_mode_error(path: &Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    // An unreadable path is not this check's failure to report: the read that
+    // follows produces the message naming it.
+    let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Some(format!(
+            "mode {mode:04o} is group/world-accessible; chmod 600 it"
+        ));
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn private_mode_error(_path: &Path) -> Option<String> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
@@ -54,5 +97,38 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(b"   \n  \t  ").unwrap();
         load_secret_file("test-label", f.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_reader_accepts_an_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"tight\n").unwrap();
+        std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(load_secret_file_private("test-label", f.path()), "tight");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "mode 0640 is group/world-accessible")]
+    fn private_reader_rejects_a_group_readable_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"loose\n").unwrap();
+        std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(0o640)).unwrap();
+        load_secret_file_private("test-label", f.path());
+    }
+
+    /// A missing file reports the read failure, not a mode failure: there is no
+    /// mode to speak of, and naming the wrong problem sends an operator to the
+    /// wrong fix.
+    #[test]
+    #[should_panic(expected = "failed to read secret file")]
+    fn private_reader_reports_a_missing_file_as_a_read_failure() {
+        load_secret_file_private(
+            "test-label",
+            std::path::Path::new("/nonexistent/path/secret.txt"),
+        );
     }
 }

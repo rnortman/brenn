@@ -48,7 +48,7 @@ mod tests;
 
 use brenn_attach_client::Millis;
 use brenn_attach_client::publish::{BatchAnswer, OutboxSteps};
-use brenn_attach_client::subs::DeliverDisposition;
+use brenn_attach_client::subs::{DeliverDisposition, SubscribeSettlement};
 use brenn_attach_proto::{
     ClientFrame, DeferredViewEntry, DeliverRow, GapInfo, PublishBatchOutcome, PublishOutcome,
     ServerFrame, SubscribeOutcome,
@@ -191,9 +191,21 @@ fn on_subscribe_result(
     replay_count: u32,
     gap: Option<GapInfo>,
 ) -> Result<Inbound, String> {
-    let ack = page
+    let settlement = page
         .subs
         .on_subscribe_result(&channel, outcome, replay_count, gap)?;
+    let ack = match settlement {
+        SubscribeSettlement::Opened(ack) => ack,
+        // Every channel a surface subscribes is provisioned before the backend
+        // accepts a connection and named by the wiring it delivered, so an
+        // unavailable one is an answer this route's profile cannot legally
+        // produce — a broken peer, like any other.
+        SubscribeSettlement::Unavailable => {
+            return Err(format!(
+                "the peer answered Unavailable on {channel}, a channel its own wiring names"
+            ));
+        }
+    };
     if page.connect.is_config_channel(&channel) {
         // Errors before the gap is reported below: on this channel a gap answers
         // a resume claim the page never made, which is a broken peer rather than

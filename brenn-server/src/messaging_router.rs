@@ -5,11 +5,13 @@
 //! types; this adapter is the single bridge across that boundary. Held
 //! on `AppState` indirectly via `Arc<dyn WakeRouter>` inside `Messenger`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use brenn_lib::messaging::config::ResolvedSurface;
-use brenn_lib::messaging::store::{DeferredMessage, SurfaceFeedTarget};
+use brenn_lib::messaging::remote::ResolvedRemote;
+use brenn_lib::messaging::store::{AttachFeedTarget, DeferredMessage};
 use brenn_lib::messaging::{
     DeliveryShape, MessageEnvelope, ParticipantId, SubscriberEntryKind, WakeRouter,
 };
@@ -64,8 +66,38 @@ pub(crate) enum DeliveryBinding {
     /// Deliver via the conversation's active bridge; wake via
     /// `state.spawn_eager_wake` (app subscribers).
     ConversationBridge,
-    /// Claim-and-fan-out to attached, subscribed surface sessions.
-    SurfaceSessions,
+    /// Fan out to the attach registry's attached, subscribed sessions for this
+    /// key — a browser surface's or a remote daemon's, on identical terms.
+    AttachSessions,
+}
+
+/// The attach-registry key for an attach-shaped subscriber, or `None` for a kind
+/// that holds a position instead of an attachment.
+///
+/// The registry is one map keyed by a bare string and shared by both attach
+/// routes, so the keyspaces are kept disjoint here: a surface keys by its bare
+/// slug (the spelling the surface route registers under) and a remote by
+/// `remote:<slug>`. Neither a surface slug nor a remote slug may carry a `:`, so
+/// no remote key can spell a surface slug and vice versa — the participant-id
+/// charset guards, applied to the one shared map.
+///
+/// Borrowed for a surface and owned for a remote: this runs per message per
+/// target on the live fan-out and on the precheck that exists to make the
+/// no-listener publish cheap, so the common key costs nothing. The remote
+/// spelling is the one `ParticipantId::for_remote` mints; its charset guards ran
+/// at boot, and re-running them per message would buy nothing.
+fn attach_registry_key(key: &SubscriberEntryKind) -> Option<Cow<'_, str>> {
+    match key {
+        SubscriberEntryKind::Surface(slug) => Some(Cow::Borrowed(slug.as_str())),
+        SubscriberEntryKind::Remote(slug) => Some(Cow::Owned(format!(
+            "{}{slug}",
+            ParticipantId::REMOTE_PREFIX
+        ))),
+        SubscriberEntryKind::App(_)
+        | SubscriberEntryKind::Wasm(_)
+        | SubscriberEntryKind::System(_)
+        | SubscriberEntryKind::ChatConversation { .. } => None,
+    }
 }
 
 impl WakeRouterImpl {
@@ -107,7 +139,7 @@ impl WakeRouterImpl {
     /// Register the delivery binding for one subscriber, keyed by its
     /// [`SubscriberEntryKind`]. Called at bootstrap for every configured app
     /// (`ConversationBridge`), WASM consumer / system component (`ParkedNotify`
-    /// with the off-loop task's `Notify`), and surface (`SurfaceSessions`),
+    /// with the off-loop task's `Notify`), surface and remote (`AttachSessions`),
     /// before any publish path runs. Duplicate registration for the same key is
     /// a bootstrap wiring bug → panic.
     pub(crate) fn register_delivery_binding(
@@ -123,7 +155,7 @@ impl WakeRouterImpl {
         );
     }
 
-    /// Register the `SurfaceSessions` delivery route for one surface. This is
+    /// Register the `AttachSessions` delivery route for one surface. This is
     /// the whole per-surface half of the host's delivery wiring; boot calls it
     /// once per installed surface and test rigs call it for the same reason, so
     /// a fixture cannot register a different route set than the running server.
@@ -136,7 +168,23 @@ impl WakeRouterImpl {
     pub(crate) fn register_surface_delivery_routes(&self, surface: &ResolvedSurface) {
         self.register_delivery_binding(
             SubscriberEntryKind::Surface(surface.slug.clone()),
-            DeliveryBinding::SurfaceSessions,
+            DeliveryBinding::AttachSessions,
+        );
+    }
+
+    /// Register the `AttachSessions` delivery route for one remote — the same
+    /// route a surface gets, because a remote is the same kind of attacher, and
+    /// registered at boot for the same reason: nothing may reach dispatch
+    /// unbound.
+    ///
+    /// It is registered whether or not the remote ever subscribes. A remote's
+    /// directory entries are minted at runtime by its own subscribes, so
+    /// deriving the binding set from the boot directory would leave the first
+    /// subscribe of every restart dispatching into the no-binding panic.
+    pub(crate) fn register_remote_delivery_routes(&self, remote: &ResolvedRemote) {
+        self.register_delivery_binding(
+            SubscriberEntryKind::Remote(remote.slug.clone()),
+            DeliveryBinding::AttachSessions,
         );
     }
 
@@ -160,7 +208,7 @@ impl WakeRouterImpl {
         let map = self.bindings.read().expect("bindings RwLock poisoned");
         match map.get(key) {
             Some(DeliveryBinding::ConversationBridge) => DeliveryRoute::ConversationBridge,
-            Some(DeliveryBinding::SurfaceSessions) => DeliveryRoute::SurfaceSessions,
+            Some(DeliveryBinding::AttachSessions) => DeliveryRoute::AttachSessions,
             Some(DeliveryBinding::ParkedNotify(_)) => DeliveryRoute::Parked,
             None => panic!(
                 "no delivery binding registered for {key:?} — host-wiring invariant violated \
@@ -208,7 +256,7 @@ fn retention_position(retained_seq: i64) -> u64 {
 /// without carrying the lock guard into async delivery.
 enum DeliveryRoute {
     ConversationBridge,
-    SurfaceSessions,
+    AttachSessions,
     Parked,
 }
 
@@ -220,7 +268,7 @@ impl WakeRouter for WakeRouterImpl {
         envelope: &Arc<MessageEnvelope>,
         retained_seq: i64,
     ) -> Result<bool, String> {
-        // Row-less fan-out to attached, subscribed sessions. A surface holds no
+        // Row-less fan-out to attached, subscribed sessions. An attacher holds no
         // server-side delivery state: the client's echoed cursor is the whole of
         // it, so this hands the envelope over and arbitrates nothing. The session
         // drops a copy its cursor already covers, and a session that missed one —
@@ -228,19 +276,20 @@ impl WakeRouter for WakeRouterImpl {
         // the suffix. `try_send` (not awaited): a hung session must not stall the
         // shared fan-out task.
         //
-        // Only surface subscribers reach here: `surface_feed_targets` is the one
-        // caller's target set, and every other kind holds a position and is served
-        // from it.
-        let SubscriberEntryKind::Surface(slug) = key else {
+        // Only attach-shaped subscribers reach here: `attach_feed_targets` is the
+        // one caller's target set, and every other kind holds a position and is
+        // served from it.
+        let Some(registry_key) = attach_registry_key(key) else {
             panic!(
-                "WakeRouter::deliver called for non-surface subscriber {key:?} — only a surface \
-                 subscription takes the row-less live feed"
+                "WakeRouter::deliver called for non-attacher subscriber {key:?} — only an \
+                 attach-shaped subscription takes the row-less live feed"
             );
         };
+        let slug = registry_key.as_ref();
         let state = self
             .state
             .get()
-            .expect("WakeRouter state must be set before any Surface deliver call");
+            .expect("WakeRouter state must be set before any attacher deliver call");
         let retained_seq = retention_position(retained_seq);
 
         // 1. Sessions subscribed to the message's channel. Channel is the whole
@@ -283,7 +332,7 @@ impl WakeRouter for WakeRouterImpl {
                 retained_seq,
                 rejected,
                 accepted,
-                "surface live delivery: some session queues full; those \
+                "attacher live delivery: some session queues full; those \
                  sessions are served the suffix by the drain nudge below"
             );
         }
@@ -308,17 +357,18 @@ impl WakeRouter for WakeRouterImpl {
         envelope: &Arc<MessageEnvelope>,
         retained_seq: i64,
     ) {
-        // Row-less deliver-if-attached fan-out for a fold-0 surface subscription.
-        // No push row: a fold-0 subscription has no push window, so the message
-        // reaches an attached session only here, live.
-        let SubscriberEntryKind::Surface(slug) = key else {
-            // `resolve_context_targets` filters to Surface subscribers, so any
-            // other kind here is a caller-side wiring bug.
+        // Row-less deliver-if-attached fan-out for a fold-0 attacher
+        // subscription. No push row: a fold-0 subscription has no push window, so
+        // the message reaches an attached session only here, live.
+        let Some(registry_key) = attach_registry_key(key) else {
+            // The feed-target resolver filters to attach-shaped subscribers, so
+            // any other kind here is a caller-side wiring bug.
             panic!(
-                "deliver_context called for non-surface subscriber {key:?} — only fold-0 \
-                 surface subscriptions take the row-less context feed"
+                "deliver_context called for non-attacher subscriber {key:?} — only fold-0 \
+                 attach-shaped subscriptions take the row-less context feed"
             );
         };
+        let slug = registry_key.as_ref();
         let state = self
             .state
             .get()
@@ -358,7 +408,7 @@ impl WakeRouter for WakeRouterImpl {
                     slug = %slug,
                     channel = %envelope.channel,
                     retained_seq,
-                    "surface depth-0 context feed: session queue full; row-less \
+                    "attacher depth-0 context feed: session queue full; row-less \
                      delivery dropped (served by the next drain or resume)"
                 );
             }
@@ -397,19 +447,18 @@ impl WakeRouter for WakeRouterImpl {
         state.attach_registry.count(slug) > 0
     }
 
-    fn any_surface_session_subscribed(&self, channel: &str, targets: &[SurfaceFeedTarget]) -> bool {
+    fn any_attach_session_subscribed(&self, channel: &str, targets: &[AttachFeedTarget]) -> bool {
         let Some(state) = self.state.get() else {
             // No state wired yet — no session can be attached.
             return false;
         };
         targets.iter().any(|target| {
-            let key = &target.kind;
-            let SubscriberEntryKind::Surface(slug) = key else {
+            let Some(registry_key) = attach_registry_key(&target.kind) else {
                 return false;
             };
             state
                 .attach_registry
-                .sessions(slug)
+                .sessions(&registry_key)
                 .into_iter()
                 .any(|h| h.is_subscribed(channel))
         })
@@ -441,12 +490,12 @@ impl WakeRouter for WakeRouterImpl {
                     Err(e) => Err(e),
                 }
             }
-            // Ingress is conversation-targeted by invariant: surfaces bind
+            // Ingress is conversation-targeted by invariant: attachers bind
             // brenn:/ephemeral: channels, parked subscribers (WASM/system) take
             // bus tool requests, and neither intersects the webhook:/mqtt:
             // channels ingress arrives on. A non-conversation target here is a
             // host-wiring invariant violation.
-            DeliveryRoute::SurfaceSessions | DeliveryRoute::Parked => {
+            DeliveryRoute::AttachSessions | DeliveryRoute::Parked => {
                 panic!(
                     "WakeRouter::deliver_ingress called for non-conversation subscriber {key:?} — \
                      host-wiring invariant violated: ingress rows only target conversations"
@@ -501,17 +550,22 @@ impl WakeRouter for WakeRouterImpl {
                 // reaches a conversation through this one call.
                 state.spawn_bus_wake(conversation_id, Tz::UTC);
             }
-            // Nudge every attached session of this slug to run a drain pass. No
-            // per-channel filter (the wake carries only the participant): the
+            // Nudge every attached session of this attacher to run a drain pass.
+            // No per-channel filter (the wake carries only the participant): the
             // session drains all its active durable channels. No sessions → no-op;
             // parked rows wait for the next attach.
-            Some(DeliveryBinding::SurfaceSessions) => {
-                let slug = key.slug();
+            Some(DeliveryBinding::AttachSessions) => {
+                let registry_key = attach_registry_key(key).unwrap_or_else(|| {
+                    panic!(
+                        "spawn_eager_wake: {key:?} holds an AttachSessions binding but names no \
+                         attach registry key — bootstrap wiring bug"
+                    )
+                });
                 let state = self
                     .state
                     .get()
                     .expect("WakeRouter state must be set before any spawn_eager_wake call");
-                for handle in state.attach_registry.sessions(slug) {
+                for handle in state.attach_registry.sessions(&registry_key) {
                     handle.drain_notify.notify_one();
                 }
             }
@@ -602,7 +656,7 @@ impl WakeRouter for WakeRouterImpl {
         }
         let map = self.bindings.read().expect("bindings RwLock poisoned");
         match map.get(key) {
-            Some(DeliveryBinding::ConversationBridge) | Some(DeliveryBinding::SurfaceSessions) => {
+            Some(DeliveryBinding::ConversationBridge) | Some(DeliveryBinding::AttachSessions) => {
                 DeliveryShape::Inline
             }
             Some(DeliveryBinding::ParkedNotify(_)) => DeliveryShape::ParkedWake,
@@ -685,8 +739,8 @@ mod tests {
 
     /// The push-enabled feed target for [`surface_key`], as the publish path
     /// resolves it.
-    fn surface_feed_target() -> SurfaceFeedTarget {
-        SurfaceFeedTarget {
+    fn attach_feed_target() -> AttachFeedTarget {
+        AttachFeedTarget {
             kind: surface_key(),
             push_enabled: true,
         }
@@ -1063,7 +1117,7 @@ mod tests {
     /// host-wiring invariant violation (`dispatch_row` gates parked rows to
     /// `spawn_eager_wake` and never calls `deliver` for them).
     #[tokio::test]
-    #[should_panic(expected = "WakeRouter::deliver called for non-surface subscriber")]
+    #[should_panic(expected = "WakeRouter::deliver called for non-attacher subscriber")]
     async fn deliver_panics_for_wasm_subscriber() {
         use brenn_lib::messaging::{MessageEnvelope, Urgency};
         use chrono::Utc;
@@ -1317,7 +1371,7 @@ mod tests {
 
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.set_state(state);
-        router.register_delivery_binding(surface_key(), DeliveryBinding::SurfaceSessions);
+        router.register_delivery_binding(surface_key(), DeliveryBinding::AttachSessions);
 
         let _ = &participant;
         let result = router
@@ -1340,6 +1394,105 @@ mod tests {
         );
     }
 
+    /// **A remote and a surface sharing a slug never see each other's rows.**
+    /// The attach registry is one map keyed by a bare string, so the whole
+    /// disjointness argument rests on the key derivation: a surface keys by its
+    /// bare slug, a remote by `remote:<slug>`.
+    #[tokio::test]
+    async fn a_remote_and_a_surface_of_one_slug_key_disjoint_registry_slots() {
+        let db = brenn_lib::db::init_db_memory();
+        let channel = "brenn:durable-demo";
+        let (messenger, _participant, seq) = surface_push_fixture(&db, "kitchen", channel).await;
+
+        let mut state = AppState::for_test(db.clone(), None);
+        state.messenger = Some(messenger);
+        let (_surface_guard, mut surface_rx, _sn) =
+            register_surface_session(&state, "kitchen", channel);
+        let (_remote_guard, mut remote_rx, _rn) =
+            register_surface_session(&state, "remote:kitchen", channel);
+
+        let surface = SubscriberEntryKind::Surface("kitchen".to_string());
+        let remote = SubscriberEntryKind::Remote("kitchen".to_string());
+
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        router.set_state(state);
+        router.register_delivery_binding(surface.clone(), DeliveryBinding::AttachSessions);
+        router.register_delivery_binding(remote.clone(), DeliveryBinding::AttachSessions);
+
+        assert!(matches!(
+            router
+                .deliver(&surface, &Arc::new(surface_envelope(channel)), seq)
+                .await,
+            Ok(true)
+        ));
+        assert!(
+            surface_rx.try_recv().is_ok(),
+            "the surface's session was fed"
+        );
+        assert!(
+            remote_rx.try_recv().is_err(),
+            "the remote of the same slug holds no part of a surface's delivery"
+        );
+
+        assert!(matches!(
+            router
+                .deliver(&remote, &Arc::new(surface_envelope(channel)), seq)
+                .await,
+            Ok(true)
+        ));
+        assert!(remote_rx.try_recv().is_ok(), "the remote's session was fed");
+        assert!(
+            surface_rx.try_recv().is_err(),
+            "and the surface holds no part of the remote's"
+        );
+    }
+
+    /// The publish-time build-skip precheck resolves a remote target through the
+    /// same key derivation `deliver` uses — otherwise a remote's fan-out would be
+    /// skipped before the envelope was ever built.
+    #[tokio::test]
+    async fn any_attach_session_subscribed_sees_a_remotes_session() {
+        let db = brenn_lib::db::init_db_memory();
+        let channel = "brenn:durable-demo";
+        let state = AppState::for_test(db, None);
+        let (_guard, _rx, _notify) =
+            register_surface_session(&state, "remote:pod-kitchen", channel);
+
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        router.set_state(state);
+
+        let target = AttachFeedTarget {
+            kind: SubscriberEntryKind::Remote("pod-kitchen".to_string()),
+            push_enabled: true,
+        };
+        assert!(router.any_attach_session_subscribed(channel, std::slice::from_ref(&target)));
+        assert!(
+            !router.any_attach_session_subscribed("brenn:other", std::slice::from_ref(&target)),
+            "a channel no session holds is not a reason to build the feed envelope"
+        );
+    }
+
+    /// A remote's eager wake nudges its own sessions' drains — the same treatment
+    /// a surface gets, resolved through the same key.
+    #[tokio::test]
+    async fn spawn_eager_wake_nudges_a_remotes_sessions() {
+        let db = brenn_lib::db::init_db_memory();
+        let state = AppState::for_test(db, None);
+        let (_guard, _rx, notify) =
+            register_surface_session(&state, "remote:pod-kitchen", "brenn:durable-demo");
+
+        let router = WakeRouterImpl::new(ActiveBridges::new());
+        router.set_state(state);
+        let key = SubscriberEntryKind::Remote("pod-kitchen".to_string());
+        router.register_delivery_binding(key.clone(), DeliveryBinding::AttachSessions);
+
+        router.spawn_eager_wake(&key, &ParticipantId::for_remote("pod-kitchen"));
+
+        tokio::time::timeout(std::time::Duration::from_millis(10), notify.notified())
+            .await
+            .expect("the remote's session drain was nudged");
+    }
+
     /// `deliver` for a `surface:` subscriber with no attached/subscribed session
     /// parks (`Ok(false)`) so the dispatcher wakes again for a later attach.
     #[tokio::test]
@@ -1354,7 +1507,7 @@ mod tests {
 
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.set_state(state);
-        router.register_delivery_binding(surface_key(), DeliveryBinding::SurfaceSessions);
+        router.register_delivery_binding(surface_key(), DeliveryBinding::AttachSessions);
 
         let _ = &participant;
         let result = router
@@ -1381,7 +1534,7 @@ mod tests {
 
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.set_state(state);
-        router.register_delivery_binding(surface_key(), DeliveryBinding::SurfaceSessions);
+        router.register_delivery_binding(surface_key(), DeliveryBinding::AttachSessions);
 
         let _ = &participant;
         let result = router
@@ -1404,7 +1557,7 @@ mod tests {
 
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.set_state(state);
-        router.register_delivery_binding(surface_key(), DeliveryBinding::SurfaceSessions);
+        router.register_delivery_binding(surface_key(), DeliveryBinding::AttachSessions);
 
         router
             .deliver_context(&surface_key(), &Arc::new(surface_envelope(channel)), 7)
@@ -1423,7 +1576,7 @@ mod tests {
         let state = AppState::for_test(db.clone(), None);
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.set_state(state);
-        router.register_delivery_binding(surface_key(), DeliveryBinding::SurfaceSessions);
+        router.register_delivery_binding(surface_key(), DeliveryBinding::AttachSessions);
         // No session registered — completes without panic, delivers nothing.
         router
             .deliver_context(
@@ -1434,7 +1587,7 @@ mod tests {
             .await;
     }
 
-    /// `any_surface_session_subscribed` — the publish-time build-skip precheck —
+    /// `any_attach_session_subscribed` — the publish-time build-skip precheck —
     /// answers true for a subscribed attached session and false with none. The
     /// false branch is the cost saver: no envelope is built when no page is open.
     #[tokio::test]
@@ -1446,17 +1599,17 @@ mod tests {
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.set_state(state.clone());
         assert!(
-            !router.any_surface_session_subscribed(channel, &[surface_feed_target()]),
+            !router.any_attach_session_subscribed(channel, &[attach_feed_target()]),
             "no session open — nothing to feed, skip the build"
         );
 
         let (_guard, _rx, _notify) = register_surface_session(&state, "deskbar", channel);
         assert!(
-            router.any_surface_session_subscribed(channel, &[surface_feed_target()]),
+            router.any_attach_session_subscribed(channel, &[attach_feed_target()]),
             "the subscribed attached session is a feed target"
         );
         assert!(
-            !router.any_surface_session_subscribed("brenn:other-channel", &[surface_feed_target()]),
+            !router.any_attach_session_subscribed("brenn:other-channel", &[attach_feed_target()]),
             "subscribed to a different channel — not a target here"
         );
     }
@@ -1499,7 +1652,7 @@ mod tests {
 
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.set_state(state);
-        router.register_delivery_binding(surface_key(), DeliveryBinding::SurfaceSessions);
+        router.register_delivery_binding(surface_key(), DeliveryBinding::AttachSessions);
 
         // Dropped silently — no panic, no DB access.
         router
@@ -1511,7 +1664,7 @@ mod tests {
     /// subscriptions take the row-less feed (`resolve_context_targets` filters to
     /// them), so any other kind is a caller wiring bug.
     #[tokio::test]
-    #[should_panic(expected = "deliver_context called for non-surface subscriber")]
+    #[should_panic(expected = "deliver_context called for non-attacher subscriber")]
     async fn deliver_context_panics_for_non_surface_key() {
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router
@@ -1531,7 +1684,7 @@ mod tests {
     async fn deliver_ingress_panics_for_surface_subscriber() {
         use brenn_lib::messaging::ingress::Event;
         let router = WakeRouterImpl::new(ActiveBridges::new());
-        router.register_delivery_binding(surface_key(), DeliveryBinding::SurfaceSessions);
+        router.register_delivery_binding(surface_key(), DeliveryBinding::AttachSessions);
         let event = Event {
             id: 1,
             conversation_id: 1,
@@ -1562,7 +1715,7 @@ mod tests {
 
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.set_state(state);
-        router.register_delivery_binding(surface_key(), DeliveryBinding::SurfaceSessions);
+        router.register_delivery_binding(surface_key(), DeliveryBinding::AttachSessions);
 
         router.spawn_eager_wake(&surface_key(), &ParticipantId::for_surface("deskbar"));
 
@@ -1658,7 +1811,7 @@ mod tests {
     fn delivery_shape_maps_each_binding_variant() {
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.register_delivery_binding(conv_key(), DeliveryBinding::ConversationBridge);
-        router.register_delivery_binding(surface_key(), DeliveryBinding::SurfaceSessions);
+        router.register_delivery_binding(surface_key(), DeliveryBinding::AttachSessions);
         let parked_key = SubscriberEntryKind::System("tool-executor".to_string());
         router.register_delivery_binding(
             parked_key.clone(),
@@ -1704,7 +1857,7 @@ mod tests {
     /// must never reach the shared dispatch loop deliver path (host-wiring
     /// invariant). Mirrors the `wasm:` counterpart.
     #[tokio::test]
-    #[should_panic(expected = "WakeRouter::deliver called for non-surface subscriber")]
+    #[should_panic(expected = "WakeRouter::deliver called for non-attacher subscriber")]
     async fn deliver_panics_for_system_subscriber() {
         let router = WakeRouterImpl::new(ActiveBridges::new());
         let key = SubscriberEntryKind::System("tool-executor".to_string());

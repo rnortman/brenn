@@ -12,6 +12,8 @@ use brenn_envelope::{SURFACE_SUB_IDENTITY_SEP, surface_sub_identity};
 /// - `for_surface` — browser surface; produces `surface:<slug>`.
 /// - `for_surface_component` — one declared component instance; produces
 ///   `surface:<slug>#<instance>`.
+/// - `for_remote` — authenticated remote attacher (native daemon); produces
+///   `remote:<slug>`.
 ///
 /// The substrate keys all of them on `as_str()` and performs no structural
 /// parsing.
@@ -83,6 +85,16 @@ pub enum SubscriberKind {
         slug: String,
         instance: Option<String>,
     },
+    /// An authenticated remote attacher — a native daemon bridged onto the bus
+    /// (`remote:<slug>`). One grain, not two: a remote declares no components
+    /// and mints no sub-identities, so the slug is the whole principal and the
+    /// whole subscriber key.
+    ///
+    /// Attach-shaped like a `Surface` (row-less, deliver-if-attached), but a
+    /// distinct kind: its authority lowers from a `[[remote]]` block, its
+    /// channels are minted at runtime rather than boot-declared, and its
+    /// registry keyspace is disjoint from the surfaces'.
+    Remote(String),
     /// An in-process system-substrate subscriber (`system:<component>`); the
     /// component name identifies the substrate service (e.g. `tool-executor`).
     /// Parked-and-woken exactly like a `Wasm` subscriber — never delivered
@@ -91,6 +103,12 @@ pub enum SubscriberKind {
 }
 
 impl ParticipantId {
+    /// The scheme a remote attacher's identity carries. Public because the
+    /// attach registry keys a remote's sessions by the same spelling, and one
+    /// spelling of a keyspace is what keeps it disjoint from the surface slugs
+    /// sharing that map.
+    pub const REMOTE_PREFIX: &'static str = "remote:";
+
     /// The LLM (Claude conversation) as participant: subscriber on its command
     /// channels, publisher of its own conversation record and token stream.
     /// Distinct from the owning app's `app:<slug>@<server>` — the two are
@@ -234,6 +252,50 @@ impl ParticipantId {
         Self(surface_sub_identity(&base.0, instance))
     }
 
+    /// Remote-attacher participant. Host-assigned from the `[[remote]]` slug the
+    /// bearer token authenticated, never claimed on the wire. Produces
+    /// `remote:<slug>`: the identity a remote subscribes and publishes under,
+    /// and the account its session logs attribute to.
+    ///
+    /// The `#` guard is load-bearing: it prevents `remote:<slug>` from composing
+    /// into the `surface:<slug>#<instance>` shape, keeping the two keyspaces
+    /// disjoint.
+    ///
+    /// Panics on an empty slug or a slug containing `:`, `@`, or `#`.
+    pub fn for_remote(slug: &str) -> Self {
+        assert!(
+            !slug.is_empty(),
+            "ParticipantId::for_remote: slug must not be empty"
+        );
+        assert!(
+            !slug.contains(':'),
+            "ParticipantId::for_remote: slug must not contain ':': {slug:?}"
+        );
+        assert!(
+            !slug.contains('@'),
+            "ParticipantId::for_remote: slug must not contain '@': {slug:?}"
+        );
+        assert!(
+            !slug.contains('#'),
+            "ParticipantId::for_remote: slug must not contain '#' (reserved for \
+             per-component sub-identities): {slug:?}"
+        );
+        Self(format!("{}{slug}", Self::REMOTE_PREFIX))
+    }
+
+    /// Recover the remote slug this identity denotes.
+    ///
+    /// Panics if the identity is not `remote:<slug>` — an unrecognized kind at
+    /// a recovery point is a structural host-wiring bug.
+    pub fn as_remote_slug(&self) -> &str {
+        self.0.strip_prefix(Self::REMOTE_PREFIX).unwrap_or_else(|| {
+            panic!(
+                "ParticipantId::as_remote_slug: not a remote identity: {:?}",
+                self.0
+            )
+        })
+    }
+
     /// In-process system-substrate participant. Host-assigned, never claimed.
     /// Produces `system:<component>`; the component name identifies the
     /// substrate service (`tool-executor`). Both a publisher (results flow
@@ -362,6 +424,7 @@ impl ParticipantId {
             || s.starts_with("conversation:")
             || s.starts_with("wasm:")
             || s.starts_with("surface:")
+            || s.starts_with("remote:")
             || s.starts_with("system:")
     }
 
@@ -386,6 +449,8 @@ impl ParticipantId {
                 slug: self.as_surface_slug().to_owned(),
                 instance: self.surface_component().map(str::to_owned),
             }
+        } else if let Some(slug) = self.0.strip_prefix("remote:") {
+            SubscriberKind::Remote(slug.to_owned())
         } else if let Some(component) = self.0.strip_prefix("system:") {
             SubscriberKind::System(component.to_owned())
         } else if self.0.starts_with("app:") {
@@ -797,6 +862,90 @@ mod tests {
     #[should_panic(expected = "not a surface identity")]
     fn as_surface_slug_panics_on_wasm_kind() {
         ParticipantId::for_wasm("my-component").as_surface_slug();
+    }
+
+    // --- remote: kind ---
+
+    #[test]
+    fn for_remote_round_trip() {
+        let pid = ParticipantId::for_remote("pod-kitchen");
+        assert_eq!(pid.as_str(), "remote:pod-kitchen");
+        assert_eq!(pid.as_remote_slug(), "pod-kitchen");
+        assert_eq!(pid.kind(), SubscriberKind::Remote("pod-kitchen".to_owned()));
+    }
+
+    #[test]
+    fn for_remote_various_slugs() {
+        for slug in ["a", "pod-kitchen", "pod.study", "x1"] {
+            let pid = ParticipantId::for_remote(slug);
+            assert_eq!(pid.as_str(), format!("remote:{slug}"));
+            assert_eq!(pid.as_remote_slug(), slug);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "for_remote: slug must not be empty")]
+    fn for_remote_panics_on_empty_slug() {
+        ParticipantId::for_remote("");
+    }
+
+    #[test]
+    #[should_panic(expected = "for_remote: slug must not contain ':'")]
+    fn for_remote_panics_on_colon_in_slug() {
+        ParticipantId::for_remote("bad:slug");
+    }
+
+    #[test]
+    #[should_panic(expected = "for_remote: slug must not contain '@'")]
+    fn for_remote_panics_on_at_in_slug() {
+        ParticipantId::for_remote("bad@slug");
+    }
+
+    /// The guard that keeps the two attach keyspaces from ever meeting: without
+    /// it a remote slug could spell the sub-identity separator and compose into
+    /// the `surface:<slug>#<instance>` shape.
+    #[test]
+    #[should_panic(expected = "for_remote: slug must not contain '#'")]
+    fn for_remote_panics_on_hash_in_slug() {
+        ParticipantId::for_remote("pod#kitchen");
+    }
+
+    /// A remote and a surface sharing a slug are different principals, and
+    /// neither one's string is a prefix or suffix of the other's — the property
+    /// the registry keyspace argument rests on.
+    #[test]
+    fn a_remote_and_a_surface_of_one_slug_are_distinct_principals() {
+        let remote = ParticipantId::for_remote("kitchen");
+        let surface = ParticipantId::for_surface("kitchen");
+        assert_ne!(remote, surface);
+        assert_ne!(remote.as_str(), surface.as_str());
+        assert_eq!(remote.kind(), SubscriberKind::Remote("kitchen".to_owned()));
+        assert_eq!(
+            surface.kind(),
+            SubscriberKind::Surface {
+                slug: "kitchen".to_owned(),
+                instance: None,
+            }
+        );
+    }
+
+    /// A remote has one grain, so the surface accessors refuse it outright
+    /// rather than answering for a component it cannot have.
+    #[test]
+    #[should_panic(expected = "not a surface identity")]
+    fn surface_component_panics_on_a_remote_identity() {
+        ParticipantId::for_remote("pod-kitchen").surface_component();
+    }
+
+    #[test]
+    #[should_panic(expected = "not a remote identity")]
+    fn as_remote_slug_panics_on_surface_kind() {
+        ParticipantId::for_surface("deskbar").as_remote_slug();
+    }
+
+    #[test]
+    fn is_structured_recognizes_remote() {
+        assert!(ParticipantId::is_structured("remote:pod-kitchen"));
     }
 
     // --- system: kind ---

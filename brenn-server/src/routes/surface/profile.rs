@@ -14,8 +14,8 @@ mod tests;
 use std::collections::{HashMap, HashSet};
 
 use brenn_lib::access::AppCapability;
-use brenn_lib::messaging::ParticipantId;
 use brenn_lib::messaging::config::{Depth, ResolvedSurface};
+use brenn_lib::messaging::{ParticipantId, SubscriberEntry};
 
 use crate::routes::attach::profile::{
     AttachProfile, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts,
@@ -309,6 +309,20 @@ impl AttachProfile for SurfaceProfile {
             per_attacher: MAX_SESSIONS_PER_SURFACE,
             per_account: MAX_SESSIONS_PER_USER_PER_SURFACE,
         }
+    }
+
+    fn max_active_subscriptions(&self) -> usize {
+        // The map that answers `subscribable`, so the cap is exactly what this
+        // surface may hold and can never drift from it. Unreachable in practice
+        // — a second Subscribe on an already-active channel violates first — and
+        // that is the point: a boot-enumerated attacher gets the cap for free.
+        self.subscribable.len()
+    }
+
+    fn runtime_entry(&self, _channel: &str) -> Option<SubscriberEntry> {
+        // A surface's directory entries are folded from its declared bindings
+        // at boot, before it can attach at all.
+        None
     }
 }
 

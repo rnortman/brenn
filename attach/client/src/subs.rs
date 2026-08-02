@@ -63,7 +63,33 @@ enum WireState {
     Active,
 }
 
-/// What a `SubscribeResult` settled.
+/// What one `SubscribeResult` settled.
+///
+/// Two shapes because the peer's two outcomes settle different things: an opened
+/// subscription has a span, a replay and possibly a gap to describe, while an
+/// unavailable channel has only its name — nothing opened, so there is nothing
+/// about it to report but that it did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubscribeSettlement {
+    /// The peer acknowledged the subscription.
+    Opened(SubscribeAck),
+    /// The peer answered `Unavailable`: the channel is inside this attacher's
+    /// grants but is not there right now.
+    ///
+    /// The plane has returned the channel to unsubscribed and dropped every
+    /// local hold on it, exactly as the last release would have — so the
+    /// embedder's own bookkeeping must forget it too, and a reattach never
+    /// resubscribes it. The cursor is kept: a later acquisition of the same
+    /// address presents it, and a cursor minted under a dead incarnation of the
+    /// channel is the peer's incarnation guard to answer, not this layer's.
+    ///
+    /// Nothing is retried here. When to ask again is the embedder's policy —
+    /// whatever told it the channel exists is what tells it to try — and an
+    /// embedder whose peer cannot legally produce this treats it as fatal.
+    Unavailable,
+}
+
+/// What an acknowledged `SubscribeResult` settled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeAck {
     /// Frames the embedder must send — the deferred `Unsubscribe` of a channel
@@ -378,7 +404,9 @@ impl Subscriptions {
     ///
     /// It must answer a `Pending` channel: the peer's writer orders the result
     /// ahead of any replay, so a result for a channel this attacher is not
-    /// waiting on is unreconcilable.
+    /// waiting on is unreconcilable. An `Unavailable` answer settles to
+    /// [`SubscribeSettlement::Unavailable`], whose doc states what the plane did
+    /// with the channel.
     ///
     /// This is also where a subscription restated while its `Subscribe` was in
     /// flight is enacted — the acknowledged subscription is closed and the current
@@ -389,7 +417,7 @@ impl Subscriptions {
         outcome: SubscribeOutcome,
         replay_count: u32,
         gap: Option<GapInfo>,
-    ) -> Result<SubscribeAck, String> {
+    ) -> Result<SubscribeSettlement, String> {
         let entry = match self.channels.get_mut(channel) {
             Some(entry) if entry.wire == WireState::Pending => entry,
             _ => {
@@ -398,7 +426,23 @@ impl Subscriptions {
                 ));
             }
         };
-        let SubscribeOutcome::Ok = outcome;
+        match outcome {
+            SubscribeOutcome::Ok => {}
+            SubscribeOutcome::Unavailable => {
+                // Nothing opened, so nothing is owed the peer: no `Unsubscribe`
+                // closes a subscription that never existed, and no span means no
+                // straggler to tolerate. The holds go because the alternative is
+                // a channel the plane would resubscribe at every attach and the
+                // peer would refuse at every attach. The cursor stays: it costs
+                // one entry and it is what makes a re-acquisition after the
+                // channel comes back lossless.
+                entry.wire = WireState::Unsubscribed;
+                entry.refcount = 0;
+                entry.span_hw = None;
+                entry.stated = None;
+                return Ok(SubscribeSettlement::Unavailable);
+            }
+        }
         // The channel has now been acknowledged on this attachment, even if the
         // next line immediately closes it again: that is what makes a delivery
         // crossing the `Unsubscribe` a straggler rather than an inexplicable one.
@@ -424,12 +468,12 @@ impl Subscriptions {
         // No pruning here even when the deferred `Unsubscribe` just closed it:
         // the channel has been active, so a straggler is still possible and its
         // entry is what tells one from an inexplicable delivery.
-        Ok(SubscribeAck {
+        Ok(SubscribeSettlement::Opened(SubscribeAck {
             frames,
             live,
             replay_count,
             gap,
-        })
+        }))
     }
 
     /// Intake one `Deliver`'s wire half — a whole delivery pass on one channel —

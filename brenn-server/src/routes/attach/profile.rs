@@ -9,8 +9,8 @@
 //! Every answer here is boot-resolved, so a profile is immutable for the life of
 //! the process and shared by every session of its attacher.
 
-use brenn_lib::messaging::ParticipantId;
 use brenn_lib::messaging::config::Depth;
+use brenn_lib::messaging::{ParticipantId, SubscriberEntry};
 
 use super::registry::SessionCaps;
 
@@ -199,6 +199,38 @@ pub trait AttachProfile: Send + Sync {
     /// reconnecting into a full slot may deserve a different posture entirely.
     /// The registry only enforces the numbers.
     fn session_caps(&self) -> SessionCaps;
+
+    /// How many subscriptions one attachment of this attacher may hold at once.
+    ///
+    /// Route policy for the same reason the two burst knobs are, and load-
+    /// bearing for exactly one shape of attacher: a profile that answers
+    /// [`AttachProfile::subscribable`] from a *matcher* admits every channel
+    /// under a prefix, so without a stated cap the per-session subscription
+    /// bookkeeping is bounded only by how many channels the operator's prefix
+    /// ever matches. A profile whose subscribable set is a finite boot-declared
+    /// map answers that set's size, where the cap is unreachable by
+    /// construction and costs nothing.
+    ///
+    /// Over-cap is a violation, not an outcome: a correct attacher knows its own
+    /// subscription set and the operator sized the cap for it.
+    fn max_active_subscriptions(&self) -> usize;
+
+    /// The directory subscriber entry this attacher needs on `channel` in order
+    /// to be delivered to, or `None` when the route's entries are all
+    /// boot-declared.
+    ///
+    /// The delivery fan-out reads the channel's subscriber list, so an attacher
+    /// with no entry on a channel receives nothing however legal its
+    /// subscription. A surface's entries are folded from its declared bindings
+    /// at boot and this answers `None`; an attacher whose channels come into
+    /// being at runtime has nothing to fold from and answers the entry its own
+    /// ACL ceilings describe — never the client-stated depths, so two sessions
+    /// of one attacher mint the same entry and a re-subscribe is idempotent.
+    ///
+    /// Pure and total like the rest of the trait: the *depths* are the profile's
+    /// answer, and clamping them against what the channel actually retains is
+    /// the caller's, because only the caller holds the channel.
+    fn runtime_entry(&self, channel: &str) -> Option<SubscriberEntry>;
 }
 
 #[cfg(test)]

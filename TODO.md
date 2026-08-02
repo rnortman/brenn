@@ -1113,4 +1113,3 @@ state the contract that was chosen rather than the mismatch.
 Code sites (`TODO(batch-frame-cap)`): `attach/proto/src/lib.rs`
 (`max_client_frame_bytes`) and `brenn-server/src/routes/attach/socket.rs`
 (`InboundError::Oversized`, which is where the violation is raised).
-

@@ -5,6 +5,7 @@ pub mod login;
 pub mod logout;
 pub mod redirector;
 pub mod register;
+pub mod remote;
 pub mod statics;
 pub mod surface;
 pub mod target_handler;

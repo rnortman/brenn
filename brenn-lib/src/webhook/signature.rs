@@ -17,7 +17,6 @@ use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use sha2::Sha256;
-use subtle::ConstantTimeEq;
 
 use crate::webhook::config::ResolvedWebhookEndpoint;
 use crate::webhook::is_valid_key_id;
@@ -228,7 +227,7 @@ pub(crate) fn hmac_sha256_parts_verify(key: &[u8], parts: &[&[u8]], sig: &[u8]) 
         return false;
     }
     let expected = hmac_sha256_parts(key, parts);
-    expected.as_slice().ct_eq(sig).into()
+    crate::util::ct_eq_bytes(expected.as_slice(), sig)
 }
 
 /// Verify a raw HMAC-SHA256 signature in constant time.
@@ -241,16 +240,6 @@ pub(crate) fn hmac_sha256_parts_verify(key: &[u8], parts: &[&[u8]], sig: &[u8]) 
 /// Thin wrapper over `hmac_sha256_parts_verify(key, &[data], sig)`.
 pub fn hmac_sha256_verify(key: &[u8], data: &[u8], sig: &[u8]) -> bool {
     hmac_sha256_parts_verify(key, &[data], sig)
-}
-
-/// Constant-time equality check for two byte slices.
-///
-/// Returns `true` iff both slices have the same length and identical contents.
-/// Uses `subtle::ConstantTimeEq` to prevent timing oracles. Length inequality
-/// is not secret in the webhook context (secret lengths are operator-controlled
-/// config values), but the comparison is constant-time on equal-length inputs.
-pub fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
-    a.ct_eq(b).into()
 }
 
 /// Parse a hex-encoded HMAC signature from a header value per the given
@@ -641,11 +630,9 @@ pub fn verify_request(
             // Step 4: resolve token (timing-parity).
             let kr = resolve_token(token_id_header, tokens, headers)?;
 
-            // Step 5: constant-time compare. `subtle::ConstantTimeEq` on `[u8]`
-            // yields Choice(0) immediately on length mismatch — that's the
-            // length-prefix timing channel acknowledged in design §3. Acceptable
-            // for ≥32-byte random tokens.
-            let ct_equal = bool::from(supplied.ct_eq(kr.effective_key));
+            // Step 5: constant-time compare. Length mismatch leaks length
+            // (documented on `ct_eq_bytes`); acceptable for ≥32-byte random tokens.
+            let ct_equal = crate::util::ct_eq_bytes(supplied, kr.effective_key);
 
             // Step 6: decide.
             if kr.unknown {

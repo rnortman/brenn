@@ -1,3 +1,20 @@
+use subtle::ConstantTimeEq;
+
+/// Constant-time equality check for two byte slices.
+///
+/// Returns `true` iff both slices have the same length and identical contents.
+/// `subtle::ConstantTimeEq` answers `false` on a length mismatch without
+/// comparing contents, so no byte position leaks through timing; the length
+/// itself does, which every implementation of this comparison also does and
+/// which is not secret for the credentials compared here (operator-authored
+/// config secrets and bearer tokens).
+///
+/// The single constant-time comparison for the crate: a timing-hygiene audit
+/// or a `subtle` API migration has one site to visit.
+pub fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    a.ct_eq(b).into()
+}
+
 /// Compare two version strings of the form `X.Y.Z` numerically.
 ///
 /// Returns `true` when `v >= minimum`. Non-numeric components and versions

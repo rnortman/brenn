@@ -22,7 +22,6 @@ pub use brenn_queue::GapReason;
 use crate::access::AppPolicy;
 use crate::messaging::gates::{check_body_size, publish_acl_allows};
 use crate::messaging::store::RingStore;
-use crate::messaging::store::SurfaceFeedTarget;
 use crate::messaging::store::ring::Appended;
 use crate::messaging::{ChannelEntry, Messenger, ParticipantId};
 
@@ -44,15 +43,16 @@ pub struct PrepaidEntry<'a> {
     pub publish_ts: DateTime<Utc>,
 }
 
-/// Where an activation flush's entries land: the resolved channel, the ring that
-/// takes its messages, and the surface subscribers a committed entry is fanned
-/// out to.
+/// Where an activation flush's entries land: the resolved channel and the ring
+/// that takes its messages.
 ///
-/// Split out of the entry so a flush resolves its destination **once per
-/// address** rather than once per entry: the directory and the channel's
-/// subscriber list are fixed for the flush's life, and the dominant case is a
-/// flush fanning one port. Whether a session is *attached* is still asked per
-/// entry, at fan-out, since a session can detach mid-flush.
+/// Split out of the entry so a flush runs the class and authorization decision
+/// **once per address** rather than once per entry: neither answer can change
+/// for the flush's life, and the dominant case is a flush fanning one port. The
+/// channel's attacher feed targets are deliberately *not* memoized here — a
+/// subscriber can mint its directory entry mid-flush, so they are resolved after
+/// each append, where [`Messenger::attached_feed_targets`] documents the
+/// ordering that owes the row to nobody.
 ///
 /// Constructing one runs the whole class and authorization decision
 /// ([`Messenger::resolve_prepaid`]), so holding one is the proof that entries
@@ -62,7 +62,6 @@ pub struct PrepaidDestination {
     scheme: ChannelScheme,
     entry: Arc<ChannelEntry>,
     store: Arc<RingStore>,
-    feed_targets: Vec<SurfaceFeedTarget>,
 }
 
 impl Messenger {
@@ -121,14 +120,11 @@ impl Messenger {
             sender = sender.as_str(),
         );
         let store = self.ring_store(&entry.uuid);
-        let feed_targets =
-            self.resolve_surface_feed_targets(&entry.address, entry.subscribers.as_slice());
         PrepaidDestination {
             sender: sender.clone(),
             scheme,
             entry,
             store,
-            feed_targets,
         }
     }
 
@@ -156,8 +152,8 @@ impl Messenger {
     /// breach here means the transport and bus caps disagree. The class and ACL
     /// gates were run once, at [`resolve_prepaid`].
     ///
-    /// The committed entry is fanned out to the channel's attached surface
-    /// subscriptions before this returns: a surface holds no position for
+    /// The committed entry is fanned out to the channel's attached attacher
+    /// subscriptions before this returns: an attacher holds no position for
     /// anything to walk, so the commit is its whole delivery trigger.
     ///
     /// Returns the append's outcome, whose `overflow` names every attached
@@ -175,15 +171,14 @@ impl Messenger {
     ) -> Appended {
         let envelope = self.prepaid_envelope(dest, entry);
         let appended = dest.store.append(envelope);
-        // Resolution is the destination's, memoized across the flush; attachment
-        // is asked now, because a session can detach mid-flush.
-        if !dest.feed_targets.is_empty()
-            && self
-                .router
-                .any_surface_session_subscribed(&dest.entry.address, &dest.feed_targets)
-        {
-            self.fan_out_surface_feed(
-                &dest.feed_targets,
+        // Resolved after the append, not memoized on the destination: a
+        // subscriber can mint its directory entry mid-flush, and one minted
+        // before this read holds a position no earlier resolution would have
+        // served it from.
+        let feed_targets = self.attached_feed_targets(&dest.entry);
+        if !feed_targets.is_empty() {
+            self.fan_out_attach_feed(
+                &feed_targets,
                 Arc::clone(&appended.retained.envelope),
                 i64::try_from(appended.retained.seq)
                     .expect("messaging: retention position out of range"),

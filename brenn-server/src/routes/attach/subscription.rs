@@ -33,7 +33,7 @@ use brenn_attach_proto::{
     Cursor, DeliverRow, GapInfo, GapReason as ProtoGapReason, ServerFrame, SubscribeOutcome,
 };
 use brenn_lib::messaging::store::{ResumeCursor, gap_suffix};
-use brenn_lib::messaging::{GapReason as BusGapReason, MessageEnvelope, Replay};
+use brenn_lib::messaging::{ChannelEntry, GapReason as BusGapReason, MessageEnvelope, Replay};
 use brenn_lib::token_bucket::{TokenBucket, TokenBucketOutcome};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -111,6 +111,16 @@ impl ActiveChannels {
 
     pub fn is_active(&self, channel: &str) -> bool {
         self.active.contains_key(channel)
+    }
+
+    /// How many subscriptions this connection currently holds — the quantity the
+    /// profile's `max_active_subscriptions` bounds.
+    pub fn len(&self) -> usize {
+        self.active.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.active.is_empty()
     }
 
     /// Every active channel, for the drain sweep.
@@ -619,6 +629,18 @@ pub async fn handle_subscribe(
         ));
     }
 
+    // A correct attacher knows its own subscription set and the operator sized
+    // the cap to hold it, so exceeding it is fail2ban-grade signal rather than
+    // an outcome — the same argument the subscribe bucket rests on. The channel
+    // is not named: the cap is a fact about the attacher, not about the channel
+    // that happened to trip it.
+    let cap = ctx.profile.max_active_subscriptions();
+    if active.len() >= cap {
+        return ctx.violation(format!(
+            "Subscribe beyond the {cap} active-subscription cap"
+        ));
+    }
+
     // The client states both knobs and the server clamps them to what boot
     // resolved for the channel. A conforming attacher echoes the depths its own
     // configuration gave it and sees no difference; a client asking for a wider
@@ -650,10 +672,41 @@ pub async fn handle_subscribe(
         },
     };
 
+    // The channel has to exist before anything below can hold a position in it.
+    // Every violation the frame could earn has already been answered above, so a
+    // channel this attacher is granted and the directory does not hold is the
+    // deprovision race and nothing else: answered `Unavailable`, non-fatal,
+    // opening nothing. What the answer discloses, the operator's own grant
+    // authorized — outside the grants the address never reaches here.
+    let Some(entry) = ctx.messenger.directory().resolve(channel) else {
+        let result = ServerFrame::SubscribeResult {
+            channel: channel.to_string(),
+            outcome: SubscribeOutcome::Unavailable,
+            replay_count: 0,
+            gap: None,
+        };
+        // Sanitized: this is the one log on this path whose channel is not a
+        // provisioned address. A prefix-granted attacher composes the suffix, and
+        // nothing above rejected it, so the bytes here are the client's.
+        debug!(
+            channel = %sanitize_client_detail(channel),
+            "attach subscribe: granted channel absent from the directory; answering Unavailable"
+        );
+        return super::session::send_frame(&ctx.tx, result, counters).await;
+    };
+
     // Activate before the store read: from here the router queues live rows. A
     // row the replay below also serves arrives at the live arm at or below the
     // position this subscribe anchors, so the handoff race closes on the cursor.
     active.activate(channel, facts);
+
+    // Then the directory entry, before the store read and in the same direction:
+    // a publisher reads the channel's subscriber list after its own commit, so a
+    // commit landing after this mint feeds this attacher live, and one landing
+    // before the read below is in the replay. Minting after the read would leave
+    // the window between them owed to nobody. A profile whose entries are
+    // boot-declared mints nothing here.
+    ensure_runtime_entry(ctx, &entry, channel);
 
     // The connection's boot incarnation (see `WireCursors::incarnation` for the
     // staleness check it feeds). A stale cursor is conforming, so it is answered
@@ -679,10 +732,13 @@ pub async fn handle_subscribe(
     };
 
     // The subscription's whole delivery state: the client's own cursor, answered
-    // from retention.
+    // from retention. The store is resolved from the entry already in hand, not
+    // re-looked-up by address: a deprovision landing between the two would make
+    // the address lookup panic on a race this path answers `Unavailable` to one
+    // statement earlier.
     let replay = ctx
         .messenger
-        .store_for_address(channel)
+        .store_for(&entry)
         .replay_from(store_cursor, facts.replay_clamp())
         .await;
 
@@ -740,6 +796,61 @@ pub async fn handle_subscribe(
         })
         .collect();
     send_pass(ctx, cursors, channel, pass, counters).await
+}
+
+/// Mint the profile's directory entry for `channel` if it declares one, clamped
+/// to what the channel actually retains.
+///
+/// The clamp is not politeness: `ChannelEntry::reap_frontier` asserts every
+/// subscriber depth is at or below the channel's `standing_retain_depth`, and
+/// the frontier is what the reaper trusts, so an entry above it would panic the
+/// process on the next sweep. The profile states an ACL ceiling that knows
+/// nothing of the channel; this is where the two meet.
+///
+/// Idempotent both ways: an entry already present at these depths is left alone
+/// (the common re-subscribe and second-session case), and a changed one is
+/// replaced rather than duplicated. The "already present" test asks
+/// `SubscriberEntryKind::same_principal`, the same predicate `add_subscriber`
+/// replaces by, so the skip covers exactly the writes that would be no-ops.
+/// Entries are never removed here — another session of the same attacher may
+/// hold the channel, delivery to an attacher with no session is already the
+/// no-op path, and the entry dies with the channel.
+fn ensure_runtime_entry(ctx: &AttachSessionCtx, entry: &ChannelEntry, channel: &str) {
+    let Some(mut minted) = ctx.profile.runtime_entry(channel) else {
+        return;
+    };
+    let standing = entry.resolved_channel.standing_retain_depth;
+    minted.push_depth = minted.push_depth.narrowed_by(standing);
+    minted.retain_depth = minted.retain_depth.narrowed_by(standing);
+
+    let unchanged = entry.subscribers.iter().any(|existing| {
+        existing.kind.same_principal(&minted.kind)
+            && existing.push_depth == minted.push_depth
+            && existing.retain_depth == minted.retain_depth
+    });
+    if unchanged {
+        return;
+    }
+
+    debug!(
+        channel,
+        push_depth = ?minted.push_depth,
+        retain_depth = ?minted.retain_depth,
+        "attach subscribe: minting the attacher's directory entry"
+    );
+    if !ctx
+        .messenger
+        .directory()
+        .add_subscriber(&entry.uuid, minted)
+    {
+        // The channel was deprovisioned between the resolve above and here. The
+        // subscription is already active and will deliver nothing, which is the
+        // same place the attacher lands on any other deprovision.
+        warn!(
+            channel,
+            "attach subscribe: channel vanished before its subscriber entry landed"
+        );
+    }
 }
 
 /// Drain every active subscription's unseen suffix — the eager-wake nudge path.

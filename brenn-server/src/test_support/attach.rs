@@ -18,7 +18,9 @@ use brenn_lib::messaging::config::{
     ChannelConfigRaw, Depth, MessagingGlobalConfig, build_channel_entries,
 };
 use brenn_lib::messaging::query::NoopWakeRouter;
-use brenn_lib::messaging::{MessagingDirectory, Messenger, ParticipantId, WakeRouter};
+use brenn_lib::messaging::{
+    MessagingDirectory, Messenger, ParticipantId, SubscriberEntry, WakeRouter,
+};
 use brenn_lib::obs::alerting::AlertDispatcher;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -65,6 +67,13 @@ pub(crate) struct TestProfile {
     pub publish_rate: PublishRate,
     pub alert_granted: bool,
     pub session_caps: SessionCaps,
+    /// Concurrent subscriptions one attachment of this attacher may hold.
+    pub max_active_subscriptions: usize,
+    /// The directory entry this stub mints on a successful subscribe, if any.
+    /// `None` is the boot-declared answer a surface gives; a suite exercising
+    /// the runtime-entry hook states the entry it means to see minted, whose
+    /// depths the plane then clamps against the channel.
+    pub runtime_entry: Option<SubscriberEntry>,
 }
 
 impl TestProfile {
@@ -87,6 +96,8 @@ impl TestProfile {
             },
             alert_granted: false,
             session_caps: SessionCaps::UNCAPPED,
+            max_active_subscriptions: usize::MAX,
+            runtime_entry: None,
         }
     }
 }
@@ -146,6 +157,14 @@ impl AttachProfile for TestProfile {
     fn session_caps(&self) -> SessionCaps {
         self.session_caps
     }
+
+    fn max_active_subscriptions(&self) -> usize {
+        self.max_active_subscriptions
+    }
+
+    fn runtime_entry(&self, _channel: &str) -> Option<SubscriberEntry> {
+        self.runtime_entry.clone()
+    }
 }
 
 /// A `Messenger` over one durable in-memory channel, and the uuid rows are
@@ -155,15 +174,28 @@ impl AttachProfile for TestProfile {
 /// out of; the channel's own sizing is never their subject, so it is as wide as
 /// it can be and every clamp under test comes from the profile instead.
 pub(crate) async fn one_channel_messenger(db: &Db, bare: &str) -> (Arc<Messenger>, Uuid) {
+    one_channel_messenger_at_standing(db, bare, Depth::Unbounded).await
+}
+
+/// [`one_channel_messenger`] with the channel's standing retention stated.
+///
+/// The standing depth is the ceiling on every depth any subscriber may hold on
+/// the channel, so a suite whose subject is that clamp names a bounded one here
+/// and leaves the rest of the fixture alone.
+pub(crate) async fn one_channel_messenger_at_standing(
+    db: &Db,
+    bare: &str,
+    standing: Depth,
+) -> (Arc<Messenger>, Uuid) {
     let raw = ChannelConfigRaw {
         send_rate: None,
         uuid: Some(Uuid::new_v4().to_string()),
         address: Some(bare.to_string()),
         address_prefix: None,
         description: None,
-        push_depth: Some(Depth::Unbounded),
-        retain_depth: Some(Depth::Unbounded),
-        standing_retain_depth: Some(Depth::Unbounded),
+        push_depth: Some(standing),
+        retain_depth: Some(standing),
+        standing_retain_depth: Some(standing),
         noise: None,
         sink: None,
         wake_min: None,

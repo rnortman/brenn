@@ -100,10 +100,11 @@ impl Messenger {
                     SubscriberEntryKind::System(component) => {
                         Some(ParticipantId::for_system(component))
                     }
-                    // A surface holds no server-side position at all: the cursor
-                    // it echoes at subscribe is its whole delivery state. Any row
-                    // under a surface identity is an orphan.
-                    SubscriberEntryKind::Surface(_) => None,
+                    // An attach-shaped subscriber holds no server-side position
+                    // at all: the cursor it echoes at subscribe is its whole
+                    // delivery state. Any row under one of their identities is
+                    // an orphan.
+                    SubscriberEntryKind::Surface(_) | SubscriberEntryKind::Remote(_) => None,
                     // The subscription names its conversation outright, so
                     // nothing has to be resolved to know whose row is whose. The
                     // row is the one this boot's provisioning just re-created,

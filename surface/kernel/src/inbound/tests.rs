@@ -296,6 +296,29 @@ fn a_subscribe_result_puts_the_channel_on_the_wire() {
     assert_eq!(inbound, Inbound::default());
 }
 
+/// The surface half of the one-outcome-two-postures split: a remote reconciles
+/// an `Unavailable` against its next roster snapshot, but every channel a page
+/// subscribes was provisioned before the backend accepted the connection and
+/// named by the wiring it delivered. So the answer is one this route's profile
+/// cannot legally produce — a broken peer, and a loud reconnect instead of a
+/// component left silently holding a channel it never opened.
+#[test]
+fn an_unavailable_on_a_surface_channel_is_fatal() {
+    let mut page = attached();
+    let configured = only_configured(route(&mut page, deliver(CONFIG, &body(W::default()), 1, 0)));
+    assert_eq!(subscribed(&configured.frames), vec![WIRE]);
+    let unavailable = ServerFrame::SubscribeResult {
+        channel: WIRE.to_string(),
+        outcome: SubscribeOutcome::Unavailable,
+        replay_count: 0,
+        gap: None,
+    };
+    let err = on_server_frame(&mut page, unavailable, NOW)
+        .expect_err("a surface's channels are all boot-provisioned");
+    assert!(err.contains(WIRE), "{err}");
+    assert!(!page.subs.is_active(WIRE));
+}
+
 #[test]
 fn a_subscribe_result_for_a_channel_nothing_asked_for_is_fatal() {
     let mut page = attached();

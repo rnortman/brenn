@@ -75,7 +75,7 @@ impl VersionRange {
 /// number on both ends at once. The negotiation *mechanism* exists from the
 /// start regardless, because it is the one thing that cannot be added later
 /// without breaking the frozen [`ClientFrame::Hello`] shell.
-pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exactly(2);
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exactly(3);
 
 /// The version two ends agree on, or `None` when their ranges do not overlap.
 ///
@@ -186,6 +186,13 @@ pub enum ClientFrame {
     /// Contract: call order is preserved within each delivery class; cross-class
     /// relative ordering is not guaranteed.
     ///
+    /// **Legality is protocol law**, stated by [`check_batch_legality`]: a
+    /// bounded op count and a bounded charge of channel and body bytes, both
+    /// checked by the client before it sends and by the server after it parses.
+    /// The law is what makes [`max_client_frame_bytes`] able to bound every
+    /// legal frame, so a conforming attacher can never compose a flush its peer
+    /// reads as tampering.
+    ///
     /// **Every per-entry error is violation-grade**, unlike the single
     /// [`Publish`](ClientFrame::Publish) whose oversize body is an outcome. The
     /// client is the primary enforcer here — it checks each entry's channel,
@@ -203,7 +210,7 @@ pub enum ClientFrame {
         correlation: u64,
         /// The activation's buffered publishes, in call order. Bounded by
         /// `brenn_budget::MAX_PUBLISHES_PER_ACTIVATION`; a longer batch is a
-        /// violation.
+        /// violation, as is one over the whole-batch law.
         publishes: Vec<BatchEntry>,
         /// The activation's buffered control ops against messages this sender
         /// already parked, in call order. Applied **before** `publishes`: an op
@@ -508,14 +515,28 @@ pub struct DeferredViewEntry {
 #[serde(transparent)]
 pub struct Cursor(String);
 
-/// Result of a [`ClientFrame::Subscribe`]. A subscribe that cannot be honoured
-/// is a protocol violation that kills the connection rather than a wire outcome,
-/// so `Ok` is the only variant. Kept a tagged enum so a future non-fatal outcome
-/// — a profile that provisions channels dynamically has one — is additive.
+/// Result of a [`ClientFrame::Subscribe`].
+///
+/// A subscribe the attacher was never entitled to make is a protocol violation
+/// that kills the connection rather than a wire outcome — including one on a
+/// channel outside its grants, which answers identically whether or not the
+/// channel exists, so the wire is no existence oracle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum SubscribeOutcome {
     Ok,
+    /// The channel is inside this attacher's grants but does not exist right
+    /// now: a profile whose channels are provisioned at runtime raced their
+    /// coming and going.
+    ///
+    /// Non-fatal and disclosing nothing an operator did not authorize — the
+    /// grant that admits the address is the operator's own statement that this
+    /// attacher may know whether it is there. The subscription is not opened:
+    /// nothing replays, no span starts, and the client is free to ask again
+    /// when whatever names the channel says it exists. A profile whose channels
+    /// are all provisioned before it accepts a connection never produces this,
+    /// and a client of such a profile treats it as a broken peer.
+    Unavailable,
 }
 
 /// Result of a [`ClientFrame::Publish`].
@@ -592,6 +613,114 @@ pub enum GapReason {
 /// rather than tracking each field.
 pub const PUBLISH_FRAME_OVERHEAD_BYTES: usize = 8 * 1024;
 
+/// Worst-case JSON string expansion: one source byte serializes as at most six
+/// (`\u00XX` for a control character).
+const JSON_ESCAPE_EXPANSION: usize = 6;
+
+/// How many operations one [`ClientFrame::PublishBatch`] may carry — publishes
+/// and control ops together.
+///
+/// Wide enough to admit the widest flush an activation can buffer: the
+/// per-activation caps allow `brenn_budget::MAX_PUBLISHES_PER_ACTIVATION`
+/// publishes *and* the same number of control ops, so at twice that number the
+/// count half of the law never refuses a flush the buffer-time budget accepted.
+/// The number is spelled here rather than imported because this crate links into
+/// wasm attachers on three dependencies; the server's batch handler holds the
+/// tripwire that keeps the two in step.
+pub const MAX_BATCH_OPS: usize = 512;
+
+/// Per-operation allowance in the frame-cap derivation: the JSON keys, the
+/// braces and commas, the type and kind tags, an urgency, a release timestamp
+/// and a message uuid of one batch operation.
+///
+/// The two unbounded fields of an operation — its channel address and its body —
+/// are deliberately not in here. They are charged against the batch's own byte
+/// budget by [`batch_charged_bytes`] instead, which is what makes the derivation
+/// below a bound rather than an estimate.
+pub const BATCH_OP_OVERHEAD_BYTES: usize = 256;
+
+/// Why a [`ClientFrame::PublishBatch`] is not a legal frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchIllegal {
+    /// More publishes and control ops than [`MAX_BATCH_OPS`] together.
+    TooManyOps { ops: usize, cap: usize },
+    /// More charged bytes than the attachment's body cap.
+    TooManyBytes { bytes: usize, cap: usize },
+}
+
+impl std::fmt::Display for BatchIllegal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyOps { ops, cap } => {
+                write!(f, "{ops} batch operations, over the cap of {cap}")
+            }
+            Self::TooManyBytes { bytes, cap } => write!(
+                f,
+                "{bytes} charged batch bytes, over the {cap}-byte body cap"
+            ),
+        }
+    }
+}
+
+/// What a batch's two lists charge against the body cap: every variable-length
+/// string they carry, which is each operation's channel address plus each body
+/// it publishes or writes.
+///
+/// A batch is charged as a whole rather than per entry because it travels as one
+/// frame: what has to be bounded is the frame, and one budget spent across the
+/// operations bounds it whatever the mix. Charging the channel alongside the
+/// body is what closes the derivation — an address is client-composed and has no
+/// length of its own, so a rule that ignored it would bound nothing.
+pub fn batch_charged_bytes(publishes: &[BatchEntry], deferred_ops: &[BatchDeferredOp]) -> usize {
+    let entries: usize = publishes
+        .iter()
+        .map(|entry| entry.channel.len() + entry.body.len())
+        .sum();
+    let ops: usize = deferred_ops
+        .iter()
+        .map(|op| {
+            op.channel.len()
+                + match &op.op {
+                    DeferredOpKind::Cancel => 0,
+                    DeferredOpKind::Edit { body, .. } => body.as_ref().map_or(0, String::len),
+                }
+        })
+        .sum();
+    entries + ops
+}
+
+/// Whether these two lists compose a legal [`ClientFrame::PublishBatch`] on an
+/// attachment whose body cap is `max_body_bytes`.
+///
+/// Protocol law, enforced at both ends of the same wire: the client checks it
+/// before composing the frame — an illegal batch is an embedder bug, since the
+/// buffer-time gates exist to prevent one — and the server checks it after
+/// parsing, where an illegal-but-parseable batch is a protocol violation.
+///
+/// The two clauses are what [`max_client_frame_bytes`] is derived from, so a
+/// legal batch is by construction a frame the peer will read.
+pub fn check_batch_legality(
+    publishes: &[BatchEntry],
+    deferred_ops: &[BatchDeferredOp],
+    max_body_bytes: usize,
+) -> Result<(), BatchIllegal> {
+    let ops = publishes.len() + deferred_ops.len();
+    if ops > MAX_BATCH_OPS {
+        return Err(BatchIllegal::TooManyOps {
+            ops,
+            cap: MAX_BATCH_OPS,
+        });
+    }
+    let bytes = batch_charged_bytes(publishes, deferred_ops);
+    if bytes > max_body_bytes {
+        return Err(BatchIllegal::TooManyBytes {
+            bytes,
+            cap: max_body_bytes,
+        });
+    }
+    Ok(())
+}
+
 /// The websocket read cap, derived — not a fixed constant. `max_body_bytes` is
 /// operator config, so a fixed frame cap could contradict a legal config; and
 /// worst-case JSON string escaping expands one body byte to six (`\u00XX` for
@@ -599,26 +728,22 @@ pub const PUBLISH_FRAME_OVERHEAD_BYTES: usize = 8 * 1024;
 /// The server computes this from its config and advertises the result as
 /// [`Welcome::max_frame_bytes`].
 ///
-/// The derivation sizes a single [`ClientFrame::Publish`]: one escaped body plus
-/// generous slack. A [`ClientFrame::PublishBatch`] carries a whole activation's
-/// flush in one frame, and the per-activation caps admit far more than six bodies'
-/// worth (`brenn_budget::MAX_PUBLISHES_PER_ACTIVATION`,
-/// `MAX_PUBLISH_BYTES_PER_ACTIVATION`), so a conforming attacher can compose a
-/// batch this cap rejects — and an oversized frame is read as a protocol
-/// violation.
+/// The derivation covers the worst legal frame of either publishing shape,
+/// because [`check_batch_legality`] gives a batch the same byte budget a single
+/// [`ClientFrame::Publish`] gets: the escaped budget, plus a fixed allowance per
+/// batch operation for the fields no budget charges, plus the base overhead a
+/// single publish is already sized with. A batch admitting more than that is not
+/// a wider frame but an illegal one, refused at both ends.
 ///
 /// [`Welcome::max_frame_bytes`]: ServerFrame::Welcome
-// TODO(batch-frame-cap): reconcile the two contracts — either size the cap for the
-// worst config-legal batch, or bound flush composition so no single
-// `PublishBatch` can exceed it. Until then a legitimate multi-publish activation
-// can be read as tampering.
 pub fn max_client_frame_bytes(max_body_bytes: usize) -> usize {
     // Checked, not wrapping: this value gates a fail2ban decision (an oversized
     // frame is a protocol violation), and it must equal the number a 32-bit wasm
     // client honours. An operator `max_body_bytes` large enough to overflow is a
     // config contradiction — fail fast rather than derive a wrong cap.
     max_body_bytes
-        .checked_mul(6)
+        .checked_mul(JSON_ESCAPE_EXPANSION)
+        .and_then(|scaled| scaled.checked_add(MAX_BATCH_OPS * BATCH_OP_OVERHEAD_BYTES))
         .and_then(|scaled| scaled.checked_add(PUBLISH_FRAME_OVERHEAD_BYTES))
         .expect("max_body_bytes too large: WS frame-cap derivation overflowed usize")
 }
@@ -730,7 +855,7 @@ mod tests {
     /// literal below is the acknowledgement that both ends moved together.
     #[test]
     fn the_wire_version_is_pinned_to_this_frame_shape() {
-        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exactly(2));
+        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exactly(3));
     }
 
     #[test]
@@ -998,7 +1123,7 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 heartbeat_secs: 20,
                 max_body_bytes: 65_536,
-                max_frame_bytes: 401_408,
+                max_frame_bytes: 532_480,
                 alert_granted: true,
             },
             json!({
@@ -1008,7 +1133,7 @@ mod tests {
                 "session_id": "sess-1",
                 "heartbeat_secs": 20,
                 "max_body_bytes": 65_536,
-                "max_frame_bytes": 401_408,
+                "max_frame_bytes": 532_480,
                 "alert_granted": true,
             }),
         );
@@ -1049,6 +1174,20 @@ mod tests {
                 "type": "SubscribeResult",
                 "channel": "ephemeral:demo",
                 "outcome": {"kind": "Ok"},
+                "replay_count": 0,
+            }),
+        );
+        pin_server(
+            &ServerFrame::SubscribeResult {
+                channel: "brenn:chat.app.home.out.42".to_string(),
+                outcome: SubscribeOutcome::Unavailable,
+                replay_count: 0,
+                gap: None,
+            },
+            json!({
+                "type": "SubscribeResult",
+                "channel": "brenn:chat.app.home.out.42",
+                "outcome": {"kind": "Unavailable"},
                 "replay_count": 0,
             }),
         );
@@ -1364,7 +1503,7 @@ mod tests {
     fn the_frame_cap_clears_the_worst_case_escaping_of_a_legal_body() {
         assert_eq!(
             max_client_frame_bytes(64 * 1024),
-            64 * 1024 * 6 + PUBLISH_FRAME_OVERHEAD_BYTES
+            64 * 1024 * 6 + MAX_BATCH_OPS * BATCH_OP_OVERHEAD_BYTES + PUBLISH_FRAME_OVERHEAD_BYTES
         );
     }
 
@@ -1372,5 +1511,126 @@ mod tests {
     #[should_panic(expected = "WS frame-cap derivation overflowed")]
     fn an_unrepresentable_body_cap_panics_rather_than_deriving_a_wrong_frame_cap() {
         max_client_frame_bytes(usize::MAX);
+    }
+
+    /// One batch entry charging `charge` bytes across its channel and body, both
+    /// filled with the control character that escapes six-for-one.
+    fn worst_case_entry(charge: usize) -> BatchEntry {
+        let channel = "\u{1}".repeat(charge / 2);
+        BatchEntry {
+            channel,
+            body: "\u{1}".repeat(charge - charge / 2),
+            urgency: Urgency::VeryLow,
+            deliver_after: Some(u64::MAX),
+        }
+    }
+
+    /// One control op charging `charge` bytes, in its widest shape: an edit that
+    /// rewrites both halves, so it carries a body, a release time and a uuid.
+    fn worst_case_op(charge: usize) -> BatchDeferredOp {
+        BatchDeferredOp {
+            channel: "\u{1}".repeat(charge / 2),
+            message_id: Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap(),
+            op: DeferredOpKind::Edit {
+                body: Some("\u{1}".repeat(charge - charge / 2)),
+                deliver_after: Some(u64::MAX),
+            },
+        }
+    }
+
+    /// The law and the derivation are one contract: the widest batch legality
+    /// admits must serialize under the cap the peer reads with. Anything else
+    /// puts a conforming attacher back where the two contracts contradicted —
+    /// composing a legal flush its peer takes for tampering.
+    ///
+    /// The op mix is swept as well as the body cap, because the two halves of the
+    /// derivation answer to different inputs. The cap varies the *charged* bytes,
+    /// which the escape allowance covers; the mix varies the *fixed* bytes, which
+    /// `BATCH_OP_OVERHEAD_BYTES` covers — and the two op shapes do not weigh the
+    /// same there, since an edit carries a uuid, a kind tag and a release time an
+    /// entry does not. All-ops is the maximizing shape, so a fixture that only
+    /// ever ran the even mix would leave the overhead constant free to shrink
+    /// under the widest legal batch.
+    #[test]
+    fn the_frame_cap_bounds_the_worst_legal_batch() {
+        for max_body_bytes in [1_024_usize, 64 * 1024, 1024 * 1024] {
+            let charge = max_body_bytes / MAX_BATCH_OPS;
+            for entry_count in [MAX_BATCH_OPS, MAX_BATCH_OPS / 2, 0] {
+                let op_count = MAX_BATCH_OPS - entry_count;
+                let publishes: Vec<BatchEntry> =
+                    (0..entry_count).map(|_| worst_case_entry(charge)).collect();
+                let deferred_ops: Vec<BatchDeferredOp> =
+                    (0..op_count).map(|_| worst_case_op(charge)).collect();
+                check_batch_legality(&publishes, &deferred_ops, max_body_bytes)
+                    .expect("the batch is built to the law");
+                let frame = ClientFrame::PublishBatch {
+                    attribution: Some("instance-that-a-document-declared".to_string()),
+                    correlation: u64::MAX,
+                    publishes,
+                    deferred_ops,
+                };
+                let bytes = serde_json::to_string(&frame).unwrap().len();
+                let cap = max_client_frame_bytes(max_body_bytes);
+                assert!(
+                    bytes <= cap,
+                    "{entry_count} entries + {op_count} ops at a {max_body_bytes}-byte cap \
+                     serialize to {bytes} bytes, over the {cap}-byte cap"
+                );
+            }
+        }
+    }
+
+    /// Both clauses, at and one past their boundaries.
+    #[test]
+    fn batch_legality_holds_at_its_boundaries() {
+        let entry = |charge| worst_case_entry(charge);
+        // Charged bytes: the budget is the body cap, spent across the batch.
+        assert_eq!(check_batch_legality(&[entry(64)], &[], 64), Ok(()));
+        assert_eq!(
+            check_batch_legality(&[entry(64), entry(1)], &[], 64),
+            Err(BatchIllegal::TooManyBytes { bytes: 65, cap: 64 })
+        );
+        // A channel address is charged like a body: it is client-composed, so a
+        // rule that ignored it would bound nothing.
+        assert_eq!(
+            batch_charged_bytes(
+                &[BatchEntry {
+                    channel: "ephemeral:x".to_string(),
+                    body: "hello".to_string(),
+                    urgency: Urgency::Normal,
+                    deliver_after: None,
+                }],
+                &[]
+            ),
+            "ephemeral:x".len() + "hello".len()
+        );
+        // A cancel op charges its channel and nothing else.
+        assert_eq!(
+            batch_charged_bytes(
+                &[],
+                &[BatchDeferredOp {
+                    channel: "ephemeral:x".to_string(),
+                    message_id: Uuid::nil(),
+                    op: DeferredOpKind::Cancel,
+                }]
+            ),
+            "ephemeral:x".len()
+        );
+        // Op count: publishes and ops share one ceiling, because they share one
+        // frame.
+        let empty = worst_case_entry(0);
+        let full: Vec<BatchEntry> = (0..MAX_BATCH_OPS).map(|_| empty.clone()).collect();
+        assert_eq!(check_batch_legality(&full, &[], 1), Ok(()));
+        assert_eq!(
+            check_batch_legality(&full[..MAX_BATCH_OPS - 1], &[worst_case_op(0)], 1),
+            Ok(())
+        );
+        assert_eq!(
+            check_batch_legality(&full, &[worst_case_op(0)], 1),
+            Err(BatchIllegal::TooManyOps {
+                ops: MAX_BATCH_OPS + 1,
+                cap: MAX_BATCH_OPS,
+            })
+        );
     }
 }

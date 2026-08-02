@@ -139,6 +139,15 @@ pub fn surface_registrations(
     registrations_for(policies, SubscriberEntryKind::Surface, WakeEconomics::Eager)
 }
 
+/// Registrations for remote-attacher subscribers (`Eager` wake), from a
+/// `slug → policy` map. One per `[[remote]]`: a remote is a single principal
+/// with no finer grain.
+pub fn remote_registrations(
+    policies: HashMap<String, AppPolicy>,
+) -> HashMap<SubscriberEntryKind, SubscriberRegistration> {
+    registrations_for(policies, SubscriberEntryKind::Remote, WakeEconomics::Eager)
+}
+
 /// Registrations for system-substrate subscribers (`Eager` wake), from a
 /// `component → policy` map.
 pub fn system_registrations(

@@ -12,6 +12,11 @@ use super::*;
 use brenn_attach_proto::DeferredOpKind;
 use uuid::Uuid;
 
+/// The attachment's advertised body cap, which is also the budget batch
+/// legality spends. Generous against these fixtures' handful of short bodies,
+/// so only the test that states an oversize batch reaches the law.
+const BODY_CAP: usize = 64 * 1024;
+
 const CHANNEL: &str = "ephemeral:demo";
 const OTHER: &str = "brenn:other";
 
@@ -60,7 +65,7 @@ fn alpha() -> String {
 fn attached(depth: u64) -> Outboxes<String> {
     let mut outboxes = Outboxes::new();
     outboxes.register(alpha(), Some(alpha()), depth);
-    let steps = outboxes.on_attached(now(), |_, _| true);
+    let steps = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
     assert!(steps.frames.is_empty(), "nothing was queued to send");
     outboxes
 }
@@ -220,7 +225,7 @@ fn a_flush_while_detached_queues_and_leaves_at_the_next_attach() {
     );
     assert_eq!(outboxes.parked_len(&alpha()), 1);
 
-    let steps = outboxes.on_attached(now(), |_, _| true);
+    let steps = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
     assert_eq!(bodies_of(&steps.frames[0]), vec!["one"]);
     assert_eq!(
         steps.retry_wakeup, None,
@@ -283,7 +288,7 @@ fn the_outbox_drops_oldest_at_its_cap_and_counts_it() {
     assert_eq!(outboxes.dropped_count(&alpha()), 1);
     assert_eq!(outboxes.parked_len(&alpha()), 2);
 
-    let steps = outboxes.on_attached(now(), |_, _| true);
+    let steps = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
     assert_eq!(
         bodies_of(&steps.frames[0]),
         vec!["two"],
@@ -780,7 +785,7 @@ fn a_detach_frees_the_wire_without_resending_the_unanswered_flush() {
         "the batch the previous connection carried is unanswerable"
     );
 
-    let steps = outboxes.on_attached(now(), |_, _| true);
+    let steps = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
     assert!(
         steps.frames.is_empty(),
         "a flush the peer may have applied is never resent"
@@ -830,7 +835,7 @@ fn an_attach_re_validates_every_queued_flush_against_the_new_contract() {
     );
     outboxes.flush(&alpha(), batch(&["also-keep"]), now());
 
-    let steps = outboxes.on_attached(now(), |_, flush| {
+    let steps = outboxes.on_attached(BODY_CAP, now(), |_, flush| {
         flush.entries.iter().all(|e| e.channel == CHANNEL)
     });
     assert_eq!(steps.dropped, vec![alpha()]);
@@ -852,7 +857,7 @@ fn one_head_per_registrant_leaves_on_a_retry_tick() {
         outboxes.flush(&alpha(), batch(&[body]), now());
         outboxes.flush(&"beta".to_string(), batch(&[body]), now());
     }
-    let steps = outboxes.on_attached(now(), |_, _| true);
+    let steps = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
     assert_eq!(steps.frames.len(), 2, "one head each, in registrant order");
     assert_eq!(bodies_of(&steps.frames[0]), vec!["one"]);
 
@@ -871,7 +876,7 @@ fn traffic_while_a_head_is_blocked_leaves_the_armed_timer_alone() {
     let mut outboxes = Outboxes::new();
     outboxes.register(alpha(), None, 4);
     outboxes.register("beta".to_string(), None, 4);
-    let sent = outboxes.on_attached(now(), |_, _| true);
+    let sent = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
     assert!(sent.frames.is_empty());
 
     let alphas = outboxes.flush(&alpha(), batch(&["one"]), now());
@@ -917,7 +922,7 @@ fn a_siblings_result_leaves_a_blocked_registrants_deadline_where_it_was() {
     outboxes.flush(&alpha(), batch(&["one"]), now());
     outboxes.flush(&"beta".to_string(), batch(&["b1"]), now());
     outboxes.flush(&"beta".to_string(), batch(&["b2"]), now());
-    let heads = outboxes.on_attached(now(), |_, _| true);
+    let heads = outboxes.on_attached(BODY_CAP, now(), |_, _| true);
     assert_eq!(heads.frames.len(), 2, "one head each");
 
     let armed = outboxes
@@ -950,6 +955,46 @@ fn a_siblings_result_leaves_a_blocked_registrants_deadline_where_it_was() {
 fn an_idle_attacher_arms_no_retry_timer() {
     let mut outboxes = attached(4);
     assert_eq!(outboxes.on_retry_tick(Millis(2_000)).retry_wakeup, None);
+}
+
+// --- batch legality ---------------------------------------------------------
+
+/// A batch over the byte budget never reaches the wire: the peer would kill the
+/// attachment for it, and a batch is atomic, so there is no smaller honest
+/// version of one to send instead. The embedder's buffer-time gates are what
+/// keep this unreachable.
+#[test]
+#[should_panic(expected = "illegal PublishBatch")]
+fn an_oversize_batch_panics_rather_than_reaching_the_wire() {
+    let mut outboxes = attached(4);
+    let half = "x".repeat(BODY_CAP / 2);
+    outboxes.flush(&alpha(), batch(&[&half, &half, &half]), now());
+}
+
+/// The law counts operations across both lists, because they share one frame.
+#[test]
+#[should_panic(expected = "batch operations, over the cap")]
+fn a_batch_over_the_operation_cap_panics() {
+    let mut outboxes = attached(4);
+    let flush = FlushBatch {
+        entries: (0..brenn_attach_proto::MAX_BATCH_OPS)
+            .map(|_| entry("x"))
+            .collect(),
+        ops: vec![cancel_op(Uuid::nil())],
+    };
+    outboxes.flush(&alpha(), flush, now());
+}
+
+/// The budget is a fact of the attachment, so a flush queued while detached is
+/// judged against the cap of whichever attachment ends up carrying it.
+#[test]
+#[should_panic(expected = "illegal PublishBatch")]
+fn a_queued_flush_is_judged_against_the_attachment_that_carries_it() {
+    let mut outboxes = Outboxes::new();
+    outboxes.register(alpha(), None, 4);
+    let body = "x".repeat(64);
+    outboxes.flush(&alpha(), batch(&[body.as_str()]), now());
+    outboxes.on_attached(32, now(), |_, _| true);
 }
 
 // --- the parked-set mirror --------------------------------------------------
