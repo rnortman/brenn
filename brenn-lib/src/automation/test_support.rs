@@ -190,23 +190,102 @@ pub(super) fn make_engine_with_apps(
     )
 }
 
-/// Build an `AutomationEngine` with full control over all collaborators.
+/// [`make_engine_with_apps`]'s bus-aware twin: the same engine, plus every app's
+/// chat roster channel — the durable row, the directory entry, the reserved
+/// writer's registration, and the chat vocabulary the address is composed from.
 ///
-/// Call sites that only need defaults can pass `Arc::new(FakeWakeRouter)`,
-/// `AlertDispatcher::noop().0`, and `AutomationGlobalConfig::default()`.
-pub(super) fn make_engine_full(
+/// Without that wiring `publish_chat_roster` answers `None` at its directory
+/// lookup before it reads anything, so a test driving a conversation-creating
+/// path green-lights an announcement that never happens. `extra_entries` are
+/// upserted and put in the directory beside the rosters, for a test whose
+/// subject also needs a destination channel.
+pub(super) async fn make_engine_on_the_bus(
     db: crate::db::Db,
-    directory: MessagingDirectory,
+    apps: Arc<indexmap::IndexMap<String, AppConfig>>,
+    extra_entries: Vec<crate::messaging::ChannelEntry>,
     ingress_router: Arc<dyn IngressRouter>,
-    wake_router: Arc<dyn WakeRouter>,
-    alerts: AlertDispatcher,
-    global_cfg: AutomationGlobalConfig,
-    singleton: bool,
 ) -> Arc<AutomationEngine> {
-    // Build subscriptions for "test-app" from the directory so the app's config
-    // and the directory agree: every push-enabled channel subscriber has a
-    // matching ResolvedSubscription on the app.
-    let subscriptions: Vec<crate::messaging::config::ResolvedSubscription> = directory
+    use crate::config::LlmChatConfig;
+    use crate::messaging::ChannelScheme;
+    use crate::messaging::chat_roster::{CHAT_ROSTER_COMPONENT, chat_roster_entry};
+    use crate::messaging::system::{SystemParticipantSpec, registrations_from_specs};
+
+    let chat = LlmChatConfig::default();
+    let defaults = MessagingGlobalConfig::default();
+    let rosters: Vec<crate::messaging::ChannelEntry> = apps
+        .keys()
+        .map(|slug| chat_roster_entry(&chat, slug, &defaults))
+        .collect();
+    let roster_writer = SystemParticipantSpec::publish_only(
+        CHAT_ROSTER_COMPONENT,
+        ChannelScheme::Brenn,
+        &rosters
+            .iter()
+            .map(|entry| {
+                entry
+                    .address
+                    .strip_prefix(ChannelScheme::Brenn.prefix())
+                    .expect("a roster address is a brenn: address")
+                    .to_string()
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let entries: Vec<crate::messaging::ChannelEntry> =
+        rosters.into_iter().chain(extra_entries).collect();
+    {
+        let conn = db.lock().await;
+        crate::messaging::db::upsert_channels(&conn, &entries);
+    }
+
+    let directory = Arc::new(MessagingDirectory::with_entries(entries));
+    let messenger = Messenger::new(
+        db.clone(),
+        directory.clone(),
+        Arc::from("brenn://test"),
+        apps.clone(),
+        Arc::new(FakeWakeRouter),
+        defaults,
+    )
+    .with_subscriber_registrations(registrations_from_specs(&[roster_writer]))
+    .with_llm_chat(chat);
+    let (alerts, _) = AlertDispatcher::noop();
+    AutomationEngine::new(
+        db,
+        messenger,
+        apps,
+        directory,
+        ingress_router,
+        AutomationGlobalConfig::default(),
+        alerts,
+    )
+}
+
+/// Every roster snapshot published for `app_slug`, oldest first.
+pub(super) async fn roster_snapshots(engine: &AutomationEngine, app_slug: &str) -> Vec<String> {
+    let address =
+        brenn_envelope::chat::chat_roster_address(&engine.messenger.llm_chat().prefix, app_slug);
+    let conn = engine.db.lock().await;
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.body FROM messaging_messages m \
+             JOIN messaging_channels c ON c.uuid = m.channel_uuid \
+             WHERE c.address = ?1 ORDER BY m.id",
+        )
+        .expect("prepare roster scan");
+    stmt.query_map([address], |row| row.get::<_, String>(0))
+        .expect("query roster snapshots")
+        .map(|row| row.expect("decode roster row"))
+        .collect()
+}
+
+/// The `ResolvedSubscription` list "test-app" needs to agree with `directory`:
+/// one per push-enabled subscriber entry naming the app, so the app's config and
+/// the directory say the same thing about what it subscribes to.
+pub(super) fn app_subscriptions(
+    directory: &MessagingDirectory,
+) -> Vec<crate::messaging::config::ResolvedSubscription> {
+    directory
         .list()
         .iter()
         .flat_map(|entry| {
@@ -224,8 +303,24 @@ pub(super) fn make_engine_full(
                 })
                 .collect::<Vec<_>>()
         })
-        .collect();
-    let app_cfg = default_app_cfg_with_subscriptions("test-app", singleton, subscriptions);
+        .collect()
+}
+
+/// Build an `AutomationEngine` with full control over all collaborators.
+///
+/// Call sites that only need defaults can pass `Arc::new(FakeWakeRouter)`,
+/// `AlertDispatcher::noop().0`, and `AutomationGlobalConfig::default()`.
+pub(super) fn make_engine_full(
+    db: crate::db::Db,
+    directory: MessagingDirectory,
+    ingress_router: Arc<dyn IngressRouter>,
+    wake_router: Arc<dyn WakeRouter>,
+    alerts: AlertDispatcher,
+    global_cfg: AutomationGlobalConfig,
+    singleton: bool,
+) -> Arc<AutomationEngine> {
+    let app_cfg =
+        default_app_cfg_with_subscriptions("test-app", singleton, app_subscriptions(&directory));
     let mut apps = indexmap::IndexMap::new();
     apps.insert("test-app".to_string(), app_cfg);
     let apps = Arc::new(apps);

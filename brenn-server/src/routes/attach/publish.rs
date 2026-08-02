@@ -13,8 +13,6 @@
 //! belongs to the sender that parked it, so a deferred view is cut at
 //! `(attribution, channel)` — the publish plane's own grain.
 
-#![allow(dead_code)]
-
 #[cfg(test)]
 mod tests;
 
@@ -23,9 +21,11 @@ use brenn_attach_proto::{
     PublishOutcome, ServerFrame, Urgency, check_batch_legality,
 };
 use brenn_budget::{MAX_PUBLISH_BYTES_PER_ACTIVATION, MAX_PUBLISHES_PER_ACTIVATION};
+use brenn_lib::messaging::gates::well_formed_name;
 use brenn_lib::messaging::store::{DeferralOutcome, DeferredMessage};
 use brenn_lib::messaging::{
-    ParticipantId, PublishResult, SurfaceBatchPublish, SurfaceSendVerdict, utc_from_epoch_ms,
+    AttachBatchPublish, AttachSendVerdict, ChannelScheme, ParticipantId, PublishResult,
+    utc_from_epoch_ms,
 };
 use brenn_lib::token_bucket::{TokenBucket, TokenBucketOutcome};
 use chrono::{DateTime, Utc};
@@ -178,14 +178,14 @@ pub async fn handle_publish(
         }
     }
 
-    // 5. Publish. The budget bucket is `(scope, attribution)`: a sub-identity's
-    //    retry loop drains its own allowance and leaves its siblings and the
-    //    attacher's own writes able to publish.
+    // 5. Publish. The budget bucket is the principal the scope and attribution
+    //    name together: a sub-identity's retry loop drains its own allowance and
+    //    leaves its siblings and the attacher's own writes able to publish.
     let posture = ctx.profile.publish_posture(channel);
-    let scope = ctx.profile.send_budget_scope();
+    let scope = ctx.profile.attach_scope();
     let outcome = match ctx
         .messenger
-        .publish_from_surface(scope, attribution, channel, body, urgency)
+        .publish_from_attacher(scope, attribution, channel, body, urgency)
         .await
     {
         PublishResult::Ok { .. } => {
@@ -446,11 +446,11 @@ pub async fn handle_publish_batch(
     //    TODO(surface-op-send-budget): price control ops in the send budget.
     let draw =
         u32::try_from(resolved.len().max(1)).expect("batch length is capped well below u32::MAX");
-    if ctx.messenger.draw_surface_send_budget_for_batch(
-        ctx.profile.send_budget_scope(),
+    if ctx.messenger.draw_attach_send_budget_for_batch(
+        ctx.profile.attach_scope(),
         attribution,
         draw,
-    ) == SurfaceSendVerdict::Denied
+    ) == AttachSendVerdict::Denied
     {
         // Not a kill: the attacher re-parks the batch and retries on the next
         // refill. Count each entry that did not publish.
@@ -511,7 +511,7 @@ pub async fn handle_publish_batch(
     //    clock does. The delivered envelope's `publish_ts` carries this at ns
     //    precision; it is the ordering contract's only observable.
     let mut prev_ts: Option<i64> = None;
-    let batch: Vec<SurfaceBatchPublish<'_>> = resolved
+    let batch: Vec<AttachBatchPublish<'_>> = resolved
         .iter()
         .map(|entry| {
             let now_ns = brenn_lib::messaging::db::utc_to_ns(Utc::now());
@@ -520,7 +520,7 @@ pub async fn handle_publish_batch(
                 Some(prev) => std::cmp::max(prev + 1, now_ns),
             };
             prev_ts = Some(ts);
-            SurfaceBatchPublish {
+            AttachBatchPublish {
                 channel_address: entry.channel,
                 body: entry.body,
                 urgency: entry.urgency,
@@ -530,14 +530,20 @@ pub async fn handle_publish_batch(
         })
         .collect();
 
-    // 7. Apply. Entries whose schedule the channel's deferred cap refused
-    //    published nothing, so they reduce the publish count. No wire error: the
-    //    activation already returned, so there is nothing left to answer, and the
-    //    entries it published unconditionally must not be lost to one it merely
-    //    scheduled.
+    // 7. Apply. Entries that published nothing — a schedule the channel's
+    //    deferred cap refused, or a target that vanished under a route whose
+    //    targets are provisioned at runtime — reduce the publish count. No wire
+    //    error: the activation already returned, so there is nothing left to
+    //    answer, and the entries it published unconditionally must not be lost to
+    //    one it merely scheduled.
     let schedules_dropped = ctx
         .messenger
-        .publish_batch_from_surface(ctx.profile.send_budget_scope(), attribution, &batch)
+        .publish_batch_from_attacher(
+            ctx.profile.attach_scope(),
+            attribution,
+            &batch,
+            ctx.profile.missing_channel_posture(),
+        )
         .await;
     for _ in 0..(batch.len() - schedules_dropped) {
         counters.publish_ok(attribution);
@@ -657,6 +663,13 @@ fn resolve_deferred_ops<'a>(
 /// An unpublishable channel is a violation (not an outcome — this path has none to
 /// answer with), and a page-local channel — which no profile's publishable set may
 /// contain — is an assert.
+///
+/// Shape is checked here too, after authority. A profile that answers from
+/// prefix matchers admits whatever follows the prefix, so authority alone does
+/// not bound the bytes: an address carrying a newline is as granted as its
+/// well-formed sibling. Refusing it here is what keeps every address the publish
+/// plane hands downstream a name the bus could have minted, on the batch path as
+/// much as the single one.
 fn assert_publishable(
     ctx: &AttachSessionCtx,
     attribution: Option<&str>,
@@ -669,11 +682,21 @@ fn assert_publishable(
             sanitize_client_detail(channel),
         )));
     }
+    // Ahead of the shape gate: a page-local address is a broken route whatever
+    // its spelling, and `local:` names carry characters the gate refuses.
     assert!(
         !brenn_envelope::is_local_channel(channel),
         "attach session: publishable channel {channel} is page-local — a profile's publishable \
          sets must exclude local addresses, which never cross the wire"
     );
+    let well_formed = ChannelScheme::of(channel)
+        .is_some_and(|scheme| well_formed_name(channel, scheme).is_some());
+    if !well_formed {
+        return Err(ctx.violation(format!(
+            "{what} names malformed channel {}",
+            sanitize_client_detail(channel),
+        )));
+    }
     Ok(())
 }
 
@@ -918,7 +941,7 @@ async fn orphaned_parked_sets(
     now: DateTime<Utc>,
 ) -> Vec<DeferredTarget> {
     ctx.messenger
-        .parked_surface_components(ctx.profile.send_budget_scope(), now)
+        .parked_attach_sub_identities(ctx.profile.attach_scope(), now)
         .await
         .into_iter()
         .map(|parked| DeferredTarget {

@@ -1,11 +1,14 @@
-//! `[llm_chat]` config and the channel-name grammar it roots.
+//! `[llm_chat]` config: the prefix rooting every chat channel address, the
+//! retention and wake parameters of a conversation's channel family, and the
+//! harness policy derived from them.
 //!
-//! A conversation talks to the bus over a family of channels derived from one
-//! configured prefix. Every name in that family is minted by [`chat_bare_name`]
-//! and nothing else, so provisioning, ACL authoring, and the adapter cannot
-//! drift on the shape.
+//! The names themselves are minted in [`brenn_envelope::chat`], beside the
+//! protocol whose addresses they are; this module supplies the prefix they are
+//! rooted at.
 
 use serde::Deserialize;
+
+use brenn_envelope::chat::{CHAT_SEGMENT_SEP, ChatLeaf, chat_leaf_prefix};
 
 use crate::access::acl::ChannelMatcher;
 use crate::access::{AppCapability, AppPolicy};
@@ -105,10 +108,11 @@ impl LlmChatConfig {
         );
     }
 
-    /// The harness policy for one LLM app: authority over that app's chat
-    /// subtree and nothing else. One `Prefix("<prefix>.app.<slug>.")` matcher on
-    /// each of the four pub/sub ACL lists the chat channels use, plus the
-    /// transport grant each of those lists is narrowed by.
+    /// The harness policy for one LLM app: authority over that app's
+    /// conversation leaves and nothing else. One
+    /// `Prefix("<prefix>.app.<slug>.<leaf>.")` matcher per leaf on each pub/sub
+    /// ACL list that leaf's scheme is gated by, plus the transport grant each of
+    /// those lists is narrowed by.
     ///
     /// This is the authority the *harness* acts under — the server-side
     /// machinery wrapping the LLM: the adapter that publishes a conversation's
@@ -117,25 +121,38 @@ impl LlmChatConfig {
     /// bypass anywhere — so its authority has to exist as policy. It is derived
     /// rather than authored because the conversation ids that terminate the
     /// names are minted at runtime, while matchers are runtime patterns: one
-    /// app-level prefix covers every present and future conversation.
+    /// leaf-level prefix covers every present and future conversation.
+    ///
+    /// **Per leaf rather than one app-wide prefix**, so the app's roster channel
+    /// — which sits in the leaf position and is written by a reserved system
+    /// identity — stays outside every principal's reach but that one. An
+    /// app-wide prefix would cover it, and a state channel with two possible
+    /// writers is a state channel with no owner.
     ///
     /// It is deliberately a **separate** policy object from the app's authored
     /// one. The app's LLM publishes as the `App` principal under the authored
     /// policy; folding the chat tree into that policy would hand the LLM its own
     /// command channel, its own record, and bus tools it was never granted.
     ///
-    /// Cross-app isolation is untouched: the prefix stops at the owning app's
+    /// Cross-app isolation is untouched: each prefix stops at the owning app's
     /// slug boundary.
     pub fn harness_policy(&self, app_slug: &str) -> AppPolicy {
         let mut policy = AppPolicy::default();
-        let matcher = ChannelMatcher::Prefix(chat_app_prefix(&self.prefix, app_slug));
-        for list in [
-            &mut policy.acls.brenn_publish,
-            &mut policy.acls.brenn_subscribe,
-            &mut policy.acls.ephemeral_publish,
-            &mut policy.acls.ephemeral_subscribe,
-        ] {
-            list.push(matcher.clone());
+        for leaf in ChatLeaf::ALL {
+            let matcher = ChannelMatcher::Prefix(chat_leaf_prefix(&self.prefix, app_slug, leaf));
+            let (publish, subscribe) = match leaf.scheme() {
+                ChannelScheme::Brenn => (
+                    &mut policy.acls.brenn_publish,
+                    &mut policy.acls.brenn_subscribe,
+                ),
+                ChannelScheme::Ephemeral => (
+                    &mut policy.acls.ephemeral_publish,
+                    &mut policy.acls.ephemeral_subscribe,
+                ),
+                other => panic!("chat leaves ride brenn:/ephemeral: only, got {other:?}"),
+            };
+            publish.push(matcher.clone());
+            subscribe.push(matcher);
         }
         for grant in [
             AppCapability::MessagingPublish,
@@ -149,177 +166,15 @@ impl LlmChatConfig {
     }
 }
 
-// ── Derived addresses ──────────────────────────────────────────────────────
-
-/// Segment separator in a chat channel name.
-const CHAT_SEGMENT_SEP: char = '.';
-
-/// Literal second segment of every chat channel name. It reserves root-level
-/// room beside the per-app subtree for future siblings under the prefix, which
-/// would otherwise collide with an app slug.
-const CHAT_APP_SEGMENT: &str = "app";
-
-/// The traffic leaf of a chat channel name — the segment between the owning
-/// app's slug and the conversation id.
-///
-/// The conversation id is the terminal segment because it is the only segment
-/// minted at runtime. That ordering is what lets an exact matcher name one
-/// conversation and a segment-boundary prefix name every conversation of an
-/// app, per leaf, with no wildcard matcher: a grant may cover "may drive every
-/// conversation of this app" without also covering "may forge its record".
-///
-/// The cost is that a conversation owns no single subtree of its own — its
-/// channels are siblings under the per-leaf subtrees.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatLeaf {
-    /// Commands from peers to the conversation.
-    In,
-    /// The conversation record: messages, status, errors, telemetry.
-    Out,
-    /// Token batches.
-    Stream,
-    /// Pre-warm signal: bodies are ignored, the message's existence is the
-    /// signal.
-    Wake,
-    /// Tool-call permission flow. **Reserved, unbuilt** — the name is fixed so
-    /// the grammar cannot collide once the flow exists, and so "may chat" and
-    /// "may approve tool calls" are separately grantable today.
-    Approvals,
-}
-
-impl ChatLeaf {
-    /// Every leaf. The single source enumerating callers use, so a new leaf
-    /// cannot be added and silently skipped by a hand-listed set.
-    pub const ALL: [ChatLeaf; 5] = [
-        Self::In,
-        Self::Out,
-        Self::Stream,
-        Self::Wake,
-        Self::Approvals,
-    ];
-
-    /// The leaf's name segment.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::In => "in",
-            Self::Out => "out",
-            Self::Stream => "stream",
-            Self::Wake => "wake",
-            Self::Approvals => "approvals",
-        }
-    }
-
-    /// The address scheme this leaf's traffic rides. Durable where the content
-    /// is the record and must survive restart; ephemeral where loss is
-    /// preferable to a persistence round trip.
-    pub fn scheme(self) -> ChannelScheme {
-        match self {
-            Self::In | Self::Out | Self::Approvals => ChannelScheme::Brenn,
-            Self::Stream | Self::Wake => ChannelScheme::Ephemeral,
-        }
-    }
-}
-
-/// `<prefix>.app.<app_slug>.<leaf>.<conversation_id>` — the sole derivation of a
-/// chat channel name.
-pub fn chat_bare_name(
-    prefix: &str,
-    app_slug: &str,
-    leaf: ChatLeaf,
-    conversation_id: i64,
-) -> String {
-    let leaf = leaf.as_str();
-    format!(
-        "{prefix}{CHAT_SEGMENT_SEP}{CHAT_APP_SEGMENT}{CHAT_SEGMENT_SEP}{app_slug}{CHAT_SEGMENT_SEP}{leaf}{CHAT_SEGMENT_SEP}{conversation_id}"
-    )
-}
-
-/// [`chat_bare_name`] with its leaf's address scheme, e.g.
-/// `brenn:chat.app.<slug>.in.<id>`.
-pub fn chat_address(prefix: &str, app_slug: &str, leaf: ChatLeaf, conversation_id: i64) -> String {
-    format!(
-        "{}{}",
-        leaf.scheme().prefix(),
-        chat_bare_name(prefix, app_slug, leaf, conversation_id)
-    )
-}
-
-/// `<prefix>.app.<app_slug>.` — the segment-boundary prefix covering every chat
-/// channel of one app, across leaves and conversations.
-pub fn chat_app_prefix(prefix: &str, app_slug: &str) -> String {
-    format!(
-        "{prefix}{CHAT_SEGMENT_SEP}{CHAT_APP_SEGMENT}{CHAT_SEGMENT_SEP}{app_slug}{CHAT_SEGMENT_SEP}"
-    )
-}
-
-/// `<prefix>.app.<app_slug>.<leaf>.` — the segment-boundary prefix covering one
-/// leaf of every conversation of one app. The fleet-grain grant: it reaches
-/// every conversation on that leaf and no other leaf.
-pub fn chat_leaf_prefix(prefix: &str, app_slug: &str, leaf: ChatLeaf) -> String {
-    let leaf = leaf.as_str();
-    format!(
-        "{prefix}{CHAT_SEGMENT_SEP}{CHAT_APP_SEGMENT}{CHAT_SEGMENT_SEP}{app_slug}{CHAT_SEGMENT_SEP}{leaf}{CHAT_SEGMENT_SEP}"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brenn_envelope::chat::{
+        chat_address, chat_app_prefix, chat_bare_name, chat_roster_bare_name,
+    };
+
     use crate::access::acl::ChannelMatcher;
     use crate::messaging::gates::well_formed_name;
-
-    #[test]
-    fn names_match_the_pinned_grammar() {
-        assert_eq!(
-            chat_bare_name("chat", "alice", ChatLeaf::In, 42),
-            "chat.app.alice.in.42"
-        );
-        assert_eq!(
-            chat_bare_name("chat", "alice", ChatLeaf::Out, 42),
-            "chat.app.alice.out.42"
-        );
-        assert_eq!(
-            chat_bare_name("chat", "alice", ChatLeaf::Stream, 42),
-            "chat.app.alice.stream.42"
-        );
-        assert_eq!(
-            chat_bare_name("chat", "alice", ChatLeaf::Wake, 42),
-            "chat.app.alice.wake.42"
-        );
-        assert_eq!(
-            chat_bare_name("chat", "alice", ChatLeaf::Approvals, 42),
-            "chat.app.alice.approvals.42"
-        );
-        assert_eq!(
-            chat_bare_name("talk", "alice", ChatLeaf::In, 42),
-            "talk.app.alice.in.42",
-            "the configured prefix roots the tree"
-        );
-    }
-
-    #[test]
-    fn addresses_carry_their_leafs_scheme() {
-        assert_eq!(
-            chat_address("chat", "alice", ChatLeaf::In, 42),
-            "brenn:chat.app.alice.in.42"
-        );
-        assert_eq!(
-            chat_address("chat", "alice", ChatLeaf::Out, 42),
-            "brenn:chat.app.alice.out.42"
-        );
-        assert_eq!(
-            chat_address("chat", "alice", ChatLeaf::Approvals, 42),
-            "brenn:chat.app.alice.approvals.42"
-        );
-        assert_eq!(
-            chat_address("chat", "alice", ChatLeaf::Stream, 42),
-            "ephemeral:chat.app.alice.stream.42"
-        );
-        assert_eq!(
-            chat_address("chat", "alice", ChatLeaf::Wake, 42),
-            "ephemeral:chat.app.alice.wake.42"
-        );
-    }
 
     #[test]
     fn every_derived_address_passes_the_publish_gate() {
@@ -431,18 +286,43 @@ mod tests {
         assert!(!policy.allows_brenn_publish("chat.app.alice.out.1"));
     }
 
-    /// The harness policy is built from nothing: it carries exactly the four
-    /// transport grants and the four chat matchers, so no authored entry can
-    /// leak into it and it can never widen an app's own reach.
+    /// The app's roster is written by a reserved system identity and read by
+    /// whoever the operator grants it. The harness is neither: it drives
+    /// conversations, it does not decide which exist.
     #[test]
-    fn the_harness_policy_carries_nothing_but_the_chat_tree() {
+    fn the_harness_policy_does_not_reach_the_roster() {
+        let policy = LlmChatConfig::default().harness_policy("alice");
+        let roster = chat_roster_bare_name("chat", "alice");
+
+        assert!(!policy.allows_brenn_publish(&roster));
+        assert!(!policy.allows_brenn_delivery(&roster));
+    }
+
+    /// The harness policy is built from nothing: it carries exactly the four
+    /// transport grants and one matcher per leaf on each list that leaf's
+    /// scheme is gated by, so no authored entry can leak into it and it can
+    /// never widen an app's own reach.
+    #[test]
+    fn the_harness_policy_carries_nothing_but_the_conversation_leaves() {
         let policy = LlmChatConfig::default().harness_policy("alice");
 
-        let chat = ChannelMatcher::Prefix("chat.app.alice.".to_string());
-        assert_eq!(policy.acls.brenn_publish, vec![chat.clone()]);
-        assert_eq!(policy.acls.brenn_subscribe, vec![chat.clone()]);
-        assert_eq!(policy.acls.ephemeral_publish, vec![chat.clone()]);
-        assert_eq!(policy.acls.ephemeral_subscribe, vec![chat]);
+        let leaves = |scheme: ChannelScheme| -> Vec<ChannelMatcher> {
+            ChatLeaf::ALL
+                .into_iter()
+                .filter(|leaf| leaf.scheme() == scheme)
+                .map(|leaf| ChannelMatcher::Prefix(chat_leaf_prefix("chat", "alice", leaf)))
+                .collect()
+        };
+        assert_eq!(policy.acls.brenn_publish, leaves(ChannelScheme::Brenn));
+        assert_eq!(policy.acls.brenn_subscribe, leaves(ChannelScheme::Brenn));
+        assert_eq!(
+            policy.acls.ephemeral_publish,
+            leaves(ChannelScheme::Ephemeral)
+        );
+        assert_eq!(
+            policy.acls.ephemeral_subscribe,
+            leaves(ChannelScheme::Ephemeral)
+        );
 
         for granted in [
             AppCapability::MessagingPublish,

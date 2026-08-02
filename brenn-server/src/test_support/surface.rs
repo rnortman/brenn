@@ -1,8 +1,8 @@
 use brenn_lib::access::AppPolicy;
 use brenn_lib::messaging::Urgency;
 use brenn_lib::messaging::config::{
-    NoiseLevel, ResolvedComponent, ResolvedSubscription, ResolvedSurface,
-    ResolvedSurfaceSubscription, SurfaceBinding, SurfaceOutput, SurfaceSendBudget,
+    AttachSendBudget, NoiseLevel, ResolvedComponent, ResolvedSubscription, ResolvedSurface,
+    ResolvedSurfaceSubscription, SurfaceBinding, SurfaceOutput,
 };
 
 /// The `[surface_description]` parameters a runtime fixture carries. Taken from
@@ -61,7 +61,7 @@ impl SurfaceFixture {
                     instance: component.to_string(),
                     kind: component.to_string(),
                     abi: brenn_surface_schema::Abi::Dom,
-                    send_budget: SurfaceSendBudget::default(),
+                    send_budget: AttachSendBudget::default(),
                     parked_batch_depth: 8,
                     config: Default::default(),
                     chrome: true,
@@ -90,7 +90,7 @@ impl SurfaceFixture {
             instance: instance.to_string(),
             kind: kind.to_string(),
             abi: brenn_surface_schema::Abi::Processor,
-            send_budget: SurfaceSendBudget::default(),
+            send_budget: AttachSendBudget::default(),
             parked_batch_depth: 8,
             config,
             chrome: false,

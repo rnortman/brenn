@@ -34,7 +34,8 @@ use brenn_attach_client::publish::PendingPublishes;
 use brenn_attach_client::subs::{DeliverDisposition, Subscriptions};
 use brenn_attach_client::transport::native::NativeConnector;
 use brenn_attach_proto::{
-    ClientFrame, DeferredViewEntry, PublishBatchOutcome, PublishOutcome, ServerFrame, VersionRange,
+    AlertSeverity, ClientFrame, DeferredViewEntry, PublishBatchOutcome, PublishOutcome,
+    ServerFrame, VersionRange,
 };
 
 // The vocabulary this client's own API is stated in, re-exported so a caller
@@ -130,14 +131,26 @@ pub enum Observation {
     PublishLost { correlation: u64 },
 }
 
+/// Which credential this attacher presents on the handshake.
+///
+/// The whole of the per-route difference an attacher sees. One route
+/// authenticates a browser session, another authenticates a daemon; below the
+/// connector both are the same code reading the same frames.
+pub enum Credential {
+    /// The raw `brenn_session` token, sent as a cookie.
+    SessionCookie(String),
+    /// A bearer token, sent as an `Authorization` header.
+    Bearer(String),
+}
+
 /// What an [`AttachClient`] needs to reach its peer.
 pub struct ClientConfig {
     /// The fully-formed websocket URL, query included. Composing whatever a
     /// route demands ahead of the socket is the attacher's business, exactly as
     /// it is the browser kernel's.
     pub url: String,
-    /// The raw session-cookie token the native connector authenticates with.
-    pub session_cookie: String,
+    /// What the connector authenticates with.
+    pub credential: Credential,
     /// The build string put on this end's `Hello`, for the peer's logs.
     pub ident: String,
 }
@@ -164,9 +177,13 @@ impl AttachClient {
     pub fn new(config: ClientConfig) -> Self {
         let ClientConfig {
             url,
-            session_cookie,
+            credential,
             ident,
         } = config;
+        let connector = match credential {
+            Credential::SessionCookie(token) => NativeConnector::new(token),
+            Credential::Bearer(token) => NativeConnector::with_bearer(token),
+        };
         let driver = AttachDriver::new(
             ConnConfig {
                 url,
@@ -182,7 +199,7 @@ impl AttachClient {
                 // every peer close is an ordinary drop to reconnect from.
                 terminal_close_code: None,
             },
-            NativeConnector::new(session_cookie),
+            connector,
         );
         Self {
             driver,
@@ -247,6 +264,26 @@ impl AttachClient {
         self.next_subscribe_settlement(channel).await
     }
 
+    /// Send a `Subscribe` for `channel` and return without waiting for an
+    /// answer.
+    ///
+    /// For the cases whose expected answer is *no frame at all*. A subscribe the
+    /// peer judges a protocol violation is answered by closing the socket, so
+    /// [`AttachClient::subscribe`] would pump past the detach, reconnect, re-send
+    /// the held subscription, and earn the same close again until it timed out.
+    /// The caller reads [`AttachClient::next_observation`] instead and asserts on
+    /// the detach — and, having taken the pump into its own hands, no reconnect
+    /// happens behind its back.
+    pub async fn send_subscribe(
+        &mut self,
+        channel: &str,
+        depths: SubscriptionDepths,
+        resume_policy: ResumePolicy,
+    ) {
+        let frames = self.subs.acquire(channel, depths, resume_policy);
+        self.write(frames).await;
+    }
+
     /// The next acknowledgement for `channel`, pumping until one arrives.
     ///
     /// What a caller awaits after a reattachment: the subscriptions that
@@ -302,6 +339,35 @@ impl AttachClient {
             Observation::Published { outcome, .. } => outcome,
             other => unreachable!("the predicate admits only Published, got {other:?}"),
         }
+    }
+
+    /// Send one publish and return the correlation it went out under, without
+    /// waiting for the outcome.
+    ///
+    /// The publish-side [`AttachClient::send_subscribe`], for the same reason: a
+    /// publish the peer judges a violation is answered with a closed socket
+    /// rather than a `PublishResult`.
+    pub async fn send_publish(&mut self, request: PublishRequest) -> u64 {
+        let correlation = self.next_correlation;
+        self.next_correlation += 1;
+        let frame = self.pending.send(correlation, correlation, request);
+        self.write(vec![frame]).await;
+        correlation
+    }
+
+    /// Send an alert.
+    ///
+    /// Fire-and-forget by the protocol's own shape rather than by choice: the
+    /// alert plane deliberately touches no channel and answers no frame, so what
+    /// a granted alert produces is visible only at the peer's dispatcher, and
+    /// what an ungranted one produces is a closed socket.
+    pub async fn send_alert(&mut self, severity: AlertSeverity, title: &str, body: &str) {
+        self.write(vec![ClientFrame::Alert {
+            severity,
+            title: title.to_string(),
+            body: body.to_string(),
+        }])
+        .await;
     }
 
     /// The next delivery on `channel`, pumping until one arrives.

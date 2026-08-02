@@ -22,7 +22,9 @@
 use rusqlite::Connection;
 use uuid::Uuid;
 
-use crate::config::{ChatLeaf, LlmChatConfig, chat_address};
+use brenn_envelope::chat::{ChatLeaf, chat_address};
+
+use crate::config::LlmChatConfig;
 use crate::messaging::config::{Depth, ResolvedChannel, SendRate};
 use crate::messaging::db::upsert_channels;
 use crate::messaging::{
@@ -291,7 +293,10 @@ impl Messenger {
     /// row per subscriber cursor per conversation ever deleted.
     ///
     /// TODO(chat-deletion-teardown): no conversation-deletion path exists yet,
-    /// so nothing calls this; the one that gets built has to.
+    /// so nothing calls this; the one that gets built has to — and has to
+    /// follow it with [`Messenger::republish_chat_roster`], outside the
+    /// database lock, so peers learn the conversation is gone rather than
+    /// discovering it as a failed publish.
     ///
     /// The durable half is atomic — cursors, pending pushes, and messages all
     /// reference the channel row, so a partial teardown leaves dangling
@@ -509,7 +514,9 @@ mod tests {
 
     use indexmap::IndexMap;
 
-    use crate::config::{AppConfig, chat_bare_name};
+    use brenn_envelope::chat::chat_bare_name;
+
+    use crate::config::AppConfig;
     use crate::db::init_db_memory;
     use crate::messaging::config::MessagingGlobalConfig;
     use crate::messaging::store::RingStores;

@@ -1113,3 +1113,28 @@ state the contract that was chosen rather than the mismatch.
 Code sites (`TODO(batch-frame-cap)`): `attach/proto/src/lib.rs`
 (`max_client_frame_bytes`) and `brenn-server/src/routes/attach/socket.rs`
 (`InboundError::Oversized`, which is where the violation is raised).
+
+## `chat-conversation-provision-chokepoint`
+
+A conversation row and its chat channel family have to appear together, and the
+bus has to be told: every creation site owes `provision_conversation_chat_channels`
+under the database lock and `republish_chat_roster` outside it. Nothing enforces
+that — it is a two-call convention spelled out in a doc comment on
+`create_conversation` — and the tree has already missed it twice (the send-message
+create path and the singleton first-attach path, both fixed by hand). One site is
+still unfixable by hand: `MessageTargets::ensure_app_conversation`
+(`brenn-lib/src/messaging/store/targets.rs`) mints an app's singleton conversation
+lazily inside delivery, from a synchronous method holding the caller's
+`&Connection`, so it can neither provision (no messenger) nor await a republish.
+
+Needs a design call before code: the choke point is a `Messenger` method that
+creates-or-adopts, provisions and announces, which means deciding what the
+delivery-path creator does instead — take the messenger and a deferred announce
+queue, stop creating and answer `None`, or move the mint out of the delivery
+path. Done when a conversation cannot be created without its channels and the
+roster snapshot that names it, with the creation sites routed through one call.
+
+Code sites (`TODO(chat-conversation-provision-chokepoint)`):
+`brenn-lib/src/conversation/mod.rs`, on `create_conversation` (where the
+convention is documented), and `brenn-lib/src/messaging/store/targets.rs`, on
+`MessageTargets::ensure_app_conversation` (the site that cannot discharge it).

@@ -24,9 +24,10 @@
 //! arms and their bias are the embedder's own.
 //!
 //! Authentication is the connector's business, not the protocol's: the native
-//! connector injects a cookie header, the browser connector relies on the
-//! same-origin cookie the browser attaches, and a future bearer-token connector
-//! plugs into the same seam without either of them noticing.
+//! connector injects either a cookie header or an `Authorization: Bearer` one
+//! depending on which credential it was constructed with, and the browser
+//! connector relies on the same-origin cookie the browser attaches. The choice
+//! is invisible to every layer below the seam.
 
 pub mod conn;
 pub mod driver;
@@ -58,11 +59,13 @@ impl Millis {
 pub use transport::{TransportConnection, TransportConnector, TransportError, TransportEvent};
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use transport::native::{NativeConnection, NativeConnector, insert_session_cookie};
+pub use transport::native::{
+    NativeConnection, NativeConnector, insert_bearer_token, insert_session_cookie,
+};
 
-// Signature types of `insert_session_cookie`, re-exported so out-of-tree
-// attachers can name them without guessing this crate's tungstenite pin. The
-// helper's doc comment states the semver coupling to that pin.
+// Signature types of the two header helpers, re-exported so out-of-tree
+// attachers can name them without guessing this crate's tungstenite pin. Their
+// doc comments state the semver coupling to that pin.
 #[cfg(not(target_arch = "wasm32"))]
 pub use tokio_tungstenite::tungstenite::http::{HeaderMap, header::InvalidHeaderValue};
 

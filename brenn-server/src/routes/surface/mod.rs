@@ -42,7 +42,6 @@ use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Messenger};
 use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
 use brenn_surface_contract::{KERNEL_ARTIFACT, module_artifact};
 use brenn_surface_schema::surface_bindable_address;
-use chrono::Utc;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -80,9 +79,10 @@ pub const MAX_SESSIONS_PER_USER_PER_SURFACE: usize = 16;
 // per_user) and signal a botched edit; fail the build.
 const _: () = assert!(MAX_SESSIONS_PER_USER_PER_SURFACE <= MAX_SESSIONS_PER_SURFACE);
 
-/// Idle-heartbeat interval advertised in `Welcome`, in seconds. Constant in
-/// production; test states set 1 for fast integration tests. Carried on
-/// `AppState::surface_heartbeat_secs` solely for that test seam.
+/// Idle-heartbeat interval advertised in `Welcome`, in seconds. Shared by both
+/// attach routes. Constant in production; test states set 1 for fast
+/// integration tests. Carried on `AppState::attach_heartbeat_secs` solely for
+/// that test seam.
 pub const HEARTBEAT_SECS: u32 = 20;
 
 /// Compiled-in skin registry: skin name → static stylesheet path (served under
@@ -821,8 +821,6 @@ pub async fn surface_ws_handler(
     let handle = AttachSessionHandle {
         session_id,
         account: session.user.username.clone(),
-        client_ip: ip,
-        connected_at: Utc::now(),
         push_tx,
         active_channels: active_channels.clone(),
         drain_notify: drain_notify.clone(),
@@ -875,7 +873,7 @@ pub async fn surface_ws_handler(
     // 5. Frame cap derived from config, then upgrade into the session task.
     let cap = max_client_frame_bytes(runtime.max_body_bytes);
     let account = session.user.username;
-    let heartbeat_secs = state.surface_heartbeat_secs;
+    let heartbeat_secs = state.attach_heartbeat_secs;
     let alert_dispatcher = state.alert_dispatcher.clone();
     let registry = state.attach_registry.clone();
     Ok(ws
@@ -912,8 +910,8 @@ pub async fn surface_ws_handler(
 mod tests {
     use brenn_lib::messaging::Urgency;
     use brenn_lib::messaging::config::{
-        ResolvedComponent, ResolvedSubscription, ResolvedSurface, ResolvedSurfaceSubscription,
-        SurfaceBinding, SurfaceOutput, SurfaceSendBudget,
+        AttachSendBudget, ResolvedComponent, ResolvedSubscription, ResolvedSurface,
+        ResolvedSurfaceSubscription, SurfaceBinding, SurfaceOutput,
     };
 
     use super::test_fixtures::{TEST_MAX_BODY_BYTES, directory_with, directory_with_standing};
@@ -943,7 +941,7 @@ mod tests {
                     instance: "protobar".to_string(),
                     kind: "protobar".to_string(),
                     abi: brenn_surface_schema::Abi::Dom,
-                    send_budget: SurfaceSendBudget::default(),
+                    send_budget: AttachSendBudget::default(),
                     parked_batch_depth: 8,
                     config: Default::default(),
                     chrome: true,
@@ -952,7 +950,7 @@ mod tests {
                     instance: "writer".to_string(),
                     kind: "writer".to_string(),
                     abi: brenn_surface_schema::Abi::Dom,
-                    send_budget: SurfaceSendBudget::default(),
+                    send_budget: AttachSendBudget::default(),
                     parked_batch_depth: 8,
                     config: Default::default(),
                     chrome: false,
@@ -1282,7 +1280,7 @@ mod tests {
             instance: format!("{kind}-1"),
             kind: kind.to_string(),
             abi: brenn_surface_schema::Abi::Processor,
-            send_budget: SurfaceSendBudget::default(),
+            send_budget: AttachSendBudget::default(),
             parked_batch_depth: 8,
             config: Default::default(),
             chrome: false,

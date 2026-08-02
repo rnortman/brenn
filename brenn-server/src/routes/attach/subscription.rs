@@ -19,8 +19,6 @@
 //! characteristic this module reads is what the profile's fold says about it,
 //! because only transportable channels cross the websocket at all.
 
-#![allow(dead_code)]
-
 #[cfg(test)]
 mod tests;
 
@@ -117,10 +115,6 @@ impl ActiveChannels {
     /// profile's `max_active_subscriptions` bounds.
     pub fn len(&self) -> usize {
         self.active.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.active.is_empty()
     }
 
     /// Every active channel, for the drain sweep.

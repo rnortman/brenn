@@ -10,7 +10,7 @@
 //! the process and shared by every session of its attacher.
 
 use brenn_lib::messaging::config::Depth;
-use brenn_lib::messaging::{ParticipantId, SubscriberEntry};
+use brenn_lib::messaging::{AttachScope, MissingChannelPosture, ParticipantId, SubscriberEntry};
 
 use super::registry::SessionCaps;
 
@@ -149,11 +149,22 @@ pub trait AttachProfile: Send + Sync {
     /// both kinds at once.
     fn publish_posture(&self, channel: &str) -> PublishPosture;
 
-    /// The scope half of this attacher's send-budget key. The other half is the
-    /// attribution the caller already holds, so a budget bucket is
-    /// `(scope, attribution)` and a sub-identity's retry loop drains only its
-    /// own.
-    fn send_budget_scope(&self) -> &str;
+    /// Which route this attacher came through and which of that route's blocks
+    /// it is — the pair every publish-side gate keys on. Combined with the
+    /// attribution the caller already holds it names the principal, so a
+    /// sub-identity's retry loop drains only its own budget, and a surface and a
+    /// remote of the same slug never share one.
+    fn attach_scope(&self) -> AttachScope<'_>;
+
+    /// What a batch entry naming a channel the server cannot publish onto means
+    /// for this attacher — see [`MissingChannelPosture`].
+    ///
+    /// Attacher-level, unlike [`AttachProfile::publish_posture`]: a flush is
+    /// admitted or refused whole, so the question is about where this route's
+    /// targets come from, not about which one an entry named. A boot-declared
+    /// output set answers `Invariant`; a matcher-granted, runtime-provisioned one
+    /// answers `Race`.
+    fn missing_channel_posture(&self) -> MissingChannelPosture;
 
     /// Every `(attribution, channel)` whose parked-message mirror a fresh
     /// attachment is seeded with, deduped and in a stable order so the seeding

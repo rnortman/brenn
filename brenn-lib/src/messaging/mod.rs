@@ -13,6 +13,7 @@
 //! the binary crate implements over `ActiveBridges` + `AppState`.
 
 pub mod chat_provision;
+pub mod chat_roster;
 pub mod config;
 pub mod conversations;
 pub mod db;
@@ -53,7 +54,7 @@ pub use config::{
     WasmConsumerConfigRaw, WasmConsumerSubscriptionRaw, WasmInputPort,
 };
 pub use edit::{CancelResult, EditFields, EditResult};
-pub use identity::{ParticipantId, SubscriberKind};
+pub use identity::{AttachKind, AttachScope, ParticipantId, SubscriberKind};
 pub use ingress::{
     CollapsedDrain, Event as IngressEvent, MAX_DELIVERED_RETENTION_DAYS,
     MAX_REPO_SYNC_STALENESS_DAYS, ONELINE_CAP, REPO_SYNC_KIND_CONFLICT, REPO_SYNC_KIND_LOCAL,
@@ -65,8 +66,8 @@ pub use ingress::{
 };
 pub use live::{GapReason, PrepaidDestination, PrepaidEntry, Replay};
 pub use publish::{
-    PublishOrigin, PublishResult, SurfaceBatchPublish, SurfaceSendDraw, SurfaceSendVerdict,
-    WasmPublish, is_well_formed_address,
+    AttachBatchPublish, AttachSendDraw, AttachSendVerdict, MissingChannelPosture, PublishOrigin,
+    PublishResult, WasmPublish, is_well_formed_address,
 };
 pub use query::{MessageQuery, QueryError};
 pub use remote::{RemoteConfigRaw, RemoteDepths, RemoteGrant, RemoteToken, ResolvedRemote};
@@ -598,6 +599,19 @@ impl SubscriberEntryKind {
             | SubscriberEntryKind::Surface(s)
             | SubscriberEntryKind::Remote(s) => s.as_str(),
             SubscriberEntryKind::ChatConversation { app_slug, .. } => app_slug.as_str(),
+        }
+    }
+
+    /// The registration key one attacher's authority resolves through.
+    ///
+    /// The inverse of [`attach_slug`](Self::attach_slug), and the reason the two
+    /// live together: a publish path holds an [`AttachScope`] and needs the key,
+    /// a delivery path holds the key and needs the slug, and neither may spell
+    /// the mapping itself.
+    pub fn for_attach(scope: AttachScope<'_>) -> Self {
+        match scope.kind {
+            AttachKind::Surface => SubscriberEntryKind::Surface(scope.slug.to_string()),
+            AttachKind::Remote => SubscriberEntryKind::Remote(scope.slug.to_string()),
         }
     }
 
@@ -1414,12 +1428,28 @@ pub trait WakeRouter: Send + Sync + 'static {
     }
 }
 
-/// One surface deferred-view set: a channel, and the component instance whose
-/// parked messages on it are in question.
+/// Flatten one attacher's declared principals onto the `(principal, budget)`
+/// pairs [`Messenger::with_attach_send_budgets`] installs.
+///
+/// The one place a surface's `(instance, budget)` list becomes principals, so
+/// boot and every fixture that stands a `Messenger` up compose the key the same
+/// way the draw path reads it. A remote passes a single `(None, budget)`.
+pub fn attach_principal_budgets(
+    scope: AttachScope<'_>,
+    principals: config::AttachPrincipalBudgets,
+) -> Vec<(ParticipantId, config::AttachSendBudget)> {
+    principals
+        .into_iter()
+        .map(|(instance, budget)| (scope.principal(instance.as_deref()), budget))
+        .collect()
+}
+
+/// One attach deferred-view set: a channel, and the sub-identity whose parked
+/// messages on it are in question.
 ///
 /// Named rather than a `(String, String)` because two producers answer about the
 /// same pairs — which sets a page can be seeded for, and which sets exist at all
-/// ([`Messenger::parked_surface_components`]) — and their answers are compared
+/// ([`Messenger::parked_attach_sub_identities`]) — and their answers are compared
 /// against each other. Two structurally identical string pairs let one side be
 /// read in the other's order, which type-checks clean and answers wrongly.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1502,6 +1532,20 @@ pub struct Messenger {
     /// a durable channel's messages sit in the database, but its store is still
     /// constructed once per channel and reused.
     ring_stores: Arc<store::RingStores>,
+    /// The last roster snapshot published per app slug — the dedupe behind
+    /// [`Messenger::publish_chat_roster`].
+    ///
+    /// The provisioning sites that republish the roster are idempotent and run
+    /// far more often than a conversation is created, so without this a peer
+    /// would be woken with a snapshot identical to the one it already holds on
+    /// every automation fire. Empty at boot, which is what makes each app's
+    /// first snapshot unconditional.
+    ///
+    /// Async, and held across the whole read-compare-publish rather than around
+    /// the map alone: it is what serializes two concurrent publishers, so the
+    /// snapshot that lands last is the newest one. See
+    /// [`Messenger::publish_chat_roster`].
+    chat_roster_published: tokio::sync::Mutex<HashMap<String, String>>,
     /// `[llm_chat]`, the shape of every conversation's chat channel family.
     ///
     /// It lives here rather than being passed at each call because chat channels
@@ -1587,10 +1631,15 @@ pub struct Messenger {
     /// nothing acquires them the other way, and nothing holds it across a socket
     /// write — one stalled connection must never stop the release sweep.
     deferred_view_gate: tokio::sync::Mutex<()>,
-    /// Durable send budgets for surface principals, keyed by the principal's two
-    /// grains: `(slug, None)` is the surface's own kernel identity, `(slug,
-    /// Some(instance))` is one declared component instance on it. Installed
-    /// boot-only via [`Messenger::with_surface_send_budgets`].
+    /// Durable send budgets for attach principals, keyed by the principal string
+    /// itself: `surface:<slug>` and `surface:<slug>#<instance>` for a page's two
+    /// grains, `remote:<slug>` for a daemon's one. Installed boot-only via
+    /// [`Messenger::with_attach_send_budgets`].
+    ///
+    /// The principal is the key because it is the *only* thing that separates the
+    /// two routes' keyspaces: a `[[surface]]` and a `[[remote]]` may carry the
+    /// same slug, and a bucket keyed on the bare slug would be shared between
+    /// them.
     ///
     /// One bucket per key is the blast-radius scoping: a component looping on
     /// retries drains its own instance's bucket and leaves its siblings — including
@@ -1598,12 +1647,11 @@ pub struct Messenger {
     /// Keyed by principal rather than by connection so a reconnect inherits the
     /// drained bucket rather than refreshing it.
     ///
-    /// The `publish_core` Surface arm consults it for every durable publish a
-    /// surface makes under its own identity. Empty on a `Messenger` with no
-    /// surfaces; a Surface publish whose key is absent is a broken boot invariant
-    /// (panic). The `std::sync::Mutex` holds no lock across an await.
-    pub(crate) surface_send_budgets:
-        HashMap<(String, Option<String>), Mutex<crate::token_bucket::TokenBucket>>,
+    /// The `publish_core` Attach arm consults it for every durable publish an
+    /// attacher makes under its own identity. Empty on a `Messenger` with no
+    /// attachers; an Attach publish whose key is absent is a broken boot
+    /// invariant (panic). The `std::sync::Mutex` holds no lock across an await.
+    pub(crate) attach_send_budgets: HashMap<String, Mutex<crate::token_bucket::TokenBucket>>,
     /// The unified send-rate gate: one token bucket per `(sender, channel)`,
     /// created on that pair's first publish at the channel's resolved rate.
     /// Every publish on every scheme draws from it.
@@ -1803,6 +1851,7 @@ impl Messenger {
             store_incarnation,
             pending_bus_pushes_scan_count: AtomicU64::new(0),
             ring_stores,
+            chat_roster_published: tokio::sync::Mutex::new(HashMap::new()),
             llm_chat: crate::config::LlmChatConfig::default(),
             system_channel_tuning: config::SystemChannelTuning::default(),
             db_stores: Mutex::new(HashMap::new()),
@@ -1811,7 +1860,7 @@ impl Messenger {
             acl_denied_warned: Mutex::new(HashSet::new()),
             dynamic_subscribe_gate: tokio::sync::Mutex::new(()),
             deferred_view_gate: tokio::sync::Mutex::new(()),
-            surface_send_budgets: HashMap::new(),
+            attach_send_budgets: HashMap::new(),
             send_rate_buckets: Mutex::new(HashMap::new()),
             publish_rate_limited: Mutex::new(HashMap::new()),
             publish_denied: Mutex::new(HashMap::new()),
@@ -1926,57 +1975,56 @@ impl Messenger {
         self
     }
 
-    /// Install the durable send budgets for every surface principal before the
-    /// `Messenger` is shared: one full [`crate::token_bucket::TokenBucket`] for
-    /// each resolved surface's kernel identity, plus one per component instance
-    /// declared on it.
+    /// Install the durable send budgets for every attach principal before the
+    /// `Messenger` is shared: one full [`crate::token_bucket::TokenBucket`] per
+    /// principal — each resolved surface's kernel identity plus one per component
+    /// instance declared on it, and each resolved remote's single identity.
     ///
-    /// Each input is `(slug, instances)` — the surface and its declared instance
-    /// ids. Instances, not kinds: the principal is the instance, the analog of a
-    /// backend `[[app]]` slug (matching the `surface:<slug>#<instance>` grain),
-    /// so twelve instances of one kind are twelve buckets and a runaway one
-    /// drains only its own.
+    /// Each input is a principal and its budget. The principal, not a
+    /// `(slug, instance)` pair: it is what the draw path holds and the only
+    /// spelling under which a surface and a remote of the same slug stay
+    /// separate. For a surface the grain is the *instance*, the analog of a
+    /// backend `[[app]]` slug, so twelve instances of one kind are twelve buckets
+    /// and a runaway one drains only its own.
     ///
     /// Same boot-only, uniquely-owned discipline as
     /// [`Messenger::with_subscriber_registrations`]: the `Arc` is populated at
     /// boot while still uniquely owned, so `Arc::get_mut` always succeeds; a
     /// share before this call is a boot-ordering bug and panics. A duplicate
-    /// *slug*, or a duplicate principal within one surface, is a boot-wiring bug
-    /// and panics — boot resolution already proved instances unique per surface.
+    /// principal is a boot-wiring bug and panics — boot resolution already proved
+    /// slugs unique per route and instances unique per surface.
     ///
     /// Each principal arrives with its own resolved
-    /// [`SurfaceSendBudget`](config::SurfaceSendBudget) — the instance's declared
+    /// [`AttachSendBudget`](config::AttachSendBudget) — the instance's declared
     /// override or the defaults — rather than the caller passing bare names for
     /// this function to meter identically. Boot resolution owns the parameters;
     /// this owns the buckets.
-    pub fn with_surface_send_budgets(
+    pub fn with_attach_send_budgets(
         mut self: Arc<Self>,
-        surfaces: impl IntoIterator<Item = (String, config::SurfacePrincipalBudgets)>,
+        principals: impl IntoIterator<Item = (ParticipantId, config::AttachSendBudget)>,
     ) -> Arc<Self> {
         let inner = Arc::get_mut(&mut self).expect(
-            "with_surface_send_budgets must run before the Messenger Arc is shared \
+            "with_attach_send_budgets must run before the Messenger Arc is shared \
              (boot-ordering bug)",
         );
-        for (slug, principals) in surfaces {
-            // The kernel grain (`None`) rides in the principal set like any
-            // other: geometry/status skip the budget via the platform path, but
-            // the kernel's own error reports do not, so its bucket must exist.
-            for (instance, budget) in principals {
-                let prev = inner.surface_send_budgets.insert(
-                    (slug.clone(), instance.clone()),
-                    Mutex::new(crate::token_bucket::TokenBucket::new(
-                        budget.burst,
-                        budget.refill,
-                        1,
-                    )),
-                );
-                assert!(
-                    prev.is_none(),
-                    "with_surface_send_budgets: duplicate budget for surface {slug:?} principal \
-                     {instance:?} — principals are unique within a surface, so a repeat is a boot \
-                     wiring bug",
-                );
-            }
+        // The bare grain rides in the principal set like any other: a surface's
+        // geometry/status skip the budget via the platform path, but the kernel's
+        // own error reports do not, so its bucket must exist.
+        for (principal, budget) in principals {
+            let prev = inner.attach_send_budgets.insert(
+                principal.as_str().to_owned(),
+                Mutex::new(crate::token_bucket::TokenBucket::new(
+                    budget.burst,
+                    budget.refill,
+                    1,
+                )),
+            );
+            assert!(
+                prev.is_none(),
+                "with_attach_send_budgets: duplicate budget for attach principal {} — principals \
+                 are unique across the attach routes, so a repeat is a boot wiring bug",
+                principal.as_str(),
+            );
         }
         self
     }
@@ -2597,11 +2645,11 @@ impl Messenger {
         }
     }
 
-    /// Every component instance of surface `slug` holding something parked at
-    /// `now`, sorted.
+    /// Every sub-identity of attacher `scope` holding something parked at `now`,
+    /// sorted.
     ///
     /// The question the sender-scoped view cannot answer: which of this
-    /// surface's schedules exist at all. A page is seeded only for the
+    /// attacher's schedules exist at all. A page is seeded only for the
     /// instances its bindings document declares and the channels their outputs
     /// bind, so
     /// this is what tells the seeding pass about a parked set no frame will
@@ -2610,26 +2658,30 @@ impl Messenger {
     /// what is lost is the page's ability to see or cancel them, which is an
     /// operator's business.
     ///
+    /// A kind that mints no sub-identities answers empty without walking: there
+    /// is no sender it could recognize. That is the `AttachScope`'s own rule,
+    /// asked here rather than restated.
+    ///
     /// Walks every channel's store, so it costs one deferred-set read per
     /// channel — a query per durable channel. Called at attach, not per frame.
-    pub async fn parked_surface_components(
+    pub async fn parked_attach_sub_identities(
         &self,
-        slug: &str,
+        scope: AttachScope<'_>,
         now: DateTime<Utc>,
     ) -> Vec<ParkedSet> {
+        if !scope.kind.mints_sub_identities() {
+            return Vec::new();
+        }
         let mut found: Vec<ParkedSet> = Vec::new();
         for entry in self.directory.list() {
             for sender in self.store_for(&entry).deferred_senders(now).await {
-                let Some((sender_slug, instance)) = ParticipantId::surface_component_of(&sender)
-                else {
+                let Some(instance) = scope.sub_identity_of(&sender) else {
                     continue;
                 };
-                if sender_slug == slug {
-                    found.push(ParkedSet {
-                        channel: entry.address.clone(),
-                        instance: instance.to_string(),
-                    });
-                }
+                found.push(ParkedSet {
+                    channel: entry.address.clone(),
+                    instance: instance.to_string(),
+                });
             }
         }
         found.sort();

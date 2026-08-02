@@ -29,6 +29,12 @@ ephemeral:<prefix>.app.<app-slug>.wake.<conversation-id>    pre-warm signal
 brenn:<prefix>.app.<app-slug>.approvals.<conversation-id>   RESERVED — see §8
 ```
 
+Beside them, one channel per **app** rather than per conversation:
+
+```
+brenn:<prefix>.app.<app-slug>.roster                        which conversations exist — see §9
+```
+
 The conversation id is the last segment because it is the only one minted at
 runtime. That ordering is what makes grants expressible at three grains without
 wildcards:
@@ -42,6 +48,11 @@ wildcards:
 
 A conversation therefore owns no subtree of its own; its channels are siblings
 under the per-leaf subtrees.
+
+The roster sits in the leaf position with nothing after it, so no fleet prefix
+reaches it: a peer granted every conversation of an app is not thereby granted
+the list of them, and — more to the point — cannot write it. Grant it by exact
+name.
 
 **Schemes.** `brenn:` is durable — the messages survive a restart, and the
 channel's retained window *is* the readable history. `ephemeral:` is in-memory
@@ -427,7 +438,60 @@ anything about what will appear on it. Brenn does not provision it.
 
 ---
 
-## 9. Malformed commands
+## 9. The roster: which conversations exist
+
+A conversation id is minted at runtime and `subscribe` is exact-channel, so a
+peer holding a fleet grant still has to learn *which* conversations to address.
+The app's roster channel is where it learns that, and the only place.
+
+```
+brenn:<prefix>.app.<app-slug>.roster
+```
+
+**The body is a full snapshot, not an event.**
+
+```json
+{"v": 1, "conversations": [{"id": 7}, {"id": 42}]}
+```
+
+| field | type | meaning |
+|---|---|---|
+| `conversations` | array | every conversation of this app that exists right now, ascending by `id` |
+| `conversations[].id` | integer | the conversation id that terminates each of its channel addresses |
+
+Each snapshot subsumes the one before it. A peer that was away does not replay
+what it missed — it reads the newest snapshot and reconciles: subscribe the
+leaves of each listed id it does not hold, unsubscribe the ones it holds that
+are no longer listed. A conversation created during an outage is simply an id in
+the first snapshot after reconnect.
+
+The channel is durable, with a shallow retained window. History here has no
+readers: the current snapshot is the whole truth, and an older one is only ever
+wrong. Subscribe at `retain_depth = 1` unless you have a reason not to.
+
+**One writer, and it is Brenn.** The roster is published by a reserved
+`system:chat-roster` identity that no configuration can mint, at boot and again
+whenever the app's conversation set changes. No app, harness, or peer may
+publish to it — a peer that thinks a conversation should exist asks through
+whatever channel creates conversations, not by editing the list.
+
+**Ordering and stability.** The body is a pure function of the conversation
+table: ascending ids, no timestamps, no counters. Two publishes of the same set
+are byte-identical, so a peer may compare a snapshot against the one it holds
+and do nothing when they match.
+
+**Races.** A conversation can be deprovisioned between a snapshot and your
+subscribe. That is ordinary: the subscribe answers "unavailable" rather than
+failing your attachment, and a publish into a vanished conversation returns a
+failed outcome. Wait for the next snapshot; do not retry in a loop.
+
+`v` is `1` from birth and this body is an external contract: a field may be
+added within `v = 1` (metadata about each conversation is the obvious one), and
+anything else bumps the version.
+
+---
+
+## 10. Malformed commands
 
 A body Brenn cannot decode is answered with an `error` on the record — correlated
 when the correlation was recoverable — and recorded as a schema violation against
@@ -442,7 +506,7 @@ attention, not a ban.
 
 ---
 
-## 10. Changing this protocol
+## 11. Changing this protocol
 
 1. Additive changes only within `v = 1`: new optional fields, new event types.
    Anything else bumps `v`.

@@ -1128,29 +1128,31 @@ pub struct SurfaceComponentRaw {
 /// burst.
 pub const DEFAULT_PARKED_BATCH_DEPTH: u64 = 8;
 
-/// One surface component instance's durable send budget: a burst capacity that
-/// refills one publish per interval, per principal.
+/// One attach principal's durable send budget: a burst capacity that refills one
+/// publish per interval.
 ///
 /// The knob an operator tunes per `[[surface.component]]`, and the parameters
-/// boot hands the instance's token bucket. The default is the pair of constants
-/// this replaces at the finer grain ([`publish::SURFACE_SEND_BURST`] /
+/// boot hands the principal's token bucket. Every attach-route principal gets
+/// one — a surface's kernel grain, each of its declared component instances, and
+/// each `[[remote]]`, which takes the default. The default is the pair of
+/// constants this replaces at the finer grain ([`publish::SURFACE_SEND_BURST`] /
 /// [`publish::SURFACE_SEND_REFILL`]), which were sized for one surface's whole
-/// traffic and now bound one instance of it.
+/// traffic and now bound one principal of it.
 ///
 /// This is deliberately *not* the backend's `WasmSinkBudget` shape. That budget
 /// is per-sink millitokens filled per activation, with input-amplification
-/// grants; a surface's is a flat wall-clock refill, because the server does not
+/// grants; an attacher's is a flat wall-clock refill, because the server does not
 /// run the activations it would meter. What both hostings preserve is the
 /// property — blast-radius scoping to one principal — not the mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SurfaceSendBudget {
+pub struct AttachSendBudget {
     /// Bucket capacity in publishes; the bucket starts full.
     pub burst: u32,
     /// Wall-clock interval per one publish of refill. Never zero.
     pub refill: std::time::Duration,
 }
 
-impl Default for SurfaceSendBudget {
+impl Default for AttachSendBudget {
     fn default() -> Self {
         Self {
             burst: publish::SURFACE_SEND_BURST,
@@ -1159,14 +1161,16 @@ impl Default for SurfaceSendBudget {
     }
 }
 
-/// One surface's principals, each with its resolved send budget: `None` is the
-/// surface's kernel grain, `Some(instance)` a declared component instance.
+/// One attacher's principals, each with its resolved send budget: `None` is the
+/// attacher's own bare grain, `Some(instance)` a declared component instance. A
+/// remote has only the bare grain; a surface has both.
 ///
-/// Produced by [`ResolvedSurface::principal_send_budgets`] and consumed by
-/// `Messenger::with_surface_send_budgets`. Named because the shape travels
-/// between boot and the installer and appears in every fixture that stands one
-/// up — one name means a reader learns the pair grain once.
-pub type SurfacePrincipalBudgets = Vec<(Option<String>, SurfaceSendBudget)>;
+/// Produced by [`ResolvedSurface::principal_send_budgets`] and folded into the
+/// flat, principal-keyed list `Messenger::with_attach_send_budgets` installs.
+/// Named because the shape travels between boot and the installer and appears in
+/// every fixture that stands one up — one name means a reader learns the pair
+/// grain once.
+pub type AttachPrincipalBudgets = Vec<(Option<String>, AttachSendBudget)>;
 
 /// A static input binding on a surface (`[[surface.subscription]]`).
 ///
@@ -1500,7 +1504,7 @@ pub struct ResolvedComponent {
     /// This instance's durable send budget: its own declared override, or the
     /// defaults. Server-side only — the page is told nothing about it, because
     /// the server is the authority and a mirrored bucket has no reader yet.
-    pub send_budget: SurfaceSendBudget,
+    pub send_budget: AttachSendBudget,
     /// How many activation flushes the kernel parks for this instance while the
     /// link is down before dropping the oldest whole batch. Bounded and `>= 1`.
     /// Carried to the page in the bindings document: the parked queue is the
@@ -1593,8 +1597,8 @@ impl ResolvedSurface {
     /// surface's), so this is the one set that has to be enumerated.
     pub fn principal_send_budgets(
         &self,
-    ) -> impl Iterator<Item = (Option<String>, SurfaceSendBudget)> + '_ {
-        std::iter::once((None, SurfaceSendBudget::default())).chain(
+    ) -> impl Iterator<Item = (Option<String>, AttachSendBudget)> + '_ {
+        std::iter::once((None, AttachSendBudget::default())).chain(
             self.components
                 .iter()
                 .map(|c| (Some(c.instance.clone()), c.send_budget)),
@@ -1679,7 +1683,7 @@ pub struct SurfaceOutput {
     /// server resolves the numbers and states them in the bindings document — the
     /// kernel
     /// enforces resolved values and never re-derives config. The server's own
-    /// per-instance send bucket ([`SurfaceSendBudget`]) is a separate,
+    /// per-instance send bucket ([`AttachSendBudget`]) is a separate,
     /// wall-clock tier behind this one.
     pub budget: brenn_budget::SinkBudget,
 }

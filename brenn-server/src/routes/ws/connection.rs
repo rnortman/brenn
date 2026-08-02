@@ -553,12 +553,30 @@ impl WsConnection {
         if singleton {
             let conv = {
                 let db_conn = state.db.lock().await;
-                conversation::get_or_create_singleton_conversation(
+                let conv = conversation::get_or_create_singleton_conversation(
                     &db_conn,
                     self.user_id,
                     &self.app_slug,
-                )
+                );
+                // This call is a creation site — a singleton's row is minted on
+                // the owner's first attach — and a conversation owes its chat
+                // channel family from the moment its row exists. Provisioning is
+                // idempotent, so the far more common already-there case pays an
+                // upsert and nothing else.
+                if let Some(messenger) = &state.messenger {
+                    messenger.provision_conversation_chat_channels(
+                        &db_conn,
+                        &self.app_slug,
+                        conv.id,
+                    );
+                }
+                conv
             };
+            // Outside the lock the publish needs; an unchanged conversation set
+            // is deduplicated away.
+            if let Some(messenger) = &state.messenger {
+                messenger.republish_chat_roster(&self.app_slug).await;
+            }
 
             let from_seq = if requested_conversation_id == Some(conv.id) {
                 requested_last_seq
@@ -2112,6 +2130,54 @@ mod tests {
         assert_eq!(
             today, expected,
             "today_in_connection_tz must use browser TZ (UTC) when override is expired"
+        );
+    }
+
+    /// A singleton app's conversation is minted on its owner's first attach, so
+    /// `run_setup` is a creation site and owes the bus the same two things every
+    /// other one does: the chat channel family, and a roster snapshot naming the
+    /// conversation.
+    #[tokio::test]
+    async fn a_singleton_conversation_minted_at_attach_is_provisioned_and_announced() {
+        use brenn_envelope::chat::{ChatLeaf, chat_address};
+
+        let (mut conn, _ws_rx, db, messenger, _user_id) = test_ws_conn_on_the_bus(true).await;
+        assert!(
+            roster_snapshots(&db, &messenger, "test").await.is_empty(),
+            "precondition: no conversation, nothing announced"
+        );
+
+        conn.run_setup(None, None).await;
+
+        let conv_id = conn
+            .current_conversation_id
+            .expect("the singleton path selected the conversation it minted");
+        let prefix = messenger.llm_chat().prefix.clone();
+        for leaf in [
+            ChatLeaf::In,
+            ChatLeaf::Out,
+            ChatLeaf::Stream,
+            ChatLeaf::Wake,
+        ] {
+            let address = chat_address(&prefix, "test", leaf, conv_id);
+            assert!(
+                messenger.directory().resolve(&address).is_some(),
+                "leaf {address} is unprovisioned; a peer publishing on it would be refused"
+            );
+        }
+        assert_eq!(
+            roster_snapshots(&db, &messenger, "test").await,
+            vec![format!(r#"{{"v":1,"conversations":[{{"id":{conv_id}}}]}}"#)],
+            "the minted conversation was announced exactly once"
+        );
+
+        // A second attach mints nothing, so it announces nothing: the dedupe is
+        // what keeps an idempotent creation site off the bus.
+        conn.run_setup(None, None).await;
+        assert_eq!(
+            roster_snapshots(&db, &messenger, "test").await.len(),
+            1,
+            "an unchanged conversation set is not republished"
         );
     }
 }

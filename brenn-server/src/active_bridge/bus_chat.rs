@@ -36,9 +36,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use brenn_cc::session::ModelOption;
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
 use brenn_envelope::chat::{
-    self, ChatCommand, ChatEvent, ChatStreamEvent, ModelInfo, TokenKind, legacy_ws_sender,
+    self, ChatCommand, ChatEvent, ChatLeaf, ChatStreamEvent, ModelInfo, TokenKind, chat_address,
+    legacy_ws_sender,
 };
-use brenn_lib::config::{ChatLeaf, chat_address};
+
 use brenn_lib::messaging::{
     Depth, MessageEnvelope, Messenger, ParticipantId, PublishResult, Urgency,
 };

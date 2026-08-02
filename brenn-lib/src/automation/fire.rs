@@ -163,6 +163,13 @@ pub async fn fire_one(engine: &AutomationEngine, job: JobSnapshot) {
             .provision_conversation_chat_channels(&conn, &job.owner_app_slug, id);
         id
     };
+    // Outside the lock the publish needs, and deduplicated against the last
+    // snapshot: the common fire finds its conversation already there and
+    // announces nothing.
+    engine
+        .messenger
+        .republish_chat_roster(&job.owner_app_slug)
+        .await;
 
     // Verify that the action destination still resolves in the directory.
     let (action_to, action_body, action_urgency, action_reply_to, action_deadline_secs) =
@@ -590,7 +597,7 @@ async fn handle_unsatisfiable_cron(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: report conversation routing (§2.8)
+// Helpers: report conversation routing
 // ---------------------------------------------------------------------------
 
 /// Resolve the conversation to which error reports for `job` should be sent.
@@ -616,11 +623,16 @@ pub(crate) async fn resolve_report_conversation(
     engine
         .messenger
         .provision_conversation_chat_channels(&conn, &job.owner_app_slug, conv_id);
+    drop(conn);
+    engine
+        .messenger
+        .republish_chat_roster(&job.owner_app_slug)
+        .await;
     Some(conv_id)
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: per-app automation events conversation (§2.8 / §2.9)
+// Helpers: per-app automation events conversation
 // ---------------------------------------------------------------------------
 
 /// Return (or create) the per-app automation events conversation for a
@@ -826,7 +838,10 @@ mod tests {
     use crate::automation::IngressRouter;
     use crate::automation::config::AutomationGlobalConfig;
     use crate::automation::job::{Action, CronTrigger, SendMessageAction, Trigger};
-    use crate::automation::test_support::{FakeIngressRouter, FakeWakeRouter, make_engine_full};
+    use crate::automation::test_support::{
+        FakeIngressRouter, FakeWakeRouter, app_subscriptions, default_app_cfg_with_subscriptions,
+        make_engine_full, make_engine_on_the_bus, roster_snapshots,
+    };
     use crate::db::init_db_memory;
     use crate::messaging::{
         ChannelEntry, ChannelScheme, MessageEnvelope, MessagingDirectory, SubscriberEntry,
@@ -948,6 +963,32 @@ mod tests {
         )
     }
 
+    /// [`make_engine`]'s bus-aware twin: the same fixture channel, plus the app's
+    /// roster channel and its reserved writer, and "test-app" as a *non*-singleton
+    /// so the conversation a fire creates is the automation-events one.
+    async fn make_engine_announcing(
+        db: crate::db::Db,
+        directory: MessagingDirectory,
+    ) -> Arc<AutomationEngine> {
+        let entries: Vec<ChannelEntry> = directory
+            .list()
+            .iter()
+            .map(|entry| (**entry).clone())
+            .collect();
+        let mut apps = indexmap::IndexMap::new();
+        apps.insert(
+            "test-app".to_string(),
+            default_app_cfg_with_subscriptions("test-app", false, app_subscriptions(&directory)),
+        );
+        make_engine_on_the_bus(
+            db,
+            Arc::new(apps),
+            entries,
+            FakeIngressRouter::new() as Arc<dyn IngressRouter>,
+        )
+        .await
+    }
+
     fn make_job_snapshot(row_id: i64, owner_app_slug: &str) -> JobSnapshot {
         JobSnapshot {
             row_id,
@@ -1037,6 +1078,86 @@ mod tests {
         // No error reports submitted.
         let events = ingress_router.events().await;
         assert!(events.is_empty(), "no error reports on success");
+    }
+
+    /// A fire is a conversation-creation site: the first one mints the app's
+    /// automation-events conversation, so it owes the bus a roster snapshot
+    /// naming it. Nobody watches this path — the conversation is created by
+    /// machinery, not a person — so an announcement that stopped happening would
+    /// leave a fleet driver blind to it with nothing to notice.
+    ///
+    /// The second fire finds the conversation already there and announces
+    /// nothing: provisioning is idempotent and runs on *every* fire, so a
+    /// republish per fire would wake every subscribed peer at automation cadence
+    /// to tell it nothing.
+    #[tokio::test]
+    async fn a_fire_announces_the_events_conversation_it_creates_exactly_once() {
+        let (db, _user_id, _channel_uuid, directory) = make_db_with_user_and_channel().await;
+        let engine = make_engine_announcing(db.clone(), directory).await;
+
+        let job = make_job_snapshot(1, "test-app");
+        {
+            let conn = db.lock().await;
+            insert_job_row(&conn, &job);
+        }
+        assert!(
+            roster_snapshots(&engine, "test-app").await.is_empty(),
+            "precondition: nothing has been announced yet"
+        );
+
+        fire_one(&engine, job.clone()).await;
+
+        let conv_id = {
+            let conn = db.lock().await;
+            conn.query_row(
+                "SELECT id FROM conversations WHERE app_slug = 'test-app'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("the fire created the automation-events conversation")
+        };
+        assert_eq!(
+            roster_snapshots(&engine, "test-app").await,
+            vec![format!(r#"{{"v":1,"conversations":[{{"id":{conv_id}}}]}}"#)],
+            "the created conversation was announced"
+        );
+
+        fire_one(&engine, job).await;
+        assert_eq!(
+            roster_snapshots(&engine, "test-app").await.len(),
+            1,
+            "a fire that creates nothing announces nothing"
+        );
+    }
+
+    /// The error-report path creates the same conversation when a fire fails
+    /// before one exists, so it carries the same obligation — and it is the path
+    /// that runs when something is already going wrong.
+    #[tokio::test]
+    async fn resolving_a_report_conversation_announces_the_one_it_creates() {
+        let (db, _user_id, _channel_uuid, directory) = make_db_with_user_and_channel().await;
+        let engine = make_engine_announcing(db.clone(), directory).await;
+        let job = make_job_snapshot(1, "test-app");
+
+        let conv_id = resolve_report_conversation(&engine, &job)
+            .await
+            .expect("the owner app and user resolve");
+
+        assert_eq!(
+            roster_snapshots(&engine, "test-app").await,
+            vec![format!(r#"{{"v":1,"conversations":[{{"id":{conv_id}}}]}}"#)],
+            "the report conversation is on the bus like any other"
+        );
+        assert_eq!(
+            resolve_report_conversation(&engine, &job).await,
+            Some(conv_id),
+            "the second call finds it"
+        );
+        assert_eq!(
+            roster_snapshots(&engine, "test-app").await.len(),
+            1,
+            "and announces nothing"
+        );
     }
 
     #[tokio::test]

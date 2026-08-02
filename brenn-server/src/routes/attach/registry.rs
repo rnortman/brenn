@@ -15,15 +15,11 @@
 //! whatever sits behind the channel on the attacher's side is the attacher's
 //! own bookkeeping.
 
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use brenn_attach_proto::DeferredViewEntry;
 use brenn_lib::messaging::MessageEnvelope;
-use chrono::{DateTime, Utc};
 use tokio::sync::{Notify, mpsc};
 use tracing::warn;
 use uuid::Uuid;
@@ -104,8 +100,8 @@ impl SessionCaps {
     };
 }
 
-/// Live attachment sessions, keyed by attacher — the slug of a surface, and
-/// whatever names a daemon later.
+/// Live attachment sessions, keyed by attacher — a surface's bare slug, a
+/// remote's `remote:<slug>`; `AttachScope::registry_key` spells both.
 ///
 /// Sync `Mutex`, never held across `.await` (push-window precedent): every
 /// operation is a brief in-memory map mutation. Poisoning is a broken invariant
@@ -125,12 +121,10 @@ pub struct AttachSessionHandle {
     /// Per-connection id, for log attribution.
     pub session_id: Uuid,
     /// The authenticated account behind this attachment — the logged-in user
-    /// for a browser page. Held for the per-account cap and for log
-    /// attribution; the attacher's *authority* comes from its profile, never
-    /// from here.
+    /// for a browser page, `remote:<slug>` for a daemon, whose two cap grains
+    /// therefore collapse. Held for the per-account cap and for log attribution;
+    /// the attacher's *authority* comes from its profile, never from here.
     pub account: String,
-    pub client_ip: IpAddr,
-    pub connected_at: DateTime<Utc>,
     /// Live rows and deferred-view snapshots to this session's task (bounded,
     /// `try_send`).
     pub push_tx: mpsc::Sender<SessionPush>,
@@ -165,7 +159,7 @@ impl AttachSessionHandle {
     }
 
     /// Minimal handle for tests that only care about `account` / capacity:
-    /// fresh id, localhost IP, throwaway push channel, no subscriptions.
+    /// fresh id, throwaway push channel, no subscriptions.
     /// One constructor so a new field lands in one place, not every test file.
     #[cfg(test)]
     pub fn for_test(account: &str) -> Self {
@@ -173,8 +167,6 @@ impl AttachSessionHandle {
         Self {
             session_id: Uuid::new_v4(),
             account: account.to_string(),
-            client_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            connected_at: Utc::now(),
             push_tx,
             active_channels: Arc::new(Mutex::new(HashSet::new())),
             drain_notify: Arc::new(Notify::new()),

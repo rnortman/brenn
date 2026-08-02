@@ -27,8 +27,8 @@ use brenn_lib::access::{AppCapability, AppPolicy};
 use brenn_lib::db;
 use brenn_lib::messaging::MessagingDirectory;
 use brenn_lib::messaging::config::{
-    ChannelConfigRaw, Depth, MessagingGlobalConfig, ResolvedComponent, ResolvedSurface,
-    SurfaceOutput, SurfaceSendBudget, build_channel_entries,
+    AttachSendBudget, ChannelConfigRaw, Depth, MessagingGlobalConfig, ResolvedComponent,
+    ResolvedSurface, SurfaceOutput, build_channel_entries,
 };
 use brenn_lib::messaging::store::RingStores;
 use brenn_lib::messaging::{ChannelEntry, Urgency};
@@ -184,7 +184,7 @@ pub(crate) fn surface_outputting_to(channel_address: &str) -> ResolvedSurface {
             instance: "writer".to_string(),
             kind: "writer".to_string(),
             abi: brenn_surface_schema::Abi::Dom,
-            send_budget: SurfaceSendBudget::default(),
+            send_budget: AttachSendBudget::default(),
             parked_batch_depth: 8,
             config: Default::default(),
             chrome: false,
@@ -484,10 +484,10 @@ pub(crate) fn fixture_messenger(
             )]
             .into(),
         )
-        .with_surface_send_budgets([(
-            surface.slug.clone(),
+        .with_attach_send_budgets(brenn_lib::messaging::attach_principal_budgets(
+            brenn_lib::messaging::AttachScope::surface(&surface.slug),
             surface.principal_send_budgets().collect(),
-        )])
+        ))
         .with_ring_stores(stores)
 }
 

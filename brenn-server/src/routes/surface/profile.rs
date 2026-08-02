@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use brenn_lib::access::AppCapability;
 use brenn_lib::messaging::config::{Depth, ResolvedSurface};
-use brenn_lib::messaging::{ParticipantId, SubscriberEntry};
+use brenn_lib::messaging::{AttachScope, MissingChannelPosture, ParticipantId, SubscriberEntry};
 
 use crate::routes::attach::profile::{
     AttachProfile, DeferredTarget, PublishPosture, PublishRate, SubscriptionFacts,
@@ -274,8 +274,16 @@ impl AttachProfile for SurfaceProfile {
         }
     }
 
-    fn send_budget_scope(&self) -> &str {
-        &self.slug
+    fn attach_scope(&self) -> AttachScope<'_> {
+        AttachScope::surface(&self.slug)
+    }
+
+    fn missing_channel_posture(&self) -> MissingChannelPosture {
+        // Every channel a surface may publish is a boot-declared output that
+        // boot validation proved exists and is policy-covered, so a flush
+        // naming one the server cannot write is the server disagreeing with
+        // itself.
+        MissingChannelPosture::Invariant
     }
 
     fn deferred_view_targets(&self) -> &[DeferredTarget] {

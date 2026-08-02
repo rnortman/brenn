@@ -461,7 +461,8 @@ async fn build_messaging_reconstructs_runtime_created_mqtt_channel() {
 /// so the peer's cross-subscription is silently dead on every reboot.
 #[tokio::test]
 async fn build_messaging_keeps_a_dynamic_subscription_on_a_chat_channel() {
-    use brenn_lib::config::{BrennConfig, ChatLeaf, chat_address};
+    use brenn_envelope::chat::{ChatLeaf, chat_address};
+    use brenn_lib::config::BrennConfig;
     use brenn_lib::db::init_db_memory;
     use brenn_lib::messaging::chat_channel_uuid_from_address;
     use indexmap::IndexMap as IM;
@@ -3366,6 +3367,62 @@ async fn build_messaging_brings_up_remote_only_config() {
         "a remote's entries are runtime-minted and never in the boot directory, so this \
          config-driven registration is all that stands between them and a fail-closed ACL gate"
     );
+    assert_eq!(
+        messenger.draw_attach_send_budget_for_batch(
+            brenn_lib::messaging::AttachScope::remote("pod-kitchen"),
+            None,
+            1
+        ),
+        brenn_lib::messaging::AttachSendVerdict::Admitted,
+        "boot installs the remote's durable send budget; this is the call that panics on a \
+         missing bucket, so a dropped or mis-scoped installer takes the remote's first durable \
+         publish down with it"
+    );
+}
+
+/// A `[[surface]]` and a `[[remote]]` may share a slug — nothing forbids an
+/// operator naming a pod and a page alike — and the durable send budget is keyed
+/// by *principal*, so the two must hold separate buckets. Draining one and
+/// finding the other full is what proves the key carries the kind.
+#[tokio::test]
+async fn a_remote_and_a_surface_of_one_slug_hold_separate_send_budgets() {
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use brenn_lib::messaging::{AttachScope, AttachSendVerdict};
+
+    let (remote, _token) = minimal_remote("deskbar");
+    let config = BrennConfig {
+        remotes: vec![remote],
+        surfaces: vec![minimal_surface_raw()],
+        ..BrennConfig::default()
+    };
+
+    let result = boot_messaging(&config, init_db_memory()).await;
+    let messenger = result
+        .messenger
+        .as_ref()
+        .expect("a remote plus a surface brings messaging up");
+
+    // Drain the remote's bucket whole: the burst is one all-or-nothing draw, and
+    // the refill is minutes away.
+    assert_eq!(
+        messenger.draw_attach_send_budget_for_batch(
+            AttachScope::remote("deskbar"),
+            None,
+            brenn_lib::messaging::publish::SURFACE_SEND_BURST,
+        ),
+        AttachSendVerdict::Admitted,
+    );
+    assert_eq!(
+        messenger.draw_attach_send_budget_for_batch(AttachScope::remote("deskbar"), None, 1),
+        AttachSendVerdict::Denied,
+        "the remote's own bucket is now empty"
+    );
+    assert_eq!(
+        messenger.draw_attach_send_budget_for_batch(AttachScope::surface("deskbar"), None, 1),
+        AttachSendVerdict::Admitted,
+        "the surface of the same slug is a different principal and spends a different bucket"
+    );
 }
 
 /// A registry holding one async tool `apull` (acl key `repo`), matching the
@@ -4353,4 +4410,142 @@ fn tuning_raw(address: &str) -> brenn_lib::messaging::config::ChannelConfigRaw {
         sink: None,
         wake_min: None,
     }
+}
+
+/// The chat roster: one boot-declared channel per app, carrying a snapshot of
+/// that app's conversations published under the reserved writer.
+///
+/// Two boots over the same database are asserted to produce byte-identical
+/// snapshots, which is the property a peer's "compare, then reconcile" loop
+/// rests on — anything time-varying in the body (a timestamp, a counter, row
+/// order) would make every restart look like a change to every peer.
+#[tokio::test]
+async fn build_messaging_publishes_a_roster_snapshot_per_app() {
+    use brenn_envelope::chat::chat_roster_address;
+    use brenn_lib::config::BrennConfig;
+    use brenn_lib::db::init_db_memory;
+    use indexmap::IndexMap as IM;
+
+    let owner = "cchost";
+    let quiet = "nobodyhome";
+    // One unrelated channel brings messaging up; the rosters are derived from
+    // the app set, never declared.
+    let config = BrennConfig {
+        channels: vec![nondurable_channel("ephemeral:inert", 1)],
+        ..BrennConfig::default()
+    };
+    let roster = chat_roster_address(&config.llm_chat.prefix, owner);
+
+    let db = init_db_memory();
+    {
+        let conn = db.lock().await;
+        conn.execute(
+            "INSERT INTO users (id, username, password_hash, created_at) \
+             VALUES (1, 'alice', 'h', '2024-01-01')",
+            [],
+        )
+        .expect("seed user");
+        for id in [4_i64, 2] {
+            conn.execute(
+                "INSERT INTO conversations (id, user_id, status, app_slug, created_at, updated_at) \
+                 VALUES (?1, 1, 'active', ?2, '2024-01-01', '2024-01-01')",
+                rusqlite::params![id, owner],
+            )
+            .expect("seed conversation");
+        }
+    }
+
+    let mut apps_map: IM<String, AppConfig> = IM::new();
+    apps_map.insert(owner.to_string(), minimal_app_config(owner, None, vec![]));
+    apps_map.insert(quiet.to_string(), minimal_app_config(quiet, None, vec![]));
+    let apps: Arc<IndexMap<String, AppConfig>> = Arc::new(apps_map);
+
+    let boot = async |db: brenn_lib::db::Db| {
+        let (alert_dispatcher, _alert_join) = AlertDispatcher::noop();
+        boot_messaging_with(&config, db, &apps, alert_dispatcher, "brenn://test")
+            .await
+            .messenger
+            .expect("a configured app brings messaging up")
+    };
+
+    let messenger = boot(db.clone()).await;
+    let entry = messenger
+        .directory()
+        .resolve(&roster)
+        .expect("every configured app gets a roster channel at boot");
+    assert!(
+        entry.capabilities().durable,
+        "the roster is the state a peer reconciles against after an outage"
+    );
+    assert!(
+        messenger
+            .directory()
+            .resolve(&chat_roster_address(&config.llm_chat.prefix, quiet))
+            .is_some(),
+        "an app with no conversations still owes a peer the snapshot that says so"
+    );
+
+    let first: Vec<(String, String)> = {
+        let conn = db.lock().await;
+        published_rosters(&conn)
+    };
+    assert_eq!(
+        first,
+        vec![
+            (
+                roster.clone(),
+                r#"{"v":1,"conversations":[{"id":2},{"id":4}]}"#.to_string()
+            ),
+            (
+                chat_roster_address(&config.llm_chat.prefix, quiet),
+                r#"{"v":1,"conversations":[]}"#.to_string()
+            ),
+        ],
+        "each app's snapshot lists its own conversations, ascending by id"
+    );
+
+    // A second boot over the same database: the set is unchanged, so the bytes
+    // are too.
+    drop(boot(db.clone()).await);
+    let second: Vec<(String, String)> = {
+        let conn = db.lock().await;
+        published_rosters(&conn)
+    };
+    assert_eq!(
+        second,
+        [first.clone(), first].concat(),
+        "a restart republishes the same snapshot, byte for byte"
+    );
+}
+
+/// Every roster publish in the database, in publish order, as
+/// `(channel address, body)` — and each asserted to carry the reserved writer,
+/// so a snapshot from any other principal fails here rather than being counted.
+fn published_rosters(conn: &rusqlite::Connection) -> Vec<(String, String)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.address, m.body, m.sender \
+             FROM messaging_messages m \
+             JOIN messaging_channels c ON c.uuid = m.channel_uuid \
+             WHERE c.address LIKE '%.roster' \
+             ORDER BY m.id",
+        )
+        .expect("prepare the roster scan");
+    stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })
+    .expect("query roster publishes")
+    .map(|r| {
+        let (address, body, sender) = r.expect("decode a roster publish");
+        assert_eq!(
+            sender, "system:chat-roster",
+            "the roster has exactly one writer"
+        );
+        (address, body)
+    })
+    .collect()
 }

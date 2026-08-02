@@ -58,8 +58,8 @@ use super::gates::{
 };
 use super::store::AttachFeedTarget;
 use super::{
-    ChannelEntry, ChannelScheme, Impetus, Messenger, ParticipantId, PrepaidDestination,
-    PrepaidEntry, SubscriberEntryKind, Urgency, store,
+    AttachScope, ChannelEntry, ChannelScheme, Impetus, Messenger, ParticipantId,
+    PrepaidDestination, PrepaidEntry, SubscriberEntryKind, Urgency, store,
 };
 use crate::access::AppCapability;
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
@@ -163,18 +163,14 @@ impl PublishResult {
     }
 }
 
-/// One draw against a surface principal's send budget.
+/// One draw against an attach principal's send budget.
 ///
-/// The fields the bucket needs (`slug`/`component`/`tokens`) travel with the
-/// ones only its transition warns need (`principal`/`channel`), because a warn
-/// with no principal on it is unactionable — the bucket is per-principal and the
-/// operator's next question is always "which one".
-pub struct SurfaceSendDraw<'a> {
-    pub slug: &'a str,
-    /// The identity grain: `Some(instance)` draws that instance's bucket, `None`
-    /// the surface's own kernel bucket. Server-derived, never client-claimed.
-    pub component: Option<&'a str>,
-    /// The stamped principal string, for the warns only.
+/// The bucket is keyed by principal, so the principal is all the draw needs; the
+/// `channel` rides along for the transition warns, because a warn with no target
+/// on it is unactionable — the operator's next question after "which principal"
+/// is always "writing where".
+pub struct AttachSendDraw<'a> {
+    /// The stamped principal string: both the bucket key and the warns' subject.
     pub principal: &'a str,
     /// The target address, when the draw has exactly one. A batch spans channels
     /// and passes `None` rather than naming an arbitrary member.
@@ -186,9 +182,9 @@ pub struct SurfaceSendDraw<'a> {
     pub tokens: u32,
 }
 
-/// Verdict of a [`SurfaceSendDraw`].
+/// Verdict of an [`AttachSendDraw`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SurfaceSendVerdict {
+pub enum AttachSendVerdict {
     /// Tokens were drawn; the caller proceeds.
     Admitted,
     /// The budget refused the draw. The caller answers its client a rate limit —
@@ -196,17 +192,21 @@ pub enum SurfaceSendVerdict {
     Denied,
 }
 
-/// The principal a surface publish is stamped with: the sub-identity's when the
-/// caller names one, the surface's own bare identity otherwise.
+/// What a batch entry naming a channel the server cannot publish onto means.
 ///
-/// The two-grain key every surface-side gate shares — budget bucket, stored
-/// sender, parked-set ownership — so a flush and a report by the same principal
-/// are the same principal everywhere.
-fn surface_principal(slug: &str, component: Option<&str>) -> ParticipantId {
-    match component {
-        Some(component) => ParticipantId::for_surface_component(slug, component),
-        None => ParticipantId::for_surface(slug),
-    }
+/// The two attach routes answer differently and both answers are correct. A
+/// surface's outputs are boot-declared and boot-validated, so a missing channel
+/// or an uncovered ACL is the server disagreeing with itself. A remote's targets
+/// are matcher-granted and provisioned at runtime, so the same reading is an
+/// ordinary deprovision race — the entry publishes nothing and the flush carries
+/// on, exactly as a deferred schedule the channel's cap refuses already does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingChannelPosture {
+    /// A broken boot invariant: panic rather than route traffic no operator
+    /// authorized.
+    Invariant,
+    /// An ordinary race: drop the entry, warn, and count it as unpublished.
+    Race,
 }
 
 /// Identifies the publisher for the send-budget gate.
@@ -237,22 +237,25 @@ enum PublishPrincipal<'a> {
     /// is `for_app(slug)`; the `Conversation`-origin budget is the app's
     /// configured send budget.
     App { slug: &'a str },
-    /// Surface (browser WASM) publisher: layer-1 resolves against the unified
-    /// subscriber registry (surfaces are not in `self.apps`). Always paired with
+    /// Attach publisher — a browser surface or an authenticated remote: layer-1
+    /// resolves against the unified subscriber registry (neither is in
+    /// `self.apps`), through the registration key its
+    /// [`AttachScope`](crate::messaging::AttachScope) names. Always paired with
     /// a `System` origin, so it reads no per-conversation budget; its durable
-    /// flood bound is the surface send budget consulted in `publish_core`
-    /// (`surface_send_budgets`), keyed by principal so it is reconnect-resistant.
+    /// flood bound is the attach send budget consulted in `publish_core`
+    /// (`attach_send_budgets`), keyed by principal so it is reconnect-resistant.
     /// The per-connection publish bucket at the session gates first.
     ///
-    /// `component` picks the identity grain, and is the **server's** answer, never
+    /// `attribution` picks the identity grain, and is the **server's** answer, never
     /// the client's: `Some(instance)` — an instance the boot-resolved declaration
     /// set admits — stamps the sub-identity `surface:<slug>#<instance>` and draws
-    /// that instance's bucket; `None` stamps the bare `surface:<slug>` kernel
-    /// identity and draws the surface's own bucket. Layer-1 and layer-2 read the
-    /// surface's policy in both cases: a component's grants *are* its
-    /// config-declared bindings, which boot validation already proved are covered
-    /// by the surface's ACLs, so there is no separate per-component policy to
-    /// consult.
+    /// that instance's bucket; `None` stamps the bare attacher identity and draws
+    /// the attacher's own bucket. A remote declares no sub-identities, so `Some`
+    /// under a `Remote` scope is a caller that skipped its profile's admission
+    /// step and panics. Layer-1 and layer-2 read the attacher's policy in both
+    /// cases: a component's grants *are* its config-declared bindings, which boot
+    /// validation already proved are covered by the surface's ACLs, so there is
+    /// no separate per-component policy to consult.
     ///
     /// `platform` distinguishes application publishes (`false` — bound content
     /// outputs and error reports, which draw the send budget) from
@@ -270,9 +273,9 @@ enum PublishPrincipal<'a> {
     /// telemetry is exempt, and a kernel error report — bare identity, `platform:
     /// false` — is not, because its cadence is driven by whatever went wrong
     /// rather than by a server-side timer.
-    Surface {
-        slug: &'a str,
-        component: Option<&'a str>,
+    Attach {
+        scope: AttachScope<'a>,
+        attribution: Option<&'a str>,
         platform: bool,
     },
     /// System-substrate publisher (e.g. the tool executor delivering results):
@@ -310,7 +313,7 @@ impl Messenger {
     /// the LLM tool call.
     ///
     /// Thin wrapper over `publish_core` with the app-sender authority source;
-    /// `publish_from_surface` is the sibling entry for surface publishers.
+    /// `publish_from_attacher` is the sibling entry for attach publishers.
     #[allow(clippy::too_many_arguments)]
     pub async fn publish(
         &self,
@@ -345,50 +348,51 @@ impl Messenger {
         .await
     }
 
-    /// Publish a durable (`brenn:`) message on behalf of a surface (browser
-    /// WASM) component.
+    /// Publish a message on behalf of an attacher — a browser surface's component
+    /// or an authenticated remote.
     ///
     /// Runs the identical gate sequence as `publish` (`publish_core`) — the same
-    /// address-shape, directory, `MessagingPublish` grant, `brenn_publish` ACL,
-    /// and body-cap gates — differing only in the layer-1 authority source (the
-    /// unified subscriber registry, keyed by boot-resolved surface slug) and the
-    /// stored principal. `System` origin: no per-conversation send budget, but the
-    /// durable surface send budget (`surface_send_budgets`) bounds it in
+    /// address-shape, directory, publish grant, per-scheme ACL, and body-cap
+    /// gates — differing only in the layer-1 authority source (the unified
+    /// subscriber registry, keyed by the scope's registration key) and the stored
+    /// principal. `System` origin: no per-conversation send budget, but the
+    /// durable attach send budget (`attach_send_budgets`) bounds it in
     /// `publish_core`, so `BudgetExhausted` is a client-reachable outcome here.
-    /// Urgency is `Normal` in v1 (the surface `Publish` frame carries none). No
-    /// `reply_to`/`delivery_deadline` — not exposed to surfaces. No
-    /// `deliver_after` either: a surface's deferred publish is always a *buffered*
-    /// component publish, and buffered publishes flush as batches, so surface
-    /// deferral rides [`Messenger::publish_batch_from_surface`] and never this
-    /// single-frame path.
+    /// No `reply_to`/`delivery_deadline` — not exposed to attachers. No
+    /// `deliver_after` either: an attacher's deferred publish is always a
+    /// *buffered* one, and buffered publishes flush as batches, so deferral rides
+    /// [`Messenger::publish_batch_from_attacher`] and never this single-frame
+    /// path.
     ///
-    /// `component` is the identity grain, and both halves are backend-validated,
+    /// `attribution` is the identity grain, and both halves are backend-validated,
     /// never client-trusted fields: `Some(instance)` stamps
     /// `surface:<slug>#<instance>` and draws that instance's budget — the caller
     /// admitted `instance` against its own declaration set before naming it here;
-    /// `None` stamps the bare `surface:<slug>` and draws the surface's own budget,
-    /// for a publish the kernel itself made with no component subject (its own
-    /// error reports).
+    /// `None` stamps the bare attacher identity and draws the attacher's own
+    /// budget, for a publish the kernel or daemon itself made with no sub-identity
+    /// subject.
     ///
-    /// Because every reachable channel is an operator allowlist
-    /// (`[[surface.output]]` binding + covering `publish_acl`, both boot-validated),
-    /// `MissingSender`/`AclDenied`/`UnknownChannel`/`MalformedAddress` here are
-    /// broken boot invariants — the session caller panics on them (see
-    /// `handle_publish`); `Ok`/`BodyTooLarge`/`BudgetExhausted` are the
-    /// client-reachable outcomes.
-    pub async fn publish_from_surface(
+    /// Which denials are reachable is the *route's* answer, not this function's.
+    /// A surface reaches only an operator allowlist (a `[[surface.output]]`
+    /// binding plus a covering `publish_acl`, both boot-validated), so
+    /// `MissingSender`, `AclDenied`, `UnknownChannel` and `MalformedAddress` are
+    /// broken boot invariants there and the session caller panics on them. A
+    /// remote's targets are matcher-granted and runtime-provisioned, so the same
+    /// outcomes are ordinary races it reports. See
+    /// `AttachProfile::publish_posture`.
+    pub async fn publish_from_attacher(
         &self,
-        slug: &str,
-        component: Option<&str>,
+        scope: AttachScope<'_>,
+        attribution: Option<&str>,
         addr: &str,
         body: &str,
         urgency: super::Urgency,
     ) -> PublishResult {
         self.publish_core(
             PublishOrigin::System,
-            PublishPrincipal::Surface {
-                slug,
-                component,
+            PublishPrincipal::Attach {
+                scope,
+                attribution,
                 platform: false,
             },
             addr,
@@ -406,7 +410,7 @@ impl Messenger {
     /// surface: the server-constructed geometry/status snapshots and the
     /// boot/terminal status stamps.
     ///
-    /// Identical to [`publish_from_surface`] except that it is **exempt from the
+    /// Identical to [`publish_from_attacher`] except that it is **exempt from the
     /// per-surface send budget** — every other gate (address shape, directory,
     /// `MessagingPublish` grant, `brenn_publish` ACL, body cap) applies unchanged.
     /// The exemption keeps a heartbeat-forever cadence from draining the budget
@@ -427,9 +431,9 @@ impl Messenger {
     ) -> PublishResult {
         self.publish_core(
             PublishOrigin::System,
-            PublishPrincipal::Surface {
-                slug,
-                component: None,
+            PublishPrincipal::Attach {
+                scope: AttachScope::surface(slug),
+                attribution: None,
                 platform: true,
             },
             addr,
@@ -520,8 +524,9 @@ impl Messenger {
         .await
     }
 
-    /// Draw against one surface principal's send budget — the defense-in-depth
-    /// backstop on everything a surface republishes into the server's substrate.
+    /// Draw against one attach principal's send budget — the defense-in-depth
+    /// backstop on everything an attacher republishes into the server's
+    /// substrate.
     ///
     /// Keyed by principal, not connection: a component's retry loop drains its own
     /// instance's bucket and leaves its siblings and the kernel's own reports
@@ -534,87 +539,73 @@ impl Messenger {
     /// publishes", "activation batches") — the operator reads them to tell an
     /// erroring component from a flooding one.
     ///
-    /// Panics if the principal has no bucket: boot installs one per surface and
+    /// Panics if the principal has no bucket: boot installs one per attacher and
     /// one per declared instance, so a miss is a broken boot invariant, and
     /// admitting an unbudgeted principal would be a silent hole in exactly the
     /// backstop this is.
-    fn draw_surface_send_budget(
-        &self,
-        draw: SurfaceSendDraw<'_>,
-        unit: &str,
-    ) -> SurfaceSendVerdict {
-        let SurfaceSendDraw {
-            slug,
-            component,
+    fn draw_attach_send_budget(&self, draw: AttachSendDraw<'_>, unit: &str) -> AttachSendVerdict {
+        let AttachSendDraw {
             principal,
             channel,
             tokens,
         } = draw;
-        // Owned key: the map is keyed by principal grain, and probing it without
-        // allocating would mean a parallel borrowed-key type for a lookup that
-        // happens once per publish.
-        let key = (slug.to_string(), component.map(str::to_string));
-        let bucket = self.surface_send_budgets.get(&key).unwrap_or_else(|| {
+        let bucket = self.attach_send_budgets.get(principal).unwrap_or_else(|| {
             panic!(
-                "draw_surface_send_budget: surface principal {principal:?} has no send budget — \
-                 boot installs one per surface and one per declared component instance, so a miss \
+                "draw_attach_send_budget: attach principal {principal:?} has no send budget — \
+                 boot installs one per attacher and one per declared component instance, so a miss \
                  is a broken boot invariant"
             )
         });
         match bucket
             .lock()
-            .expect("surface send budget mutex poisoned")
+            .expect("attach send budget mutex poisoned")
             .try_consume_n(tokens)
         {
-            TokenBucketOutcome::Granted => SurfaceSendVerdict::Admitted,
+            TokenBucketOutcome::Granted => AttachSendVerdict::Admitted,
             TokenBucketOutcome::GrantedAfterSuppression { suppressed } => {
                 warn!(
-                    surface = %slug,
                     principal = %principal,
                     channel = channel.unwrap_or("<batch>"),
                     suppressed,
-                    "surface send budget recovered; {unit} were suppressed"
+                    "attach send budget recovered; {unit} were suppressed"
                 );
-                SurfaceSendVerdict::Admitted
+                AttachSendVerdict::Admitted
             }
             TokenBucketOutcome::Denied { first } => {
                 if first {
                     warn!(
-                        surface = %slug,
                         principal = %principal,
                         channel = channel.unwrap_or("<batch>"),
                         tokens,
-                        "surface send budget exhausted; suppressing {unit}"
+                        "attach send budget exhausted; suppressing {unit}"
                     );
                 }
-                SurfaceSendVerdict::Denied
+                AttachSendVerdict::Denied
             }
         }
     }
 
-    /// Draw `tokens` against a surface principal's send budget as one
+    /// Draw `tokens` against an attach principal's send budget as one
     /// all-or-nothing unit — the entry point for an activation flush, which is
     /// admitted or refused whole because the batch is atomic.
     ///
     /// The caller draws once for the whole batch and then applies its entries
-    /// through [`Messenger::publish_batch_from_surface`], which does not draw
+    /// through [`Messenger::publish_batch_from_attacher`], which does not draw
     /// again. That split is deliberate: a per-entry draw could admit a prefix of
     /// an atomic flush and refuse the rest, which is the one thing the batch
     /// contract forbids.
     ///
-    /// `component` is the sub-identity whose activation produced the flush, or
-    /// `None` for the surface's own kernel grain.
-    pub fn draw_surface_send_budget_for_batch(
+    /// `attribution` is the sub-identity whose activation produced the flush, or
+    /// `None` for the attacher's own bare grain.
+    pub fn draw_attach_send_budget_for_batch(
         &self,
-        slug: &str,
-        component: Option<&str>,
+        scope: AttachScope<'_>,
+        attribution: Option<&str>,
         tokens: u32,
-    ) -> SurfaceSendVerdict {
-        let principal = surface_principal(slug, component);
-        self.draw_surface_send_budget(
-            SurfaceSendDraw {
-                slug,
-                component,
+    ) -> AttachSendVerdict {
+        let principal = scope.principal(attribution);
+        self.draw_attach_send_budget(
+            AttachSendDraw {
                 principal: principal.as_str(),
                 channel: None,
                 tokens,
@@ -623,15 +614,15 @@ impl Messenger {
         )
     }
 
-    /// The one publish gate sequence, behind `publish`, `publish_from_surface`,
+    /// The one publish gate sequence, behind `publish`, `publish_from_attacher`,
     /// and `publish_from_system`, for every pub/sub scheme.
     ///
-    /// The `principal` selects the layer-1 authority source (app vs surface vs
+    /// The `principal` selects the layer-1 authority source (app vs attach vs
     /// system); every other gate is identical across arms. Where behavior
     /// differs by class it is driven by the resolved channel's
     /// [`ChannelCapabilities`](brenn_envelope::ChannelCapabilities), never by
     /// matching on the scheme at a call site: `durable` picks the commit (DB
-    /// rows vs the in-memory ring) and gates the surface send budget;
+    /// rows vs the in-memory ring) and gates the attach send budget;
     /// `transportable` decides whether a commit also fans out to attached wire
     /// receivers. Every option field a publish can carry is carried on both
     /// classes.
@@ -640,7 +631,7 @@ impl Messenger {
     /// arm that carries a [`DenialKind`], so the counter cannot drift from the
     /// outcome. It does not log denials: it lacks the boundary context to tell
     /// an attack from a server bug, and the same arms are "impossible, panic"
-    /// for the surface caller. A caller passing an attacker-influenceable
+    /// for the attach caller. A caller passing an attacker-influenceable
     /// address owns boundary-appropriate security signaling.
     #[allow(clippy::too_many_arguments)]
     async fn publish_core(
@@ -679,9 +670,9 @@ impl Messenger {
     fn principal_identity(&self, principal: PublishPrincipal<'_>) -> String {
         match principal {
             PublishPrincipal::App { slug } => ParticipantId::for_app(slug, &self.source),
-            PublishPrincipal::Surface {
-                slug, component, ..
-            } => surface_principal(slug, component),
+            PublishPrincipal::Attach {
+                scope, attribution, ..
+            } => scope.principal(attribution),
             PublishPrincipal::System { component } => ParticipantId::for_system(component),
             PublishPrincipal::Conversation { id, .. } => ParticipantId::for_conversation(id),
         }
@@ -701,8 +692,8 @@ impl Messenger {
     /// with no path from a publish to a creation. If peer-initiated creation is
     /// ever added, a bus-wide per-sender backstop bucket must land with it.
     ///
-    /// This gate is not surface-specific — it runs on every scheme — so it
-    /// reports a plain admit/deny rather than a [`SurfaceSendVerdict`].
+    /// This gate is not attach-specific — it runs on every scheme — so it
+    /// reports a plain admit/deny rather than a [`AttachSendVerdict`].
     fn draw_send_rate(&self, sender: &str, channel: &super::ChannelEntry) -> bool {
         let outcome = {
             let mut buckets = self
@@ -827,7 +818,7 @@ impl Messenger {
         //    string, and the optional `Conversation`-origin send budget:
         //    `Some(budget)` for an app (read in the `Conversation` arm of step 5;
         //    falls back to the global default for an app with no `[app.messaging]`
-        //    block), `None` for the always-`System` surface arm.
+        //    block), `None` for the always-`System` attach arm.
         //
         //    The grant the layer-1 gate demands follows the target's scheme:
         //    `ephemeral:` traffic is authorized by `EphemeralPublish`, `local:`
@@ -845,12 +836,12 @@ impl Messenger {
                 };
                 (&app.policy, Some(app.messaging_send_budget()))
             }
-            PublishPrincipal::Surface { slug, .. } => {
-                // Surfaces are not in `self.apps`; their boot-resolved policy
+            PublishPrincipal::Attach { scope, .. } => {
+                // Attachers are not in `self.apps`; their boot-resolved policy
                 // lives in the unified `subscribers` registry, the same
                 // authority the delivery-time gate reads via `subscriber_policy`.
                 //
-                // Keyed at the surface grain for a component publish too: a
+                // Keyed at the attacher grain for a component publish too: a
                 // component's grants are its config-declared bindings, and boot
                 // validation already proved each one is covered by the surface's
                 // own ACLs. The sub-identity finer-grains attribution and budget,
@@ -858,7 +849,7 @@ impl Messenger {
                 // hand-maintain.
                 let policy = match self
                     .targets
-                    .registration(&SubscriberEntryKind::Surface(slug.to_string()))
+                    .registration(&SubscriberEntryKind::for_attach(scope))
                     .map(|r| r.policy.as_ref())
                     .filter(|p| p.has_grant(grant))
                 {
@@ -867,9 +858,9 @@ impl Messenger {
                 };
                 (
                     policy,
-                    // Surface is always paired with a `System` origin (see
-                    // `publish_from_surface`), which never reads the budget below.
-                    // `None` makes that pairing structural: a future `Surface` +
+                    // Attach is always paired with a `System` origin (see
+                    // `publish_from_attacher`), which never reads the budget below.
+                    // `None` makes that pairing structural: a future `Attach` +
                     // `Conversation` misuse panics loudly at the `.expect()` in
                     // step 5 rather than silently seeding a `remaining = 0` row.
                     None,
@@ -891,7 +882,7 @@ impl Messenger {
                 (
                     policy,
                     // System is always paired with a `System` origin, which never
-                    // reads the budget below — same structural `None` as Surface.
+                    // reads the budget below — same structural `None` as Attach.
                     None,
                 )
             }
@@ -1010,9 +1001,9 @@ impl Messenger {
             None
         };
 
-        // 3b. Surface send budget, keyed by principal — the surface's own kernel
-        //     identity or one component kind on it. Every durable publish a
-        //     surface makes under its own identity (bound outputs and error
+        // 3b. Attach send budget, keyed by principal — the attacher's own bare
+        //     identity or one component kind on it. Every durable publish an
+        //     attacher makes under its own identity (bound outputs and error
         //     reports alike) draws from the process-lifetime bucket of whichever
         //     principal made it. That keying *is* the blast-radius scoping: a
         //     component's retry loop drains its own kind's bucket, leaving its
@@ -1029,32 +1020,28 @@ impl Messenger {
         //     attributed to the principal.
         // Platform-origin surface telemetry (geometry/status/stamps) is exempt:
         // it skips only this step and passes every other gate. See
-        // `PublishPrincipal::Surface`.
+        // `PublishPrincipal::Attach`.
         //
-        // Scoped to durable channels by capability: this bucket bounds what a
-        // surface writes into the server's *persistent* substrate, and its
+        // Scoped to durable channels by capability: this bucket bounds what an
+        // attacher writes into the server's *persistent* substrate, and its
         // sustained rate is sized for that (single-digit publishes per minute).
         // A non-durable channel writes nothing to disk and carries traffic
         // orders of magnitude faster; it is bounded by the per-(sender, channel)
         // send-rate gate below, which every scheme runs.
         if capabilities.durable
-            && let PublishPrincipal::Surface {
-                slug,
-                component,
-                platform: false,
+            && let PublishPrincipal::Attach {
+                platform: false, ..
             } = principal
             && matches!(
-                self.draw_surface_send_budget(
-                    SurfaceSendDraw {
-                        slug,
-                        component,
+                self.draw_attach_send_budget(
+                    AttachSendDraw {
                         principal: sender,
                         channel: Some(addr),
                         tokens: 1,
                     },
                     "durable publishes"
                 ),
-                SurfaceSendVerdict::Denied
+                AttachSendVerdict::Denied
             )
         {
             return PublishResult::BudgetExhausted;
@@ -1063,12 +1050,12 @@ impl Messenger {
         // 3c. Per-(sender, channel) send-rate gate — the one unified rate limit,
         //     on every scheme. Every validate-only gate (shape, authorization,
         //     size, reply_to) runs ahead of it, so a publish doomed by any of
-        //     those costs no token. Of the two spending gates, the surface send
-        //     budget (3b) is drawn first: a durable surface publish that is then
-        //     rate-limited here has already spent one surface-budget token. That
-        //     ordering is deliberate — the surface budget only gates durable
-        //     surface writes, the common case is a publish that passes both, and
-        //     a rate token refills far faster than the scarce surface budget.
+        //     those costs no token. Of the two spending gates, the attach send
+        //     budget (3b) is drawn first: a durable attach publish that is then
+        //     rate-limited here has already spent one attach-budget token. That
+        //     ordering is deliberate — the attach budget only gates durable
+        //     attach writes, the common case is a publish that passes both, and
+        //     a rate token refills far faster than the scarce attach budget.
         if !self.draw_send_rate(sender, &channel) {
             return PublishResult::RateLimited;
         }
@@ -1829,12 +1816,12 @@ impl Messenger {
     }
 }
 
-/// One entry of a surface activation's flush. `channel_address` is the bound
-/// output's boot-resolved address (the caller resolved port → channel against
-/// its own declaration set); `urgency` is already the per-call override or the
-/// port's configured default, resolved by the caller from the *server's* output
-/// map.
-pub struct SurfaceBatchPublish<'a> {
+/// One entry of an attacher's flush. `channel_address` is the address the
+/// caller already admitted against its own authority (a surface's boot-resolved
+/// bound output, a remote's matcher-granted target); `urgency` is already the
+/// per-call override or the port's configured default, resolved by the caller
+/// from the *server's* output map.
+pub struct AttachBatchPublish<'a> {
     pub channel_address: &'a str,
     pub body: &'a str,
     pub urgency: super::Urgency,
@@ -1855,9 +1842,8 @@ pub struct SurfaceBatchPublish<'a> {
 }
 
 impl Messenger {
-    /// Apply one surface activation's flush, whatever mix of channels it names —
-    /// in call order, each entry at its own urgency and its caller-assigned
-    /// timestamp.
+    /// Apply one attacher's flush, whatever mix of channels it names — in call
+    /// order, each entry at its own urgency and its caller-assigned timestamp.
     ///
     /// **Where a message lands is decided here, not by the caller.** The batch
     /// arrives as one list; the channel's own capabilities put each entry in a
@@ -1878,25 +1864,28 @@ impl Messenger {
     /// rolls the whole thing back.
     ///
     /// **The send budget is not drawn here** — the caller draws once for the whole
-    /// batch via [`Messenger::draw_surface_send_budget_for_batch`] before calling,
+    /// batch via [`Messenger::draw_attach_send_budget_for_batch`] before calling,
     /// because a per-entry draw could refuse the tail of an atomic flush.
     ///
-    /// Every other gate runs, per entry, and **panics rather than returning**: for
-    /// a bound output, address shape, directory existence, the scheme's publish
-    /// grant and ACL, and the body cap are all boot-validated and boot-static, and
-    /// the caller has already answered its client a violation for every
-    /// client-reachable way to name something else. Reaching a failure here means
-    /// the server's own output map disagrees with its directory or its policy —
-    /// publishing anyway would be routing traffic no operator authorized.
+    /// **`posture` decides what an entry the server cannot publish means.** Under
+    /// [`MissingChannelPosture::Invariant`] — a surface, whose outputs are
+    /// boot-declared — directory existence and ACL coverage are boot-static, so a
+    /// miss is the server disagreeing with itself and panics. Under
+    /// [`MissingChannelPosture::Race`] — a remote, whose targets are
+    /// matcher-granted and provisioned at runtime — the entry is dropped, warned
+    /// about, and counted in the return value, and the rest of the flush carries
+    /// on. Every other gate panics under both: address shape and the body cap are
+    /// caller-validated, and the caller has already answered its client a
+    /// violation for every client-reachable way to name something else.
     ///
-    /// **Caller precondition, unchecked here: `component`, when set, must be a
+    /// **Caller precondition, unchecked here: `attribution`, when set, must be a
     /// declared instance's name.** It is interpolated straight into the sender
-    /// identity (`surface:<slug>#<component>`), and nothing below re-derives or
+    /// identity (`surface:<slug>#<attribution>`), and nothing below re-derives or
     /// re-admits it — this entry point deliberately draws no budget (see above),
     /// so there is no lookup left to catch a fabricated name. A caller that skips
     /// the declaration check commits durable rows under a sub-identity no operator
     /// declared, which is the one attribution the surface identity model exists to
-    /// make impossible. `None` is the surface's own bare identity and needs no
+    /// make impossible. `None` is the attacher's own bare identity and needs no
     /// admission — it is the identity a caller already has. Any caller owes the
     /// admission check against the boot-resolved declaration set.
     ///
@@ -1911,61 +1900,93 @@ impl Messenger {
     /// scheduled, and a post-activation flush has no error channel back to the
     /// guest to carry either outcome.
     ///
-    /// Returns the number of entries whose schedule was refused that way, so the
-    /// caller counts as published only what published.
-    pub async fn publish_batch_from_surface(
+    /// Returns the number of entries that published nothing — a schedule the
+    /// deferred cap refused, or (under [`MissingChannelPosture::Race`]) a target
+    /// that was gone — so the caller counts as published only what published.
+    pub async fn publish_batch_from_attacher(
         &self,
-        slug: &str,
-        component: Option<&str>,
-        publishes: &[SurfaceBatchPublish<'_>],
+        scope: AttachScope<'_>,
+        attribution: Option<&str>,
+        publishes: &[AttachBatchPublish<'_>],
+        posture: MissingChannelPosture,
     ) -> usize {
         if publishes.is_empty() {
             return 0;
         }
+        let slug = scope.slug;
+        let route = scope.kind.as_str();
 
-        // Layer-1, once per batch: the surface's boot-resolved policy, keyed at
-        // the surface grain for a component publish exactly as `publish_core`
+        // Layer-1, once per batch: the attacher's boot-resolved policy, keyed at
+        // the attacher grain for a component publish exactly as `publish_core`
         // does — a component's grants *are* its config-declared bindings, which
         // boot proved covered by the surface's own ACLs. Which grant each entry
         // needs is its channel's scheme's business, checked per entry below.
         let policy = self
             .targets
-            .registration(&SubscriberEntryKind::Surface(slug.to_string()))
+            .registration(&SubscriberEntryKind::for_attach(scope))
             .map(|r| r.policy.as_ref())
             .unwrap_or_else(|| {
                 panic!(
-                    "publish_batch_from_surface: surface {slug:?} has no registered policy — a \
-                     bound output implies one, so this is a broken boot invariant"
+                    "publish_batch_from_attacher: {route} {slug:?} has no registered policy — an \
+                     admitted publish target implies one, so this is a broken boot invariant"
                 )
             });
 
-        let sender_id = surface_principal(slug, component);
+        let sender_id = scope.principal(attribution);
         let sender = sender_id.as_str().to_owned();
         let source = self.source.as_ref();
 
         info!(
-            surface = %slug,
+            route,
+            attacher = %slug,
             principal = %sender,
             publish_count = publishes.len(),
-            "publish_batch_from_surface: applying activation flush"
+            "publish_batch_from_attacher: applying flush"
         );
 
-        // The split is the channel's, not the caller's: a bound output's
+        // Targets that vanished between the caller's admission and this call.
+        // Only reachable under `Race`; the `Invariant` arm panics in the loop.
+        //
+        // Sanitized on the way in, not at the warn below: under `Race` the
+        // caller admitted the address against a *matcher*, and a prefix matcher
+        // admits whatever follows the prefix — including bytes that would forge
+        // lines in the operator's log. An address that never resolved is client
+        // input and nothing else.
+        let mut vanished: Vec<String> = Vec::new();
+        // The split is the channel's, not the caller's: the target's
         // capabilities decide whether its entry belongs in the transaction
         // below or on a ring.
-        let mut durable: Vec<&SurfaceBatchPublish<'_>> = Vec::new();
-        let mut nondurable: Vec<(&SurfaceBatchPublish<'_>, Arc<ChannelEntry>)> = Vec::new();
+        let mut durable: Vec<(&AttachBatchPublish<'_>, Arc<ChannelEntry>)> = Vec::new();
+        let mut nondurable: Vec<(&AttachBatchPublish<'_>, Arc<ChannelEntry>)> = Vec::new();
         for publish in publishes {
             let addr = publish.channel_address;
-            let channel = self.directory.resolve(addr).unwrap_or_else(|| {
-                panic!(
-                    "publish_batch_from_surface: bound output {addr:?} of surface {slug:?} is not \
-                     in the directory — boot validation proves every bound output exists, so this \
-                     is a broken boot invariant"
-                )
-            });
+            let Some(channel) = self.directory.resolve(addr) else {
+                match posture {
+                    MissingChannelPosture::Race => {
+                        vanished.push(sanitize_untrusted_str(addr, MAX_LOGGED_UNTRUSTED_BYTES));
+                        continue;
+                    }
+                    MissingChannelPosture::Invariant => panic!(
+                        "publish_batch_from_attacher: bound output {addr:?} of {route} {slug:?} is \
+                         not in the directory — boot validation proves every bound output exists, \
+                         so this is a broken boot invariant"
+                    ),
+                }
+            };
+            // Under `Race` the ACL is re-read here, ahead of both halves, so the
+            // asserts below stay the boot-invariant statements they are for a
+            // surface: a runtime-provisioned target can lose coverage the same
+            // way it can vanish, and an atomic flush must not die on either.
+            if posture == MissingChannelPosture::Race {
+                let (scheme, name) = ChannelScheme::split(&channel.address)
+                    .expect("a directory entry's address always carries its scheme");
+                if !publish_acl_allows(policy, scheme, name) {
+                    vanished.push(sanitize_untrusted_str(addr, MAX_LOGGED_UNTRUSTED_BYTES));
+                    continue;
+                }
+            }
             if channel.capabilities().durable {
-                durable.push(publish);
+                durable.push((publish, channel));
             } else {
                 nondurable.push((publish, channel));
             }
@@ -1983,41 +2004,54 @@ impl Messenger {
             let conn = self.db.lock().await;
             let tx = conn
                 .unchecked_transaction()
-                .expect("publish_batch_from_surface: begin tx");
+                .expect("publish_batch_from_attacher: begin tx");
 
             // Per-batch memoization of the surface-feed resolution, as in
             // `publish_from_wasm` and safe for the reason stated there: resolution
             // and commit share one held DB lock, which a durable replay read also
             // takes. The dominant case is a batch fanning one port.
-            let mut targets_cache: HashMap<&str, ResolvedChannelTargets> = HashMap::new();
+            //
+            // `None` memoizes a target that left the directory while this flush
+            // waited on the DB lock — deprovisioning runs under that same lock, so
+            // the gap between the pre-pass above and this transaction is as wide as
+            // the wait. Under `Race` those entries join `vanished`; under
+            // `Invariant` the resolve panics as it always did. The entry the row is
+            // written against is the pre-pass's, so a target's identity and caps
+            // cannot change under a half-applied batch.
+            let mut targets_cache: HashMap<&str, Option<Vec<AttachFeedTarget>>> = HashMap::new();
 
-            for publish in &durable {
+            for (publish, channel) in &durable {
                 let addr = publish.channel_address;
-                let (channel, feed_targets) = targets_cache.entry(addr).or_insert_with(|| {
+                let cached = targets_cache.entry(addr).or_insert_with(|| {
                     let name = well_formed_name(addr, ChannelScheme::Brenn).unwrap_or_else(|| {
                         panic!(
-                            "publish_batch_from_surface: bound output {addr:?} of surface \
-                                     {slug:?} is not a well-formed brenn: address — boot resolved \
-                                     it, so this is a broken boot invariant"
+                            "publish_batch_from_attacher: bound output {addr:?} of {route} \
+                                     {slug:?} is not a well-formed brenn: address — the caller \
+                                     admitted it, so this is a broken boot invariant"
                         )
                     });
                     assert!(
                         publish_acl_allows(policy, ChannelScheme::Brenn, name),
-                        "publish_batch_from_surface: surface {slug:?} has no brenn_publish ACL \
+                        "publish_batch_from_attacher: {route} {slug:?} has no brenn_publish ACL \
                              covering bound output {addr:?} — boot validation proves every bound \
                              output is policy-covered, so this is a broken boot invariant"
                     );
-                    let ch = self.directory.resolve(addr).unwrap_or_else(|| {
-                        panic!(
-                            "publish_batch_from_surface: bound output {addr:?} of surface \
+                    let Some(ch) = self.directory.resolve(addr) else {
+                        match posture {
+                            MissingChannelPosture::Race => return None,
+                            MissingChannelPosture::Invariant => panic!(
+                                "publish_batch_from_attacher: bound output {addr:?} of {route} \
                                  {slug:?} is not in the directory — boot validation proves every \
                                  bound output exists, so this is a broken boot invariant"
-                        )
-                    });
-                    let feed =
-                        self.resolve_attach_feed_targets(&ch.address, ch.subscribers.as_slice());
-                    (ch, feed)
+                            ),
+                        }
+                    };
+                    Some(self.resolve_attach_feed_targets(&ch.address, ch.subscribers.as_slice()))
                 });
+                let Some(feed_targets) = cached else {
+                    vanished.push(sanitize_untrusted_str(addr, MAX_LOGGED_UNTRUSTED_BYTES));
+                    continue;
+                };
 
                 // The caller answered the client a violation for an over-cap body
                 // before reaching here (the kernel's own buffer-time gate already
@@ -2028,8 +2062,8 @@ impl Messenger {
                 // oversized row would already be committed with its siblings.
                 if let Err(e) = check_body_size(publish.body, self.defaults.max_body_bytes) {
                     panic!(
-                        "publish_batch_from_surface: entry body is {} bytes over the {} cap for \
-                         surface {slug:?} — the session handler rejects an over-cap entry as a \
+                        "publish_batch_from_attacher: entry body is {} bytes over the {} cap for \
+                         {route} {slug:?} — the session handler rejects an over-cap entry as a \
                          violation before this point, so the two caps disagree",
                         e.len, e.max
                     );
@@ -2054,7 +2088,7 @@ impl Messenger {
                         publish.body,
                         publish.urgency,
                         publish.publish_ts_ns,
-                        None, // no reply_to — not exposed to surfaces
+                        None, // no reply_to — not exposed to attachers
                         Some(release_at),
                         None, // no delivery_deadline
                     );
@@ -2072,7 +2106,7 @@ impl Messenger {
                     publish.body,
                     publish.urgency,
                     publish.publish_ts_ns,
-                    None, // no reply_to — not exposed to surfaces
+                    None, // no reply_to — not exposed to attachers
                     None,
                     None, // no delivery_deadline
                 );
@@ -2104,7 +2138,7 @@ impl Messenger {
                 }
             }
 
-            tx.commit().expect("publish_batch_from_surface: commit tx");
+            tx.commit().expect("publish_batch_from_attacher: commit tx");
         }
 
         // Durable attacher feeds, fanned out after the lock is released.
@@ -2155,17 +2189,35 @@ impl Messenger {
         for (channel, cap) in &refused {
             self.record_dropped_deferred(&sender, channel);
             warn!(
-                surface = %slug,
+                route,
+                attacher = %slug,
                 principal = %sender,
                 channel = %channel,
                 cap,
-                "publish_batch_from_surface: deferred publish dropped — channel deferred set at \
+                "publish_batch_from_attacher: deferred publish dropped — channel deferred set at \
                  its retain_depth cap"
             );
         }
 
+        // A target that went away between admission and application. Warned at
+        // the same volume as a dropped schedule and for the same reason: the
+        // attacher was answered a count it must be able to reconcile against.
+        // The channel was sanitized where it was collected: matcher-granted
+        // addresses are client bytes, and an address that resolved nowhere never
+        // passed a shape gate.
+        for channel in &vanished {
+            warn!(
+                route,
+                attacher = %slug,
+                principal = %sender,
+                channel = %channel,
+                "publish_batch_from_attacher: entry dropped — the target is gone or no longer \
+                 policy-covered"
+            );
+        }
+
         self.dispatch_kick();
-        refused.len()
+        refused.len() + vanished.len()
     }
 }
 

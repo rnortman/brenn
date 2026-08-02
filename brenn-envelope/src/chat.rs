@@ -1,6 +1,6 @@
-//! Chat-over-pubsub payload vocabulary: the JSON bodies carried inside
-//! [`MessageEnvelope::body`](crate::MessageEnvelope) on a conversation's chat
-//! channels.
+//! Chat-over-pubsub: the channel-name grammar of a conversation's channel
+//! family, and the JSON bodies carried inside
+//! [`MessageEnvelope::body`](crate::MessageEnvelope) on those channels.
 //!
 //! This is an **external contract**. Out-of-tree WASM components and non-browser
 //! gateways speak it, so evolution within `v = 1` is additive only: new optional
@@ -13,7 +13,14 @@
 //! file derives every wire tag from the types below and fails when one of them
 //! is missing from that document.
 //!
-//! Three vocabularies, one per direction:
+//! Addresses first: every name in the family is minted by [`chat_bare_name`] or
+//! [`chat_roster_bare_name`] and nothing else, so provisioning, ACL authoring,
+//! the adapter, and an out-of-process peer cannot drift on the shape. The
+//! grammar lives here rather than beside the server's config types because a
+//! peer that composes a conversation address needs it and must not need the
+//! host.
+//!
+//! Then three body vocabularies, one per direction:
 //!
 //! - [`ChatCommand`] — peer → conversation, on the durable `…in.<id>` channel.
 //! - [`ChatEvent`] — conversation → peers, on the durable `…out.<id>` channel;
@@ -21,7 +28,11 @@
 //! - [`ChatStreamEvent`] — conversation → peers, on the ephemeral
 //!   `…stream.<id>` channel; loss-tolerant decoration over the record.
 //!
-//! Every body is a JSON object of the form `{"v": 1, "type": "<variant>", …}`.
+//! …plus [`ChatRoster`], the per-app state snapshot on the `roster` channel,
+//! which is what tells a peer which conversations exist to address at all.
+//!
+//! Every body is a JSON object of the form `{"v": 1, "type": "<variant>", …}`
+//! (the roster carries no `type` — it is one shape, not a vocabulary).
 //! [`encode`] stamps the version; [`decode`] checks it.
 //!
 //! Consumers tolerate the future: [`ChatEvent`] and [`ChatStreamEvent`] both
@@ -34,6 +45,8 @@
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+
+use crate::ChannelScheme;
 
 /// Protocol version stamped on every chat body as the `v` field.
 pub const CHAT_PROTOCOL_VERSION: u32 = 1;
@@ -126,6 +139,170 @@ pub fn decode<T: DeserializeOwned>(body: &str) -> Result<T, ChatDecodeError> {
         return Err(ChatDecodeError::UnsupportedVersion(version));
     }
     serde_json::from_value(value).map_err(|e| ChatDecodeError::Payload(e.to_string()))
+}
+
+// ── Channel addresses ──────────────────────────────────────────────────────
+
+/// Segment separator in a chat channel name.
+pub const CHAT_SEGMENT_SEP: char = '.';
+
+/// Literal second segment of every chat channel name. It reserves root-level
+/// room beside the per-app subtree for future siblings under the prefix, which
+/// would otherwise collide with an app slug.
+pub const CHAT_APP_SEGMENT: &str = "app";
+
+/// Terminal segment of an app's roster channel, in the same position a
+/// [`ChatLeaf`] occupies. It carries no conversation id after it, which is what
+/// keeps it outside every fleet prefix: a fleet grant is
+/// `<prefix>.app.<slug>.<leaf>.` with the trailing separator, and this name ends
+/// where that prefix would continue.
+const CHAT_ROSTER_SEGMENT: &str = "roster";
+
+/// The traffic leaf of a chat channel name — the segment between the owning
+/// app's slug and the conversation id.
+///
+/// The conversation id is the terminal segment because it is the only segment
+/// minted at runtime. That ordering is what lets an exact matcher name one
+/// conversation and a segment-boundary prefix name every conversation of an
+/// app, per leaf, with no wildcard matcher: a grant may cover "may drive every
+/// conversation of this app" without also covering "may forge its record".
+///
+/// The cost is that a conversation owns no single subtree of its own — its
+/// channels are siblings under the per-leaf subtrees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatLeaf {
+    /// Commands from peers to the conversation.
+    In,
+    /// The conversation record: messages, status, errors, telemetry.
+    Out,
+    /// Token batches.
+    Stream,
+    /// Pre-warm signal: bodies are ignored, the message's existence is the
+    /// signal.
+    Wake,
+    /// Tool-call permission flow. **Reserved, unbuilt** — the name is fixed so
+    /// the grammar cannot collide once the flow exists, and so "may chat" and
+    /// "may approve tool calls" are separately grantable today.
+    Approvals,
+}
+
+impl ChatLeaf {
+    /// Every leaf. The single source enumerating callers use, so a new leaf
+    /// cannot be added and silently skipped by a hand-listed set.
+    pub const ALL: [ChatLeaf; 5] = [
+        Self::In,
+        Self::Out,
+        Self::Stream,
+        Self::Wake,
+        Self::Approvals,
+    ];
+
+    /// The leaf's name segment.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::In => "in",
+            Self::Out => "out",
+            Self::Stream => "stream",
+            Self::Wake => "wake",
+            Self::Approvals => "approvals",
+        }
+    }
+
+    /// The address scheme this leaf's traffic rides. Durable where the content
+    /// is the record and must survive restart; ephemeral where loss is
+    /// preferable to a persistence round trip.
+    pub fn scheme(self) -> ChannelScheme {
+        match self {
+            Self::In | Self::Out | Self::Approvals => ChannelScheme::Brenn,
+            Self::Stream | Self::Wake => ChannelScheme::Ephemeral,
+        }
+    }
+}
+
+/// `<prefix>.app.<app_slug>.<leaf>.<conversation_id>` — the sole derivation of a
+/// chat channel name.
+pub fn chat_bare_name(
+    prefix: &str,
+    app_slug: &str,
+    leaf: ChatLeaf,
+    conversation_id: i64,
+) -> String {
+    let leaf = leaf.as_str();
+    format!(
+        "{prefix}{CHAT_SEGMENT_SEP}{CHAT_APP_SEGMENT}{CHAT_SEGMENT_SEP}{app_slug}{CHAT_SEGMENT_SEP}{leaf}{CHAT_SEGMENT_SEP}{conversation_id}"
+    )
+}
+
+/// [`chat_bare_name`] with its leaf's address scheme, e.g.
+/// `brenn:chat.app.<slug>.in.<id>`.
+pub fn chat_address(prefix: &str, app_slug: &str, leaf: ChatLeaf, conversation_id: i64) -> String {
+    format!(
+        "{}{}",
+        leaf.scheme().prefix(),
+        chat_bare_name(prefix, app_slug, leaf, conversation_id)
+    )
+}
+
+/// `<prefix>.app.<app_slug>.` — the segment-boundary prefix covering every chat
+/// channel of one app, across leaves and conversations.
+pub fn chat_app_prefix(prefix: &str, app_slug: &str) -> String {
+    format!(
+        "{prefix}{CHAT_SEGMENT_SEP}{CHAT_APP_SEGMENT}{CHAT_SEGMENT_SEP}{app_slug}{CHAT_SEGMENT_SEP}"
+    )
+}
+
+/// `<prefix>.app.<app_slug>.<leaf>.` — the segment-boundary prefix covering one
+/// leaf of every conversation of one app. The fleet-grain grant: it reaches
+/// every conversation on that leaf and no other leaf.
+pub fn chat_leaf_prefix(prefix: &str, app_slug: &str, leaf: ChatLeaf) -> String {
+    let leaf = leaf.as_str();
+    format!(
+        "{prefix}{CHAT_SEGMENT_SEP}{CHAT_APP_SEGMENT}{CHAT_SEGMENT_SEP}{app_slug}{CHAT_SEGMENT_SEP}{leaf}{CHAT_SEGMENT_SEP}"
+    )
+}
+
+/// `<prefix>.app.<app_slug>.roster` — the app's conversation roster.
+///
+/// One per app, not per conversation: the roster is what a peer reads to learn
+/// which conversation ids exist, so it cannot be addressed by one.
+pub fn chat_roster_bare_name(prefix: &str, app_slug: &str) -> String {
+    format!(
+        "{prefix}{CHAT_SEGMENT_SEP}{CHAT_APP_SEGMENT}{CHAT_SEGMENT_SEP}{app_slug}{CHAT_SEGMENT_SEP}{CHAT_ROSTER_SEGMENT}"
+    )
+}
+
+/// [`chat_roster_bare_name`] as a `brenn:` address. The roster is durable: it is
+/// the state a peer reconciles against after any outage, so it has to survive
+/// one.
+pub fn chat_roster_address(prefix: &str, app_slug: &str) -> String {
+    format!(
+        "{}{}",
+        ChannelScheme::Brenn.prefix(),
+        chat_roster_bare_name(prefix, app_slug)
+    )
+}
+
+/// The body of an app's roster channel: every conversation of that app that
+/// exists right now.
+///
+/// **State, not facts.** Each snapshot subsumes the one before it, so a peer
+/// that was away reconciles against the newest rather than replaying what it
+/// missed, and the channel retains a shallow window. A conversation is
+/// addressable from the moment it appears here; one that has vanished is gone,
+/// and a subscribe to its leaves answers "unavailable" rather than failing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChatRoster {
+    /// The app's conversations, ascending by id — an order that is a function of
+    /// the set alone, so identical state serializes to identical bytes.
+    pub conversations: Vec<RosterConversation>,
+}
+
+/// One conversation in a [`ChatRoster`]. A struct rather than a bare id so
+/// metadata (title, status, last activity) is an additive field later.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RosterConversation {
+    /// The conversation id that terminates each of its channel addresses.
+    pub id: i64,
 }
 
 /// Reference to a file already uploaded out of band, naming it for a
@@ -423,6 +600,123 @@ mod tests {
         let body = encode(&event);
         let parsed: ChatEvent = decode(&body).expect("encoded event decodes");
         assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn names_match_the_pinned_grammar() {
+        assert_eq!(
+            chat_bare_name("chat", "alice", ChatLeaf::In, 42),
+            "chat.app.alice.in.42"
+        );
+        assert_eq!(
+            chat_bare_name("chat", "alice", ChatLeaf::Out, 42),
+            "chat.app.alice.out.42"
+        );
+        assert_eq!(
+            chat_bare_name("chat", "alice", ChatLeaf::Stream, 42),
+            "chat.app.alice.stream.42"
+        );
+        assert_eq!(
+            chat_bare_name("chat", "alice", ChatLeaf::Wake, 42),
+            "chat.app.alice.wake.42"
+        );
+        assert_eq!(
+            chat_bare_name("chat", "alice", ChatLeaf::Approvals, 42),
+            "chat.app.alice.approvals.42"
+        );
+        assert_eq!(
+            chat_bare_name("talk", "alice", ChatLeaf::In, 42),
+            "talk.app.alice.in.42",
+            "the configured prefix roots the tree"
+        );
+    }
+
+    #[test]
+    fn addresses_carry_their_leafs_scheme() {
+        assert_eq!(
+            chat_address("chat", "alice", ChatLeaf::In, 42),
+            "brenn:chat.app.alice.in.42"
+        );
+        assert_eq!(
+            chat_address("chat", "alice", ChatLeaf::Out, 42),
+            "brenn:chat.app.alice.out.42"
+        );
+        assert_eq!(
+            chat_address("chat", "alice", ChatLeaf::Approvals, 42),
+            "brenn:chat.app.alice.approvals.42"
+        );
+        assert_eq!(
+            chat_address("chat", "alice", ChatLeaf::Stream, 42),
+            "ephemeral:chat.app.alice.stream.42"
+        );
+        assert_eq!(
+            chat_address("chat", "alice", ChatLeaf::Wake, 42),
+            "ephemeral:chat.app.alice.wake.42"
+        );
+    }
+
+    #[test]
+    fn the_roster_is_a_durable_per_app_address() {
+        assert_eq!(
+            chat_roster_bare_name("chat", "alice"),
+            "chat.app.alice.roster"
+        );
+        assert_eq!(
+            chat_roster_address("chat", "alice"),
+            "brenn:chat.app.alice.roster"
+        );
+        assert_eq!(
+            chat_roster_bare_name("talk", "alice"),
+            "talk.app.alice.roster"
+        );
+    }
+
+    /// The roster sits in the leaf position, so a leaf that ever spelled itself
+    /// `roster` would collide with it — and the collision would be silent, two
+    /// derivations answering one address.
+    #[test]
+    fn no_leaf_is_named_roster() {
+        for leaf in ChatLeaf::ALL {
+            assert_ne!(leaf.as_str(), CHAT_ROSTER_SEGMENT);
+            assert_ne!(
+                chat_bare_name("chat", "alice", leaf, 42),
+                chat_roster_bare_name("chat", "alice"),
+            );
+        }
+    }
+
+    /// A fleet grant is a prefix that continues past the leaf into the
+    /// conversation id; the roster ends at the leaf position, so no fleet grant
+    /// reaches it. Nothing but the app-wide prefix does.
+    #[test]
+    fn no_fleet_prefix_reaches_the_roster() {
+        let roster = chat_roster_bare_name("chat", "alice");
+        for leaf in ChatLeaf::ALL {
+            let fleet = chat_leaf_prefix("chat", "alice", leaf);
+            assert!(
+                !roster.starts_with(&fleet),
+                "{fleet} must not cover {roster}"
+            );
+        }
+        assert!(roster.starts_with(&chat_app_prefix("chat", "alice")));
+    }
+
+    #[test]
+    fn the_roster_body_is_versioned_and_ordered() {
+        let roster = ChatRoster {
+            conversations: vec![RosterConversation { id: 7 }, RosterConversation { id: 42 }],
+        };
+        assert_eq!(
+            encode(&roster),
+            r#"{"v":1,"conversations":[{"id":7},{"id":42}]}"#
+        );
+        let parsed: ChatRoster = decode(&encode(&roster)).expect("roster decodes");
+        assert_eq!(parsed, roster);
+
+        let empty = ChatRoster {
+            conversations: Vec::new(),
+        };
+        assert_eq!(encode(&empty), r#"{"v":1,"conversations":[]}"#);
     }
 
     #[test]

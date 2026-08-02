@@ -17,8 +17,6 @@
 //! attacher never sees inside it, so the encoding can grow server-side with no
 //! wire change — the opacity is what keeps future cursor state additive.
 
-#![allow(dead_code)]
-
 use brenn_attach_proto::Cursor;
 use brenn_lib::messaging::store::ResumeCursor;
 use serde::{Deserialize, Serialize};

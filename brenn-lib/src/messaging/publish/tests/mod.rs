@@ -11,7 +11,6 @@ mod transport_ingress;
 mod wasm;
 
 use super::*;
-use crate::config::{ChatLeaf, chat_bare_name};
 use crate::db::init_db_memory;
 use crate::messaging::config::{
     Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel, ResolvedMessagingConfig,
@@ -24,6 +23,7 @@ use crate::messaging::{
     ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntry, SubscriberEntryKind, WakeMin,
     WakeRouter, canonical_address,
 };
+use brenn_envelope::chat::{ChatLeaf, chat_bare_name};
 use indexmap::IndexMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 

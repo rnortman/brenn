@@ -114,14 +114,42 @@ pub(crate) async fn spawn_test_server(state: AppState) -> (String, TestServer) {
 
 /// Make an HTTP request with WebSocket upgrade headers to trigger the WS handler.
 /// Returns the response status code.
+///
+/// The cookie-authenticated shorthand over [`ws_upgrade_probe`], which composes
+/// the handshake request. One spelling of that request serves both, so a change
+/// to it cannot leave the two suites probing different things.
 pub(crate) async fn ws_upgrade_status(url: &str, session_token: Option<&str>) -> StatusCode {
+    let cookie = session_token.map(|token| format!("brenn_session={token}"));
+    let extra: Vec<(&str, &str)> = cookie
+        .as_deref()
+        .map(|value| ("cookie", value))
+        .into_iter()
+        .collect();
+    ws_upgrade_probe(url, &extra).await.status
+}
+
+/// Everything a client can observe of a refused WS upgrade, for the routes whose
+/// contract is that two different failures answer *identically*.
+///
+/// `headers` excludes `date` — it moves with the clock, so including it would
+/// make a byte-identity comparison flap — and is sorted so header ordering does
+/// not enter the comparison either.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct UpgradeProbe {
+    pub status: StatusCode,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+/// Send a WS upgrade request carrying arbitrary extra headers and return the
+/// whole observable response. The counterpart of [`ws_upgrade_status`] for
+/// routes that authenticate with something other than the session cookie.
+pub(crate) async fn ws_upgrade_probe(url: &str, extra: &[(&str, &str)]) -> UpgradeProbe {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
-    // Sec-WebSocket-Key must be 16 random bytes, base64-encoded (RFC 6455 §4.1);
-    // generate a fresh one per call rather than pinning a sample value.
     use base64ct::{Base64, Encoding as _};
     let ws_key = Base64::encode_string(&uuid::Uuid::new_v4().into_bytes());
     let mut req = client
@@ -131,10 +159,45 @@ pub(crate) async fn ws_upgrade_status(url: &str, session_token: Option<&str>) ->
         .header("sec-websocket-version", "13")
         .header("sec-websocket-key", ws_key)
         .version(reqwest::Version::HTTP_11);
-    if let Some(token) = session_token {
-        req = req.header("cookie", format!("brenn_session={token}"));
+    for (name, value) in extra {
+        req = req.header(*name, *value);
     }
-    req.send().await.unwrap().status()
+    let response = req.send().await.unwrap();
+    let status = response.status();
+    let mut headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .filter(|(name, _)| name.as_str() != "date")
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    headers.sort();
+    UpgradeProbe {
+        status,
+        headers,
+        body: response.text().await.unwrap(),
+    }
+}
+
+/// Open a real WebSocket against `url` with a bearer token and return the live
+/// stream. The remote route's counterpart of [`surface_ws_open`]; it calls the
+/// same client-side helper the native bearer connector does, so the header shape
+/// under test is the production one.
+pub(crate) async fn remote_ws_open(
+    url: &str,
+    token: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = url.into_client_request().unwrap();
+    brenn_attach_client::insert_bearer_token(req.headers_mut(), token).unwrap();
+    let (ws, _resp) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("WS handshake should succeed (HTTP 101) for this test");
+    ws
 }
 
 /// Convert an `http://` base URL to a `ws://` URL with the given path.
