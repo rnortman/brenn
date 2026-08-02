@@ -52,7 +52,11 @@ pub(crate) fn doc() -> Document {
 /// Remove any existing `#surface-root` and append a fresh empty one to `body`,
 /// returning it. Root-delegated listeners die with the removed element, so each
 /// test gets a clean listener/DOM slate.
+///
+/// The per-instance telemetry counters are cleared with it — see
+/// [`crate::dom::forget_instance_counters`].
 pub(crate) fn fresh_root() -> Element {
+    crate::dom::forget_instance_counters();
     let d = doc();
     if let Some(existing) = d.get_element_by_id(SURFACE_ROOT_ID) {
         existing.remove();

@@ -33,22 +33,32 @@
 //!   [`create_input`], [`create_element`], [`create_text_node`], [`append`],
 //!   [`append_node`]), the
 //!   page-lifetime [`add_listener`], the untrusted-detail readers
-//!   ([`string_field`], [`number_field`]), [`detail_object`], the conformant
-//!   [`publish`] and [`component_log`] dispatches, and the
-//!   [`set_timeout`]/[`clear_timeout`] scheduling helpers.
-//! - [`clamp_timeout_ms`] — DOM-free `setTimeout`-delay clamping, host-testable
-//!   and shared by every component state machine (ungated, no wasm dependency).
+//!   ([`string_field`], [`number_field`]), [`detail_object`], and the conformant
+//!   [`component_log`] dispatch.
+//! - [`wire_gesture`] — mount-time wiring from a browser event to a sync-call
+//!   activation of this instance: the author supplies only the encoder from the
+//!   event to a request body, and the reply decides whether the browser's
+//!   default action is suppressed. The whole gesture feature's public surface,
+//!   with [`gesture_reply`] as the entry's half of the dialect.
+//! - [`repark_tick`] — the deferred-self-publish tick idiom in one call: cancel
+//!   the standing tick on an in/out port and park the next one, both on the
+//!   activation's buffer. Every wall-clock-driven component wants the same thirty
+//!   lines, so they live here once.
+//! - [`publish_or_fault`] — a buffered publish that keeps the two halves of the
+//!   publish-refusal vocabulary apart: a transient quota is logged and answered,
+//!   a permanent refusal kills the instance where it happened.
 //! - [`fault`] — DOM-free port-delivery validation ([`parse_delivery`],
 //!   [`ContractViolation`]) and the shared [`FaultReport`] operator log line,
 //!   host-testable and identical across components.
-//! - [`PersistentTimer`] — a wasm `setTimeout` closure that reschedules/cancels
-//!   without ever being recreated, owning the memory-safety invariant every
-//!   component's recompute loop depends on.
+//!
+//! What it deliberately does **not** provide is a timer. A component's periodic
+//! wakeup is a deferred self-publish on an in/out port ([`repark_tick`]), so there
+//! is no `setTimeout` wrapper here to schedule work outside an activation with.
 
 mod fault;
-mod timeout;
+mod gesture;
 pub use fault::{ContractViolation, FaultReport, parse_delivery};
-pub use timeout::clamp_timeout_ms;
+pub use gesture::gesture_reply;
 
 // The activation vocabulary a component's handler is written against, re-exported
 // from the contract for the same reason the helpers exist at all: an author on
@@ -60,22 +70,18 @@ pub use brenn_surface_contract::{
     Activation, ActivationError, DeferError, DeferredEntry, DeferredWindow, PortWindow,
 };
 
-/// The recommended maximum `setTimeout` delay for a wall-clock-driven component:
-/// recompute at least every ~15 minutes so a wall-clock jump (suspend/resume,
-/// NTP, DST) self-corrects within one interval. Pass as `clamp_timeout_ms`'s
-/// `max_ms` for a component that reads the clock on each fire.
-pub const MAX_WAKEUP_MS: i32 = 15 * 60 * 1000;
-
 #[cfg(target_arch = "wasm32")]
 pub use wasm::*;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
+    use crate::gesture::reply_cancels;
     use brenn_surface_contract::{
-        ACTIVATION_REGISTER, Activation, ActivationError, COMPONENT_LOG, COMPONENT_PANIC,
-        DEFER_OP_CANCEL, DEFER_OP_EDIT, DEFER_OP_PUBLISH, DEFER_STATUS_FIELD, DeferError,
-        PORT_DEFER, PORT_PUBLISH, PUBLISH_STATUS_FIELD, PublishError, element_name_for_instance,
-        parse_defer_status, parse_publish_status,
+        ACTIVATION_REGISTER, ACTIVATION_SYNC, Activation, ActivationError, COMPONENT_LOG,
+        COMPONENT_PANIC, DEFER_OP_CANCEL, DEFER_OP_EDIT, DEFER_OP_PUBLISH, DEFER_STATUS_FIELD,
+        DeferError, ENTRY_REPLY_FIELD, PORT_DEFER, PORT_PUBLISH, PUBLISH_STATUS_FIELD,
+        PublishError, SYNC_ERROR_FIELD, SYNC_REPLY_FIELD, SYNC_STATUS_FIELD, SyncStatus,
+        element_name_for_instance, parse_defer_status, parse_publish_status, parse_sync_status,
     };
     use brenn_surface_schema::LogLevel;
     use brenn_surface_schema::Urgency;
@@ -115,86 +121,6 @@ mod wasm {
             .performance()
             .expect("window exposes performance");
         performance.now().max(0.0) as u64
-    }
-
-    /// A single page-lifetime `setTimeout` closure that reschedules or cancels
-    /// without ever being recreated.
-    ///
-    /// The fire `Closure` is created once, at construction, and lives inside the
-    /// timer for the page. It is *never* dropped and rebuilt while a timeout is
-    /// pending — doing so would free the closure environment out from under a
-    /// callback the browser is about to (or is) invoking, a use-after-free the
-    /// compiler cannot catch. A component builds one timer (typically wrapped in
-    /// an `Rc` so its recompute closure can hold it), calls [`set_callback`] once
-    /// with that closure, and then only [`reschedule`]/[`cancel`] on each tick.
-    ///
-    /// [`set_callback`]: PersistentTimer::set_callback
-    /// [`reschedule`]: PersistentTimer::reschedule
-    /// [`cancel`]: PersistentTimer::cancel
-    /// The late-bound recompute callback a [`PersistentTimer`] fires, shared
-    /// between the timer's fire closure and its owner.
-    type CallbackSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
-
-    pub struct PersistentTimer {
-        /// The pending timeout's handle, so a new schedule cancels the old.
-        handle: RefCell<Option<i32>>,
-        /// Late-bound recompute callback the fire closure invokes.
-        callback: CallbackSlot,
-        /// The page-lifetime fire closure, held so the pending timeout's callback
-        /// stays alive; rescheduled by shared reference, never recreated.
-        fire: Closure<dyn Fn()>,
-    }
-
-    impl Default for PersistentTimer {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl PersistentTimer {
-        /// Build a timer with its fire closure. The callback is unset until
-        /// [`set_callback`](PersistentTimer::set_callback); a fire before then is
-        /// a no-op.
-        pub fn new() -> Self {
-            let callback: CallbackSlot = Rc::new(RefCell::new(None));
-            let fire = {
-                let callback = Rc::clone(&callback);
-                Closure::new(move || {
-                    // Clone the callback Rc out and drop the borrow before invoking
-                    // it: the callback typically reschedules this same timer, which
-                    // must be free to borrow the timer's cells.
-                    let cb = callback.borrow().as_ref().map(Rc::clone);
-                    if let Some(cb) = cb {
-                        cb();
-                    }
-                })
-            };
-            PersistentTimer {
-                handle: RefCell::new(None),
-                callback,
-                fire,
-            }
-        }
-
-        /// Set the callback the timer fires. Call once, after the callback (which
-        /// typically captures the timer) has been built.
-        pub fn set_callback(&self, callback: Rc<dyn Fn()>) {
-            *self.callback.borrow_mut() = Some(callback);
-        }
-
-        /// Cancel any pending fire, then schedule one `delay_ms` from now. The
-        /// same fire closure is reused, never recreated.
-        pub fn reschedule(&self, delay_ms: i32) {
-            self.cancel();
-            *self.handle.borrow_mut() = Some(set_timeout(&self.fire, delay_ms));
-        }
-
-        /// Cancel any pending fire. A no-op when nothing is scheduled.
-        pub fn cancel(&self) {
-            if let Some(handle) = self.handle.borrow_mut().take() {
-                clear_timeout(handle);
-            }
-        }
     }
 
     // The custom-element class shim, per the contract's recommended module shape:
@@ -354,10 +280,13 @@ export function define_component(tag, connected) {\n\
         ///
         /// The transport is the ordinary [`PORT_PUBLISH`] event: the kernel routes
         /// it to this activation's buffer because this instance is the one whose
-        /// entry is on the stack. A missing status means the kernel took the
-        /// gesture path for it — structurally impossible from inside an entry, so
-        /// it is a kernel/SDK contract break and panics rather than being guessed
-        /// at as an ok.
+        /// entry is on the stack. A missing status means the event reached no
+        /// kernel listener at all — a broken page rather than an outcome, since a
+        /// kernel that heard the publish always answers — so it panics rather than
+        /// being guessed at as an ok.
+        ///
+        /// [`PublishError::NotPermitted`] is an answer, not a fault: it is what
+        /// the buffer says about a port this instance does not have as an output.
         fn publish_dispatch(
             &mut self,
             port: &str,
@@ -373,8 +302,8 @@ export function define_component(tag, connected) {\n\
             match status.as_deref().and_then(parse_publish_status) {
                 Some(status) => status,
                 None => panic!(
-                    "component-support: no publish status on a buffered publish of port {port:?} \
-                     — the kernel did not route it into this activation's buffer"
+                    "component-support: no publish status on a publish of port {port:?} — no \
+                     kernel listener heard it"
                 ),
             }
         }
@@ -521,8 +450,9 @@ export function define_component(tag, connected) {\n\
     }
 
     /// The activation entry as it crosses the wasm-module boundary: a JS function
-    /// taking the activation JSON and returning `undefined` (ok) or an error
-    /// string (err); a panic throws, which the kernel reads as a trap.
+    /// taking the activation JSON and returning `undefined` (ok), a
+    /// `{ reply }` object (ok, answering a sync activation), or an error string
+    /// (err); a panic throws, which the kernel reads as a trap.
     type EntryFn = Closure<dyn FnMut(JsValue) -> JsValue>;
 
     /// Register the component's custom element (tag from
@@ -541,6 +471,12 @@ export function define_component(tag, connected) {\n\
     /// failure, leaving the instance running; a panic is a trap and terminal for
     /// this instance alone.
     ///
+    /// Its `Ok` carries the reply: `Ok(None)` for an ordinary completion, and
+    /// `Ok(Some(reply))` to answer the sync port named by the activation's `sync`
+    /// field. Answering an activation that asked nothing is a contract break the
+    /// kernel reads as a trap, so a component that replies must first look at
+    /// `sync` — or simply be a gesture entry, which knows why it was called.
+    ///
     /// The entry is handed to the kernel by dispatching [`ACTIVATION_REGISTER`]
     /// from the element's first `connectedCallback` — once per instance, which is
     /// why the registration rides the same one-time claim as the UI build. The
@@ -555,7 +491,11 @@ export function define_component(tag, connected) {\n\
     pub fn register_component(
         kind: &'static str,
         on_connected: impl Fn(HtmlElement) + 'static,
-        on_activation: impl FnMut(&Activation, &mut Publisher) -> Result<(), ActivationError> + 'static,
+        on_activation: impl FnMut(
+            &Activation,
+            &mut Publisher,
+        ) -> Result<Option<String>, ActivationError>
+        + 'static,
     ) {
         // The tag is this instance's, derived from the loader's bind: one module
         // record, one instance, one element definition.
@@ -590,13 +530,14 @@ export function define_component(tag, connected) {\n\
     ///
     /// The wrapper is the whole call convention in one place: decode the
     /// activation JSON, build the instance's [`Publisher`], call the handler, and
-    /// turn its answer into what the kernel reads — `undefined` for ok, the
-    /// message string for err. It never catches a panic: a trap must reach the
-    /// kernel as a thrown exception, and swallowing one here would turn a poisoned
-    /// memory into a component that keeps being delivered.
+    /// turn its answer into what the kernel reads — `undefined` for ok with no
+    /// reply, a `{ reply }` object for ok with one, the message string for err. It
+    /// never catches a panic: a trap must reach the kernel as a thrown exception,
+    /// and swallowing one here would turn a poisoned memory into a component that
+    /// keeps being delivered.
     fn register_activation_entry<F>(host: &HtmlElement, on_activation: Rc<RefCell<F>>)
     where
-        F: FnMut(&Activation, &mut Publisher) -> Result<(), ActivationError> + 'static,
+        F: FnMut(&Activation, &mut Publisher) -> Result<Option<String>, ActivationError> + 'static,
     {
         let entry: EntryFn = {
             let host = host.clone();
@@ -611,7 +552,10 @@ export function define_component(tag, connected) {\n\
                     .expect("the kernel's activation JSON decodes to the contract Activation");
                 let mut publisher = Publisher { host: host.clone() };
                 match on_activation.borrow_mut()(&activation, &mut publisher) {
-                    Ok(()) => JsValue::UNDEFINED,
+                    Ok(None) => JsValue::UNDEFINED,
+                    Ok(Some(reply)) => {
+                        detail_object(&[(ENTRY_REPLY_FIELD, JsValue::from_str(&reply))]).into()
+                    }
                     Err(err) => JsValue::from_str(&err.message),
                 }
             })
@@ -622,6 +566,259 @@ export function define_component(tag, connected) {\n\
         // The kernel holds the entry for the instance's life; nothing here can
         // outlive it, so there is nothing to drop.
         entry.forget();
+    }
+
+    /// Wire a browser event on `target` to a sync-call activation of this
+    /// instance, on the sync port `port`.
+    ///
+    /// This is how a component acts on a gesture. It installs a page-lifetime
+    /// listener that, on each event, calls `encode` for the request body, asks the
+    /// kernel for an activation carrying it, and suppresses the browser's default
+    /// action if the entry's reply says to.
+    ///
+    /// Call it once per (target, event) pair, on a target that lives as long as
+    /// the page — normally at mount time, from `on_connected`. The listener's
+    /// closure is never reclaimed, so wiring an element that comes and goes leaks
+    /// one closure per element: for dynamic content, wire the container that holds
+    /// it once and have `encode` name the row the event came from.
+    ///
+    /// **The whole handler runs inside the browser's dispatch of the event**: the
+    /// activation is assembled, the entry runs with its full worldview and a
+    /// buffered [`Publisher`], and its publishes flush — all before the listener
+    /// returns. That is what keeps the browser's user-activation token live for the
+    /// entry, and what lets the `preventDefault()` below still take effect.
+    ///
+    /// `encode` owns the payload: the kernel never looks inside a shadow root, so
+    /// whatever the entry needs to know about the event — a target id, an input's
+    /// value, a modifier key — must be read here and encoded into the body. It runs
+    /// on the browser's stack with no activation of its own, so it may read the DOM
+    /// and nothing else: publishing and scheduling exist only inside the entry.
+    ///
+    /// The reply is the [`crate::gesture_reply`] dialect. An entry that answers
+    /// `Ok(None)` — the common case for an ack or a dismiss — lets the default
+    /// action proceed.
+    ///
+    /// Panics if the kernel refuses the request or the instance is already
+    /// terminal, and if the entry replies outside the dialect: each is a bug in
+    /// this component or the kernel, never a state to carry on from.
+    pub fn wire_gesture(
+        host: &HtmlElement,
+        target: &EventTarget,
+        event: &str,
+        port: &str,
+        encode: impl Fn(&Event) -> String + 'static,
+    ) {
+        let host = host.clone();
+        let port = port.to_string();
+        add_listener(target, event, move |event: Event| {
+            let body = encode(&event);
+            // An err is the entry's own considered no: it already reported and the
+            // kernel already counted it, so the wiring's part is simply to leave the
+            // browser's default action alone.
+            let Ok(reply) = request_sync_activation(&host, &port, &body) else {
+                return;
+            };
+            if gesture_cancels(&port, reply.as_deref()) {
+                event.prevent_default();
+            }
+        });
+    }
+
+    /// Read a gesture reply as the wiring must: cancel, do not cancel, or fault.
+    ///
+    /// A reply the wiring cannot parse means a component's entry and its own
+    /// wiring speak different dialects. There is no safe reading of an
+    /// unparseable cancel decision — taking it for a `false` would leave a gesture
+    /// that silently stopped suppressing the browser's default — so it panics.
+    fn gesture_cancels(port: &str, reply: Option<&str>) -> bool {
+        match reply_cancels(reply) {
+            Ok(cancel) => cancel,
+            Err(reason) => panic!(
+                "component-support: the entry's reply to sync port {port:?} is not the gesture \
+                 dialect ({reason}) — the two halves of this component disagree"
+            ),
+        }
+    }
+
+    /// Ask the kernel for a sync-call activation of this instance on `port`,
+    /// carrying `body`, and return what its entry answered.
+    ///
+    /// The request is the [`ACTIVATION_SYNC`] event, dispatched on the host
+    /// element; the kernel resolves which instance from the element and writes the
+    /// answer onto the same detail before the dispatch returns, so the whole
+    /// activation has already happened by the time this returns.
+    ///
+    /// Only two of the four statuses are answers a caller can act on. `ok` yields
+    /// the entry's reply, if it gave one; `err` yields the entry's own account,
+    /// informational — the entry saw its own error first and the kernel already
+    /// counted the failed activation. The rest **panic**:
+    ///
+    /// - `refused` — the kernel would not admit the request: it arrived from inside
+    ///   an activation, or before registration completed, or named a port that
+    ///   collides with a bound input. Every one is a bug in this component or the
+    ///   kernel, and carrying on would leave a gesture silently doing nothing.
+    /// - `trap` — the instance is already terminal. The closure survives the
+    ///   dispatch because the wasm instance is not torn down mid-stack; the panic is
+    ///   how it stops running as if alive. The kernel treats a panic report from an
+    ///   already-failed instance as idempotent, so this costs one death, not two.
+    /// - no status at all — the event never reached the kernel's listener. A broken
+    ///   page, not an outcome.
+    ///
+    /// Private: the only caller is the listener [`wire_gesture`] installs. The
+    /// sync class exists for the same-task reply a gesture needs, and nothing else
+    /// needs it.
+    fn request_sync_activation(
+        host: &HtmlElement,
+        port: &str,
+        body: &str,
+    ) -> Result<Option<String>, ActivationError> {
+        let detail = detail_object(&[
+            ("port", JsValue::from_str(port)),
+            ("body", JsValue::from_str(body)),
+        ]);
+        dispatch_conformant(host, ACTIVATION_SYNC, &detail)
+            .expect("dispatch brenn-activation-sync on the host element");
+        let status = detail_string(&detail, SYNC_STATUS_FIELD);
+        match status.as_deref().and_then(parse_sync_status) {
+            Some(SyncStatus::Ok) => Ok(detail_string(&detail, SYNC_REPLY_FIELD)),
+            Some(SyncStatus::Err) => Err(ActivationError {
+                message: detail_string(&detail, SYNC_ERROR_FIELD)
+                    .unwrap_or_else(|| "the entry gave no account".to_string()),
+            }),
+            Some(SyncStatus::Trap) => panic!(
+                "component-support: this instance is terminal — the kernel trapped the sync \
+                 activation on port {port:?}"
+            ),
+            Some(SyncStatus::Refused) => panic!(
+                "component-support: the kernel refused a sync activation on port {port:?} — the \
+                 request was re-entrant, premature, or named an unusable port"
+            ),
+            None => panic!(
+                "component-support: {status:?} is not a sync status — the kernel did not answer \
+                 the request on port {port:?}"
+            ),
+        }
+    }
+
+    /// Buffer a publish of `body` on `port`, splitting the refusal vocabulary the
+    /// way [`repark_tick`] does: an exhausted quota is logged and survivable,
+    /// anything else is fatal. Answers whether the publish reached the buffer, so a
+    /// caller whose own state tracks what it sent advances that state only on
+    /// `true`.
+    ///
+    /// The split is the point. [`PublishError`] is three unrelated conditions
+    /// behind one enum, and treating them alike turns a permanent deployment fault
+    /// into a page that renders normally while saying nothing on the bus — a state
+    /// whose only trace is one log line per occurrence.
+    ///
+    /// # Panics
+    ///
+    /// On [`PublishError::NotPermitted`] — the component named a port its config
+    /// does not give it, which nothing validates at boot, so the first publish is
+    /// the first detection and no later activation repairs it — and on
+    /// [`PublishError::InvalidPayload`], a component that built a body over the
+    /// surface's cap. [`PublishError::QuotaExceeded`] is the one a conforming
+    /// deployment produces transiently, since buckets refill per activation: it is
+    /// logged against `host` and answered `false`.
+    pub fn publish_or_fault(
+        publisher: &mut Publisher,
+        host: &HtmlElement,
+        port: &str,
+        body: &str,
+    ) -> bool {
+        match publisher.publish(port, body) {
+            Ok(()) => true,
+            Err(PublishError::QuotaExceeded) => {
+                component_log(
+                    host,
+                    LogLevel::Error,
+                    &format!("publish on {port:?} refused: quota exceeded"),
+                );
+                false
+            }
+            Err(err) => {
+                panic!("component-support: the publish on {port:?} was refused: {err:?}")
+            }
+        }
+    }
+
+    /// Move this component's standing tick on `port` to `release_at`, cancelling
+    /// whatever `activation` was shown parked there.
+    ///
+    /// The deferred self-publish is how a surface component gets a wall-clock
+    /// wake: it parks a message to itself on an in/out port, and the release
+    /// arrives as an ordinary async activation. Every recompute re-parks — the next
+    /// boundary, the next expiry — so the standing tick is cancelled and replaced
+    /// rather than edited: it is this component's own and always replaceable, and
+    /// both ops ride the activation's buffer, so the pair commits or is discarded
+    /// together and an entry that errs schedules nothing.
+    ///
+    /// `release_at` is `None` for a component with no next wake — a clock in a
+    /// fixed mode, a bar whose live slots never expire — which cancels and parks
+    /// nothing. The parked body is empty: the wake *is* the message, and a tick
+    /// handler recomputes from the activation's own clock.
+    ///
+    /// Call it from inside `on_activation`, where the buffered [`Publisher`] lives.
+    ///
+    /// # Panics
+    ///
+    /// On any refusal but an exhausted quota. A ticker that fails to re-park stops
+    /// ticking, and for every reason but the quota it stops *forever*: the port is
+    /// not a bound output of this instance (the surface config is missing the
+    /// component's `[[surface.io_port]]` declaration — nothing validates that
+    /// pairing at boot, so the first park is the first detection), or the index is
+    /// not one this activation's own window carried, or the release instant is not
+    /// representable. Each is a deployment or a component fault that no later
+    /// activation repairs, and a logged line on a page that then silently stops
+    /// tracking the clock is the failure hidden rather than reported. A quota is
+    /// the one refusal a conforming deployment produces transiently — buckets
+    /// refill per activation — so it is logged and the entry carries on.
+    pub fn repark_tick(
+        activation: &Activation,
+        publisher: &mut Publisher,
+        host: &HtmlElement,
+        port: &str,
+        release_at: Option<u64>,
+    ) {
+        for window in &activation.deferred {
+            if window.port != port {
+                continue;
+            }
+            for entry in &window.entries {
+                match publisher.defer_cancel(port, entry.index) {
+                    Ok(()) => {}
+                    Err(DeferError::QuotaExceeded) => component_log(
+                        host,
+                        LogLevel::Error,
+                        &format!("stale tick on {port:?} could not be cancelled: quota exceeded"),
+                    ),
+                    Err(err) => panic!(
+                        "component-support: the tick on {port:?} could not be cancelled: {err:?}"
+                    ),
+                }
+            }
+        }
+        let Some(deliver_after) = release_at else {
+            return;
+        };
+        match publisher.publish_deferred(port, "{}", deliver_after) {
+            Ok(()) => {}
+            Err(PublishError::QuotaExceeded) => component_log(
+                host,
+                LogLevel::Error,
+                &format!("tick on {port:?} could not be scheduled: quota exceeded"),
+            ),
+            Err(err) => {
+                panic!("component-support: the tick on {port:?} could not be scheduled: {err:?}")
+            }
+        }
+    }
+
+    /// Read a string field off a detail object the kernel wrote its answer onto.
+    fn detail_string(detail: &Object, key: &str) -> Option<String> {
+        Reflect::get(detail, &JsValue::from_str(key))
+            .ok()
+            .and_then(|value| value.as_string())
     }
 
     /// Claim the one-time init for a host element, keyed on the component `kind`.
@@ -780,51 +977,10 @@ export function define_component(tag, connected) {\n\
         Ok(())
     }
 
-    /// Dispatch a conformant [`PORT_PUBLISH`] on the host element with
-    /// `detail = { port, body }`, carrying no urgency: the port's configured
-    /// default applies. A dispatch failure is a structural bug on the publish
-    /// path (a live host cannot refuse a well-formed event), so it panics.
-    pub fn publish(host: &HtmlElement, port: &str, body: &str) {
-        dispatch_publish(host, port, body, None);
-    }
-
-    /// Dispatch a conformant [`PORT_PUBLISH`] with an explicit per-message
-    /// urgency, overriding the port's configured default for this one message:
-    /// `detail = { port, body, urgency }`.
-    ///
-    /// The counterpart of the backend guest's `publish-with-urgency` — same
-    /// override-else-configured-default rule, so a component's publish semantics
-    /// do not change with its hosting. `urgency` is a typed [`Urgency`], so an
-    /// unrepresentable level cannot compile; the shell drops an unknown wire
-    /// value, which only a non-conforming (non-SDK) caller can produce.
-    pub fn publish_with_urgency(host: &HtmlElement, port: &str, body: &str, urgency: Urgency) {
-        dispatch_publish(host, port, body, Some(urgency));
-    }
-
-    /// The dispatch the two **gesture** publish entry points share.
-    ///
-    /// Immediate and unanswered, because a browser event handler runs with no
-    /// activation in flight — there is no boundary to attach a flush rule to.
-    /// That is the one residual asymmetry in the delivery model, and it is a
-    /// named, bounded gap: the sync follow-on turns the input event into a
-    /// sync-call activation with a real flush-on-ok, and no code here may be
-    /// shaped in a way that assumes immediate gesture publish is permanent.
-    ///
-    /// Inside an activation entry, this is not the path: [`Publisher`] is, and
-    /// its publishes are buffered and answered.
-    fn dispatch_publish(host: &HtmlElement, port: &str, body: &str, urgency: Option<Urgency>) {
-        dispatch_conformant(host, PORT_PUBLISH, &publish_detail(port, body, urgency))
-            .expect("dispatch brenn-port-publish on the host element");
-    }
-
-    /// The [`PORT_PUBLISH`] detail both publish paths build. `urgency: None` omits
+    /// The [`PORT_PUBLISH`] detail a [`Publisher`] builds. `urgency: None` omits
     /// the field entirely rather than sending `"normal"` — the contract's
     /// absent-means-the-port's-default rule is what lets an operator retune a port
     /// without touching the component.
-    ///
-    /// Shared by the gesture path above and [`Publisher`], so the two cannot drift
-    /// into two dialects of one event: the buffered-vs-gesture split is the
-    /// kernel's routing decision, never a difference in what the component says.
     fn publish_detail(port: &str, body: &str, urgency: Option<Urgency>) -> Object {
         let mut fields = vec![
             ("port", JsValue::from_str(port)),
@@ -856,27 +1012,6 @@ export function define_component(tag, connected) {\n\
                 "component-support: brenn-log dispatch failed",
             ));
         }
-    }
-
-    /// Schedule `callback` to fire once after `delay_ms` milliseconds, returning
-    /// the timeout handle for [`clear_timeout`]. The caller owns `callback`'s
-    /// lifetime — it must outlive the pending timeout.
-    pub fn set_timeout(callback: &Closure<dyn Fn()>, delay_ms: i32) -> i32 {
-        web_sys::window()
-            .expect("a component runs in a browser with a window")
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                callback.as_ref().unchecked_ref(),
-                delay_ms,
-            )
-            .expect("schedule a timeout")
-    }
-
-    /// Cancel a pending timeout by its [`set_timeout`] handle. A handle that has
-    /// already fired or been cleared is a no-op per the DOM spec.
-    pub fn clear_timeout(handle: i32) {
-        web_sys::window()
-            .expect("a component runs in a browser with a window")
-            .clear_timeout_with_handle(handle);
     }
 
     /// The module panic hook body: log the panic and best-effort dispatch
@@ -974,7 +1109,7 @@ export function define_component(tag, connected) {\n\
                     move |host| {
                         *seen.borrow_mut() = Some(host);
                     },
-                    |_a, _p| Ok(()),
+                    |_a, _p| Ok(None),
                 );
             }
 
@@ -999,12 +1134,12 @@ export function define_component(tag, connected) {\n\
         fn second_registration_of_same_kind_panics() {
             ensure_bound();
             let kind = "wbt-cs-collide";
-            register_component(kind, |_host| {}, |_a, _p| Ok(()));
+            register_component(kind, |_host| {}, |_a, _p| Ok(None));
             // Second registration of the same instance's kind squats an
             // already-defined tag — fail loud. Holds no thread-local borrow at
             // panic time, so the wasm trap poisons nothing for later tests in this
             // binary.
-            register_component(kind, |_host| {}, |_a, _p| Ok(()));
+            register_component(kind, |_host| {}, |_a, _p| Ok(None));
         }
 
         #[wasm_bindgen_test]
@@ -1030,7 +1165,7 @@ export function define_component(tag, connected) {\n\
                     move |host| {
                         *seen.borrow_mut() = Some(host);
                     },
-                    |_a, _p| Ok(()),
+                    |_a, _p| Ok(None),
                 );
             }
             let doc = document();
@@ -1043,34 +1178,6 @@ export function define_component(tag, connected) {\n\
                 .expect("append the element into the connected document");
             let host = seen.borrow();
             host.as_ref().expect("host upgraded on insertion").clone()
-        }
-
-        /// Catch the next `brenn-port-publish` bubbling to `body` and return its
-        /// `detail`. Listening at `body` rather than on the host is deliberate: it
-        /// only sees the event if the SDK really set `bubbles`, which is what the
-        /// shell's root-delegated listener depends on.
-        fn catch_publish_detail(dispatch: impl FnOnce()) -> JsValue {
-            let caught: Rc<RefCell<Option<JsValue>>> = Rc::new(RefCell::new(None));
-            let closure = {
-                let caught = Rc::clone(&caught);
-                Closure::<dyn Fn(Event)>::new(move |event: Event| {
-                    let ce = event
-                        .dyn_into::<CustomEvent>()
-                        .expect("the SDK dispatches a CustomEvent");
-                    *caught.borrow_mut() = Some(ce.detail());
-                })
-            };
-            let body = document().body().expect("test page has a body");
-            body.add_event_listener_with_callback(PORT_PUBLISH, closure.as_ref().unchecked_ref())
-                .expect("listen for the publish event");
-            dispatch();
-            body.remove_event_listener_with_callback(
-                PORT_PUBLISH,
-                closure.as_ref().unchecked_ref(),
-            )
-            .expect("unlisten");
-            let detail = caught.borrow().clone();
-            detail.expect("the publish event reached the body listener")
         }
 
         fn detail_field(detail: &JsValue, key: &str) -> JsValue {
@@ -1097,7 +1204,10 @@ export function define_component(tag, connected) {\n\
         /// reach a kernel that is not listening on the host itself.
         fn registered_entry(
             kind: &'static str,
-            on_activation: impl FnMut(&Activation, &mut Publisher) -> Result<(), ActivationError>
+            on_activation: impl FnMut(
+                &Activation,
+                &mut Publisher,
+            ) -> Result<Option<String>, ActivationError>
             + 'static,
         ) -> js_sys::Function {
             ensure_bound();
@@ -1156,6 +1266,7 @@ export function define_component(tag, connected) {\n\
                 }],
                 deferred: vec![],
                 now: None,
+                sync: None,
             })
             .expect("the fixture activation serializes")
         }
@@ -1178,7 +1289,7 @@ export function define_component(tag, connected) {\n\
                             window.dropped,
                         ));
                     }
-                    Ok(())
+                    Ok(None)
                 })
             };
             call_entry(&entry, &activation_json()).expect("an ok entry does not throw");
@@ -1196,7 +1307,7 @@ export function define_component(tag, connected) {\n\
             // keep running), a throw is a trap (discard, terminal). Collapsing any
             // two would flush a failed activation's publishes or kill an instance
             // that merely said no.
-            let ok = registered_entry("wbt-cs-act-ok", |_a, _p| Ok(()));
+            let ok = registered_entry("wbt-cs-act-ok", |_a, _p| Ok(None));
             assert!(
                 call_entry(&ok, &activation_json())
                     .expect("ok does not throw")
@@ -1224,6 +1335,223 @@ export function define_component(tag, connected) {\n\
                 "a panic crosses the boundary as a thrown exception — the kernel's \
                  only way to tell a trap from an err"
             );
+        }
+
+        // ── the sync seam ─────────────────────────────────────────────────
+
+        /// The same activation, sync-caused on port `ack` — the shape an entry is
+        /// allowed to answer.
+        fn sync_activation_json() -> String {
+            let mut activation: Activation =
+                serde_json::from_str(&activation_json()).expect("the fixture round-trips");
+            activation.sync = Some("ack".to_string());
+            serde_json::to_string(&activation).expect("the fixture activation serializes")
+        }
+
+        #[wasm_bindgen_test]
+        fn a_sync_reply_leaves_the_entry_as_the_object_the_kernel_reads() {
+            // The fourth return shape, and the SDK's only way to answer a gesture.
+            // The kernel reads `reply` off a returned object; returning the string
+            // bare would be an err, and returning it under any other key would be a
+            // trap — so the key is the contract and nothing else pins it here.
+            let entry = registered_entry("wbt-cs-act-reply", |activation, _p| {
+                assert_eq!(activation.sync.as_deref(), Some("ack"));
+                Ok(crate::gesture_reply(true))
+            });
+            let returned = call_entry(&entry, &sync_activation_json()).expect("ok does not throw");
+            assert_eq!(
+                detail_field(&returned, ENTRY_REPLY_FIELD)
+                    .as_string()
+                    .as_deref(),
+                Some(r#"{"cancel":true}"#),
+                "the reply crosses as a string under the contract's key"
+            );
+        }
+
+        /// One sync request as the kernel-playing listener saw it: (port, body).
+        type SeenSync = (String, String);
+
+        /// Play the kernel for one test's sync `port`: record each request and write
+        /// `status` (plus `reply`, when given) onto the detail before the dispatch
+        /// returns, which is the whole seam.
+        ///
+        /// Filtered on the port because these listeners live on `body` and a test
+        /// that panics by design never reaches the unlisten. A leaked listener then
+        /// sees another test's port and stays inert, rather than answering a request
+        /// its test meant to go unanswered.
+        fn with_sync_kernel(
+            port: &'static str,
+            status: &'static str,
+            reply: Option<&'static str>,
+            act: impl FnOnce(),
+        ) -> Vec<SeenSync> {
+            let seen: Recorder<SeenSync> = Rc::new(RefCell::new(Vec::new()));
+            let closure = {
+                let seen = Rc::clone(&seen);
+                Closure::<dyn Fn(Event)>::new(move |event: Event| {
+                    let ce = event.dyn_into::<CustomEvent>().expect("a CustomEvent");
+                    let detail = ce.detail();
+                    let requested = detail_field(&detail, "port")
+                        .as_string()
+                        .unwrap_or_default();
+                    if requested != port {
+                        return;
+                    }
+                    seen.borrow_mut().push((
+                        requested,
+                        detail_field(&detail, "body")
+                            .as_string()
+                            .unwrap_or_default(),
+                    ));
+                    Reflect::set(
+                        &detail,
+                        &JsValue::from_str(SYNC_STATUS_FIELD),
+                        &JsValue::from_str(status),
+                    )
+                    .expect("write the status onto the detail");
+                    if let Some(reply) = reply {
+                        Reflect::set(
+                            &detail,
+                            &JsValue::from_str(SYNC_REPLY_FIELD),
+                            &JsValue::from_str(reply),
+                        )
+                        .expect("write the reply onto the detail");
+                    }
+                })
+            };
+            let body = document().body().expect("test page has a body");
+            body.add_event_listener_with_callback(
+                ACTIVATION_SYNC,
+                closure.as_ref().unchecked_ref(),
+            )
+            .expect("listen for the sync request");
+            act();
+            body.remove_event_listener_with_callback(
+                ACTIVATION_SYNC,
+                closure.as_ref().unchecked_ref(),
+            )
+            .expect("unlisten");
+            seen.borrow().clone()
+        }
+
+        /// A cancelable event of `name`, dispatched on `target`; the returned bool
+        /// is false iff something called `preventDefault()` — the browser's own
+        /// report, not a proxy for it.
+        fn fire_cancelable(target: &EventTarget, name: &str) -> bool {
+            let init = CustomEventInit::new();
+            init.set_cancelable(true);
+            let event =
+                CustomEvent::new_with_event_init_dict(name, &init).expect("construct the event");
+            target.dispatch_event(&event).expect("dispatch the event")
+        }
+
+        #[wasm_bindgen_test]
+        fn a_gesture_encodes_its_event_requests_an_activation_and_cancels_on_the_reply() {
+            // The whole public feature in one dispatch: the author's encoder runs on
+            // the browser's event, the body reaches the kernel under the named sync
+            // port, and the entry's reply decides the browser's default action —
+            // synchronously, which is the only reason `preventDefault` can still
+            // land.
+            let host = mounted_host("wbt-cs-gest-cancel");
+            let target = create_button(&document(), "data-gesture", "press");
+            wire_gesture(&host, &target, "click", "menu", |event| {
+                format!("{{\"type\":\"{}\"}}", event.type_())
+            });
+
+            let mut prevented = false;
+            let seen = with_sync_kernel("menu", "ok", Some(r#"{"cancel":true}"#), || {
+                prevented = !fire_cancelable(&target, "click");
+            });
+
+            assert_eq!(
+                seen.as_slice(),
+                &[("menu".to_string(), r#"{"type":"click"}"#.to_string())],
+                "the encoder's payload crosses verbatim under the wired port"
+            );
+            assert!(
+                prevented,
+                "a reply that says cancel suppresses the browser's default action"
+            );
+        }
+
+        #[wasm_bindgen_test]
+        fn a_gesture_the_entry_does_not_cancel_lets_the_default_action_proceed() {
+            // The three ways an entry declines to cancel — no reply at all, an
+            // explicit false, and an err — must be indistinguishable from the
+            // browser's point of view. Reading any of them as a cancel would break
+            // links, form submits and scrolling on a component that merely observed
+            // the click.
+            let doc = document();
+            for (kind, port, status, reply) in [
+                ("wbt-cs-gest-noreply", "ack", "ok", None),
+                (
+                    "wbt-cs-gest-false",
+                    "ack-false",
+                    "ok",
+                    Some(r#"{"cancel":false}"#),
+                ),
+                ("wbt-cs-gest-err", "ack-err", "err", None),
+            ] {
+                let host = mounted_host(kind);
+                let target = create_button(&doc, "data-gesture", "press");
+                wire_gesture(&host, &target, "click", port, |_event| "{}".to_string());
+                let mut prevented = false;
+                let seen = with_sync_kernel(port, status, reply, || {
+                    prevented = !fire_cancelable(&target, "click");
+                });
+                assert_eq!(seen.len(), 1, "{kind} requested its activation");
+                assert!(!prevented, "{kind} left the default action alone");
+            }
+        }
+
+        // The fault statuses are driven through `request_sync_activation` on the
+        // test's own stack rather than through a real gesture: the DOM swallows an
+        // exception thrown out of an event listener and reports it globally, so a
+        // panic raised inside `dispatchEvent` never reaches the harness. The path
+        // under test is the one the wiring's closure takes — the seam is the
+        // request, not the listener.
+
+        #[wasm_bindgen_test]
+        #[should_panic(expected = "refused a sync activation")]
+        fn a_refused_sync_request_panics_rather_than_silently_doing_nothing() {
+            // A refusal means the kernel would not admit the request — re-entrant,
+            // premature, or a colliding port. Every one is a bug, and swallowing it
+            // would leave a button that looks wired and does nothing.
+            let host = mounted_host("wbt-cs-gest-refused");
+            with_sync_kernel("refused-port", "refused", None, || {
+                request_sync_activation(&host, "refused-port", "{}").expect("it panics first");
+            });
+        }
+
+        #[wasm_bindgen_test]
+        #[should_panic(expected = "is terminal")]
+        fn a_trapped_sync_request_panics_so_the_closure_stops_running_as_if_alive() {
+            // The instance is already dead but the requesting closure is still on the
+            // stack — the wasm module is not torn down mid-dispatch. The panic is how
+            // it stops.
+            let host = mounted_host("wbt-cs-gest-trap");
+            with_sync_kernel("trap-port", "trap", None, || {
+                request_sync_activation(&host, "trap-port", "{}").expect("it panics first");
+            });
+        }
+
+        #[wasm_bindgen_test]
+        #[should_panic(expected = "did not answer")]
+        fn an_unanswered_sync_request_panics_rather_than_passing_for_ok() {
+            // No status means the event never reached a kernel listener at all — a
+            // broken page, not an outcome. Reading it as an ok-with-no-reply would
+            // make every gesture on a page with no kernel look like it worked.
+            let host = mounted_host("wbt-cs-gest-nostatus");
+            request_sync_activation(&host, "void-port", "{}").expect("it panics first");
+        }
+
+        #[wasm_bindgen_test]
+        #[should_panic(expected = "not the gesture dialect")]
+        fn a_reply_outside_the_dialect_panics_at_the_wiring() {
+            // The reply is a dialect between a component's two halves. One that the
+            // wiring cannot read means they disagree, and the only honest reading of
+            // an unparseable cancel decision is none.
+            gesture_cancels("dialect-port", Some("yes please"));
         }
 
         #[wasm_bindgen_test]
@@ -1277,7 +1605,7 @@ export function define_component(tag, connected) {\n\
                         "two",
                         Urgency::High,
                     ));
-                    Ok(())
+                    Ok(None)
                 })
             };
             call_entry(&entry, &activation_json()).expect("ok does not throw");
@@ -1385,7 +1713,7 @@ export function define_component(tag, connected) {\n\
                     controlled
                         .borrow_mut()
                         .push(publisher.defer_edit("out", 1, None, Some(9)));
-                    Ok(())
+                    Ok(None)
                 })
             };
             call_entry(&entry, &activation_json()).expect("ok does not throw");
@@ -1440,6 +1768,232 @@ export function define_component(tag, connected) {\n\
             );
         }
 
+        /// An activation JSON whose `deferred` half carries two parked messages on
+        /// `port` and one on another port — the shape a re-parking ticker meets on
+        /// every activation after its first.
+        fn tick_activation_json(port: &str) -> String {
+            let entry = |index: u32, deliver_after: u64| brenn_surface_contract::DeferredEntry {
+                index,
+                payload: "{}".to_string(),
+                deliver_after,
+            };
+            let window = |port: &str, entries| brenn_surface_contract::DeferredWindow {
+                port: port.to_string(),
+                entries,
+            };
+            serde_json::to_string(&Activation {
+                ports: vec![],
+                deferred: vec![
+                    window(
+                        port,
+                        vec![entry(0, 1_770_000_000_000), entry(1, 1_770_000_060_000)],
+                    ),
+                    window("other", vec![entry(0, 1_770_000_000_000)]),
+                ],
+                now: Some(1_769_999_999_000),
+                sync: None,
+            })
+            .expect("the fixture activation serializes")
+        }
+
+        /// Listen for [`PORT_DEFER`], record `(op, port, index, deliver_after)` and
+        /// answer every op with `status`, in whichever vocabulary the op speaks.
+        /// Hands back the recorder and the listener's own unlisten.
+        ///
+        /// `once` makes the browser drop the listener after one event. A fixture
+        /// whose entry is *meant* to panic never reaches its unlisten — a wasm
+        /// panic does not unwind — and a listener left on the body would answer the
+        /// later tests that assert on a kernel answering nothing at all.
+        fn record_defer_ops(
+            answer: Result<(), DeferError>,
+            once: bool,
+        ) -> (Recorder<SeenDeferOp>, impl FnOnce()) {
+            let body_el = document().body().expect("test page has a body");
+            let seen: Recorder<SeenDeferOp> = Rc::new(RefCell::new(Vec::new()));
+            let closure = {
+                let seen = Rc::clone(&seen);
+                Closure::<dyn Fn(Event)>::new(move |event: Event| {
+                    let ce = event.dyn_into::<CustomEvent>().expect("a CustomEvent");
+                    let detail = ce.detail();
+                    let op = detail_field(&detail, "op").as_string().unwrap_or_default();
+                    seen.borrow_mut().push((
+                        op.clone(),
+                        detail_field(&detail, "port")
+                            .as_string()
+                            .unwrap_or_default(),
+                        detail_field(&detail, "index").as_string(),
+                        detail_field(&detail, "body").as_string(),
+                        detail_field(&detail, "deliver_after").as_string(),
+                    ));
+                    // A deferred publish answers in the publish vocabulary and the
+                    // control ops in their own, so the fixture's one verdict is
+                    // spelled twice.
+                    let status = if op == DEFER_OP_PUBLISH {
+                        brenn_surface_contract::publish_status_str(answer.clone().map_err(|err| {
+                            match err {
+                                DeferError::NotPermitted => PublishError::NotPermitted,
+                                DeferError::QuotaExceeded => PublishError::QuotaExceeded,
+                                _ => PublishError::InvalidPayload,
+                            }
+                        }))
+                    } else {
+                        brenn_surface_contract::defer_status_str(answer.clone())
+                    };
+                    Reflect::set(
+                        &detail,
+                        &JsValue::from_str(DEFER_STATUS_FIELD),
+                        &JsValue::from_str(status),
+                    )
+                    .expect("write the status onto the detail");
+                })
+            };
+            if once {
+                js_sys::Function::new_with_args(
+                    "target, type, cb",
+                    "target.addEventListener(type, cb, { once: true });",
+                )
+                .call3(
+                    &JsValue::NULL,
+                    body_el.as_ref(),
+                    &JsValue::from_str(PORT_DEFER),
+                    closure.as_ref(),
+                )
+                .expect("listen once for the defer event");
+            } else {
+                body_el
+                    .add_event_listener_with_callback(PORT_DEFER, closure.as_ref().unchecked_ref())
+                    .expect("listen for the defer event");
+            }
+            (seen, move || {
+                if !once {
+                    body_el
+                        .remove_event_listener_with_callback(
+                            PORT_DEFER,
+                            closure.as_ref().unchecked_ref(),
+                        )
+                        .expect("unlisten");
+                }
+            })
+        }
+
+        #[wasm_bindgen_test]
+        fn a_repark_cancels_its_own_ports_standing_ticks_then_parks_the_next() {
+            // The idiom every ticker's chain runs on, and the whole of it is order
+            // and scope: each of *this* port's parked messages is cancelled
+            // — leaving another port's alone, or a component would cancel a
+            // schedule it does not own — and the replacement is parked after, so a
+            // discarded entry leaves exactly the standing tick it started with.
+            let (seen, unlisten) = record_defer_ops(Ok(()), false);
+            let host = document().body().expect("test page has a body");
+            let entry = registered_entry("wbt-cs-repark-ok", move |activation, publisher| {
+                repark_tick(
+                    activation,
+                    publisher,
+                    &host,
+                    "tick",
+                    Some(1_770_000_120_000),
+                );
+                Ok(None)
+            });
+            call_entry(&entry, &tick_activation_json("tick")).expect("ok does not throw");
+            unlisten();
+
+            assert_eq!(
+                seen.borrow().as_slice(),
+                &[
+                    (
+                        "cancel".to_string(),
+                        "tick".to_string(),
+                        Some("0".to_string()),
+                        None,
+                        None,
+                    ),
+                    (
+                        "cancel".to_string(),
+                        "tick".to_string(),
+                        Some("1".to_string()),
+                        None,
+                        None,
+                    ),
+                    (
+                        "publish".to_string(),
+                        "tick".to_string(),
+                        None,
+                        Some("{}".to_string()),
+                        Some("1770000120000".to_string()),
+                    ),
+                ],
+                "every standing tick on the port is cancelled by its own index, in \
+                 window order, and the next one is parked after them"
+            );
+        }
+
+        #[wasm_bindgen_test]
+        fn a_repark_with_no_next_wake_cancels_and_parks_nothing() {
+            // A clock in a fixed mode, a bar whose live slots never expire: the
+            // chain stops on purpose. Parking anything here would wake a component
+            // that has nothing to recompute, forever.
+            let (seen, unlisten) = record_defer_ops(Ok(()), false);
+            let host = document().body().expect("test page has a body");
+            let entry = registered_entry("wbt-cs-repark-none", move |activation, publisher| {
+                repark_tick(activation, publisher, &host, "tick", None);
+                Ok(None)
+            });
+            call_entry(&entry, &tick_activation_json("tick")).expect("ok does not throw");
+            unlisten();
+
+            let seen = seen.borrow();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert!(
+                seen.iter()
+                    .all(|(op, port, ..)| op == DEFER_OP_CANCEL && port == "tick"),
+                "{seen:?}"
+            );
+        }
+
+        #[wasm_bindgen_test]
+        #[should_panic(expected = "could not be scheduled")]
+        fn a_tick_on_a_port_the_config_never_bound_dies_at_the_first_park() {
+            // The deployment failure this idiom introduced: an operator adds a
+            // ticking component to a surface without its `[[surface.io_port]]`
+            // declaration, nothing validates the pairing at boot, and the first park
+            // is the first detection. A logged line and an ok entry would leave a
+            // page whose clock silently stopped — so the instance dies at mount and
+            // the operator is told.
+            let (_seen, _unlisten) = record_defer_ops(Err(DeferError::NotPermitted), true);
+            let host = document().body().expect("test page has a body");
+            let entry = registered_entry("wbt-cs-repark-unbound", move |activation, publisher| {
+                repark_tick(
+                    activation,
+                    publisher,
+                    &host,
+                    "tick",
+                    Some(1_770_000_120_000),
+                );
+                Ok(None)
+            });
+            // No deferred window, so the park is the first op: the cancel loop has
+            // nothing to walk.
+            call_entry(&entry, &activation_json()).expect("the inner panic surfaces as a throw");
+        }
+
+        #[wasm_bindgen_test]
+        #[should_panic(expected = "could not be cancelled")]
+        fn a_cancel_the_window_does_not_admit_dies_rather_than_carrying_on() {
+            // An index the kernel does not hold is this component's own bug: it read
+            // the window it was handed wrongly. Carrying on would leave the stale
+            // tick standing beside the new one and double the chain at every
+            // boundary.
+            let (_seen, _unlisten) = record_defer_ops(Err(DeferError::OutOfRange), true);
+            let host = document().body().expect("test page has a body");
+            let entry = registered_entry("wbt-cs-repark-range", move |activation, publisher| {
+                repark_tick(activation, publisher, &host, "tick", None);
+                Ok(None)
+            });
+            call_entry(&entry, &tick_activation_json("tick"))
+                .expect("the inner panic surfaces as a throw");
+        }
+
         #[wasm_bindgen_test]
         #[should_panic(expected = "no status on a buffered cancel")]
         fn a_defer_op_the_kernel_did_not_buffer_panics_rather_than_passing_for_ok() {
@@ -1449,7 +2003,7 @@ export function define_component(tag, connected) {\n\
             // nothing touched it.
             let entry = registered_entry("wbt-cs-act-nodefst", |_a, publisher| {
                 let _ = publisher.defer_cancel("out", 0);
-                Ok(())
+                Ok(None)
             });
             // Nothing listens for PORT_DEFER, so no status is ever written.
             call_entry(&entry, &activation_json()).expect("the inner panic surfaces as a throw");
@@ -1457,57 +2011,57 @@ export function define_component(tag, connected) {\n\
 
         #[wasm_bindgen_test]
         #[should_panic(expected = "no publish status")]
-        fn a_publish_the_kernel_did_not_buffer_panics_rather_than_passing_for_ok() {
-            // Inside an entry, a missing status means the kernel did not route the
-            // publish into this activation's buffer — structurally impossible, so a
-            // contract break. Reading it as an ok would tell a component its message
-            // is buffered when nothing holds it.
+        fn an_unanswered_publish_panics_rather_than_passing_for_ok() {
+            // A kernel that heard the publish always answers — with the buffer's
+            // verdict or with `not-permitted` — so no status at all means no
+            // listener heard it. Reading that as an ok would tell a component its
+            // message is buffered when nothing holds it.
             let entry = registered_entry("wbt-cs-act-nostatus", |_a, publisher| {
                 let _ = publisher.publish("out", "into the void");
-                Ok(())
+                Ok(None)
             });
             // Nothing listens for PORT_PUBLISH, so no status is ever written.
             call_entry(&entry, &activation_json()).expect("the inner panic surfaces as a throw");
         }
 
         #[wasm_bindgen_test]
-        fn publish_with_urgency_puts_the_wire_string_on_the_detail() {
-            // The producing half of the urgency seam. The shell reads this exact
-            // field with its three-state reader, so the value it carries — the
-            // lowercase RFC 8030 wire string, not a debug-formatted enum — is the
-            // contract between the two halves, and nothing else asserts it.
-            let host = mounted_host("wbt-cs-urg");
-            let detail = catch_publish_detail(|| {
-                publish_with_urgency(&host, "out", "hello", Urgency::High);
+        fn a_not_permitted_answer_reaches_the_component_as_an_answer() {
+            // `not-permitted` is what the kernel says about a port this instance
+            // does not have as an output, and about a publish made with no activation
+            // in flight. Both are the component's to handle — a refusal
+            // is an answer, never a fault — so the SDK hands it back rather than
+            // panicking on it.
+            let body = document().body().expect("test page has a body");
+            let closure = Closure::<dyn Fn(Event)>::new(move |event: Event| {
+                let ce = event.dyn_into::<CustomEvent>().expect("a CustomEvent");
+                Reflect::set(
+                    &ce.detail(),
+                    &JsValue::from_str(PUBLISH_STATUS_FIELD),
+                    &JsValue::from_str(brenn_surface_contract::publish_status_str(Err(
+                        PublishError::NotPermitted,
+                    ))),
+                )
+                .expect("write the status onto the detail");
             });
+            body.add_event_listener_with_callback(PORT_PUBLISH, closure.as_ref().unchecked_ref())
+                .expect("listen for the publish event");
+            let answers: Recorder<Result<(), PublishError>> = Rc::new(RefCell::new(Vec::new()));
+            let entry = {
+                let answers = Rc::clone(&answers);
+                registered_entry("wbt-cs-act-notperm", move |_a, publisher| {
+                    answers.borrow_mut().push(publisher.publish("out", "away"));
+                    Ok(None)
+                })
+            };
+            call_entry(&entry, &activation_json()).expect("ok does not throw");
+            body.remove_event_listener_with_callback(
+                PORT_PUBLISH,
+                closure.as_ref().unchecked_ref(),
+            )
+            .expect("unlisten");
             assert_eq!(
-                detail_field(&detail, "port").as_string().as_deref(),
-                Some("out")
-            );
-            assert_eq!(
-                detail_field(&detail, "body").as_string().as_deref(),
-                Some("hello")
-            );
-            assert_eq!(
-                detail_field(&detail, "urgency").as_string().as_deref(),
-                Some("high")
-            );
-        }
-
-        #[wasm_bindgen_test]
-        fn plain_publish_omits_urgency_rather_than_sending_null_or_normal() {
-            // Absent-means-the-port's-default is the contract, and the shell's
-            // reader distinguishes absent from present-but-junk. Sending `"normal"`
-            // would silently pin every SDK publish to normal and make the
-            // operator's per-output knob dead; sending `null` reads as absent today
-            // but states something the component never meant.
-            let host = mounted_host("wbt-cs-noturg");
-            let detail = catch_publish_detail(|| {
-                publish(&host, "out", "hello");
-            });
-            assert!(
-                detail_field(&detail, "urgency").is_undefined(),
-                "a publish with no override carries no urgency key at all"
+                answers.borrow().as_slice(),
+                &[Err(PublishError::NotPermitted)]
             );
         }
     }

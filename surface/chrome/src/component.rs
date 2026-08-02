@@ -15,22 +15,20 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use brenn_surface_component_support::{
-    Activation, PersistentTimer, Publisher, append, boot, claim_initialized, component_log,
-    create_div, document, publish, read_monotonic_ms, register_component,
+    Activation, Publisher, append, boot, claim_initialized, component_log, create_div, document,
+    publish_or_fault, read_monotonic_ms, register_component, repark_tick, wire_gesture,
 };
 use brenn_surface_contract::SURFACE_ROOT_ID;
 use brenn_surface_schema::layout::LayoutKind;
 use brenn_surface_schema::{ToastSeverity, ToastSource};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::wasm_bindgen;
-use web_sys::{Document, Element, HtmlElement};
+use web_sys::{Document, Element, Event, HtmlElement};
 
 use crate::logic::{
-    BannerState, ChromeAction, ChromeCore, LayoutPlacement, PORT_OVERLAY_STATE, Theme, TimerAction,
-    fold_window,
+    BannerState, ChromeAction, ChromeCore, LayoutPlacement, PORT_OVERLAY_STATE, Theme, fold_window,
 };
 
 /// This component's kind — its config `kind`, its element-tag stem
@@ -55,10 +53,17 @@ const TAKEOVER_ATTR: &str = "data-takeover";
 const BANNER_ID: &str = "brenn-surface-banner";
 /// The id of chrome's toast container under `#surface-root`.
 const TOAST_CONTAINER_ID: &str = "brenn-surface-toasts";
-/// How often the toast-lifetime timer fires to auto-dismiss expired toasts. The
-/// core's TTL is coarse (seconds), so a one-second cadence expires a toast within
-/// a tick of its deadline without a busy loop.
-const TOAST_TICK_MS: i32 = 1_000;
+/// The expiry-wake port — must match a `[[surface.io_port]] port` declaration.
+const TOAST_TICK_PORT: &str = "toast-tick";
+
+/// The sync port a click on a rendered toast arrives on, carrying the toast's id
+/// as its request body.
+const TOAST_DISMISS_PORT: &str = "toast-dismiss";
+
+/// The attribute each rendered toast carries its core-assigned id on. The
+/// container's one delegated click listener reads the id back off it, so no toast
+/// needs a listener of its own.
+const TOAST_ID_ATTR: &str = "data-toast-id";
 
 /// The timestamp the core folds toast expiry against: whole milliseconds on the
 /// page's monotonic clock, not the wall clock. A toast lifetime is a duration,
@@ -93,29 +98,6 @@ struct ChromeState {
     core: ChromeCore,
     host: Option<HtmlElement>,
     toasts: HashMap<u64, HtmlElement>,
-    /// The toast-lifetime timer, held so its scheduled fire stays alive. Armed
-    /// only while a toast with an expiry is live; while it is armed it fires
-    /// every [`TOAST_TICK_MS`] to run [`ChromeCore::tick`].
-    toast_timer: Rc<PersistentTimer>,
-    /// Whether [`ChromeState::toast_timer`] currently has a fire scheduled.
-    toast_timer_armed: bool,
-}
-
-/// Arm the toast tick while an expiring toast is live and cancel it otherwise,
-/// so the page has no periodic wakeup in the steady state (no toasts, or only
-/// `error` toasts, which never expire).
-fn sync_toast_timer(state: &mut ChromeState) {
-    match state.core.timer_action(state.toast_timer_armed) {
-        Some(TimerAction::Arm) => {
-            state.toast_timer.reschedule(TOAST_TICK_MS);
-            state.toast_timer_armed = true;
-        }
-        Some(TimerAction::Cancel) => {
-            state.toast_timer.cancel();
-            state.toast_timer_armed = false;
-        }
-        None => {}
-    }
 }
 
 /// The loader's entry, called once after this module's `default` init with the
@@ -125,35 +107,19 @@ fn sync_toast_timer(state: &mut ChromeState) {
 #[wasm_bindgen]
 pub fn brenn_bind_instance(instance: String) {
     boot(&instance);
-    let toast_timer = Rc::new(PersistentTimer::new());
-    {
-        toast_timer.set_callback(Rc::new(move || {
-            STATE.with(|s| {
-                let mut guard = s.borrow_mut();
-                if let Some(state) = guard.as_mut() {
-                    // The fire that just ran consumed the schedule.
-                    state.toast_timer_armed = false;
-                    let actions = state.core.tick(now_ms());
-                    apply_actions(state, &actions);
-                }
-            });
-        }));
-    }
     STATE.with(|s| {
         *s.borrow_mut() = Some(ChromeState {
             core: ChromeCore::new(instance.clone()),
             host: None,
             toasts: HashMap::new(),
-            toast_timer,
-            toast_timer_armed: false,
         });
     });
     register_component(
         KIND,
         on_connected,
-        move |activation: &Activation, _publisher: &mut Publisher| {
-            on_activation(activation);
-            Ok(())
+        move |activation: &Activation, publisher: &mut Publisher| {
+            on_activation(activation, publisher);
+            Ok(None)
         },
     );
 }
@@ -174,24 +140,67 @@ fn on_connected(host: HtmlElement) {
     });
 }
 
-/// Fold each window's new messages into the core and apply the actions they
-/// return.
-fn on_activation(activation: &Activation) {
+/// Act on a toast dismissal if this activation is one, fold each window's new
+/// messages into the core, sweep expired toasts, and park the next expiry wake.
+///
+/// The expiry sweep runs on every activation, not only on the wake's own: it is
+/// an idempotent recompute from the clock, and running it wherever chrome is
+/// already awake means a toast that outlived its wake by a delivery still goes.
+fn on_activation(activation: &Activation, publisher: &mut Publisher) {
     STATE.with(|s| {
         let mut guard = s.borrow_mut();
         let state = guard
             .as_mut()
             .expect("brenn_bind_instance runs before the first activation");
-        for window in &activation.ports {
-            let actions = fold_window(&mut state.core, window, now_ms());
-            apply_actions(state, &actions);
+        // The entry is registered only after `connectedCallback` records the host,
+        // so an activation without one is a kernel that called an unregistered
+        // component.
+        let host = state
+            .host
+            .clone()
+            .expect("connectedCallback records the host before the entry is registered");
+        let now_mono = now_ms();
+
+        if let Some((_, click)) = activation.sync_request() {
+            on_toast_click(state, &click.body, publisher);
         }
+        for window in activation.delivered_windows() {
+            // The wake's payload is irrelevant — the wake is the message.
+            if window.port == TOAST_TICK_PORT {
+                continue;
+            }
+            let actions = fold_window(&mut state.core, window, now_mono);
+            apply_actions(state, &actions, publisher);
+        }
+        let expired = state.core.tick(now_mono);
+        apply_actions(state, &expired, publisher);
+
+        let now_wall = activation
+            .now
+            .expect("the surface kernel stamps every activation with its wall clock");
+        let release_at = state.core.next_wake(now_mono, now_wall);
+        repark_tick(activation, publisher, &host, TOAST_TICK_PORT, release_at);
     });
+}
+
+/// Dismiss the toast one click asked for, naming it by the id its wiring encoded.
+///
+/// An empty body is a click that landed on the toast container but on no toast —
+/// the delegated listener covers the whole container — and dismisses nothing.
+fn on_toast_click(state: &mut ChromeState, click: &str, publisher: &mut Publisher) {
+    if click.is_empty() {
+        return;
+    }
+    let id: u64 = click.parse().unwrap_or_else(|_| {
+        panic!("chrome's own toast wiring encoded {click:?}, which is not a toast id")
+    });
+    let actions = state.core.dismiss_toast(id);
+    apply_actions(state, &actions, publisher);
 }
 
 /// Apply the core's actions in order. `state` is borrowed so a `ShowToast`/
 /// `DismissToast` can record or drop the toast element.
-fn apply_actions(state: &mut ChromeState, actions: &[ChromeAction]) {
+fn apply_actions(state: &mut ChromeState, actions: &[ChromeAction], publisher: &mut Publisher) {
     for action in actions {
         match action {
             ChromeAction::SetTheme(theme) => set_theme(*theme),
@@ -216,13 +225,16 @@ fn apply_actions(state: &mut ChromeState, actions: &[ChromeAction]) {
                 }
             }
             ChromeAction::PublishOverlayState { body } => {
-                if let Some(host) = state.host.as_ref() {
-                    publish(host, PORT_OVERLAY_STATE, body);
-                }
+                let host = state
+                    .host
+                    .clone()
+                    .expect("connectedCallback records the host before the first activation");
+                // Retained state: a refusal nobody acted on would leave every
+                // consumer of `overlay-state` reading a page that has moved on.
+                publish_or_fault(publisher, &host, PORT_OVERLAY_STATE, body);
             }
         }
     }
-    sync_toast_timer(state);
 }
 
 /// The live `Document`.
@@ -450,7 +462,8 @@ fn set_panel_label(section: &Element, label: Option<&str>) {
 }
 
 /// Render a new toast into the toast container and record its element under the
-/// core's page-lifetime id. A click on the toast dismisses it (folding through
+/// core's page-lifetime id, stamped on the element so the container's delegated
+/// listener can read it back. A click on the toast dismisses it (folding through
 /// the core so the id is dropped everywhere). Toast text is `textContent` only.
 fn show_toast(
     state: &mut ChromeState,
@@ -459,8 +472,15 @@ fn show_toast(
     text: &str,
     source: ToastSource,
 ) {
-    let container = find_or_create_child(&surface_root(), TOAST_CONTAINER_ID, "div");
+    let host = state
+        .host
+        .clone()
+        .expect("connectedCallback records the host before the first toast is shown");
+    let container = toast_container(&host);
     let toast = create_div(&doc(), "data-surface-toast");
+    toast
+        .set_attribute(TOAST_ID_ATTR, &id.to_string())
+        .expect("set data-toast-id");
     toast
         .set_attribute("data-toast-severity", toast_severity_str(severity))
         .expect("set data-toast-severity");
@@ -468,9 +488,46 @@ fn show_toast(
         .set_attribute("data-toast-source", toast_source_str(source))
         .expect("set data-toast-source");
     toast.set_text_content(Some(text));
-    add_dismiss_listener(&toast, id);
     append(&container, &toast);
     state.toasts.insert(id, toast);
+}
+
+/// The toast container under `#surface-root`, built on first use and wired then
+/// with the one delegated dismiss listener every toast is read through.
+///
+/// One listener for the container's life, not one per toast: an SDK listener
+/// closure is page-lifetime and never reclaimed, so wiring each toast element
+/// would leak one closure per toast a long-lived page ever shows. The container
+/// is created and never removed, which is the lifetime the wiring wants.
+fn toast_container(host: &HtmlElement) -> HtmlElement {
+    let already_built = doc().get_element_by_id(TOAST_CONTAINER_ID).is_some();
+    let container = find_or_create_child(&surface_root(), TOAST_CONTAINER_ID, "div");
+    if !already_built {
+        wire_gesture(
+            host,
+            container.as_ref(),
+            "click",
+            TOAST_DISMISS_PORT,
+            clicked_toast_id,
+        );
+    }
+    container
+}
+
+/// The id of the toast a click landed inside, or an empty body when it landed on
+/// the container itself rather than on any toast.
+fn clicked_toast_id(event: &Event) -> String {
+    let Some(target) = event
+        .target()
+        .and_then(|target| target.dyn_into::<Element>().ok())
+    else {
+        return String::new();
+    };
+    target
+        .closest(&format!("[{TOAST_ID_ATTR}]"))
+        .expect("closest runs with a well-formed attribute selector")
+        .and_then(|toast| toast.get_attribute(TOAST_ID_ATTR))
+        .unwrap_or_default()
 }
 
 /// Remove a rendered toast by its core-assigned id. A no-op for an id with no
@@ -479,26 +536,6 @@ fn dismiss_toast(state: &mut ChromeState, id: u64) {
     if let Some(toast) = state.toasts.remove(&id) {
         toast.remove();
     }
-}
-
-/// Wire a click on `toast` to dismiss the toast with `id`: fold the dismissal
-/// through the core (so a later `DismissToast` action removes the element) and
-/// apply the result. The listener lives as long as the toast element, so its
-/// closure is `forget`-leaked.
-fn add_dismiss_listener(toast: &HtmlElement, id: u64) {
-    let closure = wasm_bindgen::closure::Closure::<dyn Fn(web_sys::Event)>::new(move |_event| {
-        STATE.with(|s| {
-            let mut guard = s.borrow_mut();
-            if let Some(state) = guard.as_mut() {
-                let actions = state.core.dismiss_toast(id);
-                apply_actions(state, &actions);
-            }
-        });
-    });
-    toast
-        .add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
-        .expect("add toast dismiss listener");
-    closure.forget();
 }
 
 /// The `data-toast-severity` value for a severity.
@@ -514,5 +551,217 @@ fn toast_severity_str(severity: ToastSeverity) -> &'static str {
 fn toast_source_str(source: ToastSource) -> &'static str {
     match source {
         ToastSource::Kernel => "kernel",
+    }
+}
+
+/// Browser tests for the DOM glue, run under wasm-bindgen-test via
+/// `make surface-wasm-test`. wasm32-only, matching the glue itself.
+///
+/// The decision core is host-tested next door in `logic.rs`; what only a browser
+/// can answer is the wiring between them — that a delivered toast reaches the
+/// DOM with the attribute its own dismiss path reads back, that the container's
+/// single delegated listener resolves a click to that toast, and that the wake
+/// chain is actually re-parked from the activation rather than merely computable.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+
+    use crate::logic::{PORT_TOAST, TOAST_TTL_MS};
+    use brenn_surface_schema::{CONTROL_PLANE_VERSION, ToastBody};
+    use brenn_surface_test_fixtures::browser::{activation_json, mount, record_ops, take_recorded};
+    use wasm_bindgen::JsValue;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// The instance this test binary binds its one module record to.
+    const TEST_INSTANCE: &str = "wbt-chrome";
+
+    /// The activation wall clock. The toast lifetime is judged monotonically, so
+    /// this only has to be a plausible instant far from the monotonic origin —
+    /// which is exactly what makes the parked wake's arithmetic worth asserting.
+    const NOW_MS: u64 = 1_770_000_123_456;
+
+    /// One toast payload as the bus carries it.
+    fn toast_body(text: &str) -> String {
+        serde_json::to_string(&ToastBody {
+            v: CONTROL_PLANE_VERSION,
+            severity: ToastSeverity::Info,
+            text: text.to_string(),
+            source: ToastSource::Kernel,
+        })
+        .expect("the toast body serializes")
+    }
+
+    /// Build the `#surface-root` the backend page renders, which chrome's DOM
+    /// half drives and the harness's bare `<body>` does not have.
+    fn build_surface_root() {
+        let root = create_div(&doc(), "data-surface-root");
+        root.set_id(SURFACE_ROOT_ID);
+        doc()
+            .body()
+            .expect("the document has a body")
+            .append_child(&root)
+            .expect("append #surface-root");
+    }
+
+    /// The live toast elements, in document order.
+    fn rendered_toast_ids() -> Vec<String> {
+        let nodes = doc()
+            .query_selector_all(&format!("[{TOAST_ID_ATTR}]"))
+            .expect("query the rendered toasts");
+        (0..nodes.length())
+            .filter_map(|i| nodes.get(i))
+            .filter_map(|node| node.dyn_into::<Element>().ok())
+            .filter_map(|el| el.get_attribute(TOAST_ID_ATTR))
+            .collect()
+    }
+
+    /// Click a rendered element from the page's own event loop.
+    fn click(selector: &str) {
+        doc()
+            .query_selector(selector)
+            .expect("the selector is well-formed")
+            .expect("the element under the selector is in the document")
+            .dyn_into::<HtmlElement>()
+            .expect("a clickable HtmlElement")
+            .click();
+    }
+
+    /// Call the entry with one activation's JSON.
+    fn activate(entry: &js_sys::Function, json: &str) {
+        entry
+            .call1(&JsValue::NULL, &JsValue::from_str(json))
+            .expect("the entry returns ok");
+    }
+
+    /// The whole toast lifecycle through chrome's own seams: a delivered toast
+    /// renders and parks its expiry wake, a click on it resolves to a sync
+    /// request naming its id, a click that misses every toast names none, and the
+    /// dismissal activation removes exactly the toast the id names.
+    ///
+    /// One test rather than five: the bind is once-per-binary, so a test binary
+    /// gets exactly one mount.
+    #[wasm_bindgen_test]
+    fn a_toast_renders_parks_its_expiry_and_is_dismissed_by_its_own_click() {
+        build_surface_root();
+        // Installed before the mount: a connect-time publish, park or sync
+        // request lands here, where silence is the assertion.
+        let ops = record_ops();
+        let (entry, _host) = mount(KIND, TEST_INSTANCE, brenn_bind_instance);
+        assert_eq!(
+            ops.length(),
+            0,
+            "connect-time code records the host only, and reaches no kernel seam"
+        );
+
+        // The mount activation: nothing live, so nothing to sweep and no wake to
+        // aim. A page with no expiring toast never wakes.
+        activate(&entry, &activation_json(&[], None, NOW_MS));
+        assert_eq!(
+            take_recorded(&ops),
+            Vec::<Vec<String>>::new(),
+            "an empty mount activation neither publishes nor parks"
+        );
+
+        activate(
+            &entry,
+            &activation_json(&[(PORT_TOAST, &toast_body("under test"))], None, NOW_MS),
+        );
+        let ids = rendered_toast_ids();
+        let [toast_id] = &ids[..] else {
+            panic!("exactly one toast is rendered, stamped with its id: {ids:?}")
+        };
+        assert_eq!(
+            take_recorded(&ops),
+            vec![vec![
+                "defer".to_string(),
+                "publish".to_string(),
+                TOAST_TICK_PORT.to_string(),
+                "{}".to_string(),
+                (NOW_MS + TOAST_TTL_MS).to_string(),
+            ]],
+            "the expiry wake is parked on the in/out port, aimed a full TTL past \
+             this activation's wall reading"
+        );
+
+        // A click on the toast asks for a sync naming its id.
+        click(&format!("[{TOAST_ID_ATTR}='{toast_id}']"));
+        assert_eq!(
+            take_recorded(&ops),
+            vec![vec![
+                "sync".to_string(),
+                String::new(),
+                TOAST_DISMISS_PORT.to_string(),
+                toast_id.clone(),
+                String::new(),
+            ]],
+            "the click asks for the activation and encodes the toast it landed on"
+        );
+
+        // A click on the container but on no toast encodes nothing.
+        click(&format!("#{TOAST_CONTAINER_ID}"));
+        assert_eq!(
+            take_recorded(&ops),
+            vec![vec![
+                "sync".to_string(),
+                String::new(),
+                TOAST_DISMISS_PORT.to_string(),
+                String::new(),
+                String::new(),
+            ]],
+            "the delegated listener covers the whole container, and a miss is empty"
+        );
+
+        // The empty request dismisses nothing, and the toast still standing keeps
+        // its wake aimed — every activation re-aims it at the remaining lifetime.
+        activate(
+            &entry,
+            &activation_json(
+                &[(TOAST_DISMISS_PORT, "")],
+                Some(TOAST_DISMISS_PORT),
+                NOW_MS,
+            ),
+        );
+        assert_eq!(
+            rendered_toast_ids(),
+            vec![toast_id.clone()],
+            "a click that named no toast removes none"
+        );
+        let missed = take_recorded(&ops);
+        let [wake] = &missed[..] else {
+            panic!("a live toast keeps exactly one wake aimed at it: {missed:?}")
+        };
+        assert_eq!(
+            (wake[0].as_str(), wake[2].as_str()),
+            ("defer", TOAST_TICK_PORT)
+        );
+        let release: u64 = wake[4].parse().expect("a decimal release instant");
+        assert!(
+            release > NOW_MS && release <= NOW_MS + TOAST_TTL_MS,
+            "the re-aimed wake carries what is left of the lifetime, not a fresh \
+             one: {release} against {NOW_MS}"
+        );
+
+        // The named request dismisses exactly that toast, and with nothing live
+        // left there is no wake to re-park.
+        activate(
+            &entry,
+            &activation_json(
+                &[(TOAST_DISMISS_PORT, toast_id)],
+                Some(TOAST_DISMISS_PORT),
+                NOW_MS,
+            ),
+        );
+        assert_eq!(
+            rendered_toast_ids(),
+            Vec::<String>::new(),
+            "the dismissal removes the toast the id names"
+        );
+        assert_eq!(
+            take_recorded(&ops),
+            Vec::<Vec<String>>::new(),
+            "with nothing live expiring, the wake chain stops"
+        );
     }
 }

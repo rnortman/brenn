@@ -8,6 +8,12 @@ description = "Brenn surface echo-stub — minimal dev/test component exercising
 [lib]
 crate-type = ["cdylib"]
 
+# Run via `make surface-wasm-test`.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+brenn-surface-test-fixtures = { path = "../../test-fixtures" }
+js-sys = { workspace = true }
+wasm-bindgen-test = { workspace = true }
+
 # The echo-stub is a browser-only wasm-bindgen component module: all of its DOM
 # behavior is behind cfg(target_arch = "wasm32"). The host build is empty — it
 # carries no host-testable logic (a DOM fixture) — so the default target builds

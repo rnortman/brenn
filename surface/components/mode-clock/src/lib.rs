@@ -10,7 +10,9 @@
 //! (day/night by a wall-clock schedule), fixed `dark`, and fixed `light`.
 //!
 //! Split into a DOM-free, host-tested state machine (`logic`) and a thin
-//! `cfg(target_arch = "wasm32")` DOM/timer glue module.
+//! `cfg(target_arch = "wasm32")` glue module. Boundary wakes are deferred
+//! self-publishes on the `tick` in/out port, parked from inside the activation
+//! that recomputed.
 
 pub mod logic;
 

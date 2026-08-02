@@ -381,17 +381,20 @@ clippy:
 #   1. --lib across every surface wasm crate. The kernel's protocol-core unit
 #      tests build and run natively under `cargo test`, so its native test
 #      targets are not wanted here.
-#   2. --all-targets scoped to exactly the two crates carrying wasm-bindgen-test
-#      suites (the kernel's dom/entry suites and component-support). `make
+#   2. --all-targets scoped to exactly the crates carrying wasm-bindgen-test
+#      suites (the kernel's dom/entry suites, component-support, and the
+#      components whose activation glue is browser-only). `make
 #      surface-wasm-test` (browser + driver) is the only thing that *runs* them,
 #      and it is not in CARGO_CHECK_STEPS, so without this line the suites had no
 #      compile gate at all — and a suite that does not compile cannot fail. The
 #      kernel's tokio-bearing test modules are all `cfg(not(target_arch =
 #      "wasm32"))`, so --all-targets under the wasm target compiles them out and
 #      never reaches for the native-only dev-deps.
+SURFACE_WASM_TEST_CRATES := brenn-surface-kernel brenn-surface-component-support brenn-chrome brenn-echo-stub brenn-meeting brenn-mode-clock brenn-protobar
+
 surface-wasm-check:
 	cargo clippy $(Q) --target wasm32-unknown-unknown -p brenn-queue -p brenn-attach-client -p brenn-surface-kernel -p brenn-surface-component-support $(addprefix -p ,$(SURFACE_COMPONENT_CRATES)) --lib -- -D warnings
-	cargo clippy $(Q) --target wasm32-unknown-unknown -p brenn-surface-kernel -p brenn-surface-component-support -p brenn-meeting --all-targets -- -D warnings
+	cargo clippy $(Q) --target wasm32-unknown-unknown $(addprefix -p ,$(SURFACE_WASM_TEST_CRATES)) --all-targets -- -D warnings
 
 # Surface browser bundles: the wasm-bindgen pipeline for the shell and every
 # component crate under surface/components/*. Unlike the WASI component rules
@@ -551,13 +554,14 @@ $(SURFACE_DIST)/%.js: $(SURFACE_WASM_STAMP) | wasm-bindgen-preflight
 	mkdir -p $(SURFACE_DIST)
 	wasm-bindgen --target web --out-dir $(SURFACE_DIST) $(WASM_COMPONENTS_RELEASE)/$*.wasm
 
-# Browser-level wasm unit tests for the surface shell + component-support
-# (wasm-bindgen-test, headless browser via chromedriver/geckodriver).
+# Browser-level wasm unit tests for the surface shell, component-support and the
+# components whose activation glue is browser-only (wasm-bindgen-test, headless
+# browser via chromedriver/geckodriver).
 # Not part of local `make check`: it needs a WebDriver browser driver, which
 # contributors are not asked to install. surface-wasm-check's --all-targets line
 # type-checks these suites on every check, so they cannot rot between runs.
-# Run manually when touching surface/kernel/src/{dom,entry}.rs or
-# surface/component-support.
+# Run manually when touching surface/kernel/src/{dom,entry}.rs,
+# surface/component-support, or a component's `component.rs`.
 # NO_HEADLESS=1 passes through to the runner for a visible browser when debugging.
 #
 # TODO(surface-wasm-test-in-ci): CI should run this — a type-checked suite that
@@ -568,7 +572,7 @@ surface-wasm-test: wasm-bindgen-preflight
 	@command -v wasm-bindgen-test-runner >/dev/null 2>&1 || { echo "ERROR: wasm-bindgen-test-runner not found; it ships with wasm-bindgen-cli: cargo install --locked wasm-bindgen-cli --version $(WASM_BINDGEN_PIN)"; exit 1; }
 	@command -v chromedriver >/dev/null 2>&1 || command -v geckodriver >/dev/null 2>&1 || { echo "ERROR: need chromedriver or geckodriver on PATH (Fedora: dnf install chromedriver)"; exit 1; }
 	CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-	    cargo test --target wasm32-unknown-unknown -p brenn-surface-kernel -p brenn-surface-component-support -p brenn-meeting --lib
+	    cargo test --target wasm32-unknown-unknown $(addprefix -p ,$(SURFACE_WASM_TEST_CRATES)) --lib
 	CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
 	    cargo test --target wasm32-unknown-unknown -p brenn-surface-component-support --test prebind_panic
 

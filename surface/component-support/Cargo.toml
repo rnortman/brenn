@@ -8,8 +8,9 @@ description = "Optional in-tree helpers for authoring Brenn surface component mo
 # In-tree convenience for component authors, not contract surface: contract v0
 # is exactly brenn-surface-contract, and an out-of-tree component may use
 # this crate but is never required to. Most of the crate is behind cfg(wasm32)
-# with wasm-gated deps; the DOM-free `clamp_timeout_ms` scheduling helper
-# (timeout.rs) is ungated so component state machines can host-test it.
+# with wasm-gated deps; the DOM-free helpers — the `clamp_timeout_ms` scheduling
+# clamp (timeout.rs) and the gesture reply dialect (gesture.rs) — are ungated so
+# component state machines can host-test them.
 [dependencies]
 brenn-envelope = { path = "../../brenn-envelope" }
 chrono = { version = "0.4.44", default-features = false, features = ["alloc"] }

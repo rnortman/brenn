@@ -72,6 +72,7 @@ fn single_activation(envelope: String) -> ProcessorActivation {
         }],
         deferred: vec![],
         now: None,
+        sync: None,
     }
 }
 
@@ -85,6 +86,7 @@ fn multi_activation(envelopes: Vec<String>) -> ProcessorActivation {
         }],
         deferred: vec![],
         now: None,
+        sync: None,
     }
 }
 

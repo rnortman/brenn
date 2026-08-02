@@ -547,6 +547,9 @@ pub(in crate::wasm_dispatch) async fn drain_step(
         ports,
         deferred,
         now: Some(now_ms),
+        // Backend dispatch is message-caused, always: nothing here has a caller
+        // blocked on a reply, and the guest world could not express one.
+        sync: None,
     };
 
     // Step 4: invoke the guest. CPU-bound → spawn_blocking.

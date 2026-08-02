@@ -110,6 +110,12 @@ pub mod logic;
 #[cfg(target_arch = "wasm32")]
 pub mod dom;
 
+/// The synchronous side door onto a running page: the seam a component's gesture
+/// reaches an activation through. Browser target only, for the same reason the
+/// in-flight slot is — nothing else can be mid-dispatch on the loop's own thread.
+#[cfg(target_arch = "wasm32")]
+pub mod sync_door;
+
 /// wasm-bindgen entry point and kernel handle; browser target only.
 #[cfg(target_arch = "wasm32")]
 mod entry;

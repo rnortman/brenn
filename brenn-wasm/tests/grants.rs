@@ -188,6 +188,7 @@ fn subset_grants_loads_and_invokes() {
         ports: vec![],
         deferred: vec![],
         now: None,
+        sync: None,
     });
     assert!(
         matches!(outcome, brenn_wasm::ProcessorOutcome::Ok { .. }),
@@ -275,6 +276,7 @@ fn degenerate_empty_grants_invoke_succeeds() {
         ports: vec![],
         deferred: vec![],
         now: None,
+        sync: None,
     });
     assert!(
         matches!(outcome, brenn_wasm::ProcessorOutcome::Ok { .. }),

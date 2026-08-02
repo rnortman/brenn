@@ -62,6 +62,7 @@ fn empty_activation() -> ProcessorActivation {
         ports: vec![],
         deferred: vec![],
         now: None,
+        sync: None,
     }
 }
 
@@ -85,6 +86,7 @@ fn single_activation(envelope: String) -> ProcessorActivation {
         }],
         deferred: vec![],
         now: None,
+        sync: None,
     }
 }
 

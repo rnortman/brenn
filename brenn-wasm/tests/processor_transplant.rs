@@ -112,6 +112,7 @@ fn activation(template: &serde_json::Value, spec: &serde_json::Value) -> Process
         ports,
         deferred,
         now,
+        sync: None,
     }
 }
 

@@ -276,6 +276,10 @@ impl SurfacePage {
             schedules,
         );
         let mut frames = registrations.reconcile(bindings, stores, subs);
+        // After the positions exist: a mount that was registered before the page's
+        // first document is owed its guaranteed activation from the moment the
+        // wiring it windows against is in force.
+        schedules.wire_mounts();
         frames.extend(subs.resubscribe_survivors());
         let lost_flushes = outbound.reconcile(bindings, registrations.instances());
         let steps = outbound.on_attached(bindings, facts, now);

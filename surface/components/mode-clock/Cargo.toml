@@ -24,6 +24,12 @@ serde_json = "1.0.149"
 [dev-dependencies]
 brenn-surface-test-fixtures = { path = "../../test-fixtures" }
 
+# Browser-level tests for the activation glue (component.rs) run under
+# wasm-bindgen-test via `make surface-wasm-test`; wasm32-only so the host
+# `cargo test` sweep never pulls them.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = { workspace = true }
+
 # The DOM/timer glue (component.rs) is browser-only: it dispatches the
 # `brenn-theme` seam event and schedules boundary recomputes. These deps never
 # enter the host build (logic.rs and its tests carry no wasm deps).

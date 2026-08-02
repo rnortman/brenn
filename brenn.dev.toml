@@ -517,6 +517,16 @@ instance = "echo-stub"
 port = "out"
 channel = "ephemeral:dev-stub"
 
+# Chrome's toast-expiry self-wake. No `channel` and no `[[connection]]`, so it
+# resolves to an anonymous page-local ring. `push_depth = 1` because a wake
+# subsumes its predecessor; `retain_depth = 2` covers a cancel and its
+# replacement.
+[[surface.io_port]]
+instance = "chrome"
+port = "toast-tick"
+push_depth = 1
+retain_depth = 2
+
 # The bar: three protobar instances (p1/p2/p3), one per panel, each bound to its
 # own durable content channel. The LLM picks a layout by publishing a layout
 # document to `brenn:bar-layout` (the `[surface.layout]` block below) and pushes
@@ -692,6 +702,46 @@ instance = "mode"
 port = "theme"
 channel = "local:brenn/theme"
 
+# Self-wake ports for the clock-driven components. No `channel` and no
+# `[[connection]]`, so each resolves to an anonymous page-local ring.
+# `push_depth = 1` because a wake subsumes its predecessor; `retain_depth = 2`
+# covers a cancel and its replacement.
+[[surface.io_port]]
+instance = "mode"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "p1"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "p2"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "p3"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "meeting"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "chrome"
+port = "toast-tick"
+push_depth = 1
+retain_depth = 2
+
 # Second bar surface, identical bindings, different skin (`foundry` = 1c Pixel
 # Foundry). Same channels as `bar`, so both render the same content/layout
 # side-by-side — the config-selectable skin swap and multi-surface fan-out onto
@@ -821,6 +871,37 @@ instance = "chrome"
 port = "overlay-state"
 channel = "local:brenn/overlay-state"
 
+# The self-wake ports, as on `bar`. No mode-clock here, so no boundary tick.
+[[surface.io_port]]
+instance = "p1"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "p2"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "p3"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "meeting"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "chrome"
+port = "toast-tick"
+push_depth = 1
+retain_depth = 2
+
 # Bar feeder: the browser-driven publisher for the bar. Four echo-stub instances,
 # each with an output to one of the four bar channels — three content channels
 # plus the layout channel. Type a body, click send, and it publishes durably to
@@ -948,3 +1029,10 @@ channel = "brenn:bar-agenda"
 instance = "feed-acks"
 port = "out"
 channel = "brenn:bar-acks"
+
+# Chrome's toast-expiry self-wake, as on every other surface.
+[[surface.io_port]]
+instance = "chrome"
+port = "toast-tick"
+push_depth = 1
+retain_depth = 2

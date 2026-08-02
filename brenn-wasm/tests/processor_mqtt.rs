@@ -39,6 +39,7 @@ fn single_activation() -> ProcessorActivation {
         }],
         deferred: vec![],
         now: None,
+        sync: None,
     }
 }
 
@@ -59,6 +60,7 @@ fn trap_after_publish_activation() -> ProcessorActivation {
         }],
         deferred: vec![],
         now: None,
+        sync: None,
     }
 }
 

@@ -496,9 +496,11 @@ dependencies = [
  "brenn-surface-contract",
  "brenn-surface-schema",
  "brenn-surface-test-fixtures",
+ "js-sys",
  "serde",
  "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-test",
  "web-sys",
 ]
 
@@ -530,8 +532,11 @@ dependencies = [
  "brenn-surface-component-support",
  "brenn-surface-contract",
  "brenn-surface-schema",
+ "brenn-surface-test-fixtures",
+ "js-sys",
  "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-test",
  "web-sys",
 ]
 
@@ -633,6 +638,7 @@ dependencies = [
  "brenn-surface-schema",
  "brenn-surface-test-fixtures",
  "chrono",
+ "js-sys",
  "serde",
  "serde_json",
  "wasm-bindgen",
@@ -653,6 +659,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-test",
  "web-sys",
 ]
 
@@ -680,10 +687,12 @@ dependencies = [
  "brenn-surface-schema",
  "brenn-surface-test-fixtures",
  "chrono",
+ "js-sys",
  "pulldown-cmark",
  "serde",
  "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-test",
  "web-sys",
 ]
 
@@ -820,8 +829,12 @@ name = "brenn-surface-test-fixtures"
 version = "0.1.0"
 dependencies = [
  "brenn-envelope",
+ "brenn-surface-contract",
+ "js-sys",
  "serde_json",
  "uuid",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

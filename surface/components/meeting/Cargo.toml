@@ -28,6 +28,7 @@ brenn-surface-test-fixtures = { path = "../../test-fixtures" }
 # wasm-bindgen-test via `make surface-wasm-test`. wasm32-only, matching the
 # crate's wasm-gated glue.
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+js-sys = { workspace = true }
 wasm-bindgen-test = { workspace = true }
 
 # The DOM/timer glue (component.rs) is browser-only: it renders the panel,

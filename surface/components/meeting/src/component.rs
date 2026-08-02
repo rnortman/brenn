@@ -11,28 +11,34 @@
 //! Every text run reaches the DOM via `set_text_content` — never `innerHTML`,
 //! never an anchor — so a meeting title is inert text regardless of content.
 //!
-//! The phase is a pure function of the wall clock, so the glue reads the browser
-//! clock and recomputes on every delivery and every scheduled boundary — never
-//! trusting elapsed time. A single `setTimeout` is kept alive and rescheduled
-//! (clamped to a ~15 min ceiling so a suspend/resume or DST step self-corrects
-//! within one interval); near a meeting the recommended interval is 1 s for a
-//! smooth countdown, coarser otherwise.
+//! The phase is a pure function of the wall clock, so the panel recomputes on
+//! every activation from that activation's own clock reading — never trusting
+//! elapsed time. The next boundary is a deferred self-publish on the `tick`
+//! in/out port, re-parked from each recompute; near a meeting the recommended
+//! interval is 1 s for a smooth countdown, coarser otherwise.
+//!
+//! Every publish this component makes — the ack, the takeover transition, the
+//! next boundary — is made from inside `on_activation`. A button press causes
+//! one of its own: the wiring encodes which button and which occurrence, and the
+//! entry decides and publishes.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use brenn_surface_component_support::{
-    Activation, MAX_WAKEUP_MS, PersistentTimer, Publisher, add_listener, append, boot,
-    claim_initialized, clamp_timeout_ms, component_log, create_button, create_div, document,
-    publish, read_now_utc, register_component,
+    Activation, Publisher, append, boot, claim_initialized, component_log, create_button,
+    create_div, document, publish_or_fault, read_now_utc, register_component, repark_tick,
+    wire_gesture,
 };
 use brenn_surface_schema::{CONTROL_PLANE_VERSION, LogLevel, TakeoverAction, TakeoverBody};
+use chrono::{DateTime, Utc};
 use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::HtmlElement;
 
 use crate::logic::dismiss_body;
 use crate::logic::{
-    AckAction, AckTarget, MeetingState, Recompute, SNOOZE_SECS, WarningLevel, snooze_body,
+    AckAction, AckKind, AckTarget, MeetingState, Recompute, SNOOZE_SECS, WarningLevel,
+    ack_request_body, parse_ack_request, snooze_body,
 };
 
 /// This component's kind — its config `kind`, its element-tag stem
@@ -46,9 +52,19 @@ const ACKS_PORT: &str = "acks";
 /// `[[surface.output]]` binding onto `local:brenn/takeover`.
 const TAKEOVER_PORT: &str = "takeover";
 
-/// A page-lifetime closure that reads the clock, renders, dispatches takeover
-/// transitions, and reschedules the boundary timer.
-type Ticker = Rc<dyn Fn()>;
+/// The boundary-wake port — must match a `[[surface.io_port]] port` declaration.
+const TICK_PORT: &str = "tick";
+
+/// The sync port a Dismiss/Snooze press arrives on. Not `acks`: that is a bound
+/// input port, and the kernel refuses a sync port that collides with one.
+const ACK_PORT: &str = "ack";
+
+/// A page-lifetime closure that recomputes the panel as of an instant, renders
+/// it, and records the occurrence now on screen. It publishes nothing and
+/// schedules nothing — both are the activation's, where the buffered
+/// [`Publisher`] lives — and hands the recompute back so its caller can decide
+/// from the same view it drew.
+type Render = Rc<dyn Fn(DateTime<Utc>) -> Recompute>;
 
 /// The panel's semantic child elements, updated in place on each recompute.
 struct Panel {
@@ -82,19 +98,24 @@ pub fn brenn_bind_instance(instance: String) {
         {
             let state = Rc::clone(&state);
             let wiring = Rc::clone(&wiring);
-            move |activation: &Activation, _publisher: &mut Publisher| {
-                on_activation(activation, &state, &wiring);
-                Ok(())
+            move |activation: &Activation, publisher: &mut Publisher| {
+                on_activation(activation, &state, &wiring, publisher);
+                Ok(None)
             }
         },
     );
 }
 
-/// What an activation needs from the built element: the host to log against and
-/// the recompute closure to run. `None` until `connectedCallback` builds them.
+/// What an activation needs from the built element: the host to log against, the
+/// render closure to run, and the takeover state last announced. `None` only
+/// before `connectedCallback` builds them: `register_component` hands the kernel
+/// the entry after `on_connected` returns, so every activation finds them.
 struct Wiring {
     host: HtmlElement,
-    tick: Ticker,
+    render: Render,
+    /// The takeover state of the last announcement, so request/release goes out
+    /// on a transition rather than on every recompute.
+    last_takeover: RefCell<bool>,
 }
 
 /// Build the panel and wire its buttons, invoked from the element's
@@ -148,37 +169,55 @@ fn on_connected(
     // targets the meeting currently on screen.
     let active: Rc<RefCell<Option<AckTarget>>> = Rc::new(RefCell::new(None));
 
-    let tick = make_ticker(
+    let render = make_renderer(
         host.clone(),
         Rc::clone(&panel),
         Rc::clone(state),
         Rc::clone(&active),
     );
-    // Render the initial idle state before any delivery.
-    tick();
+    // Render the initial idle state before any delivery. A render is the one side
+    // effect connect-time code may have; nothing is published and nothing is
+    // scheduled here, and the first of both is the mount activation's.
+    render(read_now_utc());
 
-    wire_action_button(&dismiss, &host, state, &tick, &active, ActionKind::Dismiss);
-    wire_action_button(&snooze, &host, state, &tick, &active, ActionKind::Snooze);
+    wire_action_button(&dismiss, &host, &active, AckKind::Dismiss);
+    wire_action_button(&snooze, &host, &active, AckKind::Snooze);
 
-    *wiring.borrow_mut() = Some(Wiring { host, tick });
+    *wiring.borrow_mut() = Some(Wiring {
+        host,
+        render,
+        last_takeover: RefCell::new(false),
+    });
 }
 
-/// Feed each activation window to the pure state machine, then recompute once —
-/// not once per message. Errors are logged; none stop the panel.
+/// Act on a button press if this activation is one, feed each delivered window to
+/// the pure state machine, then recompute once — not once per message —
+/// announcing any takeover transition and parking the next boundary. Errors are
+/// logged; none stop the panel.
 fn on_activation(
     activation: &Activation,
     state: &Rc<RefCell<MeetingState>>,
     wiring: &Rc<RefCell<Option<Wiring>>>,
+    publisher: &mut Publisher,
 ) {
     let wiring = wiring.borrow();
-    // No panel yet, so no ticker and nothing to log against. The activation is
-    // still consumed; its messages remain visible as context in a later window
-    // while retention covers them, and the first render runs on connect.
-    let Some(wiring) = wiring.as_ref() else {
-        return;
-    };
-    let now = read_now_utc();
-    for window in &activation.ports {
+    let wiring = wiring
+        .as_ref()
+        .expect("on_connected builds the panel before the entry is registered");
+    let now_ms = activation
+        .now
+        .expect("the surface kernel stamps every activation with its wall clock");
+    let now = DateTime::from_timestamp_millis(now_ms as i64)
+        .expect("an activation's wall clock is a representable instant");
+
+    if let Some((_, press)) = activation.sync_request() {
+        on_press(&press.body, state, wiring, publisher, now);
+    }
+    for window in activation.delivered_windows() {
+        // The tick's payload is irrelevant — the wake is the message.
+        if window.port == TICK_PORT {
+            continue;
+        }
         let notes = state
             .borrow_mut()
             .on_window(window, now)
@@ -191,101 +230,115 @@ fn on_activation(
             component_log(&wiring.host, level, &note.message);
         }
     }
+
     // Once per activation, not once per message: the render is a pure function of
     // the folded state and the clock.
-    (wiring.tick)();
+    let view = (wiring.render)(now);
+    announce_takeover(wiring, publisher, view.want_takeover);
+    // Every activation re-aims the boundary: the recommended interval tightens to
+    // a second near a meeting and relaxes away from one, so the wake that just
+    // fired is rarely the wake now wanted.
+    let release_at = now_ms + u64::from(view.next_tick_secs) * 1_000;
+    repark_tick(
+        activation,
+        publisher,
+        &wiring.host,
+        TICK_PORT,
+        Some(release_at),
+    );
 }
 
-/// Which ack a button publishes.
-#[derive(Clone, Copy)]
-enum ActionKind {
-    Dismiss,
-    Snooze,
+/// Publish the ack one button press asked for and apply it locally at once
+/// (responsive; the echo and other devices converge on the idempotent ack).
+///
+/// The occurrence comes from the press rather than from the panel's current
+/// state: the user acted on what they saw. A press that named no occurrence
+/// reached a hidden button through a programmatic click and acks nothing.
+fn on_press(
+    press: &str,
+    state: &Rc<RefCell<MeetingState>>,
+    wiring: &Wiring,
+    publisher: &mut Publisher,
+    now: DateTime<Utc>,
+) {
+    let parsed = parse_ack_request(press).unwrap_or_else(|reason| {
+        panic!("meeting's own gesture wiring produced an unreadable press: {reason}")
+    });
+    let Some((kind, target)) = parsed else {
+        return;
+    };
+    let (body, action) = match kind {
+        AckKind::Dismiss => (dismiss_body(&target), AckAction::Dismiss),
+        AckKind::Snooze => {
+            let until = now + chrono::Duration::seconds(SNOOZE_SECS);
+            (snooze_body(&target, until), AckAction::Snooze { until })
+        }
+    };
+    // The local transition happens whatever the bus says: the user dismissed the
+    // meeting, and a quota-refused publish means the other devices keep escalating,
+    // not that this one should.
+    publish_or_fault(publisher, &wiring.host, ACKS_PORT, &body);
+    state.borrow_mut().apply_local_ack(&target, action, now);
 }
 
-/// Wire a Dismiss/Snooze button: on click, if a meeting is active, publish its
-/// ack on the `acks` port and transition locally immediately (responsive; the
-/// echo and other devices converge on the idempotent ack), then re-render.
+/// Publish a takeover request/release when the desired state changed, and record
+/// it as announced only once the kernel took the publish — a refused announcement
+/// leaves the transition pending for the next recompute to retry.
+fn announce_takeover(wiring: &Wiring, publisher: &mut Publisher, want_takeover: bool) {
+    if want_takeover == *wiring.last_takeover.borrow() {
+        return;
+    }
+    let action = if want_takeover {
+        TakeoverAction::Request
+    } else {
+        TakeoverAction::Release
+    };
+    // The router overwrites `instance` with meeting's authenticated identity, so
+    // the empty value here is never trusted on the wire.
+    let body = serde_json::to_string(&TakeoverBody {
+        v: CONTROL_PLANE_VERSION,
+        action,
+        instance: String::new(),
+    })
+    .expect("a TakeoverBody serializes to JSON");
+    if publish_or_fault(publisher, &wiring.host, TAKEOVER_PORT, &body) {
+        *wiring.last_takeover.borrow_mut() = want_takeover;
+    }
+}
+
+/// Wire a Dismiss/Snooze button to a sync-call activation on the `ack` port.
+///
+/// The press body names the button and the occurrence the panel was showing when
+/// it happened; every decision the press implies — which ack, what snooze
+/// deadline, whether to publish at all — is the entry's.
 fn wire_action_button(
     button: &HtmlElement,
     host: &HtmlElement,
-    state: &Rc<RefCell<MeetingState>>,
-    tick: &Ticker,
     active: &Rc<RefCell<Option<AckTarget>>>,
-    kind: ActionKind,
+    kind: AckKind,
 ) {
-    let host = host.clone();
-    let state = Rc::clone(state);
-    let tick = Rc::clone(tick);
     let active = Rc::clone(active);
-    add_listener(button.as_ref(), "click", move |_event| {
-        let Some(target) = active.borrow().clone() else {
-            return;
-        };
-        let now = read_now_utc();
-        let (body, action) = match kind {
-            ActionKind::Dismiss => (dismiss_body(&target), AckAction::Dismiss),
-            ActionKind::Snooze => {
-                let until = now + chrono::Duration::seconds(SNOOZE_SECS);
-                (snooze_body(&target, until), AckAction::Snooze { until })
-            }
-        };
-        publish(&host, ACKS_PORT, &body);
-        state.borrow_mut().apply_local_ack(&target, action, now);
-        tick();
+    wire_gesture(host, button.as_ref(), "click", ACK_PORT, move |_event| {
+        ack_request_body(kind, active.borrow().as_ref())
     });
 }
 
-/// Build the page-lifetime render/dispatch/reschedule closure. The boundary timer
-/// is a [`PersistentTimer`] (one fire closure, reused): each tick renders,
-/// publishes a takeover request/release on the `takeover` output port only when
-/// the desired takeover state changed, and reschedules the timer with a clamped
-/// delay.
-fn make_ticker(
+/// Build the page-lifetime render closure: it recomputes as of the instant it is
+/// handed, writes the panel, records the occurrence now on screen for a press to
+/// name, and hands the recompute back. It publishes nothing and schedules
+/// nothing — both live in the activation, where the buffered `Publisher` does.
+fn make_renderer(
     host: HtmlElement,
     panel: Rc<Panel>,
     state: Rc<RefCell<MeetingState>>,
     active: Rc<RefCell<Option<AckTarget>>>,
-) -> Ticker {
-    let timer = Rc::new(PersistentTimer::new());
-    // The last takeover state we dispatched, so we emit request/release only on a
-    // transition rather than every tick.
-    let last_takeover: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-
-    let ticker: Ticker = {
-        let timer = Rc::clone(&timer);
-        Rc::new(move || {
-            let now = read_now_utc();
-            let view = state.borrow().recompute(now);
-            render(&host, &panel, &view);
-            *active.borrow_mut() = view.active.clone();
-
-            let prev = *last_takeover.borrow();
-            if view.want_takeover != prev {
-                let action = if view.want_takeover {
-                    TakeoverAction::Request
-                } else {
-                    TakeoverAction::Release
-                };
-                // The router overwrites `instance` with meeting's authenticated
-                // identity, so the empty value here is never trusted on the wire.
-                let body = serde_json::to_string(&TakeoverBody {
-                    v: CONTROL_PLANE_VERSION,
-                    action,
-                    instance: String::new(),
-                })
-                .expect("a TakeoverBody serializes to JSON");
-                publish(&host, TAKEOVER_PORT, &body);
-                *last_takeover.borrow_mut() = view.want_takeover;
-            }
-
-            let target = now + chrono::Duration::seconds(i64::from(view.next_tick_secs));
-            let delay = clamp_timeout_ms(now, target, Some(MAX_WAKEUP_MS));
-            timer.reschedule(delay);
-        })
-    };
-    timer.set_callback(Rc::clone(&ticker));
-    ticker
+) -> Render {
+    Rc::new(move |now| {
+        let view = state.borrow().recompute(now);
+        render(&host, &panel, &view);
+        *active.borrow_mut() = view.active.clone();
+        view
+    })
 }
 
 /// Write the panel from `view`: the `data-state` hook on the host, each text
@@ -307,6 +360,10 @@ fn render(host: &HtmlElement, panel: &Panel, view: &Recompute) {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
     use super::*;
+    use brenn_surface_contract::{PublishError, publish_status_str};
+    use brenn_surface_test_fixtures::browser::{
+        activation_json, answer_publishes_with, mount, record_ops, take_recorded,
+    };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -382,6 +439,228 @@ mod tests {
             labels.length(),
             1,
             "a re-connect must not duplicate the panel"
+        );
+    }
+
+    /// The instance this test binary binds its one module record to.
+    const TEST_INSTANCE: &str = "wbt-meeting";
+
+    /// The occurrence every activation below is about.
+    const MEETING_START: &str = "2126-07-08T12:00:00Z";
+
+    /// A one-meeting agenda snapshot body for the occurrence `id`, all of them
+    /// starting at [`MEETING_START`].
+    fn agenda_body(id: &str) -> String {
+        serde_json::json!({
+            "v": 1,
+            "meetings": [{ "id": id, "start": MEETING_START, "title": "Design" }],
+        })
+        .to_string()
+    }
+
+    /// `MEETING_START` minus `secs`, in epoch milliseconds.
+    fn before_start_ms(secs: i64) -> u64 {
+        (MEETING_START
+            .parse::<DateTime<Utc>>()
+            .unwrap()
+            .timestamp_millis()
+            - secs * 1_000) as u64
+    }
+
+    /// The mount activation publishes nothing and parks exactly one boundary
+    /// wake — connect-time code that published or scheduled would show up here
+    /// as an extra op, and a mount that parked nothing would leave a panel that
+    /// never counts down again — and a Dismiss press then publishes the ack and
+    /// suppresses it locally at once, from inside the activation the press
+    /// caused.
+    ///
+    /// One test because one module record binds one instance: a second mount in
+    /// this binary is the double-bind the SDK panics on.
+    ///
+    /// The second half pins the critical invariant: the press names an occurrence,
+    /// and every decision it implies is made where the buffered publisher lives.
+    /// A press whose ack never reached the bus, or one that acked whatever
+    /// happens to be on screen when the entry runs, both read the same from the
+    /// DOM.
+    ///
+    /// The last half pins the refusal arm: a takeover announcement the kernel did
+    /// not take stays pending, so the next recompute re-announces it. Recording
+    /// the transition regardless would wedge the panel out of takeover for the
+    /// page's life after one transient quota, with one log line as the only trace.
+    #[wasm_bindgen_test]
+    fn the_panel_mounts_quiet_and_a_press_publishes_its_ack() {
+        // Installed before the mount: connect-time code that published, parked or
+        // asked for a sync activation lands here, where silence is the assertion.
+        let ops = record_ops();
+        let (entry, host) = mount(KIND, TEST_INSTANCE, brenn_bind_instance);
+        assert_eq!(
+            ops.length(),
+            0,
+            "connect-time code renders and wires only, and reaches no kernel seam"
+        );
+        let now_ms = before_start_ms(30);
+
+        // The mount activation: nothing delivered, nothing to say.
+        entry
+            .call1(
+                &wasm_bindgen::JsValue::NULL,
+                &wasm_bindgen::JsValue::from_str(&activation_json(&[], None, now_ms)),
+            )
+            .expect("the entry returns ok");
+        let mount_ops = take_recorded(&ops);
+        let [wake] = &mount_ops[..] else {
+            panic!(
+                "an idle mount wants no takeover and no ack — only its next boundary: {mount_ops:?}"
+            )
+        };
+        assert_eq!(
+            (
+                wake[0].as_str(),
+                wake[1].as_str(),
+                wake[2].as_str(),
+                wake[3].as_str()
+            ),
+            ("defer", "publish", TICK_PORT, "{}"),
+        );
+        assert!(
+            wake[4].parse::<u64>().expect("a decimal release instant") > now_ms,
+            "the boundary is aimed into the activation's future: {wake:?}"
+        );
+
+        // An escalating meeting.
+        entry
+            .call1(
+                &wasm_bindgen::JsValue::NULL,
+                &wasm_bindgen::JsValue::from_str(&activation_json(
+                    &[("agenda", &agenda_body("m1"))],
+                    None,
+                    now_ms,
+                )),
+            )
+            .expect("the entry returns ok");
+        assert_eq!(
+            host.get_attribute("data-state").as_deref(),
+            Some("critical"),
+            "30 s out is inside the critical rung"
+        );
+        let agenda_ops = take_recorded(&ops);
+        assert!(
+            agenda_ops
+                .iter()
+                .any(|row| (row[0].as_str(), row[2].as_str()) == ("publish", TAKEOVER_PORT)),
+            "an escalating meeting requests the takeover overlay: {agenda_ops:?}"
+        );
+
+        // The Dismiss press against the on-screen meeting.
+        let press = ack_request_body(
+            AckKind::Dismiss,
+            Some(&AckTarget {
+                meeting_id: "m1".to_string(),
+                start: MEETING_START.parse().expect("the fixture start parses"),
+            }),
+        );
+        entry
+            .call1(
+                &wasm_bindgen::JsValue::NULL,
+                &wasm_bindgen::JsValue::from_str(&activation_json(
+                    &[(ACK_PORT, &press)],
+                    Some(ACK_PORT),
+                    now_ms,
+                )),
+            )
+            .expect("the entry returns ok");
+
+        let press_ops = take_recorded(&ops);
+        let [ack, takeover, wake] = &press_ops[..] else {
+            panic!("expected an ack, a takeover release and a wake: {press_ops:?}")
+        };
+        assert_eq!((ack[0].as_str(), ack[2].as_str()), ("publish", ACKS_PORT));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ack[3]).expect("the ack body is JSON")["action"],
+            "dismiss"
+        );
+        assert_eq!(
+            (takeover[0].as_str(), takeover[2].as_str()),
+            ("publish", TAKEOVER_PORT),
+            "the dismissal drops the panel out of takeover, which must be released"
+        );
+        assert_eq!((wake[0].as_str(), wake[2].as_str()), ("defer", TICK_PORT));
+        assert_eq!(
+            host.get_attribute("data-state").as_deref(),
+            Some("idle"),
+            "the local ack applies at once, without waiting for the echo"
+        );
+
+        // A second occurrence escalates while the kernel is refusing publishes:
+        // the announcement is attempted, refused, reported, and left pending.
+        answer_publishes_with(&ops, publish_status_str(Err(PublishError::QuotaExceeded)));
+        entry
+            .call1(
+                &wasm_bindgen::JsValue::NULL,
+                &wasm_bindgen::JsValue::from_str(&activation_json(
+                    &[("agenda", &agenda_body("m2"))],
+                    None,
+                    now_ms,
+                )),
+            )
+            .expect("a refused publish is an answer, not a failed activation");
+        let refused_ops = take_recorded(&ops);
+        assert_eq!(
+            refused_ops
+                .iter()
+                .filter(|row| (row[0].as_str(), row[2].as_str()) == ("publish", TAKEOVER_PORT))
+                .count(),
+            1,
+            "the transition is announced once: {refused_ops:?}"
+        );
+        assert!(
+            refused_ops.iter().any(|row| row[0] == "log"),
+            "the refusal is reported to the operator: {refused_ops:?}"
+        );
+
+        // The next recompute re-announces the same transition, because nothing
+        // recorded it as announced.
+        answer_publishes_with(&ops, publish_status_str(Ok(())));
+        entry
+            .call1(
+                &wasm_bindgen::JsValue::NULL,
+                &wasm_bindgen::JsValue::from_str(&activation_json(
+                    &[(TICK_PORT, "{}")],
+                    None,
+                    now_ms,
+                )),
+            )
+            .expect("the entry returns ok");
+        let retry_ops = take_recorded(&ops);
+        let takeover = retry_ops
+            .iter()
+            .find(|row| (row[0].as_str(), row[2].as_str()) == ("publish", TAKEOVER_PORT))
+            .unwrap_or_else(|| {
+                panic!("a refused transition is retried, not dropped: {retry_ops:?}")
+            });
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&takeover[3])
+                .expect("the takeover body is JSON")["action"],
+            "request"
+        );
+
+        // And once taken, it is not re-announced.
+        entry
+            .call1(
+                &wasm_bindgen::JsValue::NULL,
+                &wasm_bindgen::JsValue::from_str(&activation_json(
+                    &[(TICK_PORT, "{}")],
+                    None,
+                    now_ms,
+                )),
+            )
+            .expect("the entry returns ok");
+        let settled_ops = take_recorded(&ops);
+        assert!(
+            !settled_ops
+                .iter()
+                .any(|row| (row[0].as_str(), row[2].as_str()) == ("publish", TAKEOVER_PORT)),
+            "a recorded transition is announced once: {settled_ops:?}"
         );
     }
 }

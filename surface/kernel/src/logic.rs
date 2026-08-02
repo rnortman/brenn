@@ -193,6 +193,31 @@ pub fn route_publish_intent(
     }
 }
 
+/// The drop-and-report for a well-formed publish the kernel could not buffer: no
+/// activation of the dispatching instance is on the stack.
+///
+/// The component is *also* answered `not-permitted` on the event's status field,
+/// so this is the operator's copy rather than the component's. Both exist because
+/// the two audiences differ: the SDK turns the status into a panic at the call
+/// site, and a non-SDK dispatcher — page script, a hand-rolled module — leaves no
+/// other trace.
+///
+/// There is no second publish path for it to take. Every component-origin publish
+/// is an activation's, buffered and flushed iff the activation returns ok; a
+/// publish made outside one has no flush boundary to belong to and is refused
+/// rather than sent on its own.
+pub fn unbuffered_publish_refused(instance: &str, port: &str) -> KernelAction {
+    KernelAction::Report {
+        level: LogLevel::Warn,
+        message: format!(
+            "refused {} of port {port:?} from component {instance}: no activation of it is in \
+             flight, and a publish has no path outside one",
+            contract::PORT_PUBLISH
+        ),
+        subject: Some(instance.to_string()),
+    }
+}
+
 /// A `brenn-port-defer` event's untrusted detail, as read at the
 /// kernel↔component trust boundary.
 ///
@@ -431,6 +456,80 @@ pub fn route_defer_intent(
             target_tag,
             "op must be publish, cancel or edit",
         )),
+    }
+}
+
+/// One well-formed sync-call request, resolved to the instance that dispatched
+/// it.
+///
+/// Not a [`KernelAction`], for [`DeferIntent`]'s reason: there is no effect to
+/// apply outside an activation. The only two outcomes are "ask the sync door for
+/// an activation" and "drop and report", which the router returns as the two arms
+/// of a `Result`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncIntent {
+    /// The dispatching instance — the routing identity the DOM executor resolved,
+    /// never anything the detail claimed.
+    pub instance: String,
+    /// The sync port the request arrives on, chosen by the component.
+    pub port: String,
+    /// The request payload, opaque to the kernel.
+    pub body: String,
+}
+
+/// Route a component's `brenn-activation-sync` intent to the request the sync
+/// door should run, or to the drop-and-report for a detail that does not spell
+/// one.
+///
+/// Dispatch identity resolves exactly as [`route_publish_intent`]: `instance` is
+/// the DOM-resolved mounted-instance id for the retargeted target, and a target
+/// that does not resolve to a mounted instance element is dropped with `Report`.
+/// `target_tag` is carried for the breadcrumb.
+///
+/// `port` and `body` are `None` when the detail omitted them or carried a
+/// non-string value. Malformed detail is never coerced into a request: a guessed
+/// port name would activate the component on a port it never asked for, and the
+/// entry has no way to tell that apart from a real one.
+pub fn route_sync_intent(
+    instance: Option<&str>,
+    target_tag: &str,
+    port: Option<&str>,
+    body: Option<&str>,
+) -> Result<SyncIntent, KernelAction> {
+    let instance = require_mounted_instance(instance, target_tag, contract::ACTIVATION_SYNC)?;
+    match (port, body) {
+        (Some(port), Some(body)) => Ok(SyncIntent {
+            instance: instance.to_string(),
+            port: port.to_string(),
+            body: body.to_string(),
+        }),
+        _ => Err(KernelAction::Report {
+            level: LogLevel::Warn,
+            message: format!(
+                "dropped malformed {} from <{target_tag}>: port and body must be strings",
+                contract::ACTIVATION_SYNC
+            ),
+            subject: Some(instance.to_string()),
+        }),
+    }
+}
+
+/// The drop-and-report for a well-formed request the kernel would not admit.
+///
+/// Every refusal is a bug — see [`crate::outward::SyncRefusal`] — so the sentence
+/// is the operator's account of which one, alongside the `refused` status the
+/// requester itself faults on.
+///
+/// A refusal is reported by instance and port alone, never by payload content.
+pub fn sync_refused(
+    instance: &str,
+    port: &str,
+    refusal: &crate::outward::SyncRefusal,
+) -> KernelAction {
+    KernelAction::Report {
+        level: LogLevel::Warn,
+        message: refusal.describe(instance, port),
+        subject: Some(instance.to_string()),
     }
 }
 
@@ -2228,6 +2327,91 @@ mod tests {
         }
     }
 
+    // ── route_sync_intent ─────────────────────────────────────────────────
+
+    #[test]
+    fn sync_intent_from_mounted_instance_carries_port_and_body_through() {
+        let intent =
+            route_sync_intent(Some("p1"), "brenn-protobar", Some("ack"), Some("{\"i\":2}"))
+                .expect("a well-formed request from a mounted instance routes");
+        assert_eq!(
+            intent,
+            SyncIntent {
+                instance: "p1".to_string(),
+                port: "ack".to_string(),
+                body: "{\"i\":2}".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sync_intent_from_unresolved_target_is_dropped_and_reported() {
+        // Identical posture to every other event on this seam: the instance is
+        // the DOM executor's answer, and a target that resolves to nothing is
+        // unattributable rather than guessed at.
+        for tag in ["brenn-protobar", "button"] {
+            let drop = route_sync_intent(None, tag, Some("ack"), Some("{}"))
+                .expect_err("an unresolved target does not route");
+            let KernelAction::Report {
+                level,
+                message,
+                subject,
+            } = drop
+            else {
+                panic!("expected Report for <{tag}>");
+            };
+            assert_eq!(level, LogLevel::Warn);
+            assert_eq!(subject, None);
+            assert!(message.contains(tag), "message: {message}");
+            assert!(
+                message.contains(contract::ACTIVATION_SYNC),
+                "message: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_intent_with_malformed_detail_is_dropped_as_malformed() {
+        // A guessed port would activate the component on a port it never asked
+        // for, which its entry cannot tell apart from a real request.
+        for (port, body) in [(None, Some("{}")), (Some("ack"), None), (None, None)] {
+            let drop = route_sync_intent(Some("p1"), "brenn-protobar", port, body)
+                .expect_err("malformed detail does not route");
+            let KernelAction::Report {
+                level,
+                message,
+                subject,
+            } = drop
+            else {
+                panic!("expected Report for ({port:?}, {body:?})");
+            };
+            assert_eq!(level, LogLevel::Warn);
+            assert_eq!(subject, Some("p1".to_string()));
+            assert!(message.contains("malformed"), "message: {message}");
+            assert!(message.contains("brenn-protobar"), "message: {message}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_reports_its_own_sentence_against_the_requesting_instance() {
+        let action = sync_refused("p1", "ack", &crate::outward::SyncRefusal::ReEntrant);
+        let KernelAction::Report {
+            level,
+            message,
+            subject,
+        } = action
+        else {
+            panic!("a refusal reports");
+        };
+        assert_eq!(level, LogLevel::Warn);
+        assert_eq!(subject, Some("p1".to_string()));
+        assert!(message.contains("in flight"), "{message}");
+        assert!(
+            message.contains("p1") && message.contains("ack"),
+            "{message}"
+        );
+    }
+
     // ── route_defer_intent ────────────────────────────────────────────────
 
     /// A `brenn-port-defer` detail with everything omitted but the op and the
@@ -2549,6 +2733,30 @@ mod tests {
         assert_eq!(subject, None);
         assert!(message.contains("button"), "message: {message}");
         assert!(message.contains(contract::PORT_DEFER), "message: {message}");
+    }
+
+    #[test]
+    fn a_publish_the_buffer_cannot_take_is_reported_against_its_instance() {
+        // The component reads `not-permitted` off the detail; this is the
+        // operator's copy, and the only trace a non-SDK dispatcher leaves. It names
+        // the instance so a looping component draws down its own report budget.
+        let action = unbuffered_publish_refused("p1", "out");
+        let KernelAction::Report {
+            level,
+            message,
+            subject,
+        } = action
+        else {
+            panic!("expected a Report, got {action:?}");
+        };
+        assert_eq!(level, LogLevel::Warn);
+        assert_eq!(subject.as_deref(), Some("p1"));
+        assert!(message.contains("\"out\""), "message: {message}");
+        assert!(message.contains("in flight"), "message: {message}");
+        assert!(
+            message.contains(contract::PORT_PUBLISH),
+            "message: {message}"
+        );
     }
 
     #[test]

@@ -102,30 +102,38 @@ Done when instance-death teardown clears the gate and calls
 chrome reparent (preserve delivery, never deregister). Wire it with the
 kernel-driven death path, which is a later increment / Phase-3 concern.
 
+The sync seam is a second consumer of the gate: a sync request is refused until
+the requesting instance's entry is registered, so a remount the gate wrongly
+rejects loses its gestures as well as its deliveries.
+
 Code site (`TODO(kernel-registration-gate-lifecycle)`):
 `surface/kernel/src/logic.rs`, the `KernelCore.registered` field.
 
 ---
 
-## `buffered-publish-routing-test`
+## `surface-single-publish-tightening`
 
-The buffered-vs-gesture publish split — `try_buffered_publish`
-(instance-match) and the `invoke`'s in-flight-slot install/take
-(`surface/kernel/src/front.rs`, `surface/kernel/src/runner.rs`) — has no direct
-test. Both are wasm-only
-(`cfg(target_arch = "wasm32")`), and the kernel's own state-machine suites run
-*natively* (`cargo test`); the browser suites that do exist
-(`make surface-wasm-test`) drive the DOM seam, not the slot. The
-routing decision is covered behaviorally through component-support's fake-kernel
-tests, but the real handle/runner slot glue is unverified.
+A surface attachment still sends single `ClientFrame::Publish` frames under a
+**component-instance attribution**: the kernel's error-report path attributes a
+report to the component it is about (`SurfaceOutbound::report`,
+`surface/kernel/src/outbound.rs`), so the sender sub-identity on the frame is a
+component id even though the sender is the kernel. That is legitimate and
+deliberate — the report draws down that component's budget, not its neighbours'
+— so the server cannot simply reject a surface session's single `Publish` that
+claims a component attribution, which is the tightening the gesture-activation
+work went looking for once component-origin publishes all became batches.
 
-Done when a wasm-bindgen-test drives match / mismatch / no-flight and the slot
-take-back (entangled with `surface-wasm-test-in-ci`, since a browser suite that
-never runs answers nothing).
+What is true after that work: every *component-origin* publish leaves a surface
+as a `PublishBatch`. Nothing on the server asserts it, so a future
+component-origin single `Publish` would be admitted silently.
 
-Code sites (`TODO(buffered-publish-routing-test)`):
-`surface/kernel/src/front.rs` (`try_buffered_publish`),
-`surface/kernel/src/runner.rs` (wasm `invoke_wasm`).
+Done when the server can tell the kernel's own attributed traffic from a
+component's — a distinguishing mark on the frame, or a per-attribution posture
+in the attach profile — and rejects (+ logs, fail2ban posture) a surface
+session's single `Publish` that is neither.
+
+Code site (`TODO(surface-single-publish-tightening)`):
+`brenn-server/src/routes/attach/publish.rs`, `handle_publish`.
 
 ---
 
@@ -137,7 +145,10 @@ no longer rot silently. They are still never **run** by any gate: `make
 surface-wasm-test` needs a WebDriver browser driver and is in neither
 `CARGO_CHECK_STEPS` nor `check-ci`. A type-checked suite that never runs still
 answers no behavioral question — and these are the XSS-adjacent
-text-not-markup pins, the DOM seam, mount/unmount, and port dispatch.
+text-not-markup pins, the DOM seam, mount/unmount, port dispatch, and the whole
+sync-call seam (the `brenn-activation-sync` listener, the door's answer
+vocabulary, the publish route's buffered/refused split), which exists only in
+the browser and is pinned only here.
 
 Done when `check-ci` runs `make surface-wasm-test`. **Blocked on host
 provisioning, and the ordering is load-bearing:** CI is a persistent
@@ -1037,6 +1048,40 @@ happens, and a test pins it: drop the event receiver mid-drain with a control
 sender still alive, and the run terminates.
 
 Code site (`TODO(runner-drain-host-departure)`): `surface/kernel/src/runner.rs`,
+at `run_terminal_drain`.
+
+
+## `terminal-drain-release-deadline`
+
+A terminal attachment freezes every confined deferred schedule on the page.
+Reaching terminal disarms all three of the driver's deadlines
+(`attach/client/src/driver.rs`, the terminal arm) and
+`SurfaceRunner::run_terminal_drain` (`surface/kernel/src/runner.rs`) selects no io
+arm at all, so `Input::ReleaseDue` never fires again. A tick parked before or
+during the terminal transition never releases: mode-clock's theme stops tracking
+the schedule and protobar's expired slots linger, on a page chrome is drawing a
+death banner over.
+
+Detached is not affected and is what the cycle's design names — the main loop
+keeps serving `ReleaseDue` for the whole reconnect, so the offline ticker keeps
+ticking. Terminal is the state nobody ruled on. It is a behavioural change from
+the `PersistentTimer` shape these components migrated off, where a raw
+`setTimeout` kept firing regardless of the attachment.
+
+The decision comes first: a terminal page is dead and says so, and whether its
+components should keep re-rendering behind that banner is a product call, not a
+patch. Implementing "keep ticking" then means keeping the release deadline armed
+through terminal, which contradicts the driver's stated shape (`AttachDriver::wait`
+documents pending-forever as terminal's shape by construction, so an embedder
+winding down is never handed timer events) and adds an io arm to a drain that
+currently touches no driver — the same wait `runner-drain-host-departure` is
+already blocked on redesigning.
+
+Done when either the drain releases parked confined messages and a test pins a
+tick firing after terminal, or the contract states that a terminal page's
+schedules freeze and the components' docs say so.
+
+Code site (`TODO(terminal-drain-release-deadline)`): `surface/kernel/src/runner.rs`,
 at `run_terminal_drain`.
 
 

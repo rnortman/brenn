@@ -67,12 +67,33 @@ pub(crate) fn mount(page: &mut SurfacePage, instances: &[&str]) {
     for instance in instances {
         page.registrations
             .register(instance, None, &mut page.stores, &mut page.subs);
-        page.schedules.track(instance);
+        page.schedules.track(instance, false);
     }
 }
 
-/// A configured page: phase 1, `instances` mounted, and `doc` in force.
+/// A configured page: phase 1, `instances` mounted, `doc` in force, and every
+/// mount past its guaranteed first activation.
+///
+/// The mount debts are settled here so a suite asking "is anything ready?" is
+/// asking about the messages it arranged, not about the once-per-mount activation
+/// every instance is owed. A suite whose subject *is* that activation builds its
+/// page with [`mounting_page`].
 pub(crate) fn configured_page(
+    config_channel: &str,
+    epoch: Uuid,
+    facts: AttachmentFacts,
+    instances: &[&str],
+    doc: &BindingsDocument,
+    now: Millis,
+) -> SurfacePage {
+    let mut page = mounting_page(config_channel, epoch, facts, instances, doc, now);
+    page.schedules.settle_mount_debts();
+    page
+}
+
+/// A configured page with every mount still owed its guaranteed first activation
+/// — [`configured_page`] one step earlier.
+pub(crate) fn mounting_page(
     config_channel: &str,
     epoch: Uuid,
     facts: AttachmentFacts,

@@ -101,6 +101,32 @@ pub struct AttachDriver<C: TransportConnector> {
     start_effects: Vec<ConnEffect>,
 }
 
+/// A stamp for one locally minted envelope: a fresh identity and the wall-clock
+/// instant it carries.
+///
+/// Free rather than only a method, because the driver is not the embedder's only
+/// I/O edge: a browser embedder that mints an envelope on a synchronous stack of
+/// its own has no driver in reach and must still read entropy and a clock in one
+/// place that the sans-I/O layers below do not.
+pub fn new_stamp() -> MessageStamp {
+    MessageStamp {
+        message_id: Uuid::new_v4(),
+        publish_ts: wall_now(),
+    }
+}
+
+/// `count` stamps for one flush, all carrying the same wall-clock instant: a
+/// flush is one commit, and its entries must agree about when now was.
+pub fn flush_stamps(count: usize) -> Vec<MessageStamp> {
+    let publish_ts = wall_now();
+    (0..count)
+        .map(|_| MessageStamp {
+            message_id: Uuid::new_v4(),
+            publish_ts,
+        })
+        .collect()
+}
+
 impl<C: TransportConnector> AttachDriver<C> {
     /// Build the driver and its connection. Nothing has happened yet: the first
     /// attempt's effects wait for [`AttachDriver::start`].
@@ -147,10 +173,7 @@ impl<C: TransportConnector> AttachDriver<C> {
     /// layers that compose the publish are sans-I/O. Only for confined publishes,
     /// where the attacher mints the envelope.
     pub fn new_stamp(&self) -> MessageStamp {
-        MessageStamp {
-            message_id: Uuid::new_v4(),
-            publish_ts: wall_now(),
-        }
+        new_stamp()
     }
 
     /// `count` stamps for one flush, all carrying the same wall-clock instant.
@@ -158,13 +181,7 @@ impl<C: TransportConnector> AttachDriver<C> {
     /// One clock reading: a flush is one commit, and its entries must agree about
     /// when now was.
     pub fn flush_stamps(&self, count: usize) -> Vec<MessageStamp> {
-        let publish_ts = wall_now();
-        (0..count)
-            .map(|_| MessageStamp {
-                message_id: Uuid::new_v4(),
-                publish_ts,
-            })
-            .collect()
+        flush_stamps(count)
     }
 
     /// The connection's current lifecycle state.

@@ -929,7 +929,7 @@ fn a_plane_refusal_is_reported_against_its_publisher() {
                     channel: LOCAL_OVERLAY_STATE_CHANNEL.to_string(),
                     reason: "holder is not a declared instance".to_string(),
                 }],
-                ..Completion::nothing(fixtures::CHROME.to_string(), ActivationOutcome::Ok)
+                ..Completion::nothing(fixtures::CHROME.to_string(), ActivationOutcome::Ok(None))
             },
             NOW,
             NOW_MS,

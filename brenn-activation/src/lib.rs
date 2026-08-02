@@ -32,6 +32,21 @@ pub struct Activation<E> {
     /// holding a clock of its own. `None` when the host exposes no UTC wall
     /// clock.
     pub now: Option<u64>,
+    /// Name of the live sync port, when this is a **sync-call** activation:
+    /// an ordinary activation plus a return obligation. `None` for an ordinary
+    /// async one, which is every activation a message delivery causes.
+    ///
+    /// The named port appears in `ports` carrying exactly one envelope — the
+    /// live request, `new_from == 0`, `dropped == 0` — so a component consumes
+    /// it through the same window API as everything else. A sync port has no
+    /// queue, no retention and no position: its window is always exactly the one
+    /// request, and it appears at all only on the activation it caused. Every
+    /// other bound port windows as usual, and the deferred windows ride along as
+    /// usual, so the handler sees its full normal worldview.
+    ///
+    /// The obligation is the entry's return value: a sync-call activation may
+    /// answer its caller with a reply, and an ordinary one may not.
+    pub sync: Option<String>,
 }
 
 /// One output port's view onto its own parked messages: the component's
@@ -183,6 +198,63 @@ impl<E> Activation<E> {
             .iter()
             .fold(0u64, |acc, w| acc.saturating_add(w.dropped))
     }
+
+    /// The live request's window on a sync-call activation — the [`Self::sync`]
+    /// port's entry in `ports` — or `None` on an async one.
+    ///
+    /// The primitive under [`Self::sync_request`] and [`Self::delivered_windows`],
+    /// for a component that wants the window itself rather than the request in it.
+    ///
+    /// Panics when `sync` names a port `ports` does not carry. The host assembles
+    /// both halves together, so their disagreement is a host bug, and windowing a
+    /// request that is not there is not a state to carry on from.
+    pub fn sync_window(&self) -> Option<&PortWindow<E>> {
+        let port = self.sync.as_deref()?;
+        Some(
+            self.ports
+                .iter()
+                .find(|window| window.port == port)
+                .expect("a sync-call activation carries the window of the port it names"),
+        )
+    }
+
+    /// The live request on a sync-call activation — the sync port's name and the
+    /// one envelope carrying the request — or `None` on an async one.
+    ///
+    /// This is half of the gesture idiom; [`Self::delivered_windows`] is the
+    /// other half. A component that answers gestures reads the request here and
+    /// folds deliveries there, and never sees the request twice.
+    ///
+    /// Panics when the window carries other than exactly one new envelope. The
+    /// host mints the request and windows it alone, so any other count is a host
+    /// bug, and answering a gesture from the wrong request — or from none — is not
+    /// a state to carry on from.
+    pub fn sync_request(&self) -> Option<(&str, &E)> {
+        let window = self.sync_window()?;
+        let [request] = window.new_envelopes() else {
+            panic!(
+                "a sync-call activation's window on port {:?} carries the one live request, \
+                 not {} of them",
+                window.port,
+                window.new_len()
+            )
+        };
+        Some((window.port.as_str(), request))
+    }
+
+    /// Every window this activation *delivered*: its ports, minus the sync
+    /// request's. The request is not a message anyone published, so it belongs in
+    /// no delivery fold.
+    ///
+    /// The whole `ports` list on an async activation, so a component that folds
+    /// through this reads the same worldview either way and cannot forget the
+    /// exclusion the day it grows a gesture.
+    pub fn delivered_windows(&self) -> impl Iterator<Item = &PortWindow<E>> {
+        let sync = self.sync.as_deref();
+        self.ports
+            .iter()
+            .filter(move |window| Some(window.port.as_str()) != sync)
+    }
 }
 
 #[cfg(test)]
@@ -214,8 +286,10 @@ mod tests {
                 }],
             }],
             now: Some(1_700_000_000_000),
+            sync: None,
         };
         assert_eq!(activation.now, Some(1_700_000_000_000));
+        assert_eq!(activation.sync, None);
 
         let DeferredWindow { port, entries } = &activation.deferred[0];
         assert_eq!(port, "reminders");
@@ -251,6 +325,7 @@ mod tests {
             ports: vec![window, context_only],
             deferred: vec![],
             now: None,
+            sync: None,
         };
         assert_eq!(both.ports.len(), 2);
         assert!(both.deferred.is_empty());
@@ -282,13 +357,139 @@ mod tests {
         assert!(context_only.new_envelopes().is_empty());
         assert_eq!(context_only.new_len(), 0);
 
+        // `new_from == 0`: every envelope is new and none is context — the shape a
+        // sync port's window always has, and a first delivery's.
+        let all_new = PortWindow {
+            port: "ack".to_string(),
+            envelopes: vec!["n-1"],
+            new_from: 0,
+            dropped: 0,
+        };
+        assert_eq!(all_new.new_envelopes(), &["n-1"]);
+        assert_eq!(all_new.new_len(), 1);
+
         // `total_dropped` folds `dropped` across every port, not any other field.
         let activation = Activation {
-            ports: vec![with_new, context_only],
+            ports: vec![with_new, context_only, all_new],
             deferred: vec![],
             now: None,
+            sync: None,
         };
         assert_eq!(activation.total_dropped(), 7);
+    }
+
+    /// `sync_window` picks the named port out of `ports` — the request, not the
+    /// first window and not a same-shaped delivery. A component uses it both to
+    /// find the request and to skip it in its delivery loop, so picking the wrong
+    /// one would fold a gesture as a publisher's message and act on a message as
+    /// a gesture.
+    #[test]
+    fn the_sync_window_is_the_named_port_and_nothing_else() {
+        fn window(port: &str, body: &'static str) -> PortWindow<&'static str> {
+            PortWindow {
+                port: port.to_string(),
+                envelopes: vec![body],
+                new_from: 0,
+                dropped: 0,
+            }
+        }
+        let mut activation = Activation {
+            ports: vec![window("agenda", "snapshot"), window("ack", "dismiss")],
+            deferred: vec![],
+            now: None,
+            sync: None,
+        };
+        assert!(
+            activation.sync_window().is_none(),
+            "an async activation has no request, however its ports are shaped"
+        );
+
+        activation.sync = Some("ack".to_string());
+        let request = activation.sync_window().expect("the request is windowed");
+        assert_eq!(request.port, "ack");
+        assert_eq!(request.envelopes, vec!["dismiss"]);
+    }
+
+    /// The two halves of the gesture idiom against each other: the request comes
+    /// out of the sync window, and the delivery fold sees every *other* window.
+    /// Their disagreement is what makes a component act on its own press twice or
+    /// fold it as a peer's publish.
+    #[test]
+    fn the_request_and_the_delivered_windows_partition_the_ports() {
+        fn window(port: &str, body: &'static str) -> PortWindow<&'static str> {
+            PortWindow {
+                port: port.to_string(),
+                envelopes: vec![body],
+                new_from: 0,
+                dropped: 0,
+            }
+        }
+        let mut activation = Activation {
+            ports: vec![window("agenda", "snapshot"), window("ack", "dismiss")],
+            deferred: vec![],
+            now: None,
+            sync: None,
+        };
+        assert!(activation.sync_request().is_none());
+        assert_eq!(
+            activation
+                .delivered_windows()
+                .map(|w| w.port.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agenda", "ack"],
+            "an async activation delivered every one of its ports"
+        );
+
+        activation.sync = Some("ack".to_string());
+        assert_eq!(activation.sync_request(), Some(("ack", &"dismiss")));
+        assert_eq!(
+            activation
+                .delivered_windows()
+                .map(|w| w.port.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agenda"],
+            "the request's window is not a delivery"
+        );
+    }
+
+    /// A sync window carrying anything but the one minted request is a host that
+    /// built the activation wrong. Taking the first would answer a gesture from a
+    /// request the user did not make; taking none would answer from nothing.
+    #[test]
+    #[should_panic(expected = "carries the one live request")]
+    fn a_sync_window_with_two_requests_is_a_host_bug() {
+        let activation = Activation {
+            ports: vec![PortWindow {
+                port: "ack".to_string(),
+                envelopes: vec!["dismiss", "snooze"],
+                new_from: 0,
+                dropped: 0,
+            }],
+            deferred: vec![],
+            now: None,
+            sync: Some("ack".to_string()),
+        };
+        let _ = activation.sync_request();
+    }
+
+    /// A `sync` naming a port no window carries is a host that assembled the two
+    /// halves inconsistently. Reading it as "no request" would run a gesture entry
+    /// with nothing to act on.
+    #[test]
+    #[should_panic(expected = "carries the window of the port it names")]
+    fn a_sync_port_with_no_window_is_a_host_bug() {
+        let activation = Activation {
+            ports: vec![PortWindow {
+                port: "agenda".to_string(),
+                envelopes: vec!["snapshot"],
+                new_from: 0,
+                dropped: 0,
+            }],
+            deferred: vec![],
+            now: None,
+            sync: Some("ack".to_string()),
+        };
+        let _ = activation.sync_window();
     }
 
     /// The latest-wins fold: the newest new message and nothing else, and never a

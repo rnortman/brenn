@@ -21,13 +21,18 @@
 //! sans-I/O seam the layers below keep, applied to the layer that drives them, so
 //! a whole turn is reproducible against fixed inputs.
 //!
-//! # The one pass that is not an input
+//! # The two passes that are not inputs
 //!
 //! [`dispatch`] is the exception, and it is one by necessity: assembling an
 //! activation answers with the activation itself, and the caller — which holds the
 //! entry closure the page deliberately does not — is the only party that can
 //! invoke it. It is otherwise an ordinary turn, effects and release restatement
 //! alike, and the completion comes back through [`Input::ActivationDone`].
+//!
+//! [`dispatch_sync`] is the same exception for the same reason, with the subject
+//! named by the caller rather than picked by the rotation: a component's own stack
+//! is blocked on the answer, so the request cannot be queued as an input and
+//! answered later.
 //!
 //! # Nothing is enacted
 //!
@@ -40,12 +45,13 @@ mod tests;
 
 use brenn_attach_client::Millis;
 use brenn_attach_client::conn::ConnEvent;
+use brenn_attach_client::router::MessageStamp;
 use brenn_attach_proto::ServerFrame;
 
 use crate::activation::ReadyActivation;
 use crate::command::{self, Command};
 use crate::inbound;
-use crate::outward::{self, Completed};
+use crate::outward::{self, Completed, SyncRefusal};
 use crate::page::SurfacePage;
 use crate::session::{Effect, Reactions};
 
@@ -147,6 +153,75 @@ pub fn dispatch(
     (ready, reactions.into_effects())
 }
 
+/// What a sync-call request produced, for the caller blocked on the answer.
+///
+/// Boxed on the one arm that carries anything: the other two are a byte apiece,
+/// and the answer is moved through the door's whole stack on every request.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SyncDispatch {
+    /// Assembled; the instance is **in flight**, so the caller invokes the entry
+    /// and owes exactly one [`Input::ActivationDone`] for it.
+    Ready(Box<ReadyActivation>),
+    /// The assembly's own window overflowed past the rung that kills, and the
+    /// instance went terminal before its entry could run. Nothing is in flight and
+    /// no completion is owed; the kill and its announcement are in the effects.
+    ///
+    /// The caller is blocked on an answer, and the instance is dead without its
+    /// entry having run: the same observable outcome as an entry that trapped, so
+    /// the caller answers it the same way.
+    Killed,
+    /// The request was not admissible, which is always a bug — see [`SyncRefusal`].
+    /// Nothing was assembled, nothing is in flight, and no completion is owed.
+    Refused(SyncRefusal),
+}
+
+/// Assemble a sync-call activation for a **named** instance, and answer the turn
+/// that took.
+///
+/// The second pass a caller asks for rather than one an [`Input`] brings, and for
+/// a sharper version of [`dispatch`]'s reason: the caller is blocked on the
+/// answer, so the request cannot be queued and answered later. An ordinary turn
+/// in every other respect — verdicts folded, release deadline restated.
+///
+/// `port` names the sync port the request arrives on and `body` is its payload,
+/// both the component's own; `instance` is the identity the caller resolved,
+/// never one the component claimed. `stamp` mints the request envelope.
+///
+/// # Panics
+///
+/// If the instance is registered with no bindings document in force — the gates
+/// answer that as a refusal rather than reaching an assembly.
+pub fn dispatch_sync(
+    page: &mut SurfacePage,
+    instance: &str,
+    port: &str,
+    body: String,
+    stamp: MessageStamp,
+    now: Millis,
+    now_ms: u64,
+) -> (SyncDispatch, Vec<Effect>) {
+    let mut reactions = Reactions::new();
+    let answer = match outward::dispatch_sync(page, instance, port, body, stamp, now_ms) {
+        Ok(mut ready) => {
+            // The verdicts are the page's to enact, and one of them may be the
+            // kill that means there is no entry to run.
+            let drops = std::mem::take(&mut ready.drops);
+            reactions.verdicts(page, drops, now, now_ms);
+            if page.registrations.is_failed(&ready.instance) {
+                SyncDispatch::Killed
+            } else {
+                SyncDispatch::Ready(Box::new(ready))
+            }
+        }
+        Err(refusal) => {
+            tracing::warn!("surface client: {}", refusal.describe(instance, port));
+            SyncDispatch::Refused(refusal)
+        }
+    };
+    reactions.end_turn(page);
+    (answer, reactions.into_effects())
+}
+
 /// The input's own pass, ahead of the release restatement every turn ends with.
 fn route(
     page: &mut SurfacePage,
@@ -192,7 +267,9 @@ fn route(
 /// Registration is admitted before the page's first document — a component can
 /// mount while the wiring is still in flight — and the reconcile that document
 /// runs is what wires it in. What is *not* deferred is the scheduler state, which
-/// every later pass over this instance requires.
+/// every later pass over this instance requires. The mount's guaranteed
+/// activation follows the wiring: owed from here when a document is already in
+/// force, otherwise from the one that lands.
 ///
 /// # Panics
 ///
@@ -212,7 +289,7 @@ fn on_registered(page: &mut SurfacePage, instance: &str, reactions: &mut Reactio
         } = page;
         let wiring = connect.bindings();
         let frames = registrations.register(instance, wiring, stores, subs);
-        schedules.track(instance);
+        schedules.track(instance, wiring.is_some());
         // An instance no document declares has no depth to open an outbox at, and
         // no channel it could publish on either.
         if let Some(bindings) = wiring

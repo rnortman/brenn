@@ -107,6 +107,17 @@ pub const ALERT_CHANNEL_CAPACITY: usize = 16;
 /// between turns.
 pub const TELEMETRY_CHANNEL_CAPACITY: usize = 16;
 
+/// The capacity of the channel the sync door's already-taken turns hand their
+/// effects back on.
+///
+/// A full one panics, like control: the producer is the kernel itself and its
+/// rate is a human's, one request per gesture, so a backlog this deep is the run
+/// having stopped enacting rather than a user having clicked too fast. Every
+/// stretch of the run drains it — the live wait, the terminal drain, and the
+/// connect attempt, which buffers it exactly as it buffers control — so the depth
+/// covers a burst between two drains and not an outage.
+pub const EFFECTS_CHANNEL_CAPACITY: usize = 64;
+
 /// One component's publish, on its way to the page.
 ///
 /// The correlation is assigned here so [`SurfaceHandle::publish`] can hand it back
@@ -168,11 +179,11 @@ pub enum TelemetryCommand {
 
 /// The buffer of the activation currently on the stack, and whose it is.
 ///
-/// Exists only so the kernel's publish route can tell a buffered publish from a
-/// gesture one and reach the buffer for the former. Activations are serialized
-/// per instance and synchronous on the one JS thread, so at most one instance is
-/// ever mid-activation: a publish whose resolved instance **is** this occupant is
-/// buffered; anything else is a gesture publish.
+/// Exists only so the kernel's publish route can tell a publish that belongs in a
+/// buffer from one that belongs nowhere, and reach the buffer for the former.
+/// Activations are serialized per instance and synchronous on the one JS thread,
+/// so at most one instance is ever mid-activation: a publish whose resolved
+/// instance **is** this occupant is buffered; anything else is refused.
 #[cfg(target_arch = "wasm32")]
 pub struct InFlightPublish {
     /// The instance whose entry is on the stack.
@@ -256,6 +267,9 @@ pub fn new() -> (SurfaceHandle, EventStream, FrontChannels) {
 /// activation's buffer means, and there is no honest answer. The backend's guest
 /// call is synchronous for the same reason.
 ///
+/// Ok carries the entry's reply: `Some` answers the sync port the activation's
+/// `sync` field names, `None` is an ordinary completion.
+///
 /// `Send` natively, not on wasm — the bound tracks the executor, not the seam.
 /// The runner is `tokio::spawn`ed on a multi-threaded runtime natively, so
 /// everything it holds must be `Send` (as the rest of it already is); on wasm it
@@ -267,7 +281,7 @@ pub type ActivationEntry = Box<
     dyn Fn(
             &brenn_surface_contract::Activation,
             &mut crate::publish_buffer::PublishBuffer,
-        ) -> Result<(), brenn_surface_contract::ActivationError>
+        ) -> Result<Option<String>, brenn_surface_contract::ActivationError>
         + Send,
 >;
 
@@ -543,17 +557,9 @@ impl SurfaceHandle {
     /// (the sole quota authority for the call) and answered inline. Nothing
     /// reaches the router or the wire until the entry returns ok.
     ///
-    /// `None` — no activation is in flight, or a different instance's is. That is
-    /// a **gesture publish**: the caller takes the immediate path
-    /// ([`publish`](Self::publish)), drawing the port's sink bucket with no refill
-    /// event. Reachable for a component only by dispatching against another
-    /// instance's host, which the kernel's mounted-target resolution already
-    /// treats as the contract violation it is.
-    ///
-    /// TODO(buffered-publish-routing-test): the match / mismatch / no-flight
-    /// routing here and the runner's slot install/take are wasm-only and have no
-    /// direct test — the browser suites drive the DOM seam, not the slot. Covered
-    /// behaviorally via component-support's fake kernel only.
+    /// `None` — no activation is in flight, or a different instance's is. There
+    /// is no second path: the caller is refused (`not-permitted`), because a
+    /// component-origin publish exists only inside an activation's buffer.
     #[cfg(target_arch = "wasm32")]
     pub fn try_buffered_publish(
         &self,
@@ -563,9 +569,9 @@ impl SurfaceHandle {
         urgency: Option<Urgency>,
     ) -> Option<Result<(), brenn_surface_contract::PublishError>> {
         // `body` is borrowed and only owned once the in-flight instance matches:
-        // the common gesture publish (no activation in flight, or a different
-        // instance's) returns `None` after the instance compare without paying
-        // the body's allocation.
+        // a refused publish (no activation in flight, or a different instance's)
+        // returns `None` after the instance compare without paying the body's
+        // allocation.
         self.with_in_flight(instance, |buffer| match urgency {
             Some(urgency) => buffer.publish_with_urgency(port, body.to_owned(), urgency),
             None => buffer.publish(port, body.to_owned()),
@@ -577,9 +583,8 @@ impl SurfaceHandle {
     ///
     /// Same routing rule and same `None` meaning as
     /// [`try_buffered_publish`](Self::try_buffered_publish): only the instance
-    /// whose entry is on the stack can buffer, and there is no unbuffered fallback
-    /// — a schedule laundered onto the gesture path would escape the flush-iff-ok
-    /// rule that makes an err schedule nothing.
+    /// whose entry is on the stack can buffer, and a schedule staged outside one
+    /// would escape the flush-iff-ok rule that makes an err schedule nothing.
     #[cfg(target_arch = "wasm32")]
     pub fn try_buffered_publish_deferred(
         &self,

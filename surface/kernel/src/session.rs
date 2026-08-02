@@ -456,7 +456,9 @@ impl Reactions {
             });
         }
         match outcome {
-            ActivationOutcome::Ok => {}
+            // The reply, where there is one, is the sync caller's — it is answered
+            // on the requesting stack, not announced on this plane.
+            ActivationOutcome::Ok(_) => {}
             ActivationOutcome::Err(err) => self.emit(Event::ActivationFailed {
                 instance: instance.clone(),
                 message: err.message,

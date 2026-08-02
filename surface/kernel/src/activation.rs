@@ -50,6 +50,7 @@ use std::collections::{BTreeMap, HashMap};
 use brenn_attach_client::publish::DeferredViews;
 use brenn_attach_client::router::{LocalRouter, Origin, PlanePolicy};
 use brenn_attach_client::subs::SubscriptionDepths;
+use brenn_envelope::MessageEnvelope;
 use brenn_queue::CursorOverflow;
 use brenn_surface_contract::{
     Activation, ActivationError, DeferredEntry, DeferredWindow, PortWindow,
@@ -60,6 +61,26 @@ use uuid::Uuid;
 use crate::bindings::{AppliedBindings, channel_is_transportable};
 use crate::publish_buffer::{OutputSpec, PublishBuffer};
 use crate::registry::{BindingKey, Registrations, SurfaceStores};
+
+/// Where one mount stands with the activation every mount is guaranteed.
+///
+/// A component may not publish from its connect-time code, so the first thing it
+/// ever schedules — the first tick of a deferred self-publish chain, the first
+/// state report — has to come from the tail of an activation. An activation that
+/// only happens when a bound channel happens to hold history is not something a
+/// component can build on, so one is owed unconditionally.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum MountDebt {
+    /// Registered before the page's first bindings document. There is nothing to
+    /// window against yet, so the debt is not incurred until a document lands.
+    #[default]
+    Unwired,
+    /// Owed, and not yet assembled.
+    Owed,
+    /// Settled: this mount has had its activation. A later document does not
+    /// revive it — the debt is per mount, and a re-registration is a new mount.
+    Settled,
+}
 
 /// One instance's scheduler state: what it is doing, what it has spent, and what
 /// it has lost.
@@ -72,6 +93,8 @@ struct InstanceSchedule {
     /// instance: anything arriving during a handler coalesces into the next
     /// activation rather than overlapping this one.
     in_flight: bool,
+    /// Whether this mount still owes its guaranteed first activation.
+    mount: MountDebt,
     /// Activations whose entry returned err, lifetime. An err is a failed
     /// activation, not a death.
     activation_failures: u64,
@@ -158,8 +181,13 @@ pub struct ActivationCtx<'a, P> {
 /// diagnostic event rather than being dropped at the boundary that observed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivationOutcome {
-    /// Returned ok. The buffer flushes atomically, in call order.
-    Ok,
+    /// Returned ok, with the reply a sync-call activation's entry answered its
+    /// caller with. The buffer flushes atomically, in call order.
+    ///
+    /// `None` is ordinary completion and the only shape an async activation can
+    /// finish in — a reply nobody asked for is a contract break, caught at the
+    /// invocation boundary that classified the return.
+    Ok(Option<String>),
     /// Returned err, with the component's description of why. The buffer is
     /// discarded and a failure is counted; the instance keeps running and keeps
     /// being delivered. A failed activation is not a death — backend parity.
@@ -277,19 +305,69 @@ impl Schedules {
 
     /// Start holding scheduler state for `instance`.
     ///
+    /// `wired` is whether a bindings document is in force at this moment, which
+    /// decides whether the mount's guaranteed activation is owed from here or from
+    /// the document that wires the instance in. A registration is admitted before
+    /// the page's first document, and an activation assembled with no wiring has
+    /// nothing to window.
+    ///
     /// # Panics
     ///
     /// On an instance already tracked — a page cannot hold two activation entries
     /// for one instance, and the registration table refuses the second before
     /// this is reached.
-    pub fn track(&mut self, instance: &str) {
-        let prior = self
-            .instances
-            .insert(instance.to_string(), InstanceSchedule::default());
+    pub fn track(&mut self, instance: &str, wired: bool) {
+        let prior = self.instances.insert(
+            instance.to_string(),
+            InstanceSchedule {
+                mount: if wired {
+                    MountDebt::Owed
+                } else {
+                    MountDebt::Unwired
+                },
+                ..InstanceSchedule::default()
+            },
+        );
         assert!(
             prior.is_none(),
             "surface client: {instance} is already scheduled"
         );
+    }
+
+    /// A bindings document is in force: every mount that was waiting for one now
+    /// owes its guaranteed activation.
+    ///
+    /// Idempotent across documents. Only the mounts still waiting are moved, so a
+    /// second document mid-attachment does not hand an already-activated instance
+    /// a second mount activation.
+    pub fn wire_mounts(&mut self) {
+        for schedule in self.instances.values_mut() {
+            if schedule.mount == MountDebt::Unwired {
+                schedule.mount = MountDebt::Owed;
+            }
+        }
+    }
+
+    /// Whether `instance` is still owed its mount activation. `false` for an
+    /// instance this table does not hold.
+    pub fn owes_mount_activation(&self, instance: &str) -> bool {
+        self.instances
+            .get(instance)
+            .is_some_and(|schedule| schedule.mount == MountDebt::Owed)
+    }
+
+    /// Settle every outstanding mount debt without assembling anything.
+    ///
+    /// Fixtures only, and the shortcut is the point: a suite whose subject is what
+    /// a page does *after* its components have mounted starts from a page past
+    /// them, rather than driving an activation per instance it never asserts
+    /// about. The mount activation's own guarantees are pinned by the suites that
+    /// take the real path.
+    #[cfg(test)]
+    pub(crate) fn settle_mount_debts(&mut self) {
+        for schedule in self.instances.values_mut() {
+            schedule.mount = MountDebt::Settled;
+        }
     }
 
     /// Drop `instance`'s scheduler state. Its counters go with it: they described
@@ -321,6 +399,17 @@ impl Schedules {
     /// this table does not hold.
     pub fn in_flight(&self, instance: &str) -> bool {
         self.instances.get(instance).is_some_and(|s| s.in_flight)
+    }
+
+    /// Whether **any** instance has an activation in flight.
+    ///
+    /// An entry is on the stack iff an activation is in flight, so a sync request
+    /// arriving then came from inside somebody's entry — a re-entrant call.
+    /// Per-instance would be the wrong grain: one component programmatically
+    /// dispatching an event that makes *another* component request a sync
+    /// activation is the same re-entrancy.
+    pub fn any_in_flight(&self) -> bool {
+        self.instances.values().any(|schedule| schedule.in_flight)
     }
 
     /// Lifetime count of activations of `instance` whose entry returned err.
@@ -373,11 +462,17 @@ impl Schedules {
     /// The next instance ready to run, or `None` when nothing is.
     ///
     /// Ready is three questions: the instance may run at all (registered, not
-    /// terminal, nothing of its own in flight), and one of its bindings is owed a
-    /// message its channel still holds. The owed half is asked of the positions
-    /// rather than of a queue of copies, which is where coalescing comes from —
-    /// arrivals move no position, so an instance woken three times is run once and
-    /// the window it is assembled from serves the newest.
+    /// terminal, nothing of its own in flight), and either one of its bindings is
+    /// owed a message its channel still holds or the mount still owes its
+    /// guaranteed activation. The owed half is asked of the positions rather than
+    /// of a queue of copies, which is where coalescing comes from — arrivals move
+    /// no position, so an instance woken three times is run once and the window it
+    /// is assembled from serves the newest.
+    ///
+    /// The mount debt is the one thing here that makes an instance with nothing to
+    /// deliver ready. Empty activations are elided everywhere else; this is the
+    /// deliberate, once-per-mount exception, and [`Self::assemble`] settles it so
+    /// no second empty activation follows.
     ///
     /// The pick resumes after the last instance [`Self::assemble`] handed out and
     /// wraps, so each ready instance gets one activation per pass over the set and
@@ -410,7 +505,10 @@ impl Schedules {
             .iter()
             .chain(runnable[..start].iter())
             .copied()
-            .find(|instance| stores.any_deliverable(|key: &BindingKey| key.instance == *instance))
+            .find(|instance| {
+                self.owes_mount_activation(instance)
+                    || stores.any_deliverable(|key: &BindingKey| key.instance == *instance)
+            })
     }
 
     /// Whether any instance is ready to run — the wake question, at the grain the
@@ -432,6 +530,10 @@ impl Schedules {
     /// `generation` is the instance's registration at this moment, carried on the
     /// answer so a completion can be matched to the mount that produced it.
     ///
+    /// It also settles the mount's guaranteed-activation debt, whichever reason
+    /// the instance was picked for: the guarantee is one activation, not one
+    /// activation of a particular shape.
+    ///
     /// # Panics
     ///
     /// On an instance this table does not hold, one already in flight, or a
@@ -445,6 +547,62 @@ impl Schedules {
         generation: u64,
         ctx: &mut ActivationCtx<'_, P>,
     ) -> ReadyActivation {
+        self.assemble_windows(instance, generation, None, ctx)
+    }
+
+    /// Assemble a **sync-call** activation for `instance`: the ordinary assembly
+    /// plus the live request, windowed on `sync_port`.
+    ///
+    /// Everything the async path does happens here identically — every input
+    /// binding windowed, positions advanced, the ladder walked, the deferred
+    /// snapshot taken, the buffer seeded — because the handler is owed its full
+    /// normal worldview, not a narrowed one. The two differences are the request
+    /// window appended last and the `sync` field naming it.
+    ///
+    /// Consuming queued input here cannot double-deliver: readiness is derived
+    /// from position state, so an instance a sync activation drained stops being
+    /// ready and no follow-up async activation fires until new input arrives.
+    ///
+    /// The dispatch rotation advances exactly as it does for an async assembly.
+    /// A sync activation is a pass over this instance like any other, and leaving
+    /// the cursor behind would hand it the next async pick as well.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::assemble`], plus: if `sync_port` names a bound input port of the
+    /// instance. The caller gates that (a colliding request is refused, not
+    /// assembled); reaching here means the gate did not run, and an ambiguous
+    /// `ports` list is not something to hand a component.
+    pub fn assemble_sync<P: PlanePolicy>(
+        &mut self,
+        instance: &str,
+        generation: u64,
+        sync_port: &str,
+        request: MessageEnvelope,
+        ctx: &mut ActivationCtx<'_, P>,
+    ) -> ReadyActivation {
+        assert!(
+            !ctx.bindings
+                .inputs_of(instance)
+                .any(|binding| binding.port == sync_port),
+            "surface client: sync port {sync_port} collides with a bound input port of {instance}"
+        );
+        self.assemble_windows(instance, generation, Some((sync_port, request)), ctx)
+    }
+
+    /// The one assembly both flavors run: window, charge, snapshot, seed.
+    ///
+    /// `sync` is the live request and the port it arrives on, for a sync-call
+    /// activation. It is appended to `ports` **before** the buffer is seeded, so
+    /// the request draws the same per-new-envelope grant every other new message
+    /// draws — a sync activation has no budget rule of its own.
+    fn assemble_windows<P: PlanePolicy>(
+        &mut self,
+        instance: &str,
+        generation: u64,
+        sync: Option<(&str, MessageEnvelope)>,
+        ctx: &mut ActivationCtx<'_, P>,
+    ) -> ReadyActivation {
         let schedule = self
             .instances
             .get_mut(instance)
@@ -454,11 +612,27 @@ impl Schedules {
             "surface client: {instance} already has an activation in flight"
         );
         schedule.in_flight = true;
+        // Settled at assembly, not at completion: an activation the instance
+        // trapped in still happened, and the guarantee is one activation per
+        // mount, not one successful one.
+        schedule.mount = MountDebt::Settled;
         self.dispatch_cursor = Some(instance.to_string());
 
-        let (ports, charges) = window_ports(instance, ctx);
+        let (mut ports, charges) = window_ports(instance, ctx);
         let drops = self.enact_charges(instance, charges);
         let (deferred, deferred_ids) = deferred_windows(instance, ctx);
+        let sync = sync.map(|(port, request)| {
+            // A sync port has no queue, no retention and no position, so its
+            // window is exactly the one live request: nothing before it is
+            // context, and nothing can have been passed unserved.
+            ports.push(PortWindow {
+                port: port.to_string(),
+                envelopes: vec![request],
+                new_from: 0,
+                dropped: 0,
+            });
+            port.to_string()
+        });
         let buffer = self.seed_buffer(instance, &ports, deferred_ids, ctx);
         ReadyActivation {
             instance: instance.to_string(),
@@ -467,6 +641,7 @@ impl Schedules {
                 ports,
                 deferred,
                 now: Some(ctx.now_ms),
+                sync,
             },
             buffer,
             drops,
