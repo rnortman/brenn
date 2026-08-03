@@ -2,10 +2,96 @@
 
 All notable changes to Brenn are documented here.
 
-## [0.15.0] — 2026-07-30
+## [0.16.0] — 2026-08-02
+
+The main stories here are: We are preparing to bring voice assistants in (by
+extending the message bus to remotes over a generic websocket protocol, and
+putting LLM conversations on the bus), and we refactored a lot of code in the
+pixel-surface and the websocket, which fixed various bugs that had never been
+logged as bugs and also just made the code much better and easier to maintain.
 
 ### Added
 
+- **Remote attachers.** A non-browser process can attach to the message bus over
+  the same websocket the browser uses: new `[[remote]]` config block and
+  `/remote/<slug>/ws` route, file-backed bearer token (mode-checked `0600`;
+  unreadable or empty is a boot refusal), authority re-derived per frame from the
+  config's channel matchers. No mTLS.
+- **Per-app conversation roster** — `brenn:<prefix>.app.<app-slug>.roster`, a
+  full snapshot of an app's conversation ids with a single reserved writer
+  (`docs/chat-protocol.md` §9). Completes the chat protocol that shipped
+  undocumented in 0.15.0, below.
+- **`make wasm-toolchain-install`.** Guest toolchain pins now live only in the
+  `Makefile`; preflights, CI, and the check-wit gate read them from there.
+
+### Changed
+
+- **The browser websocket protocol is now a pure message-bus extension** — it
+  knows nothing about DOM, pixels, or components, and everything
+  surface-specific rides as ordinary messages on ordinary channels.
+  **Operator action:** every surface needs a `[[channel]]` block for its bindings
+  document (`ephemeral:surface.surface.<slug>.bindings`, both depths `1`) or the
+  surface will not come up. Delivery is now single-target per (attachment,
+  channel); fan-out to instances and ports happens in the attacher.
+- **Guest WebAssembly proposals are a closed allow-list** rather than whatever
+  the wasmtime release defaults to. Notably relaxed-simd is no longer accepted —
+  its results are implementation-dependent, which a byte-identical transcript
+  cannot survive. Out-of-envelope guests are refused at compile time with the
+  proposal named. Ships with wasmtime 47 (from 45), clearing RUSTSEC-2026-0222.
+- **Gesture handlers run inside an activation,** so their publishes get the same
+  flush boundary, cancelability, and offline parking as everything else, and
+  every component gets a guaranteed activation at mount. Breaking for component
+  authors: the free publish functions are gone in favor of `wire_gesture`,
+  `PersistentTimer` is deleted (use a deferred self-publish on an in/out port),
+  and `Activation` gains a `sync` field.
+- **Latest-wins ports no longer fold.** More than one new message is an operator
+  misconfiguration, so the port takes the latest and publishes an error rather
+  than papering over it. **Operator action:** set `push_depth = 1` on every
+  latest-wins binding. Event streams and accumulating ports are unaffected.
+- `surface/proto` is now `surface/schema`, and the wire contract and its client
+  moved to new `attach/proto` and `attach/client` crates. The attach protocol is
+  at v3; both ends land together and there are no compatibility shims.
+
+### Fixed
+
+- **surface:** no more burst of `rejected layout doc` warnings on page load. A
+  subscriber's catch-up replay was one frame per retained message, so each
+  arrived in its own activation looking like the only new message; a catch-up run
+  is now a single frame.
+- **chat:** an app's lazily minted singleton conversation could exist without its
+  chat channels and go unnamed on the app's roster.
+- **wasm:** the guest yield fix for a component livelock had shipped on a line
+  that never executed.
+- `make e2e` runs again, and no longer carries a hardcoded date that turned the
+  tree red once it passed.
+
+## [0.15.0] — 2026-07-30
+
+> The chat-over-pub/sub entries below were added retroactively; the work shipped
+> in 0.15.0 but went undocumented at the time.
+
+### Added
+
+- **Chat with a Brenn-hosted LLM over the message bus.** Any authorized peer can
+  drive a conversation and read its record without a browser, keeping Brenn's
+  conversation context and tool calling. Each app+conversation gets `in`
+  (commands), `out` (the durable record), `stream` (tokens), and `wake`
+  (pre-warm) under a configurable prefix; the conversation id sits last in the
+  address so grants work at one-conversation, all-conversations, or whole-app
+  grain without wildcards. Commands are `send`, `stop`, `set_model`, `compact` —
+  no busy-gate, and text sent mid-turn is injected at the end of the current
+  tool-use round. There is no history API: the `out` retained window is the
+  history. The stream is decoration, the durable record is truth. Raw text only,
+  no HTML. Protocol `v1`, additive-only; `docs/chat-protocol.md` is the normative
+  spec, written for a peer author who reads no Rust.
+- **`[llm_chat]` config section** — `prefix`, `retained_window`, `wake_min`,
+  `idle_timeout_secs`. A command published below `wake_min` parks instead of
+  buying a subprocess. Malformed values are a boot refusal.
+- **Impetus.** A bounded per-conversation pool that unattended turn-provoking
+  injections draw from and human attention refills. Minting it requires a
+  capability no configuration can grant, so an automation loop is bounded by a
+  stock only a person can restore. A command arriving at an exhausted pool is
+  refused whole.
 - Auto and anonymous channels which come into being not with a separate spec and
   ACLs but because two component ports are connected to one another. ACLs are
   automatically granted and depth is automatically computed. If a name is given,
@@ -20,6 +106,12 @@ All notable changes to Brenn are documented here.
 
 ### Changed
 
+- **Behavior change for every deployed LLM app.** Authority over a conversation's
+  chat channels moved from the app's own LLM to the server-side harness that
+  wraps it. Previously each app was granted its whole chat tree, which put bus
+  tools in every LLM prompt and let a conversation prompt itself. Bus identity is
+  unchanged and there is no compatibility shim. A conversation is also no longer
+  ambience-injected with its own messages.
 - Unification of ephemeral/durable channels on the messaging substrate resulted
   in many configuration and default-behavior changes, and many bugs fixed (not
   individually enumerated here). The tldr is that every channel (other that auto
