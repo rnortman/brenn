@@ -630,9 +630,11 @@ pub fn verify_request(
             // Step 4: resolve token (timing-parity).
             let kr = resolve_token(token_id_header, tokens, headers)?;
 
-            // Step 5: constant-time compare. Length mismatch leaks length
-            // (documented on `ct_eq_bytes`); acceptable for ≥32-byte random tokens.
-            let ct_equal = crate::util::ct_eq_bytes(supplied, kr.effective_key);
+            // Step 5: constant-time compare, as digests — the exact length of
+            // the configured token does not leak. A block-class difference
+            // remains when the two sides straddle a 64-byte boundary
+            // (documented on `eq_secret`).
+            let ct_equal = crate::util::eq_secret(supplied, kr.effective_key);
 
             // Step 6: decide.
             if kr.unknown {

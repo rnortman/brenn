@@ -9,10 +9,13 @@
 
 use std::sync::{Arc, Mutex};
 
+use brenn_envelope::chat::chat_roster_bare_name;
 use brenn_lib::db;
+use brenn_lib::messaging::chat_roster::CHAT_ROSTER_COMPONENT;
 use brenn_lib::messaging::config::{AttachSendBudget, MessagingGlobalConfig};
 use brenn_lib::messaging::remote::{RemoteConfigRaw, resolve_remotes};
 use brenn_lib::messaging::store::RingStores;
+use brenn_lib::messaging::system::{SystemParticipantSpec, registrations_from_specs};
 use brenn_lib::messaging::{
     AttachScope, ChannelEntry, MessagingDirectory, Messenger, SubscriberEntryKind,
     SubscriberRegistration, WakeEconomics, WakeRouter, attach_principal_budgets,
@@ -24,6 +27,16 @@ use crate::test_support::state::test_state_with_capturing_alerter;
 
 /// The slug every fixture here configures.
 pub(crate) const SLUG: &str = "pod-kitchen";
+
+/// The app whose chat tree the fixture's `[[remote]]` blocks grant. Registered
+/// with the messenger so the server-side roster publish — which answers `None`
+/// for an app it does not know — is reachable from a test.
+pub(crate) const APP: &str = "home";
+
+/// The app's single allowed user. A singleton app resolves its conversation
+/// through this name, so a test that mints one through the messenger creates the
+/// matching user row.
+pub(crate) const OWNER: &str = "operator";
 
 /// The token the fixture writes into its 0600 file, after trimming.
 pub(crate) const TOKEN: &str = "s3cret-token";
@@ -125,11 +138,18 @@ pub(crate) async fn remote_harness_with_channels(
         router.register_remote_delivery_routes(remote);
     }
     let directory = Arc::new(MessagingDirectory::with_entries(entries));
+    let mut apps = indexmap::IndexMap::new();
+    // Singleton with one allowed user, the shape config validation enforces: it
+    // is what lets the messenger resolve — and mint — the app's conversation.
+    let mut app = crate::test_support::app_config::default_test_app_config(APP, APP);
+    app.singleton = true;
+    app.allowed_users = vec![OWNER.to_string()];
+    apps.insert(APP.to_string(), app);
     let messenger = Messenger::new(
         db.clone(),
         Arc::clone(&directory),
         Arc::from("test"),
-        Arc::new(indexmap::IndexMap::new()),
+        Arc::new(apps),
         Arc::clone(&router) as Arc<dyn WakeRouter>,
         MessagingGlobalConfig {
             max_body_bytes: TEST_MAX_BODY_BYTES,
@@ -150,6 +170,18 @@ pub(crate) async fn remote_harness_with_channels(
             })
             .collect(),
     )
+    // The roster writer, so a test can publish the app's snapshot the way the
+    // server does: `system:chat-roster` holds the only authority on the address.
+    .with_subscriber_registrations(registrations_from_specs(&[
+        SystemParticipantSpec::publish_only(
+            CHAT_ROSTER_COMPONENT,
+            brenn_lib::messaging::ChannelScheme::Brenn,
+            &[chat_roster_bare_name(
+                &brenn_lib::config::LlmChatConfig::default().prefix,
+                APP,
+            )],
+        ),
+    ]))
     .with_attach_send_budgets(resolved.iter().flat_map(|remote| {
         attach_principal_budgets(
             AttachScope::remote(&remote.slug),

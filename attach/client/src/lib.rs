@@ -28,6 +28,33 @@
 //! depending on which credential it was constructed with, and the browser
 //! connector relies on the same-origin cookie the browser attaches. The choice
 //! is invisible to every layer below the seam.
+//!
+//! # TLS: this crate compiles no backend
+//!
+//! The native transport takes `tokio-tungstenite` with no TLS feature enabled,
+//! and `tokio-tungstenite` ships none by default. A `wss://` dial through an
+//! unmodified consumer therefore fails with "TLS support not compiled in"
+//! before any TLS handshake is attempted — neither the upgrade request nor the
+//! credential it carries ever reaches the wire.
+//! [`transport::native`] asserts that refusal; every other test here dials
+//! `ws://localhost` and never meets it.
+//!
+//! That is deliberate. Trust store, crypto provider, and link policy are
+//! binary-level choices, not a library's, and cargo's feature unification
+//! already lets the binary state them in one line. **A native consumer that
+//! dials `wss://` must enable a backend on its own `tokio-tungstenite`
+//! dependency**, version-unified with the one here:
+//!
+//! ```toml
+//! tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
+//! ```
+//!
+//! No code in the consumer needs to call it — naming the feature is the whole
+//! act. Prefer `native-tls` unless the binary has a reason not to: it reads the
+//! platform trust store, so an operator-installed CA for a LAN origin works.
+//! The rustls features carry a caveat — `tokio-tungstenite` takes rustls with
+//! no crypto-provider feature, and rustls 0.23 panics on the first handshake
+//! unless the binary installs a provider itself.
 
 pub mod conn;
 pub mod driver;

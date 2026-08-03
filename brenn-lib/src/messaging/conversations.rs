@@ -145,6 +145,22 @@ impl Messenger {
     /// has none. A no-op beyond a depth retune when the position is already
     /// there, so a re-run at boot or a re-subscribe keeps what the conversation
     /// has seen.
+    ///
+    /// **The conversation this mints is provisioned and announced here**, which
+    /// is what makes the lazy mint safe: the chat channel family is created in
+    /// the same lock scope as the row, so no window exists in which the
+    /// conversation is channel-less and the first bridge to wake for it panics
+    /// naming a missing channel; the app's roster snapshot is republished once
+    /// the guard has dropped, so no peer holds a list that omits it.
+    ///
+    /// Both are idempotent — provisioning is a no-op once the family exists,
+    /// and the roster publish is deduplicated against the last body — so this
+    /// call runs them unconditionally rather than tracking whether it created
+    /// the conversation.
+    ///
+    /// The announce runs outside the lock because
+    /// [`Messenger::republish_chat_roster`] takes it itself; the provision runs
+    /// inside it because it takes the caller's connection.
     pub async fn attach_conversation(
         &self,
         channel_address: &str,
@@ -153,8 +169,13 @@ impl Messenger {
     ) {
         let conversation = {
             let conn = self.db.lock().await;
-            self.targets
-                .ensure_app_conversation(&conn, app_slug, channel_address)
+            let conversation =
+                self.targets
+                    .ensure_app_conversation(&conn, app_slug, channel_address);
+            if let Some(conversation) = conversation {
+                self.provision_conversation_chat_channels(&conn, app_slug, conversation);
+            }
+            conversation
         };
         let Some(conversation) = conversation else {
             // `ensure_app_conversation` has already named the missing piece.
@@ -167,6 +188,7 @@ impl Messenger {
             push_depth,
         )
         .await;
+        self.republish_chat_roster(app_slug).await;
     }
 
     /// Tear down one app's position on one channel — the inverse of
@@ -811,6 +833,258 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["mqtt-covered", "webhook-covered"],
             "each address is decided by its own transport's matchers"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The mint provisions and announces itself.
+    // -----------------------------------------------------------------------
+
+    /// A messenger wired the way boot wires one for chat: the caller's channels,
+    /// the app's boot-declared roster channel, and the roster writer's own
+    /// registration.
+    ///
+    /// [`messenger`] deliberately holds none of that, which is why the cases
+    /// above cannot see what a mint owes. Over this one both halves are
+    /// observable: the chat family in the directory, the snapshot on the wire.
+    async fn chat_messenger(entries: Vec<ChannelEntry>) -> Arc<Messenger> {
+        let chat = crate::config::LlmChatConfig::default();
+        let defaults = MessagingGlobalConfig::default();
+        let roster = crate::messaging::chat_roster::chat_roster_entry(&chat, APP, &defaults);
+        let bare = roster
+            .address
+            .strip_prefix(ChannelScheme::Brenn.prefix())
+            .expect("a roster address is a brenn: address")
+            .to_string();
+        let mut all = entries;
+        all.push(roster);
+
+        let db = init_db_memory();
+        {
+            let conn = db.lock().await;
+            crate::auth::user::create_user(&conn, USER, "$argon2id$fake");
+            upsert_channels(&conn, &all);
+        }
+        let mut app: AppConfig = test_app_config(APP, None, vec![USER.to_string()]);
+        app.singleton = true;
+        app.policy =
+            brenn_delivery_policy(crate::access::acl::ChannelMatcher::Prefix(String::new()));
+        let mut apps: IndexMap<String, AppConfig> = IndexMap::new();
+        apps.insert(APP.to_string(), app);
+
+        let spec = crate::messaging::system::SystemParticipantSpec::publish_only(
+            crate::messaging::chat_roster::CHAT_ROSTER_COMPONENT,
+            ChannelScheme::Brenn,
+            std::slice::from_ref(&bare),
+        );
+        Messenger::new(
+            db,
+            Arc::new(MessagingDirectory::with_entries(all)),
+            Arc::from("test-source"),
+            Arc::new(apps),
+            Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
+            defaults,
+        )
+        .with_subscriber_registrations(crate::messaging::system::registrations_from_specs(&[spec]))
+    }
+
+    /// A channel with no subscriber declared on it — what a dynamic subscribe
+    /// needs, since a static `App` entry makes the same call a static-collision
+    /// error.
+    fn unsubscribed_channel(name: &str) -> ChannelEntry {
+        let mut entry = channel(name, Depth::Bounded(5));
+        entry.subscribers.clear();
+        entry
+    }
+
+    /// Every provisioned leaf of `conversation`, as the directory would hold it.
+    fn leaf_addresses(conversation: i64) -> Vec<String> {
+        let chat = crate::config::LlmChatConfig::default();
+        crate::messaging::chat_provision::PROVISIONED_LEAVES
+            .into_iter()
+            .map(|leaf| brenn_envelope::chat::chat_address(&chat.prefix, APP, leaf, conversation))
+            .collect()
+    }
+
+    /// The conversation's command leaf, named the way provisioning names it
+    /// rather than by its ordinal in [`PROVISIONED_LEAVES`]: it is the one leaf
+    /// given a durable position, and the list it sits in is expected to churn.
+    fn command_leaf_address(conversation: i64) -> String {
+        let chat = crate::config::LlmChatConfig::default();
+        brenn_envelope::chat::chat_address(
+            &chat.prefix,
+            APP,
+            brenn_envelope::chat::ChatLeaf::In,
+            conversation,
+        )
+    }
+
+    /// Assert the conversation's whole chat family is reachable through the
+    /// directory — the precondition a bridge waking for it asserts by panicking.
+    fn assert_provisioned(m: &Messenger, conversation: i64) {
+        for address in leaf_addresses(conversation) {
+            assert!(
+                m.directory.resolve(&address).is_some(),
+                "the mint owes {address}, so the first wake for the conversation cannot find it"
+            );
+        }
+    }
+
+    /// The roster snapshots actually published, oldest first, each decoded to the
+    /// conversation ids it names.
+    ///
+    /// Decoded rather than byte-compared: the subject here is whether the mint
+    /// announced the conversation, not how a roster body serializes — that is
+    /// pinned by the roster's own tests, and an additive field there must not
+    /// break these.
+    async fn published_snapshots(m: &Messenger) -> Vec<Vec<i64>> {
+        let address = brenn_envelope::chat::chat_roster_address(&m.llm_chat().prefix, APP);
+        let uuid = m
+            .directory
+            .resolve(&address)
+            .expect("the fixture declares the roster channel")
+            .uuid;
+        let conn = m.db.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT body FROM messaging_messages WHERE channel_uuid = ?1 ORDER BY id")
+            .expect("prepare roster scan");
+        stmt.query_map([uuid.as_bytes().to_vec()], |row| row.get::<_, String>(0))
+            .expect("query roster snapshots")
+            .map(|r| {
+                let body = r.expect("read roster snapshot");
+                let roster: brenn_envelope::chat::ChatRoster = brenn_envelope::chat::decode(&body)
+                    .expect("a roster body is a versioned chat message");
+                roster.conversations.into_iter().map(|c| c.id).collect()
+            })
+            .collect()
+    }
+
+    /// **P1.** An app that has never held a conversation gains a push-enabled
+    /// dynamic subscription: the mint that gives it a position also gives the
+    /// conversation its channels and tells the bus it exists.
+    ///
+    /// The channels are what the first delivered message needs — a bridge woken
+    /// for a channel-less conversation stops the process rather than running on —
+    /// and the snapshot is what makes the conversation subscribable by a peer
+    /// holding a fleet grant.
+    #[tokio::test]
+    async fn a_dynamic_subscribe_mints_a_provisioned_and_announced_conversation() {
+        let ch = unsubscribed_channel("chat");
+        let address = ch.address.clone();
+        let m = chat_messenger(vec![ch]).await;
+
+        m.subscribe_dynamic(
+            APP,
+            &address,
+            crate::messaging::subscribe::DynamicSubscribeParams {
+                push_depth: Depth::Bounded(5),
+                retain_depth: Depth::Bounded(0),
+                noise: None,
+                wake_min: None,
+                qos: None,
+            },
+        )
+        .await
+        .expect("the app is granted the channel");
+
+        let conversation = conversation_of(&m).await;
+        assert_provisioned(&m, conversation);
+        assert_eq!(
+            published_snapshots(&m).await,
+            vec![vec![conversation]],
+            "one snapshot, naming the conversation the subscribe minted"
+        );
+    }
+
+    /// **P3.** The boot shape: `attach_conversation` called directly for an app
+    /// that has never had a conversation. Same two obligations, discharged at the
+    /// same place — boot order stops mattering, because the mint no longer
+    /// depends on a backfill that ran before it.
+    #[tokio::test]
+    async fn the_boot_shaped_attach_provisions_and_announces_too() {
+        let ch = channel("chat", Depth::Bounded(5));
+        let address = ch.address.clone();
+        let m = chat_messenger(vec![ch]).await;
+
+        m.attach_conversation(&address, APP, Depth::Bounded(5))
+            .await;
+
+        let conversation = conversation_of(&m).await;
+        assert_provisioned(&m, conversation);
+        assert_eq!(
+            published_snapshots(&m).await,
+            vec![vec![conversation]],
+            "one snapshot, naming the conversation the boot-shaped attach minted"
+        );
+    }
+
+    /// **P2.** The same call against an app whose conversation is already
+    /// provisioned changes nothing: no second channel family, no re-primed
+    /// position, no snapshot that says what the last one said.
+    ///
+    /// This is the idempotence contract the code relies on — it runs the provision
+    /// and the announce unconditionally rather than tracking whether this call
+    /// created the conversation.
+    #[tokio::test]
+    async fn re_attaching_an_already_provisioned_conversation_disturbs_nothing() {
+        let ch = channel("chat", Depth::Bounded(5));
+        let address = ch.address.clone();
+        let m = chat_messenger(vec![ch]).await;
+
+        m.attach_conversation(&address, APP, Depth::Bounded(5))
+            .await;
+        let conversation = conversation_of(&m).await;
+        let command = m
+            .directory
+            .resolve(&command_leaf_address(conversation))
+            .expect("the command leaf is provisioned")
+            .uuid;
+
+        // A command the conversation has not read yet: its position must still be
+        // behind these after the re-attach, not re-primed past them.
+        publish(&m, command, "one").await;
+        publish(&m, command, "two").await;
+        let before = {
+            let conn = m.db.lock().await;
+            crate::messaging::db::load_subscriber_cursor(
+                &conn,
+                command,
+                &ParticipantId::for_conversation(conversation),
+            )
+            .expect("provisioning gave the conversation its command position")
+            .next_owed_seq
+        };
+
+        m.attach_conversation(&address, APP, Depth::Bounded(5))
+            .await;
+
+        let after = {
+            let conn = m.db.lock().await;
+            crate::messaging::db::load_subscriber_cursor(
+                &conn,
+                command,
+                &ParticipantId::for_conversation(conversation),
+            )
+            .expect("the position survived the re-attach")
+            .next_owed_seq
+        };
+        assert_eq!(
+            after, before,
+            "a re-provision that re-primed the position would skip the commands it holds"
+        );
+        assert_eq!(
+            m.directory
+                .list()
+                .iter()
+                .filter(|e| leaf_addresses(conversation).contains(&e.address))
+                .count(),
+            crate::messaging::chat_provision::PROVISIONED_LEAVES.len(),
+            "the family is provisioned once, however often the attach runs"
+        );
+        assert_eq!(
+            published_snapshots(&m).await.len(),
+            1,
+            "the second attach changed no conversation set, so it announced nothing"
         );
     }
 

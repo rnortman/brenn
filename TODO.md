@@ -1121,20 +1121,102 @@ bus has to be told: every creation site owes `provision_conversation_chat_channe
 under the database lock and `republish_chat_roster` outside it. Nothing enforces
 that — it is a two-call convention spelled out in a doc comment on
 `create_conversation` — and the tree has already missed it twice (the send-message
-create path and the singleton first-attach path, both fixed by hand). One site is
-still unfixable by hand: `MessageTargets::ensure_app_conversation`
-(`brenn-lib/src/messaging/store/targets.rs`) mints an app's singleton conversation
-lazily inside delivery, from a synchronous method holding the caller's
-`&Connection`, so it can neither provision (no messenger) nor await a republish.
+create path and the singleton first-attach path, both fixed by hand). The lazy
+mint inside delivery was the third: `MessageTargets::ensure_app_conversation`
+(`brenn-lib/src/messaging/store/targets.rs`) is a synchronous method holding the
+caller's `&Connection` and can discharge neither obligation itself, so its one
+caller, `Messenger::attach_conversation`, now provisions in the mint's lock
+scope and republishes the roster after the guard drops. Every known creation
+site therefore discharges the convention today; what is missing is the structure
+that makes a future one unable to skip it.
 
 Needs a design call before code: the choke point is a `Messenger` method that
-creates-or-adopts, provisions and announces, which means deciding what the
-delivery-path creator does instead — take the messenger and a deferred announce
-queue, stop creating and answer `None`, or move the mint out of the delivery
-path. Done when a conversation cannot be created without its channels and the
-roster snapshot that names it, with the creation sites routed through one call.
+creates-or-adopts, provisions and announces, which means reshaping the creation
+APIs the send path and the automation creators call, and deciding what a
+synchronous creator like the delivery-path one does instead — take the messenger
+and a deferred announce queue, stop creating and answer `None`, or move the mint
+out of the delivery path. Deferred because it is a feature cycle's worth of
+reshaping that fixes no known-live failure: with the attach site closed, the
+remaining exposure is a creation site nobody has written yet. Done when a
+conversation cannot be created without its channels and the roster snapshot that
+names it, with the creation sites routed through one call.
 
 Code sites (`TODO(chat-conversation-provision-chokepoint)`):
 `brenn-lib/src/conversation/mod.rs`, on `create_conversation` (where the
 convention is documented), and `brenn-lib/src/messaging/store/targets.rs`, on
-`MessageTargets::ensure_app_conversation` (the site that cannot discharge it).
+`MessageTargets::ensure_app_conversation` (the site whose caller discharges it).
+
+
+## `bridge-upgrade-rejection-terminal`
+
+Cross-repo. The same slug is filed in `brenn-pod2`'s `TODO.md`, where the
+consuming half lives; this entry is brenn's half. The slug is the join key —
+move both together.
+
+`NativeConnector::connect` (`attach/client/src/transport/native.rs`) collapses a
+rejected websocket upgrade into a stringly `TransportError`, and
+`AttachDriver::connect` reduces that to a unit `ConnInput::ConnectFailed` — the
+same answer a refused TCP connect, a bad hostname, or a restarting server
+produces. An embedder therefore cannot distinguish a hopeless credential from a
+transient outage, and guessing from a run of indistinguishable failures would
+kill a daemon for an ordinary server restart.
+
+Stakes, traced through the pod: the pod's futile-attachment heuristic never
+engages on a rejected upgrade, because `futile` counts only attachments that
+were established and then detached, and a failed dial establishes nothing. So a
+persistent `401` — a token typo, a revoked remote — re-dials **unbounded**:
+backoff caps at 30 s, roughly 160 dials an hour, forever, each minting one
+server-side `AuthFailure`. That is precisely the fail2ban signal, so the
+operator's own pod ends up banning the operator's own IP.
+
+Deferred rather than fixed with the round it was found in: the status plumbing
+touches `TransportError`, `ConnInput::ConnectFailed`, and every matcher and test
+fixture on that path in both repos, then needs a pod pin bump and a pod-side
+*policy* call — which statuses are terminal, and what a headless appliance does
+on terminal exit — that belongs with the pod deployment story on the table.
+Nothing here loses data or crashes: the blast radius is wasted dials, log spam,
+and a self-inflicted ban that heals once the credential is fixed.
+
+Done = the handshake's HTTP status (a status, never the response body) reaches
+the embedder as structured data on a failed connect, so a consumer can go
+terminal on `401`/`403` instead of re-dialling into a ban.
+
+Code site (`TODO(bridge-upgrade-rejection-terminal)`):
+`attach/client/src/transport/native.rs`, the `connect_async` error mapping in
+`NativeConnector::connect`.
+
+
+## `bridge-violation-close-code`
+
+Cross-repo. The same slug is filed in `brenn-pod2`'s `TODO.md`, where the
+consuming half lives; this entry is brenn's half. The slug is the join key —
+move both together.
+
+When the attach route judges a frame a protocol violation it tears the
+attachment down by dropping the context (`brenn-server/src/routes/attach/session.rs`,
+after the `AttachProtocolViolation` event). No `Message::Close` is ever written
+on this route, so the attacher sees only `TransportClosed { code: None }` — the
+same thing a network blip produces. The two want opposite responses: a blip
+wants a reconnect, a refusal wants the process to stop, and an attacher that
+reconnects and re-sends the refused statement earns the same close forever,
+minting a security event each round.
+
+Stakes: bounded, which is why this is deferred. The pod's
+`max_futile_attachments = 3` heuristic does genuinely terminate the loop — three
+consecutive attachments that spoke and were answered nothing end the run. An
+explicit close code is strictly better signal (immediate, unambiguous,
+distinguishes violation from network flap) rather than a missing backstop, and
+its client half is already built, which is why this is a TODO and not a
+won't-do. Cost is a server protocol addition plus the pin-bump-and-policy tail
+in the pod.
+
+Done = the remote route closes a violated attachment with a dedicated close code
+— a code only, never the violation detail, which is a security record and not
+something to hand the offender — mirroring the surface route's stale-build use
+of the already-built client mechanism (`ConnConfig::terminal_close_code` /
+`ConnEvent::PeerClosedTerminal`; the pod already wires the receiving half and
+passes `terminal_close_code: None` today).
+
+Code site (`TODO(bridge-violation-close-code)`):
+`brenn-server/src/routes/attach/session.rs`, the violation-teardown path in
+`run_attach_session`.

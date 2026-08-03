@@ -159,42 +159,59 @@ pub struct RemoteConfigRaw {
 
 /// A remote's bearer token, loaded from its `token_file`.
 ///
-/// Comparison is constant-time and the only way out of the type: there is no
-/// accessor returning the secret, and `Debug` renders the length rather than
-/// the bytes, so a token cannot reach a log through a derived format of any
-/// struct that holds one.
+/// Stored as the SHA-256 digest of the token, never the plaintext: the secret
+/// stops being process-resident once the constructor returns, and every
+/// comparison is between two 32-byte values. That is what makes verification
+/// timing independent of *both* tokens' lengths — the stored side is a fixed
+/// width by construction, so no length class of the configured token is
+/// distinguishable, and an unmatchable dummy costs exactly what a real token
+/// costs.
+///
+/// Comparison is the only way out of the type: there is no accessor returning
+/// the secret, and `Debug` renders neither the bytes nor the length, so a token
+/// cannot reach a log through a derived format of any struct that holds one.
 ///
 /// `PartialEq` is written rather than derived, and routes through the same
-/// comparison [`RemoteToken::verify`] does. A derived one would be `String`'s
-/// short-circuiting memcmp, which makes `RemoteToken::new(presented) == expected`
-/// — the most natural spelling an auth path could reach for — a timing oracle on
-/// the token this type exists to protect.
+/// comparison [`RemoteToken::verify`] does. A derived one would be `[u8; 32]`'s
+/// short-circuiting compare, which makes `RemoteToken::new(presented) == expected`
+/// — the most natural spelling an auth path could reach for — a byte-position
+/// oracle on the digest.
 #[derive(Clone, Eq)]
-pub struct RemoteToken(String);
+pub struct RemoteToken([u8; 32]);
 
 impl PartialEq for RemoteToken {
     fn eq(&self, other: &Self) -> bool {
-        crate::util::ct_eq_bytes(self.0.as_bytes(), other.0.as_bytes())
+        crate::util::ct_eq_bytes(&self.0, &other.0)
     }
 }
 
 impl RemoteToken {
-    /// Wrap an already-loaded token.
-    pub fn new(token: impl Into<String>) -> Self {
-        Self(token.into())
+    /// Wrap an already-loaded token, digesting it on the way in.
+    pub fn new(token: impl AsRef<str>) -> Self {
+        Self(crate::util::sha256(token.as_ref().as_bytes()))
     }
 
-    /// Constant-time equality against a presented credential. Length is not
-    /// secret (it leaks through the timing of the comparison itself in any
-    /// implementation), but no byte position is.
+    /// A token no presentable credential can match.
+    ///
+    /// The digest is all zeros — not the digest of any string — so matching it
+    /// would require a SHA-256 preimage of `0x00…00`. Callers use it to give an
+    /// unknown principal the same comparison work as a known one.
+    pub const fn unmatchable() -> Self {
+        Self([0u8; 32])
+    }
+
+    /// Constant-time equality against a presented credential.
+    ///
+    /// Both sides are 32-byte digests, so the work is identical whatever either
+    /// token's length: no byte position and no length class leaks.
     pub fn verify(&self, presented: &str) -> bool {
-        crate::util::ct_eq_bytes(self.0.as_bytes(), presented.as_bytes())
+        crate::util::ct_eq_bytes(&self.0, &crate::util::sha256(presented.as_bytes()))
     }
 }
 
 impl std::fmt::Debug for RemoteToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RemoteToken({} bytes)", self.0.len())
+        f.write_str("RemoteToken(<redacted>)")
     }
 }
 
@@ -1019,5 +1036,54 @@ grants = ["alert"]
         assert_ne!(RemoteToken::new("s3cret-toker"), expected);
         assert_ne!(RemoteToken::new("s3cret-token-longer"), expected);
         assert_ne!(RemoteToken::new(""), expected);
+    }
+
+    /// Verification is correct across length classes — the property the digest
+    /// representation buys is that these all cost the same, and the least this
+    /// can pin is that none of them answers wrongly.
+    #[test]
+    fn tokens_of_any_length_verify_correctly() {
+        for token in [
+            "",
+            "x",
+            &"a".repeat(55)[..],
+            &"a".repeat(64)[..],
+            &"a".repeat(200)[..],
+        ] {
+            let stored = RemoteToken::new(token);
+            assert!(stored.verify(token), "{} bytes must verify", token.len());
+            assert!(
+                !stored.verify(&format!("{token}x")),
+                "a longer credential must not verify against {} bytes",
+                token.len(),
+            );
+            assert!(
+                token.is_empty() || !stored.verify(&"b".repeat(token.len())),
+                "an equal-length wrong credential must not verify",
+            );
+        }
+    }
+
+    /// The unknown-slug dummy: no credential matches it, whatever its shape.
+    #[test]
+    fn the_unmatchable_token_matches_nothing() {
+        let dummy = RemoteToken::unmatchable();
+        for presented in ["", " ", &" ".repeat(64)[..], "s3cret-token", "\0"] {
+            assert!(
+                !dummy.verify(presented),
+                "the dummy must refuse {presented:?}",
+            );
+        }
+        assert_ne!(dummy, RemoteToken::new(""));
+        assert_ne!(dummy, RemoteToken::new(" ".repeat(64)));
+    }
+
+    /// A digest-stored token renders neither its bytes nor its length.
+    #[test]
+    fn debug_reveals_no_length() {
+        let short = format!("{:?}", RemoteToken::new("x"));
+        let long = format!("{:?}", RemoteToken::new("x".repeat(200)));
+        assert_eq!(short, long, "Debug must not vary with the token");
+        assert!(!short.contains("200"), "no length in {short}");
     }
 }

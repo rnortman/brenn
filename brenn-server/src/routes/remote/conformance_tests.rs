@@ -19,18 +19,24 @@
 //! semantics, which are the shared session's and live beside it in
 //! `routes::attach`.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use brenn_attach_conformance::relay::SeverableRelay;
 use brenn_attach_conformance::{
-    AttachClient, ClientConfig, Credential, Observation, PublishRequest, ResumePolicy,
+    AttachClient, ClientConfig, Credential, Delivery, Observation, PublishRequest, ResumePolicy,
     SubscribeSettlement, SubscriptionDepths,
 };
 use brenn_attach_proto::{AlertSeverity, PublishOutcome, SUPPORTED_VERSIONS, Urgency};
+use brenn_envelope::chat::{ChatRoster, decode as chat_decode};
 use brenn_lib::db;
 use brenn_lib::messaging::config::Depth;
 use brenn_lib::messaging::testutils::{ephemeral_channel_entry, test_channel_entry};
-use brenn_lib::messaging::{ChannelEntry, SubscriberEntry, SubscriberEntryKind};
+use brenn_lib::messaging::{ChannelEntry, PublishResult, SubscriberEntry, SubscriberEntryKind};
 
-use super::test_fixtures::{RemoteTestHarness, SLUG, TOKEN, remote_harness_with_channels};
+use super::test_fixtures::{
+    APP, OWNER, RemoteTestHarness, SLUG, TOKEN, remote_harness_with_channels,
+};
 use crate::test_support::http::{TestServer, http_base_addr, spawn_test_server};
 
 /// The rig's `[[remote]]`: the fleet-driver shape of `test_fixtures::FLEET` with
@@ -268,6 +274,211 @@ async fn a_daemon_attaches_subscribes_publishes_and_resumes_across_a_severed_soc
     assert_eq!(
         second.body, "two",
         "the stream continues past the resume point rather than repeating it"
+    );
+
+    rig.client.close().await;
+}
+
+/// The app's owner, created on first ask: the app is a singleton with one
+/// allowed user, so every conversation of `home` hangs off this row and a test
+/// seeding a second one must not try to create the user twice.
+async fn owner(db: &db::Db) -> i64 {
+    let conn = db.lock().await;
+    match brenn_lib::auth::user::get_user_by_username(&conn, OWNER) {
+        Some(user) => user.id,
+        None => brenn_lib::auth::user::create_user(&conn, OWNER, "$argon2id$fake"),
+    }
+}
+
+/// Mint a conversation of app `home`, so the roster has something to name.
+///
+/// The row alone: these cases test the delivery of a server-authored snapshot,
+/// and provisioning the conversation's chat family would only add channels no
+/// assertion here reads. The case that does exercise provisioning goes through
+/// the messenger's own minting path instead.
+async fn seed_conversation(db: &db::Db) -> i64 {
+    let user = owner(db).await;
+    let conn = db.lock().await;
+    brenn_lib::conversation::create_conversation(&conn, user, APP, false)
+}
+
+/// The app's roster snapshot as the server authors it, published through the
+/// same call the conversation-creation hooks make.
+///
+/// A refusal is surfaced here rather than being read as an absent snapshot: the
+/// publish answers `Some` even when it refuses, and `None` for an app the
+/// messenger does not know or an address its directory cannot resolve — so a
+/// test that only checked for delivery could pass a rig that never published.
+async fn publish_roster(rig: &Rig) {
+    let outcome = rig
+        .harness
+        .state
+        .messenger
+        .as_ref()
+        .expect("the rig boots a messenger")
+        .publish_chat_roster(APP)
+        .await;
+    assert!(
+        matches!(outcome, Some(PublishResult::Ok { .. })),
+        "the server-side roster publish must have gone out, got {outcome:?}"
+    );
+}
+
+/// The conversation ids a delivered roster body names.
+fn roster_ids(body: &str) -> Vec<i64> {
+    let roster: ChatRoster = chat_decode(body).expect("a roster body is a versioned chat message");
+    roster.conversations.into_iter().map(|c| c.id).collect()
+}
+
+/// How long a roster case waits for a delivery before calling it absent.
+const ROSTER_WAIT: Duration = Duration::from_secs(10);
+
+/// The next delivery on `channel`, or a failed assertion — never an endless wait.
+///
+/// A delivery a regression would simply never make must surface as an ordinary
+/// test failure, not a hang that outlasts the runner's patience.
+async fn expect_roster_delivery(client: &mut AttachClient) -> Delivery {
+    tokio::time::timeout(ROSTER_WAIT, client.next_delivery(ROSTER))
+        .await
+        .unwrap_or_else(|_| panic!("no roster delivery arrived within {ROSTER_WAIT:?}"))
+}
+
+/// **The pod's cold connect: what it learns before it knows anything.**
+///
+/// A snapshot written while no peer was attached is retained, so the roster
+/// subscribe of a remote attaching afterwards replays it — which is the whole
+/// mechanism by which a daemon holding a fleet-grain grant discovers the
+/// exact-channel addresses it may subscribe to.
+#[tokio::test]
+async fn a_retained_roster_snapshot_replays_to_a_freshly_attached_remote() {
+    let db = db::init_db_memory();
+    let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+    let conversation = seed_conversation(&db).await;
+    publish_roster(&rig).await;
+
+    rig.client.attach().await;
+    let ack = rig
+        .client
+        .subscribe(ROSTER, DEPTHS, ResumePolicy::Cursorless)
+        .await;
+    assert_eq!(
+        ack.replay_count, 1,
+        "the retained snapshot is what a cold-connecting peer reconciles against"
+    );
+
+    let delivery = expect_roster_delivery(&mut rig.client).await;
+    assert_eq!(
+        roster_ids(&delivery.body),
+        vec![conversation],
+        "the replayed snapshot names the app's conversation"
+    );
+    assert_eq!(
+        delivery.sender, "system:chat-roster",
+        "the roster has one writer, and it is not the attacher"
+    );
+
+    rig.client.close().await;
+}
+
+/// **The same channel while the peer is watching, twice over.**
+///
+/// A conversation created under a live attachment reaches the daemon as a
+/// delivery on the roster it already holds — the reconcile path that keeps a
+/// long-lived pod current without reattaching. The second snapshot is the half
+/// that path actually lives on: a peer that only ever received the first would
+/// hold the world as it stood at connect time and never learn of another
+/// conversation until it reattached.
+#[tokio::test]
+async fn a_roster_republish_reaches_a_subscribed_remote() {
+    let db = db::init_db_memory();
+    let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+    rig.client.attach().await;
+
+    let ack = rig
+        .client
+        .subscribe(ROSTER, DEPTHS, ResumePolicy::Cursorless)
+        .await;
+    assert_eq!(ack.replay_count, 0, "no snapshot has been written yet");
+
+    // One publish, after the subscription exists. The roster is deduplicated
+    // against the last body it published, so each snapshot below has to name a
+    // conversation set the one before it did not.
+    let first = seed_conversation(&db).await;
+    publish_roster(&rig).await;
+
+    let delivery = expect_roster_delivery(&mut rig.client).await;
+    assert_eq!(
+        roster_ids(&delivery.body),
+        vec![first],
+        "the live snapshot names the conversation that appeared under the attachment"
+    );
+    assert_eq!(delivery.seq, 1, "the first delivery of the span");
+    assert_eq!(delivery.dropped, 0);
+
+    let second = seed_conversation(&db).await;
+    publish_roster(&rig).await;
+
+    let next = expect_roster_delivery(&mut rig.client).await;
+    assert_eq!(
+        roster_ids(&next.body),
+        vec![first, second],
+        "the follow-up snapshot reaches the subscription that already took the first"
+    );
+    assert_eq!(next.seq, 2, "the second delivery of the same span");
+    assert_eq!(next.dropped, 0);
+
+    rig.client.close().await;
+}
+
+/// **The mint the pod actually waits on.**
+///
+/// The two cases above publish the snapshot themselves; this one lets the
+/// messenger do it, through the path that mints an app's conversation lazily —
+/// `attach_conversation`, which provisions the chat family and republishes the
+/// roster. It is the seam the other cases leave open: an announce landing on an
+/// address the remote's fleet grant does not cover, or a prefix derivation that
+/// differs between the messenger and the harness, leaves both halves green while
+/// the pod learns of no conversation it did not already know.
+#[tokio::test]
+async fn a_conversation_the_attach_mints_reaches_a_subscribed_remote() {
+    let db = db::init_db_memory();
+    let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
+    let messenger = Arc::clone(
+        rig.harness
+            .state
+            .messenger
+            .as_ref()
+            .expect("the rig boots a messenger"),
+    );
+    let user = owner(&db).await;
+
+    rig.client.attach().await;
+    let ack = rig
+        .client
+        .subscribe(ROSTER, DEPTHS, ResumePolicy::Cursorless)
+        .await;
+    assert_eq!(ack.replay_count, 0, "no snapshot has been written yet");
+
+    // The app has never held a conversation: the attach mints one, provisions it
+    // and announces it, all from inside the messenger.
+    messenger
+        .attach_conversation(OUT_7, APP, Depth::Bounded(8))
+        .await;
+    let conversation = {
+        let conn = db.lock().await;
+        brenn_lib::conversation::get_singleton_conversation_id(&conn, user, APP)
+            .expect("the attach mints the app's conversation")
+    };
+
+    let delivery = expect_roster_delivery(&mut rig.client).await;
+    assert_eq!(
+        roster_ids(&delivery.body),
+        vec![conversation],
+        "the roster the attach republished names the conversation it minted"
+    );
+    assert_eq!(
+        delivery.sender, "system:chat-roster",
+        "the announce is the server's own, whoever triggered it"
     );
 
     rig.client.close().await;

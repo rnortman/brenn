@@ -26,6 +26,11 @@ chrono = { version = "0.4.44", default-features = false, features = ["serde", "a
 # backend's tungstenite pin (brenn/Cargo.toml) so the shared WS types agree.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.50.0", features = ["rt", "time", "net", "macros"] }
+# No TLS feature, deliberately: the backend is the consuming binary's choice,
+# carried into this build by cargo feature unification. A `wss://` dial through
+# a consumer that names none fails with "TLS support not compiled in", which
+# `transport::native` asserts. The crate docs in src/lib.rs say what a consumer
+# must write.
 tokio-tungstenite = "0.29.0"
 # Powers the native `wall_now()`. Deliberately not enabled for wasm: chrono's
 # `wasmbind` would reach for `Date.now()` behind our back, hiding the browser's

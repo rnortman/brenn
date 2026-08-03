@@ -144,6 +144,9 @@ impl TransportConnector for NativeConnector {
         self.credential
             .insert(req.headers_mut())
             .map_err(|err| TransportError::new(err.to_string()))?;
+        // TODO(bridge-upgrade-rejection-terminal): a rejected upgrade collapses
+        // into a stringly error here, so an embedder cannot tell a `401` from a
+        // dead server and re-dials a hopeless credential forever.
         let (ws, _resp) = tokio_tungstenite::connect_async(req)
             .await
             .map_err(|err| TransportError::new(err.to_string()))?;
@@ -394,6 +397,39 @@ mod tests {
         let url = format!("ws://{addr}/surface/demo/ws");
         let result = connector.connect(&url).await;
         assert!(result.is_err(), "refused connect should be Err, got Ok");
+    }
+
+    /// This crate compiles no TLS backend, so a `wss://` dial is refused for
+    /// want of one — the crate docs' claim, asserted rather than described.
+    ///
+    /// The listener makes the TCP connect succeed but never accepts: the TLS
+    /// refusal is assumed to land after the socket opens, so nothing beyond the
+    /// TCP handshake reaches the wire — no upgrade request, no credential.
+    ///
+    /// The wait is bounded because a backend pulled in by cargo feature
+    /// unification would instead start a handshake this listener never answers:
+    /// that must read as a failure here, not as a hung test.
+    #[tokio::test]
+    async fn a_wss_dial_is_refused_for_want_of_a_tls_backend() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut connector = NativeConnector::with_bearer("s3cret-token");
+        let url = format!("wss://{addr}/remote/pod-kitchen/ws");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), connector.connect(&url))
+                .await
+                .expect(
+                    "a TLS backend in this build would hang against a listener that never accepts",
+                );
+
+        let Err(err) = result else {
+            panic!("a wss:// dial cannot succeed with no TLS backend compiled in");
+        };
+        assert!(
+            err.to_string().contains("TLS support not compiled in"),
+            "the refusal must name the missing backend rather than a connect failure, got {err}"
+        );
     }
 
     /// A malformed WS URL fails at request construction, mapped to a

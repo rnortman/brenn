@@ -209,11 +209,16 @@ impl TargetResolver {
     /// This is the lazy creator: an app wired to receive gets its conversation at
     /// the attach that gives it a position.
     ///
-    /// TODO(chat-conversation-provision-chokepoint): a conversation minted here
-    /// gets neither its chat channel family nor a roster snapshot naming it —
-    /// this is a synchronous method on the caller's connection, with no messenger
-    /// to ask and nowhere to await a publish. The boot backfill heals the
-    /// channels at the next start; nothing heals the announcement.
+    /// Provisioning the minted conversation's chat channels and announcing it on
+    /// the app's roster is the caller's obligation: this is a synchronous method
+    /// on the caller's connection, with no messenger to ask and nowhere to await
+    /// a publish. Its one caller, `Messenger::attach_conversation`, discharges
+    /// both around this call.
+    ///
+    /// TODO(chat-conversation-provision-chokepoint): that discharge is
+    /// convention rather than structure, so a creation site added later and
+    /// wired straight to this method would mint a conversation with no chat
+    /// channels and no roster entry naming it.
     pub fn ensure_app_conversation(
         &self,
         conn: &rusqlite::Connection,

@@ -480,6 +480,10 @@ where
     // One security event per attachment, whatever detected the violation: the
     // handshake, the dispatch, or a socket-level frame class the dispatch never
     // sees. A violation is terminal, so there is never a second.
+    //
+    // TODO(bridge-violation-close-code): teardown below is by drop, so a
+    // violated attachment gets no close frame and the attacher cannot tell a
+    // refusal from a network blip.
     if let Some(detail) = &violation_detail {
         log_and_alert_security_event(
             &ctx.alert_dispatcher,
