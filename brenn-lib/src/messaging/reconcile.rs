@@ -617,8 +617,14 @@ mod tests {
         let (position, peer_position) = (positions[0].clone(), positions[1].clone());
 
         // The next boot, with the block gone: the channel is in no directory, so
-        // only the merge's skip report can name it.
+        // only the merge's skip report can name it. The boot backfill still runs,
+        // which is what re-declares the chat families the attach provisioned —
+        // without it their command cursors would read as orphans of this pass.
         let undeclared = messenger_over(db, Vec::new(), std::sync::Arc::new(NoopWakeRouter)).await;
+        {
+            let conn = undeclared.db.lock().await;
+            undeclared.backfill_conversation_chat_channels(&conn);
+        }
         let dormant = vec![DormantSubscription {
             channel_uuid: uuid,
             app_slug: APP.to_string(),
@@ -650,6 +656,86 @@ mod tests {
                 .await
                 .orphans_removed,
             1
+        );
+    }
+
+    /// An `App` subscriber declared on the channel, so the position an attach
+    /// creates there is justified by the directory on a later boot.
+    fn app_subscriber(slug: &str) -> SubscriberEntry {
+        SubscriberEntry {
+            kind: SubscriberEntryKind::App(slug.to_string()),
+            push_depth: Depth::Bounded(5),
+            retain_depth: Depth::Bounded(0),
+            noise: NoiseLevel::Silent,
+            wake_min: Some(WakeMin::Normal),
+        }
+    }
+
+    /// A database as one boot's attach leaves it: `APP` holds a position on
+    /// `entry`, and the conversation the attach minted holds the command cursor
+    /// its provisioning created on the chat inbound leaf.
+    async fn a_boot_that_attached(entry: &ChannelEntry) -> crate::db::Db {
+        let db = init_db_memory();
+        {
+            let conn = db.lock().await;
+            crate::auth::user::create_user(&conn, USER, "$argon2id$fake");
+        }
+        let m = messenger_over(
+            db.clone(),
+            vec![entry.clone()],
+            std::sync::Arc::new(NoopWakeRouter),
+        )
+        .await;
+        m.attach_conversation(&entry.address, APP, Depth::Bounded(5))
+            .await;
+        db
+    }
+
+    /// A conversation's command position is justified by a chat leaf that only
+    /// the boot backfill puts back in the directory, so
+    /// `backfill_conversation_chat_channels` has to run before this pass on every
+    /// boot. Stated as a checked fact rather than left to the order two calls
+    /// happen to sit in: swapping them reaps the read position of every
+    /// conversation's inbound leaf, and each conversation is then re-primed at
+    /// head, silently dropping the commands it had not read.
+    #[tokio::test]
+    async fn the_boot_backfill_must_run_before_the_reconcile_pass() {
+        let ch = channel("chat", vec![app_subscriber(APP)]);
+
+        // Boot's own order: the backfill re-declares the chat family, then the
+        // pass runs.
+        let backfilled = messenger_over(
+            a_boot_that_attached(&ch).await,
+            vec![ch.clone()],
+            std::sync::Arc::new(NoopWakeRouter),
+        )
+        .await;
+        {
+            let conn = backfilled.db.lock().await;
+            backfilled.backfill_conversation_chat_channels(&conn);
+        }
+        assert!(
+            backfilled
+                .reconcile_subscriber_cursors(&[])
+                .await
+                .is_clean(),
+            "a directory holding the chat family justifies the conversation's command position"
+        );
+
+        // The same boot with the two passes swapped.
+        let unbackfilled = messenger_over(
+            a_boot_that_attached(&ch).await,
+            vec![ch],
+            std::sync::Arc::new(NoopWakeRouter),
+        )
+        .await;
+        assert_eq!(
+            unbackfilled
+                .reconcile_subscriber_cursors(&[])
+                .await
+                .orphans_removed,
+            1,
+            "reconciling first reaps the command position: its leaf is in no directory yet"
         );
     }
 

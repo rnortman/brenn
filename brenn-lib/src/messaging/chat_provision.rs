@@ -209,7 +209,7 @@ fn chat_channel_entry(
 /// The leaves provisioned today. `Approvals` is reserved: its name is fixed so
 /// it cannot collide later, but nothing publishes or subscribes to it, and a
 /// channel with no traffic is a row to reap rather than a feature.
-const PROVISIONED_LEAVES: [ChatLeaf; 4] = [
+pub(crate) const PROVISIONED_LEAVES: [ChatLeaf; 4] = [
     ChatLeaf::In,
     ChatLeaf::Out,
     ChatLeaf::Stream,

@@ -161,9 +161,10 @@ pub struct Message {
 /// which the publish takes itself. A row that exists unannounced is invisible to
 /// every bus peer until something else changes the set.
 ///
-/// TODO(chat-conversation-provision-chokepoint): both obligations are
-/// convention, discharged by hand at each creation site and already missed
-/// twice. They want one call that creates, provisions and announces.
+/// TODO(chat-conversation-provision-chokepoint): every creation site discharges
+/// both obligations, but by convention rather than by structure, and the tree
+/// has already missed them twice. They want one call that creates, provisions
+/// and announces, so a site added later cannot skip either.
 pub fn create_conversation(conn: &Connection, user_id: i64, app_slug: &str, shared: bool) -> i64 {
     let now = format_ts_for_db(Utc::now());
     conn.execute(

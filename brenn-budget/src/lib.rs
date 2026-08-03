@@ -17,6 +17,12 @@
 //!   bound the host's own memory and log volume against a hostile or broken
 //!   guest, which is why they are constants and not operator knobs.
 //!
+//! A third ceiling lives outside this crate and binds first for anything
+//! wire-bound: one activation's publishes to transportable channels share one
+//! `max_body_bytes` frame budget, enforced by the surface kernel's publish buffer
+//! on the publish and control-op paths alike. See
+//! [`MAX_PUBLISH_BYTES_PER_ACTIVATION`] for which number applies where.
+//!
 //! [`ActivationGate`] composes both layers into the one per-activation gate each
 //! host runs a guest's publish and control-op calls through: the counters, the
 //! buckets, and the order the checks fire in.
@@ -42,6 +48,20 @@ pub const MILLITOKENS_PER_PUBLISH: u64 = 1000;
 pub const MAX_PUBLISHES_PER_ACTIVATION: usize = 256;
 
 /// Maximum total publish bytes buffered per activation (4 MiB).
+///
+/// The host-memory backstop on one activation's buffer, counting every channel
+/// the activation publishes to. It is also the operative ceiling for a
+/// non-transportable (local) channel, which nothing else bounds by size.
+///
+/// **It is not the operative ceiling for a wire-bound channel.** A transportable
+/// channel's publishes travel as one `PublishBatch` frame, and the protocol
+/// gives that frame a single `max_body_bytes` budget (64 KiB at default config)
+/// across the whole flush — channel addresses charged alongside bodies. The
+/// surface kernel enforces that at buffer time, before this gate is asked, and
+/// answers the overrunning publish `quota-exceeded`, so the component learns
+/// which publish overran instead of losing the whole atomic flush at the wire. A
+/// component emitting to a transportable channel should size against that
+/// budget, not against this constant.
 pub const MAX_PUBLISH_BYTES_PER_ACTIVATION: usize = 4 * 1024 * 1024;
 
 /// Maximum total publish calls (successful + failed) per activation.

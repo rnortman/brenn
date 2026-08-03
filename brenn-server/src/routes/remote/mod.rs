@@ -22,7 +22,7 @@ mod test_fixtures;
 mod ws_tests;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 use axum::Extension;
 use axum::extract::ws::WebSocketUpgrade;
@@ -49,21 +49,22 @@ use crate::state::AppState;
 
 /// The credential an unknown slug is compared against.
 ///
-/// A `[[remote]]` token is whitespace-trimmed at load, so no configured token
-/// can equal this and the comparison always fails. Its job is to keep the
-/// unknown-slug path on the same code as the wrong-token path — one comparison,
-/// one refusal, one event — rather than short-circuiting out of the handler on
-/// the directory lookup.
+/// An all-zeros digest, which under SHA-256 preimage resistance no presentable
+/// credential can match. Its job is to keep the unknown-slug path on the same
+/// code as the wrong-token path — one comparison, one refusal, one event —
+/// rather than short-circuiting out of the handler on the directory lookup.
 ///
-/// It does **not** buy timing parity, and nothing here claims it does: the
-/// constant-time comparison rejects a length mismatch before reading a byte, so
-/// a probe whose length matches this dummy but not the operator's token spends
-/// different work on the two paths. Token length is not treated as secret; the
-/// residual — a timing class that can in principle tell a configured slug from
-/// an unconfigured one — is an accepted risk on B7 in
-/// `docs/security-posture.md`, and a slug is not a credential.
-static UNKNOWN_REMOTE_TOKEN: LazyLock<RemoteToken> =
-    LazyLock::new(|| RemoteToken::new(" ".repeat(64)));
+/// Timing parity holds through the comparison: every `RemoteToken` compare is
+/// one SHA-256 of the presented credential against two fixed 32-byte values, so
+/// the work is identical whether the slug is configured or not, and no length
+/// class of an operator's token is distinguishable. The residual is the
+/// directory lookup ahead of it — the same class of residual the login path
+/// carries in its user lookup ahead of its dummy password verify.
+///
+/// Matching the dummy is not an authentication path in any case:
+/// [`authenticate_remote`]'s success arm requires the slug to have resolved to a
+/// runtime, so the dummy's only job is equalizing comparison work.
+static UNKNOWN_REMOTE_TOKEN: RemoteToken = RemoteToken::unmatchable();
 
 /// Per-remote runtime bundle, precomputed once at boot so the upgrade path does
 /// no re-derivation.
@@ -185,8 +186,8 @@ fn bearer_credential(headers: &HeaderMap) -> Option<&str> {
 ///
 /// The comparison runs on every path, against a dummy credential when the slug
 /// names no remote ([`UNKNOWN_REMOTE_TOKEN`]), so every refusal walks the same
-/// code and answers from the same place. What that is worth, and what it is
-/// not, is written on the dummy.
+/// code and answers from the same place, in the same time. What that is worth,
+/// and what it leaves, is written on the dummy.
 fn authenticate_remote(
     state: &AppState,
     slug: &str,
@@ -196,7 +197,7 @@ fn authenticate_remote(
     let runtime = state.remotes.get(slug).cloned();
     let expected = runtime
         .as_ref()
-        .map_or(&*UNKNOWN_REMOTE_TOKEN, |runtime| &runtime.token);
+        .map_or(&UNKNOWN_REMOTE_TOKEN, |runtime| &runtime.token);
     let presented = bearer_credential(headers);
     let matched = expected.verify(presented.unwrap_or_default());
 

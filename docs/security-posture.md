@@ -764,18 +764,6 @@ client-controlled path segment; resource exhaustion through concurrent sessions.
 
 **Accepted risks:**
 
-- **Token length is not secret, so timing can distinguish a configured slug
-  from an unconfigured one.** The comparison is constant-time in byte
-  *position* — no byte of a token leaks — but it rejects a length mismatch
-  before reading contents, and the dummy the unknown-slug path compares against
-  is a fixed length the operator's token need not share. A prober measuring the
-  `401` therefore sees a length-class difference between "this slug is
-  configured" and "it is not". The residual is small and the disclosure is
-  cheap: the delta is a memcmp-length return buried under TLS termination, the
-  reverse proxy, and scheduler jitter, and a slug is a name, not a credential —
-  learning it grants nothing without the token. Closing it would mean fixing
-  every token to one length or comparing digests, neither of which buys more
-  than the map lookup ahead of the comparison already gives away.
 - **The token sits at rest on both hosts.** Mitigated by mode-checked `0600`
   files on each side and by the transport refusing to carry a credential over
   cleartext to a non-loopback host. Rotation is manual and coordinated: one
@@ -792,11 +780,14 @@ client-controlled path segment; resource exhaustion through concurrent sessions.
   gated only by that per-connection bucket (§6.3).
 
 **What the reviewer verifies:** the token is file-backed, mode-checked, and
-compared in constant time; every authentication failure is indistinguishable to
-the caller and produces exactly one `AuthFailure`; the profile's scheme match is
-exhaustive and denies by default; the subscription cap is enforced; the slug is
-sanitized wherever it reaches a log or event; the cap rejection emits no security
-event.
+compared in constant time — the comparison is digest-based and fixed-width, so
+neither a byte value nor a length class of a configured token is
+timing-distinguishable, and an unknown slug is compared against an unmatchable
+dummy digest for exactly the same work; every authentication failure is
+indistinguishable to the caller and produces exactly one `AuthFailure`; the
+profile's scheme match is exhaustive and denies by default; the subscription cap
+is enforced; the slug is sanitized wherever it reaches a log or event; the cap
+rejection emits no security event.
 
 ---
 

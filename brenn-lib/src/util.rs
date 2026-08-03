@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 /// Constant-time equality check for two byte slices.
@@ -5,14 +6,41 @@ use subtle::ConstantTimeEq;
 /// Returns `true` iff both slices have the same length and identical contents.
 /// `subtle::ConstantTimeEq` answers `false` on a length mismatch without
 /// comparing contents, so no byte position leaks through timing; the length
-/// itself does, which every implementation of this comparison also does and
-/// which is not secret for the credentials compared here (operator-authored
-/// config secrets and bearer tokens).
+/// itself does. For fixed-width inputs (digests, MACs) that is nothing: both
+/// sides are the same width by construction. For variable-length secrets it is
+/// an oracle on the stored side's length — use [`eq_secret`] there, with the
+/// caveat documented on it.
 ///
 /// The single constant-time comparison for the crate: a timing-hygiene audit
 /// or a `subtle` API migration has one site to visit.
 pub fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
+}
+
+/// SHA-256 of `bytes`, the digest form secrets are compared in.
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Sha256::digest(bytes));
+    out
+}
+
+/// Constant-time equality for two variable-length secrets, compared as digests.
+///
+/// Hashes both sides and compares the two 32-byte results with [`ct_eq_bytes`],
+/// which removes the exact-length short-circuit: a prober can no longer find
+/// the stored secret's length by varying the presented one until the comparison
+/// switches from an early return to a full byte loop.
+///
+/// **What it does not buy.** Because both sides are hashed at compare time, a
+/// residual timing difference remains whenever the two inputs occupy a
+/// different number of SHA-256 blocks (64-byte classes) — the compression
+/// function runs once more for the longer input. That narrows the leak from an
+/// exact length to a block class; it does not remove it. Full independence
+/// requires pre-hashing the stored side once, so that only the presented side's
+/// length is in play — which is what
+/// [`RemoteToken`](crate::messaging::remote::RemoteToken) does.
+pub fn eq_secret(a: &[u8], b: &[u8]) -> bool {
+    ct_eq_bytes(&sha256(a), &sha256(b))
 }
 
 /// Compare two version strings of the form `X.Y.Z` numerically.
@@ -112,6 +140,47 @@ pub fn json_for_script_tag(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ct_eq_bytes_agrees_with_plain_equality() {
+        assert!(ct_eq_bytes(b"abc", b"abc"));
+        assert!(!ct_eq_bytes(b"abc", b"abd"));
+        assert!(!ct_eq_bytes(b"abc", b"abcd"));
+        assert!(ct_eq_bytes(b"", b""));
+    }
+
+    #[test]
+    fn eq_secret_matches_equal_inputs_of_any_length() {
+        for secret in [
+            "".to_string(),
+            "x".to_string(),
+            "a".repeat(55),
+            "a".repeat(64),
+            "a".repeat(200),
+        ] {
+            assert!(eq_secret(secret.as_bytes(), secret.as_bytes()));
+            assert!(!eq_secret(
+                secret.as_bytes(),
+                format!("{secret}x").as_bytes()
+            ));
+        }
+    }
+
+    #[test]
+    fn eq_secret_rejects_a_prefix_of_the_secret() {
+        // The case a length-comparing implementation would answer without
+        // comparing contents: a strict prefix of the stored secret.
+        assert!(!eq_secret(b"s3cret-token", b"s3cret"));
+        assert!(!eq_secret(b"s3cret", b"s3cret-token"));
+    }
+
+    #[test]
+    fn sha256_is_the_known_digest_of_the_empty_string() {
+        assert_eq!(
+            hex::encode(sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
 
     #[test]
     fn version_at_least_equal() {
