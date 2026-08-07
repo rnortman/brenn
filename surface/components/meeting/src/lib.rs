@@ -14,6 +14,7 @@
 //! Split into a DOM-free, host-tested state machine (`logic`) and a thin
 //! `cfg(target_arch = "wasm32")` DOM/timer glue module.
 
+pub mod help;
 pub mod logic;
 
 #[cfg(target_arch = "wasm32")]

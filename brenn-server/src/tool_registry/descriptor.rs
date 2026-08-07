@@ -83,6 +83,9 @@ pub struct ToolDescriptor {
     pub description: &'static str,
     /// JSON-schema projection of the tool's args struct — for MCP/docs, not an
     /// enforcement layer (tools validate by deserializing).
+    ///
+    /// TODO(tool-schema-derive): hand-maintained, so it can drift from the args
+    /// struct it projects with nothing failing.
     pub input_schema: serde_json::Value,
     /// Execution class (fast vs async).
     pub class: ToolClass,

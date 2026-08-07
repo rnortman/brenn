@@ -8,15 +8,16 @@ description = "Brenn surface meeting component — computes time-to-next-meeting
 [lib]
 crate-type = ["cdylib"]
 
-# The DOM-free escalation state machine (logic.rs) is compiled and unit-tested
-# on the host; its dependencies are ungated normal deps. It shares the
-# component-support fault helpers and folds the contract's activation windows,
-# both host-buildable, so those are ungated normal deps. Wasm DOM/timer glue
-# deps belong under the wasm32 target below.
+# The DOM-free escalation state machine (logic.rs) and the help-sidecar
+# generator (help.rs) are compiled and unit-tested on the host; their
+# dependencies are ungated normal deps. That includes the schema, whose channel
+# addresses the generator interpolates, and the contract, which owns the sidecar
+# header. Wasm DOM/timer glue deps belong under the wasm32 target below.
 [dependencies]
 brenn-envelope = { path = "../../../brenn-envelope" }
 brenn-surface-component-support = { version = "0.1.0", path = "../../component-support" }
 brenn-surface-contract = { version = "0.1.0", path = "../../contract" }
+brenn-surface-schema = { version = "0.1.0", path = "../../schema" }
 chrono = { version = "0.4.44", default-features = false, features = ["alloc"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.149"
@@ -35,7 +36,6 @@ wasm-bindgen-test = { workspace = true }
 # dispatches takeover request/release seam events, and publishes acks. These
 # deps never enter the host build (logic.rs and its tests carry no wasm deps).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-brenn-surface-schema = { version = "0.1.0", path = "../../schema" }
 wasm-bindgen = { workspace = true }
 web-sys = { workspace = true, features = [
     "Document",

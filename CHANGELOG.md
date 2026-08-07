@@ -2,6 +2,14 @@
 
 All notable changes to Brenn are documented here.
 
+## [0.16.1] — 2026-08-07
+
+### Fixed
+
+- Help channel text (channels published by components to teach LLMs how to use
+  them) had documentation rot. Now help text is generated within and from the
+  code itself to help prevent this.
+
 ## [0.16.0] — 2026-08-02
 
 The main stories here are: We are preparing to bring voice assistants in (by

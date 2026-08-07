@@ -1,3 +1,4 @@
+<!-- AUTO-GENERATED from this component's src/help.rs. Do not edit; run `make regen-surface-help`. -->
 # chrome
 
 The in-tree default chrome component. Chrome owns the page's layout, connection
@@ -10,20 +11,20 @@ every *other* mounted instance into a layout section; it never places itself.
 
 ## Inputs (bind these on the chrome instance)
 
-Chrome reads six ports. Bind each to the channel it carries:
+Chrome reads 6 ports. Bind each to the channel it carries:
 
 | Port | Channel | Carries |
 |---|---|---|
 | `layout` | a `brenn:` layout channel (retained, depth ≥ 1) | the layout doc (below) |
-| `theme` | `local:brenn/theme` | `{ v, theme }` — `theme` is `"dark"` or `"light"` |
+| `theme` | `local:brenn/theme` | `{ v, theme }` — the runtime theme axis |
 | `link-state` | `local:brenn/link-state` | `{ v, state }` — the connection banner |
 | `surface-state` | `local:brenn/surface-state` | the mounted-instance set chrome arranges |
 | `takeover` | `local:brenn/takeover` | a component's fullscreen request/release (needs the surface `takeover` grant) |
 | `toast` | `local:brenn/toast` | transient notices (live-only, retains nothing) |
 
-A surface with no `layout` binding renders the default layout: the first three
-mounted instances in configured order, laid out by count (1 → single, 2 →
-columns-2, 3+ → columns-3).
+A surface with no `layout` binding renders the default layout: the first three mounted instances in configured order, laid out by count (1 → `single`, 2 → `columns-2`, 3 or more → `columns-3`).
+
+The `theme` field on the theme plane is `dark` or `light`; a surface with no theme-driving component stays `dark`.
 
 ## Output (bind this on the chrome instance)
 
@@ -51,19 +52,29 @@ A JSON document naming which instance fills each slot of a layout kind:
 {
   "v": 1,
   "kind": "columns-2",
-  "ratio": 0.6,
   "panels": {
-    "a": { "instance": "left-panel", "label": "Inbox" },
-    "b": { "instance": "right-panel" }
-  }
+    "a": {
+      "instance": "left-panel",
+      "label": "Inbox"
+    },
+    "b": {
+      "instance": "right-panel"
+    }
+  },
+  "ratio": 0.6
 }
 ```
 
-- `kind` is one of `single` (slot `a`), `columns-2` (`a`,`b`), or `columns-3`
-  (`a`,`b`,`c`). Every slot the kind names must be present in `panels`.
-- Each panel's `instance` must be a mounted, arrangeable instance (not chrome
-  itself). `label`, if present, renders as a text header above the panel.
-- `ratio` is an optional split fraction exposed to skin CSS as `--surface-ratio`.
+`kind` is one of:
+
+- `single` — one panel filling the surface. Slots `a`; no `ratio`.
+- `columns-2` — two side-by-side columns, split by `ratio`. Slots `a`, `b`; takes `ratio`.
+- `columns-3` — three side-by-side columns of equal width. Slots `a`, `b`, `c`; no `ratio`.
+- `main-side` — a main column beside a side column of two stacked panels — one split each way; `ratio` splits the main column from the side. Slots `a`, `b`, `c`; takes `ratio`.
+
+Every slot the kind names must be present in `panels`, and no other key may be.
+Each panel's `instance` must be a mounted, arrangeable instance (not chrome itself). `label`, if present, renders as a text header above the panel.
+`ratio` is an optional split fraction, valid in `[0.15, 0.85]` inclusive, exposed to skin CSS as `--surface-ratio`; present on a kind that takes no `ratio`, it rejects the whole doc. `v` must be `1`.
 
 Chrome keeps the **last valid** layout on screen: a doc that fails to parse or
 names an unknown instance is dropped and reported, never partially applied, and

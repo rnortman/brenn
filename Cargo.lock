@@ -832,6 +832,7 @@ dependencies = [
  "brenn-surface-contract",
  "js-sys",
  "serde_json",
+ "tempfile",
  "uuid",
  "wasm-bindgen",
  "web-sys",

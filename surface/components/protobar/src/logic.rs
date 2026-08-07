@@ -116,12 +116,35 @@ struct RawBody {
     format: Option<String>,
 }
 
+/// The `text` key: the message body itself.
+pub(crate) const KEY_TEXT: &str = "text";
+/// The `priority` key: which [`Urgency`] slot the message occupies.
+pub(crate) const KEY_PRIORITY: &str = "priority";
+/// The `expires_at` key: when the slot stops displaying.
+pub(crate) const KEY_EXPIRES_AT: &str = "expires_at";
+/// The `format` key: how `text` is rendered.
+pub(crate) const KEY_FORMAT: &str = "format";
+
 /// The reserved convention keys. A JSON object opts into the structured
 /// convention only if its top level carries at least one of these; a publisher
 /// that used any of them was unambiguously speaking the convention, so it is
 /// held to the full schema (a typo like `{"priority": "high", "txt": ".."}`
 /// stays malformed rather than silently downgrading to verbatim JSON).
-const CONVENTION_KEYS: [&str; 4] = ["text", "priority", "expires_at", "format"];
+///
+/// Also the field list the help generator documents: a key added here without a
+/// documented shape fails protobar's generator.
+pub(crate) const CONVENTION_KEYS: [&str; 4] = [KEY_TEXT, KEY_PRIORITY, KEY_EXPIRES_AT, KEY_FORMAT];
+
+/// The `format` vocabulary: render `text` verbatim as one paragraph, or parse it
+/// as markdown. Shared by the parse below and the help generator, so the
+/// documented values are the accepted ones.
+pub(crate) const FORMAT_PLAIN: &str = "plain";
+/// See [`FORMAT_PLAIN`].
+pub(crate) const FORMAT_MARKDOWN: &str = "markdown";
+
+/// The slot a message with no `priority` occupies, and the slot bare text lands
+/// in.
+pub(crate) const DEFAULT_PRIORITY: Urgency = Urgency::Normal;
 
 impl ParsedBody {
     fn parse(body: &str) -> Self {
@@ -149,15 +172,15 @@ impl ParsedBody {
 
     fn validate(raw: RawBody) -> Self {
         let priority = match raw.priority.as_deref() {
-            None => Urgency::Normal,
+            None => DEFAULT_PRIORITY,
             Some(s) => match Urgency::parse(s) {
                 Some(u) => u,
                 None => return ParsedBody::Malformed(format!("unrecognized priority {s:?}")),
             },
         };
         let markdown = match raw.format.as_deref() {
-            None | Some("plain") => false,
-            Some("markdown") => true,
+            None | Some(FORMAT_PLAIN) => false,
+            Some(FORMAT_MARKDOWN) => true,
             Some(other) => {
                 return ParsedBody::Malformed(format!("unrecognized format {other:?}"));
             }
@@ -213,7 +236,7 @@ impl ProtobarState {
                 Ok(Ingest::Malformed(FaultReport::new(&envelope, reason)))
             }
             ParsedBody::BareText(text) => {
-                self.store(Urgency::Normal, markdown::plain(&text), None, now);
+                self.store(DEFAULT_PRIORITY, markdown::plain(&text), None, now);
                 Ok(Ingest::Accepted)
             }
             ParsedBody::Structured {

@@ -8,6 +8,7 @@
 //! `data-takeover`, but it does that only in the wasm DOM half; the decision
 //! logic here is DOM-free and host-tested.
 
+pub mod help;
 pub mod logic;
 
 #[cfg(target_arch = "wasm32")]

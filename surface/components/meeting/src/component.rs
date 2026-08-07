@@ -37,20 +37,13 @@ use web_sys::HtmlElement;
 
 use crate::logic::dismiss_body;
 use crate::logic::{
-    AckAction, AckKind, AckTarget, MeetingState, Recompute, SNOOZE_SECS, WarningLevel,
-    ack_request_body, parse_ack_request, snooze_body,
+    ACKS_PORT, AckAction, AckKind, AckTarget, MeetingState, Recompute, SNOOZE_SECS, TAKEOVER_PORT,
+    WarningLevel, ack_request_body, parse_ack_request, snooze_body,
 };
 
 /// This component's kind — its config `kind`, its element-tag stem
 /// (`brenn-<kind>`), and the `component` field of its panic events.
 const KIND: &str = "meeting";
-
-/// The ack output port — must match a `[[surface.output]] port` binding.
-const ACKS_PORT: &str = "acks";
-
-/// The output port meeting publishes takeover request/release on; must match the
-/// `[[surface.output]]` binding onto `local:brenn/takeover`.
-const TAKEOVER_PORT: &str = "takeover";
 
 /// The boundary-wake port — must match a `[[surface.io_port]] port` declaration.
 const TICK_PORT: &str = "tick";

@@ -6,6 +6,11 @@
 //! silently rotting a hand-copied literal. The envelope is kept as JSON text on
 //! purpose: the tests exercise the parse boundary, so they read the same bytes a
 //! delivery would carry.
+//!
+//! It also holds [`enforce_help_sidecar`], the drift gate each in-tree component
+//! crate's help-sidecar test calls, and [`json_blocks`], which lifts the doc's own
+//! fenced examples back out for those tests to parse — same reason: one copy of a
+//! shared test obligation.
 
 use brenn_envelope::MessageEnvelope;
 
@@ -13,6 +18,10 @@ use brenn_envelope::MessageEnvelope;
 /// it drives real DOM seams, so it exists only where those do.
 #[cfg(target_arch = "wasm32")]
 pub mod browser;
+
+mod help_sidecar;
+
+pub use help_sidecar::{enforce_help_sidecar, json_blocks};
 
 /// Re-exported so consumers can name `Uuid` parameter types (page-load epochs,
 /// message ids) without pinning `uuid` themselves.

@@ -129,6 +129,11 @@ pub struct EnvInputs {
     /// `cc-usage/tests/fixtures/**` (golden/input files read at runtime via `std::fs`,
     /// not compiled in). Recursive: the tree has subdirectories.
     pub test_fixtures: Vec<(String, Vec<u8>)>,
+    /// The in-tree surface help sidecars (`surface/components/*/help.md` plus
+    /// `surface/chrome/help.md`), read at runtime by each component's drift test.
+    /// No crate compiles them in, so a hand edit changes no test binary's bytes
+    /// and only the env key catches it.
+    pub help_sidecars: Vec<(String, Vec<u8>)>,
     /// Behavior-altering env vars: name → value (None = unset).
     pub env_vars: Vec<(String, Option<String>)>,
 }
@@ -157,6 +162,7 @@ pub fn compute_env_key(inputs: &EnvInputs) -> String {
     section("config_files", &inputs.config_files);
     section("mqtt_assets", &inputs.mqtt_assets);
     section("test_fixtures", &inputs.test_fixtures);
+    section("help_sidecars", &inputs.help_sidecars);
 
     h.update(b"toolchain");
     h.update(&(inputs.toolchain.len() as u64).to_le_bytes());
@@ -409,6 +415,12 @@ fn collect_env_inputs(repo_root: &Path) -> EnvInputs {
     let cc_fixtures = repo_root.join("cc-usage").join("tests").join("fixtures");
     inputs.test_fixtures = read_dir_files_recursive(&cc_fixtures);
 
+    // Surface help sidecars, read at runtime by each component's drift test. Same
+    // reasoning as the goldens above: editing one changes no Rust source, so the
+    // test binary is bit-identical and a cached pass would replay over exactly the
+    // edit the gate exists to catch.
+    inputs.help_sidecars = collect_help_sidecars(repo_root);
+
     // Behavior-altering env vars found by the audit.
     for name in [
         "BRENN_MQTT_INTEGRATION",
@@ -421,6 +433,45 @@ fn collect_env_inputs(repo_root: &Path) -> EnvInputs {
     }
 
     inputs
+}
+
+/// Every in-tree surface help sidecar as (repo-relative path, bytes), sorted by
+/// path. The set is `surface/components/*/help.md` plus `surface/chrome/help.md`
+/// — the same set the build ships and the xtask help guard inspects. A component
+/// dir with no sidecar contributes nothing; an unreadable one panics.
+fn collect_help_sidecars(repo_root: &Path) -> Vec<(String, Vec<u8>)> {
+    let components = repo_root.join("surface").join("components");
+    let mut paths: Vec<PathBuf> = match std::fs::read_dir(&components) {
+        Ok(entries) => entries
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|e| panic!("xtask test: failed to read {components:?}: {e}"))
+                    .path()
+                    .join("help.md")
+            })
+            .collect(),
+        // Absent dir keys as no sidecars; any other error must not masquerade as
+        // an empty set, which would hide every edit under it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => panic!("xtask test: failed to read {components:?}: {e}"),
+    };
+    paths.push(repo_root.join("surface").join("chrome").join("help.md"));
+
+    let mut out: Vec<(String, Vec<u8>)> = paths
+        .into_iter()
+        .filter(|path| path.is_file())
+        .map(|path| {
+            let name = path
+                .strip_prefix(repo_root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            let bytes = read_or_empty(&path);
+            (name, bytes)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// Read every file directly under `dir` (sorted by name), optionally filtered by
@@ -616,6 +667,39 @@ fn cache_enabled_from(val: Option<&str>) -> bool {
     }
 }
 
+/// The env var that flips the surface help-sidecar drift tests from comparing the
+/// committed `help.md` to rewriting it.
+const HELP_REGEN_VAR: &str = "BRENN_REGEN_HELP";
+
+/// Whether an observed `BRENN_REGEN_HELP` value blocks the suite. Only an absent
+/// var runs: any value at all means someone meant to regenerate, and a run that
+/// rewrites the sidecars it is supposed to be checking reports green on a
+/// comparison it never made.
+fn help_regen_blocks_run(val: Option<&str>) -> bool {
+    val.is_some()
+}
+
+/// Refuse the suite when `BRENN_REGEN_HELP` is in the ambient environment.
+///
+/// `make regen-surface-help` sets it for its own cargo invocation, which is the
+/// only place it belongs. Left exported in a shell, it would turn every
+/// subsequent run of this suite — including the one in the pre-commit hook — into
+/// a silent rewrite of the working tree that passes, so a stale committed sidecar
+/// would ship while the fresh bytes sat unstaged.
+fn assert_no_help_regen_env() {
+    let val = std::env::var(HELP_REGEN_VAR).ok();
+    if help_regen_blocks_run(val.as_deref()) {
+        eprintln!(
+            "ERROR: {HELP_REGEN_VAR} is set ({:?}). It flips the surface help-sidecar \
+             drift tests from comparing the committed help.md to rewriting it, so this \
+             suite would pass without checking a single sidecar. Unset it; \
+             `make regen-surface-help` sets it for its own cargo invocation.",
+            val.unwrap_or_default()
+        );
+        std::process::exit(1);
+    }
+}
+
 /// Pure pass-recording decision for one suite. A suite is recorded as a pass iff
 /// every non-ignored test nextest listed actually ran and passed (`complete` and
 /// `passed`), a current content hash exists for it, and its binary did not change
@@ -641,6 +725,7 @@ fn record_decision(
 /// Entry point for `cargo run -p xtask -- test`. Returns true on success.
 pub fn run_test(repo_root: &Path) -> bool {
     assert_nextest_available();
+    assert_no_help_regen_env();
     let cache_enabled = cache_enabled_from(std::env::var("BRENN_TEST_CACHE").ok().as_deref());
 
     // Enumerate (this also compiles the test binaries).
@@ -862,6 +947,7 @@ mod tests {
             config_files: vec![("brenn.dev.toml".into(), bytes("dev"))],
             mqtt_assets: vec![("ca.pem".into(), bytes("cert"))],
             test_fixtures: vec![("sub/g.golden".into(), bytes("golden"))],
+            help_sidecars: vec![("surface/chrome/help.md".into(), bytes("# chrome"))],
             env_vars: vec![("BRENN_MQTT_INTEGRATION".into(), None)],
         }
     }
@@ -971,6 +1057,60 @@ mod tests {
         let mut m = sample_inputs();
         m.test_fixtures[0].1 = bytes("golden2");
         assert_ne!(base, compute_env_key(&m));
+    }
+
+    /// A hand edit to a committed sidecar changes no test binary, so the env key
+    /// is the only thing that can make the drift test run again.
+    #[test]
+    fn env_key_help_sidecar_bytes_change_key() {
+        let base = compute_env_key(&sample_inputs());
+        let mut m = sample_inputs();
+        m.help_sidecars[0].1 = bytes("# hand-edited");
+        assert_ne!(base, compute_env_key(&m));
+    }
+
+    #[test]
+    fn help_regen_var_blocks_only_when_set() {
+        assert!(!help_regen_blocks_run(None));
+        for val in ["1", "0", "", "true"] {
+            assert!(
+                help_regen_blocks_run(Some(val)),
+                "{val:?} must block the run"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_help_sidecars_finds_components_and_chrome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (dir, sidecar) in [
+            ("surface/components/alpha", Some("a")),
+            ("surface/components/beta", Some("b")),
+            // A component dir with no sidecar contributes nothing.
+            ("surface/components/gamma", None),
+            ("surface/chrome", Some("c")),
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            if let Some(body) = sidecar {
+                std::fs::write(root.join(dir).join("help.md"), body).unwrap();
+            }
+        }
+        let found = collect_help_sidecars(root);
+        assert_eq!(
+            found,
+            vec![
+                ("surface/chrome/help.md".to_string(), bytes("c")),
+                ("surface/components/alpha/help.md".to_string(), bytes("a")),
+                ("surface/components/beta/help.md".to_string(), bytes("b")),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_help_sidecars_on_an_empty_tree_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(collect_help_sidecars(tmp.path()).is_empty());
     }
 
     #[test]

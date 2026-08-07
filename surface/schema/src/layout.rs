@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LayoutDoc {
-    /// Schema version. Must be `1`; any other value is [`LayoutError::BadVersion`]
-    /// (the forward-compat rejection point).
+    /// Schema version. Must be [`LAYOUT_DOC_VERSION`]; any other value is
+    /// [`LayoutError::BadVersion`] (the forward-compat rejection point).
     pub v: u32,
     /// Which fixed layout to render.
     pub kind: LayoutKind,
@@ -52,22 +52,39 @@ pub struct Panel {
 /// `columns-2` the schema requires).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LayoutKind {
-    /// One panel filling the surface. Slot `a`.
+    /// See [`LayoutKind::describe`].
     #[serde(rename = "single")]
     Single,
-    /// Two side-by-side columns. Slots `a`, `b`. `ratio` splits them.
+    /// See [`LayoutKind::describe`].
     #[serde(rename = "columns-2")]
     Columns2,
-    /// Three side-by-side columns. Slots `a`, `b`, `c`.
+    /// See [`LayoutKind::describe`].
     #[serde(rename = "columns-3")]
     Columns3,
-    /// A main column (`a`) beside a side column of two stacked panels (`b`, `c`)
-    /// — one split each way. `ratio` splits the main column from the side.
+    /// See [`LayoutKind::describe`].
     #[serde(rename = "main-side")]
     MainSide,
 }
 
 impl LayoutKind {
+    /// One line of prose naming what this layout puts on screen, for the
+    /// generated help a layout-doc writer reads.
+    ///
+    /// The variant docs defer here rather than restating it: this is the single
+    /// copy of each kind's description, and it is published, so a second copy
+    /// would be a second thing to rot.
+    pub fn describe(self) -> &'static str {
+        match self {
+            LayoutKind::Single => "one panel filling the surface",
+            LayoutKind::Columns2 => "two side-by-side columns, split by `ratio`",
+            LayoutKind::Columns3 => "three side-by-side columns of equal width",
+            LayoutKind::MainSide => {
+                "a main column beside a side column of two stacked panels — one \
+                 split each way; `ratio` splits the main column from the side"
+            }
+        }
+    }
+
     /// The exact slot ids this layout defines, in render order. A valid doc's
     /// `panels` keys must equal this set.
     pub fn slots(self) -> &'static [&'static str] {
@@ -111,11 +128,15 @@ pub const ALL_KINDS: [LayoutKind; 4] = [
 pub const RATIO_MIN: f64 = 0.15;
 pub const RATIO_MAX: f64 = 0.85;
 
+/// The only `v` a [`LayoutDoc`] may carry; any other value is
+/// [`LayoutError::BadVersion`].
+pub const LAYOUT_DOC_VERSION: u32 = 1;
+
 /// Why a [`LayoutDoc`] was rejected. Every variant carries enough to name the
 /// reason in a `warn` log; the shell surfaces one of these and keeps last-good.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LayoutError {
-    /// `v` was not `1`.
+    /// `v` was not [`LAYOUT_DOC_VERSION`].
     BadVersion { got: u32 },
     /// The `panels` slot set did not equal the kind's slot set.
     WrongSlots {
@@ -137,7 +158,10 @@ impl std::fmt::Display for LayoutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LayoutError::BadVersion { got } => {
-                write!(f, "unsupported layout version {got} (expected 1)")
+                write!(
+                    f,
+                    "unsupported layout version {got} (expected {LAYOUT_DOC_VERSION})"
+                )
             }
             LayoutError::WrongSlots {
                 kind,
@@ -179,7 +203,7 @@ impl LayoutDoc {
         &self,
         is_configured_instance: impl Fn(&str) -> bool,
     ) -> Result<(), LayoutError> {
-        if self.v != 1 {
+        if self.v != LAYOUT_DOC_VERSION {
             return Err(LayoutError::BadVersion { got: self.v });
         }
 
@@ -565,6 +589,63 @@ mod tests {
         assert_eq!(v["panels"]["b"], json!({ "instance": "p2" }));
         let back: LayoutDoc = serde_json::from_value(v).unwrap();
         assert_eq!(back, doc);
+    }
+
+    // ── ALL_KINDS completeness ────────────────────────────────────────────
+
+    /// The kind declared after `kind`, or `None` for the last one.
+    ///
+    /// The one variant enumeration in this file that does not read `ALL_KINDS`,
+    /// so it can be used to check `ALL_KINDS`. What the exhaustive match buys is
+    /// a compile error *at this site* when a variant is added — no more: the arm
+    /// you write must link the new variant into the chain (the previous last
+    /// kind now returns it, and it returns `None`). An arm that merely
+    /// terminates the chain compiles, and the walk below then never reaches the
+    /// new variant, so the `ALL_KINDS` check passes with the variant missing
+    /// from both. Stable Rust cannot enumerate variants, so that step is on the
+    /// author; this chain is where the compiler asks for it.
+    fn next_kind(kind: LayoutKind) -> Option<LayoutKind> {
+        match kind {
+            LayoutKind::Single => Some(LayoutKind::Columns2),
+            LayoutKind::Columns2 => Some(LayoutKind::Columns3),
+            LayoutKind::Columns3 => Some(LayoutKind::MainSide),
+            LayoutKind::MainSide => None,
+        }
+    }
+
+    /// Every declared kind, walked off `next_kind`.
+    fn declared_kinds() -> Vec<LayoutKind> {
+        std::iter::successors(Some(LayoutKind::Single), |k| next_kind(*k)).collect()
+    }
+
+    #[test]
+    fn all_kinds_lists_every_declared_kind_exactly_once() {
+        for kind in declared_kinds() {
+            let count = ALL_KINDS.iter().filter(|k| **k == kind).count();
+            assert_eq!(
+                count,
+                1,
+                "ALL_KINDS must list {} exactly once, found it {count} times",
+                kind.as_wire_str()
+            );
+        }
+        assert_eq!(
+            ALL_KINDS.len(),
+            declared_kinds().len(),
+            "ALL_KINDS holds a kind the declaration chain does not"
+        );
+    }
+
+    #[test]
+    fn every_kind_describes_itself() {
+        for kind in ALL_KINDS {
+            assert!(
+                !kind.describe().is_empty(),
+                "{} has no description",
+                kind.as_wire_str()
+            );
+            assert!(!kind.slots().is_empty());
+        }
     }
 
     #[test]

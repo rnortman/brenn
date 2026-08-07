@@ -8,19 +8,26 @@ description = "Brenn surface echo-stub — minimal dev/test component exercising
 [lib]
 crate-type = ["cdylib"]
 
-# Run via `make surface-wasm-test`.
-[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+# The help generator (help.rs) is host-compiled and emits contract's sidecar
+# header, so contract is an ungated normal dep; everything else this component
+# needs is browser-only.
+[dependencies]
+brenn-surface-contract = { version = "0.1.0", path = "../../contract" }
+
+# The help-sidecar drift gate is a host test, so the fixtures crate is ungated;
+# the browser tests run via `make surface-wasm-test`.
+[dev-dependencies]
 brenn-surface-test-fixtures = { path = "../../test-fixtures" }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 js-sys = { workspace = true }
 wasm-bindgen-test = { workspace = true }
 
 # The echo-stub is a browser-only wasm-bindgen component module: all of its DOM
-# behavior is behind cfg(target_arch = "wasm32"). The host build is empty — it
-# carries no host-testable logic (a DOM fixture) — so the default target builds
-# under the workspace host clippy/test sweep with nothing to compile.
+# behavior is behind cfg(target_arch = "wasm32"), so the host build carries only
+# the help generator and its drift test.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 brenn-surface-schema = { version = "0.1.0", path = "../../schema" }
-brenn-surface-contract = { version = "0.1.0", path = "../../contract" }
 brenn-surface-component-support = { version = "0.1.0", path = "../../component-support" }
 wasm-bindgen = { workspace = true }
 web-sys = { workspace = true, features = [

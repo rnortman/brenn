@@ -16,9 +16,11 @@
 //! module panic hook → `brenn-component-panic` → shell error-card plumbing from
 //! a real component.
 //!
-//! Everything lives behind `cfg(target_arch = "wasm32")`: the component is DOM-
-//! bound, so the host build is empty and the wasm build carries the whole
-//! module.
+//! Every behavior lives behind `cfg(target_arch = "wasm32")`: the component is
+//! DOM-bound, so the wasm build carries the whole module and the host build
+//! carries only the help-sidecar generator.
+
+pub mod help;
 
 /// The browser-only component: custom-element registration, DOM rendering,
 /// contract-event listeners, publish/panic buttons, and the module panic hook.

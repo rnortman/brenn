@@ -1,4 +1,4 @@
-.PHONY: setup-hooks scrub-selfcheck scrub-tree check check-common check-ci xtask-check xtask-deny build release release-musl fmt clippy test test-ts test-py tsc types frontend frontend-css wasm-components clean launchdev stopdev check-wasm-bindings check-wasi-check-liveness check-brenn-guest wasm-toolchain-install surface-wasm-check surface-wasm surface-wasm-test surface-sidecar-prune wasm-bindgen-preflight jco-preflight surface-transpile npm-audit node-deps e2e build-id-leaf-gate
+.PHONY: setup-hooks scrub-selfcheck scrub-tree check check-common check-ci xtask-check xtask-deny build release release-musl fmt clippy test test-ts test-py tsc types regen-surface-help frontend frontend-css wasm-components clean launchdev stopdev check-wasm-bindings check-wasi-check-liveness check-brenn-guest wasm-toolchain-install surface-wasm-check surface-wasm surface-wasm-test surface-sidecar-prune wasm-bindgen-preflight jco-preflight surface-transpile npm-audit node-deps e2e build-id-leaf-gate
 # Delete partially-written targets on recipe failure. Without this, a failing
 # WASI-import check (or any other recipe error) leaves the target file with a
 # fresh mtime, causing subsequent incremental builds to skip the gate entirely.
@@ -609,6 +609,16 @@ test-ts: surface-transpile
 types:
 	cargo test -p brenn-lib ws_types::tests::ts_rs_export
 	cargo test -p brenn-server upload::tests::ts_rs_export
+
+# Rewrite every in-tree surface component's help.md from its crate's src/help.rs
+# generator. The same tests compare instead of write when BRENN_REGEN_HELP is
+# unset, so `test` (and thus `check`) fails on a stale sidecar; this target is the
+# remediation its failure names. Not in CARGO_CHECK_STEPS: the comparison already
+# runs there, and this direction writes into the tree. --nocapture is load-bearing:
+# each rewritten path is printed by a passing test, whose stdout libtest otherwise
+# swallows, leaving no record of what changed.
+regen-surface-help:
+	BRENN_REGEN_HELP=1 cargo test $(addprefix -p ,$(SURFACE_COMPONENT_CRATES)) help_sidecar_matches_generator -- --nocapture
 
 # Regenerate frontend/src/styles/frontmatter.generated.ts from the Rust
 # source of truth (brenn-lib/src/frontmatter_css.rs). Drift between
