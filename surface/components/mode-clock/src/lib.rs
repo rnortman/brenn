@@ -14,6 +14,7 @@
 //! self-publishes on the `tick` in/out port, parked from inside the activation
 //! that recomputed.
 
+pub mod help;
 pub mod logic;
 
 #[cfg(target_arch = "wasm32")]

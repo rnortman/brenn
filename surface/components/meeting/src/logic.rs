@@ -21,27 +21,29 @@ use std::collections::BTreeMap;
 
 use brenn_envelope::MessageEnvelope;
 use chrono::{DateTime, Duration, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use brenn_surface_component_support::parse_delivery;
 pub use brenn_surface_component_support::{ContractViolation, FaultReport};
 use brenn_surface_contract::PortWindow;
 
 /// The agenda-subscription input port name.
-const AGENDA_PORT: &str = "agenda";
+pub(crate) const AGENDA_PORT: &str = "agenda";
 /// The ack subscribe-and-publish port name.
-const ACKS_PORT: &str = "acks";
+pub(crate) const ACKS_PORT: &str = "acks";
+/// The takeover-request output port name.
+pub(crate) const TAKEOVER_PORT: &str = "takeover";
 
 /// Escalation ladder defaults (seconds), used when a meeting carries no
 /// `escalation` override or an invalid one. `takeover > critical` is the ordering
 /// the phase ladder depends on.
-const DEFAULT_TAKEOVER_SECS: i64 = 120;
-const DEFAULT_CRITICAL_SECS: i64 = 60;
-const DEFAULT_OVERDUE_SECS: i64 = 60;
+pub(crate) const DEFAULT_TAKEOVER_SECS: i64 = 120;
+pub(crate) const DEFAULT_CRITICAL_SECS: i64 = 60;
+pub(crate) const DEFAULT_OVERDUE_SECS: i64 = 60;
 
 /// A meeting is retired (stops escalating) once it is this many seconds past its
 /// start with no dismissal — the "overdue forever" cap.
-const RETIRE_AFTER_SECS: i64 = 60 * 60;
+pub(crate) const RETIRE_AFTER_SECS: i64 = 60 * 60;
 
 /// An ack whose `(meeting_id, start)` occurrence is absent from the current
 /// snapshot is pruned once it is this stale (judged on the delivered envelope's
@@ -69,6 +71,15 @@ pub enum DisplayState {
     /// Past start, undismissed.
     Overdue,
 }
+
+/// The escalating states in the order a meeting passes through them, ascending.
+/// `Idle` is excluded: it is the no-meeting state, not a rung.
+pub(crate) const ESCALATION_LADDER: [DisplayState; 4] = [
+    DisplayState::Ambient,
+    DisplayState::Takeover,
+    DisplayState::Critical,
+    DisplayState::Overdue,
+];
 
 impl DisplayState {
     /// The `data-state` attribute value.
@@ -266,31 +277,35 @@ pub struct Recompute {
 
 /// Raw agenda snapshot as serde sees it. Unknown fields are ignored (additive
 /// external contract). `meetings` may be empty (valid idle state).
-#[derive(Deserialize)]
-struct RawSnapshot {
+///
+/// `Serialize` is here so the help generator can emit the documented body shape
+/// by serializing a placeholder-filled value: the field names in the published
+/// doc are then the ones this deserializer accepts, not a second copy of them.
+#[derive(Deserialize, Serialize)]
+pub(crate) struct RawSnapshot {
     #[serde(default)]
     #[allow(dead_code)]
-    v: Option<u32>,
-    meetings: Vec<RawMeeting>,
+    pub(crate) v: Option<u32>,
+    pub(crate) meetings: Vec<RawMeeting>,
 }
 
-#[derive(Deserialize)]
-struct RawMeeting {
-    id: String,
-    start: String,
-    title: String,
+#[derive(Deserialize, Serialize)]
+pub(crate) struct RawMeeting {
+    pub(crate) id: String,
+    pub(crate) start: String,
+    pub(crate) title: String,
     #[serde(default)]
     #[allow(dead_code)]
-    end: Option<String>,
+    pub(crate) end: Option<String>,
     #[serde(default)]
-    escalation: Option<RawEscalation>,
+    pub(crate) escalation: Option<RawEscalation>,
 }
 
-#[derive(Deserialize)]
-struct RawEscalation {
-    takeover_secs: i64,
-    critical_secs: i64,
-    overdue_secs: i64,
+#[derive(Deserialize, Serialize)]
+pub(crate) struct RawEscalation {
+    pub(crate) takeover_secs: i64,
+    pub(crate) critical_secs: i64,
+    pub(crate) overdue_secs: i64,
 }
 
 /// Raw ack as serde sees it. `start` is the acked occurrence; `until` is required
@@ -689,9 +704,9 @@ fn parse_ack(body: &str) -> Result<AckParse, String> {
     if raw.meeting_id.is_empty() {
         return Err("ack meeting_id must be non-empty".to_string());
     }
-    let action = match raw.action.as_str() {
-        "dismiss" => AckAction::Dismiss,
-        "snooze" => {
+    let action = match AckKind::parse(&raw.action) {
+        Some(AckKind::Dismiss) => AckAction::Dismiss,
+        Some(AckKind::Snooze) => {
             let until = raw
                 .until
                 .as_deref()
@@ -700,7 +715,7 @@ fn parse_ack(body: &str) -> Result<AckParse, String> {
                 until: parse_ts("until", until)?,
             }
         }
-        other => return Err(format!("unknown ack action {other:?}")),
+        None => return Err(format!("unknown ack action {:?}", raw.action)),
     };
     let start = match raw.start.as_deref().map(|s| parse_ts("start", s)) {
         Some(Ok(start)) => start,
@@ -726,7 +741,7 @@ fn parse_ack(body: &str) -> Result<AckParse, String> {
     ))
 }
 
-/// Which button a press came from.
+/// Which button a press came from, and the ack vocabulary that press publishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckKind {
     Dismiss,
@@ -734,11 +749,35 @@ pub enum AckKind {
 }
 
 impl AckKind {
-    /// The `kind` value this button spells in a request body.
-    fn as_str(self) -> &'static str {
+    /// The whole vocabulary, for the doc generator and round-trip tests.
+    pub const ALL: [AckKind; 2] = [AckKind::Dismiss, AckKind::Snooze];
+
+    /// The wire value this button spells, in both a request body's `kind` and an
+    /// ack body's `action`.
+    pub fn as_str(self) -> &'static str {
         match self {
             AckKind::Dismiss => "dismiss",
             AckKind::Snooze => "snooze",
+        }
+    }
+
+    /// The kind a wire value names, or `None` for a value outside the vocabulary.
+    pub fn parse(s: &str) -> Option<AckKind> {
+        AckKind::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+}
+
+impl AckAction {
+    /// The `action` value this decision publishes.
+    pub fn as_str(self) -> &'static str {
+        self.kind().as_str()
+    }
+
+    /// The button this action came from, dropping the snooze deadline.
+    pub fn kind(self) -> AckKind {
+        match self {
+            AckAction::Dismiss => AckKind::Dismiss,
+            AckAction::Snooze { .. } => AckKind::Snooze,
         }
     }
 }
@@ -772,10 +811,8 @@ pub fn ack_request_body(kind: AckKind, target: Option<&AckTarget>) -> String {
 pub fn parse_ack_request(body: &str) -> Result<Option<(AckKind, AckTarget)>, String> {
     let raw: RawAckRequest =
         serde_json::from_str(body).map_err(|e| format!("unparseable ack request: {e}"))?;
-    let kind = match raw.kind.as_str() {
-        "dismiss" => AckKind::Dismiss,
-        "snooze" => AckKind::Snooze,
-        other => return Err(format!("unknown ack request kind {other:?}")),
+    let Some(kind) = AckKind::parse(&raw.kind) else {
+        return Err(format!("unknown ack request kind {:?}", raw.kind));
     };
     let (Some(meeting_id), Some(start)) = (raw.meeting_id, raw.start) else {
         return Ok(None);
@@ -806,7 +843,7 @@ pub fn dismiss_body(target: &AckTarget) -> String {
         "v": 1,
         "meeting_id": target.meeting_id,
         "start": target.start.to_rfc3339(),
-        "action": "dismiss",
+        "action": AckAction::Dismiss.as_str(),
     })
     .to_string()
 }
@@ -817,7 +854,7 @@ pub fn snooze_body(target: &AckTarget, until: DateTime<Utc>) -> String {
         "v": 1,
         "meeting_id": target.meeting_id,
         "start": target.start.to_rfc3339(),
-        "action": "snooze",
+        "action": AckAction::Snooze { until }.as_str(),
         "until": until.to_rfc3339(),
     })
     .to_string()
@@ -1868,5 +1905,121 @@ mod tests {
                 port: "messages".to_string()
             })
         );
+    }
+
+    /// [`ESCALATION_LADDER`] must hold every state except `Idle`: it is what the
+    /// help generator publishes as the escalation order, so a rung missing from
+    /// it is a rung missing from the doc. The walk is a declaration chain rather
+    /// than a literal list, which buys a compile error *at the match below* when
+    /// a `DisplayState` variant is added — no more: the arm you write must link
+    /// the new variant into the chain, because an arm that merely `break`s
+    /// compiles and leaves the walk never reaching it, and this check then
+    /// passes with the rung absent from both the chain and the ladder. Stable
+    /// Rust cannot enumerate variants, so that step is on the author; the match
+    /// is where the compiler asks for it.
+    #[test]
+    fn the_escalation_ladder_is_every_non_idle_state() {
+        let rungs: Vec<&str> = ESCALATION_LADDER
+            .iter()
+            .map(|state| state.as_wire_str())
+            .collect();
+        assert!(!rungs.contains(&DisplayState::Idle.as_wire_str()));
+        let mut sorted = rungs.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), rungs.len(), "duplicate rung in the ladder");
+
+        let mut state = DisplayState::Idle;
+        loop {
+            let next = match state {
+                DisplayState::Idle => DisplayState::Ambient,
+                DisplayState::Ambient => DisplayState::Takeover,
+                DisplayState::Takeover => DisplayState::Critical,
+                DisplayState::Critical => DisplayState::Overdue,
+                DisplayState::Overdue => break,
+            };
+            assert!(
+                rungs.contains(&next.as_wire_str()),
+                "state {} is not on the escalation ladder",
+                next.as_wire_str()
+            );
+            state = next;
+        }
+    }
+
+    /// The ack kind declared after `kind`, or `None` for the last one.
+    ///
+    /// The one enumeration of the variants that does not read [`AckKind::ALL`], so
+    /// it can be used to check it. What the exhaustive match buys is a compile
+    /// error *at this site* when a variant is added — no more: the arm you write
+    /// must link the new variant into the chain, because an arm that merely
+    /// terminates it compiles and leaves the walk never reaching the new kind, and
+    /// the check below then passes with it missing from both. Stable Rust cannot
+    /// enumerate variants, so that step is on the author; this chain is where the
+    /// compiler asks for it.
+    fn next_ack_kind(kind: AckKind) -> Option<AckKind> {
+        match kind {
+            AckKind::Dismiss => Some(AckKind::Snooze),
+            AckKind::Snooze => None,
+        }
+    }
+
+    /// `ALL` must list every variant exactly once: it is the accepted vocabulary
+    /// (`parse` searches it), the published one, and the iteration order for
+    /// every other test — so a gap here is a silent gap everywhere.
+    #[test]
+    fn ack_kind_all_lists_every_declared_kind_exactly_once() {
+        let declared: Vec<AckKind> =
+            std::iter::successors(Some(AckKind::Dismiss), |kind| next_ack_kind(*kind)).collect();
+        for kind in &declared {
+            let count = AckKind::ALL.iter().filter(|k| *k == kind).count();
+            assert_eq!(
+                count,
+                1,
+                "AckKind::ALL must list {} exactly once, found it {count} times",
+                kind.as_str()
+            );
+        }
+        assert_eq!(
+            AckKind::ALL.len(),
+            declared.len(),
+            "AckKind::ALL holds a kind the declaration chain does not"
+        );
+    }
+
+    /// Every action in the published vocabulary round-trips through both parsers,
+    /// and one outside it is rejected by both — the doc vocabulary and the
+    /// accepted vocabulary are provably the same set.
+    #[test]
+    fn the_ack_vocabulary_round_trips_through_both_parsers() {
+        let start = at("2026-07-12T15:00:00Z");
+        let until = at("2026-07-12T15:05:00Z");
+        for kind in AckKind::ALL {
+            assert_eq!(AckKind::parse(kind.as_str()), Some(kind));
+            let body = match kind {
+                AckKind::Dismiss => dismiss_body(&target("m1", "2026-07-12T15:00:00Z")),
+                AckKind::Snooze => snooze_body(&target("m1", "2026-07-12T15:00:00Z"), until),
+            };
+            let parsed = parse_ack(&body).expect("a minted ack body parses");
+            let AckParse::Ack(got_target, action) = parsed else {
+                panic!("a minted ack body names its occurrence");
+            };
+            assert_eq!(got_target.start, start);
+            assert_eq!(action.kind(), kind);
+            assert_eq!(action.as_str(), kind.as_str());
+
+            let request = ack_request_body(kind, Some(&target("m1", "2026-07-12T15:00:00Z")));
+            let (got_kind, _) = parse_ack_request(&request)
+                .expect("a minted request body parses")
+                .expect("a request naming an occurrence");
+            assert_eq!(got_kind, kind);
+        }
+        assert_eq!(AckKind::parse("postpone"), None);
+        let bogus = serde_json::json!({
+            "v": 1, "meeting_id": "m1", "start": start.to_rfc3339(), "action": "postpone",
+        })
+        .to_string();
+        assert!(parse_ack(&bogus).is_err());
+        assert!(parse_ack_request(&serde_json::json!({ "kind": "postpone" }).to_string()).is_err());
     }
 }

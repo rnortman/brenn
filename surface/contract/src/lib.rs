@@ -1002,6 +1002,13 @@ pub fn module_artifact(kind: &str) -> String {
     format!("brenn_{}.js", kind.replace('-', "_"))
 }
 
+/// First line of every in-tree help sidecar, which is generated rather than
+/// hand-written: an HTML comment, so it is invisible in rendered markdown and
+/// merely informative in the raw text an LLM reads. Nothing at runtime parses
+/// it; the in-tree drift gate asserts a generator emits it, and the repo's
+/// help-sidecar guard matches on the `<!-- AUTO-GENERATED` prefix.
+pub const HELP_SIDECAR_HEADER: &str = "<!-- AUTO-GENERATED from this component's src/help.rs. Do not edit; run `make regen-surface-help`. -->\n";
+
 /// The jco-transpiled module path for a processor `kind`, relative to the
 /// surface asset root: `processor/<kind>/<kind>.js`.
 ///

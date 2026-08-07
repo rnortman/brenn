@@ -6,6 +6,7 @@ mod deny;
 mod discover;
 mod git_spawn_guard;
 mod guard;
+mod help_guard;
 mod lint;
 mod parallel;
 mod policy;
@@ -41,6 +42,7 @@ fn main() {
             guard::run_guard(&repo_root)
                 & removal_guard::run_removal_guard(&repo_root)
                 & git_spawn_guard::run_git_spawn_guard(&repo_root)
+                & help_guard::run_help_guard(&repo_root)
         }
         "check-wit" => check_wit::run_check_wit(&repo_root),
         "check" => {
@@ -69,7 +71,8 @@ fn main() {
                         let units_ok = guard::run_guard(&r);
                         let removal_ok = removal_guard::run_removal_guard(&r);
                         let spawn_ok = git_spawn_guard::run_git_spawn_guard(&r);
-                        units_ok && removal_ok && spawn_ok
+                        let help_ok = help_guard::run_help_guard(&r);
+                        units_ok && removal_ok && spawn_ok && help_ok
                     })
                 }),
                 ("lint-root", {

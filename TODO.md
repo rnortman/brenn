@@ -1220,3 +1220,25 @@ passes `terminal_close_code: None` today).
 Code site (`TODO(bridge-violation-close-code)`):
 `brenn-server/src/routes/attach/session.rs`, the violation-teardown path in
 `run_attach_session`.
+
+
+## `tool-schema-derive`
+
+`ToolDescriptor.input_schema` is a hand-written JSON-schema projection of each
+tool's args struct, with nothing tying the two together: a field renamed, added,
+or made optional in the args struct leaves the schema stating the old shape, and
+the only symptom is an LLM composing calls that fail to deserialize. Same drift
+shape the surface help sidecars had before they were generated from code, but
+this one travels over MCP stdio rather than a bus channel, so the sidecar
+mechanism does not reach it.
+
+Needs a dependency decision before it can be built: deriving the schema means
+adopting a JSON-schema derive crate (`schemars` is the obvious candidate) across
+every tool's args struct, which is a new public-ish dependency on the MCP
+projection path and worth a deliberate call rather than a drive-by add.
+
+Done = every descriptor's `input_schema` is derived from its args struct and no
+hand-written schema literal remains in the registry.
+
+Code site (`TODO(tool-schema-derive)`):
+`brenn-server/src/tool_registry/descriptor.rs`, the `input_schema` field.

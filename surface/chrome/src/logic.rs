@@ -186,17 +186,26 @@ fn layout_doc_to_action(doc: &LayoutDoc, instances: Vec<String>) -> ChromeAction
     }
 }
 
+/// The default layout kind for `n` arrangeable instances, or `None` when nothing
+/// is arrangeable.
+///
+/// The one definition of the count→kind rule: chrome's synthesized default
+/// layout and the generated help that documents it both read it here, so the
+/// published sentence cannot describe a mapping the code does not implement.
+pub(crate) fn default_kind_for_count(n: usize) -> Option<LayoutKind> {
+    match n {
+        0 => None,
+        1 => Some(LayoutKind::Single),
+        2 => Some(LayoutKind::Columns2),
+        _ => Some(LayoutKind::Columns3),
+    }
+}
+
 /// Synthesize the default layout from the arrangeable instances: the first three
-/// in configured order, no labels, kind chosen by count — 1 → `single`, 2 →
-/// `columns-2`, 3+ → `columns-3`. `None` when nothing is arrangeable. A bare
-/// surface (no layout binding) shows this.
+/// in configured order, no labels, kind by [`default_kind_for_count`]. `None`
+/// when nothing is arrangeable. A bare surface (no layout binding) shows this.
 fn default_layout_doc(instances: &[String]) -> Option<LayoutDoc> {
-    let kind = match instances.len() {
-        0 => return None,
-        1 => LayoutKind::Single,
-        2 => LayoutKind::Columns2,
-        _ => LayoutKind::Columns3,
-    };
+    let kind = default_kind_for_count(instances.len())?;
     let panels = kind
         .slots()
         .iter()
@@ -701,6 +710,74 @@ fn fold_class(port: &str) -> FoldClass {
 /// `local:brenn/overlay-state`, where the kernel reads it into the surface's
 /// status report.
 pub const PORT_OVERLAY_STATE: &str = "overlay-state";
+
+/// What to bind a chrome port to.
+pub enum PortChannel {
+    /// A fixed reserved plane address, named exactly.
+    Address(&'static str),
+    /// An operator-chosen channel, described rather than named.
+    Described(&'static str),
+}
+
+/// One row of the port table in chrome's generated help: the port to bind, the
+/// channel it expects, and what that channel carries.
+///
+/// The `port` and `channel` fields hold the same constants the code binds and
+/// parses, so a rename reaches the published doc as a compile error rather than
+/// as silence.
+pub struct PortDoc {
+    /// The port name, as declared in config on the chrome instance.
+    pub port: &'static str,
+    /// The channel to bind.
+    pub channel: PortChannel,
+    /// What the channel carries, for a reader deciding what to bind.
+    pub carries: &'static str,
+}
+
+/// Chrome's input ports, in the order the help table lists them.
+///
+/// Invariant: one row per `PORT_*` input constant above. Rust cannot enumerate
+/// consts, so nothing compiles this shut — a new input port needs a row here.
+pub const INPUT_PORT_DOCS: [PortDoc; 6] = [
+    PortDoc {
+        port: PORT_LAYOUT,
+        channel: PortChannel::Described("a `brenn:` layout channel (retained, depth ≥ 1)"),
+        carries: "the layout doc (below)",
+    },
+    PortDoc {
+        port: PORT_THEME,
+        channel: PortChannel::Address(proto::LOCAL_THEME_CHANNEL),
+        carries: "`{ v, theme }` — the runtime theme axis",
+    },
+    PortDoc {
+        port: PORT_LINK_STATE,
+        channel: PortChannel::Address(proto::LOCAL_LINK_STATE_CHANNEL),
+        carries: "`{ v, state }` — the connection banner",
+    },
+    PortDoc {
+        port: PORT_SURFACE_STATE,
+        channel: PortChannel::Address(proto::LOCAL_SURFACE_STATE_CHANNEL),
+        carries: "the mounted-instance set chrome arranges",
+    },
+    PortDoc {
+        port: PORT_TAKEOVER,
+        channel: PortChannel::Address(proto::LOCAL_TAKEOVER_CHANNEL),
+        carries: "a component's fullscreen request/release (needs the surface `takeover` grant)",
+    },
+    PortDoc {
+        port: PORT_TOAST,
+        channel: PortChannel::Address(proto::LOCAL_TOAST_CHANNEL),
+        carries: "transient notices (live-only, retains nothing)",
+    },
+];
+
+/// Chrome's one output port row.
+pub const OUTPUT_PORT_DOC: PortDoc = PortDoc {
+    port: PORT_OVERLAY_STATE,
+    channel: PortChannel::Address(proto::LOCAL_OVERLAY_STATE_CHANNEL),
+    carries: "`{ v, holder, since_stamp }` — which instance holds the fullscreen \
+              overlay (needs the surface `takeover` grant)",
+};
 
 /// Route a delivered body to the core method its port names. An unbound or
 /// unknown port is a config/kernel error — chrome only ever receives on ports it

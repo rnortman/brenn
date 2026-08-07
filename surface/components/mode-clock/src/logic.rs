@@ -22,7 +22,11 @@ pub use brenn_surface_component_support::{ContractViolation, FaultReport};
 
 /// The config-bound input port name. A `[[surface.subscription]] port` must
 /// match this string, or [`ModeClock::on_config`] rejects the delivery.
-const CONFIG_PORT: &str = "config";
+pub(crate) const CONFIG_PORT: &str = "config";
+
+/// The theme output port — must match a `[[surface.output]] port` binding to the
+/// reserved [`brenn_surface_schema::LOCAL_THEME_CHANNEL`] plane chrome consumes.
+pub(crate) const THEME_PORT: &str = "theme";
 
 /// Minutes in a wall-clock day. Membership and boundary math are done in
 /// minutes-since-local-midnight, so no timezone arithmetic is ever needed.
@@ -30,8 +34,8 @@ const MINUTES_PER_DAY: u16 = 24 * 60;
 
 /// The default auto schedule: light 07:00, dark 19:00 — the product default for
 /// a fresh install with no retained config.
-const DEFAULT_LIGHT_START: u16 = 7 * 60;
-const DEFAULT_DARK_START: u16 = 19 * 60;
+pub(crate) const DEFAULT_LIGHT_START: u16 = 7 * 60;
+pub(crate) const DEFAULT_DARK_START: u16 = 19 * 60;
 
 /// The computed theme. The wire strings come from the shared `proto::THEME_*`
 /// constants, so the `ThemeBody.theme` values cannot drift from chrome's parser.
@@ -53,13 +57,35 @@ impl Theme {
 
 /// The effective operating mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(crate) enum Mode {
     /// Day/night switching by [`Schedule`].
     Auto,
     /// Always dark; no boundary, so nothing is scheduled.
     Dark,
     /// Always light; no boundary, so nothing is scheduled.
     Light,
+}
+
+impl Mode {
+    /// Every variant, in the order the help sidecar lists them. The single
+    /// source both [`parse_config`] and the help generator read, so the
+    /// documented vocabulary is the accepted one.
+    pub(crate) const ALL: [Mode; 3] = [Mode::Auto, Mode::Dark, Mode::Light];
+
+    /// The `mode` wire value.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Mode::Auto => "auto",
+            Mode::Dark => "dark",
+            Mode::Light => "light",
+        }
+    }
+
+    /// Parse a `mode` wire value, or `None` for one this component does not
+    /// implement.
+    fn parse(s: &str) -> Option<Self> {
+        Mode::ALL.into_iter().find(|mode| mode.as_str() == s)
+    }
 }
 
 /// An auto-mode day/night schedule, in minutes-since-local-midnight. The light
@@ -202,19 +228,23 @@ impl TickPlan {
 /// Raw config body as serde sees it. Unknown fields are ignored (no
 /// `deny_unknown_fields`): this is a de-facto external contract that evolves
 /// additively. `mode` is required; `schedule` is optional (absent → default).
-#[derive(Deserialize)]
-struct RawConfig {
-    mode: String,
+///
+/// `Serialize` is for the help generator, which serializes a placeholder instance
+/// as the documented body shape so the field names in the doc are the ones serde
+/// reads here.
+#[derive(Deserialize, serde::Serialize)]
+pub(crate) struct RawConfig {
+    pub(crate) mode: String,
     #[serde(default)]
-    schedule: Option<RawSchedule>,
+    pub(crate) schedule: Option<RawSchedule>,
 }
 
 /// Raw schedule times as `HH:MM` strings, validated explicitly so an unparseable
 /// time produces a precise malformed reason rather than a generic serde error.
-#[derive(Deserialize)]
-struct RawSchedule {
-    light_start: String,
-    dark_start: String,
+#[derive(Deserialize, serde::Serialize)]
+pub(crate) struct RawSchedule {
+    pub(crate) light_start: String,
+    pub(crate) dark_start: String,
 }
 
 /// Parse an `HH:MM` wall-clock time to minutes since midnight, or `None` if it
@@ -227,6 +257,13 @@ fn parse_hhmm(s: &str) -> Option<u16> {
         return None;
     }
     Some(hours * 60 + minutes)
+}
+
+/// Render minutes since midnight as the `HH:MM` wall-clock string
+/// [`parse_hhmm`] accepts — the inverse, so a schedule default stated in the
+/// help sidecar is computed from the constant rather than retyped.
+pub(crate) fn fmt_hhmm(minutes: u16) -> String {
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
 /// Mode-clock state: the effective config, the last theme dispatched (for
@@ -355,11 +392,9 @@ impl ModeClock {
 fn parse_config(body: &str) -> Result<Config, String> {
     let raw: RawConfig =
         serde_json::from_str(body).map_err(|e| format!("unparseable config: {e}"))?;
-    let mode = match raw.mode.as_str() {
-        "auto" => Mode::Auto,
-        "dark" => Mode::Dark,
-        "light" => Mode::Light,
-        other => return Err(format!("unknown mode {other:?}")),
+    let mode = match Mode::parse(&raw.mode) {
+        Some(mode) => mode,
+        None => return Err(format!("unknown mode {:?}", raw.mode)),
     };
     let schedule = match raw.schedule {
         None => Schedule::default(),
@@ -395,6 +430,64 @@ mod tests {
 
     fn m(h: u16, min: u16) -> u16 {
         h * 60 + min
+    }
+
+    /// The mode declared after `mode`, or `None` for the last one.
+    ///
+    /// The one enumeration of the variants that does not read [`Mode::ALL`], so it
+    /// can be used to check it. What the exhaustive match buys is a compile error
+    /// *at this site* when a variant is added — no more: the arm you write must
+    /// link the new variant into the chain (the previous last mode now returns it,
+    /// and it returns `None`). An arm that merely terminates the chain compiles,
+    /// and the walk below then never reaches the new variant, so the check passes
+    /// with the mode missing from both. Stable Rust cannot enumerate variants, so
+    /// that step is on the author; this chain is where the compiler asks for it.
+    fn next_mode(mode: Mode) -> Option<Mode> {
+        match mode {
+            Mode::Auto => Some(Mode::Dark),
+            Mode::Dark => Some(Mode::Light),
+            Mode::Light => None,
+        }
+    }
+
+    /// `ALL` must list every variant exactly once: it is the accepted vocabulary
+    /// (`parse` searches it), the published one, and the iteration order for
+    /// every other test — so a gap here is a silent gap everywhere.
+    #[test]
+    fn mode_all_lists_every_declared_mode_exactly_once() {
+        let declared: Vec<Mode> =
+            std::iter::successors(Some(Mode::Auto), |mode| next_mode(*mode)).collect();
+        for mode in &declared {
+            let count = Mode::ALL.iter().filter(|m| *m == mode).count();
+            assert_eq!(
+                count,
+                1,
+                "Mode::ALL must list {} exactly once, found it {count} times",
+                mode.as_str()
+            );
+        }
+        assert_eq!(
+            Mode::ALL.len(),
+            declared.len(),
+            "Mode::ALL holds a mode the declaration chain does not"
+        );
+    }
+
+    /// `fmt_hhmm` is `parse_hhmm`'s inverse across the whole day, so a schedule
+    /// time the help sidecar prints is one the parser reads back as the same
+    /// minute.
+    #[test]
+    fn hhmm_round_trips_through_the_parser() {
+        for minutes in 0..MINUTES_PER_DAY {
+            let text = fmt_hhmm(minutes);
+            assert_eq!(
+                parse_hhmm(&text),
+                Some(minutes),
+                "{minutes} formatted as {text}"
+            );
+        }
+        assert_eq!(fmt_hhmm(DEFAULT_LIGHT_START), "07:00");
+        assert_eq!(fmt_hhmm(DEFAULT_DARK_START), "19:00");
     }
 
     /// The wire values a dispatched theme carries into the `ThemeBody` the wasm

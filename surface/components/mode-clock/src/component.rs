@@ -34,15 +34,11 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::HtmlElement;
 
-use crate::logic::{ConfigNote, ModeClock};
+use crate::logic::{ConfigNote, ModeClock, THEME_PORT};
 
 /// This component's kind — its config `kind`, its element-tag stem
 /// (`brenn-<kind>`), and the `component` field of its panic events.
 const KIND: &str = "mode-clock";
-
-/// The theme output port — must match a `[[surface.output]] port` binding to the
-/// reserved `local:brenn/theme` plane chrome consumes.
-const THEME_PORT: &str = "theme";
 
 /// The boundary-wake port — must match a `[[surface.io_port]] port` declaration.
 const TICK_PORT: &str = "tick";
