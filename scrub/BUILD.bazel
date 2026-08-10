@@ -34,8 +34,9 @@ rust_test(
 # gitleaks is the pinned release archive, not a PATH lookup — the harness puts
 # its directory on the `PATH` of every binary it spawns, which is how the
 # scan-reaching assertions run here at all. `BRENN_SCRUB_TEST_GITLEAKS` is
-# runtime, and its presence is also what turns the suites' "no gitleaks, skip"
-# arm into a failure: under Bazel there is no machine without it.
+# runtime. Dropping it does not quietly restore the suites' "no gitleaks, skip"
+# arm: the harness panics when the variable is absent under Bazel's test runner,
+# because under Bazel there is no machine without it.
 SCRUB_TEST_DEPS = all_crate_deps(
     normal = True,
     normal_dev = True,
@@ -81,3 +82,19 @@ SCRUB_TEST_ENV = {
         ]),
     ]
 ]
+
+# The lane marker the harness's vend check turns on, asserted live. Deliberately
+# without `env = SCRUB_TEST_ENV`: the marker is Bazel's own, and vending gitleaks
+# here would only add an input to a test that never scans. The source sits
+# outside `tests/` so cargo does not discover it and fail on a machine where the
+# marker is correctly absent.
+rust_test(
+    name = "bazel_test_marker",
+    srcs = ["bazel_only/marker.rs"] + glob(["tests/common/*.rs"]),
+    crate_root = "bazel_only/marker.rs",
+    data = [":brenn-scrub"],
+    edition = "2024",
+    proc_macro_deps = SCRUB_TEST_PROC_MACRO_DEPS,
+    rustc_env = SCRUB_TEST_RUSTC_ENV,
+    deps = SCRUB_TEST_DEPS + ["//git-fixture"],
+)

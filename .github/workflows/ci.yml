@@ -98,6 +98,47 @@ jobs:
           make bazel-release BAZEL_CONFIG=--config=ci
           make bazel-release-dir BAZEL_CONFIG=--config=ci
 
+      # TODO(bazel-ci-cache-pressure): this job builds two configurations into
+      # one disk cache — the dev graph for the gate and the release package —
+      # against the GC cap `build:ci` sets in `.bazelrc` and GitHub's ~10G
+      # per-repo cache budget. Saturation fails nothing; Bazel's GC and GitHub's
+      # eviction just start trading warm hits away until green runs are
+      # cold-slow again. So the size is reported here and the sizing call waits
+      # on real numbers.
+      #
+      # The watermark is read out of `.bazelrc` rather than written here: the
+      # cap is one of the remediations this measurement may prescribe, and a
+      # hardcoded watermark would go quietly unreachable the moment the cap
+      # dropped below it. That makes the cap's spelling a cross-file coupling,
+      # pinned by `ci_cache_watermark_violations` in xtask's sync guard — a cap
+      # this step cannot parse fails there, where it is a change to fix rather
+      # than a warning nobody was going to get.
+      #
+      # Warn, never fail: cache pressure costs time, not correctness, and this
+      # job's red has to keep meaning "the change is wrong". Runs whatever the
+      # gate did, so a red run still reports its size.
+      - name: Report bazel disk cache size
+        if: always()
+        run: |
+          size=$(du -sk .bazel-disk-cache 2>/dev/null | cut -f1 || true)
+          if [ -z "$size" ]; then
+            echo "no .bazel-disk-cache to size; nothing was cached this run"
+            exit 0
+          fi
+          echo "bazel disk cache: $((size / 1024)) MiB"
+          # Last match, mirroring bazel's own last-flag-wins reading of a
+          # repeated flag — and keeping `cap` to one line, because arithmetic on
+          # two is a syntax error and `bash -e` would redden this step with it.
+          cap=$(sed -n 's/^build:ci --experimental_disk_cache_gc_max_size=\([0-9]\{1,\}\)G$/\1/p' .bazelrc | tail -n1)
+          if [ -z "$cap" ]; then
+            echo "::warning::no build:ci --experimental_disk_cache_gc_max_size=<n>G in .bazelrc; this step can place no watermark and is reporting size only — see TODO(bazel-ci-cache-pressure)"
+            exit 0
+          fi
+          watermark=$(( cap * 1024 * 1024 * 9 / 10 ))
+          if [ "$size" -gt "$watermark" ]; then
+            echo "::warning::bazel disk cache is $((size / 1024)) MiB, past 90% of the ${cap}G GC cap build:ci sets in .bazelrc — see TODO(bazel-ci-cache-pressure)"
+          fi
+
       - name: Save bazel disk cache
         if: always()
         uses: actions/cache/save@v4

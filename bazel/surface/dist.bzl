@@ -22,7 +22,9 @@ def surface_crate_stage(name, bundle, artifact, sidecars = [], visibility = ["//
         bundle: name of the `rust_wasm_bindgen` target in this package whose
             files land at the root of the tree.
         artifact: the bundle's `brenn_*` basename, which the sidecars take too.
-        sidecars: `help.md` / `schema.json` beside the crate's Cargo.toml.
+        sidecars: the crate's documentation files, in the package. Hand-authored
+            ones (`schema.json`) are renamed here; the generated help sidecar
+            arrives already named for the artifact.
         visibility: visibility of the staging directory.
     """
     package = native.package_name()
@@ -36,7 +38,6 @@ def surface_crate_stage(name, bundle, artifact, sidecars = [], visibility = ["//
         # The bundle's files sit one level deeper than the sidecars; the longest
         # matching root path wins, so both land flat.
         replace_prefixes = {
-            "help.md": artifact + ".help.md",
             "schema.json": artifact + ".schema.json",
         },
         root_paths = [

@@ -4,6 +4,7 @@
 //! helpers it needs, so items unused by one binary are not dead overall.
 #![allow(dead_code)]
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -17,6 +18,14 @@ pub const PINNED_VERSION: &str = "8.30.0";
 /// Names the pinned gitleaks binary when the harness is handed one as a
 /// declared input instead of looking it up on `PATH`.
 const VENDORED_GITLEAKS: &str = "BRENN_SCRUB_TEST_GITLEAKS";
+
+/// Set by Bazel's test runner in every test action, and by no other lane these
+/// suites run under — not cargo, not nextest, not `make check`.
+///
+/// The vend check reads this to tell the two lanes apart, so the half that
+/// cannot be observed from inside a cargo run — that Bazel really does set it —
+/// is asserted by a Bazel-only test target of its own.
+pub const BAZEL_TEST_MARKER: &str = "TEST_SRCDIR";
 
 /// A path as given, or resolved against the process working directory.
 ///
@@ -39,9 +48,40 @@ pub fn scrub_bin() -> PathBuf {
     absolute(BIN)
 }
 
+/// What the harness does with the vend variable, as a function of the variable
+/// and the lane, so both panic arms can be exercised without touching the
+/// process environment.
+///
+/// A Bazel-run suite must be handed a gitleaks: every scan-reaching assertion in
+/// these suites reads absence as "this machine has no gitleaks" and returns
+/// early, so a sandbox with nothing vended reports a pass over nothing asserted.
+/// The skip exists for a developer machine running cargo and nowhere else.
+fn resolve_vend(named: Option<OsString>, under_bazel: bool) -> Option<OsString> {
+    let Some(named) = named else {
+        assert!(
+            !under_bazel,
+            "{VENDORED_GITLEAKS} is unset under Bazel's test runner \
+             ({BAZEL_TEST_MARKER} is set), so no gitleaks is vended and every \
+             scan-reaching assertion would skip. The scrub test rules vend it \
+             with `env = SCRUB_TEST_ENV` and `//bazel/tools:gitleaks` in `data`; \
+             restore both in scrub/BUILD.bazel."
+        );
+        return None;
+    };
+    Some(named)
+}
+
 /// The vended gitleaks, as an absolute path.
+///
+/// This is the one function all four suites reach — `run` → `prepend_path` calls
+/// it directly — so the lane invariant is enforced here rather than in a build
+/// file that can be edited into agreement with itself.
 fn vendored_gitleaks() -> Option<PathBuf> {
-    let path = absolute(PathBuf::from(std::env::var_os(VENDORED_GITLEAKS)?));
+    let named = resolve_vend(
+        std::env::var_os(VENDORED_GITLEAKS),
+        std::env::var_os(BAZEL_TEST_MARKER).is_some(),
+    )?;
+    let path = absolute(PathBuf::from(named));
     assert!(
         path.is_file(),
         "{VENDORED_GITLEAKS} names {}, which is not a file",
@@ -203,4 +243,46 @@ pub fn stub_gitleaks(version: &str) -> tempfile::TempDir {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
     dir
+}
+
+/// The lane decision, exercised in all four states.
+///
+/// Each suite compiles this module into its own binary, so these run once per
+/// suite. They are pure — the process environment is never read here — which is
+/// what lets the panic arm be a test rather than a mutation someone runs by
+/// hand.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_vended_path_is_taken_in_either_lane() {
+        for under_bazel in [true, false] {
+            assert_eq!(
+                resolve_vend(Some(OsString::from("/vend/gitleaks")), under_bazel),
+                Some(OsString::from("/vend/gitleaks")),
+                "under_bazel={under_bazel}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_vended_outside_bazel_skips() {
+        assert_eq!(resolve_vend(None, false), None);
+    }
+
+    /// The panic is the whole enforcement, and its message is the remediation —
+    /// so both variables and the file to edit are asserted, not just that
+    /// something blew up.
+    #[test]
+    fn nothing_vended_under_bazel_panics_naming_what_to_restore() {
+        let panicked = std::panic::catch_unwind(|| resolve_vend(None, true))
+            .expect_err("no gitleaks vended under Bazel must panic");
+        let message = panicked
+            .downcast_ref::<String>()
+            .expect("assert! panics with a String");
+        assert!(message.contains(VENDORED_GITLEAKS), "{message}");
+        assert!(message.contains(BAZEL_TEST_MARKER), "{message}");
+        assert!(message.contains("scrub/BUILD.bazel"), "{message}");
+    }
 }

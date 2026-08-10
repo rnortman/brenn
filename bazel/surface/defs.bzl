@@ -12,9 +12,11 @@ addresses components by that artifact name, so `surface_component` derives all
 three from the package path instead of taking them as attributes.
 """
 
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_shared_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_doc_test", "rust_library", "rust_shared_library", "rust_test")
 load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen")
+load("//bazel/gencode:defs.bzl", "generated_parity_test")
 load("//bazel/platforms:defs.bzl", "HOST_ONLY", "WASM32_ONLY")
 load(":dist.bzl", "surface_crate_stage")
 
@@ -56,8 +58,9 @@ def surface_wasm_crate(
         test_data: runtime files the host unit tests read.
         test_rustc_env: extra compile-time environment for the host unit tests.
         test_tags: tags for the host unit test target.
-        sidecars: documentation files shipped beside the bundle, renamed to the
-            artifact's basename in the asset tree.
+        sidecars: documentation files shipped beside the bundle in the asset
+            tree; hand-authored ones are renamed to the artifact's basename,
+            generated ones already carry it.
         visibility: visibility of the host library and the bundle.
     """
     srcs = native.glob(["src/**/*.rs"])
@@ -122,6 +125,65 @@ def surface_wasm_crate(
         visibility = visibility,
     )
 
+def _help_sidecar(kind, crate_name, artifact, edition):
+    """The component's `help.md`, generated from the crate that documents it.
+
+    The text is `<crate>::help::help_markdown()`, so the served sidecar is the
+    function's output rather than a copy of it: a one-line `main.rs` printing
+    the string, a host binary around it, and an action capturing its stdout.
+    `print!`, not `println!` — the function's bytes are the whole file, and the
+    drift gate that holds the committed copy to them compares byte for byte.
+
+    The output is named for the artifact, which is both what the asset tree
+    serves it as (so the staging rule renames nothing) and what keeps it from
+    colliding with the committed `help.md` in the same package, which the make
+    lane and the drift gate still read.
+
+    Args:
+        kind: the component's directory name, which names its targets.
+        crate_name: the underscored crate name, as the generated `main.rs`
+            spells it.
+        artifact: the `brenn_*` basename the sidecar is served under.
+        edition: Rust edition of the generator binary.
+    """
+    write_file(
+        name = kind + "_help_main",
+        out = kind + "_help_src/main.rs",
+        content = [
+            "fn main() {",
+            "    print!(\"{}\", " + crate_name + "::help::help_markdown());",
+            "}",
+            "",
+        ],
+    )
+
+    rust_binary(
+        name = kind + "_help_gen",
+        srcs = [":" + kind + "_help_main"],
+        edition = edition,
+        target_compatible_with = HOST_ONLY,
+        deps = [":" + kind],
+    )
+
+    native.genrule(
+        name = kind + "_help",
+        outs = [artifact + ".help.md"],
+        cmd = "set -eu; $(execpath :%s_help_gen) > $@" % kind,
+        target_compatible_with = HOST_ONLY,
+        tools = [":" + kind + "_help_gen"],
+    )
+
+    # The committed copy is still the make lane's input and this cycle's drift
+    # gate reads it, so the two have to be the same bytes. The component's own
+    # `help_sidecar_matches_generator` test already pins the committed copy to
+    # `help_markdown()`; this pins the generated file to the committed copy, so
+    # a capture that mangled the bytes cannot reach the served tree quietly.
+    generated_parity_test(
+        name = kind + "_help_parity_test",
+        committed = "help.md",
+        generated = ":" + kind + "_help",
+    )
+
 def surface_component(
         edition = "2024",
         deps = [],
@@ -164,8 +226,12 @@ def surface_component(
     test_rustc_env["CARGO_MANIFEST_DIR"] = package
 
     # Every component documents itself, so `help.md` is not optional; a schema
-    # is, and a component that ships none contributes no schema sidecar.
-    sidecars = native.glob(["help.md"]) + native.glob(["schema.json"], allow_empty = True)
+    # is, and a component that ships none contributes no schema sidecar. The
+    # schema is a hand-authored contract file and ships as committed; the help
+    # text is generated, and what ships is the generator's output. The committed
+    # `help.md` stays behind as the drift gate's fixture.
+    schema = native.glob(["schema.json"], allow_empty = True)
+    committed_help = native.glob(["help.md"])
 
     surface_wasm_crate(
         name = kind,
@@ -173,10 +239,17 @@ def surface_component(
         crate_name = crate_name,
         deps = deps,
         edition = edition,
-        sidecars = sidecars,
-        test_data = sidecars,
+        sidecars = [":" + kind + "_help"] + schema,
+        test_data = committed_help + schema,
         test_deps = test_deps,
         test_rustc_env = test_rustc_env,
         test_tags = test_tags,
         wasm_deps = wasm_deps,
+    )
+
+    _help_sidecar(
+        artifact = crate_name,
+        crate_name = crate_name,
+        edition = edition,
+        kind = kind,
     )
