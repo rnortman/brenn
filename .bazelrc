@@ -10,6 +10,16 @@ test --test_summary=terse
 
 common --incompatible_disallow_empty_glob
 
+# The MQTT harness resolves its broker as BRENN_MOSQUITTO_BIN before falling
+# back to a PATH lookup; without this line the override is dead under Bazel,
+# because a test action sees only the environment the build declares. A
+# pass-through, not a value: unset — every normal machine and both CI runners —
+# it contributes nothing to any action key, so test results stay shared across
+# hosts. Set, it lands in every test action's environment, not only the MQTT
+# suite's: the operator who exports it re-runs the whole test graph for an
+# override that //brenn-lib:mqtt_integration is the sole reader of.
+test --test_env=BRENN_MOSQUITTO_BIN
+
 # The convenience symlinks land under a dot prefix (.bazel-bin, .bazel-out, ...)
 # because the execroot they point into mirrors the whole source tree, including
 # every Cargo.toml. Tree walkers that skip dotted components — xtask's crate

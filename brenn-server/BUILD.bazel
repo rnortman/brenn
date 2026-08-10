@@ -32,8 +32,14 @@ rust_library(
 # Tests reach guest components as `<manifest dir>/../brenn-wasm/target/
 # components/`, so the workspace-relative `CARGO_MANIFEST_DIR` plus the staged
 # fixtures put them where the `env!` call sites already look.
+# `large` (900s), not the `medium` default (300s): this binary runs ~2,500
+# tests, which fits comfortably in 300s on a dev machine and does not on a cold
+# 4-vCPU CI runner sharing itself with the rest of the graph. The size is also
+# what Bazel schedules the action's local resources against, so the repo's
+# biggest test binary declaring itself large is the truthful answer twice over.
 rust_test(
     name = "brenn-server_test",
+    size = "large",
     crate = ":brenn-server",
     data = ["//brenn-wasm:component_fixtures"],
     edition = "2024",
