@@ -59,8 +59,15 @@ jobs:
       # three WASM CLIs and gitleaks are all hermetic toolchains behind
       # bazelisk, which GitHub runners preinstall and which reads .bazelversion
       # — so there is no toolchain install step here at all.
-      - name: Install mosquitto
-        run: sudo apt-get update && sudo apt-get install -y mosquitto
+      #
+      # lld is for the host C toolchain rules_cc autodetects: its probe takes
+      # lld if present, else gold, and hard-wires the winner into every link the
+      # toolchain does. This image ships gold, which rustc has deprecated and
+      # warns about on every link — and will eventually stop supporting. Only
+      # the host lane is affected (test binaries, build tools); release binaries
+      # link through the hermetic musl toolchain either way.
+      - name: Install mosquitto and lld
+        run: sudo apt-get update && sudo apt-get install -y mosquitto lld
 
       # --config=ci points the disk cache inside the workspace so actions/cache
       # can carry it; the GC size cap is what keeps it inside the cache scope.
@@ -274,8 +281,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install mosquitto
-        run: sudo apt-get update && sudo apt-get install -y mosquitto
+      # Same pair as the gate job, for the same reasons: mosquitto is the one
+      # system dependency the graph does not vend, and lld keeps the
+      # autodetected C toolchain off the deprecated gold linker.
+      - name: Install mosquitto and lld
+        run: sudo apt-get update && sudo apt-get install -y mosquitto lld
 
       - run: bazel test --config=ci --nocache_test_results //...
 

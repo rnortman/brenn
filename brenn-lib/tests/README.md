@@ -6,12 +6,21 @@ Tests the `MqttService` + `ConnectionSupervisor` stack against a live `mosquitto
 
 ### Prerequisites
 
-`mosquitto` ≥ 2.0 must be installed and reachable on `PATH`.
+`mosquitto` ≥ 2.0 must be installed. How the suite finds it differs by lane.
+
+Under cargo it must be reachable on the invoking shell's `PATH`:
 
 ```
 which mosquitto   # should print a path
 mosquitto --version
 ```
+
+Under `bazel test` the invoking shell's `PATH` is irrelevant — a test action
+gets a fixed one. `//brenn-lib:mqtt_integration` pins it to the static list in
+`brenn-lib/BUILD.bazel`: Bazel's own default plus `/usr/sbin` and
+`/usr/local/sbin`, where Debian-family packaging and source installs put
+daemons. A broker anywhere else — `/opt`, a Nix profile, a Homebrew prefix on a
+non-standard root — is not found there no matter what `which mosquitto` prints.
 
 If `mosquitto` is installed at a non-default location, set:
 
@@ -19,11 +28,33 @@ If `mosquitto` is installed at a non-default location, set:
 export BRENN_MOSQUITTO_BIN=/path/to/mosquitto
 ```
 
+That is the lane-independent answer: it takes precedence over the `PATH` lookup
+in both lanes, and `.bazelrc`'s `test --test_env=BRENN_MOSQUITTO_BIN` is what
+forwards it into the Bazel one.
+
 ### Running
 
 ```
 BRENN_MQTT_INTEGRATION=1 cargo test -p brenn-lib --test mqtt_integration
+bazel test //brenn-lib:mqtt_integration
 ```
+
+The Bazel target sets the gate variable itself; under cargo it is yours to set.
+
+### Re-verifying the Bazel-lane override
+
+Nothing gates the `.bazelrc` pass-through: delete that line and every test still
+passes, because the pinned `PATH` finds the broker anyway — while
+`BRENN_MOSQUITTO_BIN` goes silently dead in the Bazel lane and the "binary not
+found" panic starts advising a variable with no effect. After any edit to it,
+run:
+
+```
+BRENN_MOSQUITTO_BIN=/nonexistent/x bazel test //brenn-lib:mqtt_integration
+```
+
+Every test must fail naming `Tried: "/nonexistent/x"`. Green means the override
+is not reaching the test.
 
 ### Strict timing mode (optional)
 
@@ -84,7 +115,10 @@ done
 : mosquitto exited or never bound the TLS port. The panic message includes the last 4 KiB of the log file. Most common cause: mosquitto config rejected (cert/key path wrong, ACL syntax). Check the log path printed in the panic.
 
 **`mosquitto binary not found`**
-: Install mosquitto or set `BRENN_MOSQUITTO_BIN=/path/to/mosquitto`.
+: Install mosquitto or set `BRENN_MOSQUITTO_BIN=/path/to/mosquitto`. Under
+`bazel test` this also fires with mosquitto installed and on your shell's
+`PATH`, when it sits outside the `PATH` pinned in `brenn-lib/BUILD.bazel`
+(see Prerequisites); `BRENN_MOSQUITTO_BIN` is the answer there too.
 
 **TLS handshake failure**
 : Confirm the broker URL host matches a SAN in the generated server cert (`localhost` and `127.0.0.1` are covered; other hostnames fail validation). SAN coverage is set in `tests/common/certs.rs`. Check that `tls_version_min = "1.2"` matches what the broker config negotiates. Cert expiry cannot happen — certs are generated per-run by `tests/common/certs.rs` (not_after 2125), not checked in.

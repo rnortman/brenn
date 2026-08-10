@@ -55,7 +55,16 @@ rust_test(
 # The MQTT suite spawns a real mosquitto per test and talks to it over
 # loopback. mosquitto stays a system binary — it is the one non-hermetic
 # dependency left — and the env gate is set here so a missing broker fails the
-# test instead of skipping it.
+# test instead of skipping it. Dropping the gate does not quietly restore the
+# skip: the suite panics when the gate is unset under Bazel's test runner.
+#
+# PATH is pinned because a test action's default is a fixed
+# `/bin:/usr/bin:/usr/local/bin`, not the invoking shell's, and Debian-family
+# packaging installs the daemon at /usr/sbin/mosquitto — off that list, so the
+# harness's PATH lookup misses on a host where the install succeeded. The two
+# sbin directories are appended to Bazel's own default rather than replacing it.
+# A static string, so the action key stays machine-independent; the operator's
+# BRENN_MOSQUITTO_BIN override reaches the test through .bazelrc's --test_env.
 rust_test(
     name = "mqtt_integration",
     size = "large",
@@ -63,7 +72,10 @@ rust_test(
     crate_root = "tests/mqtt_integration.rs",
     data = glob(["tests/mqtt_assets/**"]),
     edition = "2024",
-    env = {"BRENN_MQTT_INTEGRATION": "1"},
+    env = {
+        "BRENN_MQTT_INTEGRATION": "1",
+        "PATH": "/bin:/usr/bin:/usr/local/bin:/usr/sbin:/usr/local/sbin",
+    },
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,

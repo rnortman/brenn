@@ -1,9 +1,11 @@
 // MQTT integration test suite.
 //
-// Gate: set `BRENN_MQTT_INTEGRATION=1` in the environment.
-// Without it, all tests early-return (compile and link, but no broker is spawned).
+// Gate: set `BRENN_MQTT_INTEGRATION=1` in the environment. Without it, all
+// tests early-return under cargo (they compile and link, but no broker is
+// spawned) and panic under Bazel, whose target sets the gate itself.
 //
 // Run: BRENN_MQTT_INTEGRATION=1 cargo test -p brenn-lib --test mqtt_integration
+//      bazel test //brenn-lib:mqtt_integration
 
 mod common;
 
@@ -25,9 +27,26 @@ use common::{
 };
 use rumqttc::mqttbytes::QoS;
 
+/// Set by Bazel's test runner in every test action; no other runner sets it.
+const BAZEL_TEST_MARKER: &str = "TEST_SRCDIR";
+
+/// The suite's opt-in gate: unset, every test early-returns without spawning a
+/// broker.
+///
+/// Cargo leaves the gate to the developer. Bazel's `mqtt_integration` target
+/// sets it unconditionally, so an unset gate under Bazel means the target lost
+/// its `env` entry — a skip would silently pass over nothing asserted. Under
+/// Bazel it is a panic.
 macro_rules! integration_gate {
     () => {
-        if std::env::var("BRENN_MQTT_INTEGRATION").is_err() {
+        if std::env::var_os("BRENN_MQTT_INTEGRATION").is_none() {
+            assert!(
+                std::env::var_os(BAZEL_TEST_MARKER).is_none(),
+                "BRENN_MQTT_INTEGRATION is unset under Bazel's test runner \
+                 ({BAZEL_TEST_MARKER} is set), so every test here would skip and \
+                 report a pass over nothing asserted. The `mqtt_integration` \
+                 rule sets it in `env`; restore it in brenn-lib/BUILD.bazel."
+            );
             eprintln!("skipping: set BRENN_MQTT_INTEGRATION=1 to run");
             return;
         }
