@@ -1283,3 +1283,68 @@ Done = the list above is deleted, `make check` is the verb layer over
 
 Code site (`TODO(bazel-teardown)`): `Makefile`, at `CARGO_CHECK_STEPS`.
 
+
+## `bazel-ci-cache-pressure`
+
+The required GitHub check builds two configurations into one Bazel disk cache —
+the dev graph for `make bazel-check`, the release package for the packaging step
+— and `build:ci` caps that cache's GC at 8G inside GitHub's ~10G per-repo cache
+budget. Nobody has measured what it actually reaches. If it saturates, Bazel's
+GC and GitHub's eviction trade warm hits away between runs and the symptom is
+green runs drifting back toward twenty cold minutes, with nothing reporting it.
+
+The observability half is done: the `check` job prints the cache size every run
+and annotates a warning past 90% of the cap, which it reads out of `.bazelrc` so
+that lowering the cap moves the watermark with it. This entry is the decision
+that needs the data. Read the reported sizes after a few weeks of warm
+main-branch runs.
+
+Done = one of: the sizes sit comfortably under the cap and this entry closes; or
+the pressure is real and one remediation lands — lower
+`--experimental_disk_cache_gc_max_size` for `build:ci` (stated once, as
+`<digits>G`, which is the shape the step's reader and xtask's sync guard both
+hold it to) so one entry cannot crowd
+the whole GitHub budget, move the release-package step off the required check
+onto the weekly `cache-canary` job (accepting that release-lane breakage is then
+caught weekly rather than per-merge), or split the dev and release caches into
+separately keyed `actions/cache` entries.
+
+Code site (`TODO(bazel-ci-cache-pressure)`): `.github/workflows/ci.yml`, the
+`Report bazel disk cache size` step.
+
+
+## `sw-registration-csp-blocked`
+
+Both pages register the service worker from an inline `<script>`
+(brenn-server/src/routes/app.rs, the landing page and the app shell), and the
+CSP is `script-src 'self'` on every page (the surface relaxation only adds
+`'wasm-unsafe-eval'`). Neither variant permits inline script, so both
+registrations are dead lines and every app page load logs a CSP console error —
+permanent noise that trains people to ignore the console.
+
+The consequence is worse than noise. The served manifest hardcodes a
+`POST /share-target` action (brenn-server/src/routes/statics.rs) and the worker's
+fetch handler (frontend/src/sw.ts) is the only thing that answers it; nothing
+server-side serves that URL. The only registration that actually runs is
+`enablePush()` (frontend/src/push.ts), reached solely from the user-gesture menu
+item — so on a device where push was never enabled there is no worker at all,
+and an OS share into the installed PWA lands in the global 404 fallback, which
+logs an `UnrecognizedUrl` security event against the user's own IP. That chain
+is code-verified only: nobody has exercised a share from an installed PWA, so
+the fixing cycle's first job is confirming the live behavior.
+
+Needs a design call before it can be built: where registration should live
+(module entry versus a shared external snippet — the landing page loads only
+`nav-on-message.js`, the app page `main.js`), whether the `{ scope: "/" }`
+option must match `push.ts`, and the open question of whether the landing page
+needs a worker at all.
+
+Done = the worker is registered on page load by CSP-legal means (an external
+script, no inline) on whichever pages the fixing design decides need one, at
+minimum the app shell; both inline `<script>` registration lines are gone; the
+app page's console is clean; and a share into an installed PWA has been verified
+live to reach the worker.
+
+Code site (`TODO(sw-registration-csp-blocked)`): brenn-server/src/routes/app.rs,
+both inline registration sites — `landing_page` and `render_app_shell`.
+

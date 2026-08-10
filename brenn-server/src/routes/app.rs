@@ -91,6 +91,9 @@ pub async fn landing_page(
             .join("\n            ")
     };
 
+    // TODO(sw-registration-csp-blocked): the inline `<script>` below registers
+    // the service worker, and `script-src 'self'` blocks inline script, so the
+    // registration never runs and the load logs a CSP console error.
     page_html(format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -204,6 +207,9 @@ fn render_app_shell(
         None => String::new(),
     };
 
+    // TODO(sw-registration-csp-blocked): the inline `<script>` below registers
+    // the service worker, and `script-src 'self'` blocks inline script, so the
+    // registration never runs and the load logs a CSP console error.
     Ok(page_html(format!(
         r#"<!DOCTYPE html>
 <html lang="en">

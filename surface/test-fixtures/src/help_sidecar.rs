@@ -1,11 +1,11 @@
 //! The drift gate shared by every in-tree surface component's help-sidecar test.
 //!
-//! An in-tree `help.md` is generated from its crate's `src/help.rs`, and the
-//! committed file is the shipped artifact — the build copies it into the surface
-//! asset dir verbatim, so nothing downstream needs to know it was generated.
-//! What keeps the two in step is one unit test per component crate calling
-//! [`enforce_help_sidecar`]: an edit to either side fails that test until the
-//! file is regenerated.
+//! An in-tree `help.md` is generated from its crate's `src/help.rs`. The Bazel
+//! build ships the generator's output directly into the surface asset dir; the
+//! committed file is what the make lane copies there, and what this gate holds
+//! to the generator. What keeps the two in step is one unit test per component
+//! crate calling [`enforce_help_sidecar`]: an edit to either side fails that
+//! test until the file is regenerated.
 
 use std::path::PathBuf;
 

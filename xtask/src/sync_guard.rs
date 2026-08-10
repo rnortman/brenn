@@ -147,15 +147,15 @@ const BAZELRC: &str = ".bazelrc";
 const CI_CONFIG: &str = "ci";
 const DISK_CACHE_FLAG: &str = "disk_cache";
 
+/// The GC cap on that cache. The workflow's cache-size step reads it out of
+/// `.bazelrc` to place its warning watermark, so its spelling is a coupling
+/// between the two files.
+const GC_MAX_SIZE_FLAG: &str = "experimental_disk_cache_gc_max_size";
+
 /// A cached directory is restored once and saved once, so the configured path
 /// appears in the workflow at least twice. One occurrence means one half of the
 /// pair moved and the other did not.
 const CACHE_STEPS_PER_DIRECTORY: usize = 2;
-
-/// The `BUILD.bazel` handing the scrub suites their gitleaks, and the harness
-/// constant naming the variable it arrives in.
-const SCRUB_TEST_BUILD: &str = "scrub/BUILD.bazel";
-const GITLEAKS_VEND_CONST: &str = "VENDORED_GITLEAKS";
 
 /// The stamp key: the build-id variable under Bazel's stable-key prefix.
 ///
@@ -438,10 +438,13 @@ fn workflow_input_violations(
     found
 }
 
-/// The value a `.bazelrc` config stanza gives a flag.
-fn bazelrc_flag_value(text: &str, config: &str, flag: &str) -> String {
+/// Every value a `.bazelrc` config stanza gives a flag, in file order.
+///
+/// Repeating a flag inside a config is legal and bazel takes the last, so the
+/// count is data for the caller rather than an error here.
+fn bazelrc_flag_values(text: &str, config: &str, flag: &str) -> Vec<String> {
     let needle = format!("build:{config} --{flag}=");
-    let mut found: Option<String> = None;
+    let mut found = Vec::new();
     for line in text.lines() {
         let Some(rest) = line.trim().strip_prefix(&needle) else {
             continue;
@@ -451,14 +454,21 @@ fn bazelrc_flag_value(text: &str, config: &str, flag: &str) -> String {
             !value.is_empty(),
             "sync guard: {BAZELRC} states `build:{config} --{flag}=` with no value"
         );
-        assert!(
-            found.is_none(),
-            "sync guard: {BAZELRC} states --{flag} for config {config} more than once; the guard \
-             would hold only one"
-        );
-        found = Some(value.to_string());
+        found.push(value.to_string());
     }
-    found.unwrap_or_else(|| {
+    found
+}
+
+/// The value a `.bazelrc` config stanza gives a flag, where the guard reading it
+/// holds exactly one.
+fn bazelrc_flag_value(text: &str, config: &str, flag: &str) -> String {
+    let mut found = bazelrc_flag_values(text, config, flag);
+    assert!(
+        found.len() < 2,
+        "sync guard: {BAZELRC} states --{flag} for config {config} more than once; the guard \
+         would hold only one"
+    );
+    found.pop().unwrap_or_else(|| {
         panic!("sync guard: {BAZELRC} config {config} states no --{flag}");
     })
 }
@@ -500,25 +510,46 @@ fn ci_disk_cache_violations(configured: &str, cache_paths: &[String]) -> Vec<Str
     )]
 }
 
-/// The scrub suites' scan-reaching assertions run only when the harness is
-/// handed the pinned gitleaks, and absence of the variable is what it reads as
-/// "this machine has no gitleaks, skip".
+/// The cache-size step warns off a fraction of the GC cap `build:{CI_CONFIG}`
+/// sets, and reads that cap by matching one `.bazelrc` line byte for byte:
+/// `<digits>G`, stated once.
 ///
-/// So the `BUILD.bazel` that sets it and the harness that reads it are one pin.
-/// Renaming either side restores the skip: three suites report pass over nothing
-/// asserted, and after the teardown deletes the cargo lane there is no other
-/// place those assertions run.
-fn gitleaks_vend_violations(variable: &str, scrub_build: &str) -> Vec<String> {
-    let needle = format!("\"{variable}\": \"$(rootpath ");
-    if scrub_build.contains(&needle) {
-        return Vec::new();
+/// Nothing fails when the cap stops matching that shape. The step still prints a
+/// size, so it still looks like it works, while the annotation — the only part
+/// of it anyone sees on a green run — can never fire again and the cache
+/// saturates unreported. Respelling the cap is also the first remediation the
+/// measurement exists to prescribe, so the likeliest edit is the one that
+/// silences the reader. Stating it twice is worse than harmless: bazel takes the
+/// last, the step's `tail` agrees, but the two files now disagree about which
+/// number is the cap unless a human reads both.
+fn ci_cache_watermark_violations(workflow: &str, caps: &[String]) -> Vec<String> {
+    if !workflow.contains(GC_MAX_SIZE_FLAG) {
+        return vec![format!(
+            "{CI_WORKFLOW} names no --{GC_MAX_SIZE_FLAG}, so nothing there reads the cap this \
+             check pins. If the cache-size step is gone, delete this check with it; if the flag \
+             was renamed, rename it here."
+        )];
     }
-    vec![format!(
-        "{SCRUB_TEST_BUILD} sets no `{variable}` to a `$(rootpath …)` value, but \
-         {GITLEAKS_HARNESS} reads the vended gitleaks from it and treats absence as a machine \
-         without gitleaks. The suites would report pass with every scan-reaching assertion \
-         skipped."
-    )]
+    if caps.len() != 1 {
+        return vec![format!(
+            "{BAZELRC} states `build:{CI_CONFIG} --{GC_MAX_SIZE_FLAG}` {} time(s), and the \
+             cache-size step in {CI_WORKFLOW} places its watermark from exactly one. None leaves \
+             the step reporting a size it can never warn about; more than one leaves the cap \
+             stated in two places for a human to reconcile.",
+            caps.len()
+        )];
+    }
+    let cap = &caps[0];
+    let digits = cap.strip_suffix('G').unwrap_or_default();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return vec![format!(
+            "{BAZELRC} states `build:{CI_CONFIG} --{GC_MAX_SIZE_FLAG}={cap}`, which the \
+             cache-size step in {CI_WORKFLOW} cannot read: it matches `<digits>G` and nothing \
+             else. A cap it cannot read costs no correctness and all of the signal — the step \
+             goes on printing a size and never warns again."
+        )];
+    }
+    Vec::new()
 }
 
 /// scrub is validated against exactly one gitleaks release, and four files name
@@ -1261,13 +1292,14 @@ pub fn run_sync_guard(root: &Path, files: &[PathBuf]) -> bool {
         &workflow_dispatch_inputs(&workflow),
         &workflow_input_references(&workflow),
     ));
+    let bazelrc = read(BAZELRC);
     found.extend(ci_disk_cache_violations(
-        &bazelrc_flag_value(&read(BAZELRC), CI_CONFIG, DISK_CACHE_FLAG),
+        &bazelrc_flag_value(&bazelrc, CI_CONFIG, DISK_CACHE_FLAG),
         &workflow_cache_paths(&workflow),
     ));
-    found.extend(gitleaks_vend_violations(
-        &rust_str_const(GITLEAKS_HARNESS, &gitleaks_harness, GITLEAKS_VEND_CONST),
-        &read(SCRUB_TEST_BUILD),
+    found.extend(ci_cache_watermark_violations(
+        &workflow,
+        &bazelrc_flag_values(&bazelrc, CI_CONFIG, GC_MAX_SIZE_FLAG),
     ));
     let surface_manifest = read(SURFACE_MANIFEST);
     found.extend(jco_violations(
@@ -2175,33 +2207,52 @@ build:cd --disk_cache=~/.build-cache/bazel-disk
     }
 
     #[test]
-    fn the_vended_gitleaks_variable_is_held_between_the_build_file_and_the_harness() {
-        let build = "SCRUB_TEST_ENV = {\n    \"BRENN_SCRUB_TEST_GITLEAKS\": \
-                     \"$(rootpath //bazel/tools:gitleaks)\",\n}\n";
-        assert!(gitleaks_vend_violations("BRENN_SCRUB_TEST_GITLEAKS", build).is_empty());
+    fn every_value_a_config_gives_a_flag_is_read_in_file_order() {
+        assert_eq!(
+            bazelrc_flag_values(
+                "build:ci --disk_cache=a\nbuild:cd --disk_cache=z\nbuild:ci --disk_cache=b\n",
+                CI_CONFIG,
+                DISK_CACHE_FLAG,
+            ),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
 
-        let renamed = gitleaks_vend_violations("BRENN_SCRUB_GITLEAKS", build);
-        assert_eq!(renamed.len(), 1, "{renamed:?}");
+    const A_WATERMARK_STEP: &str = "\
+          cap=$(sed -n 's/^build:ci --experimental_disk_cache_gc_max_size=\\([0-9]\\{1,\\}\\)G$/\\1/p' .bazelrc | tail -n1)
+";
+
+    #[test]
+    fn a_cap_the_watermark_step_can_read_is_no_violation() {
         assert!(
-            renamed[0].contains("BRENN_SCRUB_GITLEAKS"),
-            "{}",
-            renamed[0]
+            ci_cache_watermark_violations(A_WATERMARK_STEP, &["8G".to_string()]).is_empty(),
+            "the shipped shape has to pass"
         );
+    }
 
-        // Dropped from the `env` dict entirely — the edit that silently
-        // restores the skip.
-        let dropped =
-            gitleaks_vend_violations("BRENN_SCRUB_TEST_GITLEAKS", "SCRUB_TEST_ENV = {}\n");
-        assert_eq!(dropped.len(), 1, "{dropped:?}");
-        assert!(dropped[0].contains("skipped"), "{}", dropped[0]);
+    #[test]
+    fn a_cap_respelled_out_of_the_steps_pattern_is_a_violation() {
+        for cap in ["8192M", "7.5G", "8", "8g", "G"] {
+            let out = ci_cache_watermark_violations(A_WATERMARK_STEP, &[cap.to_string()]);
+            assert_eq!(out.len(), 1, "{cap}: {out:?}");
+            assert!(out[0].contains("<digits>G"), "{}", out[0]);
+        }
+    }
 
-        // Set to a literal path rather than a build-graph one: nothing in the
-        // sandbox is at an absolute host path, so this is a skip with extra
-        // steps.
-        let literal = gitleaks_vend_violations(
-            "BRENN_SCRUB_TEST_GITLEAKS",
-            "env = {\"BRENN_SCRUB_TEST_GITLEAKS\": \"/usr/bin/gitleaks\"}\n",
-        );
-        assert_eq!(literal.len(), 1, "{literal:?}");
+    #[test]
+    fn a_cap_stated_zero_or_twice_is_a_violation() {
+        for caps in [vec![], vec!["8G".to_string(), "6G".to_string()]] {
+            let count = caps.len();
+            let out = ci_cache_watermark_violations(A_WATERMARK_STEP, &caps);
+            assert_eq!(out.len(), 1, "{count}: {out:?}");
+            assert!(out[0].contains(&format!("{count} time(s)")), "{}", out[0]);
+        }
+    }
+
+    #[test]
+    fn a_workflow_that_stopped_reading_the_cap_is_a_violation() {
+        let out = ci_cache_watermark_violations("      - run: make bazel-check\n", &["8G".into()]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("delete this check with it"), "{}", out[0]);
     }
 }

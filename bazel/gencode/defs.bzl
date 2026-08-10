@@ -109,10 +109,11 @@ ts_rs_export = rule(
 # ---------------------------------------------------------------------------
 
 def _generated_parity_test_impl(ctx):
-    # The generated file's workspace-relative path is by construction the same
-    # as the committed one's, so staging both in one runfiles tree would put
-    # only one there and compare it against itself. The copy gives it a name of
-    # its own.
+    # The generated file's workspace-relative path may coincide with the
+    # committed one's — it does for the single-file gencode families — and when
+    # it does, staging both in one runfiles tree would put only one there and
+    # compare it against itself. So the generated side always gets a name of its
+    # own.
     generated = ctx.actions.declare_file(ctx.label.name + ".generated")
     ctx.actions.symlink(output = generated, target_file = ctx.file.generated)
 
