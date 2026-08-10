@@ -1,0 +1,18 @@
+"""Rules for the wasm32 guest tree, and the gate scripts they wrap."""
+
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+# The two component gates are checked-in scripts rather than generated text so
+# `//bazel/wasm/tests` can drive them over fixtures. The rules only bind
+# arguments.
+#
+# `manifest_names.sh` is the deploy manifest's grammar, exported because the
+# release packaging in `//bazel/release` reads the same manifest: one
+# implementation, three callers, so a format change cannot reach two of them.
+exports_files([
+    "deployed_components_check.sh",
+    "manifest_names.sh",
+    "wasi_import_check.sh",
+])

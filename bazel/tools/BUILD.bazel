@@ -1,0 +1,100 @@
+"""Hermetic binaries for the build pipelines and the tests that drive them.
+
+wit-bindgen, wasm-tools, the wasm-bindgen CLI and gitleaks arrive as
+sha256-pinned upstream release archives (`MODULE.bazel`), so nothing has to be
+installed to build a component, a browser bundle, or to run scrub's scanning
+tests. The first three are action tools consumed through `cfg = "exec"`
+attributes, which is why the selects key on the execution platform's cpu rather
+than on the target's; gitleaks is a test runfile and resolves in the target
+configuration, where the same settings read the same on a host build.
+"""
+
+load("@bazel_skylib//rules:native_binary.bzl", "native_binary")
+load("@rules_rust_wasm_bindgen//:defs.bzl", "rust_wasm_bindgen_toolchain")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+package(default_visibility = ["//visibility:public"])
+
+policy_srcs()
+
+config_setting(
+    name = "linux_x86_64",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+config_setting(
+    name = "linux_aarch64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+)
+
+_NO_ARCHIVE = """no pinned {tool} release archive for this execution platform.
+Only linux x86_64 and linux aarch64 are pinned; add an http_archive for the
+platform in MODULE.bazel and a branch to the select() in bazel/tools/BUILD.bazel."""
+
+alias(
+    name = "wit-bindgen",
+    actual = select(
+        {
+            ":linux_aarch64": "@wit_bindgen_aarch64_linux//:wit-bindgen",
+            ":linux_x86_64": "@wit_bindgen_x86_64_linux//:wit-bindgen",
+        },
+        no_match_error = _NO_ARCHIVE.format(tool = "wit-bindgen"),
+    ),
+)
+
+alias(
+    name = "wasm-tools",
+    actual = select(
+        {
+            ":linux_aarch64": "@wasm_tools_aarch64_linux//:wasm-tools",
+            ":linux_x86_64": "@wasm_tools_x86_64_linux//:wasm-tools",
+        },
+        no_match_error = _NO_ARCHIVE.format(tool = "wasm-tools"),
+    ),
+)
+
+alias(
+    name = "gitleaks",
+    actual = select(
+        {
+            ":linux_aarch64": "@gitleaks_aarch64_linux//:gitleaks",
+            ":linux_x86_64": "@gitleaks_x86_64_linux//:gitleaks",
+        },
+        no_match_error = _NO_ARCHIVE.format(tool = "gitleaks"),
+    ),
+)
+
+# The wasm-bindgen toolchain wants an executable target, not a file, so the
+# archive's binary is wrapped rather than aliased.
+native_binary(
+    name = "wasm-bindgen",
+    src = select(
+        {
+            ":linux_aarch64": "@wasm_bindgen_aarch64_linux//:wasm-bindgen",
+            ":linux_x86_64": "@wasm_bindgen_x86_64_linux//:wasm-bindgen",
+        },
+        no_match_error = _NO_ARCHIVE.format(tool = "wasm-bindgen"),
+    ),
+    out = "wasm-bindgen-cli",
+)
+
+# Registered ahead of the module's own toolchain in `MODULE.bazel`. Only the
+# CLI is bound: the webdriver half of the toolchain drives
+# `rust_wasm_bindgen_test`, which brenn does not use — the browser suites run
+# out of band through `make surface-wasm-test`.
+rust_wasm_bindgen_toolchain(
+    name = "wasm_bindgen_toolchain_impl",
+    wasm_bindgen_cli = ":wasm-bindgen",
+)
+
+toolchain(
+    name = "wasm_bindgen_toolchain",
+    toolchain = ":wasm_bindgen_toolchain_impl",
+    toolchain_type = "@rules_rust_wasm_bindgen//:toolchain_type",
+)

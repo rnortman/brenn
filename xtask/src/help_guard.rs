@@ -33,8 +33,6 @@ const CHROME_DIR: &str = "surface/chrome";
 /// A discovered sidecar: repo-root-relative path plus its first line.
 type Sidecar = (PathBuf, String);
 
-/// Judge a discovered sidecar set. Pure, so the policy half is testable against
-/// synthetic input: one line per unheadered file, plus one for an empty set.
 fn violations_from(observed: &[Sidecar]) -> Vec<String> {
     let mut found = Vec::new();
     if observed.is_empty() {
@@ -62,54 +60,48 @@ fn violations_from(observed: &[Sidecar]) -> Vec<String> {
     found
 }
 
-/// The sidecar dirs the build discovers: every component crate dir plus chrome.
-/// A dir without a `Cargo.toml` is not a crate, so it is not a component.
-fn sidecar_dirs(root: &Path) -> Vec<PathBuf> {
-    let components = root.join(COMPONENTS_DIR);
-    let entries = std::fs::read_dir(&components)
-        .unwrap_or_else(|e| panic!("help guard: cannot read {}: {e}", components.display()));
-    let mut dirs: Vec<PathBuf> = entries
-        .map(|entry| {
-            entry
-                .unwrap_or_else(|e| panic!("help guard: cannot read a {COMPONENTS_DIR} entry: {e}"))
-                .path()
-        })
-        .filter(|path| path.join("Cargo.toml").is_file())
+/// Component crate dirs plus chrome, repo-root-relative. A dir without a
+/// `Cargo.toml` is not a crate and is not a component.
+fn sidecar_dirs(files: &[PathBuf]) -> Vec<PathBuf> {
+    let components = Path::new(COMPONENTS_DIR);
+    let mut dirs: Vec<PathBuf> = files
+        .iter()
+        .filter(|rel| rel.file_name().is_some_and(|n| n == "Cargo.toml"))
+        .filter_map(|rel| rel.parent())
+        // Immediate children of the components dir only: a crate nested deeper
+        // is a component's own subcrate, not a component.
+        .filter(|dir| dir.parent() == Some(components))
+        .map(Path::to_path_buf)
         .collect();
     dirs.sort();
-    dirs.push(root.join(CHROME_DIR));
+    dirs.push(PathBuf::from(CHROME_DIR));
     dirs
 }
 
 /// Every discovered sidecar with its first line. A dir with no `help.md` ships no
 /// sidecar and is not this guard's business; an unreadable one is.
-fn collect_sidecars(root: &Path) -> Vec<Sidecar> {
-    sidecar_dirs(root)
+fn collect_sidecars(root: &Path, files: &[PathBuf]) -> Vec<Sidecar> {
+    let present: std::collections::HashSet<&PathBuf> = files.iter().collect();
+    sidecar_dirs(files)
         .into_iter()
         .map(|dir| dir.join("help.md"))
-        .filter(|path| path.is_file())
-        .map(|path| {
+        .filter(|rel| present.contains(rel))
+        .map(|rel| {
+            let path = root.join(&rel);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("help guard: cannot read {}: {e}", path.display()));
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
             (rel, text.lines().next().unwrap_or("").to_string())
         })
         .collect()
 }
 
-/// Scan the tree; return one line per sidecar that is not generated.
-pub fn violations(root: &Path) -> Vec<String> {
-    violations_from(&collect_sidecars(root))
+fn violations(root: &Path, files: &[PathBuf]) -> Vec<String> {
+    violations_from(&collect_sidecars(root, files))
 }
 
-/// Run the guard as a check lane. Prints violations; returns pass/fail.
-///
-/// A check lane rather than a `#[cfg(test)]` assertion for the same reason the
-/// sibling guards are: its input is a directory listing, which is in no test
-/// binary's input closure, so a cached pass would replay over exactly the
-/// addition it exists to catch.
-pub fn run_help_guard(root: &Path) -> bool {
-    let found = violations(root);
+/// True if every in-tree surface sidecar opens with the generated-file header.
+pub fn run_help_guard(root: &Path, files: &[PathBuf]) -> bool {
+    let found = violations(root, files);
     if found.is_empty() {
         return true;
     }
@@ -186,7 +178,8 @@ mod tests {
     fn the_collector_finds_every_component_sidecar_plus_chrome() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path();
-        for (dir, files) in [
+        let mut files: Vec<PathBuf> = Vec::new();
+        for (dir, names) in [
             ("surface/components/alpha", vec!["Cargo.toml", "help.md"]),
             ("surface/components/beta", vec!["Cargo.toml", "help.md"]),
             // A crate with no sidecar: nothing is published for it, so there is
@@ -194,20 +187,27 @@ mod tests {
             ("surface/components/gamma", vec!["Cargo.toml"]),
             // Not a crate — scratch, a stray dir — even carrying a help.md.
             ("surface/components/notacrate", vec!["help.md"]),
+            // A crate nested below a component is not itself a component.
+            (
+                "surface/components/alpha/inner",
+                vec!["Cargo.toml", "help.md"],
+            ),
             ("surface/chrome", vec!["Cargo.toml", "help.md"]),
         ] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
-            for file in files {
-                let body = if file == "help.md" {
+            for name in names {
+                let body = if name == "help.md" {
                     format!("{HEADER}\nbody\n")
                 } else {
                     String::new()
                 };
-                std::fs::write(root.join(dir).join(file), body).unwrap();
+                std::fs::write(root.join(dir).join(name), body).unwrap();
+                files.push(PathBuf::from(dir).join(name));
             }
         }
+        files.sort();
 
-        let observed = collect_sidecars(root);
+        let observed = collect_sidecars(root, &files);
         assert_eq!(
             observed.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
             vec![

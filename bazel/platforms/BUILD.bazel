@@ -1,0 +1,57 @@
+"""Build platforms brenn targets are requested under.
+
+Per-target platform transitions let a musl release build coexist with cdylib
+targets that cannot link statically.
+"""
+
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+package(default_visibility = ["//visibility:public"])
+
+policy_srcs()
+
+# Bazel's own constraint vocabulary has no libc axis, and rules_rust maps both
+# x86_64-unknown-linux-gnu and x86_64-unknown-linux-musl onto the same
+# cpu+os pair. Without a distinguishing constraint the two Rust toolchains are
+# ambiguous, so the axis is declared here and carried by the musl platform.
+constraint_setting(
+    name = "libc",
+    default_constraint_value = ":libc_glibc",
+)
+
+constraint_value(
+    name = "libc_glibc",
+    constraint_setting = ":libc",
+)
+
+constraint_value(
+    name = "libc_musl",
+    constraint_setting = ":libc",
+)
+
+# Static-linked deploy artifacts. Requested via `--config=release-musl`.
+platform(
+    name = "linux_x86_64_musl",
+    constraint_values = [
+        ":libc_musl",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+# Requesting the guest tree under the wasm32 platform also reaches the test
+# targets beside it, which run on the host and have no wasm32 test toolchain.
+# They opt out through this.
+config_setting(
+    name = "is_wasm32",
+    constraint_values = ["@platforms//cpu:wasm32"],
+)
+
+# Guest-side WASM: component crates and the browser-facing surface crates.
+platform(
+    name = "wasm32",
+    constraint_values = [
+        "@platforms//cpu:wasm32",
+        "@platforms//os:none",
+    ],
+)

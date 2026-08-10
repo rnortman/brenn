@@ -3,6 +3,8 @@
 #
 # Usage: emit-processor-manifest.sh <kind> <source-component.wasm> <out-dir> <jco-version>
 #
+# WASM_TOOLS names the `wasm-tools` binary; unset, one is looked up on PATH.
+#
 # The manifest binds the transpiled tree to the component bytes it came from:
 # `source_sha256` is the hash of the transpile's input, which the server
 # re-computes at boot against the copied artifact, so a component rebuilt
@@ -31,7 +33,7 @@ sha=$(sha256sum "$component" | awk '{print $1}')
 # where punctuation weights differ from byte values, so the emitted order — and
 # the parity assertion against the twin — would depend on the machine that ran
 # the transpile.
-wit=$(wasm-tools component wit "$component")
+wit=$("${WASM_TOOLS:-wasm-tools}" component wit "$component")
 imports=$(printf '%s\n' "$wit" \
     | sed -n 's/^[[:space:]]*import[[:space:]]\{1,\}\([A-Za-z0-9_-]\{1,\}:[^;[:space:]]*\);.*/\1/p' \
     | sed 's/@[^/]*$//' \

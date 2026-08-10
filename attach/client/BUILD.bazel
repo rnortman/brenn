@@ -1,0 +1,47 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//attach/proto",
+    "//brenn-envelope",
+    "//brenn-queue",
+]
+
+# The wasm32 arm of the dependency table (web-sys, js-sys, the browser clock)
+# is selected by `all_crate_deps` from the hub's per-triple resolution, so the
+# host build carries only the tokio/tungstenite arm.
+rust_library(
+    name = "client",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "brenn_attach_client",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# The native transport tests dial a real loopback websocket server they start
+# themselves.
+#
+# `futures-channel` is named explicitly: crate_universe drops a dev-dependency
+# that is also a normal dependency under some other `cfg`, and this crate takes
+# futures-channel as a wasm32 normal dep and a non-wasm32 dev dep, so it lands
+# in neither generated map.
+rust_test(
+    name = "client_test",
+    crate = ":client",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    tags = ["requires-network"],
+    deps = all_crate_deps(normal_dev = True) + ["@crates//futures-channel"],
+)
+
+rust_doc_test(
+    name = "client_doc_test",
+    crate = ":client",
+)

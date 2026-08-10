@@ -42,14 +42,10 @@ const ALLOWLIST: &[Allowed] = &[
         why: "production git subprocess; never runs under a git hook",
     },
     Allowed {
-        path: "xtask/src/removal_guard.rs",
+        path: "xtask/src/file_set.rs",
         count: 1,
-        why: "tracked-file enumeration for the removal guard",
-    },
-    Allowed {
-        path: "xtask/src/git_spawn_guard.rs",
-        count: 1,
-        why: "this guard's own tracked-file enumeration",
+        why: "the one tracked-file enumeration every policy guard takes its \
+              file set from",
     },
     Allowed {
         path: "git-fixture/src/lib.rs",
@@ -65,9 +61,6 @@ fn count_pattern(text: &str) -> usize {
     text.match_indices(PATTERN).count()
 }
 
-/// Compare observed per-file counts against the allowlist. Pure: the input is
-/// every tracked `*.rs` path with its occurrence count, so the policy half is
-/// testable with synthetic trees.
 fn violations_from(observed: &[(PathBuf, usize)]) -> Vec<String> {
     let mut found = Vec::new();
     for (rel, count) in observed {
@@ -109,39 +102,13 @@ fn violations_from(observed: &[(PathBuf, usize)]) -> Vec<String> {
     found
 }
 
-/// Tracked `*.rs` files, repo-root-relative, each with its spawn-site count.
-///
-/// The file set is git's, so build output and untracked scratch are outside the
-/// scan by construction. This does not reuse `removal_guard`'s collector: that
-/// one filters by its own notion of a scannable file, which this guard's scope
-/// must not be coupled to.
-///
-/// Paths come from the index but bytes come from the worktree, matching
-/// `removal_guard`. Under a pre-commit run that leaves one window open: a spawn
-/// site staged and then reverted in the worktree without re-staging is counted
-/// from the clean copy, so that one commit passes. The next run reads it from
-/// the worktree of whoever checks it out. Reading blobs instead would cost a
-/// `cat-file` per file and diverge from the sibling guard; the window is
-/// accepted deliberately, and the reverse case (dirty worktree, clean index)
-/// fails conservatively.
-fn collect_counts(root: &Path) -> Vec<(PathBuf, usize)> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files", "-z", "*.rs"])
-        .output()
-        .unwrap_or_else(|e| panic!("git-spawn guard: cannot run git ls-files: {e}"));
-    assert!(
-        out.status.success(),
-        "git-spawn guard: git ls-files failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let listing = String::from_utf8(out.stdout)
-        .unwrap_or_else(|e| panic!("git-spawn guard: git ls-files output is not UTF-8: {e}"));
-    listing
-        .split('\0')
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+/// Not coupled to `removal_guard`'s file scope: each guard defines its own
+/// scan filter independently.
+fn collect_counts(root: &Path, files: &[PathBuf]) -> Vec<(PathBuf, usize)> {
+    files
+        .iter()
+        .filter(|rel| rel.extension().is_some_and(|e| e == "rs"))
+        .cloned()
         .map(|rel| {
             let bytes = std::fs::read(root.join(&rel))
                 .unwrap_or_else(|e| panic!("git-spawn guard: cannot read {rel:?}: {e}"));
@@ -154,19 +121,14 @@ fn collect_counts(root: &Path) -> Vec<(PathBuf, usize)> {
         .collect()
 }
 
-/// Scan the tree; return one line per unallowlisted spawn site or count drift.
-pub fn violations(root: &Path) -> Vec<String> {
-    violations_from(&collect_counts(root))
+fn violations(root: &Path, files: &[PathBuf]) -> Vec<String> {
+    violations_from(&collect_counts(root, files))
 }
 
-/// Run the guard as a check lane. Prints violations; returns pass/fail.
-///
-/// This is a lane of `xtask check` rather than a `#[cfg(test)]` assertion: its
-/// input is the whole tracked tree, which is not in any test binary's input
-/// closure, so the test runner's pass cache would replay a stale pass for
-/// exactly the edits the guard exists to catch.
-pub fn run_git_spawn_guard(root: &Path) -> bool {
-    let found = violations(root);
+/// True if every raw git spawn site in the tree is allowlisted at its exact
+/// count.
+pub fn run_git_spawn_guard(root: &Path, files: &[PathBuf]) -> bool {
+    let found = violations(root, files);
     if found.is_empty() {
         return true;
     }
@@ -247,13 +209,13 @@ mod tests {
         let mut b = baseline();
         let entry = b
             .iter_mut()
-            .find(|(p, _)| *p == "xtask/src/removal_guard.rs")
-            .expect("xtask/src/removal_guard.rs is allowlisted");
+            .find(|(p, _)| *p == "xtask/src/file_set.rs")
+            .expect("xtask/src/file_set.rs is allowlisted");
         entry.1 = 0;
         let out = violations_from(&obs(&b));
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(
-            out[0].contains("xtask/src/removal_guard.rs: 0 raw git spawn"),
+            out[0].contains("xtask/src/file_set.rs: 0 raw git spawn"),
             "{}",
             out[0]
         );
@@ -270,25 +232,25 @@ mod tests {
         assert_eq!(count_pattern("Command::new(\"gitleaks\")"), 0);
     }
 
-    /// The collector half: the `*.rs` pathspec must reach every depth, the
-    /// extension filter must hold, and the counts must come from file bytes. A
-    /// pathspec that quietly stopped matching nested paths would leave a guard
+    /// The collector half: every Rust file in the set is scanned at any depth,
+    /// the extension filter holds, and the counts come from file bytes. A
+    /// filter that quietly stopped matching nested paths would leave a guard
     /// that scans almost nothing and passes.
     #[test]
-    fn the_collector_scans_tracked_rust_files_at_every_depth() {
+    fn the_collector_scans_every_rust_file_in_the_set() {
         let root = tempfile::tempdir().unwrap();
-        git_fixture::init_repo(root.path());
-        let nested = root.path().join("crate-a").join("src");
+        let root = root.path();
+        let nested = root.join("crate-a").join("src");
         std::fs::create_dir_all(&nested).unwrap();
 
         let spawn = concat!("Command", "::new(", "\"git\")");
         std::fs::write(nested.join("deep.rs"), format!("fn f() {{ {spawn}; }}\n")).unwrap();
-        std::fs::write(root.path().join("top.rs"), "fn g() {}\n").unwrap();
+        std::fs::write(root.join("top.rs"), "fn g() {}\n").unwrap();
         // A decoy the extension filter must exclude even though it matches.
-        std::fs::write(root.path().join("notes.txt"), spawn).unwrap();
-        git_fixture::git(root.path(), &["add", "."]);
+        std::fs::write(root.join("notes.txt"), spawn).unwrap();
 
-        let mut observed = collect_counts(root.path());
+        let files = ["crate-a/src/deep.rs", "top.rs", "notes.txt"].map(PathBuf::from);
+        let mut observed = collect_counts(root, &files);
         observed.sort();
         assert_eq!(
             observed,

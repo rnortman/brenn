@@ -16,10 +16,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use common::gitleaks_available;
+use common::{gitleaks_available, scrub_bin};
 use git_fixture::{git, init_repo, try_git};
-
-const BIN: &str = env!("CARGO_BIN_EXE_brenn-scrub");
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -69,7 +67,7 @@ fn run_in(repo: &Path, args: &[&str], stdin: &str) -> Output {
 }
 
 fn run_in_env(repo: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(BIN);
+    let mut cmd = Command::new(scrub_bin());
     cmd.current_dir(repo)
         // The overlay is a local convention; these assertions are about the
         // public rules only, so a machine's local overlay must not leak in.
@@ -83,6 +81,7 @@ fn run_in_env(repo: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> 
     // environment would point the spawned binary — and the `gitleaks` it
     // spawns — at some other repo entirely.
     git_fixture::hermetic(&mut cmd);
+    common::prepend_path(&mut cmd, None);
     let mut child = cmd.spawn().expect("failed to spawn brenn-scrub");
     child
         .stdin
@@ -260,8 +259,9 @@ fn staged_mode_scans_the_index_named_by_the_hook_environment() {
     // Hermetic first, then one explicit `GIT_DIR`: the contract under test is
     // that the environment passed to scrub overrides its cwd, and stripping
     // ambient `GIT_*` first means only this test's variable can decide that.
-    let mut cmd = Command::new(BIN);
+    let mut cmd = Command::new(scrub_bin());
     git_fixture::hermetic(&mut cmd);
+    common::prepend_path(&mut cmd, None);
     cmd.current_dir(elsewhere.path())
         .env_remove("BRENN_SCRUB_DENYLIST")
         .env("GIT_DIR", fixture.path().join(".git"))

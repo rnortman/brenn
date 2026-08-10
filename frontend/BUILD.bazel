@@ -1,0 +1,368 @@
+"""Frontend assets: what the backend embeds, what it generates, and the TS tree.
+
+The embedded set is declared here so the assets `brenn-server` reaches for with
+`include_str!`/`include_bytes!` are explicit inputs rather than ambient files.
+
+The generated set is the frontend's half of two Rust sources of truth — the
+WebSocket protocol types and the frontmatter stylesheet. Both are build
+artifacts here and committed copies in the tree, held equal by the parity gates
+until the make lanes stop reading the copies.
+
+The TypeScript tree is assembled from both: `ts_src` is the frontend's sources
+with the generated files substituted for their committed copies, and it is what
+the type-check, the bundles and the tests read. Generation is therefore a
+dependency edge, not a step that has to have run first.
+
+`dist` is the served asset tree: the four bundles plus the stylesheets, skins
+and PWA assets that are copied verbatim.
+"""
+
+load("@aspect_bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
+load("@aspect_rules_js//js:defs.bzl", "js_binary")
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("@frontend_npm//:defs.bzl", "npm_link_all_packages")
+load("@frontend_npm//frontend:typescript/package_json.bzl", tsc_bin = "bin")
+load("@frontend_npm//frontend:vitest/package_json.bzl", vitest_bin = "bin")
+load("//bazel/frontend:defs.bzl", "frontend_bundle")
+load("//bazel/gencode:defs.bzl", "generated_parity_test", "generated_tree_parity_test", "ts_rs_export")
+load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+exports_files([
+    # Also read by the release package's own copy of this tree.
+    "dist-paths.txt",
+    "pnpm-lock.yaml",
+])
+
+npm_link_all_packages(name = "node_modules")
+
+filegroup(
+    name = "embedded_assets",
+    srcs = [
+        "auth/auth.css",
+        "src/icon-192.png",
+        "src/icon-512.png",
+        "src/manifest.webmanifest",
+    ],
+    visibility = ["//brenn-server:__pkg__"],
+)
+
+# ---------------------------------------------------------------------------
+# ts-rs: the WebSocket and upload protocol types
+# ---------------------------------------------------------------------------
+# Two crates export into one directory, so each exports into its own and the
+# copy merges them. Overlap is an error: two crates claiming the same type name
+# would otherwise resolve by list order.
+
+ts_rs_export(
+    name = "ts_rs_ws_types",
+    generator = "//brenn-lib:brenn-lib_test",
+    target_compatible_with = HOST_ONLY,
+)
+
+ts_rs_export(
+    name = "ts_rs_upload",
+    generator = "//brenn-server:brenn-server_test",
+    target_compatible_with = HOST_ONLY,
+)
+
+copy_to_directory(
+    name = "generated_types",
+    srcs = [
+        ":ts_rs_upload",
+        ":ts_rs_ws_types",
+    ],
+    root_paths = [
+        "frontend/ts_rs_upload",
+        "frontend/ts_rs_ws_types",
+    ],
+    target_compatible_with = HOST_ONLY,
+    visibility = ["//visibility:public"],
+)
+
+# The committed side globs the whole subtree, not `*.ts`: the gate compares the
+# two file sets, so anything it cannot see on the committed side — a file in a
+# subdirectory, an editor backup — is a file nothing generates that every gate
+# passes over.
+generated_tree_parity_test(
+    name = "generated_types_parity_test",
+    committed = glob(["src/generated/**"]),
+    committed_dir = "src/generated",
+    generated = ":generated_types",
+)
+
+# ---------------------------------------------------------------------------
+# The frontmatter stylesheet
+# ---------------------------------------------------------------------------
+# `brenn-lib/src/frontmatter_css.rs` is the source of truth for the CSS the
+# frontmatter block renders with; this is the Lit `css` template wrapping it.
+
+# The emitter is a `srcs` entry rather than a `tools` one, so it is taken in the
+# target configuration. Both configurations are the host here, and asking for
+# the exec one would build a second copy of `brenn-lib` and everything under it
+# for byte-identical output. The same reasoning holds for `ts_rs_export`.
+genrule(
+    name = "frontmatter_css",
+    srcs = ["//brenn-cli"],
+    outs = ["generated_styles/frontmatter.generated.ts"],
+    cmd = "$(execpath //brenn-cli) emit-frontmatter-css --out $@",
+    target_compatible_with = HOST_ONLY,
+    visibility = ["//visibility:public"],
+)
+
+generated_parity_test(
+    name = "frontmatter_css_parity_test",
+    committed = "src/styles/frontmatter.generated.ts",
+    generated = ":frontmatter_css",
+)
+
+# ---------------------------------------------------------------------------
+# The TypeScript tree
+# ---------------------------------------------------------------------------
+# A staged copy rather than the package's own files, because the two generated
+# families cannot be declared at the paths their committed copies occupy — a
+# rule may not write over a source file. Staging is also the end-state shape:
+# after the committed copies go, the imports still resolve here and nowhere
+# else, so nothing has to be rewired then.
+
+copy_to_directory(
+    name = "ts_src",
+    srcs = [
+        # The bundler's option module and its test ride along: vitest discovers
+        # test files under its root, which is this tree.
+        "esbuild-bundle-opts.mjs",
+        "esbuild-bundle-opts.test.mjs",
+        "tsconfig.json",
+        "tsconfig.sw.json",
+        "vitest.config.ts",
+        ":frontmatter_css",
+        ":generated_types",
+    ] + glob(
+        ["src/**"],
+        exclude = [
+            "src/generated/**",
+            "src/styles/frontmatter.generated.ts",
+        ],
+    ),
+    replace_prefixes = {
+        "generated_styles": "src/styles",
+        "generated_types": "src/generated",
+    },
+    root_paths = ["frontend"],
+    target_compatible_with = HOST_ONLY,
+    visibility = ["//visibility:public"],
+)
+
+# Two configurations, two lib sets: the app runs in a document and the service
+# worker in a WebWorker, and a DOM global reached from worker code is an error
+# only the second one sees.
+[
+    tsc_bin.tsc_test(
+        name = "tsc_" + name,
+        args = [
+            "--noEmit",
+            "--project",
+            "$(rootpath :ts_src)/" + project,
+        ],
+        data = [
+            ":node_modules",
+            ":ts_src",
+        ],
+        target_compatible_with = HOST_ONLY,
+    )
+    for name, project in [
+        ("app", "tsconfig.json"),
+        ("sw", "tsconfig.sw.json"),
+    ]
+]
+
+# ---------------------------------------------------------------------------
+# The bundles
+# ---------------------------------------------------------------------------
+
+# esbuild through its JS API rather than its CLI, because the build id has to be
+# read out of Bazel's status file at action time and the CLI takes it only as a
+# literal. The bundler comes from the lockfile like the type checker and the
+# transpiler: one pin, nothing installed.
+js_binary(
+    name = "esbuild_bundle",
+    data = [
+        "esbuild-bundle-opts.mjs",
+        ":node_modules/esbuild",
+    ],
+    entry_point = "esbuild-bundle.mjs",
+    # rules_js patches node's `fs` so a program cannot resolve a symlink out of
+    # the sandbox. esbuild is a native process and resolves them regardless, so
+    # the patch would only stop the bundler from naming the same directory
+    # esbuild names — leaving the sandbox path in the output.
+    patch_node_fs = False,
+    target_compatible_with = HOST_ONLY,
+)
+
+# The surface bootstrap takes its build id from the page meta tag, so it is the
+# one bundle with nothing to substitute and no stamp dependency.
+[
+    frontend_bundle(
+        name = "bundle_" + entry.removesuffix(".ts"),
+        build_id = build_id,
+        entry = entry,
+        node_modules = ":node_modules",
+        out = entry.removesuffix(".ts") + ".js",
+        sourcemap = sourcemap,
+        src_tree = ":ts_src",
+        tool = ":esbuild_bundle",
+    )
+    for entry, sourcemap, build_id in [
+        ("main.ts", True, True),
+        ("sw.ts", False, True),
+        ("nav-on-message.ts", False, True),
+        ("surface.ts", True, False),
+    ]
+]
+
+# `src/` files land at the root of the tree and `skins/` keeps its directory:
+# the longest matching root path wins, so the two entries below do both.
+copy_to_directory(
+    name = "dist",
+    srcs = [
+        "src/app.css",
+        "src/file-view-copy.js",
+        "src/icon-192.png",
+        "src/icon-512.png",
+        "src/manifest.webmanifest",
+        "src/surface.css",
+        ":bundle_main",
+        ":bundle_nav-on-message",
+        ":bundle_surface",
+        ":bundle_sw",
+    ] + glob(["skins/**"]),
+    root_paths = [
+        "frontend/src",
+        "frontend",
+    ],
+    target_compatible_with = HOST_ONLY,
+    visibility = ["//visibility:public"],
+)
+
+# Nothing else reads this tree. The bundles are inputs to no test and the lint
+# invocations only build them, so a stylesheet, a skin or a whole bundle could
+# leave the served set with everything green.
+native_test(
+    name = "dist_paths",
+    size = "small",
+    src = "//bazel/dist:path_set_check.sh",
+    args = [
+        "$(rootpath :dist)",
+        "$(rootpath dist-paths.txt)",
+        "frontend/dist",
+    ],
+    data = [
+        "dist-paths.txt",
+        ":dist",
+    ],
+    out = "dist_paths.run",
+    target_compatible_with = HOST_ONLY,
+)
+
+# The build id in the shipped bytes. Which assertion holds depends on whether
+# the build stamps, so the mode comes off the same condition the bundler's
+# `--require-stamp` does. Under the default config that is the unstamped arm,
+# which is the one that proves the substitution runs at all.
+#
+# `main.js` is the only bundle whose module graph reaches `build-info.ts`, so it
+# is the only one where the substitution leaves a trace. `sw.js` and
+# `nav-on-message.js` are handed the same define and simply never use it, which
+# is an incidental property of their imports rather than something to pin.
+native_test(
+    name = "bundle_build_id",
+    size = "small",
+    src = "//bazel/frontend:build_id_check.sh",
+    args = select({
+        "//bazel/frontend:stamped": ["stamped"],
+        "//conditions:default": ["unstamped"],
+    }) + [
+        "$(rootpath :dist)",
+        "main.js",
+        "--",
+        # The surface bootstrap reads its id from the page meta tag, so it is
+        # built with no substitution at all and must never acquire one.
+        "surface.js",
+    ],
+    data = [":dist"],
+    out = "bundle_build_id.run",
+    target_compatible_with = HOST_ONLY,
+)
+
+# ---------------------------------------------------------------------------
+# vitest
+# ---------------------------------------------------------------------------
+# One test file reads two things from outside the frontend tree — the transpiled
+# processor the surface deploys and the transcript fixture it is checked
+# against — by resolving them against the directory above its working one. So
+# the working directory is a staged repo root holding them at the paths the test
+# already names, and no test learns that it is running under Bazel.
+#
+# It runs as its own target, because `//surface:dist` is downstream of every
+# surface crate, the wasm-bindgen CLI and the transpiler: carried by the whole
+# suite, any surface edit would rerun all 572 tests. Split, the wide closure
+# belongs to the three tests that need it and the main suite reruns on frontend
+# sources alone.
+
+copy_to_directory(
+    name = "vitest_root",
+    srcs = [":ts_src"],
+    replace_prefixes = {"frontend/ts_src": "frontend"},
+    # Nothing is stripped: every input keeps its workspace-relative path, which
+    # is what makes this a repo root rather than a flattened bag of files.
+    root_paths = [],
+    target_compatible_with = HOST_ONLY,
+)
+
+copy_to_directory(
+    name = "vitest_transplant_root",
+    srcs = [
+        "//brenn-wasm/components/processor-transplant:transplant.json",
+        "//surface:dist",
+        ":ts_src",
+    ],
+    replace_prefixes = {"frontend/ts_src": "frontend"},
+    root_paths = [],
+    target_compatible_with = HOST_ONLY,
+)
+
+TRANSPLANT_TEST = "src/processor-transplant.test.ts"
+
+vitest_bin.vitest_test(
+    name = "vitest",
+    size = "medium",
+    # The transplant file has no skip path — absent its tree it fails naming the
+    # command that builds it — so it is excluded here rather than left to bail.
+    args = [
+        "run",
+        "--exclude",
+        "**/" + TRANSPLANT_TEST,
+    ],
+    chdir = package_name() + "/vitest_root/frontend",
+    data = [
+        ":node_modules",
+        ":vitest_root",
+    ],
+    target_compatible_with = HOST_ONLY,
+)
+
+vitest_bin.vitest_test(
+    name = "vitest_transplant",
+    size = "medium",
+    args = [
+        "run",
+        TRANSPLANT_TEST,
+    ],
+    chdir = package_name() + "/vitest_transplant_root/frontend",
+    data = [
+        ":node_modules",
+        ":vitest_transplant_root",
+    ],
+    target_compatible_with = HOST_ONLY,
+)

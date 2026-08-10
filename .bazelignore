@@ -1,0 +1,27 @@
+# Directories Bazel never looks inside. Wildcards are not supported here, so
+# every path is spelled out; the list mirrors .gitignore's build-output and
+# vendored-dependency entries plus the convenience symlinks, which point into
+# the output base and would otherwise be globbed recursively.
+.git
+.bazel-bin
+.bazel-brenn
+.bazel-out
+.bazel-testlogs
+.rules_rust_analyzer
+.bazel-disk-cache
+target
+logs
+dev/grafdata
+frontend/dist
+frontend/node_modules
+surface/dist
+surface/node_modules
+e2e/node_modules
+e2e/test-results
+e2e/playwright-report
+e2e/blob-report
+brenn-wasm/target
+brenn-wasm/components/target
+# Symlinks into first-party crates the guest workspace shares with the host.
+# Following them would make a second copy of those packages.
+brenn-wasm/components/host-crates

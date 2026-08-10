@@ -1,0 +1,24 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/wasm:defs.bzl", "wasm_component", "wasm_guest_cdylib")
+
+policy_srcs()
+
+# The canonical transcript script, read by the host suite and by the surface
+# half so both drive the component from one source.
+exports_files(["transplant.json"])
+
+# Bindings come from the brenn-guest SDK's `generate!`; this crate names no
+# WIT of its own.
+wasm_guest_cdylib(
+    name = "brenn-processor-transplant",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//brenn-wasm/components/guest:brenn-guest",
+    ],
+)
+
+wasm_component(
+    name = "component",
+    module = ":brenn-processor-transplant",
+    visibility = ["//visibility:public"],
+)

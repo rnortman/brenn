@@ -5,6 +5,23 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_comparisons:
+        description: "Also run the cargo parity and uncached canary jobs (~3 runner-hours)"
+        type: boolean
+        default: false
+  # Each expression below is matched verbatim by the `if:` of the job it selects,
+  # and xtask's sync guard holds the two sets equal — an edit here alone leaves
+  # that job selecting a schedule that no longer fires, which is absence rather
+  # than failure and nothing else would notice.
+  schedule:
+    # The cargo comparison run. Daily, because a divergence between the two
+    # build systems is a stop-the-line bug and the window it can open in is one
+    # day of commits.
+    - cron: "17 5 * * *"
+    # The cache-soundness canary. Weekly, because what it catches does not
+    # change with the tree.
+    - cron: "43 6 * * 1"
 
 # Every job only reads the tree. Pinned here so a permissive repo-level default
 # cannot silently hand a write-capable token to cached actions, a downloaded
@@ -12,19 +29,99 @@ on:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   check:
     # This string is the required-check identifier the branch-protection ruleset
-    # keys on. Do not rename it or branch protection silently detaches.
+    # keys on. Do not rename it or branch protection silently detaches. It names
+    # what the gate covers, not how: fmt, clippy and the test suite are three of
+    # the invocations inside `make bazel-check`.
     name: check (fmt, clippy, test)
+    # The schedule triggers exist for the two comparison jobs below, each of
+    # which selects its own cron. This job gates changes, so a cron tick has
+    # nothing for it to gate: it would re-run the whole graph against a HEAD
+    # that already passed, and a red result would read as a broken main branch
+    # with no change behind it.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    # Cold, this fetches every toolchain and builds the whole graph twice over —
+    # the dev configuration for the gate, the release one for the package — and
+    # the second pass cross-compiles the binaries' closure for musl; warm, it is
+    # minutes. 120 bounds the cold case without flaking it.
+    timeout-minutes: 120
+    steps:
+      # TODO(fleet-sha-pin-actions): marketplace actions are tag-pinned. Tags are
+      # mutable, so this is looser than the sha256-pinned gitleaks download in
+      # the scrub job; converging to commit-SHA pins is tracked separately.
+      - uses: actions/checkout@v7
+
+      # The MQTT integration tests spawn their own broker, and mosquitto is the
+      # one system dependency the build graph does not vend. Rust, node, the
+      # three WASM CLIs and gitleaks are all hermetic toolchains behind
+      # bazelisk, which GitHub runners preinstall and which reads .bazelversion
+      # — so there is no toolchain install step here at all.
+      - name: Install mosquitto
+        run: sudo apt-get update && sudo apt-get install -y mosquitto
+
+      # --config=ci points the disk cache inside the workspace so actions/cache
+      # can carry it; the GC size cap is what keeps it inside the cache scope.
+      # Restore/save are split so a red run still banks the actions it did
+      # complete — a combined cache saves only on job success.
+      - name: Restore bazel disk cache
+        id: bazel-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .bazel-disk-cache
+          key: bazel-disk-${{ github.sha }}
+          restore-keys: bazel-disk-
+
+      - run: make bazel-check BAZEL_CONFIG=--config=ci
+
+      # Set equality between the policy scan's file set and the tracked tree, in
+      # both directions. Outside `bazel-check` because it cannot run in the
+      # sandbox — it needs git — and because every untracked file is a
+      # difference: signal on a fresh checkout, noise on a working tree.
+      - run: make bazel-policy-parity BAZEL_CONFIG=--config=ci
+
+      # The release lane, which `bazel test //...` above does not reach: it
+      # builds the package in the dev configuration, so the musl platform
+      # transition, the `select()` that picks the linkage assertion, and the
+      # assertion itself only run under --config=release-package. Without this
+      # step that machinery is first exercised by a deploy, where a wrong answer
+      # stops the service before it fails. The second verb is the path the
+      # deploying repo tars, checked to exist here rather than by that repo.
+      #
+      # Any build id stamps; the deploying repo supplies the real one.
+      - name: Release package
+        env:
+          BRENN_BUILD_ID: ci-${{ github.sha }}
+        run: |
+          make bazel-release BAZEL_CONFIG=--config=ci
+          make bazel-release-dir BAZEL_CONFIG=--config=ci
+
+      - name: Save bazel disk cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .bazel-disk-cache
+          key: bazel-disk-${{ github.sha }}
+
+  # The other half of the migration's parallel-run window, with the sides
+  # swapped: Bazel is the gate now and `make check-ci` runs on a schedule beside
+  # it. It is still what CD consumes until the deploy pipeline cuts over, and a
+  # divergence in verdict is a stop-the-line bug whichever side is wrong.
+  # Not a required check, so a red run here blocks no merges — but it is not
+  # `continue-on-error` either: that makes the *run* conclude success, which is
+  # what GitHub's failed-schedule notification keys on, and a comparison job
+  # whose failure notifies nobody compares nothing.
+  cargo-parity:
+    name: make check-ci (parallel run, advisory)
+    if: github.event.schedule == '17 5 * * *' || github.event.inputs.run_comparisons == 'true'
     runs-on: ubuntu-latest
     # brenn cold-cache compiles four cargo tools, the full workspace, all WASM
     # components, and three npm trees; 60 bounds a hang without flaking a cold run.
     timeout-minutes: 60
     env:
+      CARGO_TERM_COLOR: always
       # Incremental artifacts bloat rust-cache for no CI benefit.
       CARGO_INCREMENTAL: "0"
       # The graf git-dep fetch goes through the git CLI (git-fetch-with-cli); a
@@ -41,9 +138,6 @@ jobs:
       # Makefile serializes everything that shares state, so default overlap mode
       # cuts wall time. If OOM appears, set BRENN_CHECK_JOBS: "1".
     steps:
-      # TODO(fleet-sha-pin-actions): marketplace actions are tag-pinned. Tags are
-      # mutable, so this is looser than the sha256-pinned gitleaks download below;
-      # converging to commit-SHA pins is tracked separately.
       - uses: actions/checkout@v7
 
       # rust-toolchain.toml owns the channel, components, and targets; the bare
@@ -122,8 +216,33 @@ jobs:
       # which isn't installed here.
       - run: make check-ci
 
+  # Belt and braces against the residual class Bazel cannot see: an undeclared
+  # *system* input — the apt mosquitto, the kernel, the runner image. No cache
+  # is restored and no test result is reused, so this is a cold build and a full
+  # suite.
+  #
+  # Off by default on a manual dispatch: the ordinary reason to dispatch is to
+  # re-run the gate on a ref, and this job plus the cargo lane are ~3 runner-hours
+  # of advisory work between the operator and the gate's verdict.
+  cache-canary:
+    name: bazel (uncached canary)
+    if: github.event.schedule == '43 6 * * 1' || github.event.inputs.run_comparisons == 'true'
+    runs-on: ubuntu-latest
+    # Everything from scratch, twice over: no disk cache and no reused results.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install mosquitto
+        run: sudo apt-get update && sudo apt-get install -y mosquitto
+
+      - run: bazel test --config=ci --nocache_test_results //...
+
   scrub:
     name: scrub
+    # Same reasoning as `check`: the crons belong to the comparison jobs, and a
+    # full tree scan of an unchanged HEAD is minutes spent on nothing.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -137,6 +256,10 @@ jobs:
       # swapped binary reports whatever version it likes and then writes the
       # report that decides this job's verdict. The hash is the real gate; the
       # version check stays as a secondary sanity line.
+      #
+      # Both values are held equal to MODULE.bazel's pin for the same asset by
+      # xtask's sync guard: the tests that validate the wrapper and the scan that
+      # decides this verdict must run one binary.
       - name: Install gitleaks
         env:
           GITLEAKS_VERSION: 8.30.0

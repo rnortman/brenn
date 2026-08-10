@@ -9,5 +9,9 @@
   },
   "dependencies": {
     "@bytecodealliance/jco": "1.4.0"
+  },
+  "//pnpm": "No dependency in this tree has an install-time build step, so none is allowed one. rules_js refuses to translate a lockfile that leaves the question unanswered; npm ignores the key.",
+  "pnpm": {
+    "onlyBuiltDependencies": []
   }
 }

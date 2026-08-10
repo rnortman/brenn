@@ -1,0 +1,26 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# No dependencies at all, third-party or first-party, so no `all_crate_deps`
+# call: the crate has no entry in the hub to look up.
+rust_library(
+    name = "brenn-cal",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "brenn-cal_test",
+    crate = ":brenn-cal",
+    edition = "2024",
+)
+
+rust_doc_test(
+    name = "brenn-cal_doc_test",
+    crate = ":brenn-cal",
+)

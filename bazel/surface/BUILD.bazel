@@ -1,0 +1,12 @@
+"""Home of the surface browser-bundle macros, and the scripts they wrap."""
+
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+# Checked-in rather than generated text so `//bazel/surface/tests` can drive
+# them over fixtures. The rules only bind arguments.
+exports_files([
+    "merge_stages.sh",
+    "processor_stage.sh",
+])

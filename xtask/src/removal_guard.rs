@@ -165,29 +165,12 @@ fn is_scannable(rel: &Path) -> bool {
     by_ext || by_name
 }
 
-/// Tracked source files worth scanning, repo-root-relative.
-///
-/// The file set is git's, so build output, untracked scratch files, and
-/// anything `.gitignore` covers are outside the scan by construction.
-fn collect(root: &Path) -> Vec<PathBuf> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files", "-z"])
-        .output()
-        .unwrap_or_else(|e| panic!("removal guard: cannot run git ls-files: {e}"));
-    assert!(
-        out.status.success(),
-        "removal guard: git ls-files failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let listing = String::from_utf8(out.stdout)
-        .unwrap_or_else(|e| panic!("removal guard: git ls-files output is not UTF-8: {e}"));
-    listing
-        .split('\0')
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+/// The scannable subset of the caller's file set, repo-root-relative.
+fn collect(files: &[PathBuf]) -> Vec<PathBuf> {
+    files
+        .iter()
         .filter(|rel| is_scannable(rel))
+        .cloned()
         .collect()
 }
 
@@ -217,8 +200,6 @@ fn contains_token(line: &str, token: &str) -> bool {
     false
 }
 
-/// Scan one file's text. Pure: no I/O, no tree walk — the matching half of the
-/// guard, testable with synthetic inputs.
 fn scan_text(rel: &Path, text: &str) -> Vec<String> {
     let mut found = Vec::new();
     let is_test = is_test_source(rel);
@@ -245,11 +226,9 @@ fn scan_text(rel: &Path, text: &str) -> Vec<String> {
     found
 }
 
-/// Scan the tree; return one line per surviving occurrence.
-pub fn violations(root: &Path) -> Vec<String> {
-    let files = collect(root);
+fn violations(root: &Path, files: &[PathBuf]) -> Vec<String> {
     let mut found = Vec::new();
-    for rel in &files {
+    for rel in files {
         let text = match std::fs::read_to_string(root.join(rel)) {
             Ok(t) => t,
             // Non-UTF8 source is not source we condemn vocabulary in. Every
@@ -262,16 +241,11 @@ pub fn violations(root: &Path) -> Vec<String> {
     found
 }
 
-/// Run the guard as a check lane. Prints violations; returns pass/fail.
-///
-/// This is a lane of `xtask check`, not a `#[cfg(test)]` assertion: its input is
-/// the whole tracked tree, which is not part of any test binary's input closure,
-/// so the test runner's binary-hash pass cache would replay a stale pass for
-/// exactly the edits the guard exists to catch.
-pub fn run_removal_guard(root: &Path) -> bool {
-    let found = violations(root);
-    let files = collect(root);
-    if files.len() < 200 {
+/// True if no condemned vocabulary survives in the given files.
+pub fn run_removal_guard(root: &Path, files: &[PathBuf]) -> bool {
+    let files = collect(files);
+    let found = violations(root, &files);
+    if files.len() < crate::file_set::MIN_SCANNED_FILES {
         // A guard that walks an empty file set passes vacuously forever.
         eprintln!(
             "removal guard: scanned only {} files — the walk or the exclusion \
@@ -296,6 +270,19 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    /// The anti-vacuity floor is the only thing standing between a collapsed
+    /// file set and a green guard, and a collapsed file set produces no other
+    /// signal. An inverted comparison here would disable the protection
+    /// silently, so the floor is exercised directly.
+    #[test]
+    fn a_collapsed_file_set_fails_rather_than_passing_over_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("b.ts"), "export const b = 1;\n").unwrap();
+        assert!(!run_removal_guard(root, &[p("a.rs"), p("b.ts")]));
     }
 
     #[test]
@@ -356,19 +343,5 @@ mod tests {
         assert!(is_test_source(&p("e2e/tests/bar.spec.ts")));
         assert!(!is_test_source(&p("surface/kernel/src/latests.rs")));
         assert!(!is_test_source(&p("brenn-lib/src/protests/mod.rs")));
-    }
-
-    #[test]
-    fn condemned_vocabulary_is_absent_from_live_source() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("xtask has a parent directory")
-            .to_path_buf();
-        let found = violations(&root);
-        assert!(
-            found.is_empty(),
-            "removal guard: condemned vocabulary survives in live source:\n{}",
-            found.join("\n")
-        );
     }
 }

@@ -1,0 +1,38 @@
+load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# Shared by every surface suite on both sides. The browser half is cfg-gated
+# and its deps come from the hub's wasm32 arm.
+rust_library(
+    name = "test-fixtures",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "brenn_surface_test_fixtures",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-envelope",
+        "//surface/contract",
+    ],
+)
+
+rust_test(
+    name = "test-fixtures_test",
+    crate = ":test-fixtures",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    target_compatible_with = HOST_ONLY,
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "test-fixtures_doc_test",
+    crate = ":test-fixtures",
+    target_compatible_with = HOST_ONLY,
+)

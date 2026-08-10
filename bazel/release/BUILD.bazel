@@ -1,0 +1,32 @@
+"""The release packaging rule, its gate script, and the linkage flag."""
+
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+exports_files([
+    "assemble.sh",
+    "package_check.sh",
+])
+
+# Whether the packaged binaries are built static against musl. Off by default,
+# so a dev build of the release tree reuses the host binaries the rest of the
+# graph already built and the packaging logic stays cheap enough to gate on
+# every `bazel test //...`. `--config=release-package` turns it on.
+#
+# A flag rather than a `--platforms` on the command line, because only the
+# binaries are architecture-specific: requesting the whole package under the
+# musl platform would make the browser bundles and every host-side gate
+# incompatible with the build.
+bool_flag(
+    name = "static_musl",
+    build_setting_default = False,
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "musl_binaries",
+    flag_values = {":static_musl": "True"},
+    visibility = ["//visibility:public"],
+)

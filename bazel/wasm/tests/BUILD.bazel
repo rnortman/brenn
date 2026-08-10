@@ -1,0 +1,56 @@
+"""Self-tests for the component gate scripts.
+
+A gate that passes over every real input still says nothing about whether it can
+fail. These drive the same scripts the rules run, over fixtures built to be
+rejected.
+"""
+
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+
+policy_srcs()
+
+# The gates are host-side; requesting the guest tree under the wasm32 platform
+# would otherwise pull them in with no shell toolchain to run them.
+HOST_ONLY = select({
+    "//bazel/platforms:is_wasm32": ["@platforms//:incompatible"],
+    "//conditions:default": [],
+})
+
+native_test(
+    name = "wasi_import_check_test",
+    size = "small",
+    src = "wasi_import_check_test.sh",
+    args = ["$(rootpath //bazel/wasm:wasi_import_check.sh)"],
+    data = ["//bazel/wasm:wasi_import_check.sh"],
+    out = "wasi_import_check_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
+native_test(
+    name = "deployed_components_check_test",
+    size = "small",
+    src = "deployed_components_check_test.sh",
+    args = [
+        "$(rootpath //bazel/wasm:manifest_names.sh)",
+        "$(rootpath //bazel/wasm:deployed_components_check.sh)",
+    ],
+    data = [
+        "//bazel/wasm:deployed_components_check.sh",
+        "//bazel/wasm:manifest_names.sh",
+    ],
+    out = "deployed_components_check_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
+# The manifest grammar has one implementation and three callers, so its edge
+# cases are asserted here rather than in each gate.
+native_test(
+    name = "manifest_names_test",
+    size = "small",
+    src = "manifest_names_test.sh",
+    args = ["$(rootpath //bazel/wasm:manifest_names.sh)"],
+    data = ["//bazel/wasm:manifest_names.sh"],
+    out = "manifest_names_test.run",
+    target_compatible_with = HOST_ONLY,
+)

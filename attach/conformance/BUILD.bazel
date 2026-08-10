@@ -1,0 +1,29 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# The dependency set is the assertion: the attachment protocol, the
+# attacher-generic client, and the bus envelope, and nothing from the surface
+# tree. A surface concept leaking into the client fails to compile here.
+rust_library(
+    name = "conformance",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "brenn_attach_conformance",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//attach/client",
+        "//attach/proto",
+        "//brenn-envelope",
+    ],
+)
+
+rust_doc_test(
+    name = "conformance_doc_test",
+    crate = ":conformance",
+)

@@ -1,0 +1,34 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# `testutils` gates test-only helpers downstream test targets link against; the
+# release configs clear the flag so the shipped binary does not carry them.
+rust_library(
+    name = "brenn-cc",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + ["//brenn-lib"],
+)
+
+rust_test(
+    name = "brenn-cc_test",
+    crate = ":brenn-cc",
+    crate_features = ["testutils"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "brenn-cc_doc_test",
+    crate = ":brenn-cc",
+)

@@ -1,0 +1,61 @@
+"""The deploy tarball's staged tree.
+
+Which binaries, which asset trees, and which components ship is decided here,
+under gates. `VERSION` and `deploy.sh` are deliberately absent — the consumer
+adds them before archiving.
+
+Build with `--config=release-package` (or `make bazel-release`): release
+semantics plus the musl transition on the binaries.
+"""
+
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/release:defs.bzl", "release_package")
+
+policy_srcs()
+
+release_package(
+    name = "release_package",
+    binaries = [
+        "//brenn",
+        "//brenn-cli",
+    ],
+    # Every component in the tree is offered; `deployed-components.txt` decides
+    # which of them ship. Passing the deployed subset here instead would make
+    # the manifest a second list to keep in step with this one, and the drift
+    # would ship a component nobody listed or drop one everybody expects.
+    components = ["//brenn-wasm:components"],
+    frontend = "//frontend:dist",
+    lib_files = ["//:noop_mcp.py"],
+    manifest = "//brenn-wasm:deployed-components.txt",
+    surface = "//surface:dist",
+    visibility = ["//visibility:public"],
+)
+
+# The two served trees, again, against the same lists their own `dist_paths`
+# tests use. `//frontend:dist_paths` says the tree is right; this says the
+# tarball carries all of it. A `root_paths` mistake or a truncated copy sits
+# between the two and shows up on neither without this.
+[
+    native_test(
+        name = "release_package_" + tree + "_paths",
+        size = "small",
+        src = "//bazel/dist:path_set_check.sh",
+        args = [
+            "$(rootpath :release_package)/" + tree,
+            "$(rootpath %s)" % expected,
+            "release_package/" + tree,
+        ],
+        data = [
+            expected,
+            ":release_package",
+        ],
+        out = "release_package_{}_paths.run".format(tree),
+        target_compatible_with = HOST_ONLY,
+    )
+    for tree, expected in [
+        ("frontend", "//frontend:dist-paths.txt"),
+        ("surface", "//surface:dist-paths.txt"),
+    ]
+]

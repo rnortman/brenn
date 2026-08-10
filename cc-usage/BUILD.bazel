@@ -1,0 +1,49 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "cc-usage",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "cc-usage_test",
+    crate = ":cc-usage",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+# The suite joins `CARGO_MANIFEST_DIR` with `tests/fixtures`. The
+# workspace-relative form resolves from the runfiles root, which is where a
+# Bazel test starts, so the fixture tree has to be a declared runfile.
+rust_test(
+    name = "end_to_end",
+    srcs = ["tests/end_to_end.rs"],
+    crate_root = "tests/end_to_end.rs",
+    data = glob(["tests/fixtures/**"]),
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    rustc_env = {"CARGO_MANIFEST_DIR": "cc-usage"},
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [":cc-usage"],
+)
+
+rust_doc_test(
+    name = "cc-usage_doc_test",
+    crate = ":cc-usage",
+)

@@ -3,9 +3,6 @@
 # the WIT config round-trip through ProcessorComponent::handle.
 # Directive-driven for get/get_parsed/require testing.
 # Not listed in brenn-wasm/deployed-components.txt.
-# This crate is intentionally not a workspace member:
-# it targets wasm32-unknown-unknown and must be built with cargo + wasm-tools.
-[workspace]
 
 [package]
 name = "brenn-processor-config"
@@ -17,5 +14,5 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-brenn-guest = { path = "../../guest" }
+brenn-guest = { path = "../guest" }
 serde_json = "1"

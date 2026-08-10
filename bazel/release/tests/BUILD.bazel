@@ -1,0 +1,34 @@
+"""Self-tests for the release packaging scripts.
+
+Both scripts run once per release over inputs that are correct, so neither run
+proves the script can fail. These drive the same two scripts over fixtures
+built to be rejected.
+"""
+
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+[
+    native_test(
+        name = script + "_test",
+        size = "small",
+        src = script + "_test.sh",
+        args = [
+            "$(rootpath //bazel/wasm:manifest_names.sh)",
+            "$(rootpath //bazel/release:%s.sh)" % script,
+        ],
+        data = [
+            "//bazel/release:%s.sh" % script,
+            "//bazel/wasm:manifest_names.sh",
+        ],
+        out = script + "_test.run",
+        target_compatible_with = HOST_ONLY,
+    )
+    for script in [
+        "assemble",
+        "package_check",
+    ]
+]

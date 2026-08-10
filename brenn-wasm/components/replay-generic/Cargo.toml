@@ -2,9 +2,6 @@
 # Derives dedup identity from the x-brenn-push-signature header; body is never parsed.
 # Implements brenn:replay@0.1.0 — loadable via the existing replay_protection config.
 #
-# This crate is intentionally not a workspace member (targets wasm32-unknown-unknown,
-# built via the pinned `wit-bindgen-cli` + plain `cargo build` + `wasm-tools component new`).
-[workspace]
 
 [package]
 name = "brenn-replay-generic"

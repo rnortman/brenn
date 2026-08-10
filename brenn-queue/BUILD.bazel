@@ -1,0 +1,24 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "brenn-queue",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "brenn-queue_test",
+    crate = ":brenn-queue",
+    edition = "2024",
+)
+
+rust_doc_test(
+    name = "brenn-queue_doc_test",
+    crate = ":brenn-queue",
+)

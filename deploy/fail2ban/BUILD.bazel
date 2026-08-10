@@ -1,0 +1,7 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+# The deployed fail2ban regex, read by brenn-lib's security-log test so the two
+# sides of that coupling cannot drift.
+exports_files(["brenn.conf"])

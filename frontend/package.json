@@ -9,7 +9,9 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
+  "//@types/node": "The three test files that reach for node built-ins type-check against these. npm's flat layout hoisted them out of vitest's own dependencies; pnpm's does not, and a type dependency the sources name is a direct one either way.",
   "devDependencies": {
+    "@types/node": "^25.6.0",
     "esbuild": "^0.28.1",
     "fake-indexeddb": "^6.2.5",
     "happy-dom": "^20.9.0",
@@ -18,5 +20,11 @@
   },
   "dependencies": {
     "lit": "^3.3.2"
+  },
+  "//pnpm": "esbuild is the one dependency here with an install-time build step, and the bundler is run from this tree, so it is the one allowed to have it. rules_js refuses to translate a lockfile that leaves the question unanswered; npm ignores the key.",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }

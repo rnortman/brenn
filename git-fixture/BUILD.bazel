@@ -1,0 +1,33 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "git-fixture",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)
+
+# The fixtures spawn the system `git`, which the sandbox does not vend; the
+# crate's own escape canary is what these assert, so the binary has to be the
+# real one.
+rust_test(
+    name = "git-fixture_test",
+    crate = ":git-fixture",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    tags = ["requires-git"],
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "git-fixture_doc_test",
+    crate = ":git-fixture",
+)

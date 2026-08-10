@@ -1,0 +1,22 @@
+"""Self-test for the bundle build-id gate.
+
+The gate passes over the real bundles on every run, which says nothing about
+whether it can fail. This drives the same script `//frontend:bundle_build_id`
+runs, over fixtures built to be rejected.
+"""
+
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+native_test(
+    name = "build_id_check_test",
+    size = "small",
+    src = "build_id_check_test.sh",
+    args = ["$(rootpath //bazel/frontend:build_id_check.sh)"],
+    data = ["//bazel/frontend:build_id_check.sh"],
+    out = "build_id_check_test.run",
+    target_compatible_with = HOST_ONLY,
+)

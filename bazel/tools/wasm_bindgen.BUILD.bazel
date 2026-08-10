@@ -1,0 +1,6 @@
+"""Build file for an unpacked wasm-bindgen release archive."""
+
+exports_files([
+    "wasm-bindgen",
+    "wasm-bindgen-test-runner",
+])

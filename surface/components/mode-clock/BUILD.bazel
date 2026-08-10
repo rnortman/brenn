@@ -1,0 +1,15 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/surface:defs.bzl", "surface_component")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+surface_component(
+    deps = [
+        "//surface/component-support",
+        "//surface/contract",
+        "//surface/schema",
+    ],
+    test_deps = ["//surface/test-fixtures"],
+)

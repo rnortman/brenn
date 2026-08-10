@@ -1,0 +1,14 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/wasm:defs.bzl", "wasm_guest_library")
+
+policy_srcs()
+
+# The guest-side SDK. Every Family B component links this rlib, which owns the
+# `brenn:processor` bindings; `wit_bindgen::generate!` reads the WIT world at
+# macro-expansion time, so it is compile_data rather than a generated source.
+wasm_guest_library(
+    name = "brenn-guest",
+    compile_data = ["//brenn-wasm:wit"],
+    visibility = ["//visibility:public"],
+    deps = ["//brenn-envelope:brenn-envelope_wasm"],
+)

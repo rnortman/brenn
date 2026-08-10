@@ -1,0 +1,26 @@
+# Every file `//frontend:dist` serves, one tree-relative path per line.
+#
+# Checked against the built tree by `//frontend:dist_paths`. Adding or removing
+# an asset is meant to cost an edit here: a dropped `srcs` entry is otherwise a
+# green build and a 404 on the deploy target.
+app.css
+file-view-copy.js
+icon-192.png
+icon-512.png
+main.js
+main.js.map
+manifest.webmanifest
+nav-on-message.js
+skins/bench.css
+skins/fonts/b612-400.woff2
+skins/fonts/b612-700.woff2
+skins/fonts/b612mono-400.woff2
+skins/fonts/b612mono-700.woff2
+skins/fonts/chivo-400.woff2
+skins/fonts/silkscreen-400.woff2
+skins/fonts/silkscreen-700.woff2
+skins/foundry.css
+surface.css
+surface.js
+surface.js.map
+sw.js

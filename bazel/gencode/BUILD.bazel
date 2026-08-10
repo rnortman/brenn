@@ -1,0 +1,11 @@
+"""The gencode rules' scripts, exported so the rules and their tests share them."""
+
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+exports_files([
+    "parity_check.sh",
+    "tree_parity_check.sh",
+    "ts_rs_export.sh",
+])

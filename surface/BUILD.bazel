@@ -1,0 +1,107 @@
+"""The surface asset tree: the npm toolchain, and `dist` itself."""
+
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("@surface_npm//:defs.bzl", "npm_link_all_packages")
+load("@surface_npm//surface:@bytecodealliance/jco/package_json.bzl", jco_bin = "bin")
+load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/surface:dist.bzl", "surface_dist", "surface_processor_assets")
+
+policy_srcs()
+
+exports_files([
+    # Also read by the release package's own copy of this tree.
+    "dist-paths.txt",
+    "emit-processor-manifest.sh",
+    "pnpm-lock.yaml",
+])
+
+npm_link_all_packages(name = "node_modules")
+
+# The transpiler, from the lockfile: no `npx`, no `node_modules` on anyone's
+# disk, and no preflight comparing an installed version against a pin, because
+# the pin is what runs.
+jco_bin.jco_binary(
+    name = "jco",
+    target_compatible_with = HOST_ONLY,
+    visibility = ["//visibility:public"],
+)
+
+# The version each manifest records. Derived from the same `package.json` pin
+# both lockfiles resolve, so a manifest cannot claim a version nothing ran.
+#
+# A regex over JSON matches any line carrying the needle, and this file already
+# carries comment keys, so the match count is checked: a second line would
+# otherwise put two versions in every processor manifest, past a non-empty test.
+genrule(
+    name = "jco_version",
+    srcs = ["package.json"],
+    outs = ["jco_version.txt"],
+    target_compatible_with = HOST_ONLY,
+    cmd = """set -eu
+matched=$$(sed -n 's/.*"@bytecodealliance\\/jco": "\\(.*\\)".*/\\1/p' $<)
+count=$$(printf '%s' "$$matched" | grep -c '' || true)
+if [ "$$count" -ne 1 ]; then
+    echo "expected exactly one @bytecodealliance/jco pin in $<, matched $$count line(s)" >&2
+    exit 1
+fi
+printf '%s' "$$matched" > $@
+""",
+)
+
+# Kinds whose component artifacts are transpiled for browser hosting. An
+# explicit list, not a wildcard and not a read of server config: making a
+# processor surface-hostable is a deliberate addition.
+surface_processor_assets(
+    name = "processor-transplant",
+    component = "//brenn-wasm/components/processor-transplant:component",
+    jco_version = ":jco_version",
+    kind = "processor-transplant",
+)
+
+# Derived, not retyped. `surface_component()` mints `<kind>_dist` in every
+# component package, and a hand-written list here is a second edit a mechanical
+# component addition would not know to make — the component would build, lint
+# and test green while its `.js`, `.wasm` and `help.md` never reached the served
+# tree. Enumerating the subpackages makes that unreachable, and matches the make
+# lane, which globs `components/*/Cargo.toml`.
+_COMPONENT_STAGES = [
+    "//surface/{pkg}:{kind}_dist".format(pkg = pkg, kind = pkg.rpartition("/")[2])
+    for pkg in subpackages(include = ["components/*"])
+]
+
+# The two crates that are not under `components/`: the in-tree default chrome,
+# and the shell, which is not a component at all.
+_FIXED_STAGES = [
+    "//surface/chrome:chrome_dist",
+    "//surface/kernel:kernel_dist",
+]
+
+surface_dist(
+    name = "dist",
+    dirname = "dist",
+    target_compatible_with = HOST_ONLY,
+    stages = [":processor-transplant"] + _FIXED_STAGES + _COMPONENT_STAGES,
+    visibility = ["//visibility:public"],
+)
+
+# Nothing else reads this tree's top-level file set. The transplant parity pin
+# reads one processor directory and the vitest transplant suite reads the
+# transpiled modules; a bundle, a sidecar or a whole component could vanish from
+# `dist` with every other target green.
+native_test(
+    name = "dist_paths",
+    size = "small",
+    src = "//bazel/dist:path_set_check.sh",
+    args = [
+        "$(rootpath :dist)",
+        "$(rootpath dist-paths.txt)",
+        "surface/dist",
+    ],
+    data = [
+        "dist-paths.txt",
+        ":dist",
+    ],
+    out = "dist_paths.run",
+    target_compatible_with = HOST_ONLY,
+)

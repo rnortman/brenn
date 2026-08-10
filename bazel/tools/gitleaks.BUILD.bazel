@@ -1,0 +1,3 @@
+"""Build file for an unpacked gitleaks release archive."""
+
+exports_files(["gitleaks"])

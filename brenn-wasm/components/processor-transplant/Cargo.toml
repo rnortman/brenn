@@ -9,9 +9,6 @@
 # Import profile is deliberately the transpilable one: ports + log + config.
 # No store/mqtt/tools — those would make it backend-only.
 # Not listed in brenn-wasm/deployed-components.txt.
-# This crate is intentionally not a workspace member:
-# it targets wasm32-unknown-unknown and must be built with cargo + wasm-tools.
-[workspace]
 
 [package]
 name = "brenn-processor-transplant"
@@ -23,6 +20,6 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-brenn-guest = { path = "../../guest" }
+brenn-guest = { path = "../guest" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

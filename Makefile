@@ -1,4 +1,4 @@
-.PHONY: setup-hooks scrub-selfcheck scrub-tree check check-common check-ci xtask-check xtask-deny build release release-musl fmt clippy test test-ts test-py tsc types regen-surface-help frontend frontend-css wasm-components clean launchdev stopdev check-wasm-bindings check-wasi-check-liveness check-brenn-guest wasm-toolchain-install surface-wasm-check surface-wasm surface-wasm-test surface-sidecar-prune wasm-bindgen-preflight jco-preflight surface-transpile npm-audit node-deps e2e build-id-leaf-gate
+.PHONY: setup-hooks scrub-selfcheck scrub-tree check check-common check-ci bazel-check bazel-release bazel-release-dir bazel-policy-parity xtask-check xtask-deny build release release-musl fmt clippy test test-ts test-py tsc types regen-surface-help frontend frontend-css wasm-components clean launchdev stopdev check-wasm-bindings check-wasi-check-liveness check-brenn-guest wasm-toolchain-install surface-wasm-check surface-wasm surface-wasm-test surface-sidecar-prune wasm-bindgen-preflight jco-preflight surface-transpile npm-audit node-deps e2e
 # Delete partially-written targets on recipe failure. Without this, a failing
 # WASI-import check (or any other recipe error) leaves the target file with a
 # fresh mtime, causing subsequent incremental builds to skip the gate entirely.
@@ -92,8 +92,8 @@ wasm-toolchain-install:
 # Adding a new raw-bindings fixture: add to WASM_RAW_SRCS + WASM_COMPONENT_OUTS
 #   + an eval wasm_component_rule call below.
 # Adding a new brenn-guest fixture: add to WASM_GUEST_SRCS + WASM_COMPONENT_OUTS
-#   + an eval wasm_guest_component_rule call below.
-# clean derives from WASM_RAW_SRCS + WASM_GUEST_SRCS combined.
+#   + an eval wasm_guest_component_rule call below, plus a `members` line in
+#   brenn-wasm/components/Cargo.toml.
 WASM_RAW_SRCS := \
     $(WASM_REPLAY_SRC) \
     $(WASM_FAULT_SRC) \
@@ -113,9 +113,6 @@ WASM_GUEST_SRCS := \
     $(WASM_PROCESSOR_TRANSPLANT_SRC) \
     $(WASM_GIT_FORGE_PARSER_SRC) \
     $(WASM_GIT_SYNC_CONSUMER_SRC)
-
-# Combined source list for clean target.
-WASM_COMPONENT_SRCS := $(WASM_RAW_SRCS) $(WASM_GUEST_SRCS)
 
 WASM_COMPONENT_OUTS := \
     $(WASM_REPLAY_OUT) \
@@ -166,6 +163,9 @@ export BRENN_BUILD_ID
 # inner $(MAKE) <step> calls via MAKEFLAGS, so sub-targets go verbose too.
 Q := $(if $(V),,-q)
 
+# Extra flags for every `bazel-check` invocation. CI sets --config=ci.
+BAZEL_CONFIG ?=
+
 # Full pre-commit check suite. Runs each step in sequence; in quiet mode each
 # step's output is buffered and only printed if that step fails (large dumps are
 # then persisted by the agent harness anyway). Steps stay independently
@@ -181,6 +181,67 @@ xtask-check: wasm-components
 
 xtask-deny:
 	cargo run -p xtask -- deny
+
+# The Bazel gate, run alongside `make check` rather than inside it.
+#
+# `make check` is authoritative until the CI cutover; this is the other side of
+# the parallel-run window. It is a separate verb because the two gates share no
+# state and neither should wait on the other, and because the Bazel side needs
+# no cargo tool installed at all.
+#
+# CI passes BAZEL_CONFIG=--config=ci; locally the defaults in .bazelrc apply.
+#
+# Five invocations, not one: `bazel test` covers the test targets, and the
+# clippy/rustfmt aspects are build configs that only apply to top-level targets
+# — both wasm trees are reached through a platform transition (the component
+# rule's, the wasm-bindgen rule's), so clippy needs a request under the wasm32
+# platform for each of them. Together those two are what `surface-wasm-check`
+# and `check-brenn-guest` cover on the cargo side.
+bazel-check:
+	bazel test $(BAZEL_CONFIG) //...
+	bazel build $(BAZEL_CONFIG) --config=clippy //...
+	bazel build $(BAZEL_CONFIG) --config=clippy --platforms=//bazel/platforms:wasm32 //brenn-wasm/components/...
+	bazel build $(BAZEL_CONFIG) --config=clippy --platforms=//bazel/platforms:wasm32 //surface/...
+	bazel build $(BAZEL_CONFIG) --config=rustfmt //...
+
+# The deploy tarball's staged tree, and the gates on it.
+#
+# Needs BRENN_BUILD_ID: the release config stamps, and the workspace status
+# command refuses to emit an unidentifiable build.
+bazel-release:
+	bazel build $(BAZEL_CONFIG) --config=release-package //deploy:release_package
+	bazel test $(BAZEL_CONFIG) --config=release-package //deploy:all
+
+# Prints the absolute path of the tree `bazel-release` staged, and nothing else,
+# so the deploying repo can tar it. Derived rather than spelled out: the
+# configuration segment of an output path is Bazel's to choose, and the
+# convenience symlinks point at whichever configuration built last — a lane that
+# also runs `bazel-check` would find a dev-configuration package there.
+#
+# Fail-closed, because the consumer tars whatever this prints. A command
+# substitution that fails inside a `printf` leaves the enclosing recipe exiting
+# 0 with a truncated path — `/` or the bare execroot, which exists and holds the
+# mirrored source tree, so the tar step would succeed and ship a tarball with no
+# bin/.
+bazel-release-dir:
+	@set -e; \
+	root=$$(bazel info $(BAZEL_CONFIG) --config=release-package execution_root); \
+	rel=$$(bazel cquery $(BAZEL_CONFIG) --config=release-package --output=files //deploy:release_package); \
+	test -n "$$root" || { echo "bazel info printed no execution_root" >&2; exit 1; }; \
+	test -n "$$rel" || { echo "bazel cquery printed no output path for //deploy:release_package" >&2; exit 1; }; \
+	test -d "$$root/$$rel" || { echo "$$root/$$rel is not a directory; run bazel-release first" >&2; exit 1; }; \
+	printf '%s/%s\n' "$$root" "$$rel"
+
+# The policy scan's file set against the tracked tree, in both directions.
+#
+# Not a lane of `bazel-check`, and deliberately: the Bazel side is a filesystem
+# glob, so every untracked scratch file in a working tree is a difference. On a
+# clean checkout — CI's tree — that is exactly the signal wanted, which is where
+# this runs. Two invocations because the comparison needs the manifest built
+# first and then a binary run against it with the workspace still in view.
+bazel-policy-parity:
+	bazel build $(BAZEL_CONFIG) //:policy_manifest
+	bazel run $(BAZEL_CONFIG) //xtask -- policy-parity --root $(CURDIR) --manifest $(CURDIR)/.bazel-bin/policy_manifest.txt
 
 # Check steps split by whether they contend for the cargo build-dir lock.
 # CARGO_CHECK_STEPS share the root target/ (must run serially, in order). The
@@ -199,8 +260,13 @@ xtask-deny:
 #     that the `test` step rewrites. Running them concurrently with `test` races
 #     that rewrite (stale-but-green type-check, or a mid-write parse error), so
 #     they run only after the cargo lane finishes and the generated types settle.
+# TODO(bazel-teardown): these cargo lanes, the xtask machinery behind them, and
+# every committed generated file they gate come out once a Bazel-built release
+# has run clean in production. Until then they are the rollback path and the
+# other side of the scheduled comparison run: nothing to re-point at is left if
+# they go before a real deploy has exercised the Bazel-built artifact.
 CARGO_CHECK_STEPS := fmt xtask-check surface-wasm-check test
-NONCARGO_PARALLEL_STEPS := test-py npm-audit build-id-leaf-gate scrub-selfcheck
+NONCARGO_PARALLEL_STEPS := test-py npm-audit scrub-selfcheck
 NONCARGO_AFTER_STEPS := test-ts tsc
 NONCARGO_CHECK_STEPS := $(NONCARGO_PARALLEL_STEPS) $(NONCARGO_AFTER_STEPS)
 
@@ -316,34 +382,6 @@ check: check-common
 	    rm -f "$$tmp"; \
 	fi; \
 	echo "check: all steps passed ($(CARGO_CHECK_STEPS) $(NONCARGO_CHECK_STEPS) xtask-deny)"
-
-# Guard the crate split: only the thin brenn bin crate may reference
-# BRENN_BUILD_ID. The whole point of the thin-brenn / brenn-server split is that
-# the heavily tested library — and every crate it depends on — does not vary
-# with the build id, so their test binaries stay cache hits across commits. A
-# stray env!/option_env!/std::env::var or a reintroduced build.rs directive in
-# any crate below brenn (brenn-lib, the const's historical home, is the most
-# likely habit-driven reintroduction point) would silently evaporate that win
-# with no compile error or test failure — only make check drifting back to ~45s
-# (worse the deeper the crate). This turns that regression into a hard failure.
-# Scoped to the whole tree minus the brenn/ bin crate (its build.rs and
-# build_info.rs legitimately bake the value in).
-build-id-leaf-gate:
-	@if [ ! -d brenn-server ]; then \
-	    echo "ERROR: build-id-leaf-gate could not run: brenn-server/ not found."; \
-	    exit 1; \
-	fi; \
-	grep -rn --include='*.rs' --include='*.toml' \
-	    --exclude-dir=target --exclude-dir=node_modules --exclude-dir=brenn \
-	    'BRENN_BUILD_ID' .; \
-	status=$$?; \
-	if [ "$$status" -eq 0 ]; then \
-	    echo "ERROR: only the brenn bin crate may reference BRENN_BUILD_ID (see thin-brenn crate split)."; \
-	    exit 1; \
-	elif [ "$$status" -ne 1 ]; then \
-	    echo "ERROR: build-id-leaf-gate could not run (grep exit $$status)."; \
-	    exit 1; \
-	fi
 
 # Build everything (Rust + TypeScript, including type generation).
 build: types frontend wasm-components surface-wasm
@@ -812,7 +850,7 @@ endef
 # these crates automatically dirty the artifact — no stale WASM after source splits.
 define wasm_guest_component_rule
 $(2): $(wildcard $(1)/src/*.rs) $(1)/Cargo.toml \
-      $(wildcard brenn-wasm/guest/src/*.rs) brenn-wasm/guest/Cargo.toml \
+      $(wildcard brenn-wasm/components/guest/src/*.rs) brenn-wasm/components/guest/Cargo.toml \
       $(wildcard brenn-envelope/src/*.rs) brenn-envelope/Cargo.toml \
       brenn-wasm/wit/processor.wit
 	mkdir -p $$(dir $(2))
@@ -878,17 +916,17 @@ check-wasi-check-liveness:
 	fi; \
 	[ "$$ok" -eq 1 ]
 
-# Clippy for brenn-guest (wasm32-unknown-unknown target only — this crate
-# is outside the main workspace and is not covered by the workspace `make clippy`).
-# Uses the shared CARGO_TARGET_DIR so dependency compilation is warm after a full build.
+# Clippy for the whole wasm32 guest workspace (brenn-guest SDK + every component
+# crate). That workspace is separate from the root one, so the workspace `make
+# clippy` does not reach it. Its target dir is WASM_COMPONENTS_TARGET, so
+# dependency compilation is warm after a full build.
 # Note: `cargo check` is a strict subset of `cargo clippy`; no separate check step needed.
 check-brenn-guest:
-	cd brenn-wasm/guest && CARGO_TARGET_DIR=$(WASM_COMPONENTS_TARGET) cargo clippy --target wasm32-unknown-unknown -- -D warnings
+	cd brenn-wasm/components && CARGO_TARGET_DIR=$(WASM_COMPONENTS_TARGET) cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 
 clean:
 	cargo clean
 	rm -rf $(WASM_COMPONENTS_TARGET)
-	rm -rf $(addsuffix /target,$(WASM_COMPONENT_SRCS))
 	rm -rf brenn-wasm/target/components
 	rm -rf frontend/dist/main.js frontend/dist/main.js.map frontend/dist/app.css frontend/dist/sw.js frontend/dist/manifest.webmanifest frontend/dist/icon-*.png frontend/dist/surface.css frontend/dist/skins
 	rm -rf surface/dist

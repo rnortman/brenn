@@ -1,0 +1,57 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_binary(
+    name = "xtask",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)
+
+# The policy guards, over the whole repo as declared inputs.
+#
+# `--manifest` is the listing `//:policy_manifest` writes, and that target's
+# runfiles are the files it lists, at the paths it lists them under — so the
+# guards read them from the test's own working directory. A guard's verdict
+# therefore depends on nothing but files Bazel knows about, which is what makes
+# a cached pass mean what it says.
+native_test(
+    name = "policy_guards",
+    src = ":xtask",
+    args = [
+        "guard",
+        "--root",
+        ".",
+        "--manifest",
+        "policy_manifest.txt",
+    ],
+    data = ["//:policy_manifest"],
+    out = "policy_guards_test",
+    size = "small",
+)
+
+# The guards' own unit tests. Several read repo files through
+# CARGO_MANIFEST_DIR — the Makefile's sidecar-dir list, and the real crate tree
+# — so the whole source tree comes along as data and the variable takes its
+# workspace-relative form, which resolves against the runfiles root. The
+# file-set tests root fixture repos through `git-fixture`, which spawns the
+# system git.
+rust_test(
+    name = "xtask_test",
+    crate = ":xtask",
+    data = ["//:policy_manifest"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    rustc_env = {"CARGO_MANIFEST_DIR": "xtask"},
+    size = "small",
+    tags = ["requires-git"],
+    deps = all_crate_deps(normal_dev = True) + ["//git-fixture"],
+)

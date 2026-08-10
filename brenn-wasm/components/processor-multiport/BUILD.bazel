@@ -1,0 +1,20 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/wasm:defs.bzl", "wasm_component", "wasm_guest_cdylib")
+
+policy_srcs()
+
+# Bindings come from the brenn-guest SDK's `generate!`; this crate names no
+# WIT of its own.
+wasm_guest_cdylib(
+    name = "brenn-processor-multiport",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//brenn-wasm/components/guest:brenn-guest",
+    ],
+)
+
+wasm_component(
+    name = "component",
+    module = ":brenn-processor-multiport",
+    visibility = ["//visibility:public"],
+)

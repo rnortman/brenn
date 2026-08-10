@@ -1,6 +1,6 @@
 // `xtask check-wit`: WASI-free gate, bindings-drift gate, world-equivalence gate.
 
-use crate::discover::{Kind, discover_units};
+use crate::discover::{Family, wasm_crates};
 use crate::world_sig::{ItemSignature, WorldSignature, world_signature};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,7 +10,7 @@ use wit_parser::{Resolve, TypeOwner, WorldId, WorldItem, WorldKey};
 
 /// Run all WIT gates over all applicable units. Returns true if all pass.
 pub fn run_check_wit(repo_root: &Path) -> bool {
-    let units = discover_units(repo_root);
+    let crates = wasm_crates(repo_root);
     let mut ok = true;
 
     // Artifact base dir: brenn-wasm/target/components/ — the final output dir where
@@ -35,22 +35,27 @@ pub fn run_check_wit(repo_root: &Path) -> bool {
     // Makefile preflights guard component *rebuilds* only, so an up-to-date tree reaches
     // this lane with nothing having checked the binary: a wrong-version generator would
     // report spurious drift, and its fix-it hint would then plant wrong-generator bindings
-    // that the gate afterwards accepts. Assert once, before any unit runs. Unconditional —
-    // Family A units always exist in-tree, so the lane always needs the binary.
+    // that the gate afterwards accepts. Assert once, before any crate runs. Unconditional —
+    // Family A crates always exist in-tree, so the lane always needs the binary.
     let wit_bindgen_pin = makefile_pin(repo_root, WIT_BINDGEN_PIN_VAR);
     assert_wit_bindgen_version(&wit_bindgen_pin);
 
-    for (unit_index, unit) in units.iter().enumerate() {
-        match unit.kind {
-            Kind::WasmComponent | Kind::WasmGuest => {
-                let artifact = LoadedArtifact::load(&unit.dir, &artifact_dir);
+    for (crate_index, wasm_crate) in crates.iter().enumerate() {
+        match wasm_crate.family {
+            Family::Raw | Family::Guest => {
+                let artifact = LoadedArtifact::load(&wasm_crate.dir, &artifact_dir);
                 // WASI-free gate.
                 if !check_wasi_free(&artifact) {
                     ok = false;
                 }
-                // Bindings-drift gate: WasmComponent only (Family A has committed bindings.rs).
-                if unit.kind == Kind::WasmComponent
-                    && !check_bindings_drift(&unit.dir, &scratch_root, unit_index, &wit_bindgen_pin)
+                // Bindings-drift gate: Family A only (it has a committed bindings.rs).
+                if wasm_crate.family == Family::Raw
+                    && !check_bindings_drift(
+                        &wasm_crate.dir,
+                        &scratch_root,
+                        crate_index,
+                        &wit_bindgen_pin,
+                    )
                 {
                     ok = false;
                 }
@@ -58,13 +63,14 @@ pub fn run_check_wit(repo_root: &Path) -> bool {
                 // different generator invocations (the pinned CLI for Family A, the
                 // `wit_bindgen::generate!` macro in the brenn-guest SDK for Family B),
                 // so a world-moving generator change on either path must fail here.
-                let (wit_path, world_name) = wit_source_for_unit(&unit.kind, &unit.dir, repo_root);
+                let (wit_path, world_name) =
+                    wit_source_for_crate(&wasm_crate.family, &wasm_crate.dir, repo_root);
                 if !check_world_equivalence(&wit_path, &world_name, &artifact) {
                     ok = false;
                 }
             }
-            Kind::WasmSdk | Kind::RootWorkspace => {
-                // No WIT gates for these.
+            Family::Sdk => {
+                // Builds no artifact; nothing to gate.
             }
         }
     }
@@ -298,17 +304,17 @@ fn wit_path_for_crate(crate_dir: &Path) -> (PathBuf, String) {
     (wit_path, world_name)
 }
 
-/// The WIT source and world name a unit's artifact is compared against, by family.
+/// The WIT source and world name a crate's artifact is compared against, by family.
 ///
-/// Family A (`WasmComponent`) names its WIT file in Cargo metadata, so the mapping is
-/// read from there. Family B (`WasmGuest`) does not: its world comes from the
+/// Family A (`Raw`) names its WIT file in Cargo metadata, so the mapping is read
+/// from there. Family B (`Guest`) does not: its world comes from the
 /// `wit_bindgen::generate!` invocation in the brenn-guest SDK, which every Family B
 /// crate consumes, so the source is the same file and world for all of them and is
 /// stated here. `guest_sdk_world_is_processor` keeps that statement honest.
-fn wit_source_for_unit(kind: &Kind, crate_dir: &Path, repo_root: &Path) -> (PathBuf, String) {
-    match kind {
-        Kind::WasmComponent => wit_path_for_crate(crate_dir),
-        Kind::WasmGuest => {
+fn wit_source_for_crate(family: &Family, crate_dir: &Path, repo_root: &Path) -> (PathBuf, String) {
+    match family {
+        Family::Raw => wit_path_for_crate(crate_dir),
+        Family::Guest => {
             let wit_path = repo_root
                 .join("brenn-wasm")
                 .join("wit")
@@ -319,8 +325,8 @@ fn wit_source_for_unit(kind: &Kind, crate_dir: &Path, repo_root: &Path) -> (Path
             guest_sdk_world_is_processor(repo_root);
             (wit_path, GUEST_SDK_WORLD.to_string())
         }
-        Kind::WasmSdk | Kind::RootWorkspace => {
-            panic!("xtask check-wit: {kind:?} units carry no artifact to compare")
+        Family::Sdk => {
+            panic!("xtask check-wit: {family:?} crates carry no artifact to compare")
         }
     }
 }
@@ -336,6 +342,7 @@ const GUEST_SDK_WORLD: &str = "processor";
 fn guest_sdk_world_is_processor(repo_root: &Path) {
     let sdk_bindings = repo_root
         .join("brenn-wasm")
+        .join("components")
         .join("guest")
         .join("src")
         .join("bindings.rs");
@@ -343,13 +350,13 @@ fn guest_sdk_world_is_processor(repo_root: &Path) {
         .unwrap_or_else(|e| panic!("xtask check-wit: failed to read {sdk_bindings:?}: {e}"));
     for needle in [
         &format!("world: \"{GUEST_SDK_WORLD}\""),
-        &format!("path: \"../wit/{GUEST_SDK_WIT_FILE}\""),
+        &format!("path: \"../../wit/{GUEST_SDK_WIT_FILE}\""),
     ] {
         assert!(
             content.contains(needle.as_str()),
-            "xtask check-wit: {sdk_bindings:?} no longer contains `{needle}`. Every WasmGuest \
+            "xtask check-wit: {sdk_bindings:?} no longer contains `{needle}`. Every Family B \
              artifact's world comes from this `generate!` invocation and the world-equivalence \
-             gate hard-codes it; update `wit_source_for_unit` to match."
+             gate hard-codes it; update `wit_source_for_crate` to match."
         );
     }
 }
@@ -1206,7 +1213,11 @@ edition = "2021"
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         let wit_dir = root.join("brenn-wasm").join("wit");
-        let sdk_src = root.join("brenn-wasm").join("guest").join("src");
+        let sdk_src = root
+            .join("brenn-wasm")
+            .join("components")
+            .join("guest")
+            .join("src");
         fs::create_dir_all(&wit_dir).unwrap();
         fs::create_dir_all(&sdk_src).unwrap();
         fs::write(
@@ -1219,16 +1230,16 @@ edition = "2021"
     }
 
     const REAL_SDK_GENERATE: &str = "wit_bindgen::generate!({\n    world: \"processor\",\n    \
-         path: \"../wit/processor.wit\",\n});\n";
+         path: \"../../wit/processor.wit\",\n});\n";
 
-    /// Family B units carry no WIT path in Cargo metadata, so the mapping is the SDK's
+    /// Family B crates carry no WIT path in Cargo metadata, so the mapping is the SDK's
     /// own world — the same file and world for every guest crate.
     #[test]
-    fn wit_source_for_unit_maps_guest_units_to_the_sdk_world() {
+    fn wit_source_for_crate_maps_guest_crates_to_the_sdk_world() {
         let tmp = temp_repo_with_guest_sdk(REAL_SDK_GENERATE);
         let root = tmp.path();
-        // The crate dir is never consulted for a guest unit; pass the repo root itself.
-        let (wit_path, world) = wit_source_for_unit(&Kind::WasmGuest, root, root);
+        // The crate dir is never consulted for a guest crate; pass the repo root itself.
+        let (wit_path, world) = wit_source_for_crate(&Family::Guest, root, root);
         assert_eq!(
             wit_path,
             root.join("brenn-wasm")
@@ -1245,12 +1256,12 @@ edition = "2021"
     /// world nothing generates them from.
     #[test]
     #[should_panic(expected = "no longer contains")]
-    fn wit_source_for_unit_panics_when_the_guest_sdk_repoints() {
+    fn wit_source_for_crate_panics_when_the_guest_sdk_repoints() {
         let tmp = temp_repo_with_guest_sdk(
             "wit_bindgen::generate!({\n    world: \"something-else\",\n    \
-             path: \"../wit/processor.wit\",\n});\n",
+             path: \"../../wit/processor.wit\",\n});\n",
         );
-        wit_source_for_unit(&Kind::WasmGuest, tmp.path(), tmp.path());
+        wit_source_for_crate(&Family::Guest, tmp.path(), tmp.path());
     }
 
     /// Write a crate dir containing just a Cargo.toml with the given contents.

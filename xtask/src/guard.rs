@@ -1,8 +1,7 @@
-// `xtask guard`: workspace coverage guard (subsumes design.md's integration test).
+// `xtask guard`: workspace coverage guard.
 // Discovery + allowlist completeness (Assertion A) + config verification (Assertion B).
-// See design §6.
 
-use crate::discover::{Kind, Unit, discover_units};
+use crate::discover::{Kind, Unit, discover_units_from_files};
 use crate::policy::lint_command_for;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -15,7 +14,7 @@ pub struct AllowlistEntry {
 }
 
 /// Parse the allowlist TOML file. Panics on missing file or malformed TOML.
-/// Never returns an empty set on a missing file (fail-closed). See design §6.5.
+/// Never returns an empty set on a missing file (fail-closed).
 pub fn load_allowlist(repo_root: &Path) -> Vec<AllowlistEntry> {
     let allowlist_path = repo_root.join("xtask").join("lint-allowlist.toml");
     assert!(
@@ -51,7 +50,7 @@ pub fn load_allowlist(repo_root: &Path) -> Vec<AllowlistEntry> {
         let kind = Kind::from_str(kind_str).unwrap_or_else(|| {
             panic!(
                 "xtask guard: allowlist entry {dir_str:?} has unknown kind {:?}. \
-                 Valid kinds: root-workspace, wasm-component, wasm-guest, wasm-sdk.",
+                 Valid kinds: root-workspace, wasm-workspace.",
                 kind_str
             )
         });
@@ -63,9 +62,10 @@ pub fn load_allowlist(repo_root: &Path) -> Vec<AllowlistEntry> {
     entries
 }
 
-/// Run the guard. Returns true on success (both assertions pass).
-pub fn run_guard(repo_root: &Path) -> bool {
-    let units = discover_units(repo_root);
+/// True if every discovered workspace is allowlisted at its correct kind, and
+/// no stale entries remain.
+pub fn run_guard(repo_root: &Path, files: &[PathBuf]) -> bool {
+    let units = discover_units_from_files(repo_root, files);
     let allowlist = load_allowlist(repo_root);
     let mut ok = true;
 
@@ -208,13 +208,20 @@ mod tests {
         .unwrap();
     }
 
-    fn make_sdk_crate(tmp: &Path, rel: &str) {
+    /// A standalone virtual workspace with one member — the shape the classifier
+    /// recognizes as `wasm-workspace`.
+    fn make_wasm_workspace(tmp: &Path, rel: &str) {
         let dir = tmp.join(rel);
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(dir.join("member")).unwrap();
         fs::write(
             dir.join("Cargo.toml"),
-            "[workspace]\n[package]\nname = \"brenn-guest\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        ).unwrap();
+            "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+    }
+
+    fn files(rels: &[&str]) -> Vec<PathBuf> {
+        rels.iter().map(PathBuf::from).collect()
     }
 
     fn write_allowlist(tmp: &Path, entries: &[(&str, &str)]) {
@@ -231,11 +238,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         make_root(root);
-        make_sdk_crate(root, "my-sdk");
+        make_wasm_workspace(root, "my-wasm");
         // Allowlist is empty (no entries).
         write_allowlist(root, &[]);
 
-        let ok = run_guard(root);
+        let ok = run_guard(root, &files(&["Cargo.toml", "my-wasm/Cargo.toml"]));
         assert!(
             !ok,
             "Guard should fail when a discovered workspace is missing from the allowlist"
@@ -249,9 +256,9 @@ mod tests {
         let root = tmp.path();
         make_root(root);
         // No actual crates — but allowlist has a stale entry.
-        write_allowlist(root, &[("nonexistent-crate", "wasm-sdk")]);
+        write_allowlist(root, &[("nonexistent-crate", "wasm-workspace")]);
 
-        let ok = run_guard(root);
+        let ok = run_guard(root, &files(&["Cargo.toml"]));
         assert!(!ok, "Guard should fail on stale allowlist entries");
     }
 
@@ -261,10 +268,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         make_root(root);
-        make_sdk_crate(root, "my-sdk");
-        write_allowlist(root, &[("my-sdk", "wasm-sdk")]);
+        make_wasm_workspace(root, "my-wasm");
+        write_allowlist(root, &[("my-wasm", "wasm-workspace")]);
 
-        let ok = run_guard(root);
+        let ok = run_guard(root, &files(&["Cargo.toml", "my-wasm/Cargo.toml"]));
         assert!(ok, "Guard should pass when discovered == allowlisted");
     }
 
@@ -274,11 +281,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         make_root(root);
-        make_sdk_crate(root, "my-sdk");
-        // Allowlist says wasm-component, but classifier says wasm-sdk.
-        write_allowlist(root, &[("my-sdk", "wasm-component")]);
+        make_wasm_workspace(root, "my-wasm");
+        // Allowlist says root-workspace, but classifier says wasm-workspace.
+        write_allowlist(root, &[("my-wasm", "root-workspace")]);
 
-        let ok = run_guard(root);
+        let ok = run_guard(root, &files(&["Cargo.toml", "my-wasm/Cargo.toml"]));
         assert!(
             !ok,
             "Guard should fail when allowlist kind mismatches classifier"
@@ -359,7 +366,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_allowlist(
             tmp.path(),
-            &[("my-sdk", "wasm-sdk"), ("my-comp", "wasm-component")],
+            &[("my-sdk", "wasm-workspace"), ("my-comp", "root-workspace")],
         );
 
         let mut entries = load_allowlist(tmp.path());
@@ -367,8 +374,8 @@ mod tests {
 
         assert_eq!(entries.len(), 2, "two entries parsed: {entries:?}");
         assert_eq!(entries[0].dir, PathBuf::from("my-comp"));
-        assert_eq!(entries[0].kind, Kind::WasmComponent);
+        assert_eq!(entries[0].kind, Kind::RootWorkspace);
         assert_eq!(entries[1].dir, PathBuf::from("my-sdk"));
-        assert_eq!(entries[1].kind, Kind::WasmSdk);
+        assert_eq!(entries[1].kind, Kind::WasmWorkspace);
     }
 }
