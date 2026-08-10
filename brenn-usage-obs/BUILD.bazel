@@ -1,0 +1,56 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "brenn-usage-obs",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + ["//brenn-lib"],
+)
+
+rust_binary(
+    name = "brenn-usage-obs_bin",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "brenn_usage_obs",
+    crate_root = "src/main.rs",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        ":brenn-usage-obs",
+        "//brenn-lib",
+    ],
+)
+
+# Calls the library functions directly against a seeded in-memory DB; no
+# subprocess, so nothing outside the runfiles is touched.
+rust_test(
+    name = "cli_tests",
+    srcs = ["tests/cli_tests.rs"],
+    crate_root = "tests/cli_tests.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [
+        ":brenn-usage-obs",
+        "//brenn-lib",
+    ],
+)
+
+rust_doc_test(
+    name = "brenn-usage-obs_doc_test",
+    crate = ":brenn-usage-obs",
+)

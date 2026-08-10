@@ -1,0 +1,25 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/surface:defs.bzl", "surface_wasm_crate")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# The surface shell. Not a component, so it does not follow the dir → crate
+# convention `surface_component` asserts: the dir is `kernel` and the artifact
+# the page imports is `brenn_surface_kernel`.
+surface_wasm_crate(
+    name = "kernel",
+    artifact = "brenn_surface_kernel",
+    crate_name = "brenn_surface_kernel",
+    deps = [
+        "//attach/client",
+        "//attach/proto",
+        "//brenn-budget",
+        "//brenn-envelope",
+        "//brenn-queue",
+        "//surface/contract",
+        "//surface/schema",
+    ],
+    test_deps = ["//surface/test-fixtures"],
+)

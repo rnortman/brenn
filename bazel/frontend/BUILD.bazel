@@ -1,0 +1,22 @@
+"""Home of the frontend bundle macro and its stamping condition."""
+
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+exports_files(["build_id_check.sh"])
+
+# Whether this build stamps. Read straight off `--stamp` rather than off a flag
+# of our own, so there is nothing to hold equal: the release config turns
+# stamping on and this setting follows it by construction.
+#
+# The bundler infers "unstamped" from an environment variable rules_js exports
+# only on stamped runs. That inference is right today and silently wrong the day
+# the ruleset renames it — the placeholder would ship in a release with no
+# diagnostic. This setting is what makes the requirement explicit: a stamped
+# build tells the bundler so, and a bundler told so fails rather than guessing.
+config_setting(
+    name = "stamped",
+    values = {"stamp": "true"},
+    visibility = ["//visibility:public"],
+)

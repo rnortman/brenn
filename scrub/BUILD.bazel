@@ -1,0 +1,83 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_binary(
+    name = "brenn-scrub",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "brenn-scrub_test",
+    crate = ":brenn-scrub",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    tags = ["requires-git"],
+    deps = all_crate_deps(normal_dev = True) + ["//git-fixture"],
+)
+
+# The integration suites, each driving the real binary against fixture repos.
+#
+# `CARGO_BIN_EXE_brenn-scrub` hands the binary path over as a runfile, and
+# `CARGO_MANIFEST_DIR` takes its workspace-relative form so the repo files
+# resolve from the runfiles root. Both are compile-time: the sources read them
+# through `env!`.
+#
+# gitleaks is the pinned release archive, not a PATH lookup — the harness puts
+# its directory on the `PATH` of every binary it spawns, which is how the
+# scan-reaching assertions run here at all. `BRENN_SCRUB_TEST_GITLEAKS` is
+# runtime, and its presence is also what turns the suites' "no gitleaks, skip"
+# arm into a failure: under Bazel there is no machine without it.
+SCRUB_TEST_DEPS = all_crate_deps(
+    normal = True,
+    normal_dev = True,
+) + [":brenn-scrub"]
+
+SCRUB_TEST_PROC_MACRO_DEPS = all_crate_deps(
+    proc_macro = True,
+    proc_macro_dev = True,
+)
+
+SCRUB_TEST_RUSTC_ENV = {
+    "CARGO_BIN_EXE_brenn-scrub": "$(rootpath :brenn-scrub)",
+    "CARGO_MANIFEST_DIR": "scrub",
+}
+
+SCRUB_TEST_ENV = {
+    "BRENN_SCRUB_TEST_GITLEAKS": "$(rootpath //bazel/tools:gitleaks)",
+}
+
+[
+    rust_test(
+        name = suite,
+        srcs = ["tests/{}.rs".format(suite)] + glob(["tests/common/*.rs"]),
+        crate_root = "tests/{}.rs".format(suite),
+        data = [
+            ":brenn-scrub",
+            "//bazel/tools:gitleaks",
+        ] + extra_data,
+        edition = "2024",
+        env = SCRUB_TEST_ENV,
+        proc_macro_deps = SCRUB_TEST_PROC_MACRO_DEPS,
+        rustc_env = SCRUB_TEST_RUSTC_ENV,
+        tags = ["requires-git"],
+        deps = SCRUB_TEST_DEPS + ["//git-fixture"],
+    )
+    for suite, extra_data in [
+        ("exit_codes", []),
+        ("hook_dest", []),
+        ("modes", ["//:.gitleaks.toml"]),
+        ("rules", [
+            "//:.gitleaks.toml",
+            "repo-template/gitleaks.toml",
+        ]),
+    ]
+]

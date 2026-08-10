@@ -1,0 +1,34 @@
+load("//bazel/gencode:defs.bzl", "generated_parity_test")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load(
+    "//bazel/wasm:defs.bzl",
+    "wasm_component",
+    "wasm_guest_cdylib",
+    "wit_bindgen_rust",
+)
+
+policy_srcs()
+
+wit_bindgen_rust(
+    name = "bindings",
+    wit = "//brenn-wasm:wit/processor.wit",
+    wit_srcs = "//brenn-wasm:wit",
+)
+
+wasm_guest_cdylib(
+    name = "brenn-processor-exhaust",
+    bindings = ":bindings",
+    visibility = ["//visibility:public"],
+)
+
+wasm_component(
+    name = "component",
+    module = ":brenn-processor-exhaust",
+    visibility = ["//visibility:public"],
+)
+
+generated_parity_test(
+    name = "bindings_parity_test",
+    committed = "src/bindings.rs",
+    generated = ":bindings",
+)

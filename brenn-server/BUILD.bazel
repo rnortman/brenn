@@ -1,0 +1,80 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "brenn-server",
+    srcs = glob(["src/**/*.rs"]),
+    # Static assets the crate bakes in with include_str!/include_bytes!.
+    compile_data = glob(["src/**/*.ico"]) + ["//frontend:embedded_assets"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//attach/proto",
+        "//brenn-budget",
+        "//brenn-cc",
+        "//brenn-common",
+        "//brenn-envelope",
+        "//brenn-graf",
+        "//brenn-lib",
+        "//brenn-pfin",
+        "//brenn-wasm",
+        "//surface/contract",
+        "//surface/schema",
+    ],
+)
+
+# Tests reach guest components as `<manifest dir>/../brenn-wasm/target/
+# components/`, so the workspace-relative `CARGO_MANIFEST_DIR` plus the staged
+# fixtures put them where the `env!` call sites already look.
+rust_test(
+    name = "brenn-server_test",
+    crate = ":brenn-server",
+    data = ["//brenn-wasm:component_fixtures"],
+    edition = "2024",
+    # The repo-sync fetch-classification tests read a bogus remote's ssh
+    # failure. Without this, ssh rejects the host's own `/etc/ssh` config
+    # inside the sandbox and never reaches name resolution, so the failure
+    # classifies as a conflict instead of a transient error.
+    env = {"GIT_SSH_COMMAND": "ssh -F /dev/null"},
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-server"},
+    tags = ["requires-git"],
+    # ts-rs exports from tests, so this binary is also the generator behind
+    # `//frontend:generated_types`. Without the override the generated types —
+    # and so every bundle built from them — would inherit testonly.
+    testonly = False,
+    visibility = ["//frontend:__pkg__"],
+    deps = all_crate_deps(normal_dev = True) + [
+        "//attach/client",
+        "//attach/conformance",
+        "//brenn-cal",
+        "//git-fixture",
+    ],
+)
+
+# Its own suite because `//surface:dist` is downstream of every surface crate,
+# the wasm-bindgen CLI and the transpiler. On the unit-test target above, a
+# surface edit would rerun that target's ~2,500 tests; here it reruns one.
+rust_test(
+    name = "surface_manifest_parity",
+    srcs = ["tests/surface_manifest_parity.rs"],
+    crate_root = "tests/surface_manifest_parity.rs",
+    data = ["//surface:dist"],
+    edition = "2024",
+    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-server"},
+    deps = [
+        "//brenn-wasm",
+        "@crates//serde_json",
+    ],
+)
+
+rust_doc_test(
+    name = "brenn-server_doc_test",
+    crate = ":brenn-server",
+)

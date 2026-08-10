@@ -1,0 +1,10 @@
+"""The wasm32 guest workspace root: manifests for the hub, nothing to build."""
+
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])

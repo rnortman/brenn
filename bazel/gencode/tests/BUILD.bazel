@@ -1,0 +1,42 @@
+"""Self-tests for the gencode scripts.
+
+The parity gates pass over the real families on every run, which says nothing
+about whether they can fail. These drive the same scripts the rules run, over
+fixtures built to be rejected.
+"""
+
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+native_test(
+    name = "parity_check_test",
+    size = "small",
+    src = "parity_check_test.sh",
+    args = ["$(rootpath //bazel/gencode:parity_check.sh)"],
+    data = ["//bazel/gencode:parity_check.sh"],
+    out = "parity_check_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
+native_test(
+    name = "tree_parity_check_test",
+    size = "small",
+    src = "tree_parity_check_test.sh",
+    args = ["$(rootpath //bazel/gencode:tree_parity_check.sh)"],
+    data = ["//bazel/gencode:tree_parity_check.sh"],
+    out = "tree_parity_check_test.run",
+    target_compatible_with = HOST_ONLY,
+)
+
+native_test(
+    name = "ts_rs_export_test",
+    size = "small",
+    src = "ts_rs_export_test.sh",
+    args = ["$(rootpath //bazel/gencode:ts_rs_export.sh)"],
+    data = ["//bazel/gencode:ts_rs_export.sh"],
+    out = "ts_rs_export_test.run",
+    target_compatible_with = HOST_ONLY,
+)

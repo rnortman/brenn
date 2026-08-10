@@ -1,0 +1,35 @@
+load("//bazel/gencode:defs.bzl", "generated_parity_test")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load(
+    "//bazel/wasm:defs.bzl",
+    "wasm_component",
+    "wasm_guest_cdylib",
+    "wit_bindgen_rust",
+)
+
+policy_srcs()
+
+wit_bindgen_rust(
+    name = "bindings",
+    wit = "//brenn-wasm:wit/replay.wit",
+    wit_srcs = "//brenn-wasm:wit",
+)
+
+wasm_guest_cdylib(
+    name = "brenn-replay-generic",
+    bindings = ":bindings",
+    edition = "2021",
+    visibility = ["//visibility:public"],
+)
+
+wasm_component(
+    name = "component",
+    module = ":brenn-replay-generic",
+    visibility = ["//visibility:public"],
+)
+
+generated_parity_test(
+    name = "bindings_parity_test",
+    committed = "src/bindings.rs",
+    generated = ":bindings",
+)

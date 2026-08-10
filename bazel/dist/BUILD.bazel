@@ -1,0 +1,7 @@
+"""The served-tree file-set gate, shared by the frontend and surface dists."""
+
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+exports_files(["path_set_check.sh"])

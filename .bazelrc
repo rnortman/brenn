@@ -1,0 +1,100 @@
+# Brenn Bazel configuration. bzlmod only; no WORKSPACE file exists.
+
+# ---------------------------------------------------------------------------
+# Correctness posture
+# ---------------------------------------------------------------------------
+# Sandboxed actions cannot write the source tree.
+build --spawn_strategy=sandboxed
+test --test_output=errors
+test --test_summary=terse
+
+common --incompatible_disallow_empty_glob
+
+# The convenience symlinks land under a dot prefix (.bazel-bin, .bazel-out, ...)
+# because the execroot they point into mirrors the whole source tree, including
+# every Cargo.toml. Tree walkers that skip dotted components — xtask's crate
+# discovery among them — then cannot mistake the output base for source.
+build --symlink_prefix=.bazel-
+
+# ---------------------------------------------------------------------------
+# Caching
+# ---------------------------------------------------------------------------
+# A local disk cache with a real GC policy. Unbounded artifact accumulation is
+# what forced CARGO_INCREMENTAL=0 on the deploy runner; a size cap is the fix.
+build --disk_cache=~/.cache/brenn-bazel-disk
+build --experimental_disk_cache_gc_max_size=20G
+build --experimental_disk_cache_gc_max_age=30d
+
+# rules_js depends on Aspect's telemetry module, which reports ruleset usage
+# from a repository rule. Nothing in this build phones home.
+common --repo_env=DO_NOT_TRACK=1
+
+# ---------------------------------------------------------------------------
+# Rust
+# ---------------------------------------------------------------------------
+build:clippy --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build:clippy --output_groups=+clippy_checks
+build:rustfmt --aspects=@rules_rust//rust:defs.bzl%rustfmt_aspect
+build:rustfmt --output_groups=+rustfmt_checks
+
+# ---------------------------------------------------------------------------
+# Release
+# ---------------------------------------------------------------------------
+# Stamping is release-only: an env-var input to a compile action is a cache
+# key, so a per-build id on the dev loop would bust the cache on every build.
+build:release --compilation_mode=opt
+build:release --stamp
+build:release --workspace_status_command=bazel/workspace_status.sh
+
+# Cargo enables `testutils` only through dev-dependencies, so a release binary
+# built by cargo never carries the test helpers. Clearing the flag here is what
+# makes the Bazel release artifact the same shape. Tests do not build under this
+# config: they compile against the helpers.
+#
+# Only here. A dev `bazel build //brenn` does carry them, unlike a dev `cargo
+# build`; bazel/features/BUILD.bazel records why that divergence is accepted.
+build:release --//bazel/features:testutils=False
+
+build:release-musl --config=release
+build:release-musl --platforms=//bazel/platforms:linux_x86_64_musl
+
+# The deploy tarball's staged tree. Release semantics, and the musl platform on
+# the packaged binaries only — set as a flag the packaging rule transitions on,
+# not as `--platforms`, because the browser bundles and every host-side gate in
+# the package's graph cannot be built for musl.
+build:release-package --config=release
+build:release-package --//bazel/release:static_musl=True
+
+# ---------------------------------------------------------------------------
+# CI
+# ---------------------------------------------------------------------------
+build:ci --disk_cache=.bazel-disk-cache
+build:ci --experimental_disk_cache_gc_max_size=8G
+build:ci --show_timestamps
+build:ci --announce_rc
+build:ci --color=no
+build:ci --curses=no
+test:ci --keep_going
+
+# ---------------------------------------------------------------------------
+# CD (the self-hosted deploy runner)
+# ---------------------------------------------------------------------------
+# Both caches live under the runner's persistent build-cache directory, so
+# successive deploys share every action and every fetched repository that did
+# not change between the pinned revisions. The GC caps are what keep the disk
+# quota that killed CARGO_INCREMENTAL from being reachable again.
+build:cd --disk_cache=~/.build-cache/bazel-disk
+build:cd --experimental_disk_cache_gc_max_size=40G
+build:cd --experimental_disk_cache_gc_max_age=30d
+build:cd --repository_cache=~/.build-cache/bazel-repo
+# Load bounding is Bazel's: the default --jobs and --local_resources scale to
+# the host, and the runner's task capacity of 1 is what keeps deploys from
+# overlapping. Nothing here serializes the build itself.
+build:cd --show_timestamps
+build:cd --announce_rc
+build:cd --color=no
+build:cd --curses=no
+test:cd --keep_going
+
+# Operator-local overrides (never committed).
+try-import %workspace%/.bazelrc.local

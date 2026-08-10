@@ -1,8 +1,3 @@
-# This crate is intentionally not a workspace member:
-# it targets wasm32-unknown-unknown and is built via the pinned `wit-bindgen-cli`
-# + plain `cargo build` + `wasm-tools component new` (no cargo-component).
-[workspace]
-
 [package]
 name = "brenn-processor-mem-exhaust"
 version = "0.1.0"

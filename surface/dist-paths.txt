@@ -1,0 +1,49 @@
+# Every file `//surface:dist` serves, one tree-relative path per line.
+#
+# Checked against the built tree by `//surface:dist_paths`. A component whose
+# stage never reaches the merge, or a sidecar that stops being emitted, is
+# otherwise a green build and a boot-time asset-validation failure.
+#
+# The `snippets/` directory name carries a wasm-bindgen hash over the emitting
+# crate's name and version, so bumping that crate's version changes this list.
+brenn_chrome.d.ts
+brenn_chrome.help.md
+brenn_chrome.js
+brenn_chrome_bg.wasm
+brenn_chrome_bg.wasm.d.ts
+brenn_echo_stub.d.ts
+brenn_echo_stub.help.md
+brenn_echo_stub.js
+brenn_echo_stub_bg.wasm
+brenn_echo_stub_bg.wasm.d.ts
+brenn_meeting.d.ts
+brenn_meeting.help.md
+brenn_meeting.js
+brenn_meeting_bg.wasm
+brenn_meeting_bg.wasm.d.ts
+brenn_mode_clock.d.ts
+brenn_mode_clock.help.md
+brenn_mode_clock.js
+brenn_mode_clock_bg.wasm
+brenn_mode_clock_bg.wasm.d.ts
+brenn_protobar.d.ts
+brenn_protobar.help.md
+brenn_protobar.js
+brenn_protobar_bg.wasm
+brenn_protobar_bg.wasm.d.ts
+brenn_surface_kernel.d.ts
+brenn_surface_kernel.js
+brenn_surface_kernel_bg.wasm
+brenn_surface_kernel_bg.wasm.d.ts
+processor/processor-transplant/interfaces/brenn-processor-config.d.ts
+processor/processor-transplant/interfaces/brenn-processor-log.d.ts
+processor/processor-transplant/interfaces/brenn-processor-ports.d.ts
+processor/processor-transplant/interfaces/brenn-processor-types.d.ts
+processor/processor-transplant/manifest.json
+processor/processor-transplant/processor-transplant.component.wasm
+processor/processor-transplant/processor-transplant.core.wasm
+processor/processor-transplant/processor-transplant.core2.wasm
+processor/processor-transplant/processor-transplant.core3.wasm
+processor/processor-transplant/processor-transplant.d.ts
+processor/processor-transplant/processor-transplant.js
+snippets/brenn-surface-component-support-76cb16f0877aca16/inline0.js

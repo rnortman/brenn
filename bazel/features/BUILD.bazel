@@ -1,0 +1,35 @@
+"""Build settings for cargo features whose value differs between lanes."""
+
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+# `testutils` gates test-only helpers in `brenn-lib` and `brenn-cc`. Cargo
+# enables it only through dev-dependencies, so a `cargo build --release` binary
+# never carries it; the flag is how a Bazel release build matches. On by
+# default, because every test target in the tree compiles against those helpers
+# — the release configs in `.bazelrc` are what turn it off.
+#
+# The default-on choice has a consequence worth stating: a *dev* `bazel build
+# //brenn` links the helpers in, where a plain `cargo build` would not. It is a
+# deliberate trade, not an oversight. Turning the default off would need a
+# second, testutils-enabled build of `brenn-lib` for the tests, and that
+# variant cascades — `brenn-cc`, `brenn-server` and `brenn-pfin` all put the
+# library in their test graphs, and two copies of a crate in one graph do not
+# typecheck against each other. The price would be a duplicate compile of the
+# heaviest crates on every `bazel build //...`, paid on the dev loop's hottest
+# path, to remove test scaffolding from a binary that never leaves the
+# operator's machine. Shipped artifacts come out of the release configs, and
+# those clear the flag.
+bool_flag(
+    name = "testutils",
+    build_setting_default = True,
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "testutils_enabled",
+    flag_values = {":testutils": "True"},
+    visibility = ["//visibility:public"],
+)

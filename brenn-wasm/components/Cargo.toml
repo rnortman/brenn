@@ -1,0 +1,41 @@
+# The wasm32-unknown-unknown guest workspace: the brenn-guest SDK (`guest/`)
+# and every component crate built against it or against raw WIT bindings.
+#
+# Separate from the root workspace on purpose, and not merely to hide from root
+# clippy: dependency resolution and feature unification run per workspace, and
+# guest crates must resolve independently of the host. A guest crate never
+# builds for the host target, so a shared resolve would unify features across
+# two unrelated platforms.
+#
+# Adding a crate here is one `members` line plus its BUILD.bazel. Nothing else
+# discovers crates by globbing this directory.
+#
+# `host-crates/` holds symlinks to the first-party crates this workspace shares
+# with the host tree (`brenn-envelope`, `brenn-cal`), and members reach them
+# through it rather than by `../../../`. The reason is not cosmetic: a path
+# dependency that escapes the workspace root cannot be resolved when the
+# workspace is reconstructed elsewhere on disk, which is exactly what generating
+# the Bazel crate hub does. Through the symlinks every path a member names stays
+# inside this directory. The crates on the far side belong to the root
+# workspace; they are dependencies here, never members.
+[workspace]
+resolver = "3"
+members = [
+    "guest",
+    "git-forge-parser",
+    "git-sync-consumer",
+    "processor-config",
+    "processor-demo",
+    "processor-dual",
+    "processor-exhaust",
+    "processor-log",
+    "processor-mem-exhaust",
+    "processor-mqtt-test",
+    "processor-multiport",
+    "processor-store-rt",
+    "processor-tool-test",
+    "processor-transplant",
+    "replay",
+    "replay-fault-test",
+    "replay-generic",
+]

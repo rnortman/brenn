@@ -1,0 +1,50 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_binary(
+    name = "brenn-cli",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-cc",
+        "//brenn-lib",
+    ],
+)
+
+rust_test(
+    name = "brenn-cli_test",
+    crate = ":brenn-cli",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+# `CARGO_BIN_EXE_brenn-cli` is a cargo-ism with no rules_rust counterpart: the
+# suite spawns the real binary, so the path is handed over as a runfile and the
+# same env name is set from it.
+rust_test(
+    name = "cli",
+    srcs = ["tests/cli.rs"],
+    crate_root = "tests/cli.rs",
+    data = [":brenn-cli"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    rustc_env = {"CARGO_BIN_EXE_brenn-cli": "$(rootpath :brenn-cli)"},
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [
+        "//brenn-cc",
+        "//brenn-lib",
+    ],
+)

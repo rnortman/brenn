@@ -1,0 +1,145 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/wasm:defs.bzl", "component_fixtures", "deployed_components_test")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+# Every component the tree builds, deployed or test-only. Adding a component
+# crate means adding it here; the deploy manifest is checked against this list.
+COMPONENTS = [
+    "//brenn-wasm/components/git-forge-parser:component",
+    "//brenn-wasm/components/git-sync-consumer:component",
+    "//brenn-wasm/components/processor-config:component",
+    "//brenn-wasm/components/processor-demo:component",
+    "//brenn-wasm/components/processor-dual:component",
+    "//brenn-wasm/components/processor-exhaust:component",
+    "//brenn-wasm/components/processor-log:component",
+    "//brenn-wasm/components/processor-mem-exhaust:component",
+    "//brenn-wasm/components/processor-mqtt-test:component",
+    "//brenn-wasm/components/processor-multiport:component",
+    "//brenn-wasm/components/processor-store-rt:component",
+    "//brenn-wasm/components/processor-tool-test:component",
+    "//brenn-wasm/components/processor-transplant:component",
+    "//brenn-wasm/components/replay:component",
+    "//brenn-wasm/components/replay-fault-test:component",
+    "//brenn-wasm/components/replay-generic:component",
+]
+
+filegroup(
+    name = "components",
+    srcs = COMPONENTS,
+    visibility = ["//visibility:public"],
+)
+
+deployed_components_test(
+    name = "deployed_components_test",
+    components = COMPONENTS,
+    manifest = "deployed-components.txt",
+)
+
+component_fixtures(
+    name = "component_fixtures",
+    components = COMPONENTS,
+    visibility = ["//visibility:public"],
+)
+
+exports_files([
+    "Cargo.toml",
+    # The deploy manifest: read by the packaging rule and shipped beside the
+    # artifacts it names.
+    "deployed-components.txt",
+])
+
+# Individually addressable so a raw-WIT crate can name the one world it
+# generates from; the filegroup below is what the action reads.
+exports_files(glob(["wit/**/*.wit"]))
+
+# The WIT worlds, read at macro-expansion time by both sides of the boundary:
+# wasmtime's `bindgen!` here, `wit_bindgen::generate!` in the guest SDK.
+filegroup(
+    name = "wit",
+    srcs = glob(["wit/**/*.wit"]),
+    visibility = ["//visibility:public"],
+)
+
+# The wasmtime host. The guest components it loads are a separate cargo
+# workspace under this directory, built for wasm32.
+rust_library(
+    name = "brenn-wasm",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = [":wit"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-activation",
+        "//brenn-budget",
+        "//brenn-common",
+        "//brenn-envelope",
+    ],
+)
+
+# The unit tests and every `tests/` suite instantiate guest components through
+# `env!("CARGO_MANIFEST_DIR")/target/components/`. The workspace-relative form
+# of the variable resolves against the runfiles root, where `:component_fixtures`
+# stages them.
+rust_test(
+    name = "brenn-wasm_test",
+    crate = ":brenn-wasm",
+    data = [":component_fixtures"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-wasm"},
+    deps = all_crate_deps(normal_dev = True) + ["//brenn-cal"],
+)
+
+WASM_TEST_SUITES = [
+    ("consume_engine", []),
+    ("feature_envelope", []),
+    ("grants", []),
+    ("instantiation_fail", []),
+    ("processor_config", []),
+    ("processor_log", []),
+    ("processor_mqtt", []),
+    (
+        "processor_transplant",
+        ["//brenn-wasm/components/processor-transplant:transplant.json"],
+    ),
+    ("replay_engine", []),
+    ("replay_engine_bounds", []),
+    ("replay_generic_engine", []),
+    ("store_round_trip", []),
+]
+
+[
+    rust_test(
+        name = suite,
+        srcs = ["tests/{}.rs".format(suite)] + glob(["tests/common/*.rs"]),
+        crate_root = "tests/{}.rs".format(suite),
+        data = [":component_fixtures"] + extra_data,
+        edition = "2024",
+        proc_macro_deps = all_crate_deps(
+            proc_macro = True,
+            proc_macro_dev = True,
+        ),
+        rustc_env = {"CARGO_MANIFEST_DIR": "brenn-wasm"},
+        deps = all_crate_deps(
+            normal = True,
+            normal_dev = True,
+        ) + [
+            ":brenn-wasm",
+            "//brenn-activation",
+            "//brenn-budget",
+            "//brenn-cal",
+            "//brenn-common",
+            "//brenn-envelope",
+        ],
+    )
+    for suite, extra_data in WASM_TEST_SUITES
+]
+
+rust_doc_test(
+    name = "brenn-wasm_doc_test",
+    crate = ":brenn-wasm",
+)

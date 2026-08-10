@@ -1,0 +1,82 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//brenn-budget",
+    "//brenn-common",
+    "//brenn-envelope",
+    "//brenn-queue",
+    "//surface/schema",
+]
+
+# `testutils` gates shared test helpers downstream test targets link against;
+# the release configs clear the flag, keeping the shipped binary free of test
+# scaffolding.
+rust_library(
+    name = "brenn-lib",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# Two unit tests read repo files through `env!("CARGO_MANIFEST_DIR")`, so the
+# constant has to name this package and the files have to be runfiles. The
+# workspace-relative form resolves from the runfiles root, which is where a
+# Bazel test starts.
+rust_test(
+    name = "brenn-lib_test",
+    crate = ":brenn-lib",
+    crate_features = ["testutils"],
+    data = [
+        "//:brenn.dev.toml",
+        "//:brenn.e2e.toml",
+        "//deploy/fail2ban:brenn.conf",
+    ],
+    edition = "2024",
+    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-lib"},
+    # ts-rs exports from tests, so this binary is also the generator behind
+    # `//frontend:generated_types`. Without the override the generated types —
+    # and so every bundle built from them — would inherit testonly.
+    testonly = False,
+    visibility = ["//frontend:__pkg__"],
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+# The MQTT suite spawns a real mosquitto per test and talks to it over
+# loopback. mosquitto stays a system binary — it is the one non-hermetic
+# dependency left — and the env gate is set here so a missing broker fails the
+# test instead of skipping it.
+rust_test(
+    name = "mqtt_integration",
+    size = "large",
+    srcs = ["tests/mqtt_integration.rs"] + glob(["tests/common/*.rs"]),
+    crate_root = "tests/mqtt_integration.rs",
+    data = glob(["tests/mqtt_assets/**"]),
+    edition = "2024",
+    env = {"BRENN_MQTT_INTEGRATION": "1"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-lib"},
+    tags = ["requires-network"],
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [":brenn-lib"],
+)
+
+rust_doc_test(
+    name = "brenn-lib_doc_test",
+    crate = ":brenn-lib",
+)

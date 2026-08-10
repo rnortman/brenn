@@ -1,0 +1,34 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# The `serde` feature is optional in Cargo and enabled by exactly one consumer
+# (`//surface/contract`). One target carries it for everyone; the wasmtime host
+# links a derive it does not call.
+rust_library(
+    name = "brenn-activation",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = ["serde"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "brenn-activation_test",
+    crate = ":brenn-activation",
+    crate_features = ["serde"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "brenn-activation_doc_test",
+    crate = ":brenn-activation",
+)

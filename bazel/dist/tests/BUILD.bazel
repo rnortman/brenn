@@ -1,0 +1,22 @@
+"""Self-test for the served-tree file-set gate.
+
+The gate passes over the real dist trees on every run, which says nothing about
+whether it can fail. This drives the same script the dist tests run, over
+fixtures built to be rejected.
+"""
+
+load("@bazel_skylib//rules:native_binary.bzl", "native_test")
+load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()
+
+native_test(
+    name = "path_set_check_test",
+    size = "small",
+    src = "path_set_check_test.sh",
+    args = ["$(rootpath //bazel/dist:path_set_check.sh)"],
+    data = ["//bazel/dist:path_set_check.sh"],
+    out = "path_set_check_test.run",
+    target_compatible_with = HOST_ONLY,
+)

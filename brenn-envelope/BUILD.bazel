@@ -1,0 +1,61 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+load("@wasm_crates//:defs.bzl", wasm_crate_deps = "all_crate_deps")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# Where the guest cargo workspace reaches these sources from. Its hub keys this
+# crate's dependency entry under that path.
+GUEST_WORKSPACE_PATH = "brenn-wasm/components/host-crates/brenn-envelope"
+
+rust_library(
+    name = "brenn-envelope",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)
+
+# One test reads the chat-protocol doc through `env!("CARGO_MANIFEST_DIR")`.
+# The workspace-relative form resolves from the runfiles root, which is where a
+# Bazel test starts, so the doc has to be a declared runfile.
+rust_test(
+    name = "brenn-envelope_test",
+    crate = ":brenn-envelope",
+    data = ["//docs:chat-protocol.md"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-envelope"},
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "brenn-envelope_doc_test",
+    crate = ":brenn-envelope",
+)
+
+# The guest graph's build of the same sources. The two cargo workspaces resolve
+# their third-party dependencies independently, so host and guest link
+# different copies of serde; one target cannot serve both graphs, because the
+# derive impls it carries would come from the other graph's serde and satisfy
+# nothing on this side. Cargo compiles this crate twice for the same reason.
+rust_library(
+    name = "brenn-envelope_wasm",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "brenn_envelope",
+    edition = "2024",
+    target_compatible_with = ["@platforms//cpu:wasm32"],
+    visibility = ["//visibility:public"],
+    proc_macro_deps = wasm_crate_deps(
+        package_name = GUEST_WORKSPACE_PATH,
+        proc_macro = True,
+    ),
+    deps = wasm_crate_deps(
+        normal = True,
+        package_name = GUEST_WORKSPACE_PATH,
+    ),
+)

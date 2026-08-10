@@ -1242,3 +1242,44 @@ hand-written schema literal remains in the registry.
 
 Code site (`TODO(tool-schema-derive)`):
 `brenn-server/src/tool_registry/descriptor.rs`, the `input_schema` field.
+
+
+## `bazel-teardown`
+
+Both gates and both release paths are Bazel's now: the required GitHub check is
+`make bazel-check`, and the deploy pipeline builds and packages
+`//deploy:release_package`. The cargo half is still in the tree, and everything
+in this list is what comes out when it goes:
+
+- the Makefile's cargo check lanes (`CARGO_CHECK_STEPS`, `NONCARGO_*_STEPS`,
+  `check-common`, `check-ci`, the parallelism knob and the step-ordering machinery
+  around them), the cargo `build`/`release`/`release-musl` targets, and the
+  WASM/wasm-bindgen/jco preflight and pin variables — leaving the thin verb layer
+  (`check`, `build`, `launchdev`, `stopdev`, `npm-audit`, `scrub-*`).
+- xtask's reimplementation-of-Bazel half: the blake3 test-result cache
+  (`test_run.rs`), the lane scheduler (`parallel.rs`), the drift-compare core of
+  `check_wit.rs`, the crate discovery/classification machinery and
+  `lint-allowlist.toml`, and the `check` lane orchestration in `main.rs`. The
+  policy guards, the sync guards, the WIT world-equivalence check, the policy
+  parity check and `xtask deny` all stay.
+- the committed generated files and the gates pinning them: the 37 ts-rs `.ts`
+  files under `frontend/src/generated/`, `frontmatter.generated.ts`, the seven
+  raw-WIT `bindings.rs`, the surface `help.md` sidecars, and `package-lock.json`
+  in both npm trees (the pnpm lockfiles are what the build reads). With no
+  committed copy there is nothing to drift and the gates have nothing left to
+  compare.
+- the scheduled `cargo-parity` CI job, and `TODO(scrub-template-drift-cache-skip)`
+  — which closes with the cache it describes.
+
+Gated on an event, not on a decision: it runs after a Bazel-built release has
+been deployed to staging and then run clean in production. Until that has
+happened the cargo lanes are the rollback path — the deploy pipeline can be
+re-pointed at them in one commit — and the comparison run that would catch a
+verdict divergence needs both sides alive. Deleting early trades a
+reversible cutover for an irreversible one.
+
+Done = the list above is deleted, `make check` is the verb layer over
+`bazel test`, and cargo buildability is formally unsupported.
+
+Code site (`TODO(bazel-teardown)`): `Makefile`, at `CARGO_CHECK_STEPS`.
+

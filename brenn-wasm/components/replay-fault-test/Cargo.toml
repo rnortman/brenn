@@ -2,9 +2,6 @@
 # Two sentinel ops: LEAK_TX (leaked transaction → host trap) and TRAP (guest panic → host trap).
 # NOT for production use.
 #
-# This crate is intentionally not a workspace member (targets wasm32-unknown-unknown,
-# built via the pinned `wit-bindgen-cli` + plain `cargo build` + `wasm-tools component new`).
-[workspace]
 
 [package]
 name = "brenn-replay-fault-test"

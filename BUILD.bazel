@@ -1,0 +1,130 @@
+"""Workspace root — exports, and the repo-wide policy file set."""
+
+load("@rules_python//python:defs.bzl", "py_test")
+load("//bazel/policy:defs.bzl", "policy_srcs", "source_manifest")
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "MODULE.bazel",
+    # Shipped configs, read by brenn-lib's config-invariant test.
+    "brenn.dev.toml",
+    "brenn.e2e.toml",
+    # Read by scrub's rule-semantics suite.
+    ".gitleaks.toml",
+    # Shipped in the release tarball's lib/.
+    "noop_mcp.py",
+])
+
+policy_srcs()
+
+# The MCP stub's unittest suite. Both files are srcs of the one target rather
+# than a library and a test over it: the suite imports the module by name from
+# the same directory, which is how it runs under `python3 -m unittest` too.
+py_test(
+    name = "noop_mcp_test",
+    srcs = [
+        "noop_mcp.py",
+        "noop_mcp_test.py",
+    ],
+    main = "noop_mcp_test.py",
+    size = "small",
+)
+
+# Every package's contribution, in one place: one entry per BUILD.bazel in the
+# tree, the root's own included above. Their union is the whole tracked tree
+# except the two git-tracked, `.bazelignore`d `host-crates/` symlinks, which
+# Bazel does not see and which have no content to scan.
+#
+# `make bazel-policy-parity` is what holds that true, in both directions: a
+# package added without an entry here drops its whole directory out of the scan,
+# a tracked file matching one of `POLICY_SRC_EXCLUDE`'s patterns leaves it the
+# same way, and an untracked file joins this set alone. Symlinks are normalized
+# out of both sides. It runs outside the sandbox — it needs git — so it is a CI
+# step rather than a test target.
+filegroup(
+    name = "all_policy_srcs",
+    srcs = [
+        ":policy_srcs",
+        "//attach/client:policy_srcs",
+        "//attach/conformance:policy_srcs",
+        "//attach/proto:policy_srcs",
+        "//bazel/dist:policy_srcs",
+        "//bazel/dist/tests:policy_srcs",
+        "//bazel/features:policy_srcs",
+        "//bazel/frontend:policy_srcs",
+        "//bazel/frontend/tests:policy_srcs",
+        "//bazel/gencode:policy_srcs",
+        "//bazel/gencode/tests:policy_srcs",
+        "//bazel/platforms:policy_srcs",
+        "//bazel/policy:policy_srcs",
+        "//bazel/release:policy_srcs",
+        "//bazel/release/tests:policy_srcs",
+        "//bazel/surface:policy_srcs",
+        "//bazel/surface/tests:policy_srcs",
+        "//bazel/tools:policy_srcs",
+        "//bazel/wasm:policy_srcs",
+        "//bazel/wasm/tests:policy_srcs",
+        "//brenn:policy_srcs",
+        "//brenn-activation:policy_srcs",
+        "//brenn-budget:policy_srcs",
+        "//brenn-cal:policy_srcs",
+        "//brenn-cc:policy_srcs",
+        "//brenn-cli:policy_srcs",
+        "//brenn-common:policy_srcs",
+        "//brenn-envelope:policy_srcs",
+        "//brenn-graf:policy_srcs",
+        "//brenn-lib:policy_srcs",
+        "//brenn-pfin:policy_srcs",
+        "//brenn-queue:policy_srcs",
+        "//brenn-server:policy_srcs",
+        "//brenn-usage:policy_srcs",
+        "//brenn-usage-obs:policy_srcs",
+        "//brenn-wasm:policy_srcs",
+        "//brenn-wasm/components:policy_srcs",
+        "//brenn-wasm/components/git-forge-parser:policy_srcs",
+        "//brenn-wasm/components/git-sync-consumer:policy_srcs",
+        "//brenn-wasm/components/guest:policy_srcs",
+        "//brenn-wasm/components/processor-config:policy_srcs",
+        "//brenn-wasm/components/processor-demo:policy_srcs",
+        "//brenn-wasm/components/processor-dual:policy_srcs",
+        "//brenn-wasm/components/processor-exhaust:policy_srcs",
+        "//brenn-wasm/components/processor-log:policy_srcs",
+        "//brenn-wasm/components/processor-mem-exhaust:policy_srcs",
+        "//brenn-wasm/components/processor-mqtt-test:policy_srcs",
+        "//brenn-wasm/components/processor-multiport:policy_srcs",
+        "//brenn-wasm/components/processor-store-rt:policy_srcs",
+        "//brenn-wasm/components/processor-tool-test:policy_srcs",
+        "//brenn-wasm/components/processor-transplant:policy_srcs",
+        "//brenn-wasm/components/replay:policy_srcs",
+        "//brenn-wasm/components/replay-fault-test:policy_srcs",
+        "//brenn-wasm/components/replay-generic:policy_srcs",
+        "//cc-usage:policy_srcs",
+        "//deploy:policy_srcs",
+        "//deploy/fail2ban:policy_srcs",
+        "//docs:policy_srcs",
+        "//frontend:policy_srcs",
+        "//git-fixture:policy_srcs",
+        "//scrub:policy_srcs",
+        "//surface:policy_srcs",
+        "//surface/chrome:policy_srcs",
+        "//surface/component-support:policy_srcs",
+        "//surface/components/echo-stub:policy_srcs",
+        "//surface/components/meeting:policy_srcs",
+        "//surface/components/mode-clock:policy_srcs",
+        "//surface/components/protobar:policy_srcs",
+        "//surface/contract:policy_srcs",
+        "//surface/kernel:policy_srcs",
+        "//surface/schema:policy_srcs",
+        "//surface/test-fixtures:policy_srcs",
+        "//xtask:policy_srcs",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+source_manifest(
+    name = "policy_manifest",
+    srcs = [":all_policy_srcs"],
+    visibility = ["//visibility:public"],
+)

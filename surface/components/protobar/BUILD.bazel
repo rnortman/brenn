@@ -1,0 +1,16 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("//bazel/surface:defs.bzl", "surface_component")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+surface_component(
+    deps = [
+        "//brenn-envelope",
+        "//surface/component-support",
+        "//surface/contract",
+    ],
+    test_deps = ["//surface/test-fixtures"],
+    wasm_deps = ["//surface/schema"],
+)

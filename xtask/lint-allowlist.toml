@@ -5,8 +5,8 @@
 #
 # WHY THIS FILE EXISTS
 # Root `cargo clippy` lints ONLY the root workspace. Any Cargo.toml carrying its
-# own [workspace] table (required to opt out for cargo-component / wasm targets)
-# is invisible to it. Three such crates already ship to prod with ZERO lint
+# own [workspace] table (required for crates that build for a different target)
+# is invisible to it. Three such crates once shipped to prod with ZERO lint
 # coverage. This file + `xtask guard` make that impossible to repeat silently:
 # a new standalone [workspace] not listed here FAILS the guard.
 #
@@ -23,59 +23,13 @@
 #   appears that is not listed here. To make it pass: add an entry below with
 #   the crate's `kind` (run `cargo xtask lint <dir>` to see which kind it
 #   classifies as). No Makefile edit is needed — the lint is discovery-driven.
+#   A crate that just wants out of the root workspace does NOT get its own
+#   [workspace] table: it joins a workspace that a lint lane already covers.
 #
 # REMOVING A WORKSPACE: delete its dir AND its entry here.
 # =============================================================================
 
-[workspaces."brenn-wasm/guest"]
-kind = "wasm-sdk"   # brenn-guest SDK rlib; cargo clippy --target wasm32-unknown-unknown -- -D warnings
-
-# WASM component workspaces (Family A: raw bindings, [package.metadata.component])
-[workspaces."brenn-wasm/components/replay"]
-kind = "wasm-component"
-
-[workspaces."brenn-wasm/components/replay-fault-test"]
-kind = "wasm-component"
-
-[workspaces."brenn-wasm/components/replay-generic"]
-kind = "wasm-component"
-
-[workspaces."brenn-wasm/components/processor-exhaust"]
-kind = "wasm-component"
-
-[workspaces."brenn-wasm/components/processor-mem-exhaust"]
-kind = "wasm-component"
-
-[workspaces."brenn-wasm/components/processor-mqtt-test"]
-kind = "wasm-component"
-
-[workspaces."brenn-wasm/components/processor-tool-test"]
-kind = "wasm-component"
-
-# WASM guest workspaces (Family B: brenn-guest dep, no [package.metadata.component])
-[workspaces."brenn-wasm/components/processor-demo"]
-kind = "wasm-guest"
-
-[workspaces."brenn-wasm/components/processor-dual"]
-kind = "wasm-guest"
-
-[workspaces."brenn-wasm/components/processor-log"]
-kind = "wasm-guest"
-
-[workspaces."brenn-wasm/components/processor-multiport"]
-kind = "wasm-guest"
-
-[workspaces."brenn-wasm/components/processor-config"]
-kind = "wasm-guest"
-
-[workspaces."brenn-wasm/components/processor-transplant"]
-kind = "wasm-guest"
-
-[workspaces."brenn-wasm/components/processor-store-rt"]
-kind = "wasm-guest"
-
-[workspaces."brenn-wasm/components/git-forge-parser"]
-kind = "wasm-guest"
-
-[workspaces."brenn-wasm/components/git-sync-consumer"]
-kind = "wasm-guest"
+# The wasm32-unknown-unknown guest workspace: the brenn-guest SDK plus all
+# sixteen component crates. One `cargo clippy --workspace` covers the lot.
+[workspaces."brenn-wasm/components"]
+kind = "wasm-workspace"

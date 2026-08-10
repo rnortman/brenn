@@ -1,0 +1,29 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "brenn-pfin",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + ["//brenn-lib"],
+)
+
+rust_test(
+    name = "brenn-pfin_test",
+    crate = ":brenn-pfin",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "brenn-pfin_doc_test",
+    crate = ":brenn-pfin",
+)

@@ -1,0 +1,3 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+
+policy_srcs()

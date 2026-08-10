@@ -1,24 +1,81 @@
-// xtask: policy runner for brenn. Subcommands: lint, guard, check-wit, check, deny, test.
+// xtask: policy runner for brenn. Subcommands: lint, guard, policy-parity, check-wit,
+// check, deny, test.
 // Invoked via `cargo run -p xtask -- <subcommand>` or `cargo xtask <subcommand>`.
 
+mod build_id_guard;
 mod check_wit;
 mod deny;
 mod discover;
+mod file_set;
 mod git_spawn_guard;
 mod guard;
 mod help_guard;
 mod lint;
 mod parallel;
 mod policy;
+mod policy_parity;
 mod removal_guard;
+mod sync_guard;
 mod test_run;
 mod world_sig;
+
+use std::path::{Path, PathBuf};
+
+const GUARD_USAGE: &str = "guard [--root <dir>] [--manifest <file>]";
+const PARITY_USAGE: &str = "policy-parity [--root <dir>] --manifest <file>";
+
+/// Each guard runs to completion so one failure does not hide the rest.
+fn run_guards(root: &Path, files: &[PathBuf]) -> bool {
+    let units_ok = guard::run_guard(root, files);
+    let removal_ok = removal_guard::run_removal_guard(root, files);
+    let spawn_ok = git_spawn_guard::run_git_spawn_guard(root, files);
+    let help_ok = help_guard::run_help_guard(root, files);
+    let build_id_ok = build_id_guard::run_build_id_guard(root, files);
+    let sync_ok = sync_guard::run_sync_guard(root, files);
+    units_ok && removal_ok && spawn_ok && help_ok && build_id_ok && sync_ok
+}
+
+/// `--manifest` names a listing of repo-root-relative paths; without it the set
+/// is the tracked tree. Never both, and never a guess: an unreadable manifest
+/// is a failure, not a reason to fall back to git.
+struct GuardArgs {
+    root: PathBuf,
+    manifest: Option<PathBuf>,
+}
+
+fn parse_guard_args(
+    args: &mut impl Iterator<Item = String>,
+    default_root: &Path,
+    usage: &str,
+) -> GuardArgs {
+    let mut parsed = GuardArgs {
+        root: default_root.to_path_buf(),
+        manifest: None,
+    };
+    while let Some(flag) = args.next() {
+        let value = args.next().unwrap_or_else(|| {
+            eprintln!("xtask: {flag} needs a value");
+            eprintln!("Usage: cargo xtask {usage}");
+            std::process::exit(2);
+        });
+        match flag.as_str() {
+            "--root" => parsed.root = PathBuf::from(value),
+            "--manifest" => parsed.manifest = Some(PathBuf::from(value)),
+            other => {
+                eprintln!("xtask: unknown option {other:?}");
+                eprintln!("Usage: cargo xtask {usage}");
+                std::process::exit(2);
+            }
+        }
+    }
+    parsed
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let subcommand = args.next().unwrap_or_else(|| {
         eprintln!("Usage: cargo xtask <subcommand> [args]");
-        eprintln!("Subcommands: lint [<path>] | guard | check-wit | check | deny | test");
+        eprintln!("Subcommands: lint [<path>] | {GUARD_USAGE} | {PARITY_USAGE} | check-wit | check | deny | test");
         std::process::exit(2);
     });
 
@@ -39,10 +96,23 @@ fn main() {
             }
         }
         "guard" => {
-            guard::run_guard(&repo_root)
-                & removal_guard::run_removal_guard(&repo_root)
-                & git_spawn_guard::run_git_spawn_guard(&repo_root)
-                & help_guard::run_help_guard(&repo_root)
+            let parsed = parse_guard_args(&mut args, &repo_root, GUARD_USAGE);
+            let files = match &parsed.manifest {
+                Some(manifest) => file_set::from_manifest(manifest),
+                None => file_set::from_git(&parsed.root),
+            };
+            run_guards(&parsed.root, &files)
+        }
+        // Outside the sandbox by necessity: it needs both the manifest the
+        // build produced and the git listing the build cannot see.
+        "policy-parity" => {
+            let parsed = parse_guard_args(&mut args, &repo_root, PARITY_USAGE);
+            let manifest = parsed.manifest.unwrap_or_else(|| {
+                eprintln!("xtask: policy-parity needs the manifest to compare against");
+                eprintln!("Usage: cargo xtask {PARITY_USAGE}");
+                std::process::exit(2);
+            });
+            policy_parity::run_policy_parity(&parsed.root, &manifest)
         }
         "check-wit" => check_wit::run_check_wit(&repo_root),
         "check" => {
@@ -68,11 +138,8 @@ fn main() {
                 ("guard", {
                     let r = repo_root.clone();
                     Box::new(move || {
-                        let units_ok = guard::run_guard(&r);
-                        let removal_ok = removal_guard::run_removal_guard(&r);
-                        let spawn_ok = git_spawn_guard::run_git_spawn_guard(&r);
-                        let help_ok = help_guard::run_help_guard(&r);
-                        units_ok && removal_ok && spawn_ok && help_ok
+                        let files = file_set::from_git(&r);
+                        run_guards(&r, &files)
                     })
                 }),
                 ("lint-root", {
@@ -94,7 +161,9 @@ fn main() {
         "test" => test_run::run_test(&repo_root),
         other => {
             eprintln!("xtask: unknown subcommand {other:?}");
-            eprintln!("Subcommands: lint [<path>] | guard | check-wit | check | deny | test");
+            eprintln!(
+                "Subcommands: lint [<path>] | {GUARD_USAGE} | {PARITY_USAGE} | check-wit | check | deny | test"
+            );
             std::process::exit(2);
         }
     };

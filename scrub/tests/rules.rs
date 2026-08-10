@@ -17,9 +17,8 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use common::gitleaks_available;
+use common::{gitleaks_available, gitleaks_command};
 
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is <repo>/scrub.
@@ -45,7 +44,7 @@ fn rule_ids_for(files: &[(&str, &str)]) -> Vec<String> {
 
 fn scan(dir: &Path) -> Vec<String> {
     let config = repo_root().join(".gitleaks.toml");
-    let out = Command::new("gitleaks")
+    let out = gitleaks_command()
         .args(["dir", "--config"])
         .arg(&config)
         .args([

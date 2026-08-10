@@ -118,9 +118,9 @@ fn lint_unit(unit: &Unit, wasm_components_target: &Path) -> bool {
     cmd.args(&args);
     cmd.current_dir(&unit.dir);
 
-    // For WASM kinds, set CARGO_TARGET_DIR to the shared component target dir.
+    // For the wasm workspace, set CARGO_TARGET_DIR to the shared component target dir.
     match unit.kind {
-        Kind::WasmComponent | Kind::WasmGuest | Kind::WasmSdk => {
+        Kind::WasmWorkspace => {
             cmd.env("CARGO_TARGET_DIR", wasm_components_target);
         }
         Kind::RootWorkspace => {}
@@ -224,12 +224,7 @@ mod tests {
     /// holds per variant, so no unit is linted twice or skipped.
     #[test]
     fn root_wasm_lanes_partition_every_kind() {
-        for k in [
-            Kind::RootWorkspace,
-            Kind::WasmComponent,
-            Kind::WasmGuest,
-            Kind::WasmSdk,
-        ] {
+        for k in [Kind::RootWorkspace, Kind::WasmWorkspace] {
             assert_ne!(
                 is_root(&k),
                 is_wasm(&k),
@@ -237,9 +232,7 @@ mod tests {
             );
         }
         assert!(is_root(&Kind::RootWorkspace));
-        assert!(is_wasm(&Kind::WasmComponent));
-        assert!(is_wasm(&Kind::WasmGuest));
-        assert!(is_wasm(&Kind::WasmSdk));
+        assert!(is_wasm(&Kind::WasmWorkspace));
     }
 
     /// No rust-toolchain.toml in the dir → "<unknown>".

@@ -1,0 +1,3 @@
+"""Build file for an unpacked wasm-tools release archive."""
+
+exports_files(["wasm-tools"])
