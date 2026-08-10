@@ -2,6 +2,12 @@
 
 All notable changes to Brenn are documented here.
 
+## [0.16.2] — 2026-08-10
+
+### Changed
+
+- Bazel is now the build system.
+
 ## [0.16.1] — 2026-08-07
 
 ### Fixed
