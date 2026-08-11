@@ -2,6 +2,12 @@
 
 All notable changes to Brenn are documented here.
 
+## [0.16.3] — 2026-08-11
+
+### Changed
+
+- Bazel/CI speed optimizations
+
 ## [0.16.2] — 2026-08-10
 
 ### Changed
