@@ -1293,11 +1293,17 @@ budget. Nobody has measured what it actually reaches. If it saturates, Bazel's
 GC and GitHub's eviction trade warm hits away between runs and the symptom is
 green runs drifting back toward twenty cold minutes, with nothing reporting it.
 
-The observability half is done: the `check` job prints the cache size every run
-and annotates a warning past 90% of the cap, which it reads out of `.bazelrc` so
-that lowering the cap moves the watermark with it. This entry is the decision
-that needs the data. Read the reported sizes after a few weeks of warm
-main-branch runs.
+The repository cache shares that one `actions/cache` entry with it, so the
+budget question is over the pair.
+
+The observability half is done: the `check` job prints both cache sizes every
+run and annotates a warning past 90% of the cap, which it reads out of
+`.bazelrc` so that lowering the cap moves the watermark with it. (No watermark
+on the repository cache — it has no size cap to place one against; the GC flags
+bazel offers for fetched repos are age-based and belong to the repo contents
+cache, which `build:ci` disables so the entry carries downloads only. Its number
+is reported and read by a human.) This entry is the decision that needs the
+data. Read the reported sizes after a few weeks of warm main-branch runs.
 
 Done = one of: the sizes sit comfortably under the cap and this entry closes; or
 the pressure is real and one remediation lands — lower
@@ -1310,7 +1316,75 @@ caught weekly rather than per-merge), or split the dev and release caches into
 separately keyed `actions/cache` entries.
 
 Code site (`TODO(bazel-ci-cache-pressure)`): `.github/workflows/ci.yml`, the
-`Report bazel disk cache size` step.
+`Report bazel cache sizes` step.
+
+
+## `bazel-server-test-split`
+
+`//brenn-server:brenn-server_test` runs ~2,500 tests in one action, and 99 of
+them are the only ones that open a WASM component fixture. Its `data` now names
+the ten components those 99 load rather than all sixteen, but the coupling that
+remains is still all-or-nothing: an edit to any one of the ten re-runs the whole
+binary.
+
+The shape that would fix it is a filter split over two `rust_test(crate =
+":brenn-server")` targets — one Starlark list of libtest filter strings, defined
+once and consumed by both, `--skip` on the primary and positional selection on
+the secondary, with only the secondary carrying the fixtures. One list is
+load-bearing: `--skip` and positional filters match the same way, so two lists
+that drift can leave a test running on neither target with both green. The 99
+live in three private-API clusters (`wasm_dispatch::tests`, the `inbound.rs`
+replay modules, one surface boot-validation test) and use `use super::*`, so
+moving them to `tests/*.rs` files instead is not available without exposing
+crate internals.
+
+What is not known is whether it is worth it. Two targets over one crate means
+two test-binary compiles of one of the tree's two biggest crates, paid on every
+brenn-server or brenn-lib source edit, to buy a ~96% test-execution cut on
+component-only edits. Which side wins depends on the commit mix and on the
+compile-vs-execution ratio on the CI runner, and neither has been measured.
+
+Done = the post-remediation CI timings are read — per-step durations for
+docs-only, component-only, and brenn-lib/brenn-server commits — and the split is
+either landed or this entry closed with those numbers written down.
+
+Code site (`TODO(bazel-server-test-split)`): `brenn-server/BUILD.bazel`, above
+the `brenn-server_test` target.
+
+
+## `bazel-fixture-list-guard`
+
+Fourteen test targets now declare, by hand, which WASM component fixtures they
+stage: the twelve `WASM_TEST_SUITES` entries and `brenn-wasm_test` in
+`brenn-wasm/BUILD.bazel`, and `brenn-server_test`'s ten in
+`brenn-server/BUILD.bazel`. Each list was derived by reading that target's
+sources for artifact stems, and nothing mechanizes the derivation.
+
+Under-declaration is loud: a test that opens a component its target does not
+stage panics on a missing runfile the first time it runs. Over-declaration is
+silent forever. A suite that stops loading a component keeps the stale edge, the
+all-to-all invalidation this narrowing removed grows back one commit at a time,
+and the CI timings that `bazel-server-test-split` and the crate-split question
+are supposed to read get polluted by an over-declaration nobody can see.
+
+The durable answer is a guard reading `COMPONENT_NAMES`, `WASM_TEST_SUITES` and
+`brenn-server_test`'s `data` out of the BUILD files and the `brenn_*` artifact
+stems out of each target's sources, reporting both directions. What it needs
+before it can be written is a derivation rule that is sound in both: stems reach
+a suite through helpers it calls (`replay_artifact()` in
+`brenn-wasm/tests/common/mod.rs` hardcodes `brenn_replay`), and not every
+`brenn_*.wasm` literal is a fixture read — `brenn-server/src/router.rs` and
+`routes/surface/mod.rs` fabricate a `brenn_surface_kernel_bg.wasm` in a temp
+dir, which no fixture target builds. A guard that demanded that one, or that
+missed the helper-reached ones, would be worse than none: this gate's red has to
+keep meaning the change is wrong.
+
+Done = the rule is settled and the guard reports both directions with tests, or
+this entry is closed with the argument for leaving the lists hand-held.
+
+Code sites (`TODO(bazel-fixture-list-guard)`): `brenn-wasm/BUILD.bazel`, above
+`WASM_TEST_SUITES`; `brenn-server/BUILD.bazel`, above the `brenn-server_test`
+target.
 
 
 ## `sw-registration-csp-blocked`

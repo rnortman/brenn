@@ -37,11 +37,39 @@ rust_library(
 # 4-vCPU CI runner sharing itself with the rest of the graph. The size is also
 # what Bazel schedules the action's local resources against, so the repo's
 # biggest test binary declaring itself large is the truthful answer twice over.
+#
+# `data` is the ten components this crate's tests actually open, one fixture
+# target each — not the whole set. Runfiles are inputs to the test action, so
+# every component named here is an edge from a guest crate to all ~2,500 tests;
+# the six that are not named cost nothing when they change.
+#
+# TODO(bazel-fixture-list-guard): which ten those are was derived by reading
+# this crate's artifact-stem call sites, and nothing holds the list to them. A
+# component dropped from the tests keeps its edge here silently; one added
+# without its fixture fails loudly on a missing runfile.
+#
+# TODO(bazel-server-test-split): those ten still couple every component edit to
+# the whole binary, because 99 fixture-reading tests share this target with
+# ~2,460 that read none. Splitting them out by libtest filter would cut that to
+# the 99 — at the price of a second compile of one of the tree's biggest crates
+# on every source edit. Which way that trades is a measurement nobody has taken
+# yet; take it before splitting.
 rust_test(
     name = "brenn-server_test",
     size = "large",
     crate = ":brenn-server",
-    data = ["//brenn-wasm:component_fixtures"],
+    data = [
+        "//brenn-wasm:fixture_git_forge_parser",
+        "//brenn-wasm:fixture_git_sync_consumer",
+        "//brenn-wasm:fixture_processor_demo",
+        "//brenn-wasm:fixture_processor_dual",
+        "//brenn-wasm:fixture_processor_multiport",
+        "//brenn-wasm:fixture_processor_store_rt",
+        "//brenn-wasm:fixture_processor_tool_test",
+        "//brenn-wasm:fixture_replay",
+        "//brenn-wasm:fixture_replay_fault_test",
+        "//brenn-wasm:fixture_replay_generic",
+    ],
     edition = "2024",
     # The repo-sync fetch-classification tests read a bogus remote's ssh
     # failure. Without this, ssh rejects the host's own `/etc/ssh` config

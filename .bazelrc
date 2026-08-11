@@ -80,6 +80,22 @@ build:release-package --//bazel/release:static_musl=True
 # ---------------------------------------------------------------------------
 build:ci --disk_cache=.bazel-disk-cache
 build:ci --experimental_disk_cache_gc_max_size=8G
+# Every CI run starts on a fresh runner with a fresh output base, so without
+# this each run re-downloads every http_archive, both Rust toolchains, node,
+# python, and every crate source. The directory sits inside the workspace so the
+# same actions/cache entry that carries the disk cache carries it too; it is in
+# `.bazelignore` for the same reason that one is.
+build:ci --repository_cache=.bazel-repo-cache
+# The repo contents cache — whole extracted repo directories, which external/
+# symlinks into — defaults to `{--repository_cache}/contents`, so the line above
+# would otherwise put every unpacked toolchain, node, python and crate tree into
+# that same actions/cache entry: ~5 GiB of it against GitHub's ~10G per-repo
+# budget, saved again on every run. Off here, so the entry carries downloads
+# only, which is the transfer this lane exists to buy back; re-extracting into a
+# fresh output base each run costs less than restoring and saving the unpacked
+# trees would. There is no size cap for it either, and its age-based GC wants an
+# idle server, which a runner that exits after the build never becomes.
+build:ci --repo_contents_cache=
 build:ci --show_timestamps
 build:ci --announce_rc
 build:ci --color=no

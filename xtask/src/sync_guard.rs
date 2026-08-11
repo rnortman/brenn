@@ -38,11 +38,21 @@
 //! selects on it, and a rename on either side leaves an operator dispatching
 //! with the box checked and every selected job skipping.
 //!
-//! The CI disk cache is written twice too — as the `--disk_cache` of the `ci`
-//! config and as the directory the workflow's cache steps carry — and a skew
-//! there is the quietest failure in the file: the restore matches nothing, the
-//! save banks a directory Bazel never wrote, and every run is a correct, green,
-//! cold build.
+//! The CI caches are written twice too — as the `--disk_cache` and
+//! `--repository_cache` of the `ci` config and as the directories the
+//! workflow's cache steps carry — and a skew there is the quietest failure in
+//! the file: the restore matches nothing, the save banks a directory Bazel
+//! never wrote, and every run is a correct, green, cold build. The contents
+//! cache belongs to the same arm from the other side: an in-workspace
+//! repository cache is only the download cache it is meant to be while that one
+//! is switched off, and switching it back on quietly banks gigabytes of
+//! extracted trees until the disk cache sharing the entry is evicted.
+//!
+//! The Bazel gate's lint coverage is a coupling of a different shape, between
+//! the `bazel-check` recipe and the `.bazelrc` configs it names: clippy and
+//! rustfmt are `--config=` flags on invocations that do other work, so dropping
+//! one deletes a flag from a line that still builds everything, still runs
+//! every test, and is still green over a tree nothing lints.
 //!
 //! The vended gitleaks is the last: the scrub suites' harness reads its path
 //! from one environment variable and `scrub/BUILD.bazel` sets that variable, and
@@ -147,15 +157,51 @@ const BAZELRC: &str = ".bazelrc";
 const CI_CONFIG: &str = "ci";
 const DISK_CACHE_FLAG: &str = "disk_cache";
 
-/// The GC cap on that cache. The workflow's cache-size step reads it out of
+/// The other cache the `ci` config puts inside the workspace, carried by the
+/// same steps. Its skew is quieter still than the disk cache's: a repository
+/// cache the workflow does not carry re-downloads every toolchain, tool archive
+/// and crate source on every run, and nothing about the build looks wrong.
+const REPO_CACHE_FLAG: &str = "repository_cache";
+
+/// The cache of whole extracted repository directories, which defaults to a
+/// subdirectory of the repository cache. Stated empty — bazel's spelling for
+/// disabled — because an in-workspace repository cache would otherwise put
+/// every unpacked toolchain, node, python and crate tree inside the directory
+/// the workflow banks: gigabytes of it, against a per-repo cache budget the
+/// disk cache is sized for. Nothing reddens when the line goes: the entry grows
+/// until the disk cache it exists to carry is evicted, and warm runs drift back
+/// to cold-slow while every gate stays green.
+const REPO_CONTENTS_CACHE_FLAG: &str = "repo_contents_cache";
+
+/// The GC cap on the disk cache. The workflow's cache-size step reads it out of
 /// `.bazelrc` to place its warning watermark, so its spelling is a coupling
 /// between the two files.
 const GC_MAX_SIZE_FLAG: &str = "experimental_disk_cache_gc_max_size";
 
-/// A cached directory is restored once and saved once, so the configured path
-/// appears in the workflow at least twice. One occurrence means one half of the
-/// pair moved and the other did not.
-const CACHE_STEPS_PER_DIRECTORY: usize = 2;
+/// Below this many `actions/cache` path entries the cache arm is not clean, it
+/// is not reading: one directory's round trip is two, and a reader that matches
+/// nothing reports as clean as a healthy one. A backstop against the reader
+/// collapsing entirely — a directory that goes missing on its own is reported
+/// by the arm proper, in its own words.
+const MIN_WORKFLOW_CACHE_PATHS: usize = 2;
+
+/// The Makefile recipe that is the Bazel gate, and the two `.bazelrc` configs
+/// whose aspects it has to request.
+///
+/// Clippy and rustfmt are `--config=` flags on the recipe's test line rather
+/// than invocations of their own, so dropping one deletes a flag from a line
+/// that still builds everything, still runs every test, and is still green —
+/// while the lint or the formatting it named stops being gated repo-wide, with
+/// nothing about the gate's output changing shape.
+const MAKEFILE: &str = "Makefile";
+const BAZEL_CHECK_RECIPE: &str = "bazel-check";
+const CLIPPY_CONFIG: &str = "clippy";
+const RUSTFMT_CONFIG: &str = "rustfmt";
+
+/// The wasm trees the recipe lints under their own platform, each needing its
+/// own clippy request because an aspect only applies to top-level targets.
+/// A floor, for the same reason the other arms have one.
+const MIN_WASM_CLIPPY_LINES: usize = 2;
 
 /// The stamp key: the build-id variable under Bazel's stable-key prefix.
 ///
@@ -473,41 +519,216 @@ fn bazelrc_flag_value(text: &str, config: &str, flag: &str) -> String {
     })
 }
 
-/// Every directory the workflow's cache steps name, in file order.
-fn workflow_cache_paths(text: &str) -> Vec<String> {
+/// Which half of a cached directory's round trip a step performs. The split
+/// actions do one each; `actions/cache` on its own does both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheStepKind {
+    restores: bool,
+    saves: bool,
+}
+
+/// One directory named by one `actions/cache` step, tagged with that step's
+/// half of the round trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedPath {
+    kind: CacheStepKind,
+    dir: String,
+}
+
+/// The half of the round trip an `actions/cache` step's `uses:` names, or
+/// `None` for any other action.
+///
+/// Scoped to the cache actions on purpose: `path:` is an input to plenty of
+/// other steps — uploading an artifact is the obvious one — and counting those
+/// as caching would let an unrelated step stand in for a deleted restore or
+/// save.
+fn cache_step_kind(uses: &str) -> Option<CacheStepKind> {
+    let action = uses.trim().trim_matches('"').split('@').next()?;
+    match action {
+        "actions/cache" => Some(CacheStepKind {
+            restores: true,
+            saves: true,
+        }),
+        "actions/cache/restore" => Some(CacheStepKind {
+            restores: true,
+            saves: false,
+        }),
+        "actions/cache/save" => Some(CacheStepKind {
+            restores: false,
+            saves: true,
+        }),
+        _ => None,
+    }
+}
+
+/// Every directory the workflow's `actions/cache` steps name, in file order.
+///
+/// `path:` takes either one directory inline or a `|` block listing several,
+/// and a step caching two directories has to be read as two — otherwise a pair
+/// sharing one entry reads as zero occurrences of each. Blank lines inside a
+/// block are YAML's to ignore and this reader's too: a maintainer grouping
+/// entries with one would otherwise truncate the block and redden the guard
+/// with a message asserting the opposite of the truth.
+fn workflow_cache_paths(text: &str) -> Vec<CachedPath> {
     let mut found = Vec::new();
-    for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix("path:") else {
+    let mut step: Option<CacheStepKind> = None;
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        let head = match trimmed.strip_prefix("- ") {
+            // A sequence item opens a new step, so whatever the last one used
+            // stops applying here.
+            Some(item) => {
+                step = None;
+                item.trim()
+            }
+            None => trimmed,
+        };
+        if let Some(rest) = head.strip_prefix("uses:") {
+            step = cache_step_kind(rest);
+            continue;
+        }
+        let Some(rest) = head.strip_prefix("path:") else {
+            continue;
+        };
+        let Some(kind) = step else {
             continue;
         };
         let value = rest.trim().trim_matches('"');
+        if value == "|" || value == "|-" {
+            let indent = line.len() - line.trim_start().len();
+            let before = found.len();
+            while let Some(entry) = lines.peek() {
+                let entry_indent = entry.len() - entry.trim_start().len();
+                if entry.trim().is_empty() {
+                    lines.next();
+                    continue;
+                }
+                if entry_indent <= indent {
+                    break;
+                }
+                found.push(CachedPath {
+                    kind,
+                    dir: entry.trim().trim_matches('"').to_string(),
+                });
+                lines.next();
+            }
+            assert!(
+                found.len() > before,
+                "sync guard: {CI_WORKFLOW} has a cache step whose path block lists nothing"
+            );
+            continue;
+        }
         assert!(
             !value.is_empty(),
             "sync guard: {CI_WORKFLOW} has a cache step with an empty path"
         );
-        found.push(value.to_string());
+        found.push(CachedPath {
+            kind,
+            dir: value.to_string(),
+        });
     }
     found
 }
 
-/// The directory the `ci` config writes its action cache to is the directory the
-/// workflow has to carry between runs.
+/// A directory the `ci` config writes a cache to is a directory the workflow has
+/// to restore at the start of a run and save at the end of one.
 ///
 /// Nothing fails when they disagree: the restore matches a path Bazel never
 /// writes, the save banks a directory Bazel never wrote, and every run is a
 /// full cold build — green, correct, and as slow as the lane this migration
-/// exists to replace, with nothing reporting it.
-fn ci_disk_cache_violations(configured: &str, cache_paths: &[String]) -> Vec<String> {
-    let carried = cache_paths.iter().filter(|p| *p == configured).count();
-    if carried >= CACHE_STEPS_PER_DIRECTORY {
+/// exists to replace, with nothing reporting it. Both halves are checked
+/// separately because a directory named by two restores and no save is a
+/// cache nothing ever banks.
+fn ci_cache_dir_violations(
+    flag: &str,
+    configured: &str,
+    cache_paths: &[CachedPath],
+) -> Vec<String> {
+    let has = |half: fn(&CacheStepKind) -> bool| {
+        cache_paths
+            .iter()
+            .any(|p| p.dir == configured && half(&p.kind))
+    };
+    let restored = has(|k| k.restores);
+    let saved = has(|k| k.saves);
+    let missing = match (restored, saved) {
+        (true, true) => return Vec::new(),
+        (true, false) => "restores but never saves",
+        (false, true) => "saves but never restores",
+        (false, false) => "neither restores nor saves",
+    };
+    let dirs: Vec<&str> = cache_paths.iter().map(|p| p.dir.as_str()).collect();
+    vec![format!(
+        "{BAZELRC} points `build:{CI_CONFIG} --{flag}` at {configured:?}, which {CI_WORKFLOW} \
+         {missing} — a cached directory needs both halves. Its cache steps name {dirs:?}. A cache \
+         keyed on a directory Bazel does not write makes every run a cold build and reports \
+         nothing."
+    )]
+}
+
+/// True if the config states the flag with nothing after the `=`, which is how
+/// bazel spells a cache turned off.
+///
+/// A reader of its own because `bazelrc_flag_values` asserts a value is there:
+/// the one property that matters about this flag is that it has none.
+fn bazelrc_flag_is_disabled(text: &str, config: &str, flag: &str) -> bool {
+    let needle = format!("build:{config} --{flag}=");
+    text.lines().any(|line| line.trim() == needle)
+}
+
+/// An in-workspace repository cache is only the download cache it is meant to
+/// be while the contents cache under it stays off.
+///
+/// The repository cache's directory is inside the workspace so that the
+/// workflow's one cache entry carries it. The contents cache defaults to a
+/// subdirectory of that directory, so leaving it on silently moves every
+/// extracted repository tree into the banked entry as well.
+fn repo_contents_cache_violations(bazelrc: &str) -> Vec<String> {
+    let configured = bazelrc_flag_value(bazelrc, CI_CONFIG, REPO_CACHE_FLAG);
+    if configured.starts_with('/') || configured.starts_with('~') {
+        return Vec::new();
+    }
+    if bazelrc_flag_is_disabled(bazelrc, CI_CONFIG, REPO_CONTENTS_CACHE_FLAG) {
         return Vec::new();
     }
     vec![format!(
-        "{BAZELRC} points `build:{CI_CONFIG} --{DISK_CACHE_FLAG}` at {configured:?}, which \
-         {CI_WORKFLOW} names in {carried} cache step(s) — a restore and a save is \
-         {CACHE_STEPS_PER_DIRECTORY}. It caches {cache_paths:?}. A cache keyed on a directory \
-         Bazel does not write makes every run a cold build and reports nothing."
+        "{BAZELRC} points `build:{CI_CONFIG} --{REPO_CACHE_FLAG}` at {configured:?}, inside the \
+         workspace {CI_WORKFLOW} banks — but states no `build:{CI_CONFIG} \
+         --{REPO_CONTENTS_CACHE_FLAG}=` with an empty value. That cache defaults under the \
+         repository cache, so every extracted toolchain, node, python and crate tree goes into \
+         the cache entry too, evicting the disk cache it shares with. Nothing fails; warm runs \
+         just go cold again."
     )]
+}
+
+/// Every violation the CI caches' two files can have between them: each cache
+/// directory the `ci` config names carried through a restore and a save, and
+/// the contents cache under an in-workspace repository cache left off.
+///
+/// One function over the flag list rather than a loop at the call site, so that
+/// the registration — which flags are checked at all — is itself testable. A
+/// cache flag missing from the list is a guard nobody calls, which reads in
+/// review as coverage.
+fn ci_cache_violations(bazelrc: &str, workflow: &str) -> Vec<String> {
+    let cache_paths = workflow_cache_paths(workflow);
+    assert!(
+        cache_paths.len() >= MIN_WORKFLOW_CACHE_PATHS,
+        "sync guard: the cache arm read {} `actions/cache` path(s) from {CI_WORKFLOW}, below the \
+         floor of {MIN_WORKFLOW_CACHE_PATHS} — the reader stopped matching, and a guard with \
+         nothing to compare reports clean",
+        cache_paths.len()
+    );
+    let mut found = Vec::new();
+    for flag in [DISK_CACHE_FLAG, REPO_CACHE_FLAG] {
+        found.extend(ci_cache_dir_violations(
+            flag,
+            &bazelrc_flag_value(bazelrc, CI_CONFIG, flag),
+            &cache_paths,
+        ));
+    }
+    found.extend(repo_contents_cache_violations(bazelrc));
+    found
 }
 
 /// The cache-size step warns off a fraction of the GC cap `build:{CI_CONFIG}`
@@ -550,6 +771,99 @@ fn ci_cache_watermark_violations(workflow: &str, caps: &[String]) -> Vec<String>
         )];
     }
     Vec::new()
+}
+
+/// The command lines of a Makefile recipe: the tab-indented lines under
+/// `<name>:`, up to the first line that is neither one nor blank.
+fn makefile_recipe(text: &str, name: &str) -> Vec<String> {
+    let header = format!("{name}:");
+    let mut lines = text.lines().skip_while(|line| !line.starts_with(&header));
+    lines
+        .next()
+        .unwrap_or_else(|| panic!("sync guard: {MAKEFILE} has no {name} recipe"));
+    let mut found = Vec::new();
+    for line in lines {
+        if let Some(command) = line.strip_prefix('\t') {
+            found.push(command.trim().to_string());
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        break;
+    }
+    assert!(
+        !found.is_empty(),
+        "sync guard: {MAKEFILE}'s {name} recipe has no command lines"
+    );
+    found
+}
+
+/// The Bazel gate requests clippy and rustfmt as configs on the invocations it
+/// already makes, so its lint coverage is stated as flags rather than as lines.
+///
+/// Both are silent when they go. A test line without `--config=rustfmt` still
+/// builds every target and runs every test and is still green, with formatting
+/// no longer gated anywhere; a wasm-platform build without `--config=clippy`
+/// still builds the guests. Neither changes the gate's output shape, so the
+/// recipe has to be read.
+fn bazel_check_aspect_violations(recipe: &[String], bazelrc: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let host: Vec<&String> = recipe
+        .iter()
+        .filter(|line| line.contains("bazel test "))
+        .collect();
+    if host.len() != 1 {
+        found.push(format!(
+            "{MAKEFILE}'s {BAZEL_CHECK_RECIPE} recipe has {} `bazel test` line(s); the aspect \
+             check reads exactly one host lane. The recipe's shape changed under a check that \
+             cannot see the change.",
+            host.len()
+        ));
+    }
+    for line in &host {
+        for config in [CLIPPY_CONFIG, RUSTFMT_CONFIG] {
+            if !line.contains(&format!("--config={config}")) {
+                found.push(format!(
+                    "{MAKEFILE}'s {BAZEL_CHECK_RECIPE} host lane does not request \
+                     `--config={config}`, so that aspect runs over nothing. The line still \
+                     builds the graph and runs the tests, so the gate stays green over an \
+                     ungated tree."
+                ));
+            }
+        }
+    }
+    let wasm: Vec<&String> = recipe
+        .iter()
+        .filter(|line| line.contains("--platforms="))
+        .collect();
+    if wasm.len() < MIN_WASM_CLIPPY_LINES {
+        found.push(format!(
+            "{MAKEFILE}'s {BAZEL_CHECK_RECIPE} recipe has {} platform-transitioned line(s), below \
+             the floor of {MIN_WASM_CLIPPY_LINES}. An aspect applies to top-level targets only, \
+             so each wasm tree needs its own request; a missing line lints nothing and says \
+             nothing.",
+            wasm.len()
+        ));
+    }
+    for line in wasm {
+        if !line.contains(&format!("--config={CLIPPY_CONFIG}")) {
+            found.push(format!(
+                "{MAKEFILE}'s {BAZEL_CHECK_RECIPE} builds {line:?} without \
+                 `--config={CLIPPY_CONFIG}`, so that tree is built and never linted."
+            ));
+        }
+    }
+    for config in [CLIPPY_CONFIG, RUSTFMT_CONFIG] {
+        if !bazelrc.contains(&format!("build:{config} --aspects=")) {
+            found.push(format!(
+                "{BAZELRC} states no `build:{config} --aspects=`, so the config \
+                 {BAZEL_CHECK_RECIPE} names attaches no aspect. Renaming it here and in \
+                 {MAKEFILE} together is the edit; renaming it in one is the hole."
+            ));
+        }
+    }
+    found
 }
 
 /// scrub is validated against exactly one gitleaks release, and four files name
@@ -1293,13 +1607,14 @@ pub fn run_sync_guard(root: &Path, files: &[PathBuf]) -> bool {
         &workflow_input_references(&workflow),
     ));
     let bazelrc = read(BAZELRC);
-    found.extend(ci_disk_cache_violations(
-        &bazelrc_flag_value(&bazelrc, CI_CONFIG, DISK_CACHE_FLAG),
-        &workflow_cache_paths(&workflow),
-    ));
+    found.extend(ci_cache_violations(&bazelrc, &workflow));
     found.extend(ci_cache_watermark_violations(
         &workflow,
         &bazelrc_flag_values(&bazelrc, CI_CONFIG, GC_MAX_SIZE_FLAG),
+    ));
+    found.extend(bazel_check_aspect_violations(
+        &makefile_recipe(&read(MAKEFILE), BAZEL_CHECK_RECIPE),
+        &bazelrc,
     ));
     let surface_manifest = read(SURFACE_MANIFEST);
     found.extend(jco_violations(
@@ -2162,6 +2477,11 @@ build:cd --disk_cache=~/.build-cache/bazel-disk
         );
     }
 
+    /// The directories a parse read, dropping the restore/save tagging.
+    fn dirs(paths: &[CachedPath]) -> Vec<&str> {
+        paths.iter().map(|p| p.dir.as_str()).collect()
+    }
+
     #[test]
     fn the_configured_disk_cache_must_be_the_directory_the_workflow_carries() {
         let workflow = "\
@@ -2179,31 +2499,238 @@ build:cd --disk_cache=~/.build-cache/bazel-disk
           key: bazel-disk-x
 ";
         let paths = workflow_cache_paths(workflow);
-        assert_eq!(paths.len(), 3, "{paths:?}");
-        assert!(ci_disk_cache_violations(".bazel-disk-cache", &paths).is_empty());
+        assert_eq!(
+            dirs(&paths),
+            vec![
+                ".bazel-disk-cache",
+                "~/.brenn-ci-tools",
+                ".bazel-disk-cache"
+            ]
+        );
+        assert!(ci_cache_dir_violations(DISK_CACHE_FLAG, ".bazel-disk-cache", &paths).is_empty());
 
-        // The restore half moved and the save half did not: one occurrence, so
-        // the pair is broken even though the name still appears.
+        // The restore half moved and the save half did not: the name still
+        // appears, and the round trip is still broken.
         let one = workflow_cache_paths(&workflow.replacen(
             "path: .bazel-disk-cache",
             "path: .bazel-cache",
             1,
         ));
-        let out = ci_disk_cache_violations(".bazel-disk-cache", &one);
+        let out = ci_cache_dir_violations(DISK_CACHE_FLAG, ".bazel-disk-cache", &one);
         assert_eq!(out.len(), 1, "{out:?}");
-        assert!(out[0].contains("1 cache step(s)"), "{}", out[0]);
+        assert!(out[0].contains("saves but never restores"), "{}", out[0]);
 
         // And the other direction: the config moved, both workflow halves did
         // not.
-        let out = ci_disk_cache_violations(".bazel-disk-cache-2", &paths);
+        let out = ci_cache_dir_violations(DISK_CACHE_FLAG, ".bazel-disk-cache-2", &paths);
         assert_eq!(out.len(), 1, "{out:?}");
-        assert!(out[0].contains("0 cache step(s)"), "{}", out[0]);
+        assert!(out[0].contains("neither restores nor saves"), "{}", out[0]);
+    }
+
+    #[test]
+    fn a_second_restore_does_not_stand_in_for_the_missing_save() {
+        // Two restores of the same directory and no save: a count of the name
+        // reaches two and the cache is never banked.
+        let paths = workflow_cache_paths(
+            "\
+      - uses: actions/cache/restore@v4
+        with:
+          path: .bazel-disk-cache
+      - uses: actions/cache/restore@v4
+        with:
+          path: .bazel-disk-cache
+",
+        );
+        let out = ci_cache_dir_violations(DISK_CACHE_FLAG, ".bazel-disk-cache", &paths);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("restores but never saves"), "{}", out[0]);
+    }
+
+    #[test]
+    fn a_path_outside_a_cache_step_is_not_a_cached_directory() {
+        // An upload step names a `path:` too, and counting it would let it
+        // stand in for a deleted save.
+        let paths = workflow_cache_paths(
+            "\
+      - uses: actions/cache/restore@v4
+        with:
+          path: .bazel-disk-cache
+      - uses: actions/upload-artifact@v4
+        with:
+          path: .bazel-disk-cache
+      - name: Report
+        run: du -sk .bazel-disk-cache
+",
+        );
+        assert_eq!(dirs(&paths), vec![".bazel-disk-cache"]);
+        let out = ci_cache_dir_violations(DISK_CACHE_FLAG, ".bazel-disk-cache", &paths);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("restores but never saves"), "{}", out[0]);
+    }
+
+    #[test]
+    fn a_combined_cache_step_is_both_halves() {
+        let paths = workflow_cache_paths(
+            "      - uses: actions/cache@v4\n        with:\n          path: .bazel-disk-cache\n",
+        );
+        assert!(ci_cache_dir_violations(DISK_CACHE_FLAG, ".bazel-disk-cache", &paths).is_empty());
+    }
+
+    #[test]
+    fn a_step_caching_two_directories_reads_as_two() {
+        let workflow = "\
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            .bazel-disk-cache
+            .bazel-repo-cache
+          key: bazel-disk-x
+      - uses: actions/cache/save@v4
+        with:
+          path: |
+            .bazel-disk-cache
+            .bazel-repo-cache
+          key: bazel-disk-x
+";
+        let paths = workflow_cache_paths(workflow);
+        assert_eq!(
+            dirs(&paths),
+            vec![
+                ".bazel-disk-cache",
+                ".bazel-repo-cache",
+                ".bazel-disk-cache",
+                ".bazel-repo-cache",
+            ]
+        );
+        for (flag, dir) in [
+            (DISK_CACHE_FLAG, ".bazel-disk-cache"),
+            (REPO_CACHE_FLAG, ".bazel-repo-cache"),
+        ] {
+            assert!(
+                ci_cache_dir_violations(flag, dir, &paths).is_empty(),
+                "{flag} at {dir} is carried twice"
+            );
+        }
+
+        // A blank line inside the block is YAML's to ignore, and the reader's:
+        // ending the block on it would truncate a correct workflow.
+        let spaced = workflow.replacen(
+            "            .bazel-disk-cache\n",
+            "            .bazel-disk-cache\n\n",
+            1,
+        );
+        assert_eq!(dirs(&workflow_cache_paths(&spaced)), dirs(&paths));
+        let leading = workflow.replacen("          path: |\n", "          path: |\n\n", 1);
+        assert_eq!(dirs(&workflow_cache_paths(&leading)), dirs(&paths));
+
+        // Dropping one entry of the block breaks that directory's pair alone.
+        let one =
+            workflow_cache_paths(&workflow.replacen("            .bazel-repo-cache\n", "", 1));
+        let out = ci_cache_dir_violations(REPO_CACHE_FLAG, ".bazel-repo-cache", &one);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("saves but never restores"), "{}", out[0]);
+        assert!(ci_cache_dir_violations(DISK_CACHE_FLAG, ".bazel-disk-cache", &one).is_empty());
     }
 
     #[test]
     #[should_panic(expected = "cache step with an empty path")]
     fn a_cache_step_with_no_path_panics() {
-        workflow_cache_paths("        with:\n          path:\n");
+        workflow_cache_paths(
+            "      - uses: actions/cache/save@v4\n        with:\n          path:\n",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "path block lists nothing")]
+    fn a_cache_step_whose_path_block_lists_nothing_panics() {
+        workflow_cache_paths(
+            "      - uses: actions/cache/save@v4\n        with:\n          path: |\n          key: x\n",
+        );
+    }
+
+    const A_CACHE_BAZELRC: &str = "\
+build --disk_cache=~/.cache/brenn-bazel-disk
+build:ci --disk_cache=.bazel-disk-cache
+build:ci --repository_cache=.bazel-repo-cache
+build:ci --repo_contents_cache=
+build:cd --disk_cache=~/.build-cache/bazel-disk
+build:cd --repository_cache=~/.build-cache/bazel-repo
+";
+
+    const A_CACHE_WORKFLOW: &str = "\
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            .bazel-disk-cache
+            .bazel-repo-cache
+      - uses: actions/cache/save@v4
+        with:
+          path: |
+            .bazel-disk-cache
+            .bazel-repo-cache
+";
+
+    #[test]
+    fn every_cache_the_ci_config_names_is_checked_against_the_workflow() {
+        assert!(ci_cache_violations(A_CACHE_BAZELRC, A_CACHE_WORKFLOW).is_empty());
+
+        // The registration is the thing under test: a workflow carrying only
+        // the disk cache has to be reported, and reported about the repository
+        // cache specifically.
+        let disk_only = A_CACHE_WORKFLOW.replace("            .bazel-repo-cache\n", "");
+        let out = ci_cache_violations(A_CACHE_BAZELRC, &disk_only);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains(REPO_CACHE_FLAG), "{}", out[0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "below the floor")]
+    fn a_workflow_that_caches_nothing_fails_the_floor() {
+        ci_cache_violations(A_CACHE_BAZELRC, "jobs:\n  check:\n    steps:\n");
+    }
+
+    #[test]
+    fn an_in_workspace_repository_cache_needs_the_contents_cache_off() {
+        // Stated empty: the shipped shape, and the only quiet one.
+        assert!(bazelrc_flag_is_disabled(
+            A_CACHE_BAZELRC,
+            CI_CONFIG,
+            REPO_CONTENTS_CACHE_FLAG
+        ));
+        assert!(repo_contents_cache_violations(A_CACHE_BAZELRC).is_empty());
+
+        // Absent: the default puts the extracted trees under the repository
+        // cache, inside the directory the workflow banks.
+        let gone = A_CACHE_BAZELRC.replace("build:ci --repo_contents_cache=\n", "");
+        let out = repo_contents_cache_violations(&gone);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains(REPO_CONTENTS_CACHE_FLAG), "{}", out[0]);
+
+        // Stated with a path: not disabled either, whatever the path is.
+        let valued = A_CACHE_BAZELRC.replace(
+            "build:ci --repo_contents_cache=\n",
+            "build:ci --repo_contents_cache=.bazel-repo-contents\n",
+        );
+        assert!(!bazelrc_flag_is_disabled(
+            &valued,
+            CI_CONFIG,
+            REPO_CONTENTS_CACHE_FLAG
+        ));
+        assert_eq!(repo_contents_cache_violations(&valued).len(), 1);
+    }
+
+    #[test]
+    fn a_repository_cache_outside_the_workspace_carries_no_such_requirement() {
+        // The deploy runner's caches live under `$HOME` and are never banked
+        // into a cache entry, so the contents cache there costs nothing.
+        let cd = A_CACHE_BAZELRC
+            .replace("build:ci --repository_cache=.bazel-repo-cache\n", "")
+            .replace("build:ci --repo_contents_cache=\n", "")
+            .replace(
+                "build:cd --repository_cache=",
+                "build:ci --repository_cache=",
+            );
+        assert!(repo_contents_cache_violations(&cd).is_empty());
     }
 
     #[test]
@@ -2254,5 +2781,129 @@ build:cd --disk_cache=~/.build-cache/bazel-disk
         let out = ci_cache_watermark_violations("      - run: make bazel-check\n", &["8G".into()]);
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(out[0].contains("delete this check with it"), "{}", out[0]);
+    }
+
+    const A_MAKEFILE: &str = "\
+# The Bazel gate.
+bazel-check:
+\tbazel test $(BAZEL_CONFIG) --config=clippy --config=rustfmt //...
+\tbazel build $(BAZEL_CONFIG) --config=clippy --platforms=//bazel/platforms:wasm32 //brenn-wasm/components/...
+\tbazel build $(BAZEL_CONFIG) --config=clippy --platforms=//bazel/platforms:wasm32 //surface/...
+
+bazel-release:
+\tbazel build $(BAZEL_CONFIG) --config=release-package //deploy:release_package
+";
+
+    const AN_ASPECT_BAZELRC: &str = "\
+build:clippy --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build:clippy --output_groups=+clippy_checks
+build:rustfmt --aspects=@rules_rust//rust:defs.bzl%rustfmt_aspect
+build:rustfmt --output_groups=+rustfmt_checks
+";
+
+    #[test]
+    fn a_recipe_is_read_as_its_command_lines_and_stops_at_the_next_one() {
+        let recipe = makefile_recipe(A_MAKEFILE, BAZEL_CHECK_RECIPE);
+        assert_eq!(recipe.len(), 3, "{recipe:?}");
+        assert!(recipe[0].starts_with("bazel test "), "{}", recipe[0]);
+        assert_eq!(makefile_recipe(A_MAKEFILE, "bazel-release").len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no bazel-check recipe")]
+    fn a_recipe_that_is_gone_panics() {
+        makefile_recipe("check:\n\tcargo test\n", BAZEL_CHECK_RECIPE);
+    }
+
+    #[test]
+    fn the_shipped_bazel_check_recipe_requests_both_aspects() {
+        let recipe = makefile_recipe(A_MAKEFILE, BAZEL_CHECK_RECIPE);
+        assert!(
+            bazel_check_aspect_violations(&recipe, AN_ASPECT_BAZELRC).is_empty(),
+            "the shipped shape has to pass"
+        );
+    }
+
+    #[test]
+    fn an_aspect_dropped_from_the_host_lane_is_a_violation() {
+        // The silent edit: the line still builds everything and runs every
+        // test, and the aspect the config named stops running.
+        for config in [CLIPPY_CONFIG, RUSTFMT_CONFIG] {
+            let makefile = A_MAKEFILE.replacen(&format!(" --config={config}"), "", 1);
+            let recipe = makefile_recipe(&makefile, BAZEL_CHECK_RECIPE);
+            let out = bazel_check_aspect_violations(&recipe, AN_ASPECT_BAZELRC);
+            assert_eq!(out.len(), 1, "{config}: {out:?}");
+            assert!(out[0].contains(config), "{}", out[0]);
+        }
+    }
+
+    #[test]
+    fn a_wasm_lane_built_without_clippy_is_a_violation() {
+        let makefile = A_MAKEFILE.replace(
+            "--config=clippy --platforms=//bazel/platforms:wasm32 //surface/...",
+            "--platforms=//bazel/platforms:wasm32 //surface/...",
+        );
+        let recipe = makefile_recipe(&makefile, BAZEL_CHECK_RECIPE);
+        let out = bazel_check_aspect_violations(&recipe, AN_ASPECT_BAZELRC);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("built and never linted"), "{}", out[0]);
+    }
+
+    #[test]
+    fn a_recipe_that_lost_a_wasm_lane_or_grew_a_second_host_lane_is_a_violation() {
+        let one_wasm = A_MAKEFILE.replace(
+            "\tbazel build $(BAZEL_CONFIG) --config=clippy --platforms=//bazel/platforms:wasm32 //surface/...\n",
+            "",
+        );
+        let out = bazel_check_aspect_violations(
+            &makefile_recipe(&one_wasm, BAZEL_CHECK_RECIPE),
+            AN_ASPECT_BAZELRC,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains("below the floor"), "{}", out[0]);
+
+        // A split host lane is the shape the fold replaced; reading one of two
+        // would check the flags of whichever came first.
+        let two_hosts = A_MAKEFILE.replace(
+            "\tbazel test $(BAZEL_CONFIG) --config=clippy --config=rustfmt //...\n",
+            "\tbazel test $(BAZEL_CONFIG) --config=clippy --config=rustfmt //...\n\tbazel test $(BAZEL_CONFIG) //...\n",
+        );
+        let out = bazel_check_aspect_violations(
+            &makefile_recipe(&two_hosts, BAZEL_CHECK_RECIPE),
+            AN_ASPECT_BAZELRC,
+        );
+        assert!(
+            out.iter().any(|v| v.contains("2 `bazel test` line(s)")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_that_attaches_no_aspect_is_a_violation() {
+        let recipe = makefile_recipe(A_MAKEFILE, BAZEL_CHECK_RECIPE);
+        let out = bazel_check_aspect_violations(
+            &recipe,
+            "build:clippy --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect\n",
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains(RUSTFMT_CONFIG), "{}", out[0]);
+    }
+
+    /// Liveness: the fixtures above are this guard's own reading of a shape the
+    /// real files carry, so read the real ones once. A recipe or a config
+    /// respelled past the reader would otherwise leave every test here green
+    /// over a guard that matches nothing.
+    #[test]
+    fn the_real_bazel_check_recipe_and_aspect_configs_pass_this_guard() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ sits in the repo root");
+        let makefile = std::fs::read_to_string(repo_root.join(MAKEFILE))
+            .expect("the repo root has a Makefile");
+        let bazelrc =
+            std::fs::read_to_string(repo_root.join(BAZELRC)).expect("the repo root has a .bazelrc");
+        let recipe = makefile_recipe(&makefile, BAZEL_CHECK_RECIPE);
+        let out = bazel_check_aspect_violations(&recipe, &bazelrc);
+        assert!(out.is_empty(), "{out:?}");
     }
 }

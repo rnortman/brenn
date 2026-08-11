@@ -32,8 +32,16 @@ rust_library(
 # constant has to name this package and the files have to be runfiles. The
 # workspace-relative form resolves from the runfiles root, which is where a
 # Bazel test starts.
+#
+# `large` (900s) rather than the `medium` default (300s), for the same
+# arithmetic as `//brenn-server:brenn-server_test`: this binary runs ~2,500
+# tests, which fits in 300s warm and parallel on a dev machine and does not on a
+# cold 4-vCPU runner sharing itself with the rest of the graph — the weekly
+# uncached canary being exactly that run. Timeout honesty, not speed: `size`
+# reserves the same one CPU at every tier.
 rust_test(
     name = "brenn-lib_test",
+    size = "large",
     crate = ":brenn-lib",
     crate_features = ["testutils"],
     data = [

@@ -191,18 +191,23 @@ xtask-deny:
 #
 # CI passes BAZEL_CONFIG=--config=ci; locally the defaults in .bazelrc apply.
 #
-# Five invocations, not one: `bazel test` covers the test targets, and the
-# clippy/rustfmt aspects are build configs that only apply to top-level targets
-# — both wasm trees are reached through a platform transition (the component
-# rule's, the wasm-bindgen rule's), so clippy needs a request under the wasm32
-# platform for each of them. Together those two are what `surface-wasm-check`
-# and `check-brenn-guest` cover on the cargo side.
+# Three invocations, not five. The host lane is one: the clippy and rustfmt
+# aspects apply to the same `//...` in the same configuration the tests build
+# in, so requesting them alongside `test` loads and analyzes that graph once and
+# schedules one action pool instead of three back-to-back. Action keys are what
+# the disk cache stores, not invocation shapes, so the verdict and the cached
+# results are identical either way.
+#
+# The two wasm lanes stay separate because they are not the same graph: both
+# wasm trees are reached through a platform transition (the component rule's,
+# the wasm-bindgen rule's), and an aspect only applies to top-level targets, so
+# clippy needs its own request under the wasm32 platform for each. Together
+# those two are what `surface-wasm-check` and `check-brenn-guest` cover on the
+# cargo side.
 bazel-check:
-	bazel test $(BAZEL_CONFIG) //...
-	bazel build $(BAZEL_CONFIG) --config=clippy //...
+	bazel test $(BAZEL_CONFIG) --config=clippy --config=rustfmt //...
 	bazel build $(BAZEL_CONFIG) --config=clippy --platforms=//bazel/platforms:wasm32 //brenn-wasm/components/...
 	bazel build $(BAZEL_CONFIG) --config=clippy --platforms=//bazel/platforms:wasm32 //surface/...
-	bazel build $(BAZEL_CONFIG) --config=rustfmt //...
 
 # The deploy tarball's staged tree, and the gates on it.
 #

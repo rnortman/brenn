@@ -8,7 +8,11 @@
 .bazel-out
 .bazel-testlogs
 .rules_rust_analyzer
+# The two caches `--config=ci` puts inside the workspace. Unlisted, they join
+# the whole-tree glob behind `//:policy_srcs`, and every run that restored a
+# cache would then fail `make bazel-policy-parity` on files git never tracked.
 .bazel-disk-cache
+.bazel-repo-cache
 target
 logs
 dev/grafdata

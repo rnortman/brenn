@@ -7,23 +7,28 @@ policy_srcs()
 
 # Every component the tree builds, deployed or test-only. Adding a component
 # crate means adding it here; the deploy manifest is checked against this list.
+COMPONENT_NAMES = [
+    "git-forge-parser",
+    "git-sync-consumer",
+    "processor-config",
+    "processor-demo",
+    "processor-dual",
+    "processor-exhaust",
+    "processor-log",
+    "processor-mem-exhaust",
+    "processor-mqtt-test",
+    "processor-multiport",
+    "processor-store-rt",
+    "processor-tool-test",
+    "processor-transplant",
+    "replay",
+    "replay-fault-test",
+    "replay-generic",
+]
+
 COMPONENTS = [
-    "//brenn-wasm/components/git-forge-parser:component",
-    "//brenn-wasm/components/git-sync-consumer:component",
-    "//brenn-wasm/components/processor-config:component",
-    "//brenn-wasm/components/processor-demo:component",
-    "//brenn-wasm/components/processor-dual:component",
-    "//brenn-wasm/components/processor-exhaust:component",
-    "//brenn-wasm/components/processor-log:component",
-    "//brenn-wasm/components/processor-mem-exhaust:component",
-    "//brenn-wasm/components/processor-mqtt-test:component",
-    "//brenn-wasm/components/processor-multiport:component",
-    "//brenn-wasm/components/processor-store-rt:component",
-    "//brenn-wasm/components/processor-tool-test:component",
-    "//brenn-wasm/components/processor-transplant:component",
-    "//brenn-wasm/components/replay:component",
-    "//brenn-wasm/components/replay-fault-test:component",
-    "//brenn-wasm/components/replay-generic:component",
+    "//brenn-wasm/components/{}:component".format(name)
+    for name in COMPONENT_NAMES
 ]
 
 filegroup(
@@ -38,11 +43,32 @@ deployed_components_test(
     manifest = "deployed-components.txt",
 )
 
-component_fixtures(
-    name = "component_fixtures",
-    components = COMPONENTS,
-    visibility = ["//visibility:public"],
-)
+# One fixture target per component, never a bundle. Runfiles are part of a test
+# action's key, so a group is an edge from every component to every test target
+# that names it: editing one guest crate would re-run suites that never load it,
+# and on `//brenn-server:brenn-server_test` that is ~2,500 tests. Singletons let
+# each consumer name exactly what it opens.
+#
+# Singletons are also the only shape the rule admits. It declares its outputs at
+# a fixed package-relative path (`target/components/<basename>`), so two
+# instances listing the same component would declare the same artifact — an
+# analysis-time conflict. Disjoint by construction is what one component per
+# instance buys.
+#
+# A misspelling in a consumer's fixture list fails at load time.
+[
+    component_fixtures(
+        name = "fixture_" + name.replace("-", "_"),
+        components = ["//brenn-wasm/components/{}:component".format(name)],
+        visibility = ["//visibility:public"],
+    )
+    for name in COMPONENT_NAMES
+]
+
+FIXTURES = {
+    name: "//brenn-wasm:fixture_" + name.replace("-", "_")
+    for name in COMPONENT_NAMES
+}
 
 exports_files([
     "Cargo.toml",
@@ -80,36 +106,67 @@ rust_library(
     ],
 )
 
-# The unit tests and every `tests/` suite instantiate guest components through
-# `env!("CARGO_MANIFEST_DIR")/target/components/`. The workspace-relative form
-# of the variable resolves against the runfiles root, where `:component_fixtures`
-# stages them.
+# No fixtures: the in-crate unit tests build engines and stores directly and
+# open no component artifact — every `env!("CARGO_MANIFEST_DIR")/target/
+# components/` call site is in the `tests/` suites below. A unit test that grows
+# one fails here on a missing runfile, which is the direction to be wrong in.
 rust_test(
     name = "brenn-wasm_test",
     crate = ":brenn-wasm",
-    data = [":component_fixtures"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     rustc_env = {"CARGO_MANIFEST_DIR": "brenn-wasm"},
     deps = all_crate_deps(normal_dev = True) + ["//brenn-cal"],
 )
 
+# Each suite's fixture list must match the components its source opens; a guest
+# crate's edit then re-runs the suites that load it and no others.
+#
+# TODO(bazel-fixture-list-guard): the match is hand-held. A suite that stages a
+# component it no longer opens keeps the invalidation edge and nothing reports
+# it, so these lists drift back toward all-to-all one commit at a time. The
+# other direction is loud — a missing fixture is a missing runfile.
 WASM_TEST_SUITES = [
-    ("consume_engine", []),
-    ("feature_envelope", []),
-    ("grants", []),
-    ("instantiation_fail", []),
-    ("processor_config", []),
-    ("processor_log", []),
-    ("processor_mqtt", []),
+    (
+        "consume_engine",
+        [
+            "processor-demo",
+            "processor-dual",
+            "processor-exhaust",
+            "processor-mem-exhaust",
+            "processor-multiport",
+            "processor-store-rt",
+        ],
+        [],
+    ),
+    ("feature_envelope", ["processor-demo", "replay"], []),
+    (
+        "grants",
+        [
+            "processor-config",
+            "processor-demo",
+            "processor-dual",
+            "processor-exhaust",
+            "processor-log",
+            "processor-mem-exhaust",
+            "processor-multiport",
+            "processor-store-rt",
+        ],
+        [],
+    ),
+    ("instantiation_fail", ["processor-exhaust"], []),
+    ("processor_config", ["processor-config"], []),
+    ("processor_log", ["processor-log"], []),
+    ("processor_mqtt", ["processor-mqtt-test"], []),
     (
         "processor_transplant",
+        ["processor-transplant"],
         ["//brenn-wasm/components/processor-transplant:transplant.json"],
     ),
-    ("replay_engine", []),
-    ("replay_engine_bounds", []),
-    ("replay_generic_engine", []),
-    ("store_round_trip", []),
+    ("replay_engine", ["replay"], []),
+    ("replay_engine_bounds", ["replay", "replay-fault-test"], []),
+    ("replay_generic_engine", ["replay-generic"], []),
+    ("store_round_trip", ["replay-fault-test"], []),
 ]
 
 [
@@ -117,7 +174,7 @@ WASM_TEST_SUITES = [
         name = suite,
         srcs = ["tests/{}.rs".format(suite)] + glob(["tests/common/*.rs"]),
         crate_root = "tests/{}.rs".format(suite),
-        data = [":component_fixtures"] + extra_data,
+        data = [FIXTURES[c] for c in fixtures] + extra_data,
         edition = "2024",
         proc_macro_deps = all_crate_deps(
             proc_macro = True,
@@ -136,7 +193,7 @@ WASM_TEST_SUITES = [
             "//brenn-envelope",
         ],
     )
-    for suite, extra_data in WASM_TEST_SUITES
+    for suite, fixtures, extra_data in WASM_TEST_SUITES
 ]
 
 rust_doc_test(

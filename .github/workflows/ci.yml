@@ -69,15 +69,20 @@ jobs:
       - name: Install mosquitto and lld
         run: sudo apt-get update && sudo apt-get install -y mosquitto lld
 
-      # --config=ci points the disk cache inside the workspace so actions/cache
-      # can carry it; the GC size cap is what keeps it inside the cache scope.
-      # Restore/save are split so a red run still banks the actions it did
-      # complete — a combined cache saves only on job success.
-      - name: Restore bazel disk cache
+      # --config=ci points both bazel caches inside the workspace so
+      # actions/cache can carry them; the GC size cap is what keeps the disk
+      # cache inside the cache scope. One entry for the pair: they are restored
+      # and saved together, and a run that had one without the other would fetch
+      # or rebuild the missing half anyway. Restore/save are split so a red run
+      # still banks the actions it did complete — a combined cache saves only on
+      # job success.
+      - name: Restore bazel caches
         id: bazel-cache
         uses: actions/cache/restore@v4
         with:
-          path: .bazel-disk-cache
+          path: |
+            .bazel-disk-cache
+            .bazel-repo-cache
           key: bazel-disk-${{ github.sha }}
           restore-keys: bazel-disk-
 
@@ -97,10 +102,16 @@ jobs:
       # stops the service before it fails. The second verb is the path the
       # deploying repo tars, checked to exist here rather than by that repo.
       #
-      # Any build id stamps; the deploying repo supplies the real one.
+      # The id is a constant, not the commit sha. `STABLE_BRENN_BUILD_ID` is a
+      # stable workspace-status key, so it is a cache key on the root binary's
+      # compile and link, the stamped bundles, and everything staged from them:
+      # a per-commit value re-runs that whole closure on every commit, including
+      # ones that touch only a changelog. Nothing here consumes the value —
+      # GitHub publishes no artifact, the tarball is only checked to exist — and
+      # the deploying repo stamps the real per-version id on its own runner.
       - name: Release package
         env:
-          BRENN_BUILD_ID: ci-${{ github.sha }}
+          BRENN_BUILD_ID: ci-gate
         run: |
           make bazel-release BAZEL_CONFIG=--config=ci
           make bazel-release-dir BAZEL_CONFIG=--config=ci
@@ -108,10 +119,11 @@ jobs:
       # TODO(bazel-ci-cache-pressure): this job builds two configurations into
       # one disk cache — the dev graph for the gate and the release package —
       # against the GC cap `build:ci` sets in `.bazelrc` and GitHub's ~10G
-      # per-repo cache budget. Saturation fails nothing; Bazel's GC and GitHub's
-      # eviction just start trading warm hits away until green runs are
-      # cold-slow again. So the size is reported here and the sizing call waits
-      # on real numbers.
+      # per-repo cache budget, which the repository cache shares with it in the
+      # one entry. Saturation fails nothing; Bazel's GC and GitHub's eviction
+      # just start trading warm hits away until green runs are cold-slow again.
+      # So both sizes are reported here and the sizing call waits on real
+      # numbers.
       #
       # The watermark is read out of `.bazelrc` rather than written here: the
       # cap is one of the remediations this measurement may prescribe, and a
@@ -124,9 +136,20 @@ jobs:
       # Warn, never fail: cache pressure costs time, not correctness, and this
       # job's red has to keep meaning "the change is wrong". Runs whatever the
       # gate did, so a red run still reports its size.
-      - name: Report bazel disk cache size
+      - name: Report bazel cache sizes
         if: always()
         run: |
+          # Report-only, and no watermark: the repository cache has no size cap
+          # to place one against — the GC flags bazel offers for fetched repos
+          # are age-based and belong to the repo contents cache, which
+          # `build:ci` disables. It shares the actions/cache budget with the
+          # disk cache, so its size is part of what the TODO reads.
+          repo_size=$(du -sk .bazel-repo-cache 2>/dev/null | cut -f1 || true)
+          if [ -n "$repo_size" ]; then
+            echo "bazel repository cache: $((repo_size / 1024)) MiB"
+          else
+            echo "no .bazel-repo-cache to size; nothing was fetched into it this run"
+          fi
           size=$(du -sk .bazel-disk-cache 2>/dev/null | cut -f1 || true)
           if [ -z "$size" ]; then
             echo "no .bazel-disk-cache to size; nothing was cached this run"
@@ -146,11 +169,13 @@ jobs:
             echo "::warning::bazel disk cache is $((size / 1024)) MiB, past 90% of the ${cap}G GC cap build:ci sets in .bazelrc — see TODO(bazel-ci-cache-pressure)"
           fi
 
-      - name: Save bazel disk cache
+      - name: Save bazel caches
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: .bazel-disk-cache
+          path: |
+            .bazel-disk-cache
+            .bazel-repo-cache
           key: bazel-disk-${{ github.sha }}
 
   # The other half of the migration's parallel-run window, with the sides
@@ -288,6 +313,19 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y mosquitto lld
 
       - run: bazel test --config=ci --nocache_test_results //...
+
+      # The release closure, which the invocation above does not reach: it
+      # builds the package in the dev configuration, so the musl transition, the
+      # linkage assertion, and the package layout only run under
+      # --config=release-package. The gate job stamps a constant build id, so
+      # its release actions can stay cached across commits indefinitely; this
+      # job restores no cache, which makes it the from-scratch rebuild that
+      # catches an undeclared input rotting underneath them. Its own id, so a
+      # canary result can never be mistaken for a gate result.
+      - name: Release package (from scratch)
+        env:
+          BRENN_BUILD_ID: ci-canary
+        run: make bazel-release BAZEL_CONFIG=--config=ci
 
   scrub:
     name: scrub
