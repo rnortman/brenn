@@ -1,0 +1,48 @@
+[package]
+name = "brenn-surface-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The server-side surface layer: boot resolution of surfaces into runtimes, their attachment profile, bindings and self-description documents, asset validation, and the server-written disconnected stamp"
+
+[features]
+# Expose the surface fixtures the crates above build their boot and route rigs
+# on. Not for production builds.
+testutils = ["brenn-lib/testutils", "dep:brenn-db", "dep:brenn-messaging-store", "dep:indexmap"]
+
+# Reaches down to brenn-attach-server for the attachment authority a surface
+# lowers to, to brenn-messaging for the bus the boot documents publish onto, and
+# to the surface schema/contract crates for the shapes the page shares. Nothing
+# above is named here — the route hands `AppState`-held facts in.
+[dependencies]
+brenn-attach-server = { version = "0.1.0", path = "../../attach/server" }
+brenn-budget = { version = "0.1.0", path = "../../brenn-budget" }
+brenn-db = { version = "0.1.0", path = "../../brenn-db", optional = true }
+brenn-envelope = { path = "../../brenn-envelope" }
+brenn-lib = { version = "0.1.0", path = "../../brenn-lib" }
+brenn-messaging = { version = "0.1.0", path = "../../brenn-messaging" }
+brenn-messaging-store = { version = "0.1.0", path = "../../brenn-messaging-store", optional = true }
+brenn-surface-contract = { version = "0.1.0", path = "../contract" }
+brenn-surface-schema = { version = "0.1.0", path = "../schema" }
+chrono = "0.4.44"
+hex = "0.4.3"
+indexmap = { version = "2", optional = true }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+tracing = "0.1.44"
+uuid = { version = "1.23.0", features = ["v4"] }
+
+[dev-dependencies]
+brenn-db = { version = "0.1.0", path = "../../brenn-db" }
+brenn-lib = { version = "0.1.0", path = "../../brenn-lib", features = ["testutils"] }
+brenn-messaging = { version = "0.1.0", path = "../../brenn-messaging", features = ["testutils"] }
+brenn-messaging-store = { version = "0.1.0", path = "../../brenn-messaging-store" }
+indexmap = "2"
+brenn-wasm = { version = "0.1.0", path = "../../brenn-wasm" }
+rusqlite = "0.39.0"
+tempfile = "3.24.0"
+# "no-env-filter" makes `#[traced_test]` capture unconditionally; without it
+# tracing-test applies a default env filter and `logs_contain` assertions fail.
+tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
+tokio = { version = "1.50.0", features = ["full", "test-util"] }

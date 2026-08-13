@@ -6,7 +6,7 @@ The embedded set is declared here so the assets `brenn-server` reaches for with
 The generated set is the frontend's half of two Rust sources of truth — the
 WebSocket protocol types and the frontmatter stylesheet. Both are build
 artifacts here and committed copies in the tree, held equal by the parity gates
-until the make lanes stop reading the copies.
+until the committed copies go.
 
 The TypeScript tree is assembled from both: `ts_src` is the frontend's sources
 with the generated files substituted for their committed copies, and it is what
@@ -50,15 +50,21 @@ filegroup(
 )
 
 # ---------------------------------------------------------------------------
-# ts-rs: the WebSocket and upload protocol types
+# ts-rs: the WebSocket, push-payload and upload protocol types
 # ---------------------------------------------------------------------------
-# Two crates export into one directory, so each exports into its own and the
+# Three crates export into one directory, so each exports into its own and the
 # copy merges them. Overlap is an error: two crates claiming the same type name
 # would otherwise resolve by list order.
 
 ts_rs_export(
     name = "ts_rs_ws_types",
-    generator = "//brenn-lib:brenn-lib_test",
+    generator = "//brenn-ws-types:brenn-ws-types_test",
+    target_compatible_with = HOST_ONLY,
+)
+
+ts_rs_export(
+    name = "ts_rs_pwa_push",
+    generator = "//brenn-pwa-push:brenn-pwa-push_test",
     target_compatible_with = HOST_ONLY,
 )
 
@@ -71,10 +77,12 @@ ts_rs_export(
 copy_to_directory(
     name = "generated_types",
     srcs = [
+        ":ts_rs_pwa_push",
         ":ts_rs_upload",
         ":ts_rs_ws_types",
     ],
     root_paths = [
+        "frontend/ts_rs_pwa_push",
         "frontend/ts_rs_upload",
         "frontend/ts_rs_ws_types",
     ],
@@ -86,6 +94,9 @@ copy_to_directory(
 # two file sets, so anything it cannot see on the committed side — a file in a
 # subdirectory, an editor backup — is a file nothing generates that every gate
 # passes over.
+#
+# TODO(bazel-teardown): every file this gate pins is a build artifact, so
+# deleting the committed copies deletes the drift and this gate with it.
 generated_tree_parity_test(
     name = "generated_types_parity_test",
     committed = glob(["src/generated/**"]),

@@ -3,6 +3,7 @@
 //! `PwaPushGlobalConfig` is the `[pwa_push]` TOML block on `BrennConfig`.
 //! `AppPwaPushBlock` is the `[app.pwa_push]` block on `AppConfigRaw`.
 //! `ResolvedPwaPushConfig` is produced by `resolve_pwa_push_layer` at startup.
+//! `EndpointPolicy` is the host-allowlist policy data.
 
 use std::path::PathBuf;
 
@@ -10,7 +11,6 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 
 use crate::config::AppConfig;
-use crate::pwa_push::endpoint_validator::EndpointPolicy;
 
 use super::vapid::VapidKeypair;
 
@@ -75,19 +75,67 @@ impl Default for PwaPushGlobalConfig {
 
 /// Per-app `[app.pwa_push]` block.
 ///
-/// The legacy `enabled` authorization boolean was removed (access-control design
-/// §2.5.1 / §8 decision-2): push authorization is now decided by the app's
-/// `AppPolicy` (`AppConfig::pwa_push_enabled()` reads the `PwaPush` grant). The
-/// block is retained only for the non-authorization `default_title` delivery
-/// setting. Because this struct carries `#[serde(deny_unknown_fields)]`, a stale
-/// config that still sets `enabled` under `[app.pwa_push]` now fails to parse —
-/// the intended migration-forcing.
+/// Push authorization is decided by the app's `AppPolicy`
+/// (`AppConfig::pwa_push_enabled()` reads the `PwaPush` grant). This block
+/// carries only the non-authorization `default_title` delivery setting.
+/// `#[serde(deny_unknown_fields)]` rejects any stale keys.
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppPwaPushBlock {
     /// Default notification title when `PushSend` omits the `title` field.
     /// Falls back to the app's display name when absent.
     pub default_title: Option<String>,
+}
+
+/// Policy controlling which endpoint hosts are accepted.
+#[derive(Debug, Clone)]
+pub struct EndpointPolicy {
+    /// Exact lowercased hostnames that are permitted when `enforce_allowlist = true`.
+    pub allowlist: Vec<String>,
+    /// When `true`, any host not in `allowlist` (including IP literals) is rejected.
+    /// When `false`, mismatches are logged as warnings but the host is accepted
+    /// (subject to the IP-block rules, which always apply).
+    pub enforce_allowlist: bool,
+}
+
+impl EndpointPolicy {
+    /// Construct an `EndpointPolicy`, lowercasing each allowlist entry.
+    ///
+    /// # Panics
+    ///
+    /// - If any allowlist entry is empty or whitespace-only (almost certainly a
+    ///   config error).
+    /// - If `enforce_allowlist = true` and the allowlist is empty. This
+    ///   combination would silently reject every legitimate endpoint, which is
+    ///   almost certainly a typo. To disable allowlist enforcement while keeping
+    ///   only the IP-block rules, set `enforce_allowlist = false`.
+    pub fn new(allowlist: Vec<String>, enforce_allowlist: bool) -> Self {
+        let lowercased: Vec<String> = allowlist
+            .into_iter()
+            .map(|h| {
+                let trimmed = h.trim().to_string();
+                assert!(
+                    !trimmed.is_empty(),
+                    "config: endpoint_host_allowlist entry must not be empty or whitespace-only"
+                );
+                trimmed.to_lowercase()
+            })
+            .collect();
+
+        if enforce_allowlist {
+            assert!(
+                !lowercased.is_empty(),
+                "config: endpoint_host_allowlist_enforce = true but endpoint_host_allowlist is \
+                 empty; this would reject every endpoint. To disable allowlist enforcement and \
+                 rely only on IP-block rules, set endpoint_host_allowlist_enforce = false."
+            );
+        }
+
+        Self {
+            allowlist: lowercased,
+            enforce_allowlist,
+        }
+    }
 }
 
 /// Resolved, validated pwa_push configuration produced at startup.
@@ -168,6 +216,28 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    // --- EndpointPolicy constructor panics ---
+
+    #[test]
+    #[should_panic(
+        expected = "endpoint_host_allowlist_enforce = true but endpoint_host_allowlist is empty"
+    )]
+    fn policy_panics_on_enforce_true_empty_allowlist() {
+        let _ = EndpointPolicy::new(vec![], true);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not be empty or whitespace-only")]
+    fn policy_panics_on_empty_entry() {
+        let _ = EndpointPolicy::new(vec!["".to_string()], false);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not be empty or whitespace-only")]
+    fn policy_panics_on_whitespace_entry() {
+        let _ = EndpointPolicy::new(vec!["   ".to_string()], false);
+    }
     use crate::config::{AppConfig, FrontmatterRenderConfig, PathMapper};
     use crate::pwa_push::config::AppPwaPushBlock;
 

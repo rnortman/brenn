@@ -138,12 +138,12 @@ async fn assistant_message_extracts_text_and_thinking() {
 async fn slug_change_caller_seeds_from_cache() {
     use brenn_cc::protocol::incoming::{AssistantContent, AssistantMessage as CcAssistantMessage};
 
-    let db = brenn_lib::db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let (tx, _rx) = broadcast::channel(64);
     let active_bridges = ActiveBridges::new();
     let (uid, conv_id) = {
         let conn = db.lock().await;
-        let uid = brenn_lib::auth::user::create_user(&conn, "slug-cache-seed", "$argon2id$fake");
+        let uid = brenn_db::auth::user::create_user(&conn, "slug-cache-seed", "$argon2id$fake");
         let cid = conversation::create_conversation(&conn, uid, "test", false);
         // Pre-populate model_window_cache with the target slug.
         brenn_lib::model_window_cache::upsert(
@@ -160,14 +160,14 @@ async fn slug_change_caller_seeds_from_cache() {
         "test",
         db,
         tx,
-        brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+        brenn_obs::alerting::noop_alert_dispatcher().0,
         TestBridgeConfig {
             active_bridges: Some(active_bridges),
             singleton: true,
             ..Default::default()
         },
     );
-    let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+    let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
 
     // Simulate the bridge being mid-session on a different model.
     *bridge.active_model_slug.lock().expect("lock") = Some("claude-sonnet-4-6".into());
@@ -204,12 +204,12 @@ async fn slug_change_caller_seeds_from_cache() {
 async fn slug_change_caller_cache_miss_leaves_none() {
     use brenn_cc::protocol::incoming::{AssistantContent, AssistantMessage as CcAssistantMessage};
 
-    let db = brenn_lib::db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let (tx, _rx) = broadcast::channel(64);
     let active_bridges = ActiveBridges::new();
     let (uid, conv_id) = {
         let conn = db.lock().await;
-        let uid = brenn_lib::auth::user::create_user(&conn, "slug-cache-miss", "$argon2id$fake");
+        let uid = brenn_db::auth::user::create_user(&conn, "slug-cache-miss", "$argon2id$fake");
         let cid = conversation::create_conversation(&conn, uid, "test", false);
         // Intentionally do NOT populate model_window_cache for the new slug.
         (uid, cid)
@@ -220,14 +220,14 @@ async fn slug_change_caller_cache_miss_leaves_none() {
         "test",
         db,
         tx,
-        brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+        brenn_obs::alerting::noop_alert_dispatcher().0,
         TestBridgeConfig {
             active_bridges: Some(active_bridges),
             singleton: true,
             ..Default::default()
         },
     );
-    let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+    let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
 
     // Simulate the bridge being mid-session on a different model.
     *bridge.active_model_slug.lock().expect("lock") = Some("claude-sonnet-4-6".into());

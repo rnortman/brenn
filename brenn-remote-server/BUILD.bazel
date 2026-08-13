@@ -1,0 +1,44 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//attach/server",
+    "//brenn-envelope",
+    "//brenn-lib",
+    "//brenn-messaging",
+    "//brenn-obs",
+]
+
+rust_library(
+    name = "brenn-remote-server",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "brenn_remote_server",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# 18 tests: the `[[remote]]` lowering (pure value construction and matcher
+# folds) plus the credential path, which drives `authenticate_remote` in process
+# over an in-memory bus fixture. No socket, no process. The binary finishes in
+# well under a second locally; at the repo's one measured local-to-CD-runner
+# factor (~21x) that is still seconds, far inside `small` (60s).
+rust_test(
+    name = "brenn-remote-server_test",
+    size = "small",
+    crate = ":brenn-remote-server",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS,
+)
+
+rust_doc_test(
+    name = "brenn-remote-server_doc_test",
+    crate = ":brenn-remote-server",
+)

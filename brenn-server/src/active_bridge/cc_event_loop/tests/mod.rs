@@ -18,8 +18,8 @@ pub(super) fn enqueue_ingress(
     payload: &str,
 ) -> i64 {
     let subscriber = brenn_lib::messaging::ParticipantId::for_conversation(conversation_id);
-    let ts_ns = brenn_lib::messaging::db::utc_to_ns(chrono::Utc::now());
-    let (_msg_id, push_id) = brenn_lib::messaging::db::insert_ingress_message(
+    let ts_ns = brenn_messaging_store::db::utc_to_ns(chrono::Utc::now());
+    let (_msg_id, push_id) = brenn_messaging_store::db::insert_ingress_message(
         conn,
         &subscriber,
         "test", // app_slug
@@ -48,7 +48,7 @@ pub(super) fn pending_ingress_count(conn: &rusqlite::Connection, conversation_id
     .expect("pending_ingress_count")
 }
 
-use brenn_lib::obs::alerting::AlertDispatcher;
+use brenn_obs::alerting::AlertDispatcher;
 
 use crate::active_bridge::test_fixtures::TestBridgeConfig;
 use std::sync::Arc;
@@ -70,27 +70,26 @@ pub(super) async fn bridge_with_unspawned_event_loop(
     AlertDispatcher,
     ActiveBridges,
 ) {
-    let (alert_dispatcher, _handle) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+    let (alert_dispatcher, _handle) = brenn_obs::alerting::noop_alert_dispatcher();
     // The drain now reads exclusively from the unified messaging store, so
     // the bridge must have a messenger configured. Build the in-memory DB,
     // user, and conversation, then inject a minimal messenger (empty app map,
     // NoopWakeRouter) into the config before bridge construction.
-    let db = brenn_lib::db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let (user_id, conv_id) = {
         let conn = db.lock().await;
-        let uid = brenn_lib::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
-        let cid = brenn_lib::conversation::create_conversation(&conn, uid, "test", false);
+        let uid = brenn_db::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
+        let cid = brenn_db::conversation::create_conversation(&conn, uid, "test", false);
         (uid, cid)
     };
-    let messenger = brenn_lib::messaging::Messenger::new(
+    let messenger = brenn_messaging::Messenger::new(
         db.clone(),
         Arc::new(brenn_lib::messaging::MessagingDirectory::with_entries(
             vec![],
         )),
         Arc::from("test-drain"),
         Arc::new(indexmap::IndexMap::new()),
-        Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-            as Arc<dyn brenn_lib::messaging::WakeRouter>,
+        Arc::new(brenn_messaging::query::NoopWakeRouter) as Arc<dyn brenn_messaging::WakeRouter>,
         brenn_lib::messaging::MessagingGlobalConfig::default(),
     );
     let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(64);
@@ -102,7 +101,7 @@ pub(super) async fn bridge_with_unspawned_event_loop(
         "test",
         db,
         broadcast_tx,
-        brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+        brenn_obs::alerting::noop_alert_dispatcher().0,
         TestBridgeConfig {
             singleton,
             messenger: Some(messenger),
@@ -151,7 +150,7 @@ pub(super) async fn bridge_with_messenger_for_drain()
 pub(super) async fn bridge_with_messenger_for_drain_at_ceiling(
     send_budget: u32,
 ) -> (Arc<ActiveBridge>, broadcast::Receiver<WsServerMessage>) {
-    let db = brenn_lib::db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let (broadcast_tx, broadcast_rx) = broadcast::channel(64);
 
     // Single ChannelEntry binding shared between the DB upsert and the in-memory
@@ -183,10 +182,10 @@ pub(super) async fn bridge_with_messenger_for_drain_at_ceiling(
 
     let (user_id, conv_id) = {
         let conn = db.lock().await;
-        let uid = brenn_lib::auth::user::create_user(&conn, "drain-test-user", "$argon2id$fake");
+        let uid = brenn_db::auth::user::create_user(&conn, "drain-test-user", "$argon2id$fake");
         let cid = conversation::create_conversation(&conn, uid, "testapp", false);
         // Upsert channel row — required FK for messaging_messages.
-        brenn_lib::messaging::db::upsert_channels(&conn, std::slice::from_ref(&channel_entry));
+        brenn_messaging_store::db::upsert_channels(&conn, std::slice::from_ref(&channel_entry));
         (uid, cid)
     };
 
@@ -199,13 +198,12 @@ pub(super) async fn bridge_with_messenger_for_drain_at_ceiling(
         "testapp".to_string(),
         drain_test_app_config("drain-test-user"),
     );
-    let messenger = brenn_lib::messaging::Messenger::new(
+    let messenger = brenn_messaging::Messenger::new(
         db.clone(),
         Arc::new(dir),
         Arc::from("test-drain-source"),
         Arc::new(apps),
-        Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-            as Arc<dyn brenn_lib::messaging::WakeRouter>,
+        Arc::new(brenn_messaging::query::NoopWakeRouter) as Arc<dyn brenn_messaging::WakeRouter>,
         brenn_lib::messaging::MessagingGlobalConfig::default(),
     );
     // Boot's attach: the conversation holds a position on every channel its app
@@ -218,7 +216,7 @@ pub(super) async fn bridge_with_messenger_for_drain_at_ceiling(
         "testapp",
         db,
         broadcast_tx,
-        brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+        brenn_obs::alerting::noop_alert_dispatcher().0,
         TestBridgeConfig {
             messenger: Some(messenger),
             send_budget,
@@ -233,8 +231,7 @@ pub(super) async fn bridge_with_messenger_for_drain_at_ceiling(
 /// `allowed_user` owns it, and the policy covers `test-drain-channel` so the
 /// delivery-time ACL gate passes.
 fn drain_test_app_config(allowed_user: &str) -> brenn_lib::config::AppConfig {
-    let mut app =
-        crate::bootstrap::messaging::test_fixtures::minimal_app_config("testapp", None, vec![]);
+    let mut app = crate::test_support::app_config::minimal_app_config("testapp", None, vec![]);
     app.singleton = true;
     app.allowed_users = vec![allowed_user.to_string()];
     app.policy
@@ -296,8 +293,8 @@ async fn seed_push_row(
     impetus: Option<brenn_lib::messaging::Impetus>,
 ) {
     let conn = bridge.db.lock().await;
-    let now_ns = brenn_lib::messaging::db::utc_to_ns(chrono::Utc::now());
-    brenn_lib::messaging::db::insert_message(
+    let now_ns = brenn_messaging_store::db::utc_to_ns(chrono::Utc::now());
+    brenn_messaging_store::db::insert_message(
         &conn,
         DRAIN_TEST_CHANNEL_UUID,
         "test-drain-source",

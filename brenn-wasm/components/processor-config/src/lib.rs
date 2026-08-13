@@ -31,9 +31,8 @@ impl Processor for ProcessorConfig {
         if windows.is_empty() {
             // Legacy path: no port windows → read "test-key" directly.
             let value = config::get("test-key").unwrap_or_else(|| "absent".to_string());
-            publish("out", &value).unwrap_or_else(|e| {
-                panic!("processor-config: publish failed: {e:?}")
-            });
+            publish("out", &value)
+                .unwrap_or_else(|e| panic!("processor-config: publish failed: {e:?}"));
             return Ok(());
         }
         for window in &windows {
@@ -55,9 +54,8 @@ impl Processor for ProcessorConfig {
                     "require" => format!("ok:{}", config::require::<String>(key)?),
                     other => return Err(Error::malformed(format!("unknown cmd: {other}"))),
                 };
-                publish("out", &payload).unwrap_or_else(|e| {
-                    panic!("processor-config: publish failed: {e:?}")
-                });
+                publish("out", &payload)
+                    .unwrap_or_else(|e| panic!("processor-config: publish failed: {e:?}"));
             }
         }
         Ok(())

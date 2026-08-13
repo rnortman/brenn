@@ -1,10 +1,13 @@
 # Development configuration for Brenn.
-# Usage: cargo run -- --config brenn.dev.toml serve
+# Usage: make launchdev (builds, then serves with this config)
 
 [server]
 bind_address = "127.0.0.1:3000"
-static_dir = "frontend/dist"
-surface_dist_dir = "surface/dist"
+# The asset trees are build outputs, reached through bazel's convenience
+# symlinks (--symlink_prefix in .bazelrc). Relative to the workspace root,
+# which is where `make launchdev` starts the server.
+static_dir = ".bazel-bin/frontend/dist"
+surface_dist_dir = ".bazel-bin/surface/dist"
 secure_cookies = false
 # Required once messaging is configured (the dev-stub surface below): the
 # message source identifier. Matches bind_address for local dev.

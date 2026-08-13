@@ -44,4 +44,6 @@ pub(super) const MCP_GIT_REPO_STATUS_TOOL: &str = "mcp__brenn__GitRepoStatus";
 
 /// CommitAndPush and Run constants are defined in `tools::git_repo` (shared
 /// with AppTool::name()) and re-exported here to keep the single source of truth.
-pub(super) use crate::tools::git_repo::{MCP_GIT_REPO_COMMIT_AND_PUSH_TOOL, MCP_GIT_REPO_RUN_TOOL};
+pub(super) use brenn_render::tools::git_repo::{
+    MCP_GIT_REPO_COMMIT_AND_PUSH_TOOL, MCP_GIT_REPO_RUN_TOOL,
+};

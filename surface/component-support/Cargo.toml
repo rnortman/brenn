@@ -41,7 +41,7 @@ web-sys = { workspace = true, features = [
 ] }
 
 # Browser-level unit tests for register_component / the define_component shim,
-# run under wasm-bindgen-test via `make surface-wasm-test`. wasm32-only, matching
+# run under wasm-bindgen-test in a real browser. wasm32-only, matching
 # the crate's wasm-gated body; the host build stays empty.
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 uuid = "1.24.0"

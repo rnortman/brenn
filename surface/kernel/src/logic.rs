@@ -1823,10 +1823,8 @@ impl Default for KernelCore {
     }
 }
 
-// Host-only: these are native `#[test]`s run in every `make check`. Excluded
-// from the wasm32 target so the browser test binary (`make surface-wasm-test`)
-// carries no compiled-but-never-run libtest harness and its test count stays
-// honest.
+// Excluded from the wasm32 target so the browser test binary carries no
+// compiled-but-never-run libtest harness and its test count stays honest.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;

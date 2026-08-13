@@ -1,8 +1,8 @@
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use brenn_lib::obs::alerting::AlertDispatcher;
-use brenn_lib::ws_types::WsServerMessage;
+use brenn_obs::alerting::AlertDispatcher;
+use brenn_ws_types::WsServerMessage;
 use tracing::{debug, warn};
 
 use crate::active_bridge::ActiveBridge;
@@ -361,8 +361,8 @@ mod tests {
     use super::super::super::ActiveBridges;
     use super::super::super::test_support::drain_broadcast;
     use super::*;
-    use brenn_lib::conversation;
-    use brenn_lib::ws_types::WsServerMessage;
+    use brenn_db::conversation;
+    use brenn_ws_types::WsServerMessage;
 
     use crate::active_bridge::test_fixtures::TestBridgeConfig;
     use std::time::Duration;
@@ -373,11 +373,11 @@ mod tests {
         // cache_read = 50k, cache_creation = 5k, input = 1k → current = 56k.
         use brenn_cc::protocol::incoming::{AssistantContent, AssistantMessage, Usage};
         let (tx, _rx) = broadcast::channel(64);
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let active_bridges = ActiveBridges::new();
         let (uid, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "u", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "u", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -398,7 +398,7 @@ mod tests {
             "test",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges),
                 singleton: true,
@@ -409,7 +409,7 @@ mod tests {
         // Seed max_tokens so broadcast_context_usage doesn't short-circuit.
         *bridge.seed_max_tokens.lock().expect("lock") = Some(200_000);
 
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         let msg = AssistantMessage {
             message: AssistantContent {
                 role: "assistant".into(),
@@ -470,11 +470,11 @@ mod tests {
         // A message with parent_tool_use_id must not update context_usage.
         use brenn_cc::protocol::incoming::{AssistantContent, AssistantMessage, Usage};
         let (tx, _rx) = broadcast::channel(64);
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let active_bridges = ActiveBridges::new();
         let (uid, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "u2", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "u2", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -484,13 +484,13 @@ mod tests {
             "test",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges),
                 ..Default::default()
             },
         );
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         let msg = AssistantMessage {
             message: AssistantContent {
                 role: "assistant".into(),
@@ -535,7 +535,7 @@ mod tests {
                 extra: serde_json::Value::Null,
             },
         );
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         let result = pick_and_observe_model_usage(&map, Some("claude-opus-4-7"), &ad);
         let (slug, entry) = result.expect("should find a match");
         assert_eq!(slug, "claude-opus-4-7[1m]");
@@ -568,7 +568,7 @@ mod tests {
                 extra: serde_json::Value::Null,
             },
         );
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         // "claude-opus-4-7[1m]" < "claude-opus-4-7[200k]" lexicographically,
         // so [1m] must win regardless of HashMap iteration order.
         let result = pick_and_observe_model_usage(&map, Some("claude-opus-4-7"), &ad);
@@ -591,7 +591,7 @@ mod tests {
                 extra: serde_json::Value::Null,
             },
         );
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         // Exact match: active == map key, no suffix needed.
         let result = pick_and_observe_model_usage(&map, Some("claude-haiku-3-5"), &ad);
         let (slug, entry) = result.expect("exact match should be found");
@@ -613,7 +613,7 @@ mod tests {
                 extra: serde_json::Value::Null,
             },
         );
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         // No active slug → cannot pick.
         assert!(pick_and_observe_model_usage(&map, None, &ad).is_none());
     }
@@ -634,12 +634,12 @@ mod tests {
         use brenn_cc::protocol::incoming::{ModelUsageEntry, ResultMessage};
         use std::collections::HashMap;
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (tx, _rx) = broadcast::channel(64);
         let active_bridges = ActiveBridges::new();
         let (uid, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "seed-test", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "seed-test", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -649,7 +649,7 @@ mod tests {
             "test",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges),
                 singleton: true,
@@ -695,7 +695,7 @@ mod tests {
             extra: serde_json::Value::Null,
         };
 
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         let updated = update_max_tokens_from_result(&bridge, &result, &ad).await;
         assert!(updated, "update should succeed");
 
@@ -734,12 +734,12 @@ mod tests {
     async fn update_max_tokens_returns_false_when_modelusage_absent() {
         use brenn_cc::protocol::incoming::ResultMessage;
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (tx, _rx) = broadcast::channel(64);
         let active_bridges = ActiveBridges::new();
         let (uid, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "absent-test", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "absent-test", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -749,7 +749,7 @@ mod tests {
             "test",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges),
                 singleton: true,
@@ -779,7 +779,7 @@ mod tests {
             extra: serde_json::Value::Null,
         };
 
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         let updated = update_max_tokens_from_result(&bridge, &result, &ad).await;
         assert!(!updated, "should return false when modelUsage is absent");
 
@@ -803,12 +803,12 @@ mod tests {
         use brenn_cc::protocol::incoming::{ModelUsageEntry, ResultMessage};
         use std::collections::HashMap;
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (tx, _rx) = broadcast::channel(64);
         let active_bridges = ActiveBridges::new();
         let (uid, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "null-cw-test", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "null-cw-test", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -818,7 +818,7 @@ mod tests {
             "test",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges),
                 singleton: true,
@@ -859,7 +859,7 @@ mod tests {
             extra: serde_json::Value::Null,
         };
 
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         update_max_tokens_from_result(&bridge, &result, &ad).await;
         // Should have panicked — if we reach here the test fails.
     }
@@ -878,7 +878,7 @@ mod tests {
     #[tokio::test]
     async fn pick_and_observe_model_usage_observes_subagent_drift() {
         use brenn_cc::protocol::incoming::ModelUsageEntry;
-        use brenn_lib::obs::alerting::{AlertDispatcher, CountingAlerter, RateLimiter};
+        use brenn_obs::alerting::{AlertDispatcher, CountingAlerter, RateLimiter};
         use std::collections::HashMap;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -942,11 +942,11 @@ mod tests {
     async fn slug_change_returns_new_slug_and_nulls_state() {
         use brenn_cc::protocol::incoming::{AssistantContent, AssistantMessage, Usage};
         let (tx, _rx) = broadcast::channel(64);
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let active_bridges = ActiveBridges::new();
         let (uid, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "switch-test", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "switch-test", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -967,7 +967,7 @@ mod tests {
             "test",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges),
                 singleton: true,
@@ -975,7 +975,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
 
         // --- Part 1: Initial assignment (None → Some) must not signal. ---
         *bridge.active_model_slug.lock().expect("lock") = None;
@@ -1058,11 +1058,11 @@ mod tests {
     async fn duplicate_context_update_suppresses_second_broadcast() {
         use brenn_cc::protocol::incoming::{AssistantContent, AssistantMessage, Usage};
         let (tx, _rx) = broadcast::channel(64);
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let active_bridges = ActiveBridges::new();
         let (uid, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "suppress-test", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "suppress-test", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -1083,7 +1083,7 @@ mod tests {
             "test",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges),
                 singleton: true,
@@ -1111,7 +1111,7 @@ mod tests {
             uuid: "u".into(),
             parent_tool_use_id: None,
         };
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
 
         // First call: produces a broadcast.
         update_context_from_assistant(&bridge, &make_msg(), &ad);
@@ -1139,11 +1139,11 @@ mod tests {
     async fn update_context_from_assistant_defers_when_no_seed() {
         use brenn_cc::protocol::incoming::{AssistantContent, AssistantMessage, Usage};
         let (tx, _rx) = broadcast::channel(64);
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let active_bridges = ActiveBridges::new();
         let (uid, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "defer-test", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "defer-test", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -1164,7 +1164,7 @@ mod tests {
             "test",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges),
                 singleton: true,
@@ -1176,7 +1176,7 @@ mod tests {
         assert_eq!(*bridge.seed_max_tokens.lock().expect("lock"), None);
 
         let mut broadcast_rx = bridge.subscribe();
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
 
         let msg = AssistantMessage {
             message: AssistantContent {
@@ -1222,11 +1222,11 @@ mod tests {
     async fn context_from_assistant_uses_existing_context_usage_when_seed_is_none() {
         use brenn_cc::protocol::incoming::{AssistantContent, AssistantMessage, Usage};
         let (tx, _rx) = broadcast::channel(64);
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let active_bridges = ActiveBridges::new();
         let (uid, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "ctx-seed-none", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "ctx-seed-none", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -1247,7 +1247,7 @@ mod tests {
             "test",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges),
                 singleton: true,
@@ -1265,7 +1265,7 @@ mod tests {
         });
 
         let mut broadcast_rx = bridge.subscribe();
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
 
         let msg = AssistantMessage {
             message: AssistantContent {
@@ -1312,12 +1312,12 @@ mod tests {
     async fn initial_slug_assignment_with_usage_broadcasts_and_preserves_seed() {
         use brenn_cc::protocol::incoming::{AssistantContent, AssistantMessage, Usage};
         let (tx, _rx) = broadcast::channel(64);
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let active_bridges = ActiveBridges::new();
         let (uid, conv_id) = {
             let conn = db.lock().await;
             let uid =
-                brenn_lib::auth::user::create_user(&conn, "init-assign-usage", "$argon2id$fake");
+                brenn_db::auth::user::create_user(&conn, "init-assign-usage", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -1338,7 +1338,7 @@ mod tests {
             "test",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges),
                 singleton: true,
@@ -1346,7 +1346,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
 
         // Initial state: no active_model_slug yet; seed pre-populated from cache.
         *bridge.active_model_slug.lock().expect("lock") = None;

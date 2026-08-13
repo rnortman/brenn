@@ -131,7 +131,7 @@ pub struct BrennConfig {
     /// Automation engine config (`[automation]`). Defaults to
     /// `AutomationGlobalConfig::default()` when absent.
     #[serde(default)]
-    pub automation: crate::automation::config::AutomationGlobalConfig,
+    pub automation: crate::config::AutomationGlobalConfig,
     /// Top-level `[[mqtt_client]]` declarations. Each entry defines an MQTT
     /// client (the app-independent connection to a remote MQTT broker/server).
     /// Apps address it for egress via the `mqtt_publish` ACL naming the client

@@ -93,7 +93,8 @@ pub(super) async fn evaluate_compaction_triggers(bridge: &Arc<ActiveBridge>) -> 
         );
         state.phase = CompactionPhase::PersistingState;
         drop(state);
-        let rendered = crate::system_message::render_compaction_hard_trigger(usage.usage_pct);
+        let rendered =
+            brenn_render::system_message::render_compaction_hard_trigger(usage.usage_pct);
         if let Err(e) = bridge.send_system_message(rendered, None).await {
             error!("failed to send hard-trigger persist message: {e}");
             bridge.compaction.lock().await.phase = CompactionPhase::Normal;
@@ -143,7 +144,7 @@ pub(super) async fn evaluate_compaction_triggers(bridge: &Arc<ActiveBridge>) -> 
             trigger = kind.as_str(),
             "sending compaction reminder to LLM"
         );
-        let rendered = crate::system_message::render_compaction_reminder(pct);
+        let rendered = brenn_render::system_message::render_compaction_reminder(pct);
         if let Err(e) = bridge.send_system_message(rendered, None).await {
             error!("failed to send compaction reminder: {e}");
             return false;
@@ -195,7 +196,7 @@ pub(super) async fn compaction_idle_timer_fired(bridge: &ActiveBridge) {
         usage_pct, "soft compaction idle timer fired — sending persist message"
     );
 
-    let rendered = crate::system_message::render_compaction_idle_prompt(usage_pct);
+    let rendered = brenn_render::system_message::render_compaction_idle_prompt(usage_pct);
     if let Err(e) = bridge.send_system_message(rendered, None).await {
         error!("failed to send soft-trigger persist message: {e}");
         bridge.compaction.lock().await.phase = CompactionPhase::Normal;
@@ -215,8 +216,8 @@ mod tests {
     };
     use super::super::context::broadcast_context_usage;
     use super::*;
-    use brenn_lib::conversation;
-    use brenn_lib::ws_types::WsServerMessage;
+    use brenn_db::conversation;
+    use brenn_ws_types::WsServerMessage;
 
     use crate::active_bridge::compaction::tests::test_bridge_with_compaction_config;
     use crate::active_bridge::test_fixtures::TestBridgeConfig;
@@ -512,13 +513,13 @@ mod tests {
         broadcast::Receiver<WsServerMessage>,
         ActiveBridges,
     ) {
-        let db = brenn_lib::db::init_db_memory();
-        let (alert_dispatcher, _handle) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let db = crate::test_support::init_db_memory();
+        let (alert_dispatcher, _handle) = brenn_obs::alerting::noop_alert_dispatcher();
         let active_bridges = ActiveBridges::new();
 
         let (user_id, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -541,7 +542,7 @@ mod tests {
             "test",
             db,
             broadcast_tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges.clone()),
                 singleton: true,

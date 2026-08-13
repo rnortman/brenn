@@ -1,0 +1,69 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# `testutils` exposes the dispatch harness to the crates above; the release
+# configs clear the flag, keeping the shipped binary free of it.
+rust_library(
+    name = "brenn-wasm-dispatch",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-common",
+        "//brenn-lib",
+        "//brenn-messaging",
+        "//brenn-messaging-store",
+        "//brenn-obs",
+        "//brenn-wasm",
+    ],
+)
+
+# 40 tests, most of them driving a real compiled guest over an in-memory
+# messaging store; 7.2s locally against a 60s budget, so `small` holds with room
+# on a cold 4-vCPU runner.
+#
+# `data` is the four components these suites open, one fixture target each.
+# Runfiles are inputs to the test action, so every component named here is an
+# edge from a guest crate to this binary; the twelve that are not named cost
+# nothing when they change.
+#
+# TODO(bazel-fixture-list-guard): which four those are was derived by reading
+# this crate's artifact-stem call sites, and nothing holds the list to them. A
+# component dropped from the tests keeps its edge here silently; one added
+# without its fixture fails loudly on a missing runfile.
+rust_test(
+    name = "brenn-wasm-dispatch_test",
+    size = "small",
+    crate = ":brenn-wasm-dispatch",
+    crate_features = ["testutils"],
+    data = [
+        "//brenn-wasm:fixture_git_forge_parser",
+        "//brenn-wasm:fixture_processor_demo",
+        "//brenn-wasm:fixture_processor_dual",
+        "//brenn-wasm:fixture_processor_multiport",
+    ],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-wasm-dispatch"},
+    deps = all_crate_deps(normal_dev = True) + [
+        "//brenn-common",
+        "//brenn-lib",
+        "//brenn-messaging",
+        "//brenn-messaging-store",
+        "//brenn-obs",
+        "//brenn-wasm",
+    ],
+)
+
+rust_doc_test(
+    name = "brenn-wasm-dispatch_doc_test",
+    crate = ":brenn-wasm-dispatch",
+)

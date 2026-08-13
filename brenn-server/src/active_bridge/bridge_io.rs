@@ -2,8 +2,8 @@
 
 use std::sync::atomic::Ordering;
 
-use brenn_lib::conversation::{self, MessageDirection};
-use brenn_lib::ws_types::{SystemMessageCategory, ViewportClass, WsServerMessage};
+use brenn_db::conversation::{self, MessageDirection};
+use brenn_ws_types::{SystemMessageCategory, ViewportClass, WsServerMessage};
 use tokio::sync::broadcast;
 use tracing::info;
 
@@ -169,7 +169,7 @@ impl ActiveBridge {
     ///   (used by cat 7 so DB joins on the requesting human remain correct).
     pub async fn send_system_message(
         &self,
-        rendered: crate::system_message::SystemMessageRender,
+        rendered: brenn_render::system_message::SystemMessageRender,
         attribute_to_user_id: Option<i64>,
     ) -> Result<(), String> {
         let user_id_for_db = attribute_to_user_id.unwrap_or(self.user_id);
@@ -229,7 +229,7 @@ impl ActiveBridge {
 
         // 2. Broadcast with the DB seq so attached tabs can deduplicate
         //    against history replay (B.2).
-        let timestamp = brenn_lib::db::format_ts_for_db(chrono::Utc::now());
+        let timestamp = brenn_db::format_ts_for_db(chrono::Utc::now());
         self.broadcast(WsServerMessage::SystemMessageBroadcast {
             rendered_html,
             category,
@@ -284,7 +284,7 @@ impl ActiveBridge {
     /// multi-block message (e.g., device slug reminder batched with a user message).
     pub async fn persist_and_broadcast_system_message(
         &self,
-        rendered: crate::system_message::SystemMessageRender,
+        rendered: brenn_render::system_message::SystemMessageRender,
         attribute_to_user_id: Option<i64>,
     ) {
         let user_id_for_db = attribute_to_user_id.unwrap_or(self.user_id);
@@ -311,7 +311,7 @@ impl ActiveBridge {
             );
             seq
         };
-        let timestamp = brenn_lib::db::format_ts_for_db(chrono::Utc::now());
+        let timestamp = brenn_db::format_ts_for_db(chrono::Utc::now());
         self.broadcast(WsServerMessage::SystemMessageBroadcast {
             rendered_html: rendered.rendered_html,
             category: rendered.category,
@@ -509,7 +509,7 @@ mod tests {
     async fn send_system_message_persists_rendered_html_and_category() {
         let (bridge, _event_tx, mut broadcast_rx, _ab) = test_bridge_singleton().await;
 
-        let render = crate::system_message::render_compaction_reminder(75);
+        let render = brenn_render::system_message::render_compaction_reminder(75);
         // Test bridge has no real CC session so the send to CC fails, but
         // persistence + broadcast happen first.
         let _ = bridge.send_system_message(render, None).await;
@@ -576,10 +576,10 @@ mod tests {
         // Create a second, non-owner user.
         let other_uid = {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "other", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&conn, "other", "$argon2id$fake")
         };
 
-        let render = crate::system_message::render_compaction_reminder(80);
+        let render = brenn_render::system_message::render_compaction_reminder(80);
         let _ = bridge.send_system_message(render, Some(other_uid)).await;
 
         // Persisted row attributed to the specified user, NOT the owner.
@@ -632,7 +632,7 @@ mod tests {
     async fn persist_broadcast_send_emits_some_seq() {
         let (bridge, _event_tx, mut broadcast_rx, _ab) = test_bridge_singleton().await;
 
-        let render = crate::system_message::render_compaction_reminder(75);
+        let render = brenn_render::system_message::render_compaction_reminder(75);
         let _ = bridge.send_system_message(render, None).await;
 
         let mut found_seq: Option<Option<i64>> = None;
@@ -663,7 +663,7 @@ mod tests {
     async fn send_system_message_attributes_to_owner_when_none() {
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge_singleton().await;
 
-        let render = crate::system_message::render_compaction_reminder(82);
+        let render = brenn_render::system_message::render_compaction_reminder(82);
         let _ = bridge.send_system_message(render, None).await;
 
         let conn = bridge.db.lock().await;
@@ -849,7 +849,7 @@ mod tests {
         // enqueues, drops the lock, then awaits the ack (will block until we fire it).
         let bridge_clone = bridge.clone();
         let task_a = tokio::spawn(async move {
-            let render = crate::system_message::render_compaction_reminder(50);
+            let render = brenn_render::system_message::render_compaction_reminder(50);
             bridge_clone.send_system_message(render, None).await
         });
 
@@ -929,19 +929,21 @@ mod tests {
     async fn dispatcher_loop_cross_bridge_isolation() {
         use std::sync::Arc;
 
+        use brenn_lib::messaging::ParticipantId;
         use brenn_lib::messaging::config::{
             Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel, ResolvedMessagingConfig,
             ResolvedSubscription, Sink,
         };
-        use brenn_lib::messaging::db::upsert_channels;
-        use brenn_lib::messaging::db::{insert_ingress_message, utc_to_ns};
-        use brenn_lib::messaging::dispatcher::spawn_dispatcher_task;
-        use brenn_lib::messaging::query::NoopWakeRouter;
         use brenn_lib::messaging::{
-            ChannelEntry, ChannelScheme, MessagingDirectory, Messenger, SubscriberEntry,
-            SubscriberEntryKind, Urgency, WakeMin, canonical_address,
+            ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntry, SubscriberEntryKind,
+            Urgency, WakeMin, canonical_address,
         };
-        use brenn_lib::messaging::{ParticipantId, WakeRouter};
+        use brenn_messaging::Messenger;
+        use brenn_messaging::WakeRouter;
+        use brenn_messaging::dispatcher::spawn_dispatcher_task;
+        use brenn_messaging::query::NoopWakeRouter;
+        use brenn_messaging_store::db::upsert_channels;
+        use brenn_messaging_store::db::{insert_ingress_message, utc_to_ns};
         use chrono::Utc;
         use indexmap::IndexMap;
         use uuid::Uuid;
@@ -954,15 +956,15 @@ mod tests {
         // ------------------------------------------------------------------
         // 1. Shared DB + channel setup.
         // ------------------------------------------------------------------
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
 
         // Two conversations (A and B) with distinct app slugs.
         let (conv_id_a, conv_id_b) = {
             let conn = db.lock().await;
             // Insert a user.
-            let uid = brenn_lib::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
-            let cid_a = brenn_lib::conversation::create_conversation(&conn, uid, "app-a", false);
-            let cid_b = brenn_lib::conversation::create_conversation(&conn, uid, "app-b", false);
+            let uid = brenn_db::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
+            let cid_a = brenn_db::conversation::create_conversation(&conn, uid, "app-a", false);
+            let cid_b = brenn_db::conversation::create_conversation(&conn, uid, "app-b", false);
             (cid_a, cid_b)
         };
 
@@ -1037,7 +1039,7 @@ mod tests {
             });
             // The delivery-time ACL gate re-authorizes every push against the
             // app's policy; without a covering matcher the row is denied.
-            cfg.policy = crate::test_support::app_config::delivery_policy_for_addresses([ch_addr]);
+            cfg.policy = brenn_lib::access::test_fixtures::delivery_policy_for_addresses([ch_addr]);
             cfg
         };
         let mut apps: IndexMap<String, brenn_lib::config::AppConfig> = IndexMap::new();
@@ -1075,7 +1077,7 @@ mod tests {
             "app-a",
             db.clone(),
             broadcast_tx_a,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(shared_registry.clone()),
                 messenger: Some(messenger.clone()),
@@ -1090,7 +1092,7 @@ mod tests {
             "app-b",
             db.clone(),
             broadcast_tx_b,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(shared_registry.clone()),
                 messenger: Some(messenger.clone()),

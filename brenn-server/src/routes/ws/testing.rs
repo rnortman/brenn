@@ -10,13 +10,13 @@
 
 use std::sync::Arc;
 
-use brenn_lib::auth::user::create_user;
+use brenn_db::auth::user::create_user;
 use brenn_lib::config::AppConfig;
 
 use crate::test_support::app_config::default_test_app_config;
-use brenn_lib::db::init_db_memory;
-use brenn_lib::obs::alerting::noop_alert_dispatcher;
-use brenn_lib::ws_types::{ViewportClass, WsServerMessage};
+use crate::test_support::init_db_memory;
+use brenn_obs::alerting::noop_alert_dispatcher;
+use brenn_ws_types::{ViewportClass, WsServerMessage};
 use indexmap::IndexMap;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
@@ -39,7 +39,7 @@ pub(super) const TEST_CLIENT_IP: std::net::IpAddr =
 /// Create a test device for `user_id` and return the device_id.
 /// Used by test WsConnection builders to satisfy the device_id requirement.
 pub(super) fn create_test_device(conn: &rusqlite::Connection, user_id: i64) -> i64 {
-    let resolved = brenn_lib::auth::device::resolve_or_create_device(
+    let resolved = brenn_db::auth::device::resolve_or_create_device(
         conn,
         None,
         user_id,
@@ -59,7 +59,7 @@ pub(super) fn test_apps() -> Arc<IndexMap<String, AppConfig>> {
 /// 50 ms sleep between attempts and surfaces a clear timeout message so failures
 /// are not misread as logic regressions.
 pub(super) async fn poll_until_db_count(
-    db: &brenn_lib::db::Db,
+    db: &brenn_db::Db,
     sql: &str,
     min_count: i64,
     max_wait_ms: u64,
@@ -152,14 +152,14 @@ where
 ///
 /// Returns `[{value: "sonnet", …}, {value: "opus", …}]`. Use with
 /// `state.cached_models.write().await.insert(TEST_APP_SLUG, test_model_infos())`.
-pub(super) fn test_model_infos() -> Vec<brenn_lib::ws_types::ModelInfo> {
+pub(super) fn test_model_infos() -> Vec<brenn_ws_types::ModelInfo> {
     vec![
-        brenn_lib::ws_types::ModelInfo {
+        brenn_ws_types::ModelInfo {
             value: "sonnet".into(),
             display_name: "Sonnet".into(),
             description: "Fast".into(),
         },
-        brenn_lib::ws_types::ModelInfo {
+        brenn_ws_types::ModelInfo {
             value: "opus".into(),
             display_name: "Opus".into(),
             description: "Smart".into(),
@@ -294,7 +294,7 @@ impl WsConnBuilder {
 pub(super) async fn test_ws_conn_with_resume_conv() -> (
     WsConnection,
     mpsc::Receiver<WsServerMessage>,
-    brenn_lib::db::Db,
+    brenn_db::Db,
     i64,
     i64,
 ) {
@@ -307,7 +307,7 @@ pub(super) async fn test_ws_conn_with_working_dir(
 ) -> (
     WsConnection,
     mpsc::Receiver<WsServerMessage>,
-    brenn_lib::db::Db,
+    brenn_db::Db,
     i64,
     i64,
 ) {
@@ -327,7 +327,7 @@ pub(super) async fn test_ws_conn_with_working_dir(
 pub(super) async fn test_ws_conn_with_active_bridge() -> (
     WsConnection,
     mpsc::Receiver<WsServerMessage>,
-    brenn_lib::db::Db,
+    brenn_db::Db,
     i64,
     i64,
 ) {
@@ -347,7 +347,7 @@ pub(super) async fn test_ws_conn_with_active_bridge_and_apps(
 ) -> (
     WsConnection,
     mpsc::Receiver<WsServerMessage>,
-    brenn_lib::db::Db,
+    brenn_db::Db,
     i64,
     i64,
 ) {
@@ -362,8 +362,8 @@ pub(super) async fn test_ws_conn_with_active_bridge_and_apps(
         let conn = db.lock().await;
         let uid = create_user(&conn, TEST_USERNAME, "$argon2id$fake");
         let did = create_test_device(&conn, uid);
-        let cid = brenn_lib::conversation::create_conversation(&conn, uid, "test", false);
-        brenn_lib::conversation::complete_conversation(&conn, cid, None);
+        let cid = brenn_db::conversation::create_conversation(&conn, uid, "test", false);
+        brenn_db::conversation::complete_conversation(&conn, cid, None);
         (uid, cid, did)
     };
 
@@ -393,7 +393,7 @@ pub(super) async fn test_ws_conn_with_resume_conv_and_apps(
 ) -> (
     WsConnection,
     mpsc::Receiver<WsServerMessage>,
-    brenn_lib::db::Db,
+    brenn_db::Db,
     i64,
     i64,
 ) {
@@ -408,8 +408,8 @@ pub(super) async fn test_ws_conn_with_resume_conv_and_apps(
         let conn = db.lock().await;
         let uid = create_user(&conn, TEST_USERNAME, "$argon2id$fake");
         let did = create_test_device(&conn, uid);
-        let cid = brenn_lib::conversation::create_conversation(&conn, uid, "test", false);
-        brenn_lib::conversation::complete_conversation(&conn, cid, None);
+        let cid = brenn_db::conversation::create_conversation(&conn, uid, "test", false);
+        brenn_db::conversation::complete_conversation(&conn, cid, None);
         (uid, cid, did)
     };
 
@@ -512,17 +512,18 @@ pub(super) async fn test_ws_conn_on_the_bus(
 ) -> (
     WsConnection,
     mpsc::Receiver<WsServerMessage>,
-    brenn_lib::db::Db,
-    Arc<brenn_lib::messaging::Messenger>,
+    brenn_db::Db,
+    Arc<brenn_messaging::Messenger>,
     i64,
 ) {
     use brenn_lib::config::LlmChatConfig;
-    use brenn_lib::messaging::chat_roster::{CHAT_ROSTER_COMPONENT, chat_roster_entry};
     use brenn_lib::messaging::config::MessagingGlobalConfig;
-    use brenn_lib::messaging::query::NoopWakeRouter;
-    use brenn_lib::messaging::store::RingStores;
-    use brenn_lib::messaging::system::{SystemParticipantSpec, registrations_from_specs};
-    use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Messenger, WakeRouter};
+    use brenn_lib::messaging::{ChannelScheme, MessagingDirectory};
+    use brenn_messaging::chat_roster::{CHAT_ROSTER_COMPONENT, chat_roster_entry};
+    use brenn_messaging::query::NoopWakeRouter;
+    use brenn_messaging::system::{SystemParticipantSpec, registrations_from_specs};
+    use brenn_messaging::{Messenger, WakeRouter};
+    use brenn_messaging_store::store::RingStores;
 
     let db = init_db_memory();
     let chat = LlmChatConfig::default();
@@ -554,7 +555,7 @@ pub(super) async fn test_ws_conn_on_the_bus(
         let conn = db.lock().await;
         let uid = create_user(&conn, TEST_USERNAME, "$argon2id$fake");
         let did = create_test_device(&conn, uid);
-        brenn_lib::messaging::db::upsert_channels(&conn, &entries);
+        brenn_messaging_store::db::upsert_channels(&conn, &entries);
         (uid, did)
     };
 
@@ -589,8 +590,8 @@ pub(super) async fn test_ws_conn_on_the_bus(
 
 /// Every roster snapshot published for `app_slug`, oldest first.
 pub(super) async fn roster_snapshots(
-    db: &brenn_lib::db::Db,
-    messenger: &brenn_lib::messaging::Messenger,
+    db: &brenn_db::Db,
+    messenger: &brenn_messaging::Messenger,
     app_slug: &str,
 ) -> Vec<String> {
     let address = brenn_envelope::chat::chat_roster_address(&messenger.llm_chat().prefix, app_slug);
@@ -614,7 +615,7 @@ pub(super) async fn test_ws_conn_for_app(
 ) -> (
     WsConnection,
     mpsc::Receiver<WsServerMessage>,
-    brenn_lib::db::Db,
+    brenn_db::Db,
     i64,
 ) {
     let db = init_db_memory();
@@ -673,7 +674,7 @@ pub(super) fn test_apps_single_instance_multiuser() -> Arc<IndexMap<String, AppC
 pub(super) async fn test_multiuser_conn_for_privacy() -> (
     WsConnection,
     mpsc::Receiver<WsServerMessage>,
-    brenn_lib::db::Db,
+    brenn_db::Db,
     i64,
     i64,
     i64,
@@ -687,7 +688,7 @@ pub(super) async fn test_multiuser_conn_for_privacy() -> (
         let conn = db.lock().await;
         let alice = create_user(&conn, "alice", "$argon2id$fake");
         let bob = create_user(&conn, "bob", "$argon2id$fake");
-        let cid = brenn_lib::conversation::create_conversation(&conn, alice, "test", true);
+        let cid = brenn_db::conversation::create_conversation(&conn, alice, "test", true);
         let did = create_test_device(&conn, alice);
         (alice, bob, cid, did)
     };
@@ -713,7 +714,7 @@ pub(super) async fn test_ws_conn_with_channel(
 ) -> (
     WsConnection,
     mpsc::Receiver<WsServerMessage>,
-    brenn_lib::db::Db,
+    brenn_db::Db,
     i64,
 ) {
     let db = init_db_memory();
@@ -752,10 +753,10 @@ pub(super) fn seed_user_messages(
 ) -> Option<i64> {
     let mut last_seq = None;
     for i in 0..n {
-        let (_id, seq) = brenn_lib::conversation::append_message(
+        let (_id, seq) = brenn_db::conversation::append_message(
             conn,
             conv_id,
-            brenn_lib::conversation::MessageDirection::Outgoing,
+            brenn_db::conversation::MessageDirection::Outgoing,
             "user",
             None,
             None,
@@ -816,7 +817,7 @@ pub(super) fn test_apps_persistent() -> Arc<IndexMap<String, AppConfig>> {
 pub(super) async fn test_ws_conn_persistent() -> (
     WsConnection,
     mpsc::Receiver<WsServerMessage>,
-    brenn_lib::db::Db,
+    brenn_db::Db,
     i64,
     i64,
 ) {
@@ -859,9 +860,9 @@ pub(super) fn test_apps_with_pwa_push() -> Arc<IndexMap<String, AppConfig>> {
 pub(super) async fn test_ws_conn_with_pwa_push() -> (
     WsConnection,
     mpsc::Receiver<WsServerMessage>,
-    brenn_lib::db::Db,
+    brenn_db::Db,
     i64,
-    Arc<dyn brenn_lib::pwa_push::PwaPushSender>,
+    Arc<dyn brenn_pwa_push::PwaPushSender>,
 ) {
     let dir = tempfile::tempdir().expect("tempdir");
     let keypair_path = dir.path().join("vapid.json");
@@ -871,17 +872,14 @@ pub(super) async fn test_ws_conn_with_pwa_push() -> (
         subject: "mailto:test@example.com".to_string(),
         // Use unenforced empty policy in tests so test endpoints like
         // "https://push.example.com/sub" pass without an allowlist.
-        endpoint_policy: brenn_lib::pwa_push::endpoint_validator::EndpointPolicy::new(
-            vec![],
-            false,
-        ),
+        endpoint_policy: brenn_lib::pwa_push::config::EndpointPolicy::new(vec![], false),
     };
 
     let db = init_db_memory();
     let apps = test_apps_with_pwa_push();
     let (alert_dispatcher, _handle) = noop_alert_dispatcher();
-    let pwa_push: Arc<dyn brenn_lib::pwa_push::PwaPushSender> =
-        Arc::new(brenn_lib::pwa_push::PwaPushService::new(
+    let pwa_push: Arc<dyn brenn_pwa_push::PwaPushSender> =
+        Arc::new(brenn_pwa_push::PwaPushService::new(
             db.clone(),
             resolved,
             apps.clone(),
@@ -905,8 +903,8 @@ pub(super) async fn test_ws_conn_with_pwa_push() -> (
     // Minimal bridge just to satisfy WsConnection (no CC needed for push tests).
     let conv_id = {
         let conn = db.lock().await;
-        let cid = brenn_lib::conversation::create_conversation(&conn, user_id, "test", false);
-        brenn_lib::conversation::complete_conversation(&conn, cid, None);
+        let cid = brenn_db::conversation::create_conversation(&conn, user_id, "test", false);
+        brenn_db::conversation::complete_conversation(&conn, cid, None);
         cid
     };
     let test_bridge =
@@ -936,8 +934,8 @@ pub(super) async fn test_ws_conn_with_pwa_push() -> (
 /// `None`. This is the smallest valid struct the serde deserializer accepts.
 /// Used by messaging.rs tests. `dispatch.rs` serializes `DebugViewportSnapshotData::default()`
 /// via `serde_json::to_string` instead (no struct-literal duplication).
-pub(super) fn minimal_debug_snapshot_data() -> Box<brenn_lib::ws_types::DebugViewportSnapshotData> {
-    Box::new(brenn_lib::ws_types::DebugViewportSnapshotData {
+pub(super) fn minimal_debug_snapshot_data() -> Box<brenn_ws_types::DebugViewportSnapshotData> {
+    Box::new(brenn_ws_types::DebugViewportSnapshotData {
         inner_width: 390.0,
         inner_height: 844.0,
         document_element_client_width: 390.0,
@@ -1013,9 +1011,9 @@ pub(super) fn minimal_debug_snapshot_data() -> Box<brenn_lib::ws_types::DebugVie
 mod builder_tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use brenn_lib::auth::user::create_user;
-    use brenn_lib::db::init_db_memory;
-    use brenn_lib::ws_types::ViewportClass;
+    use crate::test_support::init_db_memory;
+    use brenn_db::auth::user::create_user;
+    use brenn_ws_types::ViewportClass;
     use tokio::sync::mpsc;
 
     use super::{TEST_APP_SLUG, TEST_USERNAME, WsConnBuilder, create_test_device};

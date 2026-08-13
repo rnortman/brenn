@@ -2,9 +2,9 @@
 //! `handle_set_conversation_privacy`, `try_select_requested_conversation`,
 //! `handle_reconnect`, `handle_list_conversations`.
 
-use brenn_lib::conversation;
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
-use brenn_lib::ws_types::{CcState, WsServerMessage};
+use brenn_db::conversation;
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_ws_types::{CcState, WsServerMessage};
 use tracing::{info, warn};
 
 use super::connection::WsConnection;
@@ -440,10 +440,10 @@ impl WsConnection {
 
 #[cfg(test)]
 mod tests {
-    use brenn_lib::auth::user::create_user;
-    use brenn_lib::conversation::{self as conversation, ConversationStatus};
-    use brenn_lib::db::init_db_memory;
-    use brenn_lib::ws_types::{CcState, PaneLayout, ViewportClass, WsServerMessage};
+    use crate::test_support::init_db_memory;
+    use brenn_db::auth::user::create_user;
+    use brenn_db::conversation::{self as conversation, ConversationStatus};
+    use brenn_ws_types::{CcState, PaneLayout, ViewportClass, WsServerMessage};
     use tokio::sync::{broadcast, mpsc};
 
     use super::super::dispatch::handle_client_message;
@@ -1880,10 +1880,10 @@ mod tests {
         // Step 1: Add a user message (seq 0) and send full history.
         {
             let db_conn = db.lock().await;
-            brenn_lib::conversation::append_message(
+            brenn_db::conversation::append_message(
                 &db_conn,
                 conv_id,
-                brenn_lib::conversation::MessageDirection::Outgoing,
+                brenn_db::conversation::MessageDirection::Outgoing,
                 "user",
                 None,
                 None,
@@ -1917,10 +1917,10 @@ mod tests {
         // Step 2: Simulate drain_pending_events writing a row after send_history.
         {
             let db_conn = db.lock().await;
-            brenn_lib::conversation::append_message(
+            brenn_db::conversation::append_message(
                 &db_conn,
                 conv_id,
-                brenn_lib::conversation::MessageDirection::Outgoing,
+                brenn_db::conversation::MessageDirection::Outgoing,
                 "assistant",
                 None,
                 None,
@@ -2224,10 +2224,10 @@ mod tests {
         // Step 1: Insert a user message (seq 0) and send full history.
         {
             let db_conn = db.lock().await;
-            brenn_lib::conversation::append_message(
+            brenn_db::conversation::append_message(
                 &db_conn,
                 conv_id,
-                brenn_lib::conversation::MessageDirection::Outgoing,
+                brenn_db::conversation::MessageDirection::Outgoing,
                 "user",
                 None,
                 None,
@@ -2258,10 +2258,10 @@ mod tests {
         };
         {
             let db_conn = db.lock().await;
-            brenn_lib::conversation::append_message(
+            brenn_db::conversation::append_message(
                 &db_conn,
                 conv_id,
-                brenn_lib::conversation::MessageDirection::Incoming,
+                brenn_db::conversation::MessageDirection::Incoming,
                 "assistant",
                 None,
                 None,
@@ -2357,7 +2357,7 @@ mod tests {
                 let _ = conversation::append_message(
                     &c,
                     cid,
-                    brenn_lib::conversation::MessageDirection::Outgoing,
+                    brenn_db::conversation::MessageDirection::Outgoing,
                     "user",
                     None,
                     None,

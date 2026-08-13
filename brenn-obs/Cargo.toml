@@ -1,0 +1,34 @@
+[package]
+name = "brenn-obs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Observability: the tracing layer stack, the log transcripts, the security log, and the alert dispatcher"
+
+[features]
+# Expose the test-only alerters (CountingAlerter, CapturingAlerter) to
+# downstream crates, whose tests assert on what got dispatched. Not for
+# production builds.
+testutils = []
+
+# A sink: nothing here reaches back into the rest of the tree, which is what
+# lets every crate that emits a log line or an alert depend on it without
+# dragging the backend in.
+[dependencies]
+brenn-common = { version = "0.1.0", path = "../brenn-common" }
+chrono = { version = "0.4.44", features = ["serde"] }
+gethostname = "1.1.0"
+libc = "0.2.183"
+regex = "1.12.3"
+reopen = { version = "1.0.3", features = ["signals"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls"] }
+signal-hook = "0.3"
+tokio = { version = "1.50.0", features = ["sync", "time", "process", "rt", "macros"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.4"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "fmt"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.50.0", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
+tracing-test = "0.2.6"

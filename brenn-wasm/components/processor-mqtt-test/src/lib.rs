@@ -46,9 +46,9 @@
 #[allow(dead_code, clippy::all)]
 mod bindings;
 
+use bindings::Guest;
 use bindings::brenn::processor::mqtt::{MqttPublishError, mqtt_publish};
 use bindings::brenn::processor::types::{Activation, ReceiveError};
-use bindings::Guest;
 
 struct ProcessorMqttTest;
 

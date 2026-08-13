@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
-use brenn_lib::conversation::{self, ConversationStatus};
-use brenn_lib::ws_types::{CcState, WsServerMessage};
+use brenn_db::conversation::{self, ConversationStatus};
+use brenn_ws_types::{CcState, WsServerMessage};
 
 use super::super::{ActiveBridge, CompactionPhase};
 

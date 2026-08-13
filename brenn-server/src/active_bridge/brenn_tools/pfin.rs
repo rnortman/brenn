@@ -2,11 +2,11 @@
 //! Includes pfin-specific batch-item enrichment, persisted-extra decoding,
 //! and the render-dispatch override for pfin tool cards.
 
+use brenn_approval_rules::ApprovalMatch;
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
-use brenn_lib::approval_rules::ApprovalMatch;
 use brenn_lib::integration::{IntegrationToolAction, ToolPhase};
 use brenn_lib::subprocess::SubprocessExecContext;
-use brenn_lib::ws_types::ViewportClass;
+use brenn_ws_types::ViewportClass;
 use tracing::{info, warn};
 
 use super::super::ActiveBridge;
@@ -298,7 +298,11 @@ pub(crate) fn render_pending_tool_request(
                 ViewportClass::Compact => brenn_pfin::batch::render_batch_swipe,
             };
             renderer(&enriched).unwrap_or_else(|| {
-                crate::approval_formatter::format_tool_display(tool_registry, tool_name, tool_input)
+                brenn_render::approval_formatter::format_tool_display(
+                    tool_registry,
+                    tool_name,
+                    tool_input,
+                )
             })
         }
         name if name == MCP_BATCH_ASSIGN_TOOL => {
@@ -317,12 +321,20 @@ pub(crate) fn render_pending_tool_request(
                 }
             };
             result.unwrap_or_else(|| {
-                crate::approval_formatter::format_tool_display(tool_registry, tool_name, tool_input)
+                brenn_render::approval_formatter::format_tool_display(
+                    tool_registry,
+                    tool_name,
+                    tool_input,
+                )
             })
         }
         _ => {
             // ProposeReconciliation and any other tools: render via the tool registry.
-            crate::approval_formatter::format_tool_display(tool_registry, tool_name, tool_input)
+            brenn_render::approval_formatter::format_tool_display(
+                tool_registry,
+                tool_name,
+                tool_input,
+            )
         }
     }
 }
@@ -453,7 +465,7 @@ mod tests {
     use brenn_cc::session::{
         ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest, SessionEvent,
     };
-    use brenn_lib::ws_types::{CcState, ToolResponseDecision, ViewportClass, WsServerMessage};
+    use brenn_ws_types::{CcState, ToolResponseDecision, ViewportClass, WsServerMessage};
     use tokio::sync::oneshot;
 
     use super::super::super::mcp_constants::{
@@ -480,7 +492,7 @@ mod tests {
                 integrations: std::collections::HashMap::new(), // no pfin
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -516,7 +528,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -551,7 +563,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -665,7 +677,7 @@ mod tests {
         }
         {
             let conn = bridge.db.lock().await;
-            let req = brenn_lib::db::get_pending_tool_request(&conn, "req_propose_post");
+            let req = brenn_db::get_pending_tool_request(&conn, "req_propose_post");
             assert!(req.is_some(), "should be in pending_tool_requests DB table");
             let req = req.unwrap();
             assert_eq!(req.status, "pending");
@@ -692,7 +704,7 @@ mod tests {
         // DB should show denied.
         {
             let conn = bridge.db.lock().await;
-            let req = brenn_lib::db::get_pending_tool_request(&conn, "req_propose_post")
+            let req = brenn_db::get_pending_tool_request(&conn, "req_propose_post")
                 .expect("request should exist");
             assert_eq!(req.status, "denied");
             let result: serde_json::Value =
@@ -719,7 +731,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -765,7 +777,7 @@ mod tests {
         // DB result should indicate error about missing selection.
         let req = {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::get_pending_tool_request(&conn, "req_propose_no_idx")
+            brenn_db::get_pending_tool_request(&conn, "req_propose_no_idx")
         };
         let req = req.expect("request should exist");
         let result: serde_json::Value =
@@ -788,7 +800,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -821,7 +833,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -865,7 +877,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -905,7 +917,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -958,7 +970,7 @@ mod tests {
         });
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &conn,
                 "req_batch_deny",
                 bridge.conversation_id,
@@ -987,7 +999,7 @@ mod tests {
         // Check DB: status should be 'denied'.
         let req = {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::get_pending_tool_request(&conn, "req_batch_deny")
+            brenn_db::get_pending_tool_request(&conn, "req_batch_deny")
         };
         let req = req.expect("request should exist in DB");
         assert_eq!(req.status, "denied");
@@ -1011,7 +1023,7 @@ mod tests {
         });
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &conn,
                 "req_batch_no_decisions",
                 bridge.conversation_id,
@@ -1036,7 +1048,7 @@ mod tests {
         // Check DB result.
         let req = {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::get_pending_tool_request(&conn, "req_batch_no_decisions")
+            brenn_db::get_pending_tool_request(&conn, "req_batch_no_decisions")
         };
         let req = req.expect("request should exist in DB");
         assert_eq!(req.status, "completed");
@@ -1059,7 +1071,7 @@ mod tests {
         });
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &conn,
                 "req_batch_deny_enrich",
                 bridge.conversation_id,
@@ -1081,7 +1093,7 @@ mod tests {
         // Check DB result.
         let req = {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::get_pending_tool_request(&conn, "req_batch_deny_enrich")
+            brenn_db::get_pending_tool_request(&conn, "req_batch_deny_enrich")
         };
         let req = req.expect("request should exist in DB");
         assert_eq!(req.status, "denied");
@@ -1250,7 +1262,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -1283,7 +1295,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -1322,7 +1334,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -1363,7 +1375,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -1407,7 +1419,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -1452,7 +1464,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -1503,7 +1515,7 @@ mod tests {
         });
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &conn,
                 "req_assign_deny",
                 bridge.conversation_id,
@@ -1530,7 +1542,7 @@ mod tests {
 
         let req = {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::get_pending_tool_request(&conn, "req_assign_deny")
+            brenn_db::get_pending_tool_request(&conn, "req_assign_deny")
         };
         let req = req.expect("request should exist in DB");
         assert_eq!(req.status, "denied");
@@ -1553,7 +1565,7 @@ mod tests {
         });
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &conn,
                 "req_assign_no_decisions",
                 bridge.conversation_id,
@@ -1576,7 +1588,7 @@ mod tests {
 
         let req = {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::get_pending_tool_request(&conn, "req_assign_no_decisions")
+            brenn_db::get_pending_tool_request(&conn, "req_assign_no_decisions")
         };
         let req = req.expect("request should exist in DB");
         assert_eq!(req.status, "completed");
@@ -1599,7 +1611,7 @@ mod tests {
         });
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &conn,
                 "req_assign_deny_enrich",
                 bridge.conversation_id,
@@ -1620,7 +1632,7 @@ mod tests {
 
         let req = {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::get_pending_tool_request(&conn, "req_assign_deny_enrich")
+            brenn_db::get_pending_tool_request(&conn, "req_assign_deny_enrich")
         };
         let req = req.expect("request should exist in DB");
         assert_eq!(req.status, "denied");
@@ -1753,7 +1765,7 @@ mod tests {
                 integrations: std::collections::HashMap::new(), // no pfin
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 

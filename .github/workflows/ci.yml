@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       run_comparisons:
-        description: "Also run the cargo parity and uncached canary jobs (~3 runner-hours)"
+        description: "Also run the uncached canary job (~2 runner-hours)"
         type: boolean
         default: false
   # Each expression below is matched verbatim by the `if:` of the job it selects,
@@ -15,10 +15,6 @@ on:
   # that job selecting a schedule that no longer fires, which is absence rather
   # than failure and nothing else would notice.
   schedule:
-    # The cargo comparison run. Daily, because a divergence between the two
-    # build systems is a stop-the-line bug and the window it can open in is one
-    # day of commits.
-    - cron: "17 5 * * *"
     # The cache-soundness canary. Weekly, because what it catches does not
     # change with the tree.
     - cron: "43 6 * * 1"
@@ -36,11 +32,11 @@ jobs:
     # what the gate covers, not how: fmt, clippy and the test suite are three of
     # the invocations inside `make bazel-check`.
     name: check (fmt, clippy, test)
-    # The schedule triggers exist for the two comparison jobs below, each of
-    # which selects its own cron. This job gates changes, so a cron tick has
-    # nothing for it to gate: it would re-run the whole graph against a HEAD
-    # that already passed, and a red result would read as a broken main branch
-    # with no change behind it.
+    # The schedule trigger exists for the canary job below, which selects its
+    # own cron. This job gates changes, so a cron tick has nothing for it to
+    # gate: it would re-run the whole graph against a HEAD that already passed,
+    # and a red result would read as a broken main branch with no change behind
+    # it.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     # Cold, this fetches every toolchain and builds the whole graph twice over —
@@ -178,125 +174,14 @@ jobs:
             .bazel-repo-cache
           key: bazel-disk-${{ github.sha }}
 
-  # The other half of the migration's parallel-run window, with the sides
-  # swapped: Bazel is the gate now and `make check-ci` runs on a schedule beside
-  # it. It is still what CD consumes until the deploy pipeline cuts over, and a
-  # divergence in verdict is a stop-the-line bug whichever side is wrong.
-  # Not a required check, so a red run here blocks no merges — but it is not
-  # `continue-on-error` either: that makes the *run* conclude success, which is
-  # what GitHub's failed-schedule notification keys on, and a comparison job
-  # whose failure notifies nobody compares nothing.
-  cargo-parity:
-    name: make check-ci (parallel run, advisory)
-    if: github.event.schedule == '17 5 * * *' || github.event.inputs.run_comparisons == 'true'
-    runs-on: ubuntu-latest
-    # brenn cold-cache compiles four cargo tools, the full workspace, all WASM
-    # components, and three npm trees; 60 bounds a hang without flaking a cold run.
-    timeout-minutes: 60
-    env:
-      CARGO_TERM_COLOR: always
-      # Incremental artifacts bloat rust-cache for no CI benefit.
-      CARGO_INCREMENTAL: "0"
-      # The graf git-dep fetch goes through the git CLI (git-fetch-with-cli); a
-      # bad fetch must hard-fail, not hang on a credential prompt.
-      GIT_TERMINAL_PROMPT: "0"
-      # The xtask test cache is useless on an ephemeral runner; disabling it
-      # removes any stale-skip class entirely.
-      BRENN_TEST_CACHE: "0"
-      BRENN_MQTT_INTEGRATION: "1"
-      # The Makefile leaves nextest unpinned; pin it here for deterministic cache
-      # keys and deliberate bumps.
-      NEXTEST_VERSION: 0.9.140
-      # BRENN_CHECK_JOBS deliberately unset: public runners have 4 vCPUs and the
-      # Makefile serializes everything that shares state, so default overlap mode
-      # cuts wall time. If OOM appears, set BRENN_CHECK_JOBS: "1".
-    steps:
-      - uses: actions/checkout@v7
-
-      # rust-toolchain.toml owns the channel, components, and targets; the bare
-      # install restates nothing.
-      - name: Install Rust
-        run: rustup toolchain install
-
-      - uses: Swatinem/rust-cache@v2
-
-      # engines floor is 20; pin the major to decouple from runner-image drift.
-      # No separate jco install: jco is npm ci-installed from surface/package.json
-      # and jco-preflight asserts the installed version against the pin.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      # The MQTT integration tests spawn their own broker from this binary.
-      # Distro-signed apt is acceptable provenance for a test-only dependency.
-      - name: Install mosquitto
-        run: sudo apt-get update && sudo apt-get install -y mosquitto
-
-      # Every toolchain pin is derived, never restated: wasm-bindgen-cli from the
-      # Cargo.toml crate pin (same sed expression the Makefile uses), wit-bindgen-cli
-      # and wasm-tools from the Makefile variables that the build's own preflights
-      # assert against. A literal here could install a version the build then rejects.
-      - name: Resolve toolchain pins
-        run: |
-          wbg=$(sed -n 's/^wasm-bindgen = "=\(.*\)"/\1/p' Cargo.toml)
-          test -n "$wbg" || { echo "could not extract wasm-bindgen pin from Cargo.toml"; exit 1; }
-          echo "WASM_BINDGEN_VERSION=$wbg" >> "$GITHUB_ENV"
-          wb=$(sed -n 's/^WIT_BINDGEN_CLI_VERSION := //p' Makefile)
-          test -n "$wb" || { echo "could not extract WIT_BINDGEN_CLI_VERSION from Makefile"; exit 1; }
-          echo "WIT_BINDGEN_VERSION=$wb" >> "$GITHUB_ENV"
-          wt=$(sed -n 's/^WASM_TOOLS_VERSION := //p' Makefile)
-          test -n "$wt" || { echo "could not extract WASM_TOOLS_VERSION from Makefile"; exit 1; }
-          echo "WASM_TOOLS_VERSION=$wt" >> "$GITHUB_ENV"
-
-      # A toolchain bump rebuilds the tools (hashFiles on rust-toolchain.toml).
-      # Restore/save are split so the tool build (30+ min cold) is banked even
-      # when make check-ci later fails; a combined cache saves only on job success.
-      - name: Restore cargo build tools
-        id: cargo-tools-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.brenn-ci-tools
-          key: brenn-ci-tools-${{ env.WIT_BINDGEN_VERSION }}-${{ env.WASM_TOOLS_VERSION }}-${{ env.WASM_BINDGEN_VERSION }}-${{ env.NEXTEST_VERSION }}-${{ hashFiles('rust-toolchain.toml') }}
-
-      # cargo install --locked (not sha-pinned prebuilt downloads) keeps
-      # Cargo.toml authoritative for the wasm-bindgen pin.
-      - name: Install cargo build tools
-        run: |
-          root="$HOME/.brenn-ci-tools"
-          export CARGO_INSTALL_ROOT="$root"
-          mkdir -p "$root/bin"
-          export PATH="$root/bin:$PATH"
-          wit-bindgen --version 2>/dev/null | grep -qF "$WIT_BINDGEN_VERSION" \
-            || cargo install --locked wit-bindgen-cli --version "$WIT_BINDGEN_VERSION"
-          wasm-tools --version 2>/dev/null | grep -qF "$WASM_TOOLS_VERSION" \
-            || cargo install --locked wasm-tools --version "$WASM_TOOLS_VERSION"
-          wasm-bindgen --version 2>/dev/null | grep -qF "$WASM_BINDGEN_VERSION" \
-            || cargo install --locked wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION"
-          cargo nextest --version 2>/dev/null | grep -qF "$NEXTEST_VERSION" \
-            || cargo install --locked cargo-nextest --version "$NEXTEST_VERSION"
-          echo "$root/bin" >> "$GITHUB_PATH"
-
-      # Saved before make check-ci so a red gate still banks the tool build;
-      # skipped on an exact restore hit (nothing new to store).
-      - name: Save cargo build tools
-        if: steps.cargo-tools-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.brenn-ci-tools
-          key: ${{ steps.cargo-tools-cache.outputs.cache-primary-key }}
-
-      # check-ci is the Makefile's CI target: check-common minus cargo-deny,
-      # which isn't installed here.
-      - run: make check-ci
-
   # Belt and braces against the residual class Bazel cannot see: an undeclared
   # *system* input — the apt mosquitto, the kernel, the runner image. No cache
   # is restored and no test result is reused, so this is a cold build and a full
   # suite.
   #
   # Off by default on a manual dispatch: the ordinary reason to dispatch is to
-  # re-run the gate on a ref, and this job plus the cargo lane are ~3 runner-hours
-  # of advisory work between the operator and the gate's verdict.
+  # re-run the gate on a ref, and this job is ~2 runner-hours of advisory work
+  # between the operator and the gate's verdict.
   cache-canary:
     name: bazel (uncached canary)
     if: github.event.schedule == '43 6 * * 1' || github.event.inputs.run_comparisons == 'true'

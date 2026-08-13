@@ -23,10 +23,10 @@
 
 use tracing::{debug, info, warn};
 
-use brenn_lib::messaging::db::{
+use brenn_lib::messaging::{Impetus, MessageEnvelope};
+use brenn_messaging_store::db::{
     BudgetDecrement, decrement_send_budget, read_send_budget, reset_send_budget,
 };
-use brenn_lib::messaging::{Impetus, MessageEnvelope};
 
 use super::ActiveBridge;
 

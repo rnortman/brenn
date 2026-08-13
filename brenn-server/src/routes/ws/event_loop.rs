@@ -3,10 +3,10 @@
 use std::net::IpAddr;
 
 use axum::extract::ws::{Message, WebSocket};
-use brenn_lib::auth::session::Session;
-use brenn_lib::conversation;
-use brenn_lib::usage::{self as usage};
-use brenn_lib::ws_types::{CcState, ViewportClass, WsServerMessage};
+use brenn_db::auth::session::Session;
+use brenn_db::conversation;
+use brenn_usage_db as usage;
+use brenn_ws_types::{CcState, ViewportClass, WsServerMessage};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
@@ -122,11 +122,11 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
         models.get(&conn.app_slug).cloned().unwrap_or_default()
     };
     let default_model = conn.app_config().model.clone();
-    let attachment_targets: Vec<brenn_lib::ws_types::TargetInfo> = conn
+    let attachment_targets: Vec<brenn_ws_types::TargetInfo> = conn
         .app_config()
         .attachment_targets
         .iter()
-        .map(|t| brenn_lib::ws_types::TargetInfo {
+        .map(|t| brenn_ws_types::TargetInfo {
             name: t.name.clone(),
             label: t.label.clone(),
             accept: t.accept.clone(),
@@ -150,7 +150,7 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
     if app_config.pwa_push_enabled() {
         let enabled = {
             let db_conn = state.db.lock().await;
-            brenn_lib::pwa_push::db::subscription_exists(&db_conn, conn.device_id, session.user.id)
+            brenn_pwa_push::db::subscription_exists(&db_conn, conn.device_id, session.user.id)
         };
         let _ = conn.send_ws(WsServerMessage::PushEnabled { enabled });
     }
@@ -200,14 +200,14 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
                         // Protocol-level ping/pong handled automatically by axum.
                     }
                     Some(Ok(Message::Binary(_))) => {
-                        brenn_lib::obs::security::log_and_alert_security_event(
+                        brenn_obs::security::log_and_alert_security_event(
                             &state.alert_dispatcher,
-                            brenn_lib::obs::security::SecurityEventType::SchemaViolation,
+                            brenn_obs::security::SecurityEventType::SchemaViolation,
                             client_ip,
                             &format!("binary WS frame from user {}", session.user.username),
                         );
                         let db_conn = state.db.lock().await;
-                        brenn_lib::auth::session::delete_session(&db_conn, &session.token);
+                        brenn_db::auth::session::delete_session(&db_conn, &session.token);
                         break;
                     }
                     Some(Err(e)) => {
@@ -457,8 +457,8 @@ pub(super) async fn handle_ws(hs: WsHandshake) {
 
 #[cfg(test)]
 mod tests {
-    use brenn_lib::conversation;
-    use brenn_lib::ws_types::{CcState, PaneLayout, WsServerMessage};
+    use brenn_db::conversation;
+    use brenn_ws_types::{CcState, PaneLayout, WsServerMessage};
 
     use super::super::testing::*;
 
@@ -625,7 +625,7 @@ mod tests {
         // No subscription yet — PushEnabled should be false.
         let no_sub = {
             let db_conn = db.lock().await;
-            brenn_lib::pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
+            brenn_pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
         };
         let _ = conn.send_ws(WsServerMessage::PushEnabled { enabled: no_sub });
 
@@ -662,11 +662,11 @@ mod tests {
         // Now add a subscription and simulate re-connect.
         {
             let db_conn = db.lock().await;
-            brenn_lib::pwa_push::db::upsert_subscription(
+            brenn_pwa_push::db::upsert_subscription(
                 &db_conn,
                 conn.device_id,
                 conn.user_id,
-                &brenn_lib::pwa_push::endpoint_validator::ValidatedEndpoint::for_testing(
+                &brenn_pwa_push::endpoint_validator::ValidatedEndpoint::for_testing(
                     "https://push.example.com/sub",
                 ),
                 &fake_p256dh(),
@@ -675,7 +675,7 @@ mod tests {
         }
         let with_sub = {
             let db_conn = db.lock().await;
-            brenn_lib::pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
+            brenn_pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
         };
         let _ = conn.send_ws(WsServerMessage::PushEnabled { enabled: with_sub });
         let msg = ws_rx

@@ -1,10 +1,11 @@
 //! The set of repo files the policy guards scan.
 //!
 //! Two sources, chosen by the caller and never by fallback. `git ls-files` is
-//! the make-lane source: the tracked tree, so build output and untracked
-//! scratch are outside the scan by construction. A manifest is the build-graph
-//! source: a listing produced from declared inputs, so the guards are cacheable
-//! tests that rerun exactly when a file they read changes.
+//! the workspace source, used by the checks that run outside the sandbox: the
+//! tracked tree, so build output and untracked scratch are outside the scan by
+//! construction. A manifest is the build-graph source: a listing produced from
+//! declared inputs, so the guards are cacheable tests that rerun exactly when a
+//! file they read changes.
 //!
 //! Both yield repo-root-relative paths, sorted, so a guard's output does not
 //! depend on which source produced its input.
@@ -122,7 +123,7 @@ mod tests {
 
     /// The git half of the file set: tracked files only, at every depth, sorted
     /// — and neither the untracked nor the ignored sibling. A regression in the
-    /// NUL splitting or the `-C root` targeting shrinks the make-lane scan, and
+    /// NUL splitting or the `-C root` targeting shrinks the git-side scan, and
     /// four of the six guards have no floor to notice.
     #[test]
     fn from_git_lists_tracked_files_only() {

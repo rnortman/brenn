@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brenn_lib::token_bucket::{TokenBucket, TokenBucketOutcome};
-use brenn_lib::ws_types::{
+use brenn_ws_types::{
     PaneLayout, PermissionDecision, ToolResponseDecision, ViewportClass, WsServerMessage,
 };
 use tokio::sync::{broadcast, mpsc};
@@ -229,12 +229,12 @@ impl WsConnection {
     ///
     /// Locks the DB, loads the device_user row, and delegates to `effective_timezone`.
     /// Use only when you do not already hold the device_user row; call
-    /// `brenn_lib::auth::device::effective_timezone(&du, self.timezone, Utc::now())` directly
+    /// `brenn_db::auth::device::effective_timezone(&du, self.timezone, Utc::now())` directly
     /// when the row is already loaded to avoid a redundant lock.
     pub(super) async fn effective_timezone(&self) -> chrono_tz::Tz {
         let conn = self.state.db.lock().await;
-        let du = brenn_lib::auth::device::load_device_user(&conn, self.device_id, self.user_id);
-        brenn_lib::auth::device::effective_timezone(&du, self.timezone, chrono::Utc::now())
+        let du = brenn_db::auth::device::load_device_user(&conn, self.device_id, self.user_id);
+        brenn_db::auth::device::effective_timezone(&du, self.timezone, chrono::Utc::now())
     }
 
     /// "Today" in this connection's effective timezone — the authoritative value
@@ -259,8 +259,8 @@ impl WsConnection {
     /// Panics on DB miss (matches existing inline behavior).
     pub(super) async fn fetch_device_slug(&self) -> String {
         let conn = self.state.db.lock().await;
-        let device = brenn_lib::auth::device::load_device(&conn, self.device_id);
-        let du = brenn_lib::auth::device::load_device_user(&conn, self.device_id, self.user_id);
+        let device = brenn_db::auth::device::load_device(&conn, self.device_id);
+        let du = brenn_db::auth::device::load_device_user(&conn, self.device_id, self.user_id);
         du.display_slug(&device).to_string()
     }
 
@@ -284,8 +284,8 @@ impl WsConnection {
     ) -> (Vec<(String, String)>, chrono::NaiveDate) {
         let now = chrono::Utc::now();
         let conn = self.state.db.lock().await;
-        let du = brenn_lib::auth::device::load_device_user(&conn, self.device_id, self.user_id);
-        let tz = brenn_lib::auth::device::effective_timezone(&du, self.timezone, now);
+        let du = brenn_db::auth::device::load_device_user(&conn, self.device_id, self.user_id);
+        let tz = brenn_db::auth::device::effective_timezone(&du, self.timezone, now);
         let env = super::usage::build_graf_env_from(self.app_config(), tz);
         let today = now.with_timezone(&tz).date_naive();
         (env, today)
@@ -297,8 +297,8 @@ impl WsConnection {
     /// `shared` is `false` — both vacuously (no conversation, no restriction).
     pub(super) fn conversation_switched(
         &self,
-        conversation: Option<&brenn_lib::conversation::Conversation>,
-        state: brenn_lib::ws_types::CcState,
+        conversation: Option<&brenn_db::conversation::Conversation>,
+        state: brenn_ws_types::CcState,
     ) -> WsServerMessage {
         WsServerMessage::ConversationSwitched {
             conversation_id: conversation.map(|c| c.id),
@@ -314,7 +314,7 @@ impl WsConnection {
     pub(super) fn conversation_switched_from_bridge(
         &self,
         bridge: &ActiveBridge,
-        state: brenn_lib::ws_types::CcState,
+        state: brenn_ws_types::CcState,
     ) -> WsServerMessage {
         self.conversation_switched_from_bridge_inner(bridge, state, false)
     }
@@ -325,7 +325,7 @@ impl WsConnection {
     pub(super) fn conversation_switched_reload_from_bridge(
         &self,
         bridge: &ActiveBridge,
-        state: brenn_lib::ws_types::CcState,
+        state: brenn_ws_types::CcState,
     ) -> WsServerMessage {
         self.conversation_switched_from_bridge_inner(bridge, state, true)
     }
@@ -333,7 +333,7 @@ impl WsConnection {
     fn conversation_switched_from_bridge_inner(
         &self,
         bridge: &ActiveBridge,
-        state: brenn_lib::ws_types::CcState,
+        state: brenn_ws_types::CcState,
         reload: bool,
     ) -> WsServerMessage {
         WsServerMessage::ConversationSwitched {
@@ -539,8 +539,8 @@ impl WsConnection {
         requested_conversation_id: Option<i64>,
         requested_last_seq: Option<i64>,
     ) {
-        use brenn_lib::conversation;
-        use brenn_lib::ws_types::CcState;
+        use brenn_db::conversation;
+        use brenn_ws_types::CcState;
 
         let (singleton, multiuser, single_instance) = {
             let ac = self.app_config();
@@ -701,15 +701,13 @@ impl WsConnection {
                             }
                         } else {
                             let _ = self.send_ws(self.conversation_switched(None, CcState::Idle));
-                            let _ = self.send_ws(
-                                brenn_lib::ws_types::WsServerMessage::HistoryComplete {
-                                    oldest_loaded_seq: None,
-                                },
-                            );
                             let _ =
-                                self.send_ws(brenn_lib::ws_types::WsServerMessage::ArtifactIndex {
-                                    files: vec![],
+                                self.send_ws(brenn_ws_types::WsServerMessage::HistoryComplete {
+                                    oldest_loaded_seq: None,
                                 });
+                            let _ = self.send_ws(brenn_ws_types::WsServerMessage::ArtifactIndex {
+                                files: vec![],
+                            });
                         }
                     }
                 }
@@ -734,10 +732,10 @@ impl WsConnection {
 
 #[cfg(test)]
 mod tests {
-    use brenn_lib::auth::user::create_user;
-    use brenn_lib::conversation;
-    use brenn_lib::db::init_db_memory;
-    use brenn_lib::ws_types::{CcState, WsServerMessage};
+    use crate::test_support::init_db_memory;
+    use brenn_db::auth::user::create_user;
+    use brenn_db::conversation;
+    use brenn_ws_types::{CcState, WsServerMessage};
     use tokio::sync::{broadcast, mpsc};
 
     use super::super::testing::*;
@@ -1092,7 +1090,7 @@ mod tests {
     /// Tests each arm individually so a missing arm is caught immediately.
     #[test]
     fn extract_seq_all_seq_bearing_variants_covered() {
-        use brenn_lib::ws_types::SystemMessageCategory;
+        use brenn_ws_types::SystemMessageCategory;
 
         let cases: Vec<WsServerMessage> = vec![
             WsServerMessage::UserMessageEcho {
@@ -1180,11 +1178,11 @@ mod tests {
         // Insert a bridge for a different user's conversation — same app slug.
         let other_user = {
             let c = db.lock().await;
-            brenn_lib::auth::user::create_user(&c, "other_user", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&c, "other_user", "$argon2id$fake")
         };
         let other_conv = {
             let c = db.lock().await;
-            brenn_lib::conversation::create_conversation(&c, other_user, "test", false)
+            brenn_db::conversation::create_conversation(&c, other_user, "test", false)
         };
         let (bcast_tx, _) = broadcast::channel::<WsServerMessage>(16);
         let other_bridge =
@@ -1218,7 +1216,7 @@ mod tests {
         // can assert the correct conversation_id is reported.
         let conv_id = {
             let c = db.lock().await;
-            brenn_lib::conversation::create_conversation(&c, user_id, "test", false)
+            brenn_db::conversation::create_conversation(&c, user_id, "test", false)
         };
 
         conn.run_setup(None, None).await;
@@ -1343,7 +1341,7 @@ mod tests {
         // Ensure a conversation exists so the singleton path proceeds to send_history.
         {
             let c = db.lock().await;
-            brenn_lib::conversation::create_conversation(&c, user_id, "test", false);
+            brenn_db::conversation::create_conversation(&c, user_id, "test", false);
         }
 
         // Drop the receiver — subsequent send_ws_backpressure calls will fail.
@@ -2009,7 +2007,7 @@ mod tests {
         // Write the override directly so we don't need a bridge.
         {
             let db_conn = conn.state.db.lock().await;
-            brenn_lib::auth::device::set_tz_override(
+            brenn_db::auth::device::set_tz_override(
                 &db_conn,
                 conn.device_id,
                 conn.user_id,
@@ -2038,7 +2036,7 @@ mod tests {
         // Set then clear.
         {
             let db_conn = conn.state.db.lock().await;
-            brenn_lib::auth::device::set_tz_override(
+            brenn_db::auth::device::set_tz_override(
                 &db_conn,
                 conn.device_id,
                 conn.user_id,
@@ -2048,7 +2046,7 @@ mod tests {
         }
         {
             let db_conn = conn.state.db.lock().await;
-            brenn_lib::auth::device::set_tz_override(
+            brenn_db::auth::device::set_tz_override(
                 &db_conn,
                 conn.device_id,
                 conn.user_id,
@@ -2082,7 +2080,7 @@ mod tests {
         // Set override to Asia/Tokyo.
         {
             let db_conn = conn.state.db.lock().await;
-            brenn_lib::auth::device::set_tz_override(
+            brenn_db::auth::device::set_tz_override(
                 &db_conn,
                 conn.device_id,
                 conn.user_id,
@@ -2114,7 +2112,7 @@ mod tests {
         // Set override with a past expiry.
         {
             let db_conn = conn.state.db.lock().await;
-            brenn_lib::auth::device::set_tz_override(
+            brenn_db::auth::device::set_tz_override(
                 &db_conn,
                 conn.device_id,
                 conn.user_id,

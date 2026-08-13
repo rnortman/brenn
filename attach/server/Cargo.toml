@@ -1,0 +1,49 @@
+[package]
+name = "brenn-attach-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The server half of a bus attachment: the attachment session, its socket, subscription and publish planes, and the registry the routers push through"
+
+[features]
+# Expose the session-handle and cap constructors the crates above build their
+# attachment fixtures on. Not for production builds.
+testutils = []
+
+# Reaches down to brenn-attach-proto for the wire frames, to brenn-messaging for
+# the bus a session publishes to and replays from, and to brenn-lib/brenn-obs
+# for policy and alerting. Nothing above is named here — the route that owns an
+# attacher hands its profile in.
+[dependencies]
+axum = { version = "0.8.8", features = ["ws"] }
+brenn-attach-proto = { version = "0.1.0", path = "../proto" }
+brenn-budget = { version = "0.1.0", path = "../../brenn-budget" }
+brenn-common = { version = "0.1.0", path = "../../brenn-common" }
+brenn-envelope = { path = "../../brenn-envelope" }
+brenn-lib = { version = "0.1.0", path = "../../brenn-lib" }
+brenn-messaging = { version = "0.1.0", path = "../../brenn-messaging" }
+brenn-messaging-store = { version = "0.1.0", path = "../../brenn-messaging-store" }
+brenn-obs = { version = "0.1.0", path = "../../brenn-obs" }
+chrono = "0.4.44"
+futures = "0.3.32"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["sync", "time", "macros", "rt"] }
+tracing = "0.1.44"
+# Must stay version-unified with axum's tokio-tungstenite: `classify_read_error`
+# downcasts to `tungstenite::Error` by TypeId, which silently stops matching if
+# two tungstenite versions coexist.
+tungstenite = { version = "0.29.0", default-features = false }
+uuid = { version = "1.23.0", features = ["v4"] }
+
+[dev-dependencies]
+brenn-db = { version = "0.1.0", path = "../../brenn-db" }
+brenn-lib = { version = "0.1.0", path = "../../brenn-lib", features = ["testutils"] }
+brenn-messaging = { version = "0.1.0", path = "../../brenn-messaging", features = ["testutils"] }
+brenn-obs = { version = "0.1.0", path = "../../brenn-obs", features = ["testutils"] }
+indexmap = "2"
+tokio = { version = "1.50.0", features = ["full", "test-util"] }
+tracing-subscriber = "0.3.23"
+# "no-env-filter" makes `#[traced_test]` capture unconditionally; without it
+# tracing-test applies a default env filter and `logs_contain` assertions fail.
+tracing-test = { version = "0.2.6", features = ["no-env-filter"] }

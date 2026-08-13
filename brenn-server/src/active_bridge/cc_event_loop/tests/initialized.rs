@@ -12,10 +12,8 @@ use super::super::super::test_support::{
 use super::super::*;
 
 use brenn_cc::session::SessionInfo;
-use brenn_lib::obs::alerting::{
-    AlertDispatcher, CountingAlerter, RateLimiter, make_capturing_alerter,
-};
-use brenn_lib::ws_types::PermissionModeValue;
+use brenn_obs::alerting::{AlertDispatcher, CountingAlerter, RateLimiter, make_capturing_alerter};
+use brenn_ws_types::PermissionModeValue;
 
 use crate::active_bridge::test_fixtures::TestBridgeConfig;
 use std::sync::Arc;
@@ -462,12 +460,12 @@ async fn repeated_mismatched_permission_mode_dedups_same_value() {
 #[tokio::test]
 #[should_panic(expected = "Brenn requires >= 2.1.123")]
 async fn version_floor_panics_on_old_cc() {
-    let db = brenn_lib::db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let (tx, _rx) = broadcast::channel(64);
     let active_bridges = ActiveBridges::new();
     let (uid, conv_id) = {
         let conn = db.lock().await;
-        let uid = brenn_lib::auth::user::create_user(&conn, "vfloor1", "$argon2id$fake");
+        let uid = brenn_db::auth::user::create_user(&conn, "vfloor1", "$argon2id$fake");
         let cid = conversation::create_conversation(&conn, uid, "test", false);
         (uid, cid)
     };
@@ -477,14 +475,14 @@ async fn version_floor_panics_on_old_cc() {
         "test",
         db,
         tx,
-        brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+        brenn_obs::alerting::noop_alert_dispatcher().0,
         TestBridgeConfig {
             active_bridges: Some(active_bridges),
             singleton: true,
             ..Default::default()
         },
     );
-    let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+    let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
     let info = brenn_cc::session::SessionInfo {
         session_id: "s".into(),
         tools: vec![],
@@ -501,12 +499,12 @@ async fn version_floor_panics_on_old_cc() {
 #[tokio::test]
 #[should_panic(expected = "did not include claude_code_version")]
 async fn version_floor_panics_on_missing_version() {
-    let db = brenn_lib::db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let (tx, _rx) = broadcast::channel(64);
     let active_bridges = ActiveBridges::new();
     let (uid, conv_id) = {
         let conn = db.lock().await;
-        let uid = brenn_lib::auth::user::create_user(&conn, "vfloor2", "$argon2id$fake");
+        let uid = brenn_db::auth::user::create_user(&conn, "vfloor2", "$argon2id$fake");
         let cid = conversation::create_conversation(&conn, uid, "test", false);
         (uid, cid)
     };
@@ -516,14 +514,14 @@ async fn version_floor_panics_on_missing_version() {
         "test",
         db,
         tx,
-        brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+        brenn_obs::alerting::noop_alert_dispatcher().0,
         TestBridgeConfig {
             active_bridges: Some(active_bridges),
             singleton: true,
             ..Default::default()
         },
     );
-    let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+    let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
     let info = brenn_cc::session::SessionInfo {
         session_id: "s".into(),
         tools: vec![],
@@ -541,12 +539,12 @@ async fn version_floor_panics_on_missing_version() {
 /// until the `result` frame provides the authoritative contextWindow value.
 #[tokio::test]
 async fn init_seed_none_on_cache_miss() {
-    let db = brenn_lib::db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let (tx, _rx) = broadcast::channel(64);
     let active_bridges = ActiveBridges::new();
     let (uid, conv_id) = {
         let conn = db.lock().await;
-        let uid = brenn_lib::auth::user::create_user(&conn, "seed-miss", "$argon2id$fake");
+        let uid = brenn_db::auth::user::create_user(&conn, "seed-miss", "$argon2id$fake");
         let cid = conversation::create_conversation(&conn, uid, "test", false);
         (uid, cid)
     };
@@ -556,14 +554,14 @@ async fn init_seed_none_on_cache_miss() {
         "test",
         db,
         tx,
-        brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+        brenn_obs::alerting::noop_alert_dispatcher().0,
         TestBridgeConfig {
             active_bridges: Some(active_bridges),
             singleton: true,
             ..Default::default()
         },
     );
-    let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+    let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
     let info = brenn_cc::session::SessionInfo {
         session_id: "s-miss".into(),
         tools: vec![],

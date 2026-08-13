@@ -14,7 +14,9 @@ rust_binary(
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
         "//brenn-cc",
+        "//brenn-db",
         "//brenn-lib",
+        "//brenn-obs",
     ],
 )
 
@@ -45,6 +47,8 @@ rust_test(
         normal_dev = True,
     ) + [
         "//brenn-cc",
+        "//brenn-db",
         "//brenn-lib",
+        "//brenn-obs",
     ],
 )

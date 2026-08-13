@@ -1,4 +1,4 @@
-//! `WakeRouter` adapter implementing `brenn_lib::messaging::WakeRouter`
+//! `WakeRouter` adapter implementing `brenn_messaging::WakeRouter`
 //! over `ActiveBridges` + `AppState`.
 //!
 //! `Messenger` lives in `brenn-lib` and must not depend on binary-crate
@@ -11,19 +11,18 @@ use std::sync::Arc;
 
 use brenn_lib::messaging::config::ResolvedSurface;
 use brenn_lib::messaging::remote::ResolvedRemote;
-use brenn_lib::messaging::store::{AttachFeedTarget, DeferredMessage};
-use brenn_lib::messaging::{
-    AttachScope, DeliveryShape, MessageEnvelope, ParticipantId, SubscriberEntryKind, WakeRouter,
-};
-use brenn_lib::obs::alerting::{AlertDispatcher, AlertSeverity};
+use brenn_lib::messaging::{AttachScope, MessageEnvelope, ParticipantId, SubscriberEntryKind};
+use brenn_messaging::{DeliveryShape, WakeRouter};
+use brenn_messaging_store::store::{AttachFeedTarget, DeferredMessage};
+use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use chrono_tz::Tz;
 use tracing::{debug, warn};
 
 use crate::active_bridge::ActiveBridges;
-use crate::routes::attach::publish::deferred_view_entries;
-use crate::routes::attach::registry::{DeferredViewPush, LiveDelivery, SessionPush};
 use crate::state::AppState;
-use crate::system_message::render_event_drain;
+use brenn_attach_server::publish::deferred_view_entries;
+use brenn_attach_server::registry::{DeferredViewPush, LiveDelivery, SessionPush};
+use brenn_render::system_message::render_event_drain;
 
 /// Concrete `WakeRouter` impl. Closes over `ActiveBridges` + a clone of
 /// the `AppState` so it can call `spawn_eager_wake`.
@@ -57,7 +56,7 @@ pub struct WakeRouterImpl {
 /// How a subscriber is woken and delivered to. Registered at boot behind the
 /// subscriber's [`SubscriberEntryKind`]; the live dispatch path matches on the
 /// variant rather than on the identity prefix.
-pub(crate) enum DeliveryBinding {
+pub enum DeliveryBinding {
     /// Off-loop task parked on a `Notify`; never delivered inline through the
     /// shared dispatch loop (WASM consumers, system subscribers). The off-loop
     /// dispatch task holds an `Arc` clone and awaits it; `spawn_eager_wake`
@@ -130,11 +129,7 @@ impl WakeRouterImpl {
     /// with the off-loop task's `Notify`), surface and remote (`AttachSessions`),
     /// before any publish path runs. Duplicate registration for the same key is
     /// a bootstrap wiring bug → panic.
-    pub(crate) fn register_delivery_binding(
-        &self,
-        key: SubscriberEntryKind,
-        binding: DeliveryBinding,
-    ) {
+    pub fn register_delivery_binding(&self, key: SubscriberEntryKind, binding: DeliveryBinding) {
         let mut map = self.bindings.write().expect("bindings RwLock poisoned");
         let prev = map.insert(key.clone(), binding);
         assert!(
@@ -153,7 +148,7 @@ impl WakeRouterImpl {
     /// components sit behind a channel is the page's own bookkeeping. A surface
     /// with no binding registered reaches the no-binding panic in
     /// `delivery_route`.
-    pub(crate) fn register_surface_delivery_routes(&self, surface: &ResolvedSurface) {
+    pub fn register_surface_delivery_routes(&self, surface: &ResolvedSurface) {
         self.register_delivery_binding(
             SubscriberEntryKind::Surface(surface.slug.clone()),
             DeliveryBinding::AttachSessions,
@@ -169,7 +164,7 @@ impl WakeRouterImpl {
     /// directory entries are minted at runtime by its own subscribes, so
     /// deriving the binding set from the boot directory would leave the first
     /// subscribe of every restart dispatching into the no-binding panic.
-    pub(crate) fn register_remote_delivery_routes(&self, remote: &ResolvedRemote) {
+    pub fn register_remote_delivery_routes(&self, remote: &ResolvedRemote) {
         self.register_delivery_binding(
             SubscriberEntryKind::Remote(remote.slug.clone()),
             DeliveryBinding::AttachSessions,
@@ -180,7 +175,7 @@ impl WakeRouterImpl {
     /// cross-check to assert every directory subscriber has one before any
     /// publish can reach the dispatch path (a missing binding at dispatch time
     /// panics; the cross-check turns that into a named boot failure).
-    pub(crate) fn has_delivery_binding(&self, key: &SubscriberEntryKind) -> bool {
+    pub fn has_delivery_binding(&self, key: &SubscriberEntryKind) -> bool {
         chat_conversation(key).is_some()
             || self
                 .bindings
@@ -456,7 +451,7 @@ impl WakeRouter for WakeRouterImpl {
         &self,
         key: &SubscriberEntryKind,
         subscriber: &ParticipantId,
-        event: &brenn_lib::messaging::ingress::Event,
+        event: &brenn_messaging_store::ingress::Event,
     ) -> Result<bool, String> {
         match self.delivery_route(key) {
             DeliveryRoute::ConversationBridge => {
@@ -752,11 +747,9 @@ mod tests {
         use brenn_lib::messaging::{ChannelScheme, Urgency};
         use chrono::{TimeZone, Utc};
 
-        use crate::routes::attach::registry::{
-            AttachSessionHandle, PUSH_QUEUE_FRAMES, SessionCaps,
-        };
+        use brenn_attach_server::registry::{AttachSessionHandle, PUSH_QUEUE_FRAMES, SessionCaps};
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let state = crate::test_support::state::test_state(&db);
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.set_state(state.clone());
@@ -833,18 +826,19 @@ mod tests {
     async fn owed_conversation_bridge() -> (
         ActiveBridges,
         i64,
-        tokio::sync::broadcast::Receiver<brenn_lib::ws_types::WsServerMessage>,
+        tokio::sync::broadcast::Receiver<brenn_ws_types::WsServerMessage>,
         tokio::sync::mpsc::Receiver<brenn_cc::session::OutgoingEnvelope>,
     ) {
         use brenn_lib::messaging::config::{Depth, NoiseLevel, ResolvedChannel, Sink};
-        use brenn_lib::messaging::db::{insert_message, upsert_channels, utc_to_ns};
-        use brenn_lib::messaging::query::NoopWakeRouter;
         use brenn_lib::messaging::{
-            ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, Messenger,
+            ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig,
             SubscriberEntry, Urgency, WakeMin, canonical_address,
         };
+        use brenn_messaging::Messenger;
+        use brenn_messaging::query::NoopWakeRouter;
+        use brenn_messaging_store::db::{insert_message, upsert_channels, utc_to_ns};
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let channel = ChannelEntry {
             uuid: uuid::Uuid::new_v4(),
             address: canonical_address("wake-walk-channel"),
@@ -871,17 +865,13 @@ mod tests {
 
         let (user_id, conversation_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "wake-user", "$argon2id$fake");
-            let cid = brenn_lib::conversation::create_conversation(&conn, uid, "test-app", false);
+            let uid = brenn_db::auth::user::create_user(&conn, "wake-user", "$argon2id$fake");
+            let cid = brenn_db::conversation::create_conversation(&conn, uid, "test-app", false);
             upsert_channels(&conn, std::slice::from_ref(&channel));
             (uid, cid)
         };
 
-        let mut app = crate::bootstrap::messaging::test_fixtures::minimal_app_config(
-            "test-app",
-            None,
-            vec![],
-        );
+        let mut app = crate::test_support::app_config::minimal_app_config("test-app", None, vec![]);
         app.singleton = true;
         app.allowed_users = vec!["wake-user".to_string()];
         app.policy
@@ -899,7 +889,7 @@ mod tests {
             Arc::new(MessagingDirectory::with_entries(vec![channel.clone()])),
             Arc::from("test"),
             Arc::new(apps),
-            Arc::new(NoopWakeRouter) as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(NoopWakeRouter) as Arc<dyn brenn_messaging::WakeRouter>,
             MessagingGlobalConfig::default(),
         );
         // Boot's attach, then one message the conversation has not seen.
@@ -939,12 +929,12 @@ mod tests {
 
     /// Wait for the conversation's render to land on the broadcast channel.
     async fn await_system_broadcast(
-        rx: &mut tokio::sync::broadcast::Receiver<brenn_lib::ws_types::WsServerMessage>,
+        rx: &mut tokio::sync::broadcast::Receiver<brenn_ws_types::WsServerMessage>,
     ) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
-                Ok(Ok(brenn_lib::ws_types::WsServerMessage::SystemMessageBroadcast { .. })) => {
+                Ok(Ok(brenn_ws_types::WsServerMessage::SystemMessageBroadcast { .. })) => {
                     return true;
                 }
                 Ok(Ok(_)) => continue,
@@ -1138,7 +1128,7 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "WakeRouter::deliver_ingress called for non-conversation subscriber")]
     async fn deliver_ingress_panics_for_wasm_subscriber() {
-        use brenn_lib::messaging::ingress::Event;
+        use brenn_messaging_store::ingress::Event;
         let router = WakeRouterImpl::new(ActiveBridges::new());
         let key = SubscriberEntryKind::Wasm("my-consumer".to_string());
         router.register_delivery_binding(
@@ -1204,16 +1194,17 @@ mod tests {
     /// channel, and commit one message onto it. Returns
     /// `(messenger, surface participant, retention position)`.
     async fn surface_push_fixture(
-        db: &brenn_lib::db::Db,
+        db: &brenn_db::Db,
         slug: &str,
         channel_addr: &str,
-    ) -> (Arc<brenn_lib::messaging::Messenger>, ParticipantId, i64) {
+    ) -> (Arc<brenn_messaging::Messenger>, ParticipantId, i64) {
         use brenn_lib::messaging::config::{
             ChannelConfigRaw, MessagingGlobalConfig, build_channel_entries,
         };
-        use brenn_lib::messaging::db::{insert_message, upsert_channels, utc_to_ns};
-        use brenn_lib::messaging::query::NoopWakeRouter;
-        use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Messenger, Urgency};
+        use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Urgency};
+        use brenn_messaging::Messenger;
+        use brenn_messaging::query::NoopWakeRouter;
+        use brenn_messaging_store::db::{insert_message, upsert_channels, utc_to_ns};
         use chrono::Utc;
         use indexmap::IndexMap;
         use uuid::Uuid;
@@ -1270,7 +1261,7 @@ mod tests {
     /// Whether the table holds no rows at all. A bus commit and the surface
     /// fan-out over it both write nothing per subscriber: what a channel owes is a
     /// position, and a surface does not even hold one.
-    async fn no_pending_push_rows(db: &brenn_lib::db::Db) -> bool {
+    async fn no_pending_push_rows(db: &brenn_db::Db) -> bool {
         let conn = db.lock().await;
         conn.query_row("SELECT COUNT(*) FROM messaging_pending_pushes", [], |row| {
             row.get::<_, i64>(0)
@@ -1320,13 +1311,11 @@ mod tests {
         slug: &str,
         channel: &str,
     ) -> (
-        crate::routes::attach::registry::AttachSessionGuard,
+        brenn_attach_server::registry::AttachSessionGuard,
         tokio::sync::mpsc::Receiver<SessionPush>,
         Arc<tokio::sync::Notify>,
     ) {
-        use crate::routes::attach::registry::{
-            AttachSessionHandle, PUSH_QUEUE_FRAMES, SessionCaps,
-        };
+        use brenn_attach_server::registry::{AttachSessionHandle, PUSH_QUEUE_FRAMES, SessionCaps};
 
         let (push_tx, push_rx) = tokio::sync::mpsc::channel(PUSH_QUEUE_FRAMES);
         let mut handle = AttachSessionHandle::for_test("dev");
@@ -1349,7 +1338,7 @@ mod tests {
     /// writing nothing: the session's own cursor is its delivery state.
     #[tokio::test]
     async fn deliver_surface_fans_out_without_claiming() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let channel = "brenn:durable-demo";
         let (messenger, participant, seq) = surface_push_fixture(&db, "deskbar", channel).await;
 
@@ -1388,7 +1377,7 @@ mod tests {
     /// bare slug, a remote by `remote:<slug>`.
     #[tokio::test]
     async fn a_remote_and_a_surface_of_one_slug_key_disjoint_registry_slots() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let channel = "brenn:durable-demo";
         let (messenger, _participant, seq) = surface_push_fixture(&db, "kitchen", channel).await;
 
@@ -1440,7 +1429,7 @@ mod tests {
     /// skipped before the envelope was ever built.
     #[tokio::test]
     async fn any_attach_session_subscribed_sees_a_remotes_session() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let channel = "brenn:durable-demo";
         let state = AppState::for_test(db, None);
         let (_guard, _rx, _notify) =
@@ -1464,7 +1453,7 @@ mod tests {
     /// a surface gets, resolved through the same key.
     #[tokio::test]
     async fn spawn_eager_wake_nudges_a_remotes_sessions() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let state = AppState::for_test(db, None);
         let (_guard, _rx, notify) =
             register_surface_session(&state, "remote:pod-kitchen", "brenn:durable-demo");
@@ -1485,7 +1474,7 @@ mod tests {
     /// parks (`Ok(false)`) so the dispatcher wakes again for a later attach.
     #[tokio::test]
     async fn deliver_surface_no_session_parks() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let channel = "brenn:durable-demo";
         let (messenger, participant, seq) = surface_push_fixture(&db, "deskbar", channel).await;
 
@@ -1510,7 +1499,7 @@ mod tests {
     /// nothing — the sessions catch up from their own cursors.
     #[tokio::test]
     async fn deliver_surface_all_queues_full_parks() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let channel = "brenn:durable-demo";
         let (messenger, participant, seq) = surface_push_fixture(&db, "deskbar", channel).await;
 
@@ -1537,7 +1526,7 @@ mod tests {
     /// touches no `messaging_pending_pushes` row at all.
     #[tokio::test]
     async fn deliver_context_fans_out_row_less_with_no_claim() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let channel = "brenn:durable-demo";
         // No push fixture and no messenger: the feed creates and claims no row.
         let state = AppState::for_test(db.clone(), None);
@@ -1560,7 +1549,7 @@ mod tests {
     /// is owed to a disconnected session (its context arrives at the next resume).
     #[tokio::test]
     async fn deliver_context_no_session_is_a_noop() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let state = AppState::for_test(db.clone(), None);
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.set_state(state);
@@ -1580,7 +1569,7 @@ mod tests {
     /// false branch is the cost saver: no envelope is built when no page is open.
     #[tokio::test]
     async fn any_surface_session_subscribed_true_with_subscriber_false_without() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let channel = "brenn:durable-demo";
         let state = AppState::for_test(db.clone(), None);
 
@@ -1607,7 +1596,7 @@ mod tests {
     /// the parked set belongs to the surface, and every session of it is told.
     #[tokio::test]
     async fn any_surface_session_attached_answers_per_slug() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let state = AppState::for_test(db.clone(), None);
 
         let router = WakeRouterImpl::new(ActiveBridges::new());
@@ -1631,7 +1620,7 @@ mod tests {
     /// recovery is the retained window at the next resume.
     #[tokio::test]
     async fn deliver_context_full_queue_drops_silently() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let channel = "brenn:durable-demo";
         let state = AppState::for_test(db.clone(), None);
         let (_guard, rx, _notify) = register_surface_session(&state, "deskbar", channel);
@@ -1670,7 +1659,7 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "WakeRouter::deliver_ingress called for non-conversation subscriber")]
     async fn deliver_ingress_panics_for_surface_subscriber() {
-        use brenn_lib::messaging::ingress::Event;
+        use brenn_messaging_store::ingress::Event;
         let router = WakeRouterImpl::new(ActiveBridges::new());
         router.register_delivery_binding(surface_key(), DeliveryBinding::AttachSessions);
         let event = Event {
@@ -1695,7 +1684,7 @@ mod tests {
     /// its active durable channels).
     #[tokio::test]
     async fn spawn_eager_wake_surface_notifies_attached_sessions() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let channel = "brenn:durable-demo";
         // Messenger presence is irrelevant to spawn_eager_wake; leave it None.
         let state = AppState::for_test(db.clone(), None);
@@ -1719,7 +1708,7 @@ mod tests {
     /// restore the retry storm the backoff exists to damp.
     #[tokio::test]
     async fn the_conversation_arm_spawns_through_the_bus_entrypoint() {
-        let state = AppState::for_test(brenn_lib::db::init_db_memory(), None);
+        let state = AppState::for_test(crate::test_support::init_db_memory(), None);
         let spawns = Arc::clone(&state.wake_spawns);
         let backoff = state.spawn_backoff.clone();
         let router = WakeRouterImpl::new(ActiveBridges::new());
@@ -1748,7 +1737,7 @@ mod tests {
     /// bridge held by no door and re-asked about by no timer.
     #[tokio::test]
     async fn the_chat_arm_spawns_held_through_the_bus_entrypoint() {
-        let state = AppState::for_test(brenn_lib::db::init_db_memory(), None);
+        let state = AppState::for_test(crate::test_support::init_db_memory(), None);
         let spawns = Arc::clone(&state.wake_spawns);
         let backoff = state.spawn_backoff.clone();
         let router = WakeRouterImpl::new(ActiveBridges::new());
@@ -1863,7 +1852,7 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "WakeRouter::deliver_ingress called for non-conversation subscriber")]
     async fn deliver_ingress_panics_for_system_subscriber() {
-        use brenn_lib::messaging::ingress::Event;
+        use brenn_messaging_store::ingress::Event;
         let router = WakeRouterImpl::new(ActiveBridges::new());
         let key = SubscriberEntryKind::System("tool-executor".to_string());
         router.register_delivery_binding(

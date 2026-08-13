@@ -1,5 +1,5 @@
 [workspace]
-members = ["attach/client", "attach/conformance", "attach/proto", "brenn", "brenn-server", "brenn-activation", "brenn-budget", "brenn-cal", "brenn-cc", "brenn-cli", "brenn-common", "brenn-envelope", "brenn-graf", "brenn-lib", "brenn-pfin", "brenn-queue", "brenn-wasm", "cc-usage", "brenn-usage", "brenn-usage-obs", "surface/kernel", "surface/chrome", "surface/component-support", "surface/contract", "surface/components/echo-stub", "surface/components/meeting", "surface/components/mode-clock", "surface/components/protobar", "surface/schema", "surface/test-fixtures", "scrub", "xtask", "git-fixture"]
+members = ["attach/client", "attach/conformance", "attach/proto", "attach/server", "brenn", "brenn-bootstrap", "brenn-server", "brenn-activation", "brenn-approval-rules", "brenn-automation", "brenn-budget", "brenn-cal", "brenn-cc", "brenn-cli", "brenn-common", "brenn-db", "brenn-envelope", "brenn-git", "brenn-graf", "brenn-hooks", "brenn-lib", "brenn-messaging", "brenn-messaging-boot", "brenn-messaging-store", "brenn-mqtt", "brenn-obs", "brenn-pfin", "brenn-pwa-push", "brenn-queue", "brenn-remote-server", "brenn-render", "brenn-tool-registry", "brenn-wasm", "brenn-wasm-dispatch", "brenn-ws-types", "cc-usage", "brenn-usage", "brenn-usage-db", "brenn-usage-obs", "brenn-webhook", "surface/kernel", "surface/chrome", "surface/component-support", "surface/contract", "surface/components/echo-stub", "surface/components/meeting", "surface/components/mode-clock", "surface/components/protobar", "surface/schema", "surface/server", "surface/test-fixtures", "scrub", "xtask", "git-fixture"]
 resolver = "3"
 
 # wasm-bindgen must be exact-pinned: the `wasm-bindgen` crate and the
@@ -15,8 +15,8 @@ wasm-bindgen-futures = "0.4.75"
 # Lockstep sibling of the exact-pinned wasm-bindgen above: wasm-bindgen and
 # wasm-bindgen-test release together from the same repo, so this pin moves in
 # step with the wasm-bindgen pin (0.2.125 <-> 0.3.75). A mismatch fails loudly
-# at resolve time. Dev-only: the browser-level surface test harness
-# (`make surface-wasm-test`), never a build or runtime dep.
+# at resolve time. Dev-only: the browser-level surface test harness, never a
+# build or runtime dep.
 wasm-bindgen-test = "=0.3.75"
 # Scripted transport channels for the surface shell's wasm test harness. Present
 # only transitively in Cargo.lock today; named here so the wasm-gated dev-dep

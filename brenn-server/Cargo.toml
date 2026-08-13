@@ -4,20 +4,52 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+# Expose the fixture layers this crate's own tests are built on —
+# `test_support` and the surface fixtures — to the crates above it, which test
+# the same wiring. Not for production builds.
+testutils = [
+    "dep:tempfile",
+    "dep:base64ct",
+    "dep:brenn-attach-client",
+    "dep:http-body-util",
+    "dep:reqwest",
+    "dep:tokio-tungstenite",
+]
+
 [dependencies]
 async-trait = "0.1.89"
 axum = { version = "0.8.8", features = ["ws", "multipart"] }
 axum-helmet = "1.0.1"
+brenn-approval-rules = { version = "0.1.0", path = "../brenn-approval-rules" }
 brenn-attach-proto = { version = "0.1.0", path = "../attach/proto" }
+brenn-attach-server = { version = "0.1.0", path = "../attach/server" }
 brenn-cc = { version = "0.1.0", path = "../brenn-cc" }
 brenn-common = { version = "0.1.0", path = "../brenn-common" }
 brenn-envelope = { path = "../brenn-envelope" }
+brenn-git = { version = "0.1.0", path = "../brenn-git" }
 brenn-graf = { version = "0.1.0", path = "../brenn-graf" }
+brenn-hooks = { version = "0.1.0", path = "../brenn-hooks" }
+brenn-automation = { version = "0.1.0", path = "../brenn-automation" }
+brenn-db = { version = "0.1.0", path = "../brenn-db" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
+brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store" }
+brenn-mqtt = { version = "0.1.0", path = "../brenn-mqtt" }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
 brenn-pfin = { version = "0.1.0", path = "../brenn-pfin" }
+brenn-pwa-push = { version = "0.1.0", path = "../brenn-pwa-push" }
+brenn-remote-server = { version = "0.1.0", path = "../brenn-remote-server" }
+brenn-render = { version = "0.1.0", path = "../brenn-render" }
 brenn-surface-schema = { version = "0.1.0", path = "../surface/schema" }
+brenn-surface-server = { version = "0.1.0", path = "../surface/server" }
+brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry" }
 brenn-surface-contract = { version = "0.1.0", path = "../surface/contract" }
 brenn-wasm = { version = "0.1.0", path = "../brenn-wasm" }
+brenn-wasm-dispatch = { version = "0.1.0", path = "../brenn-wasm-dispatch" }
+brenn-usage-db = { version = "0.1.0", path = "../brenn-usage-db" }
+brenn-webhook = { version = "0.1.0", path = "../brenn-webhook" }
+brenn-ws-types = { version = "0.1.0", path = "../brenn-ws-types" }
 chrono = "0.4.44"
 chrono-tz = "0.10.4"
 clap = { version = "4.6.0", features = ["derive"] }
@@ -27,13 +59,10 @@ hex = "0.4.3"
 hmac = "0.13.0"
 indexmap = "2"
 libc = "0.2.185"
-percent-encoding = "2.3.2"
-pulldown-cmark = { workspace = true, features = ["html"] }
 regex = "1.12.3"
 rusqlite = "0.39.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-serde_yaml = "0.9"
 sha2 = "0.11.0"
 tokio = { version = "1.50.0", features = ["full"] }
 tokio-stream = "0.1.18"
@@ -42,21 +71,35 @@ tower-http = { version = "0.6.8", features = ["catch-panic", "fs", "limit", "set
 tower_governor = "0.8.0"
 tracing = "0.1.44"
 ts-rs = { version = "12.0.1", features = ["serde-compat", "serde-json-impl"] }
-# Must stay version-unified with axum's tokio-tungstenite: the WS read-error
-# downcast matches on tungstenite::Error by TypeId, which silently stops matching
-# if two tungstenite versions coexist. Two sites downcast —
-# routes/attach/socket.rs (classify_read_error) and routes/surface/session.rs.
-# surface_ws_oversized_frame_is_violation_and_kills pins this end-to-end.
-tungstenite = { version = "0.29.0", default-features = false }
 url = "2.5.8"
 uuid = { version = "1.23.0", features = ["v4"] }
 brenn-budget = { version = "0.1.0", path = "../brenn-budget" }
+# Optional, enabled by "testutils": `test_support::state` hands the crates above
+# a router over a temp working dir. Also a dev-dependency below, for this
+# crate's own tests.
+tempfile = { version = "3.27.0", optional = true }
+# Optional, enabled by "testutils": the request builders in `test_support::http`
+# sign and encode with these two. Both are dev-dependencies below as well.
+base64ct = { version = "1.8.3", features = ["alloc"], optional = true }
+brenn-attach-client = { version = "0.1.0", path = "../attach/client", optional = true }
+http-body-util = { version = "0.1.3", optional = true }
+reqwest = { version = "0.13.2", optional = true }
+tokio-tungstenite = { version = "0.29.0", optional = true }
 
 [dev-dependencies]
+brenn-attach-server = { version = "0.1.0", path = "../attach/server", features = ["testutils"] }
+brenn-surface-server = { version = "0.1.0", path = "../surface/server", features = ["testutils"] }
 base64ct = { version = "1.8.3", features = ["alloc"] }
 brenn-cal = { version = "0.1.0", path = "../brenn-cal" }
 brenn-cc = { version = "0.1.0", path = "../brenn-cc", features = ["testutils"] }
+brenn-db = { version = "0.1.0", path = "../brenn-db", features = ["testutils"] }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
+brenn-messaging = { version = "0.1.0", path = "../brenn-messaging", features = ["testutils"] }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
+brenn-pwa-push = { version = "0.1.0", path = "../brenn-pwa-push", features = ["testutils"] }
+brenn-render = { version = "0.1.0", path = "../brenn-render", features = ["testutils"] }
+brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry", features = ["testutils"] }
+brenn-wasm-dispatch = { version = "0.1.0", path = "../brenn-wasm-dispatch", features = ["testutils"] }
 # The attacher-generic client, for the one handshake-cookie helper the WS test
 # harness shares with a real attacher.
 brenn-attach-client = { version = "0.1.0", path = "../attach/client" }

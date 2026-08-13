@@ -9,9 +9,9 @@ use brenn_cc::session::{ApprovalKind, ApprovalRequest};
 use brenn_lib::config::PathMapper;
 
 use crate::active_bridge::test_fixtures::TestBridgeConfig;
-use brenn_lib::conversation;
-use brenn_lib::obs::alerting::{AlertDispatcher, noop_alert_dispatcher};
-use brenn_lib::ws_types::WsServerMessage;
+use brenn_db::conversation;
+use brenn_obs::alerting::{AlertDispatcher, noop_alert_dispatcher};
+use brenn_ws_types::WsServerMessage;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::oneshot;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -46,13 +46,13 @@ pub(in crate::active_bridge) async fn make_bridge_no_loop(
     AlertDispatcher,
     ActiveBridges,
 ) {
-    let db = brenn_lib::db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     // Honor a caller-supplied shared registry; mint a fresh one if None.
-    let active_bridges = cfg.active_bridges.take().unwrap_or_else(ActiveBridges::new);
+    let active_bridges = cfg.active_bridges.take().unwrap_or_default();
 
     let (user_id, conv_id) = {
         let conn = db.lock().await;
-        let uid = brenn_lib::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
+        let uid = brenn_db::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
         let cid = conversation::create_conversation(&conn, uid, app_slug, false);
         (uid, cid)
     };
@@ -385,13 +385,13 @@ pub(in crate::active_bridge) async fn test_bridge_singleton() -> (
 
 /// Helper: create a real device row + device_users membership and return the device_id.
 pub(in crate::active_bridge) async fn create_test_device_for_user(
-    db: &brenn_lib::db::Db,
+    db: &brenn_db::Db,
     user_id: i64,
     user_agent: &str,
 ) -> i64 {
     let conn = db.lock().await;
     let resolved =
-        brenn_lib::auth::device::resolve_or_create_device(&conn, None, user_id, user_agent);
+        brenn_db::auth::device::resolve_or_create_device(&conn, None, user_id, user_agent);
     resolved.id
 }
 

@@ -1,0 +1,49 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# `testutils` gates the display-path round-trip helper brenn-server's tests link
+# against; the release configs clear the flag, keeping the shipped binary free
+# of it.
+rust_library(
+    name = "brenn-render",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-approval-rules",
+        "//brenn-cc",
+        "//brenn-db",
+        "//brenn-lib",
+        "//brenn-messaging",
+        "//brenn-ws-types",
+    ],
+)
+
+# 319 tests, all in-process string and sqlite-in-memory work: markdown and YAML
+# rendering, path resolution against a temp dir, history replay over an
+# in-memory connection. Sub-second in aggregate, so the `small` (60s) budget
+# holds with room to spare even on a cold 4-vCPU runner.
+rust_test(
+    name = "brenn-render_test",
+    size = "small",
+    crate = ":brenn-render",
+    crate_features = ["testutils"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + [
+        "//brenn-messaging-store",
+    ],
+)
+
+rust_doc_test(
+    name = "brenn-render_doc_test",
+    crate = ":brenn-render",
+)

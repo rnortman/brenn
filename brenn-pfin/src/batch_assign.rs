@@ -16,7 +16,7 @@
 use brenn_lib::app::AppTool;
 use brenn_lib::subprocess::SubprocessExecContext;
 use brenn_lib::util::html_escape;
-use brenn_lib::ws_types::ToolResponseDecision;
+use brenn_ws_types::ToolResponseDecision;
 use serde_json::Value;
 use tracing::{info, warn};
 

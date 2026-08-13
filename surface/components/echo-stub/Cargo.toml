@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 brenn-surface-contract = { version = "0.1.0", path = "../../contract" }
 
 # The help-sidecar drift gate is a host test, so the fixtures crate is ungated;
-# the browser tests run via `make surface-wasm-test`.
+# the browser tests run in a real browser.
 [dev-dependencies]
 brenn-surface-test-fixtures = { path = "../../test-fixtures" }
 

@@ -2,12 +2,23 @@
 // Fetches the advisory DB once, then checks all units in parallel with fetching
 // disabled. Aggregates failures across all units, then exits non-zero if any fail.
 
-use crate::discover::discover_units;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// Run cargo-deny over all units discovered from `repo_root`. Returns true on success (all pass).
+/// The Cargo workspaces the advisory gate covers, repo-root-relative; the empty
+/// path is the root workspace. The wasm32 guest workspace resolves its own
+/// dependency graph out of its own `Cargo.lock`, so a `cargo deny` run in the
+/// root sees none of it.
+///
+/// Stated rather than discovered: the manifests are build inputs now (Bazel's
+/// `crate.from_cargo` reads them), not a tree of lint units, and a second
+/// workspace is a deliberate act that belongs in this list. `workspace_guard`
+/// holds the list to the tree in both directions, so a third workspace cannot
+/// sit outside this gate silently.
+pub(crate) const WORKSPACES: [&str; 2] = ["", "brenn-wasm/components"];
+
+/// Run cargo-deny over every workspace under `repo_root`. Returns true on success (all pass).
 pub fn run_deny(repo_root: &Path) -> bool {
     assert_cargo_deny_available();
 
@@ -17,7 +28,7 @@ pub fn run_deny(repo_root: &Path) -> bool {
     let deny_config_str = deny_config
         .to_str()
         .expect("deny.toml path contains non-UTF-8 bytes");
-    let units = discover_units(repo_root);
+    let units: Vec<PathBuf> = WORKSPACES.iter().map(|rel| repo_root.join(rel)).collect();
 
     // Fetch the shared advisory DB once. Every parallel check below runs with
     // --disable-fetch, so they read one consistent snapshot without racing git fetches.
@@ -27,12 +38,9 @@ pub fn run_deny(repo_root: &Path) -> bool {
 
     println!("xtask deny: checking {} units in parallel...", units.len());
 
-    // Spawn one check per unit concurrently; each captures its own output. As each
-    // thread joins (in unit/discovery order) its header and output are printed, so a
-    // completed prefix streams progressively even while slower units are still running.
     let outputs = run_parallel(
         &units,
-        |unit| {
+        |dir| {
             Command::new("cargo")
                 .args([
                     "deny",
@@ -41,21 +49,14 @@ pub fn run_deny(repo_root: &Path) -> bool {
                     "--config",
                     deny_config_str,
                 ])
-                .current_dir(&unit.dir)
+                .current_dir(dir)
                 .output()
                 .unwrap_or_else(|e| {
-                    panic!(
-                        "xtask deny: failed to spawn `cargo deny check` in {:?}: {e}",
-                        unit.dir
-                    )
+                    panic!("xtask deny: failed to spawn `cargo deny check` in {dir:?}: {e}")
                 })
         },
-        |unit, output| {
-            println!(
-                "xtask deny: [{kind}] {dir}",
-                kind = unit.kind.as_str(),
-                dir = unit.dir.display()
-            );
+        |dir, output| {
+            println!("xtask deny: {}", dir.display());
             dump_child_output(output);
         },
     );
@@ -66,14 +67,14 @@ pub fn run_deny(repo_root: &Path) -> bool {
     // not mistaken for a policy finding (its captured output is usually empty).
     let mut violations: Vec<PathBuf> = Vec::new();
     let mut abnormal: Vec<PathBuf> = Vec::new();
-    for (unit, output) in units.iter().zip(&outputs) {
+    for (dir, output) in units.iter().zip(&outputs) {
         if output.status.success() {
             continue;
         }
         if output.status.code().is_some() {
-            violations.push(unit.dir.clone());
+            violations.push(dir.clone());
         } else {
-            abnormal.push(unit.dir.clone());
+            abnormal.push(dir.clone());
         }
     }
 
@@ -164,8 +165,7 @@ where
 }
 
 /// Assert that cargo-deny is available. Panics with an actionable remediation message if absent.
-/// Probes once (the binary is the same for every unit, unlike clippy whose toolchain can differ).
-/// Mirrors `assert_clippy_available` in lint.rs.
+/// Probes once, before any unit runs.
 fn assert_cargo_deny_available() {
     let output = Command::new("cargo")
         .args(["deny", "--version"])

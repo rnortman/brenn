@@ -2,7 +2,7 @@
  * Bundler entry point for the Bazel lane: esbuild's JS API over one entry
  * point, with the build id taken from Bazel's stable status file.
  *
- * The make lane injects the build id from its own environment. An environment
+ * The build id is injected from the environment. An environment
  * variable read by a Bazel action is part of that action's cache key, so a
  * per-build value there would bust the cache on exactly the builds that most
  * need it; the stamp file is the mechanism that keeps it out of dev keys.

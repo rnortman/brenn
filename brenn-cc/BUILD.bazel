@@ -16,7 +16,11 @@ rust_library(
     edition = "2024",
     visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    deps = all_crate_deps(normal = True) + ["//brenn-lib"],
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-lib",
+        "//brenn-obs",
+        "//brenn-ws-types",
+    ],
 )
 
 rust_test(

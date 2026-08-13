@@ -1,0 +1,46 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//brenn-db",
+    "//brenn-envelope",
+    "//brenn-lib",
+    "//brenn-queue",
+]
+
+# `testutils` gates the FK-seeding helper the crates above this one drive their
+# own table tests with; the release configs clear the flag.
+rust_library(
+    name = "brenn-messaging-store",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# `small` (60s): 277 tests over in-memory sqlite and the in-memory ring, 1.31s
+# locally and 1.01s at `--test-threads=1` — the suite is CPU-bound and gains
+# nothing from threads. At the repo's one measured local→CD factor (~21x,
+# brenn-server 22s/472s) that is ~28s, inside the budget.
+rust_test(
+    name = "brenn-messaging-store_test",
+    size = "small",
+    crate = ":brenn-messaging-store",
+    crate_features = ["testutils"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS,
+)
+
+rust_doc_test(
+    name = "brenn-messaging-store_doc_test",
+    crate = ":brenn-messaging-store",
+)

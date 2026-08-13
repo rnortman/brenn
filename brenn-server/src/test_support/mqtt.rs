@@ -12,7 +12,7 @@ use brenn_lib::mqtt::config::{MqttClientConfig, TlsVersionMin};
 /// connection-refused and sits in its backoff loop without touching a real
 /// network. Callers mutate fields before `Arc::new` when a test needs a
 /// variation (e.g. a non-default `urgency`/`qos`).
-pub(crate) fn test_client_config(slug: &str) -> MqttClientConfig {
+pub fn test_client_config(slug: &str) -> MqttClientConfig {
     MqttClientConfig {
         slug: slug.to_string(),
         host: "127.0.0.1".to_string(),

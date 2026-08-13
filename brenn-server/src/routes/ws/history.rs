@@ -1,7 +1,7 @@
 //! History replay, pagination, pending tool/permission replay, conversation list.
 
-use brenn_lib::conversation;
-use brenn_lib::ws_types::{CcState, WsServerMessage};
+use brenn_db::conversation;
+use brenn_ws_types::{CcState, WsServerMessage};
 use tracing::warn;
 
 use super::connection::WsConnection;
@@ -29,17 +29,18 @@ impl WsConnection {
         let working_dir = app.working_dir.as_path();
         let slug = app.slug.as_str();
         let replay_limit = app.history_replay_limit;
-        let mounts = crate::artifact::mount_roots_for(&app.mounts);
+        let mounts = brenn_render::artifact::mount_roots_for(&app.mounts);
         let frontmatter = &app.frontmatter;
         let (messages, artifact_index, oldest_loaded_seq, gap_reload_conv_fields) = {
             let conn = self.state.db.lock().await;
 
             // Find the replay seam for bounded history.
-            let seam_seq = crate::history::find_replay_seam(&conn, conversation_id, replay_limit);
+            let seam_seq =
+                brenn_render::history::find_replay_seam(&conn, conversation_id, replay_limit);
 
             // Destructure to avoid cloning cwd (Option<String> heap alloc) when conv
             // fields are only needed for the gap-reload message (Copy fields only).
-            let brenn_lib::conversation::Conversation {
+            let brenn_db::conversation::Conversation {
                 user_id: conv_user_id,
                 shared: conv_shared,
                 cwd,
@@ -57,7 +58,7 @@ impl WsConnection {
             };
             let is_gap_reload = gap_reload_conv_fields.is_some();
 
-            let index = crate::artifact_snapshot::get_artifact_index(&conn, conversation_id);
+            let index = brenn_render::artifact_snapshot::get_artifact_index(&conn, conversation_id);
 
             // When a seam is active, filter the artifact index to post-seam files.
             let filtered_index = if let Some(seam) = seam_seq {
@@ -70,8 +71,8 @@ impl WsConnection {
             };
 
             let version_counts =
-                crate::artifact_snapshot::version_counts_from_index(&filtered_index);
-            let msgs = crate::history::build_history(
+                brenn_render::artifact_snapshot::version_counts_from_index(&filtered_index);
+            let msgs = brenn_render::history::build_history(
                 &conn,
                 conversation_id,
                 cwd.as_deref(),
@@ -219,7 +220,7 @@ impl WsConnection {
 
         let (messages, has_more) = {
             let conn = self.state.db.lock().await;
-            crate::history::build_simplified_page(&conn, conv_id, before_seq)
+            brenn_render::history::build_simplified_page(&conn, conv_id, before_seq)
         };
 
         let _ = self.send_ws(WsServerMessage::HistoryPage { messages, has_more });
@@ -266,7 +267,7 @@ impl WsConnection {
     ) -> Vec<WsServerMessage> {
         let pending = {
             let conn = self.state.db.lock().await;
-            brenn_lib::db::get_pending_tool_requests_for_conversation(&conn, conversation_id)
+            brenn_db::get_pending_tool_requests_for_conversation(&conn, conversation_id)
         };
 
         if pending.is_empty() {
@@ -319,7 +320,7 @@ impl WsConnection {
             "replaying pending permissions on attach"
         );
         for snap in snapshots {
-            let formatted_display = crate::approval_formatter::format_tool_display(
+            let formatted_display = brenn_render::approval_formatter::format_tool_display(
                 &self.state.tool_registry,
                 &snap.tool_name,
                 &snap.display_input,
@@ -344,7 +345,12 @@ impl WsConnection {
         let multiuser = self.app_config().multiuser;
         let conversations = {
             let conn = self.state.db.lock().await;
-            crate::history::build_conversation_list(&conn, self.user_id, &self.app_slug, multiuser)
+            brenn_render::history::build_conversation_list(
+                &conn,
+                self.user_id,
+                &self.app_slug,
+                multiuser,
+            )
         };
         let _ = self.send_ws(WsServerMessage::ConversationList { conversations });
     }
@@ -352,8 +358,8 @@ impl WsConnection {
 
 #[cfg(test)]
 mod tests {
-    use brenn_lib::conversation;
-    use brenn_lib::ws_types::{CcState, WsServerMessage};
+    use brenn_db::conversation;
+    use brenn_ws_types::{CcState, WsServerMessage};
 
     use super::super::testing::*;
 
@@ -478,7 +484,7 @@ mod tests {
         // Insert a pending tool request in the DB.
         {
             let db_conn = db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &db_conn,
                 "req_pending_1",
                 conv_id,
@@ -754,7 +760,7 @@ mod tests {
         // Switch to a new conversation (no bridge) to trigger the clear.
         let new_conv_id = {
             let c = db.lock().await;
-            brenn_lib::conversation::create_conversation(&c, user_id, "test", false)
+            brenn_db::conversation::create_conversation(&c, user_id, "test", false)
         };
         conn.handle_switch_conversation(new_conv_id).await;
 
@@ -799,11 +805,11 @@ mod tests {
         // to kill (it returns an error and early-exits if bridges is empty).
         let other_user_id = {
             let c = db.lock().await;
-            brenn_lib::auth::user::create_user(&c, "otheruser", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&c, "otheruser", "$argon2id$fake")
         };
         let other_conv_id = {
             let c = db.lock().await;
-            brenn_lib::conversation::create_conversation(&c, other_user_id, "test", false)
+            brenn_db::conversation::create_conversation(&c, other_user_id, "test", false)
         };
         let (broadcast_tx, _) = broadcast::channel(4);
         let other_bridge = ActiveBridge::inject_for_test(

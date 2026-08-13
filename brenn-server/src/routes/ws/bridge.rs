@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use brenn_lib::ws_types::WsServerMessage;
+use brenn_ws_types::WsServerMessage;
 
 use super::connection::{QueuedResponse, WsConnection};
 use crate::active_bridge::ActiveBridge;
@@ -30,7 +30,7 @@ impl WsConnection {
         // Look up the conversation to get the resume session ID.
         let conv = {
             let conn = self.state.db.lock().await;
-            brenn_lib::conversation::get_conversation_opt(&conn, conversation_id)
+            brenn_db::conversation::get_conversation_opt(&conn, conversation_id)
         };
         let conv = match conv {
             Some(c) => c,
@@ -46,9 +46,9 @@ impl WsConnection {
         let shared = conv.shared;
 
         // Reactivate if completed/errored.
-        if conv.status != brenn_lib::conversation::ConversationStatus::Active {
+        if conv.status != brenn_db::conversation::ConversationStatus::Active {
             let conn = self.state.db.lock().await;
-            brenn_lib::conversation::reactivate_conversation(&conn, conversation_id);
+            brenn_db::conversation::reactivate_conversation(&conn, conversation_id);
         }
 
         let bridge_result = self
@@ -221,14 +221,14 @@ impl WsConnection {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::init_db_memory;
     use brenn_cc::protocol::CcOutgoing;
-    use brenn_lib::auth::user::create_user;
-    use brenn_lib::conversation;
-    use brenn_lib::db::{
-        get_pending_tool_request, init_db_memory, insert_pending_tool_request,
-        resolve_pending_tool_request,
+    use brenn_db::auth::user::create_user;
+    use brenn_db::conversation;
+    use brenn_db::{
+        get_pending_tool_request, insert_pending_tool_request, resolve_pending_tool_request,
     };
-    use brenn_lib::ws_types::{CcState, PermissionDecision, ToolResponseDecision, WsServerMessage};
+    use brenn_ws_types::{CcState, PermissionDecision, ToolResponseDecision, WsServerMessage};
     use tokio::sync::broadcast;
 
     use super::super::connection::*;
@@ -342,7 +342,7 @@ mod tests {
         // Insert a pending tool request in the DB so the drain actually resolves it.
         {
             let db_conn = db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &db_conn,
                 "req_q_tc",
                 conv_id,
@@ -367,7 +367,7 @@ mod tests {
         // The DB entry should be resolved as denied.
         {
             let db_conn = db.lock().await;
-            let req = brenn_lib::db::get_pending_tool_request(&db_conn, "req_q_tc")
+            let req = brenn_db::get_pending_tool_request(&db_conn, "req_q_tc")
                 .expect("DB entry should exist");
             assert_eq!(req.status, "denied", "should be denied after drain");
         }
@@ -381,7 +381,7 @@ mod tests {
         // Insert a pending tool request in the DB.
         {
             let db_conn = db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &db_conn,
                 "req_q_mix_tc",
                 conv_id,
@@ -417,7 +417,7 @@ mod tests {
         // ToolCard should be resolved in DB.
         {
             let db_conn = db.lock().await;
-            let req = brenn_lib::db::get_pending_tool_request(&db_conn, "req_q_mix_tc")
+            let req = brenn_db::get_pending_tool_request(&db_conn, "req_q_mix_tc")
                 .expect("DB entry should exist");
             assert_eq!(req.status, "denied");
         }

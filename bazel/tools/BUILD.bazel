@@ -87,7 +87,7 @@ native_binary(
 # Registered ahead of the module's own toolchain in `MODULE.bazel`. Only the
 # CLI is bound: the webdriver half of the toolchain drives
 # `rust_wasm_bindgen_test`, which brenn does not use — the browser suites run
-# out of band through `make surface-wasm-test`.
+# out of band in a real browser.
 rust_wasm_bindgen_toolchain(
     name = "wasm_bindgen_toolchain_impl",
     wasm_bindgen_cli = ":wasm-bindgen",

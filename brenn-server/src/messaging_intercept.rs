@@ -16,17 +16,18 @@ use std::borrow::Cow;
 
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
-use brenn_lib::messaging::{
-    CancelResult, ChannelListing, ChannelScheme, EditFields, EditResult, MessageEnvelope,
-    MessageQuery, PublishOrigin, PublishResult, QueryError, SubscriptionListing, Urgency,
+use brenn_lib::messaging::{ChannelScheme, MessageEnvelope, Urgency};
+use brenn_messaging::{
+    CancelResult, ChannelListing, EditFields, EditResult, MessageQuery, PublishOrigin,
+    PublishResult, QueryError, SubscriptionListing,
 };
-use brenn_lib::obs::security::{DenialKind, SecurityEventType, signal_publish_denial};
+use brenn_obs::security::{DenialKind, SecurityEventType, signal_publish_denial};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::active_bridge::ActiveBridge;
 use crate::intercept_helpers::{ToolErr, reject_tool, warn_if_unexpected_tool_response};
-use crate::tools::messaging::{
+use brenn_render::tools::messaging::{
     MCP_MESSAGE_CANCEL_TOOL, MCP_MESSAGE_EDIT_TOOL, MCP_MESSAGE_LIST_CHANNELS_TOOL,
     MCP_MESSAGE_PENDING_LIST_TOOL, MCP_MESSAGE_QUERY_CHANNEL_TOOL, MCP_MESSAGE_SEND_TOOL,
     MCP_MESSAGE_SUBSCRIBE_TOOL, MCP_MESSAGE_SUBSCRIPTION_LIST_TOOL, MCP_MESSAGE_UNSUBSCRIBE_TOOL,
@@ -188,13 +189,13 @@ pub async fn try_handle_messaging_tool(
             if let Some(pwa_push_svc) = bridge.pwa_push_service() {
                 let push_targets = pwa_push_svc.list_targets(app_slug).await;
                 for target in push_targets {
-                    listing.push(brenn_lib::messaging::ChannelListing {
+                    listing.push(brenn_messaging::ChannelListing {
                         protocol: brenn_lib::messaging::ChannelScheme::PwaPush,
                         address: target.address,
                         description: None,
-                        access: brenn_lib::messaging::AccessKind::Existing,
-                        details: Some(brenn_lib::messaging::ChannelDetails::PwaPush(
-                            brenn_lib::messaging::PwaPushDetails {
+                        access: brenn_messaging::AccessKind::Existing,
+                        details: Some(brenn_messaging::ChannelDetails::PwaPush(
+                            brenn_messaging::PwaPushDetails {
                                 user: target.user,
                                 device: target.device,
                                 last_seen_at: target.last_seen_at,
@@ -278,8 +279,8 @@ pub async fn try_handle_messaging_tool(
                         retain_depth: None,
                         noise: brenn_lib::messaging::config::NoiseLevel::Silent,
                         wake_min: brenn_lib::messaging::WakeMin::Normal,
-                        details: Some(brenn_lib::messaging::ChannelDetails::PwaPush(
-                            brenn_lib::messaging::PwaPushDetails {
+                        details: Some(brenn_messaging::ChannelDetails::PwaPush(
+                            brenn_messaging::PwaPushDetails {
                                 user: target.user,
                                 device: target.device,
                                 last_seen_at: target.last_seen_at,
@@ -810,7 +811,7 @@ pub async fn try_handle_messaging_tool(
             // weaker prefix+length check so all malformed shapes are logged.
             let channel_str = tool_input.get("channel").and_then(|v| v.as_str());
             if let Some(s) = channel_str
-                && !brenn_lib::messaging::is_well_formed_address(s)
+                && !brenn_messaging::is_well_formed_address(s)
             {
                 tracing::warn!(
                     tool = tool_name,
@@ -1306,7 +1307,7 @@ async fn parse_message_uuid(
 }
 
 /// Fill the runtime ingress-health fields on each `mqtt:` entry of a channel
-/// listing from `MqttService` (design §2.5 health enrichment).
+/// listing from `MqttService`.
 ///
 /// `list_channels()` emits `MqttDetails` with `client`/`topic` set and the
 /// runtime fields `None` (the messaging core has no MQTT dependency). This fills:
@@ -1317,12 +1318,9 @@ async fn parse_message_uuid(
 ///
 /// `urgency` is intentionally left `None`: it lives in `[[mqtt_client]]` config
 /// and the message-injection path, not in any `MqttService` ingress structure, so
-/// surfacing it would require adding net-new ingress state (deferred with the
-/// egress observability rework, design §7). Non-`mqtt:` entries are untouched.
-async fn enrich_mqtt_listing(
-    listing: &mut [ChannelListing],
-    mqtt_svc: &brenn_lib::mqtt::MqttService,
-) {
+/// surfacing it would require adding net-new ingress state. Non-`mqtt:` entries
+/// are untouched.
+async fn enrich_mqtt_listing(listing: &mut [ChannelListing], mqtt_svc: &brenn_mqtt::MqttService) {
     for entry in listing.iter_mut() {
         enrich_mqtt_details(&mut entry.details, mqtt_svc).await;
     }
@@ -1333,10 +1331,10 @@ async fn enrich_mqtt_listing(
 /// by both `MessageChannelList` and `MessageSubscriptionList` enrichment so the
 /// two tools report identical health labels for the same channel.
 async fn enrich_mqtt_details(
-    details: &mut Option<brenn_lib::messaging::ChannelDetails>,
-    mqtt_svc: &brenn_lib::mqtt::MqttService,
+    details: &mut Option<brenn_messaging::ChannelDetails>,
+    mqtt_svc: &brenn_mqtt::MqttService,
 ) {
-    use brenn_lib::messaging::ChannelDetails;
+    use brenn_messaging::ChannelDetails;
     let Some(ChannelDetails::Mqtt(details)) = details.as_mut() else {
         return;
     };
@@ -1383,7 +1381,7 @@ async fn handle_message_subscribe(
     tool_name: &str,
     tool_input: &serde_json::Value,
 ) -> MessagingHandled {
-    use brenn_lib::messaging::subscribe::DynamicSubscribeParams;
+    use brenn_messaging::subscribe::DynamicSubscribeParams;
 
     // `address` (required, non-empty).
     let address = match tool_input.get("address").and_then(|v| v.as_str()) {
@@ -1523,7 +1521,7 @@ async fn handle_message_subscribe(
             // subscribe errors (bad address, dormant row, resolver invariants) are
             // plain tool errors and do not warn.
             use crate::mqtt_subscribe::SubscribeActivateError;
-            use brenn_lib::messaging::subscribe::RuntimeSubscribeError;
+            use brenn_messaging::subscribe::RuntimeSubscribeError;
             let denial_reason = match &e {
                 SubscribeActivateError::PolicyDenied { .. } => Some("access policy"),
                 SubscribeActivateError::Core(RuntimeSubscribeError::DepthExceedsStanding {
@@ -1744,7 +1742,7 @@ mod tests {
         // No EphemeralPublish grant → MissingSender at the layer-1 gate; the
         // intercept must still emit the app security event + alert.
         let messenger = ephemeral_intercept_messenger_cfg(false, 65536);
-        let (dispatcher, captured, _handle) = brenn_lib::obs::alerting::make_capturing_alerter();
+        let (dispatcher, captured, _handle) = brenn_obs::alerting::make_capturing_alerter();
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_messenger_and_dispatcher(
             messenger, dispatcher,
         )
@@ -1764,10 +1762,10 @@ mod tests {
     /// denial arm (a missing signal call, a mislabeled `kind`) is caught, not
     /// just the helper's own logic.
     async fn capture_denial_alerts(
-        messenger: std::sync::Arc<brenn_lib::messaging::Messenger>,
+        messenger: std::sync::Arc<brenn_messaging::Messenger>,
         to: &str,
     ) -> Vec<(String, String)> {
-        let (dispatcher, captured, _handle) = brenn_lib::obs::alerting::make_capturing_alerter();
+        let (dispatcher, captured, _handle) = brenn_obs::alerting::make_capturing_alerter();
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_messenger_and_dispatcher(
             messenger, dispatcher,
         )
@@ -1837,7 +1835,7 @@ mod tests {
     /// to resolve the target; every durable denial arm returns before subscribers
     /// are consulted.
     fn durable_channel(name: &str) -> brenn_lib::messaging::ChannelEntry {
-        brenn_lib::messaging::testutils::test_channel_entry(name, vec![])
+        brenn_messaging::testutils::test_channel_entry(name, vec![])
     }
 
     /// A `Messenger` whose directory holds `brenn:known` (publishable by
@@ -1847,12 +1845,10 @@ mod tests {
     /// matcher (so any `reply_to` is in visibility and an unresolved one is
     /// `UnknownChannel`, not the reply_to gate's `AclDenied`); when unset,
     /// `testapp` holds only `MessagingSubscribe`, so a publish is `MissingSender`.
-    fn durable_intercept_messenger_cfg(
-        grant: bool,
-    ) -> std::sync::Arc<brenn_lib::messaging::Messenger> {
+    fn durable_intercept_messenger_cfg(grant: bool) -> std::sync::Arc<brenn_messaging::Messenger> {
         use std::sync::Arc;
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let dir = brenn_lib::messaging::MessagingDirectory::with_entries(vec![
             durable_channel("known"),
             durable_channel("locked"),
@@ -1883,18 +1879,18 @@ mod tests {
             .brenn_subscribe
             .push(brenn_lib::access::acl::ChannelMatcher::Prefix(String::new()));
         apps.insert("testapp".to_string(), testapp_cfg);
-        brenn_lib::messaging::Messenger::new(
+        brenn_messaging::Messenger::new(
             db,
             Arc::new(dir),
             Arc::from("test-source"),
             Arc::new(apps),
-            Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-                as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(brenn_messaging::query::NoopWakeRouter)
+                as Arc<dyn brenn_messaging::WakeRouter>,
             brenn_lib::messaging::MessagingGlobalConfig::default(),
         )
     }
 
-    fn durable_intercept_messenger() -> std::sync::Arc<brenn_lib::messaging::Messenger> {
+    fn durable_intercept_messenger() -> std::sync::Arc<brenn_messaging::Messenger> {
         durable_intercept_messenger_cfg(true)
     }
 
@@ -2148,9 +2144,9 @@ mod tests {
                 // Parse the address to verify it uses the canonical `@` delimiter
                 // (not `:`) for device addresses, catching any format mismatch
                 // between the address grammar and tool descriptions.
-                brenn_lib::pwa_push::targets::parse_pwa_push_address(pwa_addr).unwrap_or_else(
-                    |e| panic!("pwa_push address {pwa_addr:?} failed to parse: {e}"),
-                );
+                brenn_pwa_push::targets::parse_pwa_push_address(pwa_addr).unwrap_or_else(|e| {
+                    panic!("pwa_push address {pwa_addr:?} failed to parse: {e}")
+                });
                 assert!(
                     !first_pwa["details"]["user"]
                         .as_str()
@@ -2255,13 +2251,13 @@ mod tests {
                 topic_filter: "sensors/+/temp".to_string(),
             });
         messenger_apps.insert("testapp".to_string(), testapp_cfg);
-        let messenger = brenn_lib::messaging::Messenger::new(
-            brenn_lib::db::init_db_memory(),
+        let messenger = brenn_messaging::Messenger::new(
+            crate::test_support::init_db_memory(),
             Arc::new(dir),
             Arc::from("test-source"),
             Arc::new(messenger_apps),
-            Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-                as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(brenn_messaging::query::NoopWakeRouter)
+                as Arc<dyn brenn_messaging::WakeRouter>,
             brenn_lib::messaging::MessagingGlobalConfig::default(),
         );
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_messenger(messenger).await;
@@ -2920,9 +2916,9 @@ mod tests {
 
     /// Build a minimal `WebhookService` with one endpoint owned by "testapp".
     #[allow(dead_code)]
-    fn make_test_webhook_service() -> std::sync::Arc<brenn_lib::webhook::WebhookService> {
+    fn make_test_webhook_service() -> std::sync::Arc<brenn_webhook::WebhookService> {
         use brenn_lib::webhook::config::ResolvedWebhookEndpoint;
-        use brenn_lib::webhook::signature::{HexFormat, SignatureAlgorithm, SignatureScheme};
+        use brenn_lib::webhook::scheme::{HexFormat, SignatureAlgorithm, SignatureScheme};
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -2945,7 +2941,7 @@ mod tests {
             urgency: brenn_lib::messaging::Urgency::Normal,
             replay_protection: None,
         });
-        brenn_lib::webhook::WebhookService::new(vec![("test-ep".to_string(), ep)])
+        brenn_webhook::WebhookService::new(vec![("test-ep".to_string(), ep)])
     }
 
     /// `MessageChannelList` on a bridge whose Messenger directory contains a
@@ -2959,14 +2955,15 @@ mod tests {
     async fn message_channel_list_includes_webhook_endpoints() {
         use std::sync::Arc;
 
-        use crate::tools::messaging::MCP_MESSAGE_LIST_CHANNELS_TOOL;
         use brenn_lib::messaging::config::{Depth, NoiseLevel, ResolvedChannel, Sink};
         use brenn_lib::messaging::{
-            ChannelEntry, ChannelScheme, MessagingDirectory, Messenger, WakeMin,
+            ChannelEntry, ChannelScheme, MessagingDirectory, WakeMin,
             webhook_channel_uuid_from_slug,
         };
+        use brenn_messaging::Messenger;
+        use brenn_render::tools::messaging::MCP_MESSAGE_LIST_CHANNELS_TOOL;
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let slug = "test-ep";
         let uuid = webhook_channel_uuid_from_slug(slug);
         let entry = ChannelEntry {
@@ -2988,7 +2985,7 @@ mod tests {
         };
         {
             let conn = db.lock().await;
-            brenn_lib::messaging::db::upsert_channels(&conn, std::slice::from_ref(&entry));
+            brenn_messaging_store::db::upsert_channels(&conn, std::slice::from_ref(&entry));
         }
         let directory = Arc::new(MessagingDirectory::with_entries(vec![entry]));
         // webhook: rows survive list_accessible_channels' ACL filter only when the
@@ -3014,8 +3011,8 @@ mod tests {
             directory,
             Arc::from("https://test.example"),
             Arc::new(messenger_apps),
-            Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-                as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(brenn_messaging::query::NoopWakeRouter)
+                as Arc<dyn brenn_messaging::WakeRouter>,
             brenn_lib::messaging::config::MessagingGlobalConfig::default(),
         );
 
@@ -3201,7 +3198,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn eph_entry(name: &str) -> brenn_lib::messaging::ChannelEntry {
-        let mut entry = brenn_lib::messaging::testutils::ephemeral_channel_entry(name, 8);
+        let mut entry = brenn_messaging::testutils::ephemeral_channel_entry(name, 8);
         // A burst small enough that the send-rate gate fires well before the
         // conversation send budget, so a rate-limit test meters the gate it names.
         entry.resolved_channel.send_rate = brenn_lib::messaging::config::SendRate {
@@ -3223,10 +3220,10 @@ mod tests {
     fn ephemeral_intercept_messenger_cfg(
         grant: bool,
         max_body_bytes: usize,
-    ) -> std::sync::Arc<brenn_lib::messaging::Messenger> {
+    ) -> std::sync::Arc<brenn_messaging::Messenger> {
         use std::sync::Arc;
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let entries = vec![eph_entry("protobar"), eph_entry("locked")];
         let dir = brenn_lib::messaging::MessagingDirectory::with_entries(entries.clone());
         let mut apps = indexmap::IndexMap::new();
@@ -3250,24 +3247,24 @@ mod tests {
                 .insert(brenn_lib::access::AppCapability::MessagingPublish);
         }
         apps.insert("testapp".to_string(), testapp_cfg);
-        let messenger = brenn_lib::messaging::Messenger::new(
+        let messenger = brenn_messaging::Messenger::new(
             db,
             Arc::new(dir),
             Arc::from("test-source"),
             Arc::new(apps),
-            Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-                as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(brenn_messaging::query::NoopWakeRouter)
+                as Arc<dyn brenn_messaging::WakeRouter>,
             brenn_lib::messaging::MessagingGlobalConfig {
                 max_body_bytes,
                 ..Default::default()
             },
         );
-        let stores = Arc::new(brenn_lib::messaging::store::RingStores::build(&entries));
+        let stores = Arc::new(brenn_messaging_store::store::RingStores::build(&entries));
         messenger.with_ring_stores(stores)
     }
 
     /// The common fixture: `testapp` holds the grant, generous body limit.
-    fn ephemeral_intercept_messenger() -> std::sync::Arc<brenn_lib::messaging::Messenger> {
+    fn ephemeral_intercept_messenger() -> std::sync::Arc<brenn_messaging::Messenger> {
         ephemeral_intercept_messenger_cfg(true, 65536)
     }
 
@@ -4368,9 +4365,9 @@ mod tests {
             .uuid;
         {
             let conn = bridge.messenger().unwrap().db().lock().await;
-            brenn_lib::messaging::db::insert_dynamic_subscription(
+            brenn_messaging_store::db::insert_dynamic_subscription(
                 &conn,
-                &brenn_lib::messaging::db::DynamicSubscriptionRow {
+                &brenn_messaging_store::db::DynamicSubscriptionRow {
                     channel_uuid: uuid,
                     app_slug: "testapp".to_string(),
                     push_depth: brenn_lib::messaging::config::Depth::Bounded(0),
@@ -4378,7 +4375,7 @@ mod tests {
                     noise: brenn_lib::messaging::config::NoiseLevel::Silent,
                     wake_min: brenn_lib::messaging::WakeMin::Normal,
                     qos: None,
-                    created_at: brenn_lib::db::format_ts_for_db(chrono::Utc::now()),
+                    created_at: brenn_db::format_ts_for_db(chrono::Utc::now()),
                 },
             );
         }
@@ -4549,7 +4546,7 @@ mod tests {
 
         let rows = {
             let conn = bridge.messenger().unwrap().db().lock().await;
-            brenn_lib::messaging::db::load_dynamic_subscriptions(&conn)
+            brenn_messaging_store::db::load_dynamic_subscriptions(&conn)
         };
         assert_eq!(rows.len(), 1, "no duplicate durable row");
     }
@@ -4712,7 +4709,7 @@ mod tests {
         // Durable row gone.
         let rows = {
             let conn = bridge.messenger().unwrap().db().lock().await;
-            brenn_lib::messaging::db::load_dynamic_subscriptions(&conn)
+            brenn_messaging_store::db::load_dynamic_subscriptions(&conn)
         };
         assert!(rows.is_empty(), "durable row removed");
 

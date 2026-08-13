@@ -1,0 +1,33 @@
+[package]
+name = "brenn-git"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Git subprocess plumbing for managed repos: the bounded spawn helper, the LLM-facing repo operations, startup auto-cloning, and the sync pull path"
+
+# Reaches upward only as far as brenn-lib's resolved config types (the mount
+# and container shapes every operation targets), its shared helpers (subprocess
+# handling, the commit-oneline cap), and the alert dispatcher. No server type
+# appears in any signature here.
+[dependencies]
+brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
+futures = "0.3.32"
+indexmap = "2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["process", "time", "io-util", "rt", "macros", "sync"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+git-fixture = { version = "0.1.0", path = "../git-fixture" }
+# The timeout tests assert the spawned child is reaped, which is a `kill(pid, 0)`
+# probe.
+libc = "0.2.185"
+brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
+tempfile = "3.27.0"
+tokio = { version = "1.50.0", features = ["full", "test-util"] }
+# "no-env-filter" makes `#[traced_test]` capture unconditionally; without it
+# tracing-test applies a default env filter and `logs_contain` assertions fail.
+tracing-test = { version = "0.2.6", features = ["no-env-filter"] }

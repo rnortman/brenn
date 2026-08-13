@@ -1,7 +1,7 @@
 //! Repo-sync manager.
 //!
 //! Keeps mounted git repos fresh and notifies live/idle agents when their
-//! clones advance. See `docs/designs/repo-sync.md` for the full design.
+//! clones advance.
 //!
 //! Architecture at a glance:
 //!
@@ -22,20 +22,17 @@
 //! pipeline.** Webhook-driven pulls arrive as `Push` triggers fired by the
 //! `git-repo-pull` tool, which the WASM git-sync pipeline invokes.
 
-pub mod git;
 mod poller;
 mod reactor;
-#[cfg(test)]
-pub(crate) mod test_git_fixtures;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use brenn_db::Db;
+use brenn_git::sync::{CloneInfo, SyncTrigger, SyncTriggerSender};
 use brenn_lib::config::{AccessLevel, AppConfig, RepoDeclRaw, RepoSyncConfig};
-use brenn_lib::db::Db;
-use brenn_lib::obs::alerting::AlertDispatcher;
+use brenn_obs::alerting::AlertDispatcher;
 use indexmap::IndexMap;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -43,135 +40,10 @@ use tracing::{info, warn};
 
 use crate::active_bridge::ActiveBridges;
 
-// `PullOutcome` and `pull_clone` are public from `git.rs` but the only
-// current in-tree consumer is `reactor.rs` (via a direct path import),
-// so we don't re-export them here.
-
-/// UTF-8-safe truncation for stderr / alert detail strings. When `s.len()`
-/// exceeds `max` bytes, cuts at the largest char boundary `<= max - 3` and
-/// appends `"..."`. Shared by the git-plumbing (fetch/merge stderr trim)
-/// and the reactor (alert-body trim) so those two paths stay consistent.
-pub(crate) fn truncate_detail(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let boundary = s.floor_char_boundary(max.saturating_sub(3));
-    format!("{}...", &s[..boundary])
-}
-
-/// Why a sync cycle should run.
-///
-/// All variants converge on the same reaction pipeline; they only differ in
-/// whether they bypass debounce (Push) or go through it (Poll), and in the
-/// resume-time variant's scoped remotes list.
-#[derive(Debug, Clone)]
-pub enum SyncTrigger {
-    /// Periodic poll tick for one remote. Debounced.
-    Poll { remote: String },
-    /// An agent just mutated a clone via an MCP git tool (`GitRepoPull` or
-    /// `GitRepoCommitAndPush`). Bypasses debounce. `acting_conversation_id`
-    /// is suppressed from the notification fan-out so the invoking bridge
-    /// doesn't get a `repo_sync:pulled` for its own change.
-    Push {
-        remote: String,
-        acting_conversation_id: Option<i64>,
-    },
-    /// A conversation just resumed. Run one cycle for each remote mounted by
-    /// the app, so freshness is guaranteed before the bridge starts processing.
-    #[allow(dead_code)] // Wired in Phase 4.
-    ResumePoke { remotes: Vec<String> },
-}
-
-/// Handle returned by `RepoSyncManager::start`. Owning code (main.rs) keeps
-/// it to inject triggers; dropping it does not kill the manager task (the
-/// receiver lives inside the task).
-#[derive(Clone)]
-pub struct SyncTriggerSender {
-    tx: mpsc::Sender<SyncTrigger>,
-    /// Clone slug → remote URL. Built once at startup from the config.
-    slug_to_remote: Arc<HashMap<String, String>>,
-}
-
-impl SyncTriggerSender {
-    /// Test-only constructor. Production builds get the sender from
-    /// `RepoSyncManager::start`.
-    #[cfg(test)]
-    pub(crate) fn new_for_test(
-        tx: mpsc::Sender<SyncTrigger>,
-        slug_to_remote: Arc<HashMap<String, String>>,
-    ) -> Self {
-        Self { tx, slug_to_remote }
-    }
-
-    /// Try to send a trigger. Non-blocking; a full channel drops the
-    /// trigger with a warn — triggers are coalescable and polling will
-    /// catch up on the next tick. Returns `true` on success, `false` if
-    /// the channel was full and the trigger was dropped.
-    pub fn try_send(&self, trigger: SyncTrigger) -> bool {
-        match self.tx.try_send(trigger) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(t)) => {
-                warn!(?t, "repo_sync trigger channel full — dropping");
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                panic!(
-                    "repo_sync trigger channel closed — repo_sync manager task died; \
-                     process cannot continue safely"
-                );
-            }
-        }
-    }
-
-    /// Emit a `SyncTrigger::Push` for the clone identified by `slug`.
-    /// Unknown slug is warned and dropped — it would indicate a
-    /// config/code mismatch.
-    pub fn push_for_slug(&self, slug: &str, acting_conversation_id: Option<i64>) {
-        let Some(remote) = self.slug_to_remote.get(slug) else {
-            warn!(
-                slug = %slug,
-                "repo_sync: push_for_slug on unknown slug — no trigger emitted"
-            );
-            return;
-        };
-        // Discard intentional: Full case is already logged by try_send as a
-        // warn. Push triggers are coalescable; the poll loop catches up.
-        let _delivered = self.try_send(SyncTrigger::Push {
-            remote: remote.clone(),
-            acting_conversation_id,
-        });
-    }
-}
-
-/// Per-clone static info derived from `validate_and_resolve`.
-/// Consumer lookup happens at delivery time against this index
-/// plus a live query of `conversations`.
-#[derive(Debug, Clone)]
-pub struct CloneInfo {
-    pub slug: String,
-    pub host_path: PathBuf,
-    pub remote: String,
-    /// `true` if *any* mount of this clone has `auto_pull = true`.
-    /// Drives sync-enabled-ness per the design.
-    pub sync_enabled: bool,
-    /// Apps that mount this clone (any access, any auto_pull).
-    /// Every active conversation of an app in this set is a consumer
-    /// for notification purposes.
-    pub consumer_apps: HashSet<String>,
-    /// Apps whose mount of this clone is the declared primary (the
-    /// primary-pool). Conflict notifications go only to consumers in
-    /// conversations of these apps.
-    ///
-    /// Empty set → RO-only clone; conflicts route to `AlertDispatcher`
-    /// instead of LLM events.
-    pub primary_apps: HashSet<String>,
-}
-
 /// Per-slug tracking for the escalation policy on AuthError and
 /// TransientError outcomes.
 ///
-/// Semantics (per `docs/designs/repo-sync-auth-and-host-unification.md`
-/// §"Escalation policy"):
+/// Escalation policy:
 ///
 /// - AuthError threshold: **1**. First occurrence fires an operator alert.
 /// - TransientError threshold: **4**. Fires after four consecutive cycles
@@ -221,7 +93,7 @@ pub struct RepoSyncCtx {
     /// Per-clone last-notified HEAD SHA. A cycle that finds the current
     /// HEAD differs from this value synthesizes an `Advanced` event,
     /// regardless of cause (poll pull, MCP pull, external Bash commit,
-    /// operator edit on disk). See "Phase 2 Part A" in the design doc.
+    /// operator edit on disk).
     ///
     /// Populated lazily on first cycle per clone (cold-start seed = no
     /// event fired — we just record where we stand). `std::sync::Mutex`
@@ -316,7 +188,7 @@ impl RepoSyncManager {
         // off and don't fire a false "everything moved" alert storm.
         let seeded_cursor = {
             let conn = db.lock().await;
-            brenn_lib::repo_sync_cursor::load_all(&conn)
+            brenn_messaging::repo_sync_cursor::load_all(&conn)
         };
 
         // Build per-app coalescing mutexes for post-pull hooks.
@@ -397,7 +269,7 @@ impl RepoSyncManager {
         );
 
         Some(Self {
-            sender: SyncTriggerSender { tx, slug_to_remote },
+            sender: SyncTriggerSender::new(tx, slug_to_remote),
             task,
             ctx,
         })
@@ -430,7 +302,7 @@ async fn manager_loop(ctx: RepoSyncCtx, mut rx: mpsc::Receiver<SyncTrigger>) {
 /// subset where the mount is flagged primary (post-validation, that's at
 /// most one app per clone — but it lives here as a set for uniform
 /// downstream handling and future multiuser edge cases).
-pub(crate) fn build_clone_index(
+pub fn build_clone_index(
     repos: &[RepoDeclRaw],
     apps: &IndexMap<String, AppConfig>,
 ) -> HashMap<String, CloneInfo> {
@@ -499,9 +371,7 @@ pub(crate) fn build_clone_index(
 
 /// Invert the clone index: remote URL → slugs that share it. A remote
 /// with no mounting apps is absent (no work to do there).
-pub(crate) fn build_remote_to_slugs(
-    clones: &HashMap<String, CloneInfo>,
-) -> HashMap<String, Vec<String>> {
+pub fn build_remote_to_slugs(clones: &HashMap<String, CloneInfo>) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     for info in clones.values() {
         out.entry(info.remote.clone())
@@ -517,6 +387,8 @@ pub(crate) fn build_remote_to_slugs(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use brenn_lib::config::{
         AccessLevel, AppConfig, CompactionConfig, PathMapper, RepoDeclRaw, ResolvedMount,
@@ -786,82 +658,6 @@ mod tests {
         assert_eq!(
             inv.get(remote).unwrap(),
             &vec!["graf".to_string(), "graf-review".to_string()]
-        );
-    }
-
-    #[test]
-    fn push_for_slug_emits_trigger_for_known_slug() {
-        // Build a SyncTriggerSender with a small slug_to_remote map and
-        // exercise the fast path directly (no tokio runtime needed for
-        // try_send on a bounded channel).
-        let (tx, mut rx) = mpsc::channel::<SyncTrigger>(4);
-        let slug_to_remote = Arc::new(HashMap::from([(
-            "src-x".to_string(),
-            "ssh://example/x.git".to_string(),
-        )]));
-        let sender = SyncTriggerSender::new_for_test(tx, slug_to_remote);
-        sender.push_for_slug("src-x", Some(42));
-        match rx.try_recv() {
-            Ok(SyncTrigger::Push {
-                remote,
-                acting_conversation_id,
-            }) => {
-                assert_eq!(remote, "ssh://example/x.git");
-                assert_eq!(acting_conversation_id, Some(42));
-            }
-            other => panic!("expected Push, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn push_for_slug_drops_unknown_slug_without_panicking() {
-        let (tx, mut rx) = mpsc::channel::<SyncTrigger>(4);
-        let slug_to_remote = Arc::new(HashMap::new());
-        let sender = SyncTriggerSender::new_for_test(tx, slug_to_remote);
-        sender.push_for_slug("unknown", Some(1));
-        assert!(rx.try_recv().is_err(), "unknown slug should emit nothing");
-    }
-
-    #[test]
-    fn try_send_returns_false_when_channel_full() {
-        // Channel of capacity 1; fill it, then confirm try_send returns false.
-        let (tx, _rx) = mpsc::channel::<SyncTrigger>(1);
-        let slug_to_remote = Arc::new(HashMap::new());
-        let sender = SyncTriggerSender::new_for_test(tx.clone(), slug_to_remote);
-        // Fill the channel.
-        tx.try_send(SyncTrigger::Poll {
-            remote: "ssh://example/x.git".to_string(),
-        })
-        .expect("first send into empty channel must succeed");
-        // Now channel is full; try_send must return false.
-        let delivered = sender.try_send(SyncTrigger::Poll {
-            remote: "ssh://example/x.git".to_string(),
-        });
-        assert!(!delivered, "try_send must return false when channel full");
-    }
-
-    #[test]
-    fn push_for_slug_returns_normally_when_channel_full() {
-        // Fill the channel to capacity, then confirm push_for_slug does not
-        // panic (it discards intentionally; the warn inside try_send fires).
-        let (tx, mut rx) = mpsc::channel::<SyncTrigger>(1);
-        let slug_to_remote = Arc::new(HashMap::from([(
-            "src-x".to_string(),
-            "ssh://example/x.git".to_string(),
-        )]));
-        let sender = SyncTriggerSender::new_for_test(tx.clone(), slug_to_remote);
-        // Pre-fill the channel.
-        tx.try_send(SyncTrigger::Poll {
-            remote: "ssh://example/x.git".to_string(),
-        })
-        .expect("pre-fill must succeed");
-        // push_for_slug must not panic and must not squeeze an extra item in.
-        sender.push_for_slug("src-x", None);
-        // Drain the one pre-filled item; nothing else should be present.
-        let _ = rx.try_recv().expect("pre-filled item must be present");
-        assert!(
-            rx.try_recv().is_err(),
-            "channel must contain no extra item after dropped push"
         );
     }
 

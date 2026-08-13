@@ -1,7 +1,7 @@
 //! Set equality between the Bazel policy scan's file set and the tracked tree.
 //!
 //! The guards scan `//:all_policy_srcs`, a hand-aggregated list of one
-//! `filegroup` per Bazel package; the make lane scans `git ls-files`. Nothing
+//! `filegroup` per Bazel package; the workspace side scans `git ls-files`. Nothing
 //! inside the sandbox can compare the two — a policy test sees neither git nor
 //! `bazel query` — so this runs outside it, over a manifest the build produced
 //! and the tracked listing beside it.
@@ -11,7 +11,8 @@
 //! guard keeps passing over the smaller set. A tracked file that lands under
 //! one of the glob's exclusions leaves the scan the same silent way. And an
 //! untracked file joins the Bazel set alone, so the two verdicts diverge on any
-//! dirty tree — which is why this is a CI step and not a lane of `make check`.
+//! dirty tree — which is why this is its own step over the workspace rather
+//! than a test inside the Bazel graph.
 //!
 //! Symlinks are dropped from both sides. Bazel's glob does not follow the
 //! tracked `host-crates/` links, and a symlink carries no content for a
@@ -82,7 +83,7 @@ fn parity_violations(
     }
     for rel in declared.difference(&tracked) {
         found.push(format!(
-            "{} is in the Bazel scan but is not tracked: the two lanes' guards read different \
+            "{} is in the Bazel scan but is not tracked: the two scans read different \
              trees, and this file is in every policy test's input closure.",
             rel.display()
         ));

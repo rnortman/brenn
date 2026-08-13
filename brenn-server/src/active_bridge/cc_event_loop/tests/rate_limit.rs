@@ -7,7 +7,7 @@ use super::super::super::test_support::{
 use super::super::*;
 
 use brenn_cc::protocol::incoming::RateLimitEventMessage;
-use brenn_lib::obs::alerting::{AlertDispatcher, CountingAlerter, RateLimiter};
+use brenn_obs::alerting::{AlertDispatcher, CountingAlerter, RateLimiter};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 

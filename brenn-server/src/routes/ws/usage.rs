@@ -1,6 +1,7 @@
 //! `record_usage`, `touch_ui_activity`, `build_graf_env_from` (free fn).
 
-use brenn_lib::usage::{self as usage, EventType};
+use brenn_usage_db as usage;
+use brenn_usage_db::EventType;
 
 use super::connection::WsConnection;
 

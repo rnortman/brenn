@@ -29,7 +29,7 @@ describe("brenn-file-viewer frontmatter rendering", () => {
     // being deleted from `file-viewer.ts` (the markup hooks would
     // disappear) but does NOT catch CSS drift between the Rust
     // FRONTMATTER_CSS and the generated TS template; that's enforced
-    // by the build step (`make frontend-css` regenerates the file from
+    // by the build step (the frontmatter stylesheet is regenerated from
     // the same Rust constant).
     const fm = viewer.shadowRoot!.querySelector(".fm-block");
     expect(fm).toBeTruthy();

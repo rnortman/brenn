@@ -5,9 +5,9 @@
 // ±5-minute skew check (pre-transaction), then monotonicity + nonce-TTL-eviction
 // + N-cap-abuse-signal inside a single BEGIN IMMEDIATE transaction.
 
-use bindings::Guest;
 use bindings::brenn::replay::store;
 use bindings::brenn::replay::types::{CheckInput, ReplayError};
+use bindings::Guest;
 use brenn_cal::{days_from_epoch, days_in_month};
 
 #[allow(dead_code, clippy::all)]

@@ -2,7 +2,7 @@
 #
 # One artifact basename per line; blank lines and lines starting with `#` are
 # ignored. Each listed file is built into brenn-wasm/target/components/ by the
-# Makefile `wasm-components` target, bundled into the release tarball's lib/ by
+# component rules, bundled into the release tarball's lib/ by
 # CI, and installed to COMPONENTS_DIR on the target host by the deploy script
 # bundled into the release tarball.
 #

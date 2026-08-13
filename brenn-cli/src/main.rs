@@ -19,10 +19,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use brenn_cc::session::approval::{ApprovalDecision, ApprovalKind};
 use brenn_cc::session::{CcSession, CcSessionConfig, SessionEvent};
-use brenn_lib::auth::device::{UnenrollOutcome, unenroll_device};
-use brenn_lib::obs::alerting::AlertDispatcher;
-use brenn_lib::obs::transcript::TranscriptWriter;
-use brenn_lib::webhook::signature::hmac_sha256_hex;
+use brenn_db::auth::device::{UnenrollOutcome, unenroll_device};
+use brenn_lib::util::hmac_sha256_hex;
+use brenn_obs::alerting::AlertDispatcher;
+use brenn_obs::transcript::TranscriptWriter;
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 
@@ -774,7 +774,7 @@ async fn run_cc(cli: CcArgs) {
 mod tests {
 
     mod push {
-        use brenn_lib::webhook::signature::hmac_sha256_hex;
+        use brenn_lib::util::hmac_sha256_hex;
 
         /// Verify the canonical form produced by the push signer:
         /// canonical bytes = t_str || "." || body.

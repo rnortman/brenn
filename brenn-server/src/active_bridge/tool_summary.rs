@@ -1,10 +1,10 @@
 //! Tool-summary emission: tool_use → tool_result rendering, persistence, and broadcast.
 
+use brenn_approval_rules::ApprovalMatch;
 use brenn_cc::session::ApprovalDecision as CcApprovalDecision;
-use brenn_lib::approval_rules::ApprovalMatch;
-use brenn_lib::conversation::{self, MessageDirection};
-use brenn_lib::obs::alerting::AlertDispatcher;
-use brenn_lib::ws_types::{ToolResponseDecision, WsServerMessage};
+use brenn_db::conversation::{self, MessageDirection};
+use brenn_obs::alerting::AlertDispatcher;
+use brenn_ws_types::{ToolResponseDecision, WsServerMessage};
 use tracing::{info, warn};
 
 use super::ActiveBridge;
@@ -140,7 +140,7 @@ pub(super) async fn emit_tool_summary(
     let decision = ToolResponseDecision::Allow {
         updated_input: None,
     };
-    let mut rendered = crate::approval_formatter::format_tool_summary(
+    let mut rendered = brenn_render::approval_formatter::format_tool_summary(
         &bridge.tool_registry,
         tool_name,
         tool_input,
@@ -156,7 +156,7 @@ pub(super) async fn emit_tool_summary(
     // Detail HTML: always included so users can expand to see input/result.
     // Custom summaries control the collapsed one-line view; detail is the
     // expanded view with full input JSON and tool response.
-    let detail_html = Some(crate::approval_formatter::format_tool_detail(
+    let detail_html = Some(brenn_render::approval_formatter::format_tool_detail(
         tool_input,
         tool_response,
         &decision,
@@ -191,7 +191,7 @@ pub(super) async fn emit_tool_summary(
         rendered_summary: rendered,
         detail_html,
         seq: Some(db_seq),
-        summary_text: Some(crate::approval_formatter::format_tool_summary_text(
+        summary_text: Some(brenn_render::approval_formatter::format_tool_summary_text(
             tool_name, tool_input,
         )),
     });
@@ -272,7 +272,7 @@ pub(super) async fn emit_tool_result_summaries(
                     "ToolResult for unknown tool_use_id — no matching assistant tool_use block"
                 );
                 alert_dispatcher.alert(
-                    brenn_lib::obs::alerting::AlertSeverity::Warning,
+                    brenn_obs::alerting::AlertSeverity::Warning,
                     "ToolResult for unknown tool_use_id".into(),
                     format!(
                         "Received a ToolResult for tool_use_id {tool_use_id} but no matching \

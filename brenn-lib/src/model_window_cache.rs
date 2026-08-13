@@ -36,7 +36,7 @@ pub fn get(conn: &Connection, slug: &str) -> Option<(u64, Option<String>, String
 /// `cc_version` is the CC version string from the most recent `system/init`
 /// that observed this slug. May be `None` if the version was unavailable.
 pub fn upsert(conn: &Connection, slug: &str, max_tokens: u64, cc_version: Option<&str>) {
-    let now = crate::db::format_ts_for_db(chrono::Utc::now());
+    let now = brenn_db::format_ts_for_db(chrono::Utc::now());
     conn.execute(
         "INSERT INTO model_window_cache (model_slug, max_tokens, cc_version, updated_at)
          VALUES (?1, ?2, ?3, ?4)

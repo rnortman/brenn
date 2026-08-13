@@ -1,4 +1,4 @@
-use brenn_lib::obs::alerting::AlertDispatcher;
+use brenn_obs::alerting::AlertDispatcher;
 use tracing::warn;
 
 pub(in crate::active_bridge) fn handle_rate_limit_utilization(

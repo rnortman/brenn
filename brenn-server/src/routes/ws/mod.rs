@@ -17,9 +17,9 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use brenn_lib::auth::session::Session;
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
-use brenn_lib::ws_types::ViewportClass;
+use brenn_db::auth::session::Session;
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_ws_types::ViewportClass;
 use futures::SinkExt;
 use tracing::{error, info};
 
@@ -40,7 +40,7 @@ const _: () = assert!(STALE_CLIENT_CLOSE_CODE == brenn_surface_schema::STALE_BUI
 
 /// Query parameters for the WS endpoint.
 #[derive(serde::Deserialize)]
-pub(crate) struct WsQuery {
+pub struct WsQuery {
     /// Optional conversation ID to select on connect (initial load or reconnect).
     conv: Option<i64>,
     /// Last seen sequence number for incremental reconnect. When present with
@@ -77,7 +77,7 @@ pub async fn ws_handler(
     Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
     Extension(session): Extension<Session>,
-    Extension(device): Extension<brenn_lib::auth::device::Device>,
+    Extension(device): Extension<brenn_db::auth::device::Device>,
     Extension(ClientIp(ip)): Extension<ClientIp>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, StatusCode> {
@@ -225,7 +225,6 @@ mod tests {
     use std::sync::Arc;
 
     use axum::http::StatusCode;
-    use brenn_lib::db;
     use indexmap::IndexMap;
 
     use super::testing::poll_until_db_count;
@@ -243,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_handler_unknown_slug_returns_404() {
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let state = test_state(&db);
         let (session_token, _) = setup_authenticated_user(&db).await;
 
@@ -269,7 +268,7 @@ mod tests {
         // Passes a matching `build` because the handshake check runs
         // first; without it, the request would take the Close(3001)
         // path and return HTTP 101 instead of BAD_REQUEST.
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let state = test_state(&db);
         let (session_token, _) = setup_authenticated_user(&db).await;
 
@@ -288,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_handler_access_denied_returns_403() {
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let mut apps = IndexMap::new();
         let mut cfg = default_test_app_config("restricted", "Restricted App");
         cfg.allowed_users = vec!["otheruser".to_string()];
@@ -324,7 +323,7 @@ mod tests {
         // check runs first, so the absence of `viewport` is irrelevant
         // here — the server closes with 3001 before it gets to the
         // viewport branch, and no alert is dispatched.
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (state, alerts, _alert_handle) = test_state_with_capturing_alerter(&db);
         let (session_token, _) = setup_authenticated_user(&db).await;
 
@@ -342,7 +341,7 @@ mod tests {
         // malicious probe. Same Close(3001) path, same no-alert
         // guarantee. Viewport is absent but the build check fires first
         // regardless.
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (state, alerts, _alert_handle) = test_state_with_capturing_alerter(&db);
         let (session_token, _) = setup_authenticated_user(&db).await;
 
@@ -360,7 +359,7 @@ mod tests {
         // claims a matching build but omits `viewport` is a buggy or
         // malicious client — that's exactly the fail2ban signal we
         // want to keep.
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (state, alerts, _alert_handle) = test_state_with_capturing_alerter(&db);
         let (session_token, _) = setup_authenticated_user(&db).await;
 
@@ -401,7 +400,7 @@ mod tests {
         // Happy path: build matches and viewport is present, so the
         // upgrade completes and the server's first frame is the
         // `Welcome` JSON text (not a 3001 Close).
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let state = test_state(&db);
         let (session_token, _) = setup_authenticated_user(&db).await;
 
@@ -432,7 +431,7 @@ mod tests {
         // Verifies that event_loop::handle_ws inserts a `ws_connect` usage
         // event row and that the row's device_id matches the device the
         // middleware auto-created for the connection.
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let state = test_state(&db);
         let (session_token, _) = setup_authenticated_user(&db).await;
 
@@ -511,7 +510,7 @@ mod tests {
         // device cookie) produce two distinct device rows and two distinct
         // usage_sessions rows. This mirrors the "two browser tabs" scenario
         // where each tab gets its own device identity.
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let state = test_state(&db);
         let (session_token, _) = setup_authenticated_user(&db).await;
 

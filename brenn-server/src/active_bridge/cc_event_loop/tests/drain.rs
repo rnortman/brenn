@@ -31,7 +31,7 @@ async fn owed_on_the_bus(bridge: &ActiveBridge) -> bool {
     let messenger = bridge
         .messenger()
         .expect("the drain fixtures wire a messenger");
-    !brenn_lib::messaging::testutils::owed_everywhere(
+    !brenn_messaging::testutils::owed_everywhere(
         messenger.as_ref(),
         &brenn_lib::messaging::ParticipantId::for_conversation(bridge.conversation_id),
     )
@@ -246,13 +246,13 @@ async fn drain_drops_stale_repo_sync_events() {
 
     // Force the staleness cap low so we can backdate the conversation
     // by a known amount without waiting.
-    brenn_lib::messaging::set_repo_sync_staleness_days(1);
+    brenn_messaging::set_repo_sync_staleness_days(1);
 
     // Backdate the conversation's updated_at to 10 days ago.
     {
         let conn = bridge.db.lock().await;
         let backdate = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
-        brenn_lib::conversation::set_updated_at_for_test(&conn, bridge.conversation_id, &backdate);
+        brenn_db::conversation::set_updated_at_for_test(&conn, bridge.conversation_id, &backdate);
 
         // Enqueue one repo_sync row and one cron row. Only the
         // repo_sync row should get dropped-by-staleness.
@@ -316,7 +316,7 @@ async fn drain_drops_stale_repo_sync_events() {
     );
 
     // Reset to default so other tests aren't affected by the low cap.
-    brenn_lib::messaging::set_repo_sync_staleness_days(7);
+    brenn_messaging::set_repo_sync_staleness_days(7);
 }
 
 #[tokio::test]
@@ -449,7 +449,7 @@ async fn drain_combined_events_and_messaging_marks_all_delivered() {
             matches!(
                 m,
                 WsServerMessage::ToolUseSummary { tool_name, .. }
-                    if tool_name == crate::tools::messaging::MCP_MESSAGE_RECEIVED_PSEUDO_TOOL
+                    if tool_name == brenn_render::tools::messaging::MCP_MESSAGE_RECEIVED_PSEUDO_TOOL
             )
         })
         .collect();
@@ -592,7 +592,7 @@ async fn drain_send_failure_leaves_messaging_pushes_pending() {
         matches!(
             m,
             WsServerMessage::ToolUseSummary { tool_name, .. }
-                if tool_name == crate::tools::messaging::MCP_MESSAGE_RECEIVED_PSEUDO_TOOL
+                if tool_name == brenn_render::tools::messaging::MCP_MESSAGE_RECEIVED_PSEUDO_TOOL
         )
     });
     assert!(
@@ -656,7 +656,7 @@ async fn drain_messaging_only_delivers_without_events() {
             matches!(
                 m,
                 WsServerMessage::ToolUseSummary { tool_name, .. }
-                    if tool_name == crate::tools::messaging::MCP_MESSAGE_RECEIVED_PSEUDO_TOOL
+                    if tool_name == brenn_render::tools::messaging::MCP_MESSAGE_RECEIVED_PSEUDO_TOOL
             )
         })
         .collect();
@@ -717,7 +717,7 @@ async fn drain_messaging_only_delivers_without_events() {
 ///   6. Assert push row is still `delivered_at IS NULL`.
 #[tokio::test]
 async fn d1_real_window_broken_pipe_leaves_push_row_undelivered() {
-    use brenn_lib::obs::transcript::TranscriptWriter;
+    use brenn_obs::transcript::TranscriptWriter;
 
     let (bridge, _broadcast_rx) = bridge_with_messenger_for_drain().await;
     seed_pending_push(&bridge, "d1-window-test-body").await;
@@ -902,14 +902,14 @@ fn ceiling(bridge: &ActiveBridge) -> u32 {
 /// What the conversation's pool holds, or `None` where nothing has touched it.
 async fn pool(bridge: &ActiveBridge) -> Option<u32> {
     let conn = bridge.db.lock().await;
-    brenn_lib::messaging::db::read_send_budget(&conn, bridge.conversation_id)
+    brenn_messaging_store::db::read_send_budget(&conn, bridge.conversation_id)
 }
 
 /// Put the pool at a known level — an exhausted conversation, or one with
 /// exactly enough left to be worth counting.
 async fn set_pool(bridge: &ActiveBridge, remaining: u32) {
     let conn = bridge.db.lock().await;
-    brenn_lib::messaging::db::reset_send_budget(&conn, bridge.conversation_id, remaining);
+    brenn_messaging_store::db::reset_send_budget(&conn, bridge.conversation_id, remaining);
 }
 
 /// One injection is one CC turn, and one CC turn is one unit — however many

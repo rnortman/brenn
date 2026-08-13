@@ -1,6 +1,6 @@
 //! `MqttEventRouterImpl` — inbound MQTT delivery adapter (client-in-address model).
 //!
-//! Implements `brenn_lib::mqtt::MqttEventRouter` against `AppState`. Mirrors
+//! Implements `brenn_mqtt::MqttEventRouter` against `AppState`. Mirrors
 //! `webhook_router.rs`: an inbound MQTT message is wrapped in a typed
 //! `MqttEnvelope` and published to its `mqtt:<client>:<topic>` bus channel via
 //! `Messenger::publish_transport_ingress`. There is no singleton conversation,
@@ -23,8 +23,8 @@ use std::sync::RwLock;
 
 use brenn_lib::messaging::{MqttEnvelope, MqttPayloadBody, Urgency};
 use brenn_lib::mqtt::address::mqtt_topic_matches;
-use brenn_lib::mqtt::payload::InboundPayload;
-use brenn_lib::mqtt::service::MqttEventRouter;
+use brenn_mqtt::payload::InboundPayload;
+use brenn_mqtt::service::MqttEventRouter;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
@@ -68,6 +68,12 @@ struct RouterState {
 /// Concrete `MqttEventRouter` impl. Closes over `AppState` (via `OnceCell`).
 pub struct MqttEventRouterImpl {
     inner: OnceCell<RouterState>,
+}
+
+impl Default for MqttEventRouterImpl {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MqttEventRouterImpl {
@@ -277,15 +283,15 @@ mod tests {
     use std::sync::Arc;
 
     use brenn_lib::messaging::{
-        ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntry, SubscriberEntryKind,
-        Urgency, WakeMin,
-        config::{Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel, Sink},
-        db::upsert_channels,
+        ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, NoiseLevel,
+        ResolvedChannel, SubscriberEntry, SubscriberEntryKind, Urgency, WakeMin,
         mqtt_channel_uuid_from_address,
     };
     use brenn_lib::mqtt::config::parsed_address_canonical;
-    use brenn_lib::mqtt::payload::InboundPayload;
-    use brenn_lib::mqtt::service::MqttEventRouter;
+    use brenn_messaging::config::{Depth, Sink};
+    use brenn_messaging_store::db::upsert_channels;
+    use brenn_mqtt::payload::InboundPayload;
+    use brenn_mqtt::service::MqttEventRouter;
     use indexmap::IndexMap;
 
     use super::*;
@@ -326,10 +332,10 @@ mod tests {
     /// Build a `Messenger` over a set of `mqtt:` channel entries, with an apps
     /// map so each subscriber's policy and owner resolve.
     fn messenger_with_channels(
-        db: brenn_lib::db::Db,
+        db: brenn_db::Db,
         entries: Vec<ChannelEntry>,
         subscriber_app: Option<SubscriberSpec<'_>>,
-    ) -> Arc<brenn_lib::messaging::Messenger> {
+    ) -> Arc<brenn_messaging::Messenger> {
         use brenn_lib::messaging::config::{ResolvedMessagingConfig, ResolvedSubscription};
 
         {
@@ -347,7 +353,7 @@ mod tests {
             // subscribed `mqtt:` channel (grant + matcher), else the wake pass
             // skips the app without advancing its position. Stamp a covering
             // policy derived from the subscription addresses.
-            app_cfg.policy = crate::test_support::app_config::delivery_policy_for_addresses(
+            app_cfg.policy = brenn_lib::access::test_fixtures::delivery_policy_for_addresses(
                 subs.iter().map(|(_, a)| a.as_str()),
             );
             app_cfg.messaging = Some(ResolvedMessagingConfig {
@@ -367,13 +373,13 @@ mod tests {
             apps_raw.insert(app_slug.to_string(), app_cfg);
         }
 
-        brenn_lib::messaging::Messenger::new(
+        brenn_messaging::Messenger::new(
             db,
             directory,
             Arc::from("mqtt-test"),
             Arc::new(apps_raw),
-            Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-                as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(brenn_messaging::query::NoopWakeRouter)
+                as Arc<dyn brenn_messaging::WakeRouter>,
             MessagingGlobalConfig::default(),
         )
     }
@@ -396,11 +402,11 @@ mod tests {
     /// covering policy (grant + matcher); empty yields deny-by-default at the
     /// delivery gate.
     fn messenger_with_wasm_channels(
-        db: brenn_lib::db::Db,
+        db: brenn_db::Db,
         entries: Vec<ChannelEntry>,
         wasm_slug: &str,
         mqtt_subscribe_acl: Vec<brenn_lib::access::raw::MqttSubMatcherRaw>,
-    ) -> Arc<brenn_lib::messaging::Messenger> {
+    ) -> Arc<brenn_messaging::Messenger> {
         let policy = brenn_lib::access::resolve::build_wasm_policy(
             wasm_slug,
             [],

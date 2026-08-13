@@ -9,7 +9,7 @@
 //! message.
 //!
 //! wasm32-only, matching the crate's wasm-gated body; run under
-//! wasm-bindgen-test via `make surface-wasm-test`.
+//! wasm-bindgen-test in a real browser.
 #![cfg(target_arch = "wasm32")]
 
 use brenn_surface_component_support::{ActivationError, register_component};

@@ -1,62 +1,33 @@
-// `xtask check-wit`: WASI-free gate, bindings-drift gate, world-equivalence gate.
+// `xtask check-wit`: WASI-free gate, world-equivalence gate.
 
 use crate::discover::{Family, wasm_crates};
 use crate::world_sig::{ItemSignature, WorldSignature, world_signature};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use wasmparser::{Encoding, Parser, Payload};
 use wit_component::{DecodedWasm, decode};
 use wit_parser::{Resolve, TypeOwner, WorldId, WorldItem, WorldKey};
 
-/// Run all WIT gates over all applicable units. Returns true if all pass.
+/// Where the built component artifacts are staged, relative to the repo root.
+const ARTIFACT_DIR: &str = "brenn-wasm/target/components";
+
+/// Run both WIT gates over every built component under `repo_root`. Returns true
+/// if all pass.
+///
+/// `repo_root` holds the guest workspace's manifests, the WIT worlds, and the
+/// staged artifacts — the three inputs the gates read. It is a staged tree, not
+/// necessarily a checkout.
 pub fn run_check_wit(repo_root: &Path) -> bool {
     let crates = wasm_crates(repo_root);
     let mut ok = true;
 
-    // Artifact base dir: brenn-wasm/target/components/ — the final output dir where
-    // the Makefile copies the .wasm files (via the `cp` in wasm_component_rule /
-    // wasm_guest_component_rule). This is distinct from WASM_COMPONENTS_TARGET
-    // (brenn-wasm/components/target/) which is the cargo build dir. The WASI-free
-    // check runs on the copied final artifacts, matching the Makefile posture.
-    let artifact_dir = repo_root
-        .join("brenn-wasm")
-        .join("target")
-        .join("components");
+    let artifact_dir = repo_root.join(ARTIFACT_DIR);
 
-    // One ephemeral scratch dir outside the repo for all bindings regeneration.
-    // Generating into scratch (never a crate's src/) keeps this lane tree-read-only,
-    // so concurrent discovery walks in other lanes cannot race a vanishing file.
-    // The TempDir self-deletes when this sweep ends.
-    let scratch = tempfile::TempDir::new()
-        .unwrap_or_else(|e| panic!("xtask check-wit: failed to create scratch tempdir: {e}"));
-    let scratch_root = scratch_root_outside_repo(scratch.path(), repo_root);
-
-    // The bindings-drift gate shells out to whatever `wit-bindgen` is on PATH. The
-    // Makefile preflights guard component *rebuilds* only, so an up-to-date tree reaches
-    // this lane with nothing having checked the binary: a wrong-version generator would
-    // report spurious drift, and its fix-it hint would then plant wrong-generator bindings
-    // that the gate afterwards accepts. Assert once, before any crate runs. Unconditional —
-    // Family A crates always exist in-tree, so the lane always needs the binary.
-    let wit_bindgen_pin = makefile_pin(repo_root, WIT_BINDGEN_PIN_VAR);
-    assert_wit_bindgen_version(&wit_bindgen_pin);
-
-    for (crate_index, wasm_crate) in crates.iter().enumerate() {
+    for wasm_crate in &crates {
         match wasm_crate.family {
             Family::Raw | Family::Guest => {
                 let artifact = LoadedArtifact::load(&wasm_crate.dir, &artifact_dir);
                 // WASI-free gate.
                 if !check_wasi_free(&artifact) {
-                    ok = false;
-                }
-                // Bindings-drift gate: Family A only (it has a committed bindings.rs).
-                if wasm_crate.family == Family::Raw
-                    && !check_bindings_drift(
-                        &wasm_crate.dir,
-                        &scratch_root,
-                        crate_index,
-                        &wit_bindgen_pin,
-                    )
-                {
                     ok = false;
                 }
                 // World-equivalence gate: both families. The two are built by two
@@ -78,27 +49,6 @@ pub fn run_check_wit(repo_root: &Path) -> bool {
     ok
 }
 
-/// Canonicalize the scratch dir and assert it does not resolve inside the repo, returning
-/// the canonical scratch path. Both sides are canonicalized before the prefix test: bare
-/// `starts_with` is lexical, and a symlinked or relative TMPDIR can resolve inside the repo
-/// without lexically matching it. A scratch dir inside the repo would re-open the vanishing-
-/// file race, so this fails fast. Canonicalization failure on either side is itself
-/// unexpected and panics.
-fn scratch_root_outside_repo(scratch: &Path, repo_root: &Path) -> PathBuf {
-    let scratch_root = scratch.canonicalize().unwrap_or_else(|e| {
-        panic!("xtask check-wit: failed to canonicalize scratch dir {scratch:?}: {e}")
-    });
-    let repo_canon = repo_root.canonicalize().unwrap_or_else(|e| {
-        panic!("xtask check-wit: failed to canonicalize repo root {repo_root:?}: {e}")
-    });
-    assert!(
-        !scratch_root.starts_with(&repo_canon),
-        "xtask check-wit: scratch dir {scratch_root:?} resolves inside the repo {repo_canon:?}. \
-         Point TMPDIR at a location outside the repository."
-    );
-    scratch_root
-}
-
 /// A built artifact, read from disk and decoded once for every gate that inspects it.
 ///
 /// Both artifact gates need the same decoded world, and the decode is the expensive
@@ -113,15 +63,15 @@ struct LoadedArtifact {
 
 impl LoadedArtifact {
     /// A missing or unreadable artifact is broken build state rather than a gate outcome,
-    /// so this panics (run `make wasm-components` first).
+    /// so this panics.
     fn load(crate_dir: &Path, artifact_dir: &Path) -> Self {
         // Derive artifact name from crate package name.
         let path = artifact_dir.join(artifact_name_for(crate_dir));
 
         assert!(
             path.exists(),
-            "xtask check-wit: artifact {path:?} not found. \
-             Run `make wasm-components` first to build all WASM artifacts."
+            "xtask check-wit: artifact {path:?} not found. Every member of the guest \
+             workspace but the SDK builds one, staged under {ARTIFACT_DIR}."
         );
 
         // Existence was just asserted; a read failure now is unexpected → fail fast.
@@ -361,232 +311,6 @@ fn guest_sdk_world_is_processor(repo_root: &Path) {
     }
 }
 
-/// The Makefile variable holding the pinned `wit-bindgen-cli` version.
-const WIT_BINDGEN_PIN_VAR: &str = "WIT_BINDGEN_CLI_VERSION";
-
-/// The value of a `NAME := value` line in the repo-root `Makefile`.
-///
-/// The Makefile is the single home of the guest-build toolchain pins; the public CI
-/// workflow and the private CD pipeline read those same lines by grep, and this is the
-/// third reader. Parsing rather than embedding a copy means a bump is one edit and this
-/// lane's assert and install hints move with it.
-///
-/// Panics when the line is missing, appears more than once, carries an empty value, or
-/// departs from the exact `NAME := value` shape: a pin that cannot be resolved, or that
-/// this parser and the two seds would resolve differently, is broken build state rather
-/// than a gate outcome. The shape check is the strictest of the three readers on purpose —
-/// `sed -n 's/^NAME := //p'` takes everything after exactly one space, so an aligned or
-/// trailing-space assignment hands CI and CD a version with whitespace in it while a
-/// trimming parser sees nothing wrong.
-fn makefile_pin(repo_root: &Path, name: &str) -> String {
-    let makefile = repo_root.join("Makefile");
-    let content = std::fs::read_to_string(&makefile)
-        .unwrap_or_else(|e| panic!("xtask check-wit: failed to read {makefile:?}: {e}"));
-
-    let prefix = format!("{name} :=");
-    let raw: Vec<&str> = content
-        .lines()
-        .filter_map(|line| line.strip_prefix(prefix.as_str()))
-        .collect();
-
-    assert_eq!(
-        raw.len(),
-        1,
-        "xtask check-wit: expected exactly one `{name} := <value>` line in {makefile:?}, \
-         found {}. That line is the pin's only home and CI, CD and xtask all read it; \
-         keep the `NAME := value` shape.",
-        raw.len()
-    );
-    assert!(
-        !raw[0].trim().is_empty(),
-        "xtask check-wit: `{name} :=` in {makefile:?} has an empty value. \
-         CI, CD and xtask all read that line for the pin."
-    );
-
-    let value = raw[0].strip_prefix(' ').unwrap_or_else(|| {
-        panic!(
-            "xtask check-wit: `{name} :=` in {makefile:?} is not followed by a single space \
-             (found {:?}). CI and CD read the line with `sed -n 's/^{name} := //p'`, which \
-             matches nothing without that space; keep the `NAME := value` shape.",
-            raw[0]
-        )
-    });
-    assert_eq!(
-        value,
-        value.trim(),
-        "xtask check-wit: the value on `{name} :=` in {makefile:?} carries surrounding \
-         whitespace. CI and CD read the line with `sed -n 's/^{name} := //p'` and would \
-         install version {value:?}; keep the `NAME := value` shape."
-    );
-
-    value.to_string()
-}
-
-/// The version an installed tool reports: the second whitespace-separated field of the
-/// first `--version` line (`wit-bindgen-cli 1.2.3` → `1.2.3`). Mirrors the Makefile
-/// preflight's `awk 'NR==1{print $2}'` so both readers of the same output agree.
-fn version_field(output: &str) -> Option<&str> {
-    output.lines().next()?.split_whitespace().nth(1)
-}
-
-/// The exact command that installs the pinned generator.
-fn wit_bindgen_install_hint(pin: &str) -> String {
-    format!("Install with: cargo install --locked wit-bindgen-cli --version {pin}")
-}
-
-/// The verdict on `wit-bindgen --version` output, separated from the process spawn so
-/// both the decision and the operator-facing message are exercisable without a PATH shim.
-///
-/// `Err` carries the whole message, install command included: this gate compares generator
-/// output against committed bytes, so a wrong generator makes both its verdict and its
-/// remediation wrong, and the remediation is the part that has to name the pin.
-fn check_reported_version(version_output: &str, pin: &str) -> Result<(), String> {
-    let hint = wit_bindgen_install_hint(pin);
-    match version_field(version_output) {
-        None => Err(format!(
-            "xtask check-wit: could not read a version from `wit-bindgen --version` \
-             output {:?}. {hint}",
-            version_output.trim()
-        )),
-        Some(have) if have == pin => Ok(()),
-        Some(have) => Err(format!(
-            "xtask check-wit: wit-bindgen-cli {have} is on PATH but the pin is {pin}. {hint}"
-        )),
-    }
-}
-
-/// Assert the `wit-bindgen` on PATH reports exactly the pinned version.
-///
-/// Absence, a failed or unparseable `--version`, and a mismatch all panic with the
-/// install command.
-fn assert_wit_bindgen_version(pin: &str) {
-    let hint = wit_bindgen_install_hint(pin);
-
-    let output = Command::new("wit-bindgen")
-        .arg("--version")
-        .output()
-        .unwrap_or_else(|e| {
-            panic!("xtask check-wit: failed to run `wit-bindgen --version`: {e}. {hint}")
-        });
-    assert!(
-        output.status.success(),
-        "xtask check-wit: `wit-bindgen --version` exited {}: {}. {hint}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    check_reported_version(&stdout, pin).unwrap_or_else(|msg| panic!("{msg}"));
-}
-
-/// Bindings-drift gate: regenerate the crate's bindings into an ephemeral scratch dir
-/// via the pinned `wit-bindgen-cli` and byte-compare against the committed
-/// `src/bindings.rs`.
-/// Never writes into the crate — the working tree is untouched, so this gate is safe to
-/// run concurrently with lanes that walk the tree.
-///
-/// Both sides of the comparison are produced by the pinned generator, so this detects
-/// a hand-edited or stale `bindings.rs` and nothing else: when the pin itself moves,
-/// committed and regenerated bindings move together and the gate passes by construction.
-/// Whether the world the artifact carries still matches its WIT source is the separate
-/// question `check_world_equivalence` answers.
-fn check_bindings_drift(
-    crate_dir: &Path,
-    scratch_root: &Path,
-    unit_index: usize,
-    wit_bindgen_pin: &str,
-) -> bool {
-    let bindings_path = crate_dir.join("src").join("bindings.rs");
-    assert!(
-        bindings_path.exists(),
-        "xtask check-wit: bindings.rs not found at {bindings_path:?} for WasmComponent crate. \
-         Expected a committed bindings.rs (Family A). If this crate was reclassified, \
-         update its kind in xtask/lint-allowlist.toml."
-    );
-
-    // Parse WIT path and world name from crate Cargo.toml.
-    let (wit_path, world_name) = wit_path_for_crate(crate_dir);
-
-    let original = std::fs::read(&bindings_path)
-        .unwrap_or_else(|e| panic!("xtask check-wit: failed to read {bindings_path:?}: {e}"));
-
-    // Per-crate scratch subdir keyed on the crate's unique discovery index (with the
-    // basename appended for readability). The index guarantees disjoint output paths even
-    // when two crates share a basename, so a future parallelized per-crate loop cannot make
-    // one crate read another's regenerated bytes.
-    let crate_name = crate_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_else(|| {
-            panic!("xtask check-wit: crate dir {crate_dir:?} has no valid file name")
-        });
-    let out_dir = scratch_root.join(format!("{unit_index}-{crate_name}"));
-    std::fs::create_dir_all(&out_dir).unwrap_or_else(|e| {
-        panic!("xtask check-wit: failed to create scratch dir {out_dir:?}: {e}")
-    });
-    let world_named_path = out_dir.join(format!("{world_name}.rs"));
-
-    let wit_path_str = wit_path
-        .to_str()
-        .unwrap_or_else(|| panic!("xtask check-wit: WIT path {wit_path:?} is not valid UTF-8"));
-    let out_dir_str = out_dir
-        .to_str()
-        .unwrap_or_else(|| panic!("xtask check-wit: scratch dir {out_dir:?} is not valid UTF-8"));
-
-    let output = Command::new("wit-bindgen")
-        .args([
-            "rust",
-            wit_path_str,
-            "--runtime-path",
-            "wit_bindgen_rt",
-            "--out-dir",
-            out_dir_str,
-        ])
-        .output()
-        .unwrap_or_else(|e| {
-            let hint = wit_bindgen_install_hint(wit_bindgen_pin);
-            panic!(
-                "xtask check-wit: failed to run `wit-bindgen rust` for {crate_dir:?}: {e}. {hint}"
-            )
-        });
-
-    if !output.status.success() {
-        eprintln!(
-            "xtask check-wit [bindings-drift FAIL]: `wit-bindgen rust` failed for {crate_dir:?}"
-        );
-        eprintln!(
-            "  wit-bindgen stderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return false;
-    }
-
-    // A read failure after a successful wit-bindgen exit is unexpected → fail fast,
-    // naming the crate (lane-attributed via run_jobs).
-    let regenerated = std::fs::read(&world_named_path).unwrap_or_else(|e| {
-        panic!(
-            "xtask check-wit: failed to read regenerated bindings {world_named_path:?} \
-             for {crate_dir:?} after a successful wit-bindgen run: {e}"
-        )
-    });
-
-    let drift = original != regenerated;
-    if drift {
-        // Remediation targets the crate's real src/, not the scratch out_dir used above.
-        let src_dir = crate_dir.join("src");
-        let src_dir_str = src_dir
-            .to_str()
-            .unwrap_or_else(|| panic!("xtask check-wit: src dir {src_dir:?} is not valid UTF-8"));
-        eprintln!(
-            "xtask check-wit [bindings-drift FAIL]: {bindings_path:?} is stale. \
-             Regenerate with: wit-bindgen rust {wit_path_str} --runtime-path wit_bindgen_rt \
-             --out-dir {src_dir_str} && mv {src_dir_str}/{world_name}.rs {src_dir_str}/bindings.rs"
-        );
-    }
-
-    !drift
-}
-
 /// World-equivalence gate: assert the world embedded in the built artifact is still the
 /// world the crate's WIT source declares.
 ///
@@ -610,15 +334,14 @@ fn check_bindings_drift(
 ///    never over printed WIT — so doc-stripping and item reordering, both of which the
 ///    encoder does, are invisible by construction rather than special-cased.
 ///
-/// This is the coverage `check_bindings_drift` cannot have: both sides of that comparison
-/// are produced by the same pinned generator, so a generator or encoder change that moves
-/// the guest-visible world passes it by construction. Here the source side is the
-/// hand-written WIT, so such a change fails.
+/// The source side is the hand-written WIT, which is what makes this gate see a
+/// generator or encoder change that moves the guest-visible world: comparing generated
+/// bindings against generated bindings cannot, because both sides move together.
 ///
 /// Runs on every built artifact of both families — the two are generated by two different
 /// wit-bindgen invocations (pinned CLI vs. the SDK's `generate!` macro), and the deployed
 /// components are Family B, so covering only Family A would leave the shipped guests'
-/// world unguarded. `wit_source_for_unit` supplies each family's source.
+/// world unguarded. `wit_source_for_crate` supplies each family's source.
 ///
 /// Fails closed on anything that does not decode as a component, mirroring `wasi_imports`.
 fn check_world_equivalence(wit_path: &Path, world_name: &str, artifact: &LoadedArtifact) -> bool {
@@ -852,157 +575,6 @@ edition = "2021"
         .unwrap();
 
         wit_path_for_crate(root);
-    }
-
-    /// Write a Makefile fixture into a fresh tempdir and return the dir.
-    ///
-    /// Fixture bodies carry deliberately fictional versions: the parser is indifferent to
-    /// the value, and a real pin value here would be one more hand-maintained copy of the
-    /// number this module exists to stop copying.
-    fn makefile_fixture(body: &str) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        fs::write(tmp.path().join("Makefile"), body).unwrap();
-        tmp
-    }
-
-    #[test]
-    fn makefile_pin_reads_the_pinned_value() {
-        let tmp = makefile_fixture(
-            "# comment\nWASM_TOOLS_VERSION := 4.5.6\nWIT_BINDGEN_CLI_VERSION := 1.2.3\n\nall:\n\t@true\n",
-        );
-        assert_eq!(makefile_pin(tmp.path(), "WIT_BINDGEN_CLI_VERSION"), "1.2.3");
-        assert_eq!(makefile_pin(tmp.path(), "WASM_TOOLS_VERSION"), "4.5.6");
-    }
-
-    /// A pin line that was renamed or deleted must fail loudly rather than leave the
-    /// version assert and the install hints guessing.
-    #[test]
-    #[should_panic(expected = "expected exactly one `WIT_BINDGEN_CLI_VERSION := <value>` line")]
-    fn makefile_pin_missing_line_panics() {
-        let tmp = makefile_fixture("WASM_TOOLS_VERSION := 4.5.6\n");
-        makefile_pin(tmp.path(), "WIT_BINDGEN_CLI_VERSION");
-    }
-
-    /// Two definitions means the greps in CI and CD and this parser can disagree about
-    /// which one wins; refuse rather than pick.
-    #[test]
-    #[should_panic(expected = "found 2")]
-    fn makefile_pin_duplicate_line_panics() {
-        let tmp = makefile_fixture(
-            "WIT_BINDGEN_CLI_VERSION := 1.2.3\nWIT_BINDGEN_CLI_VERSION := 1.2.4\n",
-        );
-        makefile_pin(tmp.path(), "WIT_BINDGEN_CLI_VERSION");
-    }
-
-    #[test]
-    #[should_panic(expected = "has an empty value")]
-    fn makefile_pin_empty_value_panics() {
-        let tmp = makefile_fixture("WIT_BINDGEN_CLI_VERSION :=\n");
-        makefile_pin(tmp.path(), "WIT_BINDGEN_CLI_VERSION");
-    }
-
-    /// Aligning the two assignments is the natural cosmetic edit, and `sed -n
-    /// 's/^NAME := //p'` would hand CI and CD a version with a leading space. Reject the
-    /// shape here rather than let the pipeline install `" 1.2.3"`.
-    #[test]
-    #[should_panic(expected = "carries surrounding whitespace")]
-    fn makefile_pin_extra_leading_space_panics() {
-        let tmp = makefile_fixture("WIT_BINDGEN_CLI_VERSION :=  1.2.3\n");
-        makefile_pin(tmp.path(), "WIT_BINDGEN_CLI_VERSION");
-    }
-
-    /// Same hazard from the other end: the seds keep a trailing space, a trimming parser
-    /// does not.
-    #[test]
-    #[should_panic(expected = "carries surrounding whitespace")]
-    fn makefile_pin_trailing_space_panics() {
-        let tmp = makefile_fixture("WIT_BINDGEN_CLI_VERSION := 1.2.3   \n");
-        makefile_pin(tmp.path(), "WIT_BINDGEN_CLI_VERSION");
-    }
-
-    #[test]
-    #[should_panic(expected = "is not followed by a single space")]
-    fn makefile_pin_missing_space_panics() {
-        let tmp = makefile_fixture("WIT_BINDGEN_CLI_VERSION :=1.2.3\n");
-        makefile_pin(tmp.path(), "WIT_BINDGEN_CLI_VERSION");
-    }
-
-    /// The match is anchored at start of line, so parking the previous pin as a comment
-    /// during a bump neither resolves nor counts toward the duplicate check — the same
-    /// reading the two seds' `^` anchors give.
-    #[test]
-    fn makefile_pin_ignores_commented_out_pins() {
-        let tmp = makefile_fixture(
-            "# WIT_BINDGEN_CLI_VERSION := 9.9.9\nWIT_BINDGEN_CLI_VERSION := 1.2.3\n",
-        );
-        assert_eq!(makefile_pin(tmp.path(), "WIT_BINDGEN_CLI_VERSION"), "1.2.3");
-    }
-
-    /// Liveness against the real Makefile: both pin lines still carry the `NAME := value`
-    /// shape their three readers depend on. xtask consumes only the wit-bindgen pin, but
-    /// CI and CD read the wasm-tools one from the same contract, so both are pinned here.
-    #[test]
-    fn makefile_pin_resolves_both_repo_pins() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("xtask/ has a parent");
-        for name in ["WIT_BINDGEN_CLI_VERSION", "WASM_TOOLS_VERSION"] {
-            let value = makefile_pin(repo_root, name);
-            assert!(
-                value.starts_with(|c: char| c.is_ascii_digit()),
-                "{name} resolved to {value:?}, which is not a version"
-            );
-        }
-    }
-
-    #[test]
-    fn version_field_takes_the_second_field_of_the_first_line() {
-        assert_eq!(version_field("wit-bindgen-cli 1.2.3\n"), Some("1.2.3"));
-        assert_eq!(version_field("wasm-tools 4.5.6"), Some("4.5.6"));
-        // Space-separated build metadata is a later field and is dropped.
-        assert_eq!(
-            version_field("wit-bindgen-cli 1.2.3 (abc1234)\nsecond line 9.9.9"),
-            Some("1.2.3")
-        );
-        // A suffix glued to the version token stays attached.
-        assert_eq!(
-            version_field("wit-bindgen-cli 1.2.3+abc\n"),
-            Some("1.2.3+abc")
-        );
-        // Whitespace runs collapse and tabs count as separators, matching the awk the
-        // Makefile preflight reads the same output with.
-        assert_eq!(version_field("wit-bindgen-cli\t1.2.3\n"), Some("1.2.3"));
-        assert_eq!(version_field("wit-bindgen-cli  1.2.3\n"), Some("1.2.3"));
-        assert_eq!(version_field("single-token"), None);
-        assert_eq!(version_field(""), None);
-    }
-
-    /// The generator assert's decision and its remediation, without a PATH shim. The
-    /// install command is the substantive assertion: a stale or missing one sends the
-    /// operator to install a version every other preflight then rejects.
-    #[test]
-    fn check_reported_version_accepts_only_the_pin() {
-        assert_eq!(
-            check_reported_version("wit-bindgen-cli 1.2.3\n", "1.2.3"),
-            Ok(())
-        );
-
-        let msg = check_reported_version("wit-bindgen-cli 1.2.2\n", "1.2.3")
-            .expect_err("a mismatched version is rejected");
-        assert!(msg.contains("1.2.2"), "{msg}");
-        assert!(msg.contains("1.2.3"), "{msg}");
-        assert!(
-            msg.contains("cargo install --locked wit-bindgen-cli --version 1.2.3"),
-            "{msg}"
-        );
-
-        let msg = check_reported_version("unparseable\n", "1.2.3")
-            .expect_err("unreadable output is rejected");
-        assert!(msg.contains("unparseable"), "{msg}");
-        assert!(
-            msg.contains("cargo install --locked wit-bindgen-cli --version 1.2.3"),
-            "{msg}"
-        );
     }
 
     // Component-model text fixtures, assembled to binary at test time via `wat`.
@@ -1302,63 +874,6 @@ edition = "2021"
         let tmp = temp_crate_with_cargo("[other]\nkey = \"value\"\n");
         artifact_name_for(tmp.path());
     }
-
-    /// A scratch dir disjoint from the repo passes and returns its canonical path.
-    #[test]
-    fn scratch_root_outside_repo_accepts_disjoint_dir() {
-        let repo = tempfile::tempdir().expect("repo tempdir");
-        let scratch = tempfile::tempdir().expect("scratch tempdir");
-        let got = scratch_root_outside_repo(scratch.path(), repo.path());
-        assert_eq!(got, scratch.path().canonicalize().unwrap());
-    }
-
-    /// A scratch dir physically inside the repo trips the guard.
-    #[test]
-    #[should_panic(expected = "resolves inside the repo")]
-    fn scratch_root_outside_repo_rejects_dir_inside_repo() {
-        let repo = tempfile::tempdir().expect("repo tempdir");
-        let inside = repo.path().join("scratch");
-        fs::create_dir_all(&inside).unwrap();
-        scratch_root_outside_repo(&inside, repo.path());
-    }
-
-    /// A symlink that lives outside the repo (lexically disjoint) but resolves inside it
-    /// must still trip the guard. A lexical `starts_with` without canonicalizing first
-    /// would miss this and fail open — the exact regression the canonicalize-first order
-    /// exists to prevent.
-    #[cfg(unix)]
-    #[test]
-    #[should_panic(expected = "resolves inside the repo")]
-    fn scratch_root_outside_repo_rejects_symlink_into_repo() {
-        let repo = tempfile::tempdir().expect("repo tempdir");
-        let outside = tempfile::tempdir().expect("outside tempdir");
-        let real_inside = repo.path().join("real-scratch");
-        fs::create_dir_all(&real_inside).unwrap();
-        let link = outside.path().join("link");
-        std::os::unix::fs::symlink(&real_inside, &link).unwrap();
-        scratch_root_outside_repo(&link, repo.path());
-    }
-
-    /// Sorted (name, bytes) of every entry directly under `dir`. Directory entries carry
-    /// empty bytes; used to prove a check left a directory untouched.
-    fn dir_snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
-        let mut entries: Vec<(String, Vec<u8>)> = fs::read_dir(dir)
-            .unwrap()
-            .map(|e| {
-                let e = e.unwrap();
-                let name = e.file_name().to_string_lossy().into_owned();
-                let bytes = if e.path().is_file() {
-                    fs::read(e.path()).unwrap()
-                } else {
-                    Vec::new()
-                };
-                (name, bytes)
-            })
-            .collect();
-        entries.sort();
-        entries
-    }
-
     // World-equivalence fixtures. The "artifact side" of these tests is a WIT text too:
     // what the gate compares is two decoded worlds, and a mutated WIT is exactly how a
     // moved guest-visible world presents. The real artifacts are exercised by the live
@@ -1469,7 +984,7 @@ world app {
 
     /// A renamed function inside an imported interface: the artifact carries a member the
     /// source interface does not declare. This is the generator-drift class the whole gate
-    /// exists for — `check_bindings_drift` cannot see it.
+    /// exists for.
     #[test]
     fn world_conformance_rejects_a_renamed_import_function() {
         let renamed = SOURCE_WIT.replace(
@@ -1636,57 +1151,6 @@ world app {
         assert!(
             problems.iter().any(|p| p.contains("`accept`")),
             "{problems:?}"
-        );
-    }
-
-    /// The tree-read-only invariant: `check_bindings_drift` must never write into the
-    /// crate's `src/`. It generates into the passed scratch dir and byte-compares; a
-    /// regression pointing `--out-dir` back at `src/` (reintroducing the vanishing-file
-    /// mutation this gate was rewritten to remove) would add or modify entries under
-    /// `src/`. Robust whether or not `wit-bindgen` is on PATH: no code path writes to
-    /// `src/`, so even a wit-bindgen-absent spawn panic leaves the tree untouched.
-    #[test]
-    fn check_bindings_drift_leaves_crate_src_untouched() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let crate_dir = tmp.path().join("crate");
-        let src_dir = crate_dir.join("src");
-        let wit_dir = crate_dir.join("wit");
-        fs::create_dir_all(&src_dir).unwrap();
-        fs::create_dir_all(&wit_dir).unwrap();
-        fs::write(
-            wit_dir.join("thing.wit"),
-            "package example:thing;\nworld thing {}\n",
-        )
-        .unwrap();
-        fs::write(
-            crate_dir.join("Cargo.toml"),
-            "[package]\nname = \"thing\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-             [package.metadata.component.target]\npath = \"wit/thing.wit\"\n",
-        )
-        .unwrap();
-        // Committed bindings.rs with sentinel bytes; the gate may report drift, but src/
-        // must not be mutated regardless of the outcome.
-        let bindings = src_dir.join("bindings.rs");
-        let sentinel = b"// committed bindings sentinel\n";
-        fs::write(&bindings, sentinel).unwrap();
-
-        let before = dir_snapshot(&src_dir);
-
-        let scratch = tempfile::tempdir().expect("scratch tempdir");
-        // Tolerate a wit-bindgen-absent panic; either way, assert src/ is untouched.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            check_bindings_drift(&crate_dir, scratch.path(), 0, "0.0.0")
-        }));
-
-        let after = dir_snapshot(&src_dir);
-        assert_eq!(
-            before, after,
-            "check_bindings_drift must not add or modify entries under src/"
-        );
-        assert_eq!(
-            fs::read(&bindings).unwrap(),
-            sentinel,
-            "committed bindings.rs must be byte-identical after the check"
         );
     }
 }

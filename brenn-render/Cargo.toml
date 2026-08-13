@@ -1,0 +1,46 @@
+[package]
+name = "brenn-render"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Presentation: markdown and frontmatter rendering, artifacts and their snapshots, tool and approval formatting, system messages, conversation history"
+
+[features]
+# Expose the test-only reverse of the display-path mapping
+# (`artifact::resolve_display_path`) to downstream test targets. Not for
+# production builds.
+testutils = []
+
+# Reaches upward only as far as the shared crates every layer of the tree
+# already depends on: brenn-lib for config, conversation storage and the HTML
+# escaper, brenn-cc for the protocol content blocks, brenn-ws-types for the
+# client-facing message shapes, brenn-approval-rules for the match a formatted
+# approval card reports. No server type appears in any signature here.
+[dependencies]
+brenn-approval-rules = { version = "0.1.0", path = "../brenn-approval-rules" }
+brenn-cc = { version = "0.1.0", path = "../brenn-cc" }
+brenn-db = { version = "0.1.0", path = "../brenn-db" }
+brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
+brenn-ws-types = { version = "0.1.0", path = "../brenn-ws-types" }
+chrono = "0.4.44"
+chrono-tz = "0.10.4"
+hex = "0.4.3"
+indexmap = "2"
+percent-encoding = "2.3.2"
+pulldown-cmark = { workspace = true, features = ["html"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_yaml = "0.9"
+sha2 = "0.11.0"
+tokio = { version = "1.50.0", features = ["fs"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store" }
+tempfile = "3.27.0"
+tokio = { version = "1.50.0", features = ["macros", "rt", "rt-multi-thread"] }
+# "no-env-filter" makes `#[traced_test]` capture unconditionally; without it
+# tracing-test applies a default env filter and `logs_contain` assertions fail.
+tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
+uuid = { version = "1.23.0", features = ["v4"] }

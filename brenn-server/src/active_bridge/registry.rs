@@ -19,6 +19,12 @@ pub struct ActiveBridges {
     inner: Arc<tokio::sync::RwLock<HashMap<i64, Arc<ActiveBridge>>>>,
 }
 
+impl Default for ActiveBridges {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ActiveBridges {
     pub fn new() -> Self {
         Self {
@@ -158,11 +164,10 @@ mod tests {
     /// at the next 60-second tick.
     #[tokio::test]
     async fn registering_a_bridge_kicks_the_dispatcher() {
-        use brenn_lib::messaging::{
-            MessagingDirectory, MessagingGlobalConfig, Messenger, WakeRouter,
-        };
-        let db = brenn_lib::db::init_db_memory();
-        let router: Arc<dyn WakeRouter> = Arc::new(brenn_lib::messaging::query::NoopWakeRouter);
+        use brenn_lib::messaging::{MessagingDirectory, MessagingGlobalConfig};
+        use brenn_messaging::{Messenger, WakeRouter};
+        let db = crate::test_support::init_db_memory();
+        let router: Arc<dyn WakeRouter> = Arc::new(brenn_messaging::query::NoopWakeRouter);
         let messenger = Messenger::new(
             db.clone(),
             Arc::new(MessagingDirectory::with_entries(vec![])),
@@ -193,7 +198,7 @@ mod tests {
         // and mark each live CcSession. Verifies every session's per-session
         // `shutting_down` flag flipped so its reader task's EOF branch stays
         // quiet.
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let active_bridges = ActiveBridges::new();
 
         async fn install_session_on(bridge: &ActiveBridge) -> Arc<AtomicBool> {
@@ -210,7 +215,7 @@ mod tests {
             "test",
             db.clone(),
             tx_a,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges.clone()),
                 ..Default::default()
@@ -225,7 +230,7 @@ mod tests {
             "test",
             db.clone(),
             tx_b,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges.clone()),
                 ..Default::default()
@@ -255,7 +260,7 @@ mod tests {
     #[tokio::test]
     async fn active_bridges_keyed_by_conversation() {
         let active_bridges = ActiveBridges::new();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (tx, _) = broadcast::channel(1);
 
         let bridge1 = ActiveBridge::inject_for_test(1, 10, "alpha", db.clone(), tx.clone());
@@ -292,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn get_for_user_multiuser_returns_shared() {
         let active_bridges = ActiveBridges::new();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (tx, _) = broadcast::channel(1);
 
         // User 1 has a shared bridge, user 2 has a private bridge.
@@ -320,7 +325,7 @@ mod tests {
     #[tokio::test]
     async fn get_for_user_scoped_to_app() {
         let active_bridges = ActiveBridges::new();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (tx, _) = broadcast::channel(1);
 
         // Same user, two different apps.
@@ -350,7 +355,7 @@ mod tests {
     #[tokio::test]
     async fn get_for_app_returns_all_bridges() {
         let active_bridges = ActiveBridges::new();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (tx, _) = broadcast::channel(1);
 
         // Two users in the same app, one user in a different app.

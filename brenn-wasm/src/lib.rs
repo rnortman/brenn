@@ -327,7 +327,7 @@ impl ReplayComponent {
         let component = Component::from_file(&engine, path).unwrap_or_else(|e| {
             panic!(
                 "failed to load WASM component from {}: {e}\n\
-                 Rebuild with: make wasm-components",
+                 Rebuild the component artifacts",
                 path.display()
             )
         });
@@ -2071,7 +2071,7 @@ pub fn processor_component_imports(component_path: &Path) -> Vec<String> {
     let component = Component::from_file(&engine, component_path).unwrap_or_else(|e| {
         panic!(
             "failed to load component from {} for import listing: {e}\n\
-             Rebuild with: make wasm-components",
+             Rebuild the component artifacts",
             component_path.display()
         )
     });
@@ -2477,7 +2477,7 @@ impl ProcessorComponent {
         let component = Component::from_file(&engine, spec.component_path).unwrap_or_else(|e| {
             panic!(
                 "failed to load processor component from {}: {e}\n\
-                     Rebuild with: make wasm-components",
+                     Rebuild the component artifacts",
                 spec.component_path.display()
             )
         });

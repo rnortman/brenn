@@ -731,7 +731,7 @@ impl KernelHandle {
 }
 
 // Browser-level integration tests for the entry wiring. Run via
-// `make surface-wasm-test` under a headless WebDriver browser; the whole module
+// wasm-bindgen-test under a headless WebDriver browser; the whole module
 // is wasm32-only, so the host `cargo test` sweep never compiles them. They drive
 // `run_event_loop` directly (not `start()`) over a scripted fake connector.
 // Isolation: each test starts from `fresh_root` and uses a unique `wbt-*`

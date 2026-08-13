@@ -1051,7 +1051,7 @@ export function define_component(tag, connected) {\n\
     }
 
     // Browser-level tests for the registration path. Run via
-    // `make surface-wasm-test` under a headless WebDriver browser. Each test uses
+    // wasm-bindgen-test under a headless WebDriver browser. Each test uses
     // a unique component kind: `customElements` definitions are page-lifetime and
     // cannot be removed, so a shared kind would collide across tests.
     #[cfg(test)]

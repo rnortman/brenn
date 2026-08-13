@@ -20,7 +20,7 @@ use crate::config::{AppConfig, AppConfigRaw, load_secret_file};
 use crate::messaging::config::Depth;
 use crate::messaging::{Urgency, WakeMin};
 use crate::webhook::is_valid_key_id;
-use crate::webhook::signature::{HexFormat, SignatureAlgorithm, SignatureScheme};
+use crate::webhook::scheme::{HexFormat, SignatureAlgorithm, SignatureScheme};
 
 // ---------------------------------------------------------------------------
 // Constants

@@ -1,0 +1,22 @@
+[package]
+name = "brenn-hooks"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Lifecycle hook scripts: conversation start, post-pull, and server startup, plus the mount auto-pulls that precede them"
+
+# Reaches down to brenn-lib for the app config that declares the hooks and the
+# mounts, and to brenn-git for the pull the auto-pull path runs. Nothing above
+# is named here: the server's reaction pipeline and the bridge call in, and a
+# server edit leaves these tests cached.
+[dependencies]
+brenn-git = { version = "0.1.0", path = "../brenn-git" }
+brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+futures = "0.3.32"
+tokio = { version = "1.50.0", features = ["process", "time", "io-util", "rt", "macros"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+git-fixture = { version = "0.1.0", path = "../git-fixture" }
+tempfile = "3.27.0"
+tokio = { version = "1.50.0", features = ["full", "test-util"] }

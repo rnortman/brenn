@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use brenn_lib::ws_types::{AttachmentMeta, SelectedTask, WsServerMessage};
+use brenn_ws_types::{AttachmentMeta, SelectedTask, WsServerMessage};
 
 use super::ActiveBridge;
 
@@ -67,7 +67,7 @@ impl SendOrigin {
 /// accompanies. The caller puts that text in
 /// [`AcceptedSend::extra_blocks`].
 pub(crate) struct Interstitial {
-    pub render: crate::system_message::SystemMessageRender,
+    pub render: brenn_render::system_message::SystemMessageRender,
     /// `None` attributes the row to the conversation owner.
     pub attribute_to_user_id: Option<i64>,
 }
@@ -134,7 +134,7 @@ pub(crate) async fn accept_user_send(
             |msg_id| {
                 attachments
                     .into_iter()
-                    .map(|r| brenn_lib::conversation::StoredAttachment {
+                    .map(|r| brenn_db::conversation::StoredAttachment {
                         upload_id: r.upload_id.to_string(),
                         message_id: msg_id,
                         filename: r.filename,

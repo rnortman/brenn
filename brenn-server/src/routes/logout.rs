@@ -3,8 +3,8 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::SET_COOKIE;
 use axum::response::{IntoResponse, Response};
-use brenn_lib::auth::session::{Session, delete_session};
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_db::auth::session::{Session, delete_session};
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
 use serde::Deserialize;
 
 use crate::client_ip::ClientIp;

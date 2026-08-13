@@ -1,0 +1,33 @@
+[package]
+name = "brenn-db"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "SQLite data layer: connection handle, base schema, and the account/conversation/cost DAOs over it"
+
+[features]
+# Expose the two test-only row writers (`conversation::set_updated_at_for_test`,
+# `cost_samples::insert_at`) to downstream test targets.
+testutils = []
+
+# The bottom of the dependency graph. Nothing here reaches upward into a
+# subsystem: argon2/rand/hex for credential material, rusqlite for the store,
+# chrono for the stored timestamp format, tokio for the connection mutex, and
+# two leaf crates for the row shapes the DAOs return.
+[dependencies]
+brenn-approval-rules = { version = "0.1.0", path = "../brenn-approval-rules" }
+brenn-ws-types = { version = "0.1.0", path = "../brenn-ws-types" }
+argon2 = "0.5.3"
+chrono = { version = "0.4.44", features = ["serde"] }
+chrono-tz = "0.10.4"
+hex = "0.4.3"
+rand = "0.10.0"
+rusqlite = { version = "0.39.0", features = ["bundled", "trace"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["sync"] }
+tracing = "0.1.44"
+uuid = { version = "1.23.0", features = ["v4", "v5", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1.50.0", features = ["macros", "rt", "rt-multi-thread"] }

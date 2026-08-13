@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use brenn_lib::obs::alerting::AlertDispatcher;
+use brenn_obs::alerting::AlertDispatcher;
 
 /// Process-wide set of field names we have seen `present == true` at least once.
 ///
@@ -77,7 +77,7 @@ pub fn observe(alert_dispatcher: &AlertDispatcher, field: &'static str, present:
     // one alert fires per field per process lifetime — no separate ALERTED set
     // needed here (reuse-1).
     alert_dispatcher.alert_once_per_process(
-        brenn_lib::obs::alerting::AlertSeverity::Warning,
+        brenn_obs::alerting::AlertSeverity::Warning,
         format!("CC NDJSON schema drift: {field} disappeared"),
         field,
         format!(
@@ -133,7 +133,7 @@ pub fn observe_with_cache(
 
 #[cfg(test)]
 mod tests {
-    use brenn_lib::obs::alerting::{AlertDispatcher, CountingAlerter, RateLimiter};
+    use brenn_obs::alerting::{AlertDispatcher, CountingAlerter, RateLimiter};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 

@@ -51,10 +51,10 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     // Check for repo_sync rows to fetch the conversation's updated_at.
     let conv_updated_at_str = if ingress_events
         .iter()
-        .any(|e| brenn_lib::messaging::is_repo_sync_source(&e.source))
+        .any(|e| brenn_messaging::is_repo_sync_source(&e.source))
     {
         let conn = bridge.db.lock().await;
-        Some(brenn_lib::conversation::get_updated_at(
+        Some(brenn_db::conversation::get_updated_at(
             &conn,
             bridge.conversation_id,
         ))
@@ -83,8 +83,8 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
                     bridge.conversation_id, updated_at_str
                 )
             });
-        let staleness = brenn_lib::messaging::repo_sync_staleness_days();
-        brenn_lib::messaging::split_stale_repo_sync(
+        let staleness = brenn_messaging::repo_sync_staleness_days();
+        brenn_messaging::split_stale_repo_sync(
             ingress_events,
             conv_updated_at,
             chrono::Utc::now(),
@@ -103,12 +103,12 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     if !stale.is_empty() {
         let stale_push_ids: Vec<i64> = stale
             .iter()
-            .filter(|e| e.id != brenn_lib::messaging::SYNTHETIC_EVENT_ID)
+            .filter(|e| e.id != brenn_messaging::SYNTHETIC_EVENT_ID)
             .map(|e| e.id)
             .collect();
         if !stale_push_ids.is_empty() {
             let conn = bridge.db.lock().await;
-            brenn_lib::messaging::db::mark_pending_pushes_delivered(&conn, &stale_push_ids);
+            brenn_messaging_store::db::mark_pending_pushes_delivered(&conn, &stale_push_ids);
         }
         info!(
             conversation_id = bridge.conversation_id,
@@ -118,7 +118,7 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     }
 
     // Collapse per-slug repo_sync events into a single summary entry.
-    let collapsed = brenn_lib::messaging::collapse_repo_sync(kept);
+    let collapsed = brenn_messaging::collapse_repo_sync(kept);
 
     // Pre-render the system-message card (collapsed <details> card in chat
     // history). `render_combined_drain` is the single producer of
@@ -162,7 +162,7 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     // The positions must still move, or every wake re-serves the same batch —
     // unless the batch is held, where leaving them owed is the whole point.
     let Some(system_render) =
-        crate::system_message::render_combined_drain(&collapsed.events, to_inject)
+        brenn_render::system_message::render_combined_drain(&collapsed.events, to_inject)
     else {
         if let Some(messenger) = &bridge.messenger
             && !bus_held
@@ -180,13 +180,13 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     let ingress_push_ids_to_mark: Vec<i64> = collapsed
         .events
         .iter()
-        .filter(|e| e.id != brenn_lib::messaging::SYNTHETIC_EVENT_ID)
+        .filter(|e| e.id != brenn_messaging::SYNTHETIC_EVENT_ID)
         .map(|e| e.id)
         .chain(
             collapsed
                 .original_repo_sync_ids
                 .iter()
-                .filter(|id| **id != brenn_lib::messaging::SYNTHETIC_EVENT_ID)
+                .filter(|id| **id != brenn_messaging::SYNTHETIC_EVENT_ID)
                 .copied(),
         )
         .collect::<std::collections::HashSet<i64>>()
@@ -210,10 +210,10 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     // events stay pending — at-least-once semantics. Stale rows stay too,
     // but split_stale_repo_sync is idempotent so the next drain re-filters.
     //
-    // send_system_message now awaits a flush ack (design §2.2, D1 fix):
+    // send_system_message awaits a flush ack:
     // it returns Ok only after the message has been flushed to CC's stdin.
     // A failure (broken pipe, writer exited) leaves rows delivered_at IS NULL
-    // so the next drain will retry. This closes the D1 window where rows were
+    // so the next drain will retry. Without the flush ack, rows could be
     // marked delivered after mpsc-enqueue but before the OS-pipe flush.
     if let Err(e) = bridge.send_system_message(system_render, None).await {
         warn!(
@@ -227,7 +227,7 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     // A flush failure leaves both untouched; the batch re-serves next wake.
     if !ingress_push_ids_to_mark.is_empty() {
         let conn = bridge.db.lock().await;
-        brenn_lib::messaging::db::mark_pending_pushes_delivered(&conn, &ingress_push_ids_to_mark);
+        brenn_messaging_store::db::mark_pending_pushes_delivered(&conn, &ingress_push_ids_to_mark);
     }
     if !bus_held {
         if let Some(messenger) = &bridge.messenger {
@@ -246,7 +246,7 @@ pub(in crate::active_bridge) async fn drain_pending_events(bridge: &ActiveBridge
     if let Some(html) = messaging_card_html {
         emit_prerendered_summary(
             bridge,
-            crate::tools::messaging::MCP_MESSAGE_RECEIVED_PSEUDO_TOOL,
+            brenn_render::tools::messaging::MCP_MESSAGE_RECEIVED_PSEUDO_TOOL,
             html,
             format!("{delivered_message_count} bus message(s) delivered"),
         )
@@ -304,7 +304,7 @@ pub(crate) async fn deliver_conversation_backlog(bridge: &ActiveBridge) -> Resul
     }
     // The live path renders messages only — no event drain rides with it, and
     // (unlike the startup drain) no dual `ToolUseSummary` broadcast.
-    let mut render = crate::system_message::render_combined_drain(&[], &delivery.messages)
+    let mut render = brenn_render::system_message::render_combined_drain(&[], &delivery.messages)
         .expect("non-empty messages: render_combined_drain must produce a render");
     render.messaging_card_html = None;
     bridge.send_system_message(render, None).await?;

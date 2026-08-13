@@ -555,7 +555,7 @@ fn toast_source_str(source: ToastSource) -> &'static str {
 }
 
 /// Browser tests for the DOM glue, run under wasm-bindgen-test via
-/// `make surface-wasm-test`. wasm32-only, matching the glue itself.
+/// the browser test runner. wasm32-only, matching the glue itself.
 ///
 /// The decision core is host-tested next door in `logic.rs`; what only a browser
 /// can answer is the wiring between them — that a delivered toast reaches the

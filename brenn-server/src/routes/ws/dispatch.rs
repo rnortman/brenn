@@ -1,10 +1,10 @@
 //! `handle_client_message` — the `match msg` dispatch on `WsClientMessage`.
 
-use brenn_lib::obs::security::{
+use brenn_obs::security::{
     SecurityEventType, log_and_alert_security_event, log_and_alert_ssrf_attempt,
 };
-use brenn_lib::usage::EventType;
-use brenn_lib::ws_types::{PushClickTraceEvent, WsClientMessage, WsServerMessage};
+use brenn_usage_db::EventType;
+use brenn_ws_types::{PushClickTraceEvent, WsClientMessage, WsServerMessage};
 use tracing::{debug, error, info, warn};
 
 use super::connection::{QueuedResponse, WsConnection};
@@ -330,7 +330,7 @@ pub(super) async fn handle_client_message(
             screen_height,
         } => {
             let conn_db = conn.state.db.lock().await;
-            brenn_lib::auth::device::update_device_info(
+            brenn_db::auth::device::update_device_info(
                 &conn_db,
                 conn.device_id,
                 &user_agent,
@@ -478,20 +478,20 @@ pub(super) async fn handle_client_message(
             // Key-format rejections (p256dh/auth) continue as MalformedMessage at Warning.
             // validate_push_subscribe_fields returns a ValidatedEndpoint wrapping
             // the url::Url-normalized URL; pass that directly to upsert_subscription.
-            let normalized_endpoint = match brenn_lib::pwa_push::db::validate_push_subscribe_fields(
+            let normalized_endpoint = match brenn_pwa_push::db::validate_push_subscribe_fields(
                 &endpoint,
                 &p256dh,
                 &auth,
                 pwa_push.endpoint_policy(),
             ) {
                 Ok(normalized) => normalized,
-                Err(brenn_lib::pwa_push::db::SubscribeValidationError::Endpoint(ref reason)) => {
+                Err(brenn_pwa_push::db::SubscribeValidationError::Endpoint(ref reason)) => {
                     // Extract host prefix for triage: parse the raw endpoint to get the host;
                     // fall back to an endpoint prefix if parse fails.
                     let host_hint = url::Url::parse(&endpoint)
                         .ok()
                         .and_then(|u| u.host_str().map(|h| h.chars().take(32).collect::<String>()))
-                        .unwrap_or_else(|| brenn_lib::pwa_push::endpoint_preview(&endpoint));
+                        .unwrap_or_else(|| brenn_pwa_push::endpoint_preview(&endpoint));
                     let detail = format!(
                         "PushSubscribe endpoint reject: reason={} host_hint={} user_id={} device_id={}",
                         reason.code(),
@@ -517,7 +517,7 @@ pub(super) async fn handle_client_message(
             };
             // Upsert the subscription row using the normalized endpoint.
             let db = conn.state.db.lock().await;
-            brenn_lib::pwa_push::db::upsert_subscription(
+            brenn_pwa_push::db::upsert_subscription(
                 &db,
                 conn.device_id,
                 conn.user_id,
@@ -549,7 +549,7 @@ pub(super) async fn handle_client_message(
                 return;
             }
             let db = conn.state.db.lock().await;
-            brenn_lib::pwa_push::db::delete_subscription(&db, conn.device_id, conn.user_id);
+            brenn_pwa_push::db::delete_subscription(&db, conn.device_id, conn.user_id);
             drop(db);
             let _ = conn.send_ws(WsServerMessage::PushEnabled { enabled: false });
             debug!(
@@ -573,10 +573,10 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering as AtomicOrdering;
 
-    use brenn_lib::auth::user::create_user;
-    use brenn_lib::conversation;
-    use brenn_lib::db::init_db_memory;
-    use brenn_lib::ws_types::{
+    use crate::test_support::init_db_memory;
+    use brenn_db::auth::user::create_user;
+    use brenn_db::conversation;
+    use brenn_ws_types::{
         DebugViewportSnapshotData, ViewportClass, WsClientMessage, WsServerMessage,
     };
     use tokio::sync::{broadcast, mpsc};
@@ -829,7 +829,7 @@ mod tests {
 
         {
             let db_conn = db.lock().await;
-            brenn_lib::auth::device::update_device_info(
+            brenn_db::auth::device::update_device_info(
                 &db_conn,
                 conn.device_id,
                 "Mozilla/5.0 (X11; Linux x86_64) Chrome/125",
@@ -841,7 +841,7 @@ mod tests {
 
         let row = {
             let db_conn = db.lock().await;
-            brenn_lib::auth::device::load_device(&db_conn, conn.device_id)
+            brenn_db::auth::device::load_device(&db_conn, conn.device_id)
         };
         assert_eq!(
             row.user_agent.as_deref(),
@@ -860,7 +860,7 @@ mod tests {
         // Store a valid value first.
         {
             let db_conn = db.lock().await;
-            brenn_lib::auth::device::update_device_info(
+            brenn_db::auth::device::update_device_info(
                 &db_conn,
                 conn.device_id,
                 "ua",
@@ -873,7 +873,7 @@ mod tests {
         // Now send an absurd width — previously stored value should be retained.
         {
             let db_conn = db.lock().await;
-            brenn_lib::auth::device::update_device_info(
+            brenn_db::auth::device::update_device_info(
                 &db_conn,
                 conn.device_id,
                 "ua",
@@ -885,7 +885,7 @@ mod tests {
 
         let row = {
             let db_conn = db.lock().await;
-            brenn_lib::auth::device::load_device(&db_conn, conn.device_id)
+            brenn_db::auth::device::load_device(&db_conn, conn.device_id)
         };
         assert_eq!(
             row.screen_width,
@@ -960,7 +960,7 @@ mod tests {
         // Subscription row must exist.
         let exists = {
             let db_conn = db.lock().await;
-            brenn_lib::pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
+            brenn_pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
         };
         assert!(
             exists,
@@ -994,7 +994,7 @@ mod tests {
         // No subscription row should be created.
         let exists = {
             let db_conn = db.lock().await;
-            brenn_lib::pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
+            brenn_pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
         };
         assert!(
             !exists,
@@ -1025,7 +1025,7 @@ mod tests {
 
         let exists = {
             let db_conn = db.lock().await;
-            brenn_lib::pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
+            brenn_pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
         };
         assert!(!exists, "no subscription row on bad auth length");
         assert!(ws_rx.try_recv().is_err(), "no WS message on bad auth");
@@ -1045,7 +1045,7 @@ mod tests {
 
         let exists = {
             let db_conn = db.lock().await;
-            brenn_lib::pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
+            brenn_pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
         };
         assert!(!exists, "no subscription from non-gated app");
         assert!(
@@ -1073,7 +1073,7 @@ mod tests {
         // No subscription row must be created.
         let exists = {
             let db_conn = db.lock().await;
-            brenn_lib::pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
+            brenn_pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
         };
         assert!(
             !exists,
@@ -1095,11 +1095,11 @@ mod tests {
         // Insert a subscription first.
         {
             let db_conn = db.lock().await;
-            brenn_lib::pwa_push::db::upsert_subscription(
+            brenn_pwa_push::db::upsert_subscription(
                 &db_conn,
                 conn.device_id,
                 conn.user_id,
-                &brenn_lib::pwa_push::endpoint_validator::ValidatedEndpoint::for_testing(
+                &brenn_pwa_push::endpoint_validator::ValidatedEndpoint::for_testing(
                     "https://push.example.com/sub",
                 ),
                 &fake_p256dh(),
@@ -1111,7 +1111,7 @@ mod tests {
 
         let exists = {
             let db_conn = db.lock().await;
-            brenn_lib::pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
+            brenn_pwa_push::db::subscription_exists(&db_conn, conn.device_id, conn.user_id)
         };
         assert!(
             !exists,
@@ -1190,9 +1190,9 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
         tokio::task::JoinHandle<()>,
     ) {
-        use brenn_lib::obs::alerting::make_capturing_alerter;
+        use brenn_obs::alerting::make_capturing_alerter;
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (alert_dispatcher, captured, alert_handle) = make_capturing_alerter();
         let mut state = AppState::for_test(db.clone(), None);
         state.alert_dispatcher = alert_dispatcher;
@@ -1202,11 +1202,10 @@ mod tests {
 
         let (user_id, device_id, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "drifttest", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "drifttest", "$argon2id$fake");
             let did = create_test_device(&conn, uid);
-            let cid =
-                brenn_lib::conversation::create_conversation(&conn, uid, TEST_APP_SLUG, false);
-            brenn_lib::conversation::complete_conversation(&conn, cid, None);
+            let cid = brenn_db::conversation::create_conversation(&conn, uid, TEST_APP_SLUG, false);
+            brenn_db::conversation::complete_conversation(&conn, cid, None);
             (uid, did, cid)
         };
         let test_bridge = crate::active_bridge::ActiveBridge::inject_for_test(
@@ -1549,7 +1548,7 @@ mod tests {
             matches!(
                 msg,
                 WsServerMessage::SetLayout {
-                    layout: brenn_lib::ws_types::PaneLayout::SinglePane
+                    layout: brenn_ws_types::PaneLayout::SinglePane
                 }
             ),
             "expected SetLayout(SinglePane), got {msg:?}"

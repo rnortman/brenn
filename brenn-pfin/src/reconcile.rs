@@ -6,7 +6,7 @@
 
 use brenn_lib::app::{AppTool, wrap_in_tool_approve};
 use brenn_lib::util::html_escape;
-use brenn_lib::ws_types::ToolResponseDecision;
+use brenn_ws_types::ToolResponseDecision;
 use serde_json::Value;
 use tracing::warn;
 

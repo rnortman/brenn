@@ -1,0 +1,53 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//brenn-budget",
+    "//brenn-common",
+    "//brenn-db",
+    "//brenn-envelope",
+    "//brenn-lib",
+    "//brenn-messaging-store",
+    "//brenn-obs",
+    "//brenn-queue",
+    "//surface/schema",
+]
+
+# `testutils` gates the `Messenger` fixture builders downstream test targets
+# link against; the release configs clear the flag, keeping the shipped binary
+# free of test scaffolding.
+rust_library(
+    name = "brenn-messaging",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# `medium` (300s) rather than `small` (60s): 469 tests over in-memory sqlite
+# plus the `tokio::time` dispatch and deferral suites, 7.6s locally. Against the
+# repo's one measured local→CD factor (~21x, brenn-server 22s/472s) that is
+# ~160s on a cold 4-vCPU runner, over the small budget and inside this one.
+# Timeout honesty, not speed: `size` reserves the same one CPU at every tier.
+rust_test(
+    name = "brenn-messaging_test",
+    size = "medium",
+    crate = ":brenn-messaging",
+    crate_features = ["testutils"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS,
+)
+
+rust_doc_test(
+    name = "brenn-messaging_doc_test",
+    crate = ":brenn-messaging",
+)

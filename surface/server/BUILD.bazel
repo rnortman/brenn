@@ -1,0 +1,69 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/platforms:defs.bzl", "HOST_ONLY")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//attach/server",
+    "//brenn-budget",
+    "//brenn-db",
+    "//brenn-envelope",
+    "//brenn-lib",
+    "//brenn-messaging",
+    "//brenn-messaging-store",
+    "//surface/contract",
+    "//surface/schema",
+]
+
+# `testutils` exposes the surface fixtures the crates above build their boot and
+# route rigs on; the release configs clear the flag, so no test scaffolding
+# reaches the shipped binary.
+rust_library(
+    name = "server",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    crate_name = "brenn_surface_server",
+    edition = "2024",
+    # Server-side, unlike its `surface/` siblings: this half of the surface runs
+    # in the backend and reaches the bus, so it never crosses the wasm32
+    # transition the page's crates do.
+    target_compatible_with = HOST_ONLY,
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# 123 tests over boot-time resolution: pure config lowering plus a handful of
+# asset-tree fixtures under tempfile, with no socket bound and no process
+# spawned. The binary finishes in 1.50s locally, 1.54s at `--test-threads=1`
+# (the suite barely parallelizes because it barely blocks); at the repo's one
+# measured local-to-CD-runner factor (~21x) that is ~32s, inside `small` (60s).
+rust_test(
+    name = "server_test",
+    size = "small",
+    crate = ":server",
+    crate_features = ["testutils"],
+    # One asset-validation test reads the shipped store-rt component to pin its
+    # own premise — that the artifact really does import `brenn:processor/store`.
+    # Tests reach guest components at `brenn-wasm/target/components/`, relative
+    # to the runfiles root. TODO(bazel-fixture-list-guard): this one-entry list
+    # is hand-held against the source, like the other fifteen.
+    data = ["//brenn-wasm:fixture_processor_store_rt"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    target_compatible_with = HOST_ONLY,
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS + [
+        "//brenn-wasm",
+    ],
+)
+
+rust_doc_test(
+    name = "server_doc_test",
+    crate = ":server",
+    target_compatible_with = HOST_ONLY,
+)

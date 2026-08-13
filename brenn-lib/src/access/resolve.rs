@@ -1,12 +1,12 @@
 //! Resolution: build a resolved `AppPolicy` from an LLM app's operator-authored
-//! explicit `grants` + `[app.acl.*]` config (access-control design §2.5.2/§2.5.3).
+//! explicit `grants` + `[app.acl.*]` config.
 //!
 //! This is the **explicit-config build**: the policy is constructed *solely* from
-//! the operator's `grants`/`acl` (resolved OQ2 — no legacy-signal projection from
-//! other resolved fields). Operator-authored config is validated fail-fast: a
+//! the operator's `grants`/`acl` — no legacy-signal projection from
+//! other resolved fields. Operator-authored config is validated fail-fast: a
 //! duplicate grant, an invalid client slug, or a malformed topic filter **panics**
 //! (CLAUDE.md robustness), mirroring WASM grant resolution
-//! (`bootstrap/messaging.rs`).
+//! (`brenn-messaging-boot`).
 //!
 //! Backend-only, like the rest of `access`.
 
@@ -232,12 +232,11 @@ pub fn build_app_policy(
 ///
 /// The resolved policy backs **delivery-time ACL enforcement** over `Wasm(slug)`
 /// subscribers: it is threaded into the `Messenger` (`wasm_policies`) and consulted
-/// via `Messenger::subscriber_policy` at delivery (dynamic-sub-persistence design
-/// §2.2). The broader WASM enforcement surface (linker-seam capabilities, etc.)
-/// remains Phase 3 and is unaffected; only the delivery-time ACL gate consumes this
-/// policy today (design §2.5.4).
+/// via `Messenger::subscriber_policy` at delivery. The broader WASM enforcement
+/// surface (linker-seam capabilities, etc.) remains Phase 3 and is unaffected;
+/// only the delivery-time ACL gate consumes this policy today.
 ///
-/// The production caller (`resolve_wasm_consumers`, `bootstrap/messaging.rs`)
+/// The production caller (`brenn_messaging_boot::resolve_wasm_consumers`)
 /// iterates an already-deduplicated `BTreeSet<WasmGrant>`, so a duplicate grant
 /// cannot reach this function via the in-tree path. The duplicate check below is
 /// nonetheless asserted (not silently absorbed) because this is a `pub`

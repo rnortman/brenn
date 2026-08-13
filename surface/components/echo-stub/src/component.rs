@@ -231,7 +231,7 @@ fn update_status(status: &HtmlElement, state: &EchoState) {
     )));
 }
 
-// No host-testable half — this is a DOM fixture. Run via `make surface-wasm-test`.
+// No host-testable half — this is a DOM fixture, exercised in a real browser.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
     use super::*;

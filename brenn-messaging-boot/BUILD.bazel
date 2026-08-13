@@ -1,0 +1,57 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//brenn-budget",
+    "//brenn-db",
+    "//brenn-envelope",
+    "//brenn-lib",
+    "//brenn-messaging",
+    "//brenn-messaging-store",
+    "//brenn-obs",
+    "//brenn-server",
+    "//brenn-tool-registry",
+    "//surface/contract",
+    "//surface/schema",
+    "//surface/server",
+]
+
+# `testutils` exposes the boot fixtures the composition root's suites build on;
+# the release configs clear the flag, so no test scaffolding reaches the
+# shipped binary.
+rust_library(
+    name = "brenn-messaging-boot",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# 339 tests over boot-time lowering: config to channel entries, auto wiring,
+# surface and consumer resolution, several booting a messaging layer over an
+# in-memory database. The binary finishes in 0.39s locally and 0.32s at
+# `--test-threads=1` (nothing here blocks, so threads buy nothing); at the
+# repo's one measured local-to-CD-runner factor (~21x) that is ~8s, well inside
+# `small` (60s).
+rust_test(
+    name = "brenn-messaging-boot_test",
+    size = "small",
+    crate = ":brenn-messaging-boot",
+    crate_features = ["testutils"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS,
+)
+
+rust_doc_test(
+    name = "brenn-messaging-boot_doc_test",
+    crate = ":brenn-messaging-boot",
+)

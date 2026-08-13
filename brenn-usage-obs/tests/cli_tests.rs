@@ -5,23 +5,21 @@
 
 use std::io::BufWriter;
 
-use brenn_lib::usage::{
-    EventType, close_open_sessions_on_startup, record_llm_turn, record_ui_event, record_ws_connect,
-};
-use brenn_lib::usage_export::{write_events_json, write_sessions_csv};
-use brenn_lib::{
-    db::init_db_memory,
-    usage::{EventsFilter, SessionsFilter, query_events, query_sessions},
+use brenn_lib::db::init_db_memory;
+use brenn_usage_db::export::{write_events_json, write_sessions_csv};
+use brenn_usage_db::{
+    EventType, EventsFilter, SessionsFilter, close_open_sessions_on_startup, query_events,
+    query_sessions, record_llm_turn, record_ui_event, record_ws_connect,
 };
 use tempfile::NamedTempFile;
 
 /// Seed a fresh in-memory DB with user+device rows and return
 /// `(conn, user_id, device_id, conv_id)`.
-async fn seed_db() -> (brenn_lib::db::Db, i64, i64, i64) {
+async fn seed_db() -> (brenn_db::Db, i64, i64, i64) {
     let db = init_db_memory();
     let (uid, did, cid) = {
         let conn = db.lock().await;
-        let uid = brenn_lib::auth::user::create_user(&conn, "alice", "$argon2id$fake");
+        let uid = brenn_db::auth::user::create_user(&conn, "alice", "$argon2id$fake");
         conn.execute(
             "INSERT INTO devices (token, guessed_slug, user_agent, last_seen_at, created_at)
              VALUES ('aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899',
@@ -36,7 +34,7 @@ async fn seed_db() -> (brenn_lib::db::Db, i64, i64, i64) {
             rusqlite::params![did, uid],
         )
         .unwrap();
-        let cid = brenn_lib::conversation::create_conversation(&conn, uid, "test-app", false);
+        let cid = brenn_db::conversation::create_conversation(&conn, uid, "test-app", false);
         (uid, did, cid)
     };
     (db, uid, did, cid)

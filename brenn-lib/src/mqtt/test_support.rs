@@ -1,8 +1,8 @@
-//! Shared test fixtures for the mqtt module tree.
+//! Shared test fixtures for the mqtt config types.
 //!
-//! `#[cfg(test)]` items are invisible cross-crate, so this helper serves only
-//! brenn-lib's own unit tests (the binary crate and the integration tests have
-//! their own equivalents).
+//! Behind `testutils` rather than `#[cfg(test)]`: `brenn-mqtt`'s tests build
+//! sessions from the same resolved client config, and a `#[cfg(test)]` item is
+//! invisible cross-crate. The release configs clear the feature.
 
 use crate::messaging::Urgency;
 use crate::mqtt::config::{MqttClientConfig, TlsVersionMin};
@@ -11,13 +11,12 @@ use crate::mqtt::config::{MqttClientConfig, TlsVersionMin};
 /// read in a given test are filled with defaults; callers mutate fields before
 /// `Arc::new` when a test needs a variation.
 ///
-/// `port` is the unroutable `1` (matching the brenn-crate twin): should a future
-/// brenn-lib unit test ever build a handle from this fixture and spawn a
-/// supervisor, it gets an immediate connection-refused instead of silently
-/// dialing a real mosquitto on the dev machine's default 1883. Integration tests
-/// that need a live broker use their own fixture (`tests/common/mod.rs`), which
-/// takes an explicit port.
-pub(crate) fn test_client_config(slug: &str) -> MqttClientConfig {
+/// `port` is the unroutable `1` (matching the brenn-server twin): a test that
+/// builds a handle from this fixture and spawns a supervisor gets an immediate
+/// connection-refused instead of silently dialing a real mosquitto on the dev
+/// machine's default 1883. Integration tests that need a live broker use their
+/// own fixture (`brenn-mqtt/tests/common/mod.rs`), which takes an explicit port.
+pub fn test_client_config(slug: &str) -> MqttClientConfig {
     MqttClientConfig {
         slug: slug.to_string(),
         host: "127.0.0.1".to_string(),

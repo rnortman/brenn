@@ -17,7 +17,7 @@
 //! What this suite is *not*: a second copy of the auth ladder or the capacity
 //! gate, which are the HTTP edge's and live in `ws_tests`; nor of the frame
 //! semantics, which are the shared session's and live beside it in
-//! `routes::attach`.
+//! `brenn-attach-server`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,10 +29,10 @@ use brenn_attach_conformance::{
 };
 use brenn_attach_proto::{AlertSeverity, PublishOutcome, SUPPORTED_VERSIONS, Urgency};
 use brenn_envelope::chat::{ChatRoster, decode as chat_decode};
-use brenn_lib::db;
 use brenn_lib::messaging::config::Depth;
-use brenn_lib::messaging::testutils::{ephemeral_channel_entry, test_channel_entry};
-use brenn_lib::messaging::{ChannelEntry, PublishResult, SubscriberEntry, SubscriberEntryKind};
+use brenn_lib::messaging::{ChannelEntry, SubscriberEntry, SubscriberEntryKind};
+use brenn_messaging::PublishResult;
+use brenn_messaging::testutils::{ephemeral_channel_entry, test_channel_entry};
 
 use super::test_fixtures::{
     APP, OWNER, RemoteTestHarness, SLUG, TOKEN, remote_harness_with_channels,
@@ -124,7 +124,7 @@ struct Rig {
     _server: TestServer,
 }
 
-async fn build_rig(db: &db::Db, body: &str, channels: Vec<ChannelEntry>) -> Rig {
+async fn build_rig(db: &brenn_db::Db, body: &str, channels: Vec<ChannelEntry>) -> Rig {
     let harness = remote_harness_with_channels(db, body, channels).await;
     let (base, server) = spawn_test_server(harness.state.clone()).await;
     let relay = SeverableRelay::spawn(http_base_addr(&base)).await;
@@ -181,10 +181,10 @@ fn remote_entry(rig: &Rig, channel: &str) -> Option<SubscriberEntry> {
 
 /// Provision `entry` under a live attachment, the way a conversation's creation
 /// does: the database row and the directory, in that order.
-async fn provision(rig: &Rig, db: &db::Db, entry: ChannelEntry) {
+async fn provision(rig: &Rig, db: &brenn_db::Db, entry: ChannelEntry) {
     {
         let conn = db.lock().await;
-        brenn_lib::messaging::db::upsert_channels(&conn, std::slice::from_ref(&entry));
+        brenn_messaging_store::db::upsert_channels(&conn, std::slice::from_ref(&entry));
     }
     rig.harness.directory.add_channel(entry);
 }
@@ -213,7 +213,7 @@ async fn expect_one_violation(rig: &Rig, context: &str) {
 /// peer replays nothing already seen.
 #[tokio::test]
 async fn a_daemon_attaches_subscribes_publishes_and_resumes_across_a_severed_socket() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
 
     let facts = rig.client.attach().await;
@@ -282,11 +282,11 @@ async fn a_daemon_attaches_subscribes_publishes_and_resumes_across_a_severed_soc
 /// The app's owner, created on first ask: the app is a singleton with one
 /// allowed user, so every conversation of `home` hangs off this row and a test
 /// seeding a second one must not try to create the user twice.
-async fn owner(db: &db::Db) -> i64 {
+async fn owner(db: &brenn_db::Db) -> i64 {
     let conn = db.lock().await;
-    match brenn_lib::auth::user::get_user_by_username(&conn, OWNER) {
+    match brenn_db::auth::user::get_user_by_username(&conn, OWNER) {
         Some(user) => user.id,
-        None => brenn_lib::auth::user::create_user(&conn, OWNER, "$argon2id$fake"),
+        None => brenn_db::auth::user::create_user(&conn, OWNER, "$argon2id$fake"),
     }
 }
 
@@ -296,10 +296,10 @@ async fn owner(db: &db::Db) -> i64 {
 /// and provisioning the conversation's chat family would only add channels no
 /// assertion here reads. The case that does exercise provisioning goes through
 /// the messenger's own minting path instead.
-async fn seed_conversation(db: &db::Db) -> i64 {
+async fn seed_conversation(db: &brenn_db::Db) -> i64 {
     let user = owner(db).await;
     let conn = db.lock().await;
-    brenn_lib::conversation::create_conversation(&conn, user, APP, false)
+    brenn_db::conversation::create_conversation(&conn, user, APP, false)
 }
 
 /// The app's roster snapshot as the server authors it, published through the
@@ -351,7 +351,7 @@ async fn expect_roster_delivery(client: &mut AttachClient) -> Delivery {
 /// exact-channel addresses it may subscribe to.
 #[tokio::test]
 async fn a_retained_roster_snapshot_replays_to_a_freshly_attached_remote() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
     let conversation = seed_conversation(&db).await;
     publish_roster(&rig).await;
@@ -390,7 +390,7 @@ async fn a_retained_roster_snapshot_replays_to_a_freshly_attached_remote() {
 /// conversation until it reattached.
 #[tokio::test]
 async fn a_roster_republish_reaches_a_subscribed_remote() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
     rig.client.attach().await;
 
@@ -441,7 +441,7 @@ async fn a_roster_republish_reaches_a_subscribed_remote() {
 /// the pod learns of no conversation it did not already know.
 #[tokio::test]
 async fn a_conversation_the_attach_mints_reaches_a_subscribed_remote() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
     let messenger = Arc::clone(
         rig.harness
@@ -466,7 +466,7 @@ async fn a_conversation_the_attach_mints_reaches_a_subscribed_remote() {
         .await;
     let conversation = {
         let conn = db.lock().await;
-        brenn_lib::conversation::get_singleton_conversation_id(&conn, user, APP)
+        brenn_db::conversation::get_singleton_conversation_id(&conn, user, APP)
             .expect("the attach mints the app's conversation")
     };
 
@@ -492,7 +492,7 @@ async fn a_conversation_the_attach_mints_reaches_a_subscribed_remote() {
 /// distinction as an address prefix and no more.
 #[tokio::test]
 async fn a_durable_leaf_and_an_ephemeral_stream_deliver_alike() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
     rig.client.attach().await;
 
@@ -529,7 +529,7 @@ async fn a_durable_leaf_and_an_ephemeral_stream_deliver_alike() {
 /// client stated — and clamped to what the channel actually stands to retain.
 #[tokio::test]
 async fn the_first_subscribe_mints_the_directory_entry_at_the_clamped_profile_ceiling() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
     rig.client.attach().await;
 
@@ -583,7 +583,7 @@ async fn the_first_subscribe_mints_the_directory_entry_at_the_clamped_profile_ce
 /// reconciles from — non-fatal, opening nothing, and not fail2ban signal.
 #[tokio::test]
 async fn a_granted_channel_the_directory_lacks_is_unavailable_until_it_is_provisioned() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
     rig.client.attach().await;
 
@@ -646,7 +646,7 @@ async fn subscribing_outside_the_grants_closes_the_attachment() {
             "ephemeral:chat.app.home.out.7",
         ),
     ] {
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
         rig.client.attach().await;
 
@@ -668,7 +668,7 @@ async fn subscribing_outside_the_grants_closes_the_attachment() {
 /// a cap, which the profile answers and the plane enforces as a violation.
 #[tokio::test]
 async fn subscribing_beyond_the_configured_cap_closes_the_attachment() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let body = format!("{LOOPBACK}max_subscriptions = 2\n");
     let mut rig = build_rig(&db, &body, fleet_channels()).await;
     rig.client.attach().await;
@@ -694,7 +694,7 @@ async fn subscribing_beyond_the_configured_cap_closes_the_attachment() {
 /// and refused as a violation rather than an outcome.
 #[tokio::test]
 async fn publishing_under_a_named_attribution_closes_the_attachment() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
     rig.client.attach().await;
 
@@ -718,7 +718,7 @@ async fn publishing_under_a_named_attribution_closes_the_attachment() {
 /// keeps publishing elsewhere.
 #[tokio::test]
 async fn publishing_into_a_deprovisioned_channel_is_a_failed_outcome() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
     rig.client.attach().await;
     rig.client
@@ -758,7 +758,7 @@ async fn publishing_into_a_deprovisioned_channel_is_a_failed_outcome() {
 /// report on does not.
 #[tokio::test]
 async fn a_granted_alert_reaches_the_dispatcher_attributed_to_the_remote() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let mut rig = build_rig(&db, LOOPBACK, fleet_channels()).await;
     rig.client.attach().await;
 
@@ -796,7 +796,7 @@ async fn a_granted_alert_reaches_the_dispatcher_attributed_to_the_remote() {
 /// conforming client's bug and the peer treats it as one.
 #[tokio::test]
 async fn alerting_without_the_grant_closes_the_attachment() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let body = LOOPBACK.replace(", \"alert\"", "");
     let mut rig = build_rig(&db, &body, fleet_channels()).await;
 

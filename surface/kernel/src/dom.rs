@@ -1195,7 +1195,7 @@ pub fn install_status_timer(interval_secs: u32, callback: impl Fn() + 'static) {
 }
 
 // Browser-level tests for the DOM effect executor. Run via
-// `make surface-wasm-test` under a headless WebDriver browser; excluded from the
+// wasm-bindgen-test under a headless WebDriver browser; excluded from the
 // host sweep (the whole module is wasm32-only). Isolation: every test that
 // touches `#surface-root` starts from `fresh_root`, and every test that touches
 // `MOUNTED`/`customElements` uses a unique `wbt-*` kind (both are page-lifetime).

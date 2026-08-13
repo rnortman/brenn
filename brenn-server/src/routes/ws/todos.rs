@@ -2,8 +2,8 @@
 //! `handle_todo_refresh`, `handle_todo_done`, `inject_todo_error`,
 //! `handle_todo_schedule`, `handle_todo_reorder`.
 
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
-use brenn_lib::ws_types::WsServerMessage;
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_ws_types::WsServerMessage;
 use tracing::warn;
 
 use super::connection::WsConnection;
@@ -241,8 +241,10 @@ impl WsConnection {
             error_message,
             brenn_lib::util::GRAF_ERROR_MAX_BYTES,
         );
-        let rendered =
-            crate::system_message::render_graf_query_error(&capped, Some(&device_slug_owned));
+        let rendered = brenn_render::system_message::render_graf_query_error(
+            &capped,
+            Some(&device_slug_owned),
+        );
         if let Err(inject_err) = bridge.send_system_message(rendered, None).await {
             warn!(error = %inject_err, "graf query error inject failed");
         }
@@ -253,7 +255,7 @@ impl WsConnection {
     /// on every refresh when graf reports the same persistent lint errors.
     ///
     /// No active bridge means no CC to inject into — skip silently.
-    async fn maybe_inject_lint_errors(&self, lint_errors: &[brenn_lib::ws_types::TodoLintError]) {
+    async fn maybe_inject_lint_errors(&self, lint_errors: &[brenn_ws_types::TodoLintError]) {
         let Some(conv_id) = self.current_conversation_id else {
             return;
         };
@@ -277,7 +279,7 @@ impl WsConnection {
 
         // Format must remain after the dedup check — O(N) String build that is a
         // no-op on the fast (unchanged) path.
-        let text = crate::system_message::format_lint_errors_for_cc(lint_errors);
+        let text = brenn_render::system_message::format_lint_errors_for_cc(lint_errors);
 
         match bridge.send_cc_only_system_text(&text).await {
             Ok(()) => {
@@ -325,7 +327,7 @@ impl WsConnection {
         // that assumption ever breaks rather than emit hand-rolled JSON.
         let payload_json = serde_json::to_string(payload)
             .expect("serde_json::to_string on owned Value is infallible");
-        let rendered = crate::system_message::render_ui_error(
+        let rendered = brenn_render::system_message::render_ui_error(
             tool_name,
             path,
             extra_args,
@@ -426,7 +428,7 @@ impl WsConnection {
 
 #[cfg(test)]
 mod tests {
-    use brenn_lib::ws_types::{TodoLintError, WsServerMessage};
+    use brenn_ws_types::{TodoLintError, WsServerMessage};
 
     use super::super::testing::{
         self as testing, test_apps_with_failing_graf, test_ws_conn_with_active_bridge,

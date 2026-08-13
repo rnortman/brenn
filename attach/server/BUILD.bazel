@@ -1,0 +1,55 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//attach/proto",
+    "//brenn-budget",
+    "//brenn-common",
+    "//brenn-envelope",
+    "//brenn-lib",
+    "//brenn-messaging",
+    "//brenn-messaging-store",
+    "//brenn-obs",
+]
+
+# `testutils` exposes the session-handle and cap constructors the crates above
+# build their attachment fixtures on; the release configs clear the flag, so no
+# test scaffolding reaches the shipped binary.
+rust_library(
+    name = "server",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    crate_name = "brenn_attach_server",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# 143 tests: the four transport suites drive the session's planes in-process
+# over an in-memory sqlite under tokio's test runtime, with no socket bound and
+# no process spawned. The binary finishes in 0.64s locally; at the repo's one
+# measured local-to-CD-runner factor (~21x) that is ~14s, well inside `small`
+# (60s).
+rust_test(
+    name = "server_test",
+    size = "small",
+    crate = ":server",
+    crate_features = ["testutils"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS + [
+        "//brenn-db",
+    ],
+)
+
+rust_doc_test(
+    name = "server_doc_test",
+    crate = ":server",
+)

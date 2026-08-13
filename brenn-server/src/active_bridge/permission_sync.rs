@@ -2,10 +2,10 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
+use brenn_approval_rules::{ApprovalMatch, CompiledRule};
 use brenn_cc::session::ApprovalDecision as CcApprovalDecision;
-use brenn_lib::approval_rules::{ApprovalMatch, CompiledRule};
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
-use brenn_lib::ws_types::{CcState, PermissionDecision, RuleScope, WsServerMessage};
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_ws_types::{CcState, PermissionDecision, RuleScope, WsServerMessage};
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
@@ -252,7 +252,7 @@ impl ActiveBridge {
         };
         {
             let conn = self.db.lock().await;
-            brenn_lib::db::insert_approval_rule(
+            brenn_db::insert_approval_rule(
                 &conn,
                 &self.app_slug,
                 conversation_id,
@@ -502,7 +502,7 @@ mod tests {
         let snapshots = bridge.pending_permission_snapshots().await;
         assert_eq!(snapshots.len(), 1);
         let snap = &snapshots[0];
-        let replayed = crate::approval_formatter::format_tool_display(
+        let replayed = brenn_render::approval_formatter::format_tool_display(
             &bridge.tool_registry,
             &snap.tool_name,
             &snap.display_input,
@@ -537,7 +537,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -574,7 +574,7 @@ mod tests {
         let snapshots = bridge.pending_permission_snapshots().await;
         assert_eq!(snapshots.len(), 1);
         let snap = &snapshots[0];
-        let replayed = crate::approval_formatter::format_tool_display(
+        let replayed = brenn_render::approval_formatter::format_tool_display(
             &bridge.tool_registry,
             &snap.tool_name,
             &snap.display_input,
@@ -938,7 +938,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -1280,7 +1280,7 @@ mod tests {
         // Verify the rule was persisted to DB.
         let rules = {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::load_approval_rules(&conn, "test", bridge.conversation_id)
+            brenn_db::load_approval_rules(&conn, "test", bridge.conversation_id)
         };
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].tool_name, "Bash");
@@ -1326,7 +1326,7 @@ mod tests {
 
         let rules = {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::load_approval_rules(&conn, "test", bridge.conversation_id)
+            brenn_db::load_approval_rules(&conn, "test", bridge.conversation_id)
         };
         assert_eq!(rules.len(), 1);
         assert_eq!(
@@ -1378,7 +1378,7 @@ mod tests {
         // Rule should still have been created.
         let rules = {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::load_approval_rules(&conn, "test", bridge.conversation_id)
+            brenn_db::load_approval_rules(&conn, "test", bridge.conversation_id)
         };
         assert_eq!(
             rules.len(),
@@ -1449,7 +1449,7 @@ mod tests {
         // Both rules should exist in DB.
         let rules = {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::load_approval_rules(&conn, "test", bridge.conversation_id)
+            brenn_db::load_approval_rules(&conn, "test", bridge.conversation_id)
         };
         assert_eq!(rules.len(), 2, "should create two rules");
         let patterns: Vec<&str> = rules.iter().map(|r| r.pattern.as_str()).collect();
@@ -1494,7 +1494,7 @@ mod tests {
         // No rules should have been created.
         let rules = {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::load_approval_rules(&conn, "test", bridge.conversation_id)
+            brenn_db::load_approval_rules(&conn, "test", bridge.conversation_id)
         };
         assert_eq!(
             rules.len(),
@@ -1533,7 +1533,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_permission_request_id_emits_security_signal() {
         let (dispatcher, captured, handle) =
-            brenn_lib::obs::alerting::make_capturing_alerter_with_severity();
+            brenn_obs::alerting::make_capturing_alerter_with_severity();
         let (bridge, event_tx, mut broadcast_rx, _ab) =
             super::super::test_support::test_bridge_with_dispatcher(dispatcher).await;
         let conv_id = bridge.conversation_id;
@@ -1562,7 +1562,7 @@ mod tests {
         );
         let (severity, title, body) = &captured[0];
         assert!(
-            matches!(severity, brenn_lib::obs::alerting::AlertSeverity::Warning),
+            matches!(severity, brenn_obs::alerting::AlertSeverity::Warning),
             "alert severity must be Warning, got: {severity:?}"
         );
         assert!(
@@ -1587,7 +1587,7 @@ mod tests {
         // Insert a tool card request directly into the DB.
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &conn,
                 "req_cross_tc",
                 bridge.conversation_id,
@@ -1609,7 +1609,7 @@ mod tests {
         // The DB entry should still be pending (untouched).
         {
             let conn = bridge.db.lock().await;
-            let req = brenn_lib::db::get_pending_tool_request(&conn, "req_cross_tc")
+            let req = brenn_db::get_pending_tool_request(&conn, "req_cross_tc")
                 .expect("DB entry should still exist");
             assert_eq!(req.status, "pending", "should not have been resolved");
         }

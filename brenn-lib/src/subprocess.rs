@@ -5,7 +5,7 @@
 //! (bare process on dev, podman on containerized deployments).
 //!
 //! Also provides `drain_stream()` — shared output-draining helper used by
-//! `brenn-graf/src/subprocess.rs` and `brenn/src/git_subprocess.rs`.
+//! `brenn-graf/src/subprocess.rs` and `brenn-git/src/subprocess.rs`.
 
 use std::collections::HashMap;
 use std::io;

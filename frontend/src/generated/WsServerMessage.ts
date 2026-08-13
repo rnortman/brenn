@@ -139,7 +139,7 @@ seq?: number | null, } | { "type": "ArtifactIndex", files: Array<ArtifactFileInf
 username: string, 
 /**
  * Numeric user id (`users.id` rowid). Used by the service worker's
- * `signed_in_user_ids` IndexedDB set (§2.6.3) to guard push delivery.
+ * `signed_in_user_ids` IndexedDB set to guard push delivery.
  */
 user_id: number, 
 /**

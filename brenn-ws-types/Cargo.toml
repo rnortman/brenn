@@ -1,0 +1,19 @@
+[package]
+name = "brenn-ws-types"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The browser <-> backend WebSocket protocol types, and the ts-rs export that hands them to the frontend"
+
+# A sink: the wire contract references nothing else in the tree, which is what
+# lets every consumer of the protocol depend on it without dragging the backend
+# in. ts-rs is a build-time contract too — the derive emits the TypeScript the
+# frontend compiles against.
+[dependencies]
+chrono = { version = "0.4.44", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+ts-rs = { version = "12.0.1", features = ["serde-compat", "serde-json-impl"] }
+
+[dev-dependencies]
+base64ct = { version = "1.8.3", features = ["alloc"] }

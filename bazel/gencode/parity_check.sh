@@ -3,9 +3,9 @@
 #
 # Usage: parity_check.sh <committed> <generated> <committed-label>
 #
-# Migration-window gate. The make lanes and the deploy path still read the
-# committed copy, so the two generators have to agree byte for byte; when the
-# committed copies go, so does this.
+# The generated file is still committed, so the copy in the tree and the build
+# artifact have to agree byte for byte; when the committed copies go, so does
+# this.
 set -euo pipefail
 
 if [ "$#" -ne 3 ]; then

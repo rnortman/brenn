@@ -27,10 +27,10 @@
 // All new envelopes are processed in order; log/alert calls are immediate
 // (not buffered, survive a later trap/err — by host design, not this crate).
 
-use brenn_guest::log::Level;
 use brenn_guest::alert::Severity;
+use brenn_guest::log::Level;
 use brenn_guest::{Activation, Error, MessageEnvelopeExt, Processor};
-use brenn_guest::{log, alert};
+use brenn_guest::{alert, log};
 
 struct ProcessorLog;
 
@@ -56,22 +56,23 @@ fn execute_directive(dir: &serde_json::Value) -> Result<(), Error> {
     let cmd = dir.get("cmd").and_then(|v| v.as_str()).unwrap_or("ok");
     match cmd {
         "log" => {
-            let level =
-                parse_level(dir.get("level").and_then(|v| v.as_str()).unwrap_or("info"));
+            let level = parse_level(dir.get("level").and_then(|v| v.as_str()).unwrap_or("info"));
             let message = dir.get("message").and_then(|v| v.as_str()).unwrap_or("");
             log::log(level, message);
         }
         "alert" => {
-            let severity =
-                parse_severity(dir.get("severity").and_then(|v| v.as_str()).unwrap_or("warning"));
+            let severity = parse_severity(
+                dir.get("severity")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("warning"),
+            );
             let title = dir.get("title").and_then(|v| v.as_str()).unwrap_or("");
             let body_str = dir.get("body").and_then(|v| v.as_str()).unwrap_or("");
             alert::alert(severity, title, body_str);
         }
         "log_n" => {
             let n = dir.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-            let level =
-                parse_level(dir.get("level").and_then(|v| v.as_str()).unwrap_or("info"));
+            let level = parse_level(dir.get("level").and_then(|v| v.as_str()).unwrap_or("info"));
             let message = dir.get("message").and_then(|v| v.as_str()).unwrap_or("");
             for _ in 0..n {
                 log::log(level, message);
@@ -79,8 +80,11 @@ fn execute_directive(dir: &serde_json::Value) -> Result<(), Error> {
         }
         "alert_n" => {
             let n = dir.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-            let severity =
-                parse_severity(dir.get("severity").and_then(|v| v.as_str()).unwrap_or("warning"));
+            let severity = parse_severity(
+                dir.get("severity")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("warning"),
+            );
             let title = dir.get("title").and_then(|v| v.as_str()).unwrap_or("");
             let body_str = dir.get("body").and_then(|v| v.as_str()).unwrap_or("");
             for _ in 0..n {
@@ -91,7 +95,10 @@ fn execute_directive(dir: &serde_json::Value) -> Result<(), Error> {
             unreachable!("processor-log: deliberate trap on 'trap' directive");
         }
         "err" => {
-            let message = dir.get("message").and_then(|v| v.as_str()).unwrap_or("error");
+            let message = dir
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("error");
             return Err(Error::failed(message));
         }
         _ => {}

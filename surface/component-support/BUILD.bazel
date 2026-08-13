@@ -32,8 +32,9 @@ rust_library(
 
 # `tests/prebind_panic.rs` gets no target: the whole file is behind
 # `#![cfg(target_arch = "wasm32")]` and it runs under wasm-bindgen-test in a
-# real browser, which `make surface-wasm-test` drives out of band
-# (TODO(surface-wasm-test-in-ci) tracks putting the browser suites in a gate).
+# real browser, which nothing here drives.
+# TODO(surface-wasm-test-in-ci): the browser suites have no runner at all —
+# a rule that drives wasm-bindgen-test-runner is what would give them one.
 rust_test(
     name = "component-support_test",
     crate = ":component-support",

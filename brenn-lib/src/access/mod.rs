@@ -17,6 +17,8 @@ pub mod acl;
 pub mod mqtt_match;
 pub mod raw;
 pub mod resolve;
+#[cfg(any(test, feature = "testutils"))]
+pub mod test_fixtures;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -52,7 +54,7 @@ impl AppPolicy {
     /// across `automation`/`messaging`/`integration`/`active_bridge` would
     /// otherwise hand-roll; a single-point edit if the construction convention
     /// changes.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutils"))]
     pub fn with_grants(grants: &[AppCapability]) -> Self {
         let mut gs = GrantSet::default();
         for &cap in grants {
@@ -73,7 +75,7 @@ impl AppPolicy {
     /// just want "this app may publish" use this instead of bare
     /// `with_grants(&[MessagingPublish])` so they exercise the happy path rather
     /// than the new deny-by-default ACL gate.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testutils"))]
     pub fn messaging_sender_policy() -> Self {
         let mut p = AppPolicy::with_grants(&[AppCapability::MessagingPublish]);
         p.acls

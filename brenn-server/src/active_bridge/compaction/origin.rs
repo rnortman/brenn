@@ -4,7 +4,7 @@
 
 use brenn_cc::protocol::incoming::ResultMessage;
 use brenn_common::sanitize_untrusted_str;
-use brenn_lib::obs::alerting::{AlertDispatcher, AlertSeverity};
+use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use tracing::warn;
 
 /// Byte cap applied to the CC-controlled `origin.kind` before it reaches any log
@@ -73,7 +73,7 @@ pub(super) fn classify_turn_origin(
 mod tests {
     use super::*;
     use brenn_cc::protocol::incoming::ResultOrigin;
-    use brenn_lib::obs::alerting::make_counting_alerter;
+    use brenn_obs::alerting::make_counting_alerter;
     use std::sync::atomic::Ordering;
 
     fn result_with_origin(origin: Option<ResultOrigin>) -> ResultMessage {

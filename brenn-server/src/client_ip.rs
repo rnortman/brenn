@@ -33,7 +33,7 @@ use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use brenn_lib::obs::security::{SecurityEventType, log_security_event};
+use brenn_obs::security::{SecurityEventType, log_security_event};
 use tower_governor::errors::GovernorError;
 use tower_governor::key_extractor::KeyExtractor;
 

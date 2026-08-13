@@ -12,7 +12,7 @@ use axum::Extension;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use brenn_lib::auth::session::Session;
+use brenn_db::auth::session::Session;
 use brenn_surface_contract::{
     KERNEL_ARTIFACT, SURFACE_ROOT_ID, module_artifact, processor_module_path,
 };
@@ -137,7 +137,7 @@ pub async fn surface_page(
     // theme-driving component may later rewrite. Boot validated the skin against
     // the registry, so a miss here is a broken boot invariant.
     let skin = &runtime.resolved.skin;
-    let skin_path = super::skin_stylesheet_path(skin).unwrap_or_else(|| {
+    let skin_path = brenn_surface_server::skin_stylesheet_path(skin).unwrap_or_else(|| {
         panic!(
             "surface {slug}: configured skin {skin:?} absent from the skin registry — boot \
              validation guarantees its presence"
@@ -184,17 +184,16 @@ mod tests {
     use axum::body::Body;
     use axum::extract::connect_info::MockConnectInfo;
     use axum::http::{Request, StatusCode};
-    use brenn_lib::db;
     use brenn_lib::messaging::config::ResolvedSurface;
     use brenn_surface_contract::SURFACE_ROOT_ID;
     use std::net::SocketAddr;
     use tower::ServiceExt;
 
-    use super::super::test_fixtures::{TEST_MAX_BODY_BYTES, install_surface_runtimes};
     use crate::router::build_router;
     use crate::test_support::http::{body_string, setup_authenticated_user};
     use crate::test_support::state::test_state;
-    use crate::test_support::surface::SurfaceFixture;
+    use brenn_surface_server::fixtures_config::SurfaceFixture;
+    use brenn_surface_server::test_fixtures::{TEST_MAX_BODY_BYTES, install_surface_runtimes};
 
     /// A `deskbar` surface with an `echo-stub` component, the given access list
     /// (empty ⇒ any authenticated user).
@@ -207,18 +206,20 @@ mod tests {
 
     /// Build a router with the given surface installed and a seeded, logged-in
     /// user. Returns `(router, db, session_token)`.
-    async fn surface_router(resolved: ResolvedSurface) -> (axum::Router, db::Db, String) {
-        let db = db::init_db_memory();
+    async fn surface_router(resolved: ResolvedSurface) -> (axum::Router, brenn_db::Db, String) {
+        let db = crate::test_support::init_db_memory();
         let mut state = test_state(&db);
         state.surfaces = Arc::new(install_surface_runtimes(
             vec![resolved],
             // The page renders from the resolved bindings alone, but the surface
             // carries them, and boot gives every wire-binding surface a
             // messenger.
-            Some(crate::test_support::surface::shape_only_messenger()),
+            Some(brenn_messaging::testutils::empty_directory_messenger(
+                "test",
+            )),
             TEST_MAX_BODY_BYTES,
             None,
-            crate::test_support::surface::description_params(),
+            brenn_surface_server::fixtures_config::description_params(),
         ));
         let router = build_router(state, None, 0, 2576)
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999))));

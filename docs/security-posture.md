@@ -613,7 +613,7 @@ deliberate and does not create an unbounded loop:
   only *wakes* the LLM when its subscription has `push_depth > 0`. The normal LLM
   MQTT mode is `push_depth == 0` (pull), which never wakes and so costs nothing.
 - **WASM republish loop.** Bounded in code by the per-component activation pacer
-  (`ActivationPacer`, `brenn/src/wasm_dispatch`). Every consumer activation —
+  (`ActivationPacer`, `brenn-wasm-dispatch`). Every consumer activation —
   external wake, deadline wake, clamp self-renotify, and the startup sweep — is
   admitted through a per-component token bucket over *activations* before its drain
   step: sustained rate is capped at one activation per `activation_min_period_ms`

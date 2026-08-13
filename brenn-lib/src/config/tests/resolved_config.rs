@@ -8,15 +8,9 @@ use crate::pwa_push::config::PwaPushGlobalConfig;
 use crate::webhook::config::WebhookSignatureConfigRaw;
 use crate::webhook::{AppWebhookSubscriptionRaw, WebhookEndpointConfigRaw, WebhookKeyConfigRaw};
 
-// -----------------------------------------------------------------------
-// ResolvedConfig round-trip tests (AC-9 / design §Test plan)
-// -----------------------------------------------------------------------
-
-/// End-to-end test: `validate_and_resolve` → `ResolvedConfig.webhook_endpoints`
-/// → `WebhookService` produces the same slug set.
-///
-/// Guards the refactored bootstrap consumption path that previously had no
-/// coverage (design §"Test plan").
+/// End-to-end test: `validate_and_resolve` fills
+/// `ResolvedConfig.webhook_endpoints` with the declared endpoint, resolved
+/// scheme and all, and stamps the owning app's subscription.
 #[test]
 fn resolved_config_webhook_round_trip() {
     let dir = tempfile::tempdir().unwrap();
@@ -106,16 +100,6 @@ fn resolved_config_webhook_round_trip() {
 
     // pwa_push is None (no pwa_push configured).
     assert!(pwa_push.is_none());
-
-    // Build a WebhookService from the endpoint table and verify slug coverage.
-    let svc = crate::webhook::WebhookService::new(webhook_endpoints);
-    let svc_slugs: std::collections::HashSet<&str> =
-        svc.all_endpoints().map(|ep| ep.slug.as_str()).collect();
-    assert!(
-        svc_slugs.contains("test-hook"),
-        "service must expose test-hook"
-    );
-    assert_eq!(svc_slugs.len(), 1);
 }
 
 /// App-owned endpoints stamp a resolved `wake_min` onto the owning app's

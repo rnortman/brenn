@@ -10,7 +10,7 @@
 //! Uses `env!` (compile-time) rather than `option_env!` so the build
 //! fails fast if `BRENN_BUILD_ID` is unset when the crate is compiled
 //! directly — matches CLAUDE.md "no fallbacks, fail fast on unexpected."
-//! `make build` / `make launchdev` / `make release-musl` always export
+//! `make build` / `make launchdev` and the release lanes always export
 //! the variable (see the Makefile), so the only path where this compile
 //! error fires is bare `cargo build` without the Makefile wrapper.
 pub const BUILD_ID: &str = env!("BRENN_BUILD_ID");

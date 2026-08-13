@@ -83,8 +83,8 @@ _processor_stage = rule(
     implementation = _processor_stage_impl,
     doc = """`processor/<kind>/`: the transpiled tree, the component, the manifest.
 
-    The manifest is emitted by the same script the make lane runs, so the two
-    lanes' manifests are comparable byte for byte.
+    The manifest is emitted by the same script the component build runs, so the
+    staged manifest and the component's own are comparable byte for byte.
     """,
     attrs = {
         "component": attr.label(
@@ -206,7 +206,7 @@ surface_dist = rule(
     doc = """Merge the staged trees into the served asset directory.
 
     Declared in `//surface` under the name `dist`, so a test that reads the tree
-    finds it at the same workspace-relative path the make lane writes and the
+    finds it at the same workspace-relative path the build writes and the
     server config names.
     """,
     attrs = {

@@ -311,7 +311,7 @@ fn append_inline(doc: &Document, parent: &HtmlElement, inline: &Inline) {
 // Browser-level tests for the activation glue: the DOM-free half is covered
 // natively in `logic.rs` and `markdown.rs`, and everything below the entry — the
 // publisher, the element, the clock conversion — exists only in a browser. Run
-// via `make surface-wasm-test`.
+// in a real browser.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
     use super::*;

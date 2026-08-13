@@ -180,12 +180,6 @@ fn builtin_secret_rules_are_still_active() {
 /// cite in-tree docs that consuming repos do not have.
 #[test]
 fn repo_template_matches_the_tracked_public_config() {
-    // TODO(scrub-template-drift-cache-skip): this drift guard can be silently
-    // skipped by the xtask test cache. `collect_env_inputs` in
-    // xtask/src/test_run.rs keys the scrub::rules test binary without the two
-    // gitleaks files this test reads, so drift between `.gitleaks.toml` and
-    // `scrub/repo-template/gitleaks.toml` does not invalidate the cache entry
-    // and passes unnoticed until the binary is recompiled for another reason.
     /// Drop comment lines, blank lines, and `description` (prose, not enforcement).
     fn enforcing_lines(src: &str) -> Vec<&str> {
         src.lines()

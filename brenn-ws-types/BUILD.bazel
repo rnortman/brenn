@@ -1,0 +1,38 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "brenn-ws-types",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
+)
+
+# 71 tests, all serde round trips over in-memory values; `small` (60s) is
+# already generous for them.
+#
+# ts-rs exports from tests, so this binary is also the generator behind
+# `//frontend:generated_types`. Without the override the generated types — and
+# so every bundle built from them — would inherit testonly.
+rust_test(
+    name = "brenn-ws-types_test",
+    size = "small",
+    crate = ":brenn-ws-types",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    testonly = False,
+    visibility = ["//frontend:__pkg__"],
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_doc_test(
+    name = "brenn-ws-types_doc_test",
+    crate = ":brenn-ws-types",
+)

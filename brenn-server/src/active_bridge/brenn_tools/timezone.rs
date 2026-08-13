@@ -168,7 +168,7 @@ pub(super) async fn handle(
                         ));
                     }
                 };
-                let device_id = match brenn_lib::auth::device::resolve_device_for_assign(
+                let device_id = match brenn_db::auth::device::resolve_device_for_assign(
                     &conn,
                     &device_arg,
                     effective_user_id,
@@ -185,7 +185,7 @@ pub(super) async fn handle(
 
                 // Write the override.
                 let tz_str: Option<&str> = override_tz.as_ref().map(|tz| tz.name());
-                brenn_lib::auth::device::set_tz_override(
+                brenn_db::auth::device::set_tz_override(
                     &conn,
                     device_id,
                     effective_user_id,
@@ -363,7 +363,7 @@ mod tests {
         // Set first.
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::device::set_tz_override(
+            brenn_db::auth::device::set_tz_override(
                 &conn,
                 device_id,
                 bridge.user_id,
@@ -732,7 +732,7 @@ mod tests {
 
         let user2_id = {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "user2", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&conn, "user2", "$argon2id$fake")
         };
         // Create device_id for user1.
         let device_id =
@@ -743,8 +743,8 @@ mod tests {
         // for user2 on device_id without creating a new device.
         {
             let conn = bridge.db.lock().await;
-            let device = brenn_lib::auth::device::load_device(&conn, device_id);
-            brenn_lib::auth::device::resolve_or_create_device(
+            let device = brenn_db::auth::device::load_device(&conn, device_id);
+            brenn_db::auth::device::resolve_or_create_device(
                 &conn,
                 Some(&device.token),
                 user2_id,

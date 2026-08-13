@@ -19,12 +19,11 @@ pub const PINNED_VERSION: &str = "8.30.0";
 /// declared input instead of looking it up on `PATH`.
 const VENDORED_GITLEAKS: &str = "BRENN_SCRUB_TEST_GITLEAKS";
 
-/// Set by Bazel's test runner in every test action, and by no other lane these
-/// suites run under — not cargo, not nextest, not `make check`.
+/// Set by Bazel's test runner in every test action, and by nothing else.
 ///
-/// The vend check reads this to tell the two lanes apart, so the half that
-/// cannot be observed from inside a cargo run — that Bazel really does set it —
-/// is asserted by a Bazel-only test target of its own.
+/// The vend check reads this to tell a sandboxed run from a direct one, so the
+/// half that cannot be observed from outside the sandbox — that Bazel really
+/// does set it — is asserted by a Bazel-only test target of its own.
 pub const BAZEL_TEST_MARKER: &str = "TEST_SRCDIR";
 
 /// A path as given, or resolved against the process working directory.

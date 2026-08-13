@@ -9,11 +9,11 @@ use super::super::super::test_support::{
     test_bridge_with_dispatcher,
 };
 use super::super::*;
-use brenn_lib::ws_types::CcState;
+use brenn_ws_types::CcState;
 
 use brenn_cc::session::{ApprovalKind, ApprovalRequest};
-use brenn_lib::conversation::ConversationStatus;
-use brenn_lib::obs::alerting::{AlertDispatcher, CountingAlerter, RateLimiter};
+use brenn_db::conversation::ConversationStatus;
+use brenn_obs::alerting::{AlertDispatcher, CountingAlerter, RateLimiter};
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

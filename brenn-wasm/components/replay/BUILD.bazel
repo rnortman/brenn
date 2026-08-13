@@ -15,6 +15,9 @@ wit_bindgen_rust(
     wit_srcs = "//brenn-wasm:wit",
 )
 
+# TODO(wasm-guest-tests-unrun): the 21 `#[test]` functions in src/lib.rs have no
+# runner — this package declares no Rust test target and no rule runs a wasm32
+# test binary. Done = they run under a gate, or they are deleted.
 wasm_guest_cdylib(
     name = "brenn-replay",
     bindings = ":bindings",

@@ -2,14 +2,17 @@
 
 use std::time::Instant;
 
-use brenn_lib::obs::alerting::AlertSeverity;
-use brenn_lib::repo_sync_cursor::{self, EnqueueRow};
+use brenn_messaging::repo_sync_cursor::{self, EnqueueRow};
+use brenn_obs::alerting::AlertSeverity;
 use serde::Serialize;
 use tracing::{Instrument, debug, info, info_span, warn};
 
-use super::git::{PullOutcome, collect_oneline, oneline_unavailable, pull_clone, rev_parse};
-use super::{CloneInfo, RepoSyncCtx, SyncTrigger};
-use crate::git_subprocess::sanitize_log_line;
+use super::RepoSyncCtx;
+use brenn_git::pull::{
+    PullOutcome, collect_oneline, oneline_unavailable, pull_clone, rev_parse, truncate_detail,
+};
+use brenn_git::subprocess::sanitize_log_line;
+use brenn_git::sync::{CloneInfo, SyncTrigger};
 
 // ---------------------------------------------------------------------------
 // Typed event payload structs (A2, A3)
@@ -178,7 +181,7 @@ async fn run_cycle_for_remote(
                     transient_errors += 1;
                     warn!(
                         slug = %slug,
-                        detail = %sanitize_log_line(&super::truncate_detail(detail, 512)),
+                        detail = %sanitize_log_line(&truncate_detail(detail, 512)),
                         "repo_sync::pull transient error",
                     );
                     handle_transient_error(ctx, info, detail);
@@ -188,7 +191,7 @@ async fn run_cycle_for_remote(
                     warn!(
                         slug = %slug,
                         reason = %sanitize_log_line(reason),
-                        detail = %sanitize_log_line(&super::truncate_detail(detail, 512)),
+                        detail = %sanitize_log_line(&truncate_detail(detail, 512)),
                         "repo_sync::pull auth error",
                     );
                     handle_auth_error(ctx, info, reason, detail);
@@ -412,7 +415,7 @@ fn handle_transient_error(ctx: &RepoSyncCtx, info: &CloneInfo, detail: &str) {
          or network path.\n\nMost recent detail:\n{detail}",
         slug = info.slug,
         remote = info.remote,
-        detail = super::truncate_detail(detail, 2048),
+        detail = truncate_detail(detail, 2048),
     );
     ctx.alert_dispatcher
         .with_field("slug", info.slug.clone())
@@ -441,7 +444,7 @@ fn handle_auth_error(ctx: &RepoSyncCtx, info: &CloneInfo, reason: &str, detail: 
         slug = info.slug,
         remote = info.remote,
         reason = reason,
-        detail = super::truncate_detail(detail, 2048),
+        detail = truncate_detail(detail, 2048),
     );
     ctx.alert_dispatcher
         .with_field("slug", info.slug.clone())
@@ -628,12 +631,12 @@ async fn handle_advanced(
 ) -> Vec<PendingInject> {
     let (source, kind_str) = match kind {
         AdvanceKind::Pulled => (
-            brenn_lib::messaging::REPO_SYNC_SOURCE_PULLED,
-            brenn_lib::messaging::REPO_SYNC_KIND_PULLED,
+            brenn_messaging::REPO_SYNC_SOURCE_PULLED,
+            brenn_messaging::REPO_SYNC_KIND_PULLED,
         ),
         AdvanceKind::Local => (
-            brenn_lib::messaging::REPO_SYNC_SOURCE_LOCAL,
-            brenn_lib::messaging::REPO_SYNC_KIND_LOCAL,
+            brenn_messaging::REPO_SYNC_SOURCE_LOCAL,
+            brenn_messaging::REPO_SYNC_KIND_LOCAL,
         ),
     };
     let n = oneline.len();
@@ -736,7 +739,7 @@ async fn handle_advanced(
                         );
                         return;
                     };
-                    let warnings = crate::hooks::run_post_pull_hooks(&app, &slug).await;
+                    let warnings = brenn_hooks::run_post_pull_hooks(&app, &slug).await;
                     for w in warnings {
                         alert.alert(
                             AlertSeverity::Warning,
@@ -774,7 +777,7 @@ async fn handle_conflict(
     warn!(
         slug = %info.slug,
         reason = %reason,
-        detail = %super::truncate_detail(detail, 512),
+        detail = %truncate_detail(detail, 512),
         "repo_sync: pull conflict",
     );
 
@@ -784,7 +787,7 @@ async fn handle_conflict(
             .with_field("slug", info.slug.clone())
             .with_field("remote", info.remote.clone())
             .with_field("reason", reason.to_string())
-            .with_field("detail", super::truncate_detail(detail, 2048))
+            .with_field("detail", truncate_detail(detail, 2048))
             .alert_once_per_process(
                 AlertSeverity::Warning,
                 "repo_sync: RO-only conflict".to_string(),
@@ -802,7 +805,7 @@ async fn handle_conflict(
 
     let conflict_event = RepoSyncConflictEvent {
         detail,
-        kind: brenn_lib::messaging::REPO_SYNC_KIND_CONFLICT,
+        kind: brenn_messaging::REPO_SYNC_KIND_CONFLICT,
         reason,
         remote: &info.remote,
         slug: &info.slug,
@@ -810,7 +813,7 @@ async fn handle_conflict(
     let payload = serde_json::to_string(&conflict_event)
         .expect("RepoSyncConflictEvent serialization is infallible");
     let summary = format!("repo {} pull conflict: {}", info.slug, reason);
-    let source = brenn_lib::messaging::REPO_SYNC_SOURCE_CONFLICT;
+    let source = brenn_messaging::REPO_SYNC_SOURCE_CONFLICT;
 
     let targets = consumer_conversations(ctx, &info.primary_apps).await;
     if targets.is_empty() {
@@ -898,13 +901,13 @@ async fn maybe_inject_pending(ctx: &RepoSyncCtx, conversation_id: i64, source: &
     // Load from the unified ingress store via load_pending_ingress_for_drain,
     // filtering to repo_sync:* ingress events.
     // `Event.id` is the push_id — used for marking delivered.
-    let repo_sync_pending: Vec<brenn_lib::messaging::IngressEvent> = {
+    let repo_sync_pending: Vec<brenn_messaging::IngressEvent> = {
         let conn = ctx.db.lock().await;
         let subscriber = brenn_lib::messaging::ParticipantId::for_conversation(conversation_id);
-        brenn_lib::messaging::db::load_pending_ingress_for_drain(&conn, &subscriber)
+        brenn_messaging_store::db::load_pending_ingress_for_drain(&conn, &subscriber)
             .into_iter()
             .map(|(_push_id, ev)| ev)
-            .filter(|ev| brenn_lib::messaging::is_repo_sync_source(&ev.source))
+            .filter(|ev| brenn_messaging::is_repo_sync_source(&ev.source))
             .collect()
     };
     span.record("pending_count", repo_sync_pending.len());
@@ -928,11 +931,11 @@ async fn maybe_inject_pending(ctx: &RepoSyncCtx, conversation_id: i64, source: &
         return;
     }
 
-    let collapsed = brenn_lib::messaging::collapse_repo_sync(repo_sync_pending);
+    let collapsed = brenn_messaging::collapse_repo_sync(repo_sync_pending);
     // Render using render_event_drain, which produces both the LLM-facing text
     // (from format_event_batch) and the pre-rendered HTML card. This gives the
     // live repo_sync inject the same wire shape as the drain path.
-    let rendered = match crate::system_message::render_event_drain(&collapsed.events) {
+    let rendered = match brenn_render::system_message::render_event_drain(&collapsed.events) {
         Some(r) => r,
         None => {
             // Same routine concurrent-collapse scenario as above: the
@@ -953,14 +956,14 @@ async fn maybe_inject_pending(ctx: &RepoSyncCtx, conversation_id: i64, source: &
             let mut ids: std::collections::HashSet<i64> = collapsed
                 .events
                 .iter()
-                .filter(|e| e.id != brenn_lib::messaging::SYNTHETIC_EVENT_ID)
+                .filter(|e| e.id != brenn_messaging::SYNTHETIC_EVENT_ID)
                 .map(|e| e.id)
                 .collect();
             ids.extend(collapsed.original_repo_sync_ids);
             let ids: Vec<i64> = ids.into_iter().collect();
             let marked = ids.len();
             let conn = ctx.db.lock().await;
-            brenn_lib::messaging::db::mark_pending_pushes_delivered(&conn, &ids);
+            brenn_messaging_store::db::mark_pending_pushes_delivered(&conn, &ids);
             // Release the DB lock before emitting tracing output so the
             // mutex isn't held across macro/formatter work.
             drop(conn);
@@ -980,7 +983,7 @@ async fn maybe_inject_pending(ctx: &RepoSyncCtx, conversation_id: i64, source: &
 /// Resolve consumer conversations: every conversation whose `app_slug` is
 /// in `apps`, regardless of status. Returns a list of conversation ids.
 /// One SQL query. Status filtering is deliberately absent — see
-/// `brenn_lib::conversation::conversation_ids_for_apps` docstring.
+/// `brenn_db::conversation::conversation_ids_for_apps` docstring.
 /// Returns `(conversation_id, app_slug)` pairs for all conversations belonging
 /// to any of the given apps. Used to build `EnqueueRow` for repo_sync fan-out.
 async fn consumer_conversations(
@@ -992,7 +995,7 @@ async fn consumer_conversations(
     }
     let app_list: Vec<String> = apps.iter().cloned().collect();
     let conn = ctx.db.lock().await;
-    brenn_lib::conversation::conversation_ids_and_slugs_for_apps(&conn, &app_list)
+    brenn_db::conversation::conversation_ids_and_slugs_for_apps(&conn, &app_list)
 }
 
 #[cfg(test)]
@@ -1006,11 +1009,8 @@ mod tests {
 
     use super::*;
     use crate::active_bridge::ActiveBridges;
-    use crate::repo_sync::CloneInfo;
-    use crate::repo_sync::test_git_fixtures::{
-        head, local_commit, push_sibling_commit, scratch_remote_and_clone,
-    };
-    use brenn_lib::obs::alerting::AlertDispatcher;
+    use brenn_obs::alerting::AlertDispatcher;
+    use git_fixture::scratch::{head, local_commit, push_sibling_commit, scratch_remote_and_clone};
     use git_fixture::{clone_repo, git as fixture_git};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -1020,7 +1020,7 @@ mod tests {
     /// Build a minimal `RepoSyncCtx` with one clone + one consumer app
     /// using a noop alerter. Returns `(ctx, remote_url)`.
     fn build_ctx(
-        db: brenn_lib::db::Db,
+        db: brenn_db::Db,
         clone_path: PathBuf,
         slug: &str,
         app_slugs: &[&str],
@@ -1036,7 +1036,7 @@ mod tests {
     /// counting for escalation tests) and receive the matching `CloneInfo`
     /// back so unit tests can call the escalation helpers directly.
     fn build_ctx_with_dispatcher(
-        db: brenn_lib::db::Db,
+        db: brenn_db::Db,
         clone_path: PathBuf,
         slug: &str,
         app_slugs: &[&str],
@@ -1076,41 +1076,91 @@ mod tests {
         (ctx, remote_url, info)
     }
 
+    /// Build a `RepoSyncCtx` spanning two clones on two distinct remotes,
+    /// which the single-clone `build_ctx` cannot express. Returns the ctx and
+    /// the remote URLs in the order the clones were passed.
+    fn build_ctx_two_remotes(
+        db: brenn_db::Db,
+        clones_in: [(PathBuf, &str); 2],
+        app_slugs: &[&str],
+    ) -> (RepoSyncCtx, [String; 2]) {
+        let (alert_dispatcher, _handle) = AlertDispatcher::noop();
+        let mut clones: HashMap<String, CloneInfo> = HashMap::new();
+        let mut remote_to_slugs: HashMap<String, Vec<String>> = HashMap::new();
+        let mut remote_locks: HashMap<String, Arc<TokioMutex<()>>> = HashMap::new();
+        let mut urls: Vec<String> = Vec::new();
+        for (clone_path, slug) in clones_in {
+            let remote_url = format!("ssh://example/{slug}.git");
+            clones.insert(
+                slug.to_string(),
+                CloneInfo {
+                    slug: slug.to_string(),
+                    host_path: clone_path,
+                    remote: remote_url.clone(),
+                    sync_enabled: true,
+                    consumer_apps: app_slugs.iter().map(|s| s.to_string()).collect(),
+                    primary_apps: app_slugs.iter().map(|s| s.to_string()).collect(),
+                },
+            );
+            remote_to_slugs.insert(remote_url.clone(), vec![slug.to_string()]);
+            remote_locks.insert(remote_url.clone(), Arc::new(TokioMutex::new(())));
+            urls.push(remote_url);
+        }
+        let ctx = RepoSyncCtx {
+            db,
+            active_bridges: ActiveBridges::new(),
+            alert_dispatcher,
+            clones: Arc::new(clones),
+            remote_to_slugs: Arc::new(remote_to_slugs),
+            remote_locks: Arc::new(remote_locks),
+            last_notified_head: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            failure_state: Arc::new(std::sync::Mutex::new(
+                crate::repo_sync::PersistentFailureState::default(),
+            )),
+            apps: Arc::new(indexmap::IndexMap::new()),
+            post_pull_hook_locks: Arc::new(HashMap::new()),
+            pre_fanout_gate: None,
+            post_lock_release_notify: None,
+        };
+        let [x, y]: [String; 2] = urls.try_into().expect("two remotes in, two out");
+        (ctx, [x, y])
+    }
+
     /// Set up a user + one conversation for the given app, return conv id.
     /// Uses a unique username per call to avoid collisions when two
     /// conversations of the same app are needed in one test.
-    async fn mk_conv(db: &brenn_lib::db::Db, app_slug: &str) -> i64 {
+    async fn mk_conv(db: &brenn_db::Db, app_slug: &str) -> i64 {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let username = format!("{app_slug}-u{n}");
         let conn = db.lock().await;
-        let user_id = brenn_lib::auth::user::create_user(&conn, &username, "hash");
-        brenn_lib::conversation::create_conversation(&conn, user_id, app_slug, false)
+        let user_id = brenn_db::auth::user::create_user(&conn, &username, "hash");
+        brenn_db::conversation::create_conversation(&conn, user_id, app_slug, false)
     }
 
     /// Fetch pending `repo_sync:*` events for a conversation, oldest first.
     /// Uses the unified ingress store.
     async fn pending_repo_sync_events(
-        db: &brenn_lib::db::Db,
+        db: &brenn_db::Db,
         conv_id: i64,
-    ) -> Vec<brenn_lib::messaging::IngressEvent> {
+    ) -> Vec<brenn_messaging::IngressEvent> {
         let conn = db.lock().await;
         let subscriber = brenn_lib::messaging::ParticipantId::for_conversation(conv_id);
-        brenn_lib::messaging::db::load_pending_ingress_for_drain(&conn, &subscriber)
+        brenn_messaging_store::db::load_pending_ingress_for_drain(&conn, &subscriber)
             .into_iter()
             .map(|(_push_id, ev)| ev)
-            .filter(|ev| brenn_lib::messaging::is_repo_sync_source(&ev.source))
+            .filter(|ev| brenn_messaging::is_repo_sync_source(&ev.source))
             .collect()
     }
 
     /// Count pending `repo_sync:*` events in the queue for a conversation.
-    async fn pending_repo_sync_count(db: &brenn_lib::db::Db, conv_id: i64) -> usize {
+    async fn pending_repo_sync_count(db: &brenn_db::Db, conv_id: i64) -> usize {
         pending_repo_sync_events(db, conv_id).await.len()
     }
 
     /// Count all `repo_sync:*` ingress pushes across every conversation in the DB.
-    async fn total_repo_sync_event_count(db: &brenn_lib::db::Db) -> i64 {
+    async fn total_repo_sync_event_count(db: &brenn_db::Db) -> i64 {
         let conn = db.lock().await;
         conn.query_row(
             "SELECT COUNT(*) FROM messaging_pending_pushes pp \
@@ -1125,7 +1175,7 @@ mod tests {
     #[tokio::test]
     async fn cold_start_seeds_last_notified_head_without_firing() {
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1143,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn second_cycle_with_no_movement_is_no_op() {
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1159,7 +1209,7 @@ mod tests {
     #[tokio::test]
     async fn advance_detection_notifies_on_remote_advance() {
         let (remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1189,7 +1239,7 @@ mod tests {
         // `pulled`, because the commit was authored locally — it did not
         // come from a fetch.
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1205,12 +1255,9 @@ mod tests {
         run_cycle_for_remote(&ctx, &remote_url, "poll", None).await;
         let events = pending_repo_sync_events(&db, conv_id).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].source,
-            brenn_lib::messaging::REPO_SYNC_SOURCE_LOCAL
-        );
+        assert_eq!(events[0].source, brenn_messaging::REPO_SYNC_SOURCE_LOCAL);
         let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
-        assert_eq!(payload["kind"], brenn_lib::messaging::REPO_SYNC_KIND_LOCAL);
+        assert_eq!(payload["kind"], brenn_messaging::REPO_SYNC_KIND_LOCAL);
         // Human-readable summary must say "advanced locally", not "advanced from remote".
         assert!(
             events[0].summary.contains("advanced locally"),
@@ -1225,7 +1272,7 @@ mod tests {
         // fast-forwards → `PullOutcome::Advanced`. The emitted event must
         // be labeled `pulled`.
         let (remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1240,12 +1287,9 @@ mod tests {
         run_cycle_for_remote(&ctx, &remote_url, "poll", None).await;
         let events = pending_repo_sync_events(&db, conv_id).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].source,
-            brenn_lib::messaging::REPO_SYNC_SOURCE_PULLED
-        );
+        assert_eq!(events[0].source, brenn_messaging::REPO_SYNC_SOURCE_PULLED);
         let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
-        assert_eq!(payload["kind"], brenn_lib::messaging::REPO_SYNC_KIND_PULLED);
+        assert_eq!(payload["kind"], brenn_messaging::REPO_SYNC_KIND_PULLED);
         // Human-readable summary must say "advanced from remote", not "advanced locally".
         assert!(
             events[0].summary.contains("advanced from remote"),
@@ -1277,7 +1321,7 @@ mod tests {
         // pull_clone returns TransientError (advance-detection runs after
         // every outcome). Then we commit, then cycle 2 observes the
         // movement with outcome=TransientError → labeled local.
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1296,12 +1340,9 @@ mod tests {
         run_cycle_for_remote(&ctx, &remote_url, "poll", None).await;
         let events = pending_repo_sync_events(&db, conv_id).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].source,
-            brenn_lib::messaging::REPO_SYNC_SOURCE_LOCAL
-        );
+        assert_eq!(events[0].source, brenn_messaging::REPO_SYNC_SOURCE_LOCAL);
         let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
-        assert_eq!(payload["kind"], brenn_lib::messaging::REPO_SYNC_KIND_LOCAL);
+        assert_eq!(payload["kind"], brenn_messaging::REPO_SYNC_KIND_LOCAL);
     }
 
     #[tokio::test]
@@ -1310,7 +1351,7 @@ mod tests {
         // Cycle N+1: local commit on top of the just-merged HEAD →
         //           `pull_clone` returns UpToDate → `local` event.
         let (remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1324,10 +1365,7 @@ mod tests {
         run_cycle_for_remote(&ctx, &remote_url, "poll", None).await;
         let events = pending_repo_sync_events(&db, conv_id).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].source,
-            brenn_lib::messaging::REPO_SYNC_SOURCE_PULLED
-        );
+        assert_eq!(events[0].source, brenn_messaging::REPO_SYNC_SOURCE_PULLED);
 
         // Now author a local commit on top of the merged HEAD.
         local_commit(clone.path(), "after-pull.txt", "local after pull");
@@ -1336,10 +1374,7 @@ mod tests {
         run_cycle_for_remote(&ctx, &remote_url, "poll", None).await;
         let events = pending_repo_sync_events(&db, conv_id).await;
         assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[1].source,
-            brenn_lib::messaging::REPO_SYNC_SOURCE_LOCAL
-        );
+        assert_eq!(events[1].source, brenn_messaging::REPO_SYNC_SOURCE_LOCAL);
     }
 
     #[tokio::test]
@@ -1356,7 +1391,7 @@ mod tests {
         // contains only the sibling commit, and (b) `last_notified_head`
         // equals origin/main after the `pulled` cycle.
         let (remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1369,10 +1404,7 @@ mod tests {
         run_cycle_for_remote(&ctx, &remote_url, "poll", None).await;
         let events = pending_repo_sync_events(&db, conv_id).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].source,
-            brenn_lib::messaging::REPO_SYNC_SOURCE_PULLED
-        );
+        assert_eq!(events[0].source, brenn_messaging::REPO_SYNC_SOURCE_PULLED);
         let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
         let oneline = payload["oneline"].as_array().unwrap();
         // Only the sibling commit — single entry.
@@ -1392,16 +1424,13 @@ mod tests {
         run_cycle_for_remote(&ctx, &remote_url, "poll", None).await;
         let events = pending_repo_sync_events(&db, conv_id).await;
         assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[1].source,
-            brenn_lib::messaging::REPO_SYNC_SOURCE_LOCAL
-        );
+        assert_eq!(events[1].source, brenn_messaging::REPO_SYNC_SOURCE_LOCAL);
     }
 
     #[tokio::test]
     async fn acting_conversation_is_suppressed_from_notifications() {
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_a = mk_conv(&db, "appa").await;
         let conv_b = mk_conv(&db, "appa").await; // second conversation, same app
         let (ctx, remote_url) =
@@ -1424,7 +1453,7 @@ mod tests {
     async fn acting_conversation_none_notifies_everyone() {
         // Control for the previous test: None means no filter.
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_a = mk_conv(&db, "appa").await;
         let conv_b = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
@@ -1445,7 +1474,7 @@ mod tests {
         // high-level entry point rather than `run_cycle_for_remote`
         // directly, which is all the other tests do.
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_a = mk_conv(&db, "appa").await;
         let conv_b = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
@@ -1482,7 +1511,7 @@ mod tests {
         // path. Successor to the retired dispatch-level webhook fan-out
         // test; complements the `Some(conv)` suppression case above.
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_a = mk_conv(&db, "appa").await;
         let conv_b = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
@@ -1511,11 +1540,51 @@ mod tests {
         assert_eq!(pending_repo_sync_count(&db, conv_b).await, 1);
     }
 
+    #[tokio::test]
+    async fn run_cycle_resume_poke_runs_one_cycle_per_remote() {
+        let (remote_x, clone_x) = scratch_remote_and_clone();
+        let (remote_y, clone_y) = scratch_remote_and_clone();
+        let db = crate::test_support::init_db_memory();
+        let conv = mk_conv(&db, "appa").await;
+        let (ctx, [url_x, url_y]) = build_ctx_two_remotes(
+            db.clone(),
+            [
+                (clone_x.path().to_path_buf(), "src-x"),
+                (clone_y.path().to_path_buf(), "src-y"),
+            ],
+            &["appa"],
+        );
+        let remotes = vec![url_x, url_y];
+
+        // First poke: a cold-start cycle ran for each remote, so both heads are
+        // seeded and neither fired.
+        run_cycle(
+            ctx.clone(),
+            SyncTrigger::ResumePoke {
+                remotes: remotes.clone(),
+            },
+        )
+        .await;
+        assert_eq!(pending_repo_sync_count(&db, conv).await, 0);
+        {
+            let map = ctx.last_notified_head.lock().unwrap();
+            assert_eq!(map.get("src-x"), Some(&head(clone_x.path())));
+            assert_eq!(map.get("src-y"), Some(&head(clone_y.path())));
+        }
+
+        push_sibling_commit(remote_x.path(), "x commit");
+        push_sibling_commit(remote_y.path(), "y commit");
+
+        // Second poke: both clones advance, one notification each.
+        run_cycle(ctx.clone(), SyncTrigger::ResumePoke { remotes }).await;
+        assert_eq!(pending_repo_sync_count(&db, conv).await, 2);
+    }
+
     /// Build a second `RepoSyncCtx` backed by the same `Db`, seeding
     /// `last_notified_head` from the persisted `repo_sync_cursor` rows
     /// via `load_all`. Simulates a restart: same DB, fresh ctx / cache.
     async fn rebuild_ctx_from_persisted(
-        db: brenn_lib::db::Db,
+        db: brenn_db::Db,
         clone_path: PathBuf,
         slug: &str,
         app_slugs: &[&str],
@@ -1523,7 +1592,7 @@ mod tests {
         let (mut ctx, remote_url) = build_ctx(db.clone(), clone_path, slug, app_slugs);
         let seeded = {
             let conn = db.lock().await;
-            brenn_lib::repo_sync_cursor::load_all(&conn)
+            brenn_messaging::repo_sync_cursor::load_all(&conn)
         };
         ctx.last_notified_head = Arc::new(std::sync::Mutex::new(seeded));
         (ctx, remote_url)
@@ -1536,7 +1605,7 @@ mod tests {
         // Cycle 2 on an unchanged HEAD must be `Unchanged`, not `Seeded`,
         // and must NOT enqueue any new events.
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1569,7 +1638,7 @@ mod tests {
         // ctx with `load_all`-seeded cache. Cycle 2 must fire a
         // notification for Y → Z, not seed-and-skip.
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1605,7 +1674,7 @@ mod tests {
         // unchanged HEAD Y must assert (a) Unchanged (not Seeded), and
         // (b) no new event rows beyond cycle 1's.
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1639,7 +1708,7 @@ mod tests {
         // persisted cursor. Cycle 2 must detect the downtime advance and
         // fire exactly one notification.
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1656,7 +1725,7 @@ mod tests {
         let seed_head = head(clone.path());
         let persisted = {
             let conn = db.lock().await;
-            brenn_lib::repo_sync_cursor::load_all(&conn)
+            brenn_messaging::repo_sync_cursor::load_all(&conn)
         };
         assert_eq!(
             persisted.get("src-x").map(String::as_str),
@@ -1690,7 +1759,7 @@ mod tests {
         // ctx → advance again → assert exactly two notifications delivered,
         // prev_head of the second matches new_head of the first.
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1711,7 +1780,7 @@ mod tests {
         // Cursor row must equal Y at this point.
         let persisted_head = {
             let conn = db.lock().await;
-            brenn_lib::repo_sync_cursor::load_all(&conn)
+            brenn_messaging::repo_sync_cursor::load_all(&conn)
                 .get("src-x")
                 .cloned()
                 .expect("cursor row present")
@@ -1745,7 +1814,7 @@ mod tests {
         //     `collect_oneline(Y..Z)`, which fails because Y is not an ancestor
         //     of Z → falls back to `oneline_unavailable` placeholder.
         let (remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1845,7 +1914,7 @@ mod tests {
         // with `upsert_and_enqueue_with_empty_rows_still_advances_cursor`;
         // this is the matching reactor-level integration check.
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_acting = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1863,7 +1932,7 @@ mod tests {
         // But the cursor MUST have advanced.
         let persisted = {
             let conn = db.lock().await;
-            brenn_lib::repo_sync_cursor::load_all(&conn)
+            brenn_messaging::repo_sync_cursor::load_all(&conn)
         };
         assert_eq!(
             persisted.get("src-x").map(String::as_str),
@@ -1894,7 +1963,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_cycles_on_same_remote_serialize_and_dedupe_advance() {
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -1942,7 +2011,7 @@ mod tests {
     #[tokio::test]
     async fn fan_out_runs_after_lock_release_allowing_second_cycle_to_enter() {
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
 
         // Gate: cycle 2 blocks before fan-out until we add a permit.
@@ -2024,7 +2093,7 @@ mod tests {
         // `handle_conflict` writes a DB row → event is queryable with the
         // correct source and payload.
         let (remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -2047,7 +2116,7 @@ mod tests {
         let events = pending_repo_sync_events(&db, conv_id).await;
         let conflict_events: Vec<_> = events
             .iter()
-            .filter(|e| e.source == brenn_lib::messaging::REPO_SYNC_SOURCE_CONFLICT)
+            .filter(|e| e.source == brenn_messaging::REPO_SYNC_SOURCE_CONFLICT)
             .collect();
         assert!(
             !conflict_events.is_empty(),
@@ -2064,7 +2133,7 @@ mod tests {
         });
         assert_eq!(
             payload["kind"],
-            brenn_lib::messaging::REPO_SYNC_KIND_CONFLICT,
+            brenn_messaging::REPO_SYNC_KIND_CONFLICT,
             "conflict event payload must have kind=conflict",
         );
         assert_eq!(
@@ -2095,7 +2164,7 @@ mod tests {
         // RO-only (empty primary_apps): conflict path fires an alert via
         // AlertDispatcher but does NOT write any DB rows.
         let (remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         // Build ctx with empty app_slugs → both primary_apps and consumer_apps
         // are empty → handle_conflict returns Vec::new() and advance-detection
         // fans out to no one.
@@ -2138,7 +2207,7 @@ mod tests {
     // state-machine needs.
     // -----------------------------------------------------------------------
 
-    use brenn_lib::obs::alerting::{CountingAlerter, RateLimiter};
+    use brenn_obs::alerting::{CountingAlerter, RateLimiter};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// Build a test ctx whose `AlertDispatcher` is a `CountingAlerter`
@@ -2157,10 +2226,9 @@ mod tests {
         let count = Arc::new(AtomicU32::new(0));
         let alerter = CountingAlerter(count.clone());
         let rate_limiter = RateLimiter::new(1024, 60);
-        let (dispatcher, handle) =
-            brenn_lib::obs::alerting::AlertDispatcher::new(alerter, rate_limiter);
+        let (dispatcher, handle) = brenn_obs::alerting::AlertDispatcher::new(alerter, rate_limiter);
         let (ctx, _remote_url, info) = build_ctx_with_dispatcher(
-            brenn_lib::db::init_db_memory(),
+            crate::test_support::init_db_memory(),
             PathBuf::from("/tmp/unused"),
             slug,
             &[],
@@ -2306,7 +2374,7 @@ mod tests {
             ],
         );
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         // Conv is required so `consumer_apps` resolves but we don't
         // actually need a notification for this test.
         let _conv_id = mk_conv(&db, "appa").await;
@@ -2347,7 +2415,7 @@ mod tests {
     #[tokio::test]
     async fn run_cycle_resets_failure_trackers_on_successful_fetch() {
         let (_remote, clone) = scratch_remote_and_clone();
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let _conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx(db.clone(), clone.path().to_path_buf(), "src-x", &["appa"]);
@@ -2449,7 +2517,7 @@ mod tests {
 
     /// Build a `RepoSyncCtx` that includes an app with post-pull hooks.
     fn build_ctx_with_hooks(
-        db: brenn_lib::db::Db,
+        db: brenn_db::Db,
         clone_path: PathBuf,
         slug: &str,
         app_slug: &str,
@@ -2519,7 +2587,7 @@ mod tests {
         let marker = hook_dir.path().join("hook_ran");
 
         let app = mk_hook_app("appa", hook_dir.path().to_path_buf(), "hook_ran");
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let _conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx_with_hooks(db.clone(), clone.path().to_path_buf(), "src-x", "appa", app);
@@ -2545,7 +2613,7 @@ mod tests {
         let marker = hook_dir.path().join("hook_ran");
 
         let app = mk_hook_app("appa", hook_dir.path().to_path_buf(), "hook_ran");
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let _conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx_with_hooks(db.clone(), clone.path().to_path_buf(), "src-x", "appa", app);
@@ -2585,7 +2653,7 @@ mod tests {
             },
             ..mk_hook_app("appa", hook_dir.path().to_path_buf(), "unused")
         };
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let _conv_id = mk_conv(&db, "appa").await;
         let (ctx, remote_url) =
             build_ctx_with_hooks(db.clone(), clone.path().to_path_buf(), "src-x", "appa", app);
@@ -2656,7 +2724,7 @@ mod tests {
         // Non-empty oneline.
         let oneline: Vec<String> = vec!["abc1234 add readme".to_string()];
         let event = super::RepoSyncAdvanceEvent {
-            kind: brenn_lib::messaging::REPO_SYNC_KIND_PULLED,
+            kind: brenn_messaging::REPO_SYNC_KIND_PULLED,
             slug: "my-repo",
             remote: "https://git.example.com/user/repo.git",
             oneline: &oneline,
@@ -2664,7 +2732,7 @@ mod tests {
         let produced = serde_json::to_string(&event)
             .expect("RepoSyncAdvanceEvent serialization is infallible");
         let reference = serde_json::json!({
-            "kind": brenn_lib::messaging::REPO_SYNC_KIND_PULLED,
+            "kind": brenn_messaging::REPO_SYNC_KIND_PULLED,
             "slug": "my-repo",
             "remote": "https://git.example.com/user/repo.git",
             "oneline": ["abc1234 add readme"],
@@ -2675,7 +2743,7 @@ mod tests {
         // Empty oneline (no commits visible).
         let empty: Vec<String> = vec![];
         let event2 = super::RepoSyncAdvanceEvent {
-            kind: brenn_lib::messaging::REPO_SYNC_KIND_LOCAL,
+            kind: brenn_messaging::REPO_SYNC_KIND_LOCAL,
             slug: "another-repo",
             remote: "https://git.example.com/user/another.git",
             oneline: &empty,
@@ -2683,7 +2751,7 @@ mod tests {
         let produced2 = serde_json::to_string(&event2)
             .expect("RepoSyncAdvanceEvent serialization is infallible");
         let reference2 = serde_json::json!({
-            "kind": brenn_lib::messaging::REPO_SYNC_KIND_LOCAL,
+            "kind": brenn_messaging::REPO_SYNC_KIND_LOCAL,
             "slug": "another-repo",
             "remote": "https://git.example.com/user/another.git",
             "oneline": [],
@@ -2697,7 +2765,7 @@ mod tests {
     #[test]
     fn repo_sync_conflict_matches_reference() {
         let event = super::RepoSyncConflictEvent {
-            kind: brenn_lib::messaging::REPO_SYNC_KIND_CONFLICT,
+            kind: brenn_messaging::REPO_SYNC_KIND_CONFLICT,
             slug: "conflicted-repo",
             remote: "https://git.example.com/user/conflicted.git",
             reason: "diverged",
@@ -2706,7 +2774,7 @@ mod tests {
         let produced = serde_json::to_string(&event)
             .expect("RepoSyncConflictEvent serialization is infallible");
         let reference = serde_json::json!({
-            "kind": brenn_lib::messaging::REPO_SYNC_KIND_CONFLICT,
+            "kind": brenn_messaging::REPO_SYNC_KIND_CONFLICT,
             "slug": "conflicted-repo",
             "remote": "https://git.example.com/user/conflicted.git",
             "reason": "diverged",

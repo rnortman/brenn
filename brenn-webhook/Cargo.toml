@@ -1,0 +1,24 @@
+[package]
+name = "brenn-webhook"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Webhook transport runtime: address parsing, signature/bearer verification, and the endpoint service"
+
+# Depends on brenn-lib for the resolved endpoint table it serves and the
+# signature schemes it verifies against. Nothing in brenn-lib reaches back: the
+# `[[webhook.endpoint]]` config section and the scheme types live there because
+# the config aggregate holds them, and everything on the request path lives
+# here.
+[dependencies]
+async-trait = "0.1.89"
+brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+bytes = "1.11.1"
+hex = "0.4.3"
+http = "1.4.0"
+
+[dev-dependencies]
+# The seam test resolves a whole config, which needs brenn-lib's runtime-dir
+# fixture and a scratch tree to point the app and the key file at.
+brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
+tempfile = "3.27.0"

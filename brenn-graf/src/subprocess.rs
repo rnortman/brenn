@@ -17,7 +17,7 @@ use tokio::time::timeout;
 use crate::GrafConfig;
 use brenn_lib::config::AppConfig;
 use brenn_lib::subprocess::drain_stream;
-use brenn_lib::ws_types::{CompletionLogEntry, TodoErrorCode, TodoItem, TodoLintError};
+use brenn_ws_types::{CompletionLogEntry, TodoErrorCode, TodoItem, TodoLintError};
 
 /// Result of a todo query, mirroring graf's `TodoQueryResult` JSON.
 #[derive(Debug, serde::Deserialize)]

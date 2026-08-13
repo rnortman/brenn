@@ -1,4 +1,4 @@
-<!-- AUTO-GENERATED from this component's src/help.rs. Do not edit; run `make regen-surface-help`. -->
+<!-- AUTO-GENERATED from this component's src/help.rs. Do not edit. -->
 Meeting-notice panel that shows time-to-next-meeting and escalates ambient → takeover → critical → overdue, computing every threshold locally from the wall clock.
 
 Publish a full upcoming-meetings snapshot via BrennSend to the instance's `agenda` channel (latest-wins; use a retained channel so it replays on reconnect). Body:

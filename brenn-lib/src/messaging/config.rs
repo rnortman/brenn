@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::{
     ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntryKind, WakeMin,
-    is_reserved_channel_name, is_unreserved_char, nondurable_channel_uuid, publish,
+    is_reserved_channel_name, is_unreserved_char, nondurable_channel_uuid,
 };
 use crate::config::AppConfigRaw;
 
@@ -1064,12 +1064,12 @@ pub struct SurfaceComponentRaw {
     pub abi: String,
     /// Override for this instance's durable send-budget burst: how many
     /// publishes it may make back-to-back before the refill rate binds. Absent ⇒
-    /// [`publish::SURFACE_SEND_BURST`].
+    /// [`SURFACE_SEND_BURST`].
     #[serde(default)]
     pub send_burst: Option<u32>,
     /// Override for this instance's durable send-budget refill interval, in
     /// seconds: one publish's worth of budget returns per interval. Absent ⇒
-    /// [`publish::SURFACE_SEND_REFILL`].
+    /// [`SURFACE_SEND_REFILL`].
     #[serde(default)]
     pub send_refill_secs: Option<u64>,
     /// How many of this instance's activation flushes the kernel parks while the
@@ -1128,6 +1128,38 @@ pub struct SurfaceComponentRaw {
 /// burst.
 pub const DEFAULT_PARKED_BATCH_DEPTH: u64 = 8;
 
+/// Equal to `brenn_budget::MAX_PUBLISHES_PER_ACTIVATION`, so a full bucket
+/// admits exactly one maximal conforming activation flush. That constraint — not
+/// the number — is the contract: this bucket is a backstop drawn in
+/// whole-publish units against a flush's entries, and a backstop sized below the
+/// flush it backstops would refuse truthful traffic. Boot asserts it (see
+/// `resolve_send_budget` in the server's surface bootstrap). Sustained
+/// throughput is governed by [`SURFACE_SEND_REFILL`], which is the knob that
+/// means "rate".
+pub const SURFACE_SEND_BURST: u32 = 256;
+
+/// The default's half of the sizing invariant, at compile time.
+///
+/// Boot asserts every *resolved* burst, which covers this one too — but the
+/// default is the value every surface gets without stating anything, including
+/// the kernel grain, which has no override knob to state. A default that
+/// violates the invariant should not compile, let alone reach a boot.
+const _: () = assert!(
+    SURFACE_SEND_BURST as usize >= brenn_budget::MAX_PUBLISHES_PER_ACTIVATION,
+    "SURFACE_SEND_BURST must cover a maximal conforming activation flush \
+     (MAX_PUBLISHES_PER_ACTIVATION)"
+);
+
+/// One durable-send token refilled per this interval, per surface principal
+/// (steady-state 4/min) — far above any legitimate sustained rate while
+/// bounding an attacker.
+///
+/// The surface's bare identity (no `[[surface.component]]` override) runs at
+/// this rate. An operator sizing `status_interval_secs` is therefore sizing
+/// against this refill; a cadence faster than it outruns the budget once the
+/// burst is spent.
+pub const SURFACE_SEND_REFILL: Duration = Duration::from_secs(15);
+
 /// One attach principal's durable send budget: a burst capacity that refills one
 /// publish per interval.
 ///
@@ -1135,8 +1167,8 @@ pub const DEFAULT_PARKED_BATCH_DEPTH: u64 = 8;
 /// boot hands the principal's token bucket. Every attach-route principal gets
 /// one — a surface's kernel grain, each of its declared component instances, and
 /// each `[[remote]]`, which takes the default. The default is the pair of
-/// constants this replaces at the finer grain ([`publish::SURFACE_SEND_BURST`] /
-/// [`publish::SURFACE_SEND_REFILL`]), which were sized for one surface's whole
+/// constants this replaces at the finer grain ([`SURFACE_SEND_BURST`] /
+/// [`SURFACE_SEND_REFILL`]), which were sized for one surface's whole
 /// traffic and now bound one principal of it.
 ///
 /// This is deliberately *not* the backend's `WasmSinkBudget` shape. That budget
@@ -1155,8 +1187,8 @@ pub struct AttachSendBudget {
 impl Default for AttachSendBudget {
     fn default() -> Self {
         Self {
-            burst: publish::SURFACE_SEND_BURST,
-            refill: publish::SURFACE_SEND_REFILL,
+            burst: SURFACE_SEND_BURST,
+            refill: SURFACE_SEND_REFILL,
         }
     }
 }
@@ -2809,7 +2841,7 @@ pub fn finalize_directory_with_subscribers(
 /// config change the operator may revert.
 ///
 /// `unreconstructible` is the skip report from
-/// [`load_channels_by_uuids`](crate::messaging::db::load_channels_by_uuids): uuid
+/// the channel loader: uuid
 /// → address for every requested row that loader declined to reconstruct. It
 /// routinely names channels that *are* declared — the loader skips every
 /// non-system address, and a declared one is already in the directory — so the
@@ -2850,7 +2882,7 @@ pub fn finalize_directory_with_subscribers(
 /// floor use, so the boot gate is identical to the delivery gate.
 pub fn merge_dynamic_subscriptions<'p>(
     directory: &MessagingDirectory,
-    rows: &[crate::messaging::db::DynamicSubscriptionRow],
+    rows: &[crate::messaging::DynamicSubscriptionRow],
     unreconstructible: &HashMap<Uuid, String>,
     app_policy: &dyn Fn(&str) -> Option<&'p crate::access::AppPolicy>,
 ) -> DynamicMergeOutcome {
@@ -3017,7 +3049,7 @@ pub struct DormantSubscription {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DynamicMergeOutcome {
     /// Rows folded into the directory (to be mirrored into the static table).
-    pub kept: Vec<crate::messaging::db::DynamicSubscriptionRow>,
+    pub kept: Vec<crate::messaging::DynamicSubscriptionRow>,
     /// `(channel_uuid, app_slug)` keys of rows dropped at merge (a channel whose
     /// row is gone from `messaging_channels`, or a static collision) — to be
     /// pruned from `messaging_dynamic_subscriptions`.
@@ -5763,8 +5795,8 @@ grants = []
         app: &str,
         push: Depth,
         retain: Depth,
-    ) -> crate::messaging::db::DynamicSubscriptionRow {
-        crate::messaging::db::DynamicSubscriptionRow {
+    ) -> crate::messaging::DynamicSubscriptionRow {
+        crate::messaging::DynamicSubscriptionRow {
             channel_uuid,
             app_slug: app.to_string(),
             push_depth: push,
@@ -5803,7 +5835,7 @@ grants = []
     /// inline-closure type inference otherwise over-constrains to `'static`.
     fn merge_with_policy(
         dir: &MessagingDirectory,
-        rows: &[crate::messaging::db::DynamicSubscriptionRow],
+        rows: &[crate::messaging::DynamicSubscriptionRow],
         policy: &crate::access::AppPolicy,
     ) -> DynamicMergeOutcome {
         merge_dynamic_subscriptions(dir, rows, &HashMap::new(), &|_| Some(policy))
@@ -5813,7 +5845,7 @@ grants = []
     /// exist while no block declares them.
     fn merge_with_skipped(
         dir: &MessagingDirectory,
-        rows: &[crate::messaging::db::DynamicSubscriptionRow],
+        rows: &[crate::messaging::DynamicSubscriptionRow],
         skipped: &HashMap<Uuid, String>,
         policy: &crate::access::AppPolicy,
     ) -> DynamicMergeOutcome {
@@ -5823,7 +5855,7 @@ grants = []
     /// The dormant registration the merge reports for `row` when its channel
     /// sits at `address`.
     fn dormant_of(
-        row: &crate::messaging::db::DynamicSubscriptionRow,
+        row: &crate::messaging::DynamicSubscriptionRow,
         address: &str,
     ) -> DormantSubscription {
         DormantSubscription {
@@ -5837,7 +5869,7 @@ grants = []
     /// fail-closed → revoked).
     fn merge_with_no_policy(
         dir: &MessagingDirectory,
-        rows: &[crate::messaging::db::DynamicSubscriptionRow],
+        rows: &[crate::messaging::DynamicSubscriptionRow],
     ) -> DynamicMergeOutcome {
         merge_dynamic_subscriptions(dir, rows, &HashMap::new(), &|_| None)
     }

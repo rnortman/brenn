@@ -5,9 +5,8 @@
 //! `IntegrationFactory::tools()`. The tool registry is a flat
 //! `HashMap<String, Arc<dyn AppTool>>` keyed by tool name.
 
-use crate::approval_rules;
 use crate::util::{html_escape, json_for_script_tag};
-use crate::ws_types::ToolResponseDecision;
+use brenn_ws_types::ToolResponseDecision;
 
 /// Per-tool extension point for app-specific behavior.
 ///
@@ -78,7 +77,7 @@ pub fn wrap_in_tool_approve(
     tool_input: &serde_json::Value,
     content: &str,
 ) -> String {
-    let patterns = approval_rules::default_patterns(tool_name, tool_input);
+    let patterns = brenn_approval_rules::default_patterns(tool_name, tool_input);
     let config = serde_json::json!({ "default_patterns": patterns });
     let config_json = json_for_script_tag(&config);
 

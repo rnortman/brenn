@@ -1,0 +1,32 @@
+[package]
+name = "brenn-messaging-store"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The messaging persistence layer: the messaging tables, the channel retention stores, and the ingress event shape"
+
+# Sits between brenn-lib (the addressing/config vocabulary these tables and
+# stores speak) and brenn-messaging (the Messenger engine that keeps its state
+# here). Nothing here names the engine.
+[features]
+testutils = []
+
+[dependencies]
+brenn-db = { version = "0.1.0", path = "../brenn-db" }
+brenn-envelope = { path = "../brenn-envelope" }
+brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-queue = { version = "0.1.0", path = "../brenn-queue" }
+async-trait = "0.1.89"
+chrono = { version = "0.4.44", features = ["serde"] }
+indexmap = "2"
+rusqlite = { version = "0.39.0", features = ["bundled", "trace"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["sync", "time", "macros", "rt"] }
+tracing = "0.1.44"
+uuid = { version = "1.23.0", features = ["v4", "v5", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
+tokio = { version = "1.50.0", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }

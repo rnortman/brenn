@@ -6,15 +6,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::time::{Duration, Instant};
 
+use brenn_approval_rules::ApprovalRuleSet;
 use brenn_cc::session::CcSession;
+use brenn_db::Db;
+use brenn_db::conversation;
 use brenn_lib::app::AppTool;
-use brenn_lib::approval_rules::ApprovalRuleSet;
 use brenn_lib::config::PathMapper;
-use brenn_lib::conversation;
-use brenn_lib::db::Db;
-use brenn_lib::obs::alerting::AlertDispatcher;
-use brenn_lib::obs::transcript::TranscriptWriter;
-use brenn_lib::ws_types::{ViewportClass, WsServerMessage};
+use brenn_obs::alerting::AlertDispatcher;
+use brenn_obs::transcript::TranscriptWriter;
+use brenn_ws_types::{ViewportClass, WsServerMessage};
 #[cfg(test)]
 use tokio::sync::watch;
 use tokio::sync::{broadcast, mpsc};
@@ -92,7 +92,7 @@ pub struct ActiveBridge {
     pub(super) tool_registry: Arc<HashMap<String, Arc<dyn AppTool>>>,
     /// First-class tool registry (grant-governed tools). The `registry_adapter`
     /// intercept routes CC's `mcp__brenn__*` calls that resolve here through it.
-    pub(super) tools: Arc<crate::tool_registry::ToolRegistry>,
+    pub(super) tools: Arc<brenn_tool_registry::ToolRegistry>,
     /// This app's resolved tool grants (from `AppPolicy.tool_grants`). The
     /// authorization side of a registry tool call; joined with the descriptor's
     /// `auto_approve` in the adapter.
@@ -195,10 +195,10 @@ pub struct ActiveBridge {
     /// successful tool invocation, so sibling clones of the same remote
     /// see the advance within seconds instead of waiting for the next
     /// poll interval.
-    pub(super) repo_sync_sender: Option<crate::repo_sync::SyncTriggerSender>,
+    pub(super) repo_sync_sender: Option<brenn_git::sync::SyncTriggerSender>,
     /// Messenger for the messaging MVP. `None` when no `[[channel]]`
     /// blocks are configured (messaging effectively disabled).
-    pub(crate) messenger: Option<Arc<brenn_lib::messaging::Messenger>>,
+    pub(crate) messenger: Option<Arc<brenn_messaging::Messenger>>,
     /// Serializes this conversation's bus delivery: read the position, render,
     /// send, advance. Three callers reach that sequence — the startup drain, the
     /// dispatcher fan-out, and the wake walk — and the read is pure, so two of
@@ -217,9 +217,9 @@ pub struct ActiveBridge {
     /// not a race.
     pub(in crate::active_bridge) chat_shutdown: Arc<tokio::sync::Notify>,
     /// PWA push service. `None` when no app has `pwa_push.enabled = true`.
-    pub(super) pwa_push_service: Option<Arc<dyn brenn_lib::pwa_push::PwaPushSender>>,
+    pub(super) pwa_push_service: Option<Arc<dyn brenn_pwa_push::PwaPushSender>>,
     /// MQTT service. `None` when no `[[mqtt_client]]` is configured.
-    pub(super) mqtt_service: Option<Arc<brenn_lib::mqtt::MqttService>>,
+    pub(super) mqtt_service: Option<Arc<brenn_mqtt::MqttService>>,
     /// MQTT inbound event router (concrete type). `None` when MQTT is not
     /// configured. Held so a runtime `mqtt:` dynamic subscribe can add an
     /// `IngressRoute` via `add_route`; the `Arc<dyn MqttEventRouter>` clones
@@ -228,7 +228,7 @@ pub struct ActiveBridge {
     pub(super) mqtt_event_router: Option<Arc<crate::mqtt_router::MqttEventRouterImpl>>,
     /// Automation engine. `None` when the automation subsystem is not configured
     /// (no messenger, or no apps with allowed_users).
-    pub(super) automation_engine: Option<Arc<brenn_lib::automation::AutomationEngine>>,
+    pub(super) automation_engine: Option<Arc<brenn_automation::AutomationEngine>>,
     /// Usage session inactivity gap in seconds. Mirrors
     /// `AppState::usage_session_gap_secs`; carried here so `handle_turn_completed`
     /// can record usage without threading the AppState through.
@@ -248,8 +248,7 @@ pub struct ActiveBridge {
     /// `std::sync::Mutex` is correct here: the critical section in
     /// `maybe_inject_lint_errors` performs no `.await` while the lock is held
     /// (it reads, compares, and drops before the async send).
-    pub(crate) last_lint_snapshot:
-        std::sync::Mutex<Option<Vec<brenn_lib::ws_types::TodoLintError>>>,
+    pub(crate) last_lint_snapshot: std::sync::Mutex<Option<Vec<brenn_ws_types::TodoLintError>>>,
     /// The CC event-loop task handle, stored so the wedge watchdog can detect a
     /// dead event loop via `is_finished()`. `std::sync::Mutex` because it is set
     /// once after the loop is spawned and only peeked thereafter (no `.await`
@@ -295,7 +294,7 @@ pub struct SpawnContext<'a> {
     pub model_override: Option<&'a str>,
     pub tool_registry: Arc<HashMap<String, Arc<dyn AppTool>>>,
     /// First-class tool registry, for the LLM tool-call adapter.
-    pub tools: Arc<crate::tool_registry::ToolRegistry>,
+    pub tools: Arc<brenn_tool_registry::ToolRegistry>,
     /// Origin string for this app's tool-caller `ParticipantId`.
     pub server_origin: Arc<str>,
     pub server_shutting_down: Arc<AtomicBool>,
@@ -303,13 +302,13 @@ pub struct SpawnContext<'a> {
     /// UTC fallback for autonomous wakes). Seeds `GRAF_USER_TZ` in CC's environment
     /// for graf MCP tool calls. See `docs/designs/graf-user-tz.md`.
     pub user_tz: chrono_tz::Tz,
-    pub repo_sync_sender: Option<crate::repo_sync::SyncTriggerSender>,
-    pub messenger: Option<Arc<brenn_lib::messaging::Messenger>>,
-    pub pwa_push_service: Option<Arc<dyn brenn_lib::pwa_push::PwaPushSender>>,
-    pub mqtt_service: Option<Arc<brenn_lib::mqtt::MqttService>>,
-    /// Concrete MQTT event router handle, for runtime `add_route` (design §2.3).
+    pub repo_sync_sender: Option<brenn_git::sync::SyncTriggerSender>,
+    pub messenger: Option<Arc<brenn_messaging::Messenger>>,
+    pub pwa_push_service: Option<Arc<dyn brenn_pwa_push::PwaPushSender>>,
+    pub mqtt_service: Option<Arc<brenn_mqtt::MqttService>>,
+    /// Concrete MQTT event router handle, for runtime `add_route`.
     pub mqtt_event_router: Option<Arc<crate::mqtt_router::MqttEventRouterImpl>>,
-    pub automation_engine: Option<Arc<brenn_lib::automation::AutomationEngine>>,
+    pub automation_engine: Option<Arc<brenn_automation::AutomationEngine>>,
     pub usage_session_gap_secs: u32,
 }
 
@@ -379,7 +378,7 @@ impl ActiveBridge {
 
         // Run start hooks for new conversations (not resume).
         let hook_warnings = if resume_session_id.is_none() {
-            let hook_result = crate::hooks::run_start_hooks(app_config, conversation_id).await?;
+            let hook_result = brenn_hooks::run_start_hooks(app_config, conversation_id).await?;
             hook_result.warnings
         } else {
             Vec::new()
@@ -432,7 +431,7 @@ impl ActiveBridge {
         };
         let db_rules = {
             let conn = db.lock().await;
-            brenn_lib::db::load_approval_rules(&conn, &app_config.slug, conversation_id)
+            brenn_db::load_approval_rules(&conn, &app_config.slug, conversation_id)
         };
         let db_rule_tuples: Vec<(String, String)> = db_rules
             .iter()
@@ -445,7 +444,7 @@ impl ActiveBridge {
         // the first turn delta is correct even after a bridge restart.
         let initial_cost = {
             let conn = db.lock().await;
-            brenn_lib::conversation::get_total_cost_usd(&conn, conversation_id)
+            brenn_db::conversation::get_total_cost_usd(&conn, conversation_id)
         };
 
         #[cfg(test)]
@@ -641,8 +640,8 @@ impl ActiveBridge {
     /// Artifact-display roots for this bridge: thin wrapper around
     /// `artifact::mount_roots_for(&self.mounts)`. Kept as a method so call
     /// sites that hold an `ActiveBridge` don't have to reach into `mounts`.
-    pub(crate) fn artifact_mount_roots(&self) -> Vec<crate::artifact::MountRoot> {
-        crate::artifact::mount_roots_for(&self.mounts)
+    pub(crate) fn artifact_mount_roots(&self) -> Vec<brenn_render::artifact::MountRoot> {
+        brenn_render::artifact::mount_roots_for(&self.mounts)
     }
 
     /// Alert/security-event dispatcher for this bridge. Used by the messaging
@@ -655,8 +654,8 @@ impl ActiveBridge {
     /// Pairs `app_slug` with `conversation_id` in one place so the two cannot
     /// drift apart at a call site; every app-path `signal_publish_denial` caller
     /// uses this instead of hand-building `DenialOrigin::App`.
-    pub(crate) fn denial_origin(&self) -> brenn_lib::obs::security::DenialOrigin<'_> {
-        brenn_lib::obs::security::DenialOrigin::App {
+    pub(crate) fn denial_origin(&self) -> brenn_obs::security::DenialOrigin<'_> {
+        brenn_obs::security::DenialOrigin::App {
             slug: &self.app_slug,
             conversation_id: self.conversation_id,
         }
@@ -664,23 +663,23 @@ impl ActiveBridge {
 
     /// Messenger handle for messaging tools. `None` when this server has
     /// no messaging configured.
-    pub fn messenger(&self) -> Option<&Arc<brenn_lib::messaging::Messenger>> {
+    pub fn messenger(&self) -> Option<&Arc<brenn_messaging::Messenger>> {
         self.messenger.as_ref()
     }
 
     /// PWA push service handle. `None` when no app has `pwa_push.enabled`.
-    pub fn pwa_push_service(&self) -> Option<&Arc<dyn brenn_lib::pwa_push::PwaPushSender>> {
+    pub fn pwa_push_service(&self) -> Option<&Arc<dyn brenn_pwa_push::PwaPushSender>> {
         self.pwa_push_service.as_ref()
     }
 
     /// Automation engine handle. `None` when automation is not configured
     /// (no messaging or no apps with allowed_users).
-    pub fn automation_engine(&self) -> Option<&Arc<brenn_lib::automation::AutomationEngine>> {
+    pub fn automation_engine(&self) -> Option<&Arc<brenn_automation::AutomationEngine>> {
         self.automation_engine.as_ref()
     }
 
     /// MQTT service handle. `None` when no `[[mqtt_client]]` is configured.
-    pub fn mqtt_service(&self) -> Option<&Arc<brenn_lib::mqtt::MqttService>> {
+    pub fn mqtt_service(&self) -> Option<&Arc<brenn_mqtt::MqttService>> {
         self.mqtt_service.as_ref()
     }
 
@@ -910,15 +909,15 @@ pub(super) const GLOBAL_EXTRA_STATIC_BASE: &[&str] = &[
     // GitRepoPull is a first-class registry tool; the registry_adapter
     // auto-approves it at PreToolUse, so it needs no Permission-layer entry.
     // Messaging tools — auto-approved (the budget bounds runaway agent loops).
-    crate::tools::messaging::MCP_MESSAGE_LIST_CHANNELS_TOOL,
-    crate::tools::messaging::MCP_MESSAGE_SUBSCRIPTION_LIST_TOOL,
-    crate::tools::messaging::MCP_MESSAGE_SEND_TOOL,
-    crate::tools::messaging::MCP_MESSAGE_QUERY_CHANNEL_TOOL,
+    brenn_render::tools::messaging::MCP_MESSAGE_LIST_CHANNELS_TOOL,
+    brenn_render::tools::messaging::MCP_MESSAGE_SUBSCRIPTION_LIST_TOOL,
+    brenn_render::tools::messaging::MCP_MESSAGE_SEND_TOOL,
+    brenn_render::tools::messaging::MCP_MESSAGE_QUERY_CHANNEL_TOOL,
     // Automation tools — all four are auto-approved.
-    brenn_lib::automation::MCP_AUTO_CREATE_TOOL,
-    brenn_lib::automation::MCP_AUTO_LIST_TOOL,
-    brenn_lib::automation::MCP_AUTO_EDIT_TOOL,
-    brenn_lib::automation::MCP_AUTO_DELETE_TOOL,
+    brenn_automation::MCP_AUTO_CREATE_TOOL,
+    brenn_automation::MCP_AUTO_LIST_TOOL,
+    brenn_automation::MCP_AUTO_EDIT_TOOL,
+    brenn_automation::MCP_AUTO_DELETE_TOOL,
     MCP_DEVICE_LIST_TOOL,
     MCP_DEVICE_GET_TOOL,
     MCP_DEVICE_ASSIGN_SLUG_TOOL,
@@ -954,11 +953,11 @@ mod tests {
     #[tokio::test]
     async fn mqtt_event_router_threads_through_fixture() {
         use crate::active_bridge::test_fixtures::TestBridgeConfig;
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (user_id, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "mqttrouteruser", "$argon2id$fake");
-            let cid = brenn_lib::conversation::create_conversation(&conn, uid, "test", false);
+            let uid = brenn_db::auth::user::create_user(&conn, "mqttrouteruser", "$argon2id$fake");
+            let cid = brenn_db::conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
         let (tx, _rx) = tokio::sync::broadcast::channel(4);
@@ -970,7 +969,7 @@ mod tests {
             "test",
             db.clone(),
             tx.clone(),
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig::default(),
         );
         assert!(
@@ -986,7 +985,7 @@ mod tests {
             "test",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 mqtt_event_router: Some(router.clone()),
                 ..Default::default()
@@ -1032,11 +1031,11 @@ mod tests {
         mounts: Vec<brenn_lib::config::ResolvedMount>,
         mapper: brenn_lib::config::PathMapper,
     ) -> std::sync::Arc<ActiveBridge> {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (user_id, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "testuser2", "$argon2id$fake");
-            let cid = brenn_lib::conversation::create_conversation(&conn, uid, "test", false);
+            let uid = brenn_db::auth::user::create_user(&conn, "testuser2", "$argon2id$fake");
+            let cid = brenn_db::conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
         let (tx, _rx) = tokio::sync::broadcast::channel(4);

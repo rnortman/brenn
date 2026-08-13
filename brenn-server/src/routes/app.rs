@@ -5,8 +5,8 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::response::{IntoResponse, Redirect, Response};
-use brenn_lib::auth::session::Session;
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_db::auth::session::Session;
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
 
 use super::html_escape;
 use crate::client_ip::ClientIp;

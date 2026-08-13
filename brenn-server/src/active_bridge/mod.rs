@@ -39,7 +39,7 @@ pub use bridge::ActiveBridge;
 #[cfg(not(test))]
 pub use bridge::SpawnContext;
 pub(crate) use cc_event_loop::drain::deliver_conversation_backlog;
-pub(crate) use cc_spawn_config::write_virtual_tools_file;
+pub use cc_spawn_config::write_virtual_tools_file;
 pub(in crate::active_bridge) use compaction::CompactionPhase;
 pub use registry::ActiveBridges;
 pub(in crate::active_bridge) use tool_summary::{
@@ -47,4 +47,4 @@ pub(in crate::active_bridge) use tool_summary::{
 };
 pub(crate) use tool_summary::{emit_tool_summary_for_intercept, mark_tool_handled};
 pub(crate) use user_send::{AcceptedSend, Interstitial, SendOrigin, accept_user_send};
-pub(crate) use watchdog::spawn_watchdog;
+pub use watchdog::spawn_watchdog;

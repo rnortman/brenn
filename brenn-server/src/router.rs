@@ -10,7 +10,7 @@ use axum::response::Response;
 use axum::{Router, middleware as axum_mw, routing::get, routing::post};
 use axum_helmet::Helmet;
 use brenn_lib::config::SecurityConfig;
-use brenn_lib::obs::security::{SecurityEventType, log_security_event};
+use brenn_obs::security::{SecurityEventType, log_security_event};
 use helmet_core::{
     ContentSecurityPolicy, ReferrerPolicy, StrictTransportSecurity, XContentTypeOptions,
     XFrameOptions, XXSSProtection,
@@ -30,7 +30,7 @@ use crate::state::AppState;
 /// Newtype wrapper for `max_image_long_edge` so it can be installed as an
 /// Axum `Extension` without conflicting with other `u32` extensions.
 #[derive(Clone, Copy)]
-pub(crate) struct MaxImageLongEdge(pub(crate) u32);
+pub struct MaxImageLongEdge(pub u32);
 
 /// Private coordination header inserted by a governor's error handler and
 /// stripped by `detect_rate_limit`. Never reaches the client. Its *value* names
@@ -275,7 +275,7 @@ pub(crate) fn helmet_layer() -> axum_helmet::HelmetLayer {
 /// token from the right (see `client_ip::resolve_client_ip`).
 ///
 /// `max_image_long_edge`: delivered to browsers via `<meta name="max-image-long-edge">`.
-pub(crate) fn build_router(
+pub fn build_router(
     state: AppState,
     security: Option<&SecurityConfig>,
     trusted_proxy_hops: u8,
@@ -580,11 +580,10 @@ mod tests {
     use axum::body::Body;
     use axum::extract::connect_info::MockConnectInfo;
     use axum::http::{Request, StatusCode};
-    use brenn_lib::auth::invite::create_invite_code;
-    use brenn_lib::auth::password::hash_password;
-    use brenn_lib::auth::user::create_user;
+    use brenn_db::auth::invite::create_invite_code;
+    use brenn_db::auth::password::hash_password;
+    use brenn_db::auth::user::create_user;
     use brenn_lib::config::SecurityConfig;
-    use brenn_lib::db;
     use indexmap::IndexMap;
     use tower::ServiceExt;
 
@@ -692,7 +691,7 @@ mod tests {
     struct AlwaysOkRouter;
 
     #[async_trait::async_trait]
-    impl brenn_lib::webhook::service::WebhookEventRouter for AlwaysOkRouter {
+    impl brenn_webhook::service::WebhookEventRouter for AlwaysOkRouter {
         async fn deliver_inbound(
             &self,
             _endpoint_slug: &str,
@@ -714,11 +713,10 @@ mod tests {
     /// request reaches 204.
     #[tokio::test]
     async fn user_endpoint_mounted_at_webhooks_git_resolves_and_serves() {
+        use brenn_lib::util::hmac_sha256_hex;
         use brenn_lib::webhook::config::{ResolvedWebhookEndpoint, WebhookOwner};
-        use brenn_lib::webhook::service::WebhookService;
-        use brenn_lib::webhook::signature::{
-            HexFormat, SignatureAlgorithm, SignatureScheme, hmac_sha256_hex,
-        };
+        use brenn_lib::webhook::scheme::{HexFormat, SignatureAlgorithm, SignatureScheme};
+        use brenn_webhook::service::WebhookService;
 
         const SECRET: &[u8] = b"collision-acceptance-secret";
         const MOUNT: &str = "/webhooks/git";
@@ -744,7 +742,7 @@ mod tests {
         let svc = WebhookService::new(vec![("git-forgejo".to_string(), endpoint)]);
         svc.set_router(Arc::new(AlwaysOkRouter));
 
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let mut state = test_state(&db);
         state.webhook = Some(svc);
         // build_router registers the endpoint's mount in the dynamic per-endpoint
@@ -1395,7 +1393,7 @@ mod tests {
     #[tokio::test]
     async fn logout_from_app_page_works() {
         // Simulates the real browser flow: load app page, extract CSRF, POST logout.
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let mock_addr = MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999)));
         let (session_token, _) = setup_authenticated_user(&db).await;
 
@@ -1489,7 +1487,7 @@ mod tests {
 
         // Session should be gone from DB.
         let conn = db.lock().await;
-        let session = brenn_lib::auth::session::validate_session(&conn, &session_token);
+        let session = brenn_db::auth::session::validate_session(&conn, &session_token);
         assert!(session.is_none(), "session should be deleted from DB");
     }
 
@@ -2157,10 +2155,10 @@ mod tests {
     /// outlive the app (auth lookups and file serving depend on them).
     async fn asset_governor_app(
         sec: &SecurityConfig,
-    ) -> (Router, db::Db, String, tempfile::TempDir) {
+    ) -> (Router, brenn_db::Db, String, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("probe.js"), b"export {};").unwrap();
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let mut state = test_state(&db);
         state.static_dir = tmp.path().to_path_buf();
         state.surface_dist_dir = tmp.path().to_path_buf();
@@ -2386,7 +2384,7 @@ mod tests {
     async fn full_flow_register_login_logout() {
         // This test exercises the full user lifecycle but needs separate app instances
         // for each request since oneshot consumes the service.
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let mock_addr = MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999)));
 
         // Step 1: Create invite code.
@@ -2516,7 +2514,7 @@ mod tests {
     /// tag must reflect the configured value.
     #[tokio::test]
     async fn app_page_includes_max_image_long_edge_meta_tag_configured() {
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let state = test_state(&db);
         let mock_addr = MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9999)));
         // Build router with a non-default cap of 1024.
@@ -2551,7 +2549,7 @@ mod tests {
         let mut cfg = default_test_app_config("test", "Test App");
         cfg.working_dir = dir.path().to_path_buf();
         apps.insert("test".to_string(), cfg);
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let state = crate::test_support::state::test_state_with_apps(&db, Arc::new(apps));
         let (session_token, _csrf) = setup_authenticated_user(&db).await;
 

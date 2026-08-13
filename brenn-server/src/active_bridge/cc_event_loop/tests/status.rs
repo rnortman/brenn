@@ -6,7 +6,7 @@ use super::super::super::test_support::{
     await_fence, drain_broadcast, event_fence, recv_broadcast, test_bridge, test_bridge_singleton,
 };
 use super::super::*;
-use brenn_lib::ws_types::CcState;
+use brenn_ws_types::CcState;
 
 use brenn_cc::protocol::incoming::ResultMessage;
 
@@ -164,7 +164,7 @@ async fn status_change_null_with_compact_result_failure_broadcasts_idle_and_rese
         WsServerMessage::SystemMessageBroadcast { category, .. } => {
             assert_eq!(
                 *category,
-                brenn_lib::ws_types::SystemMessageCategory::CompactionFailed,
+                brenn_ws_types::SystemMessageCategory::CompactionFailed,
                 "expected CompactionFailed category"
             );
         }

@@ -1,6 +1,6 @@
 //! Types for messages received from CC's stdout (CC → Brenn).
 
-use brenn_lib::ws_types::PermissionModeValue;
+use brenn_ws_types::PermissionModeValue;
 use serde::{Deserialize, Serialize};
 
 /// A message received from CC's stdout.

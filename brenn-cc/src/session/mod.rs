@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use brenn_lib::config::ContainerSpawnConfig;
-use brenn_lib::obs::alerting::AlertDispatcher;
-use brenn_lib::obs::transcript::TranscriptWriter;
-use brenn_lib::ws_types::PermissionModeValue;
+use brenn_obs::alerting::AlertDispatcher;
+use brenn_obs::transcript::TranscriptWriter;
+use brenn_ws_types::PermissionModeValue;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
@@ -766,13 +766,13 @@ fn parse_init_ack_info(response: &protocol::incoming::ControlResponsePayload) ->
 mod tests {
     use super::*;
     use brenn_lib::config::ContainerSpawnConfig;
-    use brenn_lib::obs::transcript::TranscriptWriter;
+    use brenn_obs::transcript::TranscriptWriter;
 
     /// Build a minimal CcSessionConfig for testing (bare process mode).
     fn bare_config() -> CcSessionConfig {
         let dir = tempfile::tempdir().unwrap();
         let transcript = Arc::new(TranscriptWriter::new(dir.path(), "test.log").unwrap());
-        let (alert_dispatcher, _handle) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (alert_dispatcher, _handle) = brenn_obs::alerting::noop_alert_dispatcher();
         CcSessionConfig {
             model: "sonnet".into(),
             cwd: PathBuf::from("/home/user/src/myapp"),

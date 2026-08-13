@@ -12,23 +12,6 @@ pub(crate) fn unwrap_panic_msg(payload: Box<dyn std::any::Any + Send>) -> String
     }
 }
 
-/// Seed the FK rows (user id 1, conversation `conversation_id`) required by
-/// tests that insert into tables referencing `users`/`conversations`.
-pub(crate) fn ensure_user_and_conv(conn: &rusqlite::Connection, conversation_id: i64) {
-    conn.execute(
-        "INSERT OR IGNORE INTO users (id, username, password_hash, created_at) \
-         VALUES (1, 'u', 'h', '2024-01-01')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT OR IGNORE INTO conversations (id, user_id, status, created_at, updated_at) \
-         VALUES (?1, 1, 'active', '2024-01-01', '2024-01-01')",
-        [conversation_id],
-    )
-    .unwrap();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

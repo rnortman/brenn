@@ -1,6 +1,6 @@
 mod build_info;
 
-use brenn_server::{bootstrap, cli};
+use brenn_bootstrap::{self as bootstrap, cli};
 
 #[tokio::main]
 async fn main() {

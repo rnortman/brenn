@@ -132,9 +132,9 @@ _generated_parity_test = rule(
     implementation = _generated_parity_test_impl,
     doc = """Pin a committed generated file to the bytes Bazel generates.
 
-    Migration-window only: the make lanes and the deploy path still read the
-    committed copies, so the two generators have to agree byte for byte. When
-    the committed copies go, so does this rule.
+    The generated file is still committed, so the copy in the tree and the
+    build artifact have to agree byte for byte. When the committed copies go, so
+    does this rule.
     """,
     attrs = {
         "committed": attr.label(
@@ -158,7 +158,7 @@ def generated_parity_test(name, committed, generated):
 
     Args:
         name: target name.
-        committed: the committed copy, still read by the make lanes.
+        committed: the copy tracked in the tree.
         generated: the target producing the same file as a build artifact.
     """
     _generated_parity_test(

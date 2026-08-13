@@ -1,9 +1,9 @@
 //! DisplayFile tool: artifact viewer; sandbox path validation against cwd + RW mount roots.
 
+use brenn_approval_rules::ApprovalMatch;
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
-use brenn_lib::approval_rules::ApprovalMatch;
-use brenn_lib::conversation;
-use brenn_lib::ws_types::WsServerMessage;
+use brenn_db::conversation;
+use brenn_ws_types::WsServerMessage;
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -81,7 +81,7 @@ pub(super) async fn handle(
             let cwd = match cwd {
                 Some(cwd) => cwd,
                 None => {
-                    let err = crate::artifact::ArtifactError::NoCwd;
+                    let err = brenn_render::artifact::ArtifactError::NoCwd;
                     warn!("DisplayFile called but no cwd set for conversation");
                     bridge.broadcast(WsServerMessage::Error {
                         message: err.to_string(),
@@ -94,7 +94,7 @@ pub(super) async fn handle(
 
             let mount_roots = bridge.artifact_mount_roots();
 
-            match crate::artifact::read_artifact_content(
+            match brenn_render::artifact::read_artifact_content(
                 &host_file_path,
                 Path::new(&cwd),
                 &mount_roots,
@@ -104,7 +104,7 @@ pub(super) async fn handle(
                 Ok((display_path, raw_content)) => {
                     let snapshot_result = {
                         let conn = bridge.db.lock().await;
-                        crate::artifact_snapshot::store_artifact_snapshot(
+                        brenn_render::artifact_snapshot::store_artifact_snapshot(
                             &conn,
                             bridge.conversation_id,
                             &display_path,
@@ -113,12 +113,12 @@ pub(super) async fn handle(
                         )
                     };
 
-                    let rendered_html = crate::frontmatter::render_markdown_with_frontmatter(
+                    let rendered_html = brenn_render::frontmatter::render_markdown_with_frontmatter(
                         &raw_content,
                         &bridge.frontmatter,
                     );
 
-                    let stable_url = crate::artifact::compute_stable_url(
+                    let stable_url = brenn_render::artifact::compute_stable_url(
                         &display_path,
                         Path::new(&cwd),
                         &bridge.working_dir,
@@ -135,7 +135,7 @@ pub(super) async fn handle(
                         file_path: display_path,
                         rendered_html,
                         raw_content,
-                        snapshot: Some(brenn_lib::ws_types::SnapshotMetadata {
+                        snapshot: Some(brenn_ws_types::SnapshotMetadata {
                             message_id: snapshot_result.artifact_message_id,
                             version: snapshot_result.version,
                             total_versions: snapshot_result.total_versions,
@@ -147,7 +147,10 @@ pub(super) async fn handle(
 
                     let artifact_index = {
                         let conn = bridge.db.lock().await;
-                        crate::artifact_snapshot::get_artifact_index(&conn, bridge.conversation_id)
+                        brenn_render::artifact_snapshot::get_artifact_index(
+                            &conn,
+                            bridge.conversation_id,
+                        )
                     };
                     bridge.broadcast(WsServerMessage::ArtifactIndex {
                         files: artifact_index,
@@ -213,7 +216,7 @@ mod tests {
         ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest, SessionEvent,
     };
     use brenn_lib::config::PathMapper;
-    use brenn_lib::ws_types::WsServerMessage;
+    use brenn_ws_types::WsServerMessage;
     use tokio::sync::oneshot;
 
     use super::super::super::mcp_constants::MCP_DISPLAY_FILE_TOOL;
@@ -770,7 +773,7 @@ mod tests {
             is_working_dir: false,
             primary: false,
         }];
-        let mount_roots = vec![crate::artifact::MountRoot {
+        let mount_roots = vec![brenn_render::artifact::MountRoot {
             host_path: mount.path().to_path_buf(),
             slug: "graf-life".into(),
         }];
@@ -803,8 +806,11 @@ mod tests {
         };
         // Reverse-mapping the stored display path through the same mount
         // list must yield the original canonical mount file.
-        let resolved =
-            crate::artifact::resolve_display_path(&stored_display_path, cwd.path(), &mount_roots);
+        let resolved = brenn_render::artifact::resolve_display_path(
+            &stored_display_path,
+            cwd.path(),
+            &mount_roots,
+        );
         assert_eq!(resolved, Some(mount_file.canonicalize().unwrap()));
     }
 

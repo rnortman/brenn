@@ -20,24 +20,6 @@ Code site (`TODO(test-task-panic-visibility)`):
 brenn-server/src/test_support/http.rs, `spawn_test_server`.
 
 
-## `scrub-template-drift-cache-skip`
-
-`repo_template_matches_the_tracked_public_config` (scrub/tests/rules.rs) guards
-`scrub/repo-template/gitleaks.toml` against drift from the live `.gitleaks.toml`,
-but the xtask test cache keys the scrub::rules binary only on its own bytes plus
-an env key that omits both gitleaks files (`collect_env_inputs` in
-xtask/src/test_run.rs lists only the brenn config TOMLs). Drift between the two
-gitleaks files therefore leaves the binary cached-as-passed and the check
-skipped until the binary is recompiled for some other reason. A real template
-drift can pass unnoticed. Pre-existing; unrelated to the write-exemption work.
-Done when those two files feed the env key (or the check moves out of the cached
-path) so the drift check runs on every relevant change.
-
-Code site (`TODO(scrub-template-drift-cache-skip)`): scrub/tests/rules.rs,
-`repo_template_matches_the_tracked_public_config` (the guard the cache skip
-weakens). The fix lands in xtask/src/test_run.rs, `collect_env_inputs`.
-
-
 ## `section-ref-burndown`
 
 ~968 pre-existing section-symbol references to ephemeral design docs in the
@@ -133,49 +115,46 @@ in the attach profile — and rejects (+ logs, fail2ban posture) a surface
 session's single `Publish` that is neither.
 
 Code site (`TODO(surface-single-publish-tightening)`):
-`brenn-server/src/routes/attach/publish.rs`, `handle_publish`.
+`attach/server/src/publish.rs`, `handle_publish`.
 
 ---
 
 ## `surface-wasm-test-in-ci`
 
-`make check` now *type-checks* the browser-side wasm test suites
-(`surface-wasm-check`'s second, scoped `--all-targets` invocation), so they can
-no longer rot silently. They are still never **run** by any gate: `make
-surface-wasm-test` needs a WebDriver browser driver and is in neither
-`CARGO_CHECK_STEPS` nor `check-ci`. A type-checked suite that never runs still
-answers no behavioral question — and these are the XSS-adjacent
+The browser-side wasm test suites — wasm-bindgen-test, real browser — now have
+**no runner at all**. `make surface-wasm-test` drove them out of band until the
+cargo teardown removed it, and no Bazel rule runs a wasm-bindgen-test binary.
+They are still compiled: the wasm-platform clippy build over `//surface/...`
+type-checks them, so they cannot rot silently. But a type-checked suite that
+never runs answers no behavioral question — and these are the XSS-adjacent
 text-not-markup pins, the DOM seam, mount/unmount, port dispatch, and the whole
 sync-call seam (the `brenn-activation-sync` listener, the door's answer
 vocabulary, the publish route's buffered/refused split), which exists only in
 the browser and is pinned only here.
 
-Done when `check-ci` runs `make surface-wasm-test`. **Blocked on host
-provisioning, and the ordering is load-bearing:** CI is a persistent
-`runs-on: shell` host runner, not an image; build tools are installed by
-workflow steps via `cargo install`, and chromedriver is not cargo-installable
-(Fedora: `dnf install chromedriver`), so it must be installed on the runner box
-*first*. Landing the `check-ci` step before that turns CI red on every push to
-main — which is also the auto-deploy-to-staging path.
-wasm-bindgen-test-runner needs no provisioning: CI already installs
-wasm-bindgen-cli, which ships it.
+Done when a gate runs them. Two things have to land, in order. First a Bazel
+rule that drives `wasm-bindgen-test-runner` against a WebDriver browser — no
+off-the-shelf rules_rust support exists, so this is real rule work, and it is
+what makes a local run possible again too. Then the CI step, which is
+**blocked on host provisioning and the ordering is load-bearing:** CI is a
+persistent `runs-on: shell` host runner, not an image, and chromedriver has to
+be installed on the runner box *first* (Fedora: `dnf install chromedriver`).
+Landing the CI step before that turns main red on every push, which is also
+the auto-deploy-to-staging path. The local gate must stay opt-in regardless:
+contributors are not asked to install a browser driver.
 
-Local `make check` deliberately does *not* run them — no chromedriver
-requirement on contributors. The compile gate is what keeps local commits from
-rotting the suite; CI is what catches behavioral regressions before staging.
-
-Code site (`TODO(surface-wasm-test-in-ci)`): `Makefile`, the
-`surface-wasm-test` target; `surface/kernel/src/entry.rs`, the buffered-publish
-`None` arm (absent host slot → `"not-permitted"`), which depends on the live
-wasm host slot and can only be pinned by the browser test runner.
+Code site (`TODO(surface-wasm-test-in-ci)`): `surface/component-support/BUILD.bazel`,
+the note on the untargeted `tests/prebind_panic.rs`; `surface/kernel/src/entry.rs`,
+the buffered-publish `None` arm (absent host slot → `"not-permitted"`), which
+depends on the live wasm host slot and can only be pinned by the browser test
+runner.
 
 ---
 
 ## `e2e-in-ci`
 
 `make e2e` — the Playwright browser suite in `e2e/tests/` — is run by no gate:
-it is in neither `CARGO_CHECK_STEPS` nor `NONCARGO_CHECK_STEPS`, not in
-`check-ci`, and not in `.github/workflows/ci.yml`. Only an operator running it
+not by `make check`, and not by `.github/workflows/ci.yml`. Only an operator running it
 by hand answers anything, and four of its six specs sat red — a stale
 component-element selector — for an unbounded span before anyone noticed. The
 suite covers layout switching, malformed-layout last-good retention,
@@ -183,15 +162,15 @@ per-instance content isolation, and reload/durable-snapshot restore; acceptance
 decisions have already leaned on one of those specs while it was dead, which is
 the specific harm an ungated suite does.
 
-Done when `check-ci` runs `make e2e`. Blocked on two provisioning facts, and
+Done when a CI job runs `make e2e`. Blocked on two provisioning facts, and
 the ordering is load-bearing the same way `surface-wasm-test-in-ci`'s is: CI is
-a persistent `runs-on: shell` host whose build tools are installed by workflow
+a persistent `runs-on: shell` host whose extra tools are installed by workflow
 steps, and Playwright's chromium is not one of them (`npx playwright install
 chromium` plus its system libraries); and the target boots the built binary as
 a real server on port 3100, so the runner needs that port free and must
 tolerate a backgrounded server on a capacity-1 runner shared with every
-project's deploys. Landing the `check-ci` step before both hold turns CI red on
-every push to main, which is also the auto-deploy-to-staging path.
+project's deploys. Landing the CI step before both hold turns main red on
+every push, which is also the auto-deploy-to-staging path.
 
 Until then the operator-side trigger stands in for the gate: run `make e2e`
 before tagging a release, and after any change under `surface/`.
@@ -319,7 +298,7 @@ is fixed in code (only `git-repo-pull`), so a pending row can only name a
 registered tool — the case is unreachable until tools become dynamically
 (de)registerable.
 
-Code site: `brenn-server/src/bootstrap/messaging/mod.rs` (async-tool request
+Code site: `brenn-messaging-boot/src/lib.rs` (async-tool request
 channel wiring in `build_messaging`),
 `TODO(tool-registry-unregistered-tool-sweep)`.
 
@@ -367,47 +346,6 @@ Code site: `surface/components/meeting/src/logic.rs` (`recompute`,
 
 ---
 
-## `test-cache-concurrent-report`
-
-Two concurrent cache-enabled `xtask test` runs in one target dir share a single
-JUnit report path (`<target>/nextest/<profile>/junit.xml`). Run B can overwrite
-that file between run A's nextest write and run A's read, so A can parse B's
-results and record them under A's environment key — a false pass record that
-becomes a persistent false skip until the binary or env key next changes.
-
-Local-only: CI runs cache-off (`BRENN_TEST_CACHE=0`) and serial
-(`BRENN_CHECK_JOBS=1`), so neither concurrency nor the cache is in play there.
-The design (§3.6) reasoned only about interleaved *cache* writes (safe via atomic
-rename) and concluded "no locking needed"; it did not account for the shared JUnit
-report as concurrent state. A robust fix is a concurrency-model decision — either
-a run-level advisory lock around the run+record section (contradicting §3.6's "no
-locking needed" framing) or a per-run report path (needs a nextest mechanism whose
-availability must not be pre-judged per design-delta-1) — and so warrants a design
-pass rather than a respond-mode patch.
-
-Code site: `xtask/src/test_run.rs` (`run_cached`, JUnit read),
-`TODO(test-cache-concurrent-report)`.
-
----
-
-## `nextest-e2e-verification`
-
-One item remains: a green cache-off CI run on a pushed branch (nextest active).
-It requires an actual push, so it cannot run in this environment — and it
-self-resolves on the first push to `main`, since CI runs automatically. When it
-goes green, remove this entry and its code comment.
-
-All local verification (filterset DSL, JUnit report shape, per-suite pass gate,
-cache record + fast no-op, cold-vs-warm hash-cost timing, single-leaf-crate touch
-selectivity, WASM-fixture invalidation, `BRENN_TEST_CACHE=0`, and the §4 flake
-shakeout — three genuine full cache-bypassed runs, all green) is recorded in the
-ADR implementation log:
-`docs/adr/2026/07/11-make-check-speedup/implementation-log.md`.
-
-Code site: `xtask/src/test_run.rs` (`build_filterset`), `TODO(nextest-e2e-verification)`.
-
----
-
 ## `wasm-dead-subscribe-acl-check`
 
 A `[[wasm_consumer]]` with a non-empty `subscribe_acl` / `mqtt_subscribe_acl` /
@@ -419,21 +357,8 @@ check (2g) rejecting ACL-without-covering-sub for WASM consumers. This diverges 
 the shared subscribe_acl convention (the same gap exists pre-existing for `subscribe_acl`
 on `brenn:`), so it needs a design decision before landing.
 
-Code site: `brenn/src/bootstrap/messaging.rs` in `resolve_wasm_consumers`, alongside
+Code site: `brenn-messaging-boot/src/wasm.rs` in `resolve_wasm_consumers`, alongside
 checks 2c–2f. `TODO(wasm-dead-subscribe-acl-check)`.
-
----
-
-## `xtask-wasi-macro-cleanup`
-
-The WASI-free gate is enforced in two places: the `wasm_component_rule` / `wasm_guest_component_rule`
-Makefile macros (`Makefile:246-251`, `273-278`) and `xtask check-wit`. The macro-embedded grep is left
-in place until `xtask check-wit` proves itself (belt-and-suspenders on a security-relevant gate).
-Once `xtask check-wit` has run in CI for a while without issues, remove the grep from the Makefile
-macros so artifact production is not self-gating and the gate lives only in xtask.
-
-Code site: `Makefile:246-251` (WASI grep in `wasm_component_rule`), `Makefile:273-278` (WASI grep
-in `wasm_guest_component_rule`). `TODO(xtask-wasi-macro-cleanup)`.
 
 ---
 
@@ -733,11 +658,11 @@ Code site (`TODO(wasm-messenger-test-helper)`):
 Wire the `scrub-tree` release-gate sweep into an automated check so the
 green-tree invariant (and the stale-exclude panic that is meant to force
 cleanup after the GitHub migration) fires on its own instead of only when
-someone remembers to run `make scrub-tree`. Blocked on a decision: CI runs
-`make check-ci` without installing `brenn-scrub`, so wiring it into
-check-common/check-ci either needs the binary installed in CI or a hermetic
-`cargo run -p scrub` invocation (which changes the design's deliberate
-"verify the installed binary" semantics).
+someone remembers to run `make scrub-tree`. Blocked on a decision: CI never
+installs `brenn-scrub`, so wiring the sweep into `make check` or a CI job
+either needs the binary installed there or a hermetic `bazel run //scrub`
+invocation (which changes the design's deliberate "verify the installed
+binary" semantics).
 
 Code site (`TODO(scrub-tree-auto-gate)`): `Makefile` (`scrub-tree` target).
 
@@ -809,7 +734,7 @@ accurate across every park/cancel/release/quota site, including the durable park
 `insert_pushes` that does not route through `DbStore::park`.
 
 Code site (`TODO(substrate-deferred-view-count-shortcut)`):
-`brenn-server/src/wasm_dispatch/mod.rs` (the `for out in &cfg.outputs`
+`brenn-wasm-dispatch/src/lib.rs` (the `for out in &cfg.outputs`
 deferred-view loop in `drain_step`).
 
 ---
@@ -911,10 +836,9 @@ gate/dispatcher composition or whether the sweep's gated emission must
 additionally move off the dispatcher loop.
 
 Code sites (`TODO(surface-op-send-budget)`):
-`brenn-server/src/routes/attach/publish.rs` and
-`brenn-server/src/routes/surface/session.rs` (the `draw` in
-`handle_publish_batch`); `brenn-lib/src/messaging/mod.rs`
-(`push_released_surface_views`, the sweep-side gate take on the dispatcher loop).
+`attach/server/src/publish.rs` (both draws, in `handle_publish_batch`);
+`brenn-messaging/src/lib.rs` (`push_released_surface_views`, the sweep-side gate
+take on the dispatcher loop).
 
 ---
 
@@ -1089,7 +1013,7 @@ at `run_terminal_drain`.
 
 The websocket read cap and the per-activation publish caps contradict each other
 for batches. `max_client_frame_bytes` (`attach/proto/src/lib.rs`, and the same
-derivation in `brenn-server/src/routes/surface/mod.rs`) sizes the cap at
+derivation in `brenn-server/src/routes/surface.rs`) sizes the cap at
 `6 × max_body_bytes + 8 KiB` — one worst-case-escaped body plus slack — while an
 activation may buffer `MAX_PUBLISHES_PER_ACTIVATION` = 256 publishes totalling
 `MAX_PUBLISH_BYTES_PER_ACTIVATION` = 4 MiB (`brenn-budget`), and a flush travels
@@ -1111,7 +1035,7 @@ composition cannot produce one over it — and the comments at both code sites
 state the contract that was chosen rather than the mismatch.
 
 Code sites (`TODO(batch-frame-cap)`): `attach/proto/src/lib.rs`
-(`max_client_frame_bytes`) and `brenn-server/src/routes/attach/socket.rs`
+(`max_client_frame_bytes`) and `attach/server/src/socket.rs`
 (`InboundError::Oversized`, which is where the violation is raised).
 
 ## `chat-conversation-provision-chokepoint`
@@ -1193,7 +1117,7 @@ consuming half lives; this entry is brenn's half. The slug is the join key —
 move both together.
 
 When the attach route judges a frame a protocol violation it tears the
-attachment down by dropping the context (`brenn-server/src/routes/attach/session.rs`,
+attachment down by dropping the context (`attach/server/src/session.rs`,
 after the `AttachProtocolViolation` event). No `Message::Close` is ever written
 on this route, so the attacher sees only `TransportClosed { code: None }` — the
 same thing a network blip produces. The two want opposite responses: a blip
@@ -1218,7 +1142,7 @@ of the already-built client mechanism (`ConnConfig::terminal_close_code` /
 passes `terminal_close_code: None` today).
 
 Code site (`TODO(bridge-violation-close-code)`):
-`brenn-server/src/routes/attach/session.rs`, the violation-teardown path in
+`attach/server/src/session.rs`, the violation-teardown path in
 `run_attach_session`.
 
 
@@ -1246,42 +1170,25 @@ Code site (`TODO(tool-schema-derive)`):
 
 ## `bazel-teardown`
 
-Both gates and both release paths are Bazel's now: the required GitHub check is
-`make bazel-check`, and the deploy pipeline builds and packages
-`//deploy:release_package`. The cargo half is still in the tree, and everything
-in this list is what comes out when it goes:
+The cargo build and check lanes are gone: `make check` is the verb layer over
+`bazel test`, the xtask machinery that reimplemented Bazel is deleted, the
+`cargo-parity` CI job is deleted, and cargo buildability is formally
+unsupported. `Cargo.toml`/`Cargo.lock` stay as `crate.from_cargo` inputs.
 
-- the Makefile's cargo check lanes (`CARGO_CHECK_STEPS`, `NONCARGO_*_STEPS`,
-  `check-common`, `check-ci`, the parallelism knob and the step-ordering machinery
-  around them), the cargo `build`/`release`/`release-musl` targets, and the
-  WASM/wasm-bindgen/jco preflight and pin variables — leaving the thin verb layer
-  (`check`, `build`, `launchdev`, `stopdev`, `npm-audit`, `scrub-*`).
-- xtask's reimplementation-of-Bazel half: the blake3 test-result cache
-  (`test_run.rs`), the lane scheduler (`parallel.rs`), the drift-compare core of
-  `check_wit.rs`, the crate discovery/classification machinery and
-  `lint-allowlist.toml`, and the `check` lane orchestration in `main.rs`. The
-  policy guards, the sync guards, the WIT world-equivalence check, the policy
-  parity check and `xtask deny` all stay.
-- the committed generated files and the gates pinning them: the 37 ts-rs `.ts`
-  files under `frontend/src/generated/`, `frontmatter.generated.ts`, the seven
-  raw-WIT `bindings.rs`, the surface `help.md` sidecars, and `package-lock.json`
-  in both npm trees (the pnpm lockfiles are what the build reads). With no
-  committed copy there is nothing to drift and the gates have nothing left to
-  compare.
-- the scheduled `cargo-parity` CI job, and `TODO(scrub-template-drift-cache-skip)`
-  — which closes with the cache it describes.
+What is left is the last item on the original list: the committed generated
+files and the gates pinning them — the 37 ts-rs `.ts` files under
+`frontend/src/generated/`, `frontmatter.generated.ts`, the seven raw-WIT
+`bindings.rs`, and the surface `help.md` sidecars. Every one of them is a build
+artifact now, so with no committed copy there is nothing to drift and the
+`generated_parity_test` / `generated_tree_parity_test` gates, the per-crate
+`help_sidecar_matches_generator` tests, and the frontend's committed-copy
+exclusions all have nothing left to compare.
 
-Gated on an event, not on a decision: it runs after a Bazel-built release has
-been deployed to staging and then run clean in production. Until that has
-happened the cargo lanes are the rollback path — the deploy pipeline can be
-re-pointed at them in one commit — and the comparison run that would catch a
-verdict divergence needs both sides alive. Deleting early trades a
-reversible cutover for an irreversible one.
+Done = those files and their gates are deleted, and every consumer reads the
+generated tree.
 
-Done = the list above is deleted, `make check` is the verb layer over
-`bazel test`, and cargo buildability is formally unsupported.
-
-Code site (`TODO(bazel-teardown)`): `Makefile`, at `CARGO_CHECK_STEPS`.
+Code site (`TODO(bazel-teardown)`): `frontend/BUILD.bazel`, at
+`generated_types_parity_test`.
 
 
 ## `bazel-ci-cache-pressure`
@@ -1319,53 +1226,294 @@ Code site (`TODO(bazel-ci-cache-pressure)`): `.github/workflows/ci.yml`, the
 `Report bazel cache sizes` step.
 
 
-## `bazel-server-test-split`
+## `crate-split`
 
-`//brenn-server:brenn-server_test` runs ~2,500 tests in one action, and 99 of
-them are the only ones that open a WASM component fixture. Its `data` now names
-the ten components those 99 load rather than all sixteen, but the coupling that
-remains is still all-or-nothing: an edit to any one of the ten re-runs the whole
-binary.
+`brenn-lib` and `brenn-server` are each one `rust_test(crate = ...)` target over
+a whole crate, so any source edit re-runs every test in it. On the CD runner the
+brenn-server target took 472s at ~2,500 tests; it is at 1,349 and brenn-lib at
+967 as the tranches land. Only
+finer crates reduce that work — within-target partitions (wrapper targets,
+libtest filters, sharding) all keep the whole crate in the input closure, so
+they re-run exactly as much.
 
-The shape that would fix it is a filter split over two `rust_test(crate =
-":brenn-server")` targets — one Starlark list of libtest filter strings, defined
-once and consumed by both, `--skip` on the primary and positional selection on
-the secondary, with only the secondary carrying the fixtures. One list is
-load-bearing: `--skip` and positional filters match the same way, so two lists
-that drift can leave a test running on neither target with both green. The 99
-live in three private-API clusters (`wasm_dispatch::tests`, the `inbound.rs`
-replay modules, one surface boot-validation test) and use `use super::*`, so
-moving them to `tests/*.rs` files instead is not available without exposing
-crate internals.
+The program is four tranches. Tranche 0 (the cargo/xtask teardown) and tranche
+1 have landed: `brenn-approval-rules`, `brenn-obs`, `brenn-ws-types` out of
+brenn-lib, then `brenn-render` (319 tests) and `brenn-git` (now 77) out of
+brenn-server. Tranche 2 is under way: `brenn-automation` (78), `brenn-db`
+(129 — the connection handle, the base schema, and the `auth`, `conversation`
+and `cost_samples` DAOs over it), `brenn-webhook` (57), `brenn-pwa-push`
+(145) and `brenn-mqtt` (69, plus the 16-test mosquitto integration suite) have
+left brenn-lib. Remaining:
 
-What is not known is whether it is worth it. Two targets over one crate means
-two test-binary compiles of one of the tree's two biggest crates, paid on every
-brenn-server or brenn-lib source edit, to buy a ~96% test-execution cut on
-component-only edits. Which side wins depends on the commit mix and on the
-compile-vs-execution ratio on the CI runner, and neither has been measured.
+- Tranche 1 residue: four leaf sinks stayed in brenn-server — `path_validate`
+  (19 tests), `client_ip` (20), `cc_schema_drift` (5), `pid_file` (3). They
+  share no through-line with each other or with the render cluster, and 47
+  tests does not repay four crates' ceremony; each belongs with whichever
+  tranche-2/3 crate its consumer lands in.
+- Tranche 2, brenn-lib: `automation`, the data layer, `webhook`, `pwa_push` and
+  the `mqtt` runtime have left. The seam that works on the `config` hub — sink
+  the interface, raise the runtime — is now applied three times and is the
+  prescription: what production code below the subsystem reads (its config
+  blocks, the resolved types `ResolvedConfig` holds, and the data those carry —
+  the webhook `SignatureScheme`, the push `EndpointPolicy` and VAPID keypair,
+  MQTT addressing) stays in brenn-lib; the wire path rises into its own crate. Moving the aggregate
+  above the subsystems instead does not work: `messaging` reads
+  `config::{AppConfig, AppConfigRaw, LlmChatConfig, ServerConfig}` in
+  production (`gates.rs`, `store/targets.rs`, `messaging/mod.rs`,
+  `messaging/config.rs`, `chat_roster.rs`, `chat_provision.rs`, `remote.rs`),
+  and the subsystems depend on `messaging`, so an aggregate above them is above
+  `messaging` too and closes the cycle from the other side.
+- The subsystems on that seam are done. `mqtt` cut where its extra edge said it
+  had to: `messaging` and `access` production code parse MQTT addresses and
+  validate topic filters, so `mqtt::{address, config, error}` stayed in
+  brenn-lib and only the wire half — `service`, `connection`, `state`,
+  `payload`, `egress` — rose. What is left in brenn-lib below `messaging` is
+  the `config` aggregate itself and the leaf sinks
+  (`token_bucket`, `mcp_tool_names`, `model_window_cache`, `runtime_dir`,
+  `subprocess`), none of which repays a crate on its own. The usage cluster
+  did repay one and has left: `brenn-usage-db` (32 tests) sits directly above
+  `brenn-db`, owns `usage_sessions`/`usage_events`, and carries the CSV/JSON
+  export writers with the row types they serialize.
+- Tranche 2, brenn-server: `brenn-bootstrap` (401 tests) has left — the
+  composition root with `cli` and `pid_file`, and the two boot-dependent test
+  trees that had to move up with it (`routes/surface/ws_tests.rs`, the surface
+  boot harness, `wasm_dispatch/tests/e2e.rs`). The route it took is the
+  prescription for the rest: the modules the root wires are `pub`, the fixture
+  layers those tests are built on (`test_support`, `routes/surface/
+  test_fixtures`, `wasm_dispatch/tests`) are `pub` behind brenn-server's new
+  `testutils` feature, and the migration composition stayed below in
+  `brenn-server/src/db.rs` so production and test open through one function.
+  The root then shed its own biggest half: `brenn-messaging-boot` (339 tests)
+  is the boot-time lowering of the messaging configuration — channel
+  derivation, auto wiring, surface and consumer resolution, `build_messaging`
+  itself — which referenced nothing else in the root, so it extracts *below*
+  it. What stayed in `brenn-bootstrap` is the 62 tests that stand a whole wired
+  server up (the surface WS round trip and the dispatch end-to-end family);
+  they reach the lowering through its `testutils`-gated `test_fixtures`.
+  `brenn-wasm-dispatch` (40 tests) followed it out, in the other direction:
+  the dispatch task reads no server type, so it sits *below* brenn-server with
+  its four guest fixtures, and only the three suites that also drive the tool
+  executor and the repo-sync fixtures stayed (`brenn-server/src/
+  wasm_dispatch_tests/`, built on the harness the lower crate exposes behind
+  `testutils`). Still in brenn-server: the four `*_intercept` modules
+  (`active_bridge/brenn_tools` dispatches into all four in production, which is
+  why they belong to `active_bridge`'s tranche-3 treatment).
+- Tranche 3: brenn-lib `messaging`, brenn-server `routes` and `active_bridge`.
+  A first coupling pass over all three says none of them leaves whole:
+  - `active_bridge` (482 tests) reads `tool_registry`, `repo_sync`,
+    `idle_hooks`, `cc_schema_drift`, `mqtt_router`, `messaging_router`,
+    `hooks`, `routes::upload::ResolvedAttachment` and all four `*_intercept`
+    modules in production, and `state` and `routes` read it back. Taking it out
+    means taking most of brenn-server with it; the cut has to be inside it.
+  - `routes` holds the reverse shape: `state` holds
+    `routes::{surface::SurfaceRuntime, remote::RemoteRuntime}` as production
+    fields while `routes` reads `state` 47 times. Either those runtime types
+    come down or `state` goes up; that decision is the first step of any
+    routes tranche. Two of the three came down already. The attachment layer
+    (`routes::attach`, 143 tests) was a pure sink — its whole production
+    surface is `brenn-attach-proto`, `brenn-messaging`, `brenn-lib`,
+    `brenn-obs` and `brenn-envelope`, with no reference to `state`,
+    `active_bridge` or any sibling route — so it left as `brenn-attach-server`
+    at `attach/server`, beside the proto and client crates it already shares a
+    protocol with. `state.attach_registry`, `messaging_router`'s fan-out, the
+    surface and remote routes and `brenn-bootstrap`'s `AppState` literal name
+    it from above.
 
-Done = the post-remediation CI timings are read — per-step durations for
-docs-only, component-only, and brenn-lib/brenn-server commits — and the split is
-either landed or this entry closed with those numbers written down.
+    `SurfaceRuntime` came down next, as `brenn-surface-server` at
+    `surface/server` (123 tests): the whole boot half of `routes::surface` —
+    the config lowering into runtimes, the attachment profile, the bindings and
+    self-description documents, asset validation, the single-writer sweeps and
+    the disconnected stamp — reads no `state` and no sibling route, so the cut
+    ran *inside* `routes/surface/mod.rs` rather than around it. What stayed in
+    brenn-server is the part that needs `AppState`: `authorize_surface`,
+    `surface_ws_handler`, `page.rs`, the conformance suite, and the rigs that
+    stand a whole state up. The seam is the general one for this tranche —
+    a `state` field's *type* can come down even when the route that reads
+    `state` cannot.
 
-Code site (`TODO(bazel-server-test-split)`): `brenn-server/BUILD.bazel`, above
-the `brenn-server_test` target.
+    `RemoteRuntime` came down the same way, as `brenn-remote-server` (14
+    tests): the `[[remote]]` lowering, the attachment profile, and the
+    bearer-credential comparison read no `state` and no sibling route, so the
+    cut ran inside `routes/remote/mod.rs`. `authenticate_remote` came down with
+    them, taking the runtime map and the alert dispatcher as arguments instead
+    of reading them off `AppState`, which keeps the whole uniform-401 posture
+    (dummy token, one security event, one refusal) in one place. What stayed in
+    brenn-server is `remote_ws_handler` and the three suites that stand a whole
+    `AppState` up.
+
+    Left of `routes`: `ws` (248 tests, which reads `state` 24 times and
+    `active_bridge` 18), `webhooks` (43),
+    `upload`/`file`/`redirector`/`target_handler` (86), `page` and the
+    `AppState` halves of `surface` and `remote` — all of them
+    `State<AppState>` handlers, and `ws`'s sub-modules are `impl WsConnection`
+    blocks over a struct that holds `AppState`, so they cannot be split apart
+    from each other either (the same inherent-impl constraint the messaging
+    runtime hit). Nothing further comes out of `routes` without deciding who
+    owns the state fields.
+  - **What blocks the rest, stated once.** Every remaining brenn-server module
+    is inside one production cycle through `AppState`. `state` holds
+    `active_bridges`, `mqtt_event_router` and the route runtimes;
+    `active_bridge` holds `mqtt_router::MqttEventRouterImpl` as a production
+    field (`bridge.rs`), names `messaging_router::DeliveryBinding`
+    (`bridge_io.rs`) and `routes::upload::ResolvedAttachment` (`user_send.rs`),
+    and dispatches into the four `*_intercept` modules, `idle_hooks`,
+    `cc_schema_drift` and `mqtt_subscribe`; and `mqtt_router` holds an
+    `AppState` in its `OnceCell` router state, so active_bridge reaches
+    `AppState` through it. The intercepts and every `active_bridge`
+    sub-module (`brenn_tools` 126 tests, `compaction` 75, `cc_event_loop` 70,
+    `bus_chat` 50, `permission_sync` 29, `tool_card` 10) take `&ActiveBridge`,
+    so none of them is separable from the struct. Breaking any of it needs a
+    decision that is design work, not extraction: either the late-binding
+    routers stop holding `AppState` (a registry or a narrower context type), or
+    the state fields' ownership is inverted. Both are out of bounds under the
+    program's no-invented-abstraction rule.
+  - The service layer below the bridge has left. `repo_sync` split at the
+    reactor seam: its git plumbing (26 tests) and its clone/trigger vocabulary
+    (4) went down into `brenn-git`, which now also carries the `pull` path the
+    reactor, the hooks and the `git-repo-pull` tool all call; the reactor and
+    the manager stayed in brenn-server, holding `ActiveBridges` as they always
+    did. `brenn-hooks` (36) and `brenn-tool-registry` (62) followed the
+    plumbing down, and `git-fixture` gained the scratch remote-and-clone
+    helpers all three suites build on. Still in brenn-server from that layer:
+    `repo_sync`'s reactor/manager half (45 tests), which is `active_bridge`'s
+    tranche-3 problem.
+  - `messaging` (1,032) has the same seam the three subsystems took: every
+    back-edge into it from `access`, `config`, `mqtt`, `webhook`,
+    `repo_sync_cursor` and `tools` lands in `messaging::config` or in the value
+    types in `messaging/mod.rs` (`ChannelScheme`, `Urgency`, `WakeMin`,
+    `ParticipantId`, `ChannelEntry`, `MessagingDirectory`, `gates`), so the
+    addressing/config half stays and the runtime (`publish`, `store`, `db`,
+    `dispatcher`, `subscribe`, `query`, `ingress`, `edit`, `remote`, `system`,
+    `live`, `conversations`, `chat_*`, `reconcile`) rises with the messaging
+    DDL set. All three layers have landed: the below-facing vocabulary is
+    `brenn-lib/src/messaging/` (`addressing`, `config`, `directory`, `gates`,
+    `identity`, `remote`, `test_support`, 967 tests with the rest of brenn-lib),
+    the persistence layer is `brenn-messaging-store` (277), and the engine is
+    `brenn-messaging` (469), which glob-re-exports the vocabulary so the moved
+    code's own paths resolve — callers name the vocabulary through
+    `brenn_lib::messaging`. The engine had to rise as one crate: every runtime
+    module is an `impl Messenger` block, and Rust forbids an inherent impl on a
+    foreign type, so there is no smaller compiling slice. `repo_sync_cursor`
+    rose with it, since it reads `messaging::db` in production.
+
+    The store split is the one cut that constraint leaves: `db`, `store` and
+    `ingress` name `Messenger` nowhere, so they sit below the engine and stay
+    cached on an engine edit. `brenn-messaging` binds the three modules at its
+    crate root privately, so the engine's own `crate::db`/`crate::store`/
+    `crate::ingress` paths resolve; every crate above names
+    `brenn_messaging_store` directly, which is what keeps the store edge visible
+    in the BUILD files and cacheable per crate. The two crates whose *whole* use
+    of messaging was the tables — `brenn-mqtt` and `brenn-pwa-push` — repoint at
+    `brenn_messaging_store::` and drop the engine dependency outright. What is
+    left in the engine is the `impl Messenger` blocks plus `format`,
+    `dispatcher`, `testutils` and `repo_sync_cursor`; splitting any of it needs
+    the inherent-impl problem solved, not a coupling map.
+  - `brenn-bootstrap` was the fourth target over the ~300-test criterion and is
+    the one that opened. Its `messaging/` subtree had **zero** `crate::`
+    references — the lowering reads `brenn-lib`, `brenn-messaging`,
+    `brenn-server` and the surface crates and nothing of the root — so it left
+    as `brenn-messaging-boot` with no cycle to break and nothing to invert. The
+    only edges the other way were the root's two production calls
+    (`messaging_configured`, `build_messaging`) and three of its test modules
+    reaching the boot fixtures, which is what the new crate's `testutils`
+    feature is for.
+- **Where a subsystem's DDL lives is settled.** A crate's migration set covers
+  exactly the tables its own production code touches; the DDL lives in the
+  lowest crate whose production code writes the table; every composition point
+  that opens a database runs the sets for everything it wires and nothing else.
+  A set a crate owns is `run_*_migrations`; a composition of several crates'
+  sets is `run_*slice_migrations`, so the two never share a name. So
+  `brenn_db::run_migrations` is base + `pwa_push_subscriptions` (that one
+  because `unenroll_device` deletes its rows inside the unenroll transaction),
+  `brenn_usage_db::run_usage_migrations` is the two usage tables,
+  `brenn_lib::db::run_slice_migrations` composes both of those,
+  `brenn_messaging_store::db::run_slice_migrations` adds the messaging tables on
+  top, and `brenn-server/src/db.rs`'s `run_server_slice_migrations` adds
+  automation. A crate that extracts takes its DDL and its registration
+  obligation with it — the usage set moved with `brenn-usage-db` and the
+  messaging set with `brenn-messaging`, then down again with
+  `brenn-messaging-store`.
+
+**The residue against the ~300-test criterion**, for the gate that accepts or
+rejects it: `brenn-server` (1,349) and `brenn-lib` (967) are blocked by the two
+cycles written down above, `brenn-messaging` (469) by the inherent-impl
+constraint, and `brenn-messaging-boot` (339) is over the count but not over what
+the count was a proxy for — it runs in 0.39s locally, ~8s at the repo's measured
+CD factor, against `brenn-server`'s 472s that started this program. Test count
+was the criterion because no timing data existed; the timings now in each
+target's `size` comment are the better unit, and every target except the three
+blocked ones is inside a `small` budget.
+
+Every extraction is monotonic: a module whose dependency cycle will not break
+cleanly stays put and is recorded rather than forced apart with an invented
+abstraction layer. Per tranche, the sum of executed tests across new and
+remaining targets must equal the pre-tranche count.
+
+Two rules the bootstrap extraction paid for, to apply from tranche 3 on:
+publish the items the crate above actually reaches, not whole modules — the
+map-first step already enumerates that closure, and promoting a module
+wholesale hands clippy lints (`len_without_is_empty`, missing `Default`) the
+job of deciding what the public API is. And a first-party dependency that only
+the `testutils` half of a crate names goes in `deps` through
+`testutils_deps()` (`bazel/features/defs.bzl`), so the build edge tracks the
+same condition the Cargo manifest's `optional = true` states.
+
+Done = tranche 3 landed, or the residue recorded and accepted at a review gate.
+
+Code sites (`TODO(crate-split)`): `brenn-lib/BUILD.bazel` and
+`brenn-server/BUILD.bazel`, above their `rust_test` targets.
+
+
+## `attach-upgrade-preamble`
+
+`surface_ws_handler` (`brenn-server/src/routes/surface.rs`) and
+`remote_ws_handler` (`brenn-server/src/routes/remote.rs`) each carry ~60
+near-identical lines between authorization and upgrade: mint the session id,
+open the push channel at `PUSH_QUEUE_FRAMES`, build `active_channels` /
+`drain_notify`, build the `AttachSessionHandle`, read `session_caps()`,
+`try_register`, turn both `RegisterRejection` arms into a `warn!` + 503, compute
+`max_client_frame_bytes`, and fill the 17-field `AttachSessionParams`. They
+differ in the account source (session cookie vs `remote:<slug>`), the registry
+key, the surface-only build-id handshake and `last_detach` stamp, and the
+`warn!` field names.
+
+The cost is that `AttachSessionParams` gaining a field is two edits, and the
+register-before-upgrade ordering — load-bearing against a check-then-register
+race — is stated twice and can drift once. A third attacher copies one of the
+two blocks.
+
+What blocks a straight hoist is that the two handlers hold different runtime
+types (`SurfaceRuntime` reaches its messenger through a method, the remote's
+through a field), and the surface's handshake sits *between* register and
+upgrade, so a shared `register_and_run` needs either a hook parameter or a
+trait over the runtimes — an abstraction whose shape is a design question, not
+a refactor. It is also the wrong moment: `routes` is a tranche-3 extraction
+under `crate-split`, whose coupling map does not exist yet and which decides
+which crate this seam belongs to.
+
+Done = the tranche-3 routes work either lands the shared preamble in
+`brenn-attach-server` or records why the two copies stay.
+
+Code sites (`TODO(attach-upgrade-preamble)`): `brenn-server/src/routes/surface.rs`
+and `brenn-server/src/routes/remote.rs`, above each handler.
 
 
 ## `bazel-fixture-list-guard`
 
-Fourteen test targets now declare, by hand, which WASM component fixtures they
+Seventeen test targets now declare, by hand, which WASM component fixtures they
 stage: the twelve `WASM_TEST_SUITES` entries and `brenn-wasm_test` in
-`brenn-wasm/BUILD.bazel`, and `brenn-server_test`'s ten in
-`brenn-server/BUILD.bazel`. Each list was derived by reading that target's
-sources for artifact stems, and nothing mechanizes the derivation.
+`brenn-wasm/BUILD.bazel`, `brenn-server_test`'s six in
+`brenn-server/BUILD.bazel`, `brenn-wasm-dispatch_test`'s four,
+`brenn-bootstrap_test`'s one and `//surface/server:server_test`'s one. Each list
+was derived by reading that target's sources for artifact stems, and nothing
+mechanizes the derivation.
 
 Under-declaration is loud: a test that opens a component its target does not
 stage panics on a missing runfile the first time it runs. Over-declaration is
 silent forever. A suite that stops loading a component keeps the stale edge, the
 all-to-all invalidation this narrowing removed grows back one commit at a time,
-and the CI timings that `bazel-server-test-split` and the crate-split question
-are supposed to read get polluted by an over-declaration nobody can see.
+and the CI timings that `crate-split` is supposed to read get polluted by an
+over-declaration nobody can see.
 
 The durable answer is a guard reading `COMPONENT_NAMES`, `WASM_TEST_SUITES` and
 `brenn-server_test`'s `data` out of the BUILD files and the `brenn_*` artifact
@@ -1374,7 +1522,7 @@ before it can be written is a derivation rule that is sound in both: stems reach
 a suite through helpers it calls (`replay_artifact()` in
 `brenn-wasm/tests/common/mod.rs` hardcodes `brenn_replay`), and not every
 `brenn_*.wasm` literal is a fixture read — `brenn-server/src/router.rs` and
-`routes/surface/mod.rs` fabricate a `brenn_surface_kernel_bg.wasm` in a temp
+`surface/server/src/lib.rs` fabricate a `brenn_surface_kernel_bg.wasm` in a temp
 dir, which no fixture target builds. A guard that demanded that one, or that
 missed the helper-reached ones, would be worse than none: this gate's red has to
 keep meaning the change is wrong.
@@ -1384,7 +1532,48 @@ this entry is closed with the argument for leaving the lists hand-held.
 
 Code sites (`TODO(bazel-fixture-list-guard)`): `brenn-wasm/BUILD.bazel`, above
 `WASM_TEST_SUITES`; `brenn-server/BUILD.bazel`, above the `brenn-server_test`
-target.
+target; `brenn-wasm-dispatch/BUILD.bazel`, above its test target;
+`surface/server/BUILD.bazel`, inside its test target's `data`.
+
+
+## `wasm-guest-tests-unrun`
+
+Twenty-six `#[test]` functions inside deployed WASM guest components have no
+runner: 21 in `brenn-wasm/components/replay/src/lib.rs` and 5 in
+`brenn-wasm/components/replay-generic/src/lib.rs`. Both packages declare only
+`wasm_guest_cdylib` + `wasm_component`, so the wasm-platform clippy build
+type-checks the test module and nothing executes it. The deleted `xtask test`
+lane ran the root workspace only, so this predates the Bazel cycle rather than
+being caused by it.
+
+What is dark is not incidental: the replay component is the anti-replay gate in
+front of the ingress, and its tests pin `parse_sent_at_ms` (Hinnant
+days-from-epoch including pre-epoch and century-leap cases), `validate_client_id`
+path-traversal rejection, nonce and timestamp shape validation, the
+`parse_envelope` malformed-input arms, and the prune-gate predicate;
+replay-generic's pin the big-endian `entry_key` layout, its chronological
+ordering property, and `CAP < 4096` so the store returns 429 before the host's
+scan trap returns 500. Every one of those is a silent-wrong-answer failure mode
+in a component that ships.
+
+`xtask/src/test_target_guard.rs` structurally cannot notice this: its rule keys
+on a package declaring a `rust_library` or `rust_binary`, and these declare
+neither. Stretching the guard to cover guest packages is the wrong fix — it
+would demand a target that no rule can produce today.
+
+Done = the tests run under a gate, or they are deleted with the argument for
+losing the coverage. The tests are annotated "native, no WASM roundtrip" and
+touch no host imports, so the cheap route is a host-target `rust_test` over the
+logic module; the obstacle is that `src/lib.rs` also carries
+`bindings::export!(Component with_types_in bindings)` and the generated
+`bindings.rs`, which do not compile off wasm32 — so it needs either a split of
+the pure-logic code into a host-buildable module the guest crate includes, or a
+wasm32 test rule (which is the same missing rule work `surface-wasm-test-in-ci`
+describes, without the browser half).
+
+Code sites (`TODO(wasm-guest-tests-unrun)`):
+`brenn-wasm/components/replay/BUILD.bazel` and
+`brenn-wasm/components/replay-generic/BUILD.bazel`, above the guest cdylib.
 
 
 ## `sw-registration-csp-blocked`
@@ -1422,3 +1611,89 @@ live to reach the worker.
 Code site (`TODO(sw-registration-csp-blocked)`): brenn-server/src/routes/app.rs,
 both inline registration sites — `landing_page` and `render_app_shell`.
 
+
+
+## `repo-sync-resume-poke-wiring`
+
+`SyncTrigger::ResumePoke` is consumed by the repo-sync reactor — one sync cycle
+per remote in its scoped list, trigger kind `"resume"` — and constructed by
+nothing in the tree. The doc comment on the variant promises that a resuming
+conversation gets fresh clones before the bridge starts processing; no producer
+exists, so it does not. While the enum lived inside brenn-server an
+`#[allow(dead_code)]` carried that fact; it is `pub` in a library crate now, so
+the lint can never fire again and this entry is the only tracker.
+
+Two acceptable outcomes: wire the producer at the conversation-resume path so
+the mounted remotes are poked before the bridge runs, or delete the variant and
+its reactor arm (the no-shims rule means reinstating it alongside a producer is
+one commit).
+
+Done = either a resume actually emits the trigger for the app's mounted
+remotes, or the variant is gone.
+
+Code site (`TODO(repo-sync-resume-poke-wiring)`): brenn-git/src/sync.rs,
+`SyncTrigger::ResumePoke`.
+
+
+## `build-test-count-guard`
+
+Every `rust_test` size rationale in the tree states a test count ("745 tests",
+"967 tests", "77 tests") and nothing holds those numbers to the sources. They
+are also the ledger the review chain does its conservation arithmetic against
+when tests move between crates, so a count that is approximately right stops
+being useful as a check. Two of them drifted by two — in opposite directions —
+inside a single round, when a helper and its tests moved from brenn-messaging
+to brenn-lib and neither comment followed.
+
+The obvious guard — parse the `N tests` figure out of the comment above each
+`rust_test` and compare it against the test attributes under that crate's `src/`
+— needs a derivation rule the tree does not have. Attribute counting is not the
+executed count: ts-rs's derive emits one `export_bindings_*` test per exported
+type (brenn-ws-types runs 105 with 71 hand-written), and any future derive that
+generates tests widens the gap. The guard has to either model the generators or
+read counts from a run, and which of those the repo wants is the open question.
+
+Done = a gate fails when a stated count does not match what the target runs, or
+the counts are removed from the comments in favour of something checkable.
+
+Code site (`TODO(build-test-count-guard)`): `brenn-lib/BUILD.bazel`, above the
+`brenn-lib_test` target.
+
+
+## `unused-crate-deps-gate`
+
+Nothing in the tree flags a declared dependency that no source names: there is no
+`unused_crate_dependencies` lint configured anywhere, in `.bazelrc`, in any
+`rustc_flags`, or as a crate-root attribute, and no udeps-style manifest sweep.
+A spurious dep is therefore invisible to `make check` forever.
+
+The driver is that every crate extraction hand-copies a dep list from the crate
+it was cut out of, and the copies are not re-derived from the sources that
+survived the cut. One already shipped: `surface/server` was declared with
+`//brenn-obs` in `FIRST_PARTY_DEPS` and two `brenn-obs` lines in its
+`Cargo.toml` while no file under `surface/server/src/` ever named `brenn_obs` —
+the `AlertDispatcher` uses that justified it stayed behind in `brenn-server`.
+That was caught by a human reading the diff, not by a gate, and the remaining
+`crate-split` tranches cut more crates the same way. The cost of a miss is a
+permanent invalidation edge: every edit to the phantom dependency recompiles the
+crate, re-runs its tests, and cascades into everything above it.
+
+Two open questions decide the shape. Which mechanism: `unused_crate_dependencies`
+as a rustc lint, which would have to reach every `rust_library` in the build
+(a repo-wide `rustc_flags` in `.bazelrc` or an aspect, since there is no single
+crate root to annotate), versus a manifest-level sweep over the `Cargo.toml`
+files, which are advisory here — Bazel is the build of record — and so would
+check a second copy of the truth rather than the one that matters. And how to
+absorb the existing violations across ~30 crates, whose count nobody has
+measured; the lint's known false-positive shapes (deps used only by macro
+expansion, by `cfg`-gated code, or re-exported without being named) may need
+per-crate allowances, and a gate that has to be suppressed in a dozen places is
+noise rather than a check.
+
+No code site: this is a repo-wide build concern with no single place the comment
+would belong, so the entry lives here only.
+
+Done = a gate fails when a crate declares a dependency its sources do not use,
+with the existing violations either cleared or explicitly allowed; or this entry
+closes with the measurement that says the false-positive rate on this tree makes
+the gate worse than the hand audit.

@@ -1,7 +1,7 @@
 //! Git tools: list/status/pull (read), commit-and-push/run (mutating). Uses `resolve_mounts` to dispatch slugs to working-tree paths.
 
+use brenn_approval_rules::ApprovalMatch;
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
-use brenn_lib::approval_rules::ApprovalMatch;
 use tracing::info;
 
 use super::super::ActiveBridge;
@@ -100,7 +100,7 @@ pub(super) async fn handle(
                 Ok(mounts) => {
                     let futs: Vec<_> = mounts
                         .iter()
-                        .map(|m| crate::git_ops::repo_status(m, &bridge.working_dir))
+                        .map(|m| brenn_git::ops::repo_status(m, &bridge.working_dir))
                         .collect();
                     futures::future::join_all(futs).await
                 }
@@ -208,7 +208,7 @@ pub(super) async fn handle(
                                 None,
                             ),
                             Some(m) => {
-                                let result = crate::git_ops::repo_commit_and_push(
+                                let result = brenn_git::ops::repo_commit_and_push(
                                     m,
                                     working_dir,
                                     container_spawn,
@@ -318,7 +318,7 @@ pub(super) async fn handle(
             let app_mounts = &bridge.mounts;
             let output = match app_mounts.iter().find(|m| m.slug == repo_slug) {
                 Some(mount) => {
-                    let result = crate::git_ops::repo_run(
+                    let result = brenn_git::ops::repo_run(
                         mount,
                         &bridge.working_dir,
                         bridge.container_spawn.as_ref(),
@@ -384,10 +384,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use crate::test_support::init_db_memory;
     use brenn_cc::session::{
         ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest,
     };
-    use brenn_lib::db::init_db_memory;
     use tokio::sync::{broadcast, oneshot};
 
     use super::super::super::ActiveBridge;
@@ -429,28 +429,28 @@ mod tests {
         access: brenn_lib::config::AccessLevel,
     ) -> (
         Arc<ActiveBridge>,
-        tokio::sync::mpsc::Receiver<crate::repo_sync::SyncTrigger>,
+        tokio::sync::mpsc::Receiver<brenn_git::sync::SyncTrigger>,
         i64,
     ) {
         use brenn_lib::config::ResolvedMount;
 
         let (trigger_tx, trigger_rx) =
-            tokio::sync::mpsc::channel::<crate::repo_sync::SyncTrigger>(4);
+            tokio::sync::mpsc::channel::<brenn_git::sync::SyncTrigger>(4);
         let slug_to_remote = Arc::new(HashMap::from([(
             slug.to_string(),
             format!("ssh://example/{slug}.git"),
         )]));
-        let sender = crate::repo_sync::SyncTriggerSender::new_for_test(trigger_tx, slug_to_remote);
+        let sender = brenn_git::sync::SyncTriggerSender::new(trigger_tx, slug_to_remote);
 
         let db = init_db_memory();
         let (user_id, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(
+            let uid = brenn_db::auth::user::create_user(
                 &conn,
                 &format!("cp-{slug}-{}", rand_suffix()),
                 "$argon2id$fake",
             );
-            let cid = brenn_lib::conversation::create_conversation(&conn, uid, "test", false);
+            let cid = brenn_db::conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
         let (broadcast_tx, _broadcast_rx) = broadcast::channel(16);
@@ -515,7 +515,7 @@ mod tests {
             .expect("trigger should arrive within 5s")
             .expect("channel should not be closed");
         match trigger {
-            crate::repo_sync::SyncTrigger::Push {
+            brenn_git::sync::SyncTrigger::Push {
                 remote,
                 acting_conversation_id,
             } => {

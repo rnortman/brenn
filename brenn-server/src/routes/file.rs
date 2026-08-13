@@ -7,8 +7,8 @@ use axum::Extension;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use brenn_lib::auth::session::Session;
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_db::auth::session::Session;
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -16,7 +16,7 @@ use super::html_escape;
 use crate::client_ip::ClientIp;
 use crate::state::AppState;
 
-use crate::artifact::encode_url_path;
+use brenn_render::artifact::encode_url_path;
 
 /// Maximum file size for display (1 MB).
 const MAX_FILE_SIZE: u64 = 1024 * 1024;
@@ -271,13 +271,16 @@ async fn render_file_response(
             .and_then(|e| e.to_str())
             .unwrap_or("");
         if extension == "md" {
-            crate::frontmatter::render_markdown_with_frontmatter(&content_str, frontmatter_cfg)
+            brenn_render::frontmatter::render_markdown_with_frontmatter(
+                &content_str,
+                frontmatter_cfg,
+            )
         } else {
             format!("<pre><code>{}</code></pre>", html_escape(&content_str))
         }
     };
 
-    let frontmatter_css = crate::frontmatter::FRONTMATTER_CSS;
+    let frontmatter_css = brenn_render::frontmatter::FRONTMATTER_CSS;
     let build_id = state.build_id;
     let html = format!(
         r#"<!DOCTYPE html>
@@ -333,7 +336,6 @@ mod tests {
     use axum::body::Body;
     use axum::extract::connect_info::MockConnectInfo;
     use axum::http::{Request, StatusCode};
-    use brenn_lib::db;
     use indexmap::IndexMap;
     use tower::ServiceExt;
 
@@ -536,7 +538,7 @@ mod tests {
         std::fs::write(dir.path().join("test.md"), "# Test").unwrap();
 
         // Create an app with restricted access.
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let mut apps = IndexMap::new();
         let mut cfg = default_test_app_config("restricted", "Restricted");
         cfg.working_dir = dir.path().to_path_buf();

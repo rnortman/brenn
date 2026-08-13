@@ -9,12 +9,12 @@ use axum::Extension;
 use axum::extract::{Multipart, Path as AxumPath, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
-use brenn_lib::auth::session::Session;
+use brenn_db::Db;
+use brenn_db::auth::session::Session;
+use brenn_db::conversation;
 use brenn_lib::config::AppConfig;
-use brenn_lib::conversation;
-use brenn_lib::db::Db;
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
-use brenn_lib::ws_types::AttachmentMeta;
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_ws_types::AttachmentMeta;
 use indexmap::IndexMap;
 use serde::Serialize;
 use tokio::time::Instant;
@@ -617,7 +617,7 @@ impl ResolvedAttachment {
 /// Returns `Ok(vec)` on success (may be empty), `Err(reason)` on failure.
 /// On failure, the caller should send an error to the client and/or log for fail2ban.
 pub async fn resolve_attachments(
-    refs: &[brenn_lib::ws_types::AttachmentRef],
+    refs: &[brenn_ws_types::AttachmentRef],
     app_slug: &str,
     user_id: i64,
     working_dir: &std::path::Path,
@@ -911,7 +911,6 @@ mod tests {
     use axum::body::Body;
     use axum::extract::connect_info::MockConnectInfo;
     use axum::http::{Request, StatusCode};
-    use brenn_lib::db;
     use indexmap::IndexMap;
     use tower::ServiceExt;
 
@@ -1036,7 +1035,7 @@ mod tests {
         let mut cfg = default_test_app_config("test", "Test App");
         cfg.working_dir = dir.path().to_path_buf();
         apps.insert("test".to_string(), cfg);
-        let db = db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let state = test_state_with_apps(&db, Arc::new(apps));
 
         let (session_token, _csrf) = setup_authenticated_user(&db).await;
@@ -1070,11 +1069,11 @@ mod tests {
                 })
                 .unwrap();
             let conv_id =
-                brenn_lib::conversation::create_conversation(&conn, user_id, "test", false);
-            let (msg_id, _seq) = brenn_lib::conversation::append_message(
+                brenn_db::conversation::create_conversation(&conn, user_id, "test", false);
+            let (msg_id, _seq) = brenn_db::conversation::append_message(
                 &conn,
                 conv_id,
-                brenn_lib::conversation::MessageDirection::Outgoing,
+                brenn_db::conversation::MessageDirection::Outgoing,
                 "user",
                 None,
                 None,
@@ -1083,9 +1082,9 @@ mod tests {
                 None,
                 None,
             );
-            brenn_lib::conversation::insert_attachments(
+            brenn_db::conversation::insert_attachments(
                 &conn,
-                &[brenn_lib::conversation::StoredAttachment {
+                &[brenn_db::conversation::StoredAttachment {
                     upload_id: upload_id.to_string(),
                     message_id: msg_id,
                     filename: "note.txt".to_string(),

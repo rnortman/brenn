@@ -1,5 +1,4 @@
 pub mod app;
-pub mod attach;
 pub mod file;
 pub mod login;
 pub mod logout;

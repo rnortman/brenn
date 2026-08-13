@@ -37,7 +37,7 @@ const ALLOWLIST: &[Allowed] = &[
               inheriting the hook's GIT_INDEX_FILE",
     },
     Allowed {
-        path: "brenn-server/src/git_subprocess.rs",
+        path: "brenn-git/src/subprocess.rs",
         count: 1,
         why: "production git subprocess; never runs under a git hook",
     },

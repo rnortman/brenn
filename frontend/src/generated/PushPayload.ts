@@ -50,7 +50,7 @@ data: Record<string, unknown> | null,
  * `signed_in_user_ids` IndexedDB set.
  *
  * `i64` (matches DB rowid); the `#[ts(type = "number")]` annotation
- * matches the convention used throughout `ws_types.rs` for rowid-shaped
+ * matches the convention used throughout `brenn-ws-types` for rowid-shaped
  * IDs and yields JS `number` on both sides — required so the set-
  * membership check works without bigint/number coercion.
  */

@@ -7,25 +7,22 @@
 
 use std::sync::Arc;
 
+use brenn_db::Db;
 use brenn_lib::access::AppPolicy;
-use brenn_lib::db::Db;
 use brenn_lib::messaging::{
-    ChannelEntry, ChannelScheme, MessageEnvelope, MessagingDirectory, Messenger, ParticipantId,
-    SubscriberEntry, SubscriberEntryKind, WakeMin, WakeRouter,
-    config::{
-        Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel, ResolvedSubscription, Sink,
-        WasmInputPort,
-    },
-    db::upsert_channels,
-    query::NoopWakeRouter,
+    ChannelEntry, ChannelScheme, MessageEnvelope, MessagingDirectory, MessagingGlobalConfig,
+    NoiseLevel, ParticipantId, ResolvedChannel, ResolvedSubscription, Sink, SubscriberEntry,
+    SubscriberEntryKind, WakeMin, WasmInputPort,
 };
+use brenn_messaging::{Messenger, WakeRouter, config::Depth, query::NoopWakeRouter};
+use brenn_messaging_store::db::upsert_channels;
 use indexmap::IndexMap;
 use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 /// A `ChannelEntry` whose sole subscriber is the WASM consumer `wasm_slug`, for
 /// the given transport. `mount` is `Some` only for webhook channels.
-pub(crate) fn wasm_subscriber_channel_entry(
+pub fn wasm_subscriber_channel_entry(
     uuid: Uuid,
     address: &str,
     transport_type: ChannelScheme,
@@ -61,7 +58,7 @@ pub(crate) fn wasm_subscriber_channel_entry(
 /// `policy`, upserting the entries so the directory and DB agree. Callers build
 /// `policy` through the real `build_wasm_policy` path so the test exercises the
 /// production grant/ACL derivation.
-pub(crate) fn messenger_with_wasm_policy(
+pub fn messenger_with_wasm_policy(
     db: Db,
     entries: Vec<ChannelEntry>,
     origin: &str,
@@ -83,7 +80,7 @@ pub(crate) fn messenger_with_wasm_policy(
         Arc::new(NoopWakeRouter) as Arc<dyn WakeRouter>,
         MessagingGlobalConfig::default(),
     )
-    .with_subscriber_registrations(brenn_lib::messaging::testutils::wasm_registrations(
+    .with_subscriber_registrations(brenn_messaging::testutils::wasm_registrations(
         wasm_policies,
     ))
 }
@@ -94,13 +91,13 @@ pub(crate) fn messenger_with_wasm_policy(
 /// A push-enabled read against a channel the subscriber holds no position on
 /// panics, so a receive test that asks what its consumer was served has to
 /// attach first — which is what boot does for every configured input port.
-pub(crate) async fn attach_wasm_consumer(
+pub async fn attach_wasm_consumer(
     messenger: &Messenger,
     entry: &ChannelEntry,
     wasm_slug: &str,
 ) -> ParticipantId {
     let subscriber = ParticipantId::for_wasm(wasm_slug);
-    brenn_lib::messaging::testutils::attach_wasm_port(
+    brenn_messaging::testutils::attach_wasm_port(
         messenger,
         entry,
         wasm_slug,
@@ -119,7 +116,7 @@ pub(crate) async fn attach_wasm_consumer(
 /// honest way to ask whether a subscriber is being served — a retention query
 /// answers where the message is, not who may see it. Pure read: it moves no
 /// position, so a case may ask twice.
-pub(crate) async fn activation_new_messages(
+pub async fn activation_new_messages(
     messenger: &Messenger,
     entry: &ChannelEntry,
     wasm_slug: &str,
@@ -157,7 +154,7 @@ pub(crate) async fn activation_new_messages(
 /// asserts is that the message reached the channel's retention — which is where
 /// every subscriber's position reads it from. `envelope_type` is `None` when the
 /// channel retains nothing.
-pub(crate) async fn retained_on_channel(db: &Db, channel_address: &str) -> (i64, Option<String>) {
+pub async fn retained_on_channel(db: &Db, channel_address: &str) -> (i64, Option<String>) {
     let conn = db.lock().await;
     let count: i64 = conn
         .query_row(

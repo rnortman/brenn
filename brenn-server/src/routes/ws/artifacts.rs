@@ -1,8 +1,8 @@
 //! `handle_reopen_artifact`, `handle_load_artifact_snapshot`.
 
-use brenn_lib::conversation;
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
-use brenn_lib::ws_types::WsServerMessage;
+use brenn_db::conversation;
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_ws_types::WsServerMessage;
 use tracing::warn;
 
 use super::connection::WsConnection;
@@ -29,7 +29,7 @@ impl WsConnection {
 
         let Some(cwd) = cwd else {
             let _ = self.send_ws(WsServerMessage::Error {
-                message: crate::artifact::ArtifactError::NoCwd.to_string(),
+                message: brenn_render::artifact::ArtifactError::NoCwd.to_string(),
             });
             return;
         };
@@ -43,15 +43,21 @@ impl WsConnection {
             });
             return;
         };
-        let mounts = crate::artifact::mount_roots_for(&app.mounts);
+        let mounts = brenn_render::artifact::mount_roots_for(&app.mounts);
         let frontmatter = &app.frontmatter;
 
-        match crate::artifact::read_artifact_content(file_path, std::path::Path::new(&cwd), &mounts)
-            .await
+        match brenn_render::artifact::read_artifact_content(
+            file_path,
+            std::path::Path::new(&cwd),
+            &mounts,
+        )
+        .await
         {
             Ok((display_path, raw_content)) => {
-                let rendered_html =
-                    crate::frontmatter::render_markdown_with_frontmatter(&raw_content, frontmatter);
+                let rendered_html = brenn_render::frontmatter::render_markdown_with_frontmatter(
+                    &raw_content,
+                    frontmatter,
+                );
                 let _ = self.send_ws(WsServerMessage::ArtifactContent {
                     file_path: display_path,
                     rendered_html,
@@ -60,7 +66,7 @@ impl WsConnection {
                     seq: None,
                 });
             }
-            Err(crate::artifact::ArtifactError::PathTraversal { .. }) => {
+            Err(brenn_render::artifact::ArtifactError::PathTraversal { .. }) => {
                 // Browser-originated path traversal attempt — log for fail2ban.
                 log_and_alert_security_event(
                     &self.state.alert_dispatcher,
@@ -95,11 +101,11 @@ impl WsConnection {
         let working_dir = app.working_dir.as_path();
         let slug = app.slug.as_str();
         let multiuser = app.multiuser;
-        let mounts = crate::artifact::mount_roots_for(&app.mounts);
+        let mounts = brenn_render::artifact::mount_roots_for(&app.mounts);
         let frontmatter = &app.frontmatter;
         let result = {
             let conn = self.state.db.lock().await;
-            crate::artifact_snapshot::load_artifact_snapshot(
+            brenn_render::artifact_snapshot::load_artifact_snapshot(
                 &conn,
                 message_id,
                 self.user_id,
@@ -114,7 +120,7 @@ impl WsConnection {
             Ok(msg) => {
                 let _ = self.send_ws(msg);
             }
-            Err(crate::artifact_snapshot::LoadSnapshotError::NotFound) => {
+            Err(brenn_render::artifact_snapshot::LoadSnapshotError::NotFound) => {
                 // Could be genuinely missing or another user's artifact.
                 // Don't distinguish — avoids leaking existence info.
                 warn!(
@@ -131,8 +137,8 @@ impl WsConnection {
 
 #[cfg(test)]
 mod tests {
-    use brenn_lib::conversation;
-    use brenn_lib::ws_types::WsServerMessage;
+    use brenn_db::conversation;
+    use brenn_ws_types::WsServerMessage;
 
     use super::super::testing::*;
 
@@ -170,7 +176,7 @@ mod tests {
         };
         {
             let c = db.lock().await;
-            crate::artifact_snapshot::store_artifact_snapshot(
+            brenn_render::artifact_snapshot::store_artifact_snapshot(
                 &c,
                 conv_id,
                 "docs/plan.md",

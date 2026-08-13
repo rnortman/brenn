@@ -1,0 +1,32 @@
+[package]
+name = "brenn-remote-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The server-side remote layer: boot resolution of `[[remote]]` blocks into runtimes, their attachment profile, and the bearer-credential authentication the upgrade path answers from"
+
+# Reaches down to brenn-attach-server for the attachment authority a remote
+# lowers to and to brenn-messaging for the bus its sessions publish onto.
+# Nothing above is named here — the route hands the `AppState`-held runtime map
+# and alert dispatcher in.
+[dependencies]
+axum = "0.8.8"
+brenn-attach-server = { version = "0.1.0", path = "../attach/server" }
+brenn-envelope = { path = "../brenn-envelope" }
+brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
+
+[dev-dependencies]
+# The profile suite writes each `[[remote]]` token to a temp file, because a
+# resolved remote reads its credential from a path.
+tempfile = "3.24.0"
+# The suite writes `[[remote]]` blocks as TOML and resolves them the way the
+# config loader does.
+toml = "1.1.2"
+brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
+# The credential suite holds a `Messenger` it never publishes through, from the
+# engine's empty-directory fixture builder.
+brenn-messaging = { version = "0.1.0", path = "../brenn-messaging", features = ["testutils"] }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
+tokio = { version = "1.50.0", features = ["full", "test-util"] }

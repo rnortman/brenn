@@ -22,6 +22,8 @@
 //!    Hermetic fixtures alone would mask that: the fixture would build
 //!    correctly while the production calls read some other repo.
 
+pub mod scratch;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::path::Path;

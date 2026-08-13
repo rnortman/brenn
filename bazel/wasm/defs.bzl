@@ -142,7 +142,7 @@ wit_bindgen_rust = rule(
 # ---------------------------------------------------------------------------
 
 def _wasm32_transition_impl(_settings, _attr):
-    # Components are always optimized: the make lane builds them `--release`,
+    # Components are always optimized: the guests are built `--release`,
     # and an artifact that differs between a dev and a release build would make
     # the host tests that load it configuration-dependent.
     return {
@@ -237,7 +237,7 @@ def _component_fixtures_impl(ctx):
     # The host suites address artifacts as `<manifest dir>/../brenn-wasm/
     # target/components/<basename>.wasm`, a path baked into `env!` call sites in
     # both crates. Reproducing that layout inside the runfiles tree is what lets
-    # the same source read from the cargo target dir under make and from
+    # the same source read from the guest crate's own output tree and from
     # runfiles under Bazel.
     outs = []
     for target in ctx.attr.components:
@@ -251,8 +251,8 @@ component_fixtures = rule(
     implementation = _component_fixtures_impl,
     doc = """Stage every component under `brenn-wasm/target/components/`.
 
-    Declared in `//brenn-wasm`, so the runfiles paths match the cargo target
-    dir the host tests name.
+    Declared in `//brenn-wasm`, so the runfiles paths match the workspace-relative
+    directory the host tests name.
     """,
     attrs = {
         "components": attr.label_list(

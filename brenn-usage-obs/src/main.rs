@@ -23,10 +23,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::{Connection, OpenFlags};
 
 use brenn_lib::config;
-use brenn_lib::usage::{EventsFilter, SessionsFilter, query_events, query_sessions};
-use brenn_lib::usage_export::{
+use brenn_usage_db::export::{
     write_events_csv, write_events_json, write_sessions_csv, write_sessions_json,
 };
+use brenn_usage_db::{EventsFilter, SessionsFilter, query_events, query_sessions};
 use brenn_usage_obs::parse_ts;
 
 // ---------------------------------------------------------------------------
@@ -180,7 +180,7 @@ fn run_events(conn: &Connection, args: EventsArgs) -> Result<(), Box<dyn std::er
     let event_type = match args.event_type {
         None => None,
         Some(ref s) => {
-            let et = brenn_lib::usage::EventType::try_from_str(s).ok_or_else(|| {
+            let et = brenn_usage_db::EventType::try_from_str(s).ok_or_else(|| {
                 format!("unknown event type: {s}; valid values: ws_connect, ws_disconnect, llm_turn, send_message, stop_request, todo_refresh, todo_done, todo_schedule, todo_reorder, switch_conversation, new_conversation, request_compaction, run_target, set_conversation_privacy")
             })?;
             Some(et)

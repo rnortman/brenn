@@ -19,7 +19,7 @@ rust_binary(
     visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
+        "//brenn-bootstrap",
         "//brenn-lib",
-        "//brenn-server",
     ],
 )

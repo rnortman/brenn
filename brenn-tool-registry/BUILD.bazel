@@ -1,0 +1,53 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//brenn-git",
+    "//brenn-lib",
+    "//brenn-messaging",
+    "//brenn-messaging-store",
+    "//brenn-obs",
+    "//brenn-wasm",
+]
+
+# `testutils` exposes the ACL clause/grant builders to downstream test targets;
+# the release configs clear the flag, so no test scaffolding reaches the
+# shipped binary.
+rust_library(
+    name = "brenn-tool-registry",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# 62 tests: the registry/rate-limit/descriptor suites are in-process
+# microseconds, the executor suite drives an in-memory sqlite under tokio's
+# test runtime, and the `git-repo-pull` suite spawns real `git` against scratch
+# clones. The whole binary finishes in about a second locally, so `small` (60s)
+# holds with margin on a cold 4-vCPU runner.
+rust_test(
+    name = "brenn-tool-registry_test",
+    size = "small",
+    crate = ":brenn-tool-registry",
+    crate_features = ["testutils"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    tags = ["requires-git"],
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS + [
+        "//git-fixture",
+    ],
+)
+
+rust_doc_test(
+    name = "brenn-tool-registry_doc_test",
+    crate = ":brenn-tool-registry",
+)

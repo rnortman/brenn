@@ -41,9 +41,7 @@ impl Processor for ProcessorMultiport {
             for env in window.new_envelopes() {
                 let env = env?;
                 if env.body == "__trap__" {
-                    unreachable!(
-                        "processor-multiport: deliberate trap on __trap__ sentinel"
-                    );
+                    unreachable!("processor-multiport: deliberate trap on __trap__ sentinel");
                 }
                 if env.body == "__err__" {
                     return Err(Error::failed(

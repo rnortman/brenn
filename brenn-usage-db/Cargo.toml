@@ -1,0 +1,21 @@
+[package]
+name = "brenn-usage-db"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Usage sessions and interaction events: the tables, their DAOs, and the CSV/JSON export writers"
+
+# Depends on brenn-db alone: the usage rows reference devices, users and
+# conversations, and nothing else. Everything that records or queries usage
+# lives above this crate.
+[dependencies]
+brenn-db = { version = "0.1.0", path = "../brenn-db" }
+chrono = { version = "0.4.44", features = ["serde"] }
+csv = "1.4.0"
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.50.0", features = ["macros", "rt", "rt-multi-thread"] }

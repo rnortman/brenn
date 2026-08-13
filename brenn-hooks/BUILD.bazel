@@ -1,0 +1,43 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "brenn-hooks",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-git",
+        "//brenn-lib",
+    ],
+)
+
+# 36 tests. Each one spawns a real `/bin/sh` hook script or drives a pull
+# against a scratch clone, so per-test cost is fork/exec rather than
+# microseconds: measured 0.47s for the binary locally, unchanged at
+# `--test-threads=1`. Against the repo's one measured local→CD factor (~21x,
+# brenn-server 22s/472s) that is ~10s, inside the `small` (60s) budget.
+rust_test(
+    name = "brenn-hooks_test",
+    size = "small",
+    crate = ":brenn-hooks",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    tags = ["requires-git"],
+    deps = all_crate_deps(normal_dev = True) + [
+        "//brenn-git",
+        "//brenn-lib",
+        "//git-fixture",
+    ],
+)
+
+rust_doc_test(
+    name = "brenn-hooks_doc_test",
+    crate = ":brenn-hooks",
+)

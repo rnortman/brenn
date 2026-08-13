@@ -1,3 +1,4 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES", "testutils_deps")
 load("//bazel/policy:defs.bzl", "policy_srcs")
 load("@crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
@@ -6,65 +7,87 @@ policy_srcs()
 
 exports_files(["Cargo.toml"])
 
+# `testutils` exposes `test_support` to the crates above; the release configs
+# clear the flag, keeping the shipped binary free of it.
 rust_library(
     name = "brenn-server",
     srcs = glob(["src/**/*.rs"]),
     # Static assets the crate bakes in with include_str!/include_bytes!.
     compile_data = glob(["src/**/*.ico"]) + ["//frontend:embedded_assets"],
+    crate_features = TESTUTILS_FEATURES,
     edition = "2024",
     visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    deps = all_crate_deps(normal = True) + [
+    deps = all_crate_deps(normal = True) + testutils_deps([
+        # Only `test_support::http` names it, and that module compiles out with
+        # the feature.
+        "//attach/client",
+    ]) + [
         "//attach/proto",
+        "//attach/server",
+        "//brenn-approval-rules",
+        "//brenn-automation",
         "//brenn-budget",
         "//brenn-cc",
         "//brenn-common",
         "//brenn-envelope",
+        "//brenn-git",
         "//brenn-graf",
+        "//brenn-hooks",
+        "//brenn-db",
         "//brenn-lib",
+        "//brenn-messaging",
+        "//brenn-messaging-store",
+        "//brenn-mqtt",
+        "//brenn-obs",
         "//brenn-pfin",
+        "//brenn-pwa-push",
+        "//brenn-remote-server",
+        "//brenn-render",
+        "//brenn-tool-registry",
         "//brenn-wasm",
+        "//brenn-wasm-dispatch",
+        "//brenn-webhook",
+        "//brenn-usage-db",
+        "//brenn-ws-types",
         "//surface/contract",
         "//surface/schema",
+        "//surface/server",
     ],
 )
 
-# Tests reach guest components as `<manifest dir>/../brenn-wasm/target/
-# components/`, so the workspace-relative `CARGO_MANIFEST_DIR` plus the staged
-# fixtures put them where the `env!` call sites already look.
-# `large` (900s), not the `medium` default (300s): this binary runs ~2,500
+# Tests reach guest components at `brenn-wasm/target/components/`, relative to
+# the runfiles root the test runs from, which is where the staged fixtures land.
+# `large` (900s), not the `medium` default (300s): this binary runs ~1,350
 # tests, which fits comfortably in 300s on a dev machine and does not on a cold
 # 4-vCPU CI runner sharing itself with the rest of the graph. The size is also
 # what Bazel schedules the action's local resources against, so the repo's
 # biggest test binary declaring itself large is the truthful answer twice over.
 #
-# `data` is the ten components this crate's tests actually open, one fixture
+# `data` is the six components this crate's tests actually open, one fixture
 # target each — not the whole set. Runfiles are inputs to the test action, so
-# every component named here is an edge from a guest crate to all ~2,500 tests;
-# the six that are not named cost nothing when they change.
+# every component named here is an edge from a guest crate to all ~1,350 tests;
+# the ten that are not named cost nothing when they change.
 #
-# TODO(bazel-fixture-list-guard): which ten those are was derived by reading
+# TODO(bazel-fixture-list-guard): which six those are was derived by reading
 # this crate's artifact-stem call sites, and nothing holds the list to them. A
 # component dropped from the tests keeps its edge here silently; one added
 # without its fixture fails loudly on a missing runfile.
 #
-# TODO(bazel-server-test-split): those ten still couple every component edit to
-# the whole binary, because 99 fixture-reading tests share this target with
-# ~2,460 that read none. Splitting them out by libtest filter would cut that to
-# the 99 — at the price of a second compile of one of the tree's biggest crates
-# on every source edit. Which way that trades is a measurement nobody has taken
-# yet; take it before splitting.
+# TODO(crate-split): those six still couple every component edit to the whole
+# binary, because the fixture-reading tests share this target with ~1,310 that
+# read none — and any source edit re-runs all of them regardless. The cure is
+# finer crates: the dispatch families that read only a guest left with
+# `brenn-wasm-dispatch`, and the three that also drive the tool executor and the
+# repo-sync fixtures are what is left here.
 rust_test(
     name = "brenn-server_test",
     size = "large",
     crate = ":brenn-server",
+    crate_features = ["testutils"],
     data = [
         "//brenn-wasm:fixture_git_forge_parser",
         "//brenn-wasm:fixture_git_sync_consumer",
-        "//brenn-wasm:fixture_processor_demo",
-        "//brenn-wasm:fixture_processor_dual",
-        "//brenn-wasm:fixture_processor_multiport",
-        "//brenn-wasm:fixture_processor_store_rt",
         "//brenn-wasm:fixture_processor_tool_test",
         "//brenn-wasm:fixture_replay",
         "//brenn-wasm:fixture_replay_fault_test",
@@ -88,6 +111,8 @@ rust_test(
         "//attach/client",
         "//attach/conformance",
         "//brenn-cal",
+        "//brenn-tool-registry",
+        "//brenn-wasm-dispatch",
         "//git-fixture",
     ],
 )

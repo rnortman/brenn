@@ -1,0 +1,47 @@
+[package]
+name = "brenn-pwa-push"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "PWA push delivery: endpoint validation, subscription DAOs, and the encrypt-and-post publish service"
+
+[features]
+# Expose `ValidatedEndpoint::for_testing` to downstream test targets, which
+# construct subscriptions without going through URL validation. Not for
+# production builds.
+testutils = []
+
+# Depends on brenn-lib for the resolved push config and the messaging substrate
+# it publishes onto, and on brenn-db for the connection handle and the table its
+# DAOs read. Nothing below reaches back: the `[pwa_push]` config block, the
+# endpoint policy and the VAPID keypair live in brenn-lib because the config
+# aggregate holds them, and the subscription table's DDL lives in brenn-db
+# because device unenroll deletes its rows in the same transaction.
+[dependencies]
+async-trait = "0.1.89"
+base64ct = { version = "1.8.3", features = ["alloc"] }
+brenn-db = { version = "0.1.0", path = "../brenn-db" }
+brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store" }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
+chrono = { version = "0.4.44", features = ["serde"] }
+http = "1.4.0"
+indexmap = "2"
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "trace"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["sync", "time", "macros", "rt"] }
+tracing = "0.1.44"
+ts-rs = { version = "12.0.1", features = ["serde-compat", "serde-json-impl"] }
+url = "2.5.8"
+uuid = { version = "1.23.0", features = ["v4", "v5", "serde"] }
+web-push-native = { version = "0.4.0", default-features = false }
+
+[dev-dependencies]
+brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
+brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store", features = ["testutils"] }
+bytes = "1.11.1"
+tempfile = "3.27.0"
+tokio = { version = "1.50.0", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "fmt"] }

@@ -1,3 +1,4 @@
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -43,6 +44,56 @@ pub fn eq_secret(a: &[u8], b: &[u8]) -> bool {
     ct_eq_bytes(&sha256(a), &sha256(b))
 }
 
+/// Compute HMAC-SHA256 over `data` using `key`. Returns 32 output bytes.
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
+    mac.update(data);
+    mac.finalize().into_bytes().into()
+}
+
+/// Compute HMAC-SHA256 over multiple data slices fed in sequence, using `key`.
+/// Equivalent to `hmac_sha256(key, &parts.concat())` but without allocating a
+/// temporary buffer. Returns 32 output bytes.
+pub fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
+    for part in parts {
+        mac.update(part);
+    }
+    mac.finalize().into_bytes().into()
+}
+
+/// Compute HMAC-SHA256 over `data` using `key` and return the result as a
+/// lowercase hex string.
+pub fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+    hex::encode(hmac_sha256(key, data))
+}
+
+/// Verify a multi-part HMAC-SHA256 signature in constant time.
+///
+/// Returns `true` iff `sig` is exactly 32 bytes and matches
+/// `HMAC-SHA256(key, parts[0] || parts[1] || … || parts[N-1])`.
+///
+/// The length check is deliberately non-constant-time (length is not secret).
+/// The 32-byte comparison is constant-time via [`ct_eq_bytes`]. This is the
+/// single constant-time HMAC gate: every HMAC verification in the tree,
+/// including [`hmac_sha256_verify`], routes through here.
+pub fn hmac_sha256_parts_verify(key: &[u8], parts: &[&[u8]], sig: &[u8]) -> bool {
+    if sig.len() != 32 {
+        return false;
+    }
+    let expected = hmac_sha256_parts(key, parts);
+    ct_eq_bytes(expected.as_slice(), sig)
+}
+
+/// Verify a raw HMAC-SHA256 signature in constant time.
+///
+/// Returns `true` iff `sig` is exactly 32 bytes and matches `HMAC-SHA256(key,
+/// data)`. The length short-circuit is deliberately non-constant-time (length
+/// is not secret); the 32-byte comparison is constant-time.
+pub fn hmac_sha256_verify(key: &[u8], data: &[u8], sig: &[u8]) -> bool {
+    hmac_sha256_parts_verify(key, &[data], sig)
+}
+
 /// Compare two version strings of the form `X.Y.Z` numerically.
 ///
 /// Returns `true` when `v >= minimum`. Non-numeric components and versions
@@ -76,6 +127,25 @@ pub fn version_at_least(v: &str, minimum: &str) -> bool {
     let (vm, vn, vp) = parse(v);
     let (mm, mn, mp) = parse(minimum);
     (vm, vn, vp) >= (mm, mn, mp)
+}
+
+/// Maximum number of commit oneline entries reported in a `repo_sync:pulled`
+/// event and preserved through collapse/merge.
+pub const ONELINE_CAP: usize = 10;
+
+/// Apply the [`ONELINE_CAP`] truncation rule in place. When `lines.len()`
+/// exceeds the cap, keep the first `ONELINE_CAP - 1` entries and replace the
+/// tail with a single `"... N more (older)"` sentinel.
+///
+/// Shared by the producer of a commit-oneline list (the managed-clone pull) and
+/// the consumer that collapses several pulls into one event, so both sides
+/// bound the list the same way.
+pub fn cap_oneline(lines: &mut Vec<String>) {
+    if lines.len() > ONELINE_CAP {
+        let extra = lines.len() - (ONELINE_CAP - 1);
+        lines.truncate(ONELINE_CAP - 1);
+        lines.push(format!("... {extra} more (older)"));
+    }
 }
 
 /// Escape a string for safe inclusion in HTML content or attribute values.
@@ -142,6 +212,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cap_oneline_truncates_at_cap() {
+        let mut lines: Vec<String> = (0..=ONELINE_CAP).map(|i| format!("commit {i}")).collect();
+        assert_eq!(lines.len(), ONELINE_CAP + 1);
+        cap_oneline(&mut lines);
+        assert_eq!(lines.len(), ONELINE_CAP);
+        assert_eq!(
+            lines[ONELINE_CAP - 2],
+            format!("commit {}", ONELINE_CAP - 2)
+        );
+        assert_eq!(lines.last().unwrap(), "... 2 more (older)");
+    }
+
+    #[test]
+    fn cap_oneline_sentinel_counts_every_dropped_entry() {
+        let mut lines: Vec<String> = (0..25).map(|i| format!("commit {i}")).collect();
+        cap_oneline(&mut lines);
+        assert_eq!(lines.len(), ONELINE_CAP);
+        let kept: Vec<String> = (0..ONELINE_CAP - 1)
+            .map(|i| format!("commit {i}"))
+            .collect();
+        assert_eq!(lines[..ONELINE_CAP - 1], kept[..]);
+        // 25 entries in, 9 kept: the sentinel accounts for the other 16.
+        assert_eq!(lines.last().unwrap(), "... 16 more (older)");
+    }
+
+    #[test]
+    fn cap_oneline_at_exactly_cap_is_noop() {
+        let mut lines: Vec<String> = (0..ONELINE_CAP).map(|i| format!("commit {i}")).collect();
+        let before = lines.clone();
+        cap_oneline(&mut lines);
+        assert_eq!(lines, before);
+    }
+
+    #[test]
     fn ct_eq_bytes_agrees_with_plain_equality() {
         assert!(ct_eq_bytes(b"abc", b"abc"));
         assert!(!ct_eq_bytes(b"abc", b"abd"));
@@ -179,6 +283,128 @@ mod tests {
         assert_eq!(
             hex::encode(sha256(b"")),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_hex_produces_lowercase_hex_of_hmac() {
+        let key = b"test-key";
+        let data = b"test-data";
+        let raw = hmac_sha256(key, data);
+        let expected_hex = hex::encode(raw);
+        assert_eq!(hmac_sha256_hex(key, data), expected_hex);
+        let h = hmac_sha256_hex(key, data);
+        assert_eq!(h.len(), 64);
+        assert!(
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_verify_correct_returns_true() {
+        let key = b"verify-key";
+        let data = b"verify-data";
+        let sig = hmac_sha256(key, data);
+        assert!(hmac_sha256_verify(key, data, &sig));
+    }
+
+    #[test]
+    fn hmac_sha256_verify_wrong_key_returns_false() {
+        let key = b"verify-key";
+        let wrong_key = b"wrong-key!!";
+        let data = b"verify-data";
+        let sig = hmac_sha256(key, data);
+        assert!(!hmac_sha256_verify(wrong_key, data, &sig));
+    }
+
+    #[test]
+    fn hmac_sha256_verify_wrong_length_returns_false() {
+        let key = b"verify-key";
+        let data = b"verify-data";
+        let short_sig = &hmac_sha256(key, data)[..16];
+        assert!(!hmac_sha256_verify(key, data, short_sig));
+        let long_sig = [hmac_sha256(key, data).as_slice(), b"\x00"].concat();
+        assert!(!hmac_sha256_verify(key, data, &long_sig));
+    }
+
+    #[test]
+    fn hmac_sha256_parts_equivalent_to_concat() {
+        let key = b"test-key-for-parts-equivalence";
+        let a: &[u8] = b"prefix-data/";
+        let b: &[u8] = b"middle-chunk";
+        let c: &[u8] = b":suffix";
+        let parts_result = hmac_sha256_parts(key, &[a, b, c]);
+        let concat: Vec<u8> = [a, b, c].concat();
+        let concat_result = hmac_sha256(key, &concat);
+        assert_eq!(
+            parts_result, concat_result,
+            "hmac_sha256_parts must be equivalent to hmac_sha256 on concatenated input"
+        );
+    }
+
+    /// `hmac_sha256_parts_verify(key, &[data], sig)` must agree with
+    /// `hmac_sha256_verify(key, data, sig)` for both matching and non-matching
+    /// signatures. Pins the forwarding invariant.
+    #[test]
+    fn hmac_sha256_parts_verify_single_part_equivalent() {
+        let key = b"gate-key";
+        let data = b"gate-data";
+        let sig_match = hmac_sha256(key, data);
+        let sig_wrong = hmac_sha256(b"other-key", data);
+
+        assert!(
+            hmac_sha256_parts_verify(key, &[data], &sig_match),
+            "parts_verify(single part) must return true on match"
+        );
+        assert!(
+            hmac_sha256_verify(key, data, &sig_match),
+            "hmac_sha256_verify must return true on match"
+        );
+
+        assert!(
+            !hmac_sha256_parts_verify(key, &[data], &sig_wrong),
+            "parts_verify(single part) must return false on mismatch"
+        );
+        assert!(
+            !hmac_sha256_verify(key, data, &sig_wrong),
+            "hmac_sha256_verify must return false on mismatch"
+        );
+    }
+
+    /// `hmac_sha256_parts_verify` with multiple parts must match the
+    /// equivalent concatenation, reject a wrong key, and enforce the 32-byte
+    /// length guard directly at the primitive level.
+    #[test]
+    fn hmac_sha256_parts_verify_multi_part() {
+        let key = b"multi-key";
+        let a: &[u8] = b"part-a";
+        let b_part: &[u8] = b"part-b";
+        let c: &[u8] = b"part-c";
+
+        let correct_sig = hmac_sha256_parts(key, &[a, b_part, c]);
+        assert!(
+            hmac_sha256_parts_verify(key, &[a, b_part, c], &correct_sig),
+            "must return true on multi-part match"
+        );
+
+        let wrong_sig = hmac_sha256_parts(b"wrong-key", &[a, b_part, c]);
+        assert!(
+            !hmac_sha256_parts_verify(key, &[a, b_part, c], &wrong_sig),
+            "must return false with wrong key"
+        );
+
+        let short_sig = &correct_sig[..16];
+        assert!(
+            !hmac_sha256_parts_verify(key, &[a, b_part, c], short_sig),
+            "must return false for sig shorter than 32 bytes"
+        );
+
+        let mut long_sig = correct_sig.to_vec();
+        long_sig.push(0x00);
+        assert!(
+            !hmac_sha256_parts_verify(key, &[a, b_part, c], &long_sig),
+            "must return false for sig longer than 32 bytes"
         );
     }
 

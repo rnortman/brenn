@@ -62,7 +62,7 @@ fn resolve_user_scope(
                     },
                 ));
             }
-            match brenn_lib::auth::user::get_user_by_username(conn, uname) {
+            match brenn_db::auth::user::get_user_by_username(conn, uname) {
                 Some(u) => Ok(UserScope::Explicit(u.id)),
                 None => {
                     warn!(
@@ -146,7 +146,7 @@ pub(super) async fn handle(
                 };
 
                 let limit_plus_one = limit + 1;
-                let mut device_ids = brenn_lib::auth::device::list_device_ids_for_visibility_set(
+                let mut device_ids = brenn_db::auth::device::list_device_ids_for_visibility_set(
                     &conn,
                     &visibility,
                     limit_plus_one,
@@ -156,7 +156,7 @@ pub(super) async fn handle(
                     device_ids.truncate(limit);
                 }
                 let records =
-                    brenn_lib::auth::device::fetch_device_records(&conn, &device_ids, &visibility);
+                    brenn_db::auth::device::fetch_device_records(&conn, &device_ids, &visibility);
                 if truncated {
                     serde_json::json!({"devices": records, "truncated": true})
                 } else {
@@ -214,7 +214,7 @@ pub(super) async fn handle(
                         resolve_device_visibility_set(&conn, &bridge.allowed_users)
                     }
                 };
-                let mut device_ids = brenn_lib::auth::device::resolve_device_ids_for_get(
+                let mut device_ids = brenn_db::auth::device::resolve_device_ids_for_get(
                     &conn,
                     &device_arg,
                     &visibility,
@@ -226,7 +226,7 @@ pub(super) async fn handle(
                     if truncated {
                         device_ids.truncate(limit);
                     }
-                    let records = brenn_lib::auth::device::fetch_device_records(
+                    let records = brenn_db::auth::device::fetch_device_records(
                         &conn,
                         &device_ids,
                         &visibility,
@@ -291,13 +291,13 @@ pub(super) async fn handle(
                         Ok(uid) => uid,
                         Err(e) => return Some(e),
                     };
-                match brenn_lib::auth::device::resolve_device_for_assign(
+                match brenn_db::auth::device::resolve_device_for_assign(
                     &conn,
                     &device_arg,
                     effective_user_id,
                 ) {
                     Err(err_json) => err_json,
-                    Ok(device_id) => brenn_lib::auth::device::assign_device_slug(
+                    Ok(device_id) => brenn_db::auth::device::assign_device_slug(
                         &conn,
                         device_id,
                         &slug,
@@ -338,7 +338,7 @@ fn resolve_device_visibility_set(
         allowed_users
             .iter()
             .filter_map(|username| {
-                brenn_lib::auth::user::get_user_by_username(conn, username).map(|u| u.id)
+                brenn_db::auth::user::get_user_by_username(conn, username).map(|u| u.id)
             })
             .collect()
     }
@@ -394,7 +394,7 @@ mod tests {
         // Get the guessed_slug.
         let guessed_slug = {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::device::load_device(&conn, device_id).guessed_slug
+            brenn_db::auth::device::load_device(&conn, device_id).guessed_slug
         };
 
         let req = post_tool_use_req(
@@ -423,7 +423,7 @@ mod tests {
         // First assign a slug.
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::device::assign_device_slug(&conn, device_id, "phone", bridge.user_id);
+            brenn_db::auth::device::assign_device_slug(&conn, device_id, "phone", bridge.user_id);
         }
 
         // Now try to use the assigned slug "phone" as the device arg — should reject.
@@ -458,7 +458,7 @@ mod tests {
         // Assign "my-device" to device_a.
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::device::assign_device_slug(
+            brenn_db::auth::device::assign_device_slug(
                 &conn,
                 device_a,
                 "my-device",
@@ -496,7 +496,7 @@ mod tests {
         // Assign then clear.
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::device::assign_device_slug(&conn, device_id, "laptop", bridge.user_id);
+            brenn_db::auth::device::assign_device_slug(&conn, device_id, "laptop", bridge.user_id);
         }
 
         let req = post_tool_use_req(
@@ -528,7 +528,7 @@ mod tests {
         // Assign slug.
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::device::assign_device_slug(&conn, device_id, "laptop", bridge.user_id);
+            brenn_db::auth::device::assign_device_slug(&conn, device_id, "laptop", bridge.user_id);
         }
 
         // Assign same slug again — must return ok without unique-index error.
@@ -584,14 +584,14 @@ mod tests {
         // Create a second user + device NOT associated with the bridge user.
         let other_user_id = {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "other", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&conn, "other", "$argon2id$fake")
         };
         let other_device_id =
             create_test_device_for_user(&bridge.db, other_user_id, "Mozilla/5.0 Firefox/126").await;
 
         let other_guessed_slug = {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::device::load_device(&conn, other_device_id).guessed_slug
+            brenn_db::auth::device::load_device(&conn, other_device_id).guessed_slug
         };
 
         // The bridge user has no membership on other_device — must get no_membership.
@@ -649,7 +649,7 @@ mod tests {
         let alice_id = bridge.user_id;
         let bob_id = {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "bob2", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&conn, "bob2", "$argon2id$fake")
         };
 
         let alice_device =
@@ -659,8 +659,8 @@ mod tests {
 
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::device::assign_device_slug(&conn, alice_device, "phone", alice_id);
-            brenn_lib::auth::device::assign_device_slug(&conn, bob_device, "phone", bob_id);
+            brenn_db::auth::device::assign_device_slug(&conn, alice_device, "phone", alice_id);
+            brenn_db::auth::device::assign_device_slug(&conn, bob_device, "phone", bob_id);
         }
 
         let req = post_tool_use_req(MCP_DEVICE_GET_TOOL, serde_json::json!({"device": "phone"}));
@@ -692,19 +692,19 @@ mod tests {
         let conn = bridge.db.lock().await;
 
         // Create a device for a user NOT in the restricted visibility set.
-        let other_user_id = brenn_lib::auth::user::create_user(&conn, "outsider", "$argon2id$fake");
-        let other_resolved = brenn_lib::auth::device::resolve_or_create_device(
+        let other_user_id = brenn_db::auth::user::create_user(&conn, "outsider", "$argon2id$fake");
+        let other_resolved = brenn_db::auth::device::resolve_or_create_device(
             &conn,
             None,
             other_user_id,
             "Mozilla/5.0 Chrome/125",
         );
         let other_guessed_slug =
-            brenn_lib::auth::device::load_device(&conn, other_resolved.id).guessed_slug;
+            brenn_db::auth::device::load_device(&conn, other_resolved.id).guessed_slug;
 
         // Visibility set contains only bridge user — not the outsider.
         let visibility = vec![bridge.user_id];
-        let matches = brenn_lib::auth::device::resolve_device_ids_for_get(
+        let matches = brenn_db::auth::device::resolve_device_ids_for_get(
             &conn,
             &other_guessed_slug,
             &visibility,
@@ -763,7 +763,7 @@ mod tests {
         for i in 0..3u8 {
             let uid = {
                 let conn = bridge.db.lock().await;
-                brenn_lib::auth::user::create_user(
+                brenn_db::auth::user::create_user(
                     &conn,
                     &format!("shared_user_{i}"),
                     "$argon2id$fake",
@@ -773,7 +773,7 @@ mod tests {
                 create_test_device_for_user(&bridge.db, uid, &format!("Mozilla/5.0 Safari/{i}"))
                     .await;
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::device::assign_device_slug(&conn, device_id, "shared", uid);
+            brenn_db::auth::device::assign_device_slug(&conn, device_id, "shared", uid);
         }
 
         // limit=2 with 3 matches: DeviceGet returns 2 records + truncated:true.
@@ -881,7 +881,7 @@ mod tests {
         // Create a device for the bridge's user; add an explicit user "alice" as the target.
         let alice_id = {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "alice", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&conn, "alice", "$argon2id$fake")
         };
         let device_id =
             create_test_device_for_user(&bridge.db, alice_id, "Mozilla/5.0 Chrome/125").await;
@@ -930,11 +930,11 @@ mod tests {
         // Create two users with devices; verify DeviceGet scopes to the specified user.
         let alice_id = {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "alice", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&conn, "alice", "$argon2id$fake")
         };
         let bob_id = {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "bob", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&conn, "bob", "$argon2id$fake")
         };
         let alice_device =
             create_test_device_for_user(&bridge.db, alice_id, "Mozilla/5.0 Chrome/125").await;
@@ -990,11 +990,11 @@ mod tests {
         // Create two users with devices; verify DeviceList scopes to the specified user.
         let alice_id = {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "alice", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&conn, "alice", "$argon2id$fake")
         };
         let bob_id = {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "bob", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&conn, "bob", "$argon2id$fake")
         };
         let _alice_device =
             create_test_device_for_user(&bridge.db, alice_id, "Mozilla/5.0 Chrome/125").await;
@@ -1030,7 +1030,7 @@ mod tests {
 
         let other_id = {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "other_user", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&conn, "other_user", "$argon2id$fake")
         };
         let other_device =
             create_test_device_for_user(&bridge.db, other_id, "Mozilla/5.0 Chrome/125").await;
@@ -1090,7 +1090,7 @@ mod tests {
         // existing user to confirm the guard runs before the DB lookup, not after.
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "outsider", "$argon2id$fake");
+            brenn_db::auth::user::create_user(&conn, "outsider", "$argon2id$fake");
         }
 
         // "outsider" exists in the DB but is not in allowed_users → user_not_in_app.
@@ -1153,7 +1153,7 @@ mod tests {
         // Create outsider in DB to ensure the allowed_users check fires first.
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "outsider", "$argon2id$fake");
+            brenn_db::auth::user::create_user(&conn, "outsider", "$argon2id$fake");
         }
 
         let req = post_tool_use_req(
@@ -1184,7 +1184,7 @@ mod tests {
         // Create outsider in DB to ensure the allowed_users check fires first.
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "outsider", "$argon2id$fake");
+            brenn_db::auth::user::create_user(&conn, "outsider", "$argon2id$fake");
         }
 
         let req = post_tool_use_req(

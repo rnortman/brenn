@@ -1,0 +1,53 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+FIRST_PARTY_DEPS = [
+    "//brenn-db",
+    "//brenn-lib",
+    "//brenn-messaging-store",
+    "//brenn-obs",
+]
+
+# `testutils` exposes `ValidatedEndpoint::for_testing` to downstream test
+# targets; the release configs clear the flag, so no test scaffolding reaches
+# the shipped binary.
+rust_library(
+    name = "brenn-pwa-push",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
+)
+
+# 142 tests: in-memory sqlite over the subscription DAOs, the publish fan-out
+# driven through a stub poster, and the pure URL-validation suite. The whole
+# binary finishes in about a second locally, so `small` (60s) keeps a wide
+# margin on a cold 4-vCPU runner.
+#
+# ts-rs exports `PushPayload` from tests, so this binary is also a generator
+# behind `//frontend:generated_types`. Without the override the generated types
+# — and so every bundle built from them — would inherit testonly.
+rust_test(
+    name = "brenn-pwa-push_test",
+    size = "small",
+    crate = ":brenn-pwa-push",
+    crate_features = ["testutils"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    testonly = False,
+    visibility = ["//frontend:__pkg__"],
+    deps = all_crate_deps(normal_dev = True) + FIRST_PARTY_DEPS,
+)
+
+rust_doc_test(
+    name = "brenn-pwa-push_doc_test",
+    crate = ":brenn-pwa-push",
+)

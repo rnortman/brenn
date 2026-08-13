@@ -2,8 +2,8 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
-use brenn_lib::ws_types::{ToolResponseDecision, WsServerMessage};
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_ws_types::{ToolResponseDecision, WsServerMessage};
 use tracing::{info, warn};
 
 use super::ActiveBridge;
@@ -34,7 +34,7 @@ impl ActiveBridge {
         // clicking simultaneously). Only the winner proceeds to execute the action.
         let pending = {
             let conn = self.db.lock().await;
-            let req = brenn_lib::db::get_pending_tool_request(&conn, request_id);
+            let req = brenn_db::get_pending_tool_request(&conn, request_id);
             match req {
                 // Ownership guard: the row belongs to a different conversation than
                 // this bridge is attached to. Authority is re-derived from the
@@ -61,7 +61,7 @@ impl ActiveBridge {
                 Some(p) if p.status == "pending" => {
                     // Claim it: resolve with a placeholder to prevent double-execution.
                     // We'll update with the real result after execution.
-                    if !brenn_lib::db::resolve_pending_tool_request(
+                    if !brenn_db::resolve_pending_tool_request(
                         &conn,
                         request_id,
                         claim_status,
@@ -162,7 +162,7 @@ impl ActiveBridge {
         // Update with the real result and final status.
         {
             let conn = self.db.lock().await;
-            brenn_lib::db::update_pending_tool_result(&conn, request_id, new_status, &result_str);
+            brenn_db::update_pending_tool_result(&conn, request_id, new_status, &result_str);
         }
 
         self.broadcast(WsServerMessage::ToolCardResolved {
@@ -349,7 +349,7 @@ impl ActiveBridge {
 
         if sent {
             let conn = self.db.lock().await;
-            brenn_lib::db::mark_delivered_to_cc(&conn, request_id);
+            brenn_db::mark_delivered_to_cc(&conn, request_id);
         } else {
             info!(
                 request_id,
@@ -362,7 +362,7 @@ impl ActiveBridge {
     pub async fn deliver_pending_results(&self) {
         let undelivered = {
             let conn = self.db.lock().await;
-            brenn_lib::db::get_undelivered_results(&conn, self.conversation_id)
+            brenn_db::get_undelivered_results(&conn, self.conversation_id)
         };
 
         if undelivered.is_empty() {
@@ -498,7 +498,7 @@ mod tests {
         });
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &conn,
                 "req_race",
                 bridge.conversation_id,
@@ -534,7 +534,7 @@ mod tests {
         // Verify the first result stuck.
         let req = {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::get_pending_tool_request(&conn, "req_race")
+            brenn_db::get_pending_tool_request(&conn, "req_race")
         };
         let req = req.expect("request should exist");
         assert_eq!(req.status, "denied");
@@ -554,7 +554,7 @@ mod tests {
                 integrations: pfin_test_integrations(),
                 ..Default::default()
             },
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await;
 
@@ -701,7 +701,7 @@ mod tests {
         // Insert a tool card request in the DB.
         {
             let conn = _bridge.db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &conn,
                 "req_tc_cancel",
                 _bridge.conversation_id,
@@ -732,7 +732,7 @@ mod tests {
         // The DB tool card should be unaffected (still pending).
         {
             let conn = _bridge.db.lock().await;
-            let req = brenn_lib::db::get_pending_tool_request(&conn, "req_tc_cancel")
+            let req = brenn_db::get_pending_tool_request(&conn, "req_tc_cancel")
                 .expect("DB entry should still exist");
             assert_eq!(
                 req.status, "pending",
@@ -749,7 +749,7 @@ mod tests {
     #[tokio::test]
     async fn cross_conversation_tool_card_response_rejected() {
         let (dispatcher, captured, handle) =
-            brenn_lib::obs::alerting::make_capturing_alerter_with_severity();
+            brenn_obs::alerting::make_capturing_alerter_with_severity();
         let (bridge, event_tx, mut broadcast_rx, _ab) =
             super::super::test_support::test_bridge_with_dispatcher(dispatcher).await;
 
@@ -758,7 +758,7 @@ mod tests {
         // (bridge.conversation_id), so B is a foreign owner.
         let conv_b = {
             let conn = bridge.db.lock().await;
-            brenn_lib::conversation::create_conversation(&conn, bridge.user_id, "test", false)
+            brenn_db::conversation::create_conversation(&conn, bridge.user_id, "test", false)
         };
         assert_ne!(conv_b, bridge.conversation_id, "B must differ from A");
         let conv_a = bridge.conversation_id;
@@ -769,7 +769,7 @@ mod tests {
         });
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &conn,
                 "req_cross_conv",
                 conv_b,
@@ -792,7 +792,7 @@ mod tests {
         // Row B must be untouched (still pending, no result).
         {
             let conn = bridge.db.lock().await;
-            let req = brenn_lib::db::get_pending_tool_request(&conn, "req_cross_conv")
+            let req = brenn_db::get_pending_tool_request(&conn, "req_cross_conv")
                 .expect("B's row must still exist");
             assert_eq!(
                 req.status, "pending",
@@ -821,7 +821,7 @@ mod tests {
         );
         let (severity, title, body) = &captured[0];
         assert!(
-            matches!(severity, brenn_lib::obs::alerting::AlertSeverity::Warning),
+            matches!(severity, brenn_obs::alerting::AlertSeverity::Warning),
             "alert severity must be Warning, got: {severity:?}"
         );
         assert!(
@@ -848,7 +848,7 @@ mod tests {
 
         let conv_b = {
             let conn = bridge_a.db.lock().await;
-            brenn_lib::conversation::create_conversation(&conn, bridge_a.user_id, "test", false)
+            brenn_db::conversation::create_conversation(&conn, bridge_a.user_id, "test", false)
         };
         let (tx_b, mut broadcast_rx_b) = tokio::sync::broadcast::channel(64);
         let bridge_b = ActiveBridge::inject_for_test_full(
@@ -857,7 +857,7 @@ mod tests {
             "test",
             bridge_a.db.clone(),
             tx_b,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             super::super::test_fixtures::TestBridgeConfig {
                 active_bridges: Some(active_bridges.clone()),
                 ..Default::default()
@@ -869,7 +869,7 @@ mod tests {
         });
         {
             let conn = bridge_a.db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &conn,
                 "req_owner",
                 conv_b,
@@ -895,7 +895,7 @@ mod tests {
         );
         {
             let conn = bridge_a.db.lock().await;
-            let req = brenn_lib::db::get_pending_tool_request(&conn, "req_owner").unwrap();
+            let req = brenn_db::get_pending_tool_request(&conn, "req_owner").unwrap();
             assert_eq!(req.status, "pending", "row must survive the probe");
         }
 
@@ -918,7 +918,7 @@ mod tests {
         }
         {
             let conn = bridge_a.db.lock().await;
-            let req = brenn_lib::db::get_pending_tool_request(&conn, "req_owner").unwrap();
+            let req = brenn_db::get_pending_tool_request(&conn, "req_owner").unwrap();
             assert_eq!(req.status, "denied", "owner's resolve must stick");
             let result: serde_json::Value =
                 serde_json::from_str(req.result.as_deref().unwrap()).unwrap();
@@ -934,7 +934,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_card_request_id_emits_security_signal() {
         let (dispatcher, captured, handle) =
-            brenn_lib::obs::alerting::make_capturing_alerter_with_severity();
+            brenn_obs::alerting::make_capturing_alerter_with_severity();
         let (bridge, event_tx, mut broadcast_rx, _ab) =
             super::super::test_support::test_bridge_with_dispatcher(dispatcher).await;
         let conv_a = bridge.conversation_id;
@@ -962,7 +962,7 @@ mod tests {
         );
         let (severity, title, body) = &captured[0];
         assert!(
-            matches!(severity, brenn_lib::obs::alerting::AlertSeverity::Warning),
+            matches!(severity, brenn_obs::alerting::AlertSeverity::Warning),
             "alert severity must be Warning, got: {severity:?}"
         );
         assert!(
@@ -981,7 +981,7 @@ mod tests {
     /// must NOT emit a security signal — benign double-click must stay benign.
     #[tokio::test]
     async fn already_resolved_tool_card_does_not_emit_security_signal() {
-        let (dispatcher, alert_count, handle) = brenn_lib::obs::alerting::make_counting_alerter();
+        let (dispatcher, alert_count, handle) = brenn_obs::alerting::make_counting_alerter();
         let (bridge, event_tx, mut broadcast_rx, _ab) =
             super::super::test_support::test_bridge_with_dispatcher(dispatcher).await;
 
@@ -990,7 +990,7 @@ mod tests {
         });
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::db::insert_pending_tool_request(
+            brenn_db::insert_pending_tool_request(
                 &conn,
                 "req_dbl",
                 bridge.conversation_id,

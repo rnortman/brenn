@@ -21,7 +21,7 @@ use crate::active_bridge::ActiveBridge;
 
 /// Outer bound for the shutdown-path hook fan-out. Individual git queries
 /// inside `repo_status` are already bounded by the per-`git` 30 s timeout
-/// in `git_ops`; this 60 s ceiling covers the concurrent fan-out plus
+/// in `brenn_git::ops`; this 60 s ceiling covers the concurrent fan-out plus
 /// headroom.
 const SHUTDOWN_HOOK_RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -77,7 +77,7 @@ pub trait IdleHook: Send + Sync {
 
 /// First concrete hook: nudge the LLM about dirty/unpushed managed repos.
 ///
-/// Routes through `crate::git_ops::repo_status` (the same code path the
+/// Routes through `brenn_git::ops::repo_status` (the same code path the
 /// `GitRepoStatus` MCP tool uses) so the LLM and the hook see identical
 /// data. One-shot via `reminder_sent`: fires once per dirty cycle, clears
 /// when all managed repos go clean.
@@ -141,7 +141,7 @@ impl DirtyRepoHook {
         let futs = bridge
             .mounts
             .iter()
-            .map(|m| crate::git_ops::repo_status(m, &working_dir));
+            .map(|m| brenn_git::ops::repo_status(m, &working_dir));
         let results = futures::future::join_all(futs).await;
 
         // Collapse into the compact "dirty?" view the LLM cares about.
@@ -313,8 +313,8 @@ async fn invoke_hooks_and_deliver(bridge: &Arc<ActiveBridge>, hooks: &[Arc<dyn I
     );
 
     // `render_idle_hook` builds the `{"system":"idle_hooks", ...}` wrapper
-    // JSON itself — single source of truth (review F10).
-    let rendered = crate::system_message::render_idle_hook(&envelope);
+    // JSON itself — single source of truth.
+    let rendered = brenn_render::system_message::render_idle_hook(&envelope);
     match bridge.send_system_message(rendered, None).await {
         Ok(()) => {
             for hook in contributors {
@@ -355,11 +355,11 @@ mod tests {
     /// drive `DirtyRepoHook::check` directly against `bridge` to exercise
     /// the repo-status path without spinning up CC.
     async fn test_bridge_with_mounts(mounts: Vec<ResolvedMount>) -> Arc<ActiveBridge> {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (user_id, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
-            let cid = brenn_lib::conversation::create_conversation(&conn, uid, "test", false);
+            let uid = brenn_db::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
+            let cid = brenn_db::conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
         let (broadcast_tx, _broadcast_rx) = tokio::sync::broadcast::channel(64);

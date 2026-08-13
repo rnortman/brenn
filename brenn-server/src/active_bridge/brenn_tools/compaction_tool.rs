@@ -6,8 +6,8 @@
 //! progress), Post sets `CompactionPhase::PendingTurnCompletion` so the
 //! existing turn-completion path actually runs `/compact`.
 
+use brenn_approval_rules::ApprovalMatch;
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
-use brenn_lib::approval_rules::ApprovalMatch;
 use tracing::info;
 
 use super::super::ActiveBridge;

@@ -74,7 +74,7 @@ brenn-surface-test-fixtures = { path = "../test-fixtures" }
 tokio = { version = "1.50.0", features = ["rt", "time", "macros", "test-util"] }
 
 # Browser-level unit tests (dom.rs, entry.rs) run under wasm-bindgen-test via
-# `make surface-wasm-test`; wasm32-only so the host `cargo test` sweep never
+# the browser test runner; wasm32-only so a host test sweep never
 # pulls them. futures-channel scripts the fake connector's transport events; the
 # component-support path dep lets the entry integration test register a real
 # custom element.

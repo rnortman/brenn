@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 
 use brenn_wasm::ReplayComponent;
 
+use brenn_db::Db;
 use brenn_lib::app::AppTool;
 use brenn_lib::config::AppConfig;
-use brenn_lib::db::Db;
-use brenn_lib::obs::alerting::AlertDispatcher;
-use brenn_lib::ws_types::ModelInfo;
+use brenn_obs::alerting::AlertDispatcher;
+use brenn_ws_types::ModelInfo;
 use indexmap::IndexMap;
 use tokio::sync::{Mutex, RwLock, broadcast};
 #[cfg(not(test))]
@@ -22,7 +22,7 @@ use uuid::Uuid;
 #[cfg(not(test))]
 use crate::active_bridge::SpawnContext;
 use crate::active_bridge::{ActiveBridge, ActiveBridges};
-use crate::repo_sync::SyncTriggerSender;
+use brenn_git::sync::SyncTriggerSender;
 
 /// Notification that a new bridge was spawned for a conversation.
 /// WS connections watching the same conversation auto-attach.
@@ -95,7 +95,7 @@ pub struct AppState {
     /// WASM callers alike). Threaded onto each `ActiveBridge` for the LLM path.
     /// Read only on the (non-test) bridge-spawn path.
     #[cfg_attr(test, allow(dead_code))]
-    pub tools: Arc<crate::tool_registry::ToolRegistry>,
+    pub tools: Arc<brenn_tool_registry::ToolRegistry>,
     /// Origin string for tool-caller `ParticipantId`s (`app:<slug>@<origin>`).
     /// The messaging source when configured, else the server bind address.
     /// Read only on the (non-test) bridge-spawn path.
@@ -130,18 +130,18 @@ pub struct AppState {
     pub repo_sync_sender: Option<SyncTriggerSender>,
     /// Messenger for the messaging MVP. `None` when no `[[channel]]`
     /// is configured (messaging effectively disabled).
-    pub messenger: Option<Arc<brenn_lib::messaging::Messenger>>,
+    pub messenger: Option<Arc<brenn_messaging::Messenger>>,
     /// PWA push service (VAPID keypair, subscription DB, HTTP client). `None` when
     /// no app has `pwa_push.enabled = true` (push effectively disabled).
-    pub pwa_push: Option<Arc<dyn brenn_lib::pwa_push::PwaPushSender>>,
+    pub pwa_push: Option<Arc<dyn brenn_pwa_push::PwaPushSender>>,
     /// MQTT service (per-client session supervisors, event router). `None` when no
     /// `[[mqtt_client]]` is referenced by any ingress channel or `mqtt_publish`/
     /// `mqtt_subscribe` ACL matcher (`bootstrap/mqtt::referenced_clients`).
     #[cfg_attr(test, allow(dead_code))]
-    pub mqtt: Option<Arc<brenn_lib::mqtt::MqttService>>,
+    pub mqtt: Option<Arc<brenn_mqtt::MqttService>>,
     /// Concrete MQTT inbound event router. `None` when MQTT is not configured.
     /// Threaded onto each spawned `ActiveBridge` so a runtime `mqtt:` dynamic
-    /// subscribe can call `add_route` (design §2.3 step 6). The `Arc<dyn
+    /// subscribe can call `add_route`. The `Arc<dyn
     /// MqttEventRouter>` the supervisors hold exposes only `deliver_inbound`, so
     /// the concrete handle is retained here separately from `mqtt`.
     #[cfg_attr(test, allow(dead_code))]
@@ -150,11 +150,11 @@ pub struct AppState {
     /// `[[webhook_endpoint]]` is configured or no app declares any
     /// `[[app.webhook_subscription]]`.
     #[cfg_attr(test, allow(dead_code))]
-    pub webhook: Option<Arc<brenn_lib::webhook::WebhookService>>,
+    pub webhook: Option<Arc<brenn_webhook::WebhookService>>,
     /// Automation engine. `None` when automation is not configured (no messenger
     /// or no apps with allowed_users).
     #[cfg_attr(test, allow(dead_code))]
-    pub automation_engine: Option<Arc<brenn_lib::automation::AutomationEngine>>,
+    pub automation_engine: Option<Arc<brenn_automation::AutomationEngine>>,
     /// Replay-protection components, keyed by webhook endpoint slug.
     /// Empty map = no endpoint is replay-protected.
     /// Populated at startup from `ResolvedWebhookEndpoint.replay_protection`.
@@ -175,13 +175,13 @@ pub struct AppState {
     pub usage_session_gap_secs: u32,
     /// Boot-resolved surfaces, keyed by slug. Empty when no `[[surface]]`
     /// blocks are configured.
-    pub surfaces: Arc<HashMap<String, Arc<crate::routes::surface::SurfaceRuntime>>>,
+    pub surfaces: Arc<HashMap<String, Arc<brenn_surface_server::SurfaceRuntime>>>,
     /// Boot-resolved remotes, keyed by slug. Empty when no `[[remote]]` blocks
     /// are configured.
-    pub remotes: Arc<HashMap<String, Arc<crate::routes::remote::RemoteRuntime>>>,
+    pub remotes: Arc<HashMap<String, Arc<brenn_remote_server::RemoteRuntime>>>,
     /// Attached attachment sessions (attacher → handles). A durable push router
     /// reads this to route wakes to live connections.
-    pub attach_registry: crate::routes::attach::registry::AttachRegistry,
+    pub attach_registry: brenn_attach_server::registry::AttachRegistry,
     /// Idle-heartbeat interval advertised in `Welcome`, shared by both attach
     /// routes. `HEARTBEAT_SECS` in production; test states set 1 for fast
     /// integration tests.
@@ -239,7 +239,7 @@ impl WakeLocks {
 
 /// Base retry window after a failed conversation spawn: one dispatcher tick,
 /// which is the cadence the wake walk retries at anyway.
-const SPAWN_BACKOFF_BASE: Duration = brenn_lib::messaging::dispatcher::POLL_INTERVAL;
+const SPAWN_BACKOFF_BASE: Duration = brenn_messaging::dispatcher::POLL_INTERVAL;
 
 /// Longest retry window a failure episode reaches. Bounds retry noise while
 /// keeping recovery latency operator-tolerable — a spawn that starts working
@@ -457,7 +457,7 @@ impl AppState {
                 tracing::error!(conversation_id, "eager spawn failed: {e}");
                 if self.spawn_backoff.record_failure(conversation_id) {
                     self.alert_dispatcher.alert(
-                        brenn_lib::obs::alerting::AlertSeverity::Warning,
+                        brenn_obs::alerting::AlertSeverity::Warning,
                         "Conversation spawn failing".to_string(),
                         format!(
                             "Conversation {conversation_id} has failed to spawn repeatedly and \
@@ -484,7 +484,7 @@ impl AppState {
     ) -> Result<Arc<ActiveBridge>, String> {
         let conv = {
             let conn = self.db.lock().await;
-            brenn_lib::conversation::get_conversation(&conn, conversation_id)
+            brenn_db::conversation::get_conversation(&conn, conversation_id)
         };
         self.spawn_if_absent(&conv, tz).await
     }
@@ -497,7 +497,7 @@ impl AppState {
     #[cfg(not(test))]
     pub async fn wake_with_conv(
         &self,
-        conv: &brenn_lib::conversation::Conversation,
+        conv: &brenn_db::conversation::Conversation,
         tz: chrono_tz::Tz,
     ) -> Result<Arc<ActiveBridge>, String> {
         self.spawn_if_absent(conv, tz).await
@@ -512,7 +512,7 @@ impl AppState {
     #[cfg(not(test))]
     async fn spawn_if_absent(
         &self,
-        conv: &brenn_lib::conversation::Conversation,
+        conv: &brenn_db::conversation::Conversation,
         tz: chrono_tz::Tz,
     ) -> Result<Arc<ActiveBridge>, String> {
         let conversation_id = conv.id;
@@ -604,7 +604,7 @@ impl AppState {
     ) -> Result<
         (
             std::sync::Arc<ActiveBridge>,
-            tokio::sync::broadcast::Receiver<brenn_lib::ws_types::WsServerMessage>,
+            tokio::sync::broadcast::Receiver<brenn_ws_types::WsServerMessage>,
             Vec<String>,
             Vec<ModelInfo>,
         ),
@@ -632,7 +632,7 @@ impl AppState {
                 .await
                 .insert(app_slug.clone(), model_infos.clone());
             let conn = self.db.lock().await;
-            brenn_lib::db::save_app_models(&conn, &app_slug, &model_infos);
+            brenn_db::save_app_models(&conn, &app_slug, &model_infos);
         }
 
         // Register in active_bridges.
@@ -701,7 +701,7 @@ impl AppState {
     #[cfg(test)]
     pub async fn wake_with_conv(
         &self,
-        conv: &brenn_lib::conversation::Conversation,
+        conv: &brenn_db::conversation::Conversation,
         _tz: chrono_tz::Tz,
     ) -> Result<Arc<ActiveBridge>, String> {
         self.test_wake_bridge_impl(conv.id).await
@@ -729,13 +729,13 @@ impl AppState {
     ///
     /// `apps` defaults to a single `"test"` app (via `test_apps()`) when callers
     /// pass `None`; pass `Some(apps)` to override.
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        db: brenn_lib::db::Db,
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn for_test(
+        db: brenn_db::Db,
         apps: Option<Arc<IndexMap<String, brenn_lib::config::AppConfig>>>,
     ) -> Self {
         use tokio::sync::broadcast;
-        let (alert_dispatcher, _handle) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (alert_dispatcher, _handle) = brenn_obs::alerting::noop_alert_dispatcher();
         let apps = apps.unwrap_or_else(crate::test_support::app_config::test_apps);
         AppState {
             build_id: crate::test_support::TEST_BUILD_ID,
@@ -752,7 +752,7 @@ impl AppState {
             surface_dist_dir: std::path::PathBuf::from("surface/dist"),
             cached_models: Default::default(),
             tool_registry: Default::default(),
-            tools: Arc::new(crate::tool_registry::ToolRegistry::new(vec![])),
+            tools: Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])),
             tool_server_origin: Arc::from("test-origin"),
             wake_locks: Default::default(),
             spawn_backoff: Default::default(),
@@ -771,13 +771,17 @@ impl AppState {
             attach_heartbeat_secs: 1,
             replay_components: Arc::new(HashMap::new()),
             replay_locks: Arc::new(HashMap::new()),
+            // These two fields, and the wake stubs that read them, exist only
+            // in this crate's own test build.
+            #[cfg(test)]
             test_wake_bridge: Default::default(),
+            #[cfg(test)]
             wake_spawns: Default::default(),
         }
     }
 }
 
-/// Adapter implementing `brenn_lib::automation::IngressRouter` over `AppState`.
+/// Adapter implementing `brenn_automation::IngressRouter` over `AppState`.
 ///
 /// Uses the same deferred-state pattern as `WakeRouterImpl`: the `AppState`
 /// is not yet constructed when `AutomationEngine` is built, so we stash a
@@ -785,6 +789,12 @@ impl AppState {
 /// construction.
 pub struct IngressRouterImpl {
     state: tokio::sync::OnceCell<AppState>,
+}
+
+impl Default for IngressRouterImpl {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IngressRouterImpl {
@@ -805,7 +815,7 @@ impl IngressRouterImpl {
 }
 
 #[async_trait::async_trait]
-impl brenn_lib::automation::IngressRouter for IngressRouterImpl {
+impl brenn_automation::IngressRouter for IngressRouterImpl {
     async fn submit_ingress(
         &self,
         conversation_id: i64,
@@ -843,7 +853,7 @@ mod tests {
     /// without consuming `test_wake_bridge`.
     #[tokio::test]
     async fn wake_conversation_fast_path_returns_cached_bridge() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let state = AppState::for_test(db.clone(), None);
         let (broadcast_tx, _) = broadcast::channel(64);
 
@@ -997,7 +1007,7 @@ mod tests {
     /// likeliest probe to find a broken spawn working again.
     #[tokio::test]
     async fn an_armed_backoff_declines_the_bus_trigger_and_not_the_user_one() {
-        let state = AppState::for_test(brenn_lib::db::init_db_memory(), None);
+        let state = AppState::for_test(crate::test_support::init_db_memory(), None);
         let conv = 11_i64;
 
         state.spawn_bus_wake(conv, chrono_tz::Tz::UTC);
@@ -1034,7 +1044,7 @@ mod tests {
     /// differs from it in exactly one thing: what it leaves holding the bridge.
     #[tokio::test]
     async fn only_the_chat_entrypoint_asks_for_the_bus_hold() {
-        let state = AppState::for_test(brenn_lib::db::init_db_memory(), None);
+        let state = AppState::for_test(crate::test_support::init_db_memory(), None);
         let conv = 11_i64;
 
         state.spawn_chat_wake(conv, chrono_tz::Tz::UTC);
@@ -1064,7 +1074,7 @@ mod tests {
     /// spawn task hands its outcome to.
     #[tokio::test]
     async fn a_spawn_outcome_arms_and_clears_the_backoff() {
-        let state = AppState::for_test(brenn_lib::db::init_db_memory(), None);
+        let state = AppState::for_test(crate::test_support::init_db_memory(), None);
         let conv = 12_i64;
 
         state.record_spawn_outcome(conv, Err("no bridge".to_string()));
@@ -1085,10 +1095,10 @@ mod tests {
     /// silently not processing, and that is the operator's only signal.
     #[tokio::test]
     async fn the_cap_alerts_once_through_the_alert_dispatcher() {
-        use brenn_lib::obs::alerting::{AlertSeverity, make_capturing_alerter_with_severity};
+        use brenn_obs::alerting::{AlertSeverity, make_capturing_alerter_with_severity};
 
         let (alert_dispatcher, captured, handle) = make_capturing_alerter_with_severity();
-        let mut state = AppState::for_test(brenn_lib::db::init_db_memory(), None);
+        let mut state = AppState::for_test(crate::test_support::init_db_memory(), None);
         state.alert_dispatcher = alert_dispatcher;
         let conv = 13_i64;
 

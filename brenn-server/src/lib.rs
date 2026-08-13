@@ -3,45 +3,34 @@
 //! The thin `brenn` binary crate holds `main()` and the compile-time
 //! `BUILD_ID`; this library holds everything that is heavily tested and must
 //! not vary with the build id. The build id enters as a runtime-threaded
-//! `&'static str` (see `bootstrap::run_server` and `state::AppState::build_id`),
-//! never as a compile-time const in this crate.
+//! `&'static str` (see `state::AppState::build_id`), never as a compile-time
+//! const in this crate.
+//!
+//! Most modules are `pub`: the composition root (`brenn-bootstrap`) assembles
+//! the server out of them, and it lives above this crate. `test_support` is
+//! `pub` behind `testutils` for the same reason.
 
-mod active_bridge;
-mod approval_formatter;
-mod artifact;
-mod artifact_snapshot;
+pub mod active_bridge;
 mod automation_intercept;
-pub mod bootstrap;
-mod cc_message_prefix;
 mod cc_schema_drift;
-pub mod cli;
 mod client_ip;
-mod frontmatter;
-mod git_ops;
-mod git_subprocess;
-mod history;
-mod hooks;
+pub mod db;
 mod idle_hooks;
 mod intercept_helpers;
-mod markdown;
 mod messaging_intercept;
-mod messaging_router;
+pub mod messaging_router;
 mod middleware;
 mod mqtt_intercept;
-mod mqtt_router;
+pub mod mqtt_router;
 mod mqtt_subscribe;
 mod path_validate;
-mod pid_file;
 mod pwa_push_intercept;
-mod repo_clone;
-mod repo_sync;
-mod router;
-mod routes;
-mod state;
-mod system_message;
+pub mod repo_sync;
+pub mod router;
+pub mod routes;
+pub mod state;
+#[cfg(any(test, feature = "testutils"))]
+pub mod test_support;
 #[cfg(test)]
-mod test_support;
-pub mod tool_registry;
-mod tools;
-mod wasm_dispatch;
-mod webhook_router;
+mod wasm_dispatch_tests;
+pub mod webhook_router;

@@ -1,0 +1,99 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "brenn-bootstrap",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//attach/server",
+        "//brenn-automation",
+        "//brenn-common",
+        "//brenn-db",
+        "//brenn-git",
+        "//brenn-graf",
+        "//brenn-hooks",
+        "//brenn-lib",
+        "//brenn-messaging",
+        "//brenn-messaging-store",
+        "//brenn-messaging-boot",
+        "//brenn-mqtt",
+        "//brenn-obs",
+        "//brenn-pfin",
+        "//brenn-pwa-push",
+        "//brenn-remote-server",
+        "//brenn-render",
+        "//brenn-server",
+        "//brenn-tool-registry",
+        "//brenn-wasm",
+        "//brenn-wasm-dispatch",
+        "//brenn-usage-db",
+        "//brenn-webhook",
+        "//surface/schema",
+        "//surface/server",
+    ],
+)
+
+# The wiring suite: the surface WS round trip and the dispatch end-to-end
+# family. The binary links `brenn-server` with `testutils` on, since these tests
+# build on the fixtures the crate below tests with.
+#
+# 62 tests, each booting a real messaging layer and most loading a guest
+# component; the binary finishes in 6.3s locally and 53.9s at
+# `--test-threads=1`. `medium` (300s), not `small` (60s): the repo's one
+# measured local-to-CD-runner factor for a suite of this shape is ~21x
+# (brenn-server's 22s local against 472s on the forgejo runner), which puts this
+# binary near 130s on a cold 4-vCPU runner — over the small budget, under the
+# medium one. `size` reserves the same 1 CPU at either tier, so this buys
+# timeout honesty and nothing else.
+rust_test(
+    name = "brenn-bootstrap_test",
+    size = "medium",
+    crate = ":brenn-bootstrap",
+    # The moved dispatch suite loads the demo guest; the harness names it as
+    # `<manifest dir>/../brenn-wasm/target/components/`, which the fixture's
+    # staging path and the workspace-relative manifest dir below agree on.
+    data = ["//brenn-wasm:fixture_processor_demo"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + [
+        "//attach/proto",
+        "//attach/server",
+        "//brenn-automation",
+        "//brenn-common",
+        "//brenn-db",
+        "//brenn-git",
+        "//brenn-graf",
+        "//brenn-hooks",
+        "//brenn-lib",
+        "//brenn-messaging",
+        "//brenn-messaging-store",
+        "//brenn-messaging-boot",
+        "//brenn-mqtt",
+        "//brenn-obs",
+        "//brenn-pfin",
+        "//brenn-pwa-push",
+        "//brenn-remote-server",
+        "//brenn-render",
+        "//brenn-server",
+        "//brenn-tool-registry",
+        "//brenn-wasm",
+        "//brenn-wasm-dispatch",
+        "//brenn-usage-db",
+        "//brenn-webhook",
+        "//surface/schema",
+        "//surface/server",
+    ],
+)
+
+rust_doc_test(
+    name = "brenn-bootstrap_doc_test",
+    crate = ":brenn-bootstrap",
+)

@@ -4,9 +4,9 @@ use axum::http::header::COOKIE;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
-use brenn_lib::auth::device::{Device, resolve_or_create_device};
-use brenn_lib::auth::session::{Session, validate_session};
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_db::auth::device::{Device, resolve_or_create_device};
+use brenn_db::auth::session::{Session, validate_session};
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
 use tracing::info;
 
 use crate::client_ip::ClientIp;
@@ -43,7 +43,7 @@ pub async fn require_auth(
                 .unwrap_or("");
             let resolved =
                 resolve_or_create_device(&conn, device_token.as_deref(), session.user.id, ua);
-            let device: Device = brenn_lib::auth::device::load_device(&conn, resolved.id);
+            let device: Device = brenn_db::auth::device::load_device(&conn, resolved.id);
             drop(conn);
 
             // If a new device was created, set the cookie on the response.

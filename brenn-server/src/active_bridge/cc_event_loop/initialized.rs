@@ -4,9 +4,9 @@
 use std::path::Path;
 
 use brenn_cc::session::SessionInfo;
-use brenn_lib::conversation;
-use brenn_lib::obs::alerting::AlertDispatcher;
-use brenn_lib::ws_types::{PermissionModeValue, WsServerMessage};
+use brenn_db::conversation;
+use brenn_obs::alerting::AlertDispatcher;
+use brenn_ws_types::{PermissionModeValue, WsServerMessage};
 use tracing::{error, info, warn};
 
 use super::super::ActiveBridge;
@@ -34,7 +34,7 @@ pub(in crate::active_bridge) async fn handle_initialized(
                 "CC reported cwd outside mapped container root — artifact serving will not work"
             );
             alert_dispatcher.alert(
-                brenn_lib::obs::alerting::AlertSeverity::Warning,
+                brenn_obs::alerting::AlertSeverity::Warning,
                 "CC cwd outside container mapping".into(),
                 format!(
                     "CC reported cwd {:?} which is outside the container path mapping",
@@ -130,7 +130,7 @@ pub(in crate::active_bridge) async fn handle_initialized(
         unknown.sort();
         let dedup_key = unknown.join(",");
         alert_dispatcher.alert_once_per_process(
-            brenn_lib::obs::alerting::AlertSeverity::Warning,
+            brenn_obs::alerting::AlertSeverity::Warning,
             "Unknown CC tools detected".into(),
             &dedup_key,
             format!(
@@ -159,7 +159,7 @@ pub(in crate::active_bridge) async fn handle_initialized(
                 "CC permission_mode mismatch — expected 'auto'"
             );
             alert_dispatcher.alert_once_per_process(
-                brenn_lib::obs::alerting::AlertSeverity::Warning,
+                brenn_obs::alerting::AlertSeverity::Warning,
                 "CC permission_mode mismatch".into(),
                 other,
                 format!(
@@ -179,7 +179,7 @@ pub(in crate::active_bridge) async fn handle_initialized(
                 "CC init frame missing permission_mode field"
             );
             alert_dispatcher.alert_once_per_process(
-                brenn_lib::obs::alerting::AlertSeverity::Warning,
+                brenn_obs::alerting::AlertSeverity::Warning,
                 "CC permission_mode missing from init".into(),
                 "missing",
                 "CC's system/init frame did not include the \

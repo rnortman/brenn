@@ -1,7 +1,7 @@
 //! Top-level approval-request dispatcher: routes ApprovalRequest events from CC to browser, AlwaysAllow rules, auto-approval for read-only tools, and PreToolUse intercept paths.
 
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
-use brenn_lib::ws_types::{CcState, WsServerMessage};
+use brenn_ws_types::{CcState, WsServerMessage};
 use tracing::{info, warn};
 
 use super::mcp_constants::{MCP_EXPORT_USAGE_TOOL, MCP_RECONCILE_TOOL};
@@ -32,7 +32,7 @@ pub(super) async fn handle_approval_required(bridge: &ActiveBridge, req: Approva
                 // Persist to DB.
                 {
                     let conn = bridge.db.lock().await;
-                    brenn_lib::db::insert_pending_tool_request(
+                    brenn_db::insert_pending_tool_request(
                         &conn,
                         &request_id,
                         bridge.conversation_id,
@@ -204,7 +204,7 @@ pub(super) async fn handle_approval_required(bridge: &ActiveBridge, req: Approva
         );
     }
 
-    let formatted_display = crate::approval_formatter::format_tool_display(
+    let formatted_display = brenn_render::approval_formatter::format_tool_display(
         &bridge.tool_registry,
         &tool_name,
         &display_input,
@@ -229,7 +229,7 @@ mod tests {
     use brenn_cc::session::{
         ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest, SessionEvent,
     };
-    use brenn_lib::ws_types::{CcState, WsServerMessage};
+    use brenn_ws_types::{CcState, WsServerMessage};
     use tokio::sync::oneshot;
 
     #[tokio::test]

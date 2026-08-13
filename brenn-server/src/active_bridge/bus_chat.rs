@@ -40,11 +40,10 @@ use brenn_envelope::chat::{
     legacy_ws_sender,
 };
 
-use brenn_lib::messaging::{
-    Depth, MessageEnvelope, Messenger, ParticipantId, PublishResult, Urgency,
-};
-use brenn_lib::obs::security::{SecurityEventType, log_component_security_event};
-use brenn_lib::ws_types::WsServerMessage;
+use brenn_lib::messaging::{Depth, MessageEnvelope, ParticipantId, Urgency};
+use brenn_messaging::{Messenger, PublishResult};
+use brenn_obs::security::{SecurityEventType, log_component_security_event};
+use brenn_ws_types::WsServerMessage;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -136,7 +135,7 @@ fn models_from_options(options: Vec<ModelOption>) -> Vec<ModelInfo> {
 }
 
 /// The protocol's model list, from a legacy broadcast.
-fn models_from_broadcast(models: &[brenn_lib::ws_types::ModelInfo]) -> Vec<ModelInfo> {
+fn models_from_broadcast(models: &[brenn_ws_types::ModelInfo]) -> Vec<ModelInfo> {
     models
         .iter()
         .map(|m| ModelInfo {
@@ -794,7 +793,7 @@ async fn send_text(
     // the username unconditionally: which peer is speaking is not optional
     // context for a conversation several of them can drive.
     let local_now = chrono::Utc::now().with_timezone(&chrono_tz::UTC);
-    let cc_text = crate::cc_message_prefix::build_cc_message_text(
+    let cc_text = brenn_render::cc_message_prefix::build_cc_message_text(
         text, sender, None, &local_now, true, true, false,
     );
 
@@ -1046,7 +1045,7 @@ async fn compact(
         return;
     }
     let local_now = chrono::Utc::now().with_timezone(&chrono_tz::UTC);
-    let rendered = crate::system_message::render_user_compaction_request(
+    let rendered = brenn_render::system_message::render_user_compaction_request(
         sender, None, &local_now, true, true, false,
     );
     if let Err(e) = bridge.send_system_message(rendered, None).await {
@@ -1262,8 +1261,8 @@ fn expect_live(text: Option<String>, variant: &str) -> String {
 }
 
 /// Mirror the legacy session state onto the protocol's.
-fn cc_state(state: brenn_lib::ws_types::CcState) -> chat::CcState {
-    use brenn_lib::ws_types::CcState as Ws;
+fn cc_state(state: brenn_ws_types::CcState) -> chat::CcState {
+    use brenn_ws_types::CcState as Ws;
     match state {
         Ws::Idle => chat::CcState::Idle,
         Ws::Connecting => chat::CcState::Connecting,
@@ -1275,10 +1274,8 @@ fn cc_state(state: brenn_lib::ws_types::CcState) -> chat::CcState {
 }
 
 /// Mirror the legacy system-message category onto the protocol's.
-fn system_category(
-    category: brenn_lib::ws_types::SystemMessageCategory,
-) -> chat::SystemMessageCategory {
-    use brenn_lib::ws_types::SystemMessageCategory as Ws;
+fn system_category(category: brenn_ws_types::SystemMessageCategory) -> chat::SystemMessageCategory {
+    use brenn_ws_types::SystemMessageCategory as Ws;
     match category {
         Ws::MessagesReceived => chat::SystemMessageCategory::MessagesReceived,
         Ws::EventDrain => chat::SystemMessageCategory::EventDrain,
@@ -1301,11 +1298,12 @@ mod tests {
 
     use std::time::Duration;
 
+    use brenn_db::Db;
     use brenn_lib::config::LlmChatConfig;
-    use brenn_lib::db::Db;
-    use brenn_lib::messaging::store::RingStores;
-    use brenn_lib::messaging::{MessagingDirectory, MessagingGlobalConfig, query::NoopWakeRouter};
-    use brenn_lib::ws_types as ws;
+    use brenn_lib::messaging::{MessagingDirectory, MessagingGlobalConfig};
+    use brenn_messaging::query::NoopWakeRouter;
+    use brenn_messaging_store::store::RingStores;
+    use brenn_ws_types as ws;
 
     const APP: &str = "pa-bob";
 
@@ -1637,7 +1635,7 @@ mod tests {
     /// conversation.
     async fn publish_ambience(db: &Db, body: &str) {
         let conn = db.lock().await;
-        brenn_lib::messaging::db::insert_message(
+        brenn_messaging_store::db::insert_message(
             &conn,
             AMBIENCE_UUID,
             "test-source",
@@ -1649,7 +1647,7 @@ mod tests {
             None,
             None,
             None,
-            brenn_lib::messaging::db::utc_to_ns(chrono::Utc::now()),
+            brenn_messaging_store::db::utc_to_ns(chrono::Utc::now()),
         );
     }
 
@@ -1660,7 +1658,7 @@ mod tests {
             ceiling,
             ambience,
         } = fixture;
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (user_id, conversation_id) = {
             let conn = db.lock().await;
             conn.execute(
@@ -1670,7 +1668,7 @@ mod tests {
             )
             .unwrap();
             let uid = conn.last_insert_rowid();
-            let cid = brenn_lib::conversation::create_conversation(&conn, uid, APP, false);
+            let cid = brenn_db::conversation::create_conversation(&conn, uid, APP, false);
             (uid, cid)
         };
 
@@ -1704,18 +1702,18 @@ mod tests {
         } else {
             vec![]
         };
-        let messenger = brenn_lib::messaging::Messenger::new(
+        let messenger = brenn_messaging::Messenger::new(
             db.clone(),
             Arc::new(MessagingDirectory::with_entries(entries.clone())),
             Arc::from("test-source"),
             Arc::new(apps),
-            Arc::new(NoopWakeRouter) as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(NoopWakeRouter) as Arc<dyn brenn_messaging::WakeRouter>,
             defaults,
         )
         .with_ring_stores(Arc::new(RingStores::empty()));
         {
             let conn = db.lock().await;
-            brenn_lib::messaging::db::upsert_channels(&conn, &entries);
+            brenn_messaging_store::db::upsert_channels(&conn, &entries);
             messenger.provision_conversation_chat_channels(&conn, APP, conversation_id);
         }
         // The position has to exist before the publish it is meant to catch.
@@ -1728,7 +1726,7 @@ mod tests {
             APP,
             db.clone(),
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             crate::active_bridge::test_fixtures::TestBridgeConfig {
                 messenger: Some(messenger.clone()),
                 idle_timeout,
@@ -1941,7 +1939,7 @@ mod tests {
     /// Every user-authored row the conversation holds.
     async fn user_rows(db: &Db, conversation_id: i64) -> Vec<String> {
         let conn = db.lock().await;
-        brenn_lib::conversation::get_messages(&conn, conversation_id)
+        brenn_db::conversation::get_messages(&conn, conversation_id)
             .into_iter()
             .filter(|m| m.msg_type == "user")
             .map(|m| m.payload)
@@ -2131,7 +2129,7 @@ mod tests {
         }
         let conn = db.lock().await;
         assert!(
-            brenn_lib::conversation::get_messages(&conn, conversation_id).is_empty(),
+            brenn_db::conversation::get_messages(&conn, conversation_id).is_empty(),
             "a refused compaction persists nothing",
         );
     }
@@ -2482,7 +2480,7 @@ mod tests {
             .publish_from_conversation(conversation_id, APP, &prewarm.address, "", Urgency::VeryLow)
             .await;
         assert!(
-            matches!(result, brenn_lib::messaging::PublishResult::Ok { .. }),
+            matches!(result, brenn_messaging::PublishResult::Ok { .. }),
             "{result:?}"
         );
         assert_eq!(owed_prewarms(&messenger, &prewarm).await, 1);
@@ -3116,7 +3114,7 @@ mod tests {
         let mut watchdog = super::super::watchdog::Watchdog::new(
             brenn_lib::config::WatchdogConfig::default(),
             bridge.active_bridges.clone(),
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         );
         watchdog.sweep().await;
 
@@ -3249,14 +3247,14 @@ mod tests {
     /// it.
     async fn pool(db: &Db, conversation_id: i64) -> Option<u32> {
         let conn = db.lock().await;
-        brenn_lib::messaging::db::read_send_budget(&conn, conversation_id)
+        brenn_messaging_store::db::read_send_budget(&conn, conversation_id)
     }
 
     /// Put the pool at a known level — an exhausted conversation, or one with
     /// exactly enough left to be worth counting.
     async fn set_pool(db: &Db, conversation_id: i64, remaining: u32) {
         let conn = db.lock().await;
-        brenn_lib::messaging::db::reset_send_budget(&conn, conversation_id, remaining);
+        brenn_messaging_store::db::reset_send_budget(&conn, conversation_id, remaining);
     }
 
     /// [`publish_command`] for a command carrying user-interaction authority.
@@ -3863,7 +3861,7 @@ mod tests {
         const A: &str = "chat-a";
         const B: &str = "chat-b";
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (user_id, conv_a, conv_b) = {
             let conn = db.lock().await;
             conn.execute(
@@ -3873,8 +3871,8 @@ mod tests {
             )
             .unwrap();
             let uid = conn.last_insert_rowid();
-            let a = brenn_lib::conversation::create_conversation(&conn, uid, A, false);
-            let b = brenn_lib::conversation::create_conversation(&conn, uid, B, false);
+            let a = brenn_db::conversation::create_conversation(&conn, uid, A, false);
+            let b = brenn_db::conversation::create_conversation(&conn, uid, B, false);
             (uid, a, b)
         };
 
@@ -3913,12 +3911,12 @@ mod tests {
         apps.insert(A.to_string(), peer_app(A, &b_out));
         apps.insert(B.to_string(), peer_app(B, &a_out));
 
-        let messenger = brenn_lib::messaging::Messenger::new(
+        let messenger = brenn_messaging::Messenger::new(
             db.clone(),
             Arc::new(MessagingDirectory::with_entries(vec![])),
             Arc::from("test-source"),
             Arc::new(apps),
-            Arc::new(NoopWakeRouter) as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(NoopWakeRouter) as Arc<dyn brenn_messaging::WakeRouter>,
             MessagingGlobalConfig::default(),
         )
         .with_ring_stores(Arc::new(RingStores::empty()));
@@ -3935,7 +3933,7 @@ mod tests {
                 .subscribe_dynamic(
                     slug,
                     address,
-                    brenn_lib::messaging::subscribe::DynamicSubscribeParams {
+                    brenn_messaging::subscribe::DynamicSubscribeParams {
                         push_depth: brenn_lib::messaging::config::Depth::Bounded(8),
                         retain_depth: brenn_lib::messaging::config::Depth::Bounded(0),
                         noise: None,
@@ -3956,7 +3954,7 @@ mod tests {
                 slug,
                 db.clone(),
                 tx,
-                brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+                brenn_obs::alerting::noop_alert_dispatcher().0,
                 crate::active_bridge::test_fixtures::TestBridgeConfig {
                     messenger: Some(messenger.clone()),
                     send_budget: ceiling,

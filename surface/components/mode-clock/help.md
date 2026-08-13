@@ -1,4 +1,4 @@
-<!-- AUTO-GENERATED from this component's src/help.rs. Do not edit; run `make regen-surface-help`. -->
+<!-- AUTO-GENERATED from this component's src/help.rs. Do not edit. -->
 Headless clock component (renders nothing) that drives the surface dark/light
 theme by watching the wall clock.
 

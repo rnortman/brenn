@@ -130,10 +130,10 @@ async fn handle_export_usage(
     bridge: &ActiveBridge,
     tool_input: &serde_json::Value,
 ) -> serde_json::Value {
-    use brenn_lib::usage::{EventsFilter, SessionsFilter};
-    use brenn_lib::usage_export::{
+    use brenn_usage_db::export::{
         write_events_csv, write_events_json, write_sessions_csv, write_sessions_json,
     };
+    use brenn_usage_db::{EventsFilter, SessionsFilter};
     use std::io::BufWriter;
 
     // --- parse `kind` ---
@@ -257,8 +257,8 @@ async fn handle_export_usage(
     // This keeps the global Mutex<Connection> held only for the query, not
     // for the (potentially slow) file-write phase.
     enum ExportRows {
-        Sessions(Vec<brenn_lib::usage::SessionRow>),
-        Events(Vec<brenn_lib::usage::EventRow>),
+        Sessions(Vec<brenn_usage_db::SessionRow>),
+        Events(Vec<brenn_usage_db::EventRow>),
     }
     let export_rows = {
         let conn = bridge.db.lock().await;
@@ -270,11 +270,11 @@ async fn handle_export_usage(
                 device: filter_device,
                 app: filter_app,
             };
-            ExportRows::Sessions(brenn_lib::usage::query_sessions(&conn, &filter))
+            ExportRows::Sessions(brenn_usage_db::query_sessions(&conn, &filter))
         } else {
             // events
             let event_type = if let Some(ref s) = filter_event_type_str {
-                match brenn_lib::usage::EventType::try_from_str(s) {
+                match brenn_usage_db::EventType::try_from_str(s) {
                     Some(t) => Some(t),
                     None => {
                         return serde_json::json!({
@@ -294,7 +294,7 @@ async fn handle_export_usage(
                 app: filter_app,
                 event_type,
             };
-            ExportRows::Events(brenn_lib::usage::query_events(&conn, &filter))
+            ExportRows::Events(brenn_usage_db::query_events(&conn, &filter))
         }
     }; // DB lock released here
 
@@ -732,7 +732,7 @@ fn parse_export_ts(input: Option<&str>) -> Result<chrono::DateTime<chrono::Utc>,
         Some(s) if !s.is_empty() => s,
         _ => return Err("missing timestamp".to_string()),
     };
-    brenn_lib::usage::parse_ts_str(s)
+    brenn_usage_db::parse_ts_str(s)
 }
 
 /// Test-only: exercise the JSON shape and log call for the
@@ -765,9 +765,9 @@ mod tests {
     use brenn_cc::session::{
         ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest, SessionEvent,
     };
+    use brenn_db::conversation;
     use brenn_lib::config::PathMapper;
-    use brenn_lib::conversation;
-    use brenn_lib::ws_types::WsServerMessage;
+    use brenn_ws_types::WsServerMessage;
     use std::sync::Arc;
     use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -830,11 +830,11 @@ mod tests {
         broadcast::Receiver<WsServerMessage>,
         ActiveBridges,
     ) {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let active_bridges = ActiveBridges::new();
         let (user_id, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -852,7 +852,7 @@ mod tests {
         tokio::spawn(cc_event_loop(
             event_rx,
             bridge.clone(),
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         ));
         (bridge, event_tx, broadcast_rx, active_bridges)
     }
@@ -927,7 +927,7 @@ mod tests {
                 &serde_json::json!({"output_file": "/some/path.csv"}),
             )
             .await;
-        use brenn_lib::approval_rules::ApprovalMatch;
+        use brenn_approval_rules::ApprovalMatch;
         assert_eq!(
             check_result,
             ApprovalMatch::NoMatch,
@@ -1099,7 +1099,7 @@ mod tests {
         let dev = create_test_device_for_user(&bridge.db, bridge.user_id, "TestBrowser/1.0").await;
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::usage::record_ws_connect(&conn, dev, bridge.user_id, "test", None, 1800);
+            brenn_usage_db::record_ws_connect(&conn, dev, bridge.user_id, "test", None, 1800);
         }
         let req = post_tool_use_req(
             MCP_EXPORT_USAGE_TOOL,

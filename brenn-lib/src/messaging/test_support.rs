@@ -1,11 +1,18 @@
-//! Shared test infrastructure for the messaging module tree.
+//! Shared test infrastructure for the messaging module tree, here and in the
+//! runtime crate above.
 //!
 //! Exposes `test_app_config` so `publish.rs` and `deliver_after.rs` tests do
-//! not each maintain separate copies of the full `AppConfig` literal.
-//! Adding a field to `AppConfig` requires only one edit here.
+//! not each maintain separate copies of the full `AppConfig` literal, and
+//! `test_channel_entry` so the default `ChannelEntry` literal has one home.
+//! Adding a field to either type requires only one edit here.
+
+use uuid::Uuid;
+
+use brenn_envelope::ChannelScheme;
 
 use crate::config::AppConfig;
-use crate::messaging::config::ResolvedMessagingConfig;
+use crate::messaging::config::{Depth, NoiseLevel, ResolvedChannel, ResolvedMessagingConfig, Sink};
+use crate::messaging::directory::{ChannelEntry, SubscriberEntry, WakeMin};
 
 /// Construct a minimal `AppConfig` for messaging tests.
 ///
@@ -15,7 +22,7 @@ use crate::messaging::config::ResolvedMessagingConfig;
 ///
 /// Many `AppConfig` fields are not read by the messaging path and are filled
 /// with their type defaults.
-pub(super) fn test_app_config(
+pub fn test_app_config(
     slug: &str,
     messaging: Option<ResolvedMessagingConfig>,
     allowed_users: Vec<String>,
@@ -101,7 +108,7 @@ pub(super) fn test_app_config(
 /// Single home for the "allow brenn: delivery" policy stamp so test modules
 /// (`publish/tests/wasm.rs`, `config.rs`, `dispatcher.rs`) do not each maintain a
 /// private copy that must be kept in sync as `AppPolicy` evolves (reuse-1/reuse-2).
-pub(super) fn brenn_delivery_policy(
+pub fn brenn_delivery_policy(
     matcher: crate::access::acl::ChannelMatcher,
 ) -> crate::access::AppPolicy {
     let mut p = crate::access::AppPolicy::default();
@@ -109,4 +116,31 @@ pub(super) fn brenn_delivery_policy(
         .insert(crate::access::AppCapability::MessagingSubscribe);
     p.acls.brenn_subscribe.push(matcher);
     p
+}
+
+/// Build a default `brenn:` `ChannelEntry` with the given subscribers.
+///
+/// Channel-level depths are `Depth::Unbounded`, `noise = Silent`, `sink = Drop`,
+/// `transport_type = Brenn`, `mount = None`, `description = None`, and the uuid is
+/// fresh. Pass `subscribers` (often `vec![]`) for the per-subscriber wiring a test
+/// needs. Single home for the default `ChannelEntry` literal so a new field is one
+/// edit rather than one per test module.
+pub fn test_channel_entry(name: &str, subscribers: Vec<SubscriberEntry>) -> ChannelEntry {
+    ChannelEntry {
+        uuid: Uuid::new_v4(),
+        address: crate::messaging::addressing::canonical_address(name),
+        description: None,
+        resolved_channel: ResolvedChannel {
+            send_rate: Default::default(),
+            push_depth: Depth::Unbounded,
+            retain_depth: Depth::Unbounded,
+            standing_retain_depth: Depth::Unbounded,
+            noise: NoiseLevel::Silent,
+            sink: Sink::Drop,
+            wake_min: WakeMin::Normal,
+        },
+        subscribers,
+        transport_type: ChannelScheme::Brenn,
+        mount: None,
+    }
 }

@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use brenn_lib::conversation::{self, ConversationStatus};
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
-use brenn_lib::ws_types::{CcState, DebugViewportSnapshotData, WsServerMessage};
+use brenn_db::conversation::{self, ConversationStatus};
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_ws_types::{CcState, DebugViewportSnapshotData, WsServerMessage};
 use tracing::{error, info, warn};
 
 use super::connection::WsConnection;
@@ -25,9 +25,9 @@ impl WsConnection {
     pub(super) async fn handle_send_message(
         &mut self,
         text: &str,
-        attachments: Vec<brenn_lib::ws_types::AttachmentRef>,
+        attachments: Vec<brenn_ws_types::AttachmentRef>,
         model: Option<&str>,
-        selected_tasks: Vec<brenn_lib::ws_types::SelectedTask>,
+        selected_tasks: Vec<brenn_ws_types::SelectedTask>,
     ) -> bool {
         if self.viewer_only {
             let _ = self.send_ws(WsServerMessage::AppBusy {
@@ -323,7 +323,7 @@ impl WsConnection {
         let app_config = self.app_config();
         let local_now = chrono::Utc::now().with_timezone(&self.effective_timezone().await);
         let device_slug_owned = self.fetch_device_slug().await;
-        let rendered = crate::system_message::render_user_compaction_request(
+        let rendered = brenn_render::system_message::render_user_compaction_request(
             &self.username,
             Some(&device_slug_owned),
             &local_now,
@@ -357,8 +357,8 @@ impl WsConnection {
         &mut self,
         bridge: Arc<ActiveBridge>,
         text: &str,
-        attachment_refs: &[brenn_lib::ws_types::AttachmentRef],
-        selected_tasks: &[brenn_lib::ws_types::SelectedTask],
+        attachment_refs: &[brenn_ws_types::AttachmentRef],
+        selected_tasks: &[brenn_ws_types::SelectedTask],
     ) -> bool {
         // Resolve attachments from the pending uploads registry.
         let app_config = self.app_config();
@@ -375,9 +375,9 @@ impl WsConnection {
             Err(reason) => {
                 // Could be a bad UUID (fail2ban) or just an expired upload (user error).
                 // Log as schema violation — the fail2ban threshold handles frequency.
-                brenn_lib::obs::security::log_and_alert_security_event(
+                brenn_obs::security::log_and_alert_security_event(
                     &self.state.alert_dispatcher,
-                    brenn_lib::obs::security::SecurityEventType::SchemaViolation,
+                    brenn_obs::security::SecurityEventType::SchemaViolation,
                     self.client_ip,
                     &format!("SendMessage attachment resolve failed: {reason}"),
                 );
@@ -394,11 +394,11 @@ impl WsConnection {
         // tz_override is honoured — one lock, one load.
         let (device_slug_owned, slug_reminder, prefix_device, local_now) = {
             let conn = self.state.db.lock().await;
-            let device = brenn_lib::auth::device::load_device(&conn, self.device_id);
-            let du = brenn_lib::auth::device::load_device_user(&conn, self.device_id, self.user_id);
+            let device = brenn_db::auth::device::load_device(&conn, self.device_id);
+            let du = brenn_db::auth::device::load_device_user(&conn, self.device_id, self.user_id);
             let slug = du.display_slug(&device).to_string();
             let pc = self.app_config().prefix_device;
-            let eff_tz = brenn_lib::auth::device::effective_timezone(&du, self.timezone, now);
+            let eff_tz = brenn_db::auth::device::effective_timezone(&du, self.timezone, now);
             let local_now = now.with_timezone(&eff_tz);
 
             // Unassigned-slug reminder: fire when assigned_slug is null and the
@@ -410,13 +410,9 @@ impl WsConnection {
                 }
             };
             let reminder = if reminder_needed {
-                brenn_lib::auth::device::touch_slug_prompted_at(
-                    &conn,
-                    self.device_id,
-                    self.user_id,
-                );
+                brenn_db::auth::device::touch_slug_prompted_at(&conn, self.device_id, self.user_id);
                 tracing::debug!(device_id = self.device_id, "device slug reminder injected");
-                Some(crate::system_message::render_device_slug_reminder(
+                Some(brenn_render::system_message::render_device_slug_reminder(
                     &device.guessed_slug,
                     device.platform.as_deref(),
                     device.screen_width,
@@ -431,7 +427,7 @@ impl WsConnection {
         let timestamp = local_now.to_rfc3339();
 
         let cc_text = {
-            let base = crate::cc_message_prefix::build_cc_message_text(
+            let base = brenn_render::cc_message_prefix::build_cc_message_text(
                 text,
                 &self.username,
                 Some(&device_slug_owned),
@@ -462,7 +458,7 @@ impl WsConnection {
             #[derive(serde::Serialize)]
             struct ContextBlock<'a> {
                 context: &'static str,
-                tasks: &'a [brenn_lib::ws_types::SelectedTask],
+                tasks: &'a [brenn_ws_types::SelectedTask],
             }
             let context_block = serde_json::to_string(&ContextBlock {
                 context: "selected_tasks",
@@ -640,7 +636,7 @@ impl WsConnection {
         // log; it goes to the operator's own inbox, so the prompt-injection
         // concern that gates render_debug_snapshot does not apply here.
         self.state.alert_dispatcher.alert(
-            brenn_lib::obs::alerting::AlertSeverity::Info,
+            brenn_obs::alerting::AlertSeverity::Info,
             "Debug viewport snapshot".to_string(),
             full_json,
         );
@@ -659,7 +655,7 @@ impl WsConnection {
 
         // render_debug_snapshot injects only numeric/boolean geometry into CC;
         // free-text fields are excluded (prompt-injection mitigation).
-        let rendered = crate::system_message::render_debug_snapshot(&snapshot);
+        let rendered = brenn_render::system_message::render_debug_snapshot(&snapshot);
         if let Err(e) = bridge
             .send_system_message(rendered, Some(self.user_id))
             .await
@@ -675,11 +671,11 @@ impl WsConnection {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::init_db_memory;
+    use brenn_db::auth::user::create_user;
+    use brenn_db::conversation;
     use brenn_envelope::chat::{ChatLeaf, chat_address};
-    use brenn_lib::auth::user::create_user;
-    use brenn_lib::conversation;
-    use brenn_lib::db::init_db_memory;
-    use brenn_lib::ws_types::{CcState, WsServerMessage};
+    use brenn_ws_types::{CcState, WsServerMessage};
     use tokio::sync::{broadcast, mpsc};
 
     use uuid::Uuid;
@@ -869,7 +865,7 @@ mod tests {
 
         conn.handle_send_message(
             "check this receipt",
-            vec![brenn_lib::ws_types::AttachmentRef {
+            vec![brenn_ws_types::AttachmentRef {
                 upload_id: upload_id.to_string(),
             }],
             None,
@@ -922,7 +918,7 @@ mod tests {
 
         conn.handle_send_message(
             "look at this",
-            vec![brenn_lib::ws_types::AttachmentRef {
+            vec![brenn_ws_types::AttachmentRef {
                 upload_id: Uuid::new_v4().to_string(),
             }],
             None,
@@ -946,7 +942,7 @@ mod tests {
 
         conn.handle_send_message(
             "look at this",
-            vec![brenn_lib::ws_types::AttachmentRef {
+            vec![brenn_ws_types::AttachmentRef {
                 upload_id: "not-a-uuid".to_string(),
             }],
             None,
@@ -976,7 +972,7 @@ mod tests {
 
         conn.handle_send_message(
             "look",
-            vec![brenn_lib::ws_types::AttachmentRef {
+            vec![brenn_ws_types::AttachmentRef {
                 upload_id: upload_id.to_string(),
             }],
             None,
@@ -1006,7 +1002,7 @@ mod tests {
 
         conn.handle_send_message(
             "look",
-            vec![brenn_lib::ws_types::AttachmentRef {
+            vec![brenn_ws_types::AttachmentRef {
                 upload_id: upload_id.to_string(),
             }],
             None,
@@ -1093,7 +1089,7 @@ mod tests {
         // Populate cached models for the app.
         conn.state.cached_models.write().await.insert(
             "test".to_string(),
-            vec![brenn_lib::ws_types::ModelInfo {
+            vec![brenn_ws_types::ModelInfo {
                 value: "sonnet".into(),
                 display_name: "Sonnet".into(),
                 description: "Fast".into(),
@@ -1211,8 +1207,8 @@ mod tests {
     async fn send_message_rejects_too_many_selected_tasks() {
         let (mut conn, mut ws_rx, _db, _uid, _conv_id) = test_ws_conn_with_resume_conv().await;
 
-        let tasks: Vec<brenn_lib::ws_types::SelectedTask> = (0..21)
-            .map(|i| brenn_lib::ws_types::SelectedTask {
+        let tasks: Vec<brenn_ws_types::SelectedTask> = (0..21)
+            .map(|i| brenn_ws_types::SelectedTask {
                 task_ref: format!("todo/task-{i}.md"),
             })
             .collect();
@@ -1230,7 +1226,7 @@ mod tests {
     async fn send_message_rejects_path_traversal_in_task_ref() {
         let (mut conn, mut ws_rx, _db, _uid, _conv_id) = test_ws_conn_with_resume_conv().await;
 
-        let tasks = vec![brenn_lib::ws_types::SelectedTask {
+        let tasks = vec![brenn_ws_types::SelectedTask {
             task_ref: "todo/../secrets.md".to_string(),
         }];
 
@@ -1250,7 +1246,7 @@ mod tests {
     async fn send_message_rejects_non_md_task_ref() {
         let (mut conn, mut ws_rx, _db, _uid, _conv_id) = test_ws_conn_with_resume_conv().await;
 
-        let tasks = vec![brenn_lib::ws_types::SelectedTask {
+        let tasks = vec![brenn_ws_types::SelectedTask {
             task_ref: "todo/secrets.txt".to_string(),
         }];
 
@@ -1267,7 +1263,7 @@ mod tests {
     async fn send_message_accepts_valid_selected_tasks() {
         let (mut conn, mut ws_rx, db, _uid, conv_id) = test_ws_conn_with_resume_conv().await;
 
-        let tasks = vec![brenn_lib::ws_types::SelectedTask {
+        let tasks = vec![brenn_ws_types::SelectedTask {
             task_ref: "life:todo/buy-groceries.md".to_string(),
         }];
 
@@ -1299,8 +1295,8 @@ mod tests {
         let (mut conn, mut ws_rx, db, _uid, conv_id) = test_ws_conn_with_resume_conv().await;
 
         // Exactly 20 is the limit — should pass.
-        let tasks: Vec<brenn_lib::ws_types::SelectedTask> = (0..20)
-            .map(|i| brenn_lib::ws_types::SelectedTask {
+        let tasks: Vec<brenn_ws_types::SelectedTask> = (0..20)
+            .map(|i| brenn_ws_types::SelectedTask {
                 task_ref: format!("todo/task-{i}.md"),
             })
             .collect();
@@ -1332,7 +1328,7 @@ mod tests {
 
         // 257 chars — just over the limit.
         let long_ref = format!("todo/{}.md", "x".repeat(249)); // "todo/" + 249 + ".md" = 257
-        let tasks = vec![brenn_lib::ws_types::SelectedTask { task_ref: long_ref }];
+        let tasks = vec![brenn_ws_types::SelectedTask { task_ref: long_ref }];
 
         conn.handle_send_message("hello", vec![], None, tasks).await;
 
@@ -1353,7 +1349,7 @@ mod tests {
         // Exactly 256 chars — should pass.
         let ref_256 = format!("todo/{}.md", "x".repeat(248)); // "todo/" + 248 + ".md" = 256
         assert_eq!(ref_256.len(), 256);
-        let tasks = vec![brenn_lib::ws_types::SelectedTask { task_ref: ref_256 }];
+        let tasks = vec![brenn_ws_types::SelectedTask { task_ref: ref_256 }];
 
         conn.handle_send_message("hello", vec![], None, tasks).await;
 
@@ -1417,9 +1413,9 @@ mod tests {
         // Load device slug as persist_and_send would.
         let (device_slug, guessed_slug) = {
             let db_conn = db.lock().await;
-            let device = brenn_lib::auth::device::load_device(&db_conn, conn.device_id);
+            let device = brenn_db::auth::device::load_device(&db_conn, conn.device_id);
             let du =
-                brenn_lib::auth::device::load_device_user(&db_conn, conn.device_id, conn.user_id);
+                brenn_db::auth::device::load_device_user(&db_conn, conn.device_id, conn.user_id);
             let slug = du.display_slug(&device).to_string();
             let guessed = device.guessed_slug.clone();
             (slug, guessed)
@@ -1428,7 +1424,7 @@ mod tests {
         // Build prefix text as the real code path does.
         let now: chrono::DateTime<chrono_tz::Tz> =
             chrono::Utc::now().with_timezone(&chrono_tz::UTC);
-        let prefixed = crate::cc_message_prefix::build_cc_message_text(
+        let prefixed = brenn_render::cc_message_prefix::build_cc_message_text(
             "hello world",
             TEST_USERNAME,
             Some(&device_slug),
@@ -1455,7 +1451,7 @@ mod tests {
         // Assign a slug.
         {
             let db_conn = db.lock().await;
-            brenn_lib::auth::device::assign_device_slug(&db_conn, device_id, "renamed-dev", uid);
+            brenn_db::auth::device::assign_device_slug(&db_conn, device_id, "renamed-dev", uid);
         }
 
         // Load slug as persist_and_send would after the rename.
@@ -1463,7 +1459,7 @@ mod tests {
 
         let now: chrono::DateTime<chrono_tz::Tz> =
             chrono::Utc::now().with_timezone(&chrono_tz::UTC);
-        let prefixed = crate::cc_message_prefix::build_cc_message_text(
+        let prefixed = brenn_render::cc_message_prefix::build_cc_message_text(
             "message after rename",
             TEST_USERNAME,
             Some(&device_slug),
@@ -1489,7 +1485,7 @@ mod tests {
         {
             let db_conn = db.lock().await;
             let du =
-                brenn_lib::auth::device::load_device_user(&db_conn, conn.device_id, conn.user_id);
+                brenn_db::auth::device::load_device_user(&db_conn, conn.device_id, conn.user_id);
             assert!(
                 du.assigned_slug.is_none(),
                 "device must start with no assigned slug"
@@ -1503,7 +1499,7 @@ mod tests {
         {
             let db_conn = db.lock().await;
             let du =
-                brenn_lib::auth::device::load_device_user(&db_conn, conn.device_id, conn.user_id);
+                brenn_db::auth::device::load_device_user(&db_conn, conn.device_id, conn.user_id);
             assert!(
                 du.slug_prompted_at.is_some(),
                 "slug_prompted_at must be set after first reminder"
@@ -1566,7 +1562,7 @@ mod tests {
         // Assign a slug directly.
         {
             let db_conn = db.lock().await;
-            brenn_lib::auth::device::assign_device_slug(&db_conn, device_id, "my-device", uid);
+            brenn_db::auth::device::assign_device_slug(&db_conn, device_id, "my-device", uid);
         }
 
         conn.handle_send_message("message with assigned device", vec![], None, vec![])
@@ -1596,7 +1592,7 @@ mod tests {
 
         let device_slug = conn.fetch_device_slug().await;
 
-        let render = crate::system_message::render_ui_error(
+        let render = brenn_render::system_message::render_ui_error(
             "some_tool",
             "path/to/thing",
             &[],
@@ -1623,7 +1619,7 @@ mod tests {
 
         {
             let db_conn = db.lock().await;
-            brenn_lib::auth::device::assign_device_slug(
+            brenn_db::auth::device::assign_device_slug(
                 &db_conn,
                 device_id,
                 "renamed-for-error",
@@ -1633,7 +1629,7 @@ mod tests {
 
         let device_slug = conn.fetch_device_slug().await;
 
-        let render = crate::system_message::render_ui_error(
+        let render = brenn_render::system_message::render_ui_error(
             "some_tool",
             "path/to/thing",
             &[],
@@ -1694,7 +1690,7 @@ mod tests {
 
         conn.state.cached_models.write().await.insert(
             "test".to_string(),
-            vec![brenn_lib::ws_types::ModelInfo {
+            vec![brenn_ws_types::ModelInfo {
                 value: "sonnet".into(),
                 display_name: "Sonnet".into(),
                 description: "Fast".into(),
@@ -1715,8 +1711,8 @@ mod tests {
     async fn handle_send_message_returns_false_on_too_many_tasks() {
         let (mut conn, _ws_rx, _db, _uid, _conv_id) = test_ws_conn_with_resume_conv().await;
 
-        let tasks: Vec<brenn_lib::ws_types::SelectedTask> = (0..21)
-            .map(|i| brenn_lib::ws_types::SelectedTask {
+        let tasks: Vec<brenn_ws_types::SelectedTask> = (0..21)
+            .map(|i| brenn_ws_types::SelectedTask {
                 task_ref: format!("todo/task-{i}.md"),
             })
             .collect();
@@ -1733,7 +1729,7 @@ mod tests {
     async fn handle_send_message_returns_false_on_invalid_task_ref() {
         let (mut conn, _ws_rx, _db, _uid, _conv_id) = test_ws_conn_with_resume_conv().await;
 
-        let tasks = vec![brenn_lib::ws_types::SelectedTask {
+        let tasks = vec![brenn_ws_types::SelectedTask {
             task_ref: "../etc/passwd".to_string(),
         }];
 
@@ -1841,7 +1837,7 @@ mod tests {
         // Set TZ override to Asia/Tokyo.
         {
             let conn = db.lock().await;
-            brenn_lib::auth::device::set_tz_override(
+            brenn_db::auth::device::set_tz_override(
                 &conn,
                 device_id,
                 user_id,
@@ -1916,14 +1912,14 @@ mod tests {
         // Set override then immediately clear it.
         {
             let conn = db.lock().await;
-            brenn_lib::auth::device::set_tz_override(
+            brenn_db::auth::device::set_tz_override(
                 &conn,
                 device_id,
                 user_id,
                 Some("Asia/Tokyo"),
                 None,
             );
-            brenn_lib::auth::device::set_tz_override(&conn, device_id, user_id, None, None);
+            brenn_db::auth::device::set_tz_override(&conn, device_id, user_id, None, None);
         }
 
         let bridge =
@@ -1976,7 +1972,7 @@ mod tests {
         // Set override to Asia/Tokyo.
         {
             let db_conn = db.lock().await;
-            brenn_lib::auth::device::set_tz_override(
+            brenn_db::auth::device::set_tz_override(
                 &db_conn,
                 conn.device_id,
                 user_id,

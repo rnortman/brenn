@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use brenn_lib::config::WatchdogConfig;
-use brenn_lib::obs::alerting::{AlertDispatcher, AlertSeverity};
+use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use tracing::{error, info};
 
 use super::ActiveBridge;
@@ -214,7 +214,7 @@ async fn is_dead_io_busy(bridge: &ActiveBridge) -> bool {
 /// Spawn the process-wide watchdog task. Death of this task is accepted like the
 /// other process-lifetime loops (panics are logged + `Critical`-alerted by the
 /// global panic hook); it is not itself supervised.
-pub(crate) fn spawn_watchdog(
+pub fn spawn_watchdog(
     config: WatchdogConfig,
     active_bridges: ActiveBridges,
     alert_dispatcher: AlertDispatcher,

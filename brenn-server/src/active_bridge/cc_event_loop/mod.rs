@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use brenn_cc::session::SessionEvent;
-use brenn_lib::conversation::{self, MessageDirection};
-use brenn_lib::obs::alerting::AlertDispatcher;
-use brenn_lib::ws_types::WsServerMessage;
+use brenn_db::conversation::{self, MessageDirection};
+use brenn_obs::alerting::AlertDispatcher;
+use brenn_ws_types::WsServerMessage;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -223,7 +223,7 @@ pub(super) async fn cc_event_loop(
                 } else {
                     error!("CC session died: {err}");
                     alert_dispatcher.alert(
-                        brenn_lib::obs::alerting::AlertSeverity::Warning,
+                        brenn_obs::alerting::AlertSeverity::Warning,
                         "CC session died".to_string(),
                         err.to_string(),
                     );

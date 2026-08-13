@@ -257,6 +257,9 @@ mod tests {
     #[test]
     fn cap_below_scan_trap() {
         // CAP must be strictly less than the host scan trap (4096).
-        assert!(CAP < 4096, "CAP must be < 4096 to ensure 429 fires before 500");
+        assert!(
+            CAP < 4096,
+            "CAP must be < 4096 to ensure 429 fires before 500"
+        );
     }
 }

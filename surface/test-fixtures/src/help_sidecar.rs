@@ -2,18 +2,22 @@
 //!
 //! An in-tree `help.md` is generated from its crate's `src/help.rs`. The Bazel
 //! build ships the generator's output directly into the surface asset dir; the
-//! committed file is what the make lane copies there, and what this gate holds
-//! to the generator. What keeps the two in step is one unit test per component
-//! crate calling [`enforce_help_sidecar`]: an edit to either side fails that
-//! test until the file is regenerated.
+//! committed file is the fixture this gate holds to that same generator, and a
+//! parity test holds the shipped bytes to the committed ones. What keeps the two
+//! in step is one unit test per component crate calling [`enforce_help_sidecar`]:
+//! an edit to either side fails that test until the file is regenerated.
 
 use std::path::PathBuf;
 
 /// The env var that flips the gate from compare to rewrite.
 const REGEN_VAR: &str = "BRENN_REGEN_HELP";
 
-/// The command that rewrites every in-tree help sidecar from its generator.
-const REGEN_COMMAND: &str = "make regen-surface-help";
+/// How a stale sidecar is refreshed. The generator's output is a build artifact,
+/// so the procedure is to build it and copy it over the committed file rather
+/// than to run a single verb.
+const REGEN_PROCEDURE: &str = "to refresh it, build the component package's \
+     `<kind>_help` target and copy the generated `brenn_<kind>.help.md` over \
+     the package's `help.md`";
 
 /// Assert `<manifest_dir>/help.md` is byte-identical to `generated`, or — with
 /// `BRENN_REGEN_HELP=1` in the environment — rewrite the file with `generated`
@@ -25,7 +29,7 @@ const REGEN_COMMAND: &str = "make regen-surface-help";
 /// trailing newline included, is the canonical form of the file. A missing or
 /// unreadable `help.md` is a failure, never a skip.
 ///
-/// Panics carry the sidecar path and the regeneration command, so a failing
+/// Panics carry the sidecar path and the regeneration procedure, so a failing
 /// component test is self-remediating.
 pub fn enforce_help_sidecar(manifest_dir: &str, generated: &str) {
     assert!(
@@ -45,13 +49,13 @@ pub fn enforce_help_sidecar(manifest_dir: &str, generated: &str) {
     }
 
     let committed = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("reading {}: {e} — run `{REGEN_COMMAND}`", path.display()));
+        .unwrap_or_else(|e| panic!("reading {}: {e} — {REGEN_PROCEDURE}", path.display()));
 
     assert!(
         committed == generated,
         "{} is out of date: it is generated from this crate's src/help.rs, and \
-         the committed bytes no longer match the generator's output. Run \
-         `{REGEN_COMMAND}` and commit the result.",
+         the committed bytes no longer match the generator's output. \
+         {REGEN_PROCEDURE}, then commit the result.",
         path.display()
     );
 }
@@ -67,7 +71,7 @@ fn regen_requested() -> bool {
         Some(value) => panic!(
             "{REGEN_VAR}={value:?} is not an accepted value: leave it unset to \
              compare against the committed sidecar, or set it to exactly `1` to \
-             rewrite it (`{REGEN_COMMAND}`)"
+             rewrite it"
         ),
     }
 }
@@ -173,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_sidecar_names_the_regen_command() {
+    fn mismatched_sidecar_names_the_regen_procedure() {
         comparing(|| {
             let dir = dir_with_sidecar(&generated("# stale\n"));
             let manifest = dir.path().to_str().unwrap().to_string();
@@ -182,7 +186,7 @@ mod tests {
             })
             .expect_err("a mismatched sidecar must fail the gate");
             let message = panic_message(err.as_ref());
-            assert!(message.contains("make regen-surface-help"), "{message}");
+            assert!(message.contains("_help` target"), "{message}");
             assert!(message.contains("help.md"), "{message}");
         });
     }

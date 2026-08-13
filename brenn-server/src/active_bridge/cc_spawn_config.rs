@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use brenn_cc::protocol::outgoing::{HookMatcher, HooksConfig};
 use brenn_cc::session::CcSessionConfig;
-use brenn_lib::obs::alerting::AlertDispatcher;
-use brenn_lib::obs::transcript::TranscriptWriter;
+use brenn_obs::alerting::AlertDispatcher;
+use brenn_obs::transcript::TranscriptWriter;
 use tracing::info;
 
 /// The MCP server name used in the noop MCP config.
@@ -189,7 +189,7 @@ const MCP_BRENN_PREFIX: &str = "mcp__brenn__";
 /// MCP server declares short names; CC re-prefixes them).
 fn registry_virtual_tools(
     policy: &brenn_lib::access::AppPolicy,
-    registry: &crate::tool_registry::ToolRegistry,
+    registry: &brenn_tool_registry::ToolRegistry,
 ) -> Vec<brenn_lib::integration::VirtualToolDef> {
     let mut out = Vec::new();
     for tool_name in policy.tool_grants.keys() {
@@ -227,9 +227,9 @@ fn registry_virtual_tools(
 /// The state_dir is guaranteed to exist (created at config-resolve time).
 ///
 /// Called once per app at startup (not per CC spawn).
-pub(crate) fn write_virtual_tools_file(
+pub fn write_virtual_tools_file(
     app_config: &brenn_lib::config::AppConfig,
-    registry: &crate::tool_registry::ToolRegistry,
+    registry: &brenn_tool_registry::ToolRegistry,
 ) -> PathBuf {
     use brenn_lib::integration::{VirtualToolDef, core_virtual_tools, repo_virtual_tools};
 
@@ -518,10 +518,9 @@ mod tests {
         user_tz: chrono_tz::Tz,
     ) -> CcSessionConfig {
         let dir = tempfile::tempdir().unwrap();
-        let transcript = Arc::new(
-            brenn_lib::obs::transcript::TranscriptWriter::new(dir.path(), "test.log").unwrap(),
-        );
-        let (alert_dispatcher, _handle) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let transcript =
+            Arc::new(brenn_obs::transcript::TranscriptWriter::new(dir.path(), "test.log").unwrap());
+        let (alert_dispatcher, _handle) = brenn_obs::alerting::noop_alert_dispatcher();
         build_cc_session_config(
             app_config,
             Path::new("/opt/brenn/noop_mcp.py"),
@@ -730,7 +729,7 @@ mod tests {
         let mut app = minimal_test_app_config();
         app.state_dir = tmp.path().to_path_buf();
 
-        let registry = crate::tool_registry::ToolRegistry::new(vec![]);
+        let registry = brenn_tool_registry::ToolRegistry::new(vec![]);
         let path = write_virtual_tools_file(&app, &registry);
 
         // File path is state_dir/virtual-tools.json (no per-slug suffix —
@@ -761,7 +760,7 @@ mod tests {
 
         use brenn_lib::tools::{AclClause, ResolvedToolGrant};
 
-        use crate::tool_registry::{GitRepoPullTool, RegisteredTool, ToolRegistry};
+        use brenn_tool_registry::{GitRepoPullTool, RegisteredTool, ToolRegistry};
 
         let tmp = tempfile::tempdir().unwrap();
         let mut app = minimal_test_app_config();

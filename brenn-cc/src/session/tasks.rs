@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use brenn_lib::obs::alerting::{AlertDispatcher, AlertSeverity};
-use brenn_lib::obs::transcript::TranscriptWriter;
+use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
+use brenn_obs::transcript::TranscriptWriter;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
@@ -999,7 +999,7 @@ mod tests {
     // These test run_stdout_reader with mock byte streams, exercising the
     // full message routing pipeline.
 
-    use brenn_lib::obs::alerting::{RateLimiter, noop_alert_dispatcher};
+    use brenn_obs::alerting::{RateLimiter, noop_alert_dispatcher};
 
     /// Test fixture for reader loop integration tests.
     #[allow(dead_code)]
@@ -1787,7 +1787,7 @@ mod tests {
 
     #[tokio::test]
     async fn reader_loop_eof_with_shutting_down_skips_alert() {
-        use brenn_lib::obs::alerting::CountingAlerter;
+        use brenn_obs::alerting::CountingAlerter;
         use std::sync::atomic::AtomicU32;
 
         let alert_count = Arc::new(AtomicU32::new(0));
@@ -1846,7 +1846,7 @@ mod tests {
     /// spawned reader task. Tests pass string literals (sometimes
     /// `concat!`d), which are static.
     async fn run_reader_with(lines: &'static str) -> (Vec<SessionEvent>, u32) {
-        use brenn_lib::obs::alerting::CountingAlerter;
+        use brenn_obs::alerting::CountingAlerter;
         use std::sync::atomic::AtomicU32;
 
         let alert_count = Arc::new(AtomicU32::new(0));

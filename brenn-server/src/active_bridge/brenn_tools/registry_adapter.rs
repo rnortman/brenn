@@ -10,15 +10,15 @@
 //! denies them with a warn log (defense in depth; the declaration source only
 //! ever emits granted tools).
 
+use brenn_approval_rules::ApprovalMatch;
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
-use brenn_lib::approval_rules::ApprovalMatch;
 use brenn_lib::messaging::ParticipantId;
 use serde_json::json;
 use tracing::{info, warn};
 
 use super::super::ActiveBridge;
 use super::super::tool_summary::{HandleBrennToolResult, emit_tool_summary, mark_tool_handled};
-use crate::tool_registry::ToolError;
+use brenn_tool_registry::ToolError;
 
 /// Handle PreToolUse + PostToolUse for any registry tool. Returns `None` when
 /// the request's tool name does not resolve to a registered tool (letting the
@@ -158,10 +158,10 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use crate::test_support::init_db_memory;
     use brenn_cc::session::{
         ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest,
     };
-    use brenn_lib::db::init_db_memory;
     use brenn_lib::tools::{AclClause, ResolvedToolGrant};
     use tokio::sync::{broadcast, oneshot};
 
@@ -169,7 +169,7 @@ mod tests {
     use super::super::super::test_fixtures::TestBridgeConfig;
     use super::super::HandleBrennToolResult;
     use super::super::handle_brenn_tools;
-    use crate::tool_registry::{
+    use brenn_tool_registry::{
         AclDenied, DEFAULT_FAST_BUDGET, FastTool, GitRepoPullTool, Idempotency, RegisteredTool,
         ToolClass, ToolCtx, ToolDescriptor, ToolError, ToolRegistry,
     };
@@ -248,12 +248,12 @@ mod tests {
         let db = init_db_memory();
         let (uid, cid) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "adapt-user", "$argon2id$fake");
-            let cid = brenn_lib::conversation::create_conversation(&conn, uid, "test", false);
+            let uid = brenn_db::auth::user::create_user(&conn, "adapt-user", "$argon2id$fake");
+            let cid = brenn_db::conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
         let (tx, _rx) = broadcast::channel(16);
-        let (alert, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (alert, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         ActiveBridge::inject_for_test_full(
             uid,
             cid,
@@ -424,7 +424,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_tool_use_emits_summary_card() {
-        use brenn_lib::ws_types::WsServerMessage;
+        use brenn_ws_types::WsServerMessage;
 
         // The registry adapter must preserve the summary-card UX GitRepoPull had
         // on the legacy intercept: PostToolUse emits a ToolUseSummary broadcast.

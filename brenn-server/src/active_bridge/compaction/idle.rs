@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use brenn_lib::ws_types::{CcState, WsServerMessage};
+use brenn_ws_types::{CcState, WsServerMessage};
 use tracing::debug;
 
 use crate::active_bridge::ActiveBridge;

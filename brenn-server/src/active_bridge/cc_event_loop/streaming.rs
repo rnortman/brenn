@@ -1,5 +1,5 @@
-use brenn_lib::obs::alerting::AlertDispatcher;
-use brenn_lib::ws_types::WsServerMessage;
+use brenn_obs::alerting::AlertDispatcher;
+use brenn_ws_types::WsServerMessage;
 use tracing::{info, warn};
 
 use super::super::bridge_io::persist_incoming_message;
@@ -66,7 +66,7 @@ pub(in crate::active_bridge) async fn handle_assistant_message(
         if matches!(block, ContentBlock::Unknown) {
             warn!("unknown content block type in assistant message — possible CC upgrade");
             alert_dispatcher.alert(
-                brenn_lib::obs::alerting::AlertSeverity::Warning,
+                brenn_obs::alerting::AlertSeverity::Warning,
                 "Unknown CC content block type".into(),
                 "CC sent an assistant message containing an unrecognized content block type. This likely means CC was upgraded and Brenn needs updating.".into(),
             );
@@ -129,7 +129,7 @@ pub(in crate::active_bridge) async fn handle_assistant_message(
     }
 
     // Render content blocks to HTML (markdown + thinking details).
-    let content = crate::markdown::render_content_blocks(&msg.message.content);
+    let content = brenn_render::markdown::render_content_blocks(&msg.message.content);
 
     // seq: Some(db_seq) lets the frontend deduplicate this live broadcast against a
     // concurrent history replay (reconnect-from-idle race fix).

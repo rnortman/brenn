@@ -1,0 +1,44 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "brenn-git",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-lib",
+        "//brenn-obs",
+    ],
+)
+
+# 77 tests. Almost every one of them spawns real `git` or `/bin/sh` children
+# against a temp directory, so per-test cost is fork/exec plus tempdir I/O
+# rather than the microseconds the pure sinks take: measured 0.55s for the
+# binary locally, 1.67s with `--test-threads=1`. Against the repo's one measured
+# local→CD factor (~21x, brenn-server 22s/472s) that is ~12s, or ~35s if a
+# loaded runner gives the binary no parallelism at all — both inside the `small`
+# (60s) budget.
+rust_test(
+    name = "brenn-git_test",
+    size = "small",
+    crate = ":brenn-git",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    tags = ["requires-git"],
+    deps = all_crate_deps(normal_dev = True) + [
+        "//brenn-obs",
+        "//git-fixture",
+    ],
+)
+
+rust_doc_test(
+    name = "brenn-git_doc_test",
+    crate = ":brenn-git",
+)

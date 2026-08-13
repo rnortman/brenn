@@ -1,0 +1,50 @@
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "brenn-automation",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-db",
+        "//brenn-lib",
+        "//brenn-messaging",
+        "//brenn-obs",
+    ],
+)
+
+# 78 tests. Several drive the scheduler loop and the rate limiter through
+# `tokio::time`, and the rest are in-memory sqlite; the whole binary finishes in
+# 0.48s locally, so `small` (60s) keeps a wide margin even on a cold 4-vCPU
+# runner.
+#
+# The test binary links brenn-lib and brenn-obs with `testutils` on: the fire
+# suite counts dispatched alerts and the engine suite builds channel entries
+# from the shared messaging helpers.
+rust_test(
+    name = "brenn-automation_test",
+    size = "small",
+    crate = ":brenn-automation",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + [
+        "//brenn-db",
+        "//brenn-envelope",
+        "//brenn-lib",
+        "//brenn-messaging",
+        "//brenn-messaging-store",
+        "//brenn-obs",
+    ],
+)
+
+rust_doc_test(
+    name = "brenn-automation_doc_test",
+    crate = ":brenn-automation",
+)

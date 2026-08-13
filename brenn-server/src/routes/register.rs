@@ -4,11 +4,11 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::http::header::SET_COOKIE;
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use brenn_lib::auth::invite::{has_unused_invite_codes, use_invite_code, validate_invite_code};
-use brenn_lib::auth::password::hash_password;
-use brenn_lib::auth::session::create_session;
-use brenn_lib::obs::alerting::AlertSeverity;
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_db::auth::invite::{has_unused_invite_codes, use_invite_code, validate_invite_code};
+use brenn_db::auth::password::hash_password;
+use brenn_db::auth::session::create_session;
+use brenn_obs::alerting::AlertSeverity;
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -155,7 +155,7 @@ pub async fn register_submit(
         // Check username availability — case-insensitively to prevent case-variant
         // duplicates (e.g., both "alice" and "Alice") which would cause nondeterministic
         // address resolution in pwa_push canonicalization and auth divergence.
-        if brenn_lib::auth::user::get_user_by_username_nocase(&conn, &form.username).is_some() {
+        if brenn_db::auth::user::get_user_by_username_nocase(&conn, &form.username).is_some() {
             warn!(username = %form.username, ip = %ip, "registration rejected: username taken");
             state.alert_dispatcher.alert(
                 AlertSeverity::Info,
@@ -179,11 +179,8 @@ pub async fn register_submit(
         return Redirect::to("/auth/register?error=invite").into_response();
     }
 
-    let user_id = match brenn_lib::auth::user::try_create_user(
-        &conn,
-        &form.username,
-        &password_hash,
-    ) {
+    let user_id = match brenn_db::auth::user::try_create_user(&conn, &form.username, &password_hash)
+    {
         Ok(id) => id,
         Err(_) => {
             warn!(username = %form.username, ip = %ip, "registration rejected: username race condition");

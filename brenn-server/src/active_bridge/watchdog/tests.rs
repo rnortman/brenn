@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use brenn_lib::config::WatchdogConfig;
-use brenn_lib::obs::alerting::{
+use brenn_obs::alerting::{
     AlertSeverity, make_capturing_alerter_with_severity, noop_alert_dispatcher,
 };
-use brenn_lib::ws_types::{CcState, WsServerMessage};
+use brenn_ws_types::{CcState, WsServerMessage};
 use tokio::sync::broadcast;
 
 use super::Watchdog;

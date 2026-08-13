@@ -1,7 +1,7 @@
 //! Integration tests that drive the real `brenn-cli` binary.
 
-use brenn_lib::auth::device::{UNENROLLED_TOKEN_PREFIX, resolve_or_create_device};
-use brenn_lib::auth::user::create_user;
+use brenn_db::auth::device::{UNENROLLED_TOKEN_PREFIX, resolve_or_create_device};
+use brenn_db::auth::user::create_user;
 use brenn_lib::db::init_db;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -375,7 +375,7 @@ fn cli_unenroll_unknown_id_panics() {
 
 mod push {
     use super::{TestServer, run_cli, run_cli_stdin};
-    use brenn_lib::webhook::signature::hmac_sha256_hex;
+    use brenn_lib::util::hmac_sha256_hex;
 
     /// HMAC the CLI is expected to have produced for `body` at the timestamp the
     /// server observed.

@@ -1,7 +1,7 @@
 """The frontend's esbuild bundles.
 
-One target per entry point, mirroring the make lane's one invocation per entry
-point. The bundler runs over the staged TypeScript tree, so the generated
+One target per entry point. The bundler runs over the staged TypeScript tree,
+so the generated
 protocol types and stylesheet reach it as a dependency edge rather than as
 files something else must have written first.
 """

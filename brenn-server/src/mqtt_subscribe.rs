@@ -36,12 +36,12 @@
 //! tool (design §2.4, a later increment).
 
 use brenn_lib::messaging::ChannelScheme;
-use brenn_lib::messaging::subscribe::{
+use brenn_lib::mqtt::address::parse_mqtt_address;
+use brenn_messaging::subscribe::{
     DynamicSubscribeParams, RuntimeSubscribeError, RuntimeUnsubscribeError, SubscribeOutcome,
     UnsubscribeOutcome,
 };
-use brenn_lib::mqtt::address::parse_mqtt_address;
-use brenn_lib::mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
+use brenn_mqtt::service::{IngressSubscribeOutcome, IngressUnsubscribeOutcome};
 
 use crate::active_bridge::ActiveBridge;
 use crate::mqtt_router::IngressRoute;
@@ -169,7 +169,7 @@ impl From<RuntimeSubscribeError> for SubscribeActivateError {
 /// wiring bug, not bad input — hence a panic rather than a returned error (design
 /// §3.1/§3.2).
 fn app_policy<'a>(
-    messenger: &'a brenn_lib::messaging::Messenger,
+    messenger: &'a brenn_messaging::Messenger,
     app_slug: &str,
 ) -> &'a brenn_lib::access::AppPolicy {
     messenger.app_policy(app_slug).unwrap_or_else(|| {
@@ -610,9 +610,9 @@ mod tests {
     use super::*;
     use brenn_lib::messaging::SubscriberEntryKind;
     use brenn_lib::messaging::config::Depth;
-    use brenn_lib::messaging::db::load_dynamic_subscriptions;
-    use brenn_lib::mqtt::payload::InboundPayload;
-    use brenn_lib::mqtt::service::MqttEventRouter;
+    use brenn_messaging_store::db::load_dynamic_subscriptions;
+    use brenn_mqtt::payload::InboundPayload;
+    use brenn_mqtt::service::MqttEventRouter;
 
     use crate::active_bridge::ActiveBridge;
 
@@ -630,7 +630,7 @@ mod tests {
     /// Load all durable dynamic-subscription rows for the bridge's messenger.
     async fn dynamic_rows(
         bridge: &ActiveBridge,
-    ) -> Vec<brenn_lib::messaging::db::DynamicSubscriptionRow> {
+    ) -> Vec<brenn_messaging_store::db::DynamicSubscriptionRow> {
         let conn = bridge.messenger().unwrap().db().lock().await;
         load_dynamic_subscriptions(&conn)
     }

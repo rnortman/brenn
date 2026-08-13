@@ -50,9 +50,9 @@ fn violations_from(observed: &[Sidecar]) -> Vec<String> {
                  sidecars are written by their crate's `src/help.rs` \
                  (`help_markdown()`), gated by a `help_sidecar_matches_generator` test \
                  calling `brenn_surface_test_fixtures::enforce_help_sidecar`, and \
-                 rewritten by `make regen-surface-help`. Move the prose into a \
-                 generator and interpolate every fact that has an identifier in code, \
-                 rather than retyping it here.",
+                 refreshed from the package's `<kind>_help` genrule output. Move the \
+                 prose into a generator and interpolate every fact that has an \
+                 identifier in code, rather than retyping it here.",
                 rel.display()
             ));
         }
@@ -118,6 +118,11 @@ mod tests {
 
     const HEADER: &str = "<!-- AUTO-GENERATED from this component's src/help.rs. Do not edit. -->";
 
+    /// The Starlark file whose `surface_component` macro decides which packages
+    /// may be components at all, and therefore which dirs the build discovers
+    /// sidecars from. Pinned against this guard's roots below.
+    const SURFACE_DEFS: &str = "bazel/surface/defs.bzl";
+
     fn obs(pairs: &[(&str, &str)]) -> Vec<Sidecar> {
         pairs
             .iter()
@@ -142,7 +147,7 @@ mod tests {
         ]));
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(out[0].starts_with("surface/components/gauge/help.md:"));
-        assert!(out[0].contains("regen-surface-help"), "{}", out[0]);
+        assert!(out[0].contains("_help` genrule"), "{}", out[0]);
     }
 
     /// An empty file has no first line, so it cannot carry the header.
@@ -222,94 +227,64 @@ mod tests {
 
     /// The build's sidecar set and this guard's are two hand-maintained lists, and
     /// the test above only proves the walk matches its own rules. Pin the two
-    /// together: every dir the Makefile discovers sidecars from must fall under a
-    /// root this guard walks, so a new sidecar-bearing tier fails here instead of
-    /// shipping a hand-written `help.md` past a clean gate.
+    /// together: every package the `surface_component` macro admits must fall
+    /// under a root this guard walks, so a new sidecar-bearing tier fails here
+    /// instead of shipping a hand-written `help.md` past a clean gate.
     #[test]
-    fn the_makefile_discovers_no_sidecar_dir_outside_the_guards_roots() {
+    fn the_build_admits_no_component_package_outside_the_guards_roots() {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask/ sits in the repo root");
-        let makefile = std::fs::read_to_string(repo_root.join("Makefile"))
-            .expect("the repo root has a Makefile");
-        let definition = makefile_variable(&makefile, "SURFACE_COMPONENT_DIRS");
-        let dirs = path_tokens(&definition);
-        assert!(
-            !dirs.is_empty(),
-            "no path extracted from `SURFACE_COMPONENT_DIRS := {definition}` — the pin \
-             below would compare nothing"
-        );
+        let defs = std::fs::read_to_string(repo_root.join(SURFACE_DEFS))
+            .unwrap_or_else(|e| panic!("cannot read {SURFACE_DEFS}: {e}"));
 
-        let components_root = format!("{COMPONENTS_DIR}/");
-        for dir in &dirs {
-            assert!(
-                dir.starts_with(&components_root) || dir == CHROME_DIR,
-                "the build discovers component sidecars from `{dir}`, which this guard's \
-                 roots ({COMPONENTS_DIR}/*, {CHROME_DIR}) do not cover — add the new root \
-                 to `sidecar_dirs`"
-            );
-        }
-        // Both roots must be represented, or the pin is comparing against a list
-        // that has itself lost one.
-        assert!(
-            dirs.iter().any(|dir| dir.starts_with(&components_root)),
-            "{dirs:?}"
+        let parents = starlark_string_list(&defs, "_COMPONENT_PARENTS");
+        let packages = starlark_string_list(&defs, "_COMPONENT_PACKAGES");
+
+        assert_eq!(
+            parents,
+            vec![COMPONENTS_DIR.to_string()],
+            "the build admits component packages under a parent this guard does not \
+             walk — add the new root to `sidecar_dirs`"
         );
-        assert!(dirs.iter().any(|dir| dir == CHROME_DIR), "{dirs:?}");
+        assert_eq!(
+            packages,
+            vec![CHROME_DIR.to_string()],
+            "the build admits a component package by exact name that this guard does \
+             not walk — add it to `sidecar_dirs`"
+        );
     }
 
-    /// The right-hand side of a `NAME :=` / `NAME =` Makefile assignment, with
-    /// backslash continuations folded into one line.
-    fn makefile_variable(makefile: &str, name: &str) -> String {
-        let forms = [
-            format!("{name} :="),
-            format!("{name}:="),
-            format!("{name} ="),
-            format!("{name}="),
-        ];
-        let mut lines = makefile.lines();
-        while let Some(line) = lines.next() {
-            let Some(rest) = forms
-                .iter()
-                .find_map(|form| line.strip_prefix(form.as_str()))
-            else {
-                continue;
-            };
-            let mut value = rest.trim().to_string();
-            while let Some(head) = value.strip_suffix('\\') {
-                let next = lines
-                    .next()
-                    .unwrap_or_else(|| panic!("{name} ends on a line continuation"));
-                value = format!("{} {}", head.trim_end(), next.trim());
-            }
-            return value;
-        }
-        panic!("the Makefile has no {name} assignment")
-    }
-
-    /// The directory paths a Makefile expression names: words containing a `/`,
-    /// with make's own syntax (`$`, parens, commas) split away and its patterns
-    /// (`%`) dropped. A trailing `/Cargo.toml` is stripped, since the build globs
-    /// manifests to name their dirs.
-    fn path_tokens(expr: &str) -> Vec<String> {
-        expr.split(|c: char| {
-            c.is_whitespace() || matches!(c, '(' | ')' | ',' | '$' | '{' | '}' | ':')
-        })
-        .filter(|token| token.contains('/') && !token.contains('%'))
-        .map(|token| {
-            token
-                .strip_suffix("/Cargo.toml")
-                .unwrap_or(token)
-                .to_string()
-        })
-        .filter(|token| !token.is_empty())
-        .collect()
+    /// The elements of a `NAME = ["a", "b"]` Starlark assignment. Single-line
+    /// only, which is the shape both lists have and the shape the assertion
+    /// above wants held: a list grown past one line is a change worth noticing.
+    fn starlark_string_list(source: &str, name: &str) -> Vec<String> {
+        let prefix = format!("{name} = [");
+        let line = source
+            .lines()
+            .find(|line| line.starts_with(prefix.as_str()))
+            .unwrap_or_else(|| panic!("{SURFACE_DEFS} has no single-line `{name} = [...]`"));
+        let body = line
+            .strip_prefix(prefix.as_str())
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or_else(|| panic!("`{name}` in {SURFACE_DEFS} is not a one-line list"));
+        body.split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(|token| {
+                token
+                    .strip_prefix('"')
+                    .and_then(|t| t.strip_suffix('"'))
+                    .unwrap_or_else(|| panic!("`{name}` element {token:?} is not a string literal"))
+                    .to_string()
+            })
+            .collect()
     }
 
     #[test]
-    fn the_makefile_extractors_read_make_syntax() {
-        let makefile = "OTHER := x\nDIRS := $(patsubst %/,%,$(dir $(wildcard a/b/*/Cargo.toml))) \\\n    c/d\nNEXT := y\n";
-        let definition = makefile_variable(makefile, "DIRS");
-        assert_eq!(path_tokens(&definition), vec!["a/b/*", "c/d"]);
+    fn the_starlark_extractor_reads_a_string_list() {
+        let source = "OTHER = 1\n_XS = [\"a/b\", \"c\"]\n_YS = []\n";
+        assert_eq!(starlark_string_list(source, "_XS"), vec!["a/b", "c"]);
+        assert!(starlark_string_list(source, "_YS").is_empty());
     }
 }

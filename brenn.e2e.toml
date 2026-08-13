@@ -5,8 +5,9 @@
 [server]
 # Must match E2E_BASE_URL in the Makefile `e2e` target (which polls this port).
 bind_address = "127.0.0.1:3100"
-static_dir = "frontend/dist"
-surface_dist_dir = "surface/dist"
+# Build outputs, reached through bazel's convenience symlinks.
+static_dir = ".bazel-bin/frontend/dist"
+surface_dist_dir = ".bazel-bin/surface/dist"
 secure_cookies = false
 public_url = "http://127.0.0.1:3100"
 

@@ -71,9 +71,7 @@ fn round_trip() -> Result<(), Error> {
     let after_delete = tx.get(ns, key)?;
     tx.commit()?;
     if after_delete.is_some() {
-        return Err(Error::failed(
-            "store-rt: key still present after delete",
-        ));
+        return Err(Error::failed("store-rt: key still present after delete"));
     }
 
     // ── begin → put → RAII rollback (guard Drop) ──────────────────────────

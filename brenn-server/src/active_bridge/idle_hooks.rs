@@ -187,8 +187,8 @@ impl ActiveBridge {
 mod tests {
     use super::*;
     use crate::idle_hooks::IdleHook;
-    use brenn_lib::conversation;
-    use brenn_lib::ws_types::WsServerMessage;
+    use brenn_db::conversation;
+    use brenn_ws_types::WsServerMessage;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering as AtomicOrdering;
@@ -321,10 +321,10 @@ mod tests {
     }
 
     async fn idle_hook_bridge(idle_hook_secs: u64) -> Arc<ActiveBridge> {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (user_id, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "ihtest", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "ihtest", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -439,10 +439,10 @@ mod tests {
 
     #[tokio::test]
     async fn timer_fire_invokes_run_idle_hooks_and_delivers_message() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (user_id, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "fire", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "fire", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "fire", false);
             (uid, cid)
         };
@@ -490,10 +490,7 @@ mod tests {
                 ..
             } = msg
                 && rendered_html.contains("brenn-system-idle-hook")
-                && matches!(
-                    category,
-                    brenn_lib::ws_types::SystemMessageCategory::IdleHook
-                )
+                && matches!(category, brenn_ws_types::SystemMessageCategory::IdleHook)
             {
                 found = true;
                 break;
@@ -719,10 +716,10 @@ mod tests {
     /// hook's post-yield work completes.
     #[tokio::test]
     async fn timer_fired_task_is_not_aborted_by_in_flight_cancel() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (user_id, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "f1test", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "f1test", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "f1", false);
             (uid, cid)
         };
@@ -831,10 +828,10 @@ mod tests {
 
     #[tokio::test]
     async fn multi_hook_aggregation_and_lifecycle_callbacks() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (user_id, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "multi", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "multi", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "multi", false);
             (uid, cid)
         };
@@ -909,7 +906,7 @@ mod tests {
         // LLM text is wrapped in `<brenn-system-reminder>`, with the inner body
         // being `{"system":"idle_hooks", "hook_a": {...}}` JSON.
         let conn = bridge.db.lock().await;
-        let messages = brenn_lib::conversation::get_messages(&conn, bridge.conversation_id);
+        let messages = brenn_db::conversation::get_messages(&conn, bridge.conversation_id);
         let row = messages
             .last()
             .expect("DB must have the persisted system row");

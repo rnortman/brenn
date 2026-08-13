@@ -6,7 +6,9 @@ publish = false
 
 [dependencies]
 brenn-cc = { version = "0.1.0", path = "../brenn-cc" }
+brenn-db = { version = "0.1.0", path = "../brenn-db" }
 brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }

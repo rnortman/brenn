@@ -19,9 +19,9 @@ use std::sync::atomic::Ordering;
 
 use brenn_cc::protocol::incoming::ResultMessage;
 use brenn_common::sanitize_untrusted_str;
-use brenn_lib::conversation;
-use brenn_lib::obs::alerting::{AlertDispatcher, AlertSeverity};
-use brenn_lib::ws_types::WsServerMessage;
+use brenn_db::conversation;
+use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
+use brenn_ws_types::WsServerMessage;
 use tracing::{debug, error, info, warn};
 
 /// Consecutive background-turn holds in a single mid-compaction phase entry
@@ -167,15 +167,15 @@ pub(in crate::active_bridge) async fn handle_turn_completed(
         // turns where CC reported total_cost_usd = None produce zero; skipping
         // is correct in both cases.
         if last_turn > 0.0 {
-            brenn_lib::cost_samples::insert(&conn, bridge.conversation_id, last_turn);
+            brenn_db::cost_samples::insert(&conn, bridge.conversation_id, last_turn);
 
             // Record the llm_turn usage event only for real-cost turns. Zero-cost
             // frames (compaction-result, CC turns where total_cost_usd=None) must
             // not inflate llm_turns counters or produce phantom event rows.
             if let Some((device_id, user_id)) =
-                brenn_lib::usage::resolve_sender_for_conversation(&conn, bridge.conversation_id)
+                brenn_usage_db::resolve_sender_for_conversation(&conn, bridge.conversation_id)
             {
-                brenn_lib::usage::record_llm_turn(
+                brenn_usage_db::record_llm_turn(
                     &conn,
                     device_id,
                     user_id,
@@ -191,10 +191,10 @@ pub(in crate::active_bridge) async fn handle_turn_completed(
         // `now`/`cutoff`/`now_secs` are hoisted before the lock to minimise hold time.
         let last = bridge.last_cost_prune_at.load(Ordering::Relaxed);
         if now_secs - last >= 3600 {
-            brenn_lib::cost_samples::prune_before(&conn, cutoff);
+            brenn_db::cost_samples::prune_before(&conn, cutoff);
             bridge.last_cost_prune_at.store(now_secs, Ordering::Relaxed);
         }
-        last_24h = brenn_lib::cost_samples::sum_since(&conn, cutoff);
+        last_24h = brenn_db::cost_samples::sum_since(&conn, cutoff);
     }
     // DB lock released; no further DB access on this path.
 
@@ -416,8 +416,8 @@ pub(super) mod tests {
     use super::*;
     use brenn_cc::protocol::incoming::{ResultMessage, ResultOrigin};
     use brenn_cc::session::{ApprovalKind, ApprovalRequest, SessionEvent};
-    use brenn_lib::conversation;
-    use brenn_lib::ws_types::CcState;
+    use brenn_db::conversation;
+    use brenn_ws_types::CcState;
 
     use crate::active_bridge::test_fixtures::TestBridgeConfig;
     use std::time::Duration;
@@ -462,7 +462,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn turn_completed_during_waiting_for_idle_does_not_panic() {
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge_with_compaction_config().await;
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         set_waiting_for_idle(&bridge).await;
         set_context_usage(&bridge, 50); // below soft_pct (75)
 
@@ -485,7 +485,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn turn_completed_during_waiting_for_idle_keeps_timer_when_still_above_soft() {
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge_with_compaction_config().await;
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         set_waiting_for_idle(&bridge).await;
         set_context_usage(&bridge, 80); // between soft_pct (75) and hard_pct (95)
 
@@ -520,7 +520,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn turn_completed_during_waiting_for_idle_escalates_when_hard() {
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge_with_compaction_config().await;
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         set_waiting_for_idle(&bridge).await;
         set_context_usage(&bridge, 96); // above hard_pct (95)
 
@@ -564,7 +564,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn persisting_state_background_turn_stays() {
         let (bridge, _event_tx, mut broadcast_rx, _ab) = test_bridge_with_compaction_config().await;
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         let mut rx = install_recording_session(&bridge).await;
         bridge.compaction.lock().await.phase = CompactionPhase::PersistingState;
 
@@ -603,7 +603,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn persisting_state_foreground_turn_compacts() {
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge_with_compaction_config().await;
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         let mut rx = install_recording_session(&bridge).await;
         bridge.compaction.lock().await.phase = CompactionPhase::PersistingState;
 
@@ -626,7 +626,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn pending_turn_completion_background_turn_stays() {
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge_with_compaction_config().await;
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
         let mut rx = install_recording_session(&bridge).await;
         bridge.compaction.lock().await.phase = CompactionPhase::PendingTurnCompletion {
             hints: Some("remember X".into()),
@@ -659,7 +659,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn unknown_origin_kind_treated_foreground_and_alerts() {
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge_with_compaction_config().await;
-        let (ad, count, handle) = brenn_lib::obs::alerting::make_counting_alerter();
+        let (ad, count, handle) = brenn_obs::alerting::make_counting_alerter();
         let _rx = install_recording_session(&bridge).await;
 
         // First unknown-kind result in PersistingState → Compacting + 1 alert.
@@ -1352,7 +1352,7 @@ pub(super) mod tests {
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
         let db_sum = {
             let conn = bridge.db.lock().await;
-            brenn_lib::cost_samples::sum_since(&conn, cutoff)
+            brenn_db::cost_samples::sum_since(&conn, cutoff)
         };
         assert!(
             (db_sum - 0.30).abs() < 1e-6,
@@ -1452,7 +1452,7 @@ pub(super) mod tests {
         use chrono::Duration as CDuration;
 
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge_with_compaction_config().await;
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
 
         // Confirm gate starts at 0.
         assert_eq!(
@@ -1465,7 +1465,7 @@ pub(super) mod tests {
         let old = chrono::Utc::now() - CDuration::hours(25);
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::cost_samples::insert_at(&conn, bridge.conversation_id, 0.10, old);
+            brenn_db::cost_samples::insert_at(&conn, bridge.conversation_id, 0.10, old);
         }
 
         // First call: gate is 0, prune runs and deletes the old row; gate is updated.
@@ -1480,10 +1480,8 @@ pub(super) mod tests {
         // Old row should be gone.
         {
             let conn = bridge.db.lock().await;
-            let total = brenn_lib::cost_samples::sum_since(
-                &conn,
-                chrono::Utc::now() - CDuration::hours(26),
-            );
+            let total =
+                brenn_db::cost_samples::sum_since(&conn, chrono::Utc::now() - CDuration::hours(26));
             assert!(
                 (total - 0.0).abs() < 1e-9,
                 "old row should have been pruned on first call; sum={total}"
@@ -1494,7 +1492,7 @@ pub(super) mod tests {
         let old2 = chrono::Utc::now() - CDuration::hours(25);
         {
             let conn = bridge.db.lock().await;
-            brenn_lib::cost_samples::insert_at(&conn, bridge.conversation_id, 0.42, old2);
+            brenn_db::cost_samples::insert_at(&conn, bridge.conversation_id, 0.42, old2);
         }
 
         // Second call: gate was just set (< 3600s ago), prune should be skipped.
@@ -1502,10 +1500,8 @@ pub(super) mod tests {
 
         {
             let conn = bridge.db.lock().await;
-            let total = brenn_lib::cost_samples::sum_since(
-                &conn,
-                chrono::Utc::now() - CDuration::hours(26),
-            );
+            let total =
+                brenn_db::cost_samples::sum_since(&conn, chrono::Utc::now() - CDuration::hours(26));
             assert!(
                 (total - 0.42).abs() < 1e-9,
                 "old row should NOT have been pruned on second call (gate suppresses); sum={total}"
@@ -1622,8 +1618,8 @@ pub(super) mod tests {
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(25);
         let (messages, db_sum, cache_lookups) = {
             let conn = bridge.db.lock().await;
-            let messages = brenn_lib::conversation::get_messages(&conn, bridge.conversation_id);
-            let db_sum = brenn_lib::cost_samples::sum_since(&conn, cutoff);
+            let messages = brenn_db::conversation::get_messages(&conn, bridge.conversation_id);
+            let db_sum = brenn_db::cost_samples::sum_since(&conn, cutoff);
             let cache_lookups: Vec<(String, ModelWindowCacheEntry)> = cache_lookup_keys
                 .iter()
                 .map(|k| (k.to_string(), brenn_lib::model_window_cache::get(&conn, k)))
@@ -1688,13 +1684,13 @@ pub(super) mod tests {
         broadcast::Receiver<WsServerMessage>,
         ActiveBridges,
     ) {
-        let db = brenn_lib::db::init_db_memory();
-        let (alert_dispatcher, _handle) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let db = crate::test_support::init_db_memory();
+        let (alert_dispatcher, _handle) = brenn_obs::alerting::noop_alert_dispatcher();
         let active_bridges = ActiveBridges::new();
 
         let (user_id, conv_id) = {
             let conn = db.lock().await;
-            let uid = brenn_lib::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
+            let uid = brenn_db::auth::user::create_user(&conn, "testuser", "$argon2id$fake");
             let cid = conversation::create_conversation(&conn, uid, "test", false);
             (uid, cid)
         };
@@ -1717,7 +1713,7 @@ pub(super) mod tests {
             "test",
             db,
             broadcast_tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 active_bridges: Some(active_bridges.clone()),
                 singleton: true,
@@ -1760,22 +1756,22 @@ pub(super) mod tests {
     #[tokio::test]
     async fn llm_turn_attribution_uses_messages_sender_device_id() {
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge_with_compaction_config().await;
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
 
         // Create a device and insert a message row with sender_device_id so
         // resolve_sender_for_conversation can return the attribution.
         let device_id = {
             let conn = bridge.db.lock().await;
-            let resolved = brenn_lib::auth::device::resolve_or_create_device(
+            let resolved = brenn_db::auth::device::resolve_or_create_device(
                 &conn,
                 None,
                 bridge.user_id,
                 "test-ua",
             );
-            brenn_lib::conversation::append_message(
+            brenn_db::conversation::append_message(
                 &conn,
                 bridge.conversation_id,
-                brenn_lib::conversation::MessageDirection::Outgoing,
+                brenn_db::conversation::MessageDirection::Outgoing,
                 "user",
                 None,
                 None,
@@ -1817,7 +1813,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn llm_turn_no_attribution_drops_event() {
         let (bridge, _event_tx, _broadcast_rx, _ab) = test_bridge_with_compaction_config().await;
-        let (ad, _h) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (ad, _h) = brenn_obs::alerting::noop_alert_dispatcher();
 
         // Precondition: the bridge conversation must have no messages with
         // sender_device_id, so that resolve_sender_for_conversation returns None.

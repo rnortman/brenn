@@ -2,8 +2,8 @@
 //! and `handle_compact_boundary` (CompactBoundary). Both concern the
 //! compaction-status lifecycle and touch `CompactionPhase`.
 
-use brenn_lib::obs::alerting::AlertDispatcher;
-use brenn_lib::ws_types::{CcState, WsServerMessage};
+use brenn_obs::alerting::AlertDispatcher;
+use brenn_ws_types::{CcState, WsServerMessage};
 use tracing::{debug, info, warn};
 
 use super::super::bridge_io::persist_incoming_message;
@@ -53,7 +53,7 @@ pub(super) async fn handle_status_change(
                          possible CC protocol drift; ignoring state mutation"
                     );
                     alert_dispatcher.alert_once_per_process(
-                        brenn_lib::obs::alerting::AlertSeverity::Warning,
+                        brenn_obs::alerting::AlertSeverity::Warning,
                         "Unexpected compact_result outside Compacting phase".into(),
                         cr,
                         format!(
@@ -86,7 +86,7 @@ pub(super) async fn handle_status_change(
                             // Reset state machine so subsequent TurnCompleted doesn't
                             // stay stuck in StayCompacting forever.
                             bridge.reset_compaction_state().await;
-                            let render = crate::system_message::render_compaction_failed();
+                            let render = brenn_render::system_message::render_compaction_failed();
                             bridge
                                 .persist_and_broadcast_system_message(render, None)
                                 .await;
@@ -126,7 +126,7 @@ pub(super) async fn handle_status_change(
                 "unknown CC status — possible CC upgrade"
             );
             alert_dispatcher.alert_once_per_process(
-                brenn_lib::obs::alerting::AlertSeverity::Warning,
+                brenn_obs::alerting::AlertSeverity::Warning,
                 "Unknown CC status".into(),
                 other,
                 format!(

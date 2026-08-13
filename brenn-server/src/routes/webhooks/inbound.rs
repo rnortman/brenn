@@ -17,10 +17,10 @@ use axum::body::Bytes;
 use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use brenn_lib::obs::alerting::AlertDispatcher;
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
-use brenn_lib::webhook::signature::{VerifiedRequest, WebhookRejection, verify_request};
+use brenn_obs::alerting::AlertDispatcher;
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
 use brenn_wasm::{CheckInput, Header, ReplayComponent, ReplayError};
+use brenn_webhook::signature::{VerifiedRequest, WebhookRejection, verify_request};
 
 use crate::client_ip::ClientIp;
 use crate::state::AppState;
@@ -96,7 +96,7 @@ pub async fn receive(
                     name.as_str(),
                     endpoint_slug,
                 );
-                brenn_lib::obs::security::log_security_event(
+                brenn_obs::security::log_security_event(
                     SecurityEventType::SchemaViolation,
                     ip,
                     &detail,
@@ -217,7 +217,7 @@ pub async fn receive(
                          recoverable via the guest's prune/delete path."
                     );
                     dispatcher.alert(
-                        brenn_lib::obs::alerting::AlertSeverity::Warning,
+                        brenn_obs::alerting::AlertSeverity::Warning,
                         "WASM store quota exceeded".to_string(),
                         body,
                     );
@@ -460,10 +460,10 @@ mod tests {
     use axum::middleware as axum_mw;
     use axum::routing::post;
     use brenn_lib::messaging::Urgency;
-    use brenn_lib::obs::alerting::{AlertDispatcher, make_capturing_alerter};
     use brenn_lib::webhook::config::ResolvedWebhookEndpoint;
-    use brenn_lib::webhook::service::{WebhookEventRouter, WebhookService};
-    use brenn_lib::webhook::signature::{HexFormat, SignatureAlgorithm, SignatureScheme};
+    use brenn_lib::webhook::scheme::{HexFormat, SignatureAlgorithm, SignatureScheme};
+    use brenn_obs::alerting::{AlertDispatcher, make_capturing_alerter};
+    use brenn_webhook::service::{WebhookEventRouter, WebhookService};
     use tower::ServiceExt;
 
     use super::*;
@@ -570,10 +570,7 @@ mod tests {
 
     /// Compute `v1=<hex>` HMAC-SHA256 over `body` using `TEST_SECRET`.
     fn sign_v1hex(body: &[u8]) -> String {
-        format!(
-            "v1={}",
-            brenn_lib::webhook::signature::hmac_sha256_hex(TEST_SECRET, body)
-        )
+        format!("v1={}", brenn_lib::util::hmac_sha256_hex(TEST_SECRET, body))
     }
 
     /// Build a minimal test axum router for the inbound webhook handler.
@@ -582,7 +579,7 @@ mod tests {
         let router_trait: Arc<dyn WebhookEventRouter> = capture;
         svc.set_router(router_trait);
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (alert_dispatcher, _handle) = AlertDispatcher::noop();
         let mut state = crate::state::AppState::for_test(db, None);
         state.alert_dispatcher = alert_dispatcher;
@@ -820,7 +817,7 @@ mod tests {
         // Sign with a different key so the HMAC doesn't match.
         let bad_sig = format!(
             "v1={}",
-            brenn_lib::webhook::signature::hmac_sha256_hex(b"wrong-key", body)
+            brenn_lib::util::hmac_sha256_hex(b"wrong-key", body)
         );
 
         let resp = post_to_endpoint(
@@ -887,10 +884,7 @@ mod tests {
 
         let capture2 = CapturingRouter::new();
         let router2 = test_router(phonebuddy_service(), capture2);
-        let bad_sig = format!(
-            "v1={}",
-            brenn_lib::webhook::signature::hmac_sha256_hex(b"bad", body)
-        );
+        let bad_sig = format!("v1={}", brenn_lib::util::hmac_sha256_hex(b"bad", body));
         let resp_mismatch = post_to_endpoint(
             router2,
             body.to_vec(),
@@ -955,7 +949,7 @@ mod tests {
         let capture = CapturingRouter::new();
         svc.set_router(Arc::clone(&capture) as Arc<dyn WebhookEventRouter>);
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (alert_dispatcher, _handle) = AlertDispatcher::noop();
         let mut state = crate::state::AppState::for_test(db, None);
         state.alert_dispatcher = alert_dispatcher;
@@ -988,7 +982,7 @@ mod tests {
         let canonical = format!("v0:{}:{}", stale_t, std::str::from_utf8(body).unwrap());
         let sig = format!(
             "v0={}",
-            brenn_lib::webhook::signature::hmac_sha256_hex(TEST_SECRET, canonical.as_bytes())
+            brenn_lib::util::hmac_sha256_hex(TEST_SECRET, canonical.as_bytes())
         );
 
         let req = Request::builder()
@@ -1043,7 +1037,7 @@ mod tests {
         let failing: Arc<dyn WebhookEventRouter> = Arc::new(FailingRouter);
         svc.set_router(failing);
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (alert_dispatcher, _handle) = AlertDispatcher::noop();
         let mut state = crate::state::AppState::for_test(db, None);
         state.alert_dispatcher = alert_dispatcher;
@@ -1093,7 +1087,7 @@ mod tests {
         let svc = phonebuddy_service();
         svc.set_router(router_trait);
 
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let (alert_dispatcher, _handle) = AlertDispatcher::noop();
         let mut state = crate::state::AppState::for_test(db, None);
         state.alert_dispatcher = alert_dispatcher;
@@ -1160,7 +1154,7 @@ mod tests {
         use crate::webhook_router::WebhookEventRouterImpl;
         use brenn_lib::messaging::ParticipantId;
         use brenn_lib::messaging::WebhookEnvelope;
-        use brenn_lib::messaging::format::{WEBHOOK_SINGLE_HEADING, format_messaging_event_single};
+        use brenn_messaging::format::{WEBHOOK_SINGLE_HEADING, format_messaging_event_single};
 
         // Use TEST_APP_SLUG ("pa-alice") — phonebuddy_endpoint() hardcodes it as owning_app_slug.
         let (mut state, db, _user_id) = crate::test_support::state::test_state_with_user_and_app(
@@ -1171,15 +1165,13 @@ mod tests {
         // Wire a real Messenger with the webhook: channel and TEST_APP_SLUG as subscriber.
         let messenger = {
             use brenn_lib::messaging::{
-                ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntry,
-                SubscriberEntryKind, WEBHOOK_ADDRESS_PREFIX,
-                config::{
-                    Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel,
-                    ResolvedMessagingConfig, ResolvedSubscription, Sink,
-                },
-                db::upsert_channels,
+                ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, NoiseLevel,
+                ResolvedChannel, ResolvedMessagingConfig, ResolvedSubscription, Sink,
+                SubscriberEntry, SubscriberEntryKind, WEBHOOK_ADDRESS_PREFIX,
                 webhook_channel_uuid_from_slug,
             };
+            use brenn_messaging::config::Depth;
+            use brenn_messaging_store::db::upsert_channels;
             use indexmap::IndexMap;
 
             let channel_uuid = webhook_channel_uuid_from_slug(TEST_SLUG);
@@ -1218,9 +1210,9 @@ mod tests {
                 TEST_APP_SLUG,
             );
             app_cfg.allowed_users = vec!["alice".to_string()];
-            // Delivery-time ACL gate (design §2.2 Point A): cover the webhook channel.
+            // Delivery-time ACL gate: cover the webhook channel.
             app_cfg.policy =
-                crate::test_support::app_config::delivery_policy_for_addresses([address.as_str()]);
+                brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address.as_str()]);
             app_cfg.messaging = Some(ResolvedMessagingConfig {
                 send_budget: 100,
                 subscriptions: vec![ResolvedSubscription {
@@ -1235,13 +1227,13 @@ mod tests {
             let mut apps_raw: IndexMap<String, brenn_lib::config::AppConfig> = IndexMap::new();
             apps_raw.insert(TEST_APP_SLUG.to_string(), app_cfg);
 
-            brenn_lib::messaging::Messenger::new(
+            brenn_messaging::Messenger::new(
                 db.clone(),
                 directory,
                 Arc::from("e2e-test"),
                 Arc::new(apps_raw),
-                Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-                    as Arc<dyn brenn_lib::messaging::WakeRouter>,
+                Arc::new(brenn_messaging::query::NoopWakeRouter)
+                    as Arc<dyn brenn_messaging::WakeRouter>,
                 MessagingGlobalConfig::default(),
             )
         };
@@ -1270,7 +1262,7 @@ mod tests {
 
         let real_impl = Arc::new(WebhookEventRouterImpl::new());
         svc.set_router(
-            Arc::clone(&real_impl) as Arc<dyn brenn_lib::webhook::service::WebhookEventRouter>
+            Arc::clone(&real_impl) as Arc<dyn brenn_webhook::service::WebhookEventRouter>
         );
 
         // Fill in state on the WebhookEventRouterImpl BEFORE any request.
@@ -1320,8 +1312,7 @@ mod tests {
         };
         let subscriber = ParticipantId::for_conversation(conversation_id);
 
-        let owed =
-            brenn_lib::messaging::testutils::owed_everywhere(&messenger_ref, &subscriber).await;
+        let owed = brenn_messaging::testutils::owed_everywhere(&messenger_ref, &subscriber).await;
 
         assert_eq!(owed.len(), 1, "exactly one message owed to the subscriber");
         let envelope = &owed[0].1;
@@ -1467,7 +1458,7 @@ mod tests {
             let router_trait: Arc<dyn WebhookEventRouter> = Arc::clone(&capture) as _;
             svc.set_router(router_trait);
 
-            let db2 = brenn_lib::db::init_db_memory();
+            let db2 = crate::test_support::init_db_memory();
             let (alert_dispatcher, _handle) = AlertDispatcher::noop();
             let mut state = crate::state::AppState::for_test(db2, None);
             state.alert_dispatcher = alert_dispatcher;
@@ -1511,7 +1502,7 @@ mod tests {
             let router_trait: Arc<dyn WebhookEventRouter> = Arc::clone(&capture) as _;
             svc.set_router(router_trait);
 
-            let db2 = brenn_lib::db::init_db_memory();
+            let db2 = crate::test_support::init_db_memory();
             let (alert_dispatcher, _handle) = AlertDispatcher::noop();
             let mut state = crate::state::AppState::for_test(db2, None);
             state.alert_dispatcher = alert_dispatcher;
@@ -2340,7 +2331,7 @@ mod tests {
         #[tokio::test]
         async fn quota_hit_fires_warning_alert() {
             use brenn_cal::ms_to_sent_at;
-            use brenn_lib::obs::alerting::{AlertSeverity, make_capturing_alerter_with_severity};
+            use brenn_obs::alerting::{AlertSeverity, make_capturing_alerter_with_severity};
 
             // 24 pages = 96 KiB. Small enough to fill quickly (the replay component
             // inserts 2 rows per request: one in last_ns, one in the nonce namespace).
@@ -2366,7 +2357,7 @@ mod tests {
             let svc = phonebuddy_service();
             svc.set_router(Arc::clone(&capture) as Arc<dyn WebhookEventRouter>);
 
-            let db2 = brenn_lib::db::init_db_memory();
+            let db2 = crate::test_support::init_db_memory();
             let mut state = crate::state::AppState::for_test(db2, None);
             state.alert_dispatcher = dispatcher;
             state.webhook = Some(svc.clone());
@@ -2531,7 +2522,7 @@ mod tests {
             let mut canonical = t_str.as_bytes().to_vec();
             canonical.push(b'.');
             canonical.extend_from_slice(body);
-            let hex = brenn_lib::webhook::signature::hmac_sha256_hex(TEST_SECRET, &canonical);
+            let hex = brenn_lib::util::hmac_sha256_hex(TEST_SECRET, &canonical);
             let sig = format!("v1={hex}");
             (t_str, sig)
         }
@@ -2557,7 +2548,7 @@ mod tests {
             let svc = WebhookService::new(vec![(PUSH_SLUG.to_string(), push_endpoint())]);
             svc.set_router(Arc::clone(&capture) as Arc<dyn WebhookEventRouter>);
 
-            let db2 = brenn_lib::db::init_db_memory();
+            let db2 = crate::test_support::init_db_memory();
             let (alert_dispatcher, _handle) = AlertDispatcher::noop();
             let mut state = crate::state::AppState::for_test(db2, None);
             state.alert_dispatcher = alert_dispatcher;

@@ -1,6 +1,6 @@
 //! `WebhookEventRouterImpl` — inbound webhook delivery adapter.
 //!
-//! Implements `brenn_lib::webhook::WebhookEventRouter` against `AppState` + `Db`.
+//! Implements `brenn_webhook::WebhookEventRouter` against `AppState` + `Db`.
 //! Uses the same deferred-state pattern as `MqttEventRouterImpl`:
 //! the `AppState` is not yet constructed when the webhook service is created, so
 //! we stash a `OnceCell<RouterState>` and call `set_state` after `AppState`
@@ -19,8 +19,8 @@ use std::time::SystemTime;
 use axum::http::HeaderMap;
 use brenn_lib::messaging::{SubscriberEntryKind, Urgency, WEBHOOK_ADDRESS_PREFIX, WebhookEnvelope};
 use brenn_lib::webhook::config::WebhookOwner;
-use brenn_lib::webhook::service::WebhookEventRouter;
-use brenn_lib::webhook::signature::SignatureScheme;
+use brenn_lib::webhook::scheme::SignatureScheme;
+use brenn_webhook::service::WebhookEventRouter;
 use tokio::sync::OnceCell;
 
 use crate::state::AppState;
@@ -33,6 +33,12 @@ struct RouterState {
 /// Concrete `WebhookEventRouter` impl. Closes over `AppState` (via `OnceCell`).
 pub struct WebhookEventRouterImpl {
     inner: OnceCell<RouterState>,
+}
+
+impl Default for WebhookEventRouterImpl {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WebhookEventRouterImpl {
@@ -279,15 +285,15 @@ mod tests {
 
     use axum::http::HeaderMap;
     use brenn_lib::messaging::{
-        ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntry, SubscriberEntryKind,
-        Urgency, WEBHOOK_ADDRESS_PREFIX, WakeMin,
-        config::{Depth, MessagingGlobalConfig, NoiseLevel, ResolvedChannel, Sink},
-        db::upsert_channels,
-        webhook_channel_uuid_from_slug,
+        ChannelEntry, ChannelScheme, MessagingDirectory, MessagingGlobalConfig, NoiseLevel,
+        ResolvedChannel, SubscriberEntry, SubscriberEntryKind, Urgency, WEBHOOK_ADDRESS_PREFIX,
+        WakeMin, webhook_channel_uuid_from_slug,
     };
     use brenn_lib::webhook::config::ResolvedWebhookEndpoint;
-    use brenn_lib::webhook::service::WebhookService;
-    use brenn_lib::webhook::signature::{HexFormat, SignatureAlgorithm, SignatureScheme};
+    use brenn_lib::webhook::scheme::{HexFormat, SignatureAlgorithm, SignatureScheme};
+    use brenn_messaging::config::{Depth, Sink};
+    use brenn_messaging_store::db::upsert_channels;
+    use brenn_webhook::service::WebhookService;
     use indexmap::IndexMap;
 
     use super::*;
@@ -335,9 +341,9 @@ mod tests {
     /// Build a `Messenger` with one `webhook:` channel derived from `endpoint_slug`.
     /// The channel has no subscribers (zero push targets — used for envelope-level tests).
     fn messenger_with_webhook_channel(
-        db: brenn_lib::db::Db,
+        db: brenn_db::Db,
         endpoint_slug: &str,
-    ) -> Arc<brenn_lib::messaging::Messenger> {
+    ) -> Arc<brenn_messaging::Messenger> {
         let channel_uuid = webhook_channel_uuid_from_slug(endpoint_slug);
         let address = format!("{WEBHOOK_ADDRESS_PREFIX}{endpoint_slug}");
         let entry = ChannelEntry {
@@ -362,24 +368,24 @@ mod tests {
             upsert_channels(&conn, std::slice::from_ref(&entry));
         }
         let directory = Arc::new(MessagingDirectory::with_entries(vec![entry]));
-        brenn_lib::messaging::Messenger::new(
+        brenn_messaging::Messenger::new(
             db,
             directory,
             Arc::from("webhook-test"),
             Arc::new(IndexMap::new()),
-            Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-                as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(brenn_messaging::query::NoopWakeRouter)
+                as Arc<dyn brenn_messaging::WakeRouter>,
             MessagingGlobalConfig::default(),
         )
     }
 
     /// Build a `Messenger` with one `webhook:` channel and one subscriber conversation.
     fn messenger_with_webhook_channel_and_subscriber(
-        db: brenn_lib::db::Db,
+        db: brenn_db::Db,
         endpoint_slug: &str,
         app_slug: &str,
         allowed_users: Vec<String>,
-    ) -> Arc<brenn_lib::messaging::Messenger> {
+    ) -> Arc<brenn_messaging::Messenger> {
         use brenn_lib::messaging::config::{ResolvedMessagingConfig, ResolvedSubscription};
 
         let channel_uuid = webhook_channel_uuid_from_slug(endpoint_slug);
@@ -417,9 +423,9 @@ mod tests {
         let mut app_cfg =
             crate::test_support::app_config::default_test_app_config(app_slug, app_slug);
         app_cfg.allowed_users = allowed_users;
-        // Delivery-time ACL gate (design §2.2 Point A): cover the webhook channel.
+        // Delivery-time ACL gate: cover the webhook channel.
         app_cfg.policy =
-            crate::test_support::app_config::delivery_policy_for_addresses([address.as_str()]);
+            brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address.as_str()]);
         app_cfg.messaging = Some(ResolvedMessagingConfig {
             send_budget: 100,
             subscriptions: vec![ResolvedSubscription {
@@ -433,13 +439,13 @@ mod tests {
         });
         let mut apps_raw: IndexMap<String, brenn_lib::config::AppConfig> = IndexMap::new();
         apps_raw.insert(app_slug.to_string(), app_cfg);
-        brenn_lib::messaging::Messenger::new(
+        brenn_messaging::Messenger::new(
             db,
             directory,
             Arc::from("webhook-test"),
             Arc::new(apps_raw),
-            Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-                as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(brenn_messaging::query::NoopWakeRouter)
+                as Arc<dyn brenn_messaging::WakeRouter>,
             MessagingGlobalConfig::default(),
         )
     }
@@ -451,11 +457,11 @@ mod tests {
     /// delivery gate admits it; `false` leaves `webhook_acl` empty so the gate denies
     /// at runtime (the operator-forgot-the-ACL case, exercised post-boot).
     fn messenger_with_webhook_channel_and_wasm_subscriber(
-        db: brenn_lib::db::Db,
+        db: brenn_db::Db,
         endpoint_slug: &str,
         wasm_slug: &str,
         covering: bool,
-    ) -> Arc<brenn_lib::messaging::Messenger> {
+    ) -> Arc<brenn_messaging::Messenger> {
         let channel_uuid = webhook_channel_uuid_from_slug(endpoint_slug);
         let address = format!("{WEBHOOK_ADDRESS_PREFIX}{endpoint_slug}");
         let entry = crate::test_support::wasm::wasm_subscriber_channel_entry(
@@ -911,7 +917,7 @@ mod tests {
             urgency: brenn_lib::messaging::Urgency::Normal,
             replay_protection: None,
         });
-        state.webhook = Some(brenn_lib::webhook::service::WebhookService::new(vec![(
+        state.webhook = Some(brenn_webhook::service::WebhookService::new(vec![(
             "ep-test".to_string(),
             endpoint,
         )]));
@@ -1021,9 +1027,9 @@ mod tests {
         let mut app_cfg =
             crate::test_support::app_config::default_test_app_config("myapp", "myapp");
         app_cfg.allowed_users = vec!["alice".to_string()];
-        // Delivery-time ACL gate (design §2.2 Point A): cover the webhook channel.
+        // Delivery-time ACL gate: cover the webhook channel.
         app_cfg.policy =
-            crate::test_support::app_config::delivery_policy_for_addresses([address.as_str()]);
+            brenn_lib::access::test_fixtures::delivery_policy_for_addresses([address.as_str()]);
         app_cfg.messaging = Some(ResolvedMessagingConfig {
             send_budget: 0, // zero budget — must not block host-originated ingress
             subscriptions: vec![ResolvedSubscription {
@@ -1037,13 +1043,13 @@ mod tests {
         });
         let mut apps_raw: IndexMap<String, brenn_lib::config::AppConfig> = IndexMap::new();
         apps_raw.insert("myapp".to_string(), app_cfg);
-        let messenger = brenn_lib::messaging::Messenger::new(
+        let messenger = brenn_messaging::Messenger::new(
             db.clone(),
             directory,
             Arc::from("webhook-test"),
             Arc::new(apps_raw),
-            Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-                as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(brenn_messaging::query::NoopWakeRouter)
+                as Arc<dyn brenn_messaging::WakeRouter>,
             MessagingGlobalConfig::default(),
         );
         state.messenger = Some(messenger);
@@ -1104,7 +1110,7 @@ mod tests {
             urgency: brenn_lib::messaging::Urgency::Normal,
             replay_protection: None,
         });
-        state.webhook = Some(brenn_lib::webhook::service::WebhookService::new(vec![(
+        state.webhook = Some(brenn_webhook::service::WebhookService::new(vec![(
             "ep-bearer".to_string(),
             endpoint,
         )]));

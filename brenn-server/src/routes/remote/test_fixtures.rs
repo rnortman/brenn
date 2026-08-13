@@ -10,17 +10,17 @@
 use std::sync::{Arc, Mutex};
 
 use brenn_envelope::chat::chat_roster_bare_name;
-use brenn_lib::db;
-use brenn_lib::messaging::chat_roster::CHAT_ROSTER_COMPONENT;
 use brenn_lib::messaging::config::{AttachSendBudget, MessagingGlobalConfig};
 use brenn_lib::messaging::remote::{RemoteConfigRaw, resolve_remotes};
-use brenn_lib::messaging::store::RingStores;
-use brenn_lib::messaging::system::{SystemParticipantSpec, registrations_from_specs};
 use brenn_lib::messaging::{
-    AttachScope, ChannelEntry, MessagingDirectory, Messenger, SubscriberEntryKind,
-    SubscriberRegistration, WakeEconomics, WakeRouter, attach_principal_budgets,
+    AttachScope, ChannelEntry, MessagingDirectory, SubscriberEntryKind, SubscriberRegistration,
+    WakeEconomics,
 };
-use brenn_lib::obs::alerting::AlertDispatcher;
+use brenn_messaging::chat_roster::CHAT_ROSTER_COMPONENT;
+use brenn_messaging::system::{SystemParticipantSpec, registrations_from_specs};
+use brenn_messaging::{Messenger, WakeRouter, attach_principal_budgets};
+use brenn_messaging_store::store::RingStores;
+use brenn_obs::alerting::AlertDispatcher;
 
 use crate::state::AppState;
 use crate::test_support::state::test_state_with_capturing_alerter;
@@ -101,7 +101,7 @@ fn write_token() -> tempfile::NamedTempFile {
 }
 
 /// Build the rig around one `[[remote]]` body, with no channels provisioned.
-pub(crate) async fn remote_harness(db: &db::Db, body: &str) -> RemoteTestHarness {
+pub(crate) async fn remote_harness(db: &brenn_db::Db, body: &str) -> RemoteTestHarness {
     remote_harness_with_channels(db, body, vec![]).await
 }
 
@@ -113,7 +113,7 @@ pub(crate) async fn remote_harness(db: &db::Db, body: &str) -> RemoteTestHarness
 /// channel present in one half and absent from the other is a panic rather than
 /// a test failure.
 pub(crate) async fn remote_harness_with_channels(
-    db: &db::Db,
+    db: &brenn_db::Db,
     body: &str,
     entries: Vec<ChannelEntry>,
 ) -> RemoteTestHarness {
@@ -128,7 +128,7 @@ pub(crate) async fn remote_harness_with_channels(
         .partition(|entry| !entry.capabilities().durable);
     {
         let conn = db.lock().await;
-        brenn_lib::messaging::db::upsert_channels(&conn, &durable);
+        brenn_messaging_store::db::upsert_channels(&conn, &durable);
     }
 
     let router = Arc::new(crate::messaging_router::WakeRouterImpl::new(
@@ -193,7 +193,7 @@ pub(crate) async fn remote_harness_with_channels(
     let (mut state, alerts, _drainer) = test_state_with_capturing_alerter(db);
     let flusher = state.alert_dispatcher.clone();
     state.messenger = Some(Arc::clone(&messenger));
-    state.remotes = Arc::new(super::build_remote_runtimes(
+    state.remotes = Arc::new(brenn_remote_server::build_remote_runtimes(
         &resolved,
         Some(&messenger),
         TEST_MAX_BODY_BYTES,

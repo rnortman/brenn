@@ -1,0 +1,53 @@
+[package]
+name = "brenn-messaging-boot"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+# Exposes the boot fixtures the composition root's own suites build on.
+testutils = [
+    "brenn-db/testutils",
+    "brenn-lib/testutils",
+    "brenn-messaging/testutils",
+    "brenn-server/testutils",
+    "brenn-surface-server/testutils",
+    "brenn-tool-registry/testutils",
+]
+
+[dependencies]
+brenn-budget = { version = "0.1.0", path = "../brenn-budget" }
+brenn-db = { version = "0.1.0", path = "../brenn-db" }
+brenn-envelope = { path = "../brenn-envelope" }
+brenn-lib = { version = "0.1.0", path = "../brenn-lib" }
+brenn-messaging = { version = "0.1.0", path = "../brenn-messaging" }
+brenn-messaging-store = { version = "0.1.0", path = "../brenn-messaging-store" }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
+brenn-server = { version = "0.1.0", path = "../brenn-server" }
+brenn-surface-contract = { version = "0.1.0", path = "../surface/contract" }
+brenn-surface-schema = { version = "0.1.0", path = "../surface/schema" }
+brenn-surface-server = { version = "0.1.0", path = "../surface/server" }
+brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry" }
+indexmap = "2"
+tokio = { version = "1.50.0", features = ["full"] }
+tracing = "0.1.44"
+uuid = { version = "1.23.0", features = ["v4"] }
+
+[dev-dependencies]
+brenn-db = { version = "0.1.0", path = "../brenn-db", features = ["testutils"] }
+brenn-lib = { version = "0.1.0", path = "../brenn-lib", features = ["testutils"] }
+brenn-messaging = { version = "0.1.0", path = "../brenn-messaging", features = ["testutils"] }
+brenn-obs = { version = "0.1.0", path = "../brenn-obs", features = ["testutils"] }
+brenn-server = { version = "0.1.0", path = "../brenn-server", features = ["testutils"] }
+brenn-surface-server = { version = "0.1.0", path = "../surface/server", features = ["testutils"] }
+brenn-tool-registry = { version = "0.1.0", path = "../brenn-tool-registry", features = ["testutils"] }
+async-trait = "0.1.89"
+chrono = "0.4.44"
+rusqlite = "0.39.0"
+serde_json = "1.0.149"
+tempfile = "3.24.0"
+tokio = { version = "1.50.0", features = ["full", "test-util"] }
+toml = "1.1.2"
+# Without `no-env-filter` the subscriber tracing-test installs applies a default
+# env filter and `logs_contain` assertions fail.
+tracing-test = { version = "0.2.6", features = ["no-env-filter"] }

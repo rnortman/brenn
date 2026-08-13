@@ -22,8 +22,8 @@ pub struct SurfaceDescriptionConfig {
     /// Boot-validated to `5..=3600`.
     ///
     /// **This cadence draws from the bare-identity send budget**
-    /// ([`crate::messaging::publish::SURFACE_SEND_BURST`] /
-    /// [`crate::messaging::publish::SURFACE_SEND_REFILL`]: 256 burst, 4/min
+    /// ([`crate::messaging::config::SURFACE_SEND_BURST`] /
+    /// [`crate::messaging::config::SURFACE_SEND_REFILL`]: 256 burst, 4/min
     /// refill), shared with geometry and error-report publishes. A cadence
     /// faster than the refill outruns the budget once the burst is spent;
     /// refused ticks are dropped, so the cost is staleness. Sizing near the low

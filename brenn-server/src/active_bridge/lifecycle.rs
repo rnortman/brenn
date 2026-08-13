@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use brenn_lib::conversation::{self, ConversationStatus};
-use brenn_lib::ws_types::{CcState, PresenceUser, WsServerMessage};
+use brenn_db::conversation::{self, ConversationStatus};
+use brenn_ws_types::{CcState, PresenceUser, WsServerMessage};
 use tracing::{debug, info, warn};
 
 use super::ActiveBridge;
@@ -449,9 +449,9 @@ impl ActiveBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::init_db_memory;
     use brenn_cc::protocol::incoming::ResultMessage;
     use brenn_cc::session::SessionEvent;
-    use brenn_lib::db::init_db_memory;
     use tokio::sync::broadcast;
 
     use super::super::test_fixtures::TestBridgeConfig;
@@ -459,7 +459,7 @@ mod tests {
         await_fence, drain_broadcast, event_fence, install_failing_session, recv_broadcast,
         test_bridge, test_bridge_with_config,
     };
-    use brenn_lib::obs::alerting::noop_alert_dispatcher;
+    use brenn_obs::alerting::noop_alert_dispatcher;
     use tokio::sync::mpsc;
 
     /// Helper: create a test bridge with persistent mode and a given idle timeout.
@@ -540,13 +540,13 @@ mod tests {
 
     #[tokio::test]
     async fn kill_session_drops_and_removes_from_registry() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let active_bridges = ActiveBridges::new();
         let (broadcast_tx, _rx) = broadcast::channel(64);
 
         let user_id = {
             let conn = db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "testuser", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&conn, "testuser", "$argon2id$fake")
         };
         let conv_id = {
             let conn = db.lock().await;
@@ -571,13 +571,13 @@ mod tests {
 
     #[tokio::test]
     async fn kill_session_idempotent() {
-        let db = brenn_lib::db::init_db_memory();
+        let db = crate::test_support::init_db_memory();
         let active_bridges = ActiveBridges::new();
         let (broadcast_tx, _rx) = broadcast::channel(64);
 
         let user_id = {
             let conn = db.lock().await;
-            brenn_lib::auth::user::create_user(&conn, "testuser", "$argon2id$fake")
+            brenn_db::auth::user::create_user(&conn, "testuser", "$argon2id$fake")
         };
         let conv_id = {
             let conn = db.lock().await;

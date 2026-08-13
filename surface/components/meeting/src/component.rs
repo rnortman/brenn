@@ -349,7 +349,7 @@ fn render(host: &HtmlElement, panel: &Panel, view: &Recompute) {
 }
 
 /// Browser-DOM tests for the connect path, run under wasm-bindgen-test via
-/// `make surface-wasm-test`. wasm32-only, matching the crate's wasm-gated glue.
+/// the browser test runner. wasm32-only, matching the crate's wasm-gated glue.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
     use super::*;

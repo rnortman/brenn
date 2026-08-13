@@ -1,55 +1,15 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use brenn_lib::config::{AccessLevel, AppConfig, PathMapper};
+use brenn_lib::config::{AppConfig, test_app_config};
+use brenn_lib::messaging::config::ResolvedMessagingConfig;
+use brenn_lib::webhook::ResolvedWebhookSubscription;
 use indexmap::IndexMap;
 
-/// Build a minimal `AppConfig` with the given slug and display name,
-/// plus default-shape values for everything else. Used by
-/// `test_apps()` and `test_apps_multi()` so the struct literal
-/// only lives in one place.
-pub(crate) fn default_test_app_config(slug: &str, name: &str) -> AppConfig {
+/// The shared minimal `AppConfig`, with a display name distinct from the slug.
+pub fn default_test_app_config(slug: &str, name: &str) -> AppConfig {
     AppConfig {
-        slug: slug.to_string(),
         name: name.to_string(),
-        description: String::new(),
-        icon: String::new(),
-        working_dir: PathBuf::from("."),
-        model: "sonnet".to_string(),
-        single_instance: false,
-        singleton: false,
-        persistent: false,
-        idle_timeout: None,
-        compaction: None,
-        idle_hook_secs: 0,
-        allowed_users: vec![],
-        disabled_tools: vec![],
-        mcp_servers: HashMap::new(),
-        multiuser: false,
-        prefix_username: false,
-        prefix_timestamp: false,
-        prefix_device: true,
-        path_mapper: PathMapper::Identity,
-        container_spawn: None,
-        start_hooks: brenn_lib::config::StartHooksConfig::default(),
-        post_pull_hooks: brenn_lib::config::PostPullHooksConfig::default(),
-        startup_hooks: brenn_lib::config::StartupHooksConfig::default(),
-        cc_extra_args: vec![],
-        approval_rules: vec![],
-        attachment_targets: vec![],
-        integrations: HashMap::new(),
-        mounts: vec![],
-        history_replay_limit: 2000,
-        frontmatter: brenn_lib::config::FrontmatterRenderConfig::default(),
-        state_dir: PathBuf::from("/tmp/.brenn/test-state"),
-        messaging: None,
-        messaging_default_send_budget: 100,
-        policy: brenn_lib::access::AppPolicy::default(),
-        pwa_push: None,
-        webhook_subscriptions: vec![],
-        mqtt_subscriptions: vec![],
-        chat_harness_policy: brenn_lib::access::AppPolicy::default(),
+        ..test_app_config(slug)
     }
 }
 
@@ -62,7 +22,7 @@ pub(crate) fn default_test_app_config(slug: &str, name: &str) -> AppConfig {
 /// while keeping the policy production-shaped (each matcher resolves cleanly,
 /// unlike a `Prefix("")` catch-all which resolution rejects). `webhook` is empty;
 /// webhook-gate coverage uses targeted policies built inline by those tests.
-pub(crate) fn mqtt_acl_policy(client: &str, filter: &str) -> brenn_lib::access::AppPolicy {
+pub fn mqtt_acl_policy(client: &str, filter: &str) -> brenn_lib::access::AppPolicy {
     use brenn_lib::access::AppCapability;
     use brenn_lib::access::acl::{AclSet, ChannelMatcher, MqttSubMatcher};
 
@@ -91,105 +51,8 @@ pub(crate) fn mqtt_acl_policy(client: &str, filter: &str) -> brenn_lib::access::
     policy
 }
 
-/// Build an `AppPolicy` that authorizes *delivery* on each given channel address
-/// — the delivery-time ACL gate requires every subscriber's policy to cover the
-/// channel it reads. For each address, insert the transport grant its scheme
-/// gates on and an exact covering matcher.
-/// `DynamicSubscribe` is intentionally **not** granted — delivery authorization
-/// must not depend on the runtime-tool grant. A malformed address panics (test
-/// fixtures pass valid addresses).
-pub(crate) fn delivery_policy_for_addresses<'a>(
-    addresses: impl IntoIterator<Item = &'a str>,
-) -> brenn_lib::access::AppPolicy {
-    use brenn_lib::access::AppCapability;
-    use brenn_lib::access::acl::{ChannelMatcher, MqttSubMatcher, WebhookMatcher};
-    use brenn_lib::messaging::ChannelScheme;
-
-    let mut policy = brenn_lib::access::AppPolicy::default();
-    for address in addresses {
-        match ChannelScheme::split(address) {
-            Some((ChannelScheme::Mqtt, _)) => {
-                let parsed = brenn_lib::mqtt::address::parse_mqtt_address(address)
-                    .expect("delivery_policy_for_addresses: valid mqtt address");
-                policy.grants.insert(AppCapability::MqttSubscribe);
-                policy.acls.mqtt_subscribe.push(MqttSubMatcher {
-                    client: parsed.client,
-                    topic_filter: parsed.topic,
-                });
-            }
-            Some((ChannelScheme::Brenn, channel)) => {
-                policy.grants.insert(AppCapability::MessagingSubscribe);
-                policy
-                    .acls
-                    .brenn_subscribe
-                    .push(ChannelMatcher::Exact(channel.to_string()));
-            }
-            Some((ChannelScheme::Webhook, endpoint)) => {
-                policy.grants.insert(AppCapability::Webhook);
-                policy.acls.webhook.push(WebhookMatcher {
-                    endpoint: endpoint.to_string(),
-                });
-            }
-            // Ephemeral and local delivery gate on their own transport grants,
-            // not on `MessagingSubscribe` — a ring-backed input needs the right
-            // one or the delivery-time gate denies it.
-            Some((ChannelScheme::Ephemeral, channel)) => {
-                policy.grants.insert(AppCapability::EphemeralSubscribe);
-                policy
-                    .acls
-                    .ephemeral_subscribe
-                    .push(ChannelMatcher::Exact(channel.to_string()));
-            }
-            Some((ChannelScheme::Local, channel)) => {
-                policy.grants.insert(AppCapability::LocalSubscribe);
-                policy
-                    .acls
-                    .local_subscribe
-                    .push(ChannelMatcher::Exact(channel.to_string()));
-            }
-            Some((ChannelScheme::PwaPush, _)) | None => {
-                panic!("delivery_policy_for_addresses: unrecognized address prefix in {address:?}");
-            }
-        }
-    }
-    policy
-}
-
-/// Build a `wasm_policies` map (slug → delivery policy) from a set of channel
-/// entries: each `Wasm(slug)` subscriber gets a policy authorizing delivery on
-/// *every* channel address it subscribes to (design §2.2 Point A — the
-/// delivery-time ACL gate now denies any `Wasm` subscriber whose policy does not
-/// cover the channel). Derived directly from the fixture's own entries so the
-/// policy always matches the wiring. Wraps `delivery_policy_for_addresses`; lives
-/// here (next to that leaf) so every `brenn`-crate test family that wires `Wasm`
-/// subscribers can share it instead of hand-rolling the per-entry logic inline.
-pub(crate) fn wasm_policies_from_entries(
-    entries: &[brenn_lib::messaging::ChannelEntry],
-) -> HashMap<String, brenn_lib::access::AppPolicy> {
-    use brenn_lib::messaging::SubscriberEntryKind;
-
-    let mut by_slug: HashMap<String, Vec<String>> = HashMap::new();
-    for entry in entries {
-        for sub in &entry.subscribers {
-            if let SubscriberEntryKind::Wasm(slug) = &sub.kind {
-                by_slug
-                    .entry(slug.clone())
-                    .or_default()
-                    .push(entry.address.clone());
-            }
-        }
-    }
-    by_slug
-        .into_iter()
-        .map(|(slug, addrs)| {
-            let policy = delivery_policy_for_addresses(addrs.iter().map(|a| a.as_str()));
-            (slug, policy)
-        })
-        .collect()
-}
-
 /// Create a default test app registry with a single "test" app.
-pub(crate) fn test_apps() -> Arc<IndexMap<String, AppConfig>> {
+pub fn test_apps() -> Arc<IndexMap<String, AppConfig>> {
     let mut apps = IndexMap::new();
     apps.insert(
         "test".to_string(),
@@ -200,7 +63,7 @@ pub(crate) fn test_apps() -> Arc<IndexMap<String, AppConfig>> {
 
 /// Create a multi-app registry from a list of slugs. Each app's
 /// display name is `"<slug> app"`.
-pub(crate) fn test_apps_multi(slugs: &[&str]) -> Arc<IndexMap<String, AppConfig>> {
+pub fn test_apps_multi(slugs: &[&str]) -> Arc<IndexMap<String, AppConfig>> {
     let mut apps = IndexMap::new();
     for slug in slugs {
         apps.insert(
@@ -211,44 +74,24 @@ pub(crate) fn test_apps_multi(slugs: &[&str]) -> Arc<IndexMap<String, AppConfig>
     Arc::new(apps)
 }
 
-/// Build a minimal AppConfig for `select_clone_container` tests.
-/// Only fields that matter: `slug`, `container_spawn`, `mounts`.
-pub(crate) fn clone_test_app(
+/// Minimal `AppConfig` for composition-level test fixtures: a singleton app
+/// under `/tmp` with one allowed user, an unset model, and a short replay
+/// window.
+pub fn minimal_app_config(
     slug: &str,
-    container_spawn: Option<brenn_lib::config::ContainerSpawnConfig>,
-    mounts: Vec<brenn_lib::config::ResolvedMount>,
+    messaging: Option<ResolvedMessagingConfig>,
+    webhook_subscriptions: Vec<ResolvedWebhookSubscription>,
 ) -> AppConfig {
-    let mut cfg = default_test_app_config(slug, slug);
-    cfg.container_spawn = container_spawn;
-    cfg.mounts = mounts;
-    cfg
-}
-
-pub(crate) fn clone_test_mount(
-    slug: &str,
-    access: AccessLevel,
-) -> brenn_lib::config::ResolvedMount {
-    brenn_lib::config::ResolvedMount {
-        slug: slug.into(),
-        host_path: PathBuf::from(format!("/tmp/{slug}")),
-        container_path: Some(PathBuf::from(format!("/home/user/repos/{slug}"))),
-        access,
-        auto_pull: false,
-        is_working_dir: false,
-        primary: false,
-    }
-}
-
-pub(crate) fn clone_test_container(home: &str) -> brenn_lib::config::ContainerSpawnConfig {
-    brenn_lib::config::ContainerSpawnConfig {
-        image: "brenn-cc:latest".into(),
-        home_dir: PathBuf::from(home),
-        container_home: PathBuf::from("/home/user"),
-        host_working_dir: PathBuf::from("/tmp/workdir"),
-        container_working_dir: PathBuf::from("/home/user/workdir"),
-        working_dir_is_repo: false,
-        repo_mounts: vec![],
-        extra_mounts: vec![],
-        extra_args: vec![],
+    AppConfig {
+        working_dir: std::path::PathBuf::from("/tmp"),
+        model: String::new(),
+        singleton: true,
+        prefix_device: false,
+        allowed_users: vec!["alice".to_string()],
+        history_replay_limit: 100,
+        state_dir: std::path::PathBuf::from("/tmp"),
+        messaging,
+        webhook_subscriptions,
+        ..test_app_config(slug)
     }
 }

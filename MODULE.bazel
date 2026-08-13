@@ -273,10 +273,10 @@ node.toolchain(node_version = NODE_VERSION)
 # One npm tree per package.json. `surface` and `frontend` are Bazel's; `e2e`
 # drives real browsers and stays outside the build graph.
 #
-# rules_js consumes a pnpm lockfile, so each tree's `pnpm-lock.yaml` is
-# committed beside the npm lockfile the make lane installs from. Both derive
-# from the same `package.json`, and xtask's sync guard holds the versions they
-# resolve equal for every pin the build records or reruns.
+# rules_js consumes a pnpm lockfile, so each tree's `pnpm-lock.yaml` is the
+# lockfile the build installs from and the only one that decides what ships.
+# `make npm-audit` audits it, and xtask's sync guard holds the pins the build
+# records or reruns against it.
 npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
 npm.npm_translate_lock(
     name = "surface_npm",

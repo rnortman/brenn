@@ -33,7 +33,7 @@ serde_json = "1.0.149"
 brenn-surface-test-fixtures = { path = "../../test-fixtures" }
 
 # Browser-level tests for the activation glue (component.rs) run under
-# wasm-bindgen-test via `make surface-wasm-test`; wasm32-only so the host
+# wasm-bindgen-test in a real browser; wasm32-only so the host
 # `cargo test` sweep never pulls them. js-sys drives the kernel-playing harness.
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 js-sys = { workspace = true }

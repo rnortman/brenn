@@ -136,8 +136,8 @@ def _help_sidecar(kind, crate_name, artifact, edition):
 
     The output is named for the artifact, which is both what the asset tree
     serves it as (so the staging rule renames nothing) and what keeps it from
-    colliding with the committed `help.md` in the same package, which the make
-    lane and the drift gate still read.
+    colliding with the committed `help.md` in the same package, which the drift
+    gate reads.
 
     Args:
         kind: the component's directory name, which names its targets.
@@ -173,8 +173,8 @@ def _help_sidecar(kind, crate_name, artifact, edition):
         tools = [":" + kind + "_help_gen"],
     )
 
-    # The committed copy is still the make lane's input and this cycle's drift
-    # gate reads it, so the two have to be the same bytes. The component's own
+    # The committed copy is the drift gate's fixture, so it and the generated
+    # file have to be the same bytes. The component's own
     # `help_sidecar_matches_generator` test already pins the committed copy to
     # `help_markdown()`; this pins the generated file to the committed copy, so
     # a capture that mangled the bytes cannot reach the served tree quietly.

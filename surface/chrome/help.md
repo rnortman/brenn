@@ -1,4 +1,4 @@
-<!-- AUTO-GENERATED from this component's src/help.rs. Do not edit; run `make regen-surface-help`. -->
+<!-- AUTO-GENERATED from this component's src/help.rs. Do not edit. -->
 # chrome
 
 The in-tree default chrome component. Chrome owns the page's layout, connection

@@ -4,11 +4,10 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use brenn_lib::auth::password::hash_password;
-use brenn_lib::auth::session::Session;
-use brenn_lib::auth::session::create_session;
-use brenn_lib::auth::user::{User, create_user};
-use brenn_lib::db;
+use brenn_db::auth::password::hash_password;
+use brenn_db::auth::session::Session;
+use brenn_db::auth::session::create_session;
+use brenn_db::auth::user::{User, create_user};
 
 use crate::client_ip::ClientIp;
 use crate::state::AppState;
@@ -16,17 +15,17 @@ use crate::state::AppState;
 /// Canonical username created by `setup_authenticated_user`. Any test that
 /// prefills registry state for that same authenticated user references this
 /// constant so the join is a named coupling, not a repeated literal.
-pub(crate) const TEST_USERNAME: &str = "testuser";
+pub const TEST_USERNAME: &str = "testuser";
 
 /// Helper: collect response body as string.
-pub(crate) async fn body_string(body: Body) -> String {
+pub async fn body_string(body: Body) -> String {
     use http_body_util::BodyExt;
     let bytes = body.collect().await.unwrap().to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
 /// Helper: extract the Set-Cookie header value from a response.
-pub(crate) fn get_set_cookie(response: &axum::http::Response<Body>) -> Option<String> {
+pub fn get_set_cookie(response: &axum::http::Response<Body>) -> Option<String> {
     response
         .headers()
         .get("set-cookie")
@@ -34,7 +33,7 @@ pub(crate) fn get_set_cookie(response: &axum::http::Response<Body>) -> Option<St
 }
 
 /// Helper: extract the session token from a Set-Cookie header.
-pub(crate) fn extract_session_token(set_cookie: &str) -> &str {
+pub fn extract_session_token(set_cookie: &str) -> &str {
     set_cookie
         .strip_prefix("brenn_session=")
         .unwrap()
@@ -44,7 +43,7 @@ pub(crate) fn extract_session_token(set_cookie: &str) -> &str {
 }
 
 /// Helper: register a user and return session token + CSRF token.
-pub(crate) async fn setup_authenticated_user(db: &db::Db) -> (String, String) {
+pub async fn setup_authenticated_user(db: &brenn_db::Db) -> (String, String) {
     let conn = db.lock().await;
     let password_hash = hash_password(b"test-password-12chars");
     let user_id = create_user(&conn, TEST_USERNAME, &password_hash);
@@ -55,7 +54,7 @@ pub(crate) async fn setup_authenticated_user(db: &db::Db) -> (String, String) {
 /// Inject a `Session` (fixed test-token / testuser) and `ClientIp` into the
 /// request extensions. Used by middleware unit tests that exercise layers
 /// expecting these extensions to already be present.
-pub(crate) fn inject_extensions(mut req: Request<Body>, user_id: i64, ip: IpAddr) -> Request<Body> {
+pub fn inject_extensions(mut req: Request<Body>, user_id: i64, ip: IpAddr) -> Request<Body> {
     req.extensions_mut().insert(Session {
         token: "test-token".to_string(),
         csrf_token: "test-csrf".to_string(),
@@ -72,7 +71,7 @@ pub(crate) fn inject_extensions(mut req: Request<Body>, user_id: i64, ip: IpAddr
 /// signals graceful shutdown; the serve task then winds down asynchronously and
 /// nothing awaits it, so a dropped handle does not prove the server has stopped
 /// touching shared state.
-pub(crate) struct TestServer {
+pub struct TestServer {
     _shutdown_tx: tokio::sync::oneshot::Sender<()>,
     _serve: tokio::task::JoinHandle<()>,
 }
@@ -86,7 +85,7 @@ pub(crate) struct TestServer {
 /// leaves that test green.
 // TODO(test-task-panic-visibility): make a panicking connection task fail the
 // test that provoked it.
-pub(crate) async fn spawn_test_server(state: AppState) -> (String, TestServer) {
+pub async fn spawn_test_server(state: AppState) -> (String, TestServer) {
     use crate::router::build_router;
     let app =
         build_router(state, None, 0, 2576).into_make_service_with_connect_info::<SocketAddr>();
@@ -118,7 +117,7 @@ pub(crate) async fn spawn_test_server(state: AppState) -> (String, TestServer) {
 /// The cookie-authenticated shorthand over [`ws_upgrade_probe`], which composes
 /// the handshake request. One spelling of that request serves both, so a change
 /// to it cannot leave the two suites probing different things.
-pub(crate) async fn ws_upgrade_status(url: &str, session_token: Option<&str>) -> StatusCode {
+pub async fn ws_upgrade_status(url: &str, session_token: Option<&str>) -> StatusCode {
     let cookie = session_token.map(|token| format!("brenn_session={token}"));
     let extra: Vec<(&str, &str)> = cookie
         .as_deref()
@@ -135,7 +134,7 @@ pub(crate) async fn ws_upgrade_status(url: &str, session_token: Option<&str>) ->
 /// make a byte-identity comparison flap — and is sorted so header ordering does
 /// not enter the comparison either.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct UpgradeProbe {
+pub struct UpgradeProbe {
     pub status: StatusCode,
     pub headers: Vec<(String, String)>,
     pub body: String,
@@ -144,7 +143,7 @@ pub(crate) struct UpgradeProbe {
 /// Send a WS upgrade request carrying arbitrary extra headers and return the
 /// whole observable response. The counterpart of [`ws_upgrade_status`] for
 /// routes that authenticate with something other than the session cookie.
-pub(crate) async fn ws_upgrade_probe(url: &str, extra: &[(&str, &str)]) -> UpgradeProbe {
+pub async fn ws_upgrade_probe(url: &str, extra: &[(&str, &str)]) -> UpgradeProbe {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -187,7 +186,7 @@ pub(crate) async fn ws_upgrade_probe(url: &str, extra: &[(&str, &str)]) -> Upgra
 /// stream. The remote route's counterpart of [`surface_ws_open`]; it calls the
 /// same client-side helper the native bearer connector does, so the header shape
 /// under test is the production one.
-pub(crate) async fn remote_ws_open(
+pub async fn remote_ws_open(
     url: &str,
     token: &str,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
@@ -203,7 +202,7 @@ pub(crate) async fn remote_ws_open(
 /// Convert an `http://` base URL to a `ws://` URL with the given path.
 /// `spawn_test_server` hands back `http://127.0.0.1:<port>`; the
 /// tungstenite client needs `ws://…`. Swaps the scheme.
-pub(crate) fn http_to_ws_url(http_base: &str, path: &str) -> String {
+pub fn http_to_ws_url(http_base: &str, path: &str) -> String {
     let ws_base = http_base.strip_prefix("http://").unwrap();
     format!("ws://{ws_base}{path}")
 }
@@ -211,7 +210,7 @@ pub(crate) fn http_to_ws_url(http_base: &str, path: &str) -> String {
 /// Parse a `spawn_test_server` base URL (`http://<addr>`) into its `SocketAddr`.
 /// One of two sites (alongside `http_to_ws_url`) that knows
 /// `spawn_test_server`'s `http://{addr}` shape.
-pub(crate) fn http_base_addr(http_base: &str) -> SocketAddr {
+pub fn http_base_addr(http_base: &str) -> SocketAddr {
     http_base
         .strip_prefix("http://")
         .expect("the test server hands back an http:// base")
@@ -223,7 +222,7 @@ pub(crate) fn http_base_addr(http_base: &str) -> SocketAddr {
 /// return the first frame the server sends. Uses tokio-tungstenite
 /// so the test can distinguish a Close(3001) from a successful
 /// Welcome text frame.
-pub(crate) async fn ws_connect_first_frame(
+pub async fn ws_connect_first_frame(
     url: &str,
     session_token: &str,
 ) -> tokio_tungstenite::tungstenite::Message {
@@ -239,7 +238,7 @@ pub(crate) async fn ws_connect_first_frame(
 /// live stream so a test can drive the full session (send frames, read
 /// heartbeats, observe teardown). Unlike `ws_connect_first_frame`, the stream
 /// is kept open for the caller.
-pub(crate) async fn surface_ws_open(
+pub async fn surface_ws_open(
     url: &str,
     session_token: &str,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
@@ -255,7 +254,7 @@ pub(crate) async fn surface_ws_open(
 /// Shared body for the two stale-client tests: expect a Close
 /// frame with STALE_CLIENT_CLOSE_CODE carrying the server's
 /// BUILD_ID, and no captured alerts afterwards.
-pub(crate) async fn assert_stale_client_close_and_no_alert(
+pub async fn assert_stale_client_close_and_no_alert(
     msg: tokio_tungstenite::tungstenite::Message,
     alerts: &Arc<std::sync::Mutex<Vec<(String, String)>>>,
     context: &str,
@@ -280,7 +279,7 @@ pub(crate) async fn assert_stale_client_close_and_no_alert(
 }
 
 /// Build a minimal multipart/form-data body with one file field.
-pub(crate) fn multipart_body(filename: &str, content: &[u8]) -> (String, Vec<u8>) {
+pub fn multipart_body(filename: &str, content: &[u8]) -> (String, Vec<u8>) {
     let boundary = "----TestBoundary12345";
     let mut body = Vec::new();
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -295,10 +294,7 @@ pub(crate) fn multipart_body(filename: &str, content: &[u8]) -> (String, Vec<u8>
 }
 
 /// Fetch the landing page `/` with the given session cookie.
-pub(crate) async fn fetch_landing_page(
-    app: Router,
-    session_token: &str,
-) -> axum::http::Response<Body> {
+pub async fn fetch_landing_page(app: Router, session_token: &str) -> axum::http::Response<Body> {
     use tower::ServiceExt;
     app.oneshot(
         Request::get("/")
@@ -316,7 +312,7 @@ pub(crate) async fn fetch_landing_page(
 /// Clones the router so callers can fire multiple requests against the same
 /// shared rate-limiter state (the `Arc` inside `GovernorConfig` keeps the
 /// bucket alive across clones).
-pub(crate) async fn xff_get_status(app: &Router, path: &str, xff_ip: &str) -> StatusCode {
+pub async fn xff_get_status(app: &Router, path: &str, xff_ip: &str) -> StatusCode {
     use tower::ServiceExt;
     let req = Request::get(path)
         .header("x-forwarded-for", xff_ip)
@@ -329,6 +325,6 @@ pub(crate) async fn xff_get_status(app: &Router, path: &str, xff_ip: &str) -> St
 /// Clones the router so callers can fire multiple requests against the
 /// same shared rate-limiter state (the Arc inside `GovernorConfig`
 /// keeps the bucket alive across clones).
-pub(crate) async fn auth_login_status(app: &Router, xff_ip: &str) -> StatusCode {
+pub async fn auth_login_status(app: &Router, xff_ip: &str) -> StatusCode {
     xff_get_status(app, "/auth/login", xff_ip).await
 }

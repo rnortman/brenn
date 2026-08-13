@@ -1,0 +1,43 @@
+load("//bazel/features:defs.bzl", "TESTUTILS_FEATURES")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# `testutils` gates two row writers downstream test targets link against; the
+# release configs clear the flag, keeping the shipped binary free of them.
+rust_library(
+    name = "brenn-db",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = TESTUTILS_FEATURES,
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "//brenn-approval-rules",
+        "//brenn-ws-types",
+    ],
+)
+
+# 129 tests over an in-memory SQLite database; the binary finishes in 0.70s
+# locally, so `small` (60s) keeps a wide margin even on a cold 4-vCPU runner.
+rust_test(
+    name = "brenn-db_test",
+    size = "small",
+    crate = ":brenn-db",
+    crate_features = ["testutils"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True) + [
+        "//brenn-approval-rules",
+        "//brenn-ws-types",
+    ],
+)
+
+rust_doc_test(
+    name = "brenn-db_doc_test",
+    crate = ":brenn-db",
+)

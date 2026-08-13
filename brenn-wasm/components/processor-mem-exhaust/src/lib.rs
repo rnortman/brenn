@@ -19,8 +19,8 @@
 #[allow(dead_code, clippy::all)]
 mod bindings;
 
-use bindings::brenn::processor::types::{Activation, ReceiveError};
 use bindings::Guest;
+use bindings::brenn::processor::types::{Activation, ReceiveError};
 
 struct ProcessorMemExhaust;
 

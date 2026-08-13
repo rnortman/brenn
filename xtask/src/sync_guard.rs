@@ -20,13 +20,12 @@
 //! version number, and a bundle built by the wrong CLI fails in the browser
 //! rather than at the build.
 //!
-//! The npm trees are a fifth, and the only ones with two lockfiles each: cargo's
-//! lane installs from `package-lock.json` and Bazel's resolves
-//! `pnpm-lock.yaml`, so every dependency version is decided twice from one
-//! manifest. A skew there means the two lanes emit browser assets from
-//! different bundlers, transpilers, or framework versions while every gate
-//! stays green. Node itself is the same shape: the manifest states a floor and
-//! `MODULE.bazel` pins the hermetic toolchain that must satisfy it.
+//! The transpiler is a fifth: `surface/package.json` states the pin, the build
+//! records that pin in every processor manifest it emits, and
+//! `surface/pnpm-lock.yaml` decides what actually ran — so a manifest naming a
+//! transpiler no install used is a provenance record that is simply false. Node
+//! itself is the same shape: the manifest states a floor and `MODULE.bazel`
+//! pins the hermetic toolchain that must satisfy it.
 //!
 //! The workflow's cron expressions are a sixth, and they fail by absence rather
 //! than by error: each is written once under `on.schedule` and once more in the
@@ -77,16 +76,9 @@ const MODULE_NODE_NAME: &str = "NODE_VERSION";
 /// The npm package the surface asset pipeline is built around.
 const JCO_PACKAGE: &str = "@bytecodealliance/jco";
 
-/// The manifest pinning it, and the two lockfiles that resolve that pin — one
-/// per build system, both installed from.
+/// The manifest pinning it, and the lockfile the build installs from.
 const SURFACE_MANIFEST: &str = "surface/package.json";
 const SURFACE_PNPM_LOCK: &str = "surface/pnpm-lock.yaml";
-const SURFACE_NPM_LOCK: &str = "surface/package-lock.json";
-
-/// The npm trees Bazel builds, each carrying both lockfiles. `e2e` is absent
-/// because it drives real browsers and stays outside the build graph, so it has
-/// no second lockfile to disagree with.
-const NPM_TREES: [&str; 2] = ["surface", "frontend"];
 
 /// The edition rust targets take when their `BUILD.bazel` states none. Held
 /// equal to the crate macros' own defaults by `macro_default_violations` rather
@@ -964,44 +956,6 @@ fn npm_manifest_pin(text: &str) -> String {
         .to_string()
 }
 
-/// Every package an npm lockfile's own install resolves, by name.
-///
-/// Nested `node_modules/<a>/node_modules/<b>` keys are npm's hoisting record for
-/// a conflicting transitive version, not what the tree installs at top level, so
-/// they are skipped. Parsed once per file: the agreement arm below asks about
-/// every direct dependency in turn, and re-parsing the whole lockfile per lookup
-/// is the shape the next arm would copy.
-fn npm_lock_versions(rel: &str, text: &str) -> BTreeMap<String, String> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(text).unwrap_or_else(|e| panic!("sync guard: malformed {rel}: {e}"));
-    let mut found = BTreeMap::new();
-    let Some(packages) = parsed.get("packages").and_then(|p| p.as_object()) else {
-        return found;
-    };
-    for (key, entry) in packages {
-        let Some(name) = key.strip_prefix("node_modules/") else {
-            continue;
-        };
-        if name.contains("/node_modules/") {
-            continue;
-        }
-        let Some(version) = entry.get("version").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        found.insert(name.to_string(), version.to_string());
-    }
-    found
-}
-
-/// The version `surface/package-lock.json` resolves the transpiler to.
-fn npm_lock_version(text: &str) -> String {
-    npm_lock_versions(SURFACE_NPM_LOCK, text)
-        .remove(JCO_PACKAGE)
-        .unwrap_or_else(|| {
-            panic!("sync guard: {SURFACE_NPM_LOCK} resolves no node_modules/{JCO_PACKAGE}")
-        })
-}
-
 /// The version `surface/pnpm-lock.yaml` resolves the transpiler to.
 ///
 /// The transpiler is a direct dependency of that tree, so the root importer
@@ -1016,8 +970,8 @@ fn pnpm_lock_version(text: &str) -> String {
         })
 }
 
-/// One pin, two lockfiles, two build systems installing from them.
-fn jco_violations(pin: &str, npm_lock: &str, pnpm_lock: &str) -> Vec<String> {
+/// One pin, one lockfile, one build installing from it.
+fn jco_violations(pin: &str, pnpm_lock: &str) -> Vec<String> {
     let mut found = Vec::new();
     if pin.starts_with(['^', '~', '>', '<', '*']) {
         found.push(format!(
@@ -1027,99 +981,12 @@ fn jco_violations(pin: &str, npm_lock: &str, pnpm_lock: &str) -> Vec<String> {
         ));
         return found;
     }
-    for (lock, version) in [(SURFACE_NPM_LOCK, npm_lock), (SURFACE_PNPM_LOCK, pnpm_lock)] {
-        if version != pin {
-            found.push(format!(
-                "{SURFACE_MANIFEST} pins {JCO_PACKAGE} at {pin:?} but {lock} resolves \
-                 {version:?}. Re-import the lockfile: the two lanes would transpile the browser \
-                 assets with different transpilers."
-            ));
-        }
-    }
-    found
-}
-
-/// Every `(name, version)` pair an npm lockfile installs, nested copies
-/// included.
-///
-/// `npm_lock_versions` deliberately reports only the hoisted top layer, which is
-/// what a direct dependency resolves to; this is the whole graph, keyed by name,
-/// because a name can legitimately appear at two versions (one hoisted, one
-/// nested under the dependent that pinned it).
-fn npm_graph_versions(rel: &str, text: &str) -> BTreeMap<String, BTreeSet<String>> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(text).unwrap_or_else(|e| panic!("sync guard: malformed {rel}: {e}"));
-    let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let Some(packages) = parsed.get("packages").and_then(|p| p.as_object()) else {
-        return found;
-    };
-    for (key, entry) in packages {
-        // The last `node_modules/` segment names the package; everything before
-        // it is the chain of dependents it was nested under.
-        let Some((_, name)) = key.rsplit_once("node_modules/") else {
-            continue;
-        };
-        let Some(version) = entry.get("version").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        found
-            .entry(name.to_string())
-            .or_default()
-            .insert(version.to_string());
-    }
-    found
-}
-
-/// Every `(name, version)` pair a pnpm lockfile's `packages:` block resolves.
-///
-/// The keys are `name@version`, two spaces in, with scoped names quoted — the
-/// same line shape `pnpm_importer_versions` reads one block up. The `snapshots:`
-/// block repeats them with peer suffixes and is skipped by the indent-0 reset.
-fn pnpm_graph_versions(text: &str) -> BTreeMap<String, BTreeSet<String>> {
-    let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut in_packages = false;
-    for line in text.lines() {
-        let indent = line.len() - line.trim_start().len();
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if indent == 0 {
-            in_packages = trimmed == "packages:";
-            continue;
-        }
-        if !in_packages || indent != 2 {
-            continue;
-        }
-        let Some(key) = trimmed.trim_start().strip_suffix(':') else {
-            continue;
-        };
-        let key = key.trim_matches('\'');
-        // A scoped name starts with `@`, so the separator is the last one.
-        let Some((name, version)) = key.rsplit_once('@') else {
-            continue;
-        };
-        found
-            .entry(name.to_string())
-            .or_default()
-            .insert(version.to_string());
-    }
-    found
-}
-
-/// Every package a `package.json` depends on directly, runtime and dev alike.
-///
-/// Derived rather than listed, so a dependency added to a tree joins the
-/// comparison below without anyone remembering to add it here.
-fn direct_dependencies(rel: &str, text: &str) -> BTreeSet<String> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(text).unwrap_or_else(|e| panic!("sync guard: malformed {rel}: {e}"));
-    let mut found = BTreeSet::new();
-    for field in ["dependencies", "devDependencies"] {
-        let Some(table) = parsed.get(field).and_then(|d| d.as_object()) else {
-            continue;
-        };
-        found.extend(table.keys().cloned());
+    if pnpm_lock != pin {
+        found.push(format!(
+            "{SURFACE_MANIFEST} pins {JCO_PACKAGE} at {pin:?} but {SURFACE_PNPM_LOCK} resolves \
+             {pnpm_lock:?}. Re-import the lockfile: the manifest would record a transpiler \
+             version that never ran."
+        ));
     }
     found
 }
@@ -1172,84 +1039,6 @@ fn pnpm_importer_versions(text: &str) -> BTreeMap<String, String> {
     found
 }
 
-/// Two lockfiles over one manifest have to resolve the same dependency graph.
-///
-/// Two comparisons, because they fail differently. The direct one reads each
-/// lockfile's record of what the manifest asked for, so a dependency one
-/// lockfile has and the other does not is named as such. The graph one compares
-/// every `(name, version)` pair either lockfile installs, transitive included:
-/// `vite` is nobody's direct dependency and an `npm audit fix` that bumps it
-/// without a `pnpm import` leaves the two lanes bundling the browser assets with
-/// different toolchains, every gate green.
-///
-/// The overlap with `jco_violations` is deliberate and small: that arm holds the
-/// transpiler pin *exact*, because the build records it in every processor
-/// manifest.
-fn lockfile_agreement_violations(
-    tree: &str,
-    manifest: &str,
-    npm_lock: &str,
-    pnpm_lock: &str,
-) -> Vec<String> {
-    let manifest_rel = format!("{tree}/package.json");
-    let npm_rel = format!("{tree}/package-lock.json");
-    let pnpm_rel = format!("{tree}/pnpm-lock.yaml");
-    let direct = direct_dependencies(&manifest_rel, manifest);
-    if direct.is_empty() {
-        return vec![format!(
-            "{manifest_rel} declares no dependencies, so the lockfile comparison has nothing to \
-             compare. A tree with no dependencies does not need two lockfiles."
-        )];
-    }
-    let npm = npm_lock_versions(&npm_rel, npm_lock);
-    let pnpm = pnpm_importer_versions(pnpm_lock);
-    let mut found = Vec::new();
-    for package in direct {
-        let from_npm = npm.get(&package).cloned();
-        let from_pnpm = pnpm.get(&package).cloned();
-        match (from_npm, from_pnpm) {
-            (Some(a), Some(b)) if a == b => {}
-            (Some(a), Some(b)) => found.push(format!(
-                "{npm_rel} resolves {package} to {a:?} but {pnpm_rel} resolves {b:?}. Re-import the \
-                 pnpm lockfile: the make lane and the Bazel lane are building against different \
-                 versions of it."
-            )),
-            (a, b) => found.push(format!(
-                "{manifest_rel} depends on {package}, resolved by {npm_rel} to {a:?} and by \
-                 {pnpm_rel} to {b:?}. A dependency one lockfile has and the other does not is a \
-                 lockfile that was not re-imported."
-            )),
-        }
-    }
-
-    let npm_graph = npm_graph_versions(&npm_rel, npm_lock);
-    let pnpm_graph = pnpm_graph_versions(pnpm_lock);
-    if npm_graph.is_empty() || pnpm_graph.is_empty() {
-        found.push(format!(
-            "the graph comparison read {} package(s) from {npm_rel} and {} from {pnpm_rel}. An \
-             empty side compares nothing and reports clean.",
-            npm_graph.len(),
-            pnpm_graph.len(),
-        ));
-        return found;
-    }
-    let names: BTreeSet<&String> = npm_graph.keys().chain(pnpm_graph.keys()).collect();
-    for name in names {
-        let from_npm = npm_graph.get(name);
-        let from_pnpm = pnpm_graph.get(name);
-        if from_npm == from_pnpm {
-            continue;
-        }
-        found.push(format!(
-            "{npm_rel} installs {name} at {:?} but {pnpm_rel} installs it at {:?}. Re-import the \
-             pnpm lockfile: transitive versions decide what the two lanes actually build with.",
-            from_npm.map(|v| v.iter().cloned().collect::<Vec<_>>()),
-            from_pnpm.map(|v| v.iter().cloned().collect::<Vec<_>>()),
-        ));
-    }
-    found
-}
-
 /// A `<major>.<minor>.<patch>` string as a comparable triple.
 ///
 /// Whole, not truncated to the major: node features land in minors, so a floor
@@ -1283,7 +1072,7 @@ fn node_engine_floor(text: &str) -> String {
 }
 
 /// The hermetic node the Bazel lane runs must satisfy the floor the npm tree
-/// declares, which is what the make lane's preflight checks of the system node.
+/// declares, which is the version the build's node toolchain provides.
 fn node_floor_violations(floor: &str, module_node: &str) -> Vec<String> {
     let Some(minimum) = floor.strip_prefix(">=") else {
         return vec![format!(
@@ -1619,21 +1408,12 @@ pub fn run_sync_guard(root: &Path, files: &[PathBuf]) -> bool {
     let surface_manifest = read(SURFACE_MANIFEST);
     found.extend(jco_violations(
         &npm_manifest_pin(&surface_manifest),
-        &npm_lock_version(&read(SURFACE_NPM_LOCK)),
         &pnpm_lock_version(&read(SURFACE_PNPM_LOCK)),
     ));
     found.extend(node_floor_violations(
         &node_engine_floor(&surface_manifest),
         &module_pin(&module, MODULE_NODE_NAME),
     ));
-    for tree in NPM_TREES {
-        found.extend(lockfile_agreement_violations(
-            tree,
-            &read(&format!("{tree}/package.json")),
-            &read(&format!("{tree}/package-lock.json")),
-            &read(&format!("{tree}/pnpm-lock.yaml")),
-        ));
-    }
     for defs in MACRO_DEFS {
         found.extend(macro_default_violations(defs, &read(defs)));
     }
@@ -1759,14 +1539,8 @@ packages:
 ";
 
     #[test]
-    fn the_transpiler_version_is_read_out_of_the_manifest_and_both_lockfiles() {
+    fn the_transpiler_version_is_read_out_of_the_manifest_and_the_lockfile() {
         assert_eq!(npm_manifest_pin(A_SURFACE_MANIFEST), "1.4.0");
-        assert_eq!(
-            npm_lock_version(
-                r#"{"packages": {"node_modules/@bytecodealliance/jco": {"version": "1.4.0"}}}"#
-            ),
-            "1.4.0"
-        );
         assert_eq!(pnpm_lock_version(A_SURFACE_PNPM_LOCK), "1.4.0");
     }
 
@@ -1788,36 +1562,17 @@ packages:
     }
 
     #[test]
-    fn both_lockfiles_are_held_to_the_pin_and_the_pin_to_being_exact() {
-        assert!(jco_violations("1.4.0", "1.4.0", "1.4.0").is_empty());
+    fn the_lockfile_is_held_to_the_pin_and_the_pin_to_being_exact() {
+        assert!(jco_violations("1.4.0", "1.4.0").is_empty());
 
-        let npm_skew = jco_violations("1.4.0", "1.3.0", "1.4.0");
-        assert_eq!(npm_skew.len(), 1, "{npm_skew:?}");
-        assert!(npm_skew[0].contains(SURFACE_NPM_LOCK), "{}", npm_skew[0]);
+        let skew = jco_violations("1.4.0", "1.5.0");
+        assert_eq!(skew.len(), 1, "{skew:?}");
+        assert!(skew[0].contains(SURFACE_PNPM_LOCK), "{}", skew[0]);
 
-        let pnpm_skew = jco_violations("1.4.0", "1.4.0", "1.5.0");
-        assert_eq!(pnpm_skew.len(), 1, "{pnpm_skew:?}");
-        assert!(pnpm_skew[0].contains(SURFACE_PNPM_LOCK), "{}", pnpm_skew[0]);
-
-        let ranged = jco_violations("^1.4.0", "1.4.0", "1.4.0");
+        let ranged = jco_violations("^1.4.0", "1.4.0");
         assert_eq!(ranged.len(), 1, "{ranged:?}");
         assert!(ranged[0].contains("is a range"), "{}", ranged[0]);
     }
-
-    const A_FRONTEND_MANIFEST: &str = r#"{
-      "dependencies": {"lit": "^3.3.2"},
-      "devDependencies": {"typescript": "^5.9.3", "vitest": "^4.1.1"}
-    }"#;
-
-    // `vite` is nobody's direct dependency: it is the transitive half the graph
-    // comparison exists for.
-    const A_FRONTEND_NPM_LOCK: &str = r#"{"packages": {
-      "": {"name": "frontend"},
-      "node_modules/lit": {"version": "3.3.2"},
-      "node_modules/typescript": {"version": "5.9.3"},
-      "node_modules/vite": {"version": "8.0.16"},
-      "node_modules/vitest": {"version": "4.1.1"}
-    }}"#;
 
     const A_FRONTEND_PNPM_LOCK: &str = "\
 importers:
@@ -1857,17 +1612,6 @@ snapshots:
 ";
 
     #[test]
-    fn every_declared_dependency_is_collected_from_both_manifest_tables() {
-        assert_eq!(
-            direct_dependencies("frontend/package.json", A_FRONTEND_MANIFEST),
-            ["lit", "typescript", "vitest"]
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect::<BTreeSet<_>>()
-        );
-    }
-
-    #[test]
     fn the_root_importer_gives_one_version_per_dependency_without_its_peer_suffix() {
         let versions = pnpm_importer_versions(A_FRONTEND_PNPM_LOCK);
         assert_eq!(versions.get("lit").map(String::as_str), Some("3.3.2"));
@@ -1884,128 +1628,6 @@ snapshots:
             pnpm_importer_versions(&two).get("lit").map(String::as_str),
             Some("3.3.2")
         );
-    }
-
-    fn agreement(npm_lock: &str, pnpm_lock: &str) -> Vec<String> {
-        lockfile_agreement_violations("frontend", A_FRONTEND_MANIFEST, npm_lock, pnpm_lock)
-    }
-
-    #[test]
-    fn two_lockfiles_resolving_the_same_versions_agree() {
-        assert!(agreement(A_FRONTEND_NPM_LOCK, A_FRONTEND_PNPM_LOCK).is_empty());
-    }
-
-    #[test]
-    fn a_version_skew_between_the_lockfiles_is_reported_per_package() {
-        let skewed = A_FRONTEND_NPM_LOCK.replace("3.3.2", "3.3.1");
-        let out = agreement(&skewed, A_FRONTEND_PNPM_LOCK);
-        // Both arms see a direct dependency skew, and say different things
-        // about it.
-        assert_eq!(out.len(), 2, "{out:?}");
-        assert!(out.iter().all(|v| v.contains("lit")), "{out:?}");
-        assert!(
-            out[0].contains("the make lane and the Bazel lane"),
-            "{}",
-            out[0]
-        );
-        assert!(out[1].contains("transitive versions"), "{}", out[1]);
-    }
-
-    #[test]
-    fn a_transitive_skew_no_manifest_names_is_reported() {
-        // The failure the direct arm cannot see: an `npm audit fix` bumps a
-        // package nobody declares, and the two lanes bundle with different
-        // toolchains.
-        let skewed = A_FRONTEND_NPM_LOCK.replace("8.0.16", "8.0.15");
-        let out = agreement(&skewed, A_FRONTEND_PNPM_LOCK);
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert!(out[0].contains("vite"), "{}", out[0]);
-        assert!(out[0].contains("8.0.15"), "{}", out[0]);
-    }
-
-    #[test]
-    fn a_package_only_one_lockfile_installs_is_reported() {
-        let extra = A_FRONTEND_NPM_LOCK.replace(
-            r#""node_modules/vite": {"version": "8.0.16"},"#,
-            r#""node_modules/vite": {"version": "8.0.16"}, "node_modules/rollup": {"version": "4.0.0"},"#,
-        );
-        let out = agreement(&extra, A_FRONTEND_PNPM_LOCK);
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert!(out[0].contains("rollup"), "{}", out[0]);
-    }
-
-    #[test]
-    fn a_dependency_missing_from_one_lockfile_is_reported() {
-        let out = agreement(r#"{"packages": {}}"#, A_FRONTEND_PNPM_LOCK);
-        // Three direct dependencies, plus the graph arm refusing to compare
-        // against an empty side.
-        assert_eq!(out.len(), 4, "{out:?}");
-        assert!(out[0].contains("was not re-imported"), "{}", out[0]);
-        assert!(out[3].contains("reports clean"), "{}", out[3]);
-    }
-
-    #[test]
-    fn the_graph_readers_see_every_installed_version() {
-        let npm = npm_graph_versions("frontend/package-lock.json", A_FRONTEND_NPM_LOCK);
-        let pnpm = pnpm_graph_versions(A_FRONTEND_PNPM_LOCK);
-        assert_eq!(npm, pnpm, "npm {npm:?} pnpm {pnpm:?}");
-        assert_eq!(npm.len(), 4, "{npm:?}");
-        // The `snapshots:` block repeats every package with peer suffixes; a
-        // reader that fell into it would report `vite@8.0.16(esbuild@0.28.1)`
-        // as a version.
-        assert_eq!(
-            pnpm.get("vite")
-                .map(|v| v.iter().cloned().collect::<Vec<_>>()),
-            Some(vec!["8.0.16".to_string()])
-        );
-    }
-
-    #[test]
-    fn the_npm_graph_reader_keeps_a_nested_copy_beside_the_hoisted_one() {
-        let both = r#"{"packages": {
-          "node_modules/commander": {"version": "12.1.0"},
-          "node_modules/terser/node_modules/commander": {"version": "2.20.3"}
-        }}"#;
-        let graph = npm_graph_versions("surface/package-lock.json", both);
-        assert_eq!(
-            graph
-                .get("commander")
-                .map(|v| v.iter().cloned().collect::<Vec<_>>()),
-            // Lexicographic, because a version set is compared, not ordered.
-            Some(vec!["12.1.0".to_string(), "2.20.3".to_string()])
-        );
-    }
-
-    #[test]
-    fn the_pnpm_graph_reader_unquotes_a_scoped_name() {
-        let text =
-            "packages:\n\n  '@bytecodealliance/jco@1.4.0':\n    resolution: {integrity: x}\n";
-        let graph = pnpm_graph_versions(text);
-        assert_eq!(
-            graph
-                .get("@bytecodealliance/jco")
-                .map(|v| v.iter().cloned().collect::<Vec<_>>()),
-            Some(vec!["1.4.0".to_string()])
-        );
-    }
-
-    #[test]
-    fn a_nested_hoisting_entry_does_not_answer_for_a_top_level_package() {
-        let nested = r#"{"packages": {
-          "": {"name": "frontend"},
-          "node_modules/lit": {"version": "3.3.2"},
-          "node_modules/vitest/node_modules/lit": {"version": "2.0.0"}
-        }}"#;
-        let versions = npm_lock_versions("frontend/package-lock.json", nested);
-        assert_eq!(versions.get("lit").map(String::as_str), Some("3.3.2"));
-        assert_eq!(versions.len(), 1, "{versions:?}");
-    }
-
-    #[test]
-    fn a_manifest_with_no_dependencies_fails_instead_of_reporting_clean() {
-        let out = lockfile_agreement_violations("frontend", "{}", "{}", "");
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert!(out[0].contains("nothing to compare"), "{}", out[0]);
     }
 
     #[test]

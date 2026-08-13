@@ -127,7 +127,7 @@ pub struct AppConfigRaw {
     pub cc_extra_args: Vec<String>,
     /// Static auto-approval rules (pattern-based). Checked before DB rules.
     #[serde(default)]
-    pub approval_rules: Vec<crate::approval_rules::ApprovalRuleConfig>,
+    pub approval_rules: Vec<brenn_approval_rules::ApprovalRuleConfig>,
     /// App-defined attachment targets (e.g. "Import bank export").
     #[serde(default)]
     pub attachment_targets: Vec<AttachmentTargetRaw>,
@@ -264,7 +264,7 @@ pub struct AppConfig {
     /// Extra CLI arguments passed verbatim to the `claude` command.
     pub cc_extra_args: Vec<String>,
     /// Static auto-approval rules from the TOML config.
-    pub approval_rules: Vec<crate::approval_rules::ApprovalRuleConfig>,
+    pub approval_rules: Vec<brenn_approval_rules::ApprovalRuleConfig>,
     /// App-defined attachment targets.
     pub attachment_targets: Vec<AttachmentTarget>,
     /// Enabled integrations for this app, keyed by integration name.
@@ -459,9 +459,10 @@ pub struct CompactionConfig {
 /// via struct update syntax: `AppConfigRaw { slug: "myapp".into(), ..Default::default() }`.
 ///
 /// Manual impl rather than `#[derive(Default)]` because `slug: String` derives as `""`
-/// which is not a valid slug — making this `#[cfg(test)]-only` prevents production code
-/// from accidentally constructing an invalid raw config via `Default::default()`.
-#[cfg(test)]
+/// which is not a valid slug — keeping it behind the test gate prevents production
+/// code from accidentally constructing an invalid raw config via
+/// `Default::default()`.
+#[cfg(any(test, feature = "testutils"))]
 impl Default for AppConfigRaw {
     fn default() -> Self {
         Self {

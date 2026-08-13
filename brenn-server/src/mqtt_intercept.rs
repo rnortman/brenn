@@ -11,13 +11,13 @@ use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, Ap
 use brenn_common::{MAX_LOGGED_UNTRUSTED_BYTES, sanitize_untrusted_str};
 use brenn_lib::access::AppCapability;
 use brenn_lib::mqtt::address::parse_topic_name;
-use brenn_lib::mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};
-use brenn_lib::mqtt::payload::decode_outbound_body;
-use brenn_lib::obs::security::{DenialKind, SecurityEventType, signal_publish_denial};
+use brenn_mqtt::egress::{MqttEgressError, SendBudget, enforce_and_publish};
+use brenn_mqtt::payload::decode_outbound_body;
+use brenn_obs::security::{DenialKind, SecurityEventType, signal_publish_denial};
 
 use crate::active_bridge::ActiveBridge;
 use crate::intercept_helpers::{ToolErr, ToolOk, reject_tool, warn_if_unexpected_tool_response};
-use crate::tools::mqtt::MCP_MQTT_SEND_TOOL;
+use brenn_render::tools::mqtt::MCP_MQTT_SEND_TOOL;
 
 /// Outcome of `try_handle_mqtt_tool`. `None` means "not an MQTT tool".
 #[derive(Debug)]

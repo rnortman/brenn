@@ -18,7 +18,7 @@
 //!
 //! What this suite is *not*: a second copy of the frame-semantics suites. Cursor
 //! grammar, gap minting, violation handling and the publish authority matrix are
-//! pinned beside the code that decides them (`routes::attach`'s suites, and
+//! pinned beside the code that decides them (`brenn-attach-server`'s suites, and
 //! `ws_tests.rs` for the route's own wiring). This one asks a narrower question,
 //! end to end.
 
@@ -28,12 +28,11 @@ use brenn_attach_conformance::{
     SubscriptionDepths,
 };
 use brenn_attach_proto::{PublishOutcome, Urgency};
-use brenn_lib::db;
-use brenn_lib::messaging::testutils::ephemeral_channel_entry;
+use brenn_messaging::testutils::ephemeral_channel_entry;
 
-use super::test_fixtures::{
-    COMPONENT, EPH_ADDR, EPH_NAME, SurfaceTestHarness, deskbar_loop, surface_harness,
-};
+use brenn_surface_server::test_fixtures::{COMPONENT, EPH_ADDR, EPH_NAME, deskbar_loop};
+
+use super::test_fixtures::{SurfaceTestHarness, surface_harness};
 use crate::test_support::TEST_BUILD_ID;
 use crate::test_support::http::{
     TestServer, http_base_addr, setup_authenticated_user, spawn_test_server,
@@ -58,7 +57,7 @@ struct Rig {
     _server: TestServer,
 }
 
-async fn build_rig(db: &db::Db, retain_depth: u64) -> Rig {
+async fn build_rig(db: &brenn_db::Db, retain_depth: u64) -> Rig {
     let SurfaceTestHarness { state, .. } = surface_harness(
         db,
         deskbar_loop(vec![]),
@@ -112,7 +111,7 @@ async fn expect_detach(client: &mut AttachClient) {
 /// rather than repeating it.
 #[tokio::test]
 async fn a_non_browser_attacher_subscribes_publishes_and_resumes_across_a_severed_socket() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     // Retained depth 4, so a *cursorless* resubscribe here would replay the
     // message already seen. That is what makes `replay_count == 0` after the
     // sever evidence that the cursor was presented and honoured.
@@ -190,7 +189,7 @@ async fn a_non_browser_attacher_subscribes_publishes_and_resumes_across_a_severe
 /// severed socket.
 #[tokio::test]
 async fn a_cursorless_subscription_is_replayed_the_retained_window_at_every_attachment() {
-    let db = db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let mut rig = build_rig(&db, 4).await;
 
     rig.client.attach().await;

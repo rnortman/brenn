@@ -491,11 +491,3 @@ fn log_survives_err() {
 // This is covered automatically by the existing consume_engine.rs tests, which
 // load processor-demo under the same ProcessorComponent::load path.  No separate
 // test is needed here; the existing suite is the regression proof.
-
-// ── test 8: DispatcherAlerter attribution ─────────────────────────────────────
-// This is in brenn/src/wasm_dispatch.rs tests, not here — DispatcherAlerter is
-// in the binary crate and is tested there.
-
-// ── test 9: sanitize_diag path ────────────────────────────────────────────────
-// The wasm_dispatch.rs diagnostic sinks call brenn_common::sanitize_untrusted_str;
-// the trap/err-path tests in wasm_dispatch.rs cover that wiring.

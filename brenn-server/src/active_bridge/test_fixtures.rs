@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::time::{Duration, Instant};
 
-use brenn_lib::approval_rules::ApprovalRuleSet;
+use brenn_approval_rules::ApprovalRuleSet;
+use brenn_db::Db;
 use brenn_lib::config::PathMapper;
-use brenn_lib::db::Db;
-use brenn_lib::obs::alerting::AlertDispatcher;
-use brenn_lib::ws_types::{ViewportClass, WsServerMessage};
+use brenn_obs::alerting::AlertDispatcher;
+use brenn_ws_types::{ViewportClass, WsServerMessage};
 use tokio::sync::oneshot;
 use tokio::sync::{broadcast, watch};
 
@@ -46,15 +46,15 @@ pub(in crate::active_bridge) struct TestBridgeConfig {
     pub singleton: bool,
     pub compaction_config: Option<brenn_lib::config::CompactionConfig>,
     pub mounts: Vec<brenn_lib::config::ResolvedMount>,
-    pub repo_sync_sender: Option<crate::repo_sync::SyncTriggerSender>,
+    pub repo_sync_sender: Option<brenn_git::sync::SyncTriggerSender>,
     pub idle_hook_secs: u64,
     pub path_mapper: PathMapper,
-    pub messenger: Option<Arc<brenn_lib::messaging::Messenger>>,
-    pub pwa_push_service: Option<Arc<dyn brenn_lib::pwa_push::PwaPushSender>>,
+    pub messenger: Option<Arc<brenn_messaging::Messenger>>,
+    pub pwa_push_service: Option<Arc<dyn brenn_pwa_push::PwaPushSender>>,
     /// Optional MQTT service (ingress registry + health). `None` (default) leaves
     /// `bridge.mqtt_service()` empty; `Some` injects it so `MessageChannelList`
     /// mqtt: health enrichment can be exercised.
-    pub mqtt_service: Option<Arc<brenn_lib::mqtt::MqttService>>,
+    pub mqtt_service: Option<Arc<brenn_mqtt::MqttService>>,
     /// Optional concrete MQTT event router. `None` (default) leaves
     /// `bridge.mqtt_event_router()` empty; only the runtime `mqtt:`
     /// subscribe-activation path needs it.
@@ -64,13 +64,13 @@ pub(in crate::active_bridge) struct TestBridgeConfig {
     /// Optional automation engine. `None` = no automation. Threaded into
     /// `inject_for_test_full` so inline `Arc::new(Self { ... })` literals in
     /// automation helpers are no longer needed.
-    pub automation_engine: Option<Arc<brenn_lib::automation::AutomationEngine>>,
+    pub automation_engine: Option<Arc<brenn_automation::AutomationEngine>>,
     /// Per-app integration instances. Empty map = no integrations enabled.
     /// Pfin tests that exercise config-dependent paths should set this.
     pub integrations: HashMap<String, std::sync::Arc<dyn brenn_lib::integration::Integration>>,
     /// First-class tool registry. `None` (default) mints an empty registry;
     /// `Some` injects one so the `registry_adapter` intercept can be exercised.
-    pub tools: Option<Arc<crate::tool_registry::ToolRegistry>>,
+    pub tools: Option<Arc<brenn_tool_registry::ToolRegistry>>,
     /// This app's resolved tool grants. Empty (default) = no registry tools
     /// granted.
     pub tool_grants: std::collections::BTreeMap<String, brenn_lib::tools::ResolvedToolGrant>,
@@ -183,7 +183,7 @@ impl ActiveBridge {
             app_slug,
             db,
             broadcast_tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig::default(),
         )
     }
@@ -197,7 +197,7 @@ impl ActiveBridge {
         app_slug: &str,
         db: Db,
         broadcast_tx: broadcast::Sender<WsServerMessage>,
-        messenger: Arc<brenn_lib::messaging::Messenger>,
+        messenger: Arc<brenn_messaging::Messenger>,
     ) -> Arc<Self> {
         Self::inject_for_test_full(
             user_id,
@@ -205,7 +205,7 @@ impl ActiveBridge {
             app_slug,
             db,
             broadcast_tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 messenger: Some(messenger),
                 ..Default::default()
@@ -227,7 +227,7 @@ impl ActiveBridge {
             app_slug,
             db,
             broadcast_tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 shared,
                 ..Default::default()
@@ -269,7 +269,7 @@ impl ActiveBridge {
             app_slug,
             db,
             broadcast_tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 mounts,
                 path_mapper,
@@ -288,7 +288,7 @@ impl ActiveBridge {
         db: Db,
         broadcast_tx: broadcast::Sender<WsServerMessage>,
         mounts: Vec<brenn_lib::config::ResolvedMount>,
-        repo_sync_sender: crate::repo_sync::SyncTriggerSender,
+        repo_sync_sender: brenn_git::sync::SyncTriggerSender,
     ) -> Arc<Self> {
         Self::inject_for_test_full(
             user_id,
@@ -296,7 +296,7 @@ impl ActiveBridge {
             app_slug,
             db,
             broadcast_tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 mounts,
                 repo_sync_sender: Some(repo_sync_sender),
@@ -324,7 +324,7 @@ impl ActiveBridge {
             app_slug,
             db,
             broadcast_tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 idle_hook_secs,
                 mounts,
@@ -367,7 +367,7 @@ impl ActiveBridge {
         let active_bridges = active_bridges_opt.unwrap_or_else(ActiveBridges::new);
         // Default: an empty first-class tool registry (no tools registered).
         let tools =
-            tools.unwrap_or_else(|| Arc::new(crate::tool_registry::ToolRegistry::new(vec![])));
+            tools.unwrap_or_else(|| Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])));
         let (epoch_tx, _epoch_rx) = watch::channel(0u64);
         // Same rule as production: the bus door exists exactly where a messenger
         // does.
@@ -456,8 +456,8 @@ impl ActiveBridge {
         use std::sync::Arc;
 
         let (tx, _rx) = broadcast::channel(16);
-        let db = brenn_lib::db::init_db_memory();
-        let now = brenn_lib::db::format_ts_for_db(chrono::Utc::now());
+        let db = crate::test_support::init_db_memory();
+        let now = brenn_db::format_ts_for_db(chrono::Utc::now());
 
         // Seed user + conversation (for emit_tool_summary FK), plus alice + device + subscription.
         let (user_id, conversation_id) = {
@@ -522,11 +522,11 @@ impl ActiveBridge {
         };
         {
             let conn = db.lock().await;
-            brenn_lib::messaging::db::upsert_channels(
+            brenn_messaging_store::db::upsert_channels(
                 &conn,
                 std::slice::from_ref(&test_channel_entry),
             );
-            brenn_lib::messaging::db::upsert_channels(
+            brenn_messaging_store::db::upsert_channels(
                 &conn,
                 std::slice::from_ref(&locked_channel_entry),
             );
@@ -591,13 +591,13 @@ impl ActiveBridge {
             brenn_lib::access::acl::ChannelMatcher::Exact("test-channel".to_string()),
         );
         messenger_apps.insert("testapp".to_string(), testapp_cfg);
-        let messenger = brenn_lib::messaging::Messenger::new(
+        let messenger = brenn_messaging::Messenger::new(
             db.clone(),
             Arc::new(dir),
             Arc::from("test-source"),
             Arc::new(messenger_apps),
-            Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-                as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(brenn_messaging::query::NoopWakeRouter)
+                as Arc<dyn brenn_messaging::WakeRouter>,
             brenn_lib::messaging::MessagingGlobalConfig::default(),
         );
 
@@ -607,19 +607,15 @@ impl ActiveBridge {
         let pwa_config = brenn_lib::pwa_push::config::ResolvedPwaPushConfig {
             vapid,
             subject: "mailto:test@example.com".to_string(),
-            endpoint_policy: brenn_lib::pwa_push::endpoint_validator::EndpointPolicy::new(
-                vec![],
-                false,
-            ),
+            endpoint_policy: brenn_lib::pwa_push::config::EndpointPolicy::new(vec![], false),
         };
         let mut apps = indexmap::IndexMap::new();
         apps.insert(
             "testapp".to_string(),
             make_test_push_app_config(tmp.path().to_path_buf(), vec![], true),
         );
-        let (test_alert_dispatcher, _alert_handle) =
-            brenn_lib::obs::alerting::noop_alert_dispatcher();
-        let pwa_push_service = Arc::new(brenn_lib::pwa_push::PwaPushService::new(
+        let (test_alert_dispatcher, _alert_handle) = brenn_obs::alerting::noop_alert_dispatcher();
+        let pwa_push_service = Arc::new(brenn_pwa_push::PwaPushService::new(
             db.clone(),
             pwa_config,
             Arc::new(apps),
@@ -634,7 +630,7 @@ impl ActiveBridge {
             "testapp",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 messenger: Some(messenger),
                 pwa_push_service: Some(pwa_push_service),
@@ -659,8 +655,8 @@ impl ActiveBridge {
         use std::sync::Arc;
 
         let (tx, _rx) = broadcast::channel(16);
-        let db = brenn_lib::db::init_db_memory();
-        let now = brenn_lib::db::format_ts_for_db(chrono::Utc::now());
+        let db = crate::test_support::init_db_memory();
+        let now = brenn_db::format_ts_for_db(chrono::Utc::now());
         let (user_id, conversation_id) = {
             let conn = db.lock().await;
             seed_test_user_and_conversation(&conn, &now, "testapp")
@@ -707,23 +703,23 @@ impl ActiveBridge {
                 topic_filter: "sensors/+/temp".to_string(),
             });
         messenger_apps.insert("testapp".to_string(), testapp_cfg);
-        let messenger = brenn_lib::messaging::Messenger::new(
+        let messenger = brenn_messaging::Messenger::new(
             db.clone(),
             Arc::new(dir),
             Arc::from("test-source"),
             Arc::new(messenger_apps),
-            Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-                as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(brenn_messaging::query::NoopWakeRouter)
+                as Arc<dyn brenn_messaging::WakeRouter>,
             brenn_lib::messaging::MessagingGlobalConfig::default(),
         );
 
         // MqttService with a registered ingress handle for `home`; the filter is
         // subscribed at QoS 2 so the enrichment surfaces it. The handle's `client`
         // cell is `None` (no live broker in a unit test) → health "disconnected".
-        let mqtt_service = brenn_lib::mqtt::MqttService::new();
+        let mqtt_service = brenn_mqtt::MqttService::new();
         let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
         let config = Arc::new(crate::test_support::mqtt::test_client_config("home"));
-        let handle = brenn_lib::mqtt::MqttClientHandle::new(config, vec![], stop_tx);
+        let handle = brenn_mqtt::MqttClientHandle::new(config, vec![], stop_tx);
         handle
             .add_subscription("sensors/+/temp".to_string(), 2)
             .await;
@@ -735,7 +731,7 @@ impl ActiveBridge {
             "testapp",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 messenger: Some(messenger),
                 mqtt_service: Some(mqtt_service),
@@ -830,8 +826,8 @@ impl ActiveBridge {
         use std::sync::Arc;
 
         let (tx, _rx) = broadcast::channel(16);
-        let db = brenn_lib::db::init_db_memory();
-        let now = brenn_lib::db::format_ts_for_db(chrono::Utc::now());
+        let db = crate::test_support::init_db_memory();
+        let now = brenn_db::format_ts_for_db(chrono::Utc::now());
         let (user_id, conversation_id) = {
             let conn = db.lock().await;
             seed_test_user_and_conversation(&conn, &now, "testapp")
@@ -857,13 +853,13 @@ impl ActiveBridge {
         };
         {
             let conn = db.lock().await;
-            brenn_lib::messaging::db::upsert_channels(&conn, std::slice::from_ref(&brenn_entry));
+            brenn_messaging_store::db::upsert_channels(&conn, std::slice::from_ref(&brenn_entry));
         }
         // A non-durable channel alongside it, so the runtime subscribe paths have
         // one of each class to resolve. It carries no DB row (nothing to persist)
         // and its retention lives in the ring store built below.
-        let ring_entry = brenn_lib::messaging::testutils::ephemeral_channel_entry("test-ring", 8);
-        let ring_stores = Arc::new(brenn_lib::messaging::store::RingStores::build(
+        let ring_entry = brenn_messaging::testutils::ephemeral_channel_entry("test-ring", 8);
+        let ring_stores = Arc::new(brenn_messaging_store::store::RingStores::build(
             std::slice::from_ref(&ring_entry),
         ));
         let dir = Arc::new(brenn_lib::messaging::MessagingDirectory::with_entries(
@@ -902,13 +898,13 @@ impl ActiveBridge {
         otherapp_cfg.policy = policy;
         apps.insert("otherapp".to_string(), otherapp_cfg);
 
-        let messenger = brenn_lib::messaging::Messenger::new(
+        let messenger = brenn_messaging::Messenger::new(
             db.clone(),
             dir,
             Arc::from("test-source"),
             Arc::new(apps),
-            Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-                as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(brenn_messaging::query::NoopWakeRouter)
+                as Arc<dyn brenn_messaging::WakeRouter>,
             brenn_lib::messaging::MessagingGlobalConfig::default(),
         )
         .with_ring_stores(ring_stores);
@@ -916,12 +912,12 @@ impl ActiveBridge {
         // MqttService with a registered `home` ingress supervisor. Non-default
         // qos (2) / urgency (High) so qos-/urgency-resolution is observable; the
         // `client` cell is None (no broker) → live SUBSCRIBE deferred.
-        let mqtt_service = brenn_lib::mqtt::MqttService::new();
+        let mqtt_service = brenn_mqtt::MqttService::new();
         let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
         let mut config = crate::test_support::mqtt::test_client_config("home");
         config.urgency = brenn_lib::messaging::Urgency::High;
         config.qos = 2;
-        let handle = brenn_lib::mqtt::MqttClientHandle::new(Arc::new(config), vec![], stop_tx);
+        let handle = brenn_mqtt::MqttClientHandle::new(Arc::new(config), vec![], stop_tx);
         mqtt_service.add_client(handle).await;
 
         // Concrete router wired with an AppState holding the same Messenger, so a
@@ -937,7 +933,7 @@ impl ActiveBridge {
             "testapp",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 messenger: Some(messenger),
                 mqtt_service: Some(mqtt_service),
@@ -954,10 +950,8 @@ impl ActiveBridge {
     /// The automation engine is connected to the bridge so intercept tests
     /// can exercise the full create/edit/delete/list paths.
     pub(crate) async fn test_new_with_automation() -> Arc<Self> {
-        Self::test_new_with_automation_config(
-            brenn_lib::automation::AutomationGlobalConfig::default(),
-        )
-        .await
+        Self::test_new_with_automation_config(brenn_automation::AutomationGlobalConfig::default())
+            .await
     }
 
     /// Like `test_new_with_automation` but with a caller-supplied
@@ -972,11 +966,11 @@ impl ActiveBridge {
     /// future tests that need a tool call to flow through the approval path (rather
     /// than being auto-approved) should not use this fixture for that tool.
     pub(crate) async fn test_new_with_automation_config(
-        automation_cfg: brenn_lib::automation::AutomationGlobalConfig,
+        automation_cfg: brenn_automation::AutomationGlobalConfig,
     ) -> Arc<Self> {
         Self::test_new_with_automation_config_and_dispatcher(
             automation_cfg,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await
     }
@@ -986,14 +980,14 @@ impl ActiveBridge {
     /// `make_capturing_alerter`) to assert on security-event alerts the automation
     /// intercept emits (e.g. create/edit address-denial signals).
     pub(crate) async fn test_new_with_automation_config_and_dispatcher(
-        automation_cfg: brenn_lib::automation::AutomationGlobalConfig,
+        automation_cfg: brenn_automation::AutomationGlobalConfig,
         bridge_alert_dispatcher: AlertDispatcher,
     ) -> Arc<Self> {
         use std::sync::Arc;
 
         let (tx, _rx) = broadcast::channel(16);
-        let db = brenn_lib::db::init_db_memory();
-        let now = brenn_lib::db::format_ts_for_db(chrono::Utc::now());
+        let db = crate::test_support::init_db_memory();
+        let now = brenn_db::format_ts_for_db(chrono::Utc::now());
 
         let (user_id, conversation_id) = {
             let conn = db.lock().await;
@@ -1099,25 +1093,25 @@ impl ActiveBridge {
         );
         let apps_arc = Arc::new(apps);
 
-        let messenger = brenn_lib::messaging::Messenger::new(
+        let messenger = brenn_messaging::Messenger::new(
             db.clone(),
             dir.clone(),
             Arc::from("test-source"),
             apps_arc.clone(),
-            Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-                as Arc<dyn brenn_lib::messaging::WakeRouter>,
+            Arc::new(brenn_messaging::query::NoopWakeRouter)
+                as Arc<dyn brenn_messaging::WakeRouter>,
             brenn_lib::messaging::MessagingGlobalConfig::default(),
         );
 
-        let (alert_dispatcher, _handle) = brenn_lib::obs::alerting::noop_alert_dispatcher();
+        let (alert_dispatcher, _handle) = brenn_obs::alerting::noop_alert_dispatcher();
 
-        let engine = brenn_lib::automation::AutomationEngine::new(
+        let engine = brenn_automation::AutomationEngine::new(
             db.clone(),
             messenger.clone(),
             apps_arc,
             dir,
             Arc::new(crate::test_support::NoopEventRouter)
-                as Arc<dyn brenn_lib::automation::IngressRouter>,
+                as Arc<dyn brenn_automation::IngressRouter>,
             automation_cfg,
             alert_dispatcher,
         );
@@ -1143,11 +1137,11 @@ impl ActiveBridge {
     /// DB pre-seeded with user + conversation for "testapp".
     /// The `db` embedded in `messenger` is reused as the bridge's DB.
     pub(crate) async fn test_new_with_messenger(
-        messenger: Arc<brenn_lib::messaging::Messenger>,
+        messenger: Arc<brenn_messaging::Messenger>,
     ) -> Arc<Self> {
         Self::test_new_with_messenger_and_dispatcher(
             messenger,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
         )
         .await
     }
@@ -1156,7 +1150,7 @@ impl ActiveBridge {
     /// `AlertDispatcher` — pass a capturing one (see `make_capturing_alerter`) to
     /// assert on security-event alerts emitted from the intercept.
     pub(crate) async fn test_new_with_messenger_and_dispatcher(
-        messenger: Arc<brenn_lib::messaging::Messenger>,
+        messenger: Arc<brenn_messaging::Messenger>,
         alert_dispatcher: AlertDispatcher,
     ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(16);
@@ -1170,7 +1164,7 @@ impl ActiveBridge {
             )
             .expect("insert user");
             let uid: i64 = conn.last_insert_rowid();
-            let cid = brenn_lib::conversation::create_conversation(&conn, uid, "testapp", false);
+            let cid = brenn_db::conversation::create_conversation(&conn, uid, "testapp", false);
             (uid, cid)
         };
         Self::inject_for_test_full(
@@ -1198,13 +1192,13 @@ impl ActiveBridge {
     /// `svc.send()` without making real HTTP calls. Returns a bridge with
     /// `app_slug = "testapp"` and the given service wired in.
     pub(crate) async fn test_new_for_pwa_push_with_service(
-        svc: Arc<dyn brenn_lib::pwa_push::PwaPushSender>,
+        svc: Arc<dyn brenn_pwa_push::PwaPushSender>,
     ) -> Arc<Self> {
         Self::test_new_for_pwa_push_with_service_opt(Some(svc)).await
     }
 
     async fn test_new_for_pwa_push_with_service_opt(
-        svc: Option<Arc<dyn brenn_lib::pwa_push::PwaPushSender>>,
+        svc: Option<Arc<dyn brenn_pwa_push::PwaPushSender>>,
     ) -> Arc<Self> {
         let (db, tx, user_id, conversation_id) = make_minimal_test_db_and_channel().await;
         Self::inject_for_test_full(
@@ -1213,7 +1207,7 @@ impl ActiveBridge {
             "testapp",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 pwa_push_service: svc,
                 ..Default::default()
@@ -1239,7 +1233,7 @@ impl ActiveBridge {
             "testapp",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 messenger: Some(messenger),
                 ..Default::default()
@@ -1256,14 +1250,14 @@ impl ActiveBridge {
     pub(crate) async fn test_new_for_mqtt_no_grant() -> Arc<Self> {
         let (db, tx, user_id, conversation_id) = make_minimal_test_db_and_channel().await;
         let messenger = make_test_messenger_no_mqtt_grant(db.clone());
-        let mqtt_service = brenn_lib::mqtt::MqttService::new();
+        let mqtt_service = brenn_mqtt::MqttService::new();
         Self::inject_for_test_full(
             user_id,
             conversation_id,
             "testapp",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 messenger: Some(messenger),
                 mqtt_service: Some(mqtt_service),
@@ -1294,11 +1288,11 @@ impl ActiveBridge {
         let (db, tx, user_id, conversation_id) = make_minimal_test_db_and_channel().await;
         let messenger = make_test_messenger_with_mqtt_publish(db.clone(), allowed_clients);
 
-        let mqtt_service = brenn_lib::mqtt::MqttService::new();
+        let mqtt_service = brenn_mqtt::MqttService::new();
         for client in session_clients {
             let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
             let config = Arc::new(crate::test_support::mqtt::test_client_config(client));
-            let handle = brenn_lib::mqtt::MqttClientHandle::new(config, vec![], stop_tx);
+            let handle = brenn_mqtt::MqttClientHandle::new(config, vec![], stop_tx);
             mqtt_service.add_client(handle).await;
         }
 
@@ -1308,7 +1302,7 @@ impl ActiveBridge {
             "testapp",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 messenger: Some(messenger),
                 mqtt_service: Some(mqtt_service),
@@ -1327,8 +1321,8 @@ impl ActiveBridge {
     /// Used by `pwa_push_channel_get_forbidden_returns_access_denied`.
     pub(crate) async fn test_new_with_restricted_push_access() -> Arc<Self> {
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
-        let db = brenn_lib::db::init_db_memory();
-        let now = brenn_lib::db::format_ts_for_db(chrono::Utc::now());
+        let db = crate::test_support::init_db_memory();
+        let now = brenn_db::format_ts_for_db(chrono::Utc::now());
 
         // Seed user + conversation, plus alice + device + subscription.
         let (user_id, conversation_id) = {
@@ -1344,10 +1338,7 @@ impl ActiveBridge {
         let pwa_config = brenn_lib::pwa_push::config::ResolvedPwaPushConfig {
             vapid,
             subject: "mailto:test@example.com".to_string(),
-            endpoint_policy: brenn_lib::pwa_push::endpoint_validator::EndpointPolicy::new(
-                vec![],
-                false,
-            ),
+            endpoint_policy: brenn_lib::pwa_push::config::EndpointPolicy::new(vec![], false),
         };
 
         // "testapp" has allowed_users: ["bob"] — alice is absent → Forbidden.
@@ -1357,9 +1348,8 @@ impl ActiveBridge {
             make_test_push_app_config(tmp.path().to_path_buf(), vec!["bob".to_string()], true),
         );
 
-        let (test_alert_dispatcher, _alert_handle) =
-            brenn_lib::obs::alerting::noop_alert_dispatcher();
-        let pwa_push_service = Arc::new(brenn_lib::pwa_push::PwaPushService::new(
+        let (test_alert_dispatcher, _alert_handle) = brenn_obs::alerting::noop_alert_dispatcher();
+        let pwa_push_service = Arc::new(brenn_pwa_push::PwaPushService::new(
             db.clone(),
             pwa_config,
             Arc::new(apps),
@@ -1374,7 +1364,7 @@ impl ActiveBridge {
             "testapp",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 pwa_push_service: Some(pwa_push_service),
                 ..Default::default()
@@ -1392,10 +1382,7 @@ impl ActiveBridge {
         let pwa_config = brenn_lib::pwa_push::config::ResolvedPwaPushConfig {
             vapid,
             subject: "mailto:test@example.com".to_string(),
-            endpoint_policy: brenn_lib::pwa_push::endpoint_validator::EndpointPolicy::new(
-                vec![],
-                false,
-            ),
+            endpoint_policy: brenn_lib::pwa_push::config::EndpointPolicy::new(vec![], false),
         };
 
         // "testapp" has pwa_push block with enabled = false.
@@ -1405,10 +1392,9 @@ impl ActiveBridge {
             make_test_push_app_config(tmp.path().to_path_buf(), vec![], false),
         );
 
-        let (test_alert_dispatcher, _alert_handle) =
-            brenn_lib::obs::alerting::noop_alert_dispatcher();
-        let pwa_push_service = Arc::new(brenn_lib::pwa_push::PwaPushService::new(
-            brenn_lib::db::init_db_memory(),
+        let (test_alert_dispatcher, _alert_handle) = brenn_obs::alerting::noop_alert_dispatcher();
+        let pwa_push_service = Arc::new(brenn_pwa_push::PwaPushService::new(
+            crate::test_support::init_db_memory(),
             pwa_config,
             Arc::new(apps),
             brenn_lib::messaging::MessagingGlobalConfig::default(),
@@ -1423,7 +1409,7 @@ impl ActiveBridge {
             "testapp",
             db,
             tx,
-            brenn_lib::obs::alerting::noop_alert_dispatcher().0,
+            brenn_obs::alerting::noop_alert_dispatcher().0,
             TestBridgeConfig {
                 pwa_push_service: Some(pwa_push_service),
                 ..Default::default()
@@ -1439,7 +1425,7 @@ impl ActiveBridge {
 /// Returns `(db, broadcast_tx, user_id, conversation_id)`.
 async fn make_minimal_test_db_and_channel() -> (Db, broadcast::Sender<WsServerMessage>, i64, i64) {
     let (tx, _rx) = broadcast::channel(16);
-    let db = brenn_lib::db::init_db_memory();
+    let db = crate::test_support::init_db_memory();
     let (user_id, conversation_id) = {
         let conn = db.lock().await;
         conn.execute(
@@ -1449,7 +1435,7 @@ async fn make_minimal_test_db_and_channel() -> (Db, broadcast::Sender<WsServerMe
         )
         .expect("insert user");
         let uid: i64 = conn.last_insert_rowid();
-        let cid = brenn_lib::conversation::create_conversation(&conn, uid, "testapp", false);
+        let cid = brenn_db::conversation::create_conversation(&conn, uid, "testapp", false);
         (uid, cid)
     };
     (db, tx, user_id, conversation_id)
@@ -1463,7 +1449,7 @@ async fn make_minimal_test_db_and_channel() -> (Db, broadcast::Sender<WsServerMe
 fn make_test_messenger_with_mqtt_publish(
     db: Db,
     clients: &[&str],
-) -> Arc<brenn_lib::messaging::Messenger> {
+) -> Arc<brenn_messaging::Messenger> {
     let mut testapp_cfg =
         crate::test_support::app_config::default_test_app_config("testapp", "testapp");
     testapp_cfg
@@ -1481,15 +1467,14 @@ fn make_test_messenger_with_mqtt_publish(
     }
     let mut messenger_apps = indexmap::IndexMap::new();
     messenger_apps.insert("testapp".to_string(), testapp_cfg);
-    brenn_lib::messaging::Messenger::new(
+    brenn_messaging::Messenger::new(
         db,
         Arc::new(brenn_lib::messaging::MessagingDirectory::with_entries(
             vec![],
         )),
         Arc::from("test-source"),
         Arc::new(messenger_apps),
-        Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-            as Arc<dyn brenn_lib::messaging::WakeRouter>,
+        Arc::new(brenn_messaging::query::NoopWakeRouter) as Arc<dyn brenn_messaging::WakeRouter>,
         brenn_lib::messaging::MessagingGlobalConfig::default(),
     )
 }
@@ -1500,20 +1485,19 @@ fn make_test_messenger_with_mqtt_publish(
 /// policy via `messenger.app_policy("testapp")` and `enforce_and_publish` returns
 /// `AclDenied`; the intercept's secondary `has_grant(MqttPublish)` check (false
 /// here) selects the "MQTT publish is not enabled" remedy string.
-fn make_test_messenger_no_mqtt_grant(db: Db) -> Arc<brenn_lib::messaging::Messenger> {
+fn make_test_messenger_no_mqtt_grant(db: Db) -> Arc<brenn_messaging::Messenger> {
     let testapp_cfg =
         crate::test_support::app_config::default_test_app_config("testapp", "testapp");
     let mut messenger_apps = indexmap::IndexMap::new();
     messenger_apps.insert("testapp".to_string(), testapp_cfg);
-    brenn_lib::messaging::Messenger::new(
+    brenn_messaging::Messenger::new(
         db,
         Arc::new(brenn_lib::messaging::MessagingDirectory::with_entries(
             vec![],
         )),
         Arc::from("test-source"),
         Arc::new(messenger_apps),
-        Arc::new(brenn_lib::messaging::query::NoopWakeRouter)
-            as Arc<dyn brenn_lib::messaging::WakeRouter>,
+        Arc::new(brenn_messaging::query::NoopWakeRouter) as Arc<dyn brenn_messaging::WakeRouter>,
         brenn_lib::messaging::MessagingGlobalConfig::default(),
     )
 }
@@ -1587,7 +1571,7 @@ fn make_test_push_app_config(
 /// connection. Returns `alice_id`.
 ///
 /// Called after the `"test"` user + conversation are already inserted. `now`
-/// must be a DB-formatted timestamp string (from `brenn_lib::db::format_ts_for_db`).
+/// must be a DB-formatted timestamp string (from `brenn_db::format_ts_for_db`).
 /// Seed the test user `'test'` and a conversation for `app_slug`, returning
 /// `(user_id, conversation_id)`. Replaces the hand-rolled INSERT-user +
 /// `create_conversation` block copied across the bridge test fixtures
@@ -1603,7 +1587,7 @@ fn seed_test_user_and_conversation(
     )
     .expect("insert test user");
     let uid: i64 = conn.last_insert_rowid();
-    let cid = brenn_lib::conversation::create_conversation(conn, uid, app_slug, false);
+    let cid = brenn_db::conversation::create_conversation(conn, uid, app_slug, false);
     (uid, cid)
 }
 
@@ -1636,11 +1620,11 @@ fn seed_alice_with_subscription(conn: &rusqlite::Connection, now: &str) -> i64 {
         rusqlite::params![device_id, alice_id, now],
     )
     .expect("insert device_users");
-    brenn_lib::pwa_push::db::upsert_subscription(
+    brenn_pwa_push::db::upsert_subscription(
         conn,
         device_id,
         alice_id,
-        &brenn_lib::pwa_push::endpoint_validator::ValidatedEndpoint::for_testing(
+        &brenn_pwa_push::endpoint_validator::ValidatedEndpoint::for_testing(
             "https://push.example.com/sub",
         ),
         "p256dh_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",

@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use brenn_lib::conversation;
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
-use brenn_lib::ws_types::WsServerMessage;
+use brenn_db::conversation;
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_ws_types::WsServerMessage;
 use tracing::warn;
 
 use super::connection::WsConnection;
@@ -13,7 +13,7 @@ use crate::active_bridge::ActiveBridge;
 /// Context for a target command execution task.
 pub(super) struct TargetTaskContext {
     pub(super) bridge: Arc<ActiveBridge>,
-    pub(super) db: brenn_lib::db::Db,
+    pub(super) db: brenn_db::Db,
     pub(super) conv_id: i64,
     pub(super) target: brenn_lib::config::AttachmentTarget,
     pub(super) written_files: Vec<crate::routes::upload::WrittenFile>,
@@ -280,13 +280,13 @@ impl WsConnection {
 mod tests {
     use std::sync::Arc;
 
-    use brenn_lib::auth::user::create_user;
+    use brenn_db::auth::user::create_user;
     use brenn_lib::config::AppConfig;
 
     use crate::test_support::app_config::default_test_app_config;
-    use brenn_lib::conversation;
-    use brenn_lib::db::init_db_memory;
-    use brenn_lib::ws_types::WsServerMessage;
+    use crate::test_support::init_db_memory;
+    use brenn_db::conversation;
+    use brenn_ws_types::WsServerMessage;
     use indexmap::IndexMap;
     use tokio::sync::{broadcast, mpsc};
 
@@ -341,7 +341,7 @@ mod tests {
     ) -> (
         WsConnection,
         mpsc::Receiver<WsServerMessage>,
-        brenn_lib::db::Db,
+        brenn_db::Db,
         i64,
         std::path::PathBuf,
         tempfile::TempDir,
@@ -361,7 +361,7 @@ mod tests {
     ) -> (
         WsConnection,
         mpsc::Receiver<WsServerMessage>,
-        brenn_lib::db::Db,
+        brenn_db::Db,
         i64,
         std::path::PathBuf,
         tempfile::TempDir,

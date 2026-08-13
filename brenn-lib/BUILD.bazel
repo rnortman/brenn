@@ -8,10 +8,15 @@ policy_srcs()
 exports_files(["Cargo.toml"])
 
 FIRST_PARTY_DEPS = [
+    "//brenn-approval-rules",
     "//brenn-budget",
     "//brenn-common",
+    "//brenn-db",
     "//brenn-envelope",
+    "//brenn-obs",
     "//brenn-queue",
+    "//brenn-usage-db",
+    "//brenn-ws-types",
     "//surface/schema",
 ]
 
@@ -28,72 +33,36 @@ rust_library(
     deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
 )
 
-# Two unit tests read repo files through `env!("CARGO_MANIFEST_DIR")`, so the
-# constant has to name this package and the files have to be runfiles. The
-# workspace-relative form resolves from the runfiles root, which is where a
+# Two unit tests read the shipped configs through `env!("CARGO_MANIFEST_DIR")`,
+# so the constant has to name this package and the files have to be runfiles.
+# The workspace-relative form resolves from the runfiles root, which is where a
 # Bazel test starts.
 #
-# `large` (900s) rather than the `medium` default (300s), for the same
-# arithmetic as `//brenn-server:brenn-server_test`: this binary runs ~2,500
-# tests, which fits in 300s warm and parallel on a dev machine and does not on a
-# cold 4-vCPU runner sharing itself with the rest of the graph — the weekly
-# uncached canary being exactly that run. Timeout honesty, not speed: `size`
-# reserves the same one CPU at every tier.
+# `small` (60s): 967 tests, almost all pure config resolution and in-memory
+# sqlite, finishing in 0.05s locally. Against the repo's one measured local→CD
+# factor (~21x) that is about a second on a cold 4-vCPU runner, three orders
+# under the budget.
+#
+# TODO(build-test-count-guard): the test counts stated in this and every sibling
+# size rationale are hand-maintained and match nothing mechanical.
+#
+# TODO(crate-split): what is left here is the config aggregate, `access`, the
+# per-subsystem config halves and the small leaf modules. Tranche 1,
+# `automation`, the data layer, `webhook`, `pwa_push`, the `mqtt` runtime, the
+# usage accounting and the messaging runtime have all left.
 rust_test(
     name = "brenn-lib_test",
-    size = "large",
+    size = "small",
     crate = ":brenn-lib",
     crate_features = ["testutils"],
     data = [
         "//:brenn.dev.toml",
         "//:brenn.e2e.toml",
-        "//deploy/fail2ban:brenn.conf",
     ],
     edition = "2024",
     rustc_env = {"CARGO_MANIFEST_DIR": "brenn-lib"},
-    # ts-rs exports from tests, so this binary is also the generator behind
-    # `//frontend:generated_types`. Without the override the generated types —
-    # and so every bundle built from them — would inherit testonly.
-    testonly = False,
-    visibility = ["//frontend:__pkg__"],
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),
     deps = all_crate_deps(normal_dev = True),
-)
-
-# The MQTT suite spawns a real mosquitto per test and talks to it over
-# loopback. mosquitto stays a system binary — it is the one non-hermetic
-# dependency left — and the env gate is set here so a missing broker fails the
-# test instead of skipping it. Dropping the gate does not quietly restore the
-# skip: the suite panics when the gate is unset under Bazel's test runner.
-#
-# PATH is pinned because a test action's default is a fixed
-# `/bin:/usr/bin:/usr/local/bin`, not the invoking shell's, and Debian-family
-# packaging installs the daemon at /usr/sbin/mosquitto — off that list, so the
-# harness's PATH lookup misses on a host where the install succeeded. The two
-# sbin directories are appended to Bazel's own default rather than replacing it.
-# A static string, so the action key stays machine-independent; the operator's
-# BRENN_MOSQUITTO_BIN override reaches the test through .bazelrc's --test_env.
-rust_test(
-    name = "mqtt_integration",
-    size = "large",
-    srcs = ["tests/mqtt_integration.rs"] + glob(["tests/common/*.rs"]),
-    crate_root = "tests/mqtt_integration.rs",
-    data = glob(["tests/mqtt_assets/**"]),
-    edition = "2024",
-    env = {
-        "BRENN_MQTT_INTEGRATION": "1",
-        "PATH": "/bin:/usr/bin:/usr/local/bin:/usr/sbin:/usr/local/sbin",
-    },
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
-    ),
-    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-lib"},
-    tags = ["requires-network"],
-    deps = all_crate_deps(
-        normal = True,
-        normal_dev = True,
-    ) + [":brenn-lib"],
 )
 
 rust_doc_test(

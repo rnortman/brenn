@@ -12,12 +12,12 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
-use brenn_lib::pwa_push::publish::{GetTargetResult, PushSendResult, Urgency};
+use brenn_pwa_push::publish::{GetTargetResult, PushSendResult, Urgency};
 use serde::Serialize;
 
 use crate::active_bridge::ActiveBridge;
 use crate::intercept_helpers::{ToolErr, reject_tool, warn_if_unexpected_tool_response};
-use crate::tools::pwa_push::{MCP_PUSH_LIST_TARGETS_TOOL, MCP_PUSH_SEND_TOOL};
+use brenn_render::tools::pwa_push::{MCP_PUSH_LIST_TARGETS_TOOL, MCP_PUSH_SEND_TOOL};
 
 // ---------------------------------------------------------------------------
 // Typed tool-response structs (C3)
@@ -151,7 +151,7 @@ pub async fn try_handle_pwa_push_tool(
             // Parse address first; query only the requested target — O(1) for
             // device addresses, O(user-subs) for user fan-out — instead of
             // scanning all subscriptions server-wide.
-            let parsed_addr = match brenn_lib::pwa_push::targets::parse_pwa_push_address(address) {
+            let parsed_addr = match brenn_pwa_push::targets::parse_pwa_push_address(address) {
                 Ok(a) => a,
                 Err(e) => {
                     return Some(
@@ -348,7 +348,7 @@ pub async fn try_handle_pwa_push_tool(
             let ttl_seconds = tool_input
                 .get("ttl_seconds")
                 .and_then(|v| v.as_u64())
-                .map(|n| n.min(u64::from(brenn_lib::pwa_push::publish::MAX_TTL_SECONDS)) as u32)
+                .map(|n| n.min(u64::from(brenn_pwa_push::publish::MAX_TTL_SECONDS)) as u32)
                 .unwrap_or(86400);
             let urgency_str = tool_input
                 .get("urgency")
@@ -695,23 +695,20 @@ mod tests {
 
     struct MockPwaPushSender {
         captured_send_args: Mutex<Option<CapturedSendArgs>>,
-        endpoint_policy: brenn_lib::pwa_push::endpoint_validator::EndpointPolicy,
+        endpoint_policy: brenn_lib::pwa_push::config::EndpointPolicy,
     }
 
     impl MockPwaPushSender {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 captured_send_args: Mutex::new(None),
-                endpoint_policy: brenn_lib::pwa_push::endpoint_validator::EndpointPolicy::new(
-                    vec![],
-                    false,
-                ),
+                endpoint_policy: brenn_lib::pwa_push::config::EndpointPolicy::new(vec![], false),
             })
         }
     }
 
     #[async_trait::async_trait]
-    impl brenn_lib::pwa_push::PwaPushSender for MockPwaPushSender {
+    impl brenn_pwa_push::PwaPushSender for MockPwaPushSender {
         async fn send(
             self: Arc<Self>,
             _sender_conversation_id: i64,
@@ -720,17 +717,17 @@ mod tests {
             body: &str,
             _title: Option<&str>,
             _ttl_seconds: u32,
-            _urgency: brenn_lib::pwa_push::publish::Urgency,
+            _urgency: brenn_pwa_push::publish::Urgency,
             _topic: Option<&str>,
             _tag: Option<&str>,
             data: Option<serde_json::Map<String, serde_json::Value>>,
-        ) -> brenn_lib::pwa_push::publish::PushSendResult {
+        ) -> brenn_pwa_push::publish::PushSendResult {
             *self.captured_send_args.lock().await = Some(CapturedSendArgs {
                 data,
                 address: address.to_string(),
                 body: body.to_string(),
             });
-            brenn_lib::pwa_push::publish::PushSendResult::Ok {
+            brenn_pwa_push::publish::PushSendResult::Ok {
                 message_uuid: uuid::Uuid::nil(),
                 address: address.to_string(),
                 delivered: 0,
@@ -745,15 +742,15 @@ mod tests {
         async fn get_target(
             &self,
             _app_slug: &str,
-            _parsed_addr: &brenn_lib::pwa_push::targets::PwaPushAddress,
-        ) -> brenn_lib::pwa_push::publish::GetTargetResult {
-            brenn_lib::pwa_push::publish::GetTargetResult::NotFound
+            _parsed_addr: &brenn_pwa_push::targets::PwaPushAddress,
+        ) -> brenn_pwa_push::publish::GetTargetResult {
+            brenn_pwa_push::publish::GetTargetResult::NotFound
         }
 
         async fn list_targets(
             &self,
             _app_slug: &str,
-        ) -> Vec<brenn_lib::pwa_push::publish::PushTargetEntry> {
+        ) -> Vec<brenn_pwa_push::publish::PushTargetEntry> {
             vec![]
         }
 
@@ -761,7 +758,7 @@ mod tests {
             "mock-vapid-key"
         }
 
-        fn endpoint_policy(&self) -> &brenn_lib::pwa_push::endpoint_validator::EndpointPolicy {
+        fn endpoint_policy(&self) -> &brenn_lib::pwa_push::config::EndpointPolicy {
             &self.endpoint_policy
         }
     }
@@ -773,7 +770,7 @@ mod tests {
     ) {
         let mock = MockPwaPushSender::new();
         let bridge = crate::active_bridge::ActiveBridge::test_new_for_pwa_push_with_service(
-            Arc::clone(&mock) as Arc<dyn brenn_lib::pwa_push::PwaPushSender>,
+            Arc::clone(&mock) as Arc<dyn brenn_pwa_push::PwaPushSender>,
         )
         .await;
         (bridge, mock)

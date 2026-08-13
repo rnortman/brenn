@@ -13,25 +13,20 @@
 
 use std::borrow::Cow;
 
-use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
-use brenn_lib::automation::{
+use brenn_automation::{
     CreateJob, CreateResult, DeleteResult, EditJob, EditResult, ListResult, MCP_AUTO_CREATE_TOOL,
     MCP_AUTO_DELETE_TOOL, MCP_AUTO_EDIT_TOOL, MCP_AUTO_LIST_TOOL,
     job::{Action, CronTrigger, JobView, SendMessageAction, Trigger},
 };
+use brenn_cc::session::{ApprovalDecision as CcApprovalDecision, ApprovalKind, ApprovalRequest};
 use serde::Serialize;
 
 use crate::active_bridge::ActiveBridge;
 use crate::intercept_helpers::{ToolErr, ToolOk, reject_tool, warn_if_unexpected_tool_response};
 
-// ---------------------------------------------------------------------------
-// Typed tool-response structs (C1)
-// ---------------------------------------------------------------------------
-
 /// Returned to CC when `AutomationCreate` succeeds.
 #[derive(Serialize)]
 struct AutomationCreateOk {
-    // alphabetical: id, next_fire_at, ok
     id: String,
     next_fire_at: String,
     ok: bool,
@@ -40,7 +35,6 @@ struct AutomationCreateOk {
 /// Returned to CC when `AutomationList` succeeds.
 #[derive(Serialize)]
 struct AutomationListOk<'a> {
-    // alphabetical: jobs, ok
     jobs: &'a [JobView],
     ok: bool,
 }
@@ -48,7 +42,6 @@ struct AutomationListOk<'a> {
 /// Returned to CC when `AutomationEdit` succeeds.
 #[derive(Serialize)]
 struct AutomationEditOk {
-    // alphabetical: next_fire_at, ok
     next_fire_at: String,
     ok: bool,
 }
@@ -571,8 +564,8 @@ fn parse_action(tool_input: &serde_json::Value) -> Result<Action, String> {
                 .ok_or_else(|| "action.body is required".to_string())?
                 .to_string();
             // Reject legacy `wake` key — a stale-habit sender would otherwise
-            // be silently defaulted to urgency `low` baking wrong urgency into
-            // a recurring job (§2.4 reject-and-teach).
+            // be silently defaulted to urgency `low`, baking wrong urgency into
+            // a recurring job.
             if action_obj.get("wake").is_some() {
                 return Err("action.wake is no longer valid; use action.urgency \
                      (\"very-low\"|\"low\"|\"normal\"|\"high\")"
@@ -594,9 +587,8 @@ fn parse_action(tool_input: &serde_json::Value) -> Result<Action, String> {
                     let n = v.as_u64().ok_or_else(|| {
                         "action.delivery_deadline_secs must be a positive integer".to_string()
                     })?;
-                    // Reject before cast to avoid silent truncation (security-1):
-                    // a value > u32::MAX would wrap to a small number that passes
-                    // the [1, 2_592_000] range check.
+                    // Reject before cast: a value > u32::MAX would wrap to a
+                    // small number that passes the range check.
                     let n32 = u32::try_from(n).map_err(|_| {
                         format!("action.delivery_deadline_secs {n} exceeds maximum (2592000)")
                     })?;
@@ -630,14 +622,10 @@ fn automation_address_denied_msg(addr: &str) -> String {
 /// for a create/edit address rejection, via the shared publish-denial signal.
 /// `kind` is the internal denial tag carried on the result variant; `addr` is
 /// CC-supplied and sanitized inside the helper.
-fn signal_address_denial(
-    bridge: &ActiveBridge,
-    kind: brenn_lib::obs::security::DenialKind,
-    addr: &str,
-) {
-    brenn_lib::obs::security::signal_publish_denial(
+fn signal_address_denial(bridge: &ActiveBridge, kind: brenn_obs::security::DenialKind, addr: &str) {
+    brenn_obs::security::signal_publish_denial(
         bridge.alert_dispatcher(),
-        brenn_lib::obs::security::SecurityEventType::BrennPublishDenied,
+        brenn_obs::security::SecurityEventType::BrennPublishDenied,
         bridge.denial_origin(),
         kind,
         addr,
@@ -772,7 +760,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// AutoCreate with a valid cron + send_message action returns ok:true,
-    /// an id, and next_fire_at (req §4: auto_create_succeeds_returns_id_and_next_fire).
+    /// an id, and next_fire_at.
     #[tokio::test]
     async fn auto_create_succeeds_returns_id_and_next_fire() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_automation().await;
@@ -801,7 +789,7 @@ mod tests {
     }
 
     /// AutoCreate with an invalid cron expression returns ok:false,
-    /// no DB row created (req §4: auto_create_invalid_cron_returns_structured_error_no_db_change).
+    /// no DB row created.
     #[tokio::test]
     async fn auto_create_invalid_cron_returns_structured_error_no_db_change() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_automation().await;
@@ -826,8 +814,7 @@ mod tests {
                 );
                 // Verify no row was inserted.
                 let engine = bridge.automation_engine().unwrap();
-                let brenn_lib::automation::ListResult::Ok(jobs) =
-                    engine.list("testapp", false).await;
+                let brenn_automation::ListResult::Ok(jobs) = engine.list("testapp", false).await;
                 assert!(
                     jobs.is_empty(),
                     "no DB row should be created for invalid cron"
@@ -837,8 +824,7 @@ mod tests {
         }
     }
 
-    /// AutoEdit cross-app attempt returns forbidden and logs an anomaly
-    /// (req §4: auto_edit_cross_app_rejected_with_anomaly_log).
+    /// AutoEdit cross-app attempt returns forbidden and logs an anomaly.
     #[tokio::test]
     async fn auto_edit_cross_app_rejected_with_anomaly_log() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_automation().await;
@@ -847,17 +833,15 @@ mod tests {
         let create = engine
             .create(
                 "testapp",
-                brenn_lib::automation::CreateJob {
+                brenn_automation::CreateJob {
                     name: "owned job".to_string(),
-                    trigger: brenn_lib::automation::Trigger::Cron(
-                        brenn_lib::automation::CronTrigger {
-                            expr: "0 9 * * *".to_string(),
-                            tz: "UTC".to_string(),
-                            persistent: false,
-                        },
-                    ),
-                    action: brenn_lib::automation::Action::SendMessage(
-                        brenn_lib::automation::SendMessageAction {
+                    trigger: brenn_automation::Trigger::Cron(brenn_automation::CronTrigger {
+                        expr: "0 9 * * *".to_string(),
+                        tz: "UTC".to_string(),
+                        persistent: false,
+                    }),
+                    action: brenn_automation::Action::SendMessage(
+                        brenn_automation::SendMessageAction {
                             to: "brenn:test-channel".to_string(),
                             body: "hello".to_string(),
                             urgency: brenn_lib::messaging::Urgency::Low,
@@ -870,7 +854,7 @@ mod tests {
             )
             .await;
         let id = match create {
-            brenn_lib::automation::CreateResult::Ok { id, .. } => id,
+            brenn_automation::CreateResult::Ok { id, .. } => id,
             other => panic!("create failed: {other:?}"),
         };
 
@@ -880,7 +864,7 @@ mod tests {
         let edit_result = engine
             .edit(
                 "otherapp",
-                brenn_lib::automation::EditJob {
+                brenn_automation::EditJob {
                     id: id.clone(),
                     name: Some("hacked".to_string()),
                     trigger: None,
@@ -890,13 +874,12 @@ mod tests {
             )
             .await;
         match edit_result {
-            brenn_lib::automation::EditResult::Forbidden { .. } => {}
+            brenn_automation::EditResult::Forbidden { .. } => {}
             other => panic!("expected Forbidden, got: {other:?}"),
         }
     }
 
-    /// AutoDelete cross-app attempt returns forbidden
-    /// (req §4: auto_delete_cross_app_rejected_with_anomaly_log).
+    /// AutoDelete cross-app attempt returns forbidden.
     #[tokio::test]
     async fn auto_delete_cross_app_rejected_with_anomaly_log() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_automation().await;
@@ -904,17 +887,15 @@ mod tests {
         let create = engine
             .create(
                 "testapp",
-                brenn_lib::automation::CreateJob {
+                brenn_automation::CreateJob {
                     name: "owned job".to_string(),
-                    trigger: brenn_lib::automation::Trigger::Cron(
-                        brenn_lib::automation::CronTrigger {
-                            expr: "0 9 * * *".to_string(),
-                            tz: "UTC".to_string(),
-                            persistent: false,
-                        },
-                    ),
-                    action: brenn_lib::automation::Action::SendMessage(
-                        brenn_lib::automation::SendMessageAction {
+                    trigger: brenn_automation::Trigger::Cron(brenn_automation::CronTrigger {
+                        expr: "0 9 * * *".to_string(),
+                        tz: "UTC".to_string(),
+                        persistent: false,
+                    }),
+                    action: brenn_automation::Action::SendMessage(
+                        brenn_automation::SendMessageAction {
                             to: "brenn:test-channel".to_string(),
                             body: "hello".to_string(),
                             urgency: brenn_lib::messaging::Urgency::Low,
@@ -927,18 +908,17 @@ mod tests {
             )
             .await;
         let id = match create {
-            brenn_lib::automation::CreateResult::Ok { id, .. } => id,
+            brenn_automation::CreateResult::Ok { id, .. } => id,
             other => panic!("create failed: {other:?}"),
         };
         let delete_result = engine.delete("otherapp", &id).await;
         match delete_result {
-            brenn_lib::automation::DeleteResult::Forbidden { .. } => {}
+            brenn_automation::DeleteResult::Forbidden { .. } => {}
             other => panic!("expected Forbidden, got: {other:?}"),
         }
     }
 
-    /// AutoList returns only the caller's app's jobs and filters correctly
-    /// (req §4: auto_list_returns_only_caller_app_jobs, auto_list_filter_enabled_only_works).
+    /// AutoList returns only the caller's app's jobs and filters correctly.
     #[tokio::test]
     async fn auto_list_returns_only_caller_app_jobs_and_filter_enabled_works() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_automation().await;
@@ -951,17 +931,17 @@ mod tests {
                 engine
                     .create(
                         "testapp",
-                        brenn_lib::automation::CreateJob {
+                        brenn_automation::CreateJob {
                             name: name.to_string(),
-                            trigger: brenn_lib::automation::Trigger::Cron(
-                                brenn_lib::automation::CronTrigger {
+                            trigger: brenn_automation::Trigger::Cron(
+                                brenn_automation::CronTrigger {
                                     expr: "0 9 * * *".to_string(),
                                     tz: "UTC".to_string(),
                                     persistent: false,
                                 },
                             ),
-                            action: brenn_lib::automation::Action::SendMessage(
-                                brenn_lib::automation::SendMessageAction {
+                            action: brenn_automation::Action::SendMessage(
+                                brenn_automation::SendMessageAction {
                                     to: "brenn:test-channel".to_string(),
                                     body: "body".to_string(),
                                     urgency: brenn_lib::messaging::Urgency::Low,
@@ -1019,10 +999,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Wire-shape regression guards for C1 typed structs
-    // -----------------------------------------------------------------------
-
     /// `AutomationCreateOk` must serialize byte-identically to the source `json!`.
     #[test]
     fn automation_create_ok_matches_reference() {
@@ -1046,7 +1022,7 @@ mod tests {
     /// (empty jobs slice — guards struct shape and field names).
     #[test]
     fn automation_list_ok_matches_reference() {
-        let jobs: &[brenn_lib::automation::job::JobView] = &[];
+        let jobs: &[brenn_automation::job::JobView] = &[];
         let ok = super::AutomationListOk { ok: true, jobs };
         let produced =
             serde_json::to_string(&ok).expect("AutomationListOk serialization is infallible");
@@ -1060,9 +1036,9 @@ mod tests {
     #[tokio::test]
     async fn auto_create_too_many_jobs_returns_error_with_message() {
         let bridge = crate::active_bridge::ActiveBridge::test_new_with_automation_config(
-            brenn_lib::automation::AutomationGlobalConfig {
+            brenn_automation::AutomationGlobalConfig {
                 max_jobs_per_app: 1,
-                ..brenn_lib::automation::AutomationGlobalConfig::default()
+                ..brenn_automation::AutomationGlobalConfig::default()
             },
         )
         .await;
@@ -1114,9 +1090,9 @@ mod tests {
     // test-2: Legacy `wake` key and unknown `urgency` value rejection in parse_action
     // -----------------------------------------------------------------------
 
-    /// AutoCreate with legacy `action.wake` key returns `ok:false` error mentioning `urgency`.
-    /// Guards the reject-and-teach path (§2.4): a stale-habit sender sending `wake` in a
-    /// recurring job would bake the wrong urgency in permanently — must be an explicit error.
+    /// AutoCreate with legacy `action.wake` key returns `ok:false` error mentioning
+    /// `urgency`. A stale sender sending `wake` in a recurring job would bake
+    /// the wrong urgency permanently — must be an explicit error.
     #[tokio::test]
     async fn auto_create_legacy_wake_key_returns_error() {
         let bridge =
@@ -1225,7 +1201,7 @@ mod tests {
         to: &str,
         reply_to: Option<&str>,
     ) -> Vec<(String, String)> {
-        let (dispatcher, captured, _handle) = brenn_lib::obs::alerting::make_capturing_alerter();
+        let (dispatcher, captured, _handle) = brenn_obs::alerting::make_capturing_alerter();
         let bridge =
             crate::active_bridge::ActiveBridge::test_new_with_automation_config_and_dispatcher(
                 Default::default(),
@@ -1292,7 +1268,7 @@ mod tests {
     /// probe vector's signal wiring.
     #[tokio::test]
     async fn auto_edit_out_of_acl_to_signals_acl_denied() {
-        let (dispatcher, captured, _handle) = brenn_lib::obs::alerting::make_capturing_alerter();
+        let (dispatcher, captured, _handle) = brenn_obs::alerting::make_capturing_alerter();
         let bridge =
             crate::active_bridge::ActiveBridge::test_new_with_automation_config_and_dispatcher(
                 Default::default(),

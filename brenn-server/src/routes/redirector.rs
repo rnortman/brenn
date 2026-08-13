@@ -16,7 +16,7 @@ use axum::Extension;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
-use brenn_lib::obs::security::{SecurityEventType, log_and_alert_security_event};
+use brenn_obs::security::{SecurityEventType, log_and_alert_security_event};
 
 use crate::client_ip::ClientIp;
 use crate::path_validate::validate_app_path;
@@ -170,7 +170,7 @@ mod tests {
     use axum::routing::get as route_get;
     use axum::{Router, middleware as axum_mw};
     use brenn_lib::db;
-    use brenn_lib::obs::alerting::make_capturing_alerter;
+    use brenn_obs::alerting::make_capturing_alerter;
     use http_body_util::BodyExt;
     use indexmap::IndexMap;
     use tower::ServiceExt;
@@ -220,7 +220,7 @@ mod tests {
             surface_dist_dir: std::path::PathBuf::from("/tmp"),
             cached_models: Default::default(),
             tool_registry: Default::default(),
-            tools: std::sync::Arc::new(crate::tool_registry::ToolRegistry::new(vec![])),
+            tools: std::sync::Arc::new(brenn_tool_registry::ToolRegistry::new(vec![])),
             tool_server_origin: std::sync::Arc::from("test-origin"),
             wake_locks: WakeLocks::default(),
             spawn_backoff: Default::default(),
