@@ -10,9 +10,8 @@ use tracing::warn;
 
 /// Why a sync cycle should run.
 ///
-/// All variants converge on the same reaction pipeline; they only differ in
-/// whether they bypass debounce (Push) or go through it (Poll), and in the
-/// resume-time variant's scoped remotes list.
+/// Both variants converge on the same reaction pipeline; they differ only in
+/// whether they bypass debounce (Push) or go through it (Poll).
 #[derive(Debug, Clone)]
 pub enum SyncTrigger {
     /// Periodic poll tick for one remote. Debounced.
@@ -25,13 +24,6 @@ pub enum SyncTrigger {
         remote: String,
         acting_conversation_id: Option<i64>,
     },
-    /// A conversation just resumed. Run one cycle for each remote mounted by
-    /// the app, so freshness is guaranteed before the bridge starts processing.
-    ///
-    /// TODO(repo-sync-resume-poke-wiring): nothing constructs this variant;
-    /// the resume path never pokes, so the freshness guarantee above is not
-    /// delivered today.
-    ResumePoke { remotes: Vec<String> },
 }
 
 /// The sending half of the trigger channel. Dropping it does not kill the

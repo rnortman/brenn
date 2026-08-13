@@ -32,7 +32,7 @@ rust_library(
     deps = all_crate_deps(normal = True) + FIRST_PARTY_DEPS,
 )
 
-# `medium` (300s) rather than `small` (60s): 469 tests over in-memory sqlite
+# `medium` (300s) rather than `small` (60s): 470 tests over in-memory sqlite
 # plus the `tokio::time` dispatch and deferral suites, 7.6s locally. Against the
 # repo's one measured local→CD factor (~21x, brenn-server 22s/472s) that is
 # ~160s on a cold 4-vCPU runner, over the small budget and inside this one.

@@ -27,6 +27,20 @@ Rust tree (comment-standard Rule 1). Grandfathered: the scrub rule is
 diff-only, so tree scans skip it and only newly touched lines are flagged.
 Post-release cleanup, blocks nothing.
 
+Same class, same burndown: 37 comment lines across 26 `.rs` files cite
+`docs/designs/*.md` paths, a directory that does not exist in the public tree
+(`docs/` holds five files); `repo-sync.md` alone accounts for 12 of them across
+9 files. Re-derive both figures before working the list —
+`grep -rn "docs/designs/" --include='*.rs' .` is what produced them. These are worse than the
+section-symbol refs — the referent is unresolvable outright, and the rationale
+each comment defers to lives only in the private ops annex, so replacing one
+means deciding what of that rationale may be restated publicly. That decision
+is the owner's, and it is why this burns down by hand rather than by sweep.
+Unlike the section-symbol refs there is no gate at all here: a dead doc path is
+mechanically checkable (path shape plus a stat), so part of the work is
+deciding whether a `docs`-path-existence guard beside the scrub rules is worth
+its false reds.
+
 No code site: the instances are the work list.
 
 
@@ -247,15 +261,15 @@ ingress-only code paths are gone):
 3. **Delete the remnants**: `EnvelopeTypeColumn` collapses to a bare
    `ChannelScheme`; remove `IngressEvent` and the ingress decode/render
    (`[Event]` card) paths, `insert_ingress_message*`, the `ingress_*`
-   columns/queries in `brenn-lib/src/messaging/db/ingress.rs`, and with them the
+   columns/queries in `brenn-messaging-store/src/db/ingress.rs`, and with them the
    `messaging_pending_pushes` table itself — these rows are all it still carries,
    and `dispatch_row` plus the dispatcher's ingress scan die with them.
 
 Code sites (`TODO(ingress-retirement)`):
-`brenn-lib/src/messaging/db/envelope_column.rs` (`EnvelopeTypeColumn::Ingress`),
-`brenn-lib/src/repo_sync_cursor.rs` (the two `insert_ingress_message_raw`
-writers), `brenn-lib/src/messaging/publish/mod.rs` (`insert_ingress_message`
-writer), `brenn-lib/src/messaging/ingress.rs` (`Event`).
+`brenn-messaging-store/src/db/envelope_column.rs` (`EnvelopeTypeColumn::Ingress`),
+`brenn-messaging/src/repo_sync_cursor.rs` (the two `insert_ingress_message_raw`
+writers), `brenn-messaging/src/publish/mod.rs` (`insert_ingress_message`
+writer), `brenn-messaging-store/src/ingress.rs` (`Event`).
 
 ---
 
@@ -277,13 +291,13 @@ Code site: `brenn-server/src/active_bridge/brenn_tools/git.rs`,
 ## `tool-registry-absorb-apptool`
 
 The legacy `AppTool` display registry (`build_tool_registry` in
-`brenn-server/src/tools/mod.rs`) coexists with the first-class
+`brenn-render/src/tools/mod.rs`) coexists with the first-class
 `tool_registry::ToolRegistry`. `ActiveBridge` carries both `tool_registry` and
 `tools`, a naming trap. The `AppTool` per-tool metadata (summary formatting,
 auto-approve) should eventually fold into `ToolDescriptor` so there is a single
 tool table.
 
-Code site: `brenn-server/src/tools/mod.rs` (`build_tool_registry`),
+Code site: `brenn-render/src/tools/mod.rs` (`build_tool_registry`),
 `TODO(tool-registry-absorb-apptool)`.
 
 ---
@@ -321,7 +335,7 @@ the replay is harmless now; a `RequiresKey` tool is only safe once dedupe keys
 survive across executor incarnations. `call_id` already rides every request and
 is the correlation a duplicate result carries.
 
-Code site: `brenn-server/src/tool_registry/registry.rs` (`ToolRegistry::new`
+Code site: `brenn-tool-registry/src/registry.rs` (`ToolRegistry::new`
 registration panic), `TODO(tool-registry-idempotency-dedupe)`.
 
 ---
@@ -380,9 +394,8 @@ pointless.
 
 UPDATE: Not blocked on telemtry: the best telemetry option is Brenn's bus itself,
 with retained channels.
-See docs/adr/2026/07/12-surface-ui-round2/retro-fixes.md for discussion.
 
-Code site: `brenn-lib/src/messaging/mod.rs`
+Code site: `brenn-messaging/src/lib.rs`
 (`enact_overflow_noise`), `TODO(drop-counters-export)`.
 
 ---
@@ -456,13 +469,13 @@ reach the affected WS connections.)
 
 Covers ALL process-lifetime background tasks with intentionally-dropped
 `JoinHandle`s: `bus_gc_loop`, `spawn_deliver_after_task`, `spawn_deadline_task`,
-`session_cleanup_loop`, `ingress_cleanup_loop` (all in `brenn/src/bootstrap/mod.rs`).
+`session_cleanup_loop`, `ingress_cleanup_loop` (all in `brenn-bootstrap/src/shutdown.rs`).
 
 Reviewers and burndowns keep rediscovering that these tasks "die silently" on panic
 and proposing a supervisory wrapper. They are wrong about "silently," and the
 decision is final: **every panic is logged (structured `tracing::error!`,
 `panic=true`, with location) AND fires a Critical phone alert via the global panic
-hook (`brenn-lib/src/obs/panic_hook.rs`).** The residual gap — the process keeps
+hook (`brenn-obs/src/panic_hook.rs`).** The residual gap — the process keeps
 running with that one task dead until someone restarts it — is ACCEPTED. Alert +
 manual restart is the intended and sufficient mitigation. We are NOT adding per-task
 supervision, nor process-crash-on-task-death.
@@ -490,8 +503,8 @@ it's documented and accepted. Leave it alone. Do not delete this entry.
 (Original gap description, for context only — NOT a call to action: (1) already-open
 WS sessions keep dispatching until server restart; (2) `resolve_or_create_device`
 mints a new device row for the same authenticated user post-unenroll while the
-login session is still valid. Code sites: `brenn/src/routes/ws/dispatch.rs:17-33`,
-`brenn-lib/src/auth/device.rs::unenroll_device` and `resolve_or_create_device`.)
+login session is still valid. Code sites: `brenn-server/src/routes/ws/dispatch.rs`,
+`brenn-db/src/auth/device.rs::unenroll_device` and `resolve_or_create_device`.)
 
 
 
@@ -556,7 +569,7 @@ not by verification against croner's actual handling of the spring-forward gap a
 the fall-back repeat. Done when the DST spike tests run against a pinned croner
 version and the observed behavior is recorded.
 
-Code site (`TODO(automation-croner-dst-verify)`): `brenn-lib/src/automation/job.rs`.
+Code site (`TODO(automation-croner-dst-verify)`): `brenn-automation/src/job.rs`.
 
 ---
 
@@ -567,8 +580,8 @@ the sweep expensive, a more sophisticated prune (retention by job, per-N batchin
 is the follow-up. Not urgent: current volume is trivial.
 
 Code sites (`TODO(automation-fires-cleanup)`):
-`brenn-lib/src/automation/db.rs` (the prune statement),
-`brenn-lib/src/automation/fire.rs` (the sweep loop).
+`brenn-automation/src/db.rs` (the prune statement),
+`brenn-automation/src/fire.rs` (the sweep loop).
 
 ---
 
@@ -578,7 +591,7 @@ Some fire-semantics cases (overlap suppression, catch-up-after-downtime edges)
 are covered by reasoning in comments rather than tests. Done when those cases have
 direct tests.
 
-Code site (`TODO(automation-fire-semantics-tests)`): `brenn-lib/src/automation/fire.rs`.
+Code site (`TODO(automation-fire-semantics-tests)`): `brenn-automation/src/fire.rs`.
 
 ---
 
@@ -588,7 +601,7 @@ Events enqueued to a conversation that is later abandoned are never delivered an
 never cleaned up; the rows accumulate. Done when abandoned-conversation cleanup
 also retires their undelivered events.
 
-Code site (`TODO(event-cleanup-undelivered)`): `brenn-lib/src/conversation/mod.rs`.
+Code site (`TODO(event-cleanup-undelivered)`): `brenn-db/src/conversation/mod.rs`.
 
 ---
 
@@ -639,7 +652,7 @@ Code site (`TODO(replay-generic-bounded-scan)`):
 The bus GC loop is spawned separately from the other cleanup loops; unifying them
 under one sweep scheduler was deferred. Cosmetic/structural, not a defect.
 
-Code site (`TODO(unify-gc)`): `brenn-server/src/bootstrap/mod.rs`.
+Code site (`TODO(unify-gc)`): `brenn-bootstrap/src/lib.rs`.
 
 ---
 
@@ -693,7 +706,7 @@ calls `dispatch_kick()`. Skipped rows therefore wait up to `POLL_INTERVAL`
 supervisor honors.
 
 Code site (`TODO(dispatcher-completion-kick)`):
-`brenn-lib/src/messaging/dispatcher.rs` (the supervisor task's normal-completion
+`brenn-messaging/src/dispatcher.rs` (the supervisor task's normal-completion
 arm).
 
 ---
@@ -759,7 +772,7 @@ count, the non-durable one at the ring's cap — so the fix is one report path, 
 two.
 
 Code site (`TODO(deferred-flush-drop-signal)`):
-`brenn-lib/src/messaging/publish/mod.rs` (the refusal-reporting loop at the end of
+`brenn-messaging/src/publish/mod.rs` (the refusal-reporting loop at the end of
 `publish_from_wasm`, which both park arms feed).
 
 ---
@@ -790,7 +803,7 @@ in the three tool descriptions meanwhile.
 Done when the LLM recall tools reach ring-parked messages, or the durable-only
 scope is ratified in `docs/message-bus.md`.
 
-Code site (`TODO(ring-deferred-recall)`): `brenn-lib/src/messaging/edit.rs`
+Code site (`TODO(ring-deferred-recall)`): `brenn-messaging/src/edit.rs`
 (`Messenger::cancel`).
 
 ---
@@ -819,10 +832,10 @@ operator-facing `burst` config whose documented unit is publishes.
 
 What the amplification also buys, beyond the write work: every view restatement
 runs under the process-wide `deferred_view_gate`
-(`brenn-lib/src/messaging/mod.rs`), held across the deferred-set read, and the
+(`brenn-messaging/src/lib.rs`), held across the deferred-set read, and the
 release sweep takes that same gate while running on the single dispatcher loop
 that also wakes ordinary subscribers (`push_released_surface_views`;
-`brenn-lib/src/messaging/dispatcher.rs`). Op-driven recomputes therefore queue
+`brenn-messaging/src/dispatcher.rs`). Op-driven recomputes therefore queue
 ahead of sweeps and subscriber wakes — bus-wide dispatch delay, on the order of
 fractions of a second to seconds of aggregate delay under a deliberate burst, not
 merely delay for the surface that caused it. A raced (`NotDeferred`) op restates
@@ -899,7 +912,7 @@ the retained window to be sized for the worst case. Done when a peer can read
 past its retain depth without the channel retaining more.
 
 Code site (`TODO(chat-history-on-demand)`):
-`brenn-lib/src/messaging/chat_provision.rs`, where the record channel's retained
+`brenn-messaging/src/chat_provision.rs`, where the record channel's retained
 window is fixed.
 
 
@@ -915,7 +928,7 @@ so. Done when conversation deletion tears the chat family down with the
 conversation.
 
 Code site (`TODO(chat-deletion-teardown)`):
-`brenn-lib/src/messaging/chat_provision.rs`, on
+`brenn-messaging/src/chat_provision.rs`, on
 `deprovision_conversation_chat_channels`.
 
 
@@ -944,7 +957,7 @@ absent from the apps map either keeps its position or documentedly loses it, wit
 a test either way.
 
 Code site (`TODO(dormant-missing-app-cursor)`):
-`brenn-lib/src/messaging/reconcile.rs`, the dormant justification loop in
+`brenn-messaging/src/reconcile.rs`, the dormant justification loop in
 `Messenger::reconcile_subscriber_cursors`.
 
 
@@ -1047,7 +1060,7 @@ that — it is a two-call convention spelled out in a doc comment on
 `create_conversation` — and the tree has already missed it twice (the send-message
 create path and the singleton first-attach path, both fixed by hand). The lazy
 mint inside delivery was the third: `MessageTargets::ensure_app_conversation`
-(`brenn-lib/src/messaging/store/targets.rs`) is a synchronous method holding the
+(`brenn-messaging-store/src/store/targets.rs`) is a synchronous method holding the
 caller's `&Connection` and can discharge neither obligation itself, so its one
 caller, `Messenger::attach_conversation`, now provisions in the mint's lock
 scope and republishes the roster after the guard drops. Every known creation
@@ -1066,8 +1079,8 @@ conversation cannot be created without its channels and the roster snapshot that
 names it, with the creation sites routed through one call.
 
 Code sites (`TODO(chat-conversation-provision-chokepoint)`):
-`brenn-lib/src/conversation/mod.rs`, on `create_conversation` (where the
-convention is documented), and `brenn-lib/src/messaging/store/targets.rs`, on
+`brenn-db/src/conversation/mod.rs`, on `create_conversation` (where the
+convention is documented), and `brenn-messaging-store/src/store/targets.rs`, on
 `MessageTargets::ensure_app_conversation` (the site whose caller discharges it).
 
 
@@ -1165,7 +1178,7 @@ Done = every descriptor's `input_schema` is derived from its args struct and no
 hand-written schema literal remains in the registry.
 
 Code site (`TODO(tool-schema-derive)`):
-`brenn-server/src/tool_registry/descriptor.rs`, the `input_schema` field.
+`brenn-tool-registry/src/descriptor.rs`, the `input_schema` field.
 
 
 ## `bazel-teardown`
@@ -1226,11 +1239,33 @@ Code site (`TODO(bazel-ci-cache-pressure)`): `.github/workflows/ci.yml`, the
 `Report bazel cache sizes` step.
 
 
+## `bazel-ci-timings`
+
+The bazel-optimization program's whole payoff claim rests on incremental runs
+being cheap, and nothing has measured that. Record per-step CI durations for
+~2 weeks of post-landing runs across the three commit shapes the program's test
+plan named — docs-only, component-only, source — plus the per-target test times
+the run summary already prints.
+
+Done = the numbers are read and one of three outcomes is chosen: close (the
+incremental floor is fine and the work paid off), reopen `crate-split` for a
+tranche 3 per the reopen condition recorded there, or target the specific slow
+suites the data names (cheapening the wasm engine tests with a shared engine or
+precompiled guests is the obvious candidate).
+
+Separate from `bazel-ci-cache-pressure` on purpose: the two read-outs share a
+cadence but answer different questions — durations here, cache saturation there
+— and they prescribe different remedies.
+
+Code site (`TODO(bazel-ci-timings)`): `.github/workflows/ci.yml`, beside the
+`Report bazel cache sizes` step.
+
+
 ## `crate-split`
 
 `brenn-lib` and `brenn-server` are each one `rust_test(crate = ...)` target over
 a whole crate, so any source edit re-runs every test in it. On the CD runner the
-brenn-server target took 472s at ~2,500 tests; it is at 1,349 and brenn-lib at
+brenn-server target took 472s at ~2,500 tests; it is at 1,348 and brenn-lib at
 967 as the tranches land. Only
 finer crates reduce that work — within-target partitions (wrapper targets,
 libtest filters, sharding) all keep the whole crate in the input closure, so
@@ -1259,8 +1294,9 @@ left brenn-lib. Remaining:
   MQTT addressing) stays in brenn-lib; the wire path rises into its own crate. Moving the aggregate
   above the subsystems instead does not work: `messaging` reads
   `config::{AppConfig, AppConfigRaw, LlmChatConfig, ServerConfig}` in
-  production (`gates.rs`, `store/targets.rs`, `messaging/mod.rs`,
-  `messaging/config.rs`, `chat_roster.rs`, `chat_provision.rs`, `remote.rs`),
+  production (brenn-lib's `messaging/{gates,config,remote}.rs`,
+  `brenn-messaging-store`'s `store/targets.rs`, and `brenn-messaging`'s
+  `lib.rs`, `chat_roster.rs` and `chat_provision.rs`),
   and the subsystems depend on `messaging`, so an aggregate above them is above
   `messaging` too and closes the cycle from the other side.
 - The subsystems on that seam are done. `mqtt` cut where its extra edge said it
@@ -1276,7 +1312,8 @@ left brenn-lib. Remaining:
   export writers with the row types they serialize.
 - Tranche 2, brenn-server: `brenn-bootstrap` (401 tests) has left — the
   composition root with `cli` and `pid_file`, and the two boot-dependent test
-  trees that had to move up with it (`routes/surface/ws_tests.rs`, the surface
+  trees that had to move up with it (the tree then at
+  `routes/surface/ws_tests.rs`, the surface
   boot harness, `wasm_dispatch/tests/e2e.rs`). The route it took is the
   prescription for the rest: the modules the root wires are `pub`, the fixture
   layers those tests are built on (`test_support`, `routes/surface/
@@ -1324,7 +1361,8 @@ left brenn-lib. Remaining:
     the config lowering into runtimes, the attachment profile, the bindings and
     self-description documents, asset validation, the single-writer sweeps and
     the disconnected stamp — reads no `state` and no sibling route, so the cut
-    ran *inside* `routes/surface/mod.rs` rather than around it. What stayed in
+    ran *inside* what was then `routes/surface/mod.rs` rather than around it.
+    What stayed in
     brenn-server is the part that needs `AppState`: `authorize_surface`,
     `surface_ws_handler`, `page.rs`, the conformance suite, and the rigs that
     stand a whole state up. The seam is the general one for this tranche —
@@ -1380,7 +1418,7 @@ left brenn-lib. Remaining:
   - `messaging` (1,032) has the same seam the three subsystems took: every
     back-edge into it from `access`, `config`, `mqtt`, `webhook`,
     `repo_sync_cursor` and `tools` lands in `messaging::config` or in the value
-    types in `messaging/mod.rs` (`ChannelScheme`, `Urgency`, `WakeMin`,
+    types in `messaging.rs` (`ChannelScheme`, `Urgency`, `WakeMin`,
     `ParticipantId`, `ChannelEntry`, `MessagingDirectory`, `gates`), so the
     addressing/config half stays and the runtime (`publish`, `store`, `db`,
     `dispatcher`, `subscribe`, `query`, `ingress`, `edit`, `remote`, `system`,
@@ -1389,7 +1427,7 @@ left brenn-lib. Remaining:
     `brenn-lib/src/messaging/` (`addressing`, `config`, `directory`, `gates`,
     `identity`, `remote`, `test_support`, 967 tests with the rest of brenn-lib),
     the persistence layer is `brenn-messaging-store` (277), and the engine is
-    `brenn-messaging` (469), which glob-re-exports the vocabulary so the moved
+    `brenn-messaging` (470), which glob-re-exports the vocabulary so the moved
     code's own paths resolve — callers name the vocabulary through
     `brenn_lib::messaging`. The engine had to rise as one crate: every runtime
     module is an `impl Messenger` block, and Rust forbids an inherent impl on a
@@ -1428,21 +1466,35 @@ left brenn-lib. Remaining:
   `brenn_usage_db::run_usage_migrations` is the two usage tables,
   `brenn_lib::db::run_slice_migrations` composes both of those,
   `brenn_messaging_store::db::run_slice_migrations` adds the messaging tables on
-  top, and `brenn-server/src/db.rs`'s `run_server_slice_migrations` adds
-  automation. A crate that extracts takes its DDL and its registration
-  obligation with it — the usage set moved with `brenn-usage-db` and the
-  messaging set with `brenn-messaging`, then down again with
-  `brenn-messaging-store`.
+  top, `brenn_messaging::slice::run_slice_migrations` adds
+  `brenn_messaging::repo_sync_cursor::run_repo_sync_cursor_migrations` (the
+  advance cursor, whose only production writer is the engine's
+  `upsert_and_enqueue`), and `brenn-server/src/db.rs`'s
+  `run_server_slice_migrations` composes that with automation. A crate that
+  extracts takes its DDL and
+  its registration obligation with it — the usage set moved with
+  `brenn-usage-db` and the messaging set with `brenn-messaging`, then down again
+  with `brenn-messaging-store`.
 
 **The residue against the ~300-test criterion**, for the gate that accepts or
-rejects it: `brenn-server` (1,349) and `brenn-lib` (967) are blocked by the two
-cycles written down above, `brenn-messaging` (469) by the inherent-impl
+rejects it: `brenn-server` (1,348) and `brenn-lib` (967) are blocked by the two
+cycles written down above, `brenn-messaging` (470) by the inherent-impl
 constraint, and `brenn-messaging-boot` (339) is over the count but not over what
 the count was a proxy for — it runs in 0.39s locally, ~8s at the repo's measured
 CD factor, against `brenn-server`'s 472s that started this program. Test count
 was the criterion because no timing data existed; the timings now in each
 target's `size` comment are the better unit, and every target except the three
 blocked ones is inside a `small` budget.
+
+**Accepted at the 2026-08-13 follow-up gate**, on the first real CI
+measurements: `brenn-server_test` runs ~100s there against the 472s that opened
+this program, `brenn-bootstrap_test` ~94s, and the whole `make bazel-check`
+9m33s. Both residue targets sit at the top of the tree, so nearly any source
+edit re-runs both — that pair, running in parallel, is the incremental floor,
+and only the deferred state-ownership inversion lowers it. Reopen condition: if
+the `bazel-ci-timings` read-out shows typical incremental runs dominated by the
+residue targets, commission the state-ownership/registry design cycle as a
+tranche 3; otherwise this entry closes with the residue standing.
 
 Every extraction is monotonic: a module whose dependency cycle will not break
 cleanly stays put and is recorded rather than forced apart with an invented
@@ -1611,28 +1663,6 @@ live to reach the worker.
 Code site (`TODO(sw-registration-csp-blocked)`): brenn-server/src/routes/app.rs,
 both inline registration sites — `landing_page` and `render_app_shell`.
 
-
-
-## `repo-sync-resume-poke-wiring`
-
-`SyncTrigger::ResumePoke` is consumed by the repo-sync reactor — one sync cycle
-per remote in its scoped list, trigger kind `"resume"` — and constructed by
-nothing in the tree. The doc comment on the variant promises that a resuming
-conversation gets fresh clones before the bridge starts processing; no producer
-exists, so it does not. While the enum lived inside brenn-server an
-`#[allow(dead_code)]` carried that fact; it is `pub` in a library crate now, so
-the lint can never fire again and this entry is the only tracker.
-
-Two acceptable outcomes: wire the producer at the conversation-resume path so
-the mounted remotes are poked before the bridge runs, or delete the variant and
-its reactor arm (the no-shims rule means reinstating it alongside a producer is
-one commit).
-
-Done = either a resume actually emits the trigger for the app's mounted
-remotes, or the variant is gone.
-
-Code site (`TODO(repo-sync-resume-poke-wiring)`): brenn-git/src/sync.rs,
-`SyncTrigger::ResumePoke`.
 
 
 ## `build-test-count-guard`

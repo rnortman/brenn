@@ -28,6 +28,7 @@ pub mod publish;
 pub mod query;
 pub mod reconcile;
 pub mod repo_sync_cursor;
+pub mod slice;
 pub mod subscribe;
 pub mod system;
 

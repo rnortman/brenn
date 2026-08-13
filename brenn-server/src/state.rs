@@ -122,11 +122,8 @@ pub struct AppState {
     pub server_shutting_down: Arc<AtomicBool>,
     /// Repo-sync trigger sender. `None` when no sync-enabled clones are
     /// configured — in that case the feature is effectively disabled and
-    /// call sites that would fire a trigger (webhook endpoint, push hook,
-    /// resume-poke) skip gracefully.
-    ///
-    /// See `docs/designs/repo-sync.md`.
-    #[allow(dead_code)] // Consumers wired in Phases 2–4.
+    /// call sites that would fire a trigger (webhook endpoint, push hook)
+    /// skip gracefully.
     pub repo_sync_sender: Option<SyncTriggerSender>,
     /// Messenger for the messaging MVP. `None` when no `[[channel]]`
     /// is configured (messaging effectively disabled).

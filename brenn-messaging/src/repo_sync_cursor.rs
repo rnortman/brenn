@@ -1,14 +1,12 @@
 //! Persisted `last_notified_head` cursor for repo_sync advance detection.
 //!
-//! See `docs/designs/repo-sync-last-notified-head-loss-across-restart.md`
-//! for the design. The cursor is a performance cache over what could in
-//! principle be derived from the unified ingress store (if `new_head` were
-//! added to the payload). It is kept as a dedicated table so the atomic
-//! cursor-plus-fanout shape is cheap: one transaction that updates a
-//! single row plus N ingress inserts.
+//! The cursor is a performance cache over what could in principle be derived
+//! from the unified ingress store (if `new_head` were added to the payload).
+//! It is kept as a dedicated table so the atomic cursor-plus-fanout shape is
+//! cheap: one transaction that updates a single row plus N ingress inserts.
 //!
 //! Naming: `repo_slug` is the `[[repo]].slug` config value (same as
-//! `CloneInfo.slug` in `brenn/src/repo_sync/mod.rs`). Not app slug,
+//! `CloneInfo.slug` in `brenn-server/src/repo_sync/mod.rs`). Not app slug,
 //! not mount slug.
 
 use std::collections::HashMap;
@@ -19,6 +17,28 @@ use rusqlite::Connection;
 use crate::ParticipantId;
 use crate::Urgency;
 use crate::db::{insert_ingress_message_raw, utc_to_ns};
+
+/// This crate's own DDL set: the one table its production code writes.
+/// Idempotent — `IF NOT EXISTS` throughout. The table has no foreign keys, so
+/// it composes in any order after the base tables. Composed into this crate's
+/// slice by [`crate::slice::run_slice_migrations`].
+pub fn run_repo_sync_cursor_migrations(conn: &Connection) {
+    conn.execute_batch(
+        r#"
+        -- Persisted `last_notified_head` cursor for repo_sync advance detection.
+        -- Written in the same transaction as the corresponding event inserts
+        -- so a crash mid-fan-out cannot drop the advance notification across
+        -- restart. `updated_at` is forensics-only — no read path depends on
+        -- it; keep it for post-hoc debugging of when a cursor last advanced.
+        CREATE TABLE IF NOT EXISTS repo_sync_cursor (
+            repo_slug  TEXT PRIMARY KEY,
+            head       TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .expect("run repo_sync_cursor migrations");
+}
 
 /// One row to be inserted into the unified ingress store as part of an atomic
 /// cursor-plus-fanout transaction. Borrowed strings keep the caller
@@ -36,7 +56,7 @@ pub struct EnqueueRow<'a> {
 /// DB error per Brenn's "BETTER DEAD THAN WRONG" policy.
 ///
 /// `repo_slug` is the `[[repo]].slug` config value (same as
-/// `CloneInfo.slug` in `brenn/src/repo_sync/mod.rs`). Not app slug,
+/// `CloneInfo.slug` in `brenn-server/src/repo_sync/mod.rs`). Not app slug,
 /// not mount slug.
 ///
 /// Rollback note: this function does not call `tx.rollback()` anywhere.
@@ -118,7 +138,7 @@ pub fn enqueue_batch(conn: &mut Connection, rows: &[EnqueueRow<'_>]) {
 /// Read every persisted cursor. Returned map is keyed by repo slug
 /// (`CloneInfo.slug` / `[[repo]].slug`), ready to wrap in
 /// `Arc<std::sync::Mutex<_>>` matching today's `last_notified_head`
-/// init shape in `brenn/src/repo_sync/mod.rs`.
+/// init shape in `brenn-server/src/repo_sync/mod.rs`.
 pub fn load_all(conn: &Connection) -> HashMap<String, String> {
     let mut stmt = conn
         .prepare("SELECT repo_slug, head FROM repo_sync_cursor")
@@ -138,8 +158,8 @@ pub fn load_all(conn: &Connection) -> HashMap<String, String> {
 mod tests {
     use super::*;
     use crate::ParticipantId;
-    use crate::db::init_db_memory;
     use crate::db::load_pending_ingress_for_drain;
+    use crate::slice::init_db_memory;
 
     fn seed_conversation(conn: &Connection, conv_id: i64) {
         conn.execute(
@@ -201,36 +221,58 @@ mod tests {
         assert_eq!(pending_count(&conn, 2), 1);
     }
 
+    /// Reject the ingress insert whose summary is `summary`, so a fan-out that
+    /// reaches that row fails mid-transaction the way a schema violation would.
+    fn reject_ingress_row(conn: &Connection, summary: &str) {
+        conn.execute(
+            &format!(
+                "CREATE TRIGGER reject_row BEFORE INSERT ON messaging_messages \
+                 WHEN NEW.ingress_summary = '{summary}' \
+                 BEGIN SELECT RAISE(ABORT, 'rejected'); END"
+            ),
+            [],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn upsert_and_enqueue_rolls_back_on_event_insert_failure() {
         let db = init_db_memory();
         let mut conn = db.blocking_lock();
         seed_conversation(&conn, 1);
+        seed_conversation(&conn, 2);
+        reject_ingress_row(&conn, "s2");
 
-        // conversation_id=9999 has no FK target → the ParticipantId is
-        // 'conversation:9999' which itself has no FK constraint (the
-        // pending_pushes table has no FK to conversations). However, the
-        // messaging_messages insert has no FK to conversations either.
-        // So both inserts land — the FK guard is on the messaging schema.
-        // This test now verifies the happy path for 2-conversation batch.
-        let rows = vec![EnqueueRow {
-            conversation_id: 1,
-            app_slug: "appa",
-            source: "repo_sync:pulled",
-            summary: "s1",
-            payload: "{}",
-        }];
-        upsert_and_enqueue(&mut conn, "r1", "abc123", &rows);
-        // Cursor landed.
+        let rows = vec![
+            EnqueueRow {
+                conversation_id: 1,
+                app_slug: "appa",
+                source: "repo_sync:pulled",
+                summary: "s1",
+                payload: "{}",
+            },
+            EnqueueRow {
+                conversation_id: 2,
+                app_slug: "appa",
+                source: "repo_sync:pulled",
+                summary: "s2",
+                payload: "{}",
+            },
+        ];
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            upsert_and_enqueue(&mut conn, "r1", "abc123", &rows);
+        }));
+        assert!(outcome.is_err(), "a failed ingress insert must panic");
+
+        // Transaction `Drop` rolled everything back.
         let cursor_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM repo_sync_cursor WHERE repo_slug = ?1",
-                rusqlite::params!["r1"],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM repo_sync_cursor", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert_eq!(cursor_count, 1, "cursor must be persisted");
-        assert_eq!(pending_count(&conn, 1), 1, "event must be present");
+        assert_eq!(cursor_count, 0, "cursor must not advance");
+        assert_eq!(pending_count(&conn, 1), 0, "first row must roll back");
+        assert_eq!(pending_count(&conn, 2), 0, "failing row must not land");
     }
 
     #[test]
@@ -329,23 +371,34 @@ mod tests {
 
     #[test]
     fn enqueue_batch_rolls_back_on_failure() {
-        // Note: Unlike the old events table path, the unified ingress store
-        // has no FK from pending_pushes to conversations, so a non-existent
-        // conversation_id doesn't cause a DB error. The atomicity guarantee
-        // still holds for real errors (e.g., schema violations). This test
-        // verifies the batch lands atomically for the normal case.
         let db = init_db_memory();
         let mut conn = db.blocking_lock();
         seed_conversation(&conn, 1);
+        seed_conversation(&conn, 2);
+        reject_ingress_row(&conn, "c2");
 
-        let rows = vec![EnqueueRow {
-            conversation_id: 1,
-            app_slug: "appa",
-            source: "repo_sync:conflict",
-            summary: "c1",
-            payload: "{}",
-        }];
-        enqueue_batch(&mut conn, &rows);
-        assert_eq!(pending_count(&conn, 1), 1);
+        let rows = vec![
+            EnqueueRow {
+                conversation_id: 1,
+                app_slug: "appa",
+                source: "repo_sync:conflict",
+                summary: "c1",
+                payload: "{}",
+            },
+            EnqueueRow {
+                conversation_id: 2,
+                app_slug: "appa",
+                source: "repo_sync:conflict",
+                summary: "c2",
+                payload: "{}",
+            },
+        ];
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            enqueue_batch(&mut conn, &rows);
+        }));
+        assert!(outcome.is_err(), "a failed ingress insert must panic");
+
+        assert_eq!(pending_count(&conn, 1), 0, "first row must roll back");
+        assert_eq!(pending_count(&conn, 2), 0, "failing row must not land");
     }
 }

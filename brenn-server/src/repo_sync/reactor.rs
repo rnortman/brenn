@@ -85,11 +85,6 @@ pub async fn run_cycle(ctx: RepoSyncCtx, trigger: SyncTrigger) {
         } => {
             run_cycle_for_remote(&ctx, &remote, "push", acting_conversation_id).await;
         }
-        SyncTrigger::ResumePoke { remotes } => {
-            for remote in &remotes {
-                run_cycle_for_remote(&ctx, remote, "resume", None).await;
-            }
-        }
     }
 }
 
@@ -1076,56 +1071,6 @@ mod tests {
         (ctx, remote_url, info)
     }
 
-    /// Build a `RepoSyncCtx` spanning two clones on two distinct remotes,
-    /// which the single-clone `build_ctx` cannot express. Returns the ctx and
-    /// the remote URLs in the order the clones were passed.
-    fn build_ctx_two_remotes(
-        db: brenn_db::Db,
-        clones_in: [(PathBuf, &str); 2],
-        app_slugs: &[&str],
-    ) -> (RepoSyncCtx, [String; 2]) {
-        let (alert_dispatcher, _handle) = AlertDispatcher::noop();
-        let mut clones: HashMap<String, CloneInfo> = HashMap::new();
-        let mut remote_to_slugs: HashMap<String, Vec<String>> = HashMap::new();
-        let mut remote_locks: HashMap<String, Arc<TokioMutex<()>>> = HashMap::new();
-        let mut urls: Vec<String> = Vec::new();
-        for (clone_path, slug) in clones_in {
-            let remote_url = format!("ssh://example/{slug}.git");
-            clones.insert(
-                slug.to_string(),
-                CloneInfo {
-                    slug: slug.to_string(),
-                    host_path: clone_path,
-                    remote: remote_url.clone(),
-                    sync_enabled: true,
-                    consumer_apps: app_slugs.iter().map(|s| s.to_string()).collect(),
-                    primary_apps: app_slugs.iter().map(|s| s.to_string()).collect(),
-                },
-            );
-            remote_to_slugs.insert(remote_url.clone(), vec![slug.to_string()]);
-            remote_locks.insert(remote_url.clone(), Arc::new(TokioMutex::new(())));
-            urls.push(remote_url);
-        }
-        let ctx = RepoSyncCtx {
-            db,
-            active_bridges: ActiveBridges::new(),
-            alert_dispatcher,
-            clones: Arc::new(clones),
-            remote_to_slugs: Arc::new(remote_to_slugs),
-            remote_locks: Arc::new(remote_locks),
-            last_notified_head: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            failure_state: Arc::new(std::sync::Mutex::new(
-                crate::repo_sync::PersistentFailureState::default(),
-            )),
-            apps: Arc::new(indexmap::IndexMap::new()),
-            post_pull_hook_locks: Arc::new(HashMap::new()),
-            pre_fanout_gate: None,
-            post_lock_release_notify: None,
-        };
-        let [x, y]: [String; 2] = urls.try_into().expect("two remotes in, two out");
-        (ctx, [x, y])
-    }
-
     /// Set up a user + one conversation for the given app, return conv id.
     /// Uses a unique username per call to avoid collisions when two
     /// conversations of the same app are needed in one test.
@@ -1538,46 +1483,6 @@ mod tests {
         .await;
         assert_eq!(pending_repo_sync_count(&db, conv_a).await, 1);
         assert_eq!(pending_repo_sync_count(&db, conv_b).await, 1);
-    }
-
-    #[tokio::test]
-    async fn run_cycle_resume_poke_runs_one_cycle_per_remote() {
-        let (remote_x, clone_x) = scratch_remote_and_clone();
-        let (remote_y, clone_y) = scratch_remote_and_clone();
-        let db = crate::test_support::init_db_memory();
-        let conv = mk_conv(&db, "appa").await;
-        let (ctx, [url_x, url_y]) = build_ctx_two_remotes(
-            db.clone(),
-            [
-                (clone_x.path().to_path_buf(), "src-x"),
-                (clone_y.path().to_path_buf(), "src-y"),
-            ],
-            &["appa"],
-        );
-        let remotes = vec![url_x, url_y];
-
-        // First poke: a cold-start cycle ran for each remote, so both heads are
-        // seeded and neither fired.
-        run_cycle(
-            ctx.clone(),
-            SyncTrigger::ResumePoke {
-                remotes: remotes.clone(),
-            },
-        )
-        .await;
-        assert_eq!(pending_repo_sync_count(&db, conv).await, 0);
-        {
-            let map = ctx.last_notified_head.lock().unwrap();
-            assert_eq!(map.get("src-x"), Some(&head(clone_x.path())));
-            assert_eq!(map.get("src-y"), Some(&head(clone_y.path())));
-        }
-
-        push_sibling_commit(remote_x.path(), "x commit");
-        push_sibling_commit(remote_y.path(), "y commit");
-
-        // Second poke: both clones advance, one notification each.
-        run_cycle(ctx.clone(), SyncTrigger::ResumePoke { remotes }).await;
-        assert_eq!(pending_repo_sync_count(&db, conv).await, 2);
     }
 
     /// Build a second `RepoSyncCtx` backed by the same `Db`, seeding

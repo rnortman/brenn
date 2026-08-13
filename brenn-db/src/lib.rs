@@ -208,18 +208,6 @@ pub fn run_base_migrations(conn: &Connection) {
         CREATE INDEX IF NOT EXISTS idx_pending_tool_requests_conversation
             ON pending_tool_requests(conversation_id, status);
 
-        -- Persisted `last_notified_head` cursor for repo_sync advance detection.
-        -- See docs/designs/repo-sync-last-notified-head-loss-across-restart.md.
-        -- Written in the same transaction as the corresponding event inserts
-        -- so a crash mid-fan-out cannot drop the advance notification across
-        -- restart. `updated_at` is forensics-only — no read path depends on
-        -- it; keep it for post-hoc debugging of when a cursor last advanced.
-        CREATE TABLE IF NOT EXISTS repo_sync_cursor (
-            repo_slug  TEXT PRIMARY KEY,
-            head       TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
         -- Max context-window size keyed by model slug (including suffix).
         -- Seeded from result.modelUsage.contextWindow on each turn completion.
         -- Used at session start to supply an initial max_tokens before the

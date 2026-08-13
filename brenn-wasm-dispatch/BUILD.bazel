@@ -27,8 +27,10 @@ rust_library(
 )
 
 # 40 tests, most of them driving a real compiled guest over an in-memory
-# messaging store; 7.2s locally against a 60s budget, so `small` holds with room
-# on a cold 4-vCPU runner.
+# messaging store; 7.2s locally. At the repo's one measured local-to-runner
+# factor (~20x) that projects to ~145s, and CI confirmed the order: the suite
+# timed out at `small`'s 60s with 17 of the 40 tests done. `medium` (300s) is
+# the honest budget — roughly 2x headroom at the measured factor.
 #
 # `data` is the four components these suites open, one fixture target each.
 # Runfiles are inputs to the test action, so every component named here is an
@@ -41,7 +43,7 @@ rust_library(
 # without its fixture fails loudly on a missing runfile.
 rust_test(
     name = "brenn-wasm-dispatch_test",
-    size = "small",
+    size = "medium",
     crate = ":brenn-wasm-dispatch",
     crate_features = ["testutils"],
     data = [

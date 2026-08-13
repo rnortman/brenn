@@ -14,10 +14,7 @@ use rusqlite::Connection;
 /// is `IF NOT EXISTS` throughout, and no set's foreign keys point outside
 /// itself and the base tables, so "base first, then any order" holds.
 pub fn run_server_slice_migrations(conn: &Connection) {
-    // Base tables, push subscriptions, messaging, usage.
-    brenn_messaging_store::db::run_slice_migrations(conn);
-
-    // Automation jobs, fires, and the per-app event-conversation mapping.
+    brenn_messaging::slice::run_slice_migrations(conn);
     brenn_automation::run_automation_migrations(conn);
 }
 
@@ -74,6 +71,6 @@ mod tests {
     fn server_migrations_are_idempotent() {
         let conn = brenn_db::open_connection_memory();
         run_server_slice_migrations(&conn);
-        run_server_slice_migrations(&conn); // Second run must not fail.
+        run_server_slice_migrations(&conn);
     }
 }

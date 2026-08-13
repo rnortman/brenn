@@ -132,6 +132,12 @@ jobs:
       # Warn, never fail: cache pressure costs time, not correctness, and this
       # job's red has to keep meaning "the change is wrong". Runs whatever the
       # gate did, so a red run still reports its size.
+      #
+      # TODO(bazel-ci-timings): the other post-landing read-out rides the same
+      # cadence as this one and nothing here emits it — per-step durations
+      # across docs-only, component-only and source commits, which is what
+      # decides whether the crate split's incremental floor is acceptable. Read
+      # from the run summaries for ~2 weeks; no step is added for it.
       - name: Report bazel cache sizes
         if: always()
         run: |

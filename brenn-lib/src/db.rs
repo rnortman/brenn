@@ -93,11 +93,6 @@ mod tests {
         )
         .expect("pending_tool_requests table should exist");
         conn.execute(
-            "SELECT repo_slug, head, updated_at FROM repo_sync_cursor WHERE 0",
-            [],
-        )
-        .expect("repo_sync_cursor table should exist");
-        conn.execute(
             "SELECT id, token, guessed_slug, platform, user_agent, \
              screen_width, screen_height, last_seen_at, created_at FROM devices WHERE 0",
             [],
@@ -113,6 +108,15 @@ mod tests {
             .expect("usage_sessions table should exist");
         conn.execute("SELECT 1 FROM usage_events WHERE 0", [])
             .expect("usage_events table should exist");
+        // Load-bearing negative probe: `repo_sync_cursor` is owned by
+        // `brenn-messaging`, a layer up, because its production writer lives
+        // there. Re-adding the DDL below this slice would silently widen the
+        // table's blast radius back to `brenn-db`'s reverse closure.
+        assert!(
+            conn.execute("SELECT 1 FROM repo_sync_cursor WHERE 0", [])
+                .is_err(),
+            "repo_sync_cursor must not be in the brenn-lib slice"
+        );
         assert!(
             column_exists(&conn, "messages", "sender_device_id"),
             "messages.sender_device_id column should exist"
