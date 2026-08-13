@@ -273,6 +273,20 @@ pub(in crate::active_bridge) async fn install_failing_session(bridge: &Arc<Activ
     *guard = Some(brenn_cc::session::CcSession::dummy_for_test());
 }
 
+/// Push a line into the installed session's stderr tail.
+///
+/// Test sessions have no child writing to them, so their tail is empty and the
+/// death and wedge reporters take their "nothing to attach" branch. Seeding one
+/// is the only way to exercise the branch that actually carries CC's own error
+/// text to the operator.
+pub(in crate::active_bridge) async fn seed_session_stderr(bridge: &Arc<ActiveBridge>, line: &str) {
+    let guard = bridge.session.lock().await;
+    guard
+        .as_ref()
+        .expect("a session must be installed before seeding its stderr")
+        .push_stderr_line_for_test(line);
+}
+
 /// Overwrite `bridge.session` with a session whose I/O tasks are installed but
 /// whose reader task has already finished: `is_alive() = true`, `io_alive() =
 /// false`. Reproduces the conv45 incident signature — the reader exited via the

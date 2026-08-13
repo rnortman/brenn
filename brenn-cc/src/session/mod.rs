@@ -5,14 +5,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use brenn_lib::config::ContainerSpawnConfig;
-use brenn_obs::alerting::AlertDispatcher;
+use brenn_lib::config::{ContainerSpawnConfig, container_rm_args};
+use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use brenn_obs::transcript::TranscriptWriter;
 use brenn_ws_types::PermissionModeValue;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
-use tracing::warn;
+use tracing::{debug, error, info, warn};
 
 use crate::error::{CcError, TransportError};
 use crate::protocol::outgoing::*;
@@ -87,14 +87,25 @@ pub struct CcSessionConfig {
     /// Extra environment variables for the CC process (bare apps only).
     /// For containerized apps, env vars are injected as podman -e flags instead.
     pub env_vars: Vec<(String, String)>,
-    /// Pre-created shutdown flag for the reader task to check on EOF.
+    /// Pre-created **per-session** shutdown flag for the reader task to check
+    /// on EOF.
     ///
     /// If provided, `spawn()` uses this instead of creating its own. This lets
     /// the caller hold a clone and set it when the spawn is cancelled
     /// mid-init-handshake — before a `CcSession` is ever constructed.
     ///
+    /// Must never be a flag shared across sessions: `mark_shutting_down()`
+    /// writes through it, so a shared Arc would let one session's teardown
+    /// suppress every other session's death alert. Use `server_shutting_down`
+    /// for the process-wide flag.
+    ///
     /// Leave `None` for normal spawns; `spawn()` will create its own.
     pub shutting_down: Option<Arc<AtomicBool>>,
+    /// The process-wide shutdown flag, read-only from the session's
+    /// perspective. The reader task checks it alongside the per-session flag,
+    /// so a session that EOFs while the whole server is going down does not
+    /// page. Nothing in the session ever writes it.
+    pub server_shutting_down: Option<Arc<AtomicBool>>,
 }
 
 /// A model available for selection, sourced from CC's init ack.
@@ -245,14 +256,18 @@ pub struct CcSession {
     /// Set to true before dropping the session to indicate intentional shutdown.
     /// The reader task checks this on EOF to avoid firing spurious alerts.
     shutting_down: Arc<AtomicBool>,
-    /// The child process handle. Held here so kill_on_drop works.
-    _child: Child,
+    /// The child process handle plus the container it owns. Held here so
+    /// `kill_on_drop` and the container removal in `CcChild::drop` both run
+    /// when the session is discarded.
+    _child: CcChild,
     /// Stdout reader and stdin writer task handles. `None` in test sessions
     /// that never spawn the real I/O tasks. Retained so the bridge watchdog can
     /// tell whether the session's I/O is still alive — the `alive` flag alone
     /// misses the case where the reader task exits via its "consumer gone"
     /// branch (event loop dropped the receiver) without clearing `alive`.
     io_tasks: Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)>,
+    /// Rolling tail of the child's stderr, attached to death reports.
+    stderr_tail: tasks::StderrTail,
     /// Test-only: when true, `send_message_acked` fires the flush-ack with
     /// `Ok(())` immediately after enqueue (no writer task needed). The ack
     /// receiver returned to the caller is pre-resolved. This prevents
@@ -275,6 +290,211 @@ pub(crate) struct SpawnCommand {
     pub cwd: Option<PathBuf>,
     /// Extra environment variables for the process (bare-process mode only).
     pub env_vars: Vec<(String, String)>,
+    /// Name of the container this command creates. `None` for bare-process mode.
+    pub container_name: Option<String>,
+}
+
+/// How long a failing spawn waits to reap the child for its exit status.
+const CHILD_REAP_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+
+/// How long the EOF failure path waits for the stderr drain to finish before
+/// snapshotting the tail. The drain ends promptly once the child is gone; the
+/// bound only covers a child whose stderr pipe outlives its stdout.
+const STDERR_DRAIN_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(2);
+
+const PODMAN: &str = "podman";
+
+/// Child-process handle that also owns the container the child started.
+///
+/// For a containerized app the child is the `podman run` attach client, not the
+/// container: SIGKILLing it only closes the container's stdin, which a wedged
+/// CC never reads. Removing the container explicitly on drop is what makes
+/// teardown work for exactly the sessions teardown exists for.
+struct CcChild {
+    /// The spawned process, configured with `kill_on_drop(true)`. Drop delivers
+    /// the SIGKILL; the failure paths reap it first for its exit status.
+    child: Child,
+    /// Container to remove on drop. `None` for bare apps and test sessions.
+    container_name: Option<String>,
+    /// The binary to invoke for the removal — the same program that started the
+    /// container, so a spawn pointed at a stand-in removes through that
+    /// stand-in too. Unused when `container_name` is `None`.
+    podman_program: String,
+}
+
+impl CcChild {
+    fn new(child: Child, container_name: Option<String>, podman_program: String) -> Self {
+        Self {
+            child,
+            container_name,
+            podman_program,
+        }
+    }
+
+    /// Wrap a child that owns no container.
+    fn bare(child: Child) -> Self {
+        Self::new(child, None, PODMAN.to_string())
+    }
+
+    /// Reap the child and return its exit code, waiting at most `CHILD_REAP_TIMEOUT`.
+    ///
+    /// Only called once the child's stdout is at EOF, so the wait is expected to
+    /// resolve immediately. `None` means the child could not be reaped in time
+    /// or exited on a signal.
+    async fn wait_for_exit_code(&mut self) -> Option<i32> {
+        match tokio::time::timeout(CHILD_REAP_TIMEOUT, self.child.wait()).await {
+            Ok(Ok(status)) => status.code(),
+            Ok(Err(e)) => {
+                debug!(error = %e, "failed to reap CC child after stdout EOF");
+                None
+            }
+            Err(_) => {
+                debug!("CC child did not exit within the reap timeout");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for CcChild {
+    /// Remove the container synchronously, before the `Child` field's own drop
+    /// SIGKILLs the podman client.
+    ///
+    /// Blocking is deliberate: container names are stable per conversation, so
+    /// a removal that outlived this drop could delete the *next* session's
+    /// container. Waiting here gives every in-process respawn a happens-before
+    /// edge, and also reaps the `podman rm` process.
+    fn drop(&mut self) {
+        let Some(name) = self.container_name.clone() else {
+            return;
+        };
+        let program = self.podman_program.clone();
+        let run = || {
+            std::process::Command::new(&program)
+                .args(container_rm_args(std::slice::from_ref(&name)))
+                .output()
+        };
+        // On a multi-thread runtime hand the block off to a blocking thread so
+        // the worker keeps serving other tasks; `block_in_place` still returns
+        // only once the removal is done, preserving the happens-before edge.
+        // Anywhere else (current-thread runtime, plain thread, process
+        // teardown) run it directly.
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(run)
+            }
+            _ => run(),
+        };
+        match result {
+            // The removal runs before the `Child` field's drop SIGKILLs the
+            // podman client, so on an ordinary teardown the container has not yet
+            // been given its stdin EOF and is still up: podman echoes the name it
+            // removed and that is the normal case, not an anomaly. Empty stdout
+            // means the container was already gone — CC exited on its own and
+            // `--rm` reaped it, which `--ignore` turns into a success. Anomalous
+            // liveness is signalled by the pre-spawn reclaim, not here.
+            Ok(out) if out.status.success() => {
+                if String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+                    debug!(container = %name, "no container to remove on session teardown");
+                } else {
+                    info!(container = %name, "removed CC container on session teardown");
+                }
+            }
+            Ok(out) => {
+                error!(
+                    container = %name,
+                    code = ?out.status.code(),
+                    stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                    "failed to remove CC container on session teardown"
+                );
+            }
+            Err(e) => {
+                error!(
+                    container = %name,
+                    error = %e,
+                    "failed to run `podman rm` on session teardown"
+                );
+            }
+        }
+    }
+}
+
+/// Force-remove anything still holding `name` before a spawn claims it.
+///
+/// All spawns for a conversation are serialized under the per-conversation wake
+/// lock, and teardown's own removal completes before the session is
+/// deregistered, so a container still holding this name here is unowned by
+/// definition — its bridge is gone and it can never do useful work again.
+/// Removing it is recovery, but it is never silent: a reclaim that actually
+/// removed something means a teardown failed.
+async fn reclaim_container_name(
+    name: &str,
+    podman_program: &str,
+    alert_dispatcher: &AlertDispatcher,
+) -> Result<(), CcError> {
+    let output = Command::new(podman_program)
+        .args(container_rm_args(std::slice::from_ref(&name)))
+        .output()
+        .await
+        .map_err(|e| {
+            CcError::ContainerReclaimFailed(format!("failed to run `podman rm` for {name}: {e}"))
+        })?;
+
+    if !output.status.success() {
+        return Err(CcError::ContainerReclaimFailed(format!(
+            "`podman rm` for {name} exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    // podman prints the removed container's name on stdout; a no-op `--ignore`
+    // removal prints nothing.
+    if String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+        debug!(container = %name, "no container held the name before spawn");
+        return Ok(());
+    }
+
+    error!(
+        container = %name,
+        "orphaned CC container reclaimed — a previous teardown failed to remove it"
+    );
+    alert_dispatcher.alert(
+        AlertSeverity::Warning,
+        "Orphaned CC container reclaimed".to_string(),
+        format!(
+            "container {name} was still running before this spawn — \
+             a previous teardown failed to remove it"
+        ),
+    );
+    Ok(())
+}
+
+/// Why the init handshake did not complete, before enrichment with the child's
+/// exit status and stderr tail.
+enum InitFailure {
+    /// CC answered the initialize request with an error. CC is still alive.
+    Reported(String),
+    /// CC's stdout closed before the init ack arrived.
+    Eof,
+}
+
+/// Wait for the stderr drain to finish (bounded) and return the tail, so a
+/// failure report carries everything the child wrote.
+///
+/// Only for the paths where the child is known to be gone. A live child holds
+/// its stderr pipe open and the drain cannot finish, so those paths snapshot
+/// the tail directly instead of waiting out the deadline.
+async fn drained_stderr_tail(
+    tail: &tasks::StderrTail,
+    handle: tokio::task::JoinHandle<()>,
+) -> Vec<String> {
+    match tokio::time::timeout(STDERR_DRAIN_TIMEOUT, handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => debug!(error = %e, "stderr drain task ended abnormally"),
+        Err(_) => debug!("stderr drain unfinished before deadline; tail may be incomplete"),
+    }
+    tail.snapshot()
 }
 
 /// Build the CC CLI arguments common to both bare and containerized modes.
@@ -339,7 +559,7 @@ pub(crate) fn build_spawn_command(config: &CcSessionConfig) -> SpawnCommand {
         let extra_flags: Vec<String> = vec![
             "-i".into(),
             "--name".into(),
-            container_name,
+            container_name.clone(),
             "--label".into(),
             "brenn-managed=true".to_string(),
         ];
@@ -354,6 +574,7 @@ pub(crate) fn build_spawn_command(config: &CcSessionConfig) -> SpawnCommand {
             args: podman_args,
             cwd: None,
             env_vars: vec![],
+            container_name: Some(container_name),
         }
     } else {
         SpawnCommand {
@@ -361,6 +582,7 @@ pub(crate) fn build_spawn_command(config: &CcSessionConfig) -> SpawnCommand {
             args: cc_args,
             cwd: Some(config.cwd.clone()),
             env_vars: config.env_vars.clone(),
+            container_name: None,
         }
     }
 }
@@ -375,7 +597,33 @@ impl CcSession {
         config: CcSessionConfig,
         event_tx: mpsc::Sender<SessionEvent>,
     ) -> Result<(Self, InitAckInfo), CcError> {
-        let cmd = build_spawn_command(&config);
+        Self::spawn_inner(config, event_tx, None).await
+    }
+
+    /// `spawn()` with an optional replacement for the program to execute.
+    ///
+    /// Tests point the override at a stub that writes to stderr and exits with a
+    /// known code; production always passes `None`.
+    async fn spawn_inner(
+        config: CcSessionConfig,
+        event_tx: mpsc::Sender<SessionEvent>,
+        program_override: Option<String>,
+    ) -> Result<(Self, InitAckInfo), CcError> {
+        let mut cmd = build_spawn_command(&config);
+        if let Some(program) = program_override {
+            cmd.program = program;
+        }
+
+        // In containerized mode the program being spawned *is* podman, so it is
+        // also what removes the container — one spelling, and a test override
+        // reaches the removal paths as well.
+        let podman_program = cmd.program.clone();
+
+        // Claim the container name before `podman run` can collide with an
+        // orphan holding it.
+        if let Some(ref name) = cmd.container_name {
+            reclaim_container_name(name, &podman_program, &config.alert_dispatcher).await?;
+        }
 
         let mut command = Command::new(&cmd.program);
         command
@@ -398,6 +646,10 @@ impl CcSession {
         let stdin = child.stdin.take().expect("stdin was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
 
+        // Wrap before the init handshake so every early `Err` return below tears
+        // the container down through the same drop.
+        let mut child = CcChild::new(child, cmd.container_name, podman_program);
+
         // Channel for outgoing messages to the stdin writer task.
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(64);
 
@@ -411,7 +663,7 @@ impl CcSession {
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
 
         // Start background tasks.
-        tasks::spawn_stderr_drain(stderr);
+        let (stderr_tail, stderr_handle) = tasks::spawn_stderr_drain(stderr);
         let writer_handle =
             tasks::spawn_stdin_writer(stdin, outgoing_rx, config.transcript.clone());
         let reader_handle = tasks::spawn_stdout_reader(
@@ -423,6 +675,7 @@ impl CcSession {
             config.alert_dispatcher.clone(),
             alive.clone(),
             shutting_down.clone(),
+            config.server_shutting_down.clone(),
         );
 
         // Send initialization request (fire-and-forget; no ack needed for the init handshake).
@@ -442,7 +695,7 @@ impl CcSession {
                 match init_rx.recv().await {
                     Some(CcIncoming::ControlResponse { response }) => {
                         if response.subtype == "error" {
-                            return Err(CcError::InitFailed(
+                            return Err(InitFailure::Reported(
                                 response.error.unwrap_or_else(|| "unknown error".into()),
                             ));
                         }
@@ -455,9 +708,7 @@ impl CcSession {
                         continue;
                     }
                     None => {
-                        return Err(CcError::InitFailed(
-                            "CC process exited during initialization".into(),
-                        ));
+                        return Err(InitFailure::Eof);
                     }
                 }
             }
@@ -466,8 +717,32 @@ impl CcSession {
 
         let init_ack_info = match init_ack {
             Ok(Ok(info)) => info,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(CcError::InitTimeout),
+            Ok(Err(InitFailure::Eof)) => {
+                // Stdout is closed, so the child is gone or going: reap it for
+                // its exit code. For a containerized app this is the `podman
+                // run` client's status, which is what carries a name conflict.
+                let exit_status = child.wait_for_exit_code().await;
+                return Err(CcError::InitFailed {
+                    reason: "CC process exited during initialization".into(),
+                    exit_status,
+                    stderr_tail: drained_stderr_tail(&stderr_tail, stderr_handle).await,
+                });
+            }
+            // CC is still alive on both of the paths below and is holding its
+            // stderr pipe open, so the drain task cannot finish: snapshot what
+            // it has read rather than waiting out the drain deadline.
+            Ok(Err(InitFailure::Reported(reason))) => {
+                return Err(CcError::InitFailed {
+                    reason,
+                    exit_status: None,
+                    stderr_tail: stderr_tail.snapshot(),
+                });
+            }
+            Err(_) => {
+                return Err(CcError::InitTimeout {
+                    stderr_tail: stderr_tail.snapshot(),
+                });
+            }
         };
 
         Ok((
@@ -477,6 +752,7 @@ impl CcSession {
                 shutting_down,
                 _child: child,
                 io_tasks: Some((reader_handle, writer_handle)),
+                stderr_tail,
                 #[cfg(any(test, feature = "testutils"))]
                 auto_ack: false,
             },
@@ -587,11 +863,29 @@ impl CcSession {
         }
     }
 
-    /// Signal that this session is being intentionally shut down.
+    /// The most recent lines the child wrote to stderr, oldest first.
+    ///
+    /// Best effort: empty when the child wrote nothing, and frozen at whatever
+    /// was read if the drain stopped early (non-UTF-8 output).
+    pub fn stderr_tail(&self) -> Vec<String> {
+        self.stderr_tail.snapshot()
+    }
+
+    /// Seed the stderr tail of a test session, which has no child writing to it.
+    ///
+    /// Lets the server-side death and wedge paths be exercised with a non-empty
+    /// tail, which is the only state in which they add it to their reports.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn push_stderr_line_for_test(&self, line: &str) {
+        self.stderr_tail.push(line.to_string());
+    }
+
+    /// Signal that **this** session is being intentionally shut down.
     ///
     /// Call this before dropping the session to prevent the reader task from
     /// firing spurious "CC process died" alerts. The reader task checks this
-    /// flag on EOF and suppresses alerts when set.
+    /// flag on EOF and suppresses alerts when set. The flag is per-session, so
+    /// reaping one conversation leaves every other session's death alert armed.
     pub fn mark_shutting_down(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
     }
@@ -643,8 +937,9 @@ impl CcSession {
             outgoing_tx,
             alive: Arc::new(AtomicBool::new(true)),
             shutting_down: Arc::new(AtomicBool::new(false)),
-            _child: child,
+            _child: CcChild::bare(child),
             io_tasks: None,
+            stderr_tail: tasks::StderrTail::new(),
             auto_ack,
         };
         (session, outgoing_rx)
@@ -684,6 +979,20 @@ impl CcSession {
     #[cfg(any(test, feature = "testutils"))]
     pub fn dummy_for_test() -> Self {
         Self::new_for_test(1, false).0
+    }
+
+    /// A `dummy_for_test` session that owns a container, so dropping it runs
+    /// `<podman_program> rm ...` and blocks until that program exits.
+    ///
+    /// Point `podman_program` at a script the test controls to make the teardown
+    /// observably slow, which is what lets callers assert on what is and is not
+    /// held while a container teardown is in flight.
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn dummy_with_container_for_test(podman_program: &str, container_name: &str) -> Self {
+        let mut session = Self::new_for_test(1, false).0;
+        session._child.container_name = Some(container_name.to_string());
+        session._child.podman_program = podman_program.to_string();
+        session
     }
 
     /// Create a `CcSession` whose I/O task handles are installed but whose reader
@@ -789,6 +1098,7 @@ mod tests {
             cc_extra_args: vec![],
             env_vars: vec![],
             shutting_down: None,
+            server_shutting_down: None,
         }
     }
 
@@ -1147,6 +1457,586 @@ mod tests {
         assert_eq!(cmd.env_vars.len(), 2);
         assert_eq!(cmd.env_vars[0].0, "GRAF_MANIFEST");
         assert_eq!(cmd.env_vars[1].1, "custom_value");
+    }
+
+    // --- container teardown tests ---
+
+    #[tokio::test]
+    async fn container_command_carries_container_name() {
+        let cmd = build_spawn_command(&container_config());
+        assert_eq!(cmd.container_name.as_deref(), Some("brenn-myapp-conv42"));
+    }
+
+    #[tokio::test]
+    async fn bare_command_has_no_container_name() {
+        let cmd = build_spawn_command(&bare_config());
+        assert_eq!(cmd.container_name, None);
+    }
+
+    /// Serializes every test in this module that forks a child process.
+    ///
+    /// Exec of a file that any process holds open for writing fails with
+    /// `ETXTBSY`. A child forked while another thread is writing a shim inherits
+    /// that write descriptor until it execs, so a shim written and run
+    /// concurrently with unrelated process spawns intermittently fails to start.
+    /// Holding this across the write *and* the run keeps that window empty.
+    static SUBPROCESS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn subprocess_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        SUBPROCESS_LOCK.lock().await
+    }
+
+    fn write_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A shell script that records its argv, one argument per line, to
+    /// `marker`. Returned path is executable and usable as a `podman` stand-in.
+    fn write_recording_shim(dir: &std::path::Path, marker: &std::path::Path) -> PathBuf {
+        write_script(
+            dir,
+            "podman-shim",
+            &format!("printf '%s\\n' \"$@\" > '{}'\n", marker.display()),
+        )
+    }
+
+    /// A `podman` stand-in that emits fixed output and exits with `code`.
+    fn write_podman_stub(dir: &std::path::Path, stdout: &str, stderr: &str, code: i32) -> PathBuf {
+        let mut body = String::new();
+        if !stdout.is_empty() {
+            body.push_str(&format!("echo '{stdout}'\n"));
+        }
+        if !stderr.is_empty() {
+            body.push_str(&format!("echo '{stderr}' >&2\n"));
+        }
+        body.push_str(&format!("exit {code}\n"));
+        write_script(dir, "podman-stub", &body)
+    }
+
+    /// Run the reclaim against `stub` and report its result plus the number of
+    /// alerts that actually reached the alerter.
+    ///
+    /// Dispatch is a `try_send` onto a channel a background task drains, so the
+    /// count is only meaningful after every dispatcher clone is dropped and the
+    /// drainer has run to completion. A yield proves nothing — an assertion of
+    /// zero alerts would pass simply because the drainer never got there.
+    async fn reclaim_with_stub(stub: &std::path::Path) -> (Result<(), CcError>, u32) {
+        let _guard = subprocess_guard().await;
+        let (dispatcher, count, drainer) = brenn_obs::alerting::make_counting_alerter();
+        let result = reclaim_container_name(
+            "brenn-myapp-conv42",
+            &stub.display().to_string(),
+            &dispatcher,
+        )
+        .await;
+        drop(dispatcher);
+        drainer.await.expect("alert drainer panicked");
+        (result, count.load(Ordering::SeqCst))
+    }
+
+    /// The common case: nothing held the name. podman prints nothing, so the
+    /// reclaim must stay quiet — no alert, no error.
+    #[tokio::test]
+    async fn reclaim_with_no_orphan_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = write_podman_stub(dir.path(), "", "", 0);
+        let (result, alerts) = reclaim_with_stub(&stub).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(alerts, 0, "a no-op reclaim must not alert");
+    }
+
+    /// podman echoes the name of a container it actually removed. That means a
+    /// previous teardown failed, which is exactly what must not be silent.
+    #[tokio::test]
+    async fn reclaim_of_orphan_alerts() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = write_podman_stub(dir.path(), "brenn-myapp-conv42", "", 0);
+        let (result, alerts) = reclaim_with_stub(&stub).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(alerts, 1, "a reclaimed orphan must fire exactly one alert");
+    }
+
+    /// A reclaim that podman rejects abandons the spawn carrying podman's own
+    /// error text, rather than running into the name conflict anyway.
+    #[tokio::test]
+    async fn reclaim_failure_carries_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = write_podman_stub(dir.path(), "", "cannot remove container in use", 1);
+        let (result, alerts) = reclaim_with_stub(&stub).await;
+        match result {
+            Err(CcError::ContainerReclaimFailed(msg)) => {
+                assert!(msg.contains("cannot remove container in use"), "{msg}");
+                assert!(msg.contains("brenn-myapp-conv42"), "{msg}");
+            }
+            other => panic!("expected ContainerReclaimFailed, got {other:?}"),
+        }
+        assert_eq!(alerts, 0, "a failed reclaim reports through the error");
+    }
+
+    fn spawn_sleeper() -> Child {
+        Command::new("sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn sleep for test")
+    }
+
+    /// Dropping a `CcChild` that owns a container must run the removal command
+    /// **and wait for it**. Reading the marker immediately after `drop` returns
+    /// asserts the happens-before edge that the pre-spawn reclaim's safety
+    /// argument depends on: no removal can slip past the next spawn of the same
+    /// conversation.
+    #[tokio::test]
+    async fn cc_child_drop_removes_container_before_returning() {
+        let _guard = subprocess_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("podman-argv");
+        let shim = write_recording_shim(dir.path(), &marker);
+
+        let cc_child = CcChild::new(
+            spawn_sleeper(),
+            Some("brenn-myapp-conv42".into()),
+            shim.display().to_string(),
+        );
+        drop(cc_child);
+
+        let recorded = std::fs::read_to_string(&marker)
+            .expect("drop must wait for the removal command to complete");
+        let args: Vec<&str> = recorded.lines().collect();
+        assert_eq!(
+            args,
+            [
+                "rm",
+                "--force",
+                "--time",
+                "0",
+                "--ignore",
+                "brenn-myapp-conv42"
+            ]
+        );
+    }
+
+    /// The same property on a multi-thread runtime, dropping from inside a
+    /// worker task. That is the flavor every production teardown runs on, and it
+    /// is the only one that takes the `block_in_place` arm — an arm that panics
+    /// if it is ever reached on a current-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cc_child_drop_on_multi_thread_runtime_removes_container() {
+        let _guard = subprocess_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("podman-argv");
+        let shim = write_recording_shim(dir.path(), &marker);
+
+        let marker_path = marker.clone();
+        let program = shim.display().to_string();
+        tokio::spawn(async move {
+            let cc_child =
+                CcChild::new(spawn_sleeper(), Some("brenn-myapp-conv42".into()), program);
+            drop(cc_child);
+            let recorded = std::fs::read_to_string(&marker_path)
+                .expect("drop must wait for the removal command to complete");
+            let args: Vec<&str> = recorded.lines().collect();
+            assert_eq!(
+                args,
+                [
+                    "rm",
+                    "--force",
+                    "--time",
+                    "0",
+                    "--ignore",
+                    "brenn-myapp-conv42"
+                ]
+            );
+        })
+        .await
+        .expect("drop task panicked");
+    }
+
+    /// Bare apps own no container, so drop must not invoke podman at all.
+    #[tokio::test]
+    async fn cc_child_drop_without_container_invokes_nothing() {
+        let _guard = subprocess_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("podman-argv");
+        let shim = write_recording_shim(dir.path(), &marker);
+
+        let cc_child = CcChild::new(spawn_sleeper(), None, shim.display().to_string());
+        drop(cc_child);
+
+        assert!(
+            !marker.exists(),
+            "no removal command may run for a bare session"
+        );
+    }
+
+    // --- spawn-failure enrichment tests ---
+
+    /// A shell script that writes `lines` to stderr and exits `code`, standing
+    /// in for a `claude`/`podman` that dies before the init handshake.
+    fn write_failing_stub(dir: &std::path::Path, lines: &[&str], code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = dir.join("failing-stub");
+        let echoes: String = lines.iter().map(|l| format!("echo '{l}' >&2\n")).collect();
+        std::fs::write(&stub, format!("#!/bin/sh\n{echoes}exit {code}\n")).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        stub
+    }
+
+    /// A child that dies before answering the init request must surface its exit
+    /// status and what it wrote to stderr — the text that turns "CC process
+    /// exited during initialization" into a diagnosis.
+    #[tokio::test]
+    async fn spawn_failure_carries_exit_status_and_stderr() {
+        let _guard = subprocess_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = write_failing_stub(
+            dir.path(),
+            &[
+                "Error: the container name is already in use",
+                "You have to remove that container to be able to reuse that name",
+            ],
+            7,
+        );
+
+        let mut config = bare_config();
+        // The child runs in this cwd, so it has to exist.
+        config.cwd = dir.path().to_path_buf();
+
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let err = CcSession::spawn_inner(config, event_tx, Some(stub.display().to_string()))
+            .await
+            .err()
+            .expect("spawn must fail when the child exits during init");
+
+        match err {
+            CcError::InitFailed {
+                ref reason,
+                exit_status,
+                ref stderr_tail,
+            } => {
+                assert_eq!(reason, "CC process exited during initialization");
+                assert_eq!(exit_status, Some(7));
+                assert_eq!(
+                    stderr_tail,
+                    &[
+                        "Error: the container name is already in use".to_string(),
+                        "You have to remove that container to be able to reuse that name"
+                            .to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected InitFailed, got {other:?}"),
+        }
+
+        // The operator sees all three parts through the existing spawn-failure
+        // logging, which formats the error with Display.
+        let rendered = err.to_string();
+        assert!(rendered.contains("exit status 7"), "{rendered}");
+        assert!(rendered.contains("already in use"), "{rendered}");
+    }
+
+    #[test]
+    fn init_failure_display_omits_absent_detail() {
+        let err = CcError::InitFailed {
+            reason: "CC rejected the initialize request".into(),
+            exit_status: None,
+            stderr_tail: vec![],
+        };
+        assert_eq!(
+            err.to_string(),
+            "CC initialization failed: CC rejected the initialize request"
+        );
+
+        let err = CcError::InitTimeout {
+            stderr_tail: vec!["still starting up".into()],
+        };
+        assert_eq!(
+            err.to_string(),
+            "CC initialization timed out; stderr tail: still starting up"
+        );
+    }
+
+    /// A rendered error ends up in an alert body, so a chatty child must not be
+    /// able to inflate it to the full tail capacity.
+    #[test]
+    fn init_failure_display_bounds_a_long_tail() {
+        let err = CcError::InitTimeout {
+            stderr_tail: (0..tasks::STDERR_TAIL_LINES)
+                .map(|i| format!("line {i}"))
+                .collect(),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.len() < 1024, "{} bytes", rendered.len());
+        assert!(rendered.contains("line 49"), "{rendered}");
+        assert!(
+            !rendered.contains("line 0\n"),
+            "oldest lines must be elided: {rendered}"
+        );
+    }
+
+    // --- containerized spawn wiring tests ---
+
+    /// A `podman` stand-in that appends one line per invocation — the argv joined
+    /// by spaces — to `log`, so a single shim records the whole sequence of
+    /// removals and runs a spawn performs. `rm` exits 0 with no stdout (nothing
+    /// was holding the name); `run` exits `run_code` immediately, which closes
+    /// stdout and drives the spawn down its EOF failure path.
+    fn write_sequence_shim(dir: &std::path::Path, log: &std::path::Path, run_code: i32) -> PathBuf {
+        write_script(
+            dir,
+            "podman-sequence",
+            &format!(
+                "echo \"$*\" >> '{}'\n\
+                 if [ \"$1\" = run ]; then exit {run_code}; fi\n\
+                 exit 0\n",
+                log.display()
+            ),
+        )
+    }
+
+    fn recorded_invocations(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    const RM_ARGV: &str = "rm --force --time 0 --ignore brenn-myapp-conv42";
+
+    /// A containerized spawn must reclaim the name *before* `podman run` claims
+    /// it, and — when the handshake then fails — must remove the container it
+    /// created on its way out.
+    #[tokio::test]
+    async fn containerized_spawn_reclaims_then_runs_then_tears_down() {
+        let _guard = subprocess_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("podman-invocations");
+        let shim = write_sequence_shim(dir.path(), &log, 3);
+
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let err = CcSession::spawn_inner(
+            container_config(),
+            event_tx,
+            Some(shim.display().to_string()),
+        )
+        .await
+        .err()
+        .expect("spawn must fail when the run stub exits during init");
+        assert!(
+            matches!(err, CcError::InitFailed { .. }),
+            "expected InitFailed, got {err:?}"
+        );
+
+        // Read only after `spawn_inner` returned: the teardown removal is
+        // synchronous in `CcChild::drop`, so it is already recorded.
+        let invocations = recorded_invocations(&log);
+        assert_eq!(invocations.len(), 3, "{invocations:?}");
+        assert_eq!(invocations[0], RM_ARGV, "reclaim must come first");
+        assert!(
+            invocations[1].starts_with("run "),
+            "the run must follow the reclaim: {invocations:?}"
+        );
+        assert_eq!(
+            invocations[2], RM_ARGV,
+            "a failed spawn must remove its container"
+        );
+    }
+
+    /// A reclaim podman rejects abandons the spawn: no `podman run` may follow
+    /// it into the name conflict.
+    #[tokio::test]
+    async fn containerized_spawn_aborts_when_reclaim_fails() {
+        let _guard = subprocess_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("podman-invocations");
+        let shim = write_script(
+            dir.path(),
+            "podman-failing-rm",
+            &format!(
+                "echo \"$*\" >> '{}'\n\
+                 if [ \"$1\" = rm ]; then echo 'container is in use' >&2; exit 2; fi\n\
+                 exit 0\n",
+                log.display()
+            ),
+        );
+
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let err = CcSession::spawn_inner(
+            container_config(),
+            event_tx,
+            Some(shim.display().to_string()),
+        )
+        .await
+        .err()
+        .expect("spawn must fail when the reclaim fails");
+        match err {
+            CcError::ContainerReclaimFailed(ref msg) => {
+                assert!(msg.contains("container is in use"), "{msg}");
+            }
+            other => panic!("expected ContainerReclaimFailed, got {other:?}"),
+        }
+
+        let invocations = recorded_invocations(&log);
+        assert_eq!(invocations, [RM_ARGV], "no run may follow a failed reclaim");
+    }
+
+    /// podman missing or unexecutable is an explicit accepted failure mode whose
+    /// entire value is that the operator can read what happened.
+    #[tokio::test]
+    async fn reclaim_reports_when_podman_cannot_be_executed() {
+        let _guard = subprocess_guard().await;
+        let (dispatcher, _count, _drainer) = brenn_obs::alerting::make_counting_alerter();
+        let result = reclaim_container_name(
+            "brenn-myapp-conv42",
+            "/nonexistent/podman-does-not-exist",
+            &dispatcher,
+        )
+        .await;
+        match result {
+            Err(CcError::ContainerReclaimFailed(msg)) => {
+                assert!(msg.contains("brenn-myapp-conv42"), "{msg}");
+                assert!(msg.contains("No such file"), "{msg}");
+            }
+            other => panic!("expected ContainerReclaimFailed, got {other:?}"),
+        }
+    }
+
+    // --- server-shutdown flag threading ---
+
+    /// A stub that answers the init request and then exits, so the handshake
+    /// succeeds and the reader immediately hits stdout EOF — the state whose
+    /// alerting the two shutdown flags govern.
+    fn write_ack_then_exit_stub(dir: &std::path::Path) -> PathBuf {
+        write_script(
+            dir,
+            "ack-stub",
+            "echo '{\"type\":\"control_response\",\"response\":\
+             {\"subtype\":\"success\",\"request_id\":\"req_0\"}}'\n",
+        )
+    }
+
+    /// Run a spawn whose child acks and exits, and report how many alerts the
+    /// resulting reader EOF produced.
+    async fn spawn_eof_alert_count(server_shutting_down: bool) -> u32 {
+        let _guard = subprocess_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = write_ack_then_exit_stub(dir.path());
+        let (dispatcher, count, drainer) = brenn_obs::alerting::make_counting_alerter();
+
+        let mut config = bare_config();
+        config.cwd = dir.path().to_path_buf();
+        config.alert_dispatcher = dispatcher;
+        config.server_shutting_down = Some(Arc::new(AtomicBool::new(server_shutting_down)));
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (session, _info) =
+            CcSession::spawn_inner(config, event_tx, Some(stub.display().to_string()))
+                .await
+                .expect("handshake completes before the stub exits");
+
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("the child exits, so the reader must report a death")
+            .expect("event");
+        assert!(matches!(event, SessionEvent::Died(_)));
+        drop(session);
+
+        // Resolves once the reader task has dropped its dispatcher clone.
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), drainer)
+            .await
+            .expect("alert drainer did not finish")
+            .expect("alert drainer panicked");
+        count.load(Ordering::SeqCst)
+    }
+
+    /// `spawn()` must hand the server-level flag to the reader task. Dropping it
+    /// would page the operator for every session on every deploy.
+    #[tokio::test]
+    async fn spawn_threads_server_flag_to_the_reader() {
+        assert_eq!(
+            spawn_eof_alert_count(true).await,
+            0,
+            "a death during server shutdown must not alert"
+        );
+    }
+
+    /// The mirror: with the server flag clear and no per-session mark, the same
+    /// EOF must page. Also pins that `spawn()` creates a *fresh* per-session flag
+    /// (clear) when the config supplies none.
+    #[tokio::test]
+    async fn spawn_with_clear_flags_alerts_on_death() {
+        assert_eq!(
+            spawn_eof_alert_count(false).await,
+            1,
+            "an unexpected death must fire the Critical alert"
+        );
+    }
+
+    // --- failure-path timeout bounds ---
+
+    /// A child that closed its stdout but is still running must not hang the
+    /// failing spawn. The bound is real wall clock rather than a paused clock
+    /// because the thing under test is a subprocess the runtime cannot see: with
+    /// auto-advancing time the reap would resolve before the child ever ran, and
+    /// the test would prove nothing.
+    #[tokio::test]
+    async fn wait_for_exit_code_gives_up_on_a_child_that_will_not_exit() {
+        let _guard = subprocess_guard().await;
+        let mut child = CcChild::bare(spawn_sleeper());
+        let started = std::time::Instant::now();
+        assert_eq!(
+            child.wait_for_exit_code().await,
+            None,
+            "a live child yields no exit status"
+        );
+        assert!(
+            started.elapsed() >= CHILD_REAP_TIMEOUT,
+            "the reap must have waited out its bound"
+        );
+        assert!(
+            started.elapsed() < CHILD_REAP_TIMEOUT * 4,
+            "the reap must be bounded, not open-ended"
+        );
+    }
+
+    /// A child killed by a signal has no exit code. That must read as "unknown",
+    /// not as a panic or a fabricated status.
+    #[tokio::test]
+    async fn wait_for_exit_code_is_none_for_a_signal_death() {
+        let _guard = subprocess_guard().await;
+        let mut child = CcChild::bare(spawn_sleeper());
+        child.child.start_kill().expect("failed to signal child");
+        assert_eq!(child.wait_for_exit_code().await, None);
+    }
+
+    /// The drain wait exists so a child holding its stderr pipe open cannot stall
+    /// the spawn's failure report. On timeout the tail is whatever was captured,
+    /// not nothing.
+    #[tokio::test]
+    async fn drained_stderr_tail_returns_what_it_has_when_the_drain_stalls() {
+        let tail = tasks::StderrTail::new();
+        tail.push("partial output".into());
+        let never_finishes = tokio::spawn(std::future::pending::<()>());
+
+        let started = std::time::Instant::now();
+        let snapshot = drained_stderr_tail(&tail, never_finishes).await;
+        assert_eq!(snapshot, ["partial output".to_string()]);
+        assert!(
+            started.elapsed() >= STDERR_DRAIN_TIMEOUT,
+            "the drain wait must have run to its bound"
+        );
+        assert!(
+            started.elapsed() < STDERR_DRAIN_TIMEOUT * 4,
+            "the drain wait must be bounded, not open-ended"
+        );
     }
 
     #[tokio::test]

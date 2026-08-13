@@ -19,7 +19,7 @@ use crate::active_bridge::registry::ActiveBridges;
 use crate::active_bridge::test_fixtures::TestBridgeConfig;
 use crate::active_bridge::test_support::{
     drain_broadcast, install_dead_io_session, install_failing_session, make_bridge_no_loop,
-    set_context_usage, set_waiting_for_idle,
+    seed_session_stderr, set_context_usage, set_waiting_for_idle,
 };
 
 /// Build a bridge (no event loop) and register it in `registry`.
@@ -119,6 +119,88 @@ async fn watchdog_detects_dead_event_loop() {
         "alert body must name the predicate: {}",
         alerts[0].2
     );
+}
+
+/// A wedged CC that explained itself on stderr is diagnosable only from the
+/// wedge page, because the reap that follows destroys the tail. The page must
+/// carry it.
+#[tokio::test]
+async fn wedge_page_carries_the_session_stderr_tail() {
+    let registry = ActiveBridges::new();
+    let (bridge, _broadcast_rx) = registered_bridge(&registry).await;
+
+    bridge.install_event_loop_handle(finished_handle().await);
+    install_failing_session(&bridge).await;
+    seed_session_stderr(&bridge, "Error: the container name is already in use").await;
+
+    let (ad, captured, drain_handle) = make_capturing_alerter_with_severity();
+    let mut watchdog = Watchdog::new(WatchdogConfig::default(), registry.clone(), ad);
+    watchdog.sweep().await;
+
+    drop(watchdog);
+    drain_handle.await.unwrap();
+    let alerts = captured.lock().unwrap();
+    assert_eq!(alerts.len(), 1, "exactly one alert expected: {alerts:?}");
+    assert!(
+        alerts[0].2.contains("stderr tail: "),
+        "the page must label the tail: {}",
+        alerts[0].2
+    );
+    assert!(
+        alerts[0].2.contains("the container name is already in use"),
+        "the page must carry what CC wrote: {}",
+        alerts[0].2
+    );
+}
+
+/// A session that wrote nothing must not decorate the page with an empty
+/// "stderr tail:" suffix — the label is what makes the tail readable, and a
+/// label with nothing after it is noise on every page that has no tail.
+#[tokio::test]
+async fn wedge_page_omits_an_empty_stderr_tail() {
+    let registry = ActiveBridges::new();
+    let (bridge, _broadcast_rx) = registered_bridge(&registry).await;
+
+    bridge.install_event_loop_handle(finished_handle().await);
+    install_failing_session(&bridge).await;
+
+    let (ad, captured, drain_handle) = make_capturing_alerter_with_severity();
+    let mut watchdog = Watchdog::new(WatchdogConfig::default(), registry.clone(), ad);
+    watchdog.sweep().await;
+
+    drop(watchdog);
+    drain_handle.await.unwrap();
+    let alerts = captured.lock().unwrap();
+    assert_eq!(alerts.len(), 1, "exactly one alert expected: {alerts:?}");
+    assert!(
+        !alerts[0].2.contains("stderr tail"),
+        "no tail means no suffix: {}",
+        alerts[0].2
+    );
+}
+
+/// The wedge predicates that fire with no session at all must still report,
+/// not panic on the missing tail.
+#[tokio::test]
+async fn wedge_page_tolerates_a_missing_session() {
+    let registry = ActiveBridges::new();
+    let (bridge, _broadcast_rx) = registered_bridge(&registry).await;
+    assert!(
+        bridge.session.lock().await.is_none(),
+        "this fixture starts with no session, which is the case under test"
+    );
+
+    bridge.install_event_loop_handle(finished_handle().await);
+
+    let (ad, captured, drain_handle) = make_capturing_alerter_with_severity();
+    let mut watchdog = Watchdog::new(WatchdogConfig::default(), registry.clone(), ad);
+    watchdog.sweep().await;
+
+    drop(watchdog);
+    drain_handle.await.unwrap();
+    let alerts = captured.lock().unwrap();
+    assert_eq!(alerts.len(), 1, "exactly one alert expected: {alerts:?}");
+    assert!(!alerts[0].2.contains("stderr tail"), "{}", alerts[0].2);
 }
 
 /// The chat adapter reads a broadcast this bridge keeps a sender on, so it runs

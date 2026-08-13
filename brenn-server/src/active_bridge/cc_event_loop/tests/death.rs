@@ -2,10 +2,10 @@
 //! (`mark_conversation_error`, alert suppression on intentional shutdown,
 //! compact-boundary reset) and event-channel-closed teardown
 //! (registry removal, conversation completion, permission cancellation).
-//! Peeled out of `tests/mod.rs` per design §2.4.
 
 use super::super::super::test_support::{
-    await_fence, await_fence_n, drain_broadcast, event_fence, recv_broadcast, test_bridge,
+    await_fence, await_fence_n, drain_broadcast, drop_and_drain_alerts, event_fence,
+    install_failing_session, recv_broadcast, seed_session_stderr, test_bridge,
     test_bridge_with_dispatcher,
 };
 use super::super::*;
@@ -146,6 +146,82 @@ async fn died_without_shutdown_flag_still_alerts() {
         1,
         "unexpected Died must still alert"
     );
+}
+
+/// The death page is the operator's only view of why CC died; podman's and CC's
+/// own error text lives in the stderr tail, and the reset that follows destroys
+/// it. The page must carry it.
+#[tokio::test]
+async fn died_alert_carries_the_session_stderr_tail() {
+    let (dispatcher, captured, drainer) =
+        brenn_obs::alerting::make_capturing_alerter_with_severity();
+    let (bridge, event_tx, _broadcast_rx, _ab) = test_bridge_with_dispatcher(dispatcher).await;
+    install_failing_session(&bridge).await;
+    seed_session_stderr(&bridge, "Error: the container name is already in use").await;
+
+    event_tx
+        .send(SessionEvent::Died(brenn_cc::error::CcError::SendFailed))
+        .await
+        .unwrap();
+    drop_and_drain_alerts(event_tx, bridge, drainer).await;
+    let alerts = captured.lock().unwrap();
+    assert_eq!(alerts.len(), 1, "exactly one alert expected: {alerts:?}");
+    assert_eq!(alerts[0].1, "CC session died");
+    assert!(
+        alerts[0].2.contains("stderr tail: "),
+        "the page must label the tail: {}",
+        alerts[0].2
+    );
+    assert!(
+        alerts[0].2.contains("the container name is already in use"),
+        "the page must carry what CC wrote: {}",
+        alerts[0].2
+    );
+}
+
+/// With nothing on stderr the page is exactly the error, with no dangling
+/// "stderr tail:" label after it.
+#[tokio::test]
+async fn died_alert_omits_an_empty_stderr_tail() {
+    let (dispatcher, captured, drainer) =
+        brenn_obs::alerting::make_capturing_alerter_with_severity();
+    let (bridge, event_tx, _broadcast_rx, _ab) = test_bridge_with_dispatcher(dispatcher).await;
+    install_failing_session(&bridge).await;
+
+    event_tx
+        .send(SessionEvent::Died(brenn_cc::error::CcError::SendFailed))
+        .await
+        .unwrap();
+    drop_and_drain_alerts(event_tx, bridge, drainer).await;
+    let alerts = captured.lock().unwrap();
+    assert_eq!(alerts.len(), 1, "exactly one alert expected: {alerts:?}");
+    assert_eq!(
+        alerts[0].2,
+        brenn_cc::error::CcError::SendFailed.to_string(),
+        "no tail means the body is the bare error"
+    );
+}
+
+/// A session reaped before the death is reported leaves nothing to snapshot.
+/// That is a normal ordering, not a panic.
+#[tokio::test]
+async fn died_alert_tolerates_an_already_reaped_session() {
+    let (dispatcher, captured, drainer) =
+        brenn_obs::alerting::make_capturing_alerter_with_severity();
+    let (bridge, event_tx, _broadcast_rx, _ab) = test_bridge_with_dispatcher(dispatcher).await;
+    assert!(
+        bridge.session.lock().await.is_none(),
+        "this fixture starts with no session, which is the case under test"
+    );
+
+    event_tx
+        .send(SessionEvent::Died(brenn_cc::error::CcError::SendFailed))
+        .await
+        .unwrap();
+    drop_and_drain_alerts(event_tx, bridge, drainer).await;
+    let alerts = captured.lock().unwrap();
+    assert_eq!(alerts.len(), 1, "exactly one alert expected: {alerts:?}");
+    assert!(!alerts[0].2.contains("stderr tail"), "{}", alerts[0].2);
 }
 
 #[tokio::test]

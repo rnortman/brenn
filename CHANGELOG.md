@@ -2,6 +2,16 @@
 
 All notable changes to Brenn are documented here.
 
+## [0.16.4] — 2026-08-14
+
+### Fixed
+
+- Containers were not properly shut down and could sometimes be orphaned.
+
+### Changed
+
+- More Bazel/CI speed optimizations
+
 ## [0.16.3] — 2026-08-11
 
 ### Changed

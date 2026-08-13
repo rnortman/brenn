@@ -32,6 +32,24 @@ fn default_container_home() -> PathBuf {
     PathBuf::from("/home/user")
 }
 
+/// Arguments for removing containers by name: `rm --force --time 0 --ignore <names...>`.
+///
+/// `--force` because a container being removed is being discarded and nothing
+/// inside it is worth a grace period; `--time 0` so the force is immediate;
+/// `--ignore` so a name that no longer exists is a success, not an error (the
+/// removal always races `--rm`'s own cleanup).
+pub fn container_rm_args<S: AsRef<str>>(names: &[S]) -> Vec<String> {
+    let mut args = vec![
+        "rm".to_string(),
+        "--force".to_string(),
+        "--time".to_string(),
+        "0".to_string(),
+        "--ignore".to_string(),
+    ];
+    args.extend(names.iter().map(|n| n.as_ref().to_string()));
+    args
+}
+
 /// Resolved container spawn configuration for a containerized app.
 /// Passed through to `CcSessionConfig` when spawning.
 #[derive(Debug, Clone)]
@@ -139,5 +157,34 @@ impl ContainerSpawnConfig {
         for (i, flag) in flags.iter().enumerate() {
             args.insert(image_pos + i, flag.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rm_args_are_force_zero_ignore() {
+        assert_eq!(
+            container_rm_args(&["brenn-myapp-conv42"]),
+            vec![
+                "rm".to_string(),
+                "--force".to_string(),
+                "--time".to_string(),
+                "0".to_string(),
+                "--ignore".to_string(),
+                "brenn-myapp-conv42".to_string(),
+            ]
+        );
+    }
+
+    /// The startup sweep removes a whole batch in one call; the flags must not
+    /// change with the name count.
+    #[test]
+    fn rm_args_take_every_name() {
+        let args = container_rm_args(&["a".to_string(), "b".to_string()]);
+        assert_eq!(&args[..5], &["rm", "--force", "--time", "0", "--ignore"]);
+        assert_eq!(&args[5..], &["a", "b"]);
     }
 }

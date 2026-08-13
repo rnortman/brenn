@@ -46,6 +46,7 @@ pub fn spawn_stdout_reader(
     alert_dispatcher: AlertDispatcher,
     alive: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
+    server_shutting_down: Option<Arc<AtomicBool>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_stdout_reader(
         stdout,
@@ -56,6 +57,7 @@ pub fn spawn_stdout_reader(
         alert_dispatcher,
         alive,
         shutting_down,
+        server_shutting_down,
     ))
 }
 
@@ -74,6 +76,7 @@ async fn run_stdout_reader<R: tokio::io::AsyncRead + Unpin>(
     alert_dispatcher: AlertDispatcher,
     alive: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
+    server_shutting_down: Option<Arc<AtomicBool>>,
 ) {
     let mut reader = NdjsonReader::new(reader);
     let mut init_done = false;
@@ -291,7 +294,15 @@ async fn run_stdout_reader<R: tokio::io::AsyncRead + Unpin>(
                 {
                     tracing::debug!("consumer gone when sending Died (EOF)");
                 }
-                if shutting_down.load(Ordering::SeqCst) {
+                // Two independent flags: this session's own teardown, and the
+                // whole server going down. They are checked separately so a
+                // `kill_session` on one conversation cannot suppress an
+                // unexpected death elsewhere.
+                let intentional = shutting_down.load(Ordering::SeqCst)
+                    || server_shutting_down
+                        .as_ref()
+                        .is_some_and(|f| f.load(Ordering::SeqCst));
+                if intentional {
                     tracing::info!("CC stdout closed (intentional shutdown)");
                 } else {
                     alert_dispatcher.alert(
@@ -658,21 +669,117 @@ where
     })
 }
 
+/// Maximum number of stderr lines retained in the tail.
+pub(crate) const STDERR_TAIL_LINES: usize = 50;
+
+/// Maximum bytes retained per stderr line. Bounds memory against a child that
+/// writes one enormous line.
+const STDERR_TAIL_LINE_BYTES: usize = 1024;
+
+/// Rolling tail of the child's stderr, for attachment to failure reports.
+///
+/// Cheap to clone: the drain task holds one clone and pushes, the session holds
+/// another and snapshots. Holds at most
+/// `STDERR_TAIL_LINES` × `STDERR_TAIL_LINE_BYTES`; the most recent lines win,
+/// which is where error text lives.
+#[derive(Clone)]
+pub struct StderrTail(Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+
+impl StderrTail {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::with_capacity(STDERR_TAIL_LINES),
+        )))
+    }
+
+    /// Append a line, truncating it and evicting the oldest past the cap.
+    pub(crate) fn push(&self, mut line: String) {
+        if line.len() > STDERR_TAIL_LINE_BYTES {
+            line.truncate(line.floor_char_boundary(STDERR_TAIL_LINE_BYTES));
+        }
+        let mut buf = self.0.lock().expect("stderr tail mutex poisoned");
+        if buf.len() == STDERR_TAIL_LINES {
+            buf.pop_front();
+        }
+        buf.push_back(line);
+    }
+
+    /// The retained lines, oldest first.
+    pub fn snapshot(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .expect("stderr tail mutex poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
 /// Spawn the stderr drain task.
-pub fn spawn_stderr_drain(stderr: ChildStderr) {
-    tokio::spawn(async move {
+///
+/// Returns the tail buffer the task fills and the task's handle, so a failing
+/// spawn can await the drain (the child's stderr is at EOF once it exits) and
+/// then snapshot everything the child wrote.
+pub fn spawn_stderr_drain(stderr: ChildStderr) -> (StderrTail, tokio::task::JoinHandle<()>) {
+    let tail = StderrTail::new();
+    let task_tail = tail.clone();
+    let handle = tokio::spawn(async move {
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
             tracing::debug!(target: "cc_stderr", "{}", line);
+            task_tail.push(line);
         }
         tracing::info!("CC stderr drain task exited");
     });
+    (tail, handle)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- StderrTail tests ---
+
+    #[test]
+    fn stderr_tail_keeps_the_most_recent_lines_in_order() {
+        let tail = StderrTail::new();
+        for i in 0..(STDERR_TAIL_LINES + 5) {
+            tail.push(format!("line {i}"));
+        }
+        let snapshot = tail.snapshot();
+        assert_eq!(snapshot.len(), STDERR_TAIL_LINES);
+        // Oldest five evicted; remainder oldest-first.
+        assert_eq!(snapshot[0], "line 5");
+        assert_eq!(
+            snapshot[STDERR_TAIL_LINES - 1],
+            format!("line {}", STDERR_TAIL_LINES + 4)
+        );
+    }
+
+    #[test]
+    fn stderr_tail_truncates_long_lines() {
+        let tail = StderrTail::new();
+        tail.push("x".repeat(STDERR_TAIL_LINE_BYTES * 3));
+        let snapshot = tail.snapshot();
+        assert_eq!(snapshot[0].len(), STDERR_TAIL_LINE_BYTES);
+    }
+
+    /// Truncation must not split a multi-byte character.
+    #[test]
+    fn stderr_tail_truncates_on_a_char_boundary() {
+        let tail = StderrTail::new();
+        // 3-byte characters do not divide the cap evenly.
+        tail.push("\u{20ac}".repeat(STDERR_TAIL_LINE_BYTES));
+        let snapshot = tail.snapshot();
+        assert!(snapshot[0].len() <= STDERR_TAIL_LINE_BYTES);
+        assert!(snapshot[0].chars().all(|c| c == '\u{20ac}'));
+    }
+
+    #[test]
+    fn stderr_tail_starts_empty() {
+        assert!(StderrTail::new().snapshot().is_empty());
+    }
 
     // --- build_cc_response tests ---
 
@@ -1087,6 +1194,7 @@ mod tests {
             alert,
             alive.clone(),
             shutting_down.clone(),
+            None,
         ));
 
         // First event: Initialized from system/init.
@@ -1147,6 +1255,7 @@ mod tests {
             alert,
             alive.clone(),
             shutting_down.clone(),
+            None,
         ));
 
         // The unknown system subtype is handled inline (alert, no event emitted).
@@ -1199,6 +1308,7 @@ mod tests {
             alert,
             alive.clone(),
             shutting_down.clone(),
+            None,
         ));
 
         // First event: StatusChange with "compacting".
@@ -1274,6 +1384,7 @@ mod tests {
             alert,
             alive.clone(),
             shutting_down.clone(),
+            None,
         ));
 
         // First event: compact_result == "success"
@@ -1350,6 +1461,7 @@ mod tests {
             alert,
             alive.clone(),
             shutting_down.clone(),
+            None,
         ));
 
         let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), event_rx.recv())
@@ -1399,6 +1511,7 @@ mod tests {
             alert,
             alive,
             shutting_down.clone(),
+            None,
         ));
 
         let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), event_rx.recv())
@@ -1441,6 +1554,7 @@ mod tests {
             alert,
             alive.clone(),
             shutting_down.clone(),
+            None,
         ));
 
         let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), event_rx.recv())
@@ -1486,6 +1600,7 @@ mod tests {
             alert,
             alive,
             shutting_down.clone(),
+            None,
         ));
 
         // First event: UnrecognizedMessage from the bad JSON line.
@@ -1545,6 +1660,7 @@ mod tests {
             alert,
             alive.clone(),
             shutting_down.clone(),
+            None,
         ));
 
         let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), event_rx.recv())
@@ -1594,6 +1710,7 @@ mod tests {
             alert,
             alive.clone(),
             shutting_down.clone(),
+            None,
         ));
 
         let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), event_rx.recv())
@@ -1648,6 +1765,7 @@ mod tests {
             alert,
             alive.clone(),
             shutting_down,
+            None,
         ));
 
         // First event: TurnCompleted from the result message.
@@ -1732,6 +1850,7 @@ mod tests {
             alert,
             alive,
             shutting_down.clone(),
+            None,
         ));
 
         // First event: ApprovalRequired.
@@ -1816,6 +1935,7 @@ mod tests {
             alert,
             alive.clone(),
             shutting_down,
+            None,
         ));
 
         // Should still get Died event (needed for cleanup).
@@ -1833,6 +1953,100 @@ mod tests {
             alert_count.load(Ordering::SeqCst),
             0,
             "no alert should fire when shutting_down is set"
+        );
+    }
+
+    /// Run the reader over an init-ack-then-EOF stream with the given flags and
+    /// report how many alerts fired.
+    ///
+    /// The reader is awaited to completion so it drops the only `AlertDispatcher`
+    /// clone, and the drainer is awaited after that. Reading the counter after a
+    /// bare yield would let the suppression assertions pass because the drainer
+    /// had not run yet rather than because the alert was suppressed — which is
+    /// the exact failure this suite exists to catch.
+    async fn eof_alert_count(
+        session_flag: Arc<AtomicBool>,
+        server_flag: Option<Arc<AtomicBool>>,
+    ) -> u32 {
+        let (alert, alert_count, drainer) = brenn_obs::alerting::make_counting_alerter();
+
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (init_tx, _init_rx) = mpsc::channel(16);
+        let (outgoing_tx, _outgoing_rx) = mpsc::channel(64);
+        let alive = Arc::new(AtomicBool::new(true));
+        let (transcript, _transcript_dir) = make_test_transcript();
+
+        let input = concat!(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_0"}}"#,
+            "\n",
+        );
+
+        let reader = tokio::spawn(run_stdout_reader(
+            input.as_bytes(),
+            event_tx,
+            init_tx,
+            outgoing_tx,
+            transcript,
+            alert,
+            alive.clone(),
+            session_flag,
+            server_flag,
+        ));
+
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("no timeout")
+            .expect("event");
+        assert!(matches!(event, SessionEvent::Died(_)));
+        reader.await.expect("reader task panicked");
+        drainer.await.expect("alert drainer panicked");
+        alert_count.load(Ordering::SeqCst)
+    }
+
+    /// The server-level flag suppresses the EOF alert even though this
+    /// session's own flag is clear — a session that EOFs while the process is
+    /// going down must not page.
+    #[tokio::test]
+    async fn reader_loop_eof_with_server_flag_skips_alert() {
+        let count = eof_alert_count(
+            Arc::new(AtomicBool::new(false)),
+            Some(Arc::new(AtomicBool::new(true))),
+        )
+        .await;
+        assert_eq!(count, 0, "server shutdown must suppress the EOF alert");
+    }
+
+    /// Neither flag set: an unexpected EOF must page.
+    #[tokio::test]
+    async fn reader_loop_eof_with_neither_flag_alerts() {
+        let count = eof_alert_count(
+            Arc::new(AtomicBool::new(false)),
+            Some(Arc::new(AtomicBool::new(false))),
+        )
+        .await;
+        assert_eq!(count, 1, "unexpected EOF must fire the Critical alert");
+    }
+
+    /// The per-session flag must not be the shared server flag. Two sessions
+    /// sharing one `server_shutting_down` Arc — marking session A shutting down
+    /// (its own flag) must leave session B's death alert armed.
+    #[tokio::test]
+    async fn per_session_flag_does_not_poison_other_sessions() {
+        let server_flag = Arc::new(AtomicBool::new(false));
+
+        let a_flag = Arc::new(AtomicBool::new(false));
+        let b_flag = Arc::new(AtomicBool::new(false));
+
+        // Session A is being torn down intentionally.
+        a_flag.store(true, Ordering::SeqCst);
+
+        let a_count = eof_alert_count(a_flag, Some(server_flag.clone())).await;
+        assert_eq!(a_count, 0, "session A's own teardown must not alert");
+
+        let b_count = eof_alert_count(b_flag, Some(server_flag)).await;
+        assert_eq!(
+            b_count, 1,
+            "session B's unexpected death must still alert after A was reaped"
         );
     }
 
@@ -1879,6 +2093,7 @@ mod tests {
             alert,
             alive,
             shutting_down,
+            None,
         ));
 
         // Collect events until the channel closes (reader exits on EOF).

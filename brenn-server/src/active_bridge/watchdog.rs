@@ -19,7 +19,7 @@ use brenn_obs::alerting::{AlertDispatcher, AlertSeverity};
 use tracing::{error, info};
 
 use super::ActiveBridge;
-use super::cc_event_loop::{ShutdownReason, reset_dead_session};
+use super::cc_event_loop::{ShutdownReason, reset_dead_session, session_stderr_tail};
 use super::registry::ActiveBridges;
 
 /// Which wedge predicate fired, for the alert body and logs.
@@ -143,20 +143,26 @@ impl Watchdog {
     /// Page, run the clean-slate reset, reap the session, and deregister.
     async fn handle_wedge(&self, bridge: &ActiveBridge, predicate: WedgePredicate) {
         let cid = bridge.conversation_id;
+        // Snapshot before the reset reaps the session: a wedge CC explained on
+        // stderr is diagnosable only from this record.
+        let stderr_tail = session_stderr_tail(bridge).await;
         error!(
             conversation_id = cid,
             app_slug = %bridge.app_slug,
             predicate = %predicate,
+            stderr_tail = %stderr_tail.join("\n"),
             "watchdog detected wedged bridge — resetting and reaping"
         );
-        self.alert_dispatcher.alert(
-            AlertSeverity::Critical,
-            "Bridge wedged".to_string(),
-            format!(
-                "conversation {cid} ({}) wedged: {predicate}",
-                bridge.app_slug
-            ),
+        let excerpt = brenn_cc::error::stderr_tail_excerpt(&stderr_tail);
+        let mut body = format!(
+            "conversation {cid} ({}) wedged: {predicate}",
+            bridge.app_slug
         );
+        if !excerpt.is_empty() {
+            body.push_str(&format!("\nstderr tail: {excerpt}"));
+        }
+        self.alert_dispatcher
+            .alert(AlertSeverity::Critical, "Bridge wedged".to_string(), body);
 
         // Clean-slate reset: runtime state + mark Error + error broadcasts +
         // died_handled (so a further sweep before deregistration is a no-op).
@@ -168,8 +174,7 @@ impl Watchdog {
 
         // Reap the orphaned session: mark it shutting down first so a live
         // reader task's EOF branch does not fire its own Critical for a kill the
-        // watchdog is performing and already paged, then drop the CcSession —
-        // kill_on_drop kills the child, reaping the container.
+        // watchdog is performing and already paged, then drop the CcSession.
         {
             let mut guard = bridge.session.lock().await;
             if let Some(ref s) = *guard {

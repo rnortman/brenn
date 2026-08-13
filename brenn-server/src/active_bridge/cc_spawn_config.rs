@@ -169,11 +169,8 @@ pub(crate) fn build_cc_session_config(
         } else {
             vec![]
         },
-        // Pre-seeded with the server-level shutting_down flag so a bridge
-        // spawned during the shutdown window (after shutdown_signal returned
-        // but before axum finishes draining) inherits the flag and its reader
-        // task suppresses the spurious EOF Critical alert on process teardown.
-        shutting_down: Some(server_shutting_down),
+        shutting_down: None,
+        server_shutting_down: Some(server_shutting_down),
     }
 }
 
@@ -532,6 +529,21 @@ mod tests {
             user_tz,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
+    }
+
+    /// The session must get a fresh per-session shutdown flag and the shared
+    /// server flag separately.
+    #[tokio::test]
+    async fn build_cc_session_config_separates_session_and_server_flags() {
+        let cfg = run_build_cc_session_config(&minimal_test_app_config());
+        assert!(
+            cfg.shutting_down.is_none(),
+            "per-session flag must be created fresh by spawn()"
+        );
+        assert!(
+            cfg.server_shutting_down.is_some(),
+            "the process-wide flag must be passed through read-only"
+        );
     }
 
     #[tokio::test]

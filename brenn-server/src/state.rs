@@ -200,19 +200,24 @@ pub struct AppState {
 /// Lightweight: only holds entries for conversations currently being woken.
 /// The lock prevents two concurrent wake_conversation calls from both spawning CC.
 ///
-/// **This is the single-spawn mechanism, and the only one.** `spawn_if_absent`'s
-/// fast-path check, this guard held across the whole spawn, the re-check under
-/// it, and registration into `active_bridges` only after the CC handshake are
+/// **This is the single-spawn mechanism, and the only one.** Every path that
+/// can spawn CC for a conversation takes it — the autonomous wake
+/// (`spawn_if_absent`) and the user-initiated resume
+/// (`WsConnection::spawn_bridge`) alike. The fast-path check, this guard held
+/// across the whole spawn, the re-check under it, and registration into
+/// `active_bridges` only after the CC handshake are
 /// together the spawn state machine: spawn → active → idle/errored, never more
 /// than one live spawn per conversation, with concurrent wakes during the spawn
-/// window collapsing onto the lock. Do not add a pacing or cooldown layer in
+/// window collapsing onto the lock. Serialization is also what makes the
+/// pre-spawn container reclaim safe: a container still holding a conversation's
+/// name under this lock cannot belong to a live session. Do not add a pacing or
+/// cooldown layer in
 /// front of it on the theory that double-spawn needs a second defense — it does
 /// not, and one was removed for being exactly that. The one thing that *does*
 /// belong beside it is [`SpawnBackoff`], which damps spawns that **fail**, a
 /// different problem a mutex cannot solve.
 #[derive(Clone, Default)]
 pub struct WakeLocks {
-    #[cfg_attr(test, allow(dead_code))]
     inner: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
 }
 
@@ -222,8 +227,10 @@ impl WakeLocks {
     /// Returns an owned mutex guard. Entries are never removed from the map —
     /// they're `Arc<Mutex<()>>` (~64 bytes each), bounded by conversation count,
     /// and not worth the complexity of cleanup.
-    #[cfg(not(test))]
-    async fn lock(&self, conversation_id: i64) -> tokio::sync::OwnedMutexGuard<()> {
+    ///
+    /// Compiled into test builds too, so the serialization the container
+    /// reclaim's safety rests on is executable rather than review-only.
+    pub(crate) async fn lock(&self, conversation_id: i64) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut map = self.inner.lock().await;
             map.entry(conversation_id)

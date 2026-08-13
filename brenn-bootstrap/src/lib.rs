@@ -213,10 +213,6 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
     // because `registry_virtual_tools` projects each app's granted registry
     // tools from their descriptors.
 
-    // Clean up stale podman containers from previous crashes.
-    // Only runs if any app uses container isolation. Uses the `brenn-managed`
-    // label + `status=exited` filter so only stopped containers are touched —
-    // running containers from any deployment are never affected.
     if apps.values().any(|a| a.container_spawn.is_some()) {
         cleanup::cleanup_stale_containers().await;
     }

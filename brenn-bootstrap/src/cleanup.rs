@@ -5,40 +5,35 @@ use tracing::warn;
 
 /// Build the `--filter` args used by `cleanup_stale_containers`.
 ///
-/// Returns `["label=brenn-managed", "status=exited"]`. Both filters are
-/// applied together so cleanup only touches stopped containers that brenn
-/// itself spawned — never running containers from any deployment.
-pub(crate) fn cleanup_filter_args() -> [&'static str; 2] {
-    ["label=brenn-managed", "status=exited"]
+/// Returns `["label=brenn-managed"]` — label only, so the sweep sees running
+/// containers as well as stopped ones. Rootless podman state is per-user and
+/// container names are per-conversation, so **one brenn instance per Unix user**
+/// is a standing constraint of the deployment model; every brenn-managed
+/// container visible at startup therefore belongs to a previous life of this
+/// instance and is stale.
+pub(crate) fn cleanup_filter_args() -> [&'static str; 1] {
+    ["label=brenn-managed"]
 }
 
-/// Remove any stale podman containers from previous crashes of this
-/// brenn instance.
+/// Remove any stale podman containers left by a previous life of this brenn
+/// instance.
 ///
-/// When `kill_on_drop(true)` sends SIGKILL to a `podman run` process, the
-/// `--rm` flag may not get a chance to fire, leaving stopped containers
-/// behind. This runs on startup to clean them up.
+/// A host SIGKILL or an OOM leaves no chance to run session teardown, so both
+/// stopped containers (whose `--rm` never fired) and running ones (whose PID 1
+/// never saw stdin close) can survive. This runs at startup, before anything is
+/// spawned, and removes them all.
 ///
-/// Only stopped containers carrying `brenn-managed=true` are touched — running
-/// containers from any deployment are never affected.
+/// Every removal is logged at `warn!`: debris after a crash is expected, but an
+/// operator should still see that it happened.
 pub(crate) async fn cleanup_stale_containers() {
     use tokio::process::Command;
 
-    // List all stopped containers carrying the brenn-managed label.
+    // List every container carrying the brenn-managed label, running or not.
     // If podman isn't available or fails, panic — containerized apps can't function
     // without a working podman installation.
     let filters = cleanup_filter_args();
     let output = Command::new("podman")
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            filters[0],
-            "--filter",
-            filters[1],
-            "--format",
-            "{{.Names}}",
-        ])
+        .args(["ps", "-a", "--filter", filters[0], "--format", "{{.Names}}"])
         .output()
         .await
         .unwrap_or_else(|e| {
@@ -63,14 +58,14 @@ pub(crate) async fn cleanup_stale_containers() {
         return;
     }
 
-    info!(count = names.len(), "removing stale podman containers");
-    // Batch all names into a single `podman rm -f name1 name2 ...` call to
-    // eliminate N-1 fork/exec overhead at startup. `podman rm` accepts
-    // multiple names and is idempotent with `-f`.
+    warn!(
+        count = names.len(),
+        containers = %names.join(" "),
+        "removing stale podman containers left by a previous run"
+    );
+    // Batch into one call to eliminate N-1 fork/exec overhead at startup.
     let result = Command::new("podman")
-        .arg("rm")
-        .arg("-f")
-        .args(&names)
+        .args(brenn_lib::config::container_rm_args(&names))
         .output()
         .await;
     match result {
@@ -94,24 +89,35 @@ pub(crate) async fn cleanup_stale_containers() {
 mod tests {
     use super::*;
 
-    /// Cleanup filter must use `brenn-managed` label + `status=exited`, not the old
-    /// per-instance `brenn-instance=<id>` shape. The `status=exited` filter is the
-    /// critical safety property: running containers from any deployment are never touched.
+    /// Cleanup filter must be the `brenn-managed` label alone — not a
+    /// per-instance `brenn-instance=<id>` shape, and not paired with a status
+    /// filter.
+    ///
+    /// A `status=` filter would put running orphans back out of reach, which is
+    /// exactly the case a crash leaves behind. Sweeping running containers is
+    /// safe only because one brenn instance per Unix user is a standing
+    /// constraint (rootless podman state is per-user, and container names are
+    /// per-conversation, so two instances would collide on names anyway).
     ///
     /// Pairing note: spawned containers carry `--label brenn-managed=true`
     /// (`brenn-cc/src/session/mod.rs`). The cleanup filter uses `label=brenn-managed`
     /// (key-only form), which matches any value of that label key per podman semantics.
     /// This is intentional — the filter matches on label presence, not value.
     #[test]
-    fn cleanup_filter_uses_brenn_managed_and_status_exited() {
+    fn cleanup_filter_is_brenn_managed_label_only() {
         let args = cleanup_filter_args();
-        assert_eq!(args[0], "label=brenn-managed");
-        assert_eq!(args[1], "status=exited");
+        assert_eq!(args, ["label=brenn-managed"]);
         // Regression guard: must never revert to a name-prefix filter, which
         // would risk matching containers from other deployments.
         assert!(
             !args[0].starts_with("name="),
             "cleanup filter must not be a name filter — must be label-based"
+        );
+        // Regression guard: a status filter must not reappear — running orphans
+        // are precisely what this sweep exists to remove.
+        assert!(
+            !args.iter().any(|a| a.starts_with("status=")),
+            "cleanup filter must not constrain container status"
         );
     }
 }

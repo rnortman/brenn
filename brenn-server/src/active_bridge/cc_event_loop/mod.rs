@@ -22,8 +22,8 @@ mod rate_limit;
 mod status;
 mod streaming;
 
-pub(in crate::active_bridge) use death::reset_dead_session;
 use death::reset_session_runtime_state;
+pub(in crate::active_bridge) use death::{reset_dead_session, session_stderr_tail};
 pub(super) use drain::drain_pending_events;
 pub(in crate::active_bridge) use initialized::handle_initialized;
 pub(in crate::active_bridge) use rate_limit::handle_rate_limit_utilization;
@@ -221,11 +221,24 @@ pub(super) async fn cc_event_loop(
                         "CC session ended (intentional shutdown)"
                     );
                 } else {
-                    error!("CC session died: {err}");
+                    // Snapshot before the reset nulls the session, so the death
+                    // record and the page both carry what CC last wrote.
+                    let stderr_tail = session_stderr_tail(&bridge).await;
+                    error!(
+                        conversation_id = bridge.conversation_id,
+                        stderr_tail = %stderr_tail.join("\n"),
+                        "CC session died: {err}"
+                    );
+                    let excerpt = brenn_cc::error::stderr_tail_excerpt(&stderr_tail);
+                    let body = if excerpt.is_empty() {
+                        err.to_string()
+                    } else {
+                        format!("{err}\nstderr tail: {excerpt}")
+                    };
                     alert_dispatcher.alert(
                         brenn_obs::alerting::AlertSeverity::Warning,
                         "CC session died".to_string(),
-                        err.to_string(),
+                        body,
                     );
                     // Clean-slate reset: runtime state + mark conversation
                     // Error + error broadcasts + died_handled.

@@ -123,6 +123,19 @@ impl WsConnection {
             return Err("single-instance app is busy".to_string());
         }
 
+        // Serialize against the autonomous wake path, which takes the same lock.
+        // Without it a wake and a user resume can spawn concurrently for one
+        // conversation, and the pre-spawn container reclaim would then remove
+        // the other spawn's live container.
+        let _wake_guard = self.state.wake_locks.lock(conversation_id).await;
+
+        // Re-check under the lock: a bridge may have been registered while we
+        // waited. Attach to it instead of spawning a second session.
+        if let Some(existing) = self.state.active_bridges.get(conversation_id).await {
+            self.attach_to_bridge(&existing).await;
+            return Ok((existing, Vec::new()));
+        }
+
         // In tests, return the injected bridge instead of spawning CC.
         // Tests have no real CC event loop, so subscribe() is fine —
         // there's no race because nothing is broadcasting.
@@ -221,6 +234,8 @@ impl WsConnection {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::test_support::init_db_memory;
     use brenn_cc::protocol::CcOutgoing;
     use brenn_db::auth::user::create_user;
@@ -661,6 +676,79 @@ mod tests {
             cc_rx.try_recv().is_err(),
             "no CC messages must be sent when there are zero undelivered rows"
         );
+    }
+
+    /// `spawn_bridge` must not proceed while another spawner holds the
+    /// conversation's wake lock. That serialization is the whole safety
+    /// argument for the pre-spawn container reclaim: anything holding a
+    /// conversation's container name while the lock is held by the spawner
+    /// cannot belong to a live session. Asserted executably here so a refactor
+    /// that reorders or drops the guard fails a test instead of producing a
+    /// randomly murdered live conversation.
+    #[tokio::test]
+    async fn spawn_bridge_waits_for_the_conversation_wake_lock() {
+        let (mut conn, _ws_rx, db, user_id, conv_id) = test_ws_conn_with_resume_conv().await;
+        let wake_locks = conn.state.wake_locks.clone();
+
+        let held = wake_locks.lock(conv_id).await;
+
+        // Give the spawn a bridge to attach to, so the only thing that can
+        // delay it is the lock.
+        let (broadcast_tx, _) = broadcast::channel(64);
+        let registered =
+            ActiveBridge::inject_for_test(user_id, conv_id, "test", db.clone(), broadcast_tx);
+        conn.state
+            .active_bridges
+            .insert(conv_id, registered.clone())
+            .await;
+
+        let mut spawn = Box::pin(conn.spawn_bridge(conv_id, false, None, None));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut spawn)
+                .await
+                .is_err(),
+            "spawn_bridge must block while the conversation's wake lock is held"
+        );
+
+        drop(held);
+        let (bridge, _warnings) = spawn
+            .await
+            .expect("spawn_bridge must proceed after release");
+        assert!(Arc::ptr_eq(&bridge, &registered));
+    }
+
+    /// A bridge already registered for the conversation must be attached to,
+    /// not respawned. Running under the per-conversation wake lock, this check
+    /// collapses a user resume that raced an autonomous wake onto the winner's
+    /// bridge — the property the pre-spawn container reclaim relies on to never
+    /// remove a live session's container.
+    #[tokio::test]
+    async fn spawn_bridge_attaches_to_already_registered_bridge() {
+        let (mut conn, _ws_rx, db, user_id, conv_id) = test_ws_conn_with_resume_conv().await;
+
+        let (broadcast_tx, _) = broadcast::channel(64);
+        let registered =
+            ActiveBridge::inject_for_test(user_id, conv_id, "test", db.clone(), broadcast_tx);
+        conn.state
+            .active_bridges
+            .insert(conv_id, registered.clone())
+            .await;
+
+        let (bridge, warnings) = conn
+            .spawn_bridge(conv_id, false, None, None)
+            .await
+            .expect("spawn_bridge must attach to the registered bridge");
+
+        assert!(
+            Arc::ptr_eq(&bridge, &registered),
+            "must return the already-registered bridge, not a new one"
+        );
+        assert!(warnings.is_empty());
+        assert!(
+            conn.test_bridge.is_some(),
+            "the injected spawn seam must not have been consumed"
+        );
+        assert_eq!(conn.current_conversation_id, Some(conv_id));
     }
 
     /// history_sent flag: set by send_history, cleared by detach.

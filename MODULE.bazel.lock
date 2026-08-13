@@ -717,7 +717,7 @@
           "FILE:@@//brenn-hooks/Cargo.toml dca3e7582c38a076ea95321ea0e451b053b01d803a7cdf5abaac4a87097fb9f8",
           "FILE:@@//brenn-messaging-boot/Cargo.toml 865a055c13cfd4605a8a9799901f1b4a7ea3759fa6a4358a539c36e59702aa4c",
           "FILE:@@//brenn-server/Cargo.toml 87412b0b26abbd783c5d2a55f9fe85777152dfee8dac5c5a123f9248eb5345c5",
-          "FILE:@@//brenn-cc/Cargo.toml da963ffd2d73145163756a1d89f368c1117f936c8b8d20dde9dae72239ccdf57",
+          "FILE:@@//brenn-cc/Cargo.toml c3ffe5190b5a42e828a629f6c8c0a5409a622bcdb35b85972d32f717144b92a7",
           "FILE:@@//brenn-mqtt/Cargo.toml da6d26d0008be595827e7baf24d6093e54a3782ba6dbb0fbee35f3862ae47258",
           "FILE:@@//brenn-pfin/Cargo.toml 517df9d692db70ebedff9dc93181439dc1c9718415f50b157bb5fa09f355a8ef",
           "FILE:@@//brenn-pwa-push/Cargo.toml cfa8f5435ba2f8dec517b86982893db7b1348604b2bbe92b6f285aea200cbbc1",

@@ -573,6 +573,7 @@ async fn run_cc(cli: CcArgs) {
         cc_extra_args: vec![],
         env_vars: vec![],
         shutting_down: None,
+        server_shutting_down: None,
     };
 
     let (event_tx, mut event_rx) = mpsc::channel(256);

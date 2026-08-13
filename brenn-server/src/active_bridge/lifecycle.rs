@@ -419,30 +419,42 @@ impl ActiveBridge {
 
     /// Kill the CC subprocess and remove this bridge from the registry.
     ///
-    /// Removes from `ActiveBridges` synchronously (so `get_for_app` immediately
-    /// stops returning this bridge), then drops the `CcSession` (which sends
-    /// SIGKILL via `kill_on_drop`). The event loop's cleanup path is idempotent —
-    /// removing an already-removed key is a no-op.
+    /// Drops the `CcSession` first (SIGKILL via `kill_on_drop`, and for a
+    /// containerized app a blocking `podman rm` of the container), and only then
+    /// removes this bridge from `ActiveBridges`. That order is load-bearing:
+    /// container names are stable per conversation, so a spawn that starts as
+    /// soon as the registry slot frees would have its brand-new container
+    /// force-removed by this session's still-pending teardown. Deregistering
+    /// last means any container holding the name after the slot frees is this
+    /// conversation's next one, not a corpse. The event loop's cleanup path is
+    /// idempotent — removing an already-removed key is a no-op.
     ///
     /// When called from cc_event_loop teardown the CC process has already exited.
     /// Tokio's `kill_on_drop` drop impl calls `libc::kill(pid, SIGKILL)`, which
     /// returns `ESRCH` for a dead/reaped process — the kernel silently ignores
     /// it, and tokio's drop discards the error. No guard needed.
     pub async fn kill_session(&self, active_bridges: &ActiveBridges) {
+        // Take the session out and release the guard *before* dropping it. The
+        // drop tears down the container and blocks until podman has done so;
+        // holding the lock across it would stall every other task that touches
+        // this bridge's session behind a container teardown.
+        let taken = {
+            let mut session = self.session.lock().await;
+            if let Some(ref s) = *session {
+                s.mark_shutting_down();
+            }
+            session.take()
+        };
+        drop(taken);
+        // This bridge is done regardless of whether a replacement holds the slot,
+        // and its adapter is the one thing that would otherwise outlive it.
+        self.stop_chat_adapter();
         // Identity-checked: if a replacement bridge has already taken this
         // conversation_id slot (this bridge was deregistered by the watchdog and
         // the user reconnected), do not remove the replacement.
         active_bridges
             .remove_if_same(self.conversation_id, std::ptr::from_ref(self) as usize)
             .await;
-        // This bridge is done regardless of whether a replacement holds the slot,
-        // and its adapter is the one thing that would otherwise outlive it.
-        self.stop_chat_adapter();
-        let mut session = self.session.lock().await;
-        if let Some(ref s) = *session {
-            s.mark_shutting_down();
-        }
-        *session = None;
     }
 }
 
@@ -567,6 +579,114 @@ mod tests {
         assert!(active_bridges.get(conv_id).await.is_none());
         // Session is gone (inject_for_test has None session, but kill_session shouldn't panic).
         assert!(!bridge.is_alive().await);
+    }
+
+    /// Build a bridge with an installed session whose container teardown blocks
+    /// until `release` exists, plus a `started` marker the test can wait on.
+    async fn bridge_with_blocking_teardown(
+        dir: &std::path::Path,
+        active_bridges: &ActiveBridges,
+    ) -> Arc<ActiveBridge> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let started = dir.join("rm-started");
+        let release = dir.join("rm-release");
+        let script = dir.join("blocking-podman");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 touch '{}'\n\
+                 while [ ! -e '{}' ]; do sleep 0.01; done\n",
+                started.display(),
+                release.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let db = crate::test_support::init_db_memory();
+        let (broadcast_tx, _rx) = broadcast::channel(64);
+        let user_id = {
+            let conn = db.lock().await;
+            brenn_db::auth::user::create_user(&conn, "testuser", "$argon2id$fake")
+        };
+        let conv_id = {
+            let conn = db.lock().await;
+            conversation::create_conversation(&conn, user_id, "test", false)
+        };
+        let bridge =
+            ActiveBridge::inject_for_test(user_id, conv_id, "test", db.clone(), broadcast_tx);
+        *bridge.session.lock().await =
+            Some(brenn_cc::session::CcSession::dummy_with_container_for_test(
+                &script.display().to_string(),
+                "brenn-test-conv1",
+            ));
+        active_bridges.insert(conv_id, bridge.clone()).await;
+        bridge
+    }
+
+    async fn wait_for_file(path: &std::path::Path) {
+        for _ in 0..500 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        panic!("{} never appeared", path.display());
+    }
+
+    /// A containerized session's drop blocks on `podman rm`. That must happen
+    /// with the bridge's session mutex released — otherwise every task touching
+    /// this bridge queues behind a container teardown, unbounded if podman is
+    /// itself wedged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kill_session_drops_the_session_outside_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let active_bridges = ActiveBridges::new();
+        let bridge = bridge_with_blocking_teardown(dir.path(), &active_bridges).await;
+
+        let killer = {
+            let bridge = bridge.clone();
+            let active_bridges = active_bridges.clone();
+            tokio::spawn(async move { bridge.kill_session(&active_bridges).await })
+        };
+
+        wait_for_file(&dir.path().join("rm-started")).await;
+        assert!(
+            bridge.session.try_lock().is_ok(),
+            "the session mutex must be free while the container teardown blocks"
+        );
+
+        std::fs::write(dir.path().join("rm-release"), b"go").unwrap();
+        killer.await.unwrap();
+    }
+
+    /// Container names are stable per conversation, so a teardown still running
+    /// `podman rm` when the registry slot frees would remove the *next* session's
+    /// container. Deregistration must therefore come after the drop completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kill_session_deregisters_only_after_the_container_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let active_bridges = ActiveBridges::new();
+        let bridge = bridge_with_blocking_teardown(dir.path(), &active_bridges).await;
+        let conv_id = bridge.conversation_id;
+
+        let killer = {
+            let bridge = bridge.clone();
+            let active_bridges = active_bridges.clone();
+            tokio::spawn(async move { bridge.kill_session(&active_bridges).await })
+        };
+
+        wait_for_file(&dir.path().join("rm-started")).await;
+        assert!(
+            active_bridges.get(conv_id).await.is_some(),
+            "the slot must stay claimed until the old container is actually gone"
+        );
+
+        std::fs::write(dir.path().join("rm-release"), b"go").unwrap();
+        killer.await.unwrap();
+        assert!(active_bridges.get(conv_id).await.is_none());
     }
 
     #[tokio::test]

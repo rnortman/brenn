@@ -54,14 +54,28 @@ pub(in crate::active_bridge) async fn reset_session_runtime_state(bridge: &Activ
         .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+/// What CC last wrote to stderr, for the death log and alert at the site that
+/// is about to report the death.
+///
+/// Taken at the death site rather than inside the reset so the tail lands on the
+/// *same* record as the death itself — correlating two ERROR lines by
+/// conversation id during an incident is exactly the diagnosis gap this exists
+/// to close. Best effort: the session may already be gone (reaped before the
+/// report), and a child that wrote nothing leaves an empty tail.
+pub(in crate::active_bridge) async fn session_stderr_tail(bridge: &ActiveBridge) -> Vec<String> {
+    let guard = bridge.session.lock().await;
+    guard.as_ref().map(|s| s.stderr_tail()).unwrap_or_default()
+}
+
 /// Full clean-slate reset for a bridge that died or wedged unexpectedly: resets
 /// runtime state, marks the conversation `Error`, broadcasts the error and error
 /// status to attached tabs, and records that the death has been handled.
 ///
 /// Used by both the event loop's unexpected-`Died` path and the wedge watchdog.
 /// The watchdog fires its own `Critical` page before calling this; the event
-/// loop fires its `Warning` alert before calling this. Alerting is the caller's
-/// concern so each path pages at its own severity.
+/// loop fires its `Warning` alert before calling this. Alerting — and logging
+/// the stderr tail from [`session_stderr_tail`] — is the caller's concern so
+/// each path pages at its own severity and in one record.
 pub(in crate::active_bridge) async fn reset_dead_session(
     bridge: &ActiveBridge,
     error_message: String,
