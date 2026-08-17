@@ -1,0 +1,34 @@
+// The value vocabulary, imports, constants and generic sections.
+
+use wiring::alice::Deskbar;
+use wiring::bob::*;
+
+/// Where component artifacts live on this host.
+/// Second line of the same doc comment.
+const components_dir = "/home/alice/brenn/lib";
+const greeting = f"hello {alice}, welcome";
+const escaped = "a \"quoted\" word";
+const braces = f"{{literal}} and {alice.desk}";
+const notes = """raw text, no escapes: \n stays two characters
+and it spans lines""";
+const ratio = 1.5;
+const scaled = -2.5e3;
+const retries = -3;
+const enabled = true;
+const disabled = false;
+const fallback = components_dir;
+const grants = [subscribe, publish, takeover];
+const empty = [];
+const defaults = { push_depth = 8, retain_depth = 64 };
+const scope = prefix "brenn:alice-desk.";
+const feed = topic_filter f"mqtt:broker:{alice}/#" { push_depth = 4 };
+const target = exact alice.desk.messages;
+
+/// The one generic body shape, and a sub-block of the same shape.
+server {
+    bind = "127.0.0.1:3000";
+    // A line comment inside a body survives formatting.
+    tls alpha {
+        cert = "/etc/brenn/alice.pem";
+    }
+}

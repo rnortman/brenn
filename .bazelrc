@@ -47,6 +47,16 @@ build:clippy --output_groups=+clippy_checks
 build:rustfmt --aspects=@rules_rust//rust:defs.bzl%rustfmt_aspect
 build:rustfmt --output_groups=+rustfmt_checks
 
+# fltk-serde-core's serde, pointed at this workspace's hub.
+#
+# The generated `de.rs` in //brenn-dsl hands values through fltk-serde-core into
+# `#[derive(Deserialize)]` structs whose derive comes from @crates//:serde;
+# trait coherence needs one serde instance for all three. Unset, fltk-serde-core
+# links its own module-private hub's serde and the crate fails to compile with
+# mismatched-instance errors. Set here rather than per target because it has to
+# hold for whatever links fltk-serde-core, directly or not.
+build --@fltk//crates/fltk-serde-core:serde=@crates//:serde
+
 # ---------------------------------------------------------------------------
 # Release
 # ---------------------------------------------------------------------------

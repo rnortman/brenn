@@ -1,0 +1,41 @@
+// Shaping sidecar for brenn.fltkg.
+//
+// Only what the serde front end needs to read the tree: which rules are erased
+// to their payload, which repeatable elements are keyed regions, and which rule
+// is a boolean. No `type:` declarations — keys are text throughout and the
+// semantic model is the type schema.
+
+// Erased leaves: an identifier serves as its own text, which is what lets it
+// key a region.
+rule name { transparent; }
+rule cname { transparent; }
+
+rule boolean { bool: true; }
+
+// Single-field wrappers whose node adds nothing the model wants to name: the
+// payload's own shape is served in their place. Every one of them holds exactly
+// one field, exactly once — a repeatable or optional field cannot be erased.
+rule str_frag { transparent; }
+rule fstr_frag { transparent; }
+rule integer { transparent; }
+rule float { transparent; }
+rule interp { transparent; }
+rule port_doctype { transparent; }
+rule param_default { transparent; }
+rule io_target { transparent; }
+rule mcp_server_ref { transparent; }
+
+// These three keep a type of their own and redirect their text to the child
+// that carries it, so the suppressed punctuation around it — `///`, a
+// backslash, the triple quotes — stays out of what the model reads. `transparent`
+// does not compose with the redirect: an erased rule serves its whole lexeme.
+rule doc_line { text_from: text; }
+rule escape { text_from: text; }
+rule raw_string { text_from: text; }
+
+// Body entries and inline-table entries are keyed by their key child, so a
+// duplicated key in one body is refused before the target sees either element,
+// and an unknown key is reported at the offending key's own position.
+rule attr { key: key; }
+rule tail_attr { key: key; }
+rule table_entry { key: key; }

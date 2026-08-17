@@ -1,0 +1,284 @@
+// The Brenn configuration language.
+//
+// Ordering matters throughout: this is a PEG, so the first alternative that
+// succeeds wins and the parser never re-enters a rule that already succeeded.
+// Every ordering choice below is annotated where it is load-bearing.
+//
+// One separator discipline is load-bearing everywhere: a keyword followed by an
+// identifier takes `:` (required whitespace), never `,`. With optional
+// whitespace `acl subscribe` and `aclsubscribe` would parse alike.
+//
+// A statement that may end either in a braced block or in `;` carries the
+// terminator as a labeled optional, `semi:";"?`. Labeled rather than suppressed
+// because a suppressed literal leaves no trace in the CST, and the formatter
+// would then drop every terminator it was asked to reproduce. The label reaches
+// the model as a `bool`. Forms that always end in `}` carry no terminator at
+// all.
+
+file := , uses:use_stmt* , items:item* ;
+
+// Keyword-led declarations first; `section` is identifier-led and therefore
+// last, so a statement that fails partway through backtracks cleanly into it.
+item := const_def:const_def
+      | uuid_pins:uuid_pins
+      | component:component_class
+      | agent:agent_class
+      | assembly:assembly_def
+      | channel:channel_def
+      | surface:surface_def
+      | inst:new_stmt
+      | remote:remote_def
+      | webhook:webhook_def
+      | repo:repo_def
+      | mqtt_client:mqtt_client_def
+      | mcp_server:mcp_server_def
+      | acl:acl_stmt
+      | grant:grant_stmt
+      | section:section ;
+
+const_def := doc:doc? , %"const" : name:name , %"=" , value:value , %";" , ;
+
+// ── channels ─────────────────────────────────────────────────────────────────
+//
+// Two roles, two rules, because the handle is what distinguishes them and `at`
+// is a legal identifier: with one rule and an optional handle, `channel at
+// "..."` would bind `at` as the handle and then fail with no way back. As
+// separate alternatives the declaration form fails whole and the tuning form
+// gets the input.
+channel_def := decl:chan_decl | tuning:chan_tuning ;
+chan_decl := doc:doc? , %"channel" : handle:name : %"at" : addr:chan_addr , body:body_block? , semi:";"? , ;
+chan_tuning := doc:doc? , %"channel" : %"at" : addr:chan_addr , body:body_block? , semi:";"? , ;
+
+// A whole address, or the prefix of a system-minted family.
+chan_addr := is_prefix:"prefix"? , addr:str_like ;
+
+// Hand-minted uuids carried across a port, keyed by canonical address. A `Vec`,
+// not a keyed region: a region's key must reach text through a transparent
+// rule, and a quoted string is a composite of parts. Duplicate pins are the
+// resolver's to refuse.
+uuid_pins := doc:doc? , %"uuid_pins" , %"{" , pins:pin* , %"}"  , ;
+pin := addr:string , %"=" , uuid:string , %";" , ;
+
+// ── classes and instantiation ────────────────────────────────────────────────
+
+// The class carries the ports and the implementation reference; instances never
+// do.
+component_class := doc:doc? , %"component" : name:cname , %"{" , (attrs:attr | ports:port_decl)* , %"}"  , ;
+
+// `in messages: "brenn.panel.message@1";` — the doctype is reserved syntax:
+// parsed here, inert until the resolver checks it against channel doctypes.
+port_decl := dir:port_dir : name:name , doctype:port_doctype? , %";" , ;
+port_dir := into:"in" | outof:"out" | both:"io" ;
+port_doctype := %":" , ty:str_like ;
+
+// An agent body mixes attrs with five statement forms. `section` is last and
+// carries the named sub-blocks (`start_hooks`), so a new one costs no grammar.
+agent_class := doc:doc? , %"agent" : name:cname , params:param_list? , %"{" ,
+    (attrs:attr | mounts:mount_stmt | mcps:mcp_server_stmt | subs:subscribe_stmt
+     | acls:acl_stmt | blocks:section)* , %"}"  , ;
+
+// An assembly stamps entities: its body is the top-level item vocabulary again.
+assembly_def := doc:doc? , %"assembly" : name:cname , params:param_list , %"{" , items:item* , %"}"  , ;
+
+param_list := %"(" , (params:param , (%"," , params:param)*)? , %")" ;
+param := name:name , %":" , ty:cname , default:param_default? ;
+param_default := %"=" , value:value ;
+
+surface_def := doc:doc? , %"surface" : name:name , %"{" , (attrs:attr | acls:acl_stmt | insts:new_stmt)* , %"}"  , ;
+
+// One instantiation form for components, agents and assemblies: arguments for
+// the parameterized classes, a body for the ones configured per instance.
+new_stmt := doc:doc? , %"new" : handle:name , %":" , cls:path , args:arg_list? , body:inst_body? , semi:";"? , ;
+arg_list := %"(" , (args:arg , (%"," , args:arg)*)? , %")" ;
+arg := name:name , %"=" , value:value ;
+inst_body := %"{" , (attrs:attr | bindings:binding | acls:acl_stmt)* , %"}" ;
+
+// ── bindings ─────────────────────────────────────────────────────────────────
+//
+// Direction is the alternative, never a field: `in`/`out`/`io` plus the free-io
+// form, which names a port and tunes it without connecting it.
+binding := into:in_b | outof:out_b | both:io_b ;
+in_b := %"in" : port:name , %"<-" , chan:chan_ref , tail:tail_block? , semi:";"? , ;
+out_b := %"out" : port:name , %"->" , chan:chan_ref , tail:tail_block? , semi:";"? , ;
+io_b := %"io" : port:name , target:io_target? , tail:tail_block? , semi:";"? , ;
+io_target := %"<->" , chan:chan_ref ;
+
+// A handle or dotted path where a declaration exists, a literal address where
+// none does (`local:` planes, `webhook:`/`mqtt:` system channels).
+//
+// The literal alternative is first: `f` is a legal identifier, so on `f"…"` the
+// path alternative succeeds on the `f` alone and strands the string.
+chan_ref := addr:str_like | handle:path ;
+
+// ── authority ────────────────────────────────────────────────────────────────
+
+// Entity-scoped: the plane, then the matchers that scope it.
+acl_stmt := %"acl" : plane:name : matchers:matcher_list , %";" , ;
+matcher_list := %"[" , (items:matcher , (%"," , items:matcher)*)? , %"]" ;
+
+// Cross-principal: authority written about another principal, which is what an
+// assembly needs to wire its driver.
+grant_stmt := %"grant" : principal:path : plane:name : m:matcher , %";" , ;
+
+// ── the remaining entities ───────────────────────────────────────────────────
+
+remote_def := doc:doc? , %"remote" : name:name , %"{" , (attrs:attr | acls:acl_stmt)* , %"}"  , ;
+
+// `signature`, `key <name>` and `replay_protection` are ordinary sections; what
+// each one means is decided by its kindword after the parse.
+webhook_def := doc:doc? , %"webhook" : name:name , %"{" , (attrs:attr | blocks:section)* , %"}"  , ;
+
+// Three keyword-led forms of one shape, `keyword name { key = value; … }`. The
+// body goes through `body_block`, so the braces are laid out by one format-spec
+// block and the three serve one model struct.
+repo_def := doc:doc? , %"repo" : name:name , body:body_block , ;
+mqtt_client_def := doc:doc? , %"mqtt_client" : name:name , body:body_block , ;
+mcp_server_def := doc:doc? , %"mcp_server" : name:name , body:body_block , ;
+
+// Inside an agent body the bare form references a top-level definition and the
+// braced form defines one inline — the language's only inline-definition site,
+// which exists because a server body may name class parameters.
+mcp_server_stmt := ref:mcp_server_ref | inline:mcp_server_def ;
+mcp_server_ref := %"mcp_server" : name:name , %";" , ;
+
+// `mount` never defines: the repo is a reference, and the tail is per-use.
+mount_stmt := %"mount" : repo:path , tail:tail_block? , semi:";"? , ;
+
+// One subscription form, dispatched on the address scheme at lowering.
+subscribe_stmt := %"subscribe" : chan:chan_ref , tail:tail_block? , semi:";"? , ;
+
+// An entity body: entries one per line. The tail form is the same content on
+// one line, after a binding or a mount.
+body_block := %"{" , attrs:attr* , %"}" ;
+tail_block := %"{" , attrs:tail_attr* , %"}" ;
+
+// Structurally an `attr`, and served to the same target type. It is a rule of
+// its own so the format spec can say "these stay on one line" of a tail without
+// saying it of every body entry in the language.
+tail_attr := key:name , %"=" , value:value , %";" , ;
+
+// `use a::b::C;` names one declaration, `use a::b::*;` names all of them. The
+// glob is a labeled literal, so the model reads it as "was it written?".
+//
+// The two separators differ on purpose. The `,` before the glob group is what
+// gives this statement the whitespace tolerance every other one has: it is the
+// last optional-whitespace position in the rule, so `use a::b ;` parses like
+// `const a = 1 ;`, and `use a ::*;` is tolerated with it. The terminator then
+// takes `.`, because at an optional-whitespace position the formatter re-emits a
+// suppressed terminator after the trivia it finds there — the blank line after
+// the last import would end up above a lone `;`. Both edges are pinned by tests.
+use_stmt := %"use" : path:path , (%"::" . glob:"*")? . %";" , ;
+
+// A generic section: `server { ... }`, `webhook w { ... }`, and every named
+// sub-block inside an entity body. The kindword is data, not a keyword, so what
+// a section means is decided after the parse, by its kindword.
+section := doc:doc? , kindword:name , name:name? , %"{" , (attrs:attr | subs:section)* , %"}" , ;
+
+// The one body-entry shape. The grammar knows no field names; the target struct
+// closes each key set, so an unknown key is a positioned deserialize error
+// naming the legal set rather than a syntax error.
+attr := key:name , %"=" , value:value , %";" , ;
+
+// ── values ───────────────────────────────────────────────────────────────────
+//
+// Longest-and-most-specific first. `matcher` (an identifier followed by a
+// payload) before `ref` (an identifier alone); `float` before `integer`, or the
+// integer arm would strand a fraction; `boolean` before `ref`, which makes
+// `true` and `false` reserved in value position.
+value := fstr:fstring
+       | raw:raw_string
+       | str:string
+       | flt:float
+       | int:integer
+       | bool:boolean
+       | m:matcher
+       | list:list
+       | table:inline_table
+       | ref:path ;
+
+// `exact "brenn:alice-desk.in.p1.messages"`, `prefix f"brenn:{slug}."`,
+// `topic_filter "mqtt:broker:sensors/#"`, each with an optional attribute tail.
+matcher := kind:name : val:matcher_val , tail:inline_table? ;
+matcher_val := lit:str_like | chan:path ;
+
+// No trailing comma inside a list: the optional item would sit between the last
+// element and `]`, and the formatter renders a comma's trailing space at that
+// position whether or not one was written. An inline table keeps its optional
+// trailing comma because a space before its closing brace is wanted anyway.
+list := %"[" , (items:value , (%"," , items:value)*)? , %"]" ;
+
+inline_table := %"{" , (entries:table_entry , (%"," , entries:table_entry)* , %","? )? , %"}" ;
+table_entry := key:name , %"=" , value:value ;
+
+str_like := str:string | fstr:fstring ;
+
+// ── terminals ────────────────────────────────────────────────────────────────
+
+// Identifiers: hyphens allowed, never trailing — which is what keeps `acks->`
+// unambiguous, since backtracking inside the terminal yields `acks`.
+name := text:/[A-Za-z_]([A-Za-z0-9_-]*[A-Za-z0-9_])?/ ;
+
+// Class and parameter-type names: CamelCase, and consecutive uppercase refused
+// at the definition site. Every interior uppercase letter must follow a
+// non-empty lowercase-or-digit run, so `HTTPProxy` matches only the prefix `H`
+// and the parse fails on the residue — spell it `HttpProxy`. `A` and `HttpA`
+// are accepted.
+cname := text:/[A-Z]([a-z0-9]+[A-Z])*[a-z0-9]*/ ;
+
+integer := text:/-?[0-9]+/ ;
+float := text:/-?[0-9]+\.[0-9]+([eE][-+]?[0-9]+)?/ ;
+boolean := true:"true" | false:"false" ;
+
+// A dotted segment reaches inside an instantiated assembly, a `::` segment
+// names a module. Mixing them is resolution's problem; the grammar carries the
+// segments.
+path := head:name . segs:path_seg* ;
+path_seg := module:mod_seg | inst:inst_seg ;
+mod_seg := %"::" . name:name ;
+inst_seg := %"." . name:name ;
+
+// ── strings ──────────────────────────────────────────────────────────────────
+//
+// Composite part rules, never `custom(...)`: the model carries the parts and
+// escape decoding happens later, where a diagnostic can cite the offending
+// escape.
+
+string := %"\"" . parts:str_part* . %"\"" ;
+str_part := esc:escape | frag:str_frag ;
+str_frag := text:/[^"\\\n]+/ ;
+
+// f-strings interpolate `{path}` and take `{{` / `}}` for literal braces.
+fstring := %"f\"" . parts:fstr_part* . %"\"" ;
+fstr_part := esc:escape | brace:brace_escape | interp:interp | frag:fstr_frag ;
+fstr_frag := text:/[^"\\{}\n]+/ ;
+brace_escape := open:"{{" | close:"}}" ;
+interp := %"{" , path:path , %"}" ;
+
+escape := %"\\" . text:/./ ;
+
+// The character-class ladder terminates the match at the first `"""` without
+// lookaround or non-greedy repetition. Its accepted limitation: raw content
+// cannot END in `"` or `""` — each arm wants a non-quote character after the
+// quote(s), so a trailing quote falls outside the content match and the parse
+// fails on the residue. Interior and leading quotes are fine. Use a plain
+// string with escapes when content must end in a quote.
+raw_string := %"\"\"\"" . text:/(?s)([^"]|"[^"]|""[^"])*/ . %"\"\"\"" ;
+
+// ── trivia and doc comments ──────────────────────────────────────────────────
+//
+// `//` is trivia; `///` is a grammar rule that reaches the model. The Rust
+// regex backend has no lookaround, so the discrimination is a character class:
+// a line comment's body is empty or starts with a character that is not `/`, so
+// `///...` fails `line_comment` and the `doc` rule below gets it. `////...`
+// matches `doc` (the fourth slash is content).
+//
+// The terminating "\n" is required, so a .brenn file must end with a newline.
+_trivia := ( line_comment | line_comment? : )+ ;
+line_comment := prefix:"//" . content:/([^\/\n][^\n]*)?/ . "\n" ;
+
+// `doc? ,` before a declaration keyword: the `,` is what lets trivia sit
+// between the doc's newline and the keyword, which is unavoidable when
+// declarations are indented inside blocks. Attachment is positional and always
+// to the following declaration; blank lines do not detach it.
+doc := lines:doc_line+ ;
+doc_line := %"///" . text:/[^\n]*/ . %"\n" ;

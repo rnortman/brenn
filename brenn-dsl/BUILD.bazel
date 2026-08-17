@@ -1,0 +1,110 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@fltk//:rust.bzl", "generate_rust_parser")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_doc_test", "rust_library", "rust_test")
+load("//bazel/policy:defs.bzl", "policy_srcs")
+load(":defs.bzl", "dsl_test", "format_goldens")
+
+policy_srcs()
+
+exports_files(["Cargo.toml"])
+
+# The parser, CST, unparser and serde front end, generated from the grammar and
+# its two sidecars. Nothing here is tracked: Bazel's dependency tracking is what
+# a checked-in copy would need a drift gate for, and editing the format spec is
+# an ordinary edit that rebuilds the formatter and every golden below it.
+#
+# `out_dir = "src"` declares the outputs beside the hand-written sources, which
+# is what lets them address each other as `super::` siblings. The basenames are
+# load-bearing — `de.rs` must not be `serde.rs`, or every `use serde::…` in the
+# crate becomes ambiguous.
+generate_rust_parser(
+    name = "dsl_gen",
+    src = "grammar/brenn.fltkg",
+    ast_config = "grammar/brenn.fltkast",
+    format_config = "grammar/brenn.fltkfmt",
+    goal = "file",
+    out_dir = "src",
+    serde = True,
+    unparser = True,
+)
+
+rust_library(
+    name = "brenn-dsl",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/**"],
+    ) + [":dsl_gen"],
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [
+        "@fltk//crates/fltk-cst-core:no_python",
+        "@fltk//crates/fltk-parser-core:no_python",
+        "@fltk//crates/fltk-serde-core:no_python",
+        "@fltk//crates/fltk-unparser-core",
+    ],
+)
+
+rust_test(
+    name = "brenn-dsl_test",
+    crate = ":brenn-dsl",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+    deps = all_crate_deps(normal_dev = True),
+)
+
+dsl_test(name = "corpus")
+
+dsl_test(name = "statements")
+
+dsl_test(name = "sections")
+
+dsl_test(name = "entities")
+
+dsl_test(name = "config_sections")
+
+dsl_test(name = "layout_coverage")
+
+dsl_test(name = "rule_coverage")
+
+rust_doc_test(
+    name = "brenn-dsl_doc_test",
+    crate = ":brenn-dsl",
+)
+
+# Dev tools, run with `bazel run`. Neither joins the deployed-binaries list.
+#
+# `brennfmt` takes explicit deps rather than `all_crate_deps`: fltk-fmt-cli
+# links clap from fltk's own hub, and keeping this workspace's clap transitive
+# here means neither is ever a direct extern of the binary. No clap type crosses
+# the crate boundary, so the two builds coexisting in one linkage is fine.
+rust_binary(
+    name = "brennfmt",
+    srcs = ["src/bin/brennfmt.rs"],
+    crate_root = "src/bin/brennfmt.rs",
+    edition = "2024",
+    deps = [
+        ":brenn-dsl",
+        "@fltk//crates/fltk-fmt-cli",
+    ],
+)
+
+rust_binary(
+    name = "dsl_cli",
+    srcs = ["src/bin/dsl_cli.rs"],
+    crate_root = "src/bin/dsl_cli.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True) + [":brenn-dsl"],
+)
+
+format_goldens(name = "lexical")
+
+format_goldens(name = "statements")
+
+format_goldens(name = "sections")
+
+format_goldens(name = "entities")
+
+format_goldens(name = "config")

@@ -1,0 +1,52 @@
+// Generic sections: one grammar shape, typed after the parse by its kindword.
+const secrets = "/home/alice/.secrets"
+
+;
+/// An HMAC endpoint: signature, one key, and a replay guard.
+webhook push_alice {
+  mount = "/webhooks/push-alice";
+  content_type = "text/plain";
+  signature {
+    scheme = hmac-timestamped-body;
+    sig_header = "x-brenn-push-signature";
+    sig_format = "v1-hex";
+    timestamp_header = "x-brenn-push-timestamp";
+    template = "{t}.{body}";
+    max_skew_secs = 300;
+  }
+  /// The only key in rotation.
+  key primary {
+    secret_file = f"{secrets}/push-alice.secret";
+  }
+  replay_protection {
+    component_path = "/home/alice/lib/brenn_replay_generic.wasm";
+    store_path = "/home/alice/state/replay-push-alice.db";
+    store_size_limit = "128MiB";
+  }
+}
+
+// The bearer counterpart: a token where the HMAC endpoint has a key.
+webhook push_bob {
+  signature {
+    scheme = bearer-token;
+    header = "authorization";
+    token_id_header = "x-brenn-token-id";
+  }
+  token primary {
+    secret_file = "/home/alice/.secrets/push-bob.token";
+  }
+}
+
+agent PersonalAssistant(slug: String) {
+  model = "sonnet";
+  start_hooks {
+    host = ["echo ready"];
+    container = ["echo container ready"];
+  }
+  post_pull_hooks {
+    host = ["echo pulled"];
+  }
+  startup_hooks {
+    container = ["echo started"];
+  }
+}

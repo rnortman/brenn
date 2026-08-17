@@ -1,0 +1,293 @@
+// Canonical layout for .brenn documents. Baked into the generated unparser at
+// generation time, so `brennfmt` reads no spec at runtime and editing this file
+// rebuilds the formatter and every golden that depends on it.
+//
+// The corpus goldens under tests/corpus are the normative definition of what
+// this produces; this file is how it is produced.
+
+// One comment form, one role: `//` survives formatting, `///` is a grammar rule
+// and never reaches trivia at all.
+// TODO(dsl-fmt-trivia-placement): a comment written after a statement's `;`
+// renders before it, because the suppressed terminator is re-emitted after the
+// following trivia. A preserved blank line is trivia too, so the same reordering
+// puts a lone `;` under a blank after some statements. The canonical goldens pin
+// the current placement.
+trivia_preserve: LineComment;
+preserve_blanks: 1;
+
+// Nothing by default, and spacing said where it is wanted. The inverse — a
+// breaking space at every optional-whitespace position — reaches inside the
+// grouped sub-expressions collections are written with, where a rule-level
+// override does not, and leaves a stray space before every closing bracket.
+ws_allowed: nil;
+ws_required: nbsp;
+
+before ";" { nil; }
+before "=" { nbsp; }
+after "=" { nbsp; }
+before "," { nil; }
+after "," { bsp; }
+after ";" { hard; }
+before "{" { nbsp; }
+
+// `handle: Class`, `slug: String`, `in messages: "doctype"` — the colon binds
+// left and breathes right.
+before ":" { nil; }
+after ":" { nbsp; }
+
+// Binding arrows breathe on both sides.
+before "<-" { nbsp; }
+after "<-" { nbsp; }
+before "->" { nbsp; }
+after "->" { nbsp; }
+before "<->" { nbsp; }
+after "<->" { nbsp; }
+
+// A braced body: entries one per line, indented, closing brace on its own line.
+// The break after the closing brace is what separates a block-ended statement
+// from whatever follows it.
+//
+// Every rule that opens a body of its own repeats this quadruple, because the
+// spec syntax has no multi-rule block and no default for brace-bearing rules. A
+// rule that opens a body and has no block here silently renders that body on one
+// line, so `tests/layout_coverage.rs` fails the build when one is missing rather
+// than leaving it to show up as an ugly diff in someone's config file.
+//
+// TODO(dsl-fmt-block-blank-line): where that break meets an enclosing block's
+// own break before its `}`, the pair renders as a blank line. The canonical
+// goldens pin it.
+rule section
+{
+    ws_allowed: nbsp;
+    after "{" { hard; }
+    before "}" { hard; }
+    after "}" { hard; }
+    nest from after "{" to before "}";
+}
+
+rule body_block
+{
+    after "{" { hard; }
+    before "}" { hard; }
+    after "}" { hard; }
+    nest from after "{" to before "}";
+}
+
+rule uuid_pins
+{
+    after "{" { hard; }
+    before "}" { hard; }
+    after "}" { hard; }
+    nest from after "{" to before "}";
+}
+
+rule component_class
+{
+    after "{" { hard; }
+    before "}" { hard; }
+    after "}" { hard; }
+    nest from after "{" to before "}";
+}
+
+rule agent_class
+{
+    after "{" { hard; }
+    before "}" { hard; }
+    after "}" { hard; }
+    nest from after "{" to before "}";
+}
+
+rule assembly_def
+{
+    after "{" { hard; }
+    before "}" { hard; }
+    after "}" { hard; }
+    nest from after "{" to before "}";
+}
+
+rule surface_def
+{
+    after "{" { hard; }
+    before "}" { hard; }
+    after "}" { hard; }
+    nest from after "{" to before "}";
+}
+
+rule inst_body
+{
+    after "{" { hard; }
+    before "}" { hard; }
+    after "}" { hard; }
+    nest from after "{" to before "}";
+}
+
+rule remote_def
+{
+    after "{" { hard; }
+    before "}" { hard; }
+    after "}" { hard; }
+    nest from after "{" to before "}";
+}
+
+rule webhook_def
+{
+    after "{" { hard; }
+    before "}" { hard; }
+    after "}" { hard; }
+    nest from after "{" to before "}";
+}
+
+// `repo`, `mqtt_client` and `mcp_server` need no block of their own: their
+// bodies go through `body_block`.
+
+// A tail is the same content on one line: `{ push_depth = 8; }`. Its entries
+// are `tail_attr`, a rule of their own precisely so that saying "no hard break
+// after this `;`" here does not say it of every body entry in the language.
+rule tail_block
+{
+    group;
+    after "{" { nbsp; }
+    before "}" { nbsp; }
+    after "}" { hard; }
+    nest from after "{" to before "}";
+}
+
+rule tail_attr
+{
+    group;
+    after ";" { bsp; }
+}
+
+// One-line-preferred statements: they break only when they run over the width.
+rule const_def
+{
+    group;
+}
+
+rule attr
+{
+    group;
+}
+
+rule chan_decl
+{
+    group;
+}
+
+rule chan_tuning
+{
+    group;
+}
+
+rule chan_addr
+{
+    ws_allowed: nbsp;
+}
+
+rule pin
+{
+    group;
+}
+
+rule port_decl
+{
+    group;
+}
+
+rule new_stmt
+{
+    group;
+}
+
+rule in_b
+{
+    group;
+}
+
+rule out_b
+{
+    group;
+}
+
+rule io_b
+{
+    group;
+}
+
+rule acl_stmt
+{
+    group;
+}
+
+rule grant_stmt
+{
+    group;
+}
+
+rule mount_stmt
+{
+    group;
+}
+
+rule subscribe_stmt
+{
+    group;
+}
+
+rule mcp_server_ref
+{
+    group;
+}
+
+rule param
+{
+    group;
+}
+
+rule arg
+{
+    group;
+}
+
+rule param_list
+{
+    group;
+    nest from after "(" to before ")";
+}
+
+rule arg_list
+{
+    group;
+    nest from after "(" to before ")";
+}
+
+// `before "]"` is said here because `matcher`'s own `ws_allowed` would
+// otherwise leave a space between the last matcher and the bracket.
+rule matcher_list
+{
+    group;
+    before "]" { nil; }
+    nest from after "[" to before "]";
+}
+
+// `exact "brenn:alice.in"` — one space between the kind and its payload, one
+// before an attribute tail.
+rule matcher
+{
+    ws_allowed: nbsp;
+}
+
+rule list
+{
+    group;
+    nest from after "[" to before "]";
+}
+
+// An inline table breathes inside its braces, unlike a section body.
+rule inline_table
+{
+    group;
+    after "{" { nbsp; }
+    before "}" { nbsp; }
+    nest from after "{" to before "}";
+}

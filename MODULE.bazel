@@ -22,6 +22,23 @@ bazel_dep(name = "rules_nodejs", version = "6.7.3")
 bazel_dep(name = "rules_python", version = "1.7.0")
 
 # ---------------------------------------------------------------------------
+# fltk: the parser-generator module behind the config DSL
+# ---------------------------------------------------------------------------
+# One pin for everything fltk supplies: the hermetic codegen rules
+# (`@fltk//:rust.bzl`) and the runtime crates `//brenn-dsl` links. Generated
+# parser sources are build outputs, never tracked, so there is no second pin to
+# drift against.
+#
+# fltk's module() declares no version, so `version = ""`; the override decides
+# what is fetched.
+bazel_dep(name = "fltk", version = "")
+git_override(
+    module_name = "fltk",
+    commit = "89792f2f306c3a5ba48ae2e9dbcb336c4775fe36",
+    remote = "https://github.com/rnortman/fltk.git",
+)
+
+# ---------------------------------------------------------------------------
 # Rust toolchain
 # ---------------------------------------------------------------------------
 # Must equal rust-toolchain.toml's channel (the toml survives for

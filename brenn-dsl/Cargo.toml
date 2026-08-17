@@ -1,0 +1,20 @@
+[package]
+name = "brenn-dsl"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# fltk's parser generator and its runtime crates are Bazel-only: they arrive
+# through the `@fltk` module, not through this manifest. Cargo therefore cannot
+# build this crate, which is the workspace's formal posture anyway — the manifest
+# exists so `@crates` resolves serde and clap.
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+
+# Generated `cst.rs` gates its pyo3 mirror on these two cfgs. Declared so the
+# names exist and empty because nothing here ever enables them: this crate is
+# the pure-Rust flavor, and the pyo3 mirror is unreachable from it.
+[features]
+python = []
+test-introspection = []

@@ -1,0 +1,131 @@
+// Every statement form the language has, once.
+
+use wiring::alice::Deskbar;
+
+uuid_pins {
+    "brenn:alice-desk.in.p1.messages" = "bced053b-841b-4551-9868-bfe9c47cc974";
+    "brenn:bob-pad.in.p1.messages" = "7d1f6c02-3a44-4c1b-9b0e-2f8f4d5a6b7c";
+}
+
+/// Utterances from the pod host.
+channel utterance at "brenn:alice-pod.out.utterance" {
+    description = "What the pod host heard.";
+    push_depth = 8;
+    retain_depth = 128;
+}
+
+// Depth tuning for a system-minted family: no handle, nothing to bind.
+channel at prefix "mqtt:broker:alice/" {
+    push_depth = 4;
+    retain_depth = 16;
+}
+
+component Protobar {
+    abi = dom;
+    in messages;
+}
+
+component EchoStub {
+    component_path = f"{components_dir}/brenn_echo_stub.wasm";
+    in inbound: "brenn.panel.message@1";
+    out outbound;
+    io acks;
+}
+
+agent PersonalAssistant(slug: String, user: String, ws: Repo, skin: String = "bench") {
+    name = "Personal Assistant";
+    grants = [subscribe, publish];
+    container = sandbox;
+
+    mount ws { working_dir = true; }
+    mount life;
+
+    mcp_server graf;
+    mcp_server pfin {
+        command = "pf";
+        args = ["mcp"];
+    }
+
+    start_hooks {
+        container = ["pf rebuild"];
+    }
+
+    subscribe alice_cmd { push_depth = 1000; }
+    subscribe f"webhook:push-{user}" { push_depth = 10; }
+
+    acl subscribe [prefix "brenn:surface.", exact "brenn:surface-errors"];
+}
+
+mcp_server graf {
+    command = "graf";
+    args = ["mcp"];
+}
+
+assembly Deskbar(slug: String, driver: Agent) {
+    channel messages_p1 at f"brenn:{slug}.in.p1.messages" { push_depth = 64; retain_depth = 64; }
+    channel acks at f"brenn:{slug}.out.meeting.acks" { push_depth = 8; retain_depth = 32; }
+
+    surface panel {
+        grants = [subscribe, publish, takeover];
+        acl subscribe [prefix f"brenn:{slug}."];
+
+        new p1: Protobar {
+            in messages <- messages_p1;
+            io tick { push_depth = 1; retain_depth = 2; }
+        }
+
+        new echo: EchoStub {
+            io acks <-> acks;
+            out outbound -> "local:brenn/takeover";
+            in inbound <- "local:brenn/theme" { push_depth = 8; }
+        }
+    }
+
+    grant driver subscribe prefix f"brenn:{slug}.";
+}
+
+new alice_pa: PersonalAssistant(slug = "alice-pa", user = "alice", ws = ws_alice);
+
+new alice_desk: Deskbar(slug = "alice-desk", driver = alice_pa);
+
+new consume_demo: EchoStub {
+    slug = "consume-demo";
+    grants = [ports];
+
+    in inbound <- "webhook:push-alice" { push_depth = 50; noise = alarm; }
+    out outbound -> wasm_demo_out;
+}
+
+remote reachy00 {
+    token_file = f"{secrets}/remote-reachy00.token";
+    grants = [subscribe, publish];
+    acl publish [prefix "brenn:reachy00.out."];
+}
+
+webhook push_alice {
+    description = "Pushes from alice's phone.";
+    mount = "/webhooks/push-alice";
+    signature {
+        scheme = hmac-timestamped-body;
+        max_skew_secs = 300;
+    }
+    key primary {
+        secret_file = f"{secrets}/push-alice.secret";
+    }
+    replay_protection {
+        component_path = f"{components_dir}/brenn_replay_generic.wasm";
+        store_path = f"{state}/replay-push-alice.db";
+    }
+}
+
+repo life {
+    remote = "forgejo@example.com:alice/life.git";
+}
+
+mqtt_client broker {
+    url = "mqtts://broker.example.com:8883";
+}
+
+acl subscribe [prefix "brenn:alice-desk."];
+
+grant alice_pa publish exact wasm_demo_out;

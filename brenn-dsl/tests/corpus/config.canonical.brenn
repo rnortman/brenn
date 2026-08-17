@@ -1,0 +1,124 @@
+// The server's own settings. Every one of these is a generic section: what it
+// is comes from its kindword, not from a keyword the grammar knows.
+/// Where the server listens and what it believes about the proxy in front.
+server {
+  bind_address = "127.0.0.1:3000";
+  static_dir = "/opt/brenn/frontend/dist";
+  surface_dist_dir = "/opt/brenn/surface/dist";
+  secure_cookies = true;
+  trusted_proxy_hops = 1;
+  pid_file = "/run/brenn/brenn.pid";
+  public_url = "https://brenn.example.com";
+}
+
+database {
+  path = "/var/lib/brenn/brenn.db";
+}
+
+logging {
+  log_dir = "/var/log/brenn";
+  console_level = info;
+  file_level = debug;
+}
+
+security {
+  auth_rate_interval_secs = 6;
+  auth_rate_burst = 10;
+  global_rate_interval_secs = 1;
+  global_rate_burst = 100;
+  asset_rate_interval_secs = 1;
+  asset_rate_burst = 2000;
+  auth_body_limit = 4096;
+  global_body_limit = 1048576;
+  upload_body_limit = 26214400;
+  max_image_long_edge = 2576;
+}
+
+/// The rate limit is the section; the backend is the sub-block.
+alerting {
+  max_alerts = 10;
+  window_secs = 3600;
+  ntfy {
+    url = "https://ntfy.example.com/alice-alerts";
+  }
+  mail {
+    to = "alice@example.com";
+    subject_label = "Brenn";
+  }
+}
+
+claude_defaults {
+  mcp_script_path = "/opt/brenn/noop_mcp.py";
+  model = "sonnet";
+}
+
+repo_sync {
+  poll_interval_secs = 300;
+  stale_conversation_days = 7;
+}
+
+messaging {
+  default_send_budget = 100;
+  max_body_bytes = 65536;
+  default_noise = silent;
+  default_sink = drop;
+  default_wake_min = normal;
+  default_send_rate = { burst = 4, refill_interval_secs = 60, refill = 2 };
+  archive_path = "/var/lib/brenn/archive";
+}
+
+observability {
+  surface_error_channel = "brenn:surface-errors";
+  surface_error_publish_floor = warn;
+  usage {
+    session_gap_minutes = 30;
+  }
+}
+
+surface_description {
+  prefix = "surface";
+  status_interval_secs = 60;
+}
+
+llm_chat {
+  prefix = "chat";
+  retained_window = 1000;
+  wake_min = normal;
+  idle_timeout_secs = 300;
+}
+
+pwa_push {
+  keypair_file = "/var/lib/brenn/vapid.json";
+  subject = "mailto:alice@example.com";
+  endpoint_host_allowlist = ["push.example.com"];
+  endpoint_host_allowlist_enforce = true;
+}
+
+automation {
+  max_fires_per_hour_per_job = 60;
+  max_error_reports_per_hour_per_job = 3;
+  consecutive_failures_to_disable = 5;
+  max_jobs_per_app = 50;
+}
+
+events {
+  delivered_retention_days = 7;
+}
+
+wasm {
+  store_size_limit = "64MiB";
+}
+
+watchdog {
+  sweep_interval_secs = 30;
+  wedge_grace_secs = 60;
+}
+
+/// The block's name is what an agent's `container` attr references.
+container cc {
+  image = "brenn-cc:latest";
+  home_dir = "/home/alice/container-home";
+  container_home = "/home/user";
+  extra_mounts = ["/srv/shared:/srv/shared"];
+  extra_args = ["--pids-limit", "512"];
+}

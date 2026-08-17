@@ -1,0 +1,110 @@
+// Every entity's attr vocabulary, exercised once. The key is the config
+// struct's field name, so this file doubles as the vocabulary's index.
+/// Everything a channel body can say.
+channel utterance at "brenn:alice-pod.out.utterance" {
+  description = "What the pod host heard.";
+  push_depth = 8;
+  retain_depth = 128;
+  standing_retain_depth = unbounded;
+  noise = metered;
+  sink = archive;
+  wake_min = low;
+  send_rate = { burst = 4, refill_interval_secs = 60, refill = 2 };
+}
+surface alice_desk {
+  grants = [subscribe, publish, takeover];
+  skin = "bench";
+  allowed_users = ["alice", "bob"];
+  publish_burst = 32;
+  publish_per_sec = 4
+
+  ;
+  acl subscribe [prefix "brenn:alice-desk."];
+}
+
+agent PersonalAssistant(slug: String) {
+  name = "Personal Assistant";
+  description = "The desk assistant.";
+  icon = "assistant";
+  working_dir = "/home/alice/work";
+  model = "sonnet";
+  single_instance = true;
+  singleton = false;
+  persistent = true;
+  multiuser = false;
+  idle_timeout_secs = 900;
+  idle_hook_secs = 60;
+  compact_reminder_pct = 60;
+  compact_soft_pct = 70;
+  compact_red_pct = 85;
+  compact_hard_pct = 95;
+  compact_reminder_tokens = 120000;
+  compact_soft_tokens = 140000;
+  compact_red_tokens = 170000;
+  compact_hard_tokens = 190000;
+  compact_idle_secs = 1800;
+  history_replay_limit = 50;
+  allowed_users = ["alice"];
+  disabled_tools = ["WebSearch"];
+  cc_extra_args = ["--verbose"];
+  integrations = ["calendar"];
+  extra_mounts = ["/home/alice/notes"];
+  prefix_username = true;
+  prefix_timestamp = false;
+  prefix_device = true;
+  container = "sandbox";
+  container_working_dir = "/work";
+  grants = [subscribe, publish];
+}
+
+remote reachy00 {
+  token_file = "/home/alice/.secrets/remote-reachy00.token";
+  grants = [subscribe, publish];
+  publish_burst = 16;
+  publish_per_sec = 2;
+  max_sessions = 4;
+  max_subscriptions = 64
+
+  ;
+  acl publish [prefix "brenn:reachy00.out."];
+}
+
+webhook push_alice {
+  mount = "/webhooks/push-alice";
+  description = "Pushes from alice's phone.";
+  transport_ceiling_bytes = 65536;
+  content_type = "application/json";
+  urgency = high
+
+  ;
+  signature {
+    scheme = bearer-token;
+    header = "authorization";
+  }
+}
+
+repo life {
+  remote = "forgejo@example.com:alice/life.git";
+  auto_pull = true;
+}
+
+mqtt_client broker {
+  url = "mqtts://broker.example.com:8883";
+  username = "alice";
+  password_file = "/home/alice/.secrets/broker.password";
+  ca_file = "/home/alice/.secrets/broker-ca.pem";
+  tls_version_min = "1.3";
+  keepalive_secs = 30;
+  inbound_payload_cap_bytes = 262144;
+  reconnect_backoff_initial_secs = 1;
+  reconnect_backoff_max_secs = 60;
+  session_expiry_secs = 300;
+  qos = 1;
+  urgency = normal;
+}
+
+mcp_server graf {
+  command = "graf";
+  args = ["mcp"];
+  env = { GRAF_ROOT = "/home/alice/kb" };
+}

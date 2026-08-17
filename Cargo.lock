@@ -630,6 +630,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "brenn-dsl"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+]
+
+[[package]]
 name = "brenn-echo-stub"
 version = "0.1.0"
 dependencies = [

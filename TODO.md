@@ -1,5 +1,95 @@
 # TODOs
 
+## `dsl-assembly-item-vocabulary`
+
+An assembly body is parsed with the full sixteen-variant top-level `item`
+vocabulary, but `AssemblyDef`'s accessors cover eight. `acl subscribe […];` or
+`repo life { … }` written directly in an assembly body parses cleanly, lands in
+`items`, and is then invisible to every reader — silent authority loss in the
+`acl` case, where the config grants a scope nobody sees.
+
+Which way to close it is a question about assembly semantics: either an assembly
+body genuinely admits the whole vocabulary, and the accessor list completes
+(with a `sections()` escape hatch like `File`'s), or it does not, and the grammar
+takes a restricted `assembly_item` rule so the excluded forms are a positioned
+syntax error.
+
+Done = the vocabulary is decided, the accessors or the grammar match it, and a
+corpus case places an `acl` in an assembly body and asserts it is either
+reachable or refused.
+
+Code site (`TODO(dsl-assembly-item-vocabulary)`): brenn-dsl/src/model.rs,
+`impl AssemblyDef`.
+
+
+## `dsl-vocabulary-config-parity`
+
+`brenn-dsl/src/model.rs`'s ~30 attr vocabularies are each a hand transcription of
+a config struct in `brenn-lib` — `ServerAttrs` of `ServerConfig`, `AgentAttrs` of
+`AppConfigRaw`, and so on. Nothing mechanically ties the two sides: `brenn-dsl`
+has no dependency on `brenn-lib` (deliberately — lowering is a later slice), so a
+field added to a config struct cannot break a build in the DSL crate. It surfaces
+as `` `some_new_knob` is not a server key `` to whoever migrates a config months
+later, and the fix at that point is a reconciliation across every struct pair.
+
+Nobody editing `brenn-lib/src/config/` has any signal that a second file exists.
+The invariant is the kind this repo gates elsewhere (`xtask`'s policy parity,
+`brenn-dsl/tests/rule_coverage.rs`), and it wants the same treatment: a gate that
+reflects each config struct's field names and compares them against a table of
+(config struct, DSL vocabulary, deliberately omitted fields and why). The
+omitted-fields column is load-bearing — `integrations`, `approval_rules`,
+`attachment_targets`, `tool_grants`, `frontmatter`, the mqtt last-will table are
+all justified today in prose that no build step reads.
+
+Where it lives is the open question, and it is what makes this a design item
+rather than a chore: the DSL crate must not depend on the config crates, so the
+gate is a config-side test or an `xtask` subcommand, and how it obtains field
+names (a `field_names!()` macro beside each struct, a field-collecting
+`Deserializer`) is a decision with a maintenance cost of its own.
+
+Done = adding a field to a gated config struct fails a check that names the
+vocabulary it is missing from, or the field is listed as deliberately omitted
+with a reason.
+
+Code site (`TODO(dsl-vocabulary-config-parity)`): brenn-dsl/src/model.rs, the
+entity attr vocabulary section header.
+
+
+## `dsl-fmt-trivia-placement`
+
+`brennfmt` renders a comment written after a statement's `;` *before* the
+semicolon, and renders a comment on its own line inside a body at column zero
+rather than at the body's indent. Both come from fltk's unparser: a suppressed
+terminal is re-emitted after the trivia that followed it, and trivia is written
+before the enclosing nest takes effect. A preserved blank line is trivia by the
+same rule, so a statement followed by a blank line can end up with its `;` alone
+on a line below the blank. Comments survive and the output is
+idempotent, so this is cosmetic — but it is what a `.brenn` file looks like
+after formatting, so it is worth fixing upstream. The canonical goldens pin the
+current placement and will change when it is fixed.
+
+Done = a comment keeps its source-relative position and indentation through a
+format pass, with the fix in fltk and the goldens updated here.
+
+Code site (`TODO(dsl-fmt-trivia-placement)`): brenn-dsl/grammar/brenn.fltkfmt.
+
+
+## `dsl-fmt-block-blank-line`
+
+A statement whose last token is a body's `}` — a binding with an attribute
+tail, a nested `new` — leaves a blank line before its enclosing block's closing
+brace. The break after the inner `}` and the break before the outer one are two
+hard lines in a row, and fltk's unparser renders that pair as a blank. Saying
+only one of them is not an option: dropping the inner break runs the next
+statement onto the same line. Cosmetic, idempotent, and pinned by the canonical
+goldens.
+
+Done = a block-ended statement is followed by exactly one newline whatever
+follows it, with the fix in fltk and the goldens updated here.
+
+Code site (`TODO(dsl-fmt-block-blank-line)`): brenn-dsl/grammar/brenn.fltkfmt.
+
+
 ## `test-task-panic-visibility`
 
 A panic on a connection task spawned by `spawn_test_server`

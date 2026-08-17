@@ -1,4 +1,4 @@
-.PHONY: setup-hooks scrub-selfcheck scrub-tree check bazel-check bazel-release bazel-release-dir bazel-policy-parity xtask-deny build run-artifacts clean launchdev stopdev npm-audit e2e
+.PHONY: setup-hooks scrub-selfcheck scrub-tree check bazel-check bazel-dsl-coherence bazel-release bazel-release-dir bazel-policy-parity xtask-deny build run-artifacts clean launchdev stopdev npm-audit e2e
 # Delete partially-written targets on recipe failure. Without this, a failing
 # recipe leaves the target file with a fresh mtime, causing subsequent
 # incremental builds to skip it entirely.
@@ -36,10 +36,69 @@ BAZEL_BIN := .bazel-bin
 # wasm trees are reached through a platform transition (the component rule's,
 # the wasm-bindgen rule's), and an aspect only applies to top-level targets, so
 # clippy needs its own request under the wasm32 platform for each.
-bazel-check:
+bazel-check: bazel-dsl-coherence
 	bazel test $(BAZEL_CONFIG) --config=clippy --config=rustfmt //...
 	bazel build $(BAZEL_CONFIG) --config=clippy --platforms=//bazel/platforms:wasm32 //brenn-wasm/components/...
 	bazel build $(BAZEL_CONFIG) --config=clippy --platforms=//bazel/platforms:wasm32 //surface/...
+
+# What //brenn-dsl links out of the fltk module, asserted over the resolved
+# dependency graph.
+#
+# Two things a test target cannot see. First, pyo3: fltk ships two flavors of
+# each runtime crate and only the `:no_python` ones may appear here — a
+# pyo3-flavor label compiles fine and would ship unflagged, so nothing else
+# would catch it. Second, serde: `fltk-serde-core` takes its serde from a
+# label_flag that `.bazelrc` points at `@crates//:serde`, and with the flag
+# unset the crate silently links fltk's module-private hub instead. That one
+# does fail the build, as a wall of "two different versions of crate `serde`" —
+# this turns it into a named policy failure.
+#
+# Every reachability question is asked in labels, not in the text of labels.
+# Repo names are bzlmod's to mangle, so a grep over raw cquery output either
+# invents failures on a rules_rust bump or, for the negative assertions, quietly
+# stops guarding anything. `somepath` resolves through Bazel's own label
+# machinery instead, and the serde question gets its real form: not "is fltk's
+# hub serde absent" but "does fltk-serde-core reach ours", which is the seam
+# itself. The pyo3 question is the exception and is a text `filter`, because the
+# flavor it looks for is a property of the crate name in whatever hub supplies
+# it, not a label this workspace can name.
+#
+# The cquery carries the same config flags as the `bazel test` above. Bazel keys
+# its analysis cache on the build options, so alternating two option sets in one
+# server discards it and re-analyzes `//...` — on a path that runs at every local
+# commit.
+#
+# The pyo3 question is asked of `//brenn-dsl:all`, not of the library alone:
+# `brennfmt` names fltk's fmt-cli and every test target names the runtime crates
+# directly, so a flavor mix-up in any of those deps lists is outside a graph
+# rooted at the library.
+#
+# `cq` writes to a file and aborts the recipe when the query itself fails, rather
+# than being read through `$(...)`: a failed query produces empty stdout, which
+# the negative assertion would read as "nothing found" and pass. That is the one
+# assertion nothing else catches, so it must not fail open, and a command
+# substitution cannot abort the recipe from inside.
+#
+# A step of `bazel-check` rather than a lane of its own, so every pipeline that
+# already runs that verb inherits it with no workflow edit.
+bazel-dsl-coherence:
+	@set -e; \
+	out="$$(mktemp)"; err="$$(mktemp)"; trap 'rm -f "$$out" "$$err"' EXIT; \
+	cq() { bazel cquery $(BAZEL_CONFIG) --config=clippy --config=rustfmt "$$1" >"$$out" 2>"$$err" \
+	    || { echo "FAIL: bazel-dsl-coherence broken: the cquery failed: $$1"; cat "$$err"; exit 1; }; }; \
+	cq 'somepath(//brenn-dsl:brenn-dsl, @fltk//crates/fltk-cst-core:no_python)'; \
+	test -s "$$out" \
+	    || { echo "FAIL: bazel-dsl-coherence broken: //brenn-dsl does not reach fltk's runtime crates"; exit 1; }; \
+	cq 'filter("pyo3", deps(//brenn-dsl:all))'; \
+	test ! -s "$$out" \
+	    || { echo "FAIL: pyo3 is in //brenn-dsl's graph; a pyo3-flavor fltk target crept in"; cat "$$out"; exit 1; }; \
+	cq 'somepath(//brenn-dsl:brenn-dsl, @crates//:serde)'; \
+	test -s "$$out" \
+	    || { echo "FAIL: bazel-dsl-coherence broken: //brenn-dsl links no serde from this workspace's hub"; exit 1; }; \
+	cq 'somepath(@fltk//crates/fltk-serde-core:no_python, @crates//:serde)'; \
+	test -s "$$out" \
+	    || { echo "FAIL: fltk-serde-core does not reach @crates//:serde; the .bazelrc serde flag is not reaching it"; exit 1; }; \
+	echo "bazel-dsl-coherence: no pyo3, one serde (@crates//:serde)"
 
 # The deploy tarball's staged tree, and the gates on it.
 #

@@ -78,6 +78,7 @@ filegroup(
         "//brenn-cli:policy_srcs",
         "//brenn-common:policy_srcs",
         "//brenn-db:policy_srcs",
+        "//brenn-dsl:policy_srcs",
         "//brenn-envelope:policy_srcs",
         "//brenn-git:policy_srcs",
         "//brenn-graf:policy_srcs",
