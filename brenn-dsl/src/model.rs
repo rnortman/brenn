@@ -1582,10 +1582,11 @@ mod tests {
         assert_eq!(word.as_str(), "unbounded");
     }
 
-    /// A refusal from inside a list is positioned at the bad element, not at the
-    /// list and not at the key.
+    /// On the bridge path a bad list element is positioned at the whole list —
+    /// hence the element ordinal in the message — while a bad scalar value is
+    /// positioned at the value.
     #[test]
-    fn a_projection_refusal_through_the_bridge_is_positioned_at_the_value() {
+    fn a_projection_refusal_is_positioned_at_the_list_or_at_the_value() {
         let file = parse_str(
             "probe {\n    planes = [subscribe, \"publish\"];\n    depth = 8;\n}\n",
             "t.brenn",
@@ -1599,6 +1600,7 @@ mod tests {
         );
         // The span lands on the whole list, not on the element — hence the
         // element number in the message.
+        // TODO(dsl-list-element-span): narrow this to the offending element.
         assert_eq!(error.line_col(), Some((2, 14)));
 
         let file = parse_str(

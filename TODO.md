@@ -55,6 +55,25 @@ Code site (`TODO(dsl-vocabulary-config-parity)`): brenn-dsl/src/model.rs, the
 entity attr vocabulary section header.
 
 
+## `dsl-list-element-span`
+
+A projection refusal on a bad list *element* carries a span covering the whole
+list, so the caret lands on the opening `[` and the reader has to count elements
+by hand to find the one the message's ordinal names. Scalar values are
+positioned precisely; only the list path is coarse. The span comes out of the
+bridge's held-node re-entry, so narrowing it likely means carrying per-element
+spans through fltk's list projection — an upstream shape question, not a local
+edit.
+
+Done = the assertion in
+`model.rs:a_projection_refusal_is_positioned_at_the_list_or_at_the_value` moves
+from the list's line/col to the offending element's, and the message no longer
+needs an element ordinal to be actionable.
+
+Code site (`TODO(dsl-list-element-span)`): brenn-dsl/src/model.rs, the list half
+of that test.
+
+
 ## `dsl-fmt-trivia-placement`
 
 `brennfmt` renders a comment written after a statement's `;` *before* the
