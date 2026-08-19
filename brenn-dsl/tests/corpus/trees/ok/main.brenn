@@ -1,0 +1,8 @@
+// A root that reaches both a nested module and a flat one.
+
+use wiring::deskbar::Deskbar;
+use shared::*;
+
+const host = "example.com";
+
+new alice_desk: Deskbar(slug = "alice-desk");

@@ -220,6 +220,89 @@ fn an_assembly_stamps_the_top_level_vocabulary() {
     assert_eq!(surface.acls.len(), 1);
 }
 
+/// An assembly body takes the four forms it stamps with, and nothing else: an
+/// `acl` there has no enclosing principal, and a definition there would scope
+/// definitions somewhere nothing else does. Both are syntax errors, not items
+/// that parse and are then read by nobody.
+#[test]
+fn an_assembly_body_refuses_what_it_has_no_semantics_for() {
+    for (body, why) in [
+        (
+            "    acl subscribe [prefix \"brenn:alice.\"];\n",
+            "an acl in an assembly body has no principal",
+        ),
+        (
+            "    repo notes {\n        remote = \"git@example.com:alice/notes.git\";\n    }\n",
+            "an assembly body defines no entities of its own",
+        ),
+        ("    const ratio = 1.5;\n", "constants are file-scoped"),
+    ] {
+        let source = format!("assembly Deskbar(slug: String) {{\n{body}}}\n");
+        let error = parse_str(&source, "t.brenn").expect_err(why);
+        // The offending item's own position and the text of it, so the fixture
+        // cannot start passing because of an unrelated typo somewhere else.
+        assert!(
+            error.message.contains("line 2 col 5"),
+            "{why}: {}",
+            error.message
+        );
+        assert!(
+            error
+                .message
+                .contains(body.trim_start().split(' ').next().expect("a keyword")),
+            "{why}: {}",
+            error.message
+        );
+    }
+}
+
+/// A component class states its artifact shape: `abi` is required, so a class
+/// without one is refused at the class rather than at each instantiation.
+#[test]
+fn a_component_class_body_is_a_closed_vocabulary() {
+    let file = parse_str(
+        "component Protobar {\n    abi = dom;\n    in messages;\n}\n",
+        "t.brenn",
+    )
+    .expect("a parse");
+    let class = file.components().next().expect("a component class");
+    assert_eq!(class.attrs.abi.value.as_str(), "dom");
+    assert!(class.attrs.component_path.is_none());
+
+    let error = parse_str("component Protobar {\n    in messages;\n}\n", "t.brenn")
+        .expect_err("`abi` is required");
+    assert!(error.message.contains("abi"), "{}", error.message);
+
+    let error = parse_str(
+        "component Protobar {\n    abi = dom;\n    kind = panel;\n}\n",
+        "t.brenn",
+    )
+    .expect_err("`kind` is not a class key");
+    assert!(error.message.contains("kind"), "{}", error.message);
+    assert_eq!(error.line_col(), Some((3, 5)));
+}
+
+/// A wire spelling is statable wherever an identity is parameterized: the
+/// handle cannot vary per instantiation and the slug has to be able to.
+#[test]
+fn an_identity_bearing_body_takes_a_slug() {
+    let file = statements();
+    let assembly = file
+        .assemblies()
+        .next()
+        .expect("the corpus declares an assembly");
+    let surface = assembly
+        .surfaces()
+        .next()
+        .expect("the assembly stamps a surface");
+    let slug = surface.attrs.slug.as_ref().expect("the surface states one");
+    assert!(matches!(slug.value.value(), Value::Fstr(_)));
+
+    let agent = file.agents().next().expect("the corpus declares an agent");
+    let slug = agent.attrs.slug.as_ref().expect("the agent states one");
+    assert!(matches!(slug.value.value(), Value::Ref(_)));
+}
+
 /// Direction is the variant; the free io form connects nothing.
 #[test]
 fn bindings_carry_their_direction_as_the_variant() {
@@ -327,9 +410,9 @@ fn a_class_name_refuses_consecutive_uppercase() {
     );
 
     for accepted in [
-        "component HttpProxy {\n}\n",
-        "component A {\n}\n",
-        "component HttpA {\n}\n",
+        "component HttpProxy {\n    abi = dom;\n}\n",
+        "component A {\n    abi = dom;\n}\n",
+        "component HttpA {\n    abi = dom;\n}\n",
     ] {
         let file = parse_str(accepted, "t.brenn").expect("a parse");
         assert!(

@@ -6,8 +6,8 @@
 //! grammar is the only place a syntax change is made. `model` is hand-written
 //! and is the typed surface everything downstream reads.
 //!
-//! One file at a time. Imports, cross-file resolution and reference checking
-//! are the resolver's, and are not here yet.
+//! One file at a time here; `resolve` follows imports from a root file and
+//! produces the `resolved` model.
 
 use std::path::Path;
 
@@ -22,11 +22,18 @@ pub mod model;
 // types from outside this crate; `cst` is public because their signatures are
 // stated in `cst` types.
 pub mod parser;
+/// From a root document to a resolved one: imports, references, expansion.
+pub mod resolve;
+/// The far side of resolution: what a document means once references, strings,
+/// classes and assemblies are gone.
+pub mod resolved;
 pub mod unparser;
 
 use fltk_serde_core::ParseToTargetError;
 
 use diag::Diagnostic;
+
+pub use resolve::{CompileOutput, compile, resolve_files};
 
 /// How deep a document may nest before the parse is refused.
 ///

@@ -1,27 +1,5 @@
 # TODOs
 
-## `dsl-assembly-item-vocabulary`
-
-An assembly body is parsed with the full sixteen-variant top-level `item`
-vocabulary, but `AssemblyDef`'s accessors cover eight. `acl subscribe […];` or
-`repo life { … }` written directly in an assembly body parses cleanly, lands in
-`items`, and is then invisible to every reader — silent authority loss in the
-`acl` case, where the config grants a scope nobody sees.
-
-Which way to close it is a question about assembly semantics: either an assembly
-body genuinely admits the whole vocabulary, and the accessor list completes
-(with a `sections()` escape hatch like `File`'s), or it does not, and the grammar
-takes a restricted `assembly_item` rule so the excluded forms are a positioned
-syntax error.
-
-Done = the vocabulary is decided, the accessors or the grammar match it, and a
-corpus case places an `acl` in an assembly body and asserts it is either
-reachable or refused.
-
-Code site (`TODO(dsl-assembly-item-vocabulary)`): brenn-dsl/src/model.rs,
-`impl AssemblyDef`.
-
-
 ## `dsl-vocabulary-config-parity`
 
 `brenn-dsl/src/model.rs`'s ~30 attr vocabularies are each a hand transcription of
@@ -53,6 +31,28 @@ with a reason.
 
 Code site (`TODO(dsl-vocabulary-config-parity)`): brenn-dsl/src/model.rs, the
 entity attr vocabulary section header.
+
+
+## `dsl-tuning-address-merge`
+
+`channel at "brenn:alice-desk.in.messages" { push_depth = 8; }` — a tuning whose
+address is a whole address rather than a prefix — is accepted alongside a
+`channel` declaration of that same address. Both carry `ChannelAttrs`, so one
+channel has two sources for the same attribute, written as two spellings of one
+address, which is what the one-spelling rule refuses everywhere else. The prefix
+form is genuinely different: it names a family, and the family a channel sits in
+is not that channel.
+
+Deciding it needs the derivation rules that do not exist yet: either the
+resolver refuses a whole-address tuning whose address a declared channel owns,
+or derivation merges the two and the language documents which side wins.
+
+Done = the resolver refuses it, or derivation defines the merge and the accepted
+case is a test asserting that defined behaviour.
+
+Code sites (`TODO(dsl-tuning-address-merge)`): brenn-dsl/src/resolve.rs at
+`check_addresses`; brenn-dsl/tests/resolve.rs at
+`a_tuning_is_not_a_declaration_and_collides_with_nothing`.
 
 
 ## `dsl-list-element-span`

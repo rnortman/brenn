@@ -77,8 +77,14 @@ agent_class := doc:doc? , %"agent" : name:cname , params:param_list? , %"{" ,
     (attrs:attr | mounts:mount_stmt | mcps:mcp_server_stmt | subs:subscribe_stmt
      | acls:acl_stmt | blocks:section)* , %"}"  , ;
 
-// An assembly stamps entities: its body is the top-level item vocabulary again.
-assembly_def := doc:doc? , %"assembly" : name:cname , params:param_list , %"{" , items:item* , %"}"  , ;
+// An assembly stamps entities: channels, a surface, instances, and the grants
+// that wire its parameters. Not the whole top-level vocabulary — an `acl` here
+// would have no enclosing principal, and definitions here would open a second
+// definition-scoping regime; both are refused as syntax rather than parsed and
+// dropped.
+assembly_def := doc:doc? , %"assembly" : name:cname , params:param_list , %"{" , items:assembly_item* , %"}"  , ;
+
+assembly_item := channel:channel_def | surface:surface_def | inst:new_stmt | grant:grant_stmt ;
 
 param_list := %"(" , (params:param , (%"," , params:param)*)? , %")" ;
 param := name:name , %":" , ty:cname , default:param_default? ;

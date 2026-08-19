@@ -25,6 +25,7 @@ component Protobar {
 }
 
 component EchoStub {
+  abi = processor;
   component_path = f"{components_dir}/brenn_echo_stub.wasm";
   in inbound: "brenn.panel.message@1";
   out outbound;
@@ -35,6 +36,7 @@ agent PersonalAssistant(slug: String,
   user: String,
   ws: Repo,
   skin: String = "bench") {
+  slug = slug;
   name = "Personal Assistant";
   grants = [subscribe, publish];
   container = sandbox
@@ -73,6 +75,7 @@ assembly Deskbar(slug: String, driver: Agent) {
     retain_depth = 32;
   }
   surface panel {
+    slug = f"{slug}-panel";
     grants = [subscribe, publish, takeover];
     acl subscribe [prefix f"brenn:{slug}."]
 

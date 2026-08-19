@@ -1,0 +1,5 @@
+use beta::Beta;
+
+assembly Alpha(slug: String) {
+    channel a at f"brenn:{slug}.a";
+}

@@ -202,12 +202,13 @@ fn an_unknown_key_is_refused_at_the_key_naming_the_legal_set() {
     assert_eq!(error.line_col(), Some((2, 5)));
 }
 
-/// What a statement of the body carries is not also an attr: a surface's slug is
-/// its declaration name, so writing `slug` is outside the vocabulary.
+/// What a statement of the body carries is not also an attr: a surface's
+/// components are `new` statements and an agent's mcp servers are statements of
+/// their own, so neither has a key.
 #[test]
 fn a_key_a_statement_carries_is_not_an_attr() {
-    let error = refusal("surface s {\n    slug = \"s\";\n}\n");
-    assert!(error.message.contains("slug"), "{}", error.message);
+    let error = refusal("surface s {\n    grants = [subscribe];\n    components = [];\n}\n");
+    assert!(error.message.contains("components"), "{}", error.message);
 
     let error = refusal("agent A {\n    mcp_servers = [];\n}\n");
     assert!(error.message.contains("mcp_servers"), "{}", error.message);

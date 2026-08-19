@@ -111,6 +111,11 @@ const RULE_FIXTURES: &[(&str, &str, Option<&str>)] = &[
         "statements.brenn",
         Some("assembly Deskbar("),
     ),
+    (
+        "assembly_item",
+        "statements.brenn",
+        Some("channel messages_p1 at"),
+    ),
     ("param_list", "statements.brenn", Some("(slug: String,")),
     ("param", "statements.brenn", Some("driver: Agent)")),
     (

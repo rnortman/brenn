@@ -1,0 +1,16 @@
+// A nested module: `wiring::deskbar`.
+
+use shared::*;
+
+// A declaration the module makes outright, so the root's compile can be
+// asserted to carry what the module contributed and not merely to have
+// succeeded.
+channel bench_status at f"brenn:{skin}.status";
+
+assembly Deskbar(slug: String) {
+    channel messages at f"brenn:{slug}.in.p1.messages";
+}
+
+// A second declaration in the nested module, so the tree's emitted shape is
+// more than one vector deep.
+repo notes { remote = "git@example.com:alice/notes.git"; }

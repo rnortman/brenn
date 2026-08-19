@@ -1,0 +1,5 @@
+// A root that imports itself by module name: `main::` is this same file.
+
+use main::skin;
+
+const skin = "bench";

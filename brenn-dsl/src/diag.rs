@@ -90,9 +90,27 @@ impl Diagnostic {
 
     /// `line:column` of the span's start, one-based, when the span resolves one.
     pub fn line_col(&self) -> Option<(i64, i64)> {
-        self.span
-            .line_col_inner()
+        Self::span_line_col(&self.span)
+    }
+
+    /// `line:column` of a span's start, one-based.
+    pub fn span_line_col(span: &Span) -> Option<(i64, i64)> {
+        span.line_col_inner()
             .map(|position| (position.line + 1, position.col + 1))
+    }
+
+    /// `file:line:col: note` for one entry of [`Diagnostic::related`].
+    ///
+    /// Degrades gracefully: each of filename and position is omitted from the
+    /// rendering when absent rather than asserted, because this is the reporting
+    /// path — a worse prefix beats no report.
+    pub fn related_line(note: &str, span: &Span) -> String {
+        match (span.filename_inner(), Self::span_line_col(span)) {
+            (Some(file), Some((line, column))) => format!("{file}:{line}:{column}: {note}"),
+            (Some(file), None) => format!("{file}: {note}"),
+            (None, Some((line, column))) => format!("{line}:{column}: {note}"),
+            (None, None) => note.to_string(),
+        }
     }
 }
 
@@ -106,3 +124,33 @@ impl fmt::Display for Diagnostic {
 }
 
 impl std::error::Error for Diagnostic {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A span that came out of a parse: it names its file and its position.
+    fn parsed_span() -> Span {
+        let file = crate::parse_str("acl subscribe [exact \"brenn:alice.cmd\"];\n", "main.brenn")
+            .expect("a top-level acl parses");
+        let mut errors = crate::resolve_files(vec![(String::new(), file)], "")
+            .expect_err("a top-level acl is refused at resolve");
+        errors.pop().expect("one refusal").span
+    }
+
+    #[test]
+    fn a_positioned_related_line_carries_file_line_and_column() {
+        assert_eq!(
+            Diagnostic::related_line("declared here", &parsed_span()),
+            "main.brenn:1:5: declared here"
+        );
+    }
+
+    #[test]
+    fn an_unpositioned_related_line_is_the_note_alone() {
+        assert_eq!(
+            Diagnostic::related_line("declared here", &Span::unknown()),
+            "declared here"
+        );
+    }
+}

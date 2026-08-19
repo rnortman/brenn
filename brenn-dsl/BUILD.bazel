@@ -68,6 +68,38 @@ dsl_test(name = "layout_coverage")
 
 dsl_test(name = "rule_coverage")
 
+dsl_test(name = "resolve")
+
+dsl_test(name = "expand")
+
+dsl_test(name = "multifile")
+
+# The CLI suite is not a `dsl_test`: it runs the binary rather than the library,
+# so the tool is a declared runfile and the fixtures come along with it.
+rust_test(
+    name = "cli",
+    srcs = [
+        "tests/cli.rs",
+        "tests/support.rs",
+    ],
+    crate_root = "tests/cli.rs",
+    data = glob(["tests/corpus/**"]) + [":dsl_cli"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    rustc_env = {"CARGO_MANIFEST_DIR": "brenn-dsl"},
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [
+        ":brenn-dsl",
+        "@fltk//crates/fltk-cst-core:no_python",
+        "@fltk//crates/fltk-serde-core:no_python",
+    ],
+)
+
 rust_doc_test(
     name = "brenn-dsl_doc_test",
     crate = ":brenn-dsl",

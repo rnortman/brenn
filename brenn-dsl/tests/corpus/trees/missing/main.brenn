@@ -1,0 +1,3 @@
+use wiring::deskbar::Deskbar;
+
+const host = "example.com";

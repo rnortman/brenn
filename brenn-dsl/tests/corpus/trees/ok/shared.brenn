@@ -1,0 +1,5 @@
+// A flat module, imported whole.
+
+const defaults = { soft_pct = 70, hard_pct = 92 };
+
+const skin = "bench";

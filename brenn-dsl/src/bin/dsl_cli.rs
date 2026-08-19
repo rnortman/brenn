@@ -1,12 +1,14 @@
-//! Grammar-development ergonomics: parse a file and say what came out.
+//! Grammar-development ergonomics: read a document and say what came out.
 //!
-//! The subcommand is `parse`, not `check`, because nothing here resolves
-//! references — a document this accepts can still name things that do not
-//! exist.
+//! Two subcommands, and the difference between them is the whole pipeline.
+//! `parse` reads one file through the front end: a document it accepts can
+//! still name things that do not exist. `check` compiles a tree from its root
+//! and reports everything the compiler can validate today.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use brenn_dsl::diag::Diagnostic;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -26,6 +28,14 @@ enum Command {
         #[arg(long)]
         dump: bool,
     },
+    /// Compile a document from its root file: parse, resolve, report.
+    Check {
+        /// The root `.brenn` file. Its directory is the module root.
+        root: PathBuf,
+        /// Print the resolved configuration.
+        #[arg(long)]
+        dump: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -41,12 +51,36 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(diagnostic) => {
-                eprintln!("{diagnostic}");
-                for (note, span) in &diagnostic.related {
-                    eprintln!("  {note}: {span:?}");
+                report(&diagnostic);
+                ExitCode::FAILURE
+            }
+        },
+        Command::Check { root, dump } => match brenn_dsl::compile(&root) {
+            Ok(output) => {
+                for warning in &output.warnings {
+                    report(warning);
+                }
+                if dump {
+                    println!("{:#?}", output.config);
+                } else {
+                    println!("{}: ok", root.display());
+                }
+                ExitCode::SUCCESS
+            }
+            Err(errors) => {
+                for error in &errors {
+                    report(error);
                 }
                 ExitCode::FAILURE
             }
         },
+    }
+}
+
+/// One diagnostic and its secondary locations, on stderr.
+fn report(diagnostic: &Diagnostic) {
+    eprintln!("{diagnostic}");
+    for (note, span) in &diagnostic.related {
+        eprintln!("  {}", Diagnostic::related_line(note, span));
     }
 }

@@ -3,6 +3,7 @@ const secrets = "/home/alice/.secrets";
 
 /// An HMAC endpoint: signature, one key, and a replay guard.
 webhook push_alice {
+    slug = "push-alice";
     mount = "/webhooks/push-alice";
     content_type = "text/plain";
     signature {

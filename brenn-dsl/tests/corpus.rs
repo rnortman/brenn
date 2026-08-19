@@ -4,7 +4,8 @@
 use fltk_cst_core::Span;
 
 use brenn_dsl::model::{
-    BraceEscape, ConstDef, FStrPart, File, Item, PathSeg, StrPart, Value, section_kindword,
+    BraceEscape, ConstDef, FStrPart, File, InstBody, Item, PathSeg, StrPart, Value,
+    section_kindword,
 };
 use brenn_dsl::{parse_file, parse_str};
 
@@ -337,27 +338,40 @@ fn a_deserialize_failure_through_parse_str_is_positioned() {
 
 /// A body's entries are readable in the order they were written, which is what
 /// lets a diagnostic citing two of them cite them in that order.
+///
+/// An instance body is the untyped one: which vocabulary applies depends on the
+/// class, so its entries stay a map until resolution says.
 #[test]
 fn an_attr_map_keeps_source_order_and_reports_an_empty_body() {
     let file = parse_str(
-        "component Alice {\n    zeta = 1;\n    alpha = 2;\n    mid = 3;\n}\n",
+        "new a: Alice {\n    zeta = 1;\n    alpha = 2;\n    mid = 3;\n}\n",
         "t.brenn",
     )
     .expect("a parse");
-    let class = file.components().next().expect("a component class");
-    let keys: Vec<&str> = class
+    let body = instance_body(&file);
+    let keys: Vec<&str> = body
         .attrs
         .entries()
         .iter()
         .map(|(key, _)| key.as_str())
         .collect();
     assert_eq!(keys, ["zeta", "alpha", "mid"]);
-    assert!(!class.attrs.is_empty());
+    assert!(!body.attrs.is_empty());
 
-    let file = parse_str("component Empty {\n}\n", "t.brenn").expect("a parse");
-    let class = file.components().next().expect("a component class");
-    assert!(class.attrs.is_empty());
-    assert_eq!(class.attrs.len(), 0);
+    let file = parse_str("new a: Alice {\n}\n", "t.brenn").expect("a parse");
+    let body = instance_body(&file);
+    assert!(body.attrs.is_empty());
+    assert_eq!(body.attrs.len(), 0);
+}
+
+/// The body of the document's one instantiation.
+fn instance_body(file: &File) -> &InstBody {
+    file.instantiations()
+        .next()
+        .expect("one instantiation")
+        .body
+        .as_ref()
+        .expect("it was written with a body")
 }
 
 /// Pathological nesting stops at the generated entry point's depth limit, and
