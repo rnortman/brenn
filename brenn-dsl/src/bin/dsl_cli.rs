@@ -28,11 +28,11 @@ enum Command {
         #[arg(long)]
         dump: bool,
     },
-    /// Compile a document from its root file: parse, resolve, report.
+    /// Compile a document from its root file: parse, resolve, derive, report.
     Check {
         /// The root `.brenn` file. Its directory is the module root.
         root: PathBuf,
-        /// Print the resolved configuration.
+        /// Print the derived configuration.
         #[arg(long)]
         dump: bool,
     },

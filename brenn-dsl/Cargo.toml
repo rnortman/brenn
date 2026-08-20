@@ -11,6 +11,9 @@ publish = false
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
+# Durable channel identity is a pinned UUIDv5 derivation, so v5 is the whole
+# reason this is here.
+uuid = { version = "1.23.0", features = ["v5"] }
 
 # Generated `cst.rs` gates its pyo3 mirror on these two cfgs. Declared so the
 # names exist and empty because nothing here ever enables them: this crate is

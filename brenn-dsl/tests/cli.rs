@@ -35,16 +35,40 @@ fn a_tree_that_compiles_exits_zero() {
 }
 
 #[test]
-fn dump_prints_the_resolved_configuration() {
+fn dump_prints_the_derived_configuration() {
     let output = check("ok", &["--dump"]);
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("ResolvedConfig {"), "{stdout}");
+    assert!(stdout.starts_with("DerivedConfig {"), "{stdout}");
     assert!(
         stdout.contains("brenn:alice-desk.in.p1.messages"),
         "{stdout}"
     );
     assert!(stdout.contains("notes"), "{stdout}");
+    // The derived payload and not merely the resolved one it wraps: the tree's
+    // declarations are disk-backed, so the dump carries their identities.
+    assert!(
+        stdout.contains("0d178089-b13f-5a0e-8bec-0745e0475d78"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn dump_prints_the_expanded_grants() {
+    // `ephemeral_subscribe` is written nowhere in the tree: the document grants
+    // `subscribe`, and the token per scheme the plane reaches is derivation's.
+    let output = check("authority", &["--dump"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ephemeral_subscribe"), "{stdout}");
+}
+
+#[test]
+fn a_tree_refused_in_derivation_reports_and_exits_nonzero() {
+    let output = check("derive-error", &[]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("names no system-minted family"), "{stderr}");
 }
 
 #[test]

@@ -9,7 +9,8 @@ use brenn_dsl::resolved::{ChanId, MatcherKind, RChanRef, RMatcherVal, RValue};
 use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 use support::{
-    compile, compile_tree, refusal, refusal_tree, refusals, refusals_tree, resolved, resolved_tree,
+    at, compile, compile_tree, refusal, refusal_tree, refusals, refusals_tree, resolve_errors,
+    resolved, resolved_tree,
 };
 
 // ── constants ────────────────────────────────────────────────────────────────
@@ -1590,7 +1591,8 @@ fn a_misspelled_matcher_kind_is_refused_at_the_matcher() {
     assert_eq!(errors.len(), 1);
     assert_eq!(
         errors[0].message,
-        "`exakt` is not a matcher kind; matchers are `exact` or `prefix`"
+        "`exakt` is not a matcher kind; matchers are `exact`, `prefix`, `topic_filter`, \
+         `endpoint`, `client`"
     );
     // The kind word, not the address it precedes: the typo is in the keyword.
     assert_eq!(errors[0].line_col(), Some((4, 20)));
@@ -1603,13 +1605,14 @@ fn a_misspelled_matcher_kind_in_a_grant_is_refused_too() {
             "surface panel {\n    grants = [];\n}\n",
             "grant panel subscribe exakt \"brenn:alice-desk.in.messages\";\n",
         )),
-        "`exakt` is not a matcher kind; matchers are `exact` or `prefix`"
+        "`exakt` is not a matcher kind; matchers are `exact`, `prefix`, `topic_filter`, \
+         `endpoint`, `client`"
     );
 }
 
-/// A whole-address tuning over a declared address stands.
-/// TODO(dsl-tuning-address-merge): it is two sources of one channel's
-/// attributes; which side wins is derivation's to define.
+/// A tuning is not an identity, so the address-uniqueness check does not see
+/// one. Whether the address it names may be tuned at all is derivation's, and a
+/// declarable address like this one is refused there.
 #[test]
 fn a_tuning_is_not_a_declaration_and_collides_with_nothing() {
     let config = resolved(concat!(
@@ -1625,6 +1628,76 @@ fn a_tuning_is_not_a_declaration_and_collides_with_nothing() {
         .map(|tuning| tuning.is_prefix)
         .collect();
     assert_eq!(prefixes, vec![false, true]);
+}
+
+/// A declaration names one channel, so the family word has nothing to mean
+/// there and is refused rather than dropped. The refused channel still takes
+/// its id slot (the prepass minted the id); the second declaration here checks
+/// that: dropping the entry would leave `bob`'s id pointing one place short,
+/// and the position assert in `emit_channel` would fire.
+///
+/// The surface binds the refused handle, so the one-diagnostic assertion is
+/// about the consequences too: the entry stays reachable under its family
+/// address, and nothing downstream says a second thing about it.
+#[test]
+fn a_prefix_on_a_declaration_is_refused() {
+    let source = concat!(
+        "channel alice at prefix \"brenn:alice.\" {\n    push_depth = 4;\n}\n",
+        "channel bob at \"brenn:bob.in.messages\";\n",
+        "component Panel {\n    abi = dom;\n    in messages;\n}\n",
+        "surface alice_desk {\n    grants = [subscribe];\n",
+        "    new p1: Panel {\n        in messages <- alice;\n    }\n}\n",
+    );
+    let diagnostics = resolve_errors(source);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "`prefix` names the family a handle-less tuning block tunes; a declaration \
+         names exactly one channel, written `channel alice at \
+         \"brenn:alice.in.messages\"`"
+    );
+    // The flag is a bare `bool` in the AST; the address is the nearest anchor.
+    assert_eq!(diagnostics[0].line_col(), at(source, "\"brenn:alice."));
+}
+
+/// The word is refused off the AST flag, so an address the prepass could not
+/// resolve does not hide it: one compile reports both, rather than the author
+/// fixing the address and meeting the `prefix` refusal on the next run.
+#[test]
+fn a_prefix_refusal_survives_an_address_that_does_not_resolve() {
+    assert_eq!(
+        refusals("channel alice at prefix \"alice.\" {\n    push_depth = 4;\n}\n"),
+        vec![
+            "address `alice.` names no scheme; expected one of \
+             brenn:, ephemeral:, local:, webhook:, mqtt:"
+                .to_string(),
+            "`prefix` names the family a handle-less tuning block tunes; a declaration \
+             names exactly one channel, written `channel alice at \
+             \"brenn:alice.in.messages\"`"
+                .to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_stamped_prefix_refusal_survives_an_address_that_does_not_resolve() {
+    assert_eq!(
+        refusals(concat!(
+            "assembly Pod(slug: String) {\n",
+            "    channel messages at prefix f\"{slug}.\";\n",
+            "}\n",
+            "new alice: Pod(slug = \"alice\");\n",
+        )),
+        vec![
+            "address `alice.` names no scheme; expected one of \
+             brenn:, ephemeral:, local:, webhook:, mqtt:"
+                .to_string(),
+            "`prefix` names the family a handle-less tuning block tunes; a declaration \
+             names exactly one channel, written `channel alice at \
+             \"brenn:alice.in.messages\"`"
+                .to_string(),
+        ]
+    );
 }
 
 #[test]

@@ -5,10 +5,18 @@ use shared::*;
 // A declaration the module makes outright, so the root's compile can be
 // asserted to carry what the module contributed and not merely to have
 // succeeded.
-channel bench_status at f"brenn:{skin}.status";
+channel bench_status at f"brenn:{skin}.status" {
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}
 
 assembly Deskbar(slug: String) {
-    channel messages at f"brenn:{slug}.in.p1.messages";
+    channel messages at f"brenn:{slug}.in.p1.messages" {
+        push_depth = 8;
+        retain_depth = 32;
+        standing_retain_depth = 128;
+    }
 }
 
 // A second declaration in the nested module, so the tree's emitted shape is

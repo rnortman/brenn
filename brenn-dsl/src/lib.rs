@@ -7,7 +7,8 @@
 //! and is the typed surface everything downstream reads.
 //!
 //! One file at a time here; `resolve` follows imports from a root file and
-//! produces the `resolved` model.
+//! produces the `resolved` model, which `derive` then turns into the `derived`
+//! one.
 
 use std::path::Path;
 
@@ -16,6 +17,11 @@ pub mod cst;
 // ones no caller has reached for yet are dead code under `-D warnings`.
 #[allow(dead_code)]
 mod de;
+/// The pass after resolution: authority, identity and the channel model made
+/// concrete and checked.
+pub mod derive;
+/// The far side of derivation: what a document comes to.
+pub mod derived;
 pub mod diag;
 pub mod model;
 // `parser` and `unparser` are public because the formatter binary names their
@@ -33,7 +39,7 @@ use fltk_serde_core::ParseToTargetError;
 
 use diag::Diagnostic;
 
-pub use resolve::{CompileOutput, compile, resolve_files};
+pub use resolve::{CompileOutput, ResolveOutput, compile, resolve_files};
 
 /// How deep a document may nest before the parse is refused.
 ///

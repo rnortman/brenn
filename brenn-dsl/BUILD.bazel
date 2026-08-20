@@ -70,6 +70,10 @@ dsl_test(name = "rule_coverage")
 
 dsl_test(name = "resolve")
 
+dsl_test(name = "derive")
+
+dsl_test(name = "authority")
+
 dsl_test(name = "expand")
 
 dsl_test(name = "multifile")

@@ -158,26 +158,119 @@ pub struct RMatcher {
     pub tail: Vec<(String, RVal)>,
 }
 
-/// What a matcher matches: one address, or every address under a prefix.
+/// What a matcher matches: one address, every address under a prefix, or one of
+/// the shapes a transport-specific family keys on.
 ///
 /// Closed vocabulary; the grammar admits any word here and the resolver refuses
-/// the ones that spell neither kind.
+/// the ones that spell no kind. The three transport kinds are spelled exactly as
+/// the fields they land in are named, so a matcher and the entry it becomes read
+/// the same. Which kinds a scheme admits is derivation's table, not this one's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatcherKind {
     /// Names exactly one address.
     Exact,
     /// Names the family under an address prefix.
     Prefix,
+    /// An MQTT topic filter, scoped to one client: `mqtt:<client>:<filter>`.
+    TopicFilter,
+    /// A webhook endpoint: `webhook:<slug>`.
+    Endpoint,
+    /// An MQTT client, with no topic dimension: `mqtt:<client>`.
+    Client,
 }
 
 impl MatcherKind {
-    /// The kind a word spells, or `None` when it spells neither.
+    /// Every kind, in the order a diagnostic lists them.
+    pub const ALL: [MatcherKind; 5] = [
+        Self::Exact,
+        Self::Prefix,
+        Self::TopicFilter,
+        Self::Endpoint,
+        Self::Client,
+    ];
+
+    /// The kind a word spells, or `None` when it spells none.
     pub fn parse(word: &str) -> Option<Self> {
-        match word {
-            "exact" => Some(Self::Exact),
-            "prefix" => Some(Self::Prefix),
-            _ => None,
+        Self::ALL.into_iter().find(|kind| kind.as_str() == word)
+    }
+
+    /// The word this kind is written with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Prefix => "prefix",
+            Self::TopicFilter => "topic_filter",
+            Self::Endpoint => "endpoint",
+            Self::Client => "client",
         }
+    }
+}
+
+/// The schemes an address may lead with.
+///
+/// The crate's one scheme vocabulary: resolution refuses an address that names
+/// none of these, and derivation reads the family and the durability of the
+/// channel a scheme names off it. Transcribed from the runtime's
+/// `ChannelScheme`.
+/// TODO(dsl-vocabulary-config-parity): held equal to `ChannelScheme` and its
+/// capabilities by review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scheme {
+    Brenn,
+    Ephemeral,
+    Local,
+    Webhook,
+    Mqtt,
+}
+
+impl Scheme {
+    /// Every scheme, in the order a diagnostic lists them.
+    pub const ALL: [Scheme; 5] = [
+        Self::Brenn,
+        Self::Ephemeral,
+        Self::Local,
+        Self::Webhook,
+        Self::Mqtt,
+    ];
+
+    /// The prefix this scheme is written as, colon included.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::Brenn => "brenn:",
+            Self::Ephemeral => "ephemeral:",
+            Self::Local => "local:",
+            Self::Webhook => "webhook:",
+            Self::Mqtt => "mqtt:",
+        }
+    }
+
+    /// The scheme an address leads with and what follows it.
+    ///
+    /// `None` where the address names no scheme at all: `brenn:` is never
+    /// implied, in this language or in a `.brenn` address.
+    pub fn split(address: &str) -> Option<(Scheme, &str)> {
+        Self::ALL.into_iter().find_map(|scheme| {
+            address
+                .strip_prefix(scheme.prefix())
+                .map(|rest| (scheme, rest))
+        })
+    }
+
+    /// Every prefix, as a diagnostic lists them: `brenn:, ephemeral:, …`.
+    pub fn list() -> String {
+        Self::ALL.map(Self::prefix).join(", ")
+    }
+
+    /// Every prefix quoted, as a diagnostic that expects one of them lists them:
+    /// ``​`brenn:`, `ephemeral:`, … or `mqtt:` ``.
+    pub fn quoted_list() -> String {
+        crate::diag::or_list(Self::ALL.map(Self::prefix))
+    }
+
+    /// Is a channel under this scheme disk-backed — and so carrying an identity
+    /// the configuration states rather than one derived at runtime?
+    pub fn durable(self) -> bool {
+        self == Self::Brenn
     }
 }
 
@@ -422,6 +515,10 @@ pub enum RMcp {
 #[derive(Debug, PartialEq)]
 pub struct RSubscribe {
     pub chan: RChanRef,
+    /// Where the channel was named. A [`RChanRef::Decl`] holds an index and no
+    /// position, and a statement is the only thing a later refusal about this
+    /// subscription can point at.
+    pub span: Span,
     pub tail: Vec<(String, RVal)>,
 }
 

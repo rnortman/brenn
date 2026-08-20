@@ -1,0 +1,12 @@
+// A tree whose derived payload carries an expanded grant: the surface states the
+// plane it holds authority on, and the token per scheme is derivation's.
+
+channel cache at "ephemeral:alice.cache" {
+    push_depth = 4;
+    retain_depth = 16;
+}
+
+surface alice_desk {
+    grants = [subscribe];
+    acl subscribe [exact cache];
+}

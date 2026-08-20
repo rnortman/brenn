@@ -2,8 +2,9 @@
 
 ## `dsl-vocabulary-config-parity`
 
-`brenn-dsl/src/model.rs`'s ~30 attr vocabularies are each a hand transcription of
-a config struct in `brenn-lib` — `ServerAttrs` of `ServerConfig`, `AgentAttrs` of
+`brenn-dsl/src/model.rs`'s ~30 attr vocabularies, and the runtime tables
+`brenn-dsl/src/derive.rs` states, are each a hand transcription of something in
+`brenn-lib` — the vocabularies of a config struct — `ServerAttrs` of `ServerConfig`, `AgentAttrs` of
 `AppConfigRaw`, and so on. Nothing mechanically ties the two sides: `brenn-dsl`
 has no dependency on `brenn-lib` (deliberately — lowering is a later slice), so a
 field added to a config struct cannot break a build in the DSL crate. It surfaces
@@ -29,30 +30,13 @@ Done = adding a field to a gated config struct fails a check that names the
 vocabulary it is missing from, or the field is listed as deliberately omitted
 with a reason.
 
-Code site (`TODO(dsl-vocabulary-config-parity)`): brenn-dsl/src/model.rs, the
-entity attr vocabulary section header.
-
-
-## `dsl-tuning-address-merge`
-
-`channel at "brenn:alice-desk.in.messages" { push_depth = 8; }` — a tuning whose
-address is a whole address rather than a prefix — is accepted alongside a
-`channel` declaration of that same address. Both carry `ChannelAttrs`, so one
-channel has two sources for the same attribute, written as two spellings of one
-address, which is what the one-spelling rule refuses everywhere else. The prefix
-form is genuinely different: it names a family, and the family a channel sits in
-is not that channel.
-
-Deciding it needs the derivation rules that do not exist yet: either the
-resolver refuses a whole-address tuning whose address a declared channel owns,
-or derivation merges the two and the language documents which side wins.
-
-Done = the resolver refuses it, or derivation defines the merge and the accepted
-case is a test asserting that defined behaviour.
-
-Code sites (`TODO(dsl-tuning-address-merge)`): brenn-dsl/src/resolve.rs at
-`check_addresses`; brenn-dsl/tests/resolve.rs at
-`a_tuning_is_not_a_declaration_and_collides_with_nothing`.
+Code sites (`TODO(dsl-vocabulary-config-parity)`): brenn-dsl/src/model.rs, the
+entity attr vocabulary section header; brenn-dsl/src/resolve.rs, the transcribed
+key tables and charsets; brenn-dsl/src/derive.rs, at the scheme vocabulary, the
+tool namespaces, the channel-model presence rules, the non-durable uuid seeds,
+the ACL family table, the anonymous-namespace segment, the matcher pattern
+rules, the schemes a binding position may name, the remote subscribe ceilings
+shape, and the grant vocabularies and their plane-word expansions.
 
 
 ## `dsl-list-element-span`

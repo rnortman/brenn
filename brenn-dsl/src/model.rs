@@ -214,7 +214,9 @@ pub struct ChanTuning {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ChanAddr {
-    /// Whether `prefix` was written.
+    /// Whether `prefix` was written. Meaningful only on the handle-less tuning
+    /// form, which names a family; the declaration form names exactly one
+    /// channel and must refuse the word.
     pub is_prefix: bool,
     pub addr: Spanned<StrLike>,
 }

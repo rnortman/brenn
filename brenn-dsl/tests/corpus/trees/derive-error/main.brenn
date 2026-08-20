@@ -1,0 +1,8 @@
+// Resolves cleanly and is refused a pass later: a handle-less block on an
+// address the system does not mint tunes nothing.
+
+channel at "brenn:alice.status" {
+    push_depth = 4;
+    retain_depth = 16;
+    standing_retain_depth = 64;
+}

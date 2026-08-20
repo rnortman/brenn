@@ -51,6 +51,7 @@ fn a_root_reaches_a_nested_module_and_a_flat_one() {
     // whole: loading and indexing a module is not the same as emitting it.
     let addresses: Vec<&str> = output
         .config
+        .resolved
         .channels
         .iter()
         .map(|channel| channel.address.value().as_str())
@@ -61,21 +62,25 @@ fn a_root_reaches_a_nested_module_and_a_flat_one() {
         addresses,
         ["brenn:bench.status", "brenn:alice-desk.in.p1.messages"]
     );
-    assert_eq!(output.config.channels[0].handle.dotted(), "bench_status");
     assert_eq!(
-        output.config.channels[1].handle.dotted(),
+        output.config.resolved.channels[0].handle.dotted(),
+        "bench_status"
+    );
+    assert_eq!(
+        output.config.resolved.channels[1].handle.dotted(),
         "alice_desk.messages"
     );
     // The whole emitted shape, so that a change in what emission carries out of
     // a module is visible here and not only for channels.
     let repos: Vec<String> = output
         .config
+        .resolved
         .repos
         .iter()
         .map(|repo| repo.handle.dotted())
         .collect();
     assert_eq!(repos, ["notes"]);
-    let config = &output.config;
+    let config = &output.config.resolved;
     assert!(config.tunings.is_empty());
     assert!(config.uuid_pins.is_empty());
     assert!(config.surfaces.is_empty());

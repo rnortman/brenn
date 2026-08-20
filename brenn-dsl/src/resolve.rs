@@ -15,7 +15,7 @@
 //!
 //! Diagnostics accumulate rather than stopping at the first: independent errors
 //! in one document are all reported. Severity is positional — the `Err` vector
-//! is errors, [`CompileOutput::warnings`] is the warning class — so a success
+//! is errors, [`ResolveOutput::warnings`] is the warning class — so a success
 //! can carry warnings and a failure reports errors only.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -26,7 +26,8 @@ use std::rc::Rc;
 use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 
-use crate::diag::Diagnostic;
+use crate::derived::DerivedConfig;
+use crate::diag::{Diagnostic, check_unique, two_site};
 use crate::model::{
     AclStmt, AgentBlock, AgentClass, Arg, ArgList, AssemblyDef, AssemblyItem, AttrBlock, AttrMap,
     Binding as BindStmt, ChanAddr, ChanRef, ChannelAttrs, ChannelDef, ComponentClass, ConstDef,
@@ -39,17 +40,25 @@ use crate::resolved::{
     Abi, ChanId, ClassRef, HandlePath, MatcherKind, PortDir, RAcl, RAgent, RBinding, RChanRef,
     RChannel, RComponentInst, RConsumer, RGrant, RHooks, RMatcher, RMatcherVal, RMcp, RMount,
     RNamed, RPin, RPort, RRemote, RSection, RSubscribe, RSurface, RTuning, RVal, RValue, RWebhook,
-    RWebhookBlock, RWordList, ResolvedConfig,
+    RWebhookBlock, RWordList, ResolvedConfig, Scheme,
 };
 
-/// What a successful compile produces.
+/// What a successful resolve produces.
 ///
 /// Warnings ride beside the config rather than in a severity field: what a
 /// caller does with the two is different, and a failure has no config to hang
 /// them on.
 #[derive(Debug)]
-pub struct CompileOutput {
+pub struct ResolveOutput {
     pub config: ResolvedConfig,
+    pub warnings: Vec<Diagnostic>,
+}
+
+/// What a successful compile produces: the derived config and the warnings the
+/// passes before it raised.
+#[derive(Debug)]
+pub struct CompileOutput {
+    pub config: DerivedConfig,
     pub warnings: Vec<Diagnostic>,
 }
 
@@ -65,13 +74,15 @@ const MODULE_EXT: &str = "brenn";
 /// `<root_dir>/wiring/deskbar.brenn`.
 pub fn compile(root: &Path) -> Result<CompileOutput, Vec<Diagnostic>> {
     let (files, load_warnings) = load(root)?;
-    let mut output = resolve_files(files, ROOT_KEY)?;
+    let output = resolve_files(files, ROOT_KEY)?;
     // Load's warnings first: they are about the tree, and the tree is what a
     // reader looks at before any one file.
     let mut warnings = load_warnings;
-    warnings.append(&mut output.warnings);
-    output.warnings = warnings;
-    Ok(output)
+    warnings.extend(output.warnings);
+    Ok(CompileOutput {
+        config: crate::derive::derive(output.config)?,
+        warnings,
+    })
 }
 
 /// Resolve an already-loaded set of modules — the testable core, no I/O.
@@ -86,7 +97,7 @@ pub fn compile(root: &Path) -> Result<CompileOutput, Vec<Diagnostic>> {
 pub fn resolve_files(
     files: Vec<(String, File)>,
     root: &str,
-) -> Result<CompileOutput, Vec<Diagnostic>> {
+) -> Result<ResolveOutput, Vec<Diagnostic>> {
     assert!(
         files.iter().any(|(key, _)| key == root),
         "the root key names one of the files"
@@ -104,7 +115,7 @@ pub fn resolve_files(
     if !errors.is_empty() {
         return Err(errors);
     }
-    Ok(CompileOutput {
+    Ok(ResolveOutput {
         config,
         warnings: Vec::new(),
     })
@@ -907,18 +918,6 @@ fn no_such_segment(owner: &str, owner_kind: Option<&str>, segment: &Spanned<Stri
     )
 }
 
-/// A diagnostic that cites a second location.
-fn two_site(
-    message: impl Into<String>,
-    span: Span,
-    related: impl Into<String>,
-    related_span: Span,
-) -> Diagnostic {
-    let mut diagnostic = Diagnostic::at(message, span);
-    diagnostic.related.push((related.into(), related_span));
-    diagnostic
-}
-
 // ── pass 3: constants, and the value walk ────────────────────────────────────
 
 /// Refuse anything but a literal, at any depth.
@@ -1043,13 +1042,25 @@ fn resolve_table(
         .collect()
 }
 
+/// The matcher kinds, as a diagnostic lists them.
+fn matcher_kinds() -> String {
+    MatcherKind::ALL
+        .iter()
+        .map(|kind| format!("`{}`", kind.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// A matcher: its kind checked, its payload resolved, its tail walked like any
 /// other table.
 fn resolve_matcher(matcher: &Matcher, scope: &impl ValueScope) -> Result<RMatcher, Diagnostic> {
     let word = matcher.kind.value();
     let Some(kind) = MatcherKind::parse(word) else {
         return Err(Diagnostic::at(
-            format!("`{word}` is not a matcher kind; matchers are `exact` or `prefix`"),
+            format!(
+                "`{word}` is not a matcher kind; matchers are {}",
+                matcher_kinds()
+            ),
             matcher.kind.span().clone(),
         ));
     };
@@ -1712,10 +1723,6 @@ impl ValueScope for Scope<'_> {
 // expansion is the forms whose meaning is a class's: a surface's components and
 // every `new`.
 
-/// The schemes an address may lead with. What follows one is the runtime's to
-/// validate; a missing one is refused here, because `brenn:` is never implied.
-const SCHEMES: [&str; 5] = ["brenn:", "ephemeral:", "local:", "webhook:", "mqtt:"];
-
 /// Whether a grant may name an entity of this kind at all.
 ///
 /// Carried alongside a withheld handle so that withholding suppresses only the
@@ -2058,6 +2065,21 @@ fn emit_channel(
     config: &mut Emitted,
     errors: &mut Vec<Diagnostic>,
 ) {
+    // A declaration mints one directory entry — one handle, one id, one
+    // address — so a family prefix names nothing it could declare. The flag is
+    // the AST's, independent of whether the address value resolved, so the
+    // refusal runs ahead of the early return below and the channel is still
+    // pushed the same way a refused body is.
+    if let ChannelDef::Decl(decl) = &def
+        && decl.addr.is_prefix
+    {
+        errors.push(Diagnostic::at(
+            "`prefix` names the family a handle-less tuning block tunes; a \
+             declaration names exactly one channel, written `channel alice at \
+             \"brenn:alice.in.messages\"`",
+            decl.addr.addr.span().clone(),
+        ));
+    }
     let Some((address, id)) = declaration else {
         return;
     };
@@ -2558,16 +2580,19 @@ fn resolve_address(
 
 /// Refuse an address that names no scheme, or names one and nothing else.
 fn check_scheme(text: &str, span: &Span) -> Result<(), Diagnostic> {
-    match SCHEMES.iter().find(|scheme| text.starts_with(**scheme)) {
-        Some(scheme) if text.len() > scheme.len() => Ok(()),
-        Some(scheme) => Err(Diagnostic::at(
-            format!("`{scheme}` is a scheme and nothing else; an address names something under it"),
+    match Scheme::split(text) {
+        Some((_, rest)) if !rest.is_empty() => Ok(()),
+        Some((scheme, _)) => Err(Diagnostic::at(
+            format!(
+                "`{}` is a scheme and nothing else; an address names something under it",
+                scheme.prefix()
+            ),
             span.clone(),
         )),
         None => Err(Diagnostic::at(
             format!(
                 "address `{text}` names no scheme; expected one of {}",
-                SCHEMES.join(", ")
+                Scheme::list()
             ),
             span.clone(),
         )),
@@ -3307,6 +3332,14 @@ fn resolve_chan_ref(chan: &ChanRef, scope: &impl ValueScope) -> Result<RChanRef,
     }
 }
 
+/// Where a channel reference was written.
+fn chan_ref_span(chan: &ChanRef) -> Span {
+    match chan {
+        ChanRef::Handle(path) => path.head.span().clone(),
+        ChanRef::Addr(text) => str_like_span(text),
+    }
+}
+
 /// The runtime's instance charset, and uniqueness within the surface.
 ///
 /// A component instance has no `slug` spelling: the handle is the name the
@@ -4027,6 +4060,7 @@ fn emit_subs(
         match resolve_chan_ref(&sub.chan, scope) {
             Ok(chan) => resolved.push(RSubscribe {
                 chan,
+                span: chan_ref_span(&sub.chan),
                 tail: open_tail(sub.tail.as_ref(), scope, errors),
             }),
             Err(error) => {
@@ -4658,7 +4692,11 @@ impl Walk<'_> {
             match resolve_address(addr, &scope) {
                 Ok(address) => address,
                 Err(error) => {
+                    // A refused address mints no id, but the item is still
+                    // stamped so the emission pass reaches the diagnostics that
+                    // read the statement itself rather than its address.
                     errors.push(error);
+                    self.push(AssemblyItem::Channel(Box::new(def.clone())), None, frame);
                     return;
                 }
             }
@@ -4923,11 +4961,8 @@ fn check_grants(config: &ResolvedConfig, withheld: &Withheld, errors: &mut Vec<D
 fn check_addresses(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
     // The first declaration of each address holds it; a later one is the
     // collision. Tunings are not here: a tuning is a matcher over a family, not
-    // an identity, so two of them over one prefix is not a collision.
-    //
-    // TODO(dsl-tuning-address-merge): a whole-address tuning over an address a
-    // channel declares is two sources of one channel's attributes, and which
-    // side wins is derivation's to define.
+    // an identity, and derivation refuses one on a declarable address outright,
+    // so no tuning key can be a channel's address.
     let declared = check_unique(
         config.channels.iter().map(|channel| {
             (
@@ -4936,7 +4971,7 @@ fn check_addresses(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
                 channel.address.span(),
             )
         }),
-        |address, prior_handle, span, prior_span| {
+        |address, _, span, prior_handle, prior_span| {
             two_site(
                 format!("two channels declare the address `{address}`"),
                 span.clone(),
@@ -4962,32 +4997,6 @@ fn check_addresses(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
             ));
         }
     }
-}
-
-/// Every key seen once, and a diagnostic per repeat citing the site that holds
-/// it. Returns what was kept, so a caller can go on asking who holds a key.
-///
-/// The one collision engine: identities, addresses and whatever the next
-/// whole-document rule keys on all read the same way, so a fix to how repeats
-/// are reported lands once.
-fn check_unique<'a, K, V>(
-    items: impl Iterator<Item = (K, V, &'a Span)>,
-    collide: impl Fn(&K, &V, &Span, &Span) -> Diagnostic,
-    errors: &mut Vec<Diagnostic>,
-) -> HashMap<K, (V, &'a Span)>
-where
-    K: Eq + std::hash::Hash,
-{
-    let mut held: HashMap<K, (V, &'a Span)> = HashMap::new();
-    for (key, value, span) in items {
-        match held.get(&key) {
-            Some((prior, prior_span)) => errors.push(collide(&key, prior, span, prior_span)),
-            None => {
-                held.insert(key, (value, span));
-            }
-        }
-    }
-    held
 }
 
 /// Every address written as a string literal where a declared channel could
@@ -5075,7 +5084,13 @@ fn chan_ref_literal<'a>(chan: &'a RChanRef, found: &mut Vec<(&'a str, &'a Span)>
 fn matcher_literal<'a>(matcher: &'a RMatcher, found: &mut Vec<(&'a str, &'a Span)>) {
     match matcher.kind.value() {
         MatcherKind::Exact => {}
-        MatcherKind::Prefix => return,
+        // A prefix is written about a family, and the family a declared channel
+        // belongs to is not that channel. The three transport kinds name
+        // system-minted addresses, which no declaration can hold.
+        MatcherKind::Prefix
+        | MatcherKind::TopicFilter
+        | MatcherKind::Endpoint
+        | MatcherKind::Client => return,
     }
     if let RMatcherVal::Lit(text) = matcher.val.value() {
         found.push((text.as_str(), matcher.val.span()));
@@ -5133,7 +5148,7 @@ fn check_family<'a>(
     }
     check_unique(
         spanned.into_iter(),
-        |slug, (), span, prior_span| {
+        |slug, (), span, (), prior_span| {
             two_site(
                 format!("two {label}s resolve to the identity `{slug}`"),
                 span.clone(),
