@@ -20,7 +20,7 @@ pub const GIT_REPO_PULL_TOOL: &str = "git-repo-pull";
 /// Raw `[[*.tool_grant]]` table: a tool name, an optional list of ACL clauses
 /// (each a TOML table of `key = value` requirements), and an optional rate
 /// limit. `acl` clauses are OR'd; keys within a clause are AND'd.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ToolGrantRaw {
     /// Canonical (kebab-case) tool name this grant addresses.
@@ -35,7 +35,7 @@ pub struct ToolGrantRaw {
 }
 
 /// Raw `rate_limit = { burst = N, sustained_per_minute = M }` table.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitRaw {
     /// Token-bucket capacity (`>= 1`, validated at resolution).

@@ -29,15 +29,15 @@ use crate::webhook::scheme::{HexFormat, SignatureAlgorithm, SignatureScheme};
 const DEFAULT_TRANSPORT_CEILING: usize = 1024 * 1024; // 1 MiB
 const DEFAULT_CONTENT_TYPE: &str = "application/json";
 
-fn default_transport_ceiling() -> usize {
+pub(crate) fn default_transport_ceiling() -> usize {
     DEFAULT_TRANSPORT_CEILING
 }
 
-fn default_content_type() -> String {
+pub(crate) fn default_content_type() -> String {
     DEFAULT_CONTENT_TYPE.to_string()
 }
 
-fn default_hmac_algorithm() -> String {
+pub(crate) fn default_hmac_algorithm() -> String {
     "hmac-sha256".to_string()
 }
 
@@ -46,7 +46,7 @@ fn default_hmac_algorithm() -> String {
 // ---------------------------------------------------------------------------
 
 /// Top-level `[[webhook_endpoint]]` block.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookEndpointConfigRaw {
     /// URL-safe identifier; charset `[A-Za-z0-9._~-]+`, globally unique.
@@ -87,7 +87,7 @@ pub struct WebhookEndpointConfigRaw {
 
 /// Tagged signature scheme config. `deny_unknown_fields` means a field
 /// belonging to the wrong variant is a hard parse error.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(tag = "scheme", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum WebhookSignatureConfigRaw {
     /// HMAC-SHA256 over raw body. Phonebuddy, GitHub/Forgejo, generic.
@@ -125,7 +125,7 @@ pub enum WebhookSignatureConfigRaw {
 }
 
 /// `[[webhook_endpoint.key]]` entry (HMAC variants only).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookKeyConfigRaw {
     /// Opaque key identifier; charset `[A-Za-z0-9._-]{1,64}`.
@@ -135,7 +135,7 @@ pub struct WebhookKeyConfigRaw {
 }
 
 /// `[[webhook_endpoint.token]]` entry (`bearer-token` variant only).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookTokenConfigRaw {
     /// Opaque token identifier; charset `[A-Za-z0-9._-]{1,64}`.
@@ -149,7 +149,7 @@ pub struct WebhookTokenConfigRaw {
 /// When present, inbound requests for this endpoint are checked against the
 /// named WASM replay component before being delivered. Both fields required
 /// when the sub-table is present.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ReplayProtectionConfigRaw {
     /// Path to the WASM replay component artifact (must exist at startup).
@@ -171,7 +171,7 @@ pub struct ReplayProtectionConfigRaw {
 }
 
 /// Per-app `[[app.webhook_subscription]]` block.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AppWebhookSubscriptionRaw {
     /// References `[[webhook_endpoint]].slug`.

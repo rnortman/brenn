@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 /// Alerting configuration. Rate limit fields are shared; exactly one backend
 /// sub-table (`ntfy` or `mail`) must be present.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AlertingConfig {
     /// Maximum number of alerts within the rate limit window.
@@ -16,7 +16,7 @@ pub struct AlertingConfig {
 }
 
 /// ntfy alerting backend.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NtfyConfig {
     /// ntfy topic URL (e.g. "https://ntfy.sh/brenn-alerts").
@@ -24,7 +24,7 @@ pub struct NtfyConfig {
 }
 
 /// Mail alerting backend. Shells out to the `mail` command.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MailConfig {
     /// Destination email address.
@@ -34,6 +34,6 @@ pub struct MailConfig {
     pub subject_label: String,
 }
 
-fn default_subject_label() -> String {
+pub(crate) fn default_subject_label() -> String {
     "Brenn".to_string()
 }

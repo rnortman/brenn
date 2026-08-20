@@ -8,6 +8,7 @@ mod alerting;
 mod app_parse;
 mod attachment;
 mod container;
+mod dsl_lower;
 mod events;
 mod integrations;
 mod invariants;
@@ -161,7 +162,7 @@ fn mount_test_config(
 ) -> BrennConfig {
     BrennConfig {
         server: test_server_config(),
-        repo_dir: Some(dir.to_path_buf()),
+        repo_sync: repo_sync_at(dir),
         repos,
         apps: vec![AppConfigRaw {
             slug: "test".to_string(),
@@ -193,7 +194,7 @@ fn two_app_mount_config(
     };
     BrennConfig {
         server: test_server_config(),
-        repo_dir: Some(dir.to_path_buf()),
+        repo_sync: repo_sync_at(dir),
         repos,
         apps: vec![
             make_app("app-a", app_a_dir, app_a_mounts),

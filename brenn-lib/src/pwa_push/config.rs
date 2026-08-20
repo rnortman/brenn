@@ -20,7 +20,7 @@ use super::vapid::VapidKeypair;
 /// - `fcm.googleapis.com` — Chromium-family browsers (Chrome, Edge, Brave, …).
 /// - `updates.push.services.mozilla.com` — Firefox production.
 /// - `web.push.apple.com` — Safari (macOS 13+ / iOS 16.4+).
-fn default_endpoint_host_allowlist() -> Vec<String> {
+pub(crate) fn default_endpoint_host_allowlist() -> Vec<String> {
     vec![
         "fcm.googleapis.com".to_string(),
         "updates.push.services.mozilla.com".to_string(),
@@ -28,7 +28,7 @@ fn default_endpoint_host_allowlist() -> Vec<String> {
     ]
 }
 
-fn default_endpoint_host_allowlist_enforce() -> bool {
+pub(crate) fn default_endpoint_host_allowlist_enforce() -> bool {
     true
 }
 
@@ -36,7 +36,7 @@ fn default_endpoint_host_allowlist_enforce() -> bool {
 ///
 /// This block may be absent when no app holds the `PwaPush` grant;
 /// in that case `PwaPushGlobalConfig::default()` provides safe zero-values.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PwaPushGlobalConfig {
     /// Path to the VAPID keypair secrets file. Required when any app has the
@@ -79,7 +79,7 @@ impl Default for PwaPushGlobalConfig {
 /// (`AppConfig::pwa_push_enabled()` reads the `PwaPush` grant). This block
 /// carries only the non-authorization `default_title` delivery setting.
 /// `#[serde(deny_unknown_fields)]` rejects any stale keys.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppPwaPushBlock {
     /// Default notification title when `PushSend` omits the `title` field.

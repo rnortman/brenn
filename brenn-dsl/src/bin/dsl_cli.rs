@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use brenn_dsl::diag::Diagnostic;
+use brenn_dsl::diag::render_all;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -51,14 +51,14 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(diagnostic) => {
-                report(&diagnostic);
+                eprintln!("{}", diagnostic.render());
                 ExitCode::FAILURE
             }
         },
         Command::Check { root, dump } => match brenn_dsl::compile(&root) {
             Ok(output) => {
                 for warning in &output.warnings {
-                    report(warning);
+                    eprintln!("{}", warning.render());
                 }
                 if dump {
                     println!("{:#?}", output.config);
@@ -68,19 +68,9 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(errors) => {
-                for error in &errors {
-                    report(error);
-                }
+                eprintln!("{}", render_all(&errors));
                 ExitCode::FAILURE
             }
         },
-    }
-}
-
-/// One diagnostic and its secondary locations, on stderr.
-fn report(diagnostic: &Diagnostic) {
-    eprintln!("{diagnostic}");
-    for (note, span) in &diagnostic.related {
-        eprintln!("  {}", Diagnostic::related_line(note, span));
     }
 }

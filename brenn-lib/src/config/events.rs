@@ -1,7 +1,7 @@
 use serde::Deserialize;
 
 /// Retention settings for the `events` table.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct EventsConfig {
     /// Retention window in days for delivered events.

@@ -34,7 +34,7 @@ use crate::mqtt::address::{parse_mqtt_address, validate_topic_filter_str};
 /// plugin) to restrict publish rights so only authorised clients can write to
 /// topics the app reads. The principle of least privilege applies: each client
 /// should be allowed to publish only to the topics it owns.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MqttClientConfigRaw {
     /// URL-safe identifier for this client; charset `[A-Za-z0-9._~-]+`.
@@ -81,28 +81,28 @@ pub struct MqttClientConfigRaw {
     pub session_expiry_secs: u32,
 }
 
-fn default_client_urgency() -> Urgency {
+pub(crate) fn default_client_urgency() -> Urgency {
     Urgency::Normal
 }
 
-fn default_tls_version_min() -> String {
+pub(crate) fn default_tls_version_min() -> String {
     "1.2".to_string()
 }
 
-fn default_inbound_payload_cap() -> usize {
+pub(crate) fn default_inbound_payload_cap() -> usize {
     4 * 1024 * 1024 // 4 MiB
 }
 
-fn default_backoff_initial() -> u32 {
+pub(crate) fn default_backoff_initial() -> u32 {
     1
 }
 
-fn default_backoff_max() -> u32 {
+pub(crate) fn default_backoff_max() -> u32 {
     60
 }
 
 /// Last-Will configuration for a broker connection.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LastWillRaw {
     /// Topic on which the will is published.
@@ -115,7 +115,7 @@ pub struct LastWillRaw {
     pub retain: bool,
 }
 
-fn default_subscription_qos() -> u8 {
+pub(crate) fn default_subscription_qos() -> u8 {
     1
 }
 
@@ -132,7 +132,7 @@ fn default_subscription_qos() -> u8 {
 ///
 /// Transport/sender-side feed properties (`qos`/`urgency`) live on
 /// `[[mqtt_client]]`, not here.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AppMqttIngressSubscriptionRaw {
     /// Full channel address `mqtt:<client>:<topic>`; client segment mandatory.

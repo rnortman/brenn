@@ -9,6 +9,8 @@ mod apps;
 mod automation;
 mod cleanup;
 pub mod cli;
+mod config_check;
+mod config_diff;
 mod mqtt;
 mod obs_config;
 mod pid_file;
@@ -33,6 +35,9 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use brenn_server::state::AppState;
+
+pub use config_check::run_config_check;
+pub use config_diff::run_config_diff;
 
 pub async fn run_invite(config: &BrennConfig) {
     let db = brenn_server::db::init_db(&config.database.path);
@@ -199,7 +204,7 @@ pub async fn run_server(config: BrennConfig, config_path: Option<PathBuf>, build
     // validation so we have ContainerSpawnConfig for container-side clones
     // (SSH keys live inside the container's persistent home). Clones run
     // concurrently via join_all in auto_clone_repos.
-    if config.repo_dir.is_some() {
+    if config.repo_sync.repo_dir.is_some() {
         brenn_git::repo_clone::auto_clone_repos(&config, &apps, &guard.alert_dispatcher).await;
     }
 

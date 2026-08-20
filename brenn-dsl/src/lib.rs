@@ -41,6 +41,13 @@ use diag::Diagnostic;
 
 pub use resolve::{CompileOutput, ResolveOutput, compile, resolve_files};
 
+/// The position type every diagnostic and every resolved value carries.
+///
+/// Re-exported because it is part of this crate's public surface: a consumer of
+/// [`diag::Diagnostic`] or of a [`resolved::RVal`] reads and constructs spans,
+/// and the crate that owns the type is this crate's own dependency.
+pub use fltk_cst_core::Span;
+
 /// How deep a document may nest before the parse is refused.
 ///
 /// The generated parser is recursive descent and its own default is sized for an

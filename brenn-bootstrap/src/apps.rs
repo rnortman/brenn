@@ -65,7 +65,7 @@ pub(crate) async fn run_startup_hooks(
 /// passes working_dir checks. Called before validation; actual cloning happens
 /// after via `brenn_git::repo_clone::auto_clone_repos`.
 pub(crate) fn prepare_repo_dirs(config: &BrennConfig) {
-    if let Some(ref repo_dir) = config.repo_dir {
+    if let Some(ref repo_dir) = config.repo_sync.repo_dir {
         std::fs::create_dir_all(repo_dir)
             .unwrap_or_else(|e| panic!("failed to create repo_dir {:?}: {e}", repo_dir,));
         for repo in &config.repos {

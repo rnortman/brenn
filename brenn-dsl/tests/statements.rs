@@ -180,12 +180,203 @@ fn a_mount_carries_an_optional_tail() {
     let agent = file.agents().next().expect("the corpus declares an agent");
 
     assert_eq!(agent.mounts[0].repo.head.value(), "ws");
-    assert_eq!(
-        agent.mounts[0].tail.as_ref().expect("a tail").attrs.len(),
-        1
-    );
+    let tail = &agent.mounts[0].tail.as_ref().expect("a tail").attrs;
+    assert!(tail.working_dir.is_some());
+    assert!(tail.access.is_none());
     assert!(agent.mounts[1].tail.is_none());
     assert!(agent.mounts[1].semi, "the bare form ends in `;`");
+}
+
+/// A statement tail is a vocabulary, so a misspelled key is refused where it
+/// was written and a token is the bare word the entity bodies use.
+#[test]
+fn a_statement_tail_is_a_closed_vocabulary() {
+    let mount = |tail: &str| {
+        format!("agent Assistant() {{\n    mount ws {{ {tail} }}\n}}\nnew alice: Assistant();\n")
+    };
+    let file = parse_str(&mount("access = read-only;"), "t.brenn").expect("a parse");
+    let agent = file.agents().next().expect("an agent class");
+    let tail = &agent.mounts[0].tail.as_ref().expect("a tail").attrs;
+    assert_eq!(
+        tail.access
+            .as_ref()
+            .expect("an access token")
+            .value
+            .as_str(),
+        "read-only"
+    );
+
+    let error = parse_str(&mount("workdir = true;"), "t.brenn").expect_err("`workdir` is no key");
+    assert!(error.message.contains("workdir"), "{}", error.message);
+    assert_eq!(error.line_col(), Some((2, 16)));
+
+    let error =
+        parse_str(&mount("access = \"read-only\";"), "t.brenn").expect_err("a token is a word");
+    assert!(
+        error.message.contains("expected a bare word"),
+        "{}",
+        error.message
+    );
+}
+
+/// A `subscribe` tail's depths take the same two spellings a channel body's do:
+/// a count, or the bare word `unbounded`.
+#[test]
+fn a_subscribe_tail_takes_a_count_or_the_unbounded_word() {
+    let subscribe = |tail: &str| {
+        format!(
+            "agent Assistant() {{\n    subscribe cmd {{ {tail} }}\n}}\nnew alice: Assistant();\n"
+        )
+    };
+    let file =
+        parse_str(&subscribe("push_depth = 4; noise = metered;"), "t.brenn").expect("a parse");
+    let agent = file.agents().next().expect("an agent class");
+    let tail = &agent.subs[0].tail.as_ref().expect("a tail").attrs;
+    let push_depth = &tail.push_depth.as_ref().expect("a depth").value;
+    let IntOrWord::Int(count) = push_depth else {
+        panic!("the written count is an integer: {push_depth:?}");
+    };
+    assert_eq!(*count.value(), 4);
+    assert_eq!(
+        tail.noise.as_ref().expect("a noise token").value.as_str(),
+        "metered"
+    );
+
+    let file = parse_str(&subscribe("retain_depth = unbounded;"), "t.brenn").expect("a parse");
+    let agent = file.agents().next().expect("an agent class");
+    let tail = &agent.subs[0].tail.as_ref().expect("a tail").attrs;
+    let retain_depth = &tail.retain_depth.as_ref().expect("a depth").value;
+    let IntOrWord::Word(word) = retain_depth else {
+        panic!("the written token is a word: {retain_depth:?}");
+    };
+    assert_eq!(word.as_str(), "unbounded");
+
+    let error = parse_str(&subscribe("retain_depth = \"unbounded\";"), "t.brenn")
+        .expect_err("the quoted form is no longer a spelling of the token");
+    assert!(
+        error.message.contains("expected an integer or a bare word"),
+        "{}",
+        error.message
+    );
+
+    let error = parse_str(&subscribe("sink = archive;"), "t.brenn").expect_err("`sink` is no key");
+    assert!(error.message.contains("sink"), "{}", error.message);
+}
+
+/// A binding tail is a vocabulary too, one per direction: a window on the way
+/// in, a rate on the way out. Fusing the two would admit `urgency` on an `in`
+/// binding at deserialize and leave it refused nowhere afterwards.
+#[test]
+fn a_binding_tail_is_typed_by_its_direction() {
+    let bind = |statements: &str| {
+        format!(
+            concat!(
+                "component Panel {{\n",
+                "    abi = dom;\n",
+                "    in messages;\n",
+                "    out outbound;\n",
+                "    io tick;\n",
+                "}}\n",
+                "surface alice_desk {{\n",
+                "    grants = [subscribe];\n",
+                "    new p1: Panel {{\n{}    }}\n",
+                "}}\n",
+            ),
+            statements
+        )
+    };
+
+    // Every token bare, in all three directions.
+    let document = bind(concat!(
+        "        in messages <- messages { noise = metered; retain_depth = unbounded; }\n",
+        "        out outbound -> \"local:panel/out\" { urgency = high; publish_capacity = 2.0; }\n",
+        "        io tick { noise = alarm; urgency = low; push_depth = 1; }\n",
+    ));
+    let file = parse_str(&document, "t.brenn").expect("a parse");
+    let surface = file.surfaces().next().expect("the document declares one");
+    let bindings = &surface.insts[0]
+        .body
+        .as_ref()
+        .expect("a body")
+        .value()
+        .bindings;
+
+    let Binding::Into(inbound) = &bindings[0] else {
+        panic!("the first binding points in");
+    };
+    let tail = &inbound.tail.as_ref().expect("a tail").attrs;
+    assert_eq!(
+        tail.noise.as_ref().expect("a noise token").value.as_str(),
+        "metered"
+    );
+    assert!(matches!(
+        tail.retain_depth.as_ref().expect("a depth").value,
+        IntOrWord::Word(_)
+    ));
+
+    let Binding::Outof(outbound) = &bindings[1] else {
+        panic!("the second binding points out");
+    };
+    let tail = &outbound.tail.as_ref().expect("a tail").attrs;
+    assert_eq!(
+        tail.urgency
+            .as_ref()
+            .expect("an urgency token")
+            .value
+            .as_str(),
+        "high"
+    );
+
+    let Binding::Both(free) = &bindings[2] else {
+        panic!("the third binding is an io port");
+    };
+    let tail = &free.tail.as_ref().expect("a tail").attrs;
+    assert_eq!(
+        tail.noise.as_ref().expect("a noise token").value.as_str(),
+        "alarm"
+    );
+    assert_eq!(
+        tail.urgency
+            .as_ref()
+            .expect("an urgency token")
+            .value
+            .as_str(),
+        "low"
+    );
+
+    // A key of the other direction is not a key of this one.
+    let error = parse_str(
+        &bind("        in messages <- messages { urgency = high; }\n"),
+        "t.brenn",
+    )
+    .expect_err("`urgency` is an output knob");
+    assert!(error.message.contains("urgency"), "{}", error.message);
+
+    // A key of neither direction.
+    let error = parse_str(&bind("        io tick { sink = archive; }\n"), "t.brenn")
+        .expect_err("`sink` is a channel's key, not a port's");
+    assert!(error.message.contains("sink"), "{}", error.message);
+
+    // The quoted spelling of a token is no longer one.
+    let error = parse_str(&bind("        io tick { noise = \"alarm\"; }\n"), "t.brenn")
+        .expect_err("a token is a bare word");
+    assert!(
+        error.message.contains("expected a bare word"),
+        "{}",
+        error.message
+    );
+
+    // A depth takes a count or the bare word, never the quoted word.
+    let error = parse_str(
+        &bind("        io tick { push_depth = \"unbounded\"; }\n"),
+        "t.brenn",
+    )
+    .expect_err("a depth is a count or a bare word");
+    assert!(
+        error.message.contains("expected an integer or a bare word"),
+        "{}",
+        error.message
+    );
 }
 
 /// A subscription takes a handle or a literal address, and `f"…"` is the
@@ -327,7 +518,16 @@ fn bindings_carry_their_direction_as_the_variant() {
         panic!("the second binding is an io port");
     };
     assert!(free.target.is_none(), "a free io port connects nothing");
-    assert_eq!(free.tail.as_ref().expect("a tail").attrs.len(), 2);
+    let tail = &free.tail.as_ref().expect("a tail").attrs;
+    assert!(matches!(
+        tail.push_depth.as_ref().expect("a push depth").value,
+        IntOrWord::Int(_)
+    ));
+    assert!(matches!(
+        tail.retain_depth.as_ref().expect("a retain depth").value,
+        IntOrWord::Int(_)
+    ));
+    assert!(tail.noise.is_none(), "the corpus states no noise policy");
 
     let echo = surface.insts[1].body.as_ref().expect("a body");
     assert!(matches!(&echo.bindings[0], Binding::Both(io) if io.target.is_some()));

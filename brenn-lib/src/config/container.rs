@@ -6,7 +6,7 @@ use serde::Deserialize;
 ///
 /// Multiple apps can share a container definition (at different working dirs).
 /// Each CC session gets its own ephemeral container instance (`--rm`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ContainerConfig {
     /// Podman image name/tag (e.g. "brenn-cc:latest").
@@ -28,7 +28,7 @@ pub struct ContainerConfig {
     pub extra_args: Vec<String>,
 }
 
-fn default_container_home() -> PathBuf {
+pub(crate) fn default_container_home() -> PathBuf {
     PathBuf::from("/home/user")
 }
 

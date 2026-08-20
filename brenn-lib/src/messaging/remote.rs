@@ -83,7 +83,7 @@ pub enum RemoteGrant {
 /// Depths are plain integers rather than the `Depth` ladder: `"unbounded"` is
 /// not an answer a B7 network principal may be given, so the type does not
 /// offer it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteSubscribeAclRaw {
     /// `exact = "channel"` — matches this channel and no other.
@@ -110,7 +110,7 @@ pub struct RemoteSubscribeAclRaw {
 /// `[[wasm_consumer]]`: the operator states intent, and deny-by-default reads
 /// straight off the config. `deny_unknown_fields` here and on the nested ACL
 /// entry closes the door on typos.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteConfigRaw {
     /// Globally unique slug; becomes `remote:<slug>` as the participant

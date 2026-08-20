@@ -2,7 +2,7 @@ use brenn_surface_schema::LogLevel;
 use serde::Deserialize;
 
 /// Top-level `[observability]` config section.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ObservabilityConfig {
     pub usage: UsageObservabilityConfig,
@@ -26,7 +26,7 @@ pub struct ObservabilityConfig {
 /// Default [`ObservabilityConfig::surface_error_publish_floor`]: `warn` — the
 /// admission floor the interim server-side path enforced, preserved as the
 /// default publish floor.
-fn default_surface_error_publish_floor() -> LogLevel {
+pub(crate) fn default_surface_error_publish_floor() -> LogLevel {
     LogLevel::Warn
 }
 
@@ -41,7 +41,7 @@ impl Default for ObservabilityConfig {
 }
 
 /// Usage-observability sub-section (`[observability.usage]`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct UsageObservabilityConfig {
     /// Inactivity gap in minutes that closes a usage session. Default: 30.

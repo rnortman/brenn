@@ -100,6 +100,20 @@ impl Diagnostic {
             .map(|position| (position.line + 1, position.col + 1))
     }
 
+    /// The whole diagnostic as text: the `Display` line, then one indented
+    /// line per related location.
+    ///
+    /// Multi-line and newline-free at both ends, so a caller decides whether it
+    /// goes to stderr, into a panic message, or into a joined block.
+    pub fn render(&self) -> String {
+        let mut out = self.to_string();
+        for (note, span) in &self.related {
+            out.push_str("\n  ");
+            out.push_str(&Self::related_line(note, span));
+        }
+        out
+    }
+
     /// `file:line:col: note` for one entry of [`Diagnostic::related`].
     ///
     /// Degrades gracefully: each of filename and position is omitted from the
@@ -113,6 +127,19 @@ impl Diagnostic {
             (None, None) => note.to_string(),
         }
     }
+}
+
+/// A whole list of diagnostics as text: each one [`Diagnostic::render`]ed, one
+/// per block, in the order the pipeline raised them.
+///
+/// The one home for how a list reads, so a boot panic and `dsl_cli` show the
+/// same thing. Newline-free at both ends, like the single-diagnostic rendering.
+pub fn render_all(diagnostics: &[Diagnostic]) -> String {
+    diagnostics
+        .iter()
+        .map(Diagnostic::render)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A set, as a diagnostic that expects one of its members lists it:
@@ -143,6 +170,20 @@ pub fn two_site(
     let mut diagnostic = Diagnostic::at(message, span);
     diagnostic.related.push((related.into(), related_span));
     diagnostic
+}
+
+/// A second statement of something admitted once, refused at its own site and
+/// citing the first.
+///
+/// The one wording of that refusal, shared by every layer that counts
+/// at-most-once keys, so belt and brace say the same thing.
+pub fn duplicate_statement(context: &str, key: &str, span: Span, first: Span) -> Diagnostic {
+    two_site(
+        format!("{context} states `{key}` once, and this is the second"),
+        span,
+        "first stated here",
+        first,
+    )
 }
 
 /// Every key seen once, and a diagnostic per repeat citing the site that holds
@@ -214,6 +255,52 @@ mod tests {
             Diagnostic::related_line("declared here", &Span::unknown()),
             "declared here"
         );
+    }
+
+    #[test]
+    fn render_puts_each_related_location_on_its_own_indented_line() {
+        let span = parsed_span();
+        let mut diagnostic = Diagnostic::at("no acl at the top level", span.clone());
+        diagnostic
+            .related
+            .push(("declared here".to_string(), span.clone()));
+        diagnostic
+            .related
+            .push(("and here".to_string(), Span::unknown()));
+        assert_eq!(
+            diagnostic.render(),
+            "main.brenn:1:5: no acl at the top level\n  \
+             main.brenn:1:5: declared here\n  and here"
+        );
+    }
+
+    #[test]
+    fn render_of_a_diagnostic_with_no_related_sites_is_the_display_line() {
+        let diagnostic = Diagnostic::unpositioned("no such file", "main.brenn");
+        assert_eq!(diagnostic.render(), "main.brenn: no such file");
+    }
+
+    /// The list rendering is what a boot panic and `dsl_cli` both show, so it
+    /// carries every diagnostic: a report that shows only the first would make
+    /// the accumulate-don't-first-error invariant invisible exactly where an
+    /// operator reads it.
+    #[test]
+    fn render_all_carries_every_diagnostic_and_no_edge_newline() {
+        let span = parsed_span();
+        let mut first = Diagnostic::at("no acl at the top level", span.clone());
+        first.related.push(("declared here".to_string(), span));
+        let second = Diagnostic::unpositioned("no such file", "other.brenn");
+        let rendered = render_all(&[first, second]);
+        assert_eq!(
+            rendered,
+            "main.brenn:1:5: no acl at the top level\n  \
+             main.brenn:1:5: declared here\nother.brenn: no such file"
+        );
+    }
+
+    #[test]
+    fn render_all_of_nothing_is_nothing() {
+        assert_eq!(render_all(&[]), "");
     }
 
     #[test]

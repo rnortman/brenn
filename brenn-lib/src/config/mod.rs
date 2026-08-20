@@ -5,6 +5,7 @@ mod automation;
 mod brenn;
 mod claude_defaults;
 mod container;
+pub(crate) mod dsl_lower;
 mod events;
 mod frontmatter;
 mod hooks;
@@ -33,6 +34,7 @@ pub(crate) use brenn::load_config_from;
 pub use brenn::*;
 pub use claude_defaults::*;
 pub use container::*;
+pub use dsl_lower::lower;
 pub use events::*;
 pub use frontmatter::*;
 pub use hooks::*;
@@ -50,7 +52,7 @@ pub use security::*;
 pub use server::*;
 pub use surface_description::*;
 #[cfg(any(test, feature = "testutils"))]
-pub use test_fixtures::test_app_config;
+pub use test_fixtures::{repo_sync_at, test_app_config};
 pub use watchdog::*;
 
 #[cfg(test)]

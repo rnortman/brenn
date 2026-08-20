@@ -74,7 +74,7 @@ fn two_app_mount_config(
     };
     BrennConfig {
         server: super::test_server_config(),
-        repo_dir: Some(dir.to_path_buf()),
+        repo_sync: repo_sync_at(dir),
         repos,
         apps: vec![
             make_app("app-a", app_a_dir, app_a_mounts),

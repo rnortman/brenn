@@ -36,7 +36,7 @@ pub const RESERVED_CONFIG_PREFIX: &str = "brenn.";
 
 /// Global WASM-host policy (`[wasm]` block). Omitting the block entirely
 /// produces the same defaults as an empty `[wasm]` block.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WasmConfig {
     /// Default store size cap applied to every `[[webhook_endpoint]]` with
@@ -46,7 +46,7 @@ pub struct WasmConfig {
     pub store_size_limit: String,
 }
 
-fn default_store_size_limit() -> String {
+pub(crate) fn default_store_size_limit() -> String {
     "64MiB".to_string()
 }
 

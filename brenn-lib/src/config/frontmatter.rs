@@ -16,7 +16,7 @@ use serde::Deserialize;
 /// give per-field language defaults (empty vec, `0_u32`, `false`),
 /// whereas the runtime semantics described above require named
 /// defaults that only fire on the serde path.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct FrontmatterRenderConfig {
     /// Whitelist of top-level keys to render. Empty = render all.

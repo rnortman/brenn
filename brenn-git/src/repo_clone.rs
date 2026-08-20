@@ -127,7 +127,11 @@ pub async fn auto_clone_repos(
     apps: &IndexMap<String, AppConfig>,
     alert_dispatcher: &AlertDispatcher,
 ) {
-    let repo_dir = config.repo_dir.as_ref().expect("caller checked repo_dir");
+    let repo_dir = config
+        .repo_sync
+        .repo_dir
+        .as_ref()
+        .expect("caller checked repo_sync.repo_dir");
 
     let clone_futs: Vec<futures::future::BoxFuture<'static, ()>> = config
         .repos
@@ -202,7 +206,7 @@ mod tests {
 
     use git_fixture::{git as fixture_git, init_bare_repo, init_repo};
 
-    use brenn_lib::config::{AccessLevel, BrennConfig, RepoDeclRaw};
+    use brenn_lib::config::{AccessLevel, BrennConfig, RepoDeclRaw, repo_sync_at};
     use brenn_obs::alerting::make_capturing_alerter;
     use indexmap::IndexMap;
     use tracing_test::traced_test;
@@ -276,11 +280,11 @@ mod tests {
         remote
     }
 
-    /// Build a minimal `BrennConfig` with `repo_dir = repo_dir` and a single
+    /// Build a minimal `BrennConfig` with `repo_sync.repo_dir = repo_dir` and a single
     /// repo declaration pointing at `remote_url`.
     fn minimal_config(repo_dir: &std::path::Path, slug: &str, remote_url: &str) -> BrennConfig {
         BrennConfig {
-            repo_dir: Some(repo_dir.to_path_buf()),
+            repo_sync: repo_sync_at(repo_dir),
             repos: vec![RepoDeclRaw {
                 slug: slug.to_string(),
                 remote: remote_url.to_string(),
@@ -539,7 +543,7 @@ mod tests {
         // Repo 2: proper clone but config points at a different remote.
         prepare_repo_dirs_for_test(repo_dir.path(), "drift-repo2");
         let config_for_clone = BrennConfig {
-            repo_dir: Some(repo_dir.path().to_path_buf()),
+            repo_sync: repo_sync_at(repo_dir.path()),
             repos: vec![brenn_lib::config::RepoDeclRaw {
                 slug: "drift-repo2".to_string(),
                 remote: remote_a.path().display().to_string(),
@@ -555,7 +559,7 @@ mod tests {
 
         // Now a combined config: fail-repo points at a URL, drift-repo2 points at remote B.
         let config = BrennConfig {
-            repo_dir: Some(repo_dir.path().to_path_buf()),
+            repo_sync: repo_sync_at(repo_dir.path()),
             repos: vec![
                 brenn_lib::config::RepoDeclRaw {
                     slug: "fail-repo".to_string(),

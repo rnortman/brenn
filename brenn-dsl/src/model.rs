@@ -367,22 +367,30 @@ pub struct InstBody {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub enum Binding {
     /// `in messages <- messages_p1;`
-    Into(DirBinding),
+    Into(DirBinding<InTail>),
     /// `out takeover -> "local:brenn/takeover";`
-    Outof(DirBinding),
+    Outof(DirBinding<OutTail>),
     /// `io acks <-> acks;` or the free form `io tick { push_depth = 1; }`
-    Both(IoBinding),
+    ///
+    /// Boxed: an `io` tail is the union of the two directions, so this variant
+    /// is half again the size of either of the others.
+    Both(Box<IoBinding>),
 }
 
 /// A directional binding: a port connected to a channel. One struct for `in`
 /// and `out` — the direction is the `Binding` variant, which is the only thing
 /// that ever distinguished the two.
+///
+/// `T` is the tail vocabulary the direction admits. The two directions read
+/// disjoint key sets — a window on the way in, a rate on the way out — so
+/// fusing them into one vocabulary would admit `urgency` on an `in` binding at
+/// deserialize and leave it refused nowhere afterwards.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct DirBinding {
+pub struct DirBinding<T> {
     pub port: Spanned<String>,
     pub chan: ChanRef,
-    pub tail: Option<AttrBlock>,
+    pub tail: Option<AttrBlock<T>>,
     /// Whether a `;` terminated the statement.
     pub semi: bool,
 }
@@ -393,7 +401,7 @@ pub struct DirBinding {
 pub struct IoBinding {
     pub port: Spanned<String>,
     pub target: Option<ChanRef>,
-    pub tail: Option<AttrBlock>,
+    pub tail: Option<AttrBlock<IoTail>>,
     /// Whether a `;` terminated the statement.
     pub semi: bool,
 }
@@ -490,7 +498,7 @@ pub enum McpServerStmt {
 #[serde(deny_unknown_fields)]
 pub struct MountStmt {
     pub repo: PathRef,
-    pub tail: Option<AttrBlock>,
+    pub tail: Option<AttrBlock<MountTail>>,
     /// Whether a `;` terminated the statement.
     pub semi: bool,
 }
@@ -501,7 +509,7 @@ pub struct MountStmt {
 #[serde(deny_unknown_fields)]
 pub struct SubscribeStmt {
     pub chan: ChanRef,
-    pub tail: Option<AttrBlock>,
+    pub tail: Option<AttrBlock<SubscribeTail>>,
     /// Whether a `;` terminated the statement.
     pub semi: bool,
 }
@@ -510,9 +518,11 @@ pub struct SubscribeStmt {
 /// binding, mount or subscription.
 ///
 /// `A` is the vocabulary the entries deserialize into. It defaults to `AttrMap`
-/// — an untyped body — which is what the tails carry: which keys a binding or
-/// mount tail admits depends on the channel family or the repo it attaches to,
-/// and only resolution knows that.
+/// — an untyped body, which is what a component instance's body carries.
+/// Every statement tail is typed, by the union of the raw tail fields across
+/// the families that statement can lower into; which family a tail turns out
+/// to be depends on the address it names, so a key that is legal in one of
+/// them and not in another is refused at lowering rather than here.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AttrBlock<A = AttrMap> {
@@ -579,12 +589,23 @@ pub trait MapValues<V, V2> {
     ) -> Result<Self::Output, Diagnostic>;
 }
 
+/// A vocabulary whose every key is a projection takes no `<V>`: the parse form
+/// and the resolved form are the same type, because there is nothing in it a
+/// resolver would carry. Declare that one with `struct Name;` instead of
+/// `struct Name<V>` — writing `<V>` for a body with no value field is a type
+/// parameter nothing uses, which does not compile.
 macro_rules! vocabulary {
     ($(
         $(#[$struct_meta:meta])*
         struct $name:ident<V> { $($body:tt)* }
     )+) => {
-        $( vocabulary_emit! { f listed yes [$(#[$struct_meta])*] $name [] [] [] [] [] $($body)* } )+
+        $( vocabulary_emit! { f listed yes generic [$(#[$struct_meta])*] $name [] [] [] [] [] $($body)* } )+
+    };
+    ($(
+        $(#[$struct_meta:meta])*
+        struct $name:ident; { $($body:tt)* }
+    )+) => {
+        $( vocabulary_emit! { f listed yes plain [$(#[$struct_meta])*] $name [] [] [] [] [] $($body)* } )+
     };
 }
 
@@ -597,15 +618,87 @@ macro_rules! vocabulary {
 /// destructure, and the per-field crossing — are built one field at a time and
 /// emitted whole.
 macro_rules! vocabulary_emit {
-    // Every field walked: the struct, the mapping that carries it to another
-    // value type, and the key/value listing of the resolved form.
-    ($f:ident $listed:ident $empty:ident [$(#[$struct_meta:meta])*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*]) => {
-        $(#[$struct_meta])*
-        #[derive(Clone, Debug, Deserialize, PartialEq)]
-        #[serde(deny_unknown_fields)]
-        pub struct $name<V = Spanned<Value>> {
-            $($fields)*
-        }
+    // Every field walked: hand the accumulators to the emit the shape marker
+    // selects.
+    ($f:ident $listed:ident $empty:ident $shape:ident [$(#[$struct_meta:meta])*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*]) => {
+        vocabulary_item! { $shape $f $listed $empty [$(#[$struct_meta])*] $name
+            [$($fields)*] [$($names)*] [$($maps)*] [$($empties)*] [$($entries)*] }
+    };
+
+    // An optional value field. A value field is what `V` is for, so these four
+    // arms name the shape: a `struct Name;` vocabulary stating one has no
+    // matching arm and fails the expansion.
+    ($f:ident $listed:ident $empty:ident generic [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*]
+        $(#[$field_meta:meta])* opt $key:ident: V, $($rest:tt)*) => {
+        vocabulary_emit! { $f $listed $empty generic [$($meta)*] $name
+            [$($fields)* $(#[$field_meta])* pub $key: Option<Attr<V>>,]
+            [$($names)* $key,]
+            [$($maps)* $key: match $key {
+                Some(attr) => Some(Attr { value: $f(attr.value)? }),
+                None => None,
+            },]
+            [$($empties)* $key: None,]
+            [$($entries)* if let Some(attr) = $key {
+                $listed.push((stringify!($key).to_string(), attr.value.into_rval()));
+            }]
+            $($rest)* }
+    };
+
+    // A required value field.
+    ($f:ident $listed:ident $empty:ident generic [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*]
+        $(#[$field_meta:meta])* req $key:ident: V, $($rest:tt)*) => {
+        vocabulary_emit! { $f $listed no generic [$($meta)*] $name
+            [$($fields)* $(#[$field_meta])* pub $key: Attr<V>,]
+            [$($names)* $key,]
+            [$($maps)* $key: Attr { value: $f($key.value)? },]
+            [$($empties)*]
+            [$($entries)* $listed.push((stringify!($key).to_string(), $key.value.into_rval()));]
+            $($rest)* }
+    };
+
+    // A projection-typed field, optional or required: already final, so it
+    // crosses as it is.
+    ($f:ident $listed:ident $empty:ident $shape:ident [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*]
+        $(#[$field_meta:meta])* opt $key:ident: $ty:ty, $($rest:tt)*) => {
+        vocabulary_emit! { $f $listed $empty $shape [$($meta)*] $name
+            [$($fields)* $(#[$field_meta])* pub $key: Option<Attr<$ty>>,]
+            [$($names)* $key,]
+            [$($maps)* $key,]
+            [$($empties)* $key: None,]
+            [$($entries)* if let Some(attr) = $key {
+                $listed.push((stringify!($key).to_string(), attr.value.into_rval()));
+            }]
+            $($rest)* }
+    };
+
+    ($f:ident $listed:ident $empty:ident $shape:ident [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*]
+        $(#[$field_meta:meta])* req $key:ident: $ty:ty, $($rest:tt)*) => {
+        vocabulary_emit! { $f $listed no $shape [$($meta)*] $name
+            [$($fields)* $(#[$field_meta])* pub $key: Attr<$ty>,]
+            [$($names)* $key,]
+            [$($maps)* $key,]
+            [$($empties)*]
+            [$($entries)* $listed.push((stringify!($key).to_string(), $key.value.into_rval()));]
+            $($rest)* }
+    };
+}
+
+/// The struct and its impls, in the shape the vocabulary's fields decided.
+///
+/// The two arms differ in exactly what the type parameter touches, and in
+/// nothing else: a body with value fields is generic over the value type and
+/// carries itself across phases through `map_values`, and a body of projections
+/// alone is one type in both phases and crosses as itself. Everything that does
+/// not vary with the shape — the struct, `entries`, `empty` — is emitted by the
+/// shared emit below, so a change to it is one edit rather than two that can
+/// drift.
+macro_rules! vocabulary_item {
+    (generic $f:ident $listed:ident $empty:ident [$(#[$struct_meta:meta])*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*]) => {
+        vocabulary_shared! { $listed $empty [$(#[$struct_meta])*] $name
+            [V = Spanned<Value>]
+            [impl $name<crate::resolved::RVal>]
+            [impl<V> $name<V>]
+            [$($fields)*] [$($names)*] [$($empties)*] [$($entries)*] }
 
         impl<V> $name<V> {
             /// Carry every value field through `f`, giving the same vocabulary
@@ -634,8 +727,48 @@ macro_rules! vocabulary_emit {
                 self.map_values(f)
             }
         }
+    };
 
-        impl $name<crate::resolved::RVal> {
+    (plain $f:ident $listed:ident $empty:ident [$(#[$struct_meta:meta])*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*]) => {
+        vocabulary_shared! { $listed $empty [$(#[$struct_meta])*] $name
+            []
+            [impl $name]
+            [impl $name]
+            [$($fields)*] [$($names)*] [$($empties)*] [$($entries)*] }
+
+        impl<V, V2> MapValues<V, V2> for $name {
+            type Output = $name;
+
+            /// Nothing in this body is a value position, so the crossing is the
+            /// identity — which is what lets a resolver hold one of these
+            /// alongside the generic vocabularies without knowing which it has.
+            fn map_all(
+                self,
+                _f: &mut impl FnMut(V) -> Result<V2, Diagnostic>,
+            ) -> Result<Self::Output, Diagnostic> {
+                Ok(self)
+            }
+        }
+    };
+}
+
+/// What a vocabulary emits whatever its shape: the struct, the key listing and
+/// the empty-body constructor.
+///
+/// The shape decides only the headers, so both shapes hand them in — the
+/// struct's type parameters, and the two impl heads the bodies below hang from.
+macro_rules! vocabulary_shared {
+    ($listed:ident $empty:ident [$(#[$struct_meta:meta])*] $name:ident
+     [$($params:tt)*] [$($entries_head:tt)*] [$($empty_head:tt)*]
+     [$($fields:tt)*] [$($names:tt)*] [$($empties:tt)*] [$($entries:tt)*]) => {
+        $(#[$struct_meta])*
+        #[derive(Clone, Debug, Deserialize, PartialEq)]
+        #[serde(deny_unknown_fields)]
+        pub struct $name<$($params)*> {
+            $($fields)*
+        }
+
+        $($entries_head)* {
             /// Every key the body carried, in declaration order, as a
             /// key/value listing.
             // Every key pushed unconditionally is a vocabulary whose keys are
@@ -652,62 +785,7 @@ macro_rules! vocabulary_emit {
             }
         }
 
-        vocabulary_empty! { $empty $name [$($empties)*] }
-    };
-
-    // An optional value field.
-    ($f:ident $listed:ident $empty:ident [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*]
-        $(#[$field_meta:meta])* opt $key:ident: V, $($rest:tt)*) => {
-        vocabulary_emit! { $f $listed $empty [$($meta)*] $name
-            [$($fields)* $(#[$field_meta])* pub $key: Option<Attr<V>>,]
-            [$($names)* $key,]
-            [$($maps)* $key: match $key {
-                Some(attr) => Some(Attr { value: $f(attr.value)? }),
-                None => None,
-            },]
-            [$($empties)* $key: None,]
-            [$($entries)* if let Some(attr) = $key {
-                $listed.push((stringify!($key).to_string(), attr.value.into_rval()));
-            }]
-            $($rest)* }
-    };
-
-    // A required value field.
-    ($f:ident $listed:ident $empty:ident [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*]
-        $(#[$field_meta:meta])* req $key:ident: V, $($rest:tt)*) => {
-        vocabulary_emit! { $f $listed no [$($meta)*] $name
-            [$($fields)* $(#[$field_meta])* pub $key: Attr<V>,]
-            [$($names)* $key,]
-            [$($maps)* $key: Attr { value: $f($key.value)? },]
-            [$($empties)*]
-            [$($entries)* $listed.push((stringify!($key).to_string(), $key.value.into_rval()));]
-            $($rest)* }
-    };
-
-    // A projection-typed field, optional or required: already final, so it
-    // crosses as it is.
-    ($f:ident $listed:ident $empty:ident [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*]
-        $(#[$field_meta:meta])* opt $key:ident: $ty:ty, $($rest:tt)*) => {
-        vocabulary_emit! { $f $listed $empty [$($meta)*] $name
-            [$($fields)* $(#[$field_meta])* pub $key: Option<Attr<$ty>>,]
-            [$($names)* $key,]
-            [$($maps)* $key,]
-            [$($empties)* $key: None,]
-            [$($entries)* if let Some(attr) = $key {
-                $listed.push((stringify!($key).to_string(), attr.value.into_rval()));
-            }]
-            $($rest)* }
-    };
-
-    ($f:ident $listed:ident $empty:ident [$($meta:tt)*] $name:ident [$($fields:tt)*] [$($names:tt)*] [$($maps:tt)*] [$($empties:tt)*] [$($entries:tt)*]
-        $(#[$field_meta:meta])* req $key:ident: $ty:ty, $($rest:tt)*) => {
-        vocabulary_emit! { $f $listed no [$($meta)*] $name
-            [$($fields)* $(#[$field_meta])* pub $key: Attr<$ty>,]
-            [$($names)* $key,]
-            [$($maps)* $key,]
-            [$($empties)*]
-            [$($entries)* $listed.push((stringify!($key).to_string(), $key.value.into_rval()));]
-            $($rest)* }
+        vocabulary_empty! { $empty [$($empty_head)*] $name [$($empties)*] }
     };
 }
 
@@ -719,15 +797,15 @@ macro_rules! vocabulary_emit {
 /// key changed from `opt` to `req` withdraws the constructor and fails the
 /// build at whoever was calling it.
 macro_rules! vocabulary_empty {
-    (yes $name:ident [$($empties:tt)*]) => {
-        impl<V> $name<V> {
+    (yes [$($head:tt)*] $name:ident [$($empties:tt)*]) => {
+        $($head)* {
             /// The vocabulary a body nobody wrote carries: no key at all.
-            pub fn empty() -> $name<V> {
+            pub fn empty() -> Self {
                 $name { $($empties)* }
             }
         }
     };
-    (no $name:ident [$($empties:tt)*]) => {};
+    (no [$($head:tt)*] $name:ident [$($empties:tt)*]) => {};
 }
 
 vocabulary! {
@@ -817,6 +895,10 @@ vocabulary! {
         opt prefix_device: V,
         opt container: V,
         opt container_working_dir: V,
+        /// The per-conversation send budget. Lowering nests this inside the
+        /// app's `messaging` table, so the key name transcribes but the
+        /// nesting does not.
+        opt send_budget: V,
         /// Optional, unlike a surface's or a remote's: an agent's config
         /// counterpart defaults, and absent there means no grants.
         opt grants: WordList,
@@ -874,6 +956,100 @@ vocabulary! {
         req command: V,
         opt args: V,
         opt env: V,
+    }
+}
+
+// ── statement tail vocabularies ──────────────────────────────────────────────
+//
+// A statement's trailing block is a vocabulary like any body, so a token is a
+// bare word here exactly as it is in an entity body — one spelling of a token
+// per language, and no serde rename table in human-authored source.
+//
+// Where a statement can lower into more than one config struct, its vocabulary
+// is the *union* of those structs' tail fields: which family a statement is
+// depends on the address it names, and that is not known until resolution.
+// Stating a key the family it turns out to be has no field for is refused at
+// lowering, at the value's own token.
+
+vocabulary! {
+    /// A `mount` statement's tail: `mount ws { access = read_only; }`.
+    ///
+    /// TODO(dsl-vocabulary-config-parity): a transcription of
+    /// `MountConfigRaw`'s fields other than `repo`, which the statement
+    /// carries.
+    struct MountTail<V> {
+        opt access: Word,
+        opt working_dir: V,
+        opt auto_pull: V,
+        opt primary: V,
+    }
+}
+
+vocabulary! {
+    /// A `subscribe` statement's tail: the union across the three subscription
+    /// families an agent's statement can lower into — messaging, webhook and
+    /// mqtt. The webhook family carries no `noise`; stating it on a `webhook:`
+    /// subscription is refused at lowering.
+    ///
+    /// Every key is a projection, so this body is one type in both phases.
+    ///
+    /// TODO(dsl-vocabulary-config-parity): a transcription of the three raw
+    /// subscription structs' fields other than the address each carries.
+    struct SubscribeTail; {
+        /// Depth fields take a count or the word `unbounded`.
+        opt push_depth: IntOrWord,
+        opt retain_depth: IntOrWord,
+        opt noise: Word,
+        opt wake_min: Word,
+    }
+}
+
+vocabulary! {
+    /// An `in` binding's tail: the union across the consumer and surface
+    /// subscription families, which differ by exactly one key.
+    /// `amplification` is a consumer's alone; stating it on a surface port is
+    /// refused at lowering.
+    ///
+    /// TODO(dsl-vocabulary-config-parity): a transcription of
+    /// `WasmConsumerSubscriptionRaw`'s and `SurfaceSubscriptionRaw`'s fields
+    /// other than the port and the channel the statement carries.
+    struct InTail<V> {
+        /// Depth fields take a count or the word `unbounded`.
+        opt push_depth: IntOrWord,
+        opt retain_depth: IntOrWord,
+        opt noise: Word,
+        opt wake_min: Word,
+        opt amplification: V,
+    }
+
+    /// An `out` binding's tail: the union across the consumer and surface
+    /// output families, whose fields are identical.
+    ///
+    /// TODO(dsl-vocabulary-config-parity): a transcription of
+    /// `WasmConsumerOutputRaw`'s and `SurfaceOutputRaw`'s fields other than
+    /// the port and the channel.
+    struct OutTail<V> {
+        opt urgency: Word,
+        opt publish_per_activation: V,
+        opt publish_capacity: V,
+    }
+
+    /// An `io` binding's tail: a port that reads and writes, so the union of
+    /// the two directions — minus `wake_min`, which neither io family carries,
+    /// and with `amplification`, which the consumer family does.
+    ///
+    /// TODO(dsl-vocabulary-config-parity): a transcription of
+    /// `WasmConsumerIoPortRaw`'s and `SurfaceIoPortRaw`'s fields other than the
+    /// port and the channel.
+    struct IoTail<V> {
+        /// Depth fields take a count or the word `unbounded`.
+        opt push_depth: IntOrWord,
+        opt retain_depth: IntOrWord,
+        opt noise: Word,
+        opt urgency: Word,
+        opt amplification: V,
+        opt publish_per_activation: V,
+        opt publish_capacity: V,
     }
 }
 
@@ -1147,9 +1323,11 @@ kindword_dispatch! {
 //
 // What has no spelling at all, and is not an oversight: `integrations` and a
 // container's per-integration overrides are maps of arbitrary nested tables with
-// no key vocabulary to transcribe, and `repo_dir` is a bare top-level scalar,
-// which the grammar has no form for — a document says `repo_dir` nowhere,
-// because there is no top-level attr.
+// no key vocabulary to transcribe.
+//
+// The grammar has no top-level attr form, so a bare top-level scalar in
+// `BrennConfig` is unwritable here; `repo_dir` is spelled in the `repo_sync`
+// section, which is where the config holds it.
 //
 // Everything else in `BrennConfig` that is not a section here has a declaration
 // form instead: channels, surfaces, agents, remotes, mqtt clients, webhooks,
@@ -1225,9 +1403,10 @@ vocabulary! {
         opt model: V,
     }
 
-    /// The `repo_sync` section: how often repos are polled, and when a pending
-    /// event is too old to inject.
+    /// The `repo_sync` section: where repo clones live, how often repos are
+    /// polled, and when a pending event is too old to inject.
     struct RepoSyncAttrs<V> {
+        opt repo_dir: V,
         opt poll_interval_secs: V,
         opt stale_conversation_days: V,
     }
@@ -1385,6 +1564,37 @@ pub fn section_kindword(node: &SectionNode) -> (String, Span) {
         .expect("a parsed node's span carries its source")
         .to_owned();
     (text, span)
+}
+
+/// The name a section was written with, if it carries one.
+///
+/// Read from the CST beside [`section_kindword`] rather than from a
+/// deserialized block, so a section whose body is refused still answers what it
+/// was.
+pub(crate) fn section_name(node: &SectionNode) -> Option<String> {
+    let section = node.node().read();
+    let name = section
+        .maybe_name()
+        .expect("a section node carries at most one name")?;
+    let text = name
+        .read()
+        .span()
+        .text_str()
+        .expect("a parsed node's span carries its source")
+        .to_owned();
+    Some(text)
+}
+
+/// How a section is identified where at most one of it is admitted: the
+/// kindword alone when it is unnamed, `"<kindword> <name>"` when it is named.
+///
+/// The one spelling of that key, shared by every layer that counts section
+/// multiplicity, so neither can count a different thing.
+pub fn section_key(kindword: &str, name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("{kindword} {name}"),
+        None => kindword.to_owned(),
+    }
 }
 
 /// Re-enter the bridge with the target the kindword selected.

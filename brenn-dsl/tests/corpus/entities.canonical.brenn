@@ -54,6 +54,7 @@ agent PersonalAssistant(slug: String) {
   prefix_device = true;
   container = "sandbox";
   container_working_dir = "/work";
+  send_budget = 40;
   grants = [subscribe, publish];
 }
 

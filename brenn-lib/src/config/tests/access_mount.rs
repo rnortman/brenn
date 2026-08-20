@@ -37,6 +37,7 @@ fn mount_config_defaults_from_toml() {
 
     let toml = format!(
         r#"
+[repo_sync]
 repo_dir = "{}"
 
 [[repo]]
@@ -68,6 +69,7 @@ fn mount_config_access_read_only_from_toml() {
 
     let toml = format!(
         r#"
+[repo_sync]
 repo_dir = "{}"
 
 [[repo]]

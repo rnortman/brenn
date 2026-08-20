@@ -7,7 +7,7 @@ use serde::Deserialize;
 /// Global automation defaults from the `[automation]` config section.
 ///
 /// All fields have sensible defaults; the section may be omitted.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutomationGlobalConfig {
     /// Per-job cap on fires per hour. Fires beyond this are dropped and

@@ -17,7 +17,7 @@ use serde::Deserialize;
 /// Raw `[app.acl]` sub-table for an LLM app. Absent in TOML ⇒ all lists empty
 /// (every field `#[serde(default)]`). `deny_unknown_fields` so a misspelled ACL
 /// key fails to parse rather than being silently ignored (design §2.5.1).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AppAclRaw {
     /// `[[app.acl.mqtt_subscribe]]` entries: `(client, topic_filter)` pairs.
@@ -64,7 +64,7 @@ pub struct AppAclRaw {
 
 /// Raw MQTT subscribe matcher: `{ client = "...", topic_filter = "..." }`.
 /// Strings are validated and converted to `acl::MqttSubMatcher` at resolution.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MqttSubMatcherRaw {
     /// MQTT client slug (validated at resolution time).
@@ -75,7 +75,7 @@ pub struct MqttSubMatcherRaw {
 
 /// Raw MQTT publish matcher: `{ client = "..." }`. Publish is client-scoped only
 /// (design §2.1); there is no topic dimension.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MqttClientMatcherRaw {
     /// MQTT client slug (validated at resolution time).
@@ -90,7 +90,7 @@ pub struct MqttClientMatcherRaw {
 /// (empty table) is rejected because no variant tag is present; one with both
 /// keys is rejected because an external-tag variant value is a single newtype
 /// string, not a two-key table (`deny_unknown_fields` reinforces this).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum ChannelMatcherRaw {
     /// `{ exact = "channel" }` — matches the channel exactly.
@@ -100,7 +100,7 @@ pub enum ChannelMatcherRaw {
 }
 
 /// Raw inbound webhook matcher: `{ endpoint = "..." }`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookMatcherRaw {
     /// Webhook endpoint slug (validated at resolution time).

@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 /// Server-global CC defaults, shared across all apps.
 /// Per-app configs can override `model`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClaudeDefaultsConfig {
     /// Path to the Brenn DisplayFile MCP stub script (noop_mcp.py).

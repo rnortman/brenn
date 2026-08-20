@@ -91,7 +91,7 @@ pub struct ResolvedConfig {
 /// - No apps are defined
 /// - Duplicate app or repo slugs
 /// - Invalid slug format
-/// - `repo_dir` not set when `[[repo]]` entries exist
+/// - `repo_sync.repo_dir` not set when `[[repo]]` entries exist
 /// - Mount references a nonexistent `[[repo]]` slug
 /// - Working directory rules violated (must have exactly one source)
 /// - `working_dir` does not exist or is not a directory
@@ -149,8 +149,8 @@ pub fn validate_and_resolve(
     // Validate top-level repo declarations.
     if !config.repos.is_empty() {
         assert!(
-            config.repo_dir.is_some(),
-            "`repo_dir` must be set when [[repo]] entries are defined",
+            config.repo_sync.repo_dir.is_some(),
+            "`repo_sync.repo_dir` must be set when [[repo]] entries are defined",
         );
     }
     {
@@ -384,7 +384,7 @@ pub fn validate_and_resolve(
         }
 
         // --- Resolve mounts from [[repo]] + [[app.mount]] ---
-        let repo_dir = config.repo_dir.as_deref();
+        let repo_dir = config.repo_sync.repo_dir.as_deref();
         let is_containerized = raw.container.is_some();
 
         // Look up container config early — needed for mount resolution.
@@ -407,7 +407,7 @@ pub fn validate_and_resolve(
             .map(|m| {
                 let repo_dir = repo_dir.unwrap_or_else(|| {
                     panic!(
-                        "app {:?}: mount {:?} requires `repo_dir` to be set",
+                        "app {:?}: mount {:?} requires `repo_sync.repo_dir` to be set",
                         raw.slug, m.repo,
                     )
                 });

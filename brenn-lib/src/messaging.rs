@@ -26,10 +26,10 @@ pub mod test_support;
 
 pub use addressing::{
     AUTO_CHANNEL_SEGMENT, auto_channel_cid, auto_channel_name, canonical_address,
-    chat_channel_uuid_from_address, durable_auto_channel_uuid, ephemeral_channel_uuid_from_name,
-    is_auto_channel_name, is_reserved_channel_name, is_unreserved_char,
-    local_channel_uuid_from_name, mqtt_channel_uuid_from_address, nondurable_channel_uuid,
-    tool_channel_uuid_from_address, webhook_channel_uuid_from_slug,
+    canonicalize_channel_address, chat_channel_uuid_from_address, durable_auto_channel_uuid,
+    ephemeral_channel_uuid_from_name, is_auto_channel_name, is_reserved_channel_name,
+    is_unreserved_char, local_channel_uuid_from_name, mqtt_channel_uuid_from_address,
+    nondurable_channel_uuid, tool_channel_uuid_from_address, webhook_channel_uuid_from_slug,
 };
 pub use config::{
     ChannelConfigRaw, Depth, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw,

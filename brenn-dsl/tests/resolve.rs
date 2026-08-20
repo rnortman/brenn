@@ -5,7 +5,8 @@
 
 mod support;
 
-use brenn_dsl::resolved::{ChanId, MatcherKind, RChanRef, RMatcherVal, RValue};
+use brenn_dsl::model::IntOrWord;
+use brenn_dsl::resolved::{ChanId, MatcherKind, RChanRef, RMatcherVal, RTail, RValue};
 use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 use support::{
@@ -567,21 +568,269 @@ fn an_observability_sub_block_is_checked_against_its_own_vocabulary() {
     );
 }
 
+/// The grammar admits a section inside any section, and only `alerting` and
+/// `observability` have a vocabulary for what they hold. Every other section
+/// holds nothing, and that is checked here rather than at boot.
 #[test]
-fn a_sub_block_of_a_section_with_no_dispatch_is_not_checked() {
-    let config = resolved(concat!(
-        "container alice {\n",
-        "    image = \"example.com/alice:latest\";\n",
-        "    home_dir = \"/home/alice\";\n",
-        "    anything { whatever = 1; }\n",
+fn a_sub_block_of_a_section_that_holds_none_is_refused() {
+    assert_eq!(
+        refusal(concat!(
+            "container alice {\n",
+            "    image = \"example.com/alice:latest\";\n",
+            "    home_dir = \"/home/alice\";\n",
+            "    anything { whatever = 1; }\n",
+            "}\n",
+        )),
+        "the `container` block holds no sub-blocks, so `anything` has no meaning here"
+    );
+}
+
+/// A kindword the parent's sub-block vocabulary knows, under a parent that has
+/// none: `usage` is `observability`'s, and a `server` holds nothing at all.
+#[test]
+fn a_known_sub_block_kindword_under_the_wrong_parent_is_refused() {
+    assert_eq!(
+        refusal(concat!(
+            "server {\n",
+            "    public_url = \"https://brenn.example.com\";\n",
+            "    usage { session_gap_minutes = 30; }\n",
+            "}\n",
+        )),
+        "the `server` block holds no sub-blocks, so `usage` has no meaning here"
+    );
+}
+
+/// Nesting one level deeper than the vocabulary goes: `ntfy` is a sub-block,
+/// and a sub-block of it is refused at the same check.
+#[test]
+fn a_section_nested_inside_a_sub_block_is_refused() {
+    assert_eq!(
+        refusal(concat!(
+            "alerting {\n",
+            "    max_alerts = 5;\n",
+            "    window_secs = 60;\n",
+            "    ntfy {\n",
+            "        url = \"https://ntfy.example.com/alice\";\n",
+            "        mail { to = \"alice@example.com\"; }\n",
+            "    }\n",
+            "}\n",
+        )),
+        "the `ntfy` block holds no sub-blocks, so `mail` has no meaning here"
+    );
+}
+
+// ── section multiplicity ─────────────────────────────────────────────────────
+//
+// At most one unnamed section per kindword, at most one named section per
+// (kindword, name), counted over the written document.
+
+/// The refusal cites both sites, because which of the two is the mistake is the
+/// reader's to decide.
+#[test]
+fn a_second_section_of_one_kindword_is_refused_at_both() {
+    let errors = compile(concat!(
+        "server { public_url = \"https://brenn.example.com\"; }\n",
+        "server { public_url = \"https://brenn.example.org\"; }\n",
+    ))
+    .expect_err("two `server` sections");
+    assert_eq!(errors.len(), 1, "{:?}", errors);
+    assert_eq!(
+        errors[0].message,
+        "a document states `server` once, and this is the second"
+    );
+    assert_eq!(errors[0].related.len(), 1, "{}", errors[0].render());
+    assert_eq!(errors[0].related[0].0, "first stated here");
+    // Which site is which is the whole value of this diagnostic: the editor
+    // opens on the second occurrence, and the first is what "first stated here"
+    // points at. Swapping the two would read as an instruction to delete the
+    // line to keep.
+    assert_eq!(errors[0].line_col(), Some((2, 1)));
+    assert_eq!(
+        errors[0].related[0].1.line_col_inner().map(|p| p.line + 1),
+        Some(1)
+    );
+}
+
+/// The walk is flat across every file of a document, so two files stating one
+/// section state it twice.
+#[test]
+fn a_section_duplicated_across_an_import_is_refused() {
+    assert_eq!(
+        refusal_tree(&[
+            (
+                "",
+                "use wiring::*;\nserver { public_url = \"https://brenn.example.com\"; }\n"
+            ),
+            (
+                "wiring",
+                "server { public_url = \"https://brenn.example.org\"; }\n"
+            ),
+        ]),
+        "a document states `server` once, and this is the second"
+    );
+}
+
+/// A named section is one per name: two containers with different names are not
+/// a duplicate, and two of one name are.
+#[test]
+fn a_named_section_is_one_per_name() {
+    resolved(concat!(
+        "container alice { image = \"example.com/cc:latest\"; home_dir = \"/home/alice\"; }\n",
+        "container bob { image = \"example.com/cc:latest\"; home_dir = \"/home/bob\"; }\n",
+    ));
+    assert_eq!(
+        refusal(concat!(
+            "container alice { image = \"example.com/cc:latest\"; home_dir = \"/home/one\"; }\n",
+            "container alice { image = \"example.com/cc:latest\"; home_dir = \"/home/two\"; }\n",
+        )),
+        "a document states `container alice` once, and this is the second"
+    );
+}
+
+/// Sub-blocks are counted the same way, scoped to the parent that holds them.
+#[test]
+fn a_second_sub_block_of_one_kindword_is_refused() {
+    assert_eq!(
+        refusal(concat!(
+            "alerting {\n",
+            "    max_alerts = 5;\n",
+            "    window_secs = 60;\n",
+            "    ntfy { url = \"https://ntfy.example.com/alice-one\"; }\n",
+            "    ntfy { url = \"https://ntfy.example.com/alice-two\"; }\n",
+            "}\n",
+        )),
+        "a `alerting` section states `ntfy` once, and this is the second"
+    );
+}
+
+/// The other parent that nests: both arms of the nesting list are exercised, so
+/// dropping either from it fails a test rather than silently losing check-time
+/// duplicate detection for that parent's sub-blocks.
+#[test]
+fn a_second_sub_block_under_the_other_nesting_parent_is_refused() {
+    assert_eq!(
+        refusal(concat!(
+            "observability {\n",
+            "    usage { session_gap_minutes = 30; }\n",
+            "    usage { session_gap_minutes = 60; }\n",
+            "}\n",
+        )),
+        "a `observability` section states `usage` once, and this is the second"
+    );
+}
+
+/// A kindword the context admits none of is not counted: saying `bogus` appears
+/// twice would claim one `bogus` would have been fine, and would swallow the
+/// dispatch's refusal for the second one.
+#[test]
+fn a_repeated_kindword_the_context_admits_none_of_is_refused_only_as_unknown() {
+    let messages = refusals("bogus { }\nbogus { }\n");
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    for message in &messages {
+        assert!(
+            message.starts_with("`bogus` is not a block a document admits"),
+            "{messages:?}"
+        );
+    }
+}
+
+/// Counted where a section is encountered, not where one survives: the first
+/// occupies its slot even though its own body was refused, so the operator gets
+/// both verdicts in one compile instead of one per run.
+#[test]
+fn a_refused_section_still_occupies_its_slot() {
+    let messages = refusals(concat!(
+        "server { nope = 1; }\n",
+        "server { public_url = \"https://brenn.example.com\"; }\n",
+    ));
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    // Both verdicts, in whichever order the passes run: which pass reports
+    // first is not part of the rule.
+    assert!(
+        messages
+            .iter()
+            .any(|m| m == "a document states `server` once, and this is the second"),
+        "{messages:?}"
+    );
+    assert!(messages.iter().any(|m| m.contains("nope")), "{messages:?}");
+}
+
+/// A parent that nests nothing says so and says nothing else: counting how
+/// often a sub-block appears there would tell the operator that one of them
+/// would have been fine.
+#[test]
+fn a_repeated_sub_block_under_a_parent_that_nests_nothing_is_refused_only_for_nesting() {
+    let messages = refusals(concat!(
+        "server {\n",
+        "    public_url = \"https://brenn.example.com\";\n",
+        "    ntfy { url = \"https://ntfy.example.com/alice-one\"; }\n",
+        "    ntfy { url = \"https://ntfy.example.com/alice-two\"; }\n",
         "}\n",
     ));
-    // A section whose sub-blocks are per-kindword tables has no dispatch to
-    // check them against, so what they hold is accepted as written — and
-    // carried, keys and all, since no vocabulary says otherwise.
-    let sub = &config.sections[0].subs[0];
-    assert_eq!(sub.kindword.value(), "anything");
-    assert_eq!(attr(sub, "whatever"), &RValue::Int(1));
+    assert_eq!(
+        messages,
+        vec![
+            "the `server` block holds no sub-blocks, so `ntfy` has no meaning here".to_string(),
+            "the `server` block holds no sub-blocks, so `ntfy` has no meaning here".to_string(),
+        ]
+    );
+}
+
+/// A webhook's blocks are a section list too, counted the same way: which
+/// scheme guards an endpoint must not be chosen by declaration order.
+#[test]
+fn a_second_webhook_block_of_one_kindword_is_refused() {
+    assert_eq!(
+        refusal(concat!(
+            "webhook alice_inbox {\n",
+            "    mount = \"/webhooks/alice-inbox\";\n",
+            "    signature { scheme = bearer-token; header = \"authorization\"; }\n",
+            "    signature { scheme = hmac-stripe; header = \"stripe-signature\"; }\n",
+            "}\n",
+        )),
+        "webhook `alice_inbox` states `signature` once, and this is the second"
+    );
+}
+
+/// A credential block is named, so it is one per id: two ids are two
+/// credentials, and one id twice is refused.
+#[test]
+fn a_webhook_credential_block_is_one_per_id() {
+    resolved(concat!(
+        "webhook alice_inbox {\n",
+        "    mount = \"/webhooks/alice-inbox\";\n",
+        "    signature { scheme = bearer-token; header = \"authorization\"; }\n",
+        "    token phone { secret_file = \"/home/alice/.secrets/phone.token\"; }\n",
+        "    token desk { secret_file = \"/home/alice/.secrets/desk.token\"; }\n",
+        "}\n",
+    ));
+    assert_eq!(
+        refusal(concat!(
+            "webhook alice_inbox {\n",
+            "    mount = \"/webhooks/alice-inbox\";\n",
+            "    signature { scheme = bearer-token; header = \"authorization\"; }\n",
+            "    token phone { secret_file = \"/home/alice/.secrets/one.token\"; }\n",
+            "    token phone { secret_file = \"/home/alice/.secrets/two.token\"; }\n",
+            "}\n",
+        )),
+        "webhook `alice_inbox` states `token phone` once, and this is the second"
+    );
+}
+
+/// An agent's hook blocks likewise: two `start_hooks` are two answers to one
+/// question.
+#[test]
+fn a_second_hook_block_of_one_kindword_is_refused() {
+    assert_eq!(
+        refusal(concat!(
+            "agent Assistant() {\n",
+            "    start_hooks { host = [\"git fetch\"]; }\n",
+            "    start_hooks { container = [\"pf rebuild\"]; }\n",
+            "}\n",
+            "new alice: Assistant();\n",
+        )),
+        "an agent states `start_hooks` once, and this is the second"
+    );
 }
 
 /// The value a resolved block — a section or a webhook sub-block, which are one
@@ -748,7 +997,7 @@ fn a_section_nested_in_a_webhook_sub_block_is_refused() {
             "    signature { scheme = bearer-token; nested { header = \"x\"; } }\n",
             "}\n",
         )),
-        "a `signature` block holds no sub-blocks"
+        "the `signature` block holds no sub-blocks, so `nested` has no meaning here"
     );
 }
 
@@ -765,7 +1014,7 @@ fn a_section_nested_in_an_agent_hook_block_is_refused() {
             "}\n",
             "new alice_pa: Assistant(slug = \"alice-pa\");\n",
         )),
-        "a `start_hooks` block holds no sub-blocks"
+        "the `start_hooks` block holds no sub-blocks, so `nested` has no meaning here"
     );
 }
 
@@ -815,7 +1064,45 @@ fn a_surface_carries_its_components_and_their_bindings() {
     assert_eq!(component.attrs[0].0, "chrome");
     let binding = &component.bindings[0];
     assert_eq!(binding.chan, Some(RChanRef::Decl(ChanId(0))));
-    assert_eq!(binding.tail[0].0, "push_depth");
+    let RTail::In(tail) = &binding.tail else {
+        panic!("the binding points in");
+    };
+    assert!(matches!(
+        tail.push_depth.as_ref().expect("a push depth").value,
+        IntOrWord::Int(_)
+    ));
+}
+
+/// A component instance's `parked_batch_depth` is a depth, so it is projected
+/// out of the body rather than resolved among its values: a bare `unbounded`
+/// there is the word, not a name the scope has to hold.
+#[test]
+fn a_components_parked_depth_is_projected() {
+    let config = resolved(&surface_doc(
+        "    abi = dom;\n    in messages;\n",
+        "        parked_batch_depth = unbounded;\n        in messages <- messages;\n",
+    ));
+    let component = &config.surfaces[0].components[0];
+    let depth = component
+        .parked_batch_depth
+        .as_ref()
+        .expect("a parked depth");
+    let IntOrWord::Word(word) = depth else {
+        panic!("the written token is a word: {depth:?}");
+    };
+    assert_eq!(word.as_str(), "unbounded");
+    assert!(
+        component.attrs.is_empty(),
+        "the projected key does not also ride among the values"
+    );
+
+    assert_eq!(
+        refusal(&surface_doc(
+            "    abi = dom;\n    in messages;\n",
+            "        parked_batch_depth = \"unbounded\";\n",
+        )),
+        "expected an integer or a bare word, found a string"
+    );
 }
 
 #[test]
@@ -1080,6 +1367,62 @@ fn two_surfaces_may_not_resolve_to_one_identity() {
     );
 }
 
+// ── statement tails ──────────────────────────────────────────────────────────
+
+/// A tail value that resolves to nothing withholds its statement: a mount
+/// tuned by a name that stands for nothing is not a mount, and half of one is
+/// worse than none.
+#[test]
+fn a_mount_whose_tail_value_is_unresolvable_is_withheld() {
+    let errors = refusals(concat!(
+        "repo notes {\n    remote = \"https://example.com/notes.git\";\n}\n",
+        "agent Assistant() {\n    mount notes { working_dir = nowhere; }\n}\n",
+        "new alice: Assistant();\n",
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("nowhere"), "{errors:?}");
+}
+
+/// A mount naming neither a repo that exists nor a value that resolves reports
+/// both in one compile, the way its sibling statement forms do.
+#[test]
+fn a_mount_reports_its_repo_and_its_tail_together() {
+    let errors = refusals(concat!(
+        "agent Assistant() {\n    mount elsewhere { working_dir = nowhere; }\n}\n",
+        "new alice: Assistant();\n",
+    ));
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(
+        errors.iter().any(|error| error.contains("nowhere")),
+        "{errors:?}"
+    );
+    assert!(
+        errors.iter().any(|error| error.contains("elsewhere")),
+        "{errors:?}"
+    );
+}
+
+/// The binding twin: an unresolvable tail value withholds the binding, and the
+/// instance with it, rather than leaving a port tuned differently than the
+/// document says.
+#[test]
+fn a_binding_whose_tail_value_is_unresolvable_is_withheld() {
+    let errors = refusals(concat!(
+        "channel messages at \"brenn:alice-desk.in.messages\";\n",
+        "component Panel {\n",
+        "    abi = processor;\n",
+        "    component_path = \"/lib/brenn_panel.wasm\";\n",
+        "    in messages;\n",
+        "}\n",
+        "new p1: Panel {\n",
+        "    grants = [];\n",
+        "    in messages <- messages { amplification = nowhere; }\n",
+        "}\n",
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("nowhere"), "{errors:?}");
+}
+
 // ── agent instantiation ──────────────────────────────────────────────────────
 
 /// An agent class exercising every statement an agent body has, and the
@@ -1125,7 +1468,7 @@ fn an_agent_instantiation_expands_its_class() {
     let model = agent.attrs.model.as_ref().expect("a model");
     assert_eq!(model.value.value(), &RValue::Str("sonnet".into()));
     assert_eq!(agent.mounts[0].repo.dotted(), "notes");
-    assert_eq!(agent.mounts[0].tail.len(), 1);
+    assert!(agent.mounts[0].tail.working_dir.is_some());
     assert_eq!(agent.subs[0].chan, RChanRef::Decl(ChanId(0)));
     assert_eq!(agent.acls[0].plane.value(), "subscribe");
     assert_eq!(agent.hooks[0].kindword.value(), "start_hooks");
@@ -2068,9 +2411,9 @@ fn a_webhook_block_reports_its_bad_value_and_its_nested_block_at_once() {
         "{errors:?}"
     );
     assert!(
-        errors
-            .iter()
-            .any(|error| error == "a `signature` block holds no sub-blocks"),
+        errors.iter().any(|error| {
+            error == "the `signature` block holds no sub-blocks, so `nested` has no meaning here"
+        }),
         "{errors:?}"
     );
 }

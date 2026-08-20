@@ -16,7 +16,7 @@ use super::repo::{MountConfigRaw, ResolvedMount};
 
 /// Raw per-app config as deserialized from TOML `[[app]]`.
 /// Validated and resolved into `AppConfig` by `validate_and_resolve`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfigRaw {
     /// URL-safe identifier (e.g. "pfin"). Must match `[a-z0-9][a-z0-9-]*`.

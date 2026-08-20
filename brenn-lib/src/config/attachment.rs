@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 /// Raw attachment target config as deserialized from TOML `[[app.attachment_target]]`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AttachmentTargetRaw {
     /// URL-safe slug identifier (e.g. "import").
@@ -20,7 +20,7 @@ pub struct AttachmentTargetRaw {
 }
 
 /// Handler configuration for an attachment target.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, tag = "type")]
 pub enum AttachmentHandlerConfig {
     /// Run a shell command with file-role substitution.

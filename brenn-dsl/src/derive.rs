@@ -1729,7 +1729,7 @@ fn binding_bounds(bindings: &[RBinding]) -> Vec<Bound<'_>> {
         .iter()
         .filter_map(|binding| {
             Some(Bound {
-                dir: binding.dir,
+                dir: binding.dir(),
                 chan: binding.chan.as_ref()?,
                 span: binding.port.span().clone(),
                 what: "binding",

@@ -12,7 +12,7 @@ use serde::Deserialize;
 /// Values are validated at boot (prefix a well-formed bare-name segment,
 /// `status_interval_secs` in range), not at parse time, mirroring the other
 /// boot-validated messaging config.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SurfaceDescriptionConfig {
     /// Bare-name namespace rooting every derived channel (e.g. `"surface"` ⇒

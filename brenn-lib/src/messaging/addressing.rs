@@ -229,6 +229,19 @@ pub fn canonical_address(name: &str) -> String {
     format!("{}{}", BRENN_ADDRESS_PREFIX, name)
 }
 
+/// Qualify an address that names no scheme with `brenn:`, leaving a
+/// scheme-qualified one alone.
+///
+/// A bare address means `brenn:` everywhere the operator can write one, and
+/// minted addresses are always qualified, so this is the one spelling every
+/// comparison against them has to reach first.
+pub fn canonicalize_channel_address(address: &str) -> String {
+    match ChannelScheme::of(address) {
+        Some(_) => address.to_string(),
+        None => canonical_address(address),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

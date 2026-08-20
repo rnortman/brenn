@@ -12,6 +12,7 @@ FIRST_PARTY_DEPS = [
     "//brenn-budget",
     "//brenn-common",
     "//brenn-db",
+    "//brenn-dsl",
     "//brenn-envelope",
     "//brenn-obs",
     "//brenn-queue",

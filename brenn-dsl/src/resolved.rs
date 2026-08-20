@@ -27,8 +27,9 @@ use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 
 use crate::model::{
-    AgentAttrs, ChannelAttrs, DocComment, IntOrWord, McpServerAttrs, MqttClientAttrs, RemoteAttrs,
-    RepoAttrs, SurfaceAttrs, WebhookAttrs, Word, WordList,
+    AgentAttrs, ChannelAttrs, DocComment, InTail, IntOrWord, IoTail, McpServerAttrs, MountTail,
+    MqttClientAttrs, OutTail, RemoteAttrs, RepoAttrs, SubscribeTail, SurfaceAttrs, WebhookAttrs,
+    Word, WordList,
 };
 
 /// A whole configuration, resolved.
@@ -373,6 +374,10 @@ pub struct RComponentInst {
     /// The `new` handle, which is the runtime's instance name.
     pub instance: Spanned<String>,
     pub class: ClassRef,
+    /// The parked window, in the count-or-word form a depth is written in.
+    /// A token context, so it is projected rather than resolved, and it rides
+    /// beside the other keys rather than among them.
+    pub parked_batch_depth: Option<IntOrWord>,
     pub attrs: Vec<(String, RVal)>,
     pub bindings: Vec<RBinding>,
 }
@@ -457,11 +462,33 @@ impl PortDir {
 /// A port connected to a channel, or a free io port tuned in place.
 #[derive(Debug, PartialEq)]
 pub struct RBinding {
-    pub dir: PortDir,
     pub port: Spanned<String>,
     /// `None` on a free io port: the port is tuned and connects nothing.
     pub chan: Option<RChanRef>,
-    pub tail: Vec<(String, RVal)>,
+    /// The tail, in the vocabulary the direction admits. The direction is
+    /// which variant this is: carrying a `PortDir` beside it would say the
+    /// same thing twice, and the two could disagree.
+    pub tail: RTail,
+}
+
+impl RBinding {
+    /// Which way the port faces.
+    pub fn dir(&self) -> PortDir {
+        match &self.tail {
+            RTail::In(_) => PortDir::In,
+            RTail::Out(_) => PortDir::Out,
+            RTail::Io(_) => PortDir::Io,
+        }
+    }
+}
+
+/// A binding's tail, in the vocabulary its direction admits.
+#[derive(Debug, PartialEq)]
+pub enum RTail {
+    In(InTail<RVal>),
+    Out(OutTail<RVal>),
+    /// Boxed: the union of the two directions, and so the largest of the three.
+    Io(Box<IoTail<RVal>>),
 }
 
 /// What a binding, subscription or matcher names.
@@ -497,7 +524,7 @@ pub struct RAgent {
 pub struct RMount {
     pub repo: HandlePath,
     pub repo_span: Spanned<String>,
-    pub tail: Vec<(String, RVal)>,
+    pub tail: MountTail<RVal>,
 }
 
 /// What an agent says about an mcp server: a top-level definition it names, or
@@ -519,7 +546,9 @@ pub struct RSubscribe {
     /// position, and a statement is the only thing a later refusal about this
     /// subscription can point at.
     pub span: Span,
-    pub tail: Vec<(String, RVal)>,
+    /// Every key is a projection, so the tail is the same type here as it was
+    /// at parse.
+    pub tail: SubscribeTail,
 }
 
 /// A `remote`, with its authority carried and unchecked.

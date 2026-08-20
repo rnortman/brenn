@@ -6,7 +6,7 @@ use serde::Deserialize;
 /// whose event loop has died or whose session I/O is dead while the bridge
 /// still believes CC is busy. Defaults are chosen so omitting the section
 /// requires no config-file change at deploy.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WatchdogConfig {
     /// How often the watchdog sweeps the bridge registry, in seconds.

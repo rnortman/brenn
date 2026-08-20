@@ -14,6 +14,7 @@ fn mount_config_parses_from_toml() {
 
     let toml = format!(
         r#"
+[repo_sync]
 repo_dir = "{}"
 
 [[repo]]
@@ -50,6 +51,43 @@ auto_pull = true
     assert!(!config.repos[1].auto_pull);
 }
 
+/// `repo_dir` lives in `[repo_sync]`, not at the top level. `BrennConfig`
+/// carries `deny_unknown_fields`, so a config that still sets the old
+/// top-level key fails to parse instead of silently losing the value — the
+/// no-shim cutover signal this codebase uses for moved config keys.
+#[test]
+fn top_level_repo_dir_is_rejected() {
+    let toml = r#"
+repo_dir = "/home/alice/repos"
+
+[[repo]]
+slug = "life"
+remote = "https://example.com/life.git"
+"#;
+    let error = toml::from_str::<BrennConfig>(toml).expect_err("top-level repo_dir is unknown");
+    assert!(
+        error.to_string().contains("repo_dir"),
+        "the parse error names the offending key: {error}"
+    );
+}
+
+/// `repo_dir` parses inside `[repo_sync]`.
+#[test]
+fn repo_sync_repo_dir_parses() {
+    let toml = r#"
+[repo_sync]
+repo_dir = "/home/alice/repos"
+poll_interval_secs = 60
+"#;
+    let config: BrennConfig = toml::from_str(toml).unwrap();
+    assert_eq!(
+        config.repo_sync.repo_dir.as_deref(),
+        Some(std::path::Path::new("/home/alice/repos"))
+    );
+    assert_eq!(config.repo_sync.poll_interval_secs, 60);
+    assert_eq!(config.repo_sync.stale_conversation_days, 7);
+}
+
 #[test]
 #[should_panic(expected = "duplicate repo slug")]
 fn repo_duplicate_slug_panics() {
@@ -59,7 +97,7 @@ fn repo_duplicate_slug_panics() {
 
     let config = BrennConfig {
         server: super::test_server_config(),
-        repo_dir: Some(dir.path().to_path_buf()),
+        repo_sync: repo_sync_at(dir.path()),
         repos: vec![
             RepoDeclRaw {
                 slug: "life".to_string(),
@@ -137,7 +175,7 @@ fn repo_reserved_slug_panics() {
 
     let config = BrennConfig {
         server: super::test_server_config(),
-        repo_dir: Some(dir.path().to_path_buf()),
+        repo_sync: repo_sync_at(dir.path()),
         repos: vec![RepoDeclRaw {
             slug: "all".to_string(),
             remote: "https://example.com/all.git".to_string(),
@@ -251,7 +289,7 @@ fn repo_invalid_slug_format_panics() {
 
     let config = BrennConfig {
         server: super::test_server_config(),
-        repo_dir: Some(dir.path().to_path_buf()),
+        repo_sync: repo_sync_at(dir.path()),
         repos: vec![RepoDeclRaw {
             slug: "BAD SLUG".to_string(),
             remote: "https://example.com/bad.git".to_string(),
@@ -327,7 +365,7 @@ fn mount_test_config(
 ) -> BrennConfig {
     BrennConfig {
         server: super::test_server_config(),
-        repo_dir: Some(dir.to_path_buf()),
+        repo_sync: repo_sync_at(dir),
         repos,
         apps: vec![AppConfigRaw {
             slug: "test".to_string(),

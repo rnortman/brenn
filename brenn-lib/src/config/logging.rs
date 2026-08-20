@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 pub use tracing::level_filters::LevelFilter;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Directory for all log files (diagnostic, security, and CC transcripts).
@@ -27,7 +27,7 @@ impl Default for LoggingConfig {
 }
 
 /// Deserialize a `LevelFilter` from a string like "info", "debug", etc.
-fn deserialize_level_filter<'de, D>(deserializer: D) -> Result<LevelFilter, D::Error>
+pub(crate) fn deserialize_level_filter<'de, D>(deserializer: D) -> Result<LevelFilter, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

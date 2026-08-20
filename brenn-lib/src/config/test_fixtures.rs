@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 use crate::access::AppPolicy;
 use crate::config::{
-    AppConfig, FrontmatterRenderConfig, PathMapper, PostPullHooksConfig, StartHooksConfig,
-    StartupHooksConfig,
+    AppConfig, FrontmatterRenderConfig, PathMapper, PostPullHooksConfig, RepoSyncConfig,
+    StartHooksConfig, StartupHooksConfig,
 };
 
 /// A minimal `AppConfig`: `slug` for both the slug and the display name, and
@@ -56,5 +56,13 @@ pub fn test_app_config(slug: &str) -> AppConfig {
         webhook_subscriptions: vec![],
         mqtt_subscriptions: vec![],
         chat_harness_policy: AppPolicy::default(),
+    }
+}
+
+/// A `[repo_sync]` section whose only stated key is the repo root.
+pub fn repo_sync_at(dir: &std::path::Path) -> RepoSyncConfig {
+    RepoSyncConfig {
+        repo_dir: Some(dir.to_path_buf()),
+        ..Default::default()
     }
 }

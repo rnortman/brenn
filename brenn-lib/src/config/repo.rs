@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// Top-level repo declaration from `[[repo]]`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RepoDeclRaw {
     /// URL-safe identifier (`[a-z0-9][a-z0-9-]*`). Globally unique across repos.
@@ -16,7 +16,7 @@ pub struct RepoDeclRaw {
 }
 
 /// Per-app mount from `[[app.mount]]`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MountConfigRaw {
     /// Slug of a `[[repo]]` entry.
@@ -89,9 +89,12 @@ impl ResolvedMount {
 }
 
 /// Repo-sync feature config from `[repo_sync]`. See `docs/designs/repo-sync.md`.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RepoSyncConfig {
+    /// Where Brenn stores repo clones on the host. Required if any `[[repo]]`
+    /// is defined. Resolved relative to cwd like other paths.
+    pub repo_dir: Option<PathBuf>,
     /// Poll interval in seconds. Applied uniformly to every unique remote.
     /// Default: 300 (5 min).
     pub poll_interval_secs: u64,
@@ -105,12 +108,13 @@ pub struct RepoSyncConfig {
 impl Default for RepoSyncConfig {
     fn default() -> Self {
         Self {
+            repo_dir: None,
             poll_interval_secs: 300,
             stale_conversation_days: 7,
         }
     }
 }
 
-fn default_true() -> bool {
+pub(crate) fn default_true() -> bool {
     true
 }

@@ -21,7 +21,8 @@ use uuid::Uuid;
 
 use super::{
     ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntryKind, WakeMin,
-    is_reserved_channel_name, is_unreserved_char, nondurable_channel_uuid,
+    canonicalize_channel_address, is_reserved_channel_name, is_unreserved_char,
+    nondurable_channel_uuid,
 };
 use crate::config::AppConfigRaw;
 
@@ -278,7 +279,7 @@ impl SendRate {
 /// synthesis owns identity and description — and all three depths are required.
 /// A tuning block may be keyed by `address_prefix` instead, standing for a whole
 /// family of dynamically named channels.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelConfigRaw {
     /// UUID v4 in canonical hyphenated form. Globally unique across `[[channel]]`.
@@ -348,7 +349,7 @@ pub struct ChannelConfigRaw {
 /// all-one-surface ⇒ page-local `local:`, anything spanning the wire ⇒
 /// `ephemeral:`. Adding an endpoint changes the address; nothing outlives that,
 /// because an anonymous channel is never durable.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionConfigRaw {
     /// The ports this connection wires together. Two reference forms:
@@ -397,7 +398,7 @@ pub struct ConnectionConfigRaw {
 }
 
 /// `[messaging]` section.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MessagingGlobalConfig {
     /// Default per-conversation send budget. Overridable per-app via
@@ -442,7 +443,7 @@ impl Default for MessagingGlobalConfig {
 }
 
 /// Per-app `[app.messaging]` block (raw form).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MessagingConfigRaw {
     // NOTE: the legacy `enabled` authorization boolean was removed (access-control
@@ -464,7 +465,7 @@ pub struct MessagingConfigRaw {
 /// `standing_retain_depth` and `sink` are per-channel/global only; this struct
 /// has `deny_unknown_fields`, so an attempt to set them here produces a
 /// deserialize error automatically.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MessagingSubscriptionRaw {
     /// Channel address, e.g. `brenn:my-channel`.
@@ -546,7 +547,7 @@ pub enum SurfaceGrant {
 /// Declares a WASM processing component as a bus subscriber. The component
 /// at `component_path` is loaded at bootstrap; a missing or unloadable
 /// component is a fail-fast bootstrap panic (config is host-authored).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WasmConsumerConfigRaw {
     /// Globally unique slug; becomes `wasm:<slug>` as the participant identity.
@@ -764,7 +765,7 @@ pub struct ActivationPacing {
 /// Reuses the same depth-inheritance ladder as app messaging subscriptions
 /// (`push_depth`/`retain_depth` optional, inherit channel → global).
 /// `noise` controls push-overflow alarm behavior.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WasmConsumerSubscriptionRaw {
     /// Channel address, e.g. `brenn:my-channel` or `webhook:my-endpoint`.
@@ -803,7 +804,7 @@ pub struct WasmConsumerSubscriptionRaw {
 /// Binds a logical output port name to a bus channel address. The component
 /// may call `publish(port, payload)` with this port name to send a message
 /// on the bound channel.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WasmConsumerOutputRaw {
     /// Logical output port name. Must be non-empty and unreserved-charset.
@@ -859,7 +860,7 @@ pub struct WasmConsumerOutputRaw {
 /// make it a named auto channel (`brenn:` for schedules that survive restart),
 /// or list it in a `[[connection]]` to let other components see and feed the
 /// same traffic; setting both is a boot panic.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WasmConsumerIoPortRaw {
     /// Logical port name presented to the guest for both directions. Must be
@@ -920,7 +921,7 @@ pub struct WasmConsumerIoPortRaw {
 /// presence is not what authorizes egress (that is the `mqtt_publish_acl` + `mqtt`
 /// grant). `client` must name a client covered by `mqtt_publish_acl`; a block for
 /// an unlisted client, or a duplicate `client`, is a boot panic (dead config).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WasmConsumerMqttOutputRaw {
     /// MQTT client slug this override applies to. Must be covered by
@@ -980,7 +981,7 @@ pub const DEFAULT_SURFACE_PUBLISH_PER_SEC: u32 = 1;
 ///
 /// This defines and parses these types; boot-time resolution + cross-validation
 /// (`resolve_surfaces`) is done separately.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SurfaceConfigRaw {
     /// Globally unique slug; becomes `surface:<slug>` as the participant identity.
@@ -1042,7 +1043,7 @@ pub struct SurfaceConfigRaw {
 }
 
 /// A component module to mount on a surface (`[[surface.component]]`).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SurfaceComponentRaw {
     /// Component module kind to mount. Must match `^[a-z0-9][a-z0-9-]*$` — the
@@ -1209,7 +1210,7 @@ pub type AttachPrincipalBudgets = Vec<(Option<String>, AttachSendBudget)>;
 /// `channel` is a **full scheme-qualified address** (`ephemeral:protobar-demo`,
 /// `brenn:alerts.high`) — the scheme selects the delivery class, unlike the
 /// bare-name ACL matcher values.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SurfaceSubscriptionRaw {
     /// Full scheme-qualified channel address to subscribe.
@@ -1265,7 +1266,7 @@ pub struct SurfaceSubscriptionRaw {
 ///
 /// `channel` is a **full scheme-qualified address**, as in
 /// `SurfaceSubscriptionRaw`.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SurfaceOutputRaw {
     /// Declared component instance publishing on this binding.
@@ -1321,7 +1322,7 @@ pub struct SurfaceOutputRaw {
 /// on the port's input half. The activation carries the instant to compute the
 /// release time from, and the standing tick can be cancelled or edited from a
 /// later activation.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SurfaceIoPortRaw {
     /// Declared component instance owning both halves of this port.
@@ -2224,7 +2225,7 @@ fn ends_at_segment_boundary(prefix: &str) -> bool {
 /// [`build_channel_entries`], which skips the tuning ones — both passes classify
 /// through [`channel_block_role`], so no block can fall between them.
 ///
-/// Keys enter the table canonicalized ([`canonical_tuning_key`]), so a block
+/// Keys enter the table canonicalized ([`canonicalize_channel_address`]), so a block
 /// addressing `tools/pull` tunes the same channel as one addressing
 /// `brenn:tools/pull` — and the two spellings collide as duplicates.
 ///
@@ -2253,7 +2254,7 @@ pub fn build_system_channel_tuning(
                 if channel_block_role(address) == ChannelBlockRole::Declaring {
                     continue;
                 }
-                let canonical = canonical_tuning_key(address);
+                let canonical = canonicalize_channel_address(address);
                 // `mqtt:` exact blocks are exempt from the boot existence check
                 // (the population is open-ended), so their *shape* is the only
                 // thing that can be checked at all: an address the mint path
@@ -2290,7 +2291,7 @@ pub fn build_system_channel_tuning(
                      boundary ('/', '.' or the mqtt client colon) — a bare byte prefix \
                      would reach past the family it names",
                 );
-                let canonical = canonical_tuning_key(prefix);
+                let canonical = canonicalize_channel_address(prefix);
                 // A prefix ending at a segment boundary is itself the shortest
                 // address of the family, so `of()` classifies it directly.
                 assert!(
@@ -2390,16 +2391,6 @@ pub fn build_system_channel_tuning(
         .prefixes
         .sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
     tuning
-}
-
-/// Canonicalize a tuning key to the spelling minted channels carry: a key
-/// without a scheme becomes `brenn:<key>`. Minted addresses are always
-/// canonical, so a bare key would match nothing without this.
-fn canonical_tuning_key(key: &str) -> String {
-    match ChannelScheme::of(key) {
-        Some(_) => key.to_string(),
-        None => crate::messaging::canonical_address(key),
-    }
 }
 
 /// The `ResolvedChannel` a system-minted channel takes: webhook and MQTT

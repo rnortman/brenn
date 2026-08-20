@@ -27,20 +27,20 @@ use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 
 use crate::derived::DerivedConfig;
-use crate::diag::{Diagnostic, check_unique, two_site};
+use crate::diag::{Diagnostic, check_unique, duplicate_statement, two_site};
 use crate::model::{
     AclStmt, AgentBlock, AgentClass, Arg, ArgList, AssemblyDef, AssemblyItem, AttrBlock, AttrMap,
     Binding as BindStmt, ChanAddr, ChanRef, ChannelAttrs, ChannelDef, ComponentClass, ConstDef,
-    FStrPart, File, GrantStmt, InlineTable, InstBody, Item, MapValues, Matcher, MatcherVal,
-    McpServerStmt, MountStmt, NamedAttrDef, NewStmt, Param, ParamList, PathRef, PathSeg,
-    PortDir as DeclDir, SectionNode, StrLike, StrLit, StrPart, SubscribeStmt, SurfaceDef, UseStmt,
-    UuidPin, Value,
+    FStrPart, File, GrantStmt, InTail, InlineTable, InstBody, IntOrWord, IoTail, Item, MapValues,
+    Matcher, MatcherVal, McpServerStmt, MountStmt, MountTail, NamedAttrDef, NewStmt, OutTail,
+    Param, ParamList, PathRef, PathSeg, PortDir as DeclDir, SectionNode, StrLike, StrLit, StrPart,
+    SubscribeStmt, SubscribeTail, SurfaceDef, UseStmt, UuidPin, Value,
 };
 use crate::resolved::{
     Abi, ChanId, ClassRef, HandlePath, MatcherKind, PortDir, RAcl, RAgent, RBinding, RChanRef,
     RChannel, RComponentInst, RConsumer, RGrant, RHooks, RMatcher, RMatcherVal, RMcp, RMount,
-    RNamed, RPin, RPort, RRemote, RSection, RSubscribe, RSurface, RTuning, RVal, RValue, RWebhook,
-    RWebhookBlock, RWordList, ResolvedConfig, Scheme,
+    RNamed, RPin, RPort, RRemote, RSection, RSubscribe, RSurface, RTail, RTuning, RVal, RValue,
+    RWebhook, RWebhookBlock, RWordList, ResolvedConfig, Scheme,
 };
 
 /// What a successful resolve produces.
@@ -1850,9 +1850,32 @@ fn emit_entities(
     let classes = component_classes(index, &modules, &channels, &stamps, errors);
     let agents = agent_classes(&modules);
 
+    // Section multiplicity is decided over the whole document before any body
+    // is resolved: the walk is flat across every file, so the same section
+    // written in two imported files is the same duplicate.
+    let mut written: Vec<((usize, usize), &SectionNode)> = Vec::new();
+    for (position, items) in modules.iter().enumerate() {
+        for (offset, item) in items.iter().enumerate() {
+            if let Item::Section(node) = item.value() {
+                written.push(((position, offset), node));
+            }
+        }
+    }
+    let duplicates = duplicate_sections(
+        written.into_iter(),
+        "a document",
+        crate::model::CONFIG_BLOCK_KINDWORDS,
+        errors,
+    );
+
     for (position, items) in modules.into_iter().enumerate() {
         let scope = Scope::top(index, position, &channels, &stamps);
         for (offset, item) in items.into_iter().enumerate() {
+            // Only a section can be in the set, and a refused one is dropped
+            // whole rather than resolved.
+            if duplicates.contains(&(position, offset)) {
+                continue;
+            }
             let declaration = declared.get(&(position, offset)).cloned();
             emit_item(
                 item.into_value(),
@@ -2011,7 +2034,13 @@ fn emit_item(
                 def.name.span(),
                 errors,
             );
-            let blocks = emit_webhook_blocks(&def.blocks, scope, errors, &mut refused);
+            let blocks = emit_webhook_blocks(
+                &def.blocks,
+                &format!("webhook `{}`", slug.value()),
+                scope,
+                errors,
+                &mut refused,
+            );
             if refused.any() {
                 if checkable {
                     check_charset(&slug, Family::Webhook, errors);
@@ -2371,14 +2400,28 @@ fn emit_acls(
 ///
 /// A token-context field (e.g. `scheme` on a signature block) reaches the
 /// listing as the word that was written, not as a resolved reference.
+///
+/// At most one block per `(kindword, name)`: one `signature`, one
+/// `replay_protection`, and one `key`/`token` per credential id.
 fn emit_webhook_blocks(
     blocks: &[SectionNode],
+    context: &str,
     scope: &Scope<'_>,
     errors: &mut Vec<Diagnostic>,
     withhold: &mut Refused,
 ) -> Vec<RWebhookBlock> {
     let mut resolved = Vec::new();
-    for node in blocks {
+    let duplicates = duplicate_sections(
+        blocks.iter().enumerate(),
+        context,
+        crate::model::WEBHOOK_BLOCK_KINDWORDS,
+        errors,
+    );
+    for (offset, node) in blocks.iter().enumerate() {
+        if duplicates.contains(&offset) {
+            withhold.drop_part();
+            continue;
+        }
         let block = match crate::model::webhook_block(node) {
             Ok(block) => block,
             Err(error) => {
@@ -2395,7 +2438,7 @@ fn emit_webhook_blocks(
         // loss, so it is refused. Refused before the body's own verdict is
         // read: what was nested inside the block is a separate mistake from a
         // value it could not resolve, and both belong in one report.
-        refuse_subs(&parts.kindword, &parts.subs, errors);
+        refuse_subs(parts.kindword.value(), &parts.subs, errors);
         if refused.any() {
             withhold.drop_part();
             continue;
@@ -2411,17 +2454,70 @@ fn emit_webhook_blocks(
     resolved
 }
 
+/// The sections of a list that repeat a `(kindword, name)` already written,
+/// refused two-site at their own kindword. Returns which of them were refused,
+/// keyed however the caller identifies a position.
+///
+/// The key is [`crate::model::section_key`] and the refusal is
+/// [`duplicate_statement`], both shared with the lowering-side belt in
+/// `brenn-lib/src/config/dsl_lower.rs`, so the two layers count the same thing
+/// and say the same thing about it.
+///
+/// Counted over the written document rather than over what survives
+/// resolution: a section refused for an unrelated reason still occupies its
+/// slot, so `server { <bad attr> } server { }` reports both the attr error and
+/// the duplicate. A refused duplicate is dropped without resolving its body.
+///
+/// Only the kindwords in `admitted` are counted. Saying that a kindword the
+/// context admits none of appears twice would tell the operator that one of
+/// them would have been fine, and would swallow the refusal the dispatch has
+/// for it — the same reason a parent that nests nothing counts nothing.
+fn duplicate_sections<'a, K: Copy + Eq + std::hash::Hash>(
+    sections: impl Iterator<Item = (K, &'a SectionNode)>,
+    context: &str,
+    admitted: &[&str],
+    errors: &mut Vec<Diagnostic>,
+) -> HashSet<K> {
+    let keyed: Vec<(String, K, Span)> = sections
+        .filter_map(|(at, node)| {
+            let (kindword, span) = crate::model::section_kindword(node);
+            if !admitted.contains(&kindword.as_str()) {
+                return None;
+            }
+            let key =
+                crate::model::section_key(&kindword, crate::model::section_name(node).as_deref());
+            Some((key, at, span))
+        })
+        .collect();
+    let held = check_unique(
+        keyed.iter().map(|(key, at, span)| (key.clone(), *at, span)),
+        |key, _, at, _, first| duplicate_statement(context, key, at.clone(), first.clone()),
+        errors,
+    );
+    let kept: HashSet<K> = held.into_values().map(|(at, _)| at).collect();
+    keyed
+        .iter()
+        .map(|(_, at, _)| *at)
+        .filter(|at| !kept.contains(at))
+        .collect()
+}
+
 /// A block that nests nothing refuses what was written inside it.
-fn refuse_subs(parent: &Spanned<String>, subs: &[SectionNode], errors: &mut Vec<Diagnostic>) {
+fn refuse_subs(parent: &str, subs: &[SectionNode], errors: &mut Vec<Diagnostic>) {
     for sub in subs {
-        match crate::model::typed_block::<AttrMap>(sub) {
-            Ok(block) => errors.push(Diagnostic::at(
-                format!("a `{}` block holds no sub-blocks", parent.value()),
-                block.kindword.span().clone(),
-            )),
-            Err(error) => errors.push(error),
-        }
+        refuse_sub(parent, sub, errors);
     }
+}
+
+/// One such refusal, at the nested block's own kindword.
+fn refuse_sub(parent: &str, sub: &SectionNode, errors: &mut Vec<Diagnostic>) {
+    let (kindword, span) = crate::model::section_kindword(sub);
+    errors.push(Diagnostic::at(
+        // `the` rather than `a`: the article a kindword takes depends on how it
+        // is said, and `ntfy` is not the only one that reads wrong either way.
+        format!("the `{parent}` block holds no sub-blocks, so `{kindword}` has no meaning here"),
+        span,
+    ));
 }
 
 /// Resolve a configuration section, and the sections written inside it.
@@ -2438,8 +2534,7 @@ fn resolve_section(
     errors: &mut Vec<Diagnostic>,
 ) -> Option<RSection> {
     // Each dispatch already produced a `TypedBlock`, so the block is taken
-    // apart rather than deserialized a second time. Only a section with no
-    // dispatch of its own needs the untyped read.
+    // apart rather than deserialized a second time.
     macro_rules! dispatched {
         ($call:expr) => {
             match $call {
@@ -2471,30 +2566,48 @@ fn resolve_section(
     }
     match parent {
         None => dispatched!(crate::model::config_block(node)),
-        Some("alerting") => dispatched!(crate::model::alerting_block(node)),
-        Some("observability") => dispatched!(crate::model::observability_block(node)),
-        // Every other section's sub-blocks are per-kindword tables with no
-        // dispatch of their own, so there is nothing to check them against.
-        Some(_) => {}
+        Some(other) => match nesting(other) {
+            Some(Nesting::Alerting) => dispatched!(crate::model::alerting_block(node)),
+            Some(Nesting::Observability) => dispatched!(crate::model::observability_block(node)),
+            // Every other parent admits no sub-block — including `ntfy`, `mail`
+            // and `usage`, which are themselves sub-blocks.
+            None => {
+                refuse_sub(other, node, errors);
+                None
+            }
+        },
     }
-    let block = match crate::model::typed_block::<AttrMap>(node) {
-        Ok(block) => block,
-        Err(error) => {
-            errors.push(error);
-            return None;
+}
+
+/// Which vocabulary a nesting parent's sub-blocks are typed through.
+enum Nesting {
+    Alerting,
+    Observability,
+}
+
+/// What a parent kindword nests, if it nests anything.
+///
+/// The sole list of which parents nest: [`resolve_section`] reaches its
+/// dispatch through this, and [`resolve_subs`] asks it whether a sub-block is
+/// admitted here at all, so the two cannot come to disagree. A parent that
+/// gains a vocabulary gains a variant here, and the exhaustive match in
+/// `resolve_section` then refuses to compile until it gains its dispatch arm.
+fn nesting(parent: &str) -> Option<Nesting> {
+    match parent {
+        "alerting" => Some(Nesting::Alerting),
+        "observability" => Some(Nesting::Observability),
+        _ => None,
+    }
+}
+
+impl Nesting {
+    /// The kindwords this parent's body admits.
+    fn kindwords(&self) -> &'static [&'static str] {
+        match self {
+            Self::Alerting => crate::model::ALERTING_BLOCK_KINDWORDS,
+            Self::Observability => crate::model::OBSERVABILITY_BLOCK_KINDWORDS,
         }
-    };
-    // No vocabulary declares this block's keys, so none of them is a token
-    // context: every value is a value position and resolves as one.
-    let attrs = open_attrs(&block.attrs, scope, errors);
-    let subs = resolve_subs(&block.subs, block.kindword.value(), scope, errors);
-    Some(RSection {
-        kindword: block.kindword,
-        name: block.name,
-        attrs,
-        subs,
-        doc: block.doc,
-    })
+    }
 }
 
 /// The sections held inside one section, resolved under their parent's
@@ -2505,8 +2618,23 @@ fn resolve_subs(
     scope: &Scope<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Vec<RSection> {
+    let context = format!("a `{parent}` section");
+    // Counted only where being counted means something: under a parent that
+    // nests nothing, "one of these here would be fine" is false guidance, and
+    // the dispatch's own refusal is the whole truth about the document.
+    let duplicates = match nesting(parent) {
+        Some(nesting) => duplicate_sections(
+            subs.iter().enumerate(),
+            &context,
+            nesting.kindwords(),
+            errors,
+        ),
+        None => HashSet::new(),
+    };
     subs.iter()
-        .filter_map(|sub| resolve_section(sub, Some(parent), scope, errors))
+        .enumerate()
+        .filter(|(offset, _)| !duplicates.contains(offset))
+        .filter_map(|(_, sub)| resolve_section(sub, Some(parent), scope, errors))
         .collect()
 }
 
@@ -2635,9 +2763,14 @@ const SURFACE_COMPONENT_KEYS: [&str; 5] = [
     "chrome",
     "send_burst",
     "send_refill_secs",
-    "parked_batch_depth",
+    SURFACE_PARKED_DEPTH,
     "config",
 ];
+
+/// The key of a component instance's body that is a token context rather than
+/// a value: a depth is a count or the word `unbounded`, and a bare word in a
+/// value position would resolve as a name.
+const SURFACE_PARKED_DEPTH: &str = "parked_batch_depth";
 
 /// The key of a consumer body that is a token context rather than a value.
 ///
@@ -2824,7 +2957,7 @@ impl Placement {
     /// before the value walk, and so skipped by it.
     fn projected_keys(self) -> &'static [&'static str] {
         match self {
-            Placement::Surface => &[],
+            Placement::Surface => &[SURFACE_PARKED_DEPTH],
             Placement::TopLevel => &[CONSUMER_WORDS],
         }
     }
@@ -2931,11 +3064,13 @@ fn emit_component(
 ) -> Option<(RComponentInst, Refused)> {
     let class = resolve_class(&inst, scope, classes, Placement::Surface, errors)?;
     check_instance_name(&inst.handle, siblings, errors);
+    let parked_batch_depth = parked_depth(inst.body.as_ref(), errors);
     let body = instance_body(inst.body, &class, Placement::Surface, scope, errors);
     Some((
         RComponentInst {
             instance: inst.handle,
             class,
+            parked_batch_depth,
             attrs: body.attrs,
             bindings: body.bindings,
         },
@@ -2997,6 +3132,23 @@ fn emit_consumer(
         bindings,
         doc: inst.doc,
     });
+}
+
+/// A component instance's `parked_batch_depth`, projected out of the body
+/// before its values resolve: a depth is a count or a bare word, and resolving
+/// the word as a value would read it as a name.
+fn parked_depth(
+    body: Option<&Spanned<InstBody>>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<IntOrWord> {
+    let value = body?.value().attrs.get(SURFACE_PARKED_DEPTH)?;
+    match IntOrWord::from_value(value) {
+        Ok(depth) => Some(depth),
+        Err(error) => {
+            errors.push(error);
+            None
+        }
+    }
 }
 
 /// A consumer's `grants`, projected out of the body before its values resolve.
@@ -3132,7 +3284,7 @@ fn instance_body(
     // A binding that could not be resolved leaves the instance wired to less
     // than it declared, so it withholds the instance the way a refused value
     // does.
-    for binding in &body.bindings {
+    for binding in body.bindings {
         match resolve_binding(binding, class, scope, errors) {
             Some(binding) => bindings.push(binding),
             None => refused.drop_part(),
@@ -3206,52 +3358,63 @@ fn instance_attrs(
 /// One binding, once the port it names is one the class declares in that
 /// direction.
 fn resolve_binding(
-    binding: &BindStmt,
+    binding: BindStmt,
     class: &ClassRef,
     scope: &Scope<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<RBinding> {
-    let (dir, port, chan, tail) = match binding {
-        BindStmt::Into(bound) => (
-            PortDir::In,
-            &bound.port,
-            Some(&bound.chan),
-            bound.tail.as_ref(),
-        ),
-        BindStmt::Outof(bound) => (
-            PortDir::Out,
-            &bound.port,
-            Some(&bound.chan),
-            bound.tail.as_ref(),
-        ),
-        BindStmt::Both(bound) => (
-            PortDir::Io,
-            &bound.port,
-            bound.target.as_ref(),
-            bound.tail.as_ref(),
-        ),
-    };
-    check_port(class, port, dir, errors)?;
-    let chan = match chan {
+    match binding {
+        BindStmt::Into(bound) => {
+            check_port(class, &bound.port, PortDir::In, errors)?;
+            let chan = bound_chan(Some(&bound.chan), scope, errors)?;
+            let (tail, refused) = typed_tail(bound.tail, InTail::empty, scope, errors);
+            bound_binding(bound.port, chan, RTail::In(tail), &refused)
+        }
+        BindStmt::Outof(bound) => {
+            check_port(class, &bound.port, PortDir::Out, errors)?;
+            let chan = bound_chan(Some(&bound.chan), scope, errors)?;
+            let (tail, refused) = typed_tail(bound.tail, OutTail::empty, scope, errors);
+            bound_binding(bound.port, chan, RTail::Out(tail), &refused)
+        }
+        BindStmt::Both(bound) => {
+            check_port(class, &bound.port, PortDir::Io, errors)?;
+            let chan = bound_chan(bound.target.as_ref(), scope, errors)?;
+            let (tail, refused) = typed_tail(bound.tail, IoTail::empty, scope, errors);
+            bound_binding(bound.port, chan, RTail::Io(Box::new(tail)), &refused)
+        }
+    }
+}
+
+/// The channel a binding names, or `None` on a free `io` port.
+fn bound_chan(
+    chan: Option<&ChanRef>,
+    scope: &Scope<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<Option<RChanRef>> {
+    match chan {
+        None => Some(None),
         Some(reference) => match resolve_chan_ref(reference, scope) {
-            Ok(resolved) => Some(resolved),
+            Ok(resolved) => Some(Some(resolved)),
             Err(error) => {
                 errors.push(error);
-                return None;
+                None
             }
         },
-        None => None,
-    };
-    // A tail's keys depend on the channel family the port connects to, which
-    // lowering knows and this pass does not; the values resolve, the key set
-    // stays open.
-    let resolved_tail = open_tail(tail, scope, errors);
-    Some(RBinding {
-        dir,
-        port: port.clone(),
-        chan,
-        tail: resolved_tail,
-    })
+    }
+}
+
+/// The binding, unless one of its tail values was refused: a half-read tail
+/// would leave the port tuned differently than the document says.
+fn bound_binding(
+    port: Spanned<String>,
+    chan: Option<RChanRef>,
+    tail: RTail,
+    refused: &Refused,
+) -> Option<RBinding> {
+    match refused.any() {
+        true => None,
+        false => Some(RBinding { port, chan, tail }),
+    }
 }
 
 /// Refuse a binding whose port the class does not declare, or declares facing
@@ -3928,6 +4091,10 @@ fn emit_mounts(
     let mut resolved = Vec::new();
     for mount in mounts {
         let span = mount.repo.head.span().clone();
+        // The tail resolves before the repo does, so a mount naming neither a
+        // repo that exists nor a value that resolves reports both in one
+        // compile rather than one per run.
+        let (tail, tail_refused) = typed_tail(mount.tail, MountTail::empty, scope, errors);
         let repo = match resolve_repo(&mount.repo, scope) {
             Ok(handle) => handle,
             Err(error) => {
@@ -3936,10 +4103,14 @@ fn emit_mounts(
                 continue;
             }
         };
+        if tail_refused.any() {
+            refused.drop_part();
+            continue;
+        }
         resolved.push(RMount {
             repo_span: Spanned::new(mount.repo.head.value().clone(), span),
             repo,
-            tail: open_tail(mount.tail.as_ref(), scope, errors),
+            tail,
         });
     }
     resolved
@@ -4057,12 +4228,18 @@ fn emit_subs(
 ) -> Vec<RSubscribe> {
     let mut resolved = Vec::new();
     for sub in subs {
+        let (tail, tail_refused) = typed_tail(sub.tail, SubscribeTail::empty, scope, errors);
         match resolve_chan_ref(&sub.chan, scope) {
-            Ok(chan) => resolved.push(RSubscribe {
+            Ok(chan) if !tail_refused.any() => resolved.push(RSubscribe {
                 chan,
                 span: chan_ref_span(&sub.chan),
-                tail: open_tail(sub.tail.as_ref(), scope, errors),
+                tail,
             }),
+            // Every key of `SubscribeTail` is a projection, so nothing in it
+            // can fail to resolve and this arm cannot be reached today. It
+            // withholds the statement rather than half-reading it the day the
+            // vocabulary gains a value key.
+            Ok(_) => refused.drop_part(),
             Err(error) => {
                 errors.push(error);
                 refused.drop_part();
@@ -4073,6 +4250,9 @@ fn emit_subs(
 }
 
 /// An agent's hook blocks, typed by their kindword.
+///
+/// At most one block per kindword — two `start_hooks` are two answers to one
+/// question.
 fn emit_hooks(
     blocks: &[SectionNode],
     scope: &Scope<'_>,
@@ -4080,7 +4260,17 @@ fn emit_hooks(
     withhold: &mut Refused,
 ) -> Vec<RHooks> {
     let mut resolved = Vec::new();
-    for node in blocks {
+    let duplicates = duplicate_sections(
+        blocks.iter().enumerate(),
+        "an agent",
+        crate::model::AGENT_BLOCK_KINDWORDS,
+        errors,
+    );
+    for (offset, node) in blocks.iter().enumerate() {
+        if duplicates.contains(&offset) {
+            withhold.drop_part();
+            continue;
+        }
         let block = match crate::model::agent_block(node) {
             Ok(block) => block,
             Err(error) => {
@@ -4098,7 +4288,7 @@ fn emit_hooks(
         };
         // Ordered before the body's values: a nested block is a separate
         // mistake from a value it could not resolve.
-        refuse_subs(&block.kindword, &block.subs, errors);
+        refuse_subs(block.kindword.value(), &block.subs, errors);
         let (attrs, refused) = resolve_attrs(block.attrs, scope, errors);
         match refused.any() {
             true => withhold.drop_part(),
@@ -4112,34 +4302,26 @@ fn emit_hooks(
     resolved
 }
 
-/// A statement's trailing block, where its key set is the runtime's rather than
-/// this layer's: the values resolve, the keys stay open.
-fn open_tail(
-    tail: Option<&AttrBlock>,
+/// A statement's trailing block, deserialized into the statement form's own
+/// vocabulary.
+///
+/// A statement with no tail carries the vocabulary a body nobody wrote
+/// carries — every key absent — which is why `empty` is a parameter rather
+/// than a bound: each tail names its own.
+fn typed_tail<A, F>(
+    tail: Option<AttrBlock<A>>,
+    empty: F,
     scope: &Scope<'_>,
     errors: &mut Vec<Diagnostic>,
-) -> Vec<(String, RVal)> {
+) -> (A::Output, Refused)
+where
+    A: MapValues<Spanned<Value>, RVal>,
+    F: FnOnce() -> A::Output,
+{
     match tail {
-        Some(block) => open_attrs(&block.attrs, scope, errors),
-        None => Vec::new(),
+        Some(block) => resolve_attrs(block.attrs, scope, errors),
+        None => (empty(), Refused::default()),
     }
-}
-
-/// An untyped body's attrs, resolved: no vocabulary says which keys are legal,
-/// so every key is carried and every value resolves as a value.
-fn open_attrs(
-    attrs: &AttrMap,
-    scope: &Scope<'_>,
-    errors: &mut Vec<Diagnostic>,
-) -> Vec<(String, RVal)> {
-    let mut resolved = Vec::new();
-    for (key, value) in attrs.entries() {
-        match resolve_value(value, scope) {
-            Ok(value) => resolved.push((key.clone(), value)),
-            Err(error) => errors.push(error),
-        }
-    }
-    resolved
 }
 
 // ── pass 4d: assembly expansion ──────────────────────────────────────────────

@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 /// Start hook configuration for an app.
 /// Hook strings are passed to `sh -c`, so arguments, pipes, etc. work naturally.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct StartHooksConfig {
     /// Scripts to run on the host before CC starts. Cwd = working_dir.
@@ -16,7 +16,7 @@ pub struct StartHooksConfig {
 
 /// Hook scripts that run after a successful repo pull advances HEAD.
 /// Same shape as `StartHooksConfig`. Scripts run via `sh -c`.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PostPullHooksConfig {
     /// Scripts to run on the host after a successful repo pull.
@@ -30,7 +30,7 @@ pub struct PostPullHooksConfig {
 
 /// Hook scripts that run once at server startup after all startup pulls succeed.
 /// Same shape as `StartHooksConfig`. Scripts run via `sh -c`.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct StartupHooksConfig {
     /// Scripts to run on the host at server startup.

@@ -31,12 +31,34 @@ vocabulary it is missing from, or the field is listed as deliberately omitted
 with a reason.
 
 Code sites (`TODO(dsl-vocabulary-config-parity)`): brenn-dsl/src/model.rs, the
-entity attr vocabulary section header; brenn-dsl/src/resolve.rs, the transcribed
+entity attr vocabulary section header and the five statement tail vocabularies; brenn-dsl/src/resolve.rs, the transcribed
 key tables and charsets; brenn-dsl/src/derive.rs, at the scheme vocabulary, the
 tool namespaces, the channel-model presence rules, the non-durable uuid seeds,
 the ACL family table, the anonymous-namespace segment, the matcher pattern
 rules, the schemes a binding position may name, the remote subscribe ceilings
-shape, and the grant vocabularies and their plane-word expansions.
+shape, and the grant vocabularies and their plane-word expansions; and
+brenn-lib/src/config/dsl_lower.rs, at the `send_rate` key set, at the
+configuration-section kindword arms, at the webhook subscription family's key
+set, at the consumer body and ACL family map, at the surface component body and
+the per-family key sets its binding refusals name, and at the webhook signature
+scheme words and their per-variant field sets.
+
+
+## `dsl-mcp-ref-index`
+
+`RMcp::Ref` carries the referenced server's name, so lowering finds the
+definition by scanning `resolved.mcp_servers` and comparing dotted handles,
+backed by an `expect` that a match exists. Every other cross-reference in the
+resolved model carries an index (`RChanRef::Decl(ChanId)`). The scan is
+irrelevant at config scale; what it costs is a cross-crate invariant encoded as
+a string-match outcome — a differently normalised handle in resolution turns
+into a boot panic that blames the document.
+
+Fix = have resolution mint an id for an mcp reference the way it does for a
+channel, and index directly.
+
+Code sites (`TODO(dsl-mcp-ref-index)`): brenn-lib/src/config/dsl_lower.rs, in
+`mcp_servers`.
 
 
 ## `dsl-list-element-span`

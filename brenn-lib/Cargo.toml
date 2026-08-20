@@ -13,6 +13,7 @@ testutils = ["dep:tempfile", "brenn-obs/testutils"]
 brenn-approval-rules = { version = "0.1.0", path = "../brenn-approval-rules" }
 brenn-common = { version = "0.1.0", path = "../brenn-common" }
 brenn-db = { version = "0.1.0", path = "../brenn-db" }
+brenn-dsl = { version = "0.1.0", path = "../brenn-dsl" }
 brenn-obs = { version = "0.1.0", path = "../brenn-obs" }
 brenn-usage-db = { version = "0.1.0", path = "../brenn-usage-db" }
 brenn-ws-types = { version = "0.1.0", path = "../brenn-ws-types" }

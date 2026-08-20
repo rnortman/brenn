@@ -53,6 +53,7 @@ claude_defaults {
 }
 
 repo_sync {
+  repo_dir = "/home/alice/repos";
   poll_interval_secs = 300;
   stale_conversation_days = 7;
 }

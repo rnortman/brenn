@@ -76,7 +76,7 @@ const GLOBAL_AUTO_APPROVE_TOOLS: &[&str] = &["Read", "Glob", "Grep", "ToolSearch
 // ---------------------------------------------------------------------------
 
 /// A single approval rule as defined in the TOML config.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRuleConfig {
     pub tool: String,

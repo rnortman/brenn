@@ -8,6 +8,7 @@ use super::*;
 #[test]
 fn stale_webhook_secret_file_key_is_rejected() {
     let toml = r#"
+[repo_sync]
 repo_dir = "/tmp/repos"
 
 [[repo]]
