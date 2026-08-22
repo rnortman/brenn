@@ -17,8 +17,8 @@ The invariant is the kind this repo gates elsewhere (`xtask`'s policy parity,
 reflects each config struct's field names and compares them against a table of
 (config struct, DSL vocabulary, deliberately omitted fields and why). The
 omitted-fields column is load-bearing — `approval_rules`, `tool_grants`,
-`frontmatter`, `integration_config`, the mqtt last-will table are all justified
-today in prose that no build step reads.
+`frontmatter`, the mqtt last-will table are all justified today in prose that no
+build step reads.
 
 Where it lives is the open question, and it is what makes this a design item
 rather than a chore: the DSL crate must not depend on the config crates, so the
@@ -135,6 +135,28 @@ unchanged, with the fix in fltk and the goldens updated here.
 Code site (`TODO(dsl-fmt-rawstring-indent)`): brenn-dsl/src/bin/brennfmt.rs.
 
 
+## `dsl-fmt-orphan-terminator`
+
+Two layout warts in the formatter's statement handling. A comment or a blank
+line following a `;`-terminated item binds to that item, so the `;` is emitted
+*after* the comment and lands orphaned on a line of its own; and a tail-block
+statement (`mount r { working_dir = true; }`) immediately followed by a block
+statement inside the same body gains one extra leading space. Both are layout
+only — no value changes, and each output is its own fixed point, so `--check`
+accepts it and the canonical fixtures record it as intended output
+(`brenn-dsl/tests/corpus/lexical.canonical.brenn`,
+`entities.canonical.brenn`, `statements.canonical.brenn`). Every in-tree and
+out-of-tree `.brenn` written since carries the form too, so the fix is a mass
+golden churn: tracked here so it lands as one event with a stated before/after
+rather than as an unexplained reformat.
+
+Done = a comment or blank line after a `;`-terminated item leaves the `;` with
+its item, the tail-block/block pair indents like its neighbours, and every
+corpus golden is regenerated in one commit.
+
+Code site (`TODO(dsl-fmt-orphan-terminator)`): brenn-dsl/src/bin/brennfmt.rs.
+
+
 ## `dsl-toml-twins`
 
 The root configs exist twice: `brenn.dev.brenn`/`brenn.dev.toml` and
@@ -154,13 +176,16 @@ Retiring them is one checklist, all of it after the prod flip:
   (`brenn-lib/src/config/brenn.rs`, `FALLBACK_NAMES`);
 - delete `read_toml` and the TOML arm of `check_config`'s extension dispatch;
 - delete `canonicalize_config_addresses` and the differ's use of it — a config
-  that can only come from a `.brenn` document is already scheme-qualified.
+  that can only come from a `.brenn` document is already scheme-qualified;
+- refactor the production config's surface-description channels and its two
+  twin surfaces into assemblies (that file is in the ops annex, not here). They
+  are stamped out longhand only because the `[[channel]]` and surface-binding
+  arrays are order-compared against its TOML twin, and assembly-stamped
+  channels always land at the tail of the channel array — so the twin is what
+  forces the duplication, and its retirement is what lifts it.
 
 Not before then: prod and staging still load TOML, and `brenn config-diff` over a
 `.toml`/`.brenn` pair is the tool that proves each port.
-
-Retiring them unblocks `dsl-acl-derivation`, which rewrites the root configs'
-explicit ACL statements derivation-based.
 
 
 ## `dsl-config-shared-module`
@@ -172,41 +197,36 @@ bodies. Nothing catches a change made to one and not the other — the
 twin-equivalence gate compares each document to its own TOML twin, never the two
 documents to each other.
 
-Deliberately duplicated for now: a shared module extracted for two callers is
-parameterization guessed at, and the prod config is the third, richer document
-that shows what the shared shape actually is. So the shared module gets designed
-with the prod port, not before.
+The production config is now the third document, and it narrows what "shared"
+means:
 
-Done = the shared declarations live in one module both root documents `use`, or
-the duplication is re-justified against three documents rather than two.
+- The **component classes** are the shared shape: the same four classes with
+  identical port lists appear in all three documents, and they are the part a
+  drift breaks (a port list that disagrees between documents is a boot panic on
+  one surface and not the others). Their doc comments have already diverged —
+  the third copy carries none on two of the four and shortened rewrites on the
+  other two — which is the leading indicator.
+- The **assemblies are not shared.** The third document bakes different depths
+  and cannot use them at all while its TOML twin pins the order-compared
+  channel array (see `dsl-toml-twins`), so parameterizing them across three
+  callers is still guesswork.
+- The **bar channels and bar surfaces are not shared either** — they exist only
+  in the two root documents here.
+
+The asymmetry that makes this awkward: the third copy lives in the private ops
+annex, so no gate in this repo can see it, and `use` resolves module paths
+relative to the *root file's* directory (`brenn-dsl/src/resolve.rs`,
+`compile`). A module the production document imports is therefore a second file
+that has to reach the production host, which CD does not deploy config to at
+all — so a shared module spanning all three documents is an operations change,
+not only a factoring change.
+
+Done = the component-class declarations live in one module both root documents
+here `use`, and the entry records what the out-of-repo third document does
+instead (import a copied module, or keep its own classes under a stated
+divergence risk).
 
 Code sites (`TODO(dsl-config-shared-module)`): the header comment of
-`brenn.dev.brenn` and of `brenn.e2e.brenn`.
-
-
-## `dsl-acl-derivation`
-
-The `.brenn` root configs write channel authority as explicit scheme-qualified
-`acl subscribe` / `acl publish` statements even where the derivation pass could
-derive the same entries from the bindings that already name the channel. That is
-deliberate, not oversight: the twin-equivalence gate compares the lowered config
-element-for-element against the TOML twin, array order is semantic in
-`brenn config-diff`, and explicit statements keep the diff-to-TOML review
-trivial. Derived entries could reorder a list and would make every review
-reason about what the derivation pass emits.
-
-The cleanup: rewrite the ACLs derivation-based wherever a binding derives them,
-keeping explicit statements only where nothing derives them (agents, for
-instance, have no bindings).
-
-Done = no explicit `acl` statement in a `.brenn` root config restates authority
-a binding already implies, and `make check` stays green.
-
-**Blocked on `dsl-toml-twins`.** Until the twins retire the equality gate wants
-the explicit style — including in the prod and staging ports, which should copy
-it deliberately and cite this slug rather than rediscover the reason.
-
-Code sites (`TODO(dsl-acl-derivation)`): the header comment of
 `brenn.dev.brenn` and of `brenn.e2e.brenn`.
 
 

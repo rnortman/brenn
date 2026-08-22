@@ -33,6 +33,15 @@ component EchoStub {
     io acks;
 }
 
+// Port names are the component's own and nothing reserves the binding
+// keywords, so a port literally named `in` reads as `in in <- …`.
+component Reserved {
+    abi = processor;
+    component_path = f"{components_dir}/brenn_reserved.wasm";
+    in in;
+    out out;
+}
+
 agent PersonalAssistant(slug: String, user: String, ws: Repo, skin: String = "bench") {
     slug = slug;
     name = "Personal Assistant";
@@ -97,6 +106,14 @@ new consume_demo: EchoStub {
 
     in inbound <- "webhook:push-alice" { push_depth = 50; noise = alarm; }
     out outbound -> wasm_demo_out;
+}
+
+new reserved_demo: Reserved {
+    slug = "reserved-demo";
+    grants = [ports];
+
+    in in <- "webhook:push-bob" { push_depth = 4; }
+    out out -> wasm_demo_out;
 }
 
 remote reachy00 {

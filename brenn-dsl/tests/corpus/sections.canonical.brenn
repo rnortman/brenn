@@ -64,4 +64,15 @@ agent PersonalAssistant(slug: String) {
       file_roles = { ofx = [".ofx"], csv = [".csv"] };
     }
   }
+  /// What this app hands the ledger integration, on top of the global block.
+  integration_config ledger {
+    env = { LEDGER_DATA = f"{secrets}/ledger-alice", LEDGER_STRICT = "1" };
+  }
+  // A second name is a second map key: an open body claims every key it
+  // wrote, so a scalar sits beside a table without a vocabulary to check it
+  // against.
+  integration_config calendar {
+    env = { CALENDAR_HOME = "/home/alice/calendar" };
+    timeout_secs = 30;
+  }
 }

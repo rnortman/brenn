@@ -1504,8 +1504,8 @@ fn apps(derived: &DerivedConfig, errors: &mut Vec<Diagnostic>) -> Vec<AppConfigR
 /// families — mounts, mcp servers, hooks and subscriptions.
 ///
 /// The config's nested tables with no attr spelling are set empty here rather
-/// than defaulted implicitly: approval rules, tool grants, per-integration
-/// config, frontmatter rendering and the per-app push block.
+/// than defaulted implicitly: approval rules, tool grants, frontmatter
+/// rendering and the per-app push block.
 fn app(
     resolved: &DslResolved,
     agent: &RAgent,
@@ -1621,8 +1621,7 @@ fn app(
         attachment_targets: attachment_targets(&agent.attachment_targets, &label, errors),
         integrations: opt_strings(integrations.as_ref(), "integrations", errors)
             .unwrap_or_default(),
-        // No attr spelling: arbitrary nested tables, keyed by integration name.
-        integration_config: HashMap::new(),
+        integration_config: integration_config(&agent.integration_configs, &label, errors),
         mounts: agent
             .mounts
             .iter()
@@ -1764,6 +1763,35 @@ fn hook_blocks(
         }
     }
     (start, post_pull, startup)
+}
+
+/// The `[app.integration_config.<name>]` tables of one agent.
+///
+/// One entry per block, keyed by the block's name; the body is open, so the
+/// whole tree is claimed at once and nothing is read by name. A block whose
+/// body holds a value the TOML tree cannot carry is dropped and its refusal
+/// stands. Keys cannot collide — resolution refused two blocks under one name.
+fn integration_config(
+    blocks: &[RSection],
+    app: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> HashMap<String, toml::Value> {
+    let mut out = HashMap::new();
+    for block in blocks {
+        let name = block
+            .name
+            .as_ref()
+            .expect("an integration_config block carries a name")
+            .value()
+            .clone();
+        let what = format!("`integration_config {name}` of app `{app}`");
+        let mut body = Body::new(what, block.kindword.span().clone(), &block.attrs);
+        if let Some(table) = body.open(errors) {
+            out.insert(name, toml::Value::Table(table));
+        }
+        body.finish(errors);
+    }
+    out
 }
 
 /// The `[[app.attachment_target]]` entries of one agent, in declaration order.

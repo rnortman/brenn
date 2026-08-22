@@ -197,6 +197,188 @@ pub fn canonicalize_config_addresses(config: &mut BrennConfig) {
     }
 }
 
+/// Sort the collections in a loaded config whose order the runtime ignores.
+///
+/// **Comparison-only.** Nothing the runtime boots goes through here: this exists
+/// so two configs that say the same thing in a different order compare equal.
+/// The rule for adding a collection is a citation to the runtime code proving
+/// its order is dead, and nothing weaker — a wrong sort makes the comparison
+/// report false *equality*, which is the unacceptable direction. A false
+/// difference is merely annoying, so an uncited collection stays where it is.
+///
+/// What is sorted, and why its order is dead:
+///
+/// - **Grants.** App, surface, wasm-consumer and remote grants alike resolve
+///   into a `GrantSet` — a `BTreeSet` — with duplicates refused
+///   (`build_app_policy`, `build_wasm_policy`, `build_attach_policy`). Set
+///   semantics: position carries nothing.
+/// - **ACL matcher lists.** Every enforcement site is `.any(...)` over the
+///   whole list and an empty list denies (`AppPolicy::acl_covers` and its
+///   siblings). No first-match anywhere.
+/// - **Remote subscribe ACLs.** The ceiling fold is max over *every* matching
+///   entry, explicitly not the first (`RemoteSubscribeAcl::ceiling_for`), so a
+///   broad prefix and a deeper exact entry mean the same thing in either order.
+///
+/// Deliberately left order-compared: hook command lists, process `args`,
+/// container `extra_args` / `extra_mounts`, tool grants, and the block arrays
+/// themselves — all of those the runtime reads in order.
+pub fn sort_order_dead_collections(config: &mut BrennConfig) {
+    // Every ACL-bearing block is destructured with no `..`, so a matcher list
+    // added to any of them fails compilation here rather than quietly staying
+    // order-compared. Matcher order comes from the types' derived `Ord`, which
+    // ranks exactly the fields their derived `PartialEq` compares.
+    for app in &mut config.apps {
+        let crate::config::app::AppConfigRaw {
+            slug: _,
+            name: _,
+            description: _,
+            icon: _,
+            working_dir: _,
+            model: _,
+            single_instance: _,
+            singleton: _,
+            persistent: _,
+            idle_timeout_secs: _,
+            compact_reminder_pct: _,
+            compact_soft_pct: _,
+            compact_red_pct: _,
+            compact_hard_pct: _,
+            compact_reminder_tokens: _,
+            compact_soft_tokens: _,
+            compact_red_tokens: _,
+            compact_hard_tokens: _,
+            compact_idle_secs: _,
+            idle_hook_secs: _,
+            allowed_users: _,
+            disabled_tools: _,
+            mcp_servers: _,
+            multiuser: _,
+            prefix_username: _,
+            prefix_timestamp: _,
+            prefix_device: _,
+            container: _,
+            container_working_dir: _,
+            start_hooks: _,
+            post_pull_hooks: _,
+            startup_hooks: _,
+            cc_extra_args: _,
+            approval_rules: _,
+            attachment_targets: _,
+            integrations: _,
+            integration_config: _,
+            mounts: _,
+            extra_mounts: _,
+            history_replay_limit: _,
+            frontmatter: _,
+            messaging: _,
+            pwa_push: _,
+            webhook_subscriptions: _,
+            mqtt_subscriptions: _,
+            grants,
+            acl,
+            tool_grants: _,
+        } = app;
+        grants.sort_unstable();
+        let crate::access::raw::AppAclRaw {
+            mqtt_subscribe,
+            mqtt_publish,
+            brenn_subscribe,
+            brenn_publish,
+            ephemeral_publish,
+            ephemeral_subscribe,
+            local_publish,
+            webhook,
+        } = acl;
+        mqtt_subscribe.sort_unstable();
+        mqtt_publish.sort_unstable();
+        brenn_subscribe.sort_unstable();
+        brenn_publish.sort_unstable();
+        ephemeral_publish.sort_unstable();
+        ephemeral_subscribe.sort_unstable();
+        local_publish.sort_unstable();
+        webhook.sort_unstable();
+    }
+    for surface in &mut config.surfaces {
+        let crate::messaging::config::SurfaceConfigRaw {
+            slug: _,
+            grants,
+            subscribe_acl,
+            publish_acl,
+            ephemeral_subscribe_acl,
+            ephemeral_publish_acl,
+            components: _,
+            subscriptions: _,
+            outputs: _,
+            io_ports: _,
+            skin: _,
+            allowed_users: _,
+            publish_burst: _,
+            publish_per_sec: _,
+        } = surface;
+        grants.sort_unstable();
+        subscribe_acl.sort_unstable();
+        publish_acl.sort_unstable();
+        ephemeral_subscribe_acl.sort_unstable();
+        ephemeral_publish_acl.sort_unstable();
+    }
+    for consumer in &mut config.wasm_consumers {
+        let crate::messaging::config::WasmConsumerConfigRaw {
+            slug: _,
+            component_path: _,
+            grants,
+            store_path: _,
+            store_size_limit: _,
+            subscriptions: _,
+            outputs: _,
+            io_ports: _,
+            subscribe_acl,
+            ephemeral_subscribe_acl,
+            local_subscribe_acl,
+            publish_acl,
+            ephemeral_publish_acl,
+            local_publish_acl,
+            mqtt_publish_acl,
+            mqtt_subscribe_acl,
+            webhook_acl,
+            config: _,
+            activation_burst: _,
+            activation_min_period_ms: _,
+            mqtt_outputs: _,
+            tool_grants: _,
+        } = consumer;
+        grants.sort_unstable();
+        subscribe_acl.sort_unstable();
+        ephemeral_subscribe_acl.sort_unstable();
+        local_subscribe_acl.sort_unstable();
+        publish_acl.sort_unstable();
+        ephemeral_publish_acl.sort_unstable();
+        local_publish_acl.sort_unstable();
+        mqtt_publish_acl.sort_unstable();
+        mqtt_subscribe_acl.sort_unstable();
+        webhook_acl.sort_unstable();
+    }
+    for remote in &mut config.remotes {
+        let crate::messaging::remote::RemoteConfigRaw {
+            slug: _,
+            token_file: _,
+            grants,
+            subscribe_acl,
+            ephemeral_subscribe_acl,
+            publish_acl,
+            ephemeral_publish_acl,
+            publish_burst: _,
+            publish_per_sec: _,
+            max_sessions: _,
+            max_subscriptions: _,
+        } = remote;
+        grants.sort_unstable();
+        subscribe_acl.sort_unstable();
+        ephemeral_subscribe_acl.sort_unstable();
+        publish_acl.sort_unstable();
+        ephemeral_publish_acl.sort_unstable();
+    }
+}
+
 /// Load configuration from a config file.
 ///
 /// If `path` is `Some`, reads that file, dispatching on its extension: `.toml`

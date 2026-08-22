@@ -2863,6 +2863,79 @@ fn a_handler_block_holds_no_sub_blocks() {
     );
 }
 
+// ── `integration_config` blocks ──────────────────────────────────────────────
+
+/// An agent's per-integration override trees reach the model keyed by the
+/// block's name, with every key the open body wrote carried and resolved.
+#[test]
+fn an_agents_integration_configs_reach_the_model_in_order() {
+    let config = resolved(concat!(
+        "const data = \"/home/alice/data\";\n",
+        "agent A() {\n",
+        "    integration_config ledger {\n",
+        "        env = { LEDGER_DATA = f\"{data}/ledger\" };\n",
+        "    }\n",
+        "    integration_config calendar {\n",
+        "        timeout_secs = 30;\n",
+        "    }\n",
+        "}\n",
+        "new alice: A();\n",
+    ));
+    let blocks = &config.agents[0].integration_configs;
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].kindword.value(), "integration_config");
+    assert_eq!(
+        blocks[0].name.as_ref().map(Spanned::value),
+        Some(&"ledger".to_string())
+    );
+    let RValue::Table(env) = attr(&blocks[0], "env") else {
+        panic!("`env` is a table");
+    };
+    assert_eq!(
+        env.iter()
+            .map(|(key, value)| (key.as_str(), value.value().clone()))
+            .collect::<Vec<_>>(),
+        vec![("LEDGER_DATA", RValue::Str("/home/alice/data/ledger".into()))]
+    );
+    assert_eq!(
+        blocks[1].name.as_ref().map(Spanned::value),
+        Some(&"calendar".to_string())
+    );
+    assert_eq!(attr(&blocks[1], "timeout_secs"), &RValue::Int(30));
+}
+
+/// One name is one map key, so a second block under it is a two-site refusal —
+/// the same rule the hook blocks and the attachment targets follow.
+#[test]
+fn two_integration_configs_with_one_name_are_refused() {
+    let errors = refusals(concat!(
+        "agent A() {\n",
+        "    integration_config ledger { env = { X = \"1\" }; }\n",
+        "    integration_config ledger { env = { X = \"2\" }; }\n",
+        "}\n",
+        "new alice: A();\n",
+    ));
+    let expected =
+        "an agent states `integration_config ledger` once, and this is the second".to_string();
+    assert!(errors.contains(&expected), "{errors:?}");
+}
+
+/// An open body holds no sub-blocks: what a section inside one would mean has
+/// no reader, so it is refused rather than carried.
+#[test]
+fn a_stray_block_in_an_integration_config_is_refused() {
+    let errors = refusals(concat!(
+        "agent A() {\n",
+        "    integration_config ledger { retries { max = 3; } }\n",
+        "}\n",
+        "new alice: A();\n",
+    ));
+    assert!(
+        errors.iter().any(|error| error.contains("retries")),
+        "{errors:?}"
+    );
+}
+
 /// An unresolvable value inside a target withholds the agent, like any other
 /// value the body could not resolve.
 #[test]

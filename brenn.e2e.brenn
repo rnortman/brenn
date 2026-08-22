@@ -1,11 +1,8 @@
 // TODO(dsl-config-shared-module): the component classes, both assemblies, the
 // bar channels and the bar surfaces below are duplicated verbatim in
 // brenn.dev.brenn; a change to one wants the same change to the other. The
-// shared module that would end that is designed with the prod port.
-// TODO(dsl-acl-derivation): the explicit acl statements below restate authority
-// the bindings could derive; they are kept longhand so the lowered config
-// compares element-for-element against the TOML twin. Rewrite them
-// derivation-based once that twin retires.
+// component classes are duplicated a third time in the production config,
+// which no gate here can see.
 // Hermetic server configuration for the Playwright e2e harness (`make e2e`).
 // Binds a non-dev port and writes all state under target/e2e so a run is fully
 // isolated and `rm -rf target/e2e` gives a fresh DB every time.
@@ -228,9 +225,6 @@ new e2e: E2eFloor;
 surface bar {
   grants = [subscribe];
   skin = "bench";
-  acl subscribe [exact bar_a, exact bar_b, exact bar_c, exact bar_layout]
-
-  ;
   new p1: Protobar {
     in messages <- bar_a;
     // A wake subsumes its predecessor, so `push_depth = 1`; `retain_depth = 2`
@@ -278,9 +272,6 @@ surface bar {
 surface bar-pixel {
   grants = [subscribe];
   skin = "foundry";
-  acl subscribe [exact bar_a, exact bar_b, exact bar_c, exact bar_layout]
-
-  ;
   new p1: Protobar {
     in messages <- bar_a;
     io tick { push_depth = 1; retain_depth = 2; }
@@ -316,15 +307,12 @@ surface bar-pixel {
 // one output each onto the three content channels + the layout channel. The
 // specs type bodies / layout JSON and click send to drive the bar end-to-end.
 //
-// `grants = [publish]` + the covering `acl publish` + the `out` bindings are the
-// durable-publish triple. No `allowed_users` ⇒ any authenticated user may
-// publish durably — harmless on this hermetic loopback harness; a multi-user
-// config copying this surface MUST add `allowed_users`.
+// `grants = [publish]` plus the `out` bindings are the durable-publish pair;
+// publish authority is derived from the bindings. No `allowed_users` ⇒ any
+// authenticated user may publish durably — harmless on this hermetic loopback
+// harness; a multi-user config copying this surface MUST add `allowed_users`.
 surface bar-feeder {
   grants = [publish];
-  acl publish [exact bar_a, exact bar_b, exact bar_c, exact bar_layout]
-
-  ;
   new feed-a: EchoStub {
     out out -> bar_a;
   }

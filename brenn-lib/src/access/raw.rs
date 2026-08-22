@@ -64,7 +64,7 @@ pub struct AppAclRaw {
 
 /// Raw MQTT subscribe matcher: `{ client = "...", topic_filter = "..." }`.
 /// Strings are validated and converted to `acl::MqttSubMatcher` at resolution.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 pub struct MqttSubMatcherRaw {
     /// MQTT client slug (validated at resolution time).
@@ -73,9 +73,9 @@ pub struct MqttSubMatcherRaw {
     pub topic_filter: String,
 }
 
-/// Raw MQTT publish matcher: `{ client = "..." }`. Publish is client-scoped only
-/// (design §2.1); there is no topic dimension.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// Raw MQTT publish matcher: `{ client = "..." }`. Publish is client-scoped
+/// only; there is no topic dimension.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 pub struct MqttClientMatcherRaw {
     /// MQTT client slug (validated at resolution time).
@@ -83,14 +83,14 @@ pub struct MqttClientMatcherRaw {
 }
 
 /// Raw `brenn:` channel matcher. Carries an explicit kind, exactly one of
-/// `{ exact = "..." }` xor `{ prefix = "..." }` (design §2.5.1: start narrow per
-/// high-level failure mode 4). This is an **externally-tagged** enum (serde's
-/// default — no explicit tag attribute), so each variant is a single-key map:
-/// `{ exact = "..." }` or `{ prefix = "..." }`. A TOML entry with neither key
-/// (empty table) is rejected because no variant tag is present; one with both
-/// keys is rejected because an external-tag variant value is a single newtype
-/// string, not a two-key table (`deny_unknown_fields` reinforces this).
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// `{ exact = "..." }` xor `{ prefix = "..." }`. This is an **externally-tagged**
+/// enum (serde's default — no explicit tag attribute), so each variant is a
+/// single-key map: `{ exact = "..." }` or `{ prefix = "..." }`. A TOML entry
+/// with neither key (empty table) is rejected because no variant tag is present;
+/// one with both keys is rejected because an external-tag variant value is a
+/// single newtype string, not a two-key table (`deny_unknown_fields` reinforces
+/// this).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum ChannelMatcherRaw {
     /// `{ exact = "channel" }` — matches the channel exactly.
@@ -100,7 +100,7 @@ pub enum ChannelMatcherRaw {
 }
 
 /// Raw inbound webhook matcher: `{ endpoint = "..." }`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookMatcherRaw {
     /// Webhook endpoint slug (validated at resolution time).

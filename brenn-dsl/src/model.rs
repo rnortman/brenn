@@ -622,6 +622,11 @@ impl<V> OpenAttrs<V> {
         }
         Ok(OpenAttrs { entries })
     }
+
+    /// Every key the body carried, in source order.
+    pub fn entries(self) -> Vec<(String, V)> {
+        self.entries
+    }
 }
 
 impl<V, V2> MapValues<V, V2> for OpenAttrs<V> {
@@ -632,13 +637,6 @@ impl<V, V2> MapValues<V, V2> for OpenAttrs<V> {
         f: &mut impl FnMut(V) -> Result<V2, Diagnostic>,
     ) -> Result<Self::Output, Diagnostic> {
         self.map_values(f)
-    }
-}
-
-impl OpenAttrs<crate::resolved::RVal> {
-    /// Every key the body carried, in source order.
-    pub fn entries(self) -> Vec<(String, crate::resolved::RVal)> {
-        self.entries
     }
 }
 
@@ -919,10 +917,10 @@ vocabulary! {
     /// An `agent` body's attrs.
     ///
     /// Mounts, mcp servers, subscriptions and ACLs are statements; the hook
-    /// lists and the attachment targets are sub-blocks. The config's remaining
-    /// nested tables — approval rules, tool grants, per-integration config,
-    /// frontmatter rendering, pwa push — have no attr spelling and are unknown
-    /// keys here.
+    /// lists, the attachment targets and the per-integration config are
+    /// sub-blocks. The config's remaining nested tables — approval rules, tool
+    /// grants, frontmatter rendering, pwa push — have no attr spelling and are
+    /// unknown keys here.
     struct AgentAttrs<V> {
         /// The wire spelling, where it differs from the handle.
         opt slug: V,
@@ -1398,6 +1396,13 @@ kindword_dispatch! {
     "post_pull_hooks" unnamed => PostPullHooks(HooksAttrs),
     "startup_hooks" unnamed => StartupHooks(HooksAttrs),
     "attachment_target" named => AttachmentTarget(AttachmentTargetAttrs),
+    // `integration_config ledger { env = { … }; }` — this app's overrides for
+    // one integration, keyed by the integration's name. An open body, because
+    // the config field is a `toml::Value` tree with no key vocabulary to
+    // transcribe, the same shape the top-level `integration` section takes.
+    // The DSL does not validate the name; an unrecognized name is a boot-time
+    // panic.
+    "integration_config" named => IntegrationConfig(OpenAttrs),
 }
 
 kindword_dispatch! {

@@ -127,7 +127,7 @@ fn the_bearer_endpoint_writes_a_token_where_the_hmac_one_writes_a_key() {
 fn an_agent_body_types_each_of_its_hook_blocks() {
     let file = sections();
     let class = agent(&file, "PersonalAssistant");
-    assert_eq!(class.blocks.len(), 4);
+    assert_eq!(class.blocks.len(), 6);
 
     let typed: Vec<_> = class
         .blocks
@@ -189,6 +189,67 @@ fn an_attachment_target_carries_its_handler_block() {
     assert_eq!(handler.attrs.r#type.value.as_str(), "command");
     assert!(handler.name.is_none());
     assert!(handler.attrs.file_roles.is_some());
+}
+
+/// An `integration_config` block is named and its body is open: every key it
+/// wrote is carried, whatever the key is, because the config field is a value
+/// tree with no vocabulary to check against.
+#[test]
+fn an_integration_config_block_carries_an_open_body() {
+    let file = sections();
+    let class = agent(&file, "PersonalAssistant");
+
+    let AgentBlock::IntegrationConfig(ledger) =
+        agent_block(&class.blocks[4]).unwrap_or_else(|error| panic!("{error}"))
+    else {
+        panic!("the fifth block is the ledger integration config");
+    };
+    assert_eq!(
+        ledger.name.as_ref().expect("the block is named").value(),
+        "ledger"
+    );
+    assert!(ledger.doc.is_some());
+    assert!(ledger.subs.is_empty());
+    let entries = ledger.attrs.clone().entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, "env");
+    assert!(matches!(entries[0].1.value(), Value::Table(_)));
+
+    let AgentBlock::IntegrationConfig(calendar) =
+        agent_block(&class.blocks[5]).unwrap_or_else(|error| panic!("{error}"))
+    else {
+        panic!("the sixth block is the calendar integration config");
+    };
+    assert_eq!(
+        calendar.name.as_ref().expect("the block is named").value(),
+        "calendar"
+    );
+    let keys: Vec<String> = calendar
+        .attrs
+        .clone()
+        .entries()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    assert_eq!(keys, ["env", "timeout_secs"]);
+}
+
+/// An `integration_config` block states an integration name: the map key has no
+/// default, so the unnamed spelling is refused at the kindword.
+#[test]
+fn an_unnamed_integration_config_block_is_refused() {
+    let file = parse_str(
+        "agent A() {\n    integration_config {\n        env = { X = \"1\" };\n    }\n}\n",
+        "unnamed-integration-config.brenn",
+    )
+    .expect("a parse");
+    let class = file.agents().next().expect("the class");
+    let error = agent_block(&class.blocks[0]).expect_err("the block states no name");
+    assert!(
+        error.message.contains("integration_config"),
+        "{}",
+        error.message
+    );
 }
 
 /// The union vocabulary refuses a key no handler type has, at the key.

@@ -425,6 +425,11 @@ integrations = ["graf"]
 command = "graf"
 args = ["mcp"]
 
+# Deliberately redundant with the global block: exercises the per-app override
+# path without changing what the integration sees.
+[app.integration_config.graf]
+command = "graf"
+
 [[app]]
 slug = "pfin"
 name = "Personal Finance"

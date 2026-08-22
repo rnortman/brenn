@@ -540,7 +540,7 @@ fn bindings_carry_their_direction_as_the_variant() {
 fn an_instantiation_takes_arguments_or_a_body() {
     let file = statements();
     let instances: Vec<_> = file.instantiations().collect();
-    assert_eq!(instances.len(), 3);
+    assert_eq!(instances.len(), 4);
 
     let parameterized = &instances[0];
     assert_eq!(parameterized.handle.value(), "alice_pa");
@@ -561,6 +561,40 @@ fn an_instantiation_takes_arguments_or_a_body() {
         "an instance body's attrs stay a map until the class is known"
     );
     assert!(!configured.semi, "a block-ended statement takes no `;`");
+}
+
+/// Port names are the component's own, so a port named after a binding keyword
+/// has to read: `in in <- …`. Nothing in the grammar reserves the direction
+/// words, and a wire-facing port name is not the DSL's to rename.
+#[test]
+fn a_port_may_be_named_after_its_direction_keyword() {
+    let file = statements();
+    let class = file
+        .components()
+        .find(|class| class.name.value() == "Reserved")
+        .expect("the corpus declares the class");
+    let names: Vec<&str> = class
+        .ports
+        .iter()
+        .map(|port| port.name.value().as_str())
+        .collect();
+    assert_eq!(names, ["in", "out"]);
+    assert_eq!(class.ports[0].dir.value(), &PortDir::Into);
+    assert_eq!(class.ports[1].dir.value(), &PortDir::Outof);
+
+    let instance = file
+        .instantiations()
+        .find(|inst| inst.handle.value() == "reserved_demo")
+        .expect("the corpus instantiates it");
+    let body = instance.body.as_ref().expect("a body");
+    let Binding::Into(inbound) = &body.bindings[0] else {
+        panic!("the first binding faces in");
+    };
+    assert_eq!(inbound.port.value(), "in");
+    let Binding::Outof(outbound) = &body.bindings[1] else {
+        panic!("the second binding faces out");
+    };
+    assert_eq!(outbound.port.value(), "out");
 }
 
 /// The plane is a word of the statement, the matchers are its scope.

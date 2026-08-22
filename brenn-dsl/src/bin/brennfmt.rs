@@ -5,6 +5,11 @@
 //! TODO(dsl-fmt-rawstring-indent): an indented multi-line raw string has its
 //! continuation lines re-indented into its own value; the fix is in the
 //! formatting core, not here.
+//!
+//! TODO(dsl-fmt-orphan-terminator): a comment or blank line after a
+//! `;`-terminated item binds to that item, so the `;` is emitted after it and
+//! lands orphaned on its own line; a tail-block statement followed by a block
+//! statement gains a leading space. Layout only, and its own fixed point.
 
 fltk_fmt_cli::fltk_formatter_main! {
     about: "Format Brenn configuration files.",

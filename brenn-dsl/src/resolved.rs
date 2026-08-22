@@ -519,6 +519,11 @@ pub struct RAgent {
     /// The `attachment_target` blocks, in declaration order — the config field
     /// is a list.
     pub attachment_targets: Vec<RAttachmentTarget>,
+    /// The `integration_config` blocks, in declaration order. Each block's name
+    /// is an integration name and its open body is that integration's override
+    /// tree; the config field is a map, and resolution has already refused two
+    /// blocks under one name.
+    pub integration_configs: Vec<RSection>,
     pub doc: Option<DocComment>,
 }
 

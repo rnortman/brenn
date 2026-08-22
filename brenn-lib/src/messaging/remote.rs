@@ -83,7 +83,7 @@ pub enum RemoteGrant {
 /// Depths are plain integers rather than the `Depth` ladder: `"unbounded"` is
 /// not an answer a B7 network principal may be given, so the type does not
 /// offer it.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteSubscribeAclRaw {
     /// `exact = "channel"` — matches this channel and no other.

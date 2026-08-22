@@ -1,11 +1,8 @@
 // TODO(dsl-config-shared-module): the component classes, both assemblies, the
 // bar channels and the bar surfaces below are duplicated verbatim in
 // brenn.e2e.brenn; a change to one wants the same change to the other. The
-// shared module that would end that is designed with the prod port.
-// TODO(dsl-acl-derivation): the explicit acl statements below restate authority
-// the bindings could derive; they are kept longhand so the lowered config
-// compares element-for-element against the TOML twin. Rewrite them
-// derivation-based once that twin retires.
+// component classes are duplicated a third time in the production config,
+// which no gate here can see.
 /// Where the server listens and what it believes about the proxy in front.
 server {
   bind_address = "127.0.0.1:3000";
@@ -312,6 +309,11 @@ agent PersonalAssistant {
     command = "graf";
     args = ["mcp"];
   }
+  // Deliberately redundant with the global block: exercises the per-app
+  // override path without changing what the integration sees.
+  integration_config graf {
+    command = "graf";
+  }
 }
 
 new assistant: PersonalAssistant;
@@ -347,10 +349,6 @@ new pfin: Pfin;
 // demands the alert plane (boot-checked).
 surface dev-stub {
   grants = [subscribe, publish, alert];
-  acl subscribe [exact dev_stub];
-  acl publish [exact dev_stub]
-
-  ;
   new echo-stub: EchoStub {
     in messages <- dev_stub { push_depth = 8; noise = alarm; }
     out out -> dev_stub;
@@ -374,16 +372,6 @@ surface dev-stub {
 surface bar {
   grants = [subscribe, publish, takeover];
   skin = "bench";
-  acl subscribe [exact bar_a,
-    exact bar_b,
-    exact bar_c,
-    exact bar_layout,
-    exact bar_mode,
-    exact bar_agenda,
-    exact bar_acks];
-  acl publish [exact bar_acks]
-
-  ;
   new p1: Protobar {
     in messages <- bar_a;
     io tick { push_depth = 1; retain_depth = 2; }
@@ -436,15 +424,6 @@ surface bar {
 surface bar-pixel {
   grants = [subscribe, publish, takeover];
   skin = "foundry";
-  acl subscribe [exact bar_a,
-    exact bar_b,
-    exact bar_c,
-    exact bar_layout,
-    exact bar_agenda,
-    exact bar_acks];
-  acl publish [exact bar_acks]
-
-  ;
   new p1: Protobar {
     in messages <- bar_a;
     io tick { push_depth = 1; retain_depth = 2; }
@@ -489,15 +468,6 @@ surface bar-pixel {
 // this block should add `allowed_users`.
 surface bar-feeder {
   grants = [publish];
-  acl publish [exact bar_a,
-    exact bar_b,
-    exact bar_c,
-    exact bar_layout,
-    exact bar_mode,
-    exact bar_agenda,
-    exact bar_acks]
-
-  ;
   new feed-a: EchoStub {
     out out -> bar_a;
   }

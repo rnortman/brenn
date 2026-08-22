@@ -3624,6 +3624,7 @@ fn emit_agent(
         acls,
         hooks: blocks.hooks,
         attachment_targets: blocks.attachment_targets,
+        integration_configs: blocks.integration_configs,
         doc: inst.doc,
     };
     if refused.any() {
@@ -4161,14 +4162,16 @@ fn emit_subs(
 struct AgentBlocks {
     hooks: Vec<RHooks>,
     attachment_targets: Vec<RAttachmentTarget>,
+    integration_configs: Vec<RSection>,
 }
 
 /// An agent's sub-blocks, typed by their kindword.
 ///
 /// At most one block per `(kindword, name)` — two `start_hooks` are two answers
-/// to one question, and two `attachment_target import` are two definitions of
-/// one upload affordance. Targets under different names are the normal case:
-/// the config field is a list.
+/// to one question, two `attachment_target import` are two definitions of one
+/// upload affordance, and two `integration_config ledger` are two override
+/// trees for one map key. Blocks under different names are the normal case: the
+/// config fields are a list and a map.
 fn emit_blocks(
     blocks: &[SectionNode],
     scope: &Scope<'_>,
@@ -4178,6 +4181,7 @@ fn emit_blocks(
     let mut resolved = AgentBlocks {
         hooks: Vec::new(),
         attachment_targets: Vec::new(),
+        integration_configs: Vec::new(),
     };
     let duplicates = duplicate_sections(
         blocks.iter().enumerate(),
@@ -4222,6 +4226,24 @@ fn emit_blocks(
                 match emit_attachment_target(*block, scope, errors) {
                     Some(target) => resolved.attachment_targets.push(target),
                     None => withhold.drop_part(),
+                }
+            }
+            // An open body with nothing to check: every key is legal, every
+            // value is carried, and what the integration makes of the tree is
+            // the integration's business at boot.
+            AgentBlock::IntegrationConfig(block) => {
+                let block = *block;
+                refuse_subs(block.kindword.value(), &block.subs, errors);
+                let (attrs, refused) = resolve_attrs(block.attrs, scope, errors);
+                match refused.any() {
+                    true => withhold.drop_part(),
+                    false => resolved.integration_configs.push(RSection {
+                        kindword: block.kindword,
+                        name: block.name,
+                        attrs: attrs.entries(),
+                        subs: Vec::new(),
+                        doc: block.doc,
+                    }),
                 }
             }
         }

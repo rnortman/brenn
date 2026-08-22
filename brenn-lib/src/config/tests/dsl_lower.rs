@@ -717,7 +717,7 @@ const MINIMAL_OBSERVABILITY_BLOCKS: [(&str, &str, BlockWitness); 1] = [(
     |config| config.observability.usage.session_gap_minutes == 45,
 )];
 
-const MINIMAL_AGENT_BLOCKS: [(&str, &str, BlockWitness); 4] = [
+const MINIMAL_AGENT_BLOCKS: [(&str, &str, BlockWitness); 5] = [
     (
         "start_hooks",
         r#"agent A() { start_hooks { host = ["git fetch"]; } }
@@ -752,6 +752,12 @@ const MINIMAL_AGENT_BLOCKS: [(&str, &str, BlockWitness); 4] = [
            }
            new alice: A();"#,
         |config| only_app(config).attachment_targets.len() == 1,
+    ),
+    (
+        "integration_config",
+        r#"agent A() { integration_config ledger { env = { LEDGER_DATA = "/srv/ledger" }; } }
+           new alice: A();"#,
+        |config| only_app(config).integration_config.contains_key("ledger"),
     ),
 ];
 
@@ -1146,6 +1152,46 @@ host = ["cargo build"]
 
 [app.startup_hooks]
 container = ["pf migrate"]
+"#,
+    );
+}
+
+/// Per-integration overrides are named sub-blocks with open bodies, one per map
+/// key, and the value tree the DSL carries is the tree the TOML loader builds:
+/// a nested table, a scalar, and a list all land as their own `toml::Value`.
+///
+/// The block only overrides; naming an integration here implicitly enables it.
+/// This test does not verify that enablement — the `integrations` list in the
+/// twin below is the one the agent states, unchanged.
+#[test]
+fn an_agent_lowers_its_per_integration_config_blocks() {
+    assert_equivalent(
+        r#"
+agent Assistant() {
+    integrations = ["ledger"];
+
+    integration_config ledger {
+        env = { LEDGER_DATA = "/home/alice/ledger", LEDGER_STRICT = "1" };
+        timeout_secs = 30;
+    }
+    integration_config calendar {
+        accounts = ["alice", "bob"];
+    }
+}
+
+new alice: Assistant();
+"#,
+        r#"
+[[app]]
+slug = "alice"
+integrations = ["ledger"]
+
+[app.integration_config.ledger]
+env = { LEDGER_DATA = "/home/alice/ledger", LEDGER_STRICT = "1" }
+timeout_secs = 30
+
+[app.integration_config.calendar]
+accounts = ["alice", "bob"]
 "#,
     );
 }
@@ -2157,6 +2203,67 @@ ephemeral_subscribe_acl = [{ exact = "alice-pod.utterance" }]
 [[wasm_consumer.subscription]]
 port = "heard"
 channel = "ephemeral:alice-pod.utterance"
+"#,
+    );
+}
+
+/// A component's ports are its own names and nothing reserves the binding
+/// keywords, so a port may be called `in` or `out` — `in in <- ...`. This
+/// gates resolve and lowering, not just parsing: the port names must reach the
+/// raw config's wire-facing `port` field.
+#[test]
+fn a_port_named_after_its_direction_keyword_lowers_to_that_wire_name() {
+    assert_equivalent(
+        r#"
+channel utterance at "ephemeral:alice-pod.utterance" {
+    push_depth = 4;
+    retain_depth = 16;
+}
+
+channel notes at "ephemeral:alice-pod.notes" {
+    push_depth = 4;
+    retain_depth = 16;
+}
+
+component Reserved {
+    abi = processor;
+    component_path = "/lib/brenn_reserved.wasm";
+    in in;
+    out out;
+}
+
+new reserved: Reserved {
+    grants = [log, ports];
+
+    in in <- utterance;
+    out out -> notes;
+}
+"#,
+        r#"
+[[channel]]
+address = "ephemeral:alice-pod.utterance"
+push_depth = 4
+retain_depth = 16
+
+[[channel]]
+address = "ephemeral:alice-pod.notes"
+push_depth = 4
+retain_depth = 16
+
+[[wasm_consumer]]
+slug = "reserved"
+component_path = "/lib/brenn_reserved.wasm"
+grants = ["log", "ports"]
+ephemeral_subscribe_acl = [{ exact = "alice-pod.utterance" }]
+ephemeral_publish_acl = [{ exact = "alice-pod.notes" }]
+
+[[wasm_consumer.subscription]]
+port = "in"
+channel = "ephemeral:alice-pod.utterance"
+
+[[wasm_consumer.output]]
+port = "out"
+channel = "ephemeral:alice-pod.notes"
 "#,
     );
 }

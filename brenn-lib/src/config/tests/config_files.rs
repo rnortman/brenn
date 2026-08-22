@@ -8,7 +8,9 @@
 //! nothing but this assertion keeps them from drifting apart in the meantime.
 
 use super::*;
-use crate::config::brenn::{canonicalize_config_addresses, check_config};
+use crate::config::brenn::{
+    canonicalize_config_addresses, check_config, sort_order_dead_collections,
+};
 
 /// A config file at the repo root, loaded the way boot loads it.
 ///
@@ -45,11 +47,12 @@ fn assert_config_file_messaging_invariant(filename: &str) {
 
 /// A `.brenn` document and its TOML twin are one config.
 ///
-/// The comparison is the differ's: addresses canonicalized so a bare TOML
-/// `address` and a scheme-qualified lowered one are not reported as different,
-/// and then `PartialEq` over the whole value. Nothing is sorted — array order is
-/// semantic in a `BrennConfig`, so an ordering regression in lowering trips this
-/// too.
+/// The comparison is the differ's, through the same two normalizations:
+/// addresses canonicalized so a bare TOML `address` and a scheme-qualified
+/// lowered one are not reported as different, and the collections whose order
+/// the runtime ignores sorted so a derived ACL and a hand-listed one compare
+/// equal. Everything else is `PartialEq` over the whole value, so an ordering
+/// regression in lowering still trips this.
 ///
 /// TODO(dsl-toml-twins): this assertion and the TOML side of it retire together
 /// with the TOML front end.
@@ -58,6 +61,8 @@ fn assert_twins(document: &str, toml: &str) {
     let mut from_toml = load_config_file(toml);
     canonicalize_config_addresses(&mut from_dsl);
     canonicalize_config_addresses(&mut from_toml);
+    sort_order_dead_collections(&mut from_dsl);
+    sort_order_dead_collections(&mut from_toml);
     assert_eq!(
         from_dsl, from_toml,
         "{document} and {toml} are no longer the same config; \
