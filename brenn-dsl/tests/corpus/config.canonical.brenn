@@ -123,3 +123,11 @@ container cc {
   extra_mounts = ["/srv/shared:/srv/shared"];
   extra_args = ["--pids-limit", "512"];
 }
+
+/// Global defaults for one integration: an open body, so any key the
+/// integration's own reader knows is legal here.
+integration graf {
+  command = "graf";
+  timeout_secs = 30;
+  env = { GRAF_ROOT = "/home/alice/kb" };
+}

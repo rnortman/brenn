@@ -41,16 +41,10 @@ fn messages(errors: &[Diagnostic]) -> Vec<&str> {
 #[test]
 fn a_root_reaches_a_nested_module_and_a_flat_one() {
     let output = compile(&root("ok")).unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
-    assert!(
-        output.warnings.is_empty(),
-        "{:?}",
-        messages(&output.warnings)
-    );
     // The nested module's own declaration reached the resolved config, and the
     // constant it interpolated came from the flat module the root imported
     // whole: loading and indexing a module is not the same as emitting it.
     let addresses: Vec<&str> = output
-        .config
         .resolved
         .channels
         .iter()
@@ -62,25 +56,21 @@ fn a_root_reaches_a_nested_module_and_a_flat_one() {
         addresses,
         ["brenn:bench.status", "brenn:alice-desk.in.p1.messages"]
     );
+    assert_eq!(output.resolved.channels[0].handle.dotted(), "bench_status");
     assert_eq!(
-        output.config.resolved.channels[0].handle.dotted(),
-        "bench_status"
-    );
-    assert_eq!(
-        output.config.resolved.channels[1].handle.dotted(),
+        output.resolved.channels[1].handle.dotted(),
         "alice_desk.messages"
     );
     // The whole emitted shape, so that a change in what emission carries out of
     // a module is visible here and not only for channels.
     let repos: Vec<String> = output
-        .config
         .resolved
         .repos
         .iter()
         .map(|repo| repo.handle.dotted())
         .collect();
     assert_eq!(repos, ["notes"]);
-    let config = &output.config.resolved;
+    let config = &output.resolved;
     assert!(config.tunings.is_empty());
     assert!(config.uuid_pins.is_empty());
     assert!(config.surfaces.is_empty());
@@ -99,16 +89,6 @@ fn the_root_file_cannot_be_loaded_a_second_time_as_a_named_module() {
     assert_eq!(
         one_error("reimport"),
         "`main` is already loaded as <root>: one file is one module"
-    );
-}
-
-#[test]
-fn a_module_no_use_reaches_is_a_warning_and_not_an_error() {
-    let output =
-        compile(&root("orphan")).unwrap_or_else(|errors| panic!("{:?}", messages(&errors)));
-    assert_eq!(
-        messages(&output.warnings),
-        ["no `use` reaches this file: unused.brenn"]
     );
 }
 

@@ -50,4 +50,18 @@ agent PersonalAssistant(slug: String) {
   startup_hooks {
     container = ["echo started"];
   }
+  /// The upload affordance the app offers, and what runs on it.
+  attachment_target import {
+    label = "Import a statement";
+    accept = [".ofx", ".csv"];
+    multi = true;
+    handler {
+      type = command;
+      program = "pf";
+      args = ["--json", "import", "{ofx}", "--csv", "{csv}"];
+      timeout_secs = 90;
+      cc_instructions = "Reconcile the import against the ledger.";
+      file_roles = { ofx = [".ofx"], csv = [".csv"] };
+    }
+  }
 }

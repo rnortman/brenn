@@ -21,14 +21,9 @@ fn lowered(document: &str) -> Result<BrennConfig, Vec<Diagnostic>> {
     let dir = tempfile::tempdir().expect("a tempdir");
     let root = dir.path().join("main.brenn");
     std::fs::write(&root, document).expect("write the root module");
-    let output = brenn_dsl::compile(&root)
+    let config = brenn_dsl::compile(&root)
         .unwrap_or_else(|errors| panic!("the document must compile:\n{}", render(&errors)));
-    assert!(
-        output.warnings.is_empty(),
-        "the document must compile clean:\n{}",
-        render(&output.warnings)
-    );
-    lower(output.config)
+    lower(config)
 }
 
 /// Every diagnostic, one per line, for a panic message.
@@ -346,9 +341,9 @@ fn an_empty_document_lowers_to_the_default_config() {
     let dir = tempfile::tempdir().expect("a tempdir");
     let root = dir.path().join("main.brenn");
     std::fs::write(&root, "").expect("write the root module");
-    let output = brenn_dsl::compile(Path::new(&root)).expect("an empty document compiles");
+    let config = brenn_dsl::compile(Path::new(&root)).expect("an empty document compiles");
     assert_eq!(
-        lower(output.config).expect("an empty document lowers"),
+        lower(config).expect("an empty document lowers"),
         BrennConfig::default()
     );
 }
@@ -626,7 +621,7 @@ home_dir = "/home/alice/container-home"
 /// is the tripwire for that: the test below asserts it covers every kindword the
 /// language admits, and lowers all of them, so a kindword added to the
 /// vocabulary is a red test rather than a boot panic.
-const MINIMAL_SECTIONS: [(&str, &str); 17] = [
+const MINIMAL_SECTIONS: [(&str, &str); 18] = [
     (
         "server",
         r#"server { public_url = "https://brenn.example.com"; }"#,
@@ -650,6 +645,7 @@ const MINIMAL_SECTIONS: [(&str, &str); 17] = [
         "container",
         r#"container cc { image = "brenn-cc:latest"; home_dir = "/home/alice/container-home"; }"#,
     ),
+    ("integration", r#"integration graf { command = "graf"; }"#),
 ];
 
 /// Every kindword the language admits reaches a lowering arm.
@@ -681,39 +677,81 @@ fn every_configuration_section_kindword_lowers() {
 /// arm reads lowers to nothing at all. Each row below is a document that must
 /// lower, which is what makes the tables below coverage rather than a second
 /// copy of the constants.
-const MINIMAL_ALERTING_BLOCKS: [(&str, &str); 2] = [
+/// What a row's document must put in the lowered config for the row to count as
+/// covered: a lowering arm that quietly drops its block would otherwise pass.
+type BlockWitness = fn(&BrennConfig) -> bool;
+
+/// The one app a sub-block row's document declares.
+fn only_app(config: &BrennConfig) -> &crate::config::app::AppConfigRaw {
+    config.apps.first().expect("the row declares one app")
+}
+
+const MINIMAL_ALERTING_BLOCKS: [(&str, &str, BlockWitness); 2] = [
     (
         "ntfy",
         r#"alerting { max_alerts = 5; window_secs = 60;
                ntfy { url = "https://ntfy.example.com/alice"; } }"#,
+        |config| {
+            config
+                .alerting
+                .as_ref()
+                .is_some_and(|alerting| alerting.ntfy.is_some())
+        },
     ),
     (
         "mail",
         r#"alerting { max_alerts = 5; window_secs = 60;
                mail { to = "alice@example.com"; } }"#,
+        |config| {
+            config
+                .alerting
+                .as_ref()
+                .is_some_and(|alerting| alerting.mail.is_some())
+        },
     ),
 ];
 
-const MINIMAL_OBSERVABILITY_BLOCKS: [(&str, &str); 1] = [(
+const MINIMAL_OBSERVABILITY_BLOCKS: [(&str, &str, BlockWitness); 1] = [(
     "usage",
-    "observability { usage { session_gap_minutes = 30; } }",
+    "observability { usage { session_gap_minutes = 45; } }",
+    |config| config.observability.usage.session_gap_minutes == 45,
 )];
 
-const MINIMAL_AGENT_BLOCKS: [(&str, &str); 3] = [
+const MINIMAL_AGENT_BLOCKS: [(&str, &str, BlockWitness); 4] = [
     (
         "start_hooks",
         r#"agent A() { start_hooks { host = ["git fetch"]; } }
            new alice: A();"#,
+        |config| only_app(config).start_hooks.is_some(),
     ),
     (
         "post_pull_hooks",
         r#"agent A() { post_pull_hooks { host = ["cargo build"]; } }
            new alice: A();"#,
+        |config| only_app(config).post_pull_hooks.is_some(),
     ),
     (
         "startup_hooks",
         r#"agent A() { startup_hooks { host = ["pf migrate"]; } }
            new alice: A();"#,
+        |config| only_app(config).startup_hooks.is_some(),
+    ),
+    (
+        "attachment_target",
+        r#"agent A() {
+               attachment_target import {
+                   label = "Import";
+                   accept = [".ofx"];
+                   handler {
+                       type = command;
+                       program = "pf";
+                       args = ["import"];
+                       file_roles = { ofx = [".ofx"] };
+                   }
+               }
+           }
+           new alice: A();"#,
+        |config| only_app(config).attachment_targets.len() == 1,
     ),
 ];
 
@@ -735,7 +773,7 @@ fn every_sub_block_kindword_lowers() {
             MINIMAL_AGENT_BLOCKS.as_slice(),
         ),
     ] {
-        let mut covered: Vec<&str> = table.iter().map(|(kindword, _)| *kindword).collect();
+        let mut covered: Vec<&str> = table.iter().map(|(kindword, _, _)| *kindword).collect();
         covered.sort_unstable();
         let mut admitted: Vec<&str> = admitted.to_vec();
         admitted.sort_unstable();
@@ -743,9 +781,13 @@ fn every_sub_block_kindword_lowers() {
             covered, admitted,
             "every sub-block kindword needs a row above, and a lowering arm"
         );
-        for (kindword, document) in table {
-            lowered(document)
+        for (kindword, document, carried) in table {
+            let config = lowered(document)
                 .unwrap_or_else(|errors| panic!("`{kindword}` must lower:\n{}", render(&errors)));
+            assert!(
+                carried(&config),
+                "`{kindword}` lowered to nothing: its arm read the block and dropped it"
+            );
         }
     }
 }
@@ -2166,6 +2208,114 @@ retain_depth = 2
     );
 }
 
+/// Consumer twin of the surface row below: a declared channel's `io` port
+/// lowers to subscription/output, not `[[wasm_consumer.io_port]]`. Also
+/// covers `amplification`, a consumer-only knob carried on the subscription.
+#[test]
+fn a_consumers_io_port_on_a_declared_channel_lowers_to_the_pair() {
+    assert_equivalent(
+        r#"
+channel acks at "ephemeral:alice-pod.acks" {
+    push_depth = 2;
+    retain_depth = 4;
+}
+
+component Sink {
+    abi = processor;
+    component_path = "/lib/brenn_sink.wasm";
+    io acks;
+}
+
+new sink: Sink {
+    grants = [ports];
+
+    io acks <-> acks {
+        push_depth = 1;
+        retain_depth = 2;
+        noise = alarm;
+        amplification = 0.5;
+        urgency = low;
+        publish_per_activation = 1;
+        publish_capacity = 1;
+    }
+}
+"#,
+        r#"
+[[channel]]
+address = "ephemeral:alice-pod.acks"
+push_depth = 2
+retain_depth = 4
+
+[[wasm_consumer]]
+slug = "sink"
+component_path = "/lib/brenn_sink.wasm"
+grants = ["ports"]
+ephemeral_subscribe_acl = [{ exact = "alice-pod.acks" }]
+ephemeral_publish_acl = [{ exact = "alice-pod.acks" }]
+
+[[wasm_consumer.subscription]]
+port = "acks"
+channel = "ephemeral:alice-pod.acks"
+push_depth = 1
+retain_depth = 2
+noise = "alarm"
+amplification = 0.5
+
+[[wasm_consumer.output]]
+port = "acks"
+channel = "ephemeral:alice-pod.acks"
+urgency = "low"
+publish_per_activation = 1.0
+publish_capacity = 1.0
+"#,
+    );
+}
+
+#[test]
+fn an_attrless_consumer_io_port_on_a_declared_channel_lowers_to_the_pair() {
+    assert_equivalent(
+        r#"
+channel acks at "ephemeral:alice-pod.acks" {
+    push_depth = 2;
+    retain_depth = 4;
+}
+
+component Sink {
+    abi = processor;
+    component_path = "/lib/brenn_sink.wasm";
+    io acks;
+}
+
+new sink: Sink {
+    grants = [ports];
+
+    io acks <-> acks;
+}
+"#,
+        r#"
+[[channel]]
+address = "ephemeral:alice-pod.acks"
+push_depth = 2
+retain_depth = 4
+
+[[wasm_consumer]]
+slug = "sink"
+component_path = "/lib/brenn_sink.wasm"
+grants = ["ports"]
+ephemeral_subscribe_acl = [{ exact = "alice-pod.acks" }]
+ephemeral_publish_acl = [{ exact = "alice-pod.acks" }]
+
+[[wasm_consumer.subscription]]
+port = "acks"
+channel = "ephemeral:alice-pod.acks"
+
+[[wasm_consumer.output]]
+port = "acks"
+channel = "ephemeral:alice-pod.acks"
+"#,
+    );
+}
+
 /// Two consumers in one document, distinguishable on the axis lowering zips:
 /// each pairs a resolved instance with its derived authority by position, so a
 /// mis-pairing would hand one consumer the other's grants and ACLs. That is a
@@ -2541,6 +2691,125 @@ noise = "alarm"
 urgency = "low"
 publish_per_activation = 1.0
 publish_capacity = 1.0
+"#,
+    );
+}
+
+/// A declared channel's `io` port lowers to subscription/output, not
+/// `[[surface.io_port]]`.
+#[test]
+fn an_io_port_on_a_declared_channel_lowers_to_the_pair() {
+    assert_equivalent(
+        r#"
+channel acks at "ephemeral:alice-desk.acks" {
+    push_depth = 2;
+    retain_depth = 4;
+}
+
+component Panel {
+    abi = dom;
+    io acks;
+}
+
+surface alice_desk {
+    grants = [subscribe, publish];
+
+    new panel: Panel {
+        io acks <-> acks {
+            push_depth = 1;
+            retain_depth = 2;
+            noise = alarm;
+            urgency = low;
+            publish_per_activation = 1;
+            publish_capacity = 1;
+        }
+    }
+}
+"#,
+        r#"
+[[channel]]
+address = "ephemeral:alice-desk.acks"
+push_depth = 2
+retain_depth = 4
+
+[[surface]]
+slug = "alice_desk"
+grants = ["ephemeral_subscribe", "ephemeral_publish"]
+ephemeral_subscribe_acl = [{ exact = "alice-desk.acks" }]
+ephemeral_publish_acl = [{ exact = "alice-desk.acks" }]
+
+[[surface.component]]
+kind = "panel"
+instance = "panel"
+abi = "dom"
+
+[[surface.subscription]]
+channel = "ephemeral:alice-desk.acks"
+instance = "panel"
+port = "acks"
+push_depth = 1
+retain_depth = 2
+noise = "alarm"
+
+[[surface.output]]
+instance = "panel"
+port = "acks"
+channel = "ephemeral:alice-desk.acks"
+urgency = "low"
+publish_per_activation = 1.0
+publish_capacity = 1.0
+"#,
+    );
+}
+
+#[test]
+fn an_attrless_io_port_on_a_declared_channel_lowers_to_the_pair() {
+    assert_equivalent(
+        r#"
+channel acks at "ephemeral:alice-desk.acks" {
+    push_depth = 2;
+    retain_depth = 4;
+}
+
+component Panel {
+    abi = dom;
+    io acks;
+}
+
+surface alice_desk {
+    grants = [subscribe, publish];
+
+    new panel: Panel {
+        io acks <-> acks;
+    }
+}
+"#,
+        r#"
+[[channel]]
+address = "ephemeral:alice-desk.acks"
+push_depth = 2
+retain_depth = 4
+
+[[surface]]
+slug = "alice_desk"
+grants = ["ephemeral_subscribe", "ephemeral_publish"]
+ephemeral_subscribe_acl = [{ exact = "alice-desk.acks" }]
+ephemeral_publish_acl = [{ exact = "alice-desk.acks" }]
+
+[[surface.component]]
+kind = "panel"
+instance = "panel"
+abi = "dom"
+
+[[surface.subscription]]
+channel = "ephemeral:alice-desk.acks"
+instance = "panel"
+port = "acks"
+
+[[surface.output]]
+instance = "panel"
+port = "acks"
+channel = "ephemeral:alice-desk.acks"
 "#,
     );
 }
@@ -3309,5 +3578,372 @@ webhook alice_inbox {
         refusal.message,
         "webhook `alice_inbox` states no `signature` block: which scheme guards an endpoint \
          has no default"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Integration sections
+// ---------------------------------------------------------------------------
+
+/// The one open-bodied section: every key the body wrote reaches the config's
+/// `toml::Value` tree, scalars and nested tables alike.
+#[test]
+fn integration_sections_lower_to_the_map_their_toml_twin_builds() {
+    assert_equivalent(
+        r#"
+integration graf {
+    command = "graf";
+    timeout_secs = 30;
+    strict = true;
+    ratio = 0.5;
+    args = ["mcp", "--quiet"];
+    env = { GRAF_ROOT = "/home/alice/kb", GRAF_LOG = "warn" };
+}
+
+integration pfin { command = "pf"; }
+"#,
+        r#"
+[integrations.graf]
+command = "graf"
+timeout_secs = 30
+strict = true
+ratio = 0.5
+args = ["mcp", "--quiet"]
+env = { GRAF_ROOT = "/home/alice/kb", GRAF_LOG = "warn" }
+
+[integrations.pfin]
+command = "pf"
+"#,
+    );
+}
+
+/// A body nesting two levels deep: an inline table inside an inline table is
+/// the same tree TOML's own nested tables build.
+#[test]
+fn an_integration_body_nests_as_deep_as_it_is_written() {
+    assert_equivalent(
+        r#"
+integration graf {
+    limits = { queries = { per_minute = 60, burst = 10 }, bytes = 4096 };
+}
+"#,
+        r#"
+[integrations.graf.limits]
+bytes = 4096
+
+[integrations.graf.limits.queries]
+per_minute = 60
+burst = 10
+"#,
+    );
+}
+
+#[test]
+fn a_matcher_in_an_integration_body_is_refused() {
+    let refusal = refusal(
+        r#"
+integration graf {
+    command = "graf";
+    store_path = exact "alice.";
+}
+"#,
+    );
+    assert_eq!(
+        refusal.message,
+        "`store_path`: a matcher is not a value here"
+    );
+    assert_eq!(
+        refusal.line_col(),
+        Some((4, 18)),
+        "the span is the matcher's own token: {}",
+        refusal.render()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Attachment targets
+// ---------------------------------------------------------------------------
+
+/// A target stating every key, and the one handler type there is.
+#[test]
+fn an_attachment_target_lowers_with_every_key_and_its_handler() {
+    assert_equivalent(
+        r#"
+agent Assistant() {
+    attachment_target import {
+        label = "Import bank export";
+        accept = [".ofx", ".qfx", ".csv"];
+        multi = true;
+        handler {
+            type = command;
+            program = "pf";
+            args = ["--json", "import", "{ofx}", "--csv", "{csv}"];
+            timeout_secs = 120;
+            cc_instructions = "Reconcile the import against the ledger.";
+            file_roles = { ofx = [".ofx", ".qfx"], csv = [".csv"] };
+        }
+    }
+}
+
+new alice: Assistant();
+"#,
+        r#"
+[[app]]
+slug = "alice"
+
+[[app.attachment_targets]]
+name = "import"
+label = "Import bank export"
+accept = [".ofx", ".qfx", ".csv"]
+multi = true
+
+[app.attachment_targets.handler]
+type = "command"
+program = "pf"
+args = ["--json", "import", "{ofx}", "--csv", "{csv}"]
+timeout_secs = 120
+cc_instructions = "Reconcile the import against the ledger."
+file_roles = { ofx = [".ofx", ".qfx"], csv = [".csv"] }
+"#,
+    );
+}
+
+/// The minimal target: `multi` and `timeout_secs` omitted on the DSL side and
+/// on the TOML side both, so this is the defaults-parity lock — the two sides
+/// call the same default function. The wire name falls back to the block's own
+/// name, and an explicit `name` overrides it, which is why the second target
+/// states one.
+#[test]
+fn a_minimal_attachment_target_lowers_with_serdes_defaults() {
+    assert_equivalent(
+        r#"
+agent Assistant() {
+    attachment_target import {
+        label = "Import";
+        accept = [".ofx"];
+        handler { type = command; program = "pf"; args = ["import"]; file_roles = {}; }
+    }
+    attachment_target receipt {
+        name = "receipt-scan";
+        label = "Scan a receipt";
+        accept = [".jpg"];
+        handler { type = command; program = "pf"; args = ["scan"]; file_roles = {}; }
+    }
+}
+
+new alice: Assistant();
+"#,
+        r#"
+[[app]]
+slug = "alice"
+
+[[app.attachment_targets]]
+name = "import"
+label = "Import"
+accept = [".ofx"]
+
+[app.attachment_targets.handler]
+type = "command"
+program = "pf"
+args = ["import"]
+file_roles = {}
+
+[[app.attachment_targets]]
+name = "receipt-scan"
+label = "Scan a receipt"
+accept = [".jpg"]
+
+[app.attachment_targets.handler]
+type = "command"
+program = "pf"
+args = ["scan"]
+file_roles = {}
+"#,
+    );
+}
+
+// The union vocabulary has exactly one variant's fields in it today, so a key
+// the chosen type has no field for cannot be written: the vocabulary refuses it
+// first, and that refusal is tested in brenn-dsl. `Body::finish` here is the
+// belt that becomes reachable the day a second handler type lands.
+
+/// A field the chosen type requires and the block does not state is refused at
+/// the block, which is the finest position a missing key has.
+#[test]
+fn a_handler_missing_a_required_field_is_refused() {
+    let refusal = refusal(
+        r#"
+agent Assistant() {
+    attachment_target import {
+        label = "Import";
+        accept = [".ofx"];
+        handler { type = command; program = "pf"; file_roles = {}; }
+    }
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert_eq!(
+        refusal.message,
+        "`handler` of `attachment_target import` of app `alice` states no `args`, which it requires"
+    );
+    assert_eq!(
+        refusal.line_col(),
+        Some((6, 9)),
+        "the position is the `handler` kindword's, which is the finest a missing key has: {}",
+        refusal.render()
+    );
+    assert_toml_refused(
+        r#"
+[[app]]
+slug = "alice"
+
+[[app.attachment_targets]]
+name = "import"
+label = "Import"
+accept = [".ofx"]
+
+[app.attachment_targets.handler]
+type = "command"
+program = "pf"
+file_roles = {}
+"#,
+        "args",
+    );
+}
+
+/// `file_roles` is required, and a required map is refused when it is absent
+/// like every other required field — not read as an empty one.
+#[test]
+fn a_handler_stating_no_file_roles_is_refused() {
+    let refusal = refusal(
+        r#"
+agent Assistant() {
+    attachment_target import {
+        label = "Import";
+        accept = [".ofx"];
+        handler { type = command; program = "pf"; args = ["import"]; }
+    }
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert_eq!(
+        refusal.message,
+        "`handler` of `attachment_target import` of app `alice` states no `file_roles`, \
+         which it requires"
+    );
+    assert_toml_refused(
+        r#"
+[[app]]
+slug = "alice"
+
+[[app.attachment_targets]]
+name = "import"
+label = "Import"
+accept = [".ofx"]
+
+[app.attachment_targets.handler]
+type = "command"
+program = "pf"
+args = ["import"]
+"#,
+        "file_roles",
+    );
+}
+
+/// The type word is the raw enum's own serde tag, so an unknown one names the
+/// tags there are.
+#[test]
+fn an_unknown_handler_type_names_the_legal_set() {
+    let refusal = refusal(
+        r#"
+agent Assistant() {
+    attachment_target import {
+        label = "Import";
+        accept = [".ofx"];
+        handler { type = webhook; program = "pf"; args = ["import"]; }
+    }
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert_eq!(
+        refusal.message,
+        "`webhook` is not an attachment handler type; expected `command`"
+    );
+    assert_toml_refused(
+        r#"
+[[app]]
+slug = "alice"
+
+[[app.attachment_targets]]
+name = "import"
+label = "Import"
+accept = [".ofx"]
+
+[app.attachment_targets.handler]
+type = "webhook"
+"#,
+        "command",
+    );
+}
+
+/// `file_roles` maps a role to the extensions that fill it, so a value that is
+/// not a list of strings is refused at that value.
+#[test]
+fn a_file_role_that_is_not_a_list_of_strings_is_refused() {
+    let refusal = refusal(
+        r#"
+agent Assistant() {
+    attachment_target import {
+        label = "Import";
+        accept = [".ofx"];
+        handler {
+            type = command;
+            program = "pf";
+            args = ["import"];
+            file_roles = { ofx = ".ofx" };
+        }
+    }
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert_eq!(
+        refusal.message,
+        "`file_roles`: expected a list of strings, got a string"
+    );
+}
+
+/// The whole map, not one entry of it: a `file_roles` that is not a table is
+/// refused at the value.
+#[test]
+fn a_file_roles_that_is_not_a_table_is_refused() {
+    let refusal = refusal(
+        r#"
+agent Assistant() {
+    attachment_target import {
+        label = "Import";
+        accept = [".ofx"];
+        handler {
+            type = command;
+            program = "pf";
+            args = ["import"];
+            file_roles = [".ofx"];
+        }
+    }
+}
+
+new alice: Assistant();
+"#,
+    );
+    assert_eq!(
+        refusal.message,
+        "`file_roles`: expected a table of string lists, got a list"
     );
 }

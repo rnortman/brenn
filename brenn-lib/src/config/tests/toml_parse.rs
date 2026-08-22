@@ -11,46 +11,6 @@ fn parse_empty_toml_uses_defaults() {
     assert_eq!(config.logging.console_level, LevelFilter::INFO);
 }
 
-// Parse a checked-in config file and assert the public_url contract. Full
-// validation (validate_and_resolve) needs host-side paths to exist, so it only
-// runs at server startup — but this invariant needs none of those paths:
-// server.public_url is required config, unconditionally, and a config lacking it
-// refuses to start. Asserting it here guards the file against a regression that
-// make check would otherwise miss (only a live server start would catch it — and
-// make e2e is not part of make check).
-fn assert_config_file_messaging_invariant(filename: &str) {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join(filename);
-    let contents = std::fs::read_to_string(&path).unwrap();
-    let config: BrennConfig =
-        toml::from_str(&contents).unwrap_or_else(|e| panic!("{filename} parse failed: {e}"));
-    let public_url = config
-        .server
-        .public_url
-        .as_deref()
-        .unwrap_or_else(|| panic!("{filename} must set server.public_url; it is required"));
-    assert!(
-        !public_url.is_empty(),
-        "{filename} sets an empty server.public_url; it must be a well-formed URL"
-    );
-    // Every depth a `[[channel]]` block owns is required, and nothing under
-    // the block supplies one. Running both passes here catches a misconfigured
-    // block at `make check` time rather than only at a live server start.
-    crate::messaging::config::build_channel_entries(&config.channels, &config.messaging);
-    crate::messaging::config::build_system_channel_tuning(&config.channels, &config.messaging);
-}
-
-#[test]
-fn brenn_dev_toml_parses() {
-    assert_config_file_messaging_invariant("brenn.dev.toml");
-}
-
-#[test]
-fn brenn_e2e_toml_parses() {
-    assert_config_file_messaging_invariant("brenn.e2e.toml");
-}
-
 #[test]
 fn parse_partial_toml_overrides_only_specified_fields() {
     let toml = r#"

@@ -46,6 +46,25 @@ def dsl_test(name):
         ],
     )
 
+def _format(name, src, out):
+    """Run `brennfmt` over one source file into one output file.
+
+    The single statement of how the formatter is invoked, so the golden pair and
+    the in-tree config check cannot start asking different questions.
+
+    Args:
+        name: the genrule's target name.
+        src: the label of the file to format.
+        out: the output file name, package-relative.
+    """
+    native.genrule(
+        name = name,
+        srcs = [src],
+        outs = [out],
+        cmd = "$(location :brennfmt) $(location {}) > $@".format(src),
+        tools = [":brennfmt"],
+    )
+
 def format_goldens(name):
     """The byte-exact layout golden for one corpus file, and its idempotence.
 
@@ -67,12 +86,10 @@ def format_goldens(name):
         ("formatted", "tests/corpus/{}.brenn".format(name)),
         ("reformatted", canonical),
     ]:
-        native.genrule(
+        _format(
             name = "{}_{}".format(name, direction),
-            srcs = [src],
-            outs = ["{}.{}.txt".format(name, direction)],
-            cmd = "$(location :brennfmt) $(location {}) > $@".format(src),
-            tools = [":brennfmt"],
+            src = src,
+            out = "{}.{}.txt".format(name, direction),
         )
 
     diff_test(
@@ -85,4 +102,29 @@ def format_goldens(name):
         name = "{}_idempotence_test".format(name),
         file1 = ":{}_reformatted".format(name),
         file2 = canonical,
+    )
+
+def format_check(name, src):
+    """One in-tree `.brenn` document, asserted to be its own canonical form.
+
+    A config file that is not byte-identical to what `brennfmt` produces from it
+    fails `bazel test //...`, hence `make check`. The check is the Bazel-native
+    diff rather than a `--check` flag on the formatter: the same question, with
+    no dependency on a CLI surface defined outside this repo.
+
+    Args:
+        name: a target-name stem, unique within this package — a namespace
+            shared with `format_goldens`, whose stem is a corpus basename.
+        src: the label of the document to check.
+    """
+    _format(
+        name = "{}_config_formatted".format(name),
+        src = src,
+        out = "{}.config-formatted.brenn".format(name),
+    )
+
+    diff_test(
+        name = "{}_canonical_format_test".format(name),
+        file1 = ":{}_config_formatted".format(name),
+        file2 = src,
     )

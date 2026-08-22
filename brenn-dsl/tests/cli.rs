@@ -80,19 +80,6 @@ fn a_tree_that_does_not_compile_reports_and_exits_nonzero() {
 }
 
 #[test]
-fn an_unreachable_file_is_reported_and_still_compiles() {
-    let output = check("orphan", &[]);
-    assert!(output.status.success(), "{output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("no `use` reaches"), "{stderr}");
-    // Diagnostics on stderr, the payload on stdout: `check --dump > file` has
-    // to yield the dump alone.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.ends_with("main.brenn: ok\n"), "{stdout}");
-    assert!(!stdout.contains("no `use` reaches"), "{stdout}");
-}
-
-#[test]
 fn a_failing_tree_writes_nothing_to_stdout() {
     let output = check("missing", &[]);
     assert!(!output.status.success(), "{output:?}");

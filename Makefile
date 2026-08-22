@@ -227,7 +227,7 @@ npm-audit: e2e/node_modules
 
 DEV_PIDFILE := .dev-server.pid
 
-# Hermetic e2e config server settings, mirrored from brenn.e2e.toml.
+# Hermetic e2e config server settings, mirrored from brenn.e2e.brenn.
 E2E_BIN := $(BAZEL_BIN)/brenn/brenn
 E2E_BASE_URL := http://127.0.0.1:3100
 
@@ -254,8 +254,8 @@ e2e: run-artifacts e2e/node_modules
 	if curl -sf -o /dev/null $(E2E_BASE_URL)/auth/login 2>/dev/null; then \
 	    echo "ERROR: $(E2E_BASE_URL) is already serving before we started — a leaked e2e server or a port clash on 3100. Kill it before running make e2e."; exit 1; \
 	fi; \
-	invite=$$($(E2E_BIN) --config brenn.e2e.toml invite); \
-	$(E2E_BIN) --config brenn.e2e.toml serve & \
+	invite=$$($(E2E_BIN) --config brenn.e2e.brenn invite); \
+	$(E2E_BIN) --config brenn.e2e.brenn serve & \
 	srv=$$!; \
 	trap 'kill $$srv 2>/dev/null || true' EXIT INT TERM; \
 	echo "e2e: server PID $$srv; polling $(E2E_BASE_URL)/auth/login ..."; \
@@ -270,13 +270,13 @@ e2e: run-artifacts e2e/node_modules
 
 # Start the dev server in the background. Builds what the server reads, then
 # execs the built binary from the workspace root so the relative paths in
-# brenn.dev.toml — the database, the log dir, the asset trees — resolve where
+# brenn.dev.brenn — the database, the log dir, the asset trees — resolve where
 # they always did.
 launchdev: run-artifacts
 	@if [ -f $(DEV_PIDFILE) ] && kill -0 $$(cat $(DEV_PIDFILE)) 2>/dev/null; then \
 		echo "Dev server already running (PID $$(cat $(DEV_PIDFILE)))"; \
 	else \
-		$(BAZEL_BIN)/brenn/brenn --config brenn.dev.toml serve & \
+		$(BAZEL_BIN)/brenn/brenn --config brenn.dev.brenn serve & \
 		echo $$! > $(DEV_PIDFILE); \
 		echo "Dev server started (PID $$!)"; \
 		sleep 1; \

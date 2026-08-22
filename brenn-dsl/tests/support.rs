@@ -114,7 +114,7 @@ pub fn compile_tree(modules: &[(&str, &str)]) -> Result<ResolvedConfig, Vec<Diag
             ((*key).to_string(), file)
         })
         .collect();
-    resolve_files(files, "").map(|output| output.config)
+    resolve_files(files, "")
 }
 
 /// Resolve a one-file document, named as the root module.

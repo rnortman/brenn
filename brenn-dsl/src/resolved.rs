@@ -516,6 +516,9 @@ pub struct RAgent {
     pub acls: Vec<RAcl>,
     /// `start_hooks` and its siblings, typed by their kindword.
     pub hooks: Vec<RHooks>,
+    /// The `attachment_target` blocks, in declaration order — the config field
+    /// is a list.
+    pub attachment_targets: Vec<RAttachmentTarget>,
     pub doc: Option<DocComment>,
 }
 
@@ -615,6 +618,14 @@ pub struct RHooks {
 /// type rather than a second declaration of the same fields; no webhook
 /// sub-block nests, so `subs` is empty.
 pub type RWebhookBlock = RSection;
+
+/// A resolved `attachment_target` block of an agent body.
+///
+/// Same shape as a section — a named body with the `handler` block held in
+/// `subs` — so it is that type rather than a second declaration of the same
+/// fields. The name is the block's own; whether the body overrode it with a
+/// `name` attr is lowering's to read.
+pub type RAttachmentTarget = RSection;
 
 /// A top-level configuration section, resolved.
 ///

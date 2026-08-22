@@ -589,6 +589,67 @@ pub trait MapValues<V, V2> {
     ) -> Result<Self::Output, Diagnostic>;
 }
 
+/// The wire spelling of a vocabulary field's key.
+///
+/// A key whose spelling is a Rust keyword is written as a raw identifier —
+/// `r#type` for the `type` a tagged enum reads its variant from — and
+/// `stringify!` gives that ident back with its prefix. The listing is what a
+/// lowering reader matches keys against and what a refusal names, so the
+/// prefix comes off here rather than at every reader.
+fn attr_key(name: &str) -> String {
+    name.strip_prefix("r#").unwrap_or(name).to_string()
+}
+
+/// A body with no key vocabulary at all: every key legal, every value carried.
+///
+/// The one shape the closed vocabularies cannot state, for the one target that
+/// wants it — a config field that stores an opaque `toml::Value` tree per name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenAttrs<V = Spanned<Value>> {
+    entries: Vec<(String, V)>,
+}
+
+impl<V> OpenAttrs<V> {
+    /// Carry every value through `f`, giving the same body over a different
+    /// value type.
+    pub fn map_values<V2>(
+        self,
+        f: &mut impl FnMut(V) -> Result<V2, Diagnostic>,
+    ) -> Result<OpenAttrs<V2>, Diagnostic> {
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for (key, value) in self.entries {
+            entries.push((key, f(value)?));
+        }
+        Ok(OpenAttrs { entries })
+    }
+}
+
+impl<V, V2> MapValues<V, V2> for OpenAttrs<V> {
+    type Output = OpenAttrs<V2>;
+
+    fn map_all(
+        self,
+        f: &mut impl FnMut(V) -> Result<V2, Diagnostic>,
+    ) -> Result<Self::Output, Diagnostic> {
+        self.map_values(f)
+    }
+}
+
+impl OpenAttrs<crate::resolved::RVal> {
+    /// Every key the body carried, in source order.
+    pub fn entries(self) -> Vec<(String, crate::resolved::RVal)> {
+        self.entries
+    }
+}
+
+impl<'de> Deserialize<'de> for OpenAttrs<Spanned<Value>> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        AttrMap::deserialize(deserializer).map(|map| OpenAttrs {
+            entries: map.entries,
+        })
+    }
+}
+
 /// A vocabulary whose every key is a projection takes no `<V>`: the parse form
 /// and the resolved form are the same type, because there is nothing in it a
 /// resolver would carry. Declare that one with `struct Name;` instead of
@@ -639,7 +700,7 @@ macro_rules! vocabulary_emit {
             },]
             [$($empties)* $key: None,]
             [$($entries)* if let Some(attr) = $key {
-                $listed.push((stringify!($key).to_string(), attr.value.into_rval()));
+                $listed.push((attr_key(stringify!($key)), attr.value.into_rval()));
             }]
             $($rest)* }
     };
@@ -652,7 +713,7 @@ macro_rules! vocabulary_emit {
             [$($names)* $key,]
             [$($maps)* $key: Attr { value: $f($key.value)? },]
             [$($empties)*]
-            [$($entries)* $listed.push((stringify!($key).to_string(), $key.value.into_rval()));]
+            [$($entries)* $listed.push((attr_key(stringify!($key)), $key.value.into_rval()));]
             $($rest)* }
     };
 
@@ -666,7 +727,7 @@ macro_rules! vocabulary_emit {
             [$($maps)* $key,]
             [$($empties)* $key: None,]
             [$($entries)* if let Some(attr) = $key {
-                $listed.push((stringify!($key).to_string(), attr.value.into_rval()));
+                $listed.push((attr_key(stringify!($key)), attr.value.into_rval()));
             }]
             $($rest)* }
     };
@@ -678,7 +739,7 @@ macro_rules! vocabulary_emit {
             [$($names)* $key,]
             [$($maps)* $key,]
             [$($empties)*]
-            [$($entries)* $listed.push((stringify!($key).to_string(), $key.value.into_rval()));]
+            [$($entries)* $listed.push((attr_key(stringify!($key)), $key.value.into_rval()));]
             $($rest)* }
     };
 }
@@ -858,9 +919,10 @@ vocabulary! {
     /// An `agent` body's attrs.
     ///
     /// Mounts, mcp servers, subscriptions and ACLs are statements; the hook
-    /// lists are named sub-blocks. The config's nested tables — approval rules,
-    /// attachment targets, tool grants, per-integration config, frontmatter
-    /// rendering, pwa push — have no attr spelling and are unknown keys here.
+    /// lists and the attachment targets are sub-blocks. The config's remaining
+    /// nested tables — approval rules, tool grants, per-integration config,
+    /// frontmatter rendering, pwa push — have no attr spelling and are unknown
+    /// keys here.
     struct AgentAttrs<V> {
         /// The wire spelling, where it differs from the handle.
         opt slug: V,
@@ -1171,6 +1233,36 @@ vocabulary! {
         opt host: V,
         opt container: V,
     }
+
+    /// An `attachment_target import { … }` block: one upload affordance an app
+    /// offers.
+    ///
+    /// `name` is the wire spelling and defaults to the block's own name, the
+    /// same rule `slug` follows for an entity: a target whose identifier is not
+    /// identifier-shaped states it, and every other one is named once.
+    struct AttachmentTargetAttrs<V> {
+        opt name: V,
+        req label: V,
+        req accept: V,
+        opt multi: V,
+    }
+
+    /// The `handler` block of an attachment target: the union of every handler
+    /// type's fields.
+    ///
+    /// The raw config's shape is an internally tagged enum, which the bridge
+    /// cannot mirror, so the model takes the union with every type-specific
+    /// field optional and `type` the one required key. Which fields the named
+    /// type requires, and which are errors for it, is checked at lowering
+    /// against the raw enum as the source of truth.
+    struct HandlerAttrs<V> {
+        req r#type: Word,
+        opt program: V,
+        opt args: V,
+        opt file_roles: V,
+        opt timeout_secs: V,
+        opt cc_instructions: V,
+    }
 }
 
 /// One context's kindword vocabulary: the sum it deserializes into, the legal
@@ -1305,6 +1397,18 @@ kindword_dispatch! {
     "start_hooks" unnamed => StartHooks(HooksAttrs),
     "post_pull_hooks" unnamed => PostPullHooks(HooksAttrs),
     "startup_hooks" unnamed => StartupHooks(HooksAttrs),
+    "attachment_target" named => AttachmentTarget(AttachmentTargetAttrs),
+}
+
+kindword_dispatch! {
+    /// A sub-block of an `attachment_target` body, typed by its kindword.
+    enum AttachmentBlock;
+    /// The kindwords an `attachment_target` body admits.
+    const ATTACHMENT_BLOCK_KINDWORDS;
+    /// Type an `attachment_target` body's held sub-block.
+    fn attachment_block;
+    context "an attachment_target body";
+    "handler" unnamed => Handler(HandlerAttrs),
 }
 
 // ── top-level configuration sections ─────────────────────────────────────────
@@ -1321,9 +1425,11 @@ kindword_dispatch! {
 // load-time panic, and a positioned refusal at the block is what this layer can
 // do better.
 //
-// What has no spelling at all, and is not an oversight: `integrations` and a
-// container's per-integration overrides are maps of arbitrary nested tables with
-// no key vocabulary to transcribe.
+// What has no spelling at all, and is not an oversight: a container's
+// per-integration overrides are a map of arbitrary nested tables with no key
+// vocabulary to transcribe. The global `integrations` map has one — an
+// `integration <name>` section with an open body, which is what `OpenAttrs` is
+// for.
 //
 // The grammar has no top-level attr form, so a bare top-level scalar in
 // `BrennConfig` is unwritable here; `repo_dir` is spelled in the `repo_sync`
@@ -1524,6 +1630,7 @@ kindword_dispatch! {
     "wasm" unnamed => Wasm(WasmAttrs),
     "watchdog" unnamed => Watchdog(WatchdogAttrs),
     "container" named => Container(ContainerAttrs),
+    "integration" named => Integration(OpenAttrs),
 }
 
 kindword_dispatch! {

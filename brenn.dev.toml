@@ -1,5 +1,10 @@
 # Development configuration for Brenn.
-# Usage: make launchdev (builds, then serves with this config)
+#
+# `make launchdev` reads `brenn.dev.brenn`, not this file. This is its twin,
+# held equal to it by brenn-lib's twin-equivalence test; a change here that is
+# not also made there fails `make check`.
+#
+# TODO(dsl-toml-twins): delete this file when the TOML front end retires.
 
 [server]
 bind_address = "127.0.0.1:3000"
@@ -63,9 +68,9 @@ push_depth = 1
 retain_depth = 100
 standing_retain_depth = 100
 
-# Surface self-description channels: the boot-published help/schema/index topology
-# derived from prefix "surface". Each is retained latest-wins (standing_retain_depth
-# = 1) so a non-subscriber MessageChannelGet always returns the current document.
+# The root of the boot-published self-description topology: an app starts here
+# and follows addresses. Retained latest-wins (standing_retain_depth = 1) so a
+# non-subscriber MessageChannelGet always returns the current document.
 [[channel]]
 uuid = "59ec3b6b-7a9d-4ede-b692-638ed3834963"
 address = "surface.index"
@@ -73,216 +78,6 @@ description = "Surface topology index (system-published, latest-wins)"
 push_depth = 1
 retain_depth = 1
 standing_retain_depth = 1
-
-[[channel]]
-uuid = "2f36ae2a-fe98-4a89-8299-7c086b94ddec"
-address = "surface.surface.dev-stub.help"
-description = "Surface help: dev-stub"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "d1fcb93f-d598-4e42-86f2-d7a3a123e38d"
-address = "surface.surface.bar.help"
-description = "Surface help: bar"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "0ac01862-9222-4f53-a8cf-36363303c1e5"
-address = "surface.surface.bar-pixel.help"
-description = "Surface help: bar-pixel"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "cd700d1f-9f28-41bf-972b-f7a1df0dc63a"
-address = "surface.surface.bar-feeder.help"
-description = "Surface help: bar-feeder"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "7d8105bc-e267-4602-a151-ec9e7834d761"
-address = "surface.kind.echo-stub.help"
-description = "Kind help: echo-stub"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "4d56962a-ae1b-4bc4-9636-e0c83d5da770"
-address = "surface.kind.echo-stub.schema"
-description = "Kind schema: echo-stub"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "8efaf001-7f73-4c84-bd0a-d205e88044ab"
-address = "surface.kind.protobar.help"
-description = "Kind help: protobar"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "e51fb93c-744d-4c9b-8737-c6541a621761"
-address = "surface.kind.protobar.schema"
-description = "Kind schema: protobar"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "a6d0f882-4c8f-4d5f-91d5-a4ca6fc5f8e5"
-address = "surface.kind.mode-clock.help"
-description = "Kind help: mode-clock"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "c4aa5cba-de5e-46c2-8dc0-bae5970ca65f"
-address = "surface.kind.mode-clock.schema"
-description = "Kind schema: mode-clock"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "5b5b8634-5ac7-47e3-9225-a0e58829ae3e"
-address = "surface.kind.meeting.help"
-description = "Kind help: meeting"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "1f760261-f036-4420-8400-cdffa84b1f13"
-address = "surface.kind.meeting.schema"
-description = "Kind schema: meeting"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "765d89ad-d9b3-4608-80c9-6f26cdbaf689"
-address = "surface.kind.chrome.help"
-description = "Kind help: chrome"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "c446cdd8-9e9a-4420-a41f-d5c5d21459d2"
-address = "surface.kind.chrome.schema"
-description = "Kind schema: chrome"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-# Surface self-description runtime channels: geometry + status per surface. These
-# receive writes forever (geometry per resize, status per heartbeat), so both
-# retain_depth and standing_retain_depth are bounded (= 1, latest-wins); the owning
-# surface is the single writer (boot-enforced).
-[[channel]]
-uuid = "c89c02ac-8c6b-40f4-ab75-799b7050cadc"
-address = "surface.surface.dev-stub.geometry"
-description = "Surface geometry: dev-stub"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "3ea19b6b-1946-44de-a3a4-a9526f804773"
-address = "surface.surface.dev-stub.status"
-description = "Surface status: dev-stub"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "601968c1-d5dc-4620-9ddf-207ffaebc827"
-address = "surface.surface.bar.geometry"
-description = "Surface geometry: bar"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "271e790b-0e4d-4409-98f0-9987b265634b"
-address = "surface.surface.bar.status"
-description = "Surface status: bar"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "c8db3fc8-9417-4736-8a35-ddd592f43ee7"
-address = "surface.surface.bar-pixel.geometry"
-description = "Surface geometry: bar-pixel"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "32dbf7bf-6e08-45c3-bf47-2cee8bcb60e8"
-address = "surface.surface.bar-pixel.status"
-description = "Surface status: bar-pixel"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "0f613d4d-cd0a-4c4d-9b7c-7aa040c0eb66"
-address = "surface.surface.bar-feeder.geometry"
-description = "Surface geometry: bar-feeder"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-[[channel]]
-uuid = "35e3ba7e-4bc2-4236-b93a-2f21974ac1e9"
-address = "surface.surface.bar-feeder.status"
-description = "Surface status: bar-feeder"
-push_depth = 1
-retain_depth = 1
-standing_retain_depth = 1
-
-# Surface config channels: one per surface, carrying the retained bindings
-# document boot publishes as `system:surface-config` and the shell replays on
-# every attach. Ephemeral because the document is rebuilt from this file at every
-# boot — a durable copy could only preserve a stale document the next boot
-# overwrites. `retain_depth = 1` is latest-wins; on a non-durable channel the
-# retained window is the standing buffer, so there is no third number.
-[[channel]]
-address = "ephemeral:surface.surface.dev-stub.bindings"
-description = "Surface bindings document: dev-stub"
-push_depth = 1
-retain_depth = 1
-
-[[channel]]
-address = "ephemeral:surface.surface.bar.bindings"
-description = "Surface bindings document: bar"
-push_depth = 1
-retain_depth = 1
-
-[[channel]]
-address = "ephemeral:surface.surface.bar-pixel.bindings"
-description = "Surface bindings document: bar-pixel"
-push_depth = 1
-retain_depth = 1
-
-[[channel]]
-address = "ephemeral:surface.surface.bar-feeder.bindings"
-description = "Surface bindings document: bar-feeder"
-push_depth = 1
-retain_depth = 1
 
 # Bar layout channel: latest-wins layout documents for the `bar` / `bar-pixel`
 # surfaces. Durable so a reload/reboot restores the last-chosen layout snapshot
@@ -364,6 +159,229 @@ push_depth = 8
 retain_depth = 8
 standing_retain_depth = 8
 
+# Surface dev fixture: echo-stub bound to a single ephemeral channel in an echo
+# loop. Pressing "send" round-trips publish -> bus -> deliver -> rendered text
+# with no external publisher — a self-contained end-to-end check from
+# `make launchdev` alone.
+# `retain_depth = 8` covers the depth-8 surface binding below: on a non-durable
+# channel the retained window *is* the standing buffer, and no depth stated about
+# a channel may exceed it.
+[[channel]]
+address = "ephemeral:dev-stub"
+push_depth = 1
+retain_depth = 8
+
+# Surface self-description channels, one group per surface: the boot-published
+# help document, the geometry and status the owning surface reports (writes
+# forever, so both depths are bounded at 1, latest-wins, and the writer is
+# boot-enforced), and the retained bindings document boot publishes as
+# `system:surface-config` and the shell replays on every attach. The bindings
+# channel is ephemeral because the document is rebuilt from this file at every
+# boot — a durable copy could only preserve a stale document the next boot
+# overwrites; on a non-durable channel the retained window *is* the standing
+# buffer, so there is no third number.
+[[channel]]
+uuid = "2f36ae2a-fe98-4a89-8299-7c086b94ddec"
+address = "surface.surface.dev-stub.help"
+description = "Surface help: dev-stub"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "c89c02ac-8c6b-40f4-ab75-799b7050cadc"
+address = "surface.surface.dev-stub.geometry"
+description = "Surface geometry: dev-stub"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "3ea19b6b-1946-44de-a3a4-a9526f804773"
+address = "surface.surface.dev-stub.status"
+description = "Surface status: dev-stub"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+address = "ephemeral:surface.surface.dev-stub.bindings"
+description = "Surface bindings document: dev-stub"
+push_depth = 1
+retain_depth = 1
+
+[[channel]]
+uuid = "d1fcb93f-d598-4e42-86f2-d7a3a123e38d"
+address = "surface.surface.bar.help"
+description = "Surface help: bar"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "601968c1-d5dc-4620-9ddf-207ffaebc827"
+address = "surface.surface.bar.geometry"
+description = "Surface geometry: bar"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "271e790b-0e4d-4409-98f0-9987b265634b"
+address = "surface.surface.bar.status"
+description = "Surface status: bar"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+address = "ephemeral:surface.surface.bar.bindings"
+description = "Surface bindings document: bar"
+push_depth = 1
+retain_depth = 1
+
+[[channel]]
+uuid = "0ac01862-9222-4f53-a8cf-36363303c1e5"
+address = "surface.surface.bar-pixel.help"
+description = "Surface help: bar-pixel"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "c8db3fc8-9417-4736-8a35-ddd592f43ee7"
+address = "surface.surface.bar-pixel.geometry"
+description = "Surface geometry: bar-pixel"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "32dbf7bf-6e08-45c3-bf47-2cee8bcb60e8"
+address = "surface.surface.bar-pixel.status"
+description = "Surface status: bar-pixel"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+address = "ephemeral:surface.surface.bar-pixel.bindings"
+description = "Surface bindings document: bar-pixel"
+push_depth = 1
+retain_depth = 1
+
+[[channel]]
+uuid = "cd700d1f-9f28-41bf-972b-f7a1df0dc63a"
+address = "surface.surface.bar-feeder.help"
+description = "Surface help: bar-feeder"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "0f613d4d-cd0a-4c4d-9b7c-7aa040c0eb66"
+address = "surface.surface.bar-feeder.geometry"
+description = "Surface geometry: bar-feeder"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "35e3ba7e-4bc2-4236-b93a-2f21974ac1e9"
+address = "surface.surface.bar-feeder.status"
+description = "Surface status: bar-feeder"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+address = "ephemeral:surface.surface.bar-feeder.bindings"
+description = "Surface bindings document: bar-feeder"
+push_depth = 1
+retain_depth = 1
+
+# Component-kind self-description channels, one help/schema pair per kind, both
+# retained latest-wins.
+[[channel]]
+uuid = "7d8105bc-e267-4602-a151-ec9e7834d761"
+address = "surface.kind.echo-stub.help"
+description = "Kind help: echo-stub"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "4d56962a-ae1b-4bc4-9636-e0c83d5da770"
+address = "surface.kind.echo-stub.schema"
+description = "Kind schema: echo-stub"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "8efaf001-7f73-4c84-bd0a-d205e88044ab"
+address = "surface.kind.protobar.help"
+description = "Kind help: protobar"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "e51fb93c-744d-4c9b-8737-c6541a621761"
+address = "surface.kind.protobar.schema"
+description = "Kind schema: protobar"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "a6d0f882-4c8f-4d5f-91d5-a4ca6fc5f8e5"
+address = "surface.kind.mode-clock.help"
+description = "Kind help: mode-clock"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "c4aa5cba-de5e-46c2-8dc0-bae5970ca65f"
+address = "surface.kind.mode-clock.schema"
+description = "Kind schema: mode-clock"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "5b5b8634-5ac7-47e3-9225-a0e58829ae3e"
+address = "surface.kind.meeting.help"
+description = "Kind help: meeting"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "1f760261-f036-4420-8400-cdffa84b1f13"
+address = "surface.kind.meeting.schema"
+description = "Kind schema: meeting"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "765d89ad-d9b3-4608-80c9-6f26cdbaf689"
+address = "surface.kind.chrome.help"
+description = "Kind help: chrome"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
+[[channel]]
+uuid = "c446cdd8-9e9a-4420-a41f-d5c5d21459d2"
+address = "surface.kind.chrome.schema"
+description = "Kind schema: chrome"
+push_depth = 1
+retain_depth = 1
+standing_retain_depth = 1
+
 [[app]]
 slug = "dev"
 name = "Development"
@@ -433,18 +451,6 @@ If the import failed due to unmapped accounts, use the map_account tool to creat
 ofx = [".ofx", ".qfx"]
 csv = [".csv"]
 
-# Surface dev fixture: echo-stub bound to a single ephemeral channel in an echo
-# loop. Pressing "send" round-trips publish -> bus -> deliver -> rendered text
-# with no external publisher — a self-contained end-to-end check from
-# `make launchdev` alone.
-# `retain_depth = 8` covers the depth-8 surface binding below: on a non-durable
-# channel the retained window *is* the standing buffer, and no depth stated about
-# a channel may exceed it.
-[[channel]]
-address = "ephemeral:dev-stub"
-push_depth = 1
-retain_depth = 8
-
 [[surface]]
 slug = "dev-stub"
 # `alert` is required by the `noise = "alarm"` binding below: a surface whose
@@ -455,6 +461,7 @@ ephemeral_publish_acl = [{ exact = "dev-stub" }]
 
 [[surface.component]]
 kind = "echo-stub"
+instance = "echo-stub"
 abi = "dom"
 
 # The page chrome: layout/theme/takeover/banner/toast renderer, driven entirely
@@ -675,6 +682,15 @@ instance = "chrome"
 port = "toast"
 push_depth = 8
 
+# Headless mode-clock's theme output onto the reserved theme plane chrome
+# consumes. `local:` needs no publish grant/ACL (page-local; the server mediates
+# no local traffic); the plane is not kernel-publish-only, so a component may
+# produce it.
+[[surface.output]]
+instance = "mode"
+port = "theme"
+channel = "local:brenn/theme"
+
 [[surface.output]]
 instance = "meeting"
 port = "acks"
@@ -696,25 +712,10 @@ instance = "chrome"
 port = "overlay-state"
 channel = "local:brenn/overlay-state"
 
-# Headless mode-clock's theme output onto the reserved theme plane chrome
-# consumes. `local:` needs no publish grant/ACL (page-local; the server mediates
-# no local traffic); the plane is not kernel-publish-only, so a component may
-# produce it.
-[[surface.output]]
-instance = "mode"
-port = "theme"
-channel = "local:brenn/theme"
-
 # Self-wake ports for the clock-driven components. No `channel` and no
 # `[[connection]]`, so each resolves to an anonymous page-local ring.
 # `push_depth = 1` because a wake subsumes its predecessor; `retain_depth = 2`
 # covers a cancel and its replacement.
-[[surface.io_port]]
-instance = "mode"
-port = "tick"
-push_depth = 1
-retain_depth = 2
-
 [[surface.io_port]]
 instance = "p1"
 port = "tick"
@@ -729,6 +730,12 @@ retain_depth = 2
 
 [[surface.io_port]]
 instance = "p3"
+port = "tick"
+push_depth = 1
+retain_depth = 2
+
+[[surface.io_port]]
+instance = "mode"
 port = "tick"
 push_depth = 1
 retain_depth = 2

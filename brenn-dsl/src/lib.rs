@@ -39,7 +39,7 @@ use fltk_serde_core::ParseToTargetError;
 
 use diag::Diagnostic;
 
-pub use resolve::{CompileOutput, ResolveOutput, compile, resolve_files};
+pub use resolve::{compile, resolve_files};
 
 /// The position type every diagnostic and every resolved value carries.
 ///

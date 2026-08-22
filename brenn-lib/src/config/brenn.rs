@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use brenn_dsl::diag::Diagnostic;
 use serde::Deserialize;
@@ -69,7 +69,7 @@ pub const CC_KNOWN_TOOLS: &[&str] = &[
 /// Top-level Brenn configuration.
 ///
 /// Defaults are production-hardened (absolute paths, secure cookies on, etc.).
-/// Use `brenn.dev.toml` for local development.
+/// Use `brenn.dev.brenn` for local development.
 #[derive(Debug, Deserialize, Default, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct BrennConfig {
@@ -174,57 +174,114 @@ pub struct BrennConfig {
     pub watchdog: WatchdogConfig,
 }
 
+/// Qualify every bare `[[channel]]` and tuning address in a loaded config with
+/// `brenn:`.
+///
+/// The runtime reads a bare address as `brenn:` anyway, so the two spellings are
+/// one configuration; a lowered `.brenn` config is qualified on emit and a
+/// hand-written TOML file is mostly bare, so comparing the two without this
+/// reports every channel as changed. The per-address rule is the runtime's
+/// ([`canonicalize_channel_address`](crate::messaging::canonicalize_channel_address));
+/// this is the walk over the fields that carry one.
+///
+/// TODO(dsl-toml-twins): the whole walk retires with the TOML front end — a
+/// config that can only come from a `.brenn` document is already qualified.
+pub fn canonicalize_config_addresses(config: &mut BrennConfig) {
+    for channel in &mut config.channels {
+        for address in [&mut channel.address, &mut channel.address_prefix]
+            .into_iter()
+            .flatten()
+        {
+            *address = crate::messaging::canonicalize_channel_address(address);
+        }
+    }
+}
+
 /// Load configuration from a config file.
 ///
 /// If `path` is `Some`, reads that file, dispatching on its extension: `.toml`
 /// parses as TOML, `.brenn` compiles as a DSL document and lowers to the same
-/// `BrennConfig`. If `None`, looks for `brenn.toml` in the current working
-/// directory. If neither exists, returns `BrennConfig::default()`.
+/// `BrennConfig`. If `None`, probes the current working directory for
+/// `brenn.brenn` and then `brenn.toml`. If neither exists, returns
+/// `BrennConfig::default()`.
 ///
 /// # Panics
 ///
 /// Panics if:
 /// - `path` is `Some` and the file doesn't exist or fails to parse
 /// - `path` is `Some` and its extension is neither `toml` nor `brenn`
-/// - `path` is `None` and `brenn.toml` exists in cwd but fails to parse
+/// - `path` is `None` and both fallback names exist in cwd
+/// - `path` is `None` and whether a fallback name exists cannot be determined
+/// - `path` is `None` and the one fallback that exists fails to load
 /// - The file contains unrecognized keys or invalid values
 pub fn load_config(path: Option<&Path>) -> BrennConfig {
     let cwd = std::env::current_dir().expect("failed to determine current directory");
     load_config_from(path, &cwd)
 }
 
-/// Load configuration, using `fallback_dir` to find `brenn.toml` when no explicit
-/// path is given. Separated from `load_config` for testability (avoids
+/// Load configuration, probing `fallback_dir` for a config when no explicit path
+/// is given. Separated from `load_config` for testability (avoids
 /// `set_current_dir` in tests, which is process-global and not thread-safe).
-///
-/// The extension dispatch applies to an explicit path only; the fallback names
-/// `brenn.toml` and reads TOML.
 pub(crate) fn load_config_from(path: Option<&Path>, fallback_dir: &Path) -> BrennConfig {
-    match path {
-        // Boot is `check_config` plus the two things a boot does that a check
-        // does not: it prints the warnings and it dies on the report. One
-        // dispatch, so what the check tool accepts and what boots cannot
-        // diverge in either direction.
-        //
-        // Warnings go to stderr rather than through the log because
-        // observability is initialized after the config is loaded, which is the
-        // same reason the failure here is a raw panic.
-        Some(p) => {
-            let (warnings, config) = check_config(p);
-            for warning in &warnings {
-                eprintln!("warning: {warning}");
-            }
-            config.unwrap_or_else(|report| panic!("{report}"))
-        }
-        None => {
-            let default_path = fallback_dir.join("brenn.toml");
-            if default_path.exists() {
-                read_toml(&default_path).unwrap_or_else(|report| panic!("{report}"))
-            } else {
-                BrennConfig::default()
-            }
-        }
-    }
+    let path = match path {
+        Some(p) => p.to_path_buf(),
+        None => match fallback_config(fallback_dir) {
+            Some(found) => found,
+            None => return BrennConfig::default(),
+        },
+    };
+    // Boot is `check_config` plus the one thing a boot does that a check does
+    // not: it dies on the report. One dispatch, so what the check tool accepts
+    // and what boots cannot diverge in either direction.
+    check_config(&path).unwrap_or_else(|report| panic!("{report}"))
+}
+
+/// The two names a `--config`-less boot answers to, in the fallback directory.
+///
+/// Ordered `.brenn` first because that is the front end configs are written in;
+/// the TOML name is the one that retires with the TOML front end.
+///
+/// TODO(dsl-toml-twins): drop the `brenn.toml` probe when the TOML front end
+/// retires.
+const FALLBACK_NAMES: [&str; 2] = ["brenn.brenn", "brenn.toml"];
+
+/// The one config file in `fallback_dir`, or nothing where it holds none.
+///
+/// # Panics
+///
+/// Panics if the directory holds both names. Two configs that could disagree is
+/// exactly the ambiguity a silent precedence rule would hide: nobody can tell
+/// from the outside which one the server read, so neither is read.
+///
+/// Panics too where a name can neither be confirmed present nor confirmed
+/// absent — an unreadable directory, a symlink loop. "Could not check" read as
+/// "absent" would boot on defaults, or on the other of two names without the
+/// ambiguity panic, and the operator would have no way to tell.
+fn fallback_config(fallback_dir: &Path) -> Option<PathBuf> {
+    let found: Vec<PathBuf> = FALLBACK_NAMES
+        .iter()
+        .map(|name| fallback_dir.join(name))
+        .filter(|path| {
+            path.try_exists().unwrap_or_else(|error| {
+                panic!(
+                    "no --config was given and whether {} exists cannot be determined: {error}",
+                    path.display(),
+                )
+            })
+        })
+        .collect();
+    assert!(
+        found.len() < 2,
+        "no --config was given and {} holds more than one config file ({}); \
+         there is no precedence rule between them — pass --config, or remove one",
+        fallback_dir.display(),
+        found
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    found.into_iter().next()
 }
 
 /// What to say about a path that is neither of the two forms a config takes.
@@ -270,37 +327,22 @@ impl DslFailure {
 /// The file is the root module of its document tree, so its own directory is
 /// where `use` resolves from.
 ///
-/// Warnings ride beside the result rather than inside its `Ok` arm: a document
-/// that compiles with warnings and then fails lowering has both to report, and
-/// a caller that could only see warnings on success would drop them exactly
-/// when they are most likely to matter.
-fn read_dsl(path: &Path) -> (Vec<Diagnostic>, Result<BrennConfig, DslFailure>) {
-    let output = match brenn_dsl::compile(path) {
-        Ok(output) => output,
-        Err(diagnostics) => {
-            return (
-                Vec::new(),
-                Err(DslFailure {
-                    stage: "compile",
-                    diagnostics,
-                }),
-            );
-        }
-    };
-    let config = super::dsl_lower::lower(output.config).map_err(|diagnostics| DslFailure {
+fn read_dsl(path: &Path) -> Result<BrennConfig, DslFailure> {
+    let config = brenn_dsl::compile(path).map_err(|diagnostics| DslFailure {
+        stage: "compile",
+        diagnostics,
+    })?;
+    super::dsl_lower::lower(config).map_err(|diagnostics| DslFailure {
         stage: "lower",
         diagnostics,
-    });
-    (output.warnings, config)
+    })
 }
 
 /// Validate a config file the way boot loads it, reporting instead of dying.
 ///
 /// The one extension dispatch: [`load_config_from`] boots through this, adding
-/// only the stderr print and the panic, so what this accepts and what boots
-/// accepts are the same set by construction. The warnings ride beside the
-/// result for the reason [`read_dsl`] states: a failing check still reports the
-/// document's warnings.
+/// only the panic, so what this accepts and what boots accepts are the same set
+/// by construction.
 ///
 /// What it deliberately does not run is `validate_and_resolve`. That pass is
 /// environment-dependent — it stats container home directories and takes the
@@ -308,17 +350,11 @@ fn read_dsl(path: &Path) -> (Vec<Diagnostic>, Result<BrennConfig, DslFailure>) {
 /// against a config destined for another host must not fail on the
 /// workstation's filesystem. `Ok` therefore means "this file is a config", not
 /// "this config will boot on every host".
-pub fn check_config(path: &Path) -> (Vec<String>, Result<BrennConfig, String>) {
+pub fn check_config(path: &Path) -> Result<BrennConfig, String> {
     match path.extension().and_then(std::ffi::OsStr::to_str) {
-        Some("toml") => (Vec::new(), read_toml(path)),
-        Some("brenn") => {
-            let (warnings, config) = read_dsl(path);
-            (
-                warnings.iter().map(Diagnostic::render).collect(),
-                config.map_err(|failure| failure.render(path)),
-            )
-        }
+        Some("toml") => read_toml(path),
+        Some("brenn") => read_dsl(path).map_err(|failure| failure.render(path)),
         // The check tool reports; only boot panics.
-        _ => (Vec::new(), Err(unrecognized_extension(path))),
+        _ => Err(unrecognized_extension(path)),
     }
 }

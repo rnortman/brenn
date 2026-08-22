@@ -16,9 +16,9 @@ The invariant is the kind this repo gates elsewhere (`xtask`'s policy parity,
 `brenn-dsl/tests/rule_coverage.rs`), and it wants the same treatment: a gate that
 reflects each config struct's field names and compares them against a table of
 (config struct, DSL vocabulary, deliberately omitted fields and why). The
-omitted-fields column is load-bearing — `integrations`, `approval_rules`,
-`attachment_targets`, `tool_grants`, `frontmatter`, the mqtt last-will table are
-all justified today in prose that no build step reads.
+omitted-fields column is load-bearing — `approval_rules`, `tool_grants`,
+`frontmatter`, `integration_config`, the mqtt last-will table are all justified
+today in prose that no build step reads.
 
 Where it lives is the open question, and it is what makes this a design item
 rather than a chore: the DSL crate must not depend on the config crates, so the
@@ -40,8 +40,9 @@ shape, and the grant vocabularies and their plane-word expansions; and
 brenn-lib/src/config/dsl_lower.rs, at the `send_rate` key set, at the
 configuration-section kindword arms, at the webhook subscription family's key
 set, at the consumer body and ACL family map, at the surface component body and
-the per-family key sets its binding refusals name, and at the webhook signature
-scheme words and their per-variant field sets.
+the per-family key sets its binding refusals name, at the webhook signature
+scheme words and their per-variant field sets, and at the attachment handler
+type words and their per-variant field sets.
 
 
 ## `dsl-mcp-ref-index`
@@ -113,6 +114,100 @@ Done = a block-ended statement is followed by exactly one newline whatever
 follows it, with the fix in fltk and the goldens updated here.
 
 Code site (`TODO(dsl-fmt-block-blank-line)`): brenn-dsl/grammar/brenn.fltkfmt.
+
+
+## `dsl-fmt-rawstring-indent`
+
+An indented multi-line raw string (`"""…"""` written inside a block) has its
+continuation lines re-indented by a format pass, and the re-indentation lands
+*in the string's value* — the pass is neither format-stable nor value-stable. A
+formatter that changes what a config means is a correctness defect, not
+cosmetics; the fix belongs in the formatting core, not in the grammar's layout
+rules. In-tree exposure is self-limiting: an affected file can never be
+byte-identical to its own formatting, so it can never pass the canonical-format
+gate. The bite is out-of-tree `brennfmt --in-place`. Until it is fixed, the
+corpus's only multi-line raw string stays at indentation zero and in-tree
+configs write multi-line values as a single-line string with `\n` escapes.
+
+Done = an indented raw string round-trips a format pass with its value
+unchanged, with the fix in fltk and the goldens updated here.
+
+Code site (`TODO(dsl-fmt-rawstring-indent)`): brenn-dsl/src/bin/brennfmt.rs.
+
+
+## `dsl-toml-twins`
+
+The root configs exist twice: `brenn.dev.brenn`/`brenn.dev.toml` and
+`brenn.e2e.brenn`/`brenn.e2e.toml` say the same thing, and `make launchdev` and
+`make e2e` read the `.brenn` side. The TOML twins are kept only because the
+TOML front end is still the one prod runs on; they are held to their
+documents by `brenn-lib`'s twin-equivalence test, which is the only thing
+stopping them drifting apart.
+
+Retiring them is one checklist, all of it after the prod flip:
+
+- delete the TOML twins at the repo root, and their `exports_files` and
+  `brenn-lib` `data` entries;
+- delete the twin-equivalence test and the TOML arms of the config-file tests
+  (`brenn-lib/src/config/tests/config_files.rs`);
+- drop the `brenn.toml` probe from the no-`--config` fallback
+  (`brenn-lib/src/config/brenn.rs`, `FALLBACK_NAMES`);
+- delete `read_toml` and the TOML arm of `check_config`'s extension dispatch;
+- delete `canonicalize_config_addresses` and the differ's use of it — a config
+  that can only come from a `.brenn` document is already scheme-qualified.
+
+Not before then: prod and staging still load TOML, and `brenn config-diff` over a
+`.toml`/`.brenn` pair is the tool that proves each port.
+
+Retiring them unblocks `dsl-acl-derivation`, which rewrites the root configs'
+explicit ACL statements derivation-based.
+
+
+## `dsl-config-shared-module`
+
+`brenn.dev.brenn` and `brenn.e2e.brenn` share about 240 lines verbatim: the
+component classes, both assemblies (`SurfaceDescription`, `KindDescription`),
+the bar channel declarations and the `bar`/`bar-pixel`/`bar-feeder` surface
+bodies. Nothing catches a change made to one and not the other — the
+twin-equivalence gate compares each document to its own TOML twin, never the two
+documents to each other.
+
+Deliberately duplicated for now: a shared module extracted for two callers is
+parameterization guessed at, and the prod config is the third, richer document
+that shows what the shared shape actually is. So the shared module gets designed
+with the prod port, not before.
+
+Done = the shared declarations live in one module both root documents `use`, or
+the duplication is re-justified against three documents rather than two.
+
+Code sites (`TODO(dsl-config-shared-module)`): the header comment of
+`brenn.dev.brenn` and of `brenn.e2e.brenn`.
+
+
+## `dsl-acl-derivation`
+
+The `.brenn` root configs write channel authority as explicit scheme-qualified
+`acl subscribe` / `acl publish` statements even where the derivation pass could
+derive the same entries from the bindings that already name the channel. That is
+deliberate, not oversight: the twin-equivalence gate compares the lowered config
+element-for-element against the TOML twin, array order is semantic in
+`brenn config-diff`, and explicit statements keep the diff-to-TOML review
+trivial. Derived entries could reorder a list and would make every review
+reason about what the derivation pass emits.
+
+The cleanup: rewrite the ACLs derivation-based wherever a binding derives them,
+keeping explicit statements only where nothing derives them (agents, for
+instance, have no bindings).
+
+Done = no explicit `acl` statement in a `.brenn` root config restates authority
+a binding already implies, and `make check` stays green.
+
+**Blocked on `dsl-toml-twins`.** Until the twins retire the equality gate wants
+the explicit style — including in the prod and staging ports, which should copy
+it deliberately and cite this slug rather than rediscover the reason.
+
+Code sites (`TODO(dsl-acl-derivation)`): the header comment of
+`brenn.dev.brenn` and of `brenn.e2e.brenn`.
 
 
 ## `test-task-panic-visibility`

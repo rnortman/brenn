@@ -190,3 +190,59 @@ fn load_config_extensionless_path_panics() {
     std::fs::write(&path, "[server]\n").unwrap();
     load_config_from(Some(&path), dir.path());
 }
+
+// -----------------------------------------------------------------------
+// The no-`--config` fallback probes both names
+// -----------------------------------------------------------------------
+
+#[test]
+fn load_config_finds_brenn_brenn_in_fallback_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("brenn.brenn"), DOCUMENT).unwrap();
+    let config = load_config_from(None, dir.path());
+    assert_eq!(
+        config.server.bind_address,
+        "127.0.0.1:4000".parse().unwrap()
+    );
+}
+
+/// A `.brenn` fallback gets the full pipeline's diagnostics, not a parse error
+/// about an unexpected character: the probe hands the file to the same
+/// `check_config` the explicit path uses.
+#[test]
+#[should_panic(expected = "failed to lower config file")]
+fn load_config_invalid_brenn_brenn_in_fallback_dir_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("brenn.brenn"),
+        "channel alerts at \"brenn:alice-alerts\" {\n  push_depth = 8;\n  retain_depth = 128;\n  \
+         standing_retain_depth = 16;\n  noise = deafening;\n}\n",
+    )
+    .unwrap();
+    load_config_from(None, dir.path());
+}
+
+/// Two configs that could disagree, and no way to tell from the outside which
+/// one the server read. Neither is read.
+#[test]
+#[should_panic(expected = "holds more than one config file")]
+fn load_config_both_fallback_names_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("brenn.brenn"), DOCUMENT).unwrap();
+    std::fs::write(dir.path().join("brenn.toml"), TWIN).unwrap();
+    load_config_from(None, dir.path());
+}
+
+/// A name that can neither be confirmed present nor confirmed absent is not
+/// read as absent: a symlink loop named `brenn.brenn` beside a real
+/// `brenn.toml` would otherwise boot the TOML file with no word said, which is
+/// the silent precedence the both-present panic exists to forbid.
+#[test]
+#[should_panic(expected = "cannot be determined")]
+fn load_config_unstattable_fallback_name_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    let loop_path = dir.path().join("brenn.brenn");
+    std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+    std::fs::write(dir.path().join("brenn.toml"), TWIN).unwrap();
+    load_config_from(None, dir.path());
+}

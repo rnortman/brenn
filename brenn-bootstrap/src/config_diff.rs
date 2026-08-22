@@ -12,8 +12,7 @@
 
 use std::path::Path;
 
-use brenn_lib::config::{BrennConfig, load_config};
-use brenn_lib::messaging::canonicalize_channel_address;
+use brenn_lib::config::{BrennConfig, canonicalize_config_addresses, load_config};
 use similar::TextDiff;
 
 /// Load both files, compare, print the verdict. Returns whether they are equal,
@@ -44,8 +43,8 @@ pub(crate) fn diff(
     label_a: &str,
     label_b: &str,
 ) -> (bool, String) {
-    canonicalize(&mut a);
-    canonicalize(&mut b);
+    canonicalize_config_addresses(&mut a);
+    canonicalize_config_addresses(&mut b);
     if a == b {
         return (
             true,
@@ -68,26 +67,6 @@ pub(crate) fn diff(
         .header(label_a, label_b)
         .to_string();
     (false, rendering)
-}
-
-/// Qualify every bare `[[channel]]` and tuning address with `brenn:`.
-///
-/// The runtime reads a bare address as `brenn:` anyway, so the two spellings are
-/// one configuration; a lowered config is qualified on emit and a hand-written
-/// TOML corpus is mostly bare, and comparing the two without this would report
-/// every channel as changed. It lives here rather than in lowering on purpose:
-/// canonical-on-emit means the config side keeps exactly one spelling, and this
-/// tool is the temporary one. The rule itself is the runtime's
-/// ([`canonicalize_channel_address`]), not a copy of it.
-fn canonicalize(config: &mut BrennConfig) {
-    for channel in &mut config.channels {
-        for address in [&mut channel.address, &mut channel.address_prefix]
-            .into_iter()
-            .flatten()
-        {
-            *address = canonicalize_channel_address(address);
-        }
-    }
 }
 
 #[cfg(test)]

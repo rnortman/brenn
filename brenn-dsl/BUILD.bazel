@@ -2,7 +2,7 @@ load("@crates//:defs.bzl", "all_crate_deps")
 load("@fltk//:rust.bzl", "generate_rust_parser")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_doc_test", "rust_library", "rust_test")
 load("//bazel/policy:defs.bzl", "policy_srcs")
-load(":defs.bzl", "dsl_test", "format_goldens")
+load(":defs.bzl", "dsl_test", "format_check", "format_goldens")
 
 policy_srcs()
 
@@ -144,3 +144,15 @@ format_goldens(name = "sections")
 format_goldens(name = "entities")
 
 format_goldens(name = "config")
+
+# The shipped configs at the repo root are held to the same canonical layout the
+# corpus goldens define. The formatter is here, so the gate is too.
+format_check(
+    name = "brenn_dev",
+    src = "//:brenn.dev.brenn",
+)
+
+format_check(
+    name = "brenn_e2e",
+    src = "//:brenn.e2e.brenn",
+)

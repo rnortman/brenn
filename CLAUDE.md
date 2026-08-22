@@ -145,7 +145,7 @@ In particular, whenever considering WASM-related design questions, remember: out
 
 `make build` does everything and is your go-to. It compiles backend and frontend.
 `make check` runs checks.
-`make launchdev` builds and starts the dev server in the background (uses `brenn.dev.toml`, binds to `127.0.0.1:3000`).
+`make launchdev` builds and starts the dev server in the background (uses `brenn.dev.brenn`, binds to `127.0.0.1:3000`).
 `make stopdev` stops it.
 See Makefile for other targets that you don't need because those two do everything.
 

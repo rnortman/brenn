@@ -4,9 +4,9 @@
 use fltk_serde_core::Spanned;
 
 use brenn_dsl::model::{
-    AGENT_BLOCK_KINDWORDS, AgentBlock, AgentClass, File, IntOrWord, Item, SectionNode, Value,
-    WEBHOOK_BLOCK_KINDWORDS, WebhookBlock, WebhookDef, Word, WordList, agent_block,
-    section_kindword, webhook_block,
+    AGENT_BLOCK_KINDWORDS, AgentBlock, AgentClass, AttachmentBlock, File, IntOrWord, Item,
+    SectionNode, Value, WEBHOOK_BLOCK_KINDWORDS, WebhookBlock, WebhookDef, Word, WordList,
+    agent_block, attachment_block, section_kindword, webhook_block,
 };
 use brenn_dsl::parse_str;
 
@@ -127,7 +127,7 @@ fn the_bearer_endpoint_writes_a_token_where_the_hmac_one_writes_a_key() {
 fn an_agent_body_types_each_of_its_hook_blocks() {
     let file = sections();
     let class = agent(&file, "PersonalAssistant");
-    assert_eq!(class.blocks.len(), 3);
+    assert_eq!(class.blocks.len(), 4);
 
     let typed: Vec<_> = class
         .blocks
@@ -163,6 +163,92 @@ fn an_agent_body_types_each_of_its_hook_blocks() {
     };
     assert!(startup.attrs.host.is_none());
     assert!(startup.attrs.container.is_some());
+}
+
+/// An `attachment_target` is named, its `handler` is the block it holds, and the
+/// handler's `type` is a token context — the word as written, not a reference.
+#[test]
+fn an_attachment_target_carries_its_handler_block() {
+    let file = sections();
+    let class = agent(&file, "PersonalAssistant");
+    let AgentBlock::AttachmentTarget(target) =
+        agent_block(&class.blocks[3]).unwrap_or_else(|error| panic!("{error}"))
+    else {
+        panic!("the fourth block is the attachment target");
+    };
+    assert_eq!(
+        target.name.as_ref().expect("the target is named").value(),
+        "import"
+    );
+    assert!(target.attrs.name.is_none());
+    assert!(target.attrs.multi.is_some());
+    assert!(target.doc.is_some());
+
+    let AttachmentBlock::Handler(handler) =
+        attachment_block(&target.subs[0]).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(handler.attrs.r#type.value.as_str(), "command");
+    assert!(handler.name.is_none());
+    assert!(handler.attrs.file_roles.is_some());
+}
+
+/// The union vocabulary refuses a key no handler type has, at the key.
+#[test]
+fn an_unknown_handler_key_is_refused_at_the_key() {
+    let file = parse_str(
+        "agent A() {\n    attachment_target import {\n        label = \"Import\";\n                 accept = [\".ofx\"];\n        handler {\n            type = command;\n                     shell = true;\n        }\n    }\n}\n",
+        "handler-key.brenn",
+    )
+    .expect("a parse");
+    let class = file.agents().next().expect("the class");
+    let AgentBlock::AttachmentTarget(target) =
+        agent_block(&class.blocks[0]).expect("the target types")
+    else {
+        panic!("an attachment target");
+    };
+    let error = attachment_block(&target.subs[0]).expect_err("`shell` is not a handler key");
+    assert!(error.message.contains("shell"), "{}", error.message);
+    assert!(
+        error.message.contains("program"),
+        "the message names the legal set: {}",
+        error.message
+    );
+}
+
+/// A handler with no `type` word is refused: which handler kind this is has no
+/// default.
+#[test]
+fn a_handler_without_a_type_is_refused() {
+    let file = parse_str(
+        "agent A() {\n    attachment_target import {\n        label = \"Import\";\n                 accept = [\".ofx\"];\n        handler { program = \"pf\"; }\n    }\n}\n",
+        "handler-type.brenn",
+    )
+    .expect("a parse");
+    let class = file.agents().next().expect("the class");
+    let AgentBlock::AttachmentTarget(target) =
+        agent_block(&class.blocks[0]).expect("the target types")
+    else {
+        panic!("an attachment target");
+    };
+    let error = attachment_block(&target.subs[0]).expect_err("`type` is required");
+    assert!(error.message.contains("type"), "{}", error.message);
+}
+
+/// An `attachment_target` written without a name defines something nothing can
+/// address, so the arity check refuses it.
+#[test]
+fn an_unnamed_attachment_target_is_refused() {
+    let file = parse_str(
+        "agent A() {\n    attachment_target { label = \"Import\"; accept = [\".ofx\"]; }\n}\n",
+        "unnamed-target.brenn",
+    )
+    .expect("a parse");
+    let class = file.agents().next().expect("the class");
+    let error = agent_block(&class.blocks[0]).expect_err("a target is named");
+    assert!(
+        error.message.contains("attachment_target <name>"),
+        "{}",
+        error.message
+    );
 }
 
 /// Every kindword either dispatch admits is written by the corpus and types.

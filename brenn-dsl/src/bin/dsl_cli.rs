@@ -56,12 +56,9 @@ fn main() -> ExitCode {
             }
         },
         Command::Check { root, dump } => match brenn_dsl::compile(&root) {
-            Ok(output) => {
-                for warning in &output.warnings {
-                    eprintln!("{}", warning.render());
-                }
+            Ok(config) => {
                 if dump {
-                    println!("{:#?}", output.config);
+                    println!("{config:#?}");
                 } else {
                     println!("{}: ok", root.display());
                 }

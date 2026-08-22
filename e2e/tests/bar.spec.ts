@@ -18,7 +18,7 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
  *  6. Reload restores the retained layout and panel content (durable snapshot).
  *
  * Runs single-worker in declaration order (playwright.config.ts) against the
- * `brenn.e2e.toml` bar surfaces (`bar`, `bar-pixel`, `bar-feeder`). The bar
+ * `brenn.e2e.brenn` bar surfaces (`bar`, `bar-pixel`, `bar-feeder`). The bar
  * channels are durable with `retain_depth = 1` (latest-wins) and persist for
  * the whole server run, so spec 1 must run first against pristine empty
  * channels; the later specs republish their own layout/content preconditions

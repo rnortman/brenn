@@ -8,8 +8,12 @@ exports_files([
     "Cargo.lock",
     "rust-toolchain.toml",
     "MODULE.bazel",
-    # Shipped configs, read by brenn-lib's config-invariant test.
+    # Shipped configs, read by brenn-lib's config-file tests (the messaging
+    # invariant and the `.brenn`/`.toml` twin equivalence) and, for the `.brenn`
+    # documents, by the canonical-format gate in //brenn-dsl.
+    "brenn.dev.brenn",
     "brenn.dev.toml",
+    "brenn.e2e.brenn",
     "brenn.e2e.toml",
     # Read by scrub's rule-semantics suite.
     ".gitleaks.toml",

@@ -11,15 +11,8 @@ use std::path::Path;
 use brenn_lib::config::check_config;
 
 /// Check one config file, print the verdict. Returns whether it would load.
-///
-/// Warnings print in both arms: a document that compiles with warnings and then
-/// fails has both to report.
 pub fn run_config_check(file: &Path) -> bool {
-    let (warnings, config) = check_config(file);
-    for warning in &warnings {
-        eprintln!("warning: {warning}");
-    }
-    match config {
+    match check_config(file) {
         Ok(_) => {
             println!("{}: ok", file.display());
             true
@@ -42,66 +35,9 @@ mod tests {
         let file = dir.path().join(name);
         std::fs::write(&file, contents).unwrap();
         let ok = run_config_check(&file);
-        let (_, config) = check_config(&file);
+        let config = check_config(&file);
         assert_eq!(ok, config.is_ok(), "the verdict and the report disagree");
         (ok, config.err().unwrap_or_default())
-    }
-
-    /// The same, over a tree: the root file plus the other files beside it, so a
-    /// file no `use` reaches produces a load warning.
-    ///
-    /// Returns the warnings as well, because where they ride — beside the
-    /// result rather than inside its `Ok` arm — is the point being checked.
-    fn check_tree(files: &[(&str, &str)]) -> (bool, Vec<String>, String) {
-        let dir = tempfile::tempdir().unwrap();
-        for (name, contents) in files {
-            std::fs::write(dir.path().join(name), contents).unwrap();
-        }
-        let root = dir.path().join("main.brenn");
-        let ok = run_config_check(&root);
-        let (warnings, config) = check_config(&root);
-        assert_eq!(ok, config.is_ok(), "the verdict and the report disagree");
-        (ok, warnings, config.err().unwrap_or_default())
-    }
-
-    /// A document that loads and has something to say: the warning is reported
-    /// and the verdict is still `ok`, as at boot.
-    #[test]
-    fn warnings_are_reported_on_a_document_that_passes() {
-        let (ok, warnings, report) = check_tree(&[
-            (
-                "main.brenn",
-                "server { public_url = \"https://brenn.example.com\"; }\n",
-            ),
-            ("unused.brenn", "const skin = \"bench\";\n"),
-        ]);
-        assert!(ok, "{report}");
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].contains("no `use` reaches this file"),
-            "{warnings:?}"
-        );
-    }
-
-    /// Warnings ride beside the result, not inside its `Ok` arm: a document that
-    /// compiles with warnings and is then refused at lowering has both to
-    /// report, and the warnings are what say where to look.
-    #[test]
-    fn warnings_are_reported_beside_a_failure() {
-        let (ok, warnings, report) = check_tree(&[
-            (
-                "main.brenn",
-                "server { public_url = \"https://brenn.example.com\"; secure_cookies = 3; }\n",
-            ),
-            ("unused.brenn", "const skin = \"bench\";\n"),
-        ]);
-        assert!(!ok);
-        assert!(report.contains("secure_cookies"), "{report}");
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].contains("no `use` reaches this file"),
-            "{warnings:?}"
-        );
     }
 
     /// `ok` means "this file is a config", not "this config will boot here":

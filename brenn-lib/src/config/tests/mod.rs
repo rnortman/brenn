@@ -7,6 +7,7 @@ mod access_mount;
 mod alerting;
 mod app_parse;
 mod attachment;
+mod config_files;
 mod container;
 mod dsl_lower;
 mod events;

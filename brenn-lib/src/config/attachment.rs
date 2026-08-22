@@ -41,7 +41,7 @@ pub enum AttachmentHandlerConfig {
     },
 }
 
-fn default_timeout_secs() -> u64 {
+pub(crate) fn default_timeout_secs() -> u64 {
     60
 }
 

@@ -14,11 +14,9 @@
 //! 5. **Check** — everything that needs the expanded whole.
 //!
 //! Diagnostics accumulate rather than stopping at the first: independent errors
-//! in one document are all reported. Severity is positional — the `Err` vector
-//! is errors, [`ResolveOutput::warnings`] is the warning class — so a success
-//! can carry warnings and a failure reports errors only.
+//! in one document are all reported.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -29,38 +27,20 @@ use fltk_serde_core::Spanned;
 use crate::derived::DerivedConfig;
 use crate::diag::{Diagnostic, check_unique, duplicate_statement, two_site};
 use crate::model::{
-    AclStmt, AgentBlock, AgentClass, Arg, ArgList, AssemblyDef, AssemblyItem, AttrBlock, AttrMap,
-    Binding as BindStmt, ChanAddr, ChanRef, ChannelAttrs, ChannelDef, ComponentClass, ConstDef,
-    FStrPart, File, GrantStmt, InTail, InlineTable, InstBody, IntOrWord, IoTail, Item, MapValues,
-    Matcher, MatcherVal, McpServerStmt, MountStmt, MountTail, NamedAttrDef, NewStmt, OutTail,
-    Param, ParamList, PathRef, PathSeg, PortDir as DeclDir, SectionNode, StrLike, StrLit, StrPart,
-    SubscribeStmt, SubscribeTail, SurfaceDef, UseStmt, UuidPin, Value,
+    AclStmt, AgentBlock, AgentClass, Arg, ArgList, AssemblyDef, AssemblyItem,
+    AttachmentTargetAttrs, AttrBlock, AttrMap, Binding as BindStmt, ChanAddr, ChanRef,
+    ChannelAttrs, ChannelDef, ComponentClass, ConstDef, FStrPart, File, GrantStmt, InTail,
+    InlineTable, InstBody, IntOrWord, IoTail, Item, MapValues, Matcher, MatcherVal, McpServerStmt,
+    MountStmt, MountTail, NamedAttrDef, NewStmt, OutTail, Param, ParamList, PathRef, PathSeg,
+    PortDir as DeclDir, SectionNode, StrLike, StrLit, StrPart, SubscribeStmt, SubscribeTail,
+    SurfaceDef, TypedBlock, UseStmt, UuidPin, Value,
 };
 use crate::resolved::{
-    Abi, ChanId, ClassRef, HandlePath, MatcherKind, PortDir, RAcl, RAgent, RBinding, RChanRef,
-    RChannel, RComponentInst, RConsumer, RGrant, RHooks, RMatcher, RMatcherVal, RMcp, RMount,
-    RNamed, RPin, RPort, RRemote, RSection, RSubscribe, RSurface, RTail, RTuning, RVal, RValue,
-    RWebhook, RWebhookBlock, RWordList, ResolvedConfig, Scheme,
+    Abi, ChanId, ClassRef, HandlePath, MatcherKind, PortDir, RAcl, RAgent, RAttachmentTarget,
+    RBinding, RChanRef, RChannel, RComponentInst, RConsumer, RGrant, RHooks, RMatcher, RMatcherVal,
+    RMcp, RMount, RNamed, RPin, RPort, RRemote, RSection, RSubscribe, RSurface, RTail, RTuning,
+    RVal, RValue, RWebhook, RWebhookBlock, RWordList, ResolvedConfig, Scheme,
 };
-
-/// What a successful resolve produces.
-///
-/// Warnings ride beside the config rather than in a severity field: what a
-/// caller does with the two is different, and a failure has no config to hang
-/// them on.
-#[derive(Debug)]
-pub struct ResolveOutput {
-    pub config: ResolvedConfig,
-    pub warnings: Vec<Diagnostic>,
-}
-
-/// What a successful compile produces: the derived config and the warnings the
-/// passes before it raised.
-#[derive(Debug)]
-pub struct CompileOutput {
-    pub config: DerivedConfig,
-    pub warnings: Vec<Diagnostic>,
-}
 
 /// The module key of the root file: the crate root has no path to name it by.
 const ROOT_KEY: &str = "";
@@ -72,17 +52,10 @@ const MODULE_EXT: &str = "brenn";
 ///
 /// The root file's directory is the module root: `use wiring::deskbar;` reads
 /// `<root_dir>/wiring/deskbar.brenn`.
-pub fn compile(root: &Path) -> Result<CompileOutput, Vec<Diagnostic>> {
-    let (files, load_warnings) = load(root)?;
-    let output = resolve_files(files, ROOT_KEY)?;
-    // Load's warnings first: they are about the tree, and the tree is what a
-    // reader looks at before any one file.
-    let mut warnings = load_warnings;
-    warnings.extend(output.warnings);
-    Ok(CompileOutput {
-        config: crate::derive::derive(output.config)?,
-        warnings,
-    })
+pub fn compile(root: &Path) -> Result<DerivedConfig, Vec<Diagnostic>> {
+    let files = load(root)?;
+    let config = resolve_files(files, ROOT_KEY)?;
+    crate::derive::derive(config)
 }
 
 /// Resolve an already-loaded set of modules — the testable core, no I/O.
@@ -97,7 +70,7 @@ pub fn compile(root: &Path) -> Result<CompileOutput, Vec<Diagnostic>> {
 pub fn resolve_files(
     files: Vec<(String, File)>,
     root: &str,
-) -> Result<ResolveOutput, Vec<Diagnostic>> {
+) -> Result<ResolvedConfig, Vec<Diagnostic>> {
     assert!(
         files.iter().any(|(key, _)| key == root),
         "the root key names one of the files"
@@ -115,24 +88,15 @@ pub fn resolve_files(
     if !errors.is_empty() {
         return Err(errors);
     }
-    Ok(ResolveOutput {
-        config,
-        warnings: Vec::new(),
-    })
+    Ok(config)
 }
 
 // ── pass 1: load ─────────────────────────────────────────────────────────────
 
-/// The modules a load produced, and the warnings it raised about the tree.
-type Loaded = (Vec<(String, File)>, Vec<Diagnostic>);
-
 /// Parse the root file and, transitively, every module it reaches.
 ///
-/// Returns the modules in the order they were reached, and the warning class:
-/// `.brenn` files under the root directory that no `use` reaches. Dead config
-/// is how drift starts, so it is said out loud — and it is only ever a warning,
-/// because a tree mid-edit is a normal state.
-fn load(root: &Path) -> Result<Loaded, Vec<Diagnostic>> {
+/// Returns the modules in the order they were reached.
+fn load(root: &Path) -> Result<Vec<(String, File)>, Vec<Diagnostic>> {
     let root_dir = root.parent().unwrap_or(Path::new(".")).to_path_buf();
     let mut loader = Loader {
         root_dir,
@@ -145,8 +109,7 @@ fn load(root: &Path) -> Result<Loaded, Vec<Diagnostic>> {
     if !loader.errors.is_empty() {
         return Err(loader.errors);
     }
-    let warnings = loader.unreachable_report(root);
-    Ok((loader.files, warnings))
+    Ok(loader.files)
 }
 
 struct Loader {
@@ -261,70 +224,6 @@ impl Loader {
         }
         path.set_extension(MODULE_EXT);
         path
-    }
-
-    /// The one report of `.brenn` files under the root that nothing reaches.
-    fn unreachable_report(&self, root: &Path) -> Vec<Diagnostic> {
-        let reached: BTreeSet<PathBuf> = self
-            .seen
-            .values()
-            .filter_map(|path| path.canonicalize().ok())
-            .collect();
-        let mut found = BTreeSet::new();
-        collect_modules(&self.root_dir, &mut BTreeSet::new(), &mut found);
-        let orphans: Vec<String> = found
-            .into_iter()
-            // The canonical path is what says whether a file was reached; the
-            // path as walked is what a message shows, because under a runfiles
-            // tree the two are not the same file name.
-            .filter(|(canonical, _)| !reached.contains(canonical))
-            .map(|(_, path)| display_relative(&path, &self.root_dir))
-            .collect();
-        if orphans.is_empty() {
-            return Vec::new();
-        }
-        vec![Diagnostic::unpositioned(
-            format!(
-                "no `use` reaches {}: {}",
-                if orphans.len() == 1 {
-                    "this file"
-                } else {
-                    "these files"
-                },
-                orphans.join(", ")
-            ),
-            root.display().to_string(),
-        )]
-    }
-}
-
-/// Every `.brenn` file under `dir`, as its canonical path and as walked.
-///
-/// `walked` holds the canonical directories already descended into, so a
-/// symlink cycle under the root is a bounded walk rather than a stack overflow.
-fn collect_modules(
-    dir: &Path,
-    walked: &mut BTreeSet<PathBuf>,
-    into: &mut BTreeSet<(PathBuf, PathBuf)>,
-) {
-    let Ok(canonical) = dir.canonicalize() else {
-        return;
-    };
-    if !walked.insert(canonical) {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_modules(&path, walked, into);
-        } else if path.extension().is_some_and(|ext| ext == MODULE_EXT)
-            && let Ok(canonical) = path.canonicalize()
-        {
-            into.insert((canonical, path));
-        }
     }
 }
 
@@ -3706,16 +3605,25 @@ fn emit_agent(
     // checked whatever the attrs did; the agent itself is withheld when
     // anything in its body — an attr value or a statement the body could not
     // resolve — did not come out whole.
+    let mounts = emit_mounts(class.mounts, &pscope, errors, &mut refused);
+    let mcps = emit_mcps(class.mcps, &pscope, errors, &mut refused);
+    let subs = emit_subs(class.subs, &pscope, errors, &mut refused);
+    let acls = emit_acls(class.acls, &pscope, errors, &mut refused);
+    // One walk over the body's sub-blocks, whatever their kindwords: the
+    // multiplicity check counts them together, so they cannot be gathered by
+    // two walks that disagree about what a duplicate is.
+    let blocks = emit_blocks(&class.blocks, &pscope, errors, &mut refused);
     let agent = RAgent {
         handle,
         slug,
         class: class.name.clone(),
         attrs,
-        mounts: emit_mounts(class.mounts, &pscope, errors, &mut refused),
-        mcps: emit_mcps(class.mcps, &pscope, errors, &mut refused),
-        subs: emit_subs(class.subs, &pscope, errors, &mut refused),
-        acls: emit_acls(class.acls, &pscope, errors, &mut refused),
-        hooks: emit_hooks(&class.blocks, &pscope, errors, &mut refused),
+        mounts,
+        mcps,
+        subs,
+        acls,
+        hooks: blocks.hooks,
+        attachment_targets: blocks.attachment_targets,
         doc: inst.doc,
     };
     if refused.any() {
@@ -4249,17 +4157,28 @@ fn emit_subs(
     resolved
 }
 
-/// An agent's hook blocks, typed by their kindword.
+/// What an agent body's sub-blocks say, gathered by kindword.
+struct AgentBlocks {
+    hooks: Vec<RHooks>,
+    attachment_targets: Vec<RAttachmentTarget>,
+}
+
+/// An agent's sub-blocks, typed by their kindword.
 ///
-/// At most one block per kindword — two `start_hooks` are two answers to one
-/// question.
-fn emit_hooks(
+/// At most one block per `(kindword, name)` — two `start_hooks` are two answers
+/// to one question, and two `attachment_target import` are two definitions of
+/// one upload affordance. Targets under different names are the normal case:
+/// the config field is a list.
+fn emit_blocks(
     blocks: &[SectionNode],
     scope: &Scope<'_>,
     errors: &mut Vec<Diagnostic>,
     withhold: &mut Refused,
-) -> Vec<RHooks> {
-    let mut resolved = Vec::new();
+) -> AgentBlocks {
+    let mut resolved = AgentBlocks {
+        hooks: Vec::new(),
+        attachment_targets: Vec::new(),
+    };
     let duplicates = duplicate_sections(
         blocks.iter().enumerate(),
         "an agent",
@@ -4279,25 +4198,117 @@ fn emit_hooks(
                 continue;
             }
         };
-        // Every kindword an agent body admits carries the same vocabulary; what
-        // the block is, is the word it led with.
-        let block = match block {
+        match block {
+            // The three hook kindwords carry one vocabulary; what the block is,
+            // is the word it led with.
             AgentBlock::StartHooks(block)
             | AgentBlock::PostPullHooks(block)
-            | AgentBlock::StartupHooks(block) => *block,
-        };
-        // Ordered before the body's values: a nested block is a separate
-        // mistake from a value it could not resolve.
-        refuse_subs(block.kindword.value(), &block.subs, errors);
-        let (attrs, refused) = resolve_attrs(block.attrs, scope, errors);
-        match refused.any() {
-            true => withhold.drop_part(),
-            false => resolved.push(RHooks {
-                kindword: block.kindword,
-                host: attrs.host.map(|attr| attr.value),
-                container: attrs.container.map(|attr| attr.value),
-            }),
+            | AgentBlock::StartupHooks(block) => {
+                let block = *block;
+                // Ordered before the body's values: a nested block is a
+                // separate mistake from a value it could not resolve.
+                refuse_subs(block.kindword.value(), &block.subs, errors);
+                let (attrs, refused) = resolve_attrs(block.attrs, scope, errors);
+                match refused.any() {
+                    true => withhold.drop_part(),
+                    false => resolved.hooks.push(RHooks {
+                        kindword: block.kindword,
+                        host: attrs.host.map(|attr| attr.value),
+                        container: attrs.container.map(|attr| attr.value),
+                    }),
+                }
+            }
+            AgentBlock::AttachmentTarget(block) => {
+                match emit_attachment_target(*block, scope, errors) {
+                    Some(target) => resolved.attachment_targets.push(target),
+                    None => withhold.drop_part(),
+                }
+            }
         }
+    }
+    resolved
+}
+
+/// One `attachment_target` block and the `handler` block it holds.
+///
+/// `None` where either half did not come out whole: the target is then withheld
+/// and its diagnostics stand. This layer checks only that a handler was written
+/// at all; which fields the handler type requires is lowering's concern.
+fn emit_attachment_target(
+    block: TypedBlock<AttachmentTargetAttrs>,
+    scope: &Scope<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<RAttachmentTarget> {
+    let TypedBlock {
+        doc,
+        kindword,
+        name,
+        attrs,
+        subs,
+    } = block;
+    let (attrs, refused) = resolve_attrs(attrs, scope, errors);
+    // Walked whatever the body did: an operator fixing one error at a time is
+    // what a compiler that reports the whole block exists to prevent.
+    let handler = emit_handler(&subs, &kindword, scope, errors);
+    if refused.any() {
+        return None;
+    }
+    Some(RAttachmentTarget {
+        kindword,
+        name,
+        attrs: attrs.entries(),
+        subs: vec![handler?],
+        doc,
+    })
+}
+
+/// The `handler` block of an attachment target.
+fn emit_handler(
+    subs: &[SectionNode],
+    parent: &Spanned<String>,
+    scope: &Scope<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<RSection> {
+    let duplicates = duplicate_sections(
+        subs.iter().enumerate(),
+        "an attachment target",
+        crate::model::ATTACHMENT_BLOCK_KINDWORDS,
+        errors,
+    );
+    let mut resolved = None;
+    for (offset, node) in subs.iter().enumerate() {
+        if duplicates.contains(&offset) {
+            continue;
+        }
+        let block = match crate::model::attachment_block(node) {
+            Ok(block) => block,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        let (parts, refused) = resolve_attrs(block, scope, errors);
+        let parts = parts.into_parts();
+        // A handler block nests nothing, so a section written inside one has no
+        // vocabulary to be checked against and no reader.
+        refuse_subs(parts.kindword.value(), &parts.subs, errors);
+        if refused.any() {
+            continue;
+        }
+        resolved = Some(RSection {
+            kindword: parts.kindword,
+            name: parts.name,
+            attrs: parts.attrs,
+            subs: Vec::new(),
+            doc: parts.doc,
+        });
+    }
+    if resolved.is_none() && subs.is_empty() {
+        errors.push(Diagnostic::at(
+            "an `attachment_target` states no `handler` block: what an upload does \
+             has no default",
+            parent.span().clone(),
+        ));
     }
     resolved
 }

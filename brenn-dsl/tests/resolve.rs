@@ -2608,3 +2608,277 @@ fn a_refused_value_in_an_assembly_body_is_reported_once_per_instantiation() {
         assert!(error.contains("nowhere"), "{errors:?}");
     }
 }
+
+// ── the open-bodied `integration` section ────────────────────────────────────
+//
+// The one section with no key vocabulary: any key is legal and every value is
+// carried, because what the keys mean belongs to the integration's own reader
+// in the binary.
+
+#[test]
+fn an_integration_section_carries_every_key_it_was_written_with() {
+    let config = resolved(concat!(
+        "const root = \"/home/alice/kb\";\n",
+        "integration graf {\n",
+        "    command = \"graf\";\n",
+        "    timeout_secs = 30;\n",
+        "    strict = true;\n",
+        "    env = { GRAF_ROOT = root };\n",
+        "}\n",
+    ));
+    let section = &config.sections[0];
+    assert_eq!(section.kindword.value(), "integration");
+    assert_eq!(
+        section.name.as_ref().map(Spanned::value),
+        Some(&"graf".to_string())
+    );
+    assert_eq!(attr(section, "command"), &RValue::Str("graf".into()));
+    assert_eq!(attr(section, "timeout_secs"), &RValue::Int(30));
+    assert_eq!(attr(section, "strict"), &RValue::Bool(true));
+    // A reference inside the body resolves like a reference anywhere: an open
+    // body is open about its keys, not about its values.
+    let RValue::Table(entries) = attr(section, "env") else {
+        panic!("`env` is a table");
+    };
+    assert_eq!(entries[0].0, "GRAF_ROOT");
+    assert_eq!(entries[0].1.value(), &RValue::Str("/home/alice/kb".into()));
+}
+
+#[test]
+fn an_unresolvable_value_in_an_integration_section_is_reported() {
+    let errors = refusals("integration graf { command = nowhere; }\n");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("nowhere"), "{errors:?}");
+}
+
+/// A deeper tree is written as an inline-table value, so the section itself
+/// nests nothing and a block written inside it has no vocabulary and no reader.
+#[test]
+fn an_integration_section_holds_no_sub_blocks() {
+    assert_eq!(
+        refusal("integration graf {\n    limits { timeout_secs = 30; }\n}\n"),
+        "the `integration` block holds no sub-blocks, so `limits` has no meaning here"
+    );
+}
+
+#[test]
+fn two_integration_sections_with_one_name_are_refused() {
+    assert_eq!(
+        refusal(concat!(
+            "integration graf { command = \"graf\"; }\n",
+            "integration graf { command = \"graf2\"; }\n",
+        )),
+        "a document states `integration graf` once, and this is the second"
+    );
+}
+
+#[test]
+fn two_integration_sections_under_two_names_both_stand() {
+    let config = resolved(concat!(
+        "integration graf { command = \"graf\"; }\n",
+        "integration pfin { command = \"pf\"; }\n",
+    ));
+    assert_eq!(config.sections.len(), 2);
+    let names: Vec<&str> = config
+        .sections
+        .iter()
+        .map(|section| {
+            section
+                .name
+                .as_ref()
+                .expect("an integration section is named")
+                .value()
+                .as_str()
+        })
+        .collect();
+    assert_eq!(names, ["graf", "pfin"]);
+    assert_eq!(
+        attr(&config.sections[0], "command"),
+        &RValue::Str("graf".into())
+    );
+    assert_eq!(
+        attr(&config.sections[1], "command"),
+        &RValue::Str("pf".into())
+    );
+}
+
+// ── `attachment_target` blocks ───────────────────────────────────────────────
+
+/// The agent's targets reach the model in declaration order, each with its
+/// `handler` block held and the handler's `type` carried as the word written.
+#[test]
+fn an_agents_attachment_targets_reach_the_model_in_order() {
+    let config = resolved(concat!(
+        "agent A() {\n",
+        "    attachment_target import {\n",
+        "        label = \"Import\";\n",
+        "        accept = [\".ofx\"];\n",
+        "        handler {\n",
+        "            type = command;\n",
+        "            program = \"pf\";\n",
+        "            args = [\"import\", \"{ofx}\"];\n",
+        "            file_roles = { ofx = [\".ofx\"] };\n",
+        "        }\n",
+        "    }\n",
+        "    attachment_target receipt {\n",
+        "        name = \"receipt-scan\";\n",
+        "        label = \"Scan a receipt\";\n",
+        "        accept = [\".jpg\"];\n",
+        "        handler { type = command; program = \"pf\"; args = [\"scan\"]; }\n",
+        "    }\n",
+        "}\n",
+        "new alice: A();\n",
+    ));
+    let targets = &config.agents[0].attachment_targets;
+    assert_eq!(targets.len(), 2);
+    assert_eq!(
+        targets[0].name.as_ref().map(Spanned::value),
+        Some(&"import".to_string())
+    );
+    assert_eq!(attr(&targets[0], "label"), &RValue::Str("Import".into()));
+    let handler = &targets[0].subs[0];
+    assert_eq!(handler.kindword.value(), "handler");
+    assert_eq!(attr(handler, "type"), &RValue::Str("command".into()));
+    // The `name` attr, where the block states one, overrides the block's own
+    // name; this layer carries both and lowering picks.
+    assert_eq!(
+        attr(&targets[1], "name"),
+        &RValue::Str("receipt-scan".into())
+    );
+}
+
+#[test]
+fn an_attachment_target_without_a_handler_is_refused() {
+    assert_eq!(
+        refusal(concat!(
+            "agent A() {\n",
+            "    attachment_target import { label = \"Import\"; accept = [\".ofx\"]; }\n",
+            "}\n",
+            "new alice: A();\n",
+        )),
+        "an `attachment_target` states no `handler` block: what an upload does has no default"
+    );
+}
+
+#[test]
+fn two_attachment_targets_with_one_name_are_refused() {
+    let errors = refusals(concat!(
+        "agent A() {\n",
+        "    attachment_target import {\n",
+        "        label = \"Import\";\n",
+        "        accept = [\".ofx\"];\n",
+        "        handler { type = command; program = \"pf\"; args = [\"import\"]; }\n",
+        "    }\n",
+        "    attachment_target import {\n",
+        "        label = \"Import again\";\n",
+        "        accept = [\".csv\"];\n",
+        "        handler { type = command; program = \"pf\"; args = [\"import\"]; }\n",
+        "    }\n",
+        "}\n",
+        "new alice: A();\n",
+    ));
+    let expected =
+        "an agent states `attachment_target import` once, and this is the second".to_string();
+    assert!(errors.contains(&expected), "{errors:?}");
+}
+
+#[test]
+fn a_stray_block_in_an_attachment_target_is_refused() {
+    let errors = refusals(concat!(
+        "agent A() {\n",
+        "    attachment_target import {\n",
+        "        label = \"Import\";\n",
+        "        accept = [\".ofx\"];\n",
+        "        retries { max = 3; }\n",
+        "        handler { type = command; program = \"pf\"; args = [\"import\"]; }\n",
+        "    }\n",
+        "}\n",
+        "new alice: A();\n",
+    ));
+    assert!(
+        errors.iter().any(|error| error.contains("retries")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn a_stray_block_as_an_attachment_targets_only_block_is_refused() {
+    let errors = refusals(concat!(
+        "agent A() {\n",
+        "    attachment_target import {\n",
+        "        label = \"Import\";\n",
+        "        accept = [\".ofx\"];\n",
+        "        retries { max = 3; }\n",
+        "    }\n",
+        "}\n",
+        "new alice: A();\n",
+    ));
+    assert!(!errors.is_empty(), "a diagnostic, not a panic");
+    assert!(
+        errors.iter().any(|error| error.contains("retries")),
+        "{errors:?}"
+    );
+}
+
+/// Two handlers is two answers to what an upload runs, and the loser would be
+/// invisible.
+#[test]
+fn two_handler_blocks_in_one_attachment_target_are_refused() {
+    let errors = refusals(concat!(
+        "agent A() {\n",
+        "    attachment_target import {\n",
+        "        label = \"Import\";\n",
+        "        accept = [\".ofx\"];\n",
+        "        handler { type = command; program = \"pf\"; args = [\"import\"]; }\n",
+        "        handler { type = command; program = \"pf\"; args = [\"other\"]; }\n",
+        "    }\n",
+        "}\n",
+        "new alice: A();\n",
+    ));
+    let expected = "an attachment target states `handler` once, and this is the second".to_string();
+    assert!(errors.contains(&expected), "{errors:?}");
+}
+
+#[test]
+fn a_handler_block_holds_no_sub_blocks() {
+    let errors = refusals(concat!(
+        "agent A() {\n",
+        "    attachment_target import {\n",
+        "        label = \"Import\";\n",
+        "        accept = [\".ofx\"];\n",
+        "        handler {\n",
+        "            type = command;\n",
+        "            program = \"pf\";\n",
+        "            args = [\"import\"];\n",
+        "            retries { max = 3; }\n",
+        "        }\n",
+        "    }\n",
+        "}\n",
+        "new alice: A();\n",
+    ));
+    assert!(
+        errors.iter().any(|error| error
+            == "the `handler` block holds no sub-blocks, so `retries` has no meaning here"),
+        "{errors:?}"
+    );
+}
+
+/// An unresolvable value inside a target withholds the agent, like any other
+/// value the body could not resolve.
+#[test]
+fn an_unresolvable_value_in_an_attachment_target_is_reported() {
+    let errors = refusals(concat!(
+        "agent A() {\n",
+        "    attachment_target import {\n",
+        "        label = nowhere;\n",
+        "        accept = [\".ofx\"];\n",
+        "        handler { type = command; program = \"pf\"; args = [\"import\"]; }\n",
+        "    }\n",
+        "}\n",
+        "new alice: A();\n",
+    ));
+    assert!(
+        errors.iter().any(|error| error.contains("nowhere")),
+        "{errors:?}"
+    );
+}

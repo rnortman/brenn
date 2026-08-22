@@ -41,8 +41,8 @@ use brenn_dsl::model::{
     Word, section_key,
 };
 use brenn_dsl::resolved::{
-    RAgent, RChanRef, RComponentInst, RConsumer, RHooks, RMcp, RMount, RNamed, RRemote, RSection,
-    RSubscribe, RSurface, RTail, RVal, RValue, RWebhook, RWebhookBlock,
+    RAgent, RAttachmentTarget, RChanRef, RComponentInst, RConsumer, RHooks, RMcp, RMount, RNamed,
+    RRemote, RSection, RSubscribe, RSurface, RTail, RVal, RValue, RWebhook, RWebhookBlock,
     ResolvedConfig as DslResolved,
 };
 
@@ -74,6 +74,7 @@ use crate::webhook::config::{
 
 use super::alerting::{AlertingConfig, MailConfig, NtfyConfig, default_subject_label};
 use super::app::AppConfigRaw;
+use super::attachment::{AttachmentHandlerConfig, AttachmentTargetRaw, default_timeout_secs};
 use super::automation::AutomationGlobalConfig;
 use super::brenn::BrennConfig;
 use super::claude_defaults::ClaudeDefaultsConfig;
@@ -156,9 +157,7 @@ pub fn lower(derived: DerivedConfig) -> Result<BrennConfig, Vec<Diagnostic>> {
         repo_sync: sections.repo_sync.unwrap_or_default(),
         repos,
         container: sections.container,
-        // No DSL spelling, by design: a map of arbitrary nested tables has no
-        // key vocabulary to transcribe.
-        integrations: HashMap::new(),
+        integrations: sections.integrations,
         apps,
         channels,
         messaging: sections.messaging.unwrap_or_default(),
@@ -384,33 +383,57 @@ fn expect_strings(value: &RVal, key: &str, errors: &mut Vec<Diagnostic>) -> Opti
     (errors.len() == before).then_some(strings)
 }
 
-/// A map of strings from a table attr: `env = { GRAF_ROOT = "/kb" }`.
-///
-/// Generic over the map the target field stores — a `HashMap` for an mcp
-/// server's environment, a `BTreeMap` for a surface component's config — so one
-/// refusal covers both.
-///
-/// Every entry whose value is not a string is refused at that value.
-fn expect_string_map<M: FromIterator<(String, String)>>(
+/// A map from a table attr, one entry reader deep.
+fn expect_table_of<T, M: FromIterator<(String, T)>>(
     value: &RVal,
     key: &str,
+    expected: &str,
+    entry: impl Fn(&RVal, &str, &mut Vec<Diagnostic>) -> Option<T>,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<M> {
     let entries = match value.value() {
         RValue::Table(entries) => entries,
         _ => {
-            errors.push(mismatch(value, key, "a table of strings"));
+            errors.push(mismatch(value, key, expected));
             return None;
         }
     };
     let before = errors.len();
     let table: M = entries
         .iter()
-        .filter_map(|(name, entry)| {
-            keep(expect_str(entry, key), errors).map(|text| (name.clone(), text))
-        })
+        .filter_map(|(name, held)| entry(held, key, errors).map(|built| (name.clone(), built)))
         .collect();
     (errors.len() == before).then_some(table)
+}
+
+/// A map of strings from a table attr: `env = { GRAF_ROOT = "/kb" }`.
+fn expect_string_map<M: FromIterator<(String, String)>>(
+    value: &RVal,
+    key: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<M> {
+    expect_table_of(
+        value,
+        key,
+        "a table of strings",
+        |held, key, errors| keep(expect_str(held, key), errors),
+        errors,
+    )
+}
+
+/// A map of string lists from a table attr: `file_roles = { ofx = [".ofx"] }`.
+fn expect_string_list_map<M: FromIterator<(String, Vec<String>)>>(
+    value: &RVal,
+    key: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<M> {
+    expect_table_of(
+        value,
+        key,
+        "a table of string lists",
+        expect_strings,
+        errors,
+    )
 }
 
 /// An optional attr the vocabulary types as a value, read as a string.
@@ -763,6 +786,15 @@ impl<'a> Body<'a> {
         expect_strings(value, key, errors)
     }
 
+    fn required_strings(
+        &mut self,
+        key: &'static str,
+        errors: &mut Vec<Diagnostic>,
+    ) -> Option<Vec<String>> {
+        let value = self.required(key, errors)?;
+        expect_strings(value, key, errors)
+    }
+
     /// A token attr, through the enum's own `Deserialize`.
     ///
     /// A section's attrs reach lowering as a flat key/value list, so a token
@@ -797,6 +829,26 @@ impl<'a> Body<'a> {
         keep(toml_table(entries, key), errors)
     }
 
+    /// Every key the body wrote, as the `toml::Value` tree the raw field
+    /// stores.
+    ///
+    /// The one open position among the sections: no key is claimed by name
+    /// because none is known, so the whole body is claimed at once and
+    /// [`Body::finish`] has nothing left to refuse. Each value is converted
+    /// under its own key, so a value the TOML tree cannot hold — a matcher is
+    /// the only one — is refused by name; `None` where any entry was refused.
+    fn open(&mut self, errors: &mut Vec<Diagnostic>) -> Option<toml::Table> {
+        let before = errors.len();
+        let table: toml::Table = self
+            .entries
+            .drain(..)
+            .filter_map(|(name, value)| {
+                keep(rval_to_toml(value, name), errors).map(|held| (name.to_owned(), held))
+            })
+            .collect();
+        (errors.len() == before).then_some(table)
+    }
+
     /// A map of strings, as the ordered map the raw field stores.
     fn string_map(
         &mut self,
@@ -805,6 +857,17 @@ impl<'a> Body<'a> {
     ) -> Option<BTreeMap<String, String>> {
         let value = self.take(key)?;
         expect_string_map(value, key, errors)
+    }
+
+    /// A map of string lists the target requires, as the map the raw field
+    /// stores.
+    fn required_string_list_map(
+        &mut self,
+        key: &'static str,
+        errors: &mut Vec<Diagnostic>,
+    ) -> Option<HashMap<String, Vec<String>>> {
+        let value = self.required(key, errors)?;
+        expect_string_list_map(value, key, errors)
     }
 
     fn send_rate(&mut self, key: &'static str, errors: &mut Vec<Diagnostic>) -> Option<SendRate> {
@@ -837,7 +900,9 @@ impl<'a> Body<'a> {
 ///
 /// One field per section kindword, `None` where the document states no such
 /// section: the assembly then gives that `BrennConfig` field its own default,
-/// which is what serde gives an omitted table.
+/// which is what serde gives an omitted table. The two named kindwords are maps
+/// instead — a document states as many `container` and `integration` sections as
+/// it has names for.
 #[derive(Default)]
 struct Sections {
     server: Option<ServerConfig>,
@@ -857,6 +922,7 @@ struct Sections {
     wasm: Option<WasmConfig>,
     watchdog: Option<WatchdogConfig>,
     container: HashMap<String, ContainerConfig>,
+    integrations: HashMap<String, toml::Value>,
 }
 
 /// TODO(dsl-vocabulary-config-parity): the kindword arms below, and every key
@@ -904,6 +970,17 @@ fn sections(list: &[RSection], errors: &mut Vec<Diagnostic>) -> Sections {
                     .value()
                     .clone();
                 out.container.insert(name, container(&mut body, errors));
+            }
+            "integration" => {
+                let name = section
+                    .name
+                    .as_ref()
+                    .expect("an integration section carries a name")
+                    .value()
+                    .clone();
+                if let Some(table) = body.open(errors) {
+                    out.integrations.insert(name, toml::Value::Table(table));
+                }
             }
             other => panic!("`{other}` is not a configuration section kindword"),
         }
@@ -1427,8 +1504,8 @@ fn apps(derived: &DerivedConfig, errors: &mut Vec<Diagnostic>) -> Vec<AppConfigR
 /// families — mounts, mcp servers, hooks and subscriptions.
 ///
 /// The config's nested tables with no attr spelling are set empty here rather
-/// than defaulted implicitly: approval rules, attachment targets, tool grants,
-/// per-integration config, frontmatter rendering and the per-app push block.
+/// than defaulted implicitly: approval rules, tool grants, per-integration
+/// config, frontmatter rendering and the per-app push block.
 fn app(
     resolved: &DslResolved,
     agent: &RAgent,
@@ -1541,8 +1618,7 @@ fn app(
             .unwrap_or_default(),
         // No attr spelling: a nested table of rule patterns.
         approval_rules: Vec::new(),
-        // No attr spelling: a nested table per target.
-        attachment_targets: Vec::new(),
+        attachment_targets: attachment_targets(&agent.attachment_targets, &label, errors),
         integrations: opt_strings(integrations.as_ref(), "integrations", errors)
             .unwrap_or_default(),
         // No attr spelling: arbitrary nested tables, keyed by integration name.
@@ -1689,6 +1765,116 @@ fn hook_blocks(
     }
     (start, post_pull, startup)
 }
+
+/// The `[[app.attachment_target]]` entries of one agent, in declaration order.
+///
+/// A target that cannot be built is dropped and its refusals stand: the app
+/// still lowers, and the whole lowering fails at the end.
+fn attachment_targets(
+    blocks: &[RAttachmentTarget],
+    app: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> Vec<AttachmentTargetRaw> {
+    blocks
+        .iter()
+        .filter_map(|block| attachment_target(block, app, errors))
+        .collect()
+}
+
+/// One `attachment_target` block.
+///
+/// The wire name is the `name` attr where the block states one, and the block's
+/// own name otherwise — the rule an entity's `slug` follows.
+fn attachment_target(
+    block: &RAttachmentTarget,
+    app: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<AttachmentTargetRaw> {
+    let declared = block
+        .name
+        .as_ref()
+        .expect("an attachment_target block carries a name")
+        .value()
+        .clone();
+    let what = format!("`attachment_target {declared}` of app `{app}`");
+    let mut body = Body::new(what.clone(), block.kindword.span().clone(), &block.attrs);
+    let name = body.str("name", errors).unwrap_or(declared);
+    let label = body.required_str("label", errors);
+    let accept = body.required_strings("accept", errors);
+    let multi = body.bool("multi", errors).unwrap_or_default();
+    body.finish(errors);
+    let handler = handler(block, &what, errors);
+    Some(AttachmentTargetRaw {
+        name,
+        label: label?,
+        accept: accept?,
+        multi,
+        handler: handler?,
+    })
+}
+
+/// The `handler` block, as the internally tagged variant its `type` word names.
+///
+/// Hand-dispatched: `StrDeserializer` builds unit variants only, and this one
+/// carries fields. The reader set per arm is what makes a stated attr the
+/// chosen type has no field for a refusal — [`Body::finish`] names exactly the
+/// keys that arm asked for.
+///
+/// TODO(dsl-vocabulary-config-parity): the type words below and each arm's
+/// field set are a hand transcription of `AttachmentHandlerConfig`'s serde tags
+/// and variants. The parity tests hold them to serde; nothing here does.
+fn handler(
+    block: &RAttachmentTarget,
+    what: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<AttachmentHandlerConfig> {
+    let held = block.subs.first().unwrap_or_else(|| {
+        panic!("{what} states no `handler` block, which resolution refuses before lowering runs")
+    });
+    let mut body = Body::new(
+        format!("`handler` of {what}"),
+        held.kindword.span().clone(),
+        &held.attrs,
+    );
+    let (kind, at) = body.required_spanned_str("type", errors)?;
+    // Every reader runs before the first `?`: a block missing two required
+    // fields is refused for both.
+    let built = match kind.as_str() {
+        "command" => {
+            let program = body.required_str("program", errors);
+            let args = body.required_strings("args", errors);
+            let file_roles = body.required_string_list_map("file_roles", errors);
+            let timeout_secs = body.int("timeout_secs", errors);
+            let cc_instructions = body.str("cc_instructions", errors);
+            Some(AttachmentHandlerConfig::Command {
+                program: program?,
+                args: args?,
+                file_roles: file_roles?,
+                timeout_secs: timeout_secs.unwrap_or_else(default_timeout_secs),
+                cc_instructions,
+            })
+        }
+        other => {
+            errors.push(Diagnostic::at(
+                format!(
+                    "`{other}` is not an attachment handler type; expected {}",
+                    or_list(HANDLER_TYPES.as_slice())
+                ),
+                at,
+            ));
+            None
+        }
+    };
+    // A block whose type word is unknown leaves its body unread, so naming the
+    // leftover keys would name every key it wrote.
+    if built.is_some() {
+        body.finish(errors);
+    }
+    built
+}
+
+/// The type words a `handler` block may name — the raw enum's own serde tags.
+const HANDLER_TYPES: [&str; 1] = ["command"];
 
 /// The two script lists a hook block states, each empty where it says nothing.
 fn hook_scripts(block: &RHooks, errors: &mut Vec<Diagnostic>) -> (Vec<String>, Vec<String>) {
@@ -2098,24 +2284,65 @@ fn wasm_bindings(
                     publish_capacity: tail.publish_capacity,
                 });
             }
-            // An absent channel means an anonymous private ring.
             RTail::Io(tail) => {
                 let tail = io_tail(tail, errors);
-                out.io_ports.push(WasmConsumerIoPortRaw {
-                    port,
-                    channel,
-                    push_depth: tail.push_depth,
-                    retain_depth: tail.retain_depth,
-                    noise: tail.noise,
-                    amplification: tail.amplification,
-                    urgency: tail.urgency,
-                    publish_per_activation: tail.publish_per_activation,
-                    publish_capacity: tail.publish_capacity,
-                });
+                match io_shape(binding.chan.as_ref(), channel) {
+                    IoShape::Pair(address) => {
+                        out.subscriptions.push(WasmConsumerSubscriptionRaw {
+                            channel: Some(address.clone()),
+                            port: port.clone(),
+                            push_depth: tail.push_depth,
+                            retain_depth: tail.retain_depth,
+                            noise: tail.noise,
+                            wake_min: None,
+                            amplification: tail.amplification,
+                        });
+                        out.outputs.push(WasmConsumerOutputRaw {
+                            channel: Some(address),
+                            port,
+                            urgency: tail.urgency,
+                            publish_per_activation: tail.publish_per_activation,
+                            publish_capacity: tail.publish_capacity,
+                        });
+                    }
+                    IoShape::Port(channel) => {
+                        out.io_ports.push(WasmConsumerIoPortRaw {
+                            port,
+                            channel,
+                            push_depth: tail.push_depth,
+                            retain_depth: tail.retain_depth,
+                            noise: tail.noise,
+                            amplification: tail.amplification,
+                            urgency: tail.urgency,
+                            publish_per_activation: tail.publish_per_activation,
+                            publish_capacity: tail.publish_capacity,
+                        });
+                    }
+                }
             }
         }
     }
     out
+}
+
+/// What an `io` binding lowers to.
+///
+/// A declared channel becomes a subscription/output `Pair` on the declared
+/// address. An absent or literal channel becomes a `Port`.
+enum IoShape {
+    Pair(String),
+    Port(Option<String>),
+}
+
+/// Which of the two an `io` binding takes, from the reference it names and the
+/// address that reference already resolved to.
+fn io_shape(chan: Option<&RChanRef>, channel: Option<String>) -> IoShape {
+    match (chan, channel) {
+        (Some(RChanRef::Decl(_)), address) => IoShape::Pair(
+            address.expect("a binding on a declared channel names that channel's address"),
+        ),
+        (None | Some(RChanRef::Addr(_)), channel) => IoShape::Port(channel),
+    }
 }
 
 /// The address a connected binding names.
@@ -2330,7 +2557,6 @@ fn surface_bindings(
                     publish_capacity: tail.publish_capacity,
                 });
             }
-            // An absent channel means the port's own page-local ring.
             RTail::Io(tail) => {
                 let mut masked = tail.clone();
                 refuse_val(
@@ -2341,17 +2567,40 @@ fn surface_bindings(
                     errors,
                 );
                 let tail = io_tail(&masked, errors);
-                out.io_ports.push(SurfaceIoPortRaw {
-                    instance: name.to_owned(),
-                    port,
-                    channel,
-                    push_depth: tail.push_depth,
-                    retain_depth: tail.retain_depth,
-                    noise: tail.noise,
-                    urgency: tail.urgency,
-                    publish_per_activation: tail.publish_per_activation,
-                    publish_capacity: tail.publish_capacity,
-                });
+                match io_shape(binding.chan.as_ref(), channel) {
+                    IoShape::Pair(address) => {
+                        out.subscriptions.push(SurfaceSubscriptionRaw {
+                            channel: Some(address.clone()),
+                            instance: name.to_owned(),
+                            port: port.clone(),
+                            push_depth: tail.push_depth,
+                            retain_depth: tail.retain_depth,
+                            noise: tail.noise,
+                            wake_min: None,
+                        });
+                        out.outputs.push(SurfaceOutputRaw {
+                            instance: name.to_owned(),
+                            channel: Some(address),
+                            port,
+                            urgency: tail.urgency,
+                            publish_per_activation: tail.publish_per_activation,
+                            publish_capacity: tail.publish_capacity,
+                        });
+                    }
+                    IoShape::Port(channel) => {
+                        out.io_ports.push(SurfaceIoPortRaw {
+                            instance: name.to_owned(),
+                            port,
+                            channel,
+                            push_depth: tail.push_depth,
+                            retain_depth: tail.retain_depth,
+                            noise: tail.noise,
+                            urgency: tail.urgency,
+                            publish_per_activation: tail.publish_per_activation,
+                            publish_capacity: tail.publish_capacity,
+                        });
+                    }
+                }
             }
         }
     }

@@ -221,6 +221,17 @@ fn a_container_block_without_a_name_is_refused() {
     assert_eq!(error.line_col(), Some((1, 1)));
 }
 
+#[test]
+fn an_integration_block_without_a_name_is_refused() {
+    let error = typed_str("integration {\n    command = \"graf\";\n}\n")
+        .expect_err("an integration is named");
+    assert_eq!(
+        error.message,
+        "a `integration` block is named: `integration <name> { … }`"
+    );
+    assert_eq!(error.line_col(), Some((1, 1)));
+}
+
 /// The other direction: a name written on a block that has nothing to do with
 /// one would be silently dropped.
 #[test]
