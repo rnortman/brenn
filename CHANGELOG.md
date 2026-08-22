@@ -2,6 +2,12 @@
 
 All notable changes to Brenn are documented here.
 
+## [0.17.0] — 2026-08-22
+
+### Changed
+
+- A new config DSL replaces TOML config
+
 ## [0.16.4] — 2026-08-14
 
 ### Fixed
