@@ -34,7 +34,6 @@ pub(crate) use brenn::load_config_from;
 pub use brenn::*;
 pub use claude_defaults::*;
 pub use container::*;
-pub use dsl_lower::lower;
 pub use events::*;
 pub use frontmatter::*;
 pub use hooks::*;

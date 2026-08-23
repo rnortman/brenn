@@ -161,12 +161,11 @@ Code site (`TODO(dsl-fmt-orphan-terminator)`): brenn-dsl/src/bin/brennfmt.rs.
 
 The root configs exist twice: `brenn.dev.brenn`/`brenn.dev.toml` and
 `brenn.e2e.brenn`/`brenn.e2e.toml` say the same thing, and `make launchdev` and
-`make e2e` read the `.brenn` side. The TOML twins are kept only because the
-TOML front end is still the one prod runs on; they are held to their
+`make e2e` read the `.brenn` side. They are held to their
 documents by `brenn-lib`'s twin-equivalence test, which is the only thing
 stopping them drifting apart.
 
-Retiring them is one checklist, all of it after the prod flip:
+Retiring them is one checklist:
 
 - delete the TOML twins at the repo root, and their `exports_files` and
   `brenn-lib` `data` entries;
@@ -183,9 +182,6 @@ Retiring them is one checklist, all of it after the prod flip:
   arrays are order-compared against its TOML twin, and assembly-stamped
   channels always land at the tail of the channel array — so the twin is what
   forces the duplication, and its retirement is what lifts it.
-
-Not before then: prod and staging still load TOML, and `brenn config-diff` over a
-`.toml`/`.brenn` pair is the tool that proves each port.
 
 
 ## `dsl-config-shared-module`
