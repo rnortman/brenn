@@ -2,21 +2,44 @@
 
 load("@rules_python//python:defs.bzl", "py_test")
 load("//bazel/policy:defs.bzl", "policy_srcs", "source_manifest")
+load("//brenn-dsl:defs.bzl", "format_check")
 
 exports_files([
     "Cargo.toml",
     "Cargo.lock",
     "rust-toolchain.toml",
     "MODULE.bazel",
-    # Shipped configs, read by brenn-lib's config-file tests (the messaging
-    # invariant) and by the canonical-format gate in //brenn-dsl.
-    "brenn.dev.brenn",
-    "brenn.e2e.brenn",
     # Read by scrub's rule-semantics suite.
     ".gitleaks.toml",
     # Shipped in the release tarball's lib/.
     "noop_mcp.py",
 ])
+
+# The shipped root configs and the shared modules they import, globbed rather
+# than listed: a new module joins the config-file tests and the format gate
+# below by existing, so neither can be silently skipped.
+BRENN_CONFIGS = glob([
+    "*.brenn",
+    "config/*.brenn",
+])
+
+# Roots and every module they import, so test consumers get a complete config
+# tree in one runfiles group.
+filegroup(
+    name = "brenn_configs",
+    srcs = BRENN_CONFIGS,
+    visibility = ["//visibility:public"],
+)
+
+# The format gate lives beside the documents so BRENN_CONFIGS is the single
+# source of truth for which files are checked.
+[
+    format_check(
+        name = config[:-len(".brenn")].replace("/", "_").replace(".", "_"),
+        src = config,
+    )
+    for config in BRENN_CONFIGS
+]
 
 policy_srcs()
 

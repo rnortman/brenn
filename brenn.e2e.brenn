@@ -1,15 +1,16 @@
-// TODO(dsl-config-shared-module): the component classes, both assemblies, the
-// bar channels and the bar surfaces below are duplicated verbatim in
-// brenn.dev.brenn; a change to one wants the same change to the other. The
-// component classes are duplicated a third time in the production config,
-// which no gate here can see.
-// Hermetic server configuration for the Playwright e2e harness (`make e2e`).
-// Binds a non-dev port and writes all state under target/e2e so a run is fully
-// isolated and `rm -rf target/e2e` gives a fresh DB every time.
-// `bind_address` must match E2E_BASE_URL in the Makefile `e2e` target (which
-// polls this port). The two asset trees are build outputs, reached through
-// bazel's convenience symlinks.
-/// Where the server listens and what it believes about the proxy in front.
+// The hermetic deployment the Playwright harness drives (`make e2e`): a
+// non-dev port, all state under `target/e2e` so `rm -rf target/e2e` gives a
+// fresh database, and nothing shared with a developer's own instance.
+//
+// `bind_address` must match `E2E_BASE_URL` in the Makefile's `e2e` target,
+// which polls this port.
+use config::bar::*;
+use config::components::*;
+use config::surfaces::*;
+
+/// Where the server listens and what it believes about the proxy in front. The
+/// two asset trees are build outputs, reached through bazel's convenience
+/// symlinks.
 server {
   bind_address = "127.0.0.1:3100";
   static_dir = ".bazel-bin/frontend/dist";
@@ -33,16 +34,16 @@ claude_defaults {
   model = "sonnet";
 }
 
-// Surface error reporting (parallel to brenn.dev.brenn): admitted warn/error
-// surface `Log` reports republish onto this durable channel via the trusted
-// in-code system publisher. The e2e harness runs the noop alerter, so the alert
-// leg is covered by the native integration tests rather than the browser here.
+/// Where surface error reports land. This harness runs the noop alerter, so the
+/// alert leg is covered by the native integration tests rather than from the
+/// browser here.
 observability {
   surface_error_channel = "brenn:surface-errors";
 }
 
-// Every uuid is carried rather than derived. An unused pin is a compile error,
-// which keeps this block honest against the declarations.
+// Every durable uuid is carried rather than derived. An unused pin is a compile
+// error, which keeps this block honest against the declarations — including the
+// ones the assemblies below stamp.
 uuid_pins {
   "brenn:surface-errors" = "a6e15b49-0885-4971-a036-b8d5a9ba693a";
   "brenn:surface.index" = "4f8c915e-c61f-497e-940d-554a9aa8a266";
@@ -67,135 +68,6 @@ uuid_pins {
   "brenn:bar-c" = "0d0f95db-13aa-4214-a461-aa1fbf788351";
 }
 
-// ── component classes ────────────────────────────────────────────────────────
-//
-// The class name folds to the wire kind: `Protobar` is `protobar`, `EchoStub`
-// is `echo-stub`.
-/// A bar panel: renders what arrives on `messages`, wakes itself on `tick`.
-component Protobar {
-  abi = dom;
-  in messages;
-  io tick;
-}
-
-/// The browser-driven publisher the feeder surface is built from.
-component EchoStub {
-  abi = dom;
-  out out;
-}
-
-/// The page chrome: layout, theme, banner, toasts.
-component Chrome {
-  abi = dom;
-  in layout;
-  in theme;
-  in link-state;
-  in surface-state;
-  in toast;
-  io toast-tick;
-}
-
-// ── assemblies ───────────────────────────────────────────────────────────────
-/// The four self-description channels one surface carries: the boot-published
-/// help document, the geometry and status the shell reports, and the retained
-/// bindings document the shell replays on every attach.
-///
-/// The three durable ones are retained latest-wins so a non-subscriber
-/// `MessageChannelGet` always returns the current document. The bindings
-/// channel is ephemeral because the document is rebuilt from this file at every
-/// boot — a durable copy could only preserve a stale document the next boot
-/// overwrites.
-assembly SurfaceDescription(slug: String) {
-  channel help at f"brenn:surface.surface.{slug}.help" {
-    description = f"Surface help: {slug}";
-    push_depth = 1;
-    retain_depth = 1;
-    standing_retain_depth = 1;
-  }
-  channel geometry at f"brenn:surface.surface.{slug}.geometry" {
-    description = f"Surface geometry: {slug}";
-    push_depth = 1;
-    retain_depth = 1;
-    standing_retain_depth = 1;
-  }
-  channel status at f"brenn:surface.surface.{slug}.status" {
-    description = f"Surface status: {slug}";
-    push_depth = 1;
-    retain_depth = 1;
-    standing_retain_depth = 1;
-  }
-  channel bindings at f"ephemeral:surface.surface.{slug}.bindings" {
-    description = f"Surface bindings document: {slug}";
-    push_depth = 1;
-    retain_depth = 1;
-  }
-
-}
-
-/// The help and schema documents one component kind carries.
-assembly KindDescription(kind: String) {
-  channel help at f"brenn:surface.kind.{kind}.help" {
-    description = f"Component kind help: {kind}";
-    push_depth = 1;
-    retain_depth = 1;
-    standing_retain_depth = 1;
-  }
-  channel schema at f"brenn:surface.kind.{kind}.schema" {
-    description = f"Component kind schema: {kind}";
-    push_depth = 1;
-    retain_depth = 1;
-    standing_retain_depth = 1;
-  }
-
-}
-
-// ── channels ─────────────────────────────────────────────────────────────────
-// Errors are facts, not signals: a report that scrolls out of the window before
-// anyone reads it is the outage the channel exists to describe. The window is
-// sized for a burst of reports, and push_depth = 1 because whoever is watching
-// is woken once and then reads the window.
-channel surface_errors at "brenn:surface-errors" {
-  description = "Surface client error reports (trusted republish)";
-  push_depth = 1;
-  retain_depth = 100;
-  standing_retain_depth = 100;
-}
-channel surface_index at "brenn:surface.index" {
-  description = "Surface topology index (system-published, latest-wins)";
-  push_depth = 1;
-  retain_depth = 1;
-  standing_retain_depth = 1;
-}
-
-// The bar's durable layout + three panel content channels. Durable and
-// `retain_depth = 1` so `bar.spec.ts` can drive the reload-restores-layout and
-// reload-restores-content acceptance runs through the snapshot path;
-// `push_depth = 8` bounds the parked backlog, under a matching
-// `standing_retain_depth` ceiling.
-channel bar_layout at "brenn:bar-layout" {
-  description = "Bar layout documents (latest-wins)";
-  push_depth = 8;
-  retain_depth = 1;
-  standing_retain_depth = 8;
-}
-channel bar_a at "brenn:bar-a" {
-  description = "Bar panel content channel (slot a / instance p1)";
-  push_depth = 8;
-  retain_depth = 1;
-  standing_retain_depth = 8;
-}
-channel bar_b at "brenn:bar-b" {
-  description = "Bar panel content channel (slot b / instance p2)";
-  push_depth = 8;
-  retain_depth = 1;
-  standing_retain_depth = 8;
-}
-channel bar_c at "brenn:bar-c" {
-  description = "Bar panel content channel (slot c / instance p3)";
-  push_depth = 8;
-  retain_depth = 1;
-  standing_retain_depth = 8;
-}
 new bar_desc: SurfaceDescription(slug = "bar");
 new bar_pixel_desc: SurfaceDescription(slug = "bar-pixel");
 new bar_feeder_desc: SurfaceDescription(slug = "bar-feeder");
@@ -204,10 +76,9 @@ new protobar_desc: KindDescription(kind = "protobar");
 new echo_stub_desc: KindDescription(kind = "echo-stub");
 new chrome_desc: KindDescription(kind = "chrome");
 
-// ── the app ──────────────────────────────────────────────────────────────────
 /// At least one app is mandatory. This one exists only to satisfy config
-/// validation; no conversation is ever started against it in e2e, and it holds
-/// no grants.
+/// validation: no conversation is ever started against it, and it holds no
+/// grants.
 agent E2eFloor {
   name = "E2E";
   description = "e2e validation floor";
@@ -217,100 +88,66 @@ agent E2eFloor {
 
 new e2e: E2eFloor;
 
-// ── the surfaces ─────────────────────────────────────────────────────────────
-// The bar: three protobar panel instances bound to their own durable content
-// channels, layout driven from `brenn:bar-layout`. `bar.spec.ts` drives the
-// layout/content/reload flows against this surface. Skin `bench` (1a Bench
-// Instrument).
-surface bar {
-  grants = [subscribe];
-  skin = "bench";
-  new p1: Protobar {
-    in messages <- bar_a;
-    // A wake subsumes its predecessor, so `push_depth = 1`; `retain_depth = 2`
-    // covers a cancel and its replacement. No channel, so the port resolves to
-    // an anonymous page-local ring.
-    io tick { push_depth = 1; retain_depth = 2; }
+/// One read-only bar: three panel instances on the shared content channels,
+/// layout driven from `brenn:bar-layout`, under the named skin. `bar.spec.ts`
+/// drives the layout, content, and reload flows against these.
+///
+/// A binding on a latest-wins port takes `push_depth = 1` — a layout or content
+/// document is complete, never a delta — rather than inheriting the channel's
+/// burst rung, which stays 8 to bound the parked deferred-publish backlog and
+/// clamps these statements from above. The `local:` planes follow the same rule:
+/// 1 on latest-wins, 8 on the toast event stream. An unbound `io tick` /
+/// `io toast-tick` resolves to an anonymous page-local ring, where a wake
+/// subsumes its predecessor and `retain_depth = 2` covers a cancel and its
+/// replacement.
+///
+/// No `takeover` grant, so chrome binds no takeover plane.
+assembly BarSurface(slug: String, skin: String) {
+  surface bar {
+    slug = f"{slug}";
+    grants = [subscribe];
+    skin = skin;
+    new p1: Protobar {
+      in messages <- bar_a;
+      io tick { push_depth = 1; retain_depth = 2; }
+
+    }
+    new p2: Protobar {
+      in messages <- bar_b;
+      io tick { push_depth = 1; retain_depth = 2; }
+
+    }
+    new p3: Protobar {
+      in messages <- bar_c;
+      io tick { push_depth = 1; retain_depth = 2; }
+
+    }
+    new chrome: Chrome {
+      chrome = true;
+      in layout <- bar_layout { push_depth = 1; }
+      in theme <- "local:brenn/theme" { push_depth = 1; }
+      in link-state <- "local:brenn/link-state" { push_depth = 1; }
+      in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
+      in toast <- "local:brenn/toast" { push_depth = 8; }
+      io toast-tick { push_depth = 1; retain_depth = 2; }
+
+    }
 
   }
-  new p2: Protobar {
-    in messages <- bar_b;
-    io tick { push_depth = 1; retain_depth = 2; }
-
-  }
-  new p3: Protobar {
-    in messages <- bar_c;
-    io tick { push_depth = 1; retain_depth = 2; }
-
-  }
-
-  // The page chrome: owns layout (from `brenn:bar-layout`), theme, banner,
-  // toasts. This surface carries no `takeover` grant, so chrome binds no
-  // takeover plane.
-  //
-  // `layout` is a latest-wins port — a layout document is complete, never a
-  // delta — so the binding states `push_depth = 1` rather than inheriting the
-  // rung's 8. The rung keeps 8 to bound the parked deferred-publish backlog and
-  // clamps this statement from above; `retain_depth` stays the read-context
-  // knob. The `local:` planes follow the same rule: 1 on latest-wins (theme,
-  // link-state, surface-state), 8 on the toast event stream.
-  new chrome: Chrome {
-    chrome = true;
-    in layout <- bar_layout { push_depth = 1; }
-    in theme <- "local:brenn/theme" { push_depth = 1; }
-    in link-state <- "local:brenn/link-state" { push_depth = 1; }
-    in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
-    in toast <- "local:brenn/toast" { push_depth = 8; }
-    io toast-tick { push_depth = 1; retain_depth = 2; }
-
-  }
-
 }
 
-// Second bar surface, identical bindings, `foundry` skin (1c Pixel Foundry) —
-// the config-selectable skin swap proven against the same channel set.
-surface bar-pixel {
-  grants = [subscribe];
-  skin = "foundry";
-  new p1: Protobar {
-    in messages <- bar_a;
-    io tick { push_depth = 1; retain_depth = 2; }
+new bar: BarSurface(slug = "bar", skin = "bench");
+new bar_pixel: BarSurface(slug = "bar-pixel", skin = "foundry");
 
-  }
-  new p2: Protobar {
-    in messages <- bar_b;
-    io tick { push_depth = 1; retain_depth = 2; }
-
-  }
-  new p3: Protobar {
-    in messages <- bar_c;
-    io tick { push_depth = 1; retain_depth = 2; }
-
-  }
-
-  // The page chrome (foundry skin). Same bindings as `bar`'s chrome; no
-  // takeover.
-  new chrome: Chrome {
-    chrome = true;
-    in layout <- bar_layout { push_depth = 1; }
-    in theme <- "local:brenn/theme" { push_depth = 1; }
-    in link-state <- "local:brenn/link-state" { push_depth = 1; }
-    in surface-state <- "local:brenn/surface-state" { push_depth = 1; }
-    in toast <- "local:brenn/toast" { push_depth = 8; }
-    io toast-tick { push_depth = 1; retain_depth = 2; }
-
-  }
-
-}
-
-// Bar feeder: browser-driven publisher for the bar — four echo-stub instances,
-// one output each onto the three content channels + the layout channel. The
-// specs type bodies / layout JSON and click send to drive the bar end-to-end.
-//
-// `grants = [publish]` plus the `out` bindings are the durable-publish pair;
-// publish authority is derived from the bindings. No `allowed_users` ⇒ any
-// authenticated user may publish durably — harmless on this hermetic loopback
-// harness; a multi-user config copying this surface MUST add `allowed_users`.
+/// Browser-driven publisher for the bar: one echo-stub per bar channel plus the
+/// layout channel. The specs type bodies and layout JSON and click send, driving
+/// the bar end to end.
+///
+/// `grants = [publish]` plus the `out` bindings are the durable-publish pair;
+/// publish authority is derived from the bindings. No `allowed_users`, so any
+/// authenticated user may publish durably — harmless on this hermetic loopback
+/// harness, but a multi-user config copying this surface must add it. Chrome
+/// binds no layout channel here, so it renders the default layout.
 surface bar-feeder {
   grants = [publish];
   new feed-a: EchoStub {
@@ -325,9 +162,6 @@ surface bar-feeder {
   new feed-layout: EchoStub {
     out out -> bar_layout;
   }
-
-  // The page chrome. Publisher-only surface with no layout channel — chrome
-  // renders the default layout; no takeover grant, so no takeover binding.
   new chrome: Chrome {
     chrome = true;
     in theme <- "local:brenn/theme" { push_depth = 1; }

@@ -3481,6 +3481,61 @@ surface alice_desk {
     );
 }
 
+/// A declared port an instance does not bind is inert: it contributes no
+/// subscription, no output, no `io_port` and no ACL entry. This is what makes a
+/// superset component class shareable between documents that bind different
+/// subsets of its ports — the class is a declaration, the instance decides.
+///
+/// The grant list holds only `subscribe` because a granted right that no bound
+/// port or acl statement reaches is separately refused: an unbound `out` port
+/// does not earn its class's instances a `publish` grant.
+#[test]
+fn a_port_the_instance_does_not_bind_lowers_to_nothing() {
+    assert_lowers(
+        r#"
+channel messages at "ephemeral:alice-desk.messages" {
+    push_depth = 2;
+    retain_depth = 4;
+}
+
+component Panel {
+    abi = dom;
+    in messages;
+    out outbound;
+    io tick;
+}
+
+surface alice_desk {
+    grants = [subscribe];
+
+    new panel: Panel {
+        in messages <- messages;
+    }
+}
+"#,
+        BrennConfig {
+            channels: vec![ChannelConfigRaw {
+                push_depth: Some(Depth::Bounded(2)),
+                retain_depth: Some(Depth::Bounded(4)),
+                ..channel_at("ephemeral:alice-desk.messages")
+            }],
+            surfaces: vec![SurfaceConfigRaw {
+                ephemeral_subscribe_acl: vec![ChannelMatcherRaw::Exact(
+                    "alice-desk.messages".to_string(),
+                )],
+                components: vec![dom_component("panel")],
+                subscriptions: vec![surface_input(
+                    "panel",
+                    "messages",
+                    "ephemeral:alice-desk.messages",
+                )],
+                ..surface("alice_desk", vec![SurfaceGrant::EphemeralSubscribe])
+            }],
+            ..Default::default()
+        },
+    );
+}
+
 /// The minimal surface: a grant, one instance and one input. Every optional
 /// attr is omitted, so this row is where the defaults land — the wire slug
 /// falls back to the handle, the instance name to the `new` handle, and

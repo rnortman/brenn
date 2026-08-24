@@ -1,0 +1,37 @@
+// The bar's shared channel family: one durable layout document plus one content
+// channel per panel slot.
+//
+// All four are latest-wins, so `retain_depth = 1` — a document is complete,
+// never a delta, and an attaching client reads the current one through the
+// snapshot path. `push_depth = 8` bounds the parked deferred-publish backlog
+// and is the ceiling a binding's own `push_depth` is clamped against;
+// `standing_retain_depth` matches it so the standing buffer can hold that
+// backlog.
+//
+// `retain_depth = 1` is load-bearing for the e2e reload specs
+// (`e2e/tests/bar.spec.ts`), which assert that a reloading client recovers the
+// current layout and content through the snapshot path.
+channel bar_layout at "brenn:bar-layout" {
+  description = "Bar layout documents (latest-wins)";
+  push_depth = 8;
+  retain_depth = 1;
+  standing_retain_depth = 8;
+}
+channel bar_a at "brenn:bar-a" {
+  description = "Bar panel content channel (slot a / instance p1)";
+  push_depth = 8;
+  retain_depth = 1;
+  standing_retain_depth = 8;
+}
+channel bar_b at "brenn:bar-b" {
+  description = "Bar panel content channel (slot b / instance p2)";
+  push_depth = 8;
+  retain_depth = 1;
+  standing_retain_depth = 8;
+}
+channel bar_c at "brenn:bar-c" {
+  description = "Bar panel content channel (slot c / instance p3)";
+  push_depth = 8;
+  retain_depth = 1;
+  standing_retain_depth = 8;
+}

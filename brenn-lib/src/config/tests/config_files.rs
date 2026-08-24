@@ -34,6 +34,37 @@ fn assert_config_file_messaging_invariant(filename: &str) {
     // block at `make check` time rather than only at a live server start.
     crate::messaging::config::build_channel_entries(&config.channels, &config.messaging);
     crate::messaging::config::build_system_channel_tuning(&config.channels, &config.messaging);
+    assert_surface_description_channels_declared(filename, &config);
+}
+
+/// Asserts that each surface declares the four description channels its slug
+/// requires (`help`, `geometry`, `status`, `bindings`).
+///
+/// The first three are durable and uuid-pinned, so a stem typo refuses to
+/// compile. The bindings channel is ephemeral and unpinned: a typo there
+/// compiles clean, leaving declared depths on an address nothing opens.
+fn assert_surface_description_channels_declared(filename: &str, config: &BrennConfig) {
+    let prefix = &config.surface_description.prefix;
+    let declared: Vec<&str> = config
+        .channels
+        .iter()
+        .filter_map(|channel| channel.address.as_deref())
+        .collect();
+    for surface in &config.surfaces {
+        let slug = &surface.slug;
+        for address in [
+            format!("brenn:{prefix}.surface.{slug}.help"),
+            format!("brenn:{prefix}.surface.{slug}.geometry"),
+            format!("brenn:{prefix}.surface.{slug}.status"),
+            format!("ephemeral:{prefix}.surface.{slug}.bindings"),
+        ] {
+            assert!(
+                declared.contains(&address.as_str()),
+                "{filename} declares surface `{slug}` but no channel at `{address}`, \
+                 which is where the runtime derives that surface's description channel"
+            );
+        }
+    }
 }
 
 #[test]

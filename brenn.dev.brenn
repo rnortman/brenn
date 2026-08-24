@@ -1,8 +1,9 @@
-// TODO(dsl-config-shared-module): the component classes, both assemblies, the
-// bar channels and the bar surfaces below are duplicated verbatim in
-// brenn.e2e.brenn; a change to one wants the same change to the other. The
-// component classes are duplicated a third time in the production config,
-// which no gate here can see.
+// The local development deployment: what runs, where its state goes, and the
+// durable identities it owns.
+use config::bar::*;
+use config::components::*;
+use config::surfaces::*;
+
 /// Where the server listens and what it believes about the proxy in front.
 server {
   bind_address = "127.0.0.1:3000";
@@ -35,7 +36,7 @@ integration pfin {
   command = "pf";
 }
 
-/// Channel for surface error reports. The dev instance has no alerter.
+/// Where surface error reports land. The dev instance runs no alerter.
 observability {
   surface_error_channel = "brenn:surface-errors";
 }
@@ -48,7 +49,8 @@ surface_description {
 
 // Every durable uuid is carried rather than derived: these were hand-minted v4,
 // so no derivation reproduces them. An unused pin is a compile error, which
-// keeps this block honest against the declarations.
+// keeps this block honest against the declarations — including the ones the
+// assemblies below stamp.
 uuid_pins {
   "brenn:surface-errors" = "0da727fd-d0f7-414e-98e3-f1fef2ae70ca";
   "brenn:surface.index" = "59ec3b6b-7a9d-4ede-b692-638ed3834963";
@@ -83,187 +85,32 @@ uuid_pins {
   "brenn:surface.kind.chrome.schema" = "c446cdd8-9e9a-4420-a41f-d5c5d21459d2";
 }
 
-// ── component classes ────────────────────────────────────────────────────────
-//
-// The class name folds to the kind: `EchoStub` is `echo-stub`, `ModeClock` is
-// `mode-clock`.
-/// The browser-driven echo fixture: publishes what was typed, renders what
-/// arrives. An instance binds whichever half its surface needs.
-component EchoStub {
-  abi = dom;
-  in messages;
-  out out;
-}
-
-/// A bar panel: renders what arrives on `messages`, wakes itself on `tick`.
-component Protobar {
-  abi = dom;
-  in messages;
-  io tick;
-}
-
-/// Headless theme driver: no layout slot, so it mounts hidden and its only
-/// output is a `ThemeBody` on `theme` that chrome turns into the `data-theme`
-/// flip.
-component ModeClock {
-  abi = dom;
-  in config;
-  out theme;
-  io tick;
-}
-
-/// Meeting notice: shows time-to-next-meeting and escalates to a fullscreen
-/// takeover. Reads the agenda snapshot, requests takeover, and both publishes
-/// and reads dismiss/snooze acks so every device converges — hence `io acks`.
-component Meeting {
-  abi = dom;
-  in agenda;
-  io acks;
-  out takeover;
-  io tick;
-}
-
-/// The page chrome: layout, theme, takeover stack, banner, toasts, and
-/// overlay-holdership reporting.
-component Chrome {
-  abi = dom;
-  in layout;
-  in theme;
-  in takeover;
-  in link-state;
-  in surface-state;
-  in toast;
-  out overlay-state;
-  io toast-tick;
-}
-
-// ── assemblies ───────────────────────────────────────────────────────────────
-/// The four self-description channels one surface carries: help, geometry,
-/// status, and bindings. The bindings channel is ephemeral because the document
-/// is rebuilt from this file at every boot.
-assembly SurfaceDescription(slug: String) {
-  channel help at f"brenn:surface.surface.{slug}.help" {
-    description = f"Surface help: {slug}";
-    push_depth = 1;
-    retain_depth = 1;
-    standing_retain_depth = 1;
-  }
-  channel geometry at f"brenn:surface.surface.{slug}.geometry" {
-    description = f"Surface geometry: {slug}";
-    push_depth = 1;
-    retain_depth = 1;
-    standing_retain_depth = 1;
-  }
-  channel status at f"brenn:surface.surface.{slug}.status" {
-    description = f"Surface status: {slug}";
-    push_depth = 1;
-    retain_depth = 1;
-    standing_retain_depth = 1;
-  }
-  channel bindings at f"ephemeral:surface.surface.{slug}.bindings" {
-    description = f"Surface bindings document: {slug}";
-    push_depth = 1;
-    retain_depth = 1;
-  }
-
-}
-
-/// The help and schema documents one component kind carries, both retained
-/// latest-wins.
-assembly KindDescription(kind: String) {
-  channel help at f"brenn:surface.kind.{kind}.help" {
-    description = f"Kind help: {kind}";
-    push_depth = 1;
-    retain_depth = 1;
-    standing_retain_depth = 1;
-  }
-  channel schema at f"brenn:surface.kind.{kind}.schema" {
-    description = f"Kind schema: {kind}";
-    push_depth = 1;
-    retain_depth = 1;
-    standing_retain_depth = 1;
-  }
-
-}
-
-// ── channels ─────────────────────────────────────────────────────────────────
-// Errors are facts, not signals: a report that scrolls out of the window before
-// anyone reads it is the outage the channel exists to describe. The window is
-// sized for a burst of reports, and push_depth = 1 because whoever is watching
-// is woken once and then reads the window.
-channel surface_errors at "brenn:surface-errors" {
-  description = "Surface client error reports (trusted republish)";
-  push_depth = 1;
-  retain_depth = 100;
-  standing_retain_depth = 100;
-}
-
-// The root of the boot-published self-description topology: an app starts here
-// and follows addresses.
-channel surface_index at "brenn:surface.index" {
-  description = "Surface topology index (system-published, latest-wins)";
-  push_depth = 1;
-  retain_depth = 1;
-  standing_retain_depth = 1;
-}
-
-// Latest-wins layout documents for the bar surfaces.
-channel bar_layout at "brenn:bar-layout" {
-  description = "Bar layout documents (latest-wins)";
-  push_depth = 8;
-  retain_depth = 1;
-  standing_retain_depth = 8;
-}
-
-// Bar content channels: one per panel instance.
-channel bar_a at "brenn:bar-a" {
-  description = "Bar panel content channel (slot a / instance p1)";
-  push_depth = 8;
-  retain_depth = 1;
-  standing_retain_depth = 8;
-}
-channel bar_b at "brenn:bar-b" {
-  description = "Bar panel content channel (slot b / instance p2)";
-  push_depth = 8;
-  retain_depth = 1;
-  standing_retain_depth = 8;
-}
-channel bar_c at "brenn:bar-c" {
-  description = "Bar panel content channel (slot c / instance p3)";
-  push_depth = 8;
-  retain_depth = 1;
-  standing_retain_depth = 8;
-}
-
-// Retained mode-clock config. Only `bar` subscribes — `bar-pixel` is
-// dark-only, so a mode-clock there would be a no-op.
+/// Retained mode-clock config. Only `bar` subscribes — `bar-pixel` is
+/// dark-only, so a mode-clock there would be a no-op.
 channel bar_mode at "brenn:bar-mode" {
   description = "Bar mode-clock config (retained, latest-wins)";
   push_depth = 8;
   retain_depth = 1;
   standing_retain_depth = 8;
 }
-
-// Retained meeting agenda snapshot (latest-wins). Both bar surfaces subscribe.
+/// Retained meeting agenda snapshot. Both bar surfaces subscribe.
 channel bar_agenda at "brenn:bar-agenda" {
   description = "Bar meeting agenda snapshot (retained, latest-wins)";
   push_depth = 8;
   retain_depth = 1;
   standing_retain_depth = 8;
 }
-
-// Dismiss/snooze acks: each device publishes and subscribes so every device
-// converges.
+/// Dismiss/snooze acks: each device publishes and subscribes so every device
+/// converges.
 channel bar_acks at "brenn:bar-acks" {
   description = "Bar meeting dismiss/snooze acks (retained)";
   push_depth = 8;
   retain_depth = 8;
   standing_retain_depth = 8;
 }
-
-// Ephemeral echo-loop fixture channel. `retain_depth = 8` covers the depth-8
-// surface binding below: on a non-durable channel the retained window *is* the
-// standing buffer, and no binding depth may exceed it.
+/// The echo-loop fixture channel. `retain_depth = 8` covers the depth-8 surface
+/// binding below: on a non-durable channel the retained window *is* the standing
+/// buffer, and no binding depth may exceed it.
 channel dev_stub at "ephemeral:dev-stub" {
   push_depth = 1;
   retain_depth = 8;
@@ -279,7 +126,6 @@ new mode_clock_desc: KindDescription(kind = "mode-clock");
 new meeting_desc: KindDescription(kind = "meeting");
 new chrome_desc: KindDescription(kind = "chrome");
 
-// ── the apps ─────────────────────────────────────────────────────────────────
 /// Development sandbox and the LLM write path into the bar surfaces.
 agent Development {
   name = "Development";
@@ -344,18 +190,19 @@ agent Pfin {
 
 new pfin: Pfin;
 
-// ── the surfaces ─────────────────────────────────────────────────────────────
-// Echo-loop fixture. `alert` grant required because `noise = alarm` below
-// demands the alert plane (boot-checked).
+// A binding on a latest-wins port takes `push_depth = 1` — a complete document
+// subsumes its predecessor. Event streams (`toast`, `takeover`) keep the burst
+// depth, and an unbound `io tick`/`io toast-tick` resolves to an anonymous
+// page-local ring where a wake subsumes its predecessor and `retain_depth = 2`
+// covers a cancel and its replacement.
+/// The echo-loop fixture. `alert` is granted because `noise = alarm` demands the
+/// alert plane, which boot checks.
 surface dev-stub {
   grants = [subscribe, publish, alert];
   new echo-stub: EchoStub {
     in messages <- dev_stub { push_depth = 8; noise = alarm; }
     out out -> dev_stub;
   }
-
-  // Latest-wins ports take `push_depth = 1`; `toast` is a stream, so it
-  // keeps burst depth. `toast-tick` is an anonymous page-local ring.
   new chrome: Chrome {
     chrome = true;
     in theme <- "local:brenn/theme" { push_depth = 1; }
@@ -368,7 +215,7 @@ surface dev-stub {
 
 }
 
-// Three-panel bar. Skin `bench` (1a Bench Instrument).
+/// Three-panel bar, skin `bench`.
 surface bar {
   grants = [subscribe, publish, takeover];
   skin = "bench";
@@ -387,16 +234,12 @@ surface bar {
     io tick { push_depth = 1; retain_depth = 2; }
 
   }
-
-  // `config` is latest-wins, so `push_depth = 1`.
   new mode: ModeClock {
     in config <- bar_mode { push_depth = 1; }
     out theme -> "local:brenn/theme";
     io tick { push_depth = 1; retain_depth = 2; }
 
   }
-
-  // `agenda` is latest-wins; `acks` accumulates, so it inherits the rung.
   new meeting: Meeting {
     in agenda <- bar_agenda { push_depth = 1; }
     io acks <-> bar_acks;
@@ -419,8 +262,8 @@ surface bar {
 
 }
 
-// Same channels as `bar`, different skin. Foundry is dark-only, so no
-// mode-clock.
+/// The same channels as `bar` under the `foundry` skin, which is dark-only —
+/// hence no mode-clock.
 surface bar-pixel {
   grants = [subscribe, publish, takeover];
   skin = "foundry";
@@ -461,11 +304,11 @@ surface bar-pixel {
 
 }
 
-// Browser-driven publisher for the bar: one echo-stub per bar channel, driving
-// the bar end-to-end with no LLM in the path.
-//
-// No `allowed_users` — fine for single-user dev. A multi-user config copying
-// this block should add `allowed_users`.
+/// Browser-driven publisher for the bar: one echo-stub per bar channel, driving
+/// the bar end to end with no LLM in the path.
+///
+/// No `allowed_users`, which is fine for single-user dev; a multi-user config
+/// copying this block must add it.
 surface bar-feeder {
   grants = [publish];
   new feed-a: EchoStub {

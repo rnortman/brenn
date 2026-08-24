@@ -56,10 +56,7 @@ rust_test(
     size = "small",
     crate = ":brenn-lib",
     crate_features = ["testutils"],
-    data = [
-        "//:brenn.dev.brenn",
-        "//:brenn.e2e.brenn",
-    ],
+    data = ["//:brenn_configs"],
     edition = "2024",
     rustc_env = {"CARGO_MANIFEST_DIR": "brenn-lib"},
     proc_macro_deps = all_crate_deps(proc_macro_dev = True),

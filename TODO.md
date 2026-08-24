@@ -181,45 +181,6 @@ corpus golden is regenerated in one commit.
 Code site (`TODO(dsl-fmt-orphan-terminator)`): brenn-dsl/src/bin/brennfmt.rs.
 
 
-## `dsl-config-shared-module`
-
-`brenn.dev.brenn` and `brenn.e2e.brenn` share about 240 lines verbatim: the
-component classes, both assemblies (`SurfaceDescription`, `KindDescription`),
-the bar channel declarations and the `bar`/`bar-pixel`/`bar-feeder` surface
-bodies. Nothing catches a change made to one and not the other —
-nothing compares the two documents to each other.
-
-The production config is now the third document, and it narrows what "shared"
-means:
-
-- The **component classes** are the shared shape: the same four classes with
-  identical port lists appear in all three documents, and they are the part a
-  drift breaks (a port list that disagrees between documents is a boot panic on
-  one surface and not the others). Their doc comments have already diverged —
-  the third copy carries none on two of the four and shortened rewrites on the
-  other two — which is the leading indicator.
-- The **assemblies are not shared.** The third document bakes different depths,
-  so parameterizing them across three callers is still guesswork.
-- The **bar channels and bar surfaces are not shared either** — they exist only
-  in the two root documents here.
-
-The asymmetry that makes this awkward: the third copy lives in the private ops
-annex, so no gate in this repo can see it, and `use` resolves module paths
-relative to the *root file's* directory (`brenn-dsl/src/resolve.rs`,
-`compile`). A module the production document imports is therefore a second file
-that has to reach the production host, which CD does not deploy config to at
-all — so a shared module spanning all three documents is an operations change,
-not only a factoring change.
-
-Done = the component-class declarations live in one module both root documents
-here `use`, and the entry records what the out-of-repo third document does
-instead (import a copied module, or keep its own classes under a stated
-divergence risk).
-
-Code sites (`TODO(dsl-config-shared-module)`): the header comment of
-`brenn.dev.brenn` and of `brenn.e2e.brenn`.
-
-
 ## `dsl-connection-spelling`
 
 `ConnectionConfigRaw` (`brenn-lib/src/messaging/config.rs`) declares an **auto
@@ -2064,3 +2025,19 @@ unconditional `Register` link in `login_page`.
 Done = `GET /auth/register` returns the same status regardless of whether an
 unused invite code exists, and the login page's `Register` link leads somewhere
 that explains itself.
+
+## `dsl-idioms-canonical-doc`
+
+The `.brenn` authoring conventions (root file is the deployment manifest; modules
+hold definitions; an assembly earns its place at the second stamping; a rationale
+is written once at the definition site; component classes unify as the superset)
+now exist as two comment blocks that are already worded differently and already
+carry different content: `config/components.brenn` in this repo, and
+`deploy/brenn/config/prod/site.brenn` in the private brenn-ops annex. Each points
+at the other, which is the most a comment can do; nothing makes the second copy
+move when a rule changes, and the divergence has already started.
+
+Wanted: one canonical home, with the second copy reduced to its local delta plus a
+pointer. Open first: whether that home is a `docs/` page here (this repo has no DSL
+prose doc at all yet, and starting one is a scope decision, not a comment edit) and
+whether a config in a permanently-private repo may point at a path in a public one.

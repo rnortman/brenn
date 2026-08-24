@@ -61,8 +61,8 @@ def _format(name, src, out):
         name = name,
         srcs = [src],
         outs = [out],
-        cmd = "$(location :brennfmt) $(location {}) > $@".format(src),
-        tools = [":brennfmt"],
+        cmd = "$(location //brenn-dsl:brennfmt) $(location {}) > $@".format(src),
+        tools = ["//brenn-dsl:brennfmt"],
     )
 
 def format_goldens(name):
@@ -112,9 +112,11 @@ def format_check(name, src):
     diff rather than a `--check` flag on the formatter: the same question, with
     no dependency on a CLI surface defined outside this repo.
 
+    Callable from any package: the formatter is addressed absolutely, so the
+    check can live beside the documents it gates rather than beside the tool.
+
     Args:
-        name: a target-name stem, unique within this package — a namespace
-            shared with `format_goldens`, whose stem is a corpus basename.
+        name: a target-name stem, unique within the calling package.
         src: the label of the document to check.
     """
     _format(
