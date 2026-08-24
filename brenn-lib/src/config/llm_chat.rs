@@ -10,7 +10,7 @@ use brenn_envelope::chat::{CHAT_SEGMENT_SEP, ChatLeaf, chat_leaf_prefix};
 
 use crate::access::acl::ChannelMatcher;
 use crate::access::{AppCapability, AppPolicy};
-use crate::messaging::{ChannelScheme, WakeMin, is_unreserved_char};
+use crate::messaging::{ChannelScheme, WakeMin, is_unreserved_name};
 
 /// Top-level `[llm_chat]` config section.
 ///
@@ -82,9 +82,7 @@ impl LlmChatConfig {
     pub fn validate(&self) {
         let prefix = self.prefix.as_str();
         assert!(
-            !prefix.is_empty()
-                && prefix.chars().all(is_unreserved_char)
-                && !prefix.contains(CHAT_SEGMENT_SEP),
+            is_unreserved_name(prefix) && !prefix.contains(CHAT_SEGMENT_SEP),
             "boot: [llm_chat] prefix {prefix:?} is not a well-formed bare-name segment \
              (allowed: A-Za-z0-9_~-, non-empty, no {CHAT_SEGMENT_SEP:?}) — it roots every chat \
              channel address. Refusing to start (fail-fast on invalid config)."

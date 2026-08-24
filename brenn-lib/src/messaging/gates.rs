@@ -10,17 +10,14 @@ use indexmap::IndexMap;
 
 use crate::access::{AppCapability, AppPolicy};
 use crate::config::AppConfig;
-use crate::messaging::{ChannelScheme, is_unreserved_char};
+use crate::messaging::{ChannelScheme, is_unreserved_name};
 
 /// Strip `scheme`'s prefix from `addr` and validate the bare name: the prefix
-/// must be present, the remainder non-empty, and every character in the
-/// unreserved set (`is_unreserved_char`). Returns the bare name on success.
+/// must be present and the remainder a well-formed name
+/// (`is_unreserved_name`). Returns the bare name on success.
 pub fn well_formed_name(addr: &str, scheme: ChannelScheme) -> Option<&str> {
     let name = addr.strip_prefix(scheme.prefix())?;
-    if name.is_empty() {
-        return None;
-    }
-    if !name.chars().all(is_unreserved_char) {
+    if !is_unreserved_name(name) {
         return None;
     }
     Some(name)

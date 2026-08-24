@@ -128,7 +128,7 @@ pub fn brenn_delivery_policy(
 pub fn test_channel_entry(name: &str, subscribers: Vec<SubscriberEntry>) -> ChannelEntry {
     ChannelEntry {
         uuid: Uuid::new_v4(),
-        address: crate::messaging::addressing::canonical_address(name),
+        address: crate::messaging::canonical_address(name),
         description: None,
         resolved_channel: ResolvedChannel {
             send_rate: Default::default(),

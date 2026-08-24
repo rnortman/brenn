@@ -9,6 +9,9 @@ publish = false
 # build this crate, which is the workspace's formal posture anyway — the manifest
 # exists so `@crates` resolves serde and clap.
 [dependencies]
+# The shared address vocabulary. A leaf crate with no first-party dependencies,
+# so the DSL tooling stays free of the host runtime.
+brenn-envelope = { path = "../brenn-envelope" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 # Durable channel identity is a pinned UUIDv5 derivation, so v5 is the whole

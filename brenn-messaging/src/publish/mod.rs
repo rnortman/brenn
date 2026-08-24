@@ -746,7 +746,7 @@ impl Messenger {
         let reserved_system_target = matches!(principal, PublishPrincipal::System { .. })
             && addr
                 .strip_prefix(ChannelScheme::Brenn.prefix())
-                .is_some_and(brenn_lib::tools::is_reserved_channel);
+                .is_some_and(brenn_lib::messaging::is_reserved_channel);
         let channel_name = if reserved_system_target {
             match addr.strip_prefix(ChannelScheme::Brenn.prefix()) {
                 Some(name) if !name.is_empty() => name,

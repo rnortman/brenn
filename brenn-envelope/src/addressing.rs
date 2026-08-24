@@ -5,10 +5,13 @@
 //! Every UUID here is a pinned UUIDv5 derivation: the publish side and the
 //! subscription side must land on the same value from the same address, and a
 //! changed namespace seed would orphan persisted channel rows.
+//!
+//! Single source of the address vocabulary for every reader of it: the host
+//! runtime, the guest components, and the `.brenn` configuration front end.
 
 use uuid::Uuid;
 
-use super::{BRENN_ADDRESS_PREFIX, ChannelScheme};
+use crate::{BRENN_ADDRESS_PREFIX, ChannelScheme};
 
 // ---------------------------------------------------------------------------
 // Address protocol
@@ -24,9 +27,6 @@ use super::{BRENN_ADDRESS_PREFIX, ChannelScheme};
 /// `658063f4-9afb-5209-b411-249fb15498fc` (pre-computed once; constant across
 /// all deployments so restarts and multi-process setups agree).
 pub fn webhook_channel_uuid_from_slug(slug: &str) -> Uuid {
-    // Two-level derivation keeps the per-slug UUID space isolated:
-    // namespace = UUIDv5(DNS-namespace, "brenn.webhook-channel")
-    // channel UUID = UUIDv5(namespace, slug)
     let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.webhook-channel");
     Uuid::new_v5(&ns, slug.as_bytes())
 }
@@ -47,9 +47,6 @@ pub fn webhook_channel_uuid_from_slug(slug: &str) -> Uuid {
 /// spaces cannot collide: the same string yields a different UUID under each
 /// transport.
 pub fn mqtt_channel_uuid_from_address(address: &str) -> Uuid {
-    // Two-level derivation keeps the per-address UUID space isolated:
-    // namespace = UUIDv5(DNS-namespace, "brenn.mqtt-channel")
-    // channel UUID = UUIDv5(namespace, address)
     let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.mqtt-channel");
     Uuid::new_v5(&ns, address.as_bytes())
 }
@@ -65,9 +62,6 @@ pub fn mqtt_channel_uuid_from_address(address: &str) -> Uuid {
 /// different UUID under each transport — the ephemeral, webhook, and MQTT
 /// address spaces cannot collide.
 pub fn ephemeral_channel_uuid_from_name(name: &str) -> Uuid {
-    // Two-level derivation keeps the per-name UUID space isolated:
-    // namespace = UUIDv5(DNS-namespace, "brenn.ephemeral-channel")
-    // channel UUID = UUIDv5(namespace, name)
     let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.ephemeral-channel");
     Uuid::new_v5(&ns, name.as_bytes())
 }
@@ -97,6 +91,42 @@ pub fn nondurable_channel_uuid(scheme: ChannelScheme, name: &str) -> Uuid {
 }
 
 // ---------------------------------------------------------------------------
+// Reserved namespaces
+// ---------------------------------------------------------------------------
+
+/// Reserved channel-name segments owned by the tool substrate: the async-tool
+/// request channels (`brenn:tools/<tool>`) and the per-participant result
+/// inboxes (`brenn:tool-results/<slug>`). Operator-declared channel addresses
+/// may not fall in these namespaces.
+pub const RESERVED_CHANNEL_SEGMENTS: [&str; 2] = ["tools", "tool-results"];
+
+/// Does `address` (a scheme-stripped `brenn:` channel name) fall in a reserved
+/// tool namespace? True for an exact segment match (`"tools"`) or a leading
+/// segment followed by a `.`/`/` boundary (`"tools/x"`, `"tools.x"`), so a
+/// sibling name like `"toolsmith"` is not falsely reserved.
+pub fn is_reserved_channel(address: &str) -> bool {
+    RESERVED_CHANNEL_SEGMENTS.iter().any(|seg| {
+        address == *seg
+            || address
+                .strip_prefix(seg)
+                .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('/'))
+    })
+}
+
+/// Is `name` (a scheme-stripped channel name) inside a tool namespace the
+/// substrate actually mints into?
+///
+/// Narrower than [`is_reserved_channel`], which also reserves the `.` boundary
+/// form (`tools.mine`) against squatting. Only the `/` form names a channel
+/// that exists, so only it can be tuned; the rest stays rejected.
+pub fn in_a_tool_namespace(name: &str) -> bool {
+    RESERVED_CHANNEL_SEGMENTS.iter().any(|seg| {
+        name.strip_prefix(seg)
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Auto channels
 // ---------------------------------------------------------------------------
 
@@ -115,11 +145,11 @@ pub const AUTO_CHANNEL_SEGMENT: &str = "auto";
 /// the gate for every operator-authored channel name: `[[channel]]` addresses,
 /// named auto channels, and surface-declared `local:` names.
 ///
-/// Deliberately separate from [`crate::tools::is_reserved_channel`], which keys
-/// the System-principal publish-time well-formedness exemption and must not
-/// widen: an `auto.<cid>` name is charset-clean and needs no exemption.
+/// Deliberately separate from [`is_reserved_channel`], which keys the
+/// System-principal publish-time well-formedness exemption and must not widen:
+/// an `auto.<cid>` name is charset-clean and needs no exemption.
 pub fn is_reserved_channel_name(name: &str) -> bool {
-    crate::tools::is_reserved_channel(name) || is_auto_channel_name(name)
+    is_reserved_channel(name) || is_auto_channel_name(name)
 }
 
 /// Does `name` (a scheme-stripped channel name) fall in the `auto` namespace?
@@ -190,9 +220,6 @@ pub fn durable_auto_channel_uuid(bare_name: &str) -> Uuid {
 /// webhook, MQTT, and ephemeral seeds so the tool address space cannot collide
 /// with any other transport's.
 pub fn tool_channel_uuid_from_address(address: &str) -> Uuid {
-    // Two-level derivation keeps the per-address UUID space isolated:
-    // namespace = UUIDv5(DNS-namespace, "brenn.tool-channel")
-    // channel UUID = UUIDv5(namespace, address)
     let ns = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"brenn.tool-channel");
     Uuid::new_v5(&ns, address.as_bytes())
 }
@@ -215,12 +242,69 @@ pub fn chat_channel_uuid_from_address(address: &str) -> Uuid {
     Uuid::new_v5(&ns, address.as_bytes())
 }
 
+// ---------------------------------------------------------------------------
+// Segment boundaries
+// ---------------------------------------------------------------------------
+
+/// Segment boundaries a channel prefix matcher must end at, so a prefix cannot
+/// over-match a sibling namespace (`webhook:git` reaching `webhook:github`).
+pub const MATCHER_BOUNDARIES: [char; 2] = ['/', '.'];
+
+/// Boundaries a tuning prefix may end at. `:` is the extra one: it closes an
+/// mqtt client segment (`mqtt:home:`), which the matcher side has no spelling
+/// for.
+pub const TUNING_BOUNDARIES: [char; 3] = ['/', '.', ':'];
+
+/// Does `pattern` end at a boundary a channel prefix matcher may end at?
+pub fn ends_at_matcher_boundary(pattern: &str) -> bool {
+    MATCHER_BOUNDARIES.iter().any(|b| pattern.ends_with(*b))
+}
+
+/// Does `pattern` end at a boundary a tuning prefix may end at?
+pub fn ends_at_tuning_boundary(pattern: &str) -> bool {
+    TUNING_BOUNDARIES.iter().any(|b| pattern.ends_with(*b))
+}
+
+/// The matcher boundaries as a refusal lists them: `` `/` or `.` ``.
+///
+/// For refusals with no list rendering of their own. Every site that names the
+/// set renders it from the const, so widening [`MATCHER_BOUNDARIES`] cannot
+/// leave a message naming the old set.
+pub fn matcher_boundary_list() -> String {
+    boundary_list(&MATCHER_BOUNDARIES)
+}
+
+/// The tuning boundaries as a refusal lists them, in the order of
+/// [`TUNING_BOUNDARIES`] so the last one named is the mqtt client colon.
+pub fn tuning_boundary_list() -> String {
+    boundary_list(&TUNING_BOUNDARIES)
+}
+
+fn boundary_list(boundaries: &[char]) -> String {
+    let quoted: Vec<String> = boundaries.iter().map(|b| format!("`{b}`")).collect();
+    match quoted.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+        Some((last, _)) => last.clone(),
+        None => String::new(),
+    }
+}
+
 /// Returns `true` if `c` is in the RFC 3986 unreserved character set
 /// (`A-Za-z0-9._~-`). Single source of truth for channel-name and
 /// push-address charset validation; used by both `messaging` and
 /// `pwa_push::targets`.
 pub fn is_unreserved_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '-')
+}
+
+/// Is `name` a well-formed bare name: non-empty and unreserved throughout?
+///
+/// The composite every site asking "is this a legal name" wants, so that
+/// admitting the empty name cannot become a per-site accident. Sites that
+/// refuse empty and ill-charactered names with separate diagnostics keep
+/// asking the two questions separately.
+pub fn is_unreserved_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(is_unreserved_char)
 }
 
 /// Build a canonical channel address from a bare name. The name must already
@@ -266,7 +350,7 @@ mod tests {
         assert!(!is_reserved_channel_name("alerts.high"));
         // The tool-scoped predicate must not widen: it keys the publish-time
         // well-formedness exemption, which auto channels do not need.
-        assert!(!crate::tools::is_reserved_channel("auto.abc"));
+        assert!(!is_reserved_channel("auto.abc"));
     }
 
     #[test]
@@ -523,6 +607,66 @@ mod tests {
 
         // The UUID must be v5 (version bits 0101).
         assert_eq!(u1.get_version(), Some(uuid::Version::Sha1));
+    }
+
+    #[test]
+    fn reserved_channel_covers_both_separators_and_exact() {
+        // Exact segment, and either boundary separator, are reserved.
+        assert!(is_reserved_channel("tools"));
+        assert!(is_reserved_channel("tools/git-repo-pull"));
+        assert!(is_reserved_channel("tools.git-repo-pull"));
+        assert!(is_reserved_channel("tool-results"));
+        assert!(is_reserved_channel("tool-results/pfin"));
+        assert!(is_reserved_channel("tool-results.pfin"));
+        // Sibling names sharing a byte prefix are NOT reserved.
+        assert!(!is_reserved_channel("toolsmith"));
+        assert!(!is_reserved_channel("tool"));
+        assert!(!is_reserved_channel("tool-results-archive"));
+        assert!(!is_reserved_channel("alerts.high"));
+    }
+
+    #[test]
+    fn tool_namespace_predicate_is_narrower_than_the_reservation() {
+        // Only the `/` form names a channel the substrate mints.
+        assert!(in_a_tool_namespace("tools/git-repo-pull"));
+        assert!(in_a_tool_namespace("tool-results/pfin"));
+        assert!(!in_a_tool_namespace("tools"));
+        assert!(!in_a_tool_namespace("tools.git-repo-pull"));
+        assert!(!in_a_tool_namespace("toolsmith/x"));
+    }
+
+    #[test]
+    fn boundary_predicates_differ_only_in_the_mqtt_colon() {
+        for pattern in ["webhook:git/", "alerts."] {
+            assert!(ends_at_matcher_boundary(pattern));
+            assert!(ends_at_tuning_boundary(pattern));
+        }
+        // The mqtt client colon closes a tuning prefix but is no matcher
+        // boundary.
+        assert!(!ends_at_matcher_boundary("mqtt:home:"));
+        assert!(ends_at_tuning_boundary("mqtt:home:"));
+        // A bare byte prefix ends at no boundary either way.
+        assert!(!ends_at_matcher_boundary("webhook:git"));
+        assert!(!ends_at_tuning_boundary("webhook:git"));
+    }
+
+    #[test]
+    fn the_boundary_sets_read_as_a_refusal_names_them() {
+        // The rendered text is the point of these two: a refusal that names the
+        // set is only actionable if it names it the way an author writes it.
+        assert_eq!(matcher_boundary_list(), "`/` or `.`");
+        assert_eq!(tuning_boundary_list(), "`/`, `.` or `:`");
+    }
+
+    #[test]
+    fn a_well_formed_name_is_non_empty_and_unreserved_throughout() {
+        assert!(is_unreserved_name("alerts.high_1~x-2"));
+        // The empty name is the clause a caller cannot get from
+        // `is_unreserved_char`: `all` over no characters is true.
+        assert!(!is_unreserved_name(""));
+        assert!(!is_unreserved_name("a/b"));
+        assert!(!is_unreserved_name("a b"));
+        assert!(!is_unreserved_name("mqtt:home"));
     }
 
     /// `ephemeral_channel_uuid_from_name` produces a fixed, documented value for a

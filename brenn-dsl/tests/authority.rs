@@ -326,6 +326,20 @@ fn a_matcher_pattern_under_an_unknown_scheme_names_no_family() {
 }
 
 #[test]
+fn a_matcher_pattern_under_the_runtime_internal_push_scheme_names_no_family() {
+    // `pwa_push:` is a scheme the runtime knows and the language does not, so a
+    // matcher naming it takes the unknown-scheme path and the `PwaPush` arm of
+    // the family fold stays unreachable.
+    assert_eq!(
+        derive_refusal(&surface(
+            "    acl subscribe [prefix \"pwa_push:alice.\"];\n"
+        )),
+        "`pwa_push:alice.` names no scheme, so there is no family it is about; a matcher \
+         pattern leads with `brenn:`, `ephemeral:`, `local:`, `webhook:` or `mqtt:`"
+    );
+}
+
+#[test]
 fn each_family_admits_only_the_kind_its_entries_are_written_with() {
     for (statement, expected) in [
         (

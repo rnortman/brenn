@@ -16,25 +16,6 @@ pub mod config;
 
 use std::collections::BTreeMap;
 
-/// Reserved channel-name segments owned by the tool substrate: the async-tool
-/// request channels (`brenn:tools/<tool>`) and the per-participant result
-/// inboxes (`brenn:tool-results/<slug>`). Operator-declared `[[channel]]`
-/// addresses may not fall in these namespaces.
-pub const RESERVED_CHANNEL_SEGMENTS: [&str; 2] = ["tools", "tool-results"];
-
-/// Does `address` (a scheme-stripped `brenn:` channel name) fall in a reserved
-/// tool namespace? True for an exact segment match (`"tools"`) or a leading
-/// segment followed by a `.`/`/` boundary (`"tools/x"`, `"tools.x"`), so a
-/// sibling name like `"toolsmith"` is not falsely reserved.
-pub fn is_reserved_channel(address: &str) -> bool {
-    RESERVED_CHANNEL_SEGMENTS.iter().any(|seg| {
-        address == *seg
-            || address
-                .strip_prefix(seg)
-                .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('/'))
-    })
-}
-
 /// One resolved ACL clause: a conjunction of `key = value` requirements. A
 /// clause matches a call's resource attributes iff every key it names is
 /// present with a matching value (`"*"` matches any value). Keys are AND'd
@@ -157,21 +138,5 @@ mod tests {
         let mut keys: Vec<&str> = c.keys().collect();
         keys.sort_unstable();
         assert_eq!(keys, vec!["branch", "repo"]);
-    }
-
-    #[test]
-    fn reserved_channel_covers_both_separators_and_exact() {
-        // Exact segment, and either boundary separator, are reserved.
-        assert!(is_reserved_channel("tools"));
-        assert!(is_reserved_channel("tools/git-repo-pull"));
-        assert!(is_reserved_channel("tools.git-repo-pull"));
-        assert!(is_reserved_channel("tool-results"));
-        assert!(is_reserved_channel("tool-results/pfin"));
-        assert!(is_reserved_channel("tool-results.pfin"));
-        // Sibling names sharing a byte prefix are NOT reserved.
-        assert!(!is_reserved_channel("toolsmith"));
-        assert!(!is_reserved_channel("tool"));
-        assert!(!is_reserved_channel("tool-results-archive"));
-        assert!(!is_reserved_channel("alerts.high"));
     }
 }

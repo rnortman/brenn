@@ -1,9 +1,17 @@
-//! Brenn message envelope wire types.
+//! Brenn message envelope wire types and the shared address vocabulary.
 //!
 //! This crate holds the types that form the external contract between the Brenn
-//! host and WASM guest components. It is intentionally kept free of host-only
+//! host and WASM guest components, and — in [`addressing`] — the channel
+//! address vocabulary all three of its consumer classes state in common: the
+//! host, the WASM guests, and the `.brenn` configuration front end, which is
+//! neither. It is intentionally kept free of host-only
 //! dependencies (tokio, sqlite, etc.) so that guest components may depend on it
 //! directly when compiled to `wasm32-unknown-unknown`.
+//!
+//! Everything in [`addressing`] is target-independent: pure `&str`, `Uuid` and
+//! `bool` work with no I/O, no clock and no host handle. That is the property
+//! the `wasm32-unknown-unknown` build of this crate rests on, so an addition
+//! reaching for any of them belongs in `brenn-lib` instead.
 //!
 //! The canonical definition lives here; `brenn-lib` re-exports everything from
 //! this crate at the same paths so existing host callers are unaffected.
@@ -15,6 +23,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+pub mod addressing;
 pub mod chat;
 
 // ---------------------------------------------------------------------------

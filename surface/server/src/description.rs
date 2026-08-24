@@ -29,7 +29,7 @@ use std::path::Path;
 use brenn_lib::config::SurfaceDescriptionConfig;
 use brenn_lib::messaging::config::{Depth, ResolvedSurface};
 use brenn_lib::messaging::gates::well_formed_name;
-use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Urgency, is_unreserved_char};
+use brenn_lib::messaging::{ChannelScheme, MessagingDirectory, Urgency, is_unreserved_name};
 use brenn_messaging::system::SystemParticipantSpec;
 use brenn_messaging::{Messenger, PublishResult};
 use brenn_surface_contract::module_artifact;
@@ -678,7 +678,7 @@ pub fn validate_surface_description(
     let prefix = config.prefix.as_str();
 
     assert!(
-        !prefix.is_empty() && prefix.chars().all(is_unreserved_char),
+        is_unreserved_name(prefix),
         "boot: [surface_description] prefix {prefix:?} is not a well-formed bare-name segment \
          (allowed: A-Za-z0-9._~-, non-empty) — it roots every derived channel address. Refusing \
          to start (fail-fast on invalid config)."

@@ -264,6 +264,48 @@ fn an_address_with_no_scheme_names_the_schemes() {
 }
 
 #[test]
+fn the_runtime_internal_push_scheme_is_not_spellable() {
+    // `pwa_push:` is a scheme the runtime knows and the language does not: an
+    // address leading with it takes the same path as any unrecognized prefix,
+    // and the schemes it is offered are the spellable ones.
+    assert_eq!(
+        refusal("channel alerts at \"pwa_push:alerts\";\n"),
+        "address `pwa_push:alerts` names no scheme; expected one of \
+         brenn:, ephemeral:, local:, webhook:, mqtt:"
+    );
+}
+
+#[test]
+fn the_push_scheme_is_not_spellable_in_a_pin_either() {
+    // Every statement form that carries a literal address asks the same
+    // question, and the `unreachable!` arms downstream rest on all of them
+    // asking it: a pin key naming `pwa_push:` is refused here, not derived.
+    assert_eq!(
+        refusal(
+            "uuid_pins {\n    \"pwa_push:alerts\" = \
+             \"11111111-2222-5333-8444-555555555555\";\n}\n"
+        ),
+        "address `pwa_push:alerts` names no scheme; expected one of \
+         brenn:, ephemeral:, local:, webhook:, mqtt:"
+    );
+}
+
+#[test]
+fn the_push_scheme_is_not_spellable_as_a_binding_target_either() {
+    assert_eq!(
+        refusal(concat!(
+            "component Sink {\n    abi = processor;\n    component_path = \"sink.wasm\";\n",
+            "    out events;\n}\n",
+            "new alice_sink: Sink {\n",
+            "    out events -> \"pwa_push:alerts\";\n",
+            "}\n",
+        )),
+        "address `pwa_push:alerts` names no scheme; expected one of \
+         brenn:, ephemeral:, local:, webhook:, mqtt:"
+    );
+}
+
+#[test]
 fn an_empty_address_is_still_positioned() {
     let source = "const skin = \"bench\";\nchannel messages at \"\";\n";
     let errors = compile(source).expect_err("an empty address names no scheme");

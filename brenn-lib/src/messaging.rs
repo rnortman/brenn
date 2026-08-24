@@ -4,8 +4,9 @@
 //! config + a small set of MCP virtual tools.
 //!
 //! What lives here is the half of that subsystem this crate's own production
-//! code reads: the address protocol and derived channel UUIDs
-//! ([`addressing`]), the channel/subscriber directory ([`directory`]), the
+//! code reads: the address protocol and derived channel UUIDs (re-exported
+//! from `brenn_envelope::addressing`), the channel/subscriber directory
+//! ([`directory`]), the
 //! config types and their resolution ([`config`], [`remote`]), the
 //! participant identities ([`identity`]) and the name/size gates
 //! ([`gates`]). `config::validate_and_resolve`, `access`, `mqtt`, `webhook`
@@ -14,7 +15,6 @@
 //! The runtime — `Messenger`, its stores and the messaging tables — is the
 //! `brenn-messaging` crate, one layer up. Nothing here reaches it.
 
-pub mod addressing;
 pub mod config;
 pub mod directory;
 pub mod gates;
@@ -24,12 +24,14 @@ pub mod remote;
 #[cfg(any(test, feature = "testutils"))]
 pub mod test_support;
 
-pub use addressing::{
+pub use brenn_envelope::addressing::{
     AUTO_CHANNEL_SEGMENT, auto_channel_cid, auto_channel_name, canonical_address,
     canonicalize_channel_address, chat_channel_uuid_from_address, durable_auto_channel_uuid,
-    ephemeral_channel_uuid_from_name, is_auto_channel_name, is_reserved_channel_name,
-    is_unreserved_char, local_channel_uuid_from_name, mqtt_channel_uuid_from_address,
-    nondurable_channel_uuid, tool_channel_uuid_from_address, webhook_channel_uuid_from_slug,
+    ends_at_matcher_boundary, ends_at_tuning_boundary, ephemeral_channel_uuid_from_name,
+    in_a_tool_namespace, is_auto_channel_name, is_reserved_channel, is_reserved_channel_name,
+    is_unreserved_char, is_unreserved_name, local_channel_uuid_from_name, matcher_boundary_list,
+    mqtt_channel_uuid_from_address, nondurable_channel_uuid, tool_channel_uuid_from_address,
+    tuning_boundary_list, webhook_channel_uuid_from_slug,
 };
 pub use config::{
     ChannelConfigRaw, Depth, MessagingConfigRaw, MessagingGlobalConfig, MessagingSubscriptionRaw,

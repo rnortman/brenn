@@ -21,8 +21,8 @@ use uuid::Uuid;
 
 use super::{
     ChannelEntry, ChannelScheme, MessagingDirectory, SubscriberEntryKind, WakeMin,
-    canonicalize_channel_address, is_reserved_channel_name, is_unreserved_char,
-    nondurable_channel_uuid,
+    canonicalize_channel_address, ends_at_tuning_boundary, in_a_tool_namespace,
+    is_reserved_channel_name, is_unreserved_char, nondurable_channel_uuid, tuning_boundary_list,
 };
 use crate::config::AppConfigRaw;
 
@@ -2031,18 +2031,6 @@ pub const INGRESS_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(100);
 /// burst arriving while the executor is busy, not a multi-day outage.
 pub const TOOL_CHANNEL_DEFAULT_RETAIN_DEPTH: Depth = Depth::Bounded(16);
 
-/// Is `name` (a scheme-stripped channel name) inside a tool namespace the
-/// substrate actually mints into?
-///
-/// Narrower than [`crate::tools::is_reserved_channel`], which also reserves the
-/// `.` boundary form (`tools.mine`) against squatting. Only the `/` form names a
-/// channel that exists, so only it can be tuned; the rest stays rejected.
-fn in_a_tool_namespace(name: &str) -> bool {
-    crate::tools::RESERVED_CHANNEL_SEGMENTS
-        .iter()
-        .any(|seg| name.starts_with(&format!("{seg}/")))
-}
-
 /// The families of channel the system mints for itself, each with its own
 /// bounded default window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2146,16 +2134,6 @@ impl SystemChannelTuning {
     }
 }
 
-/// Does `prefix` end at a segment boundary of a channel address?
-///
-/// The same narrowing the ACL resolution boundary applies to an operator-written
-/// `Prefix` matcher: without it `webhook:git` would reach `webhook:github`.
-/// `mqtt:` adds one boundary the ACL side does not have — the colon that closes
-/// the client segment (`mqtt:home:`).
-fn ends_at_segment_boundary(prefix: &str) -> bool {
-    prefix.ends_with('/') || prefix.ends_with('.') || prefix.ends_with(':')
-}
-
 /// Build the tuning table from the `[[channel]]` blocks that play the tuning
 /// role. Declaring blocks are skipped here and consumed by
 /// [`build_channel_entries`], which skips the tuning ones — both passes classify
@@ -2222,10 +2200,11 @@ pub fn build_system_channel_tuning(
                     "config: [[channel]] address_prefix must not be empty",
                 );
                 assert!(
-                    ends_at_segment_boundary(prefix),
+                    ends_at_tuning_boundary(prefix),
                     "config: [[channel]] address_prefix {prefix:?} must end at a segment \
-                     boundary ('/', '.' or the mqtt client colon) — a bare byte prefix \
-                     would reach past the family it names",
+                     boundary ({}, the last of which closes an mqtt client) — a bare byte \
+                     prefix would reach past the family it names",
+                    tuning_boundary_list(),
                 );
                 let canonical = canonicalize_channel_address(prefix);
                 // A prefix ending at a segment boundary is itself the shortest

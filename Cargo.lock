@@ -633,6 +633,7 @@ dependencies = [
 name = "brenn-dsl"
 version = "0.1.0"
 dependencies = [
+ "brenn-envelope",
  "clap",
  "serde",
  "uuid",

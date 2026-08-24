@@ -16,6 +16,8 @@
 //! Diagnostics accumulate rather than stopping at the first: independent errors
 //! in one document are all reported.
 
+use brenn_envelope::addressing::is_unreserved_name;
+
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -35,11 +37,12 @@ use crate::model::{
     PortDir as DeclDir, SectionNode, StrLike, StrLit, StrPart, SubscribeStmt, SubscribeTail,
     SurfaceDef, TypedBlock, UseStmt, UuidPin, Value,
 };
+use crate::resolved::scheme::{spellable_list, split_spellable};
 use crate::resolved::{
     Abi, ChanId, ClassRef, HandlePath, MatcherKind, PortDir, RAcl, RAgent, RAttachmentTarget,
     RBinding, RChanRef, RChannel, RComponentInst, RConsumer, RGrant, RHooks, RMatcher, RMatcherVal,
     RMcp, RMount, RNamed, RPin, RPort, RRemote, RSection, RSubscribe, RSurface, RTail, RTuning,
-    RVal, RValue, RWebhook, RWebhookBlock, RWordList, ResolvedConfig, Scheme,
+    RVal, RValue, RWebhook, RWebhookBlock, RWordList, ResolvedConfig,
 };
 
 /// The module key of the root file: the crate root has no path to name it by.
@@ -2607,7 +2610,7 @@ fn resolve_address(
 
 /// Refuse an address that names no scheme, or names one and nothing else.
 fn check_scheme(text: &str, span: &Span) -> Result<(), Diagnostic> {
-    match Scheme::split(text) {
+    match split_spellable(text) {
         Some((_, rest)) if !rest.is_empty() => Ok(()),
         Some((scheme, _)) => Err(Diagnostic::at(
             format!(
@@ -2619,7 +2622,7 @@ fn check_scheme(text: &str, span: &Span) -> Result<(), Diagnostic> {
         None => Err(Diagnostic::at(
             format!(
                 "address `{text}` names no scheme; expected one of {}",
-                Scheme::list()
+                spellable_list()
             ),
             span.clone(),
         )),
@@ -2656,9 +2659,10 @@ fn parse_abi(word: &str) -> Option<Abi> {
 /// document already says elsewhere: the kind folds from the class name, the
 /// instance name is the `new` handle, and the abi is the class's.
 ///
-/// TODO(dsl-vocabulary-config-parity): a resolver-side key table, transcribed
-/// like the attr vocabularies and with the same exposure.
-const SURFACE_COMPONENT_KEYS: [&str; 5] = [
+/// Public so the parity gate over the runtime's `SurfaceComponentRaw` can read
+/// it: a string list is the one vocabulary an exhaustive struct literal in
+/// lowering cannot police.
+pub const SURFACE_COMPONENT_KEYS: [&str; 5] = [
     "chrome",
     "send_burst",
     "send_refill_secs",
@@ -2689,8 +2693,9 @@ const CONSUMER_SLUG: &str = "slug";
 /// writing it here is an unknown key. Unspellable in this version, for want of
 /// a statement form: `mqtt_output` and `tool_grant`.
 ///
-/// TODO(dsl-vocabulary-config-parity): as above.
-const CONSUMER_KEYS: [&str; 7] = [
+/// Public for the same reason as [`SURFACE_COMPONENT_KEYS`]: the parity gate
+/// over `WasmConsumerConfigRaw` reads it.
+pub const CONSUMER_KEYS: [&str; 7] = [
     CONSUMER_SLUG,
     CONSUMER_WORDS,
     "store_path",
@@ -4966,11 +4971,9 @@ fn emit_stamped(
 // ── pass 5: identity ─────────────────────────────────────────────────────────
 //
 // A wire identity is what the runtime will call an entity, so the charset it
-// has to satisfy is the runtime's, transcribed. Two families, because the
-// runtime has two.
-//
-// TODO(dsl-vocabulary-config-parity): transcribed charsets, with the same
-// exposure as the attr vocabularies.
+// has to satisfy is the runtime's. Two families, because the runtime has two:
+// the unreserved set is the shared predicate, and the kebab one is this
+// language's own — nothing in the runtime states it.
 
 /// An entity family, and with it the two things every identity check needs to
 /// know about one: how its identities are spelled, and what to call it in a
@@ -5052,12 +5055,7 @@ impl Charset {
     fn admits(self, text: &str) -> bool {
         match self {
             Charset::Kebab => is_kebab(text),
-            Charset::Unreserved => {
-                !text.is_empty()
-                    && text
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '-'))
-            }
+            Charset::Unreserved => is_unreserved_name(text),
         }
     }
 

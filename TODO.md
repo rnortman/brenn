@@ -2,45 +2,64 @@
 
 ## `dsl-vocabulary-config-parity`
 
-`brenn-dsl/src/model.rs`'s ~30 attr vocabularies, and the runtime tables
-`brenn-dsl/src/derive.rs` states, are each a hand transcription of something in
-`brenn-lib` — the vocabularies of a config struct — `ServerAttrs` of `ServerConfig`, `AgentAttrs` of
-`AppConfigRaw`, and so on. Nothing mechanically ties the two sides: `brenn-dsl`
-has no dependency on `brenn-lib` today, so a field added to a config struct
-cannot break a build in the DSL crate. It surfaces as
+`brenn-dsl/src/model.rs`'s ~30 attr vocabularies, and the rule tables
+`brenn-dsl/src/derive.rs` states, are hand transcriptions of something in
+`brenn-lib` — the vocabulary of a config struct, or the behavior of a boot-time
+builder. The failure this entry exists for is a field added to a config struct
+that nobody adds a DSL key for: it surfaces as
 `` `some_new_knob` is not a server key `` to whoever migrates a config months
 later, and the fix at that point is a reconciliation across every struct pair.
 
-Nobody editing `brenn-lib/src/config/` has any signal that a second file exists.
-The invariant is the kind this repo gates elsewhere (`xtask`'s policy parity,
-`brenn-dsl/tests/rule_coverage.rs`), and it wants the same treatment: a gate that
-reflects each config struct's field names and compares them against a table of
-(config struct, DSL vocabulary, deliberately omitted fields and why). The
-omitted-fields column is load-bearing — `approval_rules`, `tool_grants`,
-`frontmatter`, the mqtt last-will table are all justified today in prose that no
-build step reads.
+Two thirds of that is now mechanical and needs no gate:
 
-Where it lives is the open question, and it is what makes this a design item
-rather than a chore. Note first that `brenn-dsl`'s independence from the config
-crates is **not** a requirement — it is only where the dependency graph happens
-to stand. `brenn-dsl → brenn-lib` would be a 2-cycle today, but the expected way
-this parity problem dissolves is the brenn-lib monolith split, after which the
-DSL crate can see the config structs directly and transcribe nothing. A gate
-built before that must not assume the split never happens. Until it does, the
-gate is a config-side test or an `xtask` subcommand, and how it obtains field
-names (a `field_names!()` macro beside each struct, a field-collecting
-`Deserializer`) is a decision with a maintenance cost of its own.
+- **The attr vocabularies.** `brenn-lib/src/config/dsl_lower.rs` builds the real
+  config structs with exhaustive struct literals, so a field added to a gated
+  struct fails to compile at its literal, and a vocabulary field renamed fails
+  to compile where lowering reads it. What the literal does not police is the
+  developer who answers that compile error by hardcoding a value instead of
+  adding a DSL key — that is the residual below.
+- **The resolver key tables.** String lists, which no struct literal reaches, so
+  they are gated by
+  `brenn-lib/src/config/tests/dsl_key_parity.rs`: every field of
+  `SurfaceComponentRaw` / `WasmConsumerConfigRaw` is either a key the DSL admits
+  or a listed omission with a reason.
+- **The addressing vocabulary** — schemes, uuid seeds, reserved segments,
+  charsets, segment boundaries — is single-sourced in
+  `brenn-envelope/src/addressing.rs` and read from there by the runtime, the
+  guests and the DSL. Nothing is transcribed.
 
-Done = adding a field to a gated config struct fails a check that names the
-vocabulary it is missing from, or the field is listed as deliberately omitted
-with a reason.
+What remains transcribed, and why a gate cannot reach it: these tables mirror
+*behavior* spread across runtime code with no single counterpart to compare
+against.
+
+- The ACL `Family` table (`derive.rs`): the field presence of four raw structs
+  plus policy-building logic in `brenn-lib/src/access/resolve.rs`.
+- `bindable` (`derive.rs`): a closure that reads a live `MessagingDirectory` in
+  `brenn-messaging-boot/src/surfaces.rs`, with three documented deliberate
+  deviations.
+- The channel-model presence rules (`derive.rs`): two ~150-line builders in
+  `brenn-lib/src/messaging/config.rs` that reach the mqtt module and panic
+  instead of diagnosing.
+- The remote-ceilings shape (`derive.rs`): two private panic-based helpers in
+  `brenn-lib/src/messaging/remote.rs`.
+- The grant vocabularies and their plane-word expansions (`derive.rs`).
+- The omissions ledger for vocabulary fields lowering resolves by default: the
+  reasons live in prose that no build step reads.
+
+Single-sourcing any of the rule tables means extracting shared predicate cores
+that both a diagnostic-emitting pass and a panic-based boot path call. That is
+real design work, and it depends on the brenn-lib monolith split (below), after
+which the DSL crate can see the config structs directly. A gate built before
+the split must not assume it never happens.
+
+Done = every rule table above either reads a shared predicate the runtime also
+reads, or is gone; and the omissions ledger is a list a check reads rather than
+prose.
 
 Code sites (`TODO(dsl-vocabulary-config-parity)`): brenn-dsl/src/model.rs, the
-entity attr vocabulary section header and the five statement tail vocabularies; brenn-dsl/src/resolve.rs, the transcribed
-key tables and charsets; brenn-dsl/src/derive.rs, at the scheme vocabulary, the
-tool namespaces, the channel-model presence rules, the non-durable uuid seeds,
-the ACL family table, the anonymous-namespace segment, the matcher pattern
-rules, the schemes a binding position may name, the remote subscribe ceilings
+entity attr vocabulary section header and the five statement tail vocabularies;
+brenn-dsl/src/derive.rs, at the channel-model presence rules, the ACL family
+table, the schemes a binding position may name, the remote subscribe ceilings
 shape, and the grant vocabularies and their plane-word expansions; and
 brenn-lib/src/config/dsl_lower.rs, at the `send_rate` key set, at the
 configuration-section kindword arms, at the webhook subscription family's key

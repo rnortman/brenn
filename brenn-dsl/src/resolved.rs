@@ -207,71 +207,65 @@ impl MatcherKind {
     }
 }
 
-/// The schemes an address may lead with.
+/// The scheme vocabulary of the language: which channel schemes a `.brenn`
+/// document can spell, and the questions the passes ask of one.
 ///
-/// The crate's one scheme vocabulary: resolution refuses an address that names
-/// none of these, and derivation reads the family and the durability of the
-/// channel a scheme names off it. Transcribed from the runtime's
-/// `ChannelScheme`.
-/// TODO(dsl-vocabulary-config-parity): held equal to `ChannelScheme` and its
-/// capabilities by review.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scheme {
-    Brenn,
-    Ephemeral,
-    Local,
-    Webhook,
-    Mqtt,
-}
+/// The invariant the rest of the crate rests on: [`scheme::split_spellable`] is
+/// the crate's only entry into scheme classification, so a
+/// `ChannelScheme::PwaPush` never reaches a pass and the `PwaPush` arms of the
+/// matches that classify a spelled address are unreachable. A pass that reaches
+/// `ChannelScheme::split` directly breaks it.
+pub mod scheme {
+    use brenn_envelope::ChannelScheme;
 
-impl Scheme {
-    /// Every scheme, in the order a diagnostic lists them.
-    pub const ALL: [Scheme; 5] = [
-        Self::Brenn,
-        Self::Ephemeral,
-        Self::Local,
-        Self::Webhook,
-        Self::Mqtt,
+    /// The channel schemes a `.brenn` document can spell, in the order a diagnostic
+    /// lists them.
+    ///
+    /// `pwa_push:` is deliberately absent: it is a runtime-internal egress target
+    /// with no spelling in this language.
+    pub const SPELLABLE_SCHEMES: [ChannelScheme; 5] = [
+        ChannelScheme::Brenn,
+        ChannelScheme::Ephemeral,
+        ChannelScheme::Local,
+        ChannelScheme::Webhook,
+        ChannelScheme::Mqtt,
     ];
 
-    /// The prefix this scheme is written as, colon included.
-    pub fn prefix(self) -> &'static str {
-        match self {
-            Self::Brenn => "brenn:",
-            Self::Ephemeral => "ephemeral:",
-            Self::Local => "local:",
-            Self::Webhook => "webhook:",
-            Self::Mqtt => "mqtt:",
-        }
-    }
-
-    /// The scheme an address leads with and what follows it.
+    /// The scheme an address leads with and what follows it, restricted to the
+    /// schemes this language spells.
     ///
-    /// `None` where the address names no scheme at all: `brenn:` is never
-    /// implied, in this language or in a `.brenn` address.
-    pub fn split(address: &str) -> Option<(Scheme, &str)> {
-        Self::ALL.into_iter().find_map(|scheme| {
+    /// `None` where the address names none of them: `brenn:` is never implied, in
+    /// this language or in a `.brenn` address, and `pwa_push:` is not spellable.
+    /// The crate's only entry into scheme classification — a bare
+    /// `ChannelScheme::split` here would admit `pwa_push:`, and every match on the
+    /// result would then be reachable with a variant the language cannot write.
+    pub fn split_spellable(address: &str) -> Option<(ChannelScheme, &str)> {
+        SPELLABLE_SCHEMES.into_iter().find_map(|scheme| {
             address
                 .strip_prefix(scheme.prefix())
                 .map(|rest| (scheme, rest))
         })
     }
 
-    /// Every prefix, as a diagnostic lists them: `brenn:, ephemeral:, …`.
-    pub fn list() -> String {
-        Self::ALL.map(Self::prefix).join(", ")
+    /// Is a channel under this scheme disk-backed — and so carrying an identity the
+    /// configuration states rather than one derived at runtime?
+    ///
+    /// Not `ChannelScheme::capabilities().durable`, which is also true for the
+    /// ingress transports: those persist their rows, but their identity comes from
+    /// the transport and never from a configuration.
+    pub fn config_identified(scheme: ChannelScheme) -> bool {
+        scheme == ChannelScheme::Brenn
     }
 
-    /// Every prefix quoted, as a diagnostic that expects one of them lists them:
-    /// ``​`brenn:`, `ephemeral:`, … or `mqtt:` ``.
-    pub fn quoted_list() -> String {
-        crate::diag::or_list(Self::ALL.map(Self::prefix))
+    /// Every spellable prefix, as a diagnostic lists them: `brenn:, ephemeral:, …`.
+    pub fn spellable_list() -> String {
+        SPELLABLE_SCHEMES.map(ChannelScheme::prefix).join(", ")
     }
 
-    /// Is a channel under this scheme disk-backed — and so carrying an identity
-    /// the configuration states rather than one derived at runtime?
-    pub fn durable(self) -> bool {
-        self == Self::Brenn
+    /// Every spellable prefix quoted, as a diagnostic that expects one of them
+    /// lists them: ``​`brenn:`, `ephemeral:`, … or `mqtt:` ``.
+    pub fn spellable_quoted_list() -> String {
+        crate::diag::or_list(SPELLABLE_SCHEMES.map(ChannelScheme::prefix))
     }
 }
 

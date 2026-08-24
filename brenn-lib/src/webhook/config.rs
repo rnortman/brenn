@@ -781,7 +781,7 @@ pub fn resolve_webhook_endpoints(
     global_messaging: &crate::messaging::config::MessagingGlobalConfig,
 ) -> IndexMap<String, Arc<ResolvedWebhookEndpoint>> {
     use crate::messaging::WEBHOOK_ADDRESS_PREFIX;
-    use crate::messaging::is_unreserved_char;
+    use crate::messaging::is_unreserved_name;
 
     if raw_endpoints.is_empty() && raw_apps.iter().all(|a| a.webhook_subscriptions.is_empty()) {
         return IndexMap::new();
@@ -849,7 +849,7 @@ pub fn resolve_webhook_endpoints(
 
         // Rule 1: slug charset.
         assert!(
-            !slug.is_empty() && slug.chars().all(is_unreserved_char),
+            is_unreserved_name(slug),
             "[[webhook_endpoint]] slug {:?} is invalid; must match [A-Za-z0-9._~-]+",
             slug,
         );

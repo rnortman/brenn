@@ -9,6 +9,7 @@ mod app_parse;
 mod attachment;
 mod config_files;
 mod container;
+mod dsl_key_parity;
 mod dsl_lower;
 mod events;
 mod integrations;

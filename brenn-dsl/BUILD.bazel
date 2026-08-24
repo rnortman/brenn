@@ -39,6 +39,7 @@ rust_library(
     visibility = ["//visibility:public"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
+        "//brenn-envelope",
         "@fltk//crates/fltk-cst-core:no_python",
         "@fltk//crates/fltk-parser-core:no_python",
         "@fltk//crates/fltk-serde-core:no_python",
@@ -104,6 +105,19 @@ rust_test(
     ],
 )
 
+# The scheme-classification invariant is a property of the sources themselves,
+# so this suite reads them rather than the fixtures: the crate's hand-written
+# files are its declared runfiles. Not a `dsl_test` for that reason, and it
+# needs no dependency beyond std.
+rust_test(
+    name = "scheme_invariant",
+    srcs = ["tests/scheme_invariant.rs"],
+    crate_root = "tests/scheme_invariant.rs",
+    data = glob(["src/**/*.rs"]),
+    edition = "2024",
+    rustc_env = {"CARGO_MANIFEST_DIR": package_name()},
+)
+
 rust_doc_test(
     name = "brenn-dsl_doc_test",
     crate = ":brenn-dsl",
@@ -122,6 +136,7 @@ rust_binary(
     edition = "2024",
     deps = [
         ":brenn-dsl",
+        "//brenn-envelope",
         "@fltk//crates/fltk-fmt-cli",
     ],
 )
@@ -132,7 +147,10 @@ rust_binary(
     crate_root = "src/bin/dsl_cli.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    deps = all_crate_deps(normal = True) + [":brenn-dsl"],
+    deps = all_crate_deps(normal = True) + [
+        ":brenn-dsl",
+        "//brenn-envelope",
+    ],
 )
 
 format_goldens(name = "lexical")

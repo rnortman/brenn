@@ -692,9 +692,10 @@ fn resolve_channel(owner: &str, list: &str, raw: &ChannelMatcherRaw) -> ChannelM
                 "{owner}: {list} prefix matcher is empty (would match every channel)",
             );
             assert!(
-                p.ends_with('/') || p.ends_with('.'),
-                "{owner}: {list} prefix matcher {p:?} must end at a segment boundary \
-                 (`/` or `.`) so it cannot over-match a sibling namespace",
+                crate::messaging::ends_at_matcher_boundary(p),
+                "{owner}: {list} prefix matcher {p:?} must end at a segment boundary ({}) so \
+                 it cannot over-match a sibling namespace",
+                crate::messaging::matcher_boundary_list(),
             );
             assert!(
                 !crate::messaging::is_auto_channel_name(p),

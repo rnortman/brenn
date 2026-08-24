@@ -37,15 +37,22 @@ use fltk_cst_core::Span;
 use fltk_serde_core::Spanned;
 use uuid::Uuid;
 
+use brenn_envelope::ChannelScheme;
+use brenn_envelope::addressing::{
+    MATCHER_BOUNDARIES, TUNING_BOUNDARIES, ends_at_matcher_boundary, ends_at_tuning_boundary,
+    in_a_tool_namespace, is_auto_channel_name, nondurable_channel_uuid,
+};
+
 use crate::derived::{
     DAclSet, DAuthorities, DAuthority, DMatcher, DMqttClient, DMqttSub, DRemoteAuthority,
     DRemoteSubEntry, DWebhook, DerivedConfig,
 };
 use crate::diag::{Diagnostic, check_unique, or_list, two_site};
 use crate::model::Word;
+use crate::resolved::scheme::{config_identified, spellable_quoted_list, split_spellable};
 use crate::resolved::{
     ChanId, ClassRef, HandlePath, MatcherKind, PortDir, RAcl, RAgent, RBinding, RChanRef, RChannel,
-    RMatcher, RMatcherVal, RPort, RSurface, RTuning, RVal, RValue, ResolvedConfig, Scheme,
+    RMatcher, RMatcherVal, RPort, RSurface, RTuning, RVal, RValue, ResolvedConfig,
 };
 
 /// Derive a resolved document.
@@ -70,23 +77,6 @@ pub fn derive(config: ResolvedConfig) -> Result<DerivedConfig, Vec<Diagnostic>> 
     ))
 }
 
-/// The channel-name segments the tool substrate mints into.
-///
-/// Narrower than the runtime's reserved-name rule, which also reserves the `.`
-/// boundary form against squatting: only the `/` form names a channel that
-/// exists, so only it can be tuned.
-/// TODO(dsl-vocabulary-config-parity): held equal to
-/// `brenn_lib::tools::RESERVED_CHANNEL_SEGMENTS` by review.
-const TOOL_NAMESPACES: [&str; 2] = ["tools", "tool-results"];
-
-/// Does `name` — a scheme-stripped `brenn:` channel name — sit in a tool
-/// namespace the substrate mints into?
-fn in_a_tool_namespace(name: &str) -> bool {
-    TOOL_NAMESPACES
-        .iter()
-        .any(|segment| name.starts_with(&format!("{segment}/")))
-}
-
 /// Is this address one the system mints for itself?
 ///
 /// The ingress families (`mqtt:`, `webhook:`) and the tool substrate's
@@ -94,29 +84,11 @@ fn in_a_tool_namespace(name: &str) -> bool {
 /// operator-declared channel's address. A total function of the address, which
 /// is what makes the declaring and tuning roles disjoint.
 fn is_system_minted(address: &str) -> bool {
-    match Scheme::split(address) {
-        Some((Scheme::Mqtt | Scheme::Webhook, _)) => true,
-        Some((Scheme::Brenn, name)) => in_a_tool_namespace(name),
+    match split_spellable(address) {
+        Some((ChannelScheme::Mqtt | ChannelScheme::Webhook, _)) => true,
+        Some((ChannelScheme::Brenn, name)) => in_a_tool_namespace(name),
         _ => false,
     }
-}
-
-/// The characters a channel-name segment ends at.
-const CHANNEL_BOUNDARIES: [char; 2] = ['/', '.'];
-
-/// The characters a tuning prefix ends at: a channel name's, plus the colon that
-/// closes an mqtt client (`mqtt:broker:`).
-const TUNING_BOUNDARIES: [char; 3] = ['/', '.', ':'];
-
-/// Does `prefix` end where a segment in `boundaries` ends?
-///
-/// Without this, `webhook:git` would reach `webhook:github`. One rule for both
-/// the prefixes a tuning block names and the ones a matcher does, so a change to
-/// what closes a segment cannot be made to half of them.
-fn ends_at_segment_boundary(prefix: &str, boundaries: &[char]) -> bool {
-    boundaries
-        .iter()
-        .any(|boundary| prefix.ends_with(*boundary))
 }
 
 // ── pass 1: roles ────────────────────────────────────────────────────────────
@@ -180,7 +152,7 @@ fn check_tuning_address(tuning: &RTuning, errors: &mut Vec<Diagnostic>) {
     // what it names depends on where it was meant to stop. The description rules
     // below hold either way, so they run regardless.
     let mut classify = true;
-    if tuning.is_prefix && !ends_at_segment_boundary(address, &TUNING_BOUNDARIES) {
+    if tuning.is_prefix && !ends_at_tuning_boundary(address) {
         classify = false;
         errors.push(Diagnostic::at(
             format!(
@@ -239,7 +211,7 @@ fn check_channel_model(config: &ResolvedConfig, errors: &mut Vec<Diagnostic>) {
     for channel in &config.channels {
         let address = channel.address.value();
         let span = channel.address.span();
-        let durable = Scheme::split(address).is_some_and(|(scheme, _)| scheme.durable());
+        let durable = split_spellable(address).is_some_and(|(scheme, _)| config_identified(scheme));
         require_depth(
             channel.attrs.push_depth.is_some(),
             "push_depth",
@@ -355,19 +327,10 @@ fn int_or_word_span(value: &crate::model::IntOrWord) -> &Span {
 /// construction.
 const DSL_CHANNEL_SEED: &[u8] = b"brenn.dsl-channel";
 
-/// The seeds the runtime derives a non-durable channel's identity under.
-///
-/// Read here only to check that no pinned or derived durable uuid collides with
-/// one; these values never become a channel's configured identity.
-/// TODO(dsl-vocabulary-config-parity): held equal to the seeds in
-/// `brenn_lib::messaging::addressing` by review.
-const EPHEMERAL_CHANNEL_SEED: &[u8] = b"brenn.ephemeral-channel";
-const LOCAL_CHANNEL_SEED: &[u8] = b"brenn.local-channel";
-
-/// A channel uuid under one of the pinned namespace seeds.
-fn channel_uuid(seed: &[u8], name: &str) -> Uuid {
-    let namespace = Uuid::new_v5(&Uuid::NAMESPACE_DNS, seed);
-    Uuid::new_v5(&namespace, name.as_bytes())
+/// The uuid a durable address derives to under [`DSL_CHANNEL_SEED`].
+fn dsl_channel_uuid(address: &str) -> Uuid {
+    let namespace = Uuid::new_v5(&Uuid::NAMESPACE_DNS, DSL_CHANNEL_SEED);
+    Uuid::new_v5(&namespace, address.as_bytes())
 }
 
 /// The identity of every declared channel: pinned where a pin names it, derived
@@ -386,36 +349,37 @@ fn derive_channel_identity(
     let mut identities: Vec<(Uuid, &str, &Span)> = Vec::new();
     for channel in &config.channels {
         let address = channel.address.value().as_str();
-        let Some((scheme, name)) = Scheme::split(address) else {
+        let Some((scheme, name)) = split_spellable(address) else {
             // Resolution refuses a schemeless address, so this config never
             // reached derivation.
             unreachable!("a resolved channel address names a scheme");
         };
-        let (uuid, span) = match (scheme.durable(), pins.get(address)) {
+        let (uuid, span) = match (config_identified(scheme), pins.get(address)) {
             (true, Some(pin)) => (pin.0, pin.1),
-            (true, None) => (
-                channel_uuid(DSL_CHANNEL_SEED, address),
-                channel.address.span(),
-            ),
+            (true, None) => (dsl_channel_uuid(address), channel.address.span()),
             (false, _) => {
-                // The runtime's own derivation, computed only so a pin or a
-                // durable derivation colliding with it is refused here.
-                let seed = match scheme {
-                    Scheme::Ephemeral => EPHEMERAL_CHANNEL_SEED,
-                    Scheme::Local => LOCAL_CHANNEL_SEED,
+                match scheme {
+                    // The runtime's own derivation, computed only so a pin or a
+                    // durable derivation colliding with it is refused here.
+                    ChannelScheme::Ephemeral | ChannelScheme::Local => (
+                        nondurable_channel_uuid(scheme, name),
+                        channel.address.span(),
+                    ),
                     // Roles refused a declared channel on a system-minted
                     // scheme, and this config is already failing.
-                    Scheme::Webhook | Scheme::Mqtt => {
+                    ChannelScheme::Webhook | ChannelScheme::Mqtt => {
                         uuids.push(None);
                         continue;
                     }
-                    Scheme::Brenn => unreachable!("brenn: is durable"),
-                };
-                (channel_uuid(seed, name), channel.address.span())
+                    ChannelScheme::Brenn => unreachable!("brenn: states its identity"),
+                    // `split_spellable` refuses the prefix, so no resolved
+                    // address reaches here on it.
+                    ChannelScheme::PwaPush => unreachable!("pwa_push: is not spellable"),
+                }
             }
         };
         identities.push((uuid, address, span));
-        uuids.push(scheme.durable().then_some(uuid));
+        uuids.push(config_identified(scheme).then_some(uuid));
     }
     check_unique(
         identities.into_iter(),
@@ -445,7 +409,8 @@ fn collect_pins<'a>(
         .channels
         .iter()
         .filter(|channel| {
-            Scheme::split(channel.address.value()).is_some_and(|(scheme, _)| scheme.durable())
+            split_spellable(channel.address.value())
+                .is_some_and(|(scheme, _)| config_identified(scheme))
         })
         .map(|channel| channel.address.value().as_str())
         .collect();
@@ -595,18 +560,21 @@ impl Family {
     ///
     /// `None` only for a webhook on the publish plane: webhooks are inbound, so
     /// there is no list for a right to send to one.
-    fn of(scheme: Scheme, plane: Plane) -> Option<Family> {
+    fn of(scheme: ChannelScheme, plane: Plane) -> Option<Family> {
         Some(match (scheme, plane) {
-            (Scheme::Brenn, Plane::Subscribe) => Self::BrennSubscribe,
-            (Scheme::Brenn, Plane::Publish) => Self::BrennPublish,
-            (Scheme::Ephemeral, Plane::Subscribe) => Self::EphemeralSubscribe,
-            (Scheme::Ephemeral, Plane::Publish) => Self::EphemeralPublish,
-            (Scheme::Local, Plane::Subscribe) => Self::LocalSubscribe,
-            (Scheme::Local, Plane::Publish) => Self::LocalPublish,
-            (Scheme::Mqtt, Plane::Subscribe) => Self::MqttSubscribe,
-            (Scheme::Mqtt, Plane::Publish) => Self::MqttPublish,
-            (Scheme::Webhook, Plane::Subscribe) => Self::Webhook,
-            (Scheme::Webhook, Plane::Publish) => return None,
+            (ChannelScheme::Brenn, Plane::Subscribe) => Self::BrennSubscribe,
+            (ChannelScheme::Brenn, Plane::Publish) => Self::BrennPublish,
+            (ChannelScheme::Ephemeral, Plane::Subscribe) => Self::EphemeralSubscribe,
+            (ChannelScheme::Ephemeral, Plane::Publish) => Self::EphemeralPublish,
+            (ChannelScheme::Local, Plane::Subscribe) => Self::LocalSubscribe,
+            (ChannelScheme::Local, Plane::Publish) => Self::LocalPublish,
+            (ChannelScheme::Mqtt, Plane::Subscribe) => Self::MqttSubscribe,
+            (ChannelScheme::Mqtt, Plane::Publish) => Self::MqttPublish,
+            (ChannelScheme::Webhook, Plane::Subscribe) => Self::Webhook,
+            (ChannelScheme::Webhook, Plane::Publish) => return None,
+            // `split_spellable` refuses the prefix, so no resolved address
+            // reaches a family question on it.
+            (ChannelScheme::PwaPush, _) => unreachable!("pwa_push: is not spellable"),
         })
     }
 
@@ -692,23 +660,6 @@ enum DEntry {
     MqttSub(DMqttSub),
     MqttPub(DMqttClient),
     Webhook(DWebhook),
-}
-
-/// The reserved segment the runtime mints anonymous channels under.
-///
-/// A matcher reaching into it is refused: an anonymous channel's endpoint set
-/// *is* its authority, so a matcher over the namespace would attach a third
-/// party to a connection nobody named it in.
-/// TODO(dsl-vocabulary-config-parity): held equal to
-/// `brenn_lib::messaging::addressing::AUTO_CHANNEL_SEGMENT` by review.
-const AUTO_CHANNEL_SEGMENT: &str = "auto";
-
-/// Does this bare channel name sit in the anonymous namespace?
-fn is_auto_channel_name(name: &str) -> bool {
-    name == AUTO_CHANNEL_SEGMENT
-        || name
-            .strip_prefix(AUTO_CHANNEL_SEGMENT)
-            .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('/'))
 }
 
 /// The declarations a matcher may point at from outside the handle space.
@@ -1218,16 +1169,16 @@ fn matcher_address(
     kind: MatcherKind,
     refs: &Refs<'_>,
     errors: &mut Vec<Diagnostic>,
-) -> Option<(Scheme, String)> {
+) -> Option<(ChannelScheme, String)> {
     match matcher.val.value() {
-        RMatcherVal::Lit(text) => match Scheme::split(text) {
+        RMatcherVal::Lit(text) => match split_spellable(text) {
             Some((scheme, bare)) => Some((scheme, bare.to_string())),
             None => {
                 errors.push(Diagnostic::at(
                     format!(
                         "`{text}` names no scheme, so there is no family it is about; a \
                          matcher pattern leads with {}",
-                        Scheme::quoted_list()
+                        spellable_quoted_list()
                     ),
                     matcher.val.span().clone(),
                 ));
@@ -1249,7 +1200,7 @@ fn matcher_address(
                 return None;
             }
             let address = refs.address(*id);
-            let Some((scheme, bare)) = Scheme::split(address) else {
+            let Some((scheme, bare)) = split_spellable(address) else {
                 unreachable!("a resolved channel address names a scheme");
             };
             Some((scheme, bare.to_string()))
@@ -1262,9 +1213,9 @@ fn matcher_address(
 /// The one place this pass mirrors the runtime's own matcher validation: an empty
 /// pattern, a prefix that stops mid-segment, and any reach into the anonymous
 /// namespace are all silent over-grants on a path an attacker can influence, and
-/// a refusal here beats the same refusal at boot.
-/// TODO(dsl-vocabulary-config-parity): held equal to
-/// `brenn_lib::access::resolve::resolve_channel` by review.
+/// a refusal here beats the same refusal at boot. The rules it mirrors are the
+/// shared predicates the runtime's own validation calls, so the mirroring is a
+/// second call site rather than a second statement of the rule.
 fn channel_matcher(
     kind: MatcherKind,
     bare: String,
@@ -1294,12 +1245,12 @@ fn channel_matcher(
     match kind {
         MatcherKind::Exact => Some(DMatcher::Exact(Spanned::new(bare, span.clone()))),
         MatcherKind::Prefix => {
-            if !ends_at_segment_boundary(&bare, &CHANNEL_BOUNDARIES) {
+            if !ends_at_matcher_boundary(&bare) {
                 errors.push(Diagnostic::at(
                     format!(
                         "the prefix `{bare}` does not end at a segment boundary ({}), so \
                          it over-matches every sibling name it is the start of",
-                        or_list(CHANNEL_BOUNDARIES)
+                        or_list(MATCHER_BOUNDARIES)
                     ),
                     span.clone(),
                 ));
@@ -1684,24 +1635,30 @@ fn planes(dir: PortDir) -> &'static [Plane] {
 /// TODO(dsl-vocabulary-config-parity): held equal to
 /// `brenn_lib::messaging::boot::surfaces::validate_binding`,
 /// `WasmConsumerSubscriptionRaw` and `AppAclRaw` by review.
-fn bindable(kind: EntityKind, plane: Plane) -> &'static [Scheme] {
+fn bindable(kind: EntityKind, plane: Plane) -> &'static [ChannelScheme] {
     match (kind, plane) {
-        (EntityKind::Surface, _) => &[Scheme::Brenn, Scheme::Ephemeral, Scheme::Local],
-        (EntityKind::Consumer, Plane::Subscribe) => &[
-            Scheme::Brenn,
-            Scheme::Ephemeral,
-            Scheme::Local,
-            Scheme::Webhook,
-            Scheme::Mqtt,
+        (EntityKind::Surface, _) => &[
+            ChannelScheme::Brenn,
+            ChannelScheme::Ephemeral,
+            ChannelScheme::Local,
         ],
-        (EntityKind::Consumer, Plane::Publish) => {
-            &[Scheme::Brenn, Scheme::Ephemeral, Scheme::Local]
-        }
+        (EntityKind::Consumer, Plane::Subscribe) => &[
+            ChannelScheme::Brenn,
+            ChannelScheme::Ephemeral,
+            ChannelScheme::Local,
+            ChannelScheme::Webhook,
+            ChannelScheme::Mqtt,
+        ],
+        (EntityKind::Consumer, Plane::Publish) => &[
+            ChannelScheme::Brenn,
+            ChannelScheme::Ephemeral,
+            ChannelScheme::Local,
+        ],
         (EntityKind::Agent, Plane::Subscribe) => &[
-            Scheme::Brenn,
-            Scheme::Ephemeral,
-            Scheme::Webhook,
-            Scheme::Mqtt,
+            ChannelScheme::Brenn,
+            ChannelScheme::Ephemeral,
+            ChannelScheme::Webhook,
+            ChannelScheme::Mqtt,
         ],
         // An agent states no outbound position: it publishes through the tools
         // its grants admit, against the authority its `acl publish` states.
@@ -1843,7 +1800,7 @@ fn derive_bounds(
 
 /// The refusal for a position on a scheme the entity cannot attach to there.
 fn unbindable(
-    scheme: Scheme,
+    scheme: ChannelScheme,
     plane: Plane,
     kind: EntityKind,
     label: &str,
@@ -1891,17 +1848,17 @@ fn bound_address(
     label: &str,
     refs: &Refs<'_>,
     errors: &mut Vec<Diagnostic>,
-) -> Option<(Scheme, String)> {
+) -> Option<(ChannelScheme, String)> {
     let address = match bound.chan {
         RChanRef::Decl(id) => refs.address(*id),
         RChanRef::Addr(address) => address.value().as_str(),
     };
-    let Some((scheme, bare)) = Scheme::split(address) else {
+    let Some((scheme, bare)) = split_spellable(address) else {
         unreachable!("a resolved address names a scheme");
     };
     if matches!(bound.chan, RChanRef::Addr(_))
-        && matches!(scheme, Scheme::Brenn | Scheme::Ephemeral)
-        && !(scheme == Scheme::Brenn && in_a_tool_namespace(bare))
+        && matches!(scheme, ChannelScheme::Brenn | ChannelScheme::Ephemeral)
+        && !(scheme == ChannelScheme::Brenn && in_a_tool_namespace(bare))
     {
         errors.push(Diagnostic::at(
             format!(
@@ -2106,23 +2063,43 @@ impl Capability {
 /// configuration, which is what agreement refuses.
 /// TODO(dsl-vocabulary-config-parity): held equal to the `SurfaceGrant` and
 /// `RemoteGrant` variants and the authorable `AppCapability` tokens by review.
-fn expansions(kind: EntityKind) -> &'static [(Plane, Scheme, &'static str)] {
+fn expansions(kind: EntityKind) -> &'static [(Plane, ChannelScheme, &'static str)] {
     match kind {
         EntityKind::Surface | EntityKind::Remote => &[
-            (Plane::Subscribe, Scheme::Brenn, "subscribe"),
-            (Plane::Subscribe, Scheme::Ephemeral, "ephemeral_subscribe"),
-            (Plane::Publish, Scheme::Brenn, "publish"),
-            (Plane::Publish, Scheme::Ephemeral, "ephemeral_publish"),
+            (Plane::Subscribe, ChannelScheme::Brenn, "subscribe"),
+            (
+                Plane::Subscribe,
+                ChannelScheme::Ephemeral,
+                "ephemeral_subscribe",
+            ),
+            (Plane::Publish, ChannelScheme::Brenn, "publish"),
+            (
+                Plane::Publish,
+                ChannelScheme::Ephemeral,
+                "ephemeral_publish",
+            ),
         ],
         EntityKind::Agent => &[
-            (Plane::Subscribe, Scheme::Brenn, "messaging_subscribe"),
-            (Plane::Subscribe, Scheme::Ephemeral, "ephemeral_subscribe"),
-            (Plane::Subscribe, Scheme::Mqtt, "mqtt_subscribe"),
-            (Plane::Subscribe, Scheme::Webhook, "webhook"),
-            (Plane::Publish, Scheme::Brenn, "messaging_publish"),
-            (Plane::Publish, Scheme::Ephemeral, "ephemeral_publish"),
-            (Plane::Publish, Scheme::Local, "local_publish"),
-            (Plane::Publish, Scheme::Mqtt, "mqtt_publish"),
+            (
+                Plane::Subscribe,
+                ChannelScheme::Brenn,
+                "messaging_subscribe",
+            ),
+            (
+                Plane::Subscribe,
+                ChannelScheme::Ephemeral,
+                "ephemeral_subscribe",
+            ),
+            (Plane::Subscribe, ChannelScheme::Mqtt, "mqtt_subscribe"),
+            (Plane::Subscribe, ChannelScheme::Webhook, "webhook"),
+            (Plane::Publish, ChannelScheme::Brenn, "messaging_publish"),
+            (
+                Plane::Publish,
+                ChannelScheme::Ephemeral,
+                "ephemeral_publish",
+            ),
+            (Plane::Publish, ChannelScheme::Local, "local_publish"),
+            (Plane::Publish, ChannelScheme::Mqtt, "mqtt_publish"),
         ],
         // A wasm consumer's words are capabilities, which name no scheme and
         // expand to nothing: they cross into the config as written.
